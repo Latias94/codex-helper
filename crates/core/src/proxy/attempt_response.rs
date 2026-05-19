@@ -220,6 +220,10 @@ pub(super) async fn handle_streaming_attempt_success(
             effective_effort: effective_effort.map(ToOwned::to_owned),
             service_tier: base_service_tier.clone(),
             codex_bridge,
+            route_decision: Some(route_decision_from_model_note(
+                route_attempts,
+                route_attempt_index,
+            )),
             request_id,
             is_user_turn,
             is_codex_service,
@@ -366,6 +370,10 @@ pub(super) async fn handle_attempt_response(
                 observed_service_tier,
                 codex_bridge.clone(),
                 usage,
+                Some(route_decision_from_model_note(
+                    route_attempts,
+                    route_attempt_index,
+                )),
                 retry,
                 response_headers_filtered,
                 response_body,
@@ -423,6 +431,10 @@ pub(super) async fn handle_attempt_response(
                 observed_service_tier,
                 codex_bridge.clone(),
                 None,
+                Some(route_decision_from_model_note(
+                    route_attempts,
+                    route_attempt_index,
+                )),
                 retry,
                 response_headers_filtered,
                 response_body,
@@ -503,6 +515,10 @@ pub(super) async fn handle_attempt_response(
             observed_service_tier,
             codex_bridge,
             None,
+            Some(route_decision_from_model_note(
+                route_attempts,
+                route_attempt_index,
+            )),
             retry,
             response_headers_filtered,
             response_body,
@@ -557,6 +573,7 @@ async fn finish_attempt_forward_response(
     observed_service_tier: Option<String>,
     codex_bridge: Option<CodexBridgeLog>,
     usage: Option<UsageMetrics>,
+    route_decision: Option<crate::state::RouteDecisionProvenance>,
     retry: Option<crate::logging::RetryInfo>,
     response_headers: HeaderMap,
     response_body: Bytes,
@@ -589,10 +606,29 @@ async fn finish_attempt_forward_response(
             service_tier: service_tier_for_log,
             codex_bridge,
             usage,
+            route_decision,
             retry,
             response_headers,
             response_body,
         },
     )
     .await
+}
+
+fn route_decision_from_model_note(
+    route_attempts: &[RouteAttemptLog],
+    route_attempt_index: usize,
+) -> crate::state::RouteDecisionProvenance {
+    route_attempts
+        .get(route_attempt_index)
+        .and_then(|attempt| attempt.model.as_deref())
+        .filter(|model| *model != "-")
+        .map(|model| crate::state::RouteDecisionProvenance {
+            effective_model: Some(crate::state::ResolvedRouteValue {
+                value: model.to_string(),
+                source: crate::state::RouteValueSource::RuntimeFallback,
+            }),
+            ..crate::state::RouteDecisionProvenance::default()
+        })
+        .unwrap_or_default()
 }

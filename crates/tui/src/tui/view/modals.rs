@@ -103,10 +103,10 @@ fn startup_issue_copy(issue: &CodexStartupReadinessIssue, lang: Language) -> Sta
                     "或用配置端口重启当前 helper 实例。",
                 ),
         },
-        "Codex bridge mode does not match helper config" => StartupIssueCopy {
-            title: "Codex 桥接模式与 helper 配置不一致".to_string(),
+        "Codex bridge preset does not match helper config" => StartupIssueCopy {
+            title: "Codex 桥接预设与 helper 配置不一致".to_string(),
             detail: issue.detail.clone(),
-            action: "运行 `codex-helper switch status`；如果刚切换过模式，请完整重启 Codex 客户端。"
+            action: "运行 `codex-helper switch status`；如果刚切换过预设，请完整重启 Codex 客户端。"
                 .to_string(),
         },
         "Official relay bridge can route a session across providers" => StartupIssueCopy {

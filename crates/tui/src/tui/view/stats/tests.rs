@@ -16,6 +16,7 @@ fn sample_snapshot(provider_balances: HashMap<String, Vec<ProviderBalanceSnapsho
     Snapshot {
         rows: Vec::new(),
         recent: Vec::new(),
+        forecast_recent: Vec::new(),
         model_overrides: HashMap::new(),
         overrides: HashMap::new(),
         station_overrides: HashMap::new(),
@@ -294,6 +295,7 @@ fn stats_kpis_show_spend_forecast_when_priced_requests_exist() {
         page: crate::tui::types::Page::Stats,
         usage_forecast: crate::config::UsageForecastConfig {
             rate_window_minutes: 60,
+            min_priced_requests: 2,
             reset_utc_offset: "+08:00".to_string(),
             ..Default::default()
         },
@@ -305,6 +307,68 @@ fn stats_kpis_show_spend_forecast_when_priced_requests_exist() {
     assert!(text.contains("burn"), "{text}");
     assert!(text.contains("rate"), "{text}");
     assert!(text.contains("/h"), "{text}");
+    assert!(text.contains("not project"), "{text}");
+}
+
+#[test]
+fn stats_kpis_show_spend_projection_only_when_sample_is_confident() {
+    let now = crate::tui::model::now_ms();
+    let mut snapshot = sample_snapshot(HashMap::from([(
+        "provider".to_string(),
+        vec![ProviderBalanceSnapshot {
+            provider_id: "provider".to_string(),
+            status: BalanceSnapshotStatus::Ok,
+            quota_remaining_usd: Some("20".to_string()),
+            fetched_at_ms: now,
+            ..ProviderBalanceSnapshot::default()
+        }],
+    )]));
+    snapshot.recent = vec![
+        sample_priced_request(now.saturating_sub(59 * 60_000), "1"),
+        sample_priced_request(now.saturating_sub(30 * 60_000), "1"),
+    ];
+    let mut ui = UiState {
+        page: crate::tui::types::Page::Stats,
+        usage_forecast: crate::config::UsageForecastConfig {
+            rate_window_minutes: 60,
+            min_priced_requests: 2,
+            reset_utc_offset: "+08:00".to_string(),
+            ..Default::default()
+        },
+        ..UiState::default()
+    };
+
+    let text = render_stats_text(140, 28, &mut ui, &snapshot);
+
+    assert!(text.contains("burn"), "{text}");
+    assert!(text.contains("at current rate to reset"), "{text}");
+}
+
+#[test]
+fn spend_forecast_prefers_ledger_backed_sample_over_display_recent() {
+    let now = crate::tui::model::now_ms();
+    let mut snapshot = sample_snapshot(HashMap::new());
+    snapshot.recent = vec![sample_priced_request(now.saturating_sub(30 * 60_000), "1")];
+    snapshot.forecast_recent = vec![
+        sample_priced_request(now.saturating_sub(59 * 60_000), "1"),
+        sample_priced_request(now.saturating_sub(30 * 60_000), "1"),
+        sample_priced_request(now.saturating_sub(10 * 60_000), "1"),
+    ];
+    let config = crate::config::UsageForecastConfig {
+        rate_window_minutes: 60,
+        min_priced_requests: 2,
+        reset_utc_offset: "+08:00".to_string(),
+        ..Default::default()
+    };
+
+    let forecast = usage_spend_forecast(&snapshot, &config, now);
+
+    assert_eq!(forecast.priced_requests, 3);
+    assert_eq!(
+        forecast.confidence,
+        crate::usage_forecast::UsageForecastConfidence::Estimated
+    );
+    assert!(forecast.projected_until_reset_usd.is_some());
 }
 
 #[test]

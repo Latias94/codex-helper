@@ -26,8 +26,10 @@ pub struct CodexRelayCapabilitiesRequest {
     pub upstream_index: Option<usize>,
     #[serde(default)]
     pub model: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "patch_preset")]
     pub patch_mode: Option<CodexPatchMode>,
+    #[serde(default)]
+    pub responses_websocket: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +40,7 @@ pub struct CodexRelayCapabilitiesResponse {
     pub upstream_index: usize,
     pub upstream_base_url: String,
     pub patch_mode: CodexPatchMode,
+    pub responses_websocket: bool,
     pub model: Option<String>,
     pub expected: CodexCapabilityProfile,
     pub observed: CodexRelayCapabilitiesObserved,
@@ -83,8 +86,21 @@ pub(super) async fn codex_relay_capabilities_for_proxy(
     let patch_mode = payload
         .patch_mode
         .or_else(current_codex_switch_patch_mode)
-        .or_else(|| crate::config::codex_client_patch_mode_from_config_file().ok())
+        .or_else(|| {
+            crate::config::codex_client_patch_config_from_config_file()
+                .ok()
+                .map(|cfg| cfg.preset)
+        })
         .unwrap_or_default();
+    let responses_websocket = payload
+        .responses_websocket
+        .or_else(current_codex_switch_responses_websocket)
+        .or_else(|| {
+            crate::config::codex_client_patch_config_from_config_file()
+                .ok()
+                .map(|cfg| cfg.options.responses_websocket)
+        })
+        .unwrap_or(false);
     let model = payload
         .model
         .as_deref()
@@ -112,7 +128,12 @@ pub(super) async fn codex_relay_capabilities_for_proxy(
         )
         .await;
 
-    let expected = build_expected_profile(patch_mode, model.as_deref(), &models_observation);
+    let expected = build_expected_profile(
+        patch_mode,
+        responses_websocket,
+        model.as_deref(),
+        &models_observation,
+    );
     let observed = CodexRelayCapabilitiesObserved {
         models: models_observation.result,
         responses,
@@ -128,6 +149,7 @@ pub(super) async fn codex_relay_capabilities_for_proxy(
         upstream_index: target.upstream_index,
         upstream_base_url: target.upstream.base_url,
         patch_mode,
+        responses_websocket,
         model,
         expected,
         observed,
@@ -149,16 +171,24 @@ fn current_codex_switch_patch_mode() -> Option<CodexPatchMode> {
         .and_then(|status| status.patch_mode)
 }
 
+fn current_codex_switch_responses_websocket() -> Option<bool> {
+    crate::codex_integration::codex_switch_status()
+        .ok()
+        .and_then(|status| status.supports_websockets)
+}
+
 fn build_expected_profile(
     patch_mode: CodexPatchMode,
+    responses_websocket: bool,
     model: Option<&str>,
     models_observation: &CodexRelayProbeObservation,
 ) -> CodexCapabilityProfile {
     let model_catalog = translated_models_catalog(models_observation, model).unwrap_or_else(|| {
         CodexModelCatalogProfile::unknown(models_observation.result.reason.clone())
     });
-    CodexCapabilityProfile::for_input(CodexCapabilityProfileInput::from_patch_mode(
+    CodexCapabilityProfile::for_input(CodexCapabilityProfileInput::from_patch_mode_with_transport(
         patch_mode,
+        responses_websocket,
         model_catalog,
     ))
 }

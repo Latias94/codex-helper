@@ -73,6 +73,7 @@ fn routing_provider_balance_line_falls_back_for_legacy_snapshot_keys() {
     let snapshot = crate::tui::model::Snapshot {
         rows: Vec::new(),
         recent: Vec::new(),
+        forecast_recent: Vec::new(),
         model_overrides: std::collections::HashMap::new(),
         overrides: std::collections::HashMap::new(),
         station_overrides: std::collections::HashMap::new(),
@@ -111,6 +112,7 @@ fn routing_provider_balance_line_prefers_routing_context() {
     let snapshot = crate::tui::model::Snapshot {
         rows: Vec::new(),
         recent: Vec::new(),
+        forecast_recent: Vec::new(),
         model_overrides: std::collections::HashMap::new(),
         overrides: std::collections::HashMap::new(),
         station_overrides: std::collections::HashMap::new(),

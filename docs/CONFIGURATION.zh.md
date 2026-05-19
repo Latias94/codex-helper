@@ -41,74 +41,83 @@ Codex 自己的文件仍由 Codex 维护：
 
 `switch on/off` 和一键启动只会 patch Codex 配置中的本地代理片段。它们不会覆盖无关的 Codex 配置改动。
 
-## Codex 客户端 Patch 模式
+## Codex 客户端 Patch 预设
 
-默认模式只把 `~/.codex/config.toml` 的 `model_provider` 指到本地 `codex_proxy`。如果要保留 ChatGPT 登录态和移动端/桌面端账号能力，同时让模型请求进入 codex-helper，可启用 ChatGPT bridge：
+默认预设只把 `~/.codex/config.toml` 的 `model_provider` 指到本地 `codex_proxy`。如果要保留 ChatGPT 登录态和移动端/桌面端账号能力，同时让模型请求进入 codex-helper，可启用 ChatGPT bridge：
 
 ```toml
 version = 5
 
 [codex.client_patch]
-mode = "chatgpt-bridge"
+preset = "chatgpt-bridge"
+# 可选传输开关。只允许搭配 official relay 预设。
+responses_websocket = false
 ```
+
+兼容性：旧配置里的 `mode = "..."` 仍会被读取；但 codex-helper 保存/生成配置时统一写 `preset = "..."`。
 
 也可以临时用 CLI 切换：
 
 ```bash
-codex-helper switch on --mode chatgpt-bridge
-codex-helper switch on --mode imagegen-bridge
-codex-helper switch on --mode official-relay-bridge
-codex-helper switch on --mode official-imagegen-bridge
-codex-helper switch on --mode default
+codex-helper switch on --preset chatgpt-bridge
+codex-helper switch on --preset imagegen-bridge
+codex-helper switch on --preset official-relay
+codex-helper switch on --preset official-relay --responses-websocket
+codex-helper switch on --preset official-imagegen
+codex-helper switch on --preset default
 ```
 
-启动时，`codex-helper serve` 会在 Codex 尚未切到 codex-helper 时读取 `[codex.client_patch]`；如果 Codex 已经切到 helper，则保留当前客户端 patch 模式。要显式切换，可使用 `switch on --mode ...` 或 TUI Settings 页的 `B`/`I`/`F`/`D`。
+旧 CLI 写法 `--mode ...` 仍作为 alias 保留。启动时，`codex-helper serve` 会在 Codex 尚未切到 codex-helper 时读取 `[codex.client_patch]`；如果 Codex 已经切到 helper，则保留当前客户端 patch 预设。要显式切换，可使用 `switch on --preset ...` 或 TUI Settings 页的 `B`/`I`/`F`/`D`。
 
 `chatgpt-bridge` 会写入 `~/.codex/config.toml` 的 `requires_openai_auth = true`、`supports_websockets = false`，并把 `~/.codex/auth.json` 中的 `auth_mode` 改为 `"chatgpt"`、`OPENAI_API_KEY` 改为 `null`，其它字段保持不变。启用前必须已经在官方 Codex 里完成 ChatGPT 登录；如果 `auth.json` 没有完整 token、email 和账号信息，codex-helper 会在写入 `config.toml` / `auth.json` 前拒绝 patch，避免 Codex TUI 启动时报 `email and plan type are required for chatgpt authentication`。修改 Codex 客户端配置后，已经打开的 Codex app 通常需要重启后才会读取新配置。
 
-`imagegen-bridge` 是显式的实验 hack 模式。它会把 `~/.codex/auth.json` 临时写成空对象 `{}`，让 Codex 的默认 auth 解析仍把会话视为 ChatGPT-backed 并暴露 hosted `image_generation` tool；真实上游凭据仍来自 codex-helper routing（`auth_token_env`、`auth_token`、`api_key_env` 或 `api_key`）。它不要求官方 ChatGPT 登录，也不会显式写入 `auth_mode`。启用前，codex-helper 会校验 Codex 服务至少有一个已启用上游，并且当前进程实际能取得至少一个上游凭据；对于环境变量凭据，只在配置里写 env var 名称不够，运行 `switch on` 或启动 `serve` 时该环境变量必须有值。codex-helper 会把旧 `auth.json` 存入 switch state，并在切回 `default` 或执行 `switch off` 时恢复；但只有当前 `auth.json` 仍等于 helper 写入的 facade 时才恢复。如果用户或 Codex 期间改过 `auth.json`，codex-helper 会保持现状，不覆盖用户变更。
+`imagegen-bridge` 是显式的实验 hack 预设。它会把 `~/.codex/auth.json` 临时写成空对象 `{}`，让 Codex 的默认 auth 解析仍把会话视为 ChatGPT-backed 并暴露 hosted `image_generation` tool；真实上游凭据仍来自 codex-helper routing（`auth_token_env`、`auth_token`、`api_key_env` 或 `api_key`）。它不要求官方 ChatGPT 登录，也不会显式写入 `auth_mode`。启用前，codex-helper 会校验 Codex 服务至少有一个已启用上游，并且当前进程实际能取得至少一个上游凭据；对于环境变量凭据，只在配置里写 env var 名称不够，运行 `switch on` 或启动 `serve` 时该环境变量必须有值。codex-helper 会把旧 `auth.json` 存入 switch state，并在切回 `default` 或执行 `switch off` 时恢复；但只有当前 `auth.json` 仍等于 helper 写入的 facade 时才恢复。如果用户或 Codex 期间改过 `auth.json`，codex-helper 会保持现状，不覆盖用户变更。
 
-`official-relay-bridge` 是实验性的 HTTP 官方中转模式，适合能转发 OpenAI Responses 语义的中转，尤其是支持 `/responses/compact` 的 sub2api 风格中转。它会在 `~/.codex/config.toml` 写入 `name = "OpenAI"` 和 `supports_websockets = false`，让 Codex 选择官方 remote compaction v1，同时保持 WebSocket 关闭。它不会写 `requires_openai_auth`，也不会 patch `auth.json`；真实上游凭据仍必须来自 codex-helper routing。如果中转对 `/responses/compact` 返回 404/405/501 或 compact unsupported 这类错误，请切回 `default`，或改用明确支持 compact 的中转账号。
+`official-relay` 是实验性的官方中转预设，适合能转发 OpenAI Responses 语义的中转，尤其是支持 `/responses/compact` 的 sub2api 风格中转。它会在 `~/.codex/config.toml` 写入 `name = "OpenAI"`，让 Codex 选择官方 remote compaction v1；默认仍写 `supports_websockets = false`，保持 WebSocket 关闭。它不会写 `requires_openai_auth`，也不会 patch `auth.json`；真实上游凭据仍必须来自 codex-helper routing。如果中转对 `/responses/compact` 返回 404/405/501 或 compact unsupported 这类错误，请切回 `default`，或改用明确支持 compact 的中转账号。
 
-`official-imagegen-bridge` 是混合实验模式，适合背后确实是官方订阅账号的中转。它会像 `official-relay-bridge` 一样把 provider 声明成 `OpenAI`，让 Codex 走官方 remote compaction v1；同时像 `imagegen-bridge` 一样写入 `{}` auth facade，让 Codex 暴露 hosted `image_generation`。它保持 `supports_websockets = false`，不写 `requires_openai_auth`，且除非选中的上游配置了 helper 侧凭据，否则仍会剥离 Codex 客户端 auth。该模式只负责让 Codex 暴露并发送官方 hosted tool；中转账号本身仍必须同时支持 `/responses/compact` 和 hosted image generation 调用。
+`official-imagegen` 是混合实验预设，适合背后确实是官方订阅账号的中转。它会像 `official-relay` 一样把 provider 声明成 `OpenAI`，让 Codex 走官方 remote compaction v1；同时像 `imagegen-bridge` 一样写入 `{}` auth facade，让 Codex 暴露 hosted `image_generation`。它默认保持 `supports_websockets = false`，不写 `requires_openai_auth`，且除非选中的上游配置了 helper 侧凭据，否则仍会剥离 Codex 客户端 auth。该预设只负责让 Codex 暴露并发送官方 hosted tool；中转账号本身仍必须同时支持 `/responses/compact` 和 hosted image generation 调用。
+
+`responses_websocket = true` 是传输开关，不是新的 patch 预设。它只允许搭配 `official-relay` 和 `official-imagegen`。启用后，codex-helper 会在 Codex provider 配置里写入 `supports_websockets = true`，并由 helper 自己处理 `/responses`、`/v1/responses`、`/backend-api/codex/responses` 的 WebSocket upgrade。relay 会读取第一个 `response.create` frame，复用普通 helper 请求的 model override、model mapping、request filter、routing selection、session affinity、concurrency snapshot 和 auth injection，注入 `OpenAI-Beta: responses_websockets=2026-02-06`，然后和选中的上游做双向 frame 转发。除非你的上游中转也支持 Responses WebSocket v2，否则保持关闭。
 
 可以通过本地 admin API 主动检查某个中转的 Codex 能力画像：
 
 内置 TUI 也能直接跑同一个诊断：进入 Settings（`6`）后按 `C`，它会针对当前 Codex runtime
 执行一次有界 relay 诊断。Settings 页会显示选中的目标上游、expected 能力、实际观测到的
-`/models` / `/responses` / `/responses/compact` 支持情况、mismatch、warning 和推荐 patch mode。
-这个 TUI 动作只诊断，不会自动修改 patch mode。
+`/models` / `/responses` / `/responses/compact` 支持情况、mismatch、warning 和推荐 patch 预设。
+这个 TUI 动作只诊断，不会自动修改 patch 预设。
 
 ```bash
 curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-capabilities \
   -H 'content-type: application/json' \
-  -d '{"patch_mode":"official-imagegen-bridge","model":"gpt-5.5"}'
+  -d '{"patch_preset":"official-imagegen","model":"gpt-5.5"}'
 ```
+
+为了 API 兼容，响应 JSON 字段仍叫 `patch_mode`；请求同时接受 `patch_mode` 或 `patch_preset`，并且同时接受 `official-imagegen` 这类 preset 名称和 `official-imagegen-bridge` 这类旧 mode 名称。
 
 这里要使用 Codex proxy port 对应的 admin port（`proxy_port + 1000`；默认 Codex proxy 是
 `3211`，所以默认 admin port 是 `4211`）。这个端点故意设计成 `POST`：它会对选中的上游各发一次有界主动探测，分别访问 `/models`、`/responses` 和 `/responses/compact`。其中 `/models` 是只读探测；两个 Responses 探测发送 `{}`，并把“缺少 model/input”这类校验错误判断为端点存在。它不会走正常 routing、retry、request ledger、session affinity、passive health 或 runtime health 状态，所以这是显式诊断动作，不会放大成每请求重试风暴。
 
 响应里会包含：
 
-- `expected`：当前 patch mode 和模型 metadata 下，Codex 客户端理论上会暴露什么能力。
+- `expected`：当前 patch 预设和模型 metadata 下，Codex 客户端理论上会暴露什么能力。
 - `observed`：中转对 `/models`、`/responses`、`/responses/compact` 的实际响应、置信度，以及是否需要 helper 翻译模型列表。
 - `mismatches`：Codex 会尝试使用、但中转没有证明支持的能力。
-- `recommendation`：基于观测结果给出的保守 patch mode 建议。
+- `recommendation`：基于观测结果给出的保守 patch 预设建议。
 
 推荐矩阵刻意保守：
 
-| 中转观测状态 | 推荐模式 |
+| 中转观测状态 | 推荐预设 |
 | --- | --- |
-| `/responses` 可用，`/responses/compact` 可用，选中模型支持 image input | `official-imagegen-bridge` |
-| `/responses` 可用，`/responses/compact` 可用，选中模型不支持 image input | `official-relay-bridge` |
+| `/responses` 可用，`/responses/compact` 可用，选中模型支持 image input | `official-imagegen` |
+| `/responses` 可用，`/responses/compact` 可用，选中模型不支持 image input | `official-relay` |
 | `/responses` 可用，`/responses/compact` 不支持，选中模型支持 image input | `imagegen-bridge` |
 | `/responses` 可用，`/responses/compact` 不支持，未证明 image 能力 | `default` |
-| `/responses/compact` 状态未知 | 暂时不要推荐 official relay 模式，先证明 compact |
-| `/responses` 不可用 | `default`；缺少 Responses 端点时任何 patch mode 都补不了 |
+| `/responses/compact` 状态未知 | 暂时不要推荐 official relay 预设，先证明 compact |
+| `/responses` 不可用 | `default`；缺少 Responses 端点时任何 patch 预设都补不了 |
 
 对 sub2api 风格中转来说，原始 OpenAI `/models` 响应（`data: [...]`）本身可以接受，但前提是 codex-helper 在 Codex 看到之前把它翻译成 Codex 的 `models: [...]` catalog。诊断响应会把这类情况标成 `observed.models.translation_required = true`。非 sub2api 中转也按同一套规则处理：它可以直接返回 Codex 形态的模型 metadata，也可以返回 helper 能翻译的 OpenAI model list。如果选中模型缺失，或 metadata 无法证明 image input，推荐器不会假设 hosted image generation 可用。
 
-该诊断端点不会主动探测 hosted `image_generation`，因为这可能消耗额度或生成实际图片。WebSocket relay 仍未实现；bridge 模式会继续保持 `supports_websockets = false`。Remote compaction v2 仍只作为诊断认知保留，不由这些模式启用。
+该诊断端点不会主动探测 hosted `image_generation`，因为这可能消耗额度或生成实际图片。Responses WebSocket 通过 `responses_websocket = true` / `--responses-websocket` 显式启用；bridge 预设默认仍保持关闭。Remote compaction v2 仍只作为诊断认知保留，不由这些预设启用。
 
 当 validation-only 诊断还不能解释问题时，可以手动跑更强的 live smoke 检查。它是真实上游请求，不是后台健康检查；可能消耗额度，也可能触发上游生成图片。codex-helper 在发送任何上游请求前，必须先收到固定确认字符串：
 
@@ -139,7 +148,7 @@ TUI Settings 页也提供同一能力：在确认窗口内按两次 `X` 会跑 c
 
 ```bash
 codex-helper codex relay-capabilities \
-  --mode official-imagegen-bridge \
+  --preset official-imagegen \
   --model gpt-5.5
 
 codex-helper codex relay-live-smoke \
@@ -154,9 +163,9 @@ codex-helper codex relay-live-smoke \
 codex-helper codex relay-evidence --limit 20
 ```
 
-Live smoke 刻意和正常路由隔离。它只选择一个上游，每个选中的 case 最多发一次请求，不走 route retry/failover，也不会写 request ledger、route affinity、passive health、runtime health、余额状态或自动修改 patch mode。图片响应只做摘要：codex-helper 会报告是否出现 `image_generation_call`，但不会保存原始图片字节或 base64 payload。
+Live smoke 刻意和正常路由隔离。它只选择一个上游，每个选中的 case 最多发一次请求，不走 route retry/failover，也不会写 request ledger、route affinity、passive health、runtime health、余额状态或自动修改 patch 预设。图片响应只做摘要：codex-helper 会报告是否出现 `image_generation_call`，但不会保存原始图片字节或 base64 payload。
 
-Capability diagnostics 和 live smoke 会把已脱敏的摘要追加写入 `~/.codex-helper/logs/codex_relay_evidence.jsonl`。这个 evidence store 是本地人工诊断记忆，不是 routing truth；它不会进入 request ledger 汇总，也不会驱动 load balancing、session affinity、passive health、余额耗尽、retry policy 或自动 patch-mode 切换。需要给中转站对比或 bug report 附机器可读结果时，可以用 `codex-helper codex relay-evidence --json`。
+Capability diagnostics 和 live smoke 会把已脱敏的摘要追加写入 `~/.codex-helper/logs/codex_relay_evidence.jsonl`。这个 evidence store 是本地人工诊断记忆，不是 routing truth；它不会进入 request ledger 汇总，也不会驱动 load balancing、session affinity、passive health、余额耗尽、retry policy 或自动 patch 预设切换。需要给中转站对比或 bug report 附机器可读结果时，可以用 `codex-helper codex relay-evidence --json`。
 
 要诊断 remote compaction v1 是否生效，可以在 Codex 发生压缩后查看 codex-helper 请求账本：
 
@@ -165,11 +174,11 @@ codex-helper usage find --path responses/compact --limit 20
 codex-helper usage find --path responses --limit 20
 ```
 
-官方 compact 命中通常会在 codex-helper 日志中显示为 `POST /responses/compact`。普通本地 fallback 压缩只会显示为普通 `POST /responses` 请求。等 Codex 以后启用 remote compaction v2 时，它也会走普通 `/responses`，通过 `compaction_trigger` payload/event 形态表达，而不是 `/responses/compact`；当前 helper 模式不会启用 v2 或 WebSocket transport。
+官方 compact 命中通常会在 codex-helper 日志中显示为 `POST /responses/compact`。普通本地 fallback 压缩只会显示为普通 `POST /responses` 请求。等 Codex 以后启用 remote compaction v2 时，它也会走普通 `/responses`，通过 `compaction_trigger` payload/event 形态表达，而不是 `/responses/compact`；当前 helper 预设不会启用 v2。启用 `responses_websocket` 后，普通 turn streaming 会走 WebSocket `GET /responses` 风格 upgrade，而不是 HTTP `POST /responses`。
 
 切回 `default` 会移除 `codex_proxy` provider 的 bridge 专用字段，并在安全时恢复 helper 管理过的 auth patch。
 
-安全约束：bridge 模式下，上游 provider 应配置自己的 `auth_token_env` / `auth_token` 或等价 API key。如果上游未配置密钥，codex-helper 会移除来自 Codex 客户端的认证头，避免把 ChatGPT/facade auth 透传给第三方 relay。
+安全约束：bridge 预设下，上游 provider 应配置自己的 `auth_token_env` / `auth_token` 或等价 API key。如果上游未配置密钥，codex-helper 会移除来自 Codex 客户端的认证头，避免把 ChatGPT/facade auth 透传给第三方 relay。
 
 ## 推荐开始方式
 

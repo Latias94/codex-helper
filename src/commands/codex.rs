@@ -20,7 +20,7 @@ pub(crate) async fn handle_codex_cmd(cmd: CodexCommand) -> CliResult<()> {
             station,
             upstream_index,
             model,
-            mode,
+            preset,
             json,
         } => {
             let proxy = build_codex_proxy_for_cli().await?;
@@ -29,7 +29,8 @@ pub(crate) async fn handle_codex_cmd(cmd: CodexCommand) -> CliResult<()> {
                     station_name: station,
                     upstream_index,
                     model,
-                    patch_mode: mode.map(Into::into),
+                    patch_mode: preset.map(Into::into),
+                    responses_websocket: None,
                 })
                 .await
                 .map_err(|err| CliError::Other(err.to_string()))?;
@@ -133,8 +134,9 @@ fn print_capabilities_text(response: &CodexRelayCapabilitiesResponse) {
         response.station_name, response.upstream_index, response.upstream_base_url
     );
     println!(
-        "Patch mode: {:?}; model: {}",
-        response.patch_mode,
+        "Patch preset: {}; Responses WebSocket: {}; model: {}",
+        response.patch_mode.as_preset_str(),
+        response.responses_websocket,
         response.model.as_deref().unwrap_or("<none>")
     );
     println!(
@@ -147,8 +149,12 @@ fn print_capabilities_text(response: &CodexRelayCapabilitiesResponse) {
         response.observed.responses_compact.confidence
     );
     println!(
-        "Recommendation: {:?} ({:?})",
-        response.recommendation.recommended_patch_mode, response.recommendation.confidence
+        "Recommendation: {} ({:?})",
+        response
+            .recommendation
+            .recommended_patch_mode
+            .as_preset_str(),
+        response.recommendation.confidence
     );
     for mismatch in &response.mismatches {
         println!(

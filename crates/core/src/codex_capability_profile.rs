@@ -461,11 +461,19 @@ impl CodexCapabilityProfileInput {
         patch_mode: CodexPatchMode,
         model_catalog: CodexModelCatalogProfile,
     ) -> Self {
+        Self::from_patch_mode_with_transport(patch_mode, false, model_catalog)
+    }
+
+    pub fn from_patch_mode_with_transport(
+        patch_mode: CodexPatchMode,
+        provider_supports_websockets: bool,
+        model_catalog: CodexModelCatalogProfile,
+    ) -> Self {
         Self {
             patch_mode,
             provider_identity: CodexProviderIdentity::from_patch_mode(patch_mode),
             auth_shape: CodexAuthShape::from_patch_mode(patch_mode),
-            provider_supports_websockets: false,
+            provider_supports_websockets,
             model_catalog,
         }
     }
@@ -792,6 +800,36 @@ mod tests {
             model_catalog: catalog,
         });
 
+        assert_eq!(
+            profile.responses_websocket.support,
+            CodexCapabilitySupport::Supported
+        );
+    }
+
+    #[test]
+    fn codex_capability_profile_official_imagegen_bridge_with_transport_exposes_compact_imagegen_and_websocket()
+     {
+        let catalog = CodexModelCatalogProfile::from_models_response_json(
+            &codex_models_response(image_capable_model("gpt-5.5")),
+            Some("gpt-5.5"),
+        );
+
+        let profile = CodexCapabilityProfile::for_input(
+            CodexCapabilityProfileInput::from_patch_mode_with_transport(
+                CodexPatchMode::OfficialImagegenBridge,
+                true,
+                catalog,
+            ),
+        );
+
+        assert_eq!(
+            profile.remote_compaction_v1.support,
+            CodexCapabilitySupport::Supported
+        );
+        assert_eq!(
+            profile.hosted_image_generation.support,
+            CodexCapabilitySupport::Supported
+        );
         assert_eq!(
             profile.responses_websocket.support,
             CodexCapabilitySupport::Supported

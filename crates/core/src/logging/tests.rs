@@ -19,6 +19,7 @@ fn request_log_serializes_request_id_when_present() {
         upstream_base_url: "https://example.com/v1",
         session_id: Some("sid-1".to_string()),
         cwd: Some("/workdir".to_string()),
+        model: Some("gpt-5".to_string()),
         reasoning_effort: Some("medium".to_string()),
         service_tier: ServiceTierLog {
             requested: Some("priority".to_string()),
@@ -29,12 +30,14 @@ fn request_log_serializes_request_id_when_present() {
         usage: None,
         http_debug: None,
         http_debug_ref: None,
+        route_decision: None,
         retry: None,
     })
     .expect("serialize request log");
 
     assert_eq!(value["request_id"].as_u64(), Some(42));
     assert_eq!(value["trace_id"].as_str(), Some("codex-42"));
+    assert_eq!(value["model"].as_str(), Some("gpt-5"));
 }
 
 #[test]
@@ -56,12 +59,14 @@ fn request_log_can_serialize_provider_endpoint_without_station_identity() {
         upstream_base_url: "https://input.example/v1",
         session_id: Some("sid-1".to_string()),
         cwd: Some("/workdir".to_string()),
+        model: None,
         reasoning_effort: Some("medium".to_string()),
         service_tier: ServiceTierLog::default(),
         codex_bridge: None,
         usage: None,
         http_debug: None,
         http_debug_ref: None,
+        route_decision: None,
         retry: None,
     })
     .expect("serialize request log");
@@ -94,16 +99,19 @@ fn request_log_serializes_codex_bridge_metadata() {
         upstream_base_url: "https://relay.example/v1",
         session_id: Some("sid-1".to_string()),
         cwd: Some("/workdir".to_string()),
+        model: Some("gpt-5".to_string()),
         reasoning_effort: Some("medium".to_string()),
         service_tier: ServiceTierLog::default(),
         codex_bridge: Some(CodexBridgeLog {
             patch_mode: "official-imagegen-bridge".to_string(),
             remote_compaction_v1_request: true,
+            responses_websocket_request: false,
             strips_client_auth: true,
         }),
         usage: None,
         http_debug: None,
         http_debug_ref: None,
+        route_decision: None,
         retry: None,
     })
     .expect("serialize request log");

@@ -12,7 +12,7 @@ use crate::logging::{
     CodexBridgeLog, HttpDebugLog, RetryInfo, ServiceTierLog, log_request_with_debug,
     make_body_preview, should_include_http_debug, should_include_http_warn,
 };
-use crate::state::ProxyState;
+use crate::state::{ProxyState, RouteDecisionProvenance};
 use crate::usage_providers;
 
 use super::ProxyService;
@@ -92,6 +92,7 @@ struct StreamFinalize {
     reasoning_effort: Option<String>,
     service_tier: ServiceTierLog,
     codex_bridge: Option<CodexBridgeLog>,
+    route_decision: Option<RouteDecisionProvenance>,
     request_id: u64,
     state: Arc<ProxyState>,
     resp_headers: HeaderMap,
@@ -236,10 +237,15 @@ impl Drop for StreamFinalize {
                 &self.upstream_base_url,
                 self.session_id.clone(),
                 self.cwd.clone(),
+                self.route_decision
+                    .as_ref()
+                    .and_then(|decision| decision.effective_model.as_ref())
+                    .map(|model| model.value.clone()),
                 self.reasoning_effort.clone(),
                 service_tier,
                 self.codex_bridge.clone(),
                 usage,
+                self.route_decision.clone(),
                 self.retry.clone(),
                 http_debug,
             );
@@ -420,6 +426,7 @@ pub(super) async fn build_sse_success_response(
         method,
         path,
         concurrency_permit,
+        route_decision,
     } = meta;
 
     if is_user_turn {
@@ -500,6 +507,7 @@ pub(super) async fn build_sse_success_response(
         reasoning_effort: effective_effort.clone(),
         service_tier,
         codex_bridge: codex_bridge.clone(),
+        route_decision,
         request_id,
         state: proxy.state.clone(),
         resp_headers: resp_headers.clone(),
@@ -631,10 +639,16 @@ pub(super) async fn build_sse_success_response(
                         &base_url,
                         session_id.clone(),
                         cwd.clone(),
+                        _finalize
+                            .route_decision
+                            .as_ref()
+                            .and_then(|decision| decision.effective_model.as_ref())
+                            .map(|model| model.value.clone()),
                         effective_effort.clone(),
                         service_tier,
                         codex_bridge.clone(),
                         Some(usage),
+                        _finalize.route_decision.clone(),
                         retry.clone(),
                         http_debug,
                     );
@@ -687,6 +701,7 @@ pub(super) struct SseSuccessMeta {
     pub(super) effective_effort: Option<String>,
     pub(super) service_tier: ServiceTierLog,
     pub(super) codex_bridge: Option<CodexBridgeLog>,
+    pub(super) route_decision: Option<RouteDecisionProvenance>,
     pub(super) request_id: u64,
     pub(super) is_user_turn: bool,
     pub(super) is_codex_service: bool,

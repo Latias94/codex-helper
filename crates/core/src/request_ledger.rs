@@ -774,6 +774,34 @@ mod tests {
     }
 
     #[test]
+    fn request_model_prefers_top_level_model_from_current_request_log_schema() {
+        let record = json!({
+            "model": "gpt-5",
+            "route_decision": {
+                "effective_model": { "value": "relay-gpt-5", "source": "station_mapping" }
+            },
+            "retry": {
+                "route_attempts": [
+                    { "decision": "completed", "model": "legacy-gpt-5" }
+                ]
+            }
+        });
+
+        assert_eq!(request_model(&record).as_deref(), Some("gpt-5"));
+    }
+
+    #[test]
+    fn request_model_reads_route_decision_when_top_level_model_is_missing() {
+        let record = json!({
+            "route_decision": {
+                "effective_model": { "value": "relay-gpt-5", "source": "station_mapping" }
+            }
+        });
+
+        assert_eq!(request_model(&record).as_deref(), Some("relay-gpt-5"));
+    }
+
+    #[test]
     fn usage_aggregate_summary_includes_cache_and_average_duration() {
         let mut aggregate = RequestUsageAggregate::default();
         aggregate.record(

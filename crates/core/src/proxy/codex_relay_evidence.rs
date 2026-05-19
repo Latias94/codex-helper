@@ -258,6 +258,7 @@ mod tests {
             upstream_index: 0,
             upstream_base_url: "https://relay.example/v1".to_string(),
             patch_mode: CodexPatchMode::OfficialImagegenBridge,
+            responses_websocket: false,
             model: Some("gpt-5.5".to_string()),
             expected,
             observed: CodexRelayCapabilitiesObserved {

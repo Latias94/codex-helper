@@ -101,7 +101,7 @@ pub(super) fn prepare_selected_upstream_request(
     }
 }
 
-fn apply_selected_model_mapping(
+pub(super) fn apply_selected_model_mapping(
     target: &AttemptTarget,
     body_for_upstream: &Bytes,
     request_model: Option<&str>,

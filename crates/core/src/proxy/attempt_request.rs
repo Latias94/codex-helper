@@ -106,7 +106,7 @@ pub(super) fn prepare_attempt_request(
     }
 }
 
-fn inject_auth_headers(
+pub(super) fn inject_auth_headers(
     service_name: &str,
     auth: &UpstreamAuth,
     codex_client_patch_mode: CodexPatchMode,

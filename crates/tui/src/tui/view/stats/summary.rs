@@ -460,7 +460,12 @@ pub(super) fn usage_spend_forecast(
         .flatten()
         .cloned()
         .collect::<Vec<_>>();
-    build_usage_spend_forecast(config, &snapshot.recent, &balances, now_ms)
+    let recent = if snapshot.forecast_recent.is_empty() {
+        &snapshot.recent
+    } else {
+        &snapshot.forecast_recent
+    };
+    build_usage_spend_forecast(config, recent, &balances, now_ms)
 }
 
 pub(super) fn spend_forecast_rate_line(forecast: &UsageSpendForecast, lang: Language) -> String {
@@ -478,14 +483,27 @@ pub(super) fn spend_forecast_rate_line(forecast: &UsageSpendForecast, lang: Lang
     }
 
     let rate = fmt_usd_compact(forecast.rate_per_hour_usd.as_deref());
-    let projected = fmt_usd_compact(forecast.projected_until_reset_usd.as_deref());
     let reset = forecast
         .reset_in_ms
         .map(duration_short)
         .unwrap_or_else(|| "-".to_string());
+    let confidence = spend_forecast_confidence_label(forecast.confidence, lang);
+
+    if forecast.confidence == UsageForecastConfidence::LowSample {
+        return match lang {
+            Language::Zh => format!("速率 {rate}/h  样本少，不外推到0点 ({reset})"),
+            Language::En => format!("rate {rate}/h  low sample, not projecting to reset ({reset})"),
+        };
+    }
+
+    let projected = fmt_usd_compact(forecast.projected_until_reset_usd.as_deref());
     match lang {
-        Language::Zh => format!("速率 {rate}/h  到0点 {projected} ({reset})"),
-        Language::En => format!("rate {rate}/h  to reset {projected} ({reset})"),
+        Language::Zh => {
+            format!("速率 {rate}/h  按当前速率到0点≈{projected} ({reset}, {confidence})")
+        }
+        Language::En => {
+            format!("rate {rate}/h  at current rate to reset≈{projected} ({reset}, {confidence})")
+        }
     }
 }
 

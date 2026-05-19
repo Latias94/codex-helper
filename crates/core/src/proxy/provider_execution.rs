@@ -113,7 +113,7 @@ pub(super) fn apply_concurrency_snapshots_to_runtime(
     }
 }
 
-fn try_acquire_candidate_concurrency_permit(
+pub(super) fn try_acquire_candidate_concurrency_permit(
     proxy: &ProxyService,
     template: &crate::routing_ir::RoutePlanTemplate,
     candidate: &RouteCandidate,

@@ -147,9 +147,9 @@ pub(crate) enum CodexCommand {
         /// Requested model used for model-catalog capability interpretation
         #[arg(long)]
         model: Option<String>,
-        /// Patch mode to evaluate; defaults to current switch/config mode
-        #[arg(long, value_enum)]
-        mode: Option<CodexPatchModeArg>,
+        /// Patch preset to evaluate; defaults to current switch/config preset
+        #[arg(long = "preset", alias = "mode", value_enum)]
+        preset: Option<CodexClientPatchPresetArg>,
         /// Output JSON instead of text
         #[arg(long)]
         json: bool,
@@ -226,9 +226,12 @@ pub(crate) enum SwitchCommand {
         /// Listen port for local proxy; defaults to 3211
         #[arg(long, default_value_t = 3211)]
         port: u16,
-        /// Codex client patch mode; default preserves historical behavior
-        #[arg(long, value_enum, default_value_t = CodexPatchModeArg::Default)]
-        mode: CodexPatchModeArg,
+        /// Codex client patch preset; default preserves historical behavior
+        #[arg(long = "preset", alias = "mode", value_enum, default_value_t = CodexClientPatchPresetArg::Default)]
+        preset: CodexClientPatchPresetArg,
+        /// Enable Responses WebSocket transport advertising for official bridge presets
+        #[arg(long)]
+        responses_websocket: bool,
         /// Target Codex config (default if neither flag is set)
         #[arg(long)]
         codex: bool,
@@ -272,7 +275,7 @@ pub(crate) enum RemoteControlCommand {
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CodexPatchModeArg {
+pub(crate) enum CodexClientPatchPresetArg {
     /// Historical codex-helper patch behavior
     Default,
     /// Keep ChatGPT account auth while routing model traffic through codex-helper
@@ -280,19 +283,21 @@ pub(crate) enum CodexPatchModeArg {
     /// Experimental image generation bridge using a minimal ChatGPT auth facade
     ImagegenBridge,
     /// Experimental official relay bridge for HTTP OpenAI Responses features
+    #[value(name = "official-relay", alias = "official-relay-bridge")]
     OfficialRelayBridge,
     /// Experimental official relay bridge plus minimal image generation auth facade
+    #[value(name = "official-imagegen", alias = "official-imagegen-bridge")]
     OfficialImagegenBridge,
 }
 
-impl From<CodexPatchModeArg> for codex_helper_core::codex_integration::CodexPatchMode {
-    fn from(value: CodexPatchModeArg) -> Self {
+impl From<CodexClientPatchPresetArg> for codex_helper_core::codex_integration::CodexPatchMode {
+    fn from(value: CodexClientPatchPresetArg) -> Self {
         match value {
-            CodexPatchModeArg::Default => Self::Default,
-            CodexPatchModeArg::ChatgptBridge => Self::ChatGptBridge,
-            CodexPatchModeArg::ImagegenBridge => Self::ImagegenBridge,
-            CodexPatchModeArg::OfficialRelayBridge => Self::OfficialRelayBridge,
-            CodexPatchModeArg::OfficialImagegenBridge => Self::OfficialImagegenBridge,
+            CodexClientPatchPresetArg::Default => Self::Default,
+            CodexClientPatchPresetArg::ChatgptBridge => Self::ChatGptBridge,
+            CodexClientPatchPresetArg::ImagegenBridge => Self::ImagegenBridge,
+            CodexClientPatchPresetArg::OfficialRelayBridge => Self::OfficialRelayBridge,
+            CodexClientPatchPresetArg::OfficialImagegenBridge => Self::OfficialImagegenBridge,
         }
     }
 }
@@ -922,23 +927,53 @@ mod tests {
             "relay-capabilities",
             "--model",
             "gpt-5.5",
-            "--mode",
-            "official-imagegen-bridge",
+            "--preset",
+            "official-imagegen",
             "--json",
         ])
         .expect("parse codex relay capabilities");
 
         let Some(Command::Codex {
-            cmd: CodexCommand::Capabilities {
-                model, mode, json, ..
-            },
+            cmd:
+                CodexCommand::Capabilities {
+                    model,
+                    preset,
+                    json,
+                    ..
+                },
         }) = cli.command
         else {
             panic!("expected codex relay capabilities command");
         };
         assert_eq!(model.as_deref(), Some("gpt-5.5"));
-        assert_eq!(mode, Some(CodexPatchModeArg::OfficialImagegenBridge));
+        assert_eq!(
+            preset,
+            Some(CodexClientPatchPresetArg::OfficialImagegenBridge)
+        );
         assert!(json);
+    }
+
+    #[test]
+    fn codex_relay_cli_accepts_legacy_mode_alias() {
+        let cli = Cli::try_parse_from([
+            "codex-helper",
+            "codex",
+            "relay-capabilities",
+            "--mode",
+            "official-imagegen-bridge",
+        ])
+        .expect("parse legacy codex relay capabilities mode alias");
+
+        let Some(Command::Codex {
+            cmd: CodexCommand::Capabilities { preset, .. },
+        }) = cli.command
+        else {
+            panic!("expected codex relay capabilities command");
+        };
+        assert_eq!(
+            preset,
+            Some(CodexClientPatchPresetArg::OfficialImagegenBridge)
+        );
     }
 
     #[test]

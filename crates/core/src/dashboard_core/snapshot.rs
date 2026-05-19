@@ -90,7 +90,7 @@ pub async fn build_dashboard_snapshot(
     stats_days: usize,
 ) -> DashboardSnapshot {
     let now = now_ms();
-    let recent_limit = recent_limit.clamp(1, 2_000);
+    let recent_limit = recent_limit.clamp(1, crate::state::recent_finished_max());
     let recent_for_stats = recent_limit.max(2_000);
 
     let (

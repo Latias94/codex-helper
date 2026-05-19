@@ -50,12 +50,12 @@ pub async fn handle_status_cmd(json: bool) -> CliResult<()> {
     let bridge = codex_bridge_diagnostics();
     let bridge_status = bridge.worst_status();
     println!(
-        "{} {} (patch_mode={}, remote_compaction_v1_ready={}, imagegen_facade_ready={}, upstream_auth_ready={})",
+        "{} {} (patch_preset={}, remote_compaction_v1_ready={}, imagegen_facade_ready={}, upstream_auth_ready={})",
         "Codex bridge:".bold(),
         bridge_status.as_str(),
         bridge
             .patch_mode
-            .map(|mode| mode.as_str())
+            .map(|mode| mode.as_preset_str())
             .unwrap_or("<none>"),
         bridge.remote_compaction_v1_ready,
         bridge.imagegen_facade_ready,

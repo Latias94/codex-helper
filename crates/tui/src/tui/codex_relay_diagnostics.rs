@@ -118,8 +118,9 @@ pub(in crate::tui) fn apply_codex_relay_diagnostics_result(
             ui.codex_relay_diagnostics.last_result = Some(response);
             ui.toast = Some((
                 format!(
-                    "{}: {recommended}{}",
+                    "{}: {}{}",
                     i18n::label(ui.language, "Codex relay recommendation"),
+                    recommended.as_preset_str(),
                     if changed { " *" } else { "" }
                 ),
                 Instant::now(),
@@ -231,6 +232,7 @@ mod tests {
         Snapshot {
             rows: Vec::new(),
             recent: Vec::new(),
+            forecast_recent: Vec::new(),
             model_overrides: HashMap::new(),
             overrides: HashMap::new(),
             station_overrides: HashMap::new(),

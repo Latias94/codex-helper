@@ -993,7 +993,7 @@ fn compile_v4_rejects_zero_provider_concurrency_limit() {
 }
 
 #[test]
-fn codex_client_patch_mode_survives_save_config_v4() {
+fn codex_client_patch_legacy_mode_is_saved_as_preset_config_v4() {
     let _env = setup_temp_codex_home();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1010,6 +1010,7 @@ version = 5
 
 [codex.client_patch]
 mode = "chatgpt-bridge"
+responses_websocket = true
 "#,
         );
 
@@ -1044,12 +1045,14 @@ mode = "chatgpt-bridge"
         let path = super::save_config_v4(&cfg).await.expect("save v4");
         let saved = std::fs::read_to_string(path).expect("read saved v4 config");
         assert!(saved.contains("[codex.client_patch]"));
-        assert!(saved.contains("mode = \"chatgpt-bridge\""));
+        assert!(saved.contains("preset = \"chatgpt-bridge\""));
+        assert!(!saved.contains("mode = \"chatgpt-bridge\""));
+        assert!(saved.contains("responses_websocket = true"));
     });
 }
 
 #[test]
-fn codex_client_patch_mode_parses_imagegen_bridge() {
+fn codex_client_patch_preset_parses_imagegen_bridge() {
     let _env = setup_temp_codex_home();
     let dir = super::proxy_home_dir();
     let toml_path = dir.join("config.toml");
@@ -1059,7 +1062,7 @@ fn codex_client_patch_mode_parses_imagegen_bridge() {
 version = 5
 
 [codex.client_patch]
-mode = "imagegen-bridge"
+preset = "imagegen-bridge"
 "#,
     );
 
@@ -1070,7 +1073,7 @@ mode = "imagegen-bridge"
 }
 
 #[test]
-fn codex_client_patch_mode_parses_official_relay_bridge() {
+fn codex_client_patch_preset_parses_official_relay() {
     let _env = setup_temp_codex_home();
     let dir = super::proxy_home_dir();
     let toml_path = dir.join("config.toml");
@@ -1080,7 +1083,7 @@ fn codex_client_patch_mode_parses_official_relay_bridge() {
 version = 5
 
 [codex.client_patch]
-mode = "official-relay-bridge"
+preset = "official-relay"
 "#,
     );
 
@@ -1091,7 +1094,28 @@ mode = "official-relay-bridge"
 }
 
 #[test]
-fn codex_client_patch_mode_parses_official_imagegen_bridge() {
+fn codex_client_patch_preset_parses_official_imagegen() {
+    let _env = setup_temp_codex_home();
+    let dir = super::proxy_home_dir();
+    let toml_path = dir.join("config.toml");
+    write_file(
+        &toml_path,
+        r#"
+version = 5
+
+[codex.client_patch]
+preset = "official-imagegen"
+"#,
+    );
+
+    assert_eq!(
+        super::codex_client_patch_mode_from_config_file().expect("read client patch mode"),
+        crate::codex_integration::CodexPatchMode::OfficialImagegenBridge
+    );
+}
+
+#[test]
+fn codex_client_patch_legacy_mode_still_parses_official_imagegen_bridge() {
     let _env = setup_temp_codex_home();
     let dir = super::proxy_home_dir();
     let toml_path = dir.join("config.toml");
@@ -1109,6 +1133,56 @@ mode = "official-imagegen-bridge"
         super::codex_client_patch_mode_from_config_file().expect("read client patch mode"),
         crate::codex_integration::CodexPatchMode::OfficialImagegenBridge
     );
+}
+
+#[test]
+fn codex_client_patch_rejects_conflicting_preset_and_legacy_mode() {
+    let _env = setup_temp_codex_home();
+    let dir = super::proxy_home_dir();
+    let toml_path = dir.join("config.toml");
+    write_file(
+        &toml_path,
+        r#"
+version = 5
+
+[codex.client_patch]
+preset = "official-relay"
+mode = "imagegen-bridge"
+"#,
+    );
+
+    let err = super::codex_client_patch_config_from_config_file()
+        .expect_err("conflicting preset and legacy mode should fail");
+    assert!(
+        err.to_string()
+            .contains("conflicting codex.client_patch preset/mode values"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn codex_client_patch_config_parses_responses_websocket_transport_option() {
+    let _env = setup_temp_codex_home();
+    let dir = super::proxy_home_dir();
+    let toml_path = dir.join("config.toml");
+    write_file(
+        &toml_path,
+        r#"
+version = 5
+
+[codex.client_patch]
+preset = "official-imagegen"
+responses_websocket = true
+"#,
+    );
+
+    let cfg =
+        super::codex_client_patch_config_from_config_file().expect("read client patch config");
+    assert_eq!(
+        cfg.preset,
+        crate::codex_integration::CodexPatchMode::OfficialImagegenBridge
+    );
+    assert!(cfg.options.responses_websocket);
 }
 
 #[test]

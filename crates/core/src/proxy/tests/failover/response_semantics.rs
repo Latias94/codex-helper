@@ -1,4 +1,5 @@
 use super::*;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 #[tokio::test]
 async fn proxy_decodes_unlabeled_gzip_models_response_before_forwarding() {
@@ -1624,4 +1625,137 @@ async fn proxy_applies_model_mapping_to_request_body() {
 
     proxy_handle.abort();
     u_handle.abort();
+}
+
+#[tokio::test]
+async fn responses_websocket_relays_headers_model_mapping_and_frames() {
+    let _env_guard = env_lock().await;
+    let codex_home = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HOME", &codex_home);
+    }
+    write_text_file(
+        &codex_home.join("config.toml"),
+        r#"
+model_provider = "codex_proxy"
+
+[model_providers.codex_proxy]
+name = "OpenAI"
+base_url = "http://127.0.0.1:1"
+wire_api = "responses"
+supports_websockets = true
+"#,
+    );
+
+    let seen_headers = Arc::new(std::sync::Mutex::new(None::<HeaderMap>));
+    let seen_first_body = Arc::new(std::sync::Mutex::new(None::<serde_json::Value>));
+    let headers_sink = seen_headers.clone();
+    let body_sink = seen_first_body.clone();
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        get(
+            move |ws: axum::extract::ws::WebSocketUpgrade, headers: HeaderMap| {
+                let headers_sink = headers_sink.clone();
+                let body_sink = body_sink.clone();
+                async move {
+                    ws.on_upgrade(move |mut socket| async move {
+                        *headers_sink.lock().expect("headers lock") = Some(headers);
+                        if let Some(Ok(message)) = socket.recv().await {
+                            let body = match message {
+                                axum::extract::ws::Message::Text(text) => {
+                                    serde_json::from_str::<serde_json::Value>(text.as_str()).ok()
+                                }
+                                axum::extract::ws::Message::Binary(bytes) => {
+                                    serde_json::from_slice::<serde_json::Value>(&bytes).ok()
+                                }
+                                _ => None,
+                            };
+                            *body_sink.lock().expect("body lock") = body;
+                            let _ = socket
+                                .send(axum::extract::ws::Message::Text(
+                                    r#"{"type":"response.created","response":{"id":"resp-1"}}"#
+                                        .into(),
+                                ))
+                                .await;
+                        }
+                    })
+                }
+            },
+        ),
+    );
+    let (u_addr, u_handle) = spawn_axum_server(upstream);
+
+    let cfg = make_proxy_config(
+        vec![UpstreamConfig {
+            base_url: format!("http://{}/v1", u_addr),
+            auth: UpstreamAuth {
+                auth_token: Some("server-token".to_string()),
+                auth_token_env: None,
+                api_key: None,
+                api_key_env: None,
+            },
+            tags: HashMap::new(),
+            supported_models: HashMap::new(),
+            model_mapping: HashMap::from([("gpt-5".to_string(), "relay-gpt-5".to_string())]),
+        }],
+        retry_config(1, "502", Vec::new(), RetryStrategy::Failover),
+    );
+    let proxy = ProxyService::new(
+        Client::new(),
+        Arc::new(cfg),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let request = format!("ws://{proxy_addr}/v1/responses")
+        .into_client_request()
+        .expect("ws request");
+    let (mut socket, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("connect proxy websocket");
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"response.create","model":"gpt-5","stream":true}"#.into(),
+        ))
+        .await
+        .expect("send first frame");
+
+    let event = socket
+        .next()
+        .await
+        .expect("event")
+        .expect("event ok")
+        .to_text()
+        .expect("event text")
+        .to_string();
+    assert!(event.contains("response.created"), "{event}");
+
+    let headers = seen_headers
+        .lock()
+        .expect("headers lock")
+        .clone()
+        .expect("upstream headers");
+    assert_eq!(
+        headers.get("authorization"),
+        Some(&HeaderValue::from_static("Bearer server-token"))
+    );
+    assert_eq!(
+        headers.get("openai-beta"),
+        Some(&HeaderValue::from_static("responses_websockets=2026-02-06"))
+    );
+
+    let body = seen_first_body
+        .lock()
+        .expect("body lock")
+        .clone()
+        .expect("upstream first body");
+    assert_eq!(body["type"].as_str(), Some("response.create"));
+    assert_eq!(body["model"].as_str(), Some("relay-gpt-5"));
+
+    proxy_handle.abort();
+    u_handle.abort();
+    let _ = std::fs::remove_dir_all(codex_home);
 }

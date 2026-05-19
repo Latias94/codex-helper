@@ -40,6 +40,7 @@ fn empty_snapshot(
     Snapshot {
         rows: Vec::new(),
         recent: Vec::new(),
+        forecast_recent: Vec::new(),
         model_overrides: HashMap::new(),
         overrides: HashMap::new(),
         station_overrides: HashMap::new(),
@@ -403,6 +404,7 @@ fn routing_provider_balance_brief_preserves_subscription_amount_in_narrow_table(
     let snapshot = Snapshot {
         rows: Vec::new(),
         recent: Vec::new(),
+        forecast_recent: Vec::new(),
         model_overrides: HashMap::new(),
         overrides: HashMap::new(),
         station_overrides: HashMap::new(),
@@ -447,6 +449,7 @@ fn routing_provider_balance_brief_fits_lazy_quota_in_zh_table_cell() {
     let snapshot = Snapshot {
         rows: Vec::new(),
         recent: Vec::new(),
+        forecast_recent: Vec::new(),
         model_overrides: HashMap::new(),
         overrides: HashMap::new(),
         station_overrides: HashMap::new(),

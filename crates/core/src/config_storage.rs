@@ -3,6 +3,7 @@ use super::*;
 use crate::file_replace::write_bytes_file_async;
 use toml_edit::{
     Document as EditableTomlDocument, Item as EditableTomlItem, Table as EditableTomlTable,
+    value as editable_toml_value,
 };
 
 fn config_dir() -> PathBuf {
@@ -25,21 +26,26 @@ fn config_toml_backup_path() -> PathBuf {
     config_dir().join("config.toml.bak")
 }
 
-fn codex_client_patch_mode_from_toml_value(
-    value: &TomlValue,
-) -> Result<crate::codex_integration::CodexPatchMode> {
-    let Some(mode) = value
-        .get("codex")
-        .and_then(|codex| codex.get("client_patch"))
-        .and_then(|patch| patch.get("mode"))
-        .and_then(TomlValue::as_str)
-        .map(str::trim)
-        .filter(|mode| !mode.is_empty())
-    else {
-        return Ok(crate::codex_integration::CodexPatchMode::Default);
-    };
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodexClientPatchConfig {
+    pub preset: crate::codex_integration::CodexPatchMode,
+    pub options: crate::codex_integration::CodexSwitchOptions,
+}
 
-    match mode {
+impl Default for CodexClientPatchConfig {
+    fn default() -> Self {
+        Self {
+            preset: crate::codex_integration::CodexPatchMode::Default,
+            options: crate::codex_integration::CodexSwitchOptions::default(),
+        }
+    }
+}
+
+fn parse_codex_client_patch_preset(
+    field_name: &str,
+    value: &str,
+) -> Result<crate::codex_integration::CodexPatchMode> {
+    match value.trim() {
         "default" => Ok(crate::codex_integration::CodexPatchMode::Default),
         "chatgpt-bridge" | "chatgpt_bridge" => {
             Ok(crate::codex_integration::CodexPatchMode::ChatGptBridge)
@@ -47,29 +53,94 @@ fn codex_client_patch_mode_from_toml_value(
         "imagegen-bridge" | "imagegen_bridge" => {
             Ok(crate::codex_integration::CodexPatchMode::ImagegenBridge)
         }
-        "official-relay-bridge" | "official_relay_bridge" => {
+        "official-relay" | "official_relay" | "official-relay-bridge" | "official_relay_bridge" => {
             Ok(crate::codex_integration::CodexPatchMode::OfficialRelayBridge)
         }
-        "official-imagegen-bridge" | "official_imagegen_bridge" => {
+        "official-imagegen"
+        | "official_imagegen"
+        | "official-imagegen-bridge"
+        | "official_imagegen_bridge" => {
             Ok(crate::codex_integration::CodexPatchMode::OfficialImagegenBridge)
         }
         other => anyhow::bail!(
-            "unsupported codex.client_patch.mode '{}'; expected 'default', 'chatgpt-bridge', 'imagegen-bridge', 'official-relay-bridge', or 'official-imagegen-bridge'",
-            other
+            "unsupported codex.client_patch.{} '{}'; expected 'default', 'chatgpt-bridge', 'imagegen-bridge', 'official-relay', or 'official-imagegen'. Legacy mode values are still accepted for reading. Use codex.client_patch.responses_websocket = true for WebSocket transport instead of adding another preset.",
+            field_name,
+            other,
         ),
     }
 }
 
-pub fn codex_client_patch_mode_from_config_file() -> Result<crate::codex_integration::CodexPatchMode>
-{
+fn codex_client_patch_preset_from_toml_value(
+    value: &TomlValue,
+) -> Result<crate::codex_integration::CodexPatchMode> {
+    let patch = value
+        .get("codex")
+        .and_then(|codex| codex.get("client_patch"));
+    let preset = patch
+        .and_then(|patch| patch.get("preset"))
+        .and_then(TomlValue::as_str)
+        .map(str::trim)
+        .filter(|preset| !preset.is_empty());
+    let legacy_mode = patch
+        .and_then(|patch| patch.get("mode"))
+        .and_then(TomlValue::as_str)
+        .map(str::trim)
+        .filter(|mode| !mode.is_empty());
+
+    match (preset, legacy_mode) {
+        (Some(preset), Some(mode)) => {
+            let preset = parse_codex_client_patch_preset("preset", preset)?;
+            let legacy_mode = parse_codex_client_patch_preset("mode", mode)?;
+            if preset != legacy_mode {
+                anyhow::bail!(
+                    "conflicting codex.client_patch preset/mode values; keep only preset = \"{}\"",
+                    preset.as_preset_str()
+                );
+            }
+            Ok(preset)
+        }
+        (Some(preset), None) => parse_codex_client_patch_preset("preset", preset),
+        (None, Some(mode)) => parse_codex_client_patch_preset("mode", mode),
+        (None, None) => Ok(crate::codex_integration::CodexPatchMode::Default),
+    }
+}
+
+fn codex_client_patch_config_from_toml_value(value: &TomlValue) -> Result<CodexClientPatchConfig> {
+    let preset = codex_client_patch_preset_from_toml_value(value)?;
+    let responses_websocket = value
+        .get("codex")
+        .and_then(|codex| codex.get("client_patch"))
+        .and_then(|patch| patch.get("responses_websocket"))
+        .and_then(TomlValue::as_bool)
+        .unwrap_or(false);
+
+    Ok(CodexClientPatchConfig {
+        preset,
+        options: crate::codex_integration::CodexSwitchOptions {
+            responses_websocket,
+        },
+    })
+}
+
+pub fn codex_client_patch_config_from_config_file() -> Result<CodexClientPatchConfig> {
     let path = config_file_path();
     if !path.exists() || path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
-        return Ok(crate::codex_integration::CodexPatchMode::Default);
+        return Ok(CodexClientPatchConfig::default());
     }
 
     let text = stdfs::read_to_string(&path).with_context(|| format!("read {:?}", path))?;
     let value: TomlValue = toml::from_str(&text).with_context(|| format!("parse {:?}", path))?;
-    codex_client_patch_mode_from_toml_value(&value)
+    codex_client_patch_config_from_toml_value(&value)
+}
+
+pub fn codex_client_patch_preset_from_config_file()
+-> Result<crate::codex_integration::CodexPatchMode> {
+    Ok(codex_client_patch_config_from_config_file()?.preset)
+}
+
+pub fn codex_client_patch_mode_from_config_file() -> Result<crate::codex_integration::CodexPatchMode>
+{
+    codex_client_patch_preset_from_config_file()
 }
 
 fn existing_codex_client_patch_item() -> Option<EditableTomlItem> {
@@ -81,6 +152,33 @@ fn existing_codex_client_patch_item() -> Option<EditableTomlItem> {
         .and_then(EditableTomlItem::as_table)
         .and_then(|codex| codex.get("client_patch"))
         .cloned()
+        .map(normalize_existing_codex_client_patch_item)
+}
+
+fn normalize_existing_codex_client_patch_item(mut item: EditableTomlItem) -> EditableTomlItem {
+    let Some(table) = item.as_table_mut() else {
+        return item;
+    };
+    let preset = table
+        .get("preset")
+        .and_then(EditableTomlItem::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            table
+                .get("mode")
+                .and_then(EditableTomlItem::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+        .and_then(|value| parse_codex_client_patch_preset("preset", value).ok());
+
+    if let Some(preset) = preset {
+        table.remove("mode");
+        table.insert("preset", editable_toml_value(preset.as_preset_str()));
+    }
+
+    item
 }
 
 fn preserve_existing_codex_client_patch(text: String) -> String {
@@ -180,30 +278,36 @@ version = 5
 # default_service = "codex"
 # default_service = "claude"
 
-# --- Codex 客户端 patch 模式（可选） ---
+# --- Codex 客户端 patch 预设（可选） ---
 #
 # default：保持历史行为，只把 ~/.codex/config.toml 的 model_provider 指到本地代理。
 # chatgpt-bridge：保留 Codex/ChatGPT 登录态用于移动端/桌面端账号能力，同时模型请求进入 codex-helper。
 # imagegen-bridge：实验模式；把 auth.json 临时写成空对象 {}，利用 Codex 默认 ChatGPT
 #                  auth 解析暴露 hosted image_generation；实际上游凭据仍来自 codex-helper routing / env key。
-# official-relay-bridge：实验模式；把本地 codex_proxy 声明为 OpenAI Responses provider，
-#                        让 Codex 使用可由中转转发的官方 HTTP 能力，例如 /responses/compact。
-#                        不启用 WebSocket，且真实上游凭据仍来自 codex-helper routing / env key。
-# official-imagegen-bridge：实验模式；同时启用 official-relay-bridge 的 OpenAI provider
-#                           标识和 imagegen-bridge 的 {} auth facade，用于同时尝试
-#                           /responses/compact 与 hosted image_generation。
-# 启用 chatgpt-bridge 时，`switch on --mode chatgpt-bridge` 会把 ~/.codex/auth.json 的
+# official-relay：实验模式；把本地 codex_proxy 声明为 OpenAI Responses provider，
+#                 让 Codex 使用可由中转转发的官方 HTTP 能力，例如 /responses/compact。
+#                 真实上游凭据仍来自 codex-helper routing / env key。
+# official-imagegen：实验模式；同时启用 official-relay 的 OpenAI provider
+#                    标识和 imagegen-bridge 的 {} auth facade，用于同时尝试
+#                    /responses/compact 与 hosted image_generation。
+# 启用 chatgpt-bridge 时，`switch on --preset chatgpt-bridge` 会把 ~/.codex/auth.json 的
 # auth_mode 改为 "chatgpt"，OPENAI_API_KEY 改为 null，其它字段不动。
-# 启用 imagegen-bridge / official-imagegen-bridge 时，`switch on --mode ...` 会临时把 ~/.codex/auth.json
+# 启用 imagegen-bridge / official-imagegen 时，`switch on --preset ...` 会临时把 ~/.codex/auth.json
 # 改为 {} facade，并在 `switch off` 或切回 default 时安全恢复。
-# 该模式启用前会校验 Codex 至少有一个已启用上游，且当前进程能读到其上游凭据。
+# 该预设启用前会校验 Codex 至少有一个已启用上游，且当前进程能读到其上游凭据。
+# responses_websocket：正交传输开关；为 true 时会写 Codex provider 的
+#                      supports_websockets = true，让 Codex 可选择 Responses WebSocket v2。
+#                      只应与 official-relay / official-imagegen 搭配，
+#                      且仅在 helper 与所选中转都支持 WebSocket relay 时开启。
+# 兼容性：旧配置键 mode 仍会被读取；保存/生成配置时统一写 preset。
 #
 # [codex.client_patch]
-# mode = "default"
-# mode = "chatgpt-bridge"
-# mode = "imagegen-bridge"
-# mode = "official-relay-bridge"
-# mode = "official-imagegen-bridge"
+# preset = "default"
+# preset = "chatgpt-bridge"
+# preset = "imagegen-bridge"
+# preset = "official-relay"
+# preset = "official-imagegen"
+# responses_websocket = false
 
 # --- TUI 用量预测（可选） ---
 #
@@ -213,7 +317,7 @@ version = 5
 # [ui.usage_forecast]
 # enabled = true
 # rate_window_minutes = 60
-# min_priced_requests = 1
+# min_priced_requests = 2
 # reset_time = "00:00"
 # reset_utc_offset = "+08:00"
 

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -317,6 +317,7 @@ pub(in crate::tui) struct SessionRow {
 pub(in crate::tui) struct Snapshot {
     pub(in crate::tui) rows: Vec<SessionRow>,
     pub(in crate::tui) recent: Vec<FinishedRequest>,
+    pub(in crate::tui) forecast_recent: Vec<FinishedRequest>,
     pub(in crate::tui) model_overrides: HashMap<String, String>,
     pub(in crate::tui) overrides: HashMap<String, String>,
     pub(in crate::tui) station_overrides: HashMap<String, String>,
@@ -1878,7 +1879,12 @@ pub(in crate::tui) async fn refresh_snapshot(
     stats_days: usize,
 ) -> Snapshot {
     let (mut snap, config_meta) = tokio::join!(
-        crate::dashboard_core::build_dashboard_snapshot(state, service_name, 2_000, stats_days),
+        crate::dashboard_core::build_dashboard_snapshot(
+            state,
+            service_name,
+            crate::state::recent_finished_max(),
+            stats_days,
+        ),
         state.get_station_meta_overrides(service_name),
     );
     let mgr = match service_name {
@@ -1899,9 +1905,11 @@ pub(in crate::tui) async fn refresh_snapshot(
                 snap.session_route_target_overrides.get(session_id).cloned();
         }
     }
+    let forecast_recent = load_forecast_recent_requests(snap.recent.clone()).await;
     Snapshot {
         rows,
         recent: snap.recent,
+        forecast_recent,
         model_overrides: snap.session_model_overrides,
         overrides: snap.session_effort_overrides,
         station_overrides: snap.session_station_overrides,
@@ -1920,6 +1928,67 @@ pub(in crate::tui) async fn refresh_snapshot(
         pricing_catalog: crate::pricing::operator_model_price_catalog_snapshot(),
         refreshed_at: Instant::now(),
     }
+}
+
+fn usage_forecast_log_tail_limit() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("CODEX_HELPER_USAGE_FORECAST_LOG_TAIL_LINES")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(20_000)
+            .clamp(crate::state::recent_finished_max(), 200_000)
+    })
+}
+
+async fn load_forecast_recent_requests(
+    memory_recent: Vec<FinishedRequest>,
+) -> Vec<FinishedRequest> {
+    let path = crate::request_ledger::request_log_path();
+    let limit = usage_forecast_log_tail_limit();
+    let ledger_recent = tokio::task::spawn_blocking(move || {
+        crate::request_ledger::tail_finished_requests_from_log(&path, limit)
+    })
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .unwrap_or_default();
+
+    merge_forecast_recent_requests(memory_recent, ledger_recent, limit)
+}
+
+fn merge_forecast_recent_requests(
+    memory_recent: Vec<FinishedRequest>,
+    ledger_recent: Vec<FinishedRequest>,
+    limit: usize,
+) -> Vec<FinishedRequest> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::with_capacity(memory_recent.len().saturating_add(ledger_recent.len()));
+    for request in memory_recent.into_iter().chain(ledger_recent) {
+        if seen.insert(forecast_request_key(&request)) {
+            out.push(request);
+        }
+    }
+    out.sort_by(|left, right| {
+        right
+            .ended_at_ms
+            .cmp(&left.ended_at_ms)
+            .then_with(|| right.id.cmp(&left.id))
+            .then_with(|| right.trace_id.cmp(&left.trace_id))
+    });
+    out.truncate(limit.max(crate::state::recent_finished_max()));
+    out
+}
+
+fn forecast_request_key(request: &FinishedRequest) -> String {
+    if let Some(trace_id) = request.trace_id.as_deref() {
+        return format!("{}|trace|{trace_id}", request.service);
+    }
+    format!(
+        "{}|{}|{}|{}|{}",
+        request.service, request.ended_at_ms, request.id, request.method, request.path
+    )
 }
 
 pub(in crate::tui) fn filtered_requests_len(
@@ -2449,6 +2518,7 @@ mod tests {
                 override_service_tier: None,
             }],
             recent: Vec::new(),
+            forecast_recent: Vec::new(),
             model_overrides: HashMap::new(),
             overrides: HashMap::new(),
             station_overrides: HashMap::new(),
@@ -2519,6 +2589,7 @@ mod tests {
                 finished_request(1, Some("sid-selected")),
                 finished_request(2, Some("sid-explicit")),
             ],
+            forecast_recent: Vec::new(),
             model_overrides: HashMap::new(),
             overrides: HashMap::new(),
             station_overrides: HashMap::new(),
@@ -2553,6 +2624,7 @@ mod tests {
                 finished_request(1, None),
                 finished_request(2, Some("sid-known")),
             ],
+            forecast_recent: Vec::new(),
             model_overrides: HashMap::new(),
             overrides: HashMap::new(),
             station_overrides: HashMap::new(),
@@ -2573,6 +2645,27 @@ mod tests {
         };
 
         assert_eq!(filtered_requests_len(&snapshot, 0), 1);
+    }
+
+    #[test]
+    fn merge_forecast_recent_requests_dedups_memory_and_ledger_by_trace_id() {
+        let mut memory = finished_request(20, Some("sid-memory"));
+        memory.trace_id = Some("codex-20".to_string());
+        let mut duplicate_from_ledger = finished_request(10, Some("sid-ledger"));
+        duplicate_from_ledger.trace_id = Some("codex-20".to_string());
+        let mut older = finished_request(5, Some("sid-older"));
+        older.trace_id = Some("codex-5".to_string());
+
+        let merged = merge_forecast_recent_requests(
+            vec![memory.clone()],
+            vec![duplicate_from_ledger, older.clone()],
+            10,
+        );
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].trace_id.as_deref(), Some("codex-20"));
+        assert_eq!(merged[0].session_id.as_deref(), Some("sid-memory"));
+        assert_eq!(merged[1].trace_id.as_deref(), Some("codex-5"));
     }
 
     #[test]

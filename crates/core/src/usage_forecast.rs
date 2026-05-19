@@ -14,6 +14,7 @@ pub struct UsageSpendForecast {
     pub enabled: bool,
     pub sample_window_ms: u64,
     pub sample_elapsed_ms: u64,
+    pub projected_sample_elapsed_ms: u64,
     pub priced_requests: u64,
     pub unpriced_requests: u64,
     pub sample_cost_usd: Option<String>,
@@ -117,8 +118,23 @@ pub fn build_usage_spend_forecast(
     }
 
     let rate_per_hour = scale_usd_by_ratio(sample_cost, HOUR_MS, sample_elapsed_ms);
-    let projected_until_reset =
-        reset_in_ms.map(|reset_in_ms| scale_usd_by_ratio(rate_per_hour, reset_in_ms, HOUR_MS));
+    let confidence = if priced_requests < config.min_priced_requests.max(1) {
+        UsageForecastConfidence::LowSample
+    } else if unpriced_requests > 0 {
+        UsageForecastConfidence::PartialPricing
+    } else {
+        UsageForecastConfidence::Estimated
+    };
+    let projected_sample_elapsed_ms = if confidence == UsageForecastConfidence::LowSample {
+        0
+    } else {
+        sample_elapsed_ms
+    };
+    let projected_until_reset = if confidence == UsageForecastConfidence::LowSample {
+        None
+    } else {
+        reset_in_ms.map(|reset_in_ms| scale_usd_by_ratio(rate_per_hour, reset_in_ms, HOUR_MS))
+    };
     let primary_balance_remaining =
         primary_remaining_balance(provider_balances, now_ms).map(|(_, amount)| amount);
     let projected_balance_after_reset = match (primary_balance_remaining, projected_until_reset) {
@@ -129,18 +145,12 @@ pub fn build_usage_spend_forecast(
         (primary_balance_remaining, projected_until_reset),
         (Some(balance), Some(projected)) if projected > balance
     );
-    let confidence = if priced_requests < config.min_priced_requests.max(1) {
-        UsageForecastConfidence::LowSample
-    } else if unpriced_requests > 0 {
-        UsageForecastConfidence::PartialPricing
-    } else {
-        UsageForecastConfidence::Estimated
-    };
 
     UsageSpendForecast {
         enabled: true,
         sample_window_ms,
         sample_elapsed_ms,
+        projected_sample_elapsed_ms,
         priced_requests,
         unpriced_requests,
         sample_cost_usd: Some(sample_cost.format_usd()),
@@ -336,7 +346,7 @@ mod tests {
         let now_ms = 10 * HOUR_MS;
         let config = UsageForecastConfig {
             rate_window_minutes: 60,
-            min_priced_requests: 1,
+            min_priced_requests: 2,
             ..UsageForecastConfig::default()
         };
         let recent = vec![
@@ -366,8 +376,14 @@ mod tests {
     #[test]
     fn forecast_marks_exhaustion_when_projection_exceeds_remaining_balance() {
         let now_ms = 10 * HOUR_MS;
-        let config = UsageForecastConfig::default();
-        let recent = vec![priced_request(now_ms - 60 * MINUTE_MS, "1")];
+        let config = UsageForecastConfig {
+            min_priced_requests: 2,
+            ..UsageForecastConfig::default()
+        };
+        let recent = vec![
+            priced_request(now_ms - 60 * MINUTE_MS, "1"),
+            priced_request(now_ms - 30 * MINUTE_MS, "1"),
+        ];
         let balances = vec![ProviderBalanceSnapshot {
             provider_id: "provider".to_string(),
             quota_remaining_usd: Some("2".to_string()),
@@ -377,11 +393,29 @@ mod tests {
 
         let forecast = build_usage_spend_forecast(&config, &recent, &balances, now_ms);
 
-        assert_eq!(forecast.projected_until_reset_usd.as_deref(), Some("6"));
+        assert_eq!(forecast.projected_until_reset_usd.as_deref(), Some("12"));
         assert_eq!(
             forecast.projected_balance_after_reset_usd.as_deref(),
             Some("0")
         );
         assert!(forecast.projected_exhaustion);
+    }
+
+    #[test]
+    fn forecast_keeps_burn_rate_but_suppresses_projection_for_low_sample() {
+        let now_ms = 10 * HOUR_MS;
+        let config = UsageForecastConfig {
+            min_priced_requests: 2,
+            ..UsageForecastConfig::default()
+        };
+        let recent = vec![priced_request(now_ms - 30 * MINUTE_MS, "1")];
+
+        let forecast = build_usage_spend_forecast(&config, &recent, &[], now_ms);
+
+        assert_eq!(forecast.rate_per_hour_usd.as_deref(), Some("2"));
+        assert_eq!(forecast.confidence, UsageForecastConfidence::LowSample);
+        assert_eq!(forecast.projected_until_reset_usd, None);
+        assert_eq!(forecast.projected_sample_elapsed_ms, 0);
+        assert!(!forecast.projected_exhaustion);
     }
 }

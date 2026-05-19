@@ -41,50 +41,59 @@ Codex-owned files remain owned by Codex:
 
 `switch on/off` and one-command startup only patch the local Codex proxy section. They do not overwrite unrelated Codex config changes.
 
-## Codex Client Patch Mode
+## Codex Client Patch Preset
 
-Default mode only points `~/.codex/config.toml` `model_provider` at the local `codex_proxy`. To keep ChatGPT account auth and mobile/desktop account features while routing model requests through codex-helper, enable ChatGPT bridge:
+The default preset only points `~/.codex/config.toml` `model_provider` at the local `codex_proxy`. To keep ChatGPT account auth and mobile/desktop account features while routing model requests through codex-helper, enable ChatGPT bridge:
 
 ```toml
 version = 5
 
 [codex.client_patch]
-mode = "chatgpt-bridge"
+preset = "chatgpt-bridge"
+# Optional transport switch. Only valid with official relay presets.
+responses_websocket = false
 ```
+
+Legacy `mode = "..."` config is still accepted for existing users, but codex-helper rewrites saved/generated config as `preset = "..."`.
 
 You can also switch it temporarily from the CLI:
 
 ```bash
-codex-helper switch on --mode chatgpt-bridge
-codex-helper switch on --mode imagegen-bridge
-codex-helper switch on --mode official-relay-bridge
-codex-helper switch on --mode official-imagegen-bridge
-codex-helper switch on --mode default
+codex-helper switch on --preset chatgpt-bridge
+codex-helper switch on --preset imagegen-bridge
+codex-helper switch on --preset official-relay
+codex-helper switch on --preset official-relay --responses-websocket
+codex-helper switch on --preset official-imagegen
+codex-helper switch on --preset default
 ```
 
-On startup, `codex-helper serve` uses `[codex.client_patch]` when Codex is not already switched to codex-helper. If Codex is already switched, the existing client patch mode is preserved; use `switch on --mode ...` or the TUI Settings `B`/`I`/`F`/`D` keys to change it explicitly.
+The legacy CLI spelling `--mode ...` is also accepted as an alias. On startup, `codex-helper serve` uses `[codex.client_patch]` when Codex is not already switched to codex-helper. If Codex is already switched, the existing client patch preset is preserved; use `switch on --preset ...` or the TUI Settings `B`/`I`/`F`/`D` keys to change it explicitly.
 
 `chatgpt-bridge` writes `requires_openai_auth = true` and `supports_websockets = false` into `~/.codex/config.toml`, and changes only two `~/.codex/auth.json` fields: `auth_mode` becomes `"chatgpt"` and `OPENAI_API_KEY` becomes `null`. It requires an existing official Codex ChatGPT login state; if `auth.json` has no complete token/email/account metadata, codex-helper refuses the patch before writing `config.toml` or `auth.json`. Existing Codex apps usually need a restart before they read the changed client config.
 
-`imagegen-bridge` is an explicit experimental hack mode. It writes an empty `{}` `~/.codex/auth.json` facade so Codex's default auth resolution still treats the session as ChatGPT-backed and exposes the hosted `image_generation` tool, while actual upstream credentials still come from codex-helper routing (`auth_token_env`, `auth_token`, `api_key_env`, or `api_key`). It does not require an official ChatGPT login and does not write an explicit `auth_mode`. Before enabling it, codex-helper verifies that the Codex service has at least one enabled upstream and that at least one upstream credential is actually available to the current process. For env-based credentials, setting only the env var name in config is not enough; the env var value must also be present when you run `switch on` or start `serve`. codex-helper stores the previous `auth.json` in its switch state and restores it when switching back to `default` or running `switch off`, but only if the current `auth.json` still matches the helper-written facade. If the user or Codex changed `auth.json` meanwhile, codex-helper leaves it untouched.
+`imagegen-bridge` is an explicit experimental hack preset. It writes an empty `{}` `~/.codex/auth.json` facade so Codex's default auth resolution still treats the session as ChatGPT-backed and exposes the hosted `image_generation` tool, while actual upstream credentials still come from codex-helper routing (`auth_token_env`, `auth_token`, `api_key_env`, or `api_key`). It does not require an official ChatGPT login and does not write an explicit `auth_mode`. Before enabling it, codex-helper verifies that the Codex service has at least one enabled upstream and that at least one upstream credential is actually available to the current process. For env-based credentials, setting only the env var name in config is not enough; the env var value must also be present when you run `switch on` or start `serve`. codex-helper stores the previous `auth.json` in its switch state and restores it when switching back to `default` or running `switch off`, but only if the current `auth.json` still matches the helper-written facade. If the user or Codex changed `auth.json` meanwhile, codex-helper leaves it untouched.
 
-`official-relay-bridge` is an experimental HTTP official-relay mode for relays that forward OpenAI Responses semantics, especially sub2api-style relays that support `/responses/compact`. It writes `name = "OpenAI"` and `supports_websockets = false` into `~/.codex/config.toml` so Codex can choose official remote compaction v1 while keeping WebSocket disabled. It does not write `requires_openai_auth` and does not patch `auth.json`; upstream credentials still must come from codex-helper routing. If the relay rejects `/responses/compact` with 404/405/501 or an unsupported-compact error, switch back to `default` or use a relay account that advertises compact support.
+`official-relay` is an experimental official-relay preset for relays that forward OpenAI Responses semantics, especially sub2api-style relays that support `/responses/compact`. It writes `name = "OpenAI"` into `~/.codex/config.toml` so Codex can choose official remote compaction v1. By default it keeps `supports_websockets = false`. It does not write `requires_openai_auth` and does not patch `auth.json`; upstream credentials still must come from codex-helper routing. If the relay rejects `/responses/compact` with 404/405/501 or an unsupported-compact error, switch back to `default` or use a relay account that advertises compact support.
 
-`official-imagegen-bridge` is the hybrid experimental mode for relays backed by official OpenAI subscriptions. It writes the same OpenAI provider identity as `official-relay-bridge` so Codex can use remote compaction v1, and writes the same empty `{}` auth facade as `imagegen-bridge` so Codex exposes hosted `image_generation`. It keeps `supports_websockets = false`, does not write `requires_openai_auth`, and still strips Codex client auth before forwarding unless the selected upstream has its own helper-side credential. This mode only makes Codex expose and send the official hosted tool; the relay account still has to support both `/responses/compact` and hosted image generation calls.
+`official-imagegen` is the hybrid experimental preset for relays backed by official OpenAI subscriptions. It writes the same OpenAI provider identity as `official-relay` so Codex can use remote compaction v1, and writes the same empty `{}` auth facade as `imagegen-bridge` so Codex exposes hosted `image_generation`. By default it keeps `supports_websockets = false`, does not write `requires_openai_auth`, and still strips Codex client auth before forwarding unless the selected upstream has its own helper-side credential. This preset only makes Codex expose and send the official hosted tool; the relay account still has to support both `/responses/compact` and hosted image generation calls.
+
+`responses_websocket = true` is a transport switch, not a separate patch preset. It is only valid with `official-relay` and `official-imagegen`. When enabled, codex-helper writes `supports_websockets = true` into Codex's provider config and handles the WebSocket upgrade itself on `/responses`, `/v1/responses`, and `/backend-api/codex/responses`. The relay path reads the first `response.create` frame, applies the same model override, model mapping, request filter, routing selection, session affinity, concurrency snapshot, and auth injection as normal helper traffic, injects `OpenAI-Beta: responses_websockets=2026-02-06`, then bridges frames bidirectionally to the selected upstream. Keep it disabled unless your upstream relay also supports Responses WebSocket v2.
 
 You can actively inspect a relay's Codex capability profile through the local admin API:
 
 In the built-in TUI, open Settings (`6`) and press `C` to run the same bounded relay diagnostic
 against the current Codex runtime. The Settings page shows the selected target, expected
 capabilities, observed `/models` / `/responses` / `/responses/compact` support, mismatches,
-warnings, and the recommended patch mode. The TUI action is diagnostic-only; it never changes the
-patch mode automatically.
+warnings, and the recommended patch preset. The TUI action is diagnostic-only; it never changes the
+patch preset automatically.
 
 ```bash
 curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-capabilities \
   -H 'content-type: application/json' \
-  -d '{"patch_mode":"official-imagegen-bridge","model":"gpt-5.5"}'
+  -d '{"patch_preset":"official-imagegen","model":"gpt-5.5"}'
 ```
+
+For API compatibility the response JSON field is still named `patch_mode`; requests accept either `patch_mode` or `patch_preset`, and accept both preset names such as `official-imagegen` and legacy mode names such as `official-imagegen-bridge`.
 
 Use the admin port for your Codex proxy port (`proxy_port + 1000`; the default Codex proxy is
 `3211`, so the default admin port is `4211`). The endpoint is `POST` on purpose: it sends one
@@ -96,22 +105,22 @@ a request storm amplifier.
 
 The response includes:
 
-- `expected`: what Codex should expose for the requested patch mode and model metadata.
+- `expected`: what Codex should expose for the requested patch preset and model metadata.
 - `observed`: what the relay actually returned for `/models`, `/responses`, and
   `/responses/compact`, including confidence and whether helper translation is required.
 - `mismatches`: places where Codex will try a capability that the relay did not prove.
-- `recommendation`: the conservative patch mode recommendation for the observed relay.
+- `recommendation`: the conservative patch preset recommendation for the observed relay.
 
 Recommendation rules are intentionally conservative:
 
-| Observed relay state | Recommended mode |
+| Observed relay state | Recommended preset |
 | --- | --- |
-| `/responses` works, `/responses/compact` works, selected model is image-capable | `official-imagegen-bridge` |
-| `/responses` works, `/responses/compact` works, selected model is not image-capable | `official-relay-bridge` |
+| `/responses` works, `/responses/compact` works, selected model is image-capable | `official-imagegen` |
+| `/responses` works, `/responses/compact` works, selected model is not image-capable | `official-relay` |
 | `/responses` works, `/responses/compact` is unsupported, selected model is image-capable | `imagegen-bridge` |
 | `/responses` works, `/responses/compact` is unsupported, no image capability is proven | `default` |
-| `/responses/compact` is unknown | avoid official relay modes until compact is proven |
-| `/responses` is unavailable | `default`; no patch mode can compensate for a missing Responses endpoint |
+| `/responses/compact` is unknown | avoid official relay presets until compact is proven |
+| `/responses` is unavailable | `default`; no patch preset can compensate for a missing Responses endpoint |
 
 For sub2api-style relays, a raw OpenAI `/models` response (`data: [...]`) is fine only if
 codex-helper translates it into the Codex `models: [...]` catalog before Codex sees it. The
@@ -121,9 +130,9 @@ return an OpenAI model list that codex-helper can translate. If the selected mod
 metadata does not prove image input, the recommendation will not assume hosted image generation.
 
 Hosted `image_generation` is not actively probed by this diagnostic endpoint because that can spend
-quota or create image artifacts. WebSocket relay support is still not implemented; bridge modes keep
-`supports_websockets = false`. Remote compaction v2 remains diagnostic-only and is not enabled by
-these modes.
+quota or create image artifacts. Responses WebSocket support is opt-in through
+`responses_websocket = true` / `--responses-websocket`; bridge presets keep it disabled by default.
+Remote compaction v2 remains diagnostic-only and is not enabled by these presets.
 
 When validation-only diagnostics are inconclusive, you can run a stronger live smoke check. This is
 a real upstream request, not a background health check. It is manual, cost-bearing, and requires the
@@ -161,7 +170,7 @@ The same diagnostics are available without starting the TUI or admin listener:
 
 ```bash
 codex-helper codex relay-capabilities \
-  --mode official-imagegen-bridge \
+  --preset official-imagegen \
   --model gpt-5.5
 
 codex-helper codex relay-live-smoke \
@@ -178,14 +187,14 @@ codex-helper codex relay-evidence --limit 20
 
 Live smoke is intentionally isolated from normal routing behavior. It selects one upstream, sends at
 most one request per selected case, bypasses route retry/failover, and does not write request ledger
-entries, route affinity, passive health, runtime health, balance state, or patch-mode changes. Image
+entries, route affinity, passive health, runtime health, balance state, or patch-preset changes. Image
 responses are summarized only: codex-helper reports whether an `image_generation_call` appeared, but
 does not store raw image bytes or base64 payloads.
 
 Capability diagnostics and live smoke append sanitized summaries to
 `~/.codex-helper/logs/codex_relay_evidence.jsonl`. This evidence store is local operator memory,
 not routing truth. It does not feed request ledger summaries, load balancing, session affinity,
-passive health, balance exhaustion, retry policy, or automatic patch-mode changes. Use
+passive health, balance exhaustion, retry policy, or automatic patch-preset changes. Use
 `codex-helper codex relay-evidence --json` when you want machine-readable records for bug reports or
 relay comparisons.
 
@@ -196,11 +205,11 @@ codex-helper usage find --path responses/compact --limit 20
 codex-helper usage find --path responses --limit 20
 ```
 
-An official compact hit normally appears as `POST /responses/compact` in codex-helper logs. Ordinary local fallback compaction appears as a normal `POST /responses` request. Remote compaction v2, when Codex enables it, also travels through ordinary `/responses` with a `compaction_trigger` payload/event shape rather than `/responses/compact`; this helper mode does not enable v2 or WebSocket transport.
+An official compact hit normally appears as `POST /responses/compact` in codex-helper logs. Ordinary local fallback compaction appears as a normal `POST /responses` request. Remote compaction v2, when Codex enables it, also travels through ordinary `/responses` with a `compaction_trigger` payload/event shape rather than `/responses/compact`; this helper preset does not enable v2. When `responses_websocket` is enabled, normal turn streaming uses a WebSocket `GET /responses`-style upgrade rather than an HTTP `POST /responses`.
 
 Switching back to `default` removes the bridge-only fields from `codex_proxy` and restores helper-managed auth patches when it is safe to do so.
 
-Safety rule: in bridge modes, upstream providers should configure their own `auth_token_env` / `auth_token` or API key equivalent. If an upstream has no helper-side secret, codex-helper strips Codex client auth headers to avoid forwarding ChatGPT/facade auth to third-party relays.
+Safety rule: in bridge presets, upstream providers should configure their own `auth_token_env` / `auth_token` or API key equivalent. If an upstream has no helper-side secret, codex-helper strips Codex client auth headers to avoid forwarding ChatGPT/facade auth to third-party relays.
 
 ## Recommended Start
 

@@ -115,6 +115,7 @@ mod tests {
         Snapshot {
             rows: Vec::new(),
             recent: Vec::new(),
+            forecast_recent: Vec::new(),
             model_overrides: HashMap::new(),
             overrides: HashMap::new(),
             station_overrides: HashMap::new(),

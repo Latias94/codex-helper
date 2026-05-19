@@ -174,10 +174,10 @@ fn codex_relay_diagnostics_lines(p: Palette, ui: &UiState) -> Vec<Line<'static>>
     lines.push(Line::from(vec![Span::styled(
         match ui.language {
             Language::Zh => {
-                "  C 运行一次有界诊断：/models 只读，/responses 与 /responses/compact 只发 {} 校验请求；不会自动切换 patch。"
+                "  C 运行一次有界诊断：/models 只读，/responses 与 /responses/compact 只发 {} 校验请求；不会自动切换 patch 预设。"
             }
             Language::En => {
-                "  C runs one bounded diagnostic: /models read-only, /responses and /responses/compact send {} validation probes; patch mode is not changed automatically."
+                "  C runs one bounded diagnostic: /models read-only, /responses and /responses/compact send {} validation probes; patch preset is not changed automatically."
             }
         },
         Style::default().fg(p.muted),
@@ -351,8 +351,8 @@ fn push_codex_relay_diagnostics_result_lines(
     )]));
     lines.push(Line::from(vec![Span::styled(
         format!(
-            "  patch={}  model={}  catalog_shape={:?}  selected={:?}",
-            response.patch_mode,
+            "  preset={}  model={}  catalog_shape={:?}  selected={:?}",
+            response.patch_mode.as_preset_str(),
             response.model.as_deref().unwrap_or("-"),
             response.expected.model_catalog.shape,
             response.expected.model_catalog.selection
@@ -419,8 +419,8 @@ fn push_codex_relay_diagnostics_result_lines(
     lines.push(Line::from(vec![Span::styled(
         format!(
             "  recommendation: {} -> {}  confidence={}{}",
-            recommendation.current_patch_mode,
-            recommendation.recommended_patch_mode,
+            recommendation.current_patch_mode.as_preset_str(),
+            recommendation.recommended_patch_mode.as_preset_str(),
             recommendation_confidence_label(recommendation.confidence),
             if recommendation.changes_current_mode {
                 "  change"
@@ -1068,11 +1068,11 @@ pub(super) fn render_settings_page(
         match crate::codex_integration::codex_switch_status() {
             Ok(status) => {
                 lines.push(Line::from(vec![
-                    Span::styled("  mode: ", Style::default().fg(p.muted)),
+                    Span::styled("  preset: ", Style::default().fg(p.muted)),
                     Span::styled(
                         status
                             .patch_mode
-                            .map(|mode| mode.to_string())
+                            .map(|mode| mode.as_preset_str().to_string())
                             .unwrap_or_else(|| "-".to_string()),
                         Style::default().fg(p.text),
                     ),
@@ -1337,6 +1337,7 @@ mod tests {
             upstream_index: 0,
             upstream_base_url: "https://relay.example/v1".to_string(),
             patch_mode: crate::codex_integration::CodexPatchMode::OfficialImagegenBridge,
+            responses_websocket: false,
             model: Some("gpt-5.5".to_string()),
             expected,
             observed,
@@ -1471,7 +1472,7 @@ mod tests {
         assert!(text.contains("observed /responses/compact"), "{text}");
         assert!(text.contains("mismatches: 1"), "{text}");
         assert!(
-            text.contains("official-imagegen-bridge -> imagegen-bridge"),
+            text.contains("official-imagegen -> imagegen-bridge"),
             "{text}"
         );
         assert!(text.contains("warning:"), "{text}");

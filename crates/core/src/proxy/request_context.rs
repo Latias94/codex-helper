@@ -297,7 +297,7 @@ pub(super) async fn prepare_proxy_request(
     })
 }
 
-fn route_request_context(
+pub(super) fn route_request_context(
     method: &Method,
     uri: &Uri,
     headers: &HeaderMap,
@@ -323,7 +323,7 @@ fn route_request_context(
     }
 }
 
-async fn resolve_and_touch_session_state(
+pub(super) async fn resolve_and_touch_session_state(
     proxy: &ProxyService,
     session_id: Option<&str>,
     started_at_ms: u64,

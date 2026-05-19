@@ -62,6 +62,7 @@ pub(super) fn detect_request_flavor(
         .then(|| CodexBridgeLog {
             patch_mode: codex_client_patch_mode.as_str().to_string(),
             remote_compaction_v1_request: is_remote_compaction_v1_request,
+            responses_websocket_request: false,
             strips_client_auth: codex_client_patch_mode.strips_codex_client_auth(),
         });
 

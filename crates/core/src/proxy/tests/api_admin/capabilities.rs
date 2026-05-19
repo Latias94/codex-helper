@@ -1066,7 +1066,7 @@ async fn codex_capabilities_api_reports_expected_observed_and_mismatches() {
             "http://{proxy_addr}/__codex_helper/api/v1/codex/relay-capabilities"
         ))
         .json(&serde_json::json!({
-            "patch_mode": "official-imagegen-bridge",
+            "patch_preset": "official-imagegen",
             "model": "gpt-5.5"
         }))
         .send()
@@ -1096,6 +1096,12 @@ async fn codex_capabilities_api_reports_expected_observed_and_mismatches() {
     assert_eq!(
         diagnostics.get("patch_mode").and_then(|v| v.as_str()),
         Some("official-imagegen-bridge")
+    );
+    assert_eq!(
+        diagnostics
+            .get("responses_websocket")
+            .and_then(|v| v.as_bool()),
+        Some(false)
     );
     assert_eq!(
         diagnostics["observed"]["models"]["response_shape"].as_str(),
@@ -1171,7 +1177,7 @@ model_provider = "codex_proxy"
 name = "OpenAI"
 base_url = "http://127.0.0.1:3211"
 wire_api = "responses"
-supports_websockets = false
+supports_websockets = true
 request_max_retries = 0
 "#
         .trim_start(),
@@ -1261,6 +1267,16 @@ request_max_retries = 0
     assert_eq!(
         diagnostics.get("patch_mode").and_then(|v| v.as_str()),
         Some("official-imagegen-bridge")
+    );
+    assert_eq!(
+        diagnostics
+            .get("responses_websocket")
+            .and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        diagnostics["expected"]["responses_websocket"]["support"].as_str(),
+        Some("supported")
     );
     assert_eq!(
         diagnostics["expected"]["remote_compaction_v1"]["support"].as_str(),

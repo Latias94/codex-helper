@@ -93,7 +93,7 @@ pub struct PassiveUpstreamFailureRecord {
     pub now_ms: u64,
 }
 
-fn recent_finished_max() -> usize {
+pub fn recent_finished_max() -> usize {
     static MAX: OnceLock<usize> = OnceLock::new();
     *MAX.get_or_init(|| {
         std::env::var("CODEX_HELPER_RECENT_FINISHED_MAX")
