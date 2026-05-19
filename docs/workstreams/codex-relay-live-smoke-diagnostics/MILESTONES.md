@@ -1,9 +1,11 @@
 # Codex Relay Live Smoke Diagnostics — Milestones
 
-Status: Active
+Status: Complete
 Last updated: 2026-05-19
 
 ## M0 — Safety Contract
+
+Status: Complete
 
 Exit criteria:
 
@@ -18,6 +20,8 @@ Primary evidence:
 
 ## M1 — Core Contract
 
+Status: Complete
+
 Exit criteria:
 
 - Core DTOs represent requested cases, opt-in state, target, per-case result, and warnings.
@@ -31,6 +35,8 @@ Primary gates:
 
 ## M2 — Operator API
 
+Status: Complete
+
 Exit criteria:
 
 - Admin API exposes a live-smoke endpoint.
@@ -42,6 +48,8 @@ Primary gates:
 - `cargo nextest run -p codex-helper-core codex_live_smoke_api`
 
 ## M3 — TUI Flow
+
+Status: Complete
 
 Exit criteria:
 
@@ -55,9 +63,15 @@ Primary gates:
 
 ## M4 — Closeout
 
+Status: Complete
+
 Exit criteria:
 
 - Formatting and targeted tests pass.
 - Docs and changelog describe manual cost-bearing behavior.
 - Remaining live relay smoke evidence is recorded or explicitly deferred.
 
+Closeout note:
+
+- Automated gates use local fake upstreams only. Real paid relay smoke logs remain manual follow-on
+  evidence because they can spend quota or create hosted image artifacts.

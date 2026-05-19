@@ -1,11 +1,11 @@
 # Codex Relay Live Smoke Diagnostics — Handoff
 
-Status: Active
+Status: Complete
 Last updated: 2026-05-19
 
 ## Current State
 
-The workstream is open. Core live smoke, the admin API surface, and the TUI Settings operator flow are implemented and validated. Capability diagnostics remain validation-only and should not be changed into live checks.
+The workstream is closed. Core live smoke, the admin API surface, the TUI Settings operator flow, and user-facing docs are implemented and validated. Capability diagnostics remain validation-only and should not be changed into live checks.
 
 ## Completed Tasks
 
@@ -33,13 +33,13 @@ The workstream is open. Core live smoke, the admin API surface, and the TUI Sett
 - Review: no single accidental key starts live smoke; compact-only and image-explicit flows should be distinguishable.
 - Evidence: TUI tests plus `EVIDENCE_AND_GATES.md`
 
-## Active Task
+## Completed Closeout Task
 
 - Task ID: RLS-050
 - Owner: codex
 - Files: `docs`, `CHANGELOG.md`
 - Validation: `cargo fmt --check`; targeted nextest gates from `EVIDENCE_AND_GATES.md`
-- Status: READY
+- Status: DONE
 - Review: docs must describe live smoke as manual/cost-bearing, not a free health check.
 - Evidence: docs/changelog plus closeout gates.
 
@@ -64,4 +64,5 @@ The workstream is open. Core live smoke, the admin API surface, and the TUI Sett
 
 ## Next Recommended Action
 
-- Implement RLS-050 docs, changelog, evidence refresh, and closeout decision.
+- Split real paid relay smoke logs into a follow-on evidence lane only if the user wants manual
+  upstream validation against specific relay accounts.

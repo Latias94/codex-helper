@@ -1,6 +1,6 @@
 # Codex Relay Live Smoke Diagnostics — Evidence And Gates
 
-Status: Active
+Status: Complete
 Last updated: 2026-05-19
 
 ## Smallest Current Repro
@@ -154,6 +154,42 @@ cargo fmt --check
 ```
 
 Result: PASS; admin API tests passed (3 passed, 535 skipped), core live-smoke tests passed (7 passed, 531 skipped), and formatting check passed.
+
+### 2026-05-19 — RLS-050 Docs And Closeout
+
+Commands:
+
+```bash
+cargo nextest run -p codex-helper-core codex_relay_live_smoke
+cargo nextest run -p codex-helper-core codex_live_smoke_api
+cargo nextest run -p codex-helper-tui codex_relay_live_smoke
+cargo nextest run -p codex-helper-core
+cargo nextest run -p codex-helper-tui
+cargo fmt --check
+```
+
+Result: PASS.
+
+- Core live-smoke targeted gate: 7 tests passed, 531 skipped.
+- Admin API targeted gate: 3 tests passed, 535 skipped.
+- TUI live-smoke targeted gate: 3 tests passed, 117 skipped.
+- Core package gate: 538 tests passed, 0 skipped.
+- TUI package gate: 120 tests passed, 0 skipped.
+- Formatting check passed.
+
+Proves:
+
+- live smoke docs describe the feature as manual, cost-bearing, and not a health check,
+- core/API/TUI regression tests still cover opt-in, one-upstream, one-request-per-case, admin API,
+  confirmation flow, and summarized image-generation classification,
+- package gates cover adjacent core and TUI contracts touched by the lane.
+
+Files:
+
+- `CHANGELOG.md`
+- `docs/CONFIGURATION.md`
+- `docs/CONFIGURATION.zh.md`
+- `docs/workstreams/codex-relay-live-smoke-diagnostics/CLOSEOUT.md`
 
 ## Notes
 

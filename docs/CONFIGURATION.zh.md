@@ -109,6 +109,33 @@ curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-capabilities \
 
 该诊断端点不会主动探测 hosted `image_generation`，因为这可能消耗额度或生成实际图片。WebSocket relay 仍未实现；bridge 模式会继续保持 `supports_websockets = false`。Remote compaction v2 仍只作为诊断认知保留，不由这些模式启用。
 
+当 validation-only 诊断还不能解释问题时，可以手动跑更强的 live smoke 检查。它是真实上游请求，不是后台健康检查；可能消耗额度，也可能触发上游生成图片。codex-helper 在发送任何上游请求前，必须先收到固定确认字符串：
+
+```bash
+curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-live-smoke \
+  -H 'content-type: application/json' \
+  -d '{
+    "acknowledgement": "run-live-codex-relay-smoke",
+    "model": "gpt-5.5"
+  }'
+```
+
+不传 `cases` 时，live smoke 只会通过 `/responses/compact` 检查 remote compaction v1。Hosted image generation 永远不属于默认 case。要显式测试 hosted tool 请求链路，可以传：
+
+```bash
+curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-live-smoke \
+  -H 'content-type: application/json' \
+  -d '{
+    "acknowledgement": "run-live-codex-relay-smoke",
+    "model": "gpt-5.5",
+    "cases": ["responses_compact", "hosted_image_generation"]
+  }'
+```
+
+TUI Settings 页也提供同一能力：在确认窗口内按两次 `X` 会跑 compact-only live smoke，按两次 `Y` 会跑 compact + hosted image-generation live smoke。TUI 默认使用当前 Codex runtime target 和推断出来的模型；如果走 API，则可以在请求体里显式传目标字段。
+
+Live smoke 刻意和正常路由隔离。它只选择一个上游，每个选中的 case 最多发一次请求，不走 route retry/failover，也不会写 request ledger、route affinity、passive health、runtime health、余额状态或自动修改 patch mode。图片响应只做摘要：codex-helper 会报告是否出现 `image_generation_call`，但不会保存原始图片字节或 base64 payload。
+
 要诊断 remote compaction v1 是否生效，可以在 Codex 发生压缩后查看 codex-helper 请求账本：
 
 ```bash

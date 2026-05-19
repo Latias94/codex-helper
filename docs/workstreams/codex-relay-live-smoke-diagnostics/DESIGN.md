@@ -1,6 +1,6 @@
 # Design: Codex Relay Live Smoke Diagnostics
 
-Status: Active
+Status: Complete
 Last updated: 2026-05-19
 
 ## Why This Lane Exists
@@ -80,4 +80,3 @@ The executor should build direct `reqwest` calls from `UpstreamConfig`, matching
 ## First Implementation Slice
 
 Start with core/API and remote compaction plus hosted-tool request classification. TUI can then call the same service with a clear confirmation flow.
-

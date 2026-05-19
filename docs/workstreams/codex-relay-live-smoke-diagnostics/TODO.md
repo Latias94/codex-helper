@@ -1,6 +1,6 @@
 # Codex Relay Live Smoke Diagnostics — TODO
 
-Status: Active
+Status: Complete
 Last updated: 2026-05-19
 
 ## M0 — Scope And Safety Contract
@@ -41,9 +41,10 @@ Last updated: 2026-05-19
 
 ## M4 — Docs, Evidence, Closeout
 
-- [ ] RLS-050 [owner=codex] [deps=RLS-040] [scope=docs,CHANGELOG.md]
+- [x] RLS-050 [owner=codex] [deps=RLS-040] [scope=docs,CHANGELOG.md]
   Goal: Document live smoke semantics, risks, examples, and close the lane with fresh gates.
   Validation: `cargo fmt --check`; targeted nextest gates; package gates if contracts changed.
   Review: Confirm docs do not imply live smoke is free, automatic, or a health check.
   Evidence: `docs/workstreams/codex-relay-live-smoke-diagnostics/EVIDENCE_AND_GATES.md`
-  Handoff: Split real relay manual smoke logs into follow-on evidence if not run in automation.
+  Handoff: DONE 2026-05-19; real relay manual smoke logs are explicit follow-on evidence and are not
+  required for automated closeout.

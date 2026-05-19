@@ -2,7 +2,7 @@
   "schema_version": 1,
   "slug": "codex-relay-live-smoke-diagnostics",
   "title": "Codex Relay Live Smoke Diagnostics",
-  "status": "active",
+  "status": "complete",
   "updated": "2026-05-19",
   "scope_kind": "execution",
   "problem": "Validation-only Codex relay diagnostics cannot prove real remote compaction or hosted image generation behavior through an upstream relay.",
@@ -18,6 +18,10 @@
     {
       "role": "gates",
       "path": "docs/workstreams/codex-relay-live-smoke-diagnostics/EVIDENCE_AND_GATES.md"
+    },
+    {
+      "role": "closeout",
+      "path": "docs/workstreams/codex-relay-live-smoke-diagnostics/CLOSEOUT.md"
     }
   ],
   "gates": [
@@ -28,12 +32,12 @@
   ],
   "evidence": [
     "docs/workstreams/codex-relay-live-smoke-diagnostics/DESIGN.md",
-    "docs/workstreams/codex-relay-live-smoke-diagnostics/TODO.md"
+    "docs/workstreams/codex-relay-live-smoke-diagnostics/TODO.md",
+    "docs/workstreams/codex-relay-live-smoke-diagnostics/CLOSEOUT.md"
   ],
   "adr_refs": [],
   "continue_policy": {
-    "default_action": "continue",
-    "notes": "Continue while live smoke remains strong opt-in, single-upstream, no-retry, and side-effect isolated. Split real paid relay smoke logs into follow-on evidence unless the user explicitly requests live testing."
+    "default_action": "closed",
+    "notes": "Closed with core live smoke, admin API, TUI confirmation flow, docs, changelog, targeted gates, and package gates. Real paid relay smoke logs remain a follow-on because they can spend quota or create hosted image artifacts."
   }
 }
-

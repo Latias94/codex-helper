@@ -124,6 +124,44 @@ quota or create image artifacts. WebSocket relay support is still not implemente
 `supports_websockets = false`. Remote compaction v2 remains diagnostic-only and is not enabled by
 these modes.
 
+When validation-only diagnostics are inconclusive, you can run a stronger live smoke check. This is
+a real upstream request, not a background health check. It is manual, cost-bearing, and requires the
+literal acknowledgement string before codex-helper sends any upstream traffic:
+
+```bash
+curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-live-smoke \
+  -H 'content-type: application/json' \
+  -d '{
+    "acknowledgement": "run-live-codex-relay-smoke",
+    "model": "gpt-5.5"
+  }'
+```
+
+With no `cases` field, live smoke only checks remote compaction v1 through `/responses/compact`.
+Hosted image generation is never part of the default case set. To explicitly test the hosted tool
+request path:
+
+```bash
+curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-live-smoke \
+  -H 'content-type: application/json' \
+  -d '{
+    "acknowledgement": "run-live-codex-relay-smoke",
+    "model": "gpt-5.5",
+    "cases": ["responses_compact", "hosted_image_generation"]
+  }'
+```
+
+In the TUI Settings page, press `X` twice within the confirmation window for compact-only live
+smoke, or `Y` twice for compact plus hosted image-generation live smoke. Both actions use the
+currently selected Codex runtime target and inferred model unless the API request supplies explicit
+fields.
+
+Live smoke is intentionally isolated from normal routing behavior. It selects one upstream, sends at
+most one request per selected case, bypasses route retry/failover, and does not write request ledger
+entries, route affinity, passive health, runtime health, balance state, or patch-mode changes. Image
+responses are summarized only: codex-helper reports whether an `image_generation_call` appeared, but
+does not store raw image bytes or base64 payloads.
+
 To diagnose whether remote compaction v1 is active, inspect the codex-helper request ledger after a Codex compaction happens:
 
 ```bash
