@@ -1,7 +1,7 @@
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, Method, Response, StatusCode};
 
-use crate::logging::{RetryInfo, ServiceTierLog, log_request_with_debug};
+use crate::logging::{CodexBridgeLog, RetryInfo, ServiceTierLog, log_request_with_debug};
 use crate::state::FinishRequestParams;
 use crate::usage::UsageMetrics;
 
@@ -22,6 +22,7 @@ pub(super) struct FinalizeForwardResponseParams {
     pub cwd: Option<String>,
     pub effective_effort: Option<String>,
     pub service_tier: ServiceTierLog,
+    pub codex_bridge: Option<CodexBridgeLog>,
     pub usage: Option<UsageMetrics>,
     pub retry: Option<RetryInfo>,
     pub response_headers: HeaderMap,
@@ -49,6 +50,7 @@ pub(super) async fn finish_and_build_forward_response(
         cwd,
         effective_effort,
         service_tier,
+        codex_bridge,
         usage,
         retry,
         response_headers,
@@ -87,6 +89,7 @@ pub(super) async fn finish_and_build_forward_response(
         cwd,
         effective_effort,
         service_tier,
+        codex_bridge,
         usage,
         retry,
         None,

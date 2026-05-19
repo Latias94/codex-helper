@@ -9,8 +9,8 @@ use tracing::{info, warn};
 
 use crate::lb::LoadBalancer;
 use crate::logging::{
-    HttpDebugLog, RetryInfo, ServiceTierLog, log_request_with_debug, make_body_preview,
-    should_include_http_debug, should_include_http_warn,
+    CodexBridgeLog, HttpDebugLog, RetryInfo, ServiceTierLog, log_request_with_debug,
+    make_body_preview, should_include_http_debug, should_include_http_warn,
 };
 use crate::state::ProxyState;
 use crate::usage_providers;
@@ -91,6 +91,7 @@ struct StreamFinalize {
     cwd: Option<String>,
     reasoning_effort: Option<String>,
     service_tier: ServiceTierLog,
+    codex_bridge: Option<CodexBridgeLog>,
     request_id: u64,
     state: Arc<ProxyState>,
     resp_headers: HeaderMap,
@@ -237,6 +238,7 @@ impl Drop for StreamFinalize {
                 self.cwd.clone(),
                 self.reasoning_effort.clone(),
                 service_tier,
+                self.codex_bridge.clone(),
                 usage,
                 self.retry.clone(),
                 http_debug,
@@ -409,6 +411,7 @@ pub(super) async fn build_sse_success_response(
         cwd,
         effective_effort,
         service_tier,
+        codex_bridge,
         request_id,
         is_user_turn,
         is_codex_service,
@@ -496,6 +499,7 @@ pub(super) async fn build_sse_success_response(
         cwd: cwd.clone(),
         reasoning_effort: effective_effort.clone(),
         service_tier,
+        codex_bridge: codex_bridge.clone(),
         request_id,
         state: proxy.state.clone(),
         resp_headers: resp_headers.clone(),
@@ -629,6 +633,7 @@ pub(super) async fn build_sse_success_response(
                         cwd.clone(),
                         effective_effort.clone(),
                         service_tier,
+                        codex_bridge.clone(),
                         Some(usage),
                         retry.clone(),
                         http_debug,
@@ -681,6 +686,7 @@ pub(super) struct SseSuccessMeta {
     pub(super) cwd: Option<String>,
     pub(super) effective_effort: Option<String>,
     pub(super) service_tier: ServiceTierLog,
+    pub(super) codex_bridge: Option<CodexBridgeLog>,
     pub(super) request_id: u64,
     pub(super) is_user_turn: bool,
     pub(super) is_codex_service: bool,

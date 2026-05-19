@@ -83,6 +83,7 @@ pub(super) fn log_no_routable_station(
         ServiceTierLog::default(),
         None,
         None,
+        None,
         http_debug,
     );
 
@@ -131,6 +132,7 @@ pub(super) fn log_client_body_read_error(
         cwd,
         None,
         ServiceTierLog::default(),
+        None,
         None,
         None,
         http_debug,
@@ -198,6 +200,7 @@ pub(super) async fn finish_failed_proxy_request(
         cwd,
         effective_effort,
         service_tier,
+        None,
         None,
         retry,
         None,

@@ -1181,6 +1181,12 @@ fn print_codex_switch_status() {
         if let Some(value) = supports_websockets {
             println!("  codex_proxy.supports_websockets: {}", value);
         }
+        if let Ok(status) = codex_integration::codex_switch_status() {
+            println!(
+                "  features.remote_compaction_v2: {}",
+                status.remote_compaction_v2_enabled
+            );
+        }
 
         let is_local = base_url.contains("127.0.0.1") || base_url.contains("localhost");
         if is_local {
@@ -1198,6 +1204,22 @@ fn print_codex_switch_status() {
             "  未检测到 switch state：{:?}，switch off 不会猜测原 provider。",
             state_path
         );
+    }
+
+    let bridge = codex_integration::codex_bridge_diagnostics();
+    println!("  官方桥接诊断: {}", bridge.worst_status().as_str());
+    for check in &bridge.checks {
+        if check.status == codex_integration::CodexBridgeDiagnosticStatus::Ok {
+            continue;
+        }
+        println!(
+            "    [{}] {}",
+            check.status.as_str().to_uppercase(),
+            check.message
+        );
+        if let Some(action) = check.action.as_deref() {
+            println!("        建议: {action}");
+        }
     }
 }
 

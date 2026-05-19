@@ -572,6 +572,20 @@ fn codex_remote_control_feature_present_in_toml(text: &str) -> Result<bool> {
         .is_some_and(|features| features.contains_key("remote_control")))
 }
 
+fn codex_remote_compaction_v2_feature_enabled_from_toml(text: &str) -> Result<bool> {
+    if text.trim().is_empty() {
+        return Ok(false);
+    }
+    let value = text.parse::<Value>()?;
+    Ok(value
+        .as_table()
+        .and_then(|root| root.get("features"))
+        .and_then(Value::as_table)
+        .and_then(|features| features.get("remote_compaction_v2"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false))
+}
+
 fn json_string_at_path<'a>(value: &'a serde_json::Value, path: &[&str]) -> Option<&'a str> {
     let mut current = value;
     for key in path {
@@ -723,6 +737,15 @@ fn current_auth_json_is_empty_chatgpt_facade() -> bool {
     auth_json_is_empty_chatgpt_facade_text(Some(&text))
 }
 
+fn current_auth_json_facade_state() -> Result<Option<bool>> {
+    let path = codex_auth_path();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = read_config_text(&path).with_context(|| format!("read {:?}", path))?;
+    Ok(Some(auth_json_is_empty_chatgpt_facade_text(Some(&text))))
+}
+
 fn prepare_chatgpt_bridge_auth_patch_from_baseline(
     original_absent: bool,
     original_text: Option<String>,
@@ -853,11 +876,17 @@ fn load_runtime_config_for_bridge_check() -> Result<ProxyConfig> {
     serde_json::from_str::<ProxyConfig>(&text).with_context(|| format!("parse {:?}", path))
 }
 
-fn ensure_bridge_runtime_ready(mode: CodexPatchMode) -> Result<()> {
-    let cfg = load_runtime_config_for_bridge_check()
-        .with_context(|| format!("load codex-helper config before enabling {mode}"))?;
-    let mut routable_upstreams = 0usize;
-    let mut authed_upstreams = 0usize;
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CodexBridgeRuntimeAuthSnapshot {
+    pub routable_upstreams: usize,
+    pub authed_upstreams: usize,
+    pub missing_env: Vec<String>,
+}
+
+fn codex_bridge_runtime_auth_snapshot_from_config(
+    cfg: &ProxyConfig,
+) -> CodexBridgeRuntimeAuthSnapshot {
+    let mut snapshot = CodexBridgeRuntimeAuthSnapshot::default();
     let mut missing_env = BTreeSet::new();
     for station in cfg
         .codex
@@ -866,9 +895,9 @@ fn ensure_bridge_runtime_ready(mode: CodexPatchMode) -> Result<()> {
         .filter(|station| station.enabled)
     {
         for upstream in &station.upstreams {
-            routable_upstreams += 1;
+            snapshot.routable_upstreams += 1;
             if upstream_has_resolved_auth(upstream) {
-                authed_upstreams += 1;
+                snapshot.authed_upstreams += 1;
             } else {
                 for env_name in upstream_auth_env_names(upstream) {
                     missing_env.insert(env_name.to_string());
@@ -876,21 +905,35 @@ fn ensure_bridge_runtime_ready(mode: CodexPatchMode) -> Result<()> {
             }
         }
     }
+    snapshot.missing_env = missing_env.into_iter().collect();
+    snapshot
+}
 
-    if routable_upstreams == 0 {
+pub fn codex_bridge_runtime_auth_snapshot() -> Result<CodexBridgeRuntimeAuthSnapshot> {
+    let cfg = load_runtime_config_for_bridge_check()
+        .context("load codex-helper config for bridge diagnostics")?;
+    Ok(codex_bridge_runtime_auth_snapshot_from_config(&cfg))
+}
+
+fn ensure_bridge_runtime_ready(mode: CodexPatchMode) -> Result<()> {
+    let cfg = load_runtime_config_for_bridge_check()
+        .with_context(|| format!("load codex-helper config before enabling {mode}"))?;
+    let snapshot = codex_bridge_runtime_auth_snapshot_from_config(&cfg);
+
+    if snapshot.routable_upstreams == 0 {
         anyhow::bail!(
             "{mode} requires at least one enabled Codex upstream in codex-helper config; run `codex-helper config init` or add a [codex.providers.*] entry first"
         );
     }
-    if authed_upstreams == 0 {
-        if missing_env.is_empty() {
+    if snapshot.authed_upstreams == 0 {
+        if snapshot.missing_env.is_empty() {
             anyhow::bail!(
                 "{mode} strips Codex client auth, but no enabled Codex upstream has auth_token/auth_token_env/api_key/api_key_env configured; configure an upstream credential before enabling it"
             );
         }
         anyhow::bail!(
             "{mode} strips Codex client auth, but no enabled Codex upstream credential is available in this process; set one of these env vars first: {}",
-            missing_env.into_iter().collect::<Vec<_>>().join(", ")
+            snapshot.missing_env.join(", ")
         );
     }
 
@@ -922,6 +965,8 @@ pub struct CodexSwitchStatus {
     pub enabled: bool,
     /// Current `model_provider` value (if any).
     pub model_provider: Option<String>,
+    /// Current `model_providers.codex_proxy.name` value (if any).
+    pub provider_name: Option<String>,
     /// Current `model_providers.codex_proxy.base_url` (if any).
     pub base_url: Option<String>,
     /// Current codex-helper Codex patch mode inferred from `model_providers.codex_proxy`.
@@ -930,8 +975,340 @@ pub struct CodexSwitchStatus {
     pub requires_openai_auth: Option<bool>,
     /// Current `model_providers.codex_proxy.supports_websockets` value (if any).
     pub supports_websockets: Option<bool>,
+    /// Whether `[features].remote_compaction_v2 = true` is present in Codex config.
+    pub remote_compaction_v2_enabled: bool,
     /// Whether original switch metadata exists for disabling the local proxy patch.
     pub has_switch_state: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexBridgeDiagnosticStatus {
+    Ok,
+    Info,
+    Warn,
+    Fail,
+}
+
+impl CodexBridgeDiagnosticStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Fail => "fail",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CodexBridgeDiagnosticCheck {
+    pub id: &'static str,
+    pub status: CodexBridgeDiagnosticStatus,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CodexBridgeDiagnostics {
+    pub patch_mode: Option<CodexPatchMode>,
+    pub enabled: bool,
+    pub remote_compaction_v1_ready: bool,
+    pub imagegen_facade_ready: bool,
+    pub upstream_auth_ready: bool,
+    pub remote_compaction_v2_enabled: bool,
+    pub checks: Vec<CodexBridgeDiagnosticCheck>,
+}
+
+impl CodexBridgeDiagnostics {
+    pub fn worst_status(&self) -> CodexBridgeDiagnosticStatus {
+        if self
+            .checks
+            .iter()
+            .any(|check| check.status == CodexBridgeDiagnosticStatus::Fail)
+        {
+            return CodexBridgeDiagnosticStatus::Fail;
+        }
+        if self
+            .checks
+            .iter()
+            .any(|check| check.status == CodexBridgeDiagnosticStatus::Warn)
+        {
+            return CodexBridgeDiagnosticStatus::Warn;
+        }
+        if self
+            .checks
+            .iter()
+            .any(|check| check.status == CodexBridgeDiagnosticStatus::Info)
+        {
+            return CodexBridgeDiagnosticStatus::Info;
+        }
+        CodexBridgeDiagnosticStatus::Ok
+    }
+}
+
+fn push_bridge_check(
+    checks: &mut Vec<CodexBridgeDiagnosticCheck>,
+    id: &'static str,
+    status: CodexBridgeDiagnosticStatus,
+    message: impl Into<String>,
+    action: Option<String>,
+) {
+    checks.push(CodexBridgeDiagnosticCheck {
+        id,
+        status,
+        message: message.into(),
+        action,
+    });
+}
+
+fn bridge_mode_expects_remote_compaction_v1(mode: Option<CodexPatchMode>) -> bool {
+    matches!(
+        mode,
+        Some(CodexPatchMode::OfficialRelayBridge | CodexPatchMode::OfficialImagegenBridge)
+    )
+}
+
+fn bridge_mode_expects_imagegen_facade(mode: Option<CodexPatchMode>) -> bool {
+    matches!(
+        mode,
+        Some(CodexPatchMode::ImagegenBridge | CodexPatchMode::OfficialImagegenBridge)
+    )
+}
+
+pub fn codex_bridge_diagnostics() -> CodexBridgeDiagnostics {
+    let status_result = codex_switch_status();
+    let mut checks = Vec::new();
+    let mut enabled = false;
+    let mut patch_mode = None;
+    let mut remote_compaction_v2_enabled = false;
+    let mut remote_compaction_v1_ready = false;
+    let mut imagegen_facade_ready = false;
+
+    match status_result {
+        Ok(status) => {
+            enabled = status.enabled;
+            patch_mode = status.patch_mode;
+            remote_compaction_v2_enabled = status.remote_compaction_v2_enabled;
+
+            if !status.enabled {
+                push_bridge_check(
+                    &mut checks,
+                    "codex_bridge.switch",
+                    CodexBridgeDiagnosticStatus::Info,
+                    format!(
+                        "Codex is not currently routed through codex-helper (model_provider={}).",
+                        status.model_provider.as_deref().unwrap_or("<unset>")
+                    ),
+                    Some(
+                        "Run `codex-helper switch on --mode official-imagegen-bridge` after starting helper if you want relay + remote compact + imagegen.".to_string(),
+                    ),
+                );
+            } else {
+                push_bridge_check(
+                    &mut checks,
+                    "codex_bridge.switch",
+                    CodexBridgeDiagnosticStatus::Ok,
+                    format!(
+                        "Codex is routed through codex-helper on {} with patch_mode={}.",
+                        status.base_url.as_deref().unwrap_or("<missing base_url>"),
+                        patch_mode.map(|mode| mode.as_str()).unwrap_or("<unknown>")
+                    ),
+                    None,
+                );
+            }
+
+            if bridge_mode_expects_remote_compaction_v1(patch_mode) {
+                let provider_ok = status.provider_name.as_deref() == Some("OpenAI");
+                let websockets_ok = status.supports_websockets == Some(false);
+                remote_compaction_v1_ready = status.enabled && provider_ok && websockets_ok;
+                let status_label = if remote_compaction_v1_ready {
+                    CodexBridgeDiagnosticStatus::Ok
+                } else {
+                    CodexBridgeDiagnosticStatus::Fail
+                };
+                push_bridge_check(
+                    &mut checks,
+                    "codex_bridge.remote_compaction_v1",
+                    status_label,
+                    format!(
+                        "Remote compaction v1 requires provider name OpenAI and supports_websockets=false; current name={}, supports_websockets={}.",
+                        status.provider_name.as_deref().unwrap_or("<missing>"),
+                        status
+                            .supports_websockets
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "<missing>".to_string())
+                    ),
+                    (!remote_compaction_v1_ready).then(|| {
+                        "Run `codex-helper switch on --mode official-imagegen-bridge` or `--mode official-relay-bridge`, then fully restart Codex clients.".to_string()
+                    }),
+                );
+            } else {
+                push_bridge_check(
+                    &mut checks,
+                    "codex_bridge.remote_compaction_v1",
+                    CodexBridgeDiagnosticStatus::Info,
+                    format!(
+                        "Current patch mode {} does not advertise the local relay as the official OpenAI provider.",
+                        patch_mode
+                            .map(|mode| mode.as_str())
+                            .unwrap_or("<unknown>")
+                    ),
+                    Some(
+                        "Use official relay/imagegen bridge mode when you need Codex remote compaction v1 through relay.".to_string(),
+                    ),
+                );
+            }
+
+            if bridge_mode_expects_imagegen_facade(patch_mode) {
+                match current_auth_json_facade_state() {
+                    Ok(Some(true)) => {
+                        imagegen_facade_ready = status.enabled;
+                        push_bridge_check(
+                            &mut checks,
+                            "codex_bridge.imagegen_facade",
+                            CodexBridgeDiagnosticStatus::Ok,
+                            "Codex auth.json is the empty ChatGPT facade used to expose hosted image generation.".to_string(),
+                            None,
+                        );
+                    }
+                    Ok(Some(false)) => {
+                        push_bridge_check(
+                            &mut checks,
+                            "codex_bridge.imagegen_facade",
+                            CodexBridgeDiagnosticStatus::Fail,
+                            "Codex auth.json is not the empty ChatGPT facade expected by imagegen bridge mode.".to_string(),
+                            Some(
+                                "Run `codex-helper switch on --mode official-imagegen-bridge`, then fully restart Codex clients.".to_string(),
+                            ),
+                        );
+                    }
+                    Ok(None) => {
+                        push_bridge_check(
+                            &mut checks,
+                            "codex_bridge.imagegen_facade",
+                            CodexBridgeDiagnosticStatus::Fail,
+                            format!("Codex auth.json is missing at {:?}.", codex_auth_path()),
+                            Some(
+                                "Run `codex-helper switch on --mode official-imagegen-bridge` so helper can write the temporary facade.".to_string(),
+                            ),
+                        );
+                    }
+                    Err(err) => {
+                        push_bridge_check(
+                            &mut checks,
+                            "codex_bridge.imagegen_facade",
+                            CodexBridgeDiagnosticStatus::Warn,
+                            format!("Could not inspect Codex auth.json facade state: {err}"),
+                            Some("Inspect ~/.codex/auth.json and rerun `codex-helper switch status`.".to_string()),
+                        );
+                    }
+                }
+            } else {
+                push_bridge_check(
+                    &mut checks,
+                    "codex_bridge.imagegen_facade",
+                    CodexBridgeDiagnosticStatus::Info,
+                    format!(
+                        "Current patch mode {} does not install the imagegen auth facade.",
+                        patch_mode
+                            .map(|mode| mode.as_str())
+                            .unwrap_or("<unknown>")
+                    ),
+                    Some("Use official-imagegen-bridge when you need relay + remote compact + hosted image generation.".to_string()),
+                );
+            }
+
+            if status.remote_compaction_v2_enabled {
+                push_bridge_check(
+                    &mut checks,
+                    "codex_bridge.remote_compaction_v2",
+                    CodexBridgeDiagnosticStatus::Warn,
+                    "Codex remote_compaction_v2 is enabled; current relay compatibility is less stable than v1 /responses/compact.".to_string(),
+                    Some(
+                        "Prefer leaving [features].remote_compaction_v2 unset/false unless your relay explicitly supports compaction_trigger and compaction response items.".to_string(),
+                    ),
+                );
+            } else {
+                push_bridge_check(
+                    &mut checks,
+                    "codex_bridge.remote_compaction_v2",
+                    CodexBridgeDiagnosticStatus::Ok,
+                    "Codex remote_compaction_v2 is not enabled; remote compaction stays on the v1 /responses/compact path for official bridge modes.".to_string(),
+                    None,
+                );
+            }
+        }
+        Err(err) => {
+            push_bridge_check(
+                &mut checks,
+                "codex_bridge.switch",
+                CodexBridgeDiagnosticStatus::Fail,
+                format!("Could not inspect Codex switch status: {err}"),
+                Some(
+                    "Run `codex-helper switch status` and fix ~/.codex/config.toml parsing issues."
+                        .to_string(),
+                ),
+            );
+        }
+    }
+
+    let runtime_auth = match codex_bridge_runtime_auth_snapshot() {
+        Ok(snapshot) => {
+            let auth_ready = snapshot.authed_upstreams > 0;
+            let status = if auth_ready {
+                CodexBridgeDiagnosticStatus::Ok
+            } else if snapshot.routable_upstreams == 0 {
+                CodexBridgeDiagnosticStatus::Fail
+            } else {
+                CodexBridgeDiagnosticStatus::Fail
+            };
+            let action = if auth_ready {
+                None
+            } else if snapshot.missing_env.is_empty() {
+                Some(
+                    "Configure auth_token/auth_token_env/api_key/api_key_env for an enabled Codex upstream in codex-helper config.".to_string(),
+                )
+            } else {
+                Some(format!(
+                    "Set one of these env vars before starting codex-helper: {}.",
+                    snapshot.missing_env.join(", ")
+                ))
+            };
+            push_bridge_check(
+                &mut checks,
+                "codex_bridge.upstream_auth",
+                status,
+                format!(
+                    "codex-helper has {} enabled Codex upstream(s), {} with usable credentials in this process.",
+                    snapshot.routable_upstreams, snapshot.authed_upstreams
+                ),
+                action,
+            );
+            auth_ready
+        }
+        Err(err) => {
+            push_bridge_check(
+                &mut checks,
+                "codex_bridge.upstream_auth",
+                CodexBridgeDiagnosticStatus::Warn,
+                format!("Could not inspect codex-helper upstream credentials: {err}"),
+                Some("Check ~/.codex-helper/config.toml and rerun doctor.".to_string()),
+            );
+            false
+        }
+    };
+
+    CodexBridgeDiagnostics {
+        patch_mode,
+        enabled,
+        remote_compaction_v1_ready,
+        imagegen_facade_ready,
+        upstream_auth_ready: runtime_auth,
+        remote_compaction_v2_enabled,
+        checks,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1286,23 +1663,29 @@ pub fn codex_switch_status() -> Result<CodexSwitchStatus> {
         return Ok(CodexSwitchStatus {
             enabled: false,
             model_provider: None,
+            provider_name: None,
             base_url: None,
             patch_mode: None,
             requires_openai_auth: None,
             supports_websockets: None,
+            remote_compaction_v2_enabled: false,
             has_switch_state: state_path.exists(),
         });
     }
 
     let text = read_config_text(&cfg_path)?;
+    let remote_compaction_v2_enabled =
+        codex_remote_compaction_v2_feature_enabled_from_toml(&text).unwrap_or(false);
     if text.trim().is_empty() {
         return Ok(CodexSwitchStatus {
             enabled: false,
             model_provider: None,
+            provider_name: None,
             base_url: None,
             patch_mode: None,
             requires_openai_auth: None,
             supports_websockets: None,
+            remote_compaction_v2_enabled,
             has_switch_state: state_path.exists(),
         });
     }
@@ -1313,10 +1696,12 @@ pub fn codex_switch_status() -> Result<CodexSwitchStatus> {
             return Ok(CodexSwitchStatus {
                 enabled: false,
                 model_provider: None,
+                provider_name: None,
                 base_url: None,
                 patch_mode: None,
                 requires_openai_auth: None,
                 supports_websockets: None,
+                remote_compaction_v2_enabled,
                 has_switch_state: state_path.exists(),
             });
         }
@@ -1327,10 +1712,12 @@ pub fn codex_switch_status() -> Result<CodexSwitchStatus> {
             return Ok(CodexSwitchStatus {
                 enabled: false,
                 model_provider: None,
+                provider_name: None,
                 base_url: None,
                 patch_mode: None,
                 requires_openai_auth: None,
                 supports_websockets: None,
+                remote_compaction_v2_enabled,
                 has_switch_state: state_path.exists(),
             });
         }
@@ -1345,10 +1732,12 @@ pub fn codex_switch_status() -> Result<CodexSwitchStatus> {
         return Ok(CodexSwitchStatus {
             enabled: false,
             model_provider,
+            provider_name: None,
             base_url: None,
             patch_mode: None,
             requires_openai_auth: None,
             supports_websockets: None,
+            remote_compaction_v2_enabled,
             has_switch_state: state_path.exists(),
         });
     }
@@ -1372,6 +1761,7 @@ pub fn codex_switch_status() -> Result<CodexSwitchStatus> {
         .get("name")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
+    let provider_name = (!name.is_empty()).then(|| name.to_string());
     let requires_openai_auth = proxy_table
         .get("requires_openai_auth")
         .and_then(|v| v.as_bool());
@@ -1401,10 +1791,12 @@ pub fn codex_switch_status() -> Result<CodexSwitchStatus> {
     Ok(CodexSwitchStatus {
         enabled,
         model_provider,
+        provider_name,
         base_url,
         patch_mode: enabled.then_some(stored_patch_mode.unwrap_or(inferred_patch_mode)),
         requires_openai_auth,
         supports_websockets,
+        remote_compaction_v2_enabled,
         has_switch_state: state_path.exists(),
     })
 }
@@ -3345,6 +3737,151 @@ supports_websockets = false
         assert_eq!(status.supports_websockets, Some(false));
         assert_eq!(status.requires_openai_auth, None);
         assert!(!status.has_switch_state);
+    }
+
+    #[test]
+    fn codex_bridge_diagnostics_reports_ready_official_imagegen_bridge() {
+        let env = setup_temp_env();
+        write_helper_codex_config_with_env_auth(&env);
+        let cfg_path = env.codex_home.join("config.toml");
+        let auth_path = env.codex_home.join("auth.json");
+        write_file(
+            &cfg_path,
+            r#"
+model_provider = "codex_proxy"
+
+[model_providers.codex_proxy]
+name = "OpenAI"
+base_url = "http://127.0.0.1:3211"
+wire_api = "responses"
+supports_websockets = false
+"#
+            .trim_start(),
+        );
+        write_file(&auth_path, "{}");
+
+        let diagnostics = codex_bridge_diagnostics();
+
+        assert_eq!(
+            diagnostics.patch_mode,
+            Some(CodexPatchMode::OfficialImagegenBridge)
+        );
+        assert!(diagnostics.enabled);
+        assert!(diagnostics.remote_compaction_v1_ready);
+        assert!(diagnostics.imagegen_facade_ready);
+        assert!(diagnostics.upstream_auth_ready);
+        assert!(!diagnostics.remote_compaction_v2_enabled);
+        assert_eq!(diagnostics.worst_status(), CodexBridgeDiagnosticStatus::Ok);
+    }
+
+    #[test]
+    fn codex_bridge_diagnostics_warns_when_remote_compaction_v2_is_enabled() {
+        let env = setup_temp_env();
+        write_helper_codex_config_with_env_auth(&env);
+        let cfg_path = env.codex_home.join("config.toml");
+        let auth_path = env.codex_home.join("auth.json");
+        write_file(
+            &cfg_path,
+            r#"
+model_provider = "codex_proxy"
+
+[features]
+remote_compaction_v2 = true
+
+[model_providers.codex_proxy]
+name = "OpenAI"
+base_url = "http://127.0.0.1:3211"
+wire_api = "responses"
+supports_websockets = false
+"#
+            .trim_start(),
+        );
+        write_file(&auth_path, "{}");
+
+        let diagnostics = codex_bridge_diagnostics();
+
+        assert!(diagnostics.remote_compaction_v2_enabled);
+        assert_eq!(
+            diagnostics.worst_status(),
+            CodexBridgeDiagnosticStatus::Warn
+        );
+        let v2 = diagnostics
+            .checks
+            .iter()
+            .find(|check| check.id == "codex_bridge.remote_compaction_v2")
+            .expect("v2 check");
+        assert_eq!(v2.status, CodexBridgeDiagnosticStatus::Warn);
+        assert!(v2.message.contains("remote_compaction_v2 is enabled"));
+    }
+
+    #[test]
+    fn codex_bridge_diagnostics_fails_imagegen_when_auth_facade_is_missing() {
+        let env = setup_temp_env();
+        write_helper_codex_config_with_env_auth(&env);
+        let cfg_path = env.codex_home.join("config.toml");
+        write_file(
+            &cfg_path,
+            r#"
+model_provider = "codex_proxy"
+
+[model_providers.codex_proxy]
+name = "OpenAI"
+base_url = "http://127.0.0.1:3211"
+wire_api = "responses"
+supports_websockets = false
+"#
+            .trim_start(),
+        );
+        let state = CodexSwitchState {
+            patch_mode: Some(CodexPatchMode::OfficialImagegenBridge),
+            ..CodexSwitchState::from_codex_config_text("", true).expect("state")
+        };
+        write_codex_switch_state(&state).expect("write state");
+
+        let diagnostics = codex_bridge_diagnostics();
+
+        assert_eq!(
+            diagnostics.patch_mode,
+            Some(CodexPatchMode::OfficialImagegenBridge)
+        );
+        assert!(!diagnostics.imagegen_facade_ready);
+        let imagegen = diagnostics
+            .checks
+            .iter()
+            .find(|check| check.id == "codex_bridge.imagegen_facade")
+            .expect("imagegen check");
+        assert_eq!(imagegen.status, CodexBridgeDiagnosticStatus::Fail);
+    }
+
+    #[test]
+    fn codex_bridge_runtime_auth_snapshot_reports_missing_env_names() {
+        let env = setup_temp_env();
+        write_helper_codex_config(
+            &env,
+            r#"
+version = 5
+
+[codex.providers.relay]
+base_url = "https://relay.example/v1"
+auth_token_env = "CODEX_HELPER_MISSING_IMAGEGEN_KEY"
+
+[codex.routing]
+entry = "main"
+
+[codex.routing.routes.main]
+strategy = "ordered-failover"
+children = ["relay"]
+"#,
+        );
+
+        let snapshot = codex_bridge_runtime_auth_snapshot().expect("snapshot");
+
+        assert_eq!(snapshot.routable_upstreams, 1);
+        assert_eq!(snapshot.authed_upstreams, 0);
+        assert_eq!(
+            snapshot.missing_env,
+            vec!["CODEX_HELPER_MISSING_IMAGEGEN_KEY".to_string()]
+        );
     }
 
     #[test]
