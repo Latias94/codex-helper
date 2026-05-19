@@ -32,6 +32,7 @@ Legacy `station` 数据只是迁移输入。手写配置时应该围绕 `provide
 - 价格覆盖：`~/.codex-helper/pricing_overrides.toml`
 - 请求日志：`~/.codex-helper/logs/requests.jsonl`
 - 路由/控制面诊断日志：`~/.codex-helper/logs/control_trace.jsonl`
+- Codex relay 诊断证据：`~/.codex-helper/logs/codex_relay_evidence.jsonl`
 
 Codex 自己的文件仍由 Codex 维护：
 
@@ -134,7 +135,28 @@ curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-live-smoke \
 
 TUI Settings 页也提供同一能力：在确认窗口内按两次 `X` 会跑 compact-only live smoke，按两次 `Y` 会跑 compact + hosted image-generation live smoke。TUI 默认使用当前 Codex runtime target 和推断出来的模型；如果走 API，则可以在请求体里显式传目标字段。
 
+不启动 TUI 或 admin listener 时，也可以直接用 CLI 跑同一套诊断：
+
+```bash
+codex-helper codex relay-capabilities \
+  --mode official-imagegen-bridge \
+  --model gpt-5.5
+
+codex-helper codex relay-live-smoke \
+  --acknowledgement run-live-codex-relay-smoke \
+  --model gpt-5.5
+
+codex-helper codex relay-live-smoke \
+  --acknowledgement run-live-codex-relay-smoke \
+  --model gpt-5.5 \
+  --image
+
+codex-helper codex relay-evidence --limit 20
+```
+
 Live smoke 刻意和正常路由隔离。它只选择一个上游，每个选中的 case 最多发一次请求，不走 route retry/failover，也不会写 request ledger、route affinity、passive health、runtime health、余额状态或自动修改 patch mode。图片响应只做摘要：codex-helper 会报告是否出现 `image_generation_call`，但不会保存原始图片字节或 base64 payload。
+
+Capability diagnostics 和 live smoke 会把已脱敏的摘要追加写入 `~/.codex-helper/logs/codex_relay_evidence.jsonl`。这个 evidence store 是本地人工诊断记忆，不是 routing truth；它不会进入 request ledger 汇总，也不会驱动 load balancing、session affinity、passive health、余额耗尽、retry policy 或自动 patch-mode 切换。需要给中转站对比或 bug report 附机器可读结果时，可以用 `codex-helper codex relay-evidence --json`。
 
 要诊断 remote compaction v1 是否生效，可以在 Codex 发生压缩后查看 codex-helper 请求账本：
 

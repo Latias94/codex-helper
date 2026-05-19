@@ -18,6 +18,7 @@ mod auth_resolution;
 mod classify;
 mod client_identity;
 mod codex_relay_capabilities;
+mod codex_relay_evidence;
 mod codex_relay_live_smoke;
 mod codex_relay_probe;
 mod codex_relay_target;
@@ -78,6 +79,10 @@ pub use self::api_responses::{ProfilesResponse, ReloadResult, RuntimeStatusRespo
 pub use self::codex_relay_capabilities::{
     CodexRelayCapabilitiesObserved, CodexRelayCapabilitiesRequest, CodexRelayCapabilitiesResponse,
     CodexRelayCapabilityMismatch,
+};
+pub use self::codex_relay_evidence::{
+    CodexRelayEvidenceEntry, CodexRelayEvidenceFilters, CodexRelayEvidenceKind,
+    codex_relay_evidence_path, read_recent_codex_relay_evidence,
 };
 pub use self::codex_relay_live_smoke::{
     CODEX_RELAY_LIVE_SMOKE_ACK, CodexRelayLiveSmokeCase, CodexRelayLiveSmokeConfidence,

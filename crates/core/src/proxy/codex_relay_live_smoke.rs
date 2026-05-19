@@ -247,7 +247,7 @@ pub(super) async fn codex_relay_live_smoke_for_proxy(
         );
     }
 
-    Ok(CodexRelayLiveSmokeResponse {
+    let response = CodexRelayLiveSmokeResponse {
         api_version: LIVE_SMOKE_API_VERSION,
         service_name: proxy.service_name.to_string(),
         station_name: target.station_name,
@@ -258,7 +258,14 @@ pub(super) async fn codex_relay_live_smoke_for_proxy(
         cases,
         results,
         warnings,
-    })
+    };
+    if let Err(error) = super::codex_relay_evidence::append_codex_relay_live_smoke_evidence(
+        &response,
+        "proxy_service",
+    ) {
+        tracing::warn!("failed to write Codex relay live-smoke evidence: {}", error);
+    }
+    Ok(response)
 }
 
 fn requested_cases(cases: Vec<CodexRelayLiveSmokeCase>) -> Vec<CodexRelayLiveSmokeCase> {

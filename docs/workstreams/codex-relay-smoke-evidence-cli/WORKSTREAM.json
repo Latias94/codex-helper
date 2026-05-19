@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "slug": "codex-relay-smoke-evidence-cli",
+  "title": "Codex Relay Smoke Evidence CLI",
+  "status": "complete",
+  "updated": "2026-05-19",
+  "scope_kind": "execution",
+  "problem": "Codex relay diagnostics can be run through API/TUI, but there is no terminal-first operator command or durable non-routing evidence trail for capability and live-smoke results.",
+  "authoritative_docs": [
+    {
+      "role": "design",
+      "path": "docs/workstreams/codex-relay-smoke-evidence-cli/DESIGN.md"
+    },
+    {
+      "role": "execution",
+      "path": "docs/workstreams/codex-relay-smoke-evidence-cli/TODO.md"
+    },
+    {
+      "role": "gates",
+      "path": "docs/workstreams/codex-relay-smoke-evidence-cli/EVIDENCE_AND_GATES.md"
+    },
+    {
+      "role": "handoff",
+      "path": "docs/workstreams/codex-relay-smoke-evidence-cli/HANDOFF.md"
+    },
+    {
+      "role": "closeout",
+      "path": "docs/workstreams/codex-relay-smoke-evidence-cli/CLOSEOUT.md"
+    }
+  ],
+  "gates": [
+    "cargo nextest run -p codex-helper-core codex_relay_evidence",
+    "cargo nextest run -p codex-helper codex_relay_cli",
+    "cargo nextest run -p codex-helper-core codex_relay_live_smoke",
+    "cargo nextest run -p codex-helper-core codex_relay_probe",
+    "cargo nextest run -p codex-helper-core codex_live_smoke_api",
+    "cargo fmt --check"
+  ],
+  "evidence": [
+    "docs/workstreams/codex-relay-smoke-evidence-cli/EVIDENCE_AND_GATES.md",
+    "docs/workstreams/codex-relay-smoke-evidence-cli/CLOSEOUT.md"
+  ],
+  "adr_refs": [],
+  "continue_policy": {
+    "default_action": "closed",
+    "notes": "Closed with core evidence JSONL, service integration, CLI relay diagnostics/live-smoke/evidence commands, docs, changelog, targeted gates, core package gate, root CLI package gate, and formatting."
+  }
+}

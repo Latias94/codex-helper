@@ -32,6 +32,7 @@ Current outbound proxy support comes from the underlying HTTP client's system/en
 - Pricing overrides: `~/.codex-helper/pricing_overrides.toml`
 - Request log: `~/.codex-helper/logs/requests.jsonl`
 - Routing/control trace: `~/.codex-helper/logs/control_trace.jsonl`
+- Codex relay diagnostic evidence: `~/.codex-helper/logs/codex_relay_evidence.jsonl`
 
 Codex-owned files remain owned by Codex:
 
@@ -156,11 +157,37 @@ smoke, or `Y` twice for compact plus hosted image-generation live smoke. Both ac
 currently selected Codex runtime target and inferred model unless the API request supplies explicit
 fields.
 
+The same diagnostics are available without starting the TUI or admin listener:
+
+```bash
+codex-helper codex relay-capabilities \
+  --mode official-imagegen-bridge \
+  --model gpt-5.5
+
+codex-helper codex relay-live-smoke \
+  --acknowledgement run-live-codex-relay-smoke \
+  --model gpt-5.5
+
+codex-helper codex relay-live-smoke \
+  --acknowledgement run-live-codex-relay-smoke \
+  --model gpt-5.5 \
+  --image
+
+codex-helper codex relay-evidence --limit 20
+```
+
 Live smoke is intentionally isolated from normal routing behavior. It selects one upstream, sends at
 most one request per selected case, bypasses route retry/failover, and does not write request ledger
 entries, route affinity, passive health, runtime health, balance state, or patch-mode changes. Image
 responses are summarized only: codex-helper reports whether an `image_generation_call` appeared, but
 does not store raw image bytes or base64 payloads.
+
+Capability diagnostics and live smoke append sanitized summaries to
+`~/.codex-helper/logs/codex_relay_evidence.jsonl`. This evidence store is local operator memory,
+not routing truth. It does not feed request ledger summaries, load balancing, session affinity,
+passive health, balance exhaustion, retry policy, or automatic patch-mode changes. Use
+`codex-helper codex relay-evidence --json` when you want machine-readable records for bug reports or
+relay comparisons.
 
 To diagnose whether remote compaction v1 is active, inspect the codex-helper request ledger after a Codex compaction happens:
 

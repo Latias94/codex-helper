@@ -70,6 +70,10 @@ pub async fn run_cli() -> CliResult<()> {
             commands::provider::handle_provider_cmd(cmd).await?;
             return Ok(());
         }
+        Command::Codex { cmd } => {
+            commands::codex::handle_codex_cmd(cmd).await?;
+            return Ok(());
+        }
         Command::Session { cmd } => {
             commands::session::handle_session_cmd(cmd).await?;
             return Ok(());

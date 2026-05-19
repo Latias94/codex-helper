@@ -85,6 +85,11 @@ pub(crate) enum Command {
         #[command(subcommand)]
         cmd: ProviderCommand,
     },
+    /// Codex-specific relay diagnostics and evidence commands
+    Codex {
+        #[command(subcommand)]
+        cmd: CodexCommand,
+    },
     /// Session-related helper commands (Codex sessions)
     Session {
         #[command(subcommand)]
@@ -125,6 +130,70 @@ pub(crate) enum Command {
         /// Set default to Claude (experimental)
         #[arg(long)]
         claude: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum CodexCommand {
+    /// Run validation-only Codex relay capability diagnostics
+    RelayCapabilities {
+        /// Target station/provider name; defaults to the current Codex routing target
+        #[arg(long)]
+        station: Option<String>,
+        /// Target upstream index inside a legacy station/provider
+        #[arg(long = "upstream-index")]
+        upstream_index: Option<usize>,
+        /// Requested model used for model-catalog capability interpretation
+        #[arg(long)]
+        model: Option<String>,
+        /// Patch mode to evaluate; defaults to current switch/config mode
+        #[arg(long, value_enum)]
+        mode: Option<CodexPatchModeArg>,
+        /// Output JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run strongly opt-in Codex relay live smoke against one selected upstream
+    RelayLiveSmoke {
+        /// Required exact acknowledgement before any upstream live-smoke request is sent
+        #[arg(long = "acknowledgement", value_name = "ACK")]
+        acknowledgement: String,
+        /// Target station/provider name; defaults to the current Codex routing target
+        #[arg(long)]
+        station: Option<String>,
+        /// Target upstream index inside a legacy station/provider
+        #[arg(long = "upstream-index")]
+        upstream_index: Option<usize>,
+        /// Requested model; required for live smoke
+        #[arg(long)]
+        model: String,
+        /// Include hosted image_generation smoke in addition to compact smoke
+        #[arg(long)]
+        image: bool,
+        /// Optional service tier forwarded to the live-smoke request body
+        #[arg(long = "service-tier")]
+        service_tier: Option<String>,
+        /// Output JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+    /// List local Codex relay diagnostic evidence records
+    RelayEvidence {
+        /// Maximum number of records to show, newest first
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Filter by evidence kind
+        #[arg(long, value_enum)]
+        kind: Option<CodexRelayEvidenceKindArg>,
+        /// Match station/provider name substring
+        #[arg(long)]
+        station: Option<String>,
+        /// Match requested model substring
+        #[arg(long)]
+        model: Option<String>,
+        /// Output JSON instead of text
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -211,6 +280,34 @@ pub(crate) enum CodexPatchModeArg {
     OfficialRelayBridge,
     /// Experimental official relay bridge plus minimal image generation auth facade
     OfficialImagegenBridge,
+}
+
+impl From<CodexPatchModeArg> for codex_helper_core::codex_integration::CodexPatchMode {
+    fn from(value: CodexPatchModeArg) -> Self {
+        match value {
+            CodexPatchModeArg::Default => Self::Default,
+            CodexPatchModeArg::ChatgptBridge => Self::ChatGptBridge,
+            CodexPatchModeArg::ImagegenBridge => Self::ImagegenBridge,
+            CodexPatchModeArg::OfficialRelayBridge => Self::OfficialRelayBridge,
+            CodexPatchModeArg::OfficialImagegenBridge => Self::OfficialImagegenBridge,
+        }
+    }
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+#[value(rename_all = "kebab-case")]
+pub(crate) enum CodexRelayEvidenceKindArg {
+    CapabilityDiagnostics,
+    LiveSmoke,
+}
+
+impl From<CodexRelayEvidenceKindArg> for codex_helper_core::proxy::CodexRelayEvidenceKind {
+    fn from(value: CodexRelayEvidenceKindArg) -> Self {
+        match value {
+            CodexRelayEvidenceKindArg::CapabilityDiagnostics => Self::CapabilityDiagnostics,
+            CodexRelayEvidenceKindArg::LiveSmoke => Self::LiveSmoke,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -807,6 +904,117 @@ pub enum PricingCommand {
         #[arg(long)]
         dry_run: bool,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn codex_relay_cli_parses_capability_diagnostics() {
+        let cli = Cli::try_parse_from([
+            "codex-helper",
+            "codex",
+            "relay-capabilities",
+            "--model",
+            "gpt-5.5",
+            "--mode",
+            "official-imagegen-bridge",
+            "--json",
+        ])
+        .expect("parse codex relay capabilities");
+
+        let Some(Command::Codex {
+            cmd:
+                CodexCommand::RelayCapabilities {
+                    model, mode, json, ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected codex relay capabilities command");
+        };
+        assert_eq!(model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(mode, Some(CodexPatchModeArg::OfficialImagegenBridge));
+        assert!(json);
+    }
+
+    #[test]
+    fn codex_relay_cli_live_smoke_requires_acknowledgement_argument() {
+        let error = Cli::try_parse_from([
+            "codex-helper",
+            "codex",
+            "relay-live-smoke",
+            "--model",
+            "gpt-5.5",
+        ])
+        .expect_err("missing acknowledgement should fail clap parse");
+
+        assert!(error.to_string().contains("acknowledgement"));
+    }
+
+    #[test]
+    fn codex_relay_cli_parses_live_smoke_image_flag() {
+        let cli = Cli::try_parse_from([
+            "codex-helper",
+            "codex",
+            "relay-live-smoke",
+            "--acknowledgement",
+            "run-live-codex-relay-smoke",
+            "--model",
+            "gpt-5.5",
+            "--image",
+        ])
+        .expect("parse codex relay live smoke");
+
+        let Some(Command::Codex {
+            cmd:
+                CodexCommand::RelayLiveSmoke {
+                    acknowledgement,
+                    model,
+                    image,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected codex relay live smoke command");
+        };
+        assert_eq!(acknowledgement, "run-live-codex-relay-smoke");
+        assert_eq!(model, "gpt-5.5");
+        assert!(image);
+    }
+
+    #[test]
+    fn codex_relay_cli_parses_evidence_filters() {
+        let cli = Cli::try_parse_from([
+            "codex-helper",
+            "codex",
+            "relay-evidence",
+            "--kind",
+            "live-smoke",
+            "--station",
+            "input",
+            "--limit",
+            "5",
+        ])
+        .expect("parse codex relay evidence");
+
+        let Some(Command::Codex {
+            cmd:
+                CodexCommand::RelayEvidence {
+                    kind,
+                    station,
+                    limit,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected codex relay evidence command");
+        };
+        assert_eq!(kind, Some(CodexRelayEvidenceKindArg::LiveSmoke));
+        assert_eq!(station.as_deref(), Some("input"));
+        assert_eq!(limit, 5);
+    }
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]

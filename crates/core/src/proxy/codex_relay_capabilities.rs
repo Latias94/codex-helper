@@ -121,7 +121,7 @@ pub(super) async fn codex_relay_capabilities_for_proxy(
     let recommendation = build_recommendation(patch_mode, &expected, &observed);
     let mismatches = build_mismatches(&expected, &observed);
 
-    Ok(CodexRelayCapabilitiesResponse {
+    let response = CodexRelayCapabilitiesResponse {
         api_version: 1,
         service_name: proxy.service_name.to_string(),
         station_name: target.station_name,
@@ -133,7 +133,14 @@ pub(super) async fn codex_relay_capabilities_for_proxy(
         observed,
         recommendation,
         mismatches,
-    })
+    };
+    if let Err(error) = super::codex_relay_evidence::append_codex_relay_capabilities_evidence(
+        &response,
+        "proxy_service",
+    ) {
+        tracing::warn!("failed to write Codex relay capability evidence: {}", error);
+    }
+    Ok(response)
 }
 
 fn current_codex_switch_patch_mode() -> Option<CodexPatchMode> {

@@ -1,5 +1,6 @@
 mod config_doc;
 
+pub mod codex;
 pub mod config;
 pub mod doctor;
 pub mod pricing;
