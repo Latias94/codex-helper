@@ -78,7 +78,7 @@ fn render_sessions_panel(
                 .session_id
                 .as_deref()
                 .map(|s| short_sid(s, 18))
-                .unwrap_or_else(|| "-".to_string());
+                .unwrap_or_else(|| l("unknown").to_string());
 
             let cwd = r
                 .cwd
@@ -214,8 +214,13 @@ fn render_session_details(
     let l = |text| i18n::label(lang, text);
     let selected = snapshot.rows.get(ui.selected_session_idx);
     let sid = selected
-        .and_then(|r| r.session_id.as_deref())
-        .unwrap_or("-");
+        .map(|r| {
+            r.session_id
+                .as_deref()
+                .unwrap_or_else(|| l("unknown"))
+                .to_string()
+        })
+        .unwrap_or_else(|| "-".to_string());
     let cwd = selected
         .and_then(|r| r.cwd.as_deref())
         .map(|s| shorten_middle(s, 64))
@@ -476,8 +481,10 @@ fn render_requests_panel(
         snapshot
             .rows
             .get(ui.selected_session_idx)
-            .and_then(|r| r.session_id.as_deref())
-            .map(|sid| format!("{} [{}]", l("Requests"), sid))
+            .map(|r| {
+                let sid = r.session_id.as_deref().unwrap_or_else(|| l("unknown"));
+                format!("{} [{}]", l("Requests"), sid)
+            })
             .unwrap_or_else(|| l("Requests").to_string()),
         Style::default().fg(p.text).add_modifier(Modifier::BOLD),
     );
@@ -487,19 +494,20 @@ fn render_requests_panel(
         .border_style(Style::default().fg(if focused { p.focus } else { p.border }))
         .style(Style::default().bg(p.panel));
 
-    let selected_sid = snapshot
-        .rows
-        .get(ui.selected_session_idx)
-        .and_then(|r| r.session_id.as_deref())
-        .map(|s| s.to_string());
-
+    let selected_row = snapshot.rows.get(ui.selected_session_idx);
     let filtered = snapshot
         .recent
         .iter()
-        .filter(|r| match (&selected_sid, &r.session_id) {
-            (Some(sid), Some(rid)) => sid == rid,
-            (Some(_), None) => false,
-            (None, _) => true,
+        .filter(|r| {
+            let Some(selected_row) = selected_row else {
+                return true;
+            };
+            match (&selected_row.session_id, &r.session_id) {
+                (Some(sid), Some(rid)) => sid == rid,
+                (Some(_), None) => false,
+                (None, Some(_)) => false,
+                (None, None) => true,
+            }
         })
         .take(60)
         .collect::<Vec<_>>();

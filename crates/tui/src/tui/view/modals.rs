@@ -3,7 +3,8 @@ use ratatui::prelude::{Color, Line, Modifier, Span, Style, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
-use crate::codex_integration::CodexStartupReadinessSeverity;
+use crate::codex_integration::{CodexStartupReadinessIssue, CodexStartupReadinessSeverity};
+use crate::tui::Language;
 use crate::tui::ProviderOption;
 use crate::tui::i18n::{self, msg};
 use crate::tui::model::{
@@ -32,6 +33,147 @@ use routing::routing_provider_balance_line;
 
 mod station_info;
 pub(super) use station_info::render_station_info_modal;
+
+struct StartupIssueCopy {
+    title: String,
+    detail: String,
+    action: String,
+}
+
+fn startup_issue_copy(issue: &CodexStartupReadinessIssue, lang: Language) -> StartupIssueCopy {
+    if lang == Language::En {
+        return StartupIssueCopy {
+            title: issue.title.clone(),
+            detail: issue.detail.clone(),
+            action: issue.action.clone(),
+        };
+    }
+
+    match issue.title.as_str() {
+        "Codex client config changed on startup" => StartupIssueCopy {
+            title: "Codex 客户端配置已在启动时变更".to_string(),
+            detail: "codex-helper 已为本地桥接更新 ~/.codex/config.toml 或 ~/.codex/auth.json。"
+                .to_string(),
+            action: "完整重启已打开的 Codex App、Codex TUI 或 codex exec 会话，让它重新读取客户端配置。"
+                .to_string(),
+        },
+        "Codex local proxy patch failed" => StartupIssueCopy {
+            title: "Codex 本地代理 patch 失败".to_string(),
+            detail: issue.detail.clone(),
+            action: "运行 `codex-helper switch status`，先修复 Codex 客户端配置问题。"
+                .to_string(),
+        },
+        "Could not inspect Codex switch status" => StartupIssueCopy {
+            title: "无法检查 Codex switch 状态".to_string(),
+            detail: issue.detail.clone(),
+            action: "在普通 shell 中运行 `codex-helper switch status` 检查客户端配置。"
+                .to_string(),
+        },
+        "Could not inspect Codex remote-control status" => StartupIssueCopy {
+            title: "无法检查 Codex 远程控制状态".to_string(),
+            detail: issue.detail.clone(),
+            action: "在普通 shell 中运行 `codex-helper switch remote-control status` 检查桌面端状态。"
+                .to_string(),
+        },
+        "Codex is not using the local helper" => StartupIssueCopy {
+            title: "Codex 尚未使用本地 helper".to_string(),
+            detail: issue.detail.clone(),
+            action: issue
+                .action
+                .replace("Run `codex-helper switch on", "运行 `codex-helper switch on")
+                .replace(
+                    "or restart codex-helper so the client patch can be applied.",
+                    "或重启 codex-helper，让客户端 patch 生效。",
+                ),
+        },
+        "Codex local proxy patch has no switch state" => StartupIssueCopy {
+            title: "Codex 本地代理 patch 缺少 switch 状态".to_string(),
+            detail: "Codex 已指向本地 helper，但 codex-helper 找不到用于恢复的元数据。"
+                .to_string(),
+            action: "执行 switch-off 操作前，请先检查 ~/.codex/config.toml。".to_string(),
+        },
+        "Codex local proxy port does not match this TUI" => StartupIssueCopy {
+            title: "Codex 本地代理端口与当前 TUI 不一致".to_string(),
+            detail: issue.detail.clone(),
+            action: issue
+                .action
+                .replace("Run `codex-helper switch on", "运行 `codex-helper switch on")
+                .replace(
+                    "or restart this helper instance on the configured port.",
+                    "或用配置端口重启当前 helper 实例。",
+                ),
+        },
+        "Codex bridge mode does not match helper config" => StartupIssueCopy {
+            title: "Codex 桥接模式与 helper 配置不一致".to_string(),
+            detail: issue.detail.clone(),
+            action: "运行 `codex-helper switch status`；如果刚切换过模式，请完整重启 Codex 客户端。"
+                .to_string(),
+        },
+        "Official relay bridge can route a session across providers" => StartupIssueCopy {
+            title: "官方 relay 桥接可能把同一会话路由到不同 provider".to_string(),
+            detail: issue.detail.clone(),
+            action: "多认证上游使用官方 relay 功能时，建议把 [codex.routing].affinity_policy 设为 \"fallback-sticky\" 或 \"hard\"，让 remote compaction 更接近官方体验。"
+                .to_string(),
+        },
+        "Could not inspect codex-helper routing affinity" => StartupIssueCopy {
+            title: "无法检查 codex-helper 路由粘性配置".to_string(),
+            detail: issue.detail.clone(),
+            action: "检查 ~/.codex-helper/config.toml，并为官方 relay 功能选择合适的 affinity_policy。"
+                .to_string(),
+        },
+        "Removed remote_control config key is present" => StartupIssueCopy {
+            title: "检测到已移除的 remote_control 配置项".to_string(),
+            detail: issue.detail.clone(),
+            action: "移除 remote_control，只保留 [features].remote_connections = true。"
+                .to_string(),
+        },
+        "Codex App remote-control state is incomplete" => StartupIssueCopy {
+            title: "Codex App 远程控制状态不完整".to_string(),
+            detail: issue.detail.clone(),
+            action: "运行 `codex-helper switch remote-control enable`，然后完整重启 Codex App。"
+                .to_string(),
+        },
+        "Remote-control enablement is not confirmed in Codex logs" => StartupIssueCopy {
+            title: "未在 Codex 日志中确认远程控制启用".to_string(),
+            detail: "配置和 SQLite 状态看起来已启用，但没有找到 experimentalFeature/enablement/set 成功日志。"
+                .to_string(),
+            action: "完整重启 Codex App，然后运行 `codex-helper switch remote-control check-logs`。"
+                .to_string(),
+        },
+        "Could not inspect Codex remote-control logs" => StartupIssueCopy {
+            title: "无法检查 Codex 远程控制日志".to_string(),
+            detail: issue.detail.clone(),
+            action: "重启 Codex App 后，在普通 shell 中运行 `codex-helper switch remote-control check-logs`。"
+                .to_string(),
+        },
+        _ => StartupIssueCopy {
+            title: issue.title.clone(),
+            detail: issue.detail.clone(),
+            action: issue.action.clone(),
+        },
+    }
+}
+
+fn startup_severity_label(severity: CodexStartupReadinessSeverity, lang: Language) -> &'static str {
+    match lang {
+        Language::En => severity.label(),
+        Language::Zh => match severity {
+            CodexStartupReadinessSeverity::Info => "信息",
+            CodexStartupReadinessSeverity::Warning => "警告",
+        },
+    }
+}
+
+fn startup_hidden_issue_line(hidden: usize, lang: Language) -> String {
+    match lang {
+        Language::En => {
+            format!("+{hidden} more startup item(s); run `codex-helper switch status` for details.")
+        }
+        Language::Zh => {
+            format!("还有 {hidden} 个启动检查项；运行 `codex-helper switch status` 查看详情。")
+        }
+    }
+}
 
 pub(super) fn render_session_transcript_modal(f: &mut Frame<'_>, p: Palette, ui: &mut UiState) {
     let lang = ui.language;
@@ -172,10 +314,12 @@ pub(super) fn render_startup_alert_modal(f: &mut Frame<'_>, p: Palette, ui: &UiS
 
     let mut lines = Vec::new();
     lines.push(Line::from(Span::styled(
-        i18n::label(
-            ui.language,
-            "Review these Codex client state items before relying on this TUI session.",
-        ),
+        match ui.language {
+            Language::En => {
+                "Review these Codex client state items before relying on this TUI session."
+            }
+            Language::Zh => "继续使用本次 TUI 会话前，请先检查这些 Codex 客户端状态项。",
+        },
         Style::default().fg(p.muted),
     )));
     lines.push(Line::from(""));
@@ -200,22 +344,27 @@ pub(super) fn render_startup_alert_modal(f: &mut Frame<'_>, p: Palette, ui: &UiS
 
     let max_visible = 5;
     for (idx, issue) in report.issues.iter().take(max_visible).enumerate() {
+        let issue_copy = startup_issue_copy(issue, ui.language);
         let severity_style = match issue.severity {
             CodexStartupReadinessSeverity::Info => Style::default().fg(p.accent),
             CodexStartupReadinessSeverity::Warning => Style::default().fg(p.warn),
         };
         lines.push(Line::from(vec![
             Span::styled(
-                format!("{}. [{}] ", idx + 1, issue.severity.label()),
+                format!(
+                    "{}. [{}] ",
+                    idx + 1,
+                    startup_severity_label(issue.severity, ui.language)
+                ),
                 severity_style.add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                issue.title.clone(),
+                issue_copy.title,
                 Style::default().fg(p.text).add_modifier(Modifier::BOLD),
             ),
         ]));
         lines.push(Line::from(Span::styled(
-            issue.detail.clone(),
+            issue_copy.detail,
             Style::default().fg(p.text),
         )));
         lines.push(Line::from(vec![
@@ -223,7 +372,7 @@ pub(super) fn render_startup_alert_modal(f: &mut Frame<'_>, p: Palette, ui: &UiS
                 format!("{}: ", i18n::label(ui.language, "next")),
                 Style::default().fg(p.muted),
             ),
-            Span::styled(issue.action.clone(), Style::default().fg(p.accent)),
+            Span::styled(issue_copy.action, Style::default().fg(p.accent)),
         ]));
         lines.push(Line::from(""));
     }
@@ -231,9 +380,7 @@ pub(super) fn render_startup_alert_modal(f: &mut Frame<'_>, p: Palette, ui: &UiS
     let hidden = report.issues.len().saturating_sub(max_visible);
     if hidden > 0 {
         lines.push(Line::from(Span::styled(
-            format!(
-                "+{hidden} more startup item(s); run `codex-helper switch status` for details."
-            ),
+            startup_hidden_issue_line(hidden, ui.language),
             Style::default().fg(p.muted),
         )));
         lines.push(Line::from(""));

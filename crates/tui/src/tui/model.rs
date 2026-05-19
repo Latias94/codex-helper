@@ -1623,47 +1623,44 @@ pub(in crate::tui) fn status_style(p: Palette, status: Option<u16>) -> Style {
 fn build_session_rows_from_cards(cards: &[SessionIdentityCard]) -> Vec<SessionRow> {
     let mut rows = cards
         .iter()
-        .filter_map(|card| {
-            let session_id = card.session_id.clone()?;
-            Some(SessionRow {
-                session_id: Some(session_id),
-                observation_scope: card.observation_scope,
-                host_local_transcript_path: card.host_local_transcript_path.clone(),
-                last_client_name: card.last_client_name.clone(),
-                last_client_addr: card.last_client_addr.clone(),
-                cwd: card.cwd.clone(),
-                active_count: card.active_count as usize,
-                active_started_at_ms_min: card.active_started_at_ms_min,
-                active_last_method: None,
-                active_last_path: None,
-                last_status: card.last_status,
-                last_duration_ms: card.last_duration_ms,
-                last_ended_at_ms: card.last_ended_at_ms,
-                last_model: card.last_model.clone(),
-                last_reasoning_effort: card.last_reasoning_effort.clone(),
-                last_service_tier: card.last_service_tier.clone(),
-                last_provider_id: card.last_provider_id.clone(),
-                last_station_name: card.last_station_name.clone(),
-                last_upstream_base_url: card.last_upstream_base_url.clone(),
-                last_usage: card.last_usage.clone(),
-                total_usage: card.total_usage.clone(),
-                turns_total: card.turns_total,
-                turns_with_usage: card.turns_with_usage,
-                binding_profile_name: card.binding_profile_name.clone(),
-                binding_continuity_mode: card.binding_continuity_mode,
-                last_route_decision: card.last_route_decision.clone(),
-                route_affinity: card.route_affinity.clone(),
-                effective_model: card.effective_model.clone(),
-                effective_reasoning_effort: card.effective_reasoning_effort.clone(),
-                effective_service_tier: card.effective_service_tier.clone(),
-                effective_station: card.effective_station.clone(),
-                effective_upstream_base_url: card.effective_upstream_base_url.clone(),
-                override_model: card.override_model.clone(),
-                override_effort: card.override_effort.clone(),
-                override_station_name: card.override_station_name.clone(),
-                override_route_target: None,
-                override_service_tier: card.override_service_tier.clone(),
-            })
+        .map(|card| SessionRow {
+            session_id: card.session_id.clone(),
+            observation_scope: card.observation_scope,
+            host_local_transcript_path: card.host_local_transcript_path.clone(),
+            last_client_name: card.last_client_name.clone(),
+            last_client_addr: card.last_client_addr.clone(),
+            cwd: card.cwd.clone(),
+            active_count: card.active_count as usize,
+            active_started_at_ms_min: card.active_started_at_ms_min,
+            active_last_method: None,
+            active_last_path: None,
+            last_status: card.last_status,
+            last_duration_ms: card.last_duration_ms,
+            last_ended_at_ms: card.last_ended_at_ms,
+            last_model: card.last_model.clone(),
+            last_reasoning_effort: card.last_reasoning_effort.clone(),
+            last_service_tier: card.last_service_tier.clone(),
+            last_provider_id: card.last_provider_id.clone(),
+            last_station_name: card.last_station_name.clone(),
+            last_upstream_base_url: card.last_upstream_base_url.clone(),
+            last_usage: card.last_usage.clone(),
+            total_usage: card.total_usage.clone(),
+            turns_total: card.turns_total,
+            turns_with_usage: card.turns_with_usage,
+            binding_profile_name: card.binding_profile_name.clone(),
+            binding_continuity_mode: card.binding_continuity_mode,
+            last_route_decision: card.last_route_decision.clone(),
+            route_affinity: card.route_affinity.clone(),
+            effective_model: card.effective_model.clone(),
+            effective_reasoning_effort: card.effective_reasoning_effort.clone(),
+            effective_service_tier: card.effective_service_tier.clone(),
+            effective_station: card.effective_station.clone(),
+            effective_upstream_base_url: card.effective_upstream_base_url.clone(),
+            override_model: card.override_model.clone(),
+            override_effort: card.override_effort.clone(),
+            override_station_name: card.override_station_name.clone(),
+            override_route_target: None,
+            override_service_tier: card.override_service_tier.clone(),
         })
         .collect::<Vec<_>>();
     rows.sort_by_key(|r| std::cmp::Reverse(session_sort_key(r)));
@@ -1929,18 +1926,20 @@ pub(in crate::tui) fn filtered_requests_len(
     snapshot: &Snapshot,
     selected_session_idx: usize,
 ) -> usize {
-    let selected_sid = snapshot
-        .rows
-        .get(selected_session_idx)
-        .and_then(|r| r.session_id.as_deref());
+    let Some(selected_row) = snapshot.rows.get(selected_session_idx) else {
+        return snapshot.recent.iter().take(60).count();
+    };
     snapshot
         .recent
         .iter()
-        .filter(|r| match (selected_sid, r.session_id.as_deref()) {
-            (Some(sid), Some(rid)) => sid == rid,
-            (Some(_), None) => false,
-            (None, _) => true,
-        })
+        .filter(
+            |r| match (selected_row.session_id.as_deref(), r.session_id.as_deref()) {
+                (Some(sid), Some(rid)) => sid == rid,
+                (Some(_), None) => false,
+                (None, Some(_)) => false,
+                (None, None) => true,
+            },
+        )
         .take(60)
         .count()
 }
@@ -2053,6 +2052,36 @@ mod tests {
             override_station_name: None,
             override_route_target: None,
             override_service_tier: None,
+        }
+    }
+
+    fn finished_request(id: u64, session_id: Option<&str>) -> FinishedRequest {
+        FinishedRequest {
+            id,
+            trace_id: None,
+            session_id: session_id.map(ToOwned::to_owned),
+            client_name: None,
+            client_addr: None,
+            cwd: None,
+            model: None,
+            reasoning_effort: None,
+            service_tier: None,
+            station_name: None,
+            provider_id: None,
+            upstream_base_url: None,
+            route_decision: None,
+            usage: None,
+            cost: crate::pricing::CostBreakdown::default(),
+            retry: None,
+            observability: crate::state::RequestObservability::default(),
+            service: "codex".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/responses".to_string(),
+            status_code: 200,
+            duration_ms: 120,
+            ttfb_ms: None,
+            streaming: false,
+            ended_at_ms: id,
         }
     }
 
@@ -2487,60 +2516,8 @@ mod tests {
                 override_service_tier: None,
             }],
             recent: vec![
-                FinishedRequest {
-                    id: 1,
-                    trace_id: Some("codex-1".to_string()),
-                    session_id: Some("sid-selected".to_string()),
-                    client_name: None,
-                    client_addr: None,
-                    cwd: None,
-                    model: None,
-                    reasoning_effort: None,
-                    service_tier: None,
-                    station_name: None,
-                    provider_id: None,
-                    upstream_base_url: None,
-                    route_decision: None,
-                    usage: None,
-                    cost: crate::pricing::CostBreakdown::default(),
-                    retry: None,
-                    observability: crate::state::RequestObservability::default(),
-                    service: "codex".to_string(),
-                    method: "POST".to_string(),
-                    path: "/v1/responses".to_string(),
-                    status_code: 200,
-                    duration_ms: 120,
-                    ttfb_ms: None,
-                    streaming: false,
-                    ended_at_ms: 1,
-                },
-                FinishedRequest {
-                    id: 2,
-                    trace_id: Some("codex-2".to_string()),
-                    session_id: Some("sid-explicit".to_string()),
-                    client_name: None,
-                    client_addr: None,
-                    cwd: None,
-                    model: None,
-                    reasoning_effort: None,
-                    service_tier: None,
-                    station_name: None,
-                    provider_id: None,
-                    upstream_base_url: None,
-                    route_decision: None,
-                    usage: None,
-                    cost: crate::pricing::CostBreakdown::default(),
-                    retry: None,
-                    observability: crate::state::RequestObservability::default(),
-                    service: "codex".to_string(),
-                    method: "POST".to_string(),
-                    path: "/v1/responses".to_string(),
-                    status_code: 200,
-                    duration_ms: 120,
-                    ttfb_ms: None,
-                    streaming: false,
-                    ended_at_ms: 2,
-                },
+                finished_request(1, Some("sid-selected")),
+                finished_request(2, Some("sid-explicit")),
             ],
             model_overrides: HashMap::new(),
             overrides: HashMap::new(),
@@ -2567,10 +2544,45 @@ mod tests {
     }
 
     #[test]
-    fn build_session_rows_from_cards_skips_sessionless_cards() {
+    fn dashboard_request_len_scopes_unknown_session_row_to_unknown_requests() {
+        let mut unknown_row = empty_session_row();
+        unknown_row.session_id = None;
+        let snapshot = Snapshot {
+            rows: vec![unknown_row],
+            recent: vec![
+                finished_request(1, None),
+                finished_request(2, Some("sid-known")),
+            ],
+            model_overrides: HashMap::new(),
+            overrides: HashMap::new(),
+            station_overrides: HashMap::new(),
+            route_target_overrides: HashMap::new(),
+            service_tier_overrides: HashMap::new(),
+            global_station_override: None,
+            global_route_target_override: None,
+            station_meta_overrides: HashMap::new(),
+            usage_rollup: UsageRollupView::default(),
+            provider_balances: HashMap::new(),
+            station_health: HashMap::new(),
+            health_checks: HashMap::new(),
+            lb_view: HashMap::new(),
+            stats_5m: WindowStats::default(),
+            stats_1h: WindowStats::default(),
+            pricing_catalog: crate::pricing::bundled_model_price_catalog_snapshot(),
+            refreshed_at: Instant::now(),
+        };
+
+        assert_eq!(filtered_requests_len(&snapshot, 0), 1);
+    }
+
+    #[test]
+    fn build_session_rows_from_cards_keeps_sessionless_activity() {
         let rows = build_session_rows_from_cards(&[
             SessionIdentityCard {
                 session_id: None,
+                active_count: 1,
+                active_started_at_ms_min: Some(10),
+                last_status: Some(200),
                 ..SessionIdentityCard::default()
             },
             SessionIdentityCard {
@@ -2579,8 +2591,17 @@ mod tests {
             },
         ]);
 
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].session_id.as_deref(), Some("sid-1"));
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| {
+            row.session_id.is_none()
+                && row.active_count == 1
+                && row.active_started_at_ms_min == Some(10)
+                && row.last_status == Some(200)
+        }));
+        assert!(
+            rows.iter()
+                .any(|row| row.session_id.as_deref() == Some("sid-1"))
+        );
     }
 
     #[test]

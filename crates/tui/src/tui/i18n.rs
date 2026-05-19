@@ -430,11 +430,13 @@ fn zh_label(en: &'static str) -> Option<&'static str> {
         "nested route graph: edit route nodes in TOML for grouped reorder" => {
             "嵌套路由图：请在 TOML 中编辑路由节点来分组排序"
         }
+        "next" => "下步",
         "no" => "否",
         "no balance/quota data" => "没有余额/配额数据",
         "no Codex session file found for this session id" => {
             "没有找到该 session id 对应的 Codex 会话文件"
         }
+        "No startup issues are currently recorded." => "当前没有启动检查项。",
         "no price rows" => "没有价格行",
         "no session selected" => "未选择会话",
         "no transcript file loaded" => "未加载对话记录文件",

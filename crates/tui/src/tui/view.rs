@@ -86,8 +86,11 @@ mod tests {
         CodexStartupReadiness, CodexStartupReadinessIssue, CodexStartupReadinessIssueKind,
         CodexStartupReadinessSeverity,
     };
-    use crate::state::{BalanceSnapshotStatus, ProviderBalanceSnapshot, UsageBucket};
+    use crate::state::{
+        BalanceSnapshotStatus, ProviderBalanceSnapshot, SessionObservationScope, UsageBucket,
+    };
     use crate::tui::Language;
+    use crate::tui::model::SessionRow;
     use crate::tui::model::{RoutingProviderRef, RoutingSpecView, Snapshot};
     use crate::tui::types::{Overlay, Page, StatsFocus};
 
@@ -100,6 +103,12 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    fn text_without_whitespace(text: &str) -> String {
+        text.chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect::<String>()
     }
 
     fn sample_snapshot() -> Snapshot {
@@ -231,6 +240,60 @@ mod tests {
         }
     }
 
+    fn remote_control_log_unconfirmed_startup_readiness() -> CodexStartupReadiness {
+        CodexStartupReadiness {
+            issues: vec![CodexStartupReadinessIssue {
+                kind: CodexStartupReadinessIssueKind::RemoteControlLogUnconfirmed,
+                severity: CodexStartupReadinessSeverity::Warning,
+                title: "Remote-control enablement is not confirmed in Codex logs".to_string(),
+                detail: "The config and SQLite state look enabled, but no experimentalFeature/enablement/set success log was found.".to_string(),
+                action: "Fully restart Codex App, then run `codex-helper switch remote-control check-logs`.".to_string(),
+            }],
+        }
+    }
+
+    fn unknown_session_row() -> SessionRow {
+        SessionRow {
+            session_id: None,
+            observation_scope: SessionObservationScope::ObservedOnly,
+            host_local_transcript_path: None,
+            last_client_name: Some("codex".to_string()),
+            last_client_addr: None,
+            cwd: None,
+            active_count: 1,
+            active_started_at_ms_min: Some(1),
+            active_last_method: None,
+            active_last_path: None,
+            last_status: Some(200),
+            last_duration_ms: None,
+            last_ended_at_ms: None,
+            last_model: None,
+            last_reasoning_effort: None,
+            last_service_tier: None,
+            last_provider_id: None,
+            last_station_name: None,
+            last_upstream_base_url: None,
+            last_usage: None,
+            total_usage: None,
+            turns_total: None,
+            turns_with_usage: None,
+            binding_profile_name: None,
+            binding_continuity_mode: None,
+            last_route_decision: None,
+            route_affinity: None,
+            effective_model: None,
+            effective_reasoning_effort: None,
+            effective_service_tier: None,
+            effective_station: None,
+            effective_upstream_base_url: None,
+            override_model: None,
+            override_effort: None,
+            override_station_name: None,
+            override_route_target: None,
+            override_service_tier: None,
+        }
+    }
+
     fn render_app_text(width: u16, height: u16, ui: &mut UiState, snapshot: &Snapshot) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -323,5 +386,48 @@ mod tests {
         assert!(text.contains("Startup guardrail"), "{text}");
         assert!(text.contains("config changed"), "{text}");
         assert!(text.contains("Esc/Enter close"), "{text}");
+    }
+
+    #[test]
+    fn startup_alert_modal_localizes_remote_control_log_warning_in_chinese() {
+        let snapshot = sample_snapshot();
+        let mut ui = UiState {
+            overlay: Overlay::StartupAlert,
+            startup_readiness: Some(remote_control_log_unconfirmed_startup_readiness()),
+            language: Language::Zh,
+            ..UiState::default()
+        };
+
+        let text = render_app_text(96, 28, &mut ui, &snapshot);
+        let compact_text = text_without_whitespace(&text);
+
+        assert!(
+            compact_text.contains("未在Codex日志中确认远程控制启用"),
+            "{text}"
+        );
+        assert!(compact_text.contains("完整重启CodexApp"), "{text}");
+        assert!(compact_text.contains("[警告]"), "{text}");
+        assert!(compact_text.contains("下步:"), "{text}");
+        assert!(
+            !text.contains("Remote-control enablement is not confirmed"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn dashboard_renders_unknown_session_activity() {
+        let mut snapshot = sample_snapshot();
+        snapshot.rows.push(unknown_session_row());
+        let mut ui = UiState {
+            page: Page::Dashboard,
+            language: Language::Zh,
+            ..UiState::default()
+        };
+
+        let text = render_app_text(96, 28, &mut ui, &snapshot);
+        let compact_text = text_without_whitespace(&text);
+
+        assert!(compact_text.contains("未知"), "{text}");
+        assert!(text.contains("RUN"), "{text}");
     }
 }
