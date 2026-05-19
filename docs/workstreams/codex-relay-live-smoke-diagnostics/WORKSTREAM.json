@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "slug": "codex-relay-live-smoke-diagnostics",
+  "title": "Codex Relay Live Smoke Diagnostics",
+  "status": "active",
+  "updated": "2026-05-19",
+  "scope_kind": "execution",
+  "problem": "Validation-only Codex relay diagnostics cannot prove real remote compaction or hosted image generation behavior through an upstream relay.",
+  "authoritative_docs": [
+    {
+      "role": "design",
+      "path": "docs/workstreams/codex-relay-live-smoke-diagnostics/DESIGN.md"
+    },
+    {
+      "role": "execution",
+      "path": "docs/workstreams/codex-relay-live-smoke-diagnostics/TODO.md"
+    },
+    {
+      "role": "gates",
+      "path": "docs/workstreams/codex-relay-live-smoke-diagnostics/EVIDENCE_AND_GATES.md"
+    }
+  ],
+  "gates": [
+    "cargo nextest run -p codex-helper-core codex_relay_live_smoke",
+    "cargo nextest run -p codex-helper-core codex_live_smoke_api",
+    "cargo nextest run -p codex-helper-tui codex_relay_live_smoke",
+    "cargo fmt --check"
+  ],
+  "evidence": [
+    "docs/workstreams/codex-relay-live-smoke-diagnostics/DESIGN.md",
+    "docs/workstreams/codex-relay-live-smoke-diagnostics/TODO.md"
+  ],
+  "adr_refs": [],
+  "continue_policy": {
+    "default_action": "continue",
+    "notes": "Continue while live smoke remains strong opt-in, single-upstream, no-retry, and side-effect isolated. Split real paid relay smoke logs into follow-on evidence unless the user explicitly requests live testing."
+  }
+}
+

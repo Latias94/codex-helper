@@ -15,9 +15,10 @@ use crate::state::{ProxyState, SessionBinding, SessionContinuityMode};
 
 use super::profile_defaults::effective_default_profile_name;
 use super::{
-    CodexRelayCapabilitiesRequest, CodexRelayCapabilitiesResponse, PersistedRoutingUpsertRequest,
-    ProfilesResponse, ProviderBalanceRefreshResponse, ProxyControlError, ProxyService,
-    ReloadResult, RuntimeConfig, RuntimeStatusResponse,
+    CodexRelayCapabilitiesRequest, CodexRelayCapabilitiesResponse, CodexRelayLiveSmokeRequest,
+    CodexRelayLiveSmokeResponse, PersistedRoutingUpsertRequest, ProfilesResponse,
+    ProviderBalanceRefreshResponse, ProxyControlError, ProxyService, ReloadResult, RuntimeConfig,
+    RuntimeStatusResponse,
 };
 
 impl ProxyService {
@@ -177,6 +178,13 @@ impl ProxyService {
         request: CodexRelayCapabilitiesRequest,
     ) -> Result<CodexRelayCapabilitiesResponse, ProxyControlError> {
         super::codex_relay_capabilities::codex_relay_capabilities_for_proxy(self, request).await
+    }
+
+    pub async fn codex_relay_live_smoke(
+        &self,
+        request: CodexRelayLiveSmokeRequest,
+    ) -> Result<CodexRelayLiveSmokeResponse, ProxyControlError> {
+        super::codex_relay_live_smoke::codex_relay_live_smoke_for_proxy(self, request).await
     }
 
     pub async fn reload_runtime_config(&self) -> Result<ReloadResult, ProxyControlError> {

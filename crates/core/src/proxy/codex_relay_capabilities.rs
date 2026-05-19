@@ -9,9 +9,9 @@ use crate::codex_capability_profile::{
     CodexPatchModeRecommendationInput,
 };
 use crate::codex_integration::CodexPatchMode;
-use crate::config::{ServiceConfig, UpstreamConfig};
 
 use super::codex_relay_probe::CodexRelayProbeObservation;
+use super::codex_relay_target::{CodexRelayTargetSelection, select_codex_relay_target};
 use super::models_compat::maybe_decode_models_response_body;
 use super::{
     CodexRelayProbeClient, CodexRelayProbeKind, CodexRelayProbeResult, CodexRelayProbeSpec,
@@ -60,12 +60,6 @@ pub struct CodexRelayCapabilityMismatch {
     pub reason: String,
 }
 
-struct SelectedRelayTarget {
-    station_name: String,
-    upstream_index: usize,
-    upstream: UpstreamConfig,
-}
-
 pub(super) async fn codex_relay_capabilities_for_proxy(
     proxy: &ProxyService,
     payload: CodexRelayCapabilitiesRequest,
@@ -79,7 +73,13 @@ pub(super) async fn codex_relay_capabilities_for_proxy(
 
     let cfg = proxy.config.snapshot().await;
     let mgr = proxy.service_manager(cfg.as_ref());
-    let target = select_relay_target(mgr, &payload)?;
+    let target = select_codex_relay_target(
+        mgr,
+        CodexRelayTargetSelection {
+            station_name: payload.station_name.as_deref(),
+            upstream_index: payload.upstream_index,
+        },
+    )?;
     let patch_mode = payload
         .patch_mode
         .or_else(current_codex_switch_patch_mode)
@@ -140,62 +140,6 @@ fn current_codex_switch_patch_mode() -> Option<CodexPatchMode> {
     crate::codex_integration::codex_switch_status()
         .ok()
         .and_then(|status| status.patch_mode)
-}
-
-fn select_relay_target(
-    mgr: &crate::config::ServiceConfigManager,
-    payload: &CodexRelayCapabilitiesRequest,
-) -> Result<SelectedRelayTarget, ProxyControlError> {
-    let station_name = payload
-        .station_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| mgr.active.clone())
-        .or_else(|| stable_first_station_name(mgr))
-        .ok_or_else(|| {
-            ProxyControlError::new(StatusCode::BAD_REQUEST, "no codex station is configured")
-        })?;
-    let station = mgr.station(&station_name).ok_or_else(|| {
-        ProxyControlError::new(
-            StatusCode::NOT_FOUND,
-            format!("station '{station_name}' not found"),
-        )
-    })?;
-    let upstream_index = payload.upstream_index.unwrap_or(0);
-    let upstream = station
-        .upstreams
-        .get(upstream_index)
-        .cloned()
-        .ok_or_else(|| {
-            let (status, message) = upstream_not_found(&station_name, station, upstream_index);
-            ProxyControlError::new(status, message)
-        })?;
-    Ok(SelectedRelayTarget {
-        station_name,
-        upstream_index,
-        upstream,
-    })
-}
-
-fn stable_first_station_name(mgr: &crate::config::ServiceConfigManager) -> Option<String> {
-    mgr.stations().keys().min().cloned()
-}
-
-fn upstream_not_found(
-    station_name: &str,
-    station: &ServiceConfig,
-    upstream_index: usize,
-) -> (StatusCode, String) {
-    (
-        StatusCode::NOT_FOUND,
-        format!(
-            "upstream index {upstream_index} not found for station '{}' ({} upstreams configured)",
-            station_name,
-            station.upstreams.len()
-        ),
-    )
 }
 
 fn build_expected_profile(

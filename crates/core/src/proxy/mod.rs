@@ -18,7 +18,9 @@ mod auth_resolution;
 mod classify;
 mod client_identity;
 mod codex_relay_capabilities;
+mod codex_relay_live_smoke;
 mod codex_relay_probe;
+mod codex_relay_target;
 mod concurrency_limits;
 mod control_plane;
 mod control_plane_manifest;
@@ -76,6 +78,11 @@ pub use self::api_responses::{ProfilesResponse, ReloadResult, RuntimeStatusRespo
 pub use self::codex_relay_capabilities::{
     CodexRelayCapabilitiesObserved, CodexRelayCapabilitiesRequest, CodexRelayCapabilitiesResponse,
     CodexRelayCapabilityMismatch,
+};
+pub use self::codex_relay_live_smoke::{
+    CODEX_RELAY_LIVE_SMOKE_ACK, CodexRelayLiveSmokeCase, CodexRelayLiveSmokeConfidence,
+    CodexRelayLiveSmokeOutcome, CodexRelayLiveSmokeRequest, CodexRelayLiveSmokeResponse,
+    CodexRelayLiveSmokeResult, CodexRelayLiveSmokeSideEffect,
 };
 pub use self::codex_relay_probe::{
     CodexRelayProbeClient, CodexRelayProbeConfidence, CodexRelayProbeKind, CodexRelayProbeResult,
