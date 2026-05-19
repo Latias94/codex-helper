@@ -12,16 +12,16 @@ codex-helper-core = { path = "../core", version = "0.15.0", features = ["gui"] }
 eframe = "0.33.3"
 tray-icon = "0.21.3"
 fontdb = "0.16.2"
-tokio = { version = "1.50.0", features = ["macros", "rt-multi-thread", "signal", "fs"] }
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "signal", "fs"] }
 serde = { version = "1.0.228", features = ["derive"] }
 toml = "0.8"
 serde_json = "1.0.149"
-reqwest = { version = "0.13.2", features = ["json", "stream", "gzip", "brotli", "zstd", "deflate"] }
+reqwest = { version = "0.13.3", features = ["json", "stream", "gzip", "brotli", "zstd", "deflate"] }
 futures-util = "0.3.31"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-tracing-appender = "0.2.4"
-axum = { version = "0.8.8", features = ["http2", "macros", "ws"] }
+tracing-appender = "0.2.5"
+axum = { version = "0.8.9", features = ["http2", "macros", "ws"] }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56.0"
