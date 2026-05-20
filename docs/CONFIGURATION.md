@@ -1170,7 +1170,7 @@ The current route graph schema writes `version = 5`. Existing `version = 4` rout
 
 Normal users usually do not need to run migration commands by hand. Starting codex-helper, including the default TUI startup path, loads legacy `version = 4`, `version = 3`, `version = 2`, unversioned TOML, and legacy `config.json`, then migrates them to `config.toml` with `version = 5`. The previous file is copied to `config.toml.bak` or `config.json.bak` before writing the new file.
 
-During migration, codex-helper warns when an older route graph would use the code-level `preferred-group` default instead of fallback stickiness. New generated configs write `affinity_policy = "fallback-sticky"` explicitly; existing configs can set either policy depending on whether official relay continuity or fastest return to the preferred group matters more.
+During migration, codex-helper writes missing route-graph affinity as `affinity_policy = "fallback-sticky"` so the on-disk config is explicit. Existing configs can still set either policy depending on whether official relay continuity or fastest return to the preferred group matters more; configs that explicitly keep `preferred-group` may be called out in migration previews so operators notice the trade-off.
 
 Manual migration commands are mainly for previewing or diagnosing a migration without going through the normal TUI/proxy startup path:
 

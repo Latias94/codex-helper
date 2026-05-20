@@ -731,7 +731,6 @@ fn migrate_v2_to_v4_report_warns_when_flattening_endpoint_scoped_groups() {
     assert!(warnings.contains("flattens the effective route"));
     assert!(warnings.contains("scopes provider 'relay'"));
     assert!(warnings.contains("de-duplicated"));
-    assert!(warnings.contains("fallback-sticky"));
 
     let routing = report
         .config
@@ -746,7 +745,46 @@ fn migrate_v2_to_v4_report_warns_when_flattening_endpoint_scoped_groups() {
 }
 
 #[test]
-fn v4_route_graph_affinity_upgrade_warning_mentions_fallback_sticky() {
+fn v4_route_graph_affinity_upgrade_warning_mentions_explicit_preferred_group() {
+    let mut routing =
+        RoutingConfigV4::ordered_failover(vec!["monthly".to_string(), "paygo".to_string()]);
+    routing.affinity_policy = RoutingAffinityPolicyV5::PreferredGroup;
+    let cfg = ProxyConfigV4 {
+        version: 4,
+        codex: ServiceViewV4 {
+            providers: BTreeMap::from([
+                (
+                    "monthly".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some("https://monthly.example.com/v1".to_string()),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+                (
+                    "paygo".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some("https://paygo.example.com/v1".to_string()),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+            ]),
+            routing: Some(routing),
+            ..ServiceViewV4::default()
+        },
+        ..ProxyConfigV4::default()
+    };
+
+    let mut warnings = Vec::new();
+    collect_route_graph_affinity_migration_warnings("codex", &cfg.codex, &mut warnings);
+
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("preferred-group"));
+    assert!(warnings[0].contains("fallback-sticky"));
+    assert!(warnings[0].contains("keeps its explicit preferred-group policy"));
+}
+
+#[test]
+fn v4_route_graph_affinity_upgrade_warning_ignores_implicit_fallback_sticky_default() {
     let cfg = ProxyConfigV4 {
         version: 4,
         codex: ServiceViewV4 {
@@ -778,9 +816,7 @@ fn v4_route_graph_affinity_upgrade_warning_mentions_fallback_sticky() {
     let mut warnings = Vec::new();
     collect_route_graph_affinity_migration_warnings("codex", &cfg.codex, &mut warnings);
 
-    assert_eq!(warnings.len(), 1);
-    assert!(warnings[0].contains("preferred-group"));
-    assert!(warnings[0].contains("fallback-sticky"));
+    assert!(warnings.is_empty());
 }
 
 #[test]
@@ -949,7 +985,7 @@ fn save_config_v4_writes_v4_route_graph_schema() {
         assert!(saved.contains("version = 5"));
         assert!(saved.contains("[codex.routing]"));
         assert!(saved.contains("entry = \"main_route\""));
-        assert!(!saved.contains("affinity_policy"));
+        assert!(saved.contains("affinity_policy = \"fallback-sticky\""));
         assert!(saved.contains("[codex.routing.routes.main_route]"));
         assert!(saved.contains("strategy = \"manual-sticky\""));
         assert!(saved.contains("target = \"main\""));
@@ -1097,12 +1133,61 @@ target = "main"
         assert!(saved.contains("[codex.client_patch]"));
         assert!(saved.contains("preset = \"official-imagegen\""));
         assert!(!saved.contains("mode = \"official-imagegen-bridge\""));
+        assert!(saved.contains("affinity_policy = \"fallback-sticky\""));
 
         let backup_path = dir.join("config.toml.bak");
         let backup = std::fs::read_to_string(backup_path).expect("read normalization backup");
         assert!(backup.contains("# mode = \"imagegen-bridge\""));
         assert!(backup.contains("# mode = \"official-relay-bridge\""));
         assert!(backup.contains("mode = \"official-imagegen-bridge\""));
+    });
+}
+
+#[test]
+fn load_config_auto_adds_default_route_graph_affinity_policy() {
+    let _env = setup_temp_codex_home();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    rt.block_on(async move {
+        let dir = super::proxy_home_dir();
+        let toml_path = dir.join("config.toml");
+        write_file(
+            &toml_path,
+            r#"
+version = 5
+
+[codex.providers.main]
+base_url = "https://api.example.com/v1"
+auth_token_env = "MAIN_API_KEY"
+
+[codex.routing]
+entry = "main_route"
+
+[codex.routing.routes.main_route]
+strategy = "manual-sticky"
+target = "main"
+"#,
+        );
+
+        let loaded = super::load_config_with_v4_source()
+            .await
+            .expect("load v5 config");
+        assert_eq!(
+            loaded.runtime.version,
+            Some(CURRENT_ROUTE_GRAPH_CONFIG_VERSION)
+        );
+
+        let saved = std::fs::read_to_string(&toml_path).expect("read normalized config");
+        assert!(saved.contains("[codex.routing]"));
+        assert!(saved.contains("affinity_policy = \"fallback-sticky\""));
+
+        let backup_path = dir.join("config.toml.bak");
+        let backup = std::fs::read_to_string(backup_path).expect("read normalization backup");
+        assert!(backup.contains("[codex.routing]"));
+        assert!(!backup.contains("affinity_policy"));
     });
 }
 

@@ -1125,7 +1125,7 @@ TUI routing editor 快捷键：
 
 正常用户通常不需要手动运行迁移命令。启动 codex-helper，包括默认打开 TUI 的启动路径，会加载 legacy `version = 4`、`version = 3`、`version = 2`、未标版本 TOML 和 legacy `config.json`，然后迁移到带 `version = 5` 的 `config.toml`。写入新文件前，旧文件会复制为 `config.toml.bak` 或 `config.json.bak`。
 
-迁移期间，如果旧 route graph 会使用代码层的 `preferred-group` 默认值，而不是 fallback stickiness，codex-helper 会发出警告。新生成配置会显式写入 `affinity_policy = "fallback-sticky"`；已有配置可以按需求选择：更重视 official relay 连续性就用 `fallback-sticky`，更重视尽快回到优先组就用 `preferred-group`。
+迁移期间，codex-helper 会把缺失的 route-graph affinity 补成 `affinity_policy = "fallback-sticky"`，让落盘配置更显式。已有配置仍可按需求选择：更重视 official relay 连续性就用 `fallback-sticky`，更重视尽快回到优先组就用 `preferred-group`；如果配置显式保留 `preferred-group`，迁移预览可能会提示你注意这个取舍。
 
 手动迁移命令主要用于在不走正常 TUI/proxy 启动路径的情况下预览或诊断迁移：
 

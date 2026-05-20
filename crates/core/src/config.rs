@@ -63,7 +63,8 @@ pub use routing_impl::{RoutingCandidate, ServiceRoutingExplanation, explain_serv
 pub use storage_impl::{
     CodexClientPatchConfig, LoadedProxyConfig, codex_client_patch_config_from_config_file,
     codex_client_patch_mode_from_config_file, codex_client_patch_preset_from_config_file,
-    config_file_path, init_config_toml, load_config, load_config_with_v4_source, save_config,
+    config_file_path, init_config_toml, load_config, load_config_with_v4_source,
+    normalize_config_toml_authoring, normalize_config_toml_client_patch, save_config,
     save_config_v2, save_config_v4,
 };
 pub use v2_impl::{
@@ -89,7 +90,8 @@ pub mod storage {
     pub use super::storage_impl::{
         CodexClientPatchConfig, LoadedProxyConfig, codex_client_patch_config_from_config_file,
         codex_client_patch_mode_from_config_file, codex_client_patch_preset_from_config_file,
-        config_file_path, init_config_toml, load_config, load_config_with_v4_source, save_config,
+        config_file_path, init_config_toml, load_config, load_config_with_v4_source,
+        normalize_config_toml_authoring, normalize_config_toml_client_patch, save_config,
         save_config_v2, save_config_v4,
     };
 }
@@ -726,10 +728,7 @@ pub struct ProviderEndpointV4 {
 pub struct RoutingConfigV4 {
     #[serde(default = "default_routing_entry_v4")]
     pub entry: String,
-    #[serde(
-        default = "default_routing_affinity_policy_v5",
-        skip_serializing_if = "is_default_routing_affinity_policy_v5"
-    )]
+    #[serde(default = "default_routing_affinity_policy_v5")]
     pub affinity_policy: RoutingAffinityPolicyV5,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_ttl_ms: Option<u64>,
@@ -1108,11 +1107,7 @@ pub enum RoutingAffinityPolicyV5 {
 }
 
 fn default_routing_affinity_policy_v5() -> RoutingAffinityPolicyV5 {
-    RoutingAffinityPolicyV5::PreferredGroup
-}
-
-fn is_default_routing_affinity_policy_v5(policy: &RoutingAffinityPolicyV5) -> bool {
-    *policy == default_routing_affinity_policy_v5()
+    RoutingAffinityPolicyV5::FallbackSticky
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]

@@ -67,7 +67,7 @@ pub fn collect_route_graph_affinity_migration_warnings(
         && route_graph_has_fallback_choices(routing)
     {
         warnings.push(format!(
-            "[{service_name}] route graph affinity now defaults to preferred-group; if you relied on old fallback-sticky behavior, set affinity_policy = \"fallback-sticky\" explicitly."
+            "[{service_name}] route graph affinity now defaults to fallback-sticky for safer session/account continuity; this migrated config keeps its explicit preferred-group policy. Set \"fallback-sticky\" if you want the new default."
         ));
     }
 }

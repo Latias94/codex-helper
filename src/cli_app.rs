@@ -8,6 +8,7 @@ use crate::config::{
     ServiceKind, claude_settings_backup_path, claude_settings_path, codex_auth_path,
     codex_client_patch_config_from_config_file, codex_config_path, codex_switch_state_path,
     load_config, load_or_bootstrap_for_service_with_v4_source, model_routing_warnings,
+    normalize_config_toml_authoring,
 };
 use crate::notify;
 use crate::proxy::{
@@ -288,13 +289,19 @@ async fn run_server(
 
     // In Codex mode, automatically switch Codex to the local proxy; in Claude mode, try updating
     // settings.json as well (experimental).
-    if service_name == "codex" {
+    let loaded_before_switch = if service_name == "codex" {
         let codex_config_before_switch = read_existing_text(&codex_config_path());
         let codex_auth_before_switch = read_existing_text(&codex_auth_path());
         // Guard before switching: if Codex is already pointing to the local proxy with switch
         // state, ask whether to disable the stale local proxy patch first (interactive only).
         if let Err(err) = codex_integration::guard_codex_config_before_switch_on_interactive() {
             tracing::warn!("Failed to guard Codex config before switch on: {}", err);
+        }
+        if let Err(err) = normalize_config_toml_authoring() {
+            tracing::warn!(
+                "Failed to normalize codex-helper config authoring fields before switch on: {}",
+                err
+            );
         }
         let configured_client_patch = || match codex_client_patch_config_from_config_file() {
             Ok(config) => config,
@@ -306,9 +313,10 @@ async fn run_server(
                 crate::config::CodexClientPatchConfig::default()
             }
         };
+        let loaded = load_or_bootstrap_for_service_with_v4_source(ServiceKind::Codex).await?;
         let client_patch = configured_client_patch();
         let (patch_mode, switch_options) = match codex_integration::codex_switch_status() {
-            Ok(status) => (
+            Ok(status) if status.has_switch_state => (
                 status.patch_mode.unwrap_or(client_patch.preset),
                 codex_integration::CodexSwitchOptions {
                     responses_websocket: status
@@ -316,6 +324,15 @@ async fn run_server(
                         .unwrap_or(client_patch.options.responses_websocket),
                 },
             ),
+            Ok(status) => {
+                if status.enabled {
+                    tracing::info!(
+                        "Codex local proxy patch has no switch state; applying codex-helper config preset={} instead of inferring from stale ~/.codex/config.toml",
+                        client_patch.preset.as_preset_str()
+                    );
+                }
+                (client_patch.preset, client_patch.options)
+            }
             Err(err) => {
                 tracing::warn!(
                     "Failed to read Codex preset from ~/.codex/config.toml, falling back to default: {}",
@@ -344,6 +361,7 @@ async fn run_server(
         codex_client_state_changed_this_startup = codex_config_before_switch
             != read_existing_text(&codex_config_path())
             || codex_auth_before_switch != read_existing_text(&codex_auth_path());
+        Some(loaded)
     } else if service_name == "claude" {
         if let Err(err) = codex_integration::guard_claude_settings_before_switch_on_interactive() {
             tracing::warn!("Failed to guard Claude settings before switch on: {}", err);
@@ -359,12 +377,19 @@ async fn run_server(
                 tracing::warn!("Failed to update Claude settings for local proxy: {}", err);
             }
         }
-    }
+        None
+    } else {
+        None
+    };
 
-    let loaded = match service_name {
-        "codex" => load_or_bootstrap_for_service_with_v4_source(ServiceKind::Codex).await?,
-        "claude" => load_or_bootstrap_for_service_with_v4_source(ServiceKind::Claude).await?,
-        _ => load_or_bootstrap_for_service_with_v4_source(ServiceKind::Codex).await?,
+    let loaded = if let Some(loaded) = loaded_before_switch {
+        loaded
+    } else {
+        match service_name {
+            "codex" => load_or_bootstrap_for_service_with_v4_source(ServiceKind::Codex).await?,
+            "claude" => load_or_bootstrap_for_service_with_v4_source(ServiceKind::Claude).await?,
+            _ => load_or_bootstrap_for_service_with_v4_source(ServiceKind::Codex).await?,
+        }
     };
     let mut cfg = loaded.runtime;
     let v4_source = loaded.v4.map(Arc::new);

@@ -3888,7 +3888,7 @@ mod tests {
     }
 
     #[test]
-    fn route_plan_executor_keeps_fallback_last_good_inside_lower_preference_group() {
+    fn route_plan_executor_default_fallback_sticky_keeps_lower_preference_affinity() {
         let view = ServiceViewV4 {
             providers: BTreeMap::from([
                 (
@@ -3918,21 +3918,27 @@ mod tests {
 
         let selection =
             executor.select_supported_candidate_with_runtime_state(&mut state, &runtime, None);
-        let selected = selection.selected.expect("preferred candidate selected");
+        let selected = selection
+            .selected
+            .expect("sticky fallback candidate selected");
 
+        assert_eq!(
+            template.affinity_policy,
+            RoutingAffinityPolicyV5::FallbackSticky
+        );
         assert_eq!(
             provider_preference_groups(&template),
             vec![("monthly".to_string(), 0), ("chili".to_string(), 1),]
         );
-        assert_eq!(selected.candidate.provider_id, "monthly");
+        assert_eq!(selected.candidate.provider_id, "chili");
         assert_eq!(
             selected.provider_endpoint,
-            endpoint_key("codex", "monthly", "default")
+            endpoint_key("codex", "chili", "default")
         );
     }
 
     #[test]
-    fn route_plan_executor_prefers_ordered_primary_over_lower_order_affinity() {
+    fn route_plan_executor_default_fallback_sticky_keeps_lower_order_affinity() {
         let view = ServiceViewV4 {
             providers: BTreeMap::from([
                 (
@@ -3958,11 +3964,57 @@ mod tests {
 
         let selection =
             executor.select_supported_candidate_with_runtime_state(&mut state, &runtime, None);
-        let selected = selection.selected.expect("ordered primary selected");
+        let selected = selection
+            .selected
+            .expect("sticky fallback candidate selected");
 
+        assert_eq!(
+            template.affinity_policy,
+            RoutingAffinityPolicyV5::FallbackSticky
+        );
         assert_eq!(
             provider_preference_groups(&template),
             vec![("monthly".to_string(), 0), ("chili".to_string(), 1)]
+        );
+        assert_eq!(selected.candidate.provider_id, "chili");
+        assert_eq!(
+            selected.provider_endpoint,
+            endpoint_key("codex", "chili", "default")
+        );
+    }
+
+    #[test]
+    fn route_plan_executor_preferred_group_opt_in_prefers_primary() {
+        let mut routing =
+            RoutingConfigV4::ordered_failover(vec!["monthly".to_string(), "chili".to_string()]);
+        routing.affinity_policy = RoutingAffinityPolicyV5::PreferredGroup;
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([
+                (
+                    "monthly".to_string(),
+                    tagged_provider("https://monthly.example/v1", "billing", "monthly"),
+                ),
+                (
+                    "chili".to_string(),
+                    tagged_provider("https://chili.example/v1", "billing", "paygo"),
+                ),
+            ]),
+            routing: Some(routing),
+            ..ServiceViewV4::default()
+        };
+        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let executor = RoutePlanExecutor::new(&template);
+        let mut runtime = RoutePlanRuntimeState::default();
+        runtime.set_affinity_provider_endpoint(Some(endpoint_key("codex", "chili", "default")));
+        let mut state = RoutePlanAttemptState::default();
+
+        let selection =
+            executor.select_supported_candidate_with_runtime_state(&mut state, &runtime, None);
+        let selected = selection.selected.expect("ordered primary selected");
+
+        assert_eq!(
+            template.affinity_policy,
+            RoutingAffinityPolicyV5::PreferredGroup
         );
         assert_eq!(selected.candidate.provider_id, "monthly");
         assert_eq!(

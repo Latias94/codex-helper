@@ -45,6 +45,8 @@ All notable changes to this project will be documented in this file.
 #### 升级时关注
 
 - 常用 client preset 放在 `[codex.client_patch] preset = "..."`，也可以用 `codex-helper switch on --preset ...` 显式切换。旧的 `mode` / `--mode` 仍可读，但建议迁移到 `preset`。改完后需要完整重启 Codex App、TUI 或 `codex exec`。
+- route graph 的默认 affinity policy 回到 `fallback-sticky`，新配置会倾向同一 session 粘住已成功的 fallback provider。若你更希望故障恢复后尽快回到最高优先级 provider，请显式设置 `[codex.routing].affinity_policy = "preferred-group"`。
+- 启动时会先加载并规范化 `~/.codex-helper/config.toml`，再 patch Codex；如果 `~/.codex/config.toml` 还保留旧的本地代理但缺少 switch state，会以 codex-helper 配置里的 `preset` 为准重新 patch。
 - 如果想启用 Responses WebSocket，请额外设置 `responses_websocket = true` 或传 `--responses-websocket`；它不是 preset，只建议在已验证支持 WebSocket 的上游上开启。例如实测 `input8` 支持，`ciii` 的 HTTP endpoints 可用但 WebSocket upstream/proxy 失败，应保持关闭。
 - relay 要求模型名前缀时，用 `provider add --model-map FROM=TO` 或 provider 级 `model_mapping`，例如 `gpt-5.5` -> `openai/gpt-5.5`。
 - 不确定 relay 是否支持 compact/imagegen 时，先跑 `codex-helper codex relay-capabilities`；只有要真实验证上游链路时再跑 live smoke。
@@ -90,6 +92,8 @@ All notable changes to this project will be documented in this file.
 #### Upgrade notes
 
 - Set the usual client preset with `[codex.client_patch] preset = "..."` or `codex-helper switch on --preset ...`. Legacy `mode` / `--mode` are still accepted, but `preset` is the recommended spelling. Restart Codex App, TUI, or `codex exec` after changing it.
+- The route-graph default affinity policy is back to `fallback-sticky`, so new configs keep a session on a successful fallback provider. If you prefer returning to the highest-priority provider as soon as it recovers, set `[codex.routing].affinity_policy = "preferred-group"` explicitly.
+- Startup now loads and normalizes `~/.codex-helper/config.toml` before patching Codex; if `~/.codex/config.toml` still points at the local proxy but the switch state is missing, helper re-patches from the configured `preset` instead of trusting stale inferred state.
 - To enable Responses WebSocket, set `responses_websocket = true` or pass `--responses-websocket`; it is not a preset and should only be enabled for upstream relays verified to support WebSocket. For example, `input8` was verified to support it, while `ciii` supports the HTTP endpoints but fails the WebSocket upstream/proxy path and should keep it disabled.
 - If a relay requires provider-prefixed model names, use `provider add --model-map FROM=TO` or provider-level `model_mapping`, for example `gpt-5.5` -> `openai/gpt-5.5`.
 - If you are unsure whether a relay supports compact or imagegen, run `codex-helper codex relay-capabilities` first. Use live smoke only when you want a real upstream test.

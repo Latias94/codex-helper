@@ -502,9 +502,8 @@ async fn proxy_v4_route_graph_affinity_is_session_scoped() {
         "failover_after_status_502"
     );
 
-    let preferred_after_fallback =
-        send_responses_json(&client, proxy_addr, Some("sid-right")).await;
-    assert_eq!(preferred_after_fallback["provider"].as_str(), Some("input"));
+    let sticky_after_fallback = send_responses_json(&client, proxy_addr, Some("sid-right")).await;
+    assert_eq!(sticky_after_fallback["provider"].as_str(), Some("right"));
 
     let sticky = send_responses_json(&client, proxy_addr, Some("sid-input")).await;
     assert_eq!(sticky["provider"].as_str(), Some("input"));
@@ -512,9 +511,9 @@ async fn proxy_v4_route_graph_affinity_is_session_scoped() {
     let new_session = send_responses_json(&client, proxy_addr, Some("sid-new")).await;
     assert_eq!(new_session["provider"].as_str(), Some("input"));
 
-    assert_eq!(input_hits.load(Ordering::SeqCst), 5);
+    assert_eq!(input_hits.load(Ordering::SeqCst), 4);
     assert_eq!(input1_hits.load(Ordering::SeqCst), 1);
-    assert_eq!(right_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(right_hits.load(Ordering::SeqCst), 2);
 
     let affinities = state.list_session_route_affinities().await;
     assert_eq!(
@@ -526,13 +525,16 @@ async fn proxy_v4_route_graph_affinity_is_session_scoped() {
     let fallback_affinity = affinities.get("sid-right").expect("right affinity");
     assert_eq!(
         fallback_affinity.provider_endpoint.provider_id.as_str(),
-        "input"
+        "right"
     );
     assert_eq!(
         fallback_affinity.provider_endpoint.stable_key(),
-        "codex/input/default"
+        "codex/right/default"
     );
-    assert_eq!(fallback_affinity.change_reason.as_str(), "target_changed");
+    assert_eq!(
+        fallback_affinity.change_reason.as_str(),
+        "failover_after_status_502"
+    );
 
     let cards = state.list_session_identity_cards(20).await;
     let right_card = cards
@@ -544,7 +546,7 @@ async fn proxy_v4_route_graph_affinity_is_session_scoped() {
             .route_affinity
             .as_ref()
             .map(|affinity| affinity.provider_endpoint.provider_id.as_str()),
-        Some("input")
+        Some("right")
     );
 
     proxy_handle.abort();
@@ -680,10 +682,10 @@ async fn proxy_v4_route_graph_health_does_not_write_synthetic_routing_lb_state()
         );
     }
 
-    let preferred = send_responses_json(&client, proxy_addr, Some("sid-failover")).await;
-    assert_eq!(preferred["provider"].as_str(), Some("primary"));
-    assert_eq!(primary_hits.load(Ordering::SeqCst), 2);
-    assert_eq!(backup_hits.load(Ordering::SeqCst), 1);
+    let sticky = send_responses_json(&client, proxy_addr, Some("sid-failover")).await;
+    assert_eq!(sticky["provider"].as_str(), Some("backup"));
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 2);
 
     proxy_handle.abort();
     primary_handle.abort();

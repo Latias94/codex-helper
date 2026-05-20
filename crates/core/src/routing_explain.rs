@@ -592,15 +592,15 @@ mod tests {
             value["affinity"]["provider_endpoint_key"].as_str(),
             Some("codex/chili/default")
         );
-        assert_eq!(value["affinity_policy"].as_str(), Some("preferred_group"));
-        assert_eq!(value["affinity"]["mode"].as_str(), Some("preferred_group"));
+        assert_eq!(value["affinity_policy"].as_str(), Some("fallback_sticky"));
+        assert_eq!(value["affinity"]["mode"].as_str(), Some("fallback_sticky"));
         assert_eq!(
             value["selected_route"]["provider_endpoint_key"].as_str(),
-            Some("codex/monthly/default")
+            Some("codex/chili/default")
         );
         assert_eq!(
             value["selected_route"]["preference_group"].as_u64(),
-            Some(0)
+            Some(1)
         );
         assert_eq!(
             value["candidates"][1]["provider_endpoint_key"].as_str(),

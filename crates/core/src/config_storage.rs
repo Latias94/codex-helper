@@ -1,6 +1,6 @@
 use super::bootstrap_impl::bootstrap_from_codex;
 use super::*;
-use crate::file_replace::write_bytes_file_async;
+use crate::file_replace::{write_bytes_file_async, write_text_file};
 use toml_edit::{
     Document as EditableTomlDocument, Item as EditableTomlItem, Table as EditableTomlTable,
     value as editable_toml_value,
@@ -230,30 +230,93 @@ fn codex_client_patch_item_needs_normalization(item: &EditableTomlItem) -> bool 
         .is_some_and(|(value, preset)| value != preset.as_preset_str())
 }
 
-fn normalize_codex_client_patch_text(text: &str) -> Result<Option<String>> {
-    let mut doc = text.parse::<EditableTomlDocument>()?;
+fn normalize_codex_client_patch_doc(doc: &mut EditableTomlDocument) -> bool {
     let Some(codex) = doc
         .as_table_mut()
         .get_mut("codex")
         .and_then(EditableTomlItem::as_table_mut)
     else {
-        return Ok(None);
+        return false;
     };
     let Some(existing) = codex.get("client_patch").cloned() else {
-        return Ok(None);
+        return false;
     };
     if !codex_client_patch_item_needs_normalization(&existing) {
-        return Ok(None);
+        return false;
     }
 
     let normalized = normalize_existing_codex_client_patch_item(existing);
     codex.insert("client_patch", normalized);
+    true
+}
+
+fn normalize_route_graph_affinity_doc(
+    doc: &mut EditableTomlDocument,
+    schema_version: Option<u32>,
+) -> bool {
+    if !schema_version.is_some_and(is_supported_route_graph_config_version) {
+        return false;
+    }
+
+    let mut changed = false;
+    for service_name in ["codex", "claude"] {
+        let Some(service) = doc
+            .as_table_mut()
+            .get_mut(service_name)
+            .and_then(EditableTomlItem::as_table_mut)
+        else {
+            continue;
+        };
+        let Some(routing) = service
+            .get_mut("routing")
+            .and_then(EditableTomlItem::as_table_mut)
+        else {
+            continue;
+        };
+        if !routing.contains_key("affinity_policy") {
+            routing.insert("affinity_policy", editable_toml_value("fallback-sticky"));
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn normalize_config_toml_authoring_text(text: &str) -> Result<Option<String>> {
+    let mut doc = text.parse::<EditableTomlDocument>()?;
+    let mut changed = normalize_codex_client_patch_doc(&mut doc);
+    changed |= normalize_route_graph_affinity_doc(&mut doc, toml_schema_version_or_shape(text));
+    if !changed {
+        return Ok(None);
+    }
     let normalized_text = doc.to_string();
     if normalized_text == text {
         Ok(None)
     } else {
         Ok(Some(normalized_text))
     }
+}
+
+pub fn normalize_config_toml_authoring() -> Result<Option<PathBuf>> {
+    let path = config_toml_path();
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let text = stdfs::read_to_string(&path).with_context(|| format!("read {:?}", path))?;
+    let Some(normalized) = normalize_config_toml_authoring_text(&text)? else {
+        return Ok(None);
+    };
+
+    let backup_path = config_toml_backup_path();
+    if let Err(err) = stdfs::copy(&path, &backup_path) {
+        warn!("failed to backup {:?} to {:?}: {}", path, backup_path, err);
+    }
+    write_text_file(&path, &normalized)?;
+    Ok(Some(path))
+}
+
+pub fn normalize_config_toml_client_patch() -> Result<Option<PathBuf>> {
+    normalize_config_toml_authoring()
 }
 
 fn config_backup_source_and_path() -> (PathBuf, PathBuf) {
@@ -415,6 +478,9 @@ version = 5
 # [codex.routing]
 # entry = "main"
 # affinity_policy = "fallback-sticky"
+# 默认 fallback-sticky：失败切到备用上游后，同一 session 会尽量粘住已成功的备用账号，
+# 对 official relay / remote compaction / encrypted conversation state 更安全。
+# 如果你想每次都优先回到最高优先级 provider，可以显式改为 "preferred-group"。
 # fallback_ttl_ms = 120000
 # reprobe_preferred_after_ms = 30000
 #
@@ -689,7 +755,7 @@ pub async fn load_config_with_v4_source() -> Result<LoadedProxyConfig> {
         } else if let Some(cfg_v4) = loaded_v4.as_ref() {
             auto_compact_loaded_v4_config(cfg_v4, "config.toml").await;
         }
-        auto_normalize_loaded_codex_client_patch("config.toml").await;
+        auto_normalize_loaded_config_toml_authoring("config.toml").await;
         return Ok(LoadedProxyConfig {
             runtime: cfg,
             v4: loaded_v4,
@@ -808,24 +874,24 @@ async fn auto_compact_loaded_v4_config(cfg: &ProxyConfigV4, source: &str) {
     }
 }
 
-async fn auto_normalize_loaded_codex_client_patch(source: &str) {
+async fn auto_normalize_loaded_config_toml_authoring(source: &str) {
     let path = config_toml_path();
     let text = match fs::read_to_string(&path).await {
         Ok(text) => text,
         Err(err) => {
             warn!(
-                "failed to read {} while normalizing codex.client_patch legacy mode: {}",
+                "failed to read {} while normalizing config authoring fields: {}",
                 source, err
             );
             return;
         }
     };
-    let normalized = match normalize_codex_client_patch_text(&text) {
+    let normalized = match normalize_config_toml_authoring_text(&text) {
         Ok(Some(normalized)) => normalized,
         Ok(None) => return,
         Err(err) => {
             warn!(
-                "failed to normalize {} codex.client_patch legacy mode: {}",
+                "failed to normalize {} config authoring fields: {}",
                 source, err
             );
             return;
@@ -841,14 +907,11 @@ async fn auto_normalize_loaded_codex_client_patch(source: &str) {
 
     match write_bytes_file_async(&path, normalized.as_bytes()).await {
         Ok(()) => {
-            info!(
-                "auto-normalized {} codex.client_patch legacy mode to preset",
-                source
-            );
+            info!("auto-normalized {} config authoring fields", source);
         }
         Err(err) => {
             warn!(
-                "failed to auto-normalize {} codex.client_patch legacy mode: {}",
+                "failed to auto-normalize {} config authoring fields: {}",
                 source, err
             );
         }
