@@ -64,6 +64,32 @@ pub(crate) enum Command {
         /// Disable built-in TUI dashboard (enabled by default when running in an interactive terminal)
         #[arg(long)]
         no_tui: bool,
+        /// Keep the proxy resident when the operator console exits; client patch is not auto-restored
+        #[arg(long)]
+        resident: bool,
+        /// Mark the resident child as supervisor-owned; internal use by `daemon supervise`
+        #[arg(long, hide = true)]
+        supervisor_managed: bool,
+        /// Mark a resident proxy as desktop/tray-owned; intended for future desktop shells
+        #[arg(long, hide = true)]
+        desktop_managed: bool,
+    },
+    /// Inspect or control a resident codex-helper proxy
+    Daemon {
+        #[command(subcommand)]
+        cmd: DaemonCommand,
+    },
+    /// Attach a read-only TUI dashboard to an already-running local resident proxy
+    Tui {
+        /// Target Codex proxy (default if neither flag is set)
+        #[arg(long)]
+        codex: bool,
+        /// Target Claude proxy
+        #[arg(long)]
+        claude: bool,
+        /// Proxy port; defaults to 3211 for Codex and 3210 for Claude
+        #[arg(long)]
+        port: Option<u16>,
     },
     /// Manage Codex/Claude switch on/off state
     Switch {
@@ -130,6 +156,55 @@ pub(crate) enum Command {
         /// Set default to Claude (experimental)
         #[arg(long)]
         claude: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum DaemonCommand {
+    /// Show whether a local resident proxy is reachable
+    Status {
+        /// Target Codex proxy (default if neither flag is set)
+        #[arg(long)]
+        codex: bool,
+        /// Target Claude proxy
+        #[arg(long)]
+        claude: bool,
+        /// Proxy port; defaults to 3211 for Codex and 3210 for Claude
+        #[arg(long)]
+        port: Option<u16>,
+        /// Output status as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Ask a resident proxy to gracefully stop
+    Stop {
+        /// Target Codex proxy (default if neither flag is set)
+        #[arg(long)]
+        codex: bool,
+        /// Target Claude proxy
+        #[arg(long)]
+        claude: bool,
+        /// Proxy port; defaults to 3211 for Codex and 3210 for Claude
+        #[arg(long)]
+        port: Option<u16>,
+    },
+    /// Run a foreground watchdog that restarts a resident proxy child after crashes
+    Supervise {
+        /// Target Codex proxy (default if neither flag is set)
+        #[arg(long)]
+        codex: bool,
+        /// Target Claude proxy
+        #[arg(long)]
+        claude: bool,
+        /// Listen host for the child resident proxy
+        #[arg(long, default_value = "127.0.0.1")]
+        host: IpAddr,
+        /// Proxy port; defaults to 3211 for Codex and 3210 for Claude
+        #[arg(long)]
+        port: Option<u16>,
+        /// Maximum crash restarts before the supervisor gives up
+        #[arg(long, default_value_t = 10)]
+        max_restarts: u32,
     },
 }
 
@@ -1109,6 +1184,161 @@ mod tests {
         assert_eq!(kind, Some(CodexRelayEvidenceKindArg::LiveSmoke));
         assert_eq!(station.as_deref(), Some("input"));
         assert_eq!(limit, 5);
+    }
+
+    #[test]
+    fn serve_cli_parses_resident_flag() {
+        let cli = Cli::try_parse_from(["codex-helper", "serve", "--codex", "--resident"])
+            .expect("parse resident serve command");
+
+        let Some(Command::Serve {
+            codex, resident, ..
+        }) = cli.command
+        else {
+            panic!("expected serve command");
+        };
+        assert!(codex);
+        assert!(resident);
+    }
+
+    #[test]
+    fn serve_cli_parses_hidden_supervisor_managed_flag() {
+        let cli = Cli::try_parse_from([
+            "codex-helper",
+            "serve",
+            "--codex",
+            "--resident",
+            "--supervisor-managed",
+        ])
+        .expect("parse supervisor-managed serve command");
+
+        let Some(Command::Serve {
+            codex,
+            resident,
+            supervisor_managed,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected serve command");
+        };
+        assert!(codex);
+        assert!(resident);
+        assert!(supervisor_managed);
+    }
+
+    #[test]
+    fn serve_cli_parses_hidden_desktop_managed_flag() {
+        let cli = Cli::try_parse_from(["codex-helper", "serve", "--codex", "--desktop-managed"])
+            .expect("parse desktop-managed serve command");
+
+        let Some(Command::Serve {
+            codex,
+            resident,
+            desktop_managed,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected serve command");
+        };
+        assert!(codex);
+        assert!(!resident);
+        assert!(desktop_managed);
+    }
+
+    #[test]
+    fn daemon_cli_parses_status_json() {
+        let cli = Cli::try_parse_from([
+            "codex-helper",
+            "daemon",
+            "status",
+            "--claude",
+            "--port",
+            "4210",
+            "--json",
+        ])
+        .expect("parse daemon status command");
+
+        let Some(Command::Daemon {
+            cmd: DaemonCommand::Status {
+                claude, port, json, ..
+            },
+        }) = cli.command
+        else {
+            panic!("expected daemon status command");
+        };
+        assert!(claude);
+        assert_eq!(port, Some(4210));
+        assert!(json);
+    }
+
+    #[test]
+    fn daemon_cli_parses_stop() {
+        let cli = Cli::try_parse_from(["codex-helper", "daemon", "stop", "--codex"])
+            .expect("parse daemon stop command");
+
+        let Some(Command::Daemon {
+            cmd:
+                DaemonCommand::Stop {
+                    codex,
+                    claude,
+                    port,
+                },
+        }) = cli.command
+        else {
+            panic!("expected daemon stop command");
+        };
+        assert!(codex);
+        assert!(!claude);
+        assert_eq!(port, None);
+    }
+
+    #[test]
+    fn tui_cli_parses_attach_target() {
+        let cli = Cli::try_parse_from(["codex-helper", "tui", "--claude", "--port", "3210"])
+            .expect("parse tui attach command");
+
+        let Some(Command::Tui {
+            codex,
+            claude,
+            port,
+        }) = cli.command
+        else {
+            panic!("expected tui command");
+        };
+        assert!(!codex);
+        assert!(claude);
+        assert_eq!(port, Some(3210));
+    }
+
+    #[test]
+    fn daemon_cli_parses_supervise() {
+        let cli = Cli::try_parse_from([
+            "codex-helper",
+            "daemon",
+            "supervise",
+            "--codex",
+            "--port",
+            "4211",
+            "--max-restarts",
+            "3",
+        ])
+        .expect("parse daemon supervise command");
+
+        let Some(Command::Daemon {
+            cmd:
+                DaemonCommand::Supervise {
+                    codex,
+                    port,
+                    max_restarts,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected daemon supervise command");
+        };
+        assert!(codex);
+        assert_eq!(port, Some(4211));
+        assert_eq!(max_restarts, 3);
     }
 }
 

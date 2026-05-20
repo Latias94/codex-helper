@@ -1,3 +1,4 @@
+mod attached;
 mod codex_relay_diagnostics;
 mod codex_relay_live_smoke;
 mod i18n;
@@ -12,6 +13,7 @@ mod terminal;
 mod types;
 mod view;
 
+pub use attached::run_attached_dashboard;
 pub use i18n::Language;
 pub use i18n::{detect_system_language, parse_language, resolve_language_preference};
 #[allow(unused_imports)]

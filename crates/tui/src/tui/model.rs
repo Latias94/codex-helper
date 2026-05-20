@@ -6,8 +6,8 @@ use ratatui::prelude::{Color, Style};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::config::ProxyConfig;
-use crate::dashboard_core::WindowStats;
 pub(in crate::tui) use crate::dashboard_core::window_stats::compute_window_stats;
+use crate::dashboard_core::{ApiV1Snapshot, WindowStats};
 use crate::pricing::{ModelPriceCatalogSnapshot, UsdAmount};
 use crate::state::{
     BalanceSnapshotStatus, FinishedRequest, HealthCheckStatus, LbConfigView,
@@ -1930,6 +1930,45 @@ pub(in crate::tui) async fn refresh_snapshot(
     }
 }
 
+pub(in crate::tui) async fn snapshot_from_api_v1(api: ApiV1Snapshot) -> Snapshot {
+    let snap = api.snapshot;
+    let global_station_override = snap.effective_global_station_override().map(str::to_owned);
+    let global_route_target_override = snap
+        .effective_global_route_target_override()
+        .map(str::to_owned);
+    let station_health = snap.effective_station_health().clone();
+    let mut rows = build_session_rows_from_cards(&snap.session_cards);
+    for row in &mut rows {
+        if let Some(session_id) = row.session_id.as_deref() {
+            row.override_route_target =
+                snap.session_route_target_overrides.get(session_id).cloned();
+        }
+    }
+    let forecast_recent = load_forecast_recent_requests(snap.recent.clone()).await;
+    Snapshot {
+        rows,
+        recent: snap.recent,
+        forecast_recent,
+        model_overrides: snap.session_model_overrides,
+        overrides: snap.session_effort_overrides,
+        station_overrides: snap.session_station_overrides,
+        route_target_overrides: snap.session_route_target_overrides,
+        service_tier_overrides: snap.session_service_tier_overrides,
+        global_station_override,
+        global_route_target_override,
+        station_meta_overrides: HashMap::new(),
+        usage_rollup: snap.usage_rollup,
+        provider_balances: snap.provider_balances,
+        station_health,
+        health_checks: snap.health_checks,
+        lb_view: snap.lb_view,
+        stats_5m: snap.stats_5m,
+        stats_1h: snap.stats_1h,
+        pricing_catalog: crate::pricing::operator_model_price_catalog_snapshot(),
+        refreshed_at: Instant::now(),
+    }
+}
+
 fn usage_forecast_log_tail_limit() -> usize {
     static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| {
@@ -2129,6 +2168,7 @@ mod tests {
             id,
             trace_id: None,
             session_id: session_id.map(ToOwned::to_owned),
+            session_identity_source: None,
             client_name: None,
             client_addr: None,
             cwd: None,
@@ -2703,6 +2743,7 @@ mod tests {
             session_id: Some("sid-1".to_string()),
             route_affinity: Some(SessionRouteAffinity {
                 route_graph_key: "v4:deadbeef".to_string(),
+                session_identity_source: None,
                 provider_endpoint: codex_helper_core::runtime_identity::ProviderEndpointKey::new(
                     "codex", "right", "default",
                 ),

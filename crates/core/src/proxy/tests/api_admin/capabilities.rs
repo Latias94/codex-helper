@@ -98,6 +98,11 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
     assert!(caps["endpoints"].as_array().is_some_and(|items| {
         items
             .iter()
+            .any(|item| item.as_str() == Some("/__codex_helper/api/v1/runtime/shutdown"))
+    }));
+    assert!(caps["endpoints"].as_array().is_some_and(|items| {
+        items
+            .iter()
             .any(|item| item.as_str() == Some("/__codex_helper/api/v1/operator/summary"))
     }));
     assert!(caps["endpoints"].as_array().is_some_and(|items| {
@@ -250,6 +255,10 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
     );
     assert_eq!(
         caps["surface_capabilities"]["request_ledger_summary"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        caps["surface_capabilities"]["runtime_shutdown"].as_bool(),
         Some(true)
     );
     let host_local_history = crate::config::codex_sessions_dir().is_dir();

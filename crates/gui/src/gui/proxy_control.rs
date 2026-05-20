@@ -10,6 +10,9 @@ use crate::request_ledger::{
     RequestLogFilters, RequestUsageSummaryGroup, request_log_path, summarize_request_log,
     tail_finished_requests_from_log,
 };
+use crate::runtime_manager::{
+    RuntimeConnectionMode, RuntimeStopAction, RuntimeStopIntent, decide_runtime_stop_action,
+};
 use anyhow::bail;
 use reqwest::Client;
 
@@ -424,6 +427,7 @@ impl ProxyController {
                     supports_session_route_target_override: route_graph_routing,
                     supports_global_route_target_override: route_graph_routing,
                     supports_session_override_reset: true,
+                    supports_runtime_shutdown_api: true,
                     shared_capabilities: local_shared_control_plane_capabilities(),
                     host_local_capabilities: local_host_local_control_plane_capabilities(),
                     remote_admin_access: local_remote_admin_access_capabilities(),
@@ -470,6 +474,7 @@ impl ProxyController {
                 supports_session_route_target_override: a.supports_session_route_target_override,
                 supports_global_route_target_override: a.supports_global_route_target_override,
                 supports_session_override_reset: a.supports_session_override_reset,
+                supports_runtime_shutdown_api: a.supports_runtime_shutdown_api,
                 shared_capabilities: a.shared_capabilities.clone(),
                 host_local_capabilities: a.host_local_capabilities.clone(),
                 remote_admin_access: a.remote_admin_access.clone(),
@@ -501,6 +506,44 @@ impl ProxyController {
         self.refresh_background_if_due(rt, refresh_every);
     }
 
+    pub fn poll_running_exit(&mut self, rt: &tokio::runtime::Runtime) -> bool {
+        let server_finished = matches!(&self.mode, ProxyMode::Running(r) if r
+            .server_handle
+            .as_ref()
+            .is_some_and(|handle| handle.is_finished()));
+        if !server_finished {
+            return false;
+        }
+
+        let ProxyMode::Running(mut running) = std::mem::replace(&mut self.mode, ProxyMode::Stopped)
+        else {
+            return false;
+        };
+        let message = if let Some(handle) = running.server_handle.take() {
+            match rt.block_on(handle) {
+                Ok(Ok(())) => format!(
+                    "{} proxy on port {} stopped",
+                    running.service_name, running.port
+                ),
+                Ok(Err(err)) => format!(
+                    "{} proxy on port {} exited with error: {err}",
+                    running.service_name, running.port
+                ),
+                Err(join_err) => format!(
+                    "{} proxy on port {} task join error: {join_err}",
+                    running.service_name, running.port
+                ),
+            }
+        } else {
+            format!(
+                "{} proxy on port {} stopped",
+                running.service_name, running.port
+            )
+        };
+        self.last_start_error = Some(message);
+        true
+    }
+
     pub fn show_port_in_use_modal(&self) -> bool {
         self.port_in_use_modal.is_some()
     }
@@ -509,34 +552,81 @@ impl ProxyController {
         self.port_in_use_modal = None;
     }
 
-    pub fn stop(&mut self, rt: &tokio::runtime::Runtime) -> anyhow::Result<()> {
+    fn stop_inner(
+        &mut self,
+        rt: &tokio::runtime::Runtime,
+        intent: RuntimeStopIntent,
+    ) -> anyhow::Result<()> {
         self.clear_background_refresh();
         self.clear_provider_balance_refresh();
-        let ProxyMode::Running(mut running) = std::mem::replace(&mut self.mode, ProxyMode::Stopped)
-        else {
+        let connection = match &self.mode {
+            ProxyMode::Running(_) => RuntimeConnectionMode::Owned,
+            ProxyMode::Attached(_) => RuntimeConnectionMode::Attached,
+            ProxyMode::Stopped | ProxyMode::Starting => RuntimeConnectionMode::Stopped,
+        };
+        let attached_shutdown_available = matches!(&self.mode, ProxyMode::Attached(attached) if attached.supports_runtime_shutdown_api);
+        let action = decide_runtime_stop_action(connection, intent, attached_shutdown_available);
+        if matches!(action, RuntimeStopAction::Noop) {
             self.mode = ProxyMode::Stopped;
             return Ok(());
-        };
+        }
 
-        let _ = running.shutdown_tx.send(true);
-        if let Some(mut handle) = running.server_handle.take() {
-            let joined = rt.block_on(async {
-                tokio::time::timeout(Duration::from_secs(2), &mut handle).await
-            });
-            match joined {
-                Ok(Ok(Ok(()))) => {}
-                Ok(Ok(Err(e))) => {
-                    return Err(e);
+        let mode = std::mem::replace(&mut self.mode, ProxyMode::Stopped);
+        match (mode, action) {
+            (ProxyMode::Running(mut running), _) => {
+                let _ = running.shutdown_tx.send(true);
+                if let Some(mut handle) = running.server_handle.take() {
+                    let joined = rt.block_on(async {
+                        tokio::time::timeout(Duration::from_secs(2), &mut handle).await
+                    });
+                    match joined {
+                        Ok(Ok(Ok(()))) => {}
+                        Ok(Ok(Err(e))) => {
+                            return Err(e);
+                        }
+                        Ok(Err(join_err)) => {
+                            return Err(anyhow::anyhow!("server task join error: {join_err}"));
+                        }
+                        Err(_) => {
+                            handle.abort();
+                        }
+                    }
                 }
-                Ok(Err(join_err)) => {
-                    return Err(anyhow::anyhow!("server task join error: {join_err}"));
+                Ok(())
+            }
+            (ProxyMode::Attached(attached), RuntimeStopAction::ShutdownAttachedRuntime) => {
+                let shutdown_path = attached
+                    .operator_summary_links
+                    .as_ref()
+                    .map(|links| links.runtime_shutdown.as_str())
+                    .filter(|path| !path.trim().is_empty())
+                    .unwrap_or("/__codex_helper/api/v1/runtime/shutdown");
+                let url = format!("{}{}", attached.admin_base_url, shutdown_path);
+                let result = rt.block_on(async {
+                    send_admin_request(self.http_client.post(url))
+                        .await
+                        .map(|_| ())
+                });
+                if let Err(err) = result {
+                    self.mode = ProxyMode::Attached(attached);
+                    return Err(err);
                 }
-                Err(_) => {
-                    handle.abort();
-                }
+                Ok(())
+            }
+            (ProxyMode::Attached(_), RuntimeStopAction::DetachOnly) => Ok(()),
+            (mode, _) => {
+                self.mode = mode;
+                Ok(())
             }
         }
-        Ok(())
+    }
+
+    pub fn stop(&mut self, rt: &tokio::runtime::Runtime) -> anyhow::Result<()> {
+        self.stop_inner(rt, RuntimeStopIntent::ExplicitStop)
+    }
+
+    pub fn stop_owned(&mut self, rt: &tokio::runtime::Runtime) -> anyhow::Result<()> {
+        self.stop_inner(rt, RuntimeStopIntent::OwnerExit)
     }
 
     pub fn request_attach(&mut self, port: u16) {

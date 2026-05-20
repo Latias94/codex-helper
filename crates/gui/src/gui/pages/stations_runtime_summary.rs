@@ -84,6 +84,17 @@ pub(super) fn render_stations_runtime_summary(
                         .unwrap_or_else(|| pick(ctx.lang, "<无>", "<none>"))
                 ));
             }
+            if matches!(snapshot.kind, ProxyModeKind::Attached) {
+                ui.label(format!(
+                    "{}: {}",
+                    pick(ctx.lang, "远端停止 API", "Remote stop API"),
+                    if snapshot.supports_runtime_shutdown_api {
+                        pick(ctx.lang, "可用", "available")
+                    } else {
+                        pick(ctx.lang, "不可用", "unavailable")
+                    }
+                ));
+            }
         });
         ui.horizontal(|ui| {
             if ui.button(pick(ctx.lang, "刷新", "Refresh")).clicked() {
@@ -116,11 +127,19 @@ pub(super) fn render_stations_runtime_summary(
         ui.colored_label(
             egui::Color32::from_rgb(120, 120, 120),
             if matches!(snapshot.kind, ProxyModeKind::Attached) {
-                pick(
-                    ctx.lang,
-                    "附着模式下，route target / 运行时覆盖会直接作用到远端代理；这里不再提供旧的持久化站点写回入口。",
-                    "In attached mode, route targets and runtime overrides act on the remote proxy directly; the old persisted station write-back entrypoint is no longer shown here.",
-                )
+                if snapshot.supports_runtime_shutdown_api {
+                    pick(
+                        ctx.lang,
+                        "附着模式下，route target / 运行时覆盖会直接作用到远端代理；关闭窗口只会退出 GUI，如需停止远端请使用“停止远端代理”或 daemon stop。",
+                        "In attached mode, route targets and runtime overrides act on the remote proxy directly; closing the window exits only the GUI, use Stop remote proxy or daemon stop to stop it.",
+                    )
+                } else {
+                    pick(
+                        ctx.lang,
+                        "附着模式下，route target / 运行时覆盖会直接作用到远端代理；当前远端不支持 shutdown API，关闭窗口只会退出 GUI。",
+                        "In attached mode, route targets and runtime overrides act on the remote proxy directly; this remote does not support the shutdown API, closing the window exits only the GUI.",
+                    )
+                }
             } else {
                 pick(
                     ctx.lang,

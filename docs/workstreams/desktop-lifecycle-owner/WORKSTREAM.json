@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "slug": "desktop-lifecycle-owner",
+  "title": "Desktop Lifecycle Owner",
+  "status": "complete",
+  "updated": "2026-05-20",
+  "scope_kind": "execution",
+  "problem": "Proxy lifecycle policy is scattered across CLI, GUI, TUI, and admin callers, making default exit behavior easy to confuse and future tray/Tauri ownership hard to implement safely.",
+  "authoritative_docs": [
+    {
+      "role": "design",
+      "path": "docs/workstreams/desktop-lifecycle-owner/DESIGN.md"
+    },
+    {
+      "role": "execution",
+      "path": "docs/workstreams/desktop-lifecycle-owner/TODO.md"
+    },
+    {
+      "role": "gates",
+      "path": "docs/workstreams/desktop-lifecycle-owner/EVIDENCE_AND_GATES.md"
+    },
+    {
+      "role": "handoff",
+      "path": "docs/workstreams/desktop-lifecycle-owner/HANDOFF.md"
+    }
+  ],
+  "gates": [
+    "cargo fmt --check",
+    "cargo check -p codex-helper-core",
+    "cargo check -p codex-helper-gui",
+    "cargo check -p codex-helper-tui",
+    "cargo check -p codex-helper",
+    "cargo nextest run -p codex-helper-core runtime_manager --no-fail-fast",
+    "cargo nextest run -p codex-helper-gui proxy_control --no-fail-fast",
+    "cargo nextest run -p codex-helper-gui lifecycle_defaults --no-fail-fast",
+    "cargo nextest run -p codex-helper cli_types supervisor_tests --no-fail-fast",
+    "cargo nextest run -p codex-helper-tui attached --no-fail-fast"
+  ],
+  "evidence": [
+    {
+      "date": "2026-05-20",
+      "kind": "planning",
+      "summary": "Opened workstream and froze lifecycle owner target state."
+    },
+    {
+      "date": "2026-05-20",
+      "kind": "implementation",
+      "summary": "Completed lifecycle domain, owner markers, GUI/TUI/daemon adapter convergence, hidden desktop-managed sidecar semantics, docs, and targeted gates."
+    }
+  ],
+  "adr_refs": [],
+  "continue_policy": {
+    "default_action": "continue",
+    "notes": "Continue while default simple behavior remains non-resident and desktop/daemon owner modes stay explicit. Split full Tauri/service work as follow-on."
+  }
+}

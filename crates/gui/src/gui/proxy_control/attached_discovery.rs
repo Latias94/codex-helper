@@ -86,6 +86,7 @@ pub(super) struct ResolvedApiV1Surface {
     pub(super) request_ledger_recent: bool,
     pub(super) request_ledger_summary: bool,
     pub(super) routing_explain: bool,
+    pub(super) runtime_shutdown: bool,
     pub(super) station_api: bool,
     pub(super) station_runtime: bool,
     pub(super) session_override_aggregate: bool,
@@ -117,6 +118,7 @@ const API_V1_CONTROL_TRACE_ENDPOINT: &str = "/__codex_helper/api/v1/control-trac
 const API_V1_REQUEST_LEDGER_RECENT_ENDPOINT: &str = "/__codex_helper/api/v1/request-ledger/recent";
 const API_V1_REQUEST_LEDGER_SUMMARY_ENDPOINT: &str =
     "/__codex_helper/api/v1/request-ledger/summary";
+const API_V1_RUNTIME_SHUTDOWN_ENDPOINT: &str = "/__codex_helper/api/v1/runtime/shutdown";
 const API_V1_ROUTING_EXPLAIN_ENDPOINT: &str = "/__codex_helper/api/v1/routing/explain";
 const API_V1_PRICING_CATALOG_ENDPOINT: &str = "/__codex_helper/api/v1/pricing/catalog";
 const API_V1_STATION_PROBE_ENDPOINT: &str = "/__codex_helper/api/v1/stations/probe";
@@ -229,6 +231,11 @@ pub(super) fn resolve_api_v1_surface(
             endpoints,
             API_V1_ROUTING_EXPLAIN_ENDPOINT,
         ),
+        runtime_shutdown: supports_capability_flag(
+            surface.runtime_shutdown,
+            endpoints,
+            API_V1_RUNTIME_SHUTDOWN_ENDPOINT,
+        ),
         station_api: supports_any_capability_flag(
             surface.stations || surface.station_runtime || surface.station_probe,
             endpoints,
@@ -298,6 +305,7 @@ fn apply_resolved_surface(attached: &mut AttachedStatus, resolved_surface: Resol
     attached.supports_request_ledger_api = resolved_surface.request_ledger_recent;
     attached.supports_request_ledger_summary_api = resolved_surface.request_ledger_summary;
     attached.supports_routing_explain_api = resolved_surface.routing_explain;
+    attached.supports_runtime_shutdown_api = resolved_surface.runtime_shutdown;
     attached.supports_station_api = resolved_surface.station_api;
 }
 

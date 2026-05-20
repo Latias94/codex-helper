@@ -1,6 +1,6 @@
 use super::{
-    current_page_help_lines, help_text_for_tests, profile_declared_summary,
-    profile_resolved_summary,
+    current_page_help_lines, help_quit_line_for_tests, help_text_for_tests,
+    profile_declared_summary, profile_resolved_summary,
 };
 use crate::dashboard_core::ControlProfileOption;
 use crate::tui::Language;
@@ -189,4 +189,20 @@ fn current_page_help_includes_usage_detail_actions() {
     assert!(text.contains("Current page: Providers"), "{text}");
     assert!(text.contains("PgUp/PgDn"), "{text}");
     assert!(text.contains("refresh provider balances"), "{text}");
+}
+
+#[test]
+fn help_quit_line_reflects_attached_observer_lifecycle() {
+    let attached = help_quit_line_for_tests(Language::En, true);
+    let integrated = help_quit_line_for_tests(Language::En, false);
+
+    assert!(
+        attached.contains("exit attached console only"),
+        "{attached}"
+    );
+    assert!(
+        attached.contains("keep resident proxy running"),
+        "{attached}"
+    );
+    assert!(integrated.contains("request shutdown"), "{integrated}");
 }

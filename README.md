@@ -49,7 +49,7 @@ English: [README_EN.md](README_EN.md)
 - **余额/套餐**：支持 Sub2API、New API 和常见 `/user/balance` 探测；失败不计为耗尽。
 - **出站代理兼容**：本地代理和出站网络代理是两层概念；当前出站请求受系统/环境代理变量影响，还没有 `config.toml` 专用代理段。
 - **请求可观测**：记录 provider、model、token、cache token、缓存命中率、TTFB、总耗时、输出速度、重试链和估算成本。
-- **TUI/GUI**：TUI 内置在命令行里；GUI 可作为本地控制台或 attached 控制台使用。
+- **TUI/GUI**：TUI 内置在命令行里；GUI 默认拥有并随窗口退出停止本地代理，也可显式附着已有代理。
 
 ## 快速开始
 
@@ -107,6 +107,19 @@ ch
 ```bash
 codex-helper serve --no-tui
 ```
+
+高级：常驻/附着代理（只有显式使用 `--resident`/`daemon`/`tui` 子命令时才会让代理独立于当前控制台继续运行）：
+
+```bash
+codex-helper serve --resident
+codex-helper daemon status
+codex-helper daemon stop
+codex-helper tui --codex
+```
+
+默认 `codex-helper serve` 的 TUI 和 GUI 都遵循“界面拥有代理”：退出界面会停止它自己启动的代理，并撤销本地客户端 patch。`daemon status/stop` 只用于查询或停止你显式启动的 resident proxy；`tui` 子命令只读附着到已有 resident proxy，退出这个 attached TUI 不会停止代理。需要自动拉起/崩溃重启时可用 `codex-helper daemon supervise --codex`，supervisor 会写入轻量 crash marker 到 `~/.codex-helper/run/` 便于排查。
+
+`daemon status` 会尽量显示当前 resident proxy 的 owner marker（manual CLI、supervisor 或未来桌面/托盘 owner）；marker 只用于可观测性，读取或清理失败不会阻断代理启动/退出。面向未来桌面端的 sidecar 语义已经预留为隐藏的 managed 启动模式，普通用户无需手动判断或使用。
 
 显式开关 Codex 代理 patch：
 
@@ -350,7 +363,7 @@ codex-helper-gui
 cargo run --release --features gui --bin codex-helper-gui
 ```
 
-GUI 可以启动/附着本地代理，编辑常见单 endpoint provider、route node 和 routing，查看请求、余额、价格目录、session、health、breaker 和控制面板状态。复杂多 endpoint provider、模型映射和高级字段仍建议用 CLI 或 raw TOML。
+GUI 可以启动/附着本地代理，编辑常见单 endpoint provider、route node 和 routing，查看请求、余额、价格目录、session、health、breaker 和控制面板状态。默认行为是 GUI 启动的代理跟随 GUI 退出而停止；附着已有代理必须在界面中显式选择，关闭 GUI 只会取消附着，不会偷偷停止别的进程。复杂多 endpoint provider、模型映射和高级字段仍建议用 CLI 或 raw TOML。
 
 ## 配置文件位置
 

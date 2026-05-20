@@ -37,7 +37,7 @@ It is probably unnecessary if you only use one official account and do not need 
 - **Balance and plan visibility**: probes common Sub2API, New API, and `/user/balance` endpoints; lookup failures are not treated as exhausted.
 - **Outbound proxy compatibility**: the local proxy and outbound network proxy are separate layers; outbound requests currently follow system/environment proxy variables, with no first-class `config.toml` proxy section yet.
 - **Request observability**: provider, model, tokens, cache tokens, cache hit rate, TTFB, duration, output rate, retry chain, and estimated cost.
-- **TUI and GUI**: built-in TUI for terminal use; GUI for local or attached operation.
+- **TUI and GUI**: built-in TUI for terminal use; GUI owns and stops its local proxy by default, with explicit attach support for existing proxies.
 
 ## Quick Start
 
@@ -95,6 +95,19 @@ Start the proxy without the TUI:
 ```bash
 codex-helper serve --no-tui
 ```
+
+Advanced: run a resident/attached proxy. Only the explicit `--resident`/`daemon`/`tui` subcommands let the proxy outlive the current console:
+
+```bash
+codex-helper serve --resident
+codex-helper daemon status
+codex-helper daemon stop
+codex-helper tui --codex
+```
+
+By default, `codex-helper serve` and the GUI follow “the console owns the proxy”: exiting the UI stops the proxy it started and restores the local client patch. `daemon status/stop` is only for resident proxies you explicitly started. The `tui` subcommand attaches read-only to an existing resident proxy, so exiting that attached TUI does not stop the proxy. For automatic restart after child crashes, run `codex-helper daemon supervise --codex`; the supervisor records lightweight crash markers under `~/.codex-helper/run/`.
+
+`daemon status` best-effort shows the resident proxy owner marker (manual CLI, supervisor, or a future desktop/tray owner). The marker is only observability metadata: read or cleanup failures never block proxy startup or shutdown. A hidden managed sidecar mode is reserved for the future desktop shell, so ordinary users do not need to choose it manually.
 
 Manage the Codex proxy patch explicitly:
 
@@ -340,7 +353,7 @@ codex-helper-gui
 cargo run --release --features gui --bin codex-helper-gui
 ```
 
-The GUI can start or attach to a proxy, edit common single-endpoint providers, route nodes, and routing, and inspect requests, balances, pricing, sessions, health, breaker state, and control-plane status. Complex multi-endpoint providers, model mappings, and advanced fields should still be edited through CLI or raw TOML.
+The GUI can start or explicitly attach to a proxy, edit common single-endpoint providers, route nodes, and routing, and inspect requests, balances, pricing, sessions, health, breaker state, and control-plane status. By default, a GUI-started proxy stops when the GUI exits; attaching to an existing proxy must be selected explicitly, and closing the GUI only detaches instead of stopping someone else’s process. Complex multi-endpoint providers, model mappings, and advanced fields should still be edited through CLI or raw TOML.
 
 ## File Locations
 

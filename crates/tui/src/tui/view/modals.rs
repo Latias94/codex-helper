@@ -19,7 +19,7 @@ use super::widgets::centered_rect;
 mod help;
 pub(super) use help::render_help_modal;
 #[cfg(test)]
-use help::{current_page_help_lines, help_text_for_tests};
+use help::{current_page_help_lines, help_quit_line_for_tests, help_text_for_tests};
 
 mod profile;
 pub(super) use profile::render_profile_modal_v2;

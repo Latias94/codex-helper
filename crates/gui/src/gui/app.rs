@@ -30,60 +30,6 @@ impl StartupBehavior {
     }
 }
 
-fn parse_port_from_base_url(base_url: &str) -> Option<u16> {
-    let input = base_url.trim();
-    if input.is_empty() {
-        return None;
-    }
-
-    let after_scheme = input
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(input);
-
-    let host_port = after_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or(after_scheme)
-        .trim();
-
-    if host_port.is_empty() {
-        return None;
-    }
-
-    // Support `[::1]:3211` as well as `127.0.0.1:3211`.
-    let port_str = if let Some(rest) = host_port.strip_prefix('[') {
-        let (_, after) = rest.split_once(']')?;
-        after.strip_prefix(':')?
-    } else {
-        let (_, port) = host_port.rsplit_once(':')?;
-        port
-    };
-
-    port_str.trim().parse::<u16>().ok()
-}
-
-fn infer_port_from_client_config(gui_cfg: &GuiConfig) -> Option<u16> {
-    match gui_cfg.service_kind() {
-        crate::config::ServiceKind::Claude => {
-            let st = crate::codex_integration::claude_switch_status().ok()?;
-            if !st.enabled {
-                return None;
-            }
-            let base_url = st.base_url.as_deref()?;
-            parse_port_from_base_url(base_url)
-        }
-        _ => {
-            let st = crate::codex_integration::codex_switch_status().ok()?;
-            if !st.enabled {
-                return None;
-            }
-            let base_url = st.base_url.as_deref()?;
-            parse_port_from_base_url(base_url)
-        }
-    }
-}
-
 pub fn run() -> eframe::Result<()> {
     let log_guard = init_gui_tracing();
 
@@ -213,6 +159,12 @@ impl eframe::App for GuiApp {
             std::time::Duration::from_millis(self.gui_cfg.ui.refresh_ms.clamp(100, 5_000));
         ctx.request_repaint_after(refresh);
 
+        if self.proxy.poll_running_exit(&self.rt) {
+            if let Some(error) = self.proxy.last_start_error() {
+                self.last_error = Some(error.to_string());
+            }
+        }
+
         if self
             .single_instance
             .as_ref()
@@ -238,9 +190,8 @@ impl eframe::App for GuiApp {
             self.tray = None;
         }
 
-        // Auto start (and optionally prompt/attach on port-in-use).
-        // NOTE: Do NOT auto-attach by default. If a proxy is already running, we prefer to
-        // show the standard "port in use" prompt (or follow user's configured action).
+        // Default GUI startup owns its runtime: no silent attach-first and no implicit resident
+        // proxy. Attach remains explicit from the Overview/Setup pages.
         if !self.did_auto_connect
             && self.gui_cfg.proxy.auto_attach_or_start
             && matches!(
@@ -254,7 +205,6 @@ impl eframe::App for GuiApp {
                 .gui_cfg
                 .attach
                 .last_port
-                .or_else(|| infer_port_from_client_config(&self.gui_cfg))
                 .unwrap_or(self.gui_cfg.proxy.default_port);
 
             self.proxy.set_desired_port(preferred_port);
@@ -499,20 +449,23 @@ impl eframe::App for GuiApp {
                     }
                     TrayAction::Quit => {
                         self.allow_close_once = true;
-                        let _ = self.proxy.stop(&self.rt);
+                        let _ = self.proxy.stop_owned(&self.rt);
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 }
             }
         }
 
-        // Close behavior: default "minimize_to_tray".
+        // Close behavior: default "exit". Minimize-to-tray is still available for users who
+        // explicitly want a Clash-like background GUI.
         if ctx.input(|i| i.viewport().close_requested()) {
             if self.allow_close_once {
                 self.allow_close_once = false;
             } else if self.gui_cfg.window.close_behavior == "minimize_to_tray" {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            } else {
+                let _ = self.proxy.stop_owned(&self.rt);
             }
         }
 
@@ -554,6 +507,10 @@ impl eframe::App for GuiApp {
         if let Some(next) = self.view.requested_page.take() {
             self.page = next;
         }
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        let _ = self.proxy.stop_owned(&self.rt);
     }
 }
 

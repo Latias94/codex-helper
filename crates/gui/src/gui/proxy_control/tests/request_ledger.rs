@@ -9,6 +9,7 @@ fn sample_request(id: u64) -> FinishedRequest {
         id,
         trace_id: Some(format!("codex-{id}")),
         session_id: Some("sid-ledger".to_string()),
+        session_identity_source: None,
         client_name: None,
         client_addr: None,
         cwd: None,
@@ -76,6 +77,72 @@ fn read_request_ledger_records_prefers_attached_api_when_supported() {
     assert_eq!(result.records.len(), 1);
     assert_eq!(result.records[0].id, 77);
     assert_eq!(result.records[0].model.as_deref(), Some("gpt-5.4"));
+
+    handle.abort();
+}
+
+#[test]
+fn stop_owned_detaches_attached_proxy_without_remote_shutdown() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let shutdown_calls = Arc::new(Mutex::new(0usize));
+    let shutdown_calls_handler = shutdown_calls.clone();
+    let app = Router::new().route(
+        "/__codex_helper/api/v1/runtime/shutdown",
+        post(move || {
+            let shutdown_calls = shutdown_calls_handler.clone();
+            async move {
+                *shutdown_calls.lock().expect("shutdown call lock") += 1;
+                StatusCode::OK
+            }
+        }),
+    );
+    let (base_url, handle) = spawn_test_server(&rt, app);
+
+    let mut controller = ProxyController::new(4299, ServiceKind::Codex);
+    let mut attached = AttachedStatus::new(4299);
+    attached.admin_base_url = base_url;
+    attached.supports_runtime_shutdown_api = true;
+    controller.mode = ProxyMode::Attached(attached);
+
+    controller
+        .stop_owned(&rt)
+        .expect("detach attached proxy on owner exit");
+
+    assert!(matches!(controller.kind(), ProxyModeKind::Stopped));
+    assert_eq!(*shutdown_calls.lock().expect("shutdown call lock"), 0);
+
+    handle.abort();
+}
+
+#[test]
+fn explicit_stop_uses_attached_runtime_shutdown_api() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let shutdown_calls = Arc::new(Mutex::new(0usize));
+    let shutdown_calls_handler = shutdown_calls.clone();
+    let app = Router::new().route(
+        "/__codex_helper/api/v1/runtime/shutdown",
+        post(move || {
+            let shutdown_calls = shutdown_calls_handler.clone();
+            async move {
+                *shutdown_calls.lock().expect("shutdown call lock") += 1;
+                StatusCode::OK
+            }
+        }),
+    );
+    let (base_url, handle) = spawn_test_server(&rt, app);
+
+    let mut controller = ProxyController::new(4300, ServiceKind::Codex);
+    let mut attached = AttachedStatus::new(4300);
+    attached.admin_base_url = base_url;
+    attached.supports_runtime_shutdown_api = true;
+    controller.mode = ProxyMode::Attached(attached);
+
+    controller
+        .stop(&rt)
+        .expect("shutdown attached proxy explicitly");
+
+    assert!(matches!(controller.kind(), ProxyModeKind::Stopped));
+    assert_eq!(*shutdown_calls.lock().expect("shutdown call lock"), 1);
 
     handle.abort();
 }

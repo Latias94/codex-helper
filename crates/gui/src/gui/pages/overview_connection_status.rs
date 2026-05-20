@@ -116,6 +116,19 @@ fn render_runtime_action_buttons(
                 }
             }
             ProxyModeKind::Attached => {
+                if ui
+                    .button(pick(ctx.lang, "停止远端代理", "Stop remote proxy"))
+                    .clicked()
+                {
+                    if let Err(error) = ctx.proxy.stop(ctx.rt) {
+                        *ctx.last_error = Some(format!("stop remote proxy failed: {error}"));
+                    } else {
+                        *ctx.last_info = Some(
+                            pick(ctx.lang, "已请求停止远端代理", "Remote proxy stopped")
+                                .to_string(),
+                        );
+                    }
+                }
                 if ui.button(pick(ctx.lang, "取消附着", "Detach")).clicked() {
                     ctx.proxy.clear_port_in_use_modal();
                     ctx.proxy.detach();

@@ -13,6 +13,7 @@ pub(super) const API_V1_STATUS_STATION_HEALTH: &str =
     "/__codex_helper/api/v1/status/station-health";
 pub(super) const API_V1_RUNTIME_STATUS: &str = "/__codex_helper/api/v1/runtime/status";
 pub(super) const API_V1_RUNTIME_RELOAD: &str = "/__codex_helper/api/v1/runtime/reload";
+pub(super) const API_V1_RUNTIME_SHUTDOWN: &str = "/__codex_helper/api/v1/runtime/shutdown";
 pub(super) const API_V1_REQUEST_LEDGER_RECENT: &str =
     "/__codex_helper/api/v1/request-ledger/recent";
 pub(super) const API_V1_REQUEST_LEDGER_SUMMARY: &str =
@@ -80,6 +81,7 @@ const API_V1_ENDPOINT_PATHS: &[&str] = &[
     API_V1_STATUS_STATION_HEALTH,
     API_V1_RUNTIME_STATUS,
     API_V1_RUNTIME_RELOAD,
+    API_V1_RUNTIME_SHUTDOWN,
     API_V1_REQUEST_LEDGER_RECENT,
     API_V1_REQUEST_LEDGER_SUMMARY,
     API_V1_CONTROL_TRACE,
@@ -138,6 +140,7 @@ pub(super) fn api_v1_surface_capabilities() -> ControlPlaneSurfaceCapabilities {
         status_station_health: true,
         runtime_status: true,
         runtime_reload: true,
+        runtime_shutdown: true,
         request_ledger_recent: true,
         request_ledger_summary: true,
         control_trace: true,
@@ -181,6 +184,7 @@ pub(super) fn api_v1_operator_summary_links() -> OperatorSummaryLinks {
         status_active: API_V1_STATUS_ACTIVE.to_string(),
         runtime_status: API_V1_RUNTIME_STATUS.to_string(),
         runtime_reload: API_V1_RUNTIME_RELOAD.to_string(),
+        runtime_shutdown: API_V1_RUNTIME_SHUTDOWN.to_string(),
         status_recent: API_V1_STATUS_RECENT.to_string(),
         status_session_stats: API_V1_STATUS_SESSION_STATS.to_string(),
         status_health_checks: API_V1_STATUS_HEALTH_CHECKS.to_string(),

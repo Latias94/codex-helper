@@ -867,6 +867,67 @@ pub(super) fn render_settings_page(
         Style::default().fg(p.text).add_modifier(Modifier::BOLD),
     )]));
     lines.push(Line::from(vec![
+        Span::styled(
+            match ui.language {
+                Language::Zh => "连接：",
+                Language::En => "connection: ",
+            },
+            Style::default().fg(p.muted),
+        ),
+        Span::styled(
+            ui.runtime_connection.label(ui.language),
+            Style::default().fg(if ui.runtime_connection.is_attached() {
+                p.accent
+            } else {
+                p.text
+            }),
+        ),
+        Span::styled(
+            format!(
+                "  shutdown: {}",
+                match ui.runtime_shutdown_available {
+                    Some(true) => match ui.language {
+                        Language::Zh => "可用",
+                        Language::En => "available",
+                    },
+                    Some(false) => match ui.language {
+                        Language::Zh => "不可用",
+                        Language::En => "unavailable",
+                    },
+                    None => "-",
+                }
+            ),
+            Style::default().fg(p.muted),
+        ),
+    ]));
+    if ui.runtime_connection.is_attached() {
+        lines.push(Line::from(vec![Span::styled(
+            match ui.language {
+                Language::Zh => {
+                    "  附着 TUI 是只读观察路径：q 只退出控制台，不会停止 resident proxy；停止代理请用 `codex-helper daemon stop`。"
+                }
+                Language::En => {
+                    "  Attached TUI is read-only: q exits only the console and keeps the resident proxy running; stop it with `codex-helper daemon stop`."
+                }
+            },
+            Style::default().fg(p.muted),
+        )]));
+    }
+    if let Some(error) = ui.runtime_status_error.as_deref()
+        && !error.trim().is_empty()
+    {
+        lines.push(Line::from(vec![
+            Span::styled(
+                match ui.language {
+                    Language::Zh => "  状态刷新失败：",
+                    Language::En => "  status refresh failed: ",
+                },
+                Style::default().fg(p.warn),
+            ),
+            Span::styled(shorten(error, 96), Style::default().fg(p.warn)),
+        ]));
+    }
+    lines.push(Line::from(vec![
         Span::styled("5m ", Style::default().fg(p.muted)),
         Span::styled(
             format!(

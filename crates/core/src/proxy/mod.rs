@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use reqwest::Client;
+use tokio::sync::watch;
 
 mod admin;
 mod api_responses;
@@ -134,6 +135,7 @@ pub struct ProxyService {
     concurrency_limiter: Arc<ConcurrencyLimiter>,
     filter: RequestFilter,
     state: Arc<ProxyState>,
+    shutdown_tx: Option<watch::Sender<bool>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

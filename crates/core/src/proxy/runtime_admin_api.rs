@@ -182,6 +182,30 @@ pub(super) async fn runtime_status(
     Ok(Json(proxy.runtime_status().await))
 }
 
+#[derive(serde::Serialize)]
+pub(super) struct RuntimeShutdownResponse {
+    accepted: bool,
+    service_name: String,
+    message: String,
+}
+
+pub(super) async fn shutdown_runtime(
+    proxy: ProxyService,
+) -> Result<Json<RuntimeShutdownResponse>, (StatusCode, String)> {
+    if proxy.request_shutdown() {
+        return Ok(Json(RuntimeShutdownResponse {
+            accepted: true,
+            service_name: proxy.service_name.to_string(),
+            message: "runtime shutdown requested".to_string(),
+        }));
+    }
+
+    Err((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "runtime shutdown is not available for this proxy instance".to_string(),
+    ))
+}
+
 pub(super) async fn get_retry_config(
     proxy: ProxyService,
 ) -> Result<Json<RetryConfigResponse>, (StatusCode, String)> {

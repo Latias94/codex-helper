@@ -509,6 +509,10 @@ async fn proxy_api_v1_operator_summary_reports_runtime_target_and_retry() {
         Some("/__codex_helper/api/v1/runtime/status")
     );
     assert_eq!(
+        summary["links"]["runtime_shutdown"].as_str(),
+        Some("/__codex_helper/api/v1/runtime/shutdown")
+    );
+    assert_eq!(
         summary["links"]["retry_config"].as_str(),
         Some("/__codex_helper/api/v1/retry/config")
     );

@@ -173,6 +173,8 @@ pub struct OperatorSummaryLinks {
     pub status_active: String,
     pub runtime_status: String,
     pub runtime_reload: String,
+    #[serde(default)]
+    pub runtime_shutdown: String,
     pub status_recent: String,
     pub status_session_stats: String,
     pub status_health_checks: String,

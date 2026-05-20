@@ -30,6 +30,8 @@ pub struct RuntimeStatusResponse {
     pub loaded_at_ms: u64,
     pub source_mtime_ms: Option<u64>,
     pub retry: crate::config::ResolvedRetryConfig,
+    #[serde(default)]
+    pub shutdown_available: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -211,6 +213,7 @@ pub(super) async fn build_runtime_status_response(proxy: &ProxyService) -> Runti
         loaded_at_ms: proxy.config.last_loaded_at_ms(),
         source_mtime_ms: proxy.config.last_mtime_ms().await,
         retry: cfg.retry.resolve(),
+        shutdown_available: proxy.shutdown_available(),
     }
 }
 

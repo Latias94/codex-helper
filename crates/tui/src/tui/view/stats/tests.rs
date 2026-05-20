@@ -83,6 +83,7 @@ fn sample_priced_request(ended_at_ms: u64, usd: &str) -> FinishedRequest {
         id: ended_at_ms,
         trace_id: None,
         session_id: None,
+        session_identity_source: None,
         client_name: None,
         client_addr: None,
         cwd: None,

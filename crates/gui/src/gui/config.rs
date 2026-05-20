@@ -219,11 +219,11 @@ fn default_history_group_open_recent_n() -> usize {
 }
 
 fn default_close_behavior() -> String {
-    "minimize_to_tray".to_string()
+    "exit".to_string()
 }
 
 fn default_startup_behavior() -> String {
-    "minimize_to_tray".to_string()
+    "show".to_string()
 }
 
 impl GuiConfig {
@@ -284,5 +284,19 @@ impl GuiConfig {
         let text = toml::to_string_pretty(self)?;
         std::fs::write(&path, text)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_defaults_tests {
+    use super::*;
+
+    #[test]
+    fn gui_defaults_do_not_create_background_owner_by_surprise() {
+        let cfg = GuiConfig::default();
+
+        assert!(!cfg.proxy.auto_attach_or_start);
+        assert_eq!(cfg.window.close_behavior, "exit");
+        assert_eq!(cfg.window.startup_behavior, "show");
     }
 }

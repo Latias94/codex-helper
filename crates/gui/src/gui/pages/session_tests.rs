@@ -47,6 +47,7 @@ fn sample_finished_request(session_id: Option<&str>, ended_at_ms: u64) -> Finish
         id: ended_at_ms,
         trace_id: Some(format!("trace-{ended_at_ms}")),
         session_id: session_id.map(ToOwned::to_owned),
+        session_identity_source: None,
         client_name: None,
         client_addr: None,
         cwd: None,
@@ -302,6 +303,7 @@ fn session_current_target_summary_prefers_session_affinity() {
     });
     row.route_affinity = Some(SessionRouteAffinity {
         route_graph_key: "v4:deadbeef".to_string(),
+        session_identity_source: None,
         provider_endpoint: codex_helper_core::runtime_identity::ProviderEndpointKey::new(
             "codex", "right", "default",
         ),

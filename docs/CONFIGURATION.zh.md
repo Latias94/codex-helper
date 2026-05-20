@@ -69,6 +69,10 @@ codex-helper switch on --preset default
 
 旧 CLI 写法 `--mode ...` 仍作为 alias 保留。启动时，`codex-helper serve` 会在 Codex 尚未切到 codex-helper 时读取 `[codex.client_patch]`；如果 Codex 已经切到 helper，则保留当前客户端 patch 预设。要显式切换，可使用 `switch on --preset ...` 或 TUI Settings 页的 `B`/`I`/`F`/`D`。
 
+默认情况下，控制台拥有代理生命周期：`codex-helper serve` 会在内置 TUI 退出时停止代理并恢复本地客户端 patch，GUI 也会在退出时停止由它自己启动的代理。如果希望本地代理长期运行，可以显式使用 `codex-helper serve --resident`。resident 模式在控制台退出时保留客户端 patch，暴露 `/__codex_helper/api/v1/runtime/shutdown`，并可用 `codex-helper daemon status` 查看、`codex-helper daemon stop` 停止。`codex-helper tui --codex` 或 `codex-helper tui --claude` 可以只读附着到已有 resident proxy，退出这个 TUI 只会关闭控制台，不会停止代理。GUI 也可以在 setup/overview 页显式附着已有代理，但启动时不会再静默接管 Codex/Claude 当前配置指向的本地 helper 端口。需要前台 watchdog 时，可以运行 `codex-helper daemon supervise --codex`；它会用有界退避重启崩溃的 resident 子进程，并把轻量 crash marker 写到 `~/.codex-helper/run/` 便于排查。
+
+Resident runtime 会在 `~/.codex-helper/run/` 下尽力写入 owner marker，让 `daemon status` 能区分 manual CLI、supervisor 以及未来桌面/托盘拥有的 sidecar。这些 marker 只是可观测性元数据：即使缺失、损坏或清理失败，也不应该阻止代理启动、退出或被显式停止。desktop-managed sidecar 模式在有可见桌面/托盘外壳前保持隐藏；普通 `serve` 和 GUI 启动默认仍然不是常驻模式。
+
 `chatgpt-bridge` 会写入 `~/.codex/config.toml` 的 `requires_openai_auth = true`、`supports_websockets = false`，并把 `~/.codex/auth.json` 中的 `auth_mode` 改为 `"chatgpt"`、`OPENAI_API_KEY` 改为 `null`，其它字段保持不变。启用前必须已经在官方 Codex 里完成 ChatGPT 登录；如果 `auth.json` 没有完整 token、email 和账号信息，codex-helper 会在写入 `config.toml` / `auth.json` 前拒绝 patch，避免 Codex TUI 启动时报 `email and plan type are required for chatgpt authentication`。修改 Codex 客户端配置后，已经打开的 Codex app 通常需要重启后才会读取新配置。
 
 `imagegen-bridge` 是显式的实验 hack 预设。它会把 `~/.codex/auth.json` 临时写成空对象 `{}`，让 Codex 的默认 auth 解析仍把会话视为 ChatGPT-backed 并暴露 hosted `image_generation` tool；真实上游凭据仍来自 codex-helper routing（`auth_token_env`、`auth_token`、`api_key_env` 或 `api_key`）。它不要求官方 ChatGPT 登录，也不会显式写入 `auth_mode`。启用前，codex-helper 会校验 Codex 服务至少有一个已启用上游，并且当前进程实际能取得至少一个上游凭据；对于环境变量凭据，只在配置里写 env var 名称不够，运行 `switch on` 或启动 `serve` 时该环境变量必须有值。codex-helper 会把旧 `auth.json` 存入 switch state，并在切回 `default` 或执行 `switch off` 时恢复；但只有当前 `auth.json` 仍等于 helper 写入的 facade 时才恢复。如果用户或 Codex 期间改过 `auth.json`，codex-helper 会保持现状，不覆盖用户变更。

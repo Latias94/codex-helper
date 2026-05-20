@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "slug": "resident-proxy-attach-first",
+  "title": "Resident Proxy And Attach-First Operator Consoles",
+  "status": "closed",
+  "updated": "2026-05-20",
+  "scope_kind": "execution",
+  "problem": "The proxy lifetime is coupled to interactive TUI/GUI processes, which weakens long-running local proxy stability and recovery.",
+  "authoritative_docs": [
+    {
+      "role": "design",
+      "path": "docs/workstreams/resident-proxy-attach-first/DESIGN.md"
+    },
+    {
+      "role": "execution",
+      "path": "docs/workstreams/resident-proxy-attach-first/TODO.md"
+    },
+    {
+      "role": "gates",
+      "path": "docs/workstreams/resident-proxy-attach-first/EVIDENCE_AND_GATES.md"
+    }
+  ],
+  "gates": [
+    "cargo fmt --check",
+    "cargo check --workspace",
+    "cargo nextest run --workspace -j 4 --no-fail-fast"
+  ],
+  "evidence": [
+    "docs/workstreams/resident-proxy-attach-first/DESIGN.md",
+    "docs/workstreams/resident-proxy-attach-first/TODO.md",
+    "docs/workstreams/resident-proxy-attach-first/EVIDENCE_AND_GATES.md"
+  ],
+  "adr_refs": [],
+  "continue_policy": {
+    "default_action": "close",
+    "notes": "Resident proxy, attach-first GUI/TUI, lightweight supervisor, crash markers, docs, and targeted verification are complete. Split OS-service installation or richer attached-TUI mutations into follow-ons if requested."
+  }
+}

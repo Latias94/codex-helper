@@ -8,6 +8,7 @@ pub(super) fn status_and_runtime_routes(proxy: ProxyService) -> Router {
     let station_health_proxy = proxy.clone();
     let runtime_status_proxy = proxy.clone();
     let runtime_reload_proxy = proxy.clone();
+    let runtime_shutdown_proxy = proxy.clone();
     let request_ledger_proxy = proxy.clone();
     let request_ledger_summary_proxy = proxy.clone();
     let control_trace_proxy = proxy.clone();
@@ -42,6 +43,10 @@ pub(super) fn status_and_runtime_routes(proxy: ProxyService) -> Router {
         .route(
             API_V1_RUNTIME_RELOAD,
             post(move || reload_runtime_config(runtime_reload_proxy.clone())),
+        )
+        .route(
+            API_V1_RUNTIME_SHUTDOWN,
+            post(move || shutdown_runtime(runtime_shutdown_proxy.clone())),
         )
         .route(
             API_V1_REQUEST_LEDGER_RECENT,

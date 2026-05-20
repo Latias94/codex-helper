@@ -240,6 +240,7 @@ mod tests {
             id: 7,
             trace_id: Some("codex-7".to_string()),
             session_id: Some("sid".to_string()),
+            session_identity_source: None,
             client_name: None,
             client_addr: None,
             cwd: None,

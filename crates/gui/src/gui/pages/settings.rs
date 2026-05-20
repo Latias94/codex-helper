@@ -43,11 +43,7 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         let mut enabled = ctx.gui_cfg.proxy.auto_attach_or_start;
         ui.checkbox(
             &mut enabled,
-            pick(
-                ctx.lang,
-                "启动时自动附着/启动代理",
-                "Auto attach-or-start on launch",
-            ),
+            pick(ctx.lang, "启动时自动启动代理", "Auto start proxy on launch"),
         );
         if enabled != ctx.gui_cfg.proxy.auto_attach_or_start {
             ctx.gui_cfg.proxy.auto_attach_or_start = enabled;
@@ -140,12 +136,12 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         egui::ComboBox::from_id_salt("window_close_behavior")
             .selected_text(behavior.as_str())
             .show_ui(ui, |ui| {
+                ui.selectable_value(&mut behavior, "exit".to_string(), "exit");
                 ui.selectable_value(
                     &mut behavior,
                     "minimize_to_tray".to_string(),
                     "minimize_to_tray",
                 );
-                ui.selectable_value(&mut behavior, "exit".to_string(), "exit");
             });
         if behavior != ctx.gui_cfg.window.close_behavior {
             ctx.gui_cfg.window.close_behavior = behavior;
@@ -211,8 +207,8 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         }
         ui.label(pick(
             ctx.lang,
-            "(托盘菜单：Show/Hide、Start/Stop、Quit)",
-            "(Tray menu: Show/Hide, Start/Stop, Quit)",
+            "(默认关闭窗口会退出代理；托盘菜单 Quit 也会完全退出)",
+            "(By default closing the window exits the proxy; tray Quit exits fully too)",
         ));
     });
 

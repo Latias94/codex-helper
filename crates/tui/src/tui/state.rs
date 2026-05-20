@@ -85,6 +85,27 @@ pub(in crate::tui) struct CodexRelayLiveSmokeState {
     pub(in crate::tui) last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::tui) enum RuntimeConnectionKind {
+    Integrated,
+    Attached,
+}
+
+impl RuntimeConnectionKind {
+    pub(in crate::tui) fn label(self, lang: Language) -> &'static str {
+        match (self, lang) {
+            (RuntimeConnectionKind::Integrated, Language::Zh) => "内置",
+            (RuntimeConnectionKind::Integrated, Language::En) => "integrated",
+            (RuntimeConnectionKind::Attached, Language::Zh) => "已附着",
+            (RuntimeConnectionKind::Attached, Language::En) => "attached",
+        }
+    }
+
+    pub(in crate::tui) fn is_attached(self) -> bool {
+        matches!(self, RuntimeConnectionKind::Attached)
+    }
+}
+
 #[derive(Debug)]
 pub(in crate::tui) struct UiState {
     pub(in crate::tui) service_name: &'static str,
@@ -93,6 +114,9 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) usage_forecast: UsageForecastConfig,
     pub(in crate::tui) refresh_ms: u64,
     pub(in crate::tui) config_version: Option<u32>,
+    pub(in crate::tui) runtime_connection: RuntimeConnectionKind,
+    pub(in crate::tui) runtime_shutdown_available: Option<bool>,
+    pub(in crate::tui) runtime_status_error: Option<String>,
     pub(in crate::tui) page: Page,
     pub(in crate::tui) focus: Focus,
     pub(in crate::tui) overlay: Overlay,
@@ -200,6 +224,9 @@ impl Default for UiState {
             usage_forecast: UsageForecastConfig::default(),
             refresh_ms: 500,
             config_version: None,
+            runtime_connection: RuntimeConnectionKind::Integrated,
+            runtime_shutdown_available: None,
+            runtime_status_error: None,
             page: Page::Dashboard,
             focus: Focus::Sessions,
             overlay: Overlay::None,

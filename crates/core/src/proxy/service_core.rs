@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use reqwest::Client;
+use tokio::sync::watch;
 
 use crate::config::{
     PersistedProviderSpec, PersistedProvidersCatalog, PersistedRoutingSpec, ProxyConfig,
@@ -38,6 +39,24 @@ impl ProxyService {
         service_name: &'static str,
         lb_states: Arc<Mutex<HashMap<String, LbState>>>,
     ) -> Self {
+        Self::new_with_v4_source_and_shutdown(
+            client,
+            config,
+            v4_source,
+            service_name,
+            lb_states,
+            None,
+        )
+    }
+
+    pub fn new_with_v4_source_and_shutdown(
+        client: Client,
+        config: Arc<ProxyConfig>,
+        v4_source: Option<Arc<ProxyConfigV4>>,
+        service_name: &'static str,
+        lb_states: Arc<Mutex<HashMap<String, LbState>>>,
+        shutdown_tx: Option<watch::Sender<bool>>,
+    ) -> Self {
         let state = ProxyState::new_with_lb_states(Some(lb_states.clone()));
         ProxyState::spawn_cleanup_task(state.clone());
         if !cfg!(test) {
@@ -69,6 +88,7 @@ impl ProxyService {
             concurrency_limiter: Arc::new(super::concurrency_limits::ConcurrencyLimiter::default()),
             filter: RequestFilter::new(),
             state,
+            shutdown_tx,
         }
     }
 
@@ -112,6 +132,16 @@ impl ProxyService {
 
     pub fn state_handle(&self) -> Arc<ProxyState> {
         self.state.clone()
+    }
+
+    pub fn shutdown_available(&self) -> bool {
+        self.shutdown_tx.is_some()
+    }
+
+    pub fn request_shutdown(&self) -> bool {
+        self.shutdown_tx
+            .as_ref()
+            .is_some_and(|shutdown_tx| shutdown_tx.send(true).is_ok())
     }
 
     pub fn spawn_initial_balance_refresh(&self) {

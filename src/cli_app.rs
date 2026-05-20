@@ -1,5 +1,5 @@
 use crate::cli_types::{
-    Cli, CliError, CliResult, CodexClientPatchPresetArg, Command, NotifyCommand,
+    Cli, CliError, CliResult, CodexClientPatchPresetArg, Command, DaemonCommand, NotifyCommand,
     RemoteControlCommand, SwitchCommand,
 };
 use crate::codex_integration;
@@ -7,26 +7,28 @@ use crate::commands;
 use crate::config::{
     ServiceKind, claude_settings_backup_path, claude_settings_path, codex_auth_path,
     codex_client_patch_config_from_config_file, codex_config_path, codex_switch_state_path,
-    load_config, load_or_bootstrap_for_service_with_v4_source, model_routing_warnings,
-    normalize_config_toml_authoring,
+    load_config, load_or_bootstrap_for_service_with_v4_source, normalize_config_toml_authoring,
 };
 use crate::notify;
-use crate::proxy::{
-    ProxyService, admin_listener_router, admin_loopback_addr_for_proxy_port, local_proxy_base_url,
-    proxy_only_router_with_admin_base_url,
+use crate::proxy::admin_loopback_addr_for_proxy_port;
+use crate::runtime_host::{
+    build_proxy_runtime_from_bound_listeners, validate_service_has_upstream,
+};
+use crate::runtime_manager::{
+    RuntimeOwnerKind, RuntimeOwnerMarker, RuntimeOwnerMarkerGuard, clear_owner_marker,
+    read_owner_marker_best_effort, write_owner_marker,
 };
 use crate::tui;
 
-use axum::Router;
 use clap::Parser;
 use owo_colors::OwoColorize;
 use reqwest::Client;
-use std::collections::HashMap;
+use serde_json::Value as JsonValue;
 use std::io::ErrorKind;
 use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::time::Duration;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 
@@ -40,9 +42,32 @@ pub async fn run_cli() -> CliResult<()> {
         claude: false,
         host: IpAddr::from([127, 0, 0, 1]),
         no_tui: false,
+        resident: false,
+        supervisor_managed: false,
+        desktop_managed: false,
     }) {
         Command::Default { codex, claude } => {
             handle_default_cmd(codex, claude).await?;
+            return Ok(());
+        }
+        Command::Daemon { cmd } => {
+            handle_daemon_cmd(cmd).await?;
+            return Ok(());
+        }
+        Command::Tui {
+            codex,
+            claude,
+            port,
+        } => {
+            let service_name = resolve_cli_service_name(codex, claude).await?;
+            let port = port.unwrap_or_else(|| default_proxy_port_for_service(service_name));
+            tui::run_attached_dashboard(
+                service_name,
+                port,
+                admin_loopback_addr_for_proxy_port(port).port(),
+            )
+            .await
+            .map_err(|e| CliError::Other(e.to_string()))?;
             return Ok(());
         }
         Command::Switch { cmd } => {
@@ -113,37 +138,28 @@ pub async fn run_cli() -> CliResult<()> {
             claude,
             host,
             no_tui,
+            resident,
+            supervisor_managed,
+            desktop_managed,
         } => {
-            if codex && claude {
+            if supervisor_managed && desktop_managed {
                 return Err(CliError::Other(
-                    "Please specify at most one of --codex / --claude".to_string(),
+                    "--supervisor-managed and --desktop-managed are mutually exclusive".to_string(),
                 ));
             }
-
-            // Explicit flags win; otherwise decide based on default_service (fallback: Codex).
-            let service_name = if claude {
-                "claude"
-            } else if codex {
-                "codex"
-            } else {
-                match load_config().await {
-                    Ok(cfg) => match cfg.default_service {
-                        Some(ServiceKind::Claude) => "claude",
-                        _ => "codex",
-                    },
-                    Err(err) => {
-                        tracing::warn!(
-                            "Failed to load config for default service, falling back to Codex: {}",
-                            err
-                        );
-                        "codex"
-                    }
-                }
-            };
-            let port = port.unwrap_or_else(|| if service_name == "codex" { 3211 } else { 3210 });
-            run_server(service_name, host, port, !no_tui)
-                .await
-                .map_err(|e| CliError::Other(e.to_string()))?;
+            let service_name = resolve_cli_service_name(codex, claude).await?;
+            let port = port.unwrap_or_else(|| default_proxy_port_for_service(service_name));
+            run_server(
+                service_name,
+                host,
+                port,
+                !no_tui,
+                resident,
+                supervisor_managed,
+                desktop_managed,
+            )
+            .await
+            .map_err(|e| CliError::Other(e.to_string()))?;
         }
     }
 
@@ -157,8 +173,22 @@ fn init_tracing(cli: &Cli) -> Option<WorkerGuard> {
     // When the built-in TUI is enabled, writing logs to the same terminal will cause flicker and
     // "bleeding" output. In that case, redirect tracing output to a file by default.
     let interactive_tui = match &cli.command {
-        Some(Command::Serve { no_tui, .. }) => {
-            !*no_tui && atty::is(atty::Stream::Stdin) && atty::is(atty::Stream::Stdout)
+        Some(Command::Serve {
+            no_tui,
+            resident,
+            supervisor_managed,
+            desktop_managed,
+            ..
+        }) => {
+            !*resident
+                && !*supervisor_managed
+                && !*desktop_managed
+                && !*no_tui
+                && atty::is(atty::Stream::Stdin)
+                && atty::is(atty::Stream::Stdout)
+        }
+        Some(Command::Tui { .. }) => {
+            atty::is(atty::Stream::Stdin) && atty::is(atty::Stream::Stdout)
         }
         None => atty::is(atty::Stream::Stdin) && atty::is(atty::Stream::Stdout),
         _ => false,
@@ -247,20 +277,452 @@ fn read_existing_text(path: &std::path::Path) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
+async fn handle_daemon_cmd(cmd: DaemonCommand) -> CliResult<()> {
+    match cmd {
+        DaemonCommand::Status {
+            codex,
+            claude,
+            port,
+            json,
+        } => {
+            let service_name = resolve_cli_service_name(codex, claude).await?;
+            let port = port.unwrap_or_else(|| default_proxy_port_for_service(service_name));
+            print_daemon_status(service_name, port, json).await
+        }
+        DaemonCommand::Stop {
+            codex,
+            claude,
+            port,
+        } => {
+            let service_name = resolve_cli_service_name(codex, claude).await?;
+            let port = port.unwrap_or_else(|| default_proxy_port_for_service(service_name));
+            stop_daemon(service_name, port).await
+        }
+        DaemonCommand::Supervise {
+            codex,
+            claude,
+            host,
+            port,
+            max_restarts,
+        } => {
+            let service_name = resolve_cli_service_name(codex, claude).await?;
+            let port = port.unwrap_or_else(|| default_proxy_port_for_service(service_name));
+            supervise_daemon(service_name, host, port, max_restarts).await
+        }
+    }
+}
+
+async fn resolve_cli_service_name(codex: bool, claude: bool) -> CliResult<&'static str> {
+    if codex && claude {
+        return Err(CliError::Other(
+            "Please specify at most one of --codex / --claude".to_string(),
+        ));
+    }
+    if claude {
+        return Ok("claude");
+    }
+    if codex {
+        return Ok("codex");
+    }
+
+    match load_config().await {
+        Ok(cfg) => Ok(match cfg.default_service {
+            Some(ServiceKind::Claude) => "claude",
+            _ => "codex",
+        }),
+        Err(err) => {
+            tracing::warn!(
+                "Failed to load config for default service, falling back to Codex: {}",
+                err
+            );
+            Ok("codex")
+        }
+    }
+}
+
+fn default_proxy_port_for_service(service_name: &str) -> u16 {
+    if service_name == "claude" { 3210 } else { 3211 }
+}
+
+fn daemon_admin_base_url_for_proxy_port(port: u16) -> String {
+    format!("http://{}", admin_loopback_addr_for_proxy_port(port))
+}
+
+async fn daemon_admin_client() -> CliResult<Client> {
+    Client::builder()
+        .timeout(Duration::from_millis(1200))
+        .build()
+        .map_err(|err| CliError::Other(format!("failed to build daemon admin client: {err}")))
+}
+
+async fn get_daemon_json(port: u16, path: &str) -> CliResult<JsonValue> {
+    let client = daemon_admin_client().await?;
+    let url = format!("{}{}", daemon_admin_base_url_for_proxy_port(port), path);
+    let response = client.get(url).send().await.map_err(|err| {
+        CliError::Other(format!(
+            "local resident proxy is not reachable on admin port {}: {err}",
+            admin_loopback_addr_for_proxy_port(port).port()
+        ))
+    })?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(CliError::Other(format!(
+            "daemon admin request failed with status {status}: {}",
+            body.trim()
+        )));
+    }
+    response
+        .json::<JsonValue>()
+        .await
+        .map_err(|err| CliError::Other(format!("daemon admin response is not valid JSON: {err}")))
+}
+
+async fn print_daemon_status(service_name: &'static str, port: u16, json: bool) -> CliResult<()> {
+    let owner_marker = read_owner_marker_best_effort(service_name, port);
+    let value = match get_daemon_json(port, "/__codex_helper/api/v1/operator/summary").await {
+        Ok(value) => value,
+        Err(err) => {
+            if json {
+                let mut payload = serde_json::json!({
+                    "service_name": service_name,
+                    "port": port,
+                    "running": false,
+                    "error": err.to_string(),
+                });
+                if let Some(owner) = owner_marker.as_ref()
+                    && let Some(obj) = payload.as_object_mut()
+                {
+                    obj.insert("owner".to_string(), serde_json::json!(owner));
+                }
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
+                );
+                return Ok(());
+            }
+            println!("{}", "codex-helper daemon status".bold());
+            println!("{} {}:{}", "[DOWN]".yellow(), service_name, port);
+            println!("  {}", err);
+            println!(
+                "  高级模式可用 `codex-helper serve --{} --resident` 显式启动常驻代理。",
+                service_name
+            );
+            return Ok(());
+        }
+    };
+
+    if json {
+        let mut value = value;
+        if let Some(owner) = owner_marker.as_ref()
+            && let Some(obj) = value.as_object_mut()
+        {
+            obj.insert("owner".to_string(), serde_json::json!(owner));
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string())
+        );
+        return Ok(());
+    }
+
+    let reported_service = value
+        .get("service_name")
+        .and_then(JsonValue::as_str)
+        .unwrap_or(service_name);
+    let active = value
+        .pointer("/counts/active_requests")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(0);
+    let recent = value
+        .pointer("/counts/recent_requests")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(0);
+    let stations = value
+        .pointer("/counts/stations")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(0);
+    let active_station = value
+        .pointer("/runtime/effective_active_station")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("<none>");
+    let default_profile = value
+        .pointer("/runtime/default_profile")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("<none>");
+    let admin_addr = admin_loopback_addr_for_proxy_port(port);
+
+    println!("{}", "codex-helper daemon status".bold());
+    println!(
+        "{} {}:{} (admin: http://{})",
+        "[UP]".green(),
+        reported_service,
+        port,
+        admin_addr
+    );
+    if let Some(owner) = owner_marker.as_ref() {
+        println!(
+            "  owner: {} (mode: {}, pid: {})",
+            owner.owner, owner.lifecycle_mode, owner.pid
+        );
+    } else {
+        println!("  owner: <unknown/manual older runtime>");
+    }
+    println!("  active station: {active_station}");
+    println!("  default profile: {default_profile}");
+    println!("  active requests: {active}, recent requests: {recent}, stations: {stations}");
+    Ok(())
+}
+
+async fn stop_daemon(service_name: &'static str, port: u16) -> CliResult<()> {
+    let client = daemon_admin_client().await?;
+    let url = format!(
+        "{}{}",
+        daemon_admin_base_url_for_proxy_port(port),
+        "/__codex_helper/api/v1/runtime/shutdown"
+    );
+    let response = client.post(url).send().await.map_err(|err| {
+        CliError::Other(format!(
+            "local resident proxy is not reachable on admin port {}: {err}",
+            admin_loopback_addr_for_proxy_port(port).port()
+        ))
+    })?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(CliError::Other(format!(
+            "failed to stop {service_name} daemon on port {port}: status {status}: {}",
+            body.trim()
+        )));
+    }
+
+    println!(
+        "{} requested shutdown for {} daemon on port {}",
+        "[OK]".green(),
+        service_name,
+        port
+    );
+    Ok(())
+}
+
+async fn supervise_daemon(
+    service_name: &'static str,
+    host: IpAddr,
+    port: u16,
+    max_restarts: u32,
+) -> CliResult<()> {
+    let exe = std::env::current_exe()
+        .map_err(|err| CliError::Other(format!("failed to locate current executable: {err}")))?;
+    let crash_marker_path = supervisor_crash_marker_path(service_name, port);
+    let owner_marker = RuntimeOwnerMarker::new(RuntimeOwnerKind::Supervisor, service_name, port)
+        .with_note("supervisor is managing a resident proxy child");
+    if let Err(err) = write_owner_marker(&owner_marker) {
+        tracing::warn!("failed to write supervisor owner marker: {err}");
+    }
+    let _owner_marker_guard = RuntimeOwnerMarkerGuard::new(service_name, port, true);
+    let mut restart_count = 0u32;
+    println!(
+        "{} supervising {} resident proxy on http://{}:{}",
+        "[OK]".green(),
+        service_name,
+        host,
+        port
+    );
+
+    loop {
+        let mut args = vec![
+            "serve".to_string(),
+            format!("--{service_name}"),
+            "--host".to_string(),
+            host.to_string(),
+            "--port".to_string(),
+            port.to_string(),
+            "--resident".to_string(),
+            "--supervisor-managed".to_string(),
+        ];
+        if service_name != "codex" && service_name != "claude" {
+            args.retain(|arg| arg != &format!("--{service_name}"));
+        }
+
+        let mut child = tokio::process::Command::new(&exe)
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .map_err(|err| {
+                CliError::Other(format!(
+                    "failed to spawn resident proxy child {:?} {:?}: {err}",
+                    exe, args
+                ))
+            })?;
+
+        tokio::select! {
+            status = child.wait() => {
+                let status = status.map_err(|err| CliError::Other(format!("resident proxy child wait failed: {err}")))?;
+                if status.success() {
+                    clear_supervisor_crash_marker(&crash_marker_path);
+                    if let Err(err) = clear_owner_marker(service_name, port) {
+                        tracing::warn!("failed to clear supervisor owner marker: {err}");
+                    }
+                    println!(
+                        "{} {} resident proxy exited cleanly; supervisor is stopping",
+                        "[OK]".green(),
+                        service_name
+                    );
+                    return Ok(());
+                }
+
+                restart_count = restart_count.saturating_add(1);
+                record_supervisor_crash_marker(
+                    &crash_marker_path,
+                    service_name,
+                    host,
+                    port,
+                    restart_count,
+                    max_restarts,
+                    &status.to_string(),
+                );
+                if restart_count > max_restarts {
+                    return Err(CliError::Other(format!(
+                        "{} resident proxy crashed too many times ({restart_count}/{max_restarts}); last status: {status}",
+                        service_name
+                    )));
+                }
+
+                let delay_secs = supervisor_restart_delay_secs(restart_count);
+                println!(
+                    "{} {} resident proxy exited with {status}; restart {restart_count}/{max_restarts} in {delay_secs}s",
+                    "[WARN]".yellow(),
+                    service_name
+                );
+                tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+            }
+            _ = wait_for_shutdown_signal() => {
+                println!(
+                    "{} stopping supervisor and resident proxy child",
+                    "[INFO]".cyan()
+                );
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                if let Err(err) = clear_owner_marker(service_name, port) {
+                    tracing::warn!("failed to clear supervisor owner marker: {err}");
+                }
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn supervisor_crash_marker_path(service_name: &str, port: u16) -> PathBuf {
+    crate::config::proxy_home_dir()
+        .join("run")
+        .join(format!("{service_name}-{port}.supervisor-crash.json"))
+}
+
+fn clear_supervisor_crash_marker(path: &Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => tracing::warn!(
+            "failed to clear supervisor crash marker {:?}: {}",
+            path,
+            err
+        ),
+    }
+}
+
+fn record_supervisor_crash_marker(
+    path: &Path,
+    service_name: &str,
+    host: IpAddr,
+    port: u16,
+    restart_count: u32,
+    max_restarts: u32,
+    status: &str,
+) {
+    if let Some(parent) = path.parent()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        tracing::warn!(
+            "failed to create supervisor marker dir {:?}: {}",
+            parent,
+            err
+        );
+        return;
+    }
+
+    let payload = serde_json::json!({
+        "service_name": service_name,
+        "host": host.to_string(),
+        "port": port,
+        "restart_count": restart_count,
+        "max_restarts": max_restarts,
+        "status": status,
+        "recorded_at_ms": current_epoch_ms(),
+        "hint": "resident proxy child exited unexpectedly; supervisor will restart until max_restarts is exceeded"
+    });
+
+    match serde_json::to_string_pretty(&payload) {
+        Ok(text) => {
+            if let Err(err) = std::fs::write(path, text) {
+                tracing::warn!(
+                    "failed to write supervisor crash marker {:?}: {}",
+                    path,
+                    err
+                );
+            }
+        }
+        Err(err) => tracing::warn!("failed to serialize supervisor crash marker: {}", err),
+    }
+}
+
+fn current_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn supervisor_restart_delay_secs(restart_count: u32) -> u64 {
+    1u64 << restart_count.saturating_sub(1).min(5)
+}
+
 async fn run_server(
     service_name: &'static str,
     host: IpAddr,
     port: u16,
     enable_tui: bool,
+    resident: bool,
+    supervisor_managed: bool,
+    desktop_managed: bool,
 ) -> anyhow::Result<()> {
-    let interactive = enable_tui && atty::is(atty::Stream::Stdin) && atty::is(atty::Stream::Stdout);
+    let owner_kind = if desktop_managed {
+        Some(RuntimeOwnerKind::Desktop)
+    } else if supervisor_managed {
+        Some(RuntimeOwnerKind::Supervisor)
+    } else if resident {
+        Some(RuntimeOwnerKind::ManualCli)
+    } else {
+        None
+    };
+    let resident = resident || supervisor_managed || desktop_managed;
+    let interactive =
+        !resident && enable_tui && atty::is(atty::Stream::Stdin) && atty::is(atty::Stream::Stdout);
 
     struct AutoRestoreGuard {
         service_name: &'static str,
+        enabled: bool,
     }
 
     impl Drop for AutoRestoreGuard {
         fn drop(&mut self) {
+            if !self.enabled {
+                tracing::info!(
+                    "resident proxy mode: leaving client local proxy patch active on exit"
+                );
+                return;
+            }
             // Always try to remove the local client patch on exit. Codex uses a small switch state;
             // Claude still uses a settings backup.
             if self.service_name == "claude" {
@@ -281,7 +743,19 @@ async fn run_server(
         }
     }
 
-    let _restore_guard = AutoRestoreGuard { service_name };
+    let _restore_guard = AutoRestoreGuard {
+        service_name,
+        enabled: !resident,
+    };
+    let _owner_marker_guard =
+        RuntimeOwnerMarkerGuard::new(service_name, port, owner_kind.is_some());
+
+    if let Some(owner_kind) = owner_kind {
+        let marker = RuntimeOwnerMarker::new(owner_kind, service_name, port);
+        if let Err(err) = write_owner_marker(&marker) {
+            tracing::warn!("failed to write runtime owner marker: {err}");
+        }
+    }
     let mut codex_startup_patch_mode = codex_integration::CodexPatchMode::Default;
     let mut codex_startup_responses_websocket = false;
     let mut codex_client_state_changed_this_startup = false;
@@ -391,74 +865,27 @@ async fn run_server(
             _ => load_or_bootstrap_for_service_with_v4_source(ServiceKind::Codex).await?,
         }
     };
-    let mut cfg = loaded.runtime;
-    let v4_source = loaded.v4.map(Arc::new);
-
+    let mut cfg_for_language = loaded.runtime.clone();
     let tui_lang = {
         if let Ok(s) = std::env::var("CODEX_HELPER_TUI_LANG") {
             tui::resolve_language_preference(Some(&s))
-        } else if let Some(s) = cfg.ui.language.as_deref() {
+        } else if let Some(s) = cfg_for_language.ui.language.as_deref() {
             if !s.trim().eq_ignore_ascii_case("auto") && tui::parse_language(s).is_none() {
                 tracing::warn!("Invalid ui.language '{}', falling back to system locale", s);
             }
             tui::resolve_language_preference(Some(s))
         } else {
             let detected = tui::detect_system_language();
-            cfg.ui.language = Some("auto".to_string());
-            if let Err(err) = crate::config::save_config(&cfg).await {
+            cfg_for_language.ui.language = Some("auto".to_string());
+            if let Err(err) = crate::config::save_config(&cfg_for_language).await {
                 tracing::warn!("Failed to persist ui.language to config: {}", err);
             }
             detected
         }
     };
 
-    let cfg = Arc::new(cfg);
-
-    // Require at least one valid upstream config, so we fail fast instead of discovering
-    // it during an actual user request.
-    if service_name == "codex" {
-        if cfg.codex.configs.is_empty() || cfg.codex.active_station().is_none() {
-            anyhow::bail!(
-                "未找到任何可用的 Codex 上游配置，请先确保 ~/.codex/config.toml 与 ~/.codex/auth.json 配置完整，或手动编辑 ~/.codex-helper/config.toml（或 config.json）添加配置"
-            );
-        }
-    } else if service_name == "claude"
-        && (cfg.claude.configs.is_empty() || cfg.claude.active_station().is_none())
-    {
-        anyhow::bail!(
-            "未找到任何可用的 Claude 上游配置，请先确保 ~/.claude/settings.json 配置完整，\
-或在 ~/.codex-helper/config.toml（或 config.json）的 `claude` 段下手动添加上游配置"
-        );
-    }
-    // NOTE: We intentionally avoid a global request timeout because SSE streaming requests may
-    // legitimately run for a long time. We do set connection-level timeouts/keepalives to reduce
-    // long hangs and stale connection issues on some networks.
-    let client = Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .tcp_keepalive(std::time::Duration::from_secs(30))
-        .pool_idle_timeout(std::time::Duration::from_secs(30))
-        .build()?;
-
-    // Shared LB state (failure counters, cooldowns, usage flags).
-    let lb_states = Arc::new(Mutex::new(HashMap::new()));
     let addr: SocketAddr = SocketAddr::from((host, port));
     let admin_addr = admin_loopback_addr_for_proxy_port(port);
-
-    // Select service config based on service_name.
-    let proxy = ProxyService::new_with_v4_source(
-        client,
-        cfg.clone(),
-        v4_source,
-        service_name,
-        lb_states.clone(),
-    );
-    let state = proxy.state_handle();
-    let app: Router = proxy_only_router_with_admin_base_url(
-        proxy.clone(),
-        Some(local_proxy_base_url(admin_addr.port())),
-    );
-    let admin_app: Router = admin_listener_router(proxy.clone());
-
     if !host.is_loopback() {
         tracing::warn!(
             "Binding to non-loopback address {}. This may expose your proxy to other machines. Consider using 127.0.0.1 + SSH port forwarding instead.",
@@ -471,6 +898,23 @@ async fn run_server(
     }
     let listener = bind_local_listener_or_explain(addr, service_name).await?;
     let admin_listener = bind_local_listener_or_explain(admin_addr, service_name).await?;
+
+    validate_service_has_upstream(service_name, &loaded.runtime)?;
+    let runtime = build_proxy_runtime_from_bound_listeners(
+        service_name,
+        host,
+        port,
+        loaded,
+        listener,
+        admin_listener,
+    )
+    .await?;
+    let cfg = runtime.config.clone();
+    let proxy = runtime.proxy.clone();
+    let state = runtime.state.clone();
+    let shutdown_tx = runtime.shutdown_tx.clone();
+    let shutdown_rx = runtime.shutdown_receiver();
+
     tracing::info!(
         "codex-helper proxy listening on http://{} (service: {})",
         addr,
@@ -481,16 +925,6 @@ async fn run_server(
         admin_addr,
         service_name
     );
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-
-    let warnings = model_routing_warnings(&cfg, service_name);
-    if !warnings.is_empty() {
-        tracing::warn!("======== Model routing config warnings ========");
-        for w in warnings {
-            tracing::warn!("{}", w);
-        }
-        tracing::warn!("==============================================");
-    }
 
     proxy.spawn_initial_balance_refresh();
 
@@ -502,34 +936,10 @@ async fn run_server(
         });
     }
 
+    let server_handle = runtime.start().server_handle;
+
     let result = if interactive {
-        let proxy_server_shutdown = {
-            let mut rx = shutdown_rx.clone();
-            async move {
-                let _ = rx.changed().await;
-            }
-        };
-        let admin_server_shutdown = {
-            let mut rx = shutdown_rx.clone();
-            async move {
-                let _ = rx.changed().await;
-            }
-        };
-        let mut server_handle = tokio::spawn(async move {
-            tokio::try_join!(
-                axum::serve(
-                    listener,
-                    app.into_make_service_with_connect_info::<SocketAddr>(),
-                )
-                .with_graceful_shutdown(proxy_server_shutdown),
-                axum::serve(
-                    admin_listener,
-                    admin_app.into_make_service_with_connect_info::<SocketAddr>(),
-                )
-                .with_graceful_shutdown(admin_server_shutdown),
-            )?;
-            Ok::<(), anyhow::Error>(())
-        });
+        let mut server_handle = server_handle;
 
         let providers = tui::build_provider_options(&cfg, service_name);
         let startup_readiness = (service_name == "codex").then(|| {
@@ -588,36 +998,21 @@ async fn run_server(
             }
         }
     } else {
-        let proxy_server_shutdown = {
-            let mut rx = shutdown_rx.clone();
-            async move {
-                let _ = rx.changed().await;
-            }
-        };
-        let admin_server_shutdown = {
-            let mut rx = shutdown_rx.clone();
-            async move {
-                let _ = rx.changed().await;
-            }
-        };
-        tokio::try_join!(
-            axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .with_graceful_shutdown(proxy_server_shutdown),
-            axum::serve(
-                admin_listener,
-                admin_app.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .with_graceful_shutdown(admin_server_shutdown),
-        )?;
+        await_server_shutdown(server_handle).await?;
         Ok(())
     };
 
     result?;
 
     Ok(())
+}
+
+async fn await_server_shutdown(
+    server_handle: tokio::task::JoinHandle<anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    server_handle
+        .await
+        .map_err(|e| anyhow::anyhow!("server task join error: {e}"))?
 }
 
 async fn await_server_shutdown_with_timeout(
@@ -686,7 +1081,7 @@ fn listener_bind_help(addr: SocketAddr, service_name: &str, err: &std::io::Error
         let mut lines = vec![format!(
             "无法监听 http://{addr}（service: {service_name}）：端口 {port} 可能已被占用。"
         )];
-        if let Some(hint) = port_owner_hint(port) {
+        if let Some(hint) = listener_bind_port_owner_hint(port) {
             lines.push(hint);
         }
         lines.push(format!(
@@ -705,7 +1100,7 @@ fn listener_bind_help(addr: SocketAddr, service_name: &str, err: &std::io::Error
                     .to_string(),
             );
         }
-        if let Some(hint) = port_owner_hint(port) {
+        if let Some(hint) = listener_bind_port_owner_hint(port) {
             lines.push(hint);
         }
         lines.push(format!(
@@ -721,12 +1116,24 @@ fn listener_bind_help(addr: SocketAddr, service_name: &str, err: &std::io::Error
     )
 }
 
+#[cfg(test)]
+fn listener_bind_port_owner_hint(_port: u16) -> Option<String> {
+    None
+}
+
+#[cfg(not(test))]
+fn listener_bind_port_owner_hint(port: u16) -> Option<String> {
+    port_owner_hint(port)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(test, allow(dead_code))]
 struct PortOwner {
     pid: u32,
     name: Option<String>,
 }
 
+#[cfg_attr(test, allow(dead_code))]
 fn port_owner_hint(port: u16) -> Option<String> {
     let owners = port_owners(port);
     if owners.is_empty() {
@@ -745,6 +1152,7 @@ fn port_owner_hint(port: u16) -> Option<String> {
 }
 
 #[cfg(windows)]
+#[cfg_attr(test, allow(dead_code))]
 fn port_owners(port: u16) -> Vec<PortOwner> {
     let out = run_cmd_stdout("netstat", &["-ano", "-p", "tcp"]).unwrap_or_default();
     let pids = parse_windows_netstat_listening_pids(&out, port);
@@ -757,6 +1165,7 @@ fn port_owners(port: u16) -> Vec<PortOwner> {
 }
 
 #[cfg(unix)]
+#[cfg_attr(test, allow(dead_code))]
 fn port_owners(port: u16) -> Vec<PortOwner> {
     #[cfg(target_os = "linux")]
     {
@@ -791,6 +1200,7 @@ fn port_owners(_port: u16) -> Vec<PortOwner> {
 }
 
 #[cfg(any(windows, target_os = "linux"))]
+#[cfg_attr(test, allow(dead_code))]
 fn run_cmd_stdout(program: &str, args: &[&str]) -> Option<String> {
     let output = ProcessCommand::new(program).args(args).output().ok()?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -800,6 +1210,7 @@ fn run_cmd_stdout(program: &str, args: &[&str]) -> Option<String> {
     Some(stdout)
 }
 
+#[cfg_attr(test, allow(dead_code))]
 fn run_cmd_stdout_owned(program: &str, args: &[String]) -> Option<String> {
     let output = ProcessCommand::new(program).args(args).output().ok()?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -842,6 +1253,7 @@ fn parse_windows_netstat_listening_pids(output: &str, port: u16) -> Vec<u32> {
 }
 
 #[cfg(windows)]
+#[cfg_attr(test, allow(dead_code))]
 fn windows_tasklist_image_name(pid: u32) -> Option<String> {
     let filter = format!("PID eq {pid}");
     let out = run_cmd_stdout_owned(
@@ -1479,5 +1891,48 @@ node    7777 user   23u  IPv4 0x0      0t0     TCP 127.0.0.1:3211 (LISTEN)\n\
                 name: Some("node".to_string())
             }]
         );
+    }
+}
+
+#[cfg(test)]
+mod supervisor_tests {
+    use super::*;
+
+    #[test]
+    fn restart_delay_grows_with_restarts_and_caps_out() {
+        assert_eq!(supervisor_restart_delay_secs(1), 1);
+        assert_eq!(supervisor_restart_delay_secs(2), 2);
+        assert_eq!(supervisor_restart_delay_secs(3), 4);
+        assert_eq!(supervisor_restart_delay_secs(6), 32);
+        assert_eq!(supervisor_restart_delay_secs(9), 32);
+    }
+
+    #[test]
+    fn owner_marker_makes_supervisor_runtime_visible_to_status() {
+        let run_dir = std::env::temp_dir().join(format!(
+            "codex-helper-supervisor-owner-{}-{}",
+            std::process::id(),
+            crate::logging::now_ms()
+        ));
+        let marker =
+            RuntimeOwnerMarker::new_with_pid(RuntimeOwnerKind::Supervisor, "codex", 3211, 123, 456)
+                .with_note("test supervisor owner");
+
+        let path = crate::runtime_manager::write_owner_marker_to(&run_dir, &marker)
+            .expect("write supervisor owner marker");
+        assert_eq!(path, run_dir.join("codex-3211.owner.json"));
+
+        let loaded = crate::runtime_manager::read_owner_marker_from(&run_dir, "codex", 3211)
+            .expect("read supervisor owner marker")
+            .expect("marker should exist");
+        assert_eq!(loaded.owner, RuntimeOwnerKind::Supervisor);
+        assert_eq!(
+            loaded.lifecycle_mode,
+            crate::runtime_manager::ProxyLifecycleMode::ResidentDaemon
+        );
+        assert_eq!(loaded.note.as_deref(), Some("test supervisor owner"));
+
+        crate::runtime_manager::clear_owner_marker_from(&run_dir, "codex", 3211)
+            .expect("clear supervisor owner marker");
     }
 }

@@ -81,6 +81,7 @@ fn empty_snapshot() -> GuiRuntimeSnapshot {
         supports_session_route_target_override: false,
         supports_global_route_target_override: false,
         supports_session_override_reset: true,
+        supports_runtime_shutdown_api: true,
         shared_capabilities: SharedControlPlaneCapabilities {
             session_observability: true,
             request_history: true,
@@ -251,6 +252,7 @@ fn observed_history_summaries_fall_back_to_recent_requests() {
         id: 1,
         trace_id: Some("codex-1".to_string()),
         session_id: Some("sid-recent".to_string()),
+        session_identity_source: None,
         client_name: Some("Tablet".to_string()),
         client_addr: Some("100.64.0.13".to_string()),
         cwd: Some("/remote/recent".to_string()),

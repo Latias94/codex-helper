@@ -210,6 +210,22 @@ pub(super) fn help_text_for_tests(lines: &[Line<'_>]) -> String {
         .join("\n")
 }
 
+fn help_quit_line(lang: Language, attached: bool) -> &'static str {
+    match (lang, attached) {
+        (Language::Zh, true) => "  q          只退出附着控制台；不停止 resident proxy",
+        (Language::Zh, false) => "  q          退出并触发 shutdown",
+        (Language::En, true) => {
+            "  q          exit attached console only; keep resident proxy running"
+        }
+        (Language::En, false) => "  q          quit and request shutdown",
+    }
+}
+
+#[cfg(test)]
+pub(super) fn help_quit_line_for_tests(lang: Language, attached: bool) -> &'static str {
+    help_quit_line(lang, attached)
+}
+
 pub(in crate::tui::view) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui: &UiState) {
     let lang = ui.language;
     let is_route_graph = ui.uses_route_graph_routing();
@@ -385,7 +401,10 @@ pub(in crate::tui::view) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui:
                 "退出",
                 Style::default().fg(p.text).add_modifier(Modifier::BOLD),
             )]),
-            Line::from("  q          退出并触发 shutdown"),
+            Line::from(help_quit_line(
+                lang,
+                ui.runtime_connection.is_attached(),
+            )),
             Line::from("  Esc/?      关闭帮助"),
         ]
     } else {
@@ -549,7 +568,10 @@ pub(in crate::tui::view) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui:
                 "Quit",
                 Style::default().fg(p.text).add_modifier(Modifier::BOLD),
             )]),
-            Line::from("  q          quit and request shutdown"),
+            Line::from(help_quit_line(
+                lang,
+                ui.runtime_connection.is_attached(),
+            )),
             Line::from("  Esc/?      close this modal"),
         ]
     });

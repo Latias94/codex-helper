@@ -174,6 +174,17 @@ fn footer_parts_fit(parts: &[&str], next: &str, max_width: usize) -> bool {
 }
 
 fn footer_help_text(ui: &UiState) -> &'static str {
+    if ui.runtime_connection.is_attached() && ui.overlay == Overlay::None {
+        return match ui.language {
+            crate::tui::Language::Zh => {
+                "1-8 页面  q 只退出控制台  L 语言  Tab 焦点  ↑/↓ 移动  ? 帮助"
+            }
+            crate::tui::Language::En => {
+                "1-8 pages  q exit console only  L language  Tab focus  ↑/↓ move  ? help"
+            }
+        };
+    }
+
     match ui.overlay {
         Overlay::None => match ui.page {
             Page::Dashboard if ui.uses_route_graph_routing() => {
@@ -359,6 +370,7 @@ pub(super) fn render_header(
         }
         Focus::Stations => i18n::text(ui.language, msg::FOCUS_STATIONS),
     };
+    let connection = ui.runtime_connection.label(ui.language);
     let title = if inner.width >= 72 {
         Line::from(vec![
             Span::styled(
@@ -370,6 +382,8 @@ pub(super) fn render_header(
                 format!("{service_name}:{port}"),
                 Style::default().fg(p.muted),
             ),
+            Span::raw("  "),
+            Span::styled(connection.to_string(), Style::default().fg(p.muted)),
             Span::raw("  "),
             Span::styled(
                 format!("{}{focus}", i18n::text(ui.language, msg::FOCUS_LABEL)),
@@ -387,6 +401,8 @@ pub(super) fn render_header(
                 format!("{service_name}:{port}"),
                 Style::default().fg(p.muted),
             ),
+            Span::raw("  "),
+            Span::styled(connection.to_string(), Style::default().fg(p.muted)),
             Span::raw("  "),
             Span::styled(focus.to_string(), Style::default().fg(p.muted)),
         ])
