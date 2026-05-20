@@ -55,12 +55,30 @@ English: [README_EN.md](README_EN.md)
 
 ### 安装
 
+推荐使用预编译安装脚本（无需本机安装 Rust）：
+
+macOS / Linux:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Latias94/codex-helper/releases/download/v0.16.0/codex-helper-installer.sh | sh
+```
+
+Windows PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/Latias94/codex-helper/releases/download/v0.16.0/codex-helper-installer.ps1 | iex"
+```
+
+安装后会得到三个命令：`codex-helper`、短别名 `ch`，以及可选 GUI 入口 `codex-helper-gui`。
+
+如果不想 pipe shell，可以到 [GitHub Releases](https://github.com/Latias94/codex-helper/releases) 下载对应平台压缩包，并使用同名 `.sha256` 文件校验。
+
+Rust 用户也可以使用 `cargo-binstall`：
+
 ```bash
 cargo install cargo-binstall
 cargo binstall codex-helper
 ```
-
-安装后会得到两个命令：`codex-helper` 和短别名 `ch`。
 
 从源码构建：
 

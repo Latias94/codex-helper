@@ -43,12 +43,30 @@ It is probably unnecessary if you only use one official account and do not need 
 
 ### Install
 
+Recommended: install prebuilt binaries with the release installer scripts. Rust is not required.
+
+macOS / Linux:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Latias94/codex-helper/releases/download/v0.16.0/codex-helper-installer.sh | sh
+```
+
+Windows PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/Latias94/codex-helper/releases/download/v0.16.0/codex-helper-installer.ps1 | iex"
+```
+
+This installs `codex-helper`, the short alias `ch`, and the optional GUI entrypoint `codex-helper-gui`.
+
+If you do not want to pipe a shell script, download the archive for your platform from [GitHub Releases](https://github.com/Latias94/codex-helper/releases) and verify it with the matching `.sha256` file.
+
+Rust users can also install with `cargo-binstall`:
+
 ```bash
 cargo install cargo-binstall
 cargo binstall codex-helper
 ```
-
-This installs both `codex-helper` and the short alias `ch`.
 
 Build from source:
 
