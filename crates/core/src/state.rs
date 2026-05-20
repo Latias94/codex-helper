@@ -2457,6 +2457,11 @@ impl ProxyState {
         id
     }
 
+    #[cfg(test)]
+    pub(crate) fn begin_request_for_test(&self) -> BeginRequestTestBuilder<'_> {
+        BeginRequestTestBuilder::new(self)
+    }
+
     pub async fn update_request_route(
         &self,
         request_id: u64,
@@ -3047,6 +3052,84 @@ impl ProxyState {
 }
 
 #[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct BeginRequestTestBuilder<'a> {
+    state: &'a ProxyState,
+    service: &'static str,
+    method: &'static str,
+    path: &'static str,
+    session_id: Option<String>,
+    session_identity_source: Option<SessionIdentitySource>,
+    client_name: Option<String>,
+    client_addr: Option<String>,
+    cwd: Option<String>,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    service_tier: Option<String>,
+    started_at_ms: u64,
+}
+
+#[cfg(test)]
+impl<'a> BeginRequestTestBuilder<'a> {
+    pub(crate) fn new(state: &'a ProxyState) -> Self {
+        Self {
+            state,
+            service: "codex",
+            method: "POST",
+            path: "/v1/responses",
+            session_id: None,
+            session_identity_source: None,
+            client_name: None,
+            client_addr: None,
+            cwd: None,
+            model: None,
+            reasoning_effort: None,
+            service_tier: None,
+            started_at_ms: 0,
+        }
+    }
+
+    pub(crate) fn session_id(mut self, value: impl Into<String>) -> Self {
+        self.session_id = Some(value.into());
+        self
+    }
+
+    pub(crate) fn model(mut self, value: impl Into<String>) -> Self {
+        self.model = Some(value.into());
+        self
+    }
+
+    pub(crate) fn service_tier(mut self, value: impl Into<String>) -> Self {
+        self.service_tier = Some(value.into());
+        self
+    }
+
+    pub(crate) fn started_at_ms(mut self, value: u64) -> Self {
+        self.started_at_ms = value;
+        self
+    }
+
+    pub(crate) async fn begin(self) -> u64 {
+        self.state
+            .begin_request(
+                self.service,
+                self.method,
+                self.path,
+                self.session_id,
+                self.session_identity_source,
+                self.client_name,
+                self.client_addr,
+                self.cwd,
+                self.model,
+                self.reasoning_effort,
+                self.service_tier,
+                self.started_at_ms,
+            )
+            .await
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -3077,20 +3160,11 @@ mod tests {
         runtime.block_on(async {
             let state = ProxyState::new();
             let request_id = state
-                .begin_request(
-                    "codex",
-                    "POST",
-                    "/v1/responses",
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some("gpt-5".to_string()),
-                    None,
-                    Some("priority".to_string()),
-                    100,
-                )
+                .begin_request_for_test()
+                .model("gpt-5")
+                .service_tier("priority")
+                .started_at_ms(100)
+                .begin()
                 .await;
 
             let active = state.list_active_requests().await;
@@ -3145,20 +3219,11 @@ mod tests {
             assert!(balance_version > 0);
 
             let request_id = state
-                .begin_request(
-                    "codex",
-                    "POST",
-                    "/v1/responses",
-                    Some("sid-1".to_string()),
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some("gpt-5".to_string()),
-                    None,
-                    None,
-                    200,
-                )
+                .begin_request_for_test()
+                .session_id("sid-1")
+                .model("gpt-5")
+                .started_at_ms(200)
+                .begin()
                 .await;
             changes.changed().await.expect("begin request change");
             let active_version = *changes.borrow();
@@ -3206,20 +3271,10 @@ mod tests {
         runtime.block_on(async {
             let state = ProxyState::new();
             let request_id = state
-                .begin_request(
-                    "codex",
-                    "POST",
-                    "/v1/responses",
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some("gpt-5".to_string()),
-                    None,
-                    None,
-                    100,
-                )
+                .begin_request_for_test()
+                .model("gpt-5")
+                .started_at_ms(100)
+                .begin()
                 .await;
 
             state
@@ -3267,20 +3322,10 @@ mod tests {
             let old_ms = now_ms.saturating_sub(10 * 86_400_000);
 
             let old_id = state
-                .begin_request(
-                    "codex",
-                    "POST",
-                    "/v1/responses",
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some("gpt-5".to_string()),
-                    None,
-                    None,
-                    old_ms.saturating_sub(1_000),
-                )
+                .begin_request_for_test()
+                .model("gpt-5")
+                .started_at_ms(old_ms.saturating_sub(1_000))
+                .begin()
                 .await;
             state
                 .update_request_route(
@@ -3309,20 +3354,10 @@ mod tests {
                 .await;
 
             let fresh_id = state
-                .begin_request(
-                    "codex",
-                    "POST",
-                    "/v1/responses",
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some("gpt-5".to_string()),
-                    None,
-                    None,
-                    now_ms.saturating_sub(1_000),
-                )
+                .begin_request_for_test()
+                .model("gpt-5")
+                .started_at_ms(now_ms.saturating_sub(1_000))
+                .begin()
                 .await;
             state
                 .update_request_route(
@@ -4348,20 +4383,11 @@ mod tests {
                 .await;
 
             let request_id = state
-                .begin_request(
-                    "codex",
-                    "POST",
-                    "/v1/responses",
-                    Some("sid-old".to_string()),
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some("gpt-5".to_string()),
-                    None,
-                    None,
-                    30,
-                )
+                .begin_request_for_test()
+                .session_id("sid-old")
+                .model("gpt-5")
+                .started_at_ms(30)
+                .begin()
                 .await;
             state
                 .update_request_route(

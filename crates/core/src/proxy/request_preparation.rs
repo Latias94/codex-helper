@@ -685,7 +685,7 @@ mod tests {
         assert!(
             String::from_utf8_lossy(prepared.body_for_upstream.as_ref()).contains("\"gpt-5.4\"")
         );
-        assert_eq!(prepared.request_body_previews, false);
+        assert!(!prepared.request_body_previews);
         assert!(!prepared.route_selection.is_empty());
 
         let active = proxy.state.list_active_requests().await;

@@ -2,6 +2,7 @@ use super::*;
 use std::collections::BTreeMap;
 
 use crate::config::{ProviderConcurrencyLimits, ProviderEndpointV4};
+use crate::proxy::tests::harness::BeginRequestTestBuilder;
 use crate::state::FinishRequestParams;
 
 #[tokio::test]
@@ -138,39 +139,24 @@ async fn proxy_api_v1_operator_summary_reports_runtime_target_and_retry() {
             },
         );
     }
-    let _req_id = proxy
-        .state
-        .begin_request(
-            "codex",
-            "POST",
-            "/v1/responses",
-            Some("sid-summary".to_string()),
-            None,
-            Some("Frank-Desk".to_string()),
-            Some("100.64.0.12".to_string()),
-            Some("G:/codes/demo".to_string()),
-            Some("gpt-5.4-mini".to_string()),
-            Some("low".to_string()),
-            Some("priority".to_string()),
-            1,
-        )
+    let _req_id = BeginRequestTestBuilder::new(&proxy.state)
+        .session_id("sid-summary")
+        .client_name("Frank-Desk")
+        .client_addr("100.64.0.12")
+        .cwd("G:/codes/demo")
+        .model("gpt-5.4-mini")
+        .reasoning_effort("low")
+        .service_tier("priority")
+        .started_at_ms(1)
+        .begin()
         .await;
-    let recent_same_station = proxy
-        .state
-        .begin_request(
-            "codex",
-            "POST",
-            "/v1/responses",
-            Some("sid-summary".to_string()),
-            None,
-            None,
-            None,
-            None,
-            Some("gpt-5.4-mini".to_string()),
-            Some("low".to_string()),
-            Some("priority".to_string()),
-            10,
-        )
+    let recent_same_station = BeginRequestTestBuilder::new(&proxy.state)
+        .session_id("sid-summary")
+        .model("gpt-5.4-mini")
+        .reasoning_effort("low")
+        .service_tier("priority")
+        .started_at_ms(10)
+        .begin()
         .await;
     proxy
         .state
@@ -200,22 +186,13 @@ async fn proxy_api_v1_operator_summary_reports_runtime_target_and_retry() {
             streaming: false,
         })
         .await;
-    let recent_cross_station = proxy
-        .state
-        .begin_request(
-            "codex",
-            "POST",
-            "/v1/responses",
-            Some("sid-summary".to_string()),
-            None,
-            None,
-            None,
-            None,
-            Some("gpt-5.4".to_string()),
-            Some("medium".to_string()),
-            Some("default".to_string()),
-            12,
-        )
+    let recent_cross_station = BeginRequestTestBuilder::new(&proxy.state)
+        .session_id("sid-summary")
+        .model("gpt-5.4")
+        .reasoning_effort("medium")
+        .service_tier("default")
+        .started_at_ms(12)
+        .begin()
         .await;
     proxy
         .state
@@ -248,22 +225,13 @@ async fn proxy_api_v1_operator_summary_reports_runtime_target_and_retry() {
             streaming: false,
         })
         .await;
-    let recent_fast_mode_only = proxy
-        .state
-        .begin_request(
-            "codex",
-            "POST",
-            "/v1/responses",
-            Some("sid-summary".to_string()),
-            None,
-            None,
-            None,
-            None,
-            Some("gpt-5.4-mini".to_string()),
-            Some("low".to_string()),
-            Some("priority".to_string()),
-            14,
-        )
+    let recent_fast_mode_only = BeginRequestTestBuilder::new(&proxy.state)
+        .session_id("sid-summary")
+        .model("gpt-5.4-mini")
+        .reasoning_effort("low")
+        .service_tier("priority")
+        .started_at_ms(14)
+        .begin()
         .await;
     proxy
         .state

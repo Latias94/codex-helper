@@ -195,10 +195,10 @@ fn build_observed_from_probe_observations(
     }
 }
 
-fn observation_for_kind<'a>(
-    observations: &'a [CodexRelayProbeObservation],
+fn observation_for_kind(
+    observations: &[CodexRelayProbeObservation],
     kind: CodexRelayProbeKind,
-) -> &'a CodexRelayProbeObservation {
+) -> &CodexRelayProbeObservation {
     observations
         .iter()
         .find(|observation| observation.result.kind == kind)

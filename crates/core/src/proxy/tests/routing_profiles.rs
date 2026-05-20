@@ -1,4 +1,5 @@
 use super::*;
+use crate::proxy::tests::harness::BeginRequestTestBuilder;
 
 #[tokio::test]
 async fn proxy_rejects_incompatible_profile_station_capabilities() {
@@ -241,22 +242,16 @@ async fn proxy_api_v1_snapshot_works() {
         .state
         .set_session_service_tier_override("sid-1".to_string(), "priority".to_string(), 1)
         .await;
-    let req_id = proxy
-        .state
-        .begin_request(
-            "codex",
-            "POST",
-            "/v1/responses",
-            Some("sid-1".to_string()),
-            None,
-            Some("Frank-Desk".to_string()),
-            Some("100.64.0.12".to_string()),
-            Some("G:/codes/demo".to_string()),
-            Some("gpt-5.4".to_string()),
-            Some("medium".to_string()),
-            Some("priority".to_string()),
-            1,
-        )
+    let req_id = BeginRequestTestBuilder::new(&proxy.state)
+        .session_id("sid-1")
+        .client_name("Frank-Desk")
+        .client_addr("100.64.0.12")
+        .cwd("G:/codes/demo")
+        .model("gpt-5.4")
+        .reasoning_effort("medium")
+        .service_tier("priority")
+        .started_at_ms(1)
+        .begin()
         .await;
     proxy
         .state

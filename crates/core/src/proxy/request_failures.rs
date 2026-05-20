@@ -46,22 +46,24 @@ pub(super) struct FailedProxyRequestParams<'a> {
     pub(super) failure_route_attempts: Vec<RouteAttemptLog>,
 }
 
-pub(super) fn log_no_routable_station(
-    proxy: &ProxyService,
-    method: &Method,
-    path: &str,
-    client_uri: &str,
-    session_id: Option<String>,
-    session_identity_source: Option<SessionIdentitySource>,
-    client_headers: Vec<HeaderEntry>,
-    duration_ms: u64,
-) -> (StatusCode, String) {
+pub(super) struct NoRoutableStationParams<'a> {
+    pub(super) proxy: &'a ProxyService,
+    pub(super) method: &'a Method,
+    pub(super) path: &'a str,
+    pub(super) client_uri: &'a str,
+    pub(super) session_id: Option<String>,
+    pub(super) session_identity_source: Option<SessionIdentitySource>,
+    pub(super) client_headers: Vec<HeaderEntry>,
+    pub(super) duration_ms: u64,
+}
+
+pub(super) fn log_no_routable_station(params: NoRoutableStationParams<'_>) -> (StatusCode, String) {
     let status = StatusCode::BAD_GATEWAY;
     let message = "no routable station".to_string();
     let http_debug = build_early_error_http_debug(
         status,
-        client_uri,
-        client_headers,
+        params.client_uri,
+        params.client_headers,
         "no_routable_station",
         NO_ROUTABLE_STATION_HINT,
         message.as_str(),
@@ -69,19 +71,19 @@ pub(super) fn log_no_routable_station(
 
     log_request_with_debug(
         None,
-        proxy.service_name,
-        method.as_str(),
-        path,
+        params.proxy.service_name,
+        params.method.as_str(),
+        params.path,
         status.as_u16(),
-        duration_ms,
+        params.duration_ms,
         None,
         None,
         None,
         None,
         None,
         EMPTY_TARGET_URL,
-        session_id,
-        session_identity_source,
+        params.session_id,
+        params.session_identity_source,
         None,
         None,
         None,

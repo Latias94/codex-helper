@@ -11,7 +11,9 @@ use super::ProxyService;
 use super::client_identity::{extract_client_addr, extract_client_name, extract_session_identity};
 use super::headers::header_map_to_entries;
 use super::request_encoding::normalize_request_content_encoding;
-use super::request_failures::{log_client_body_read_error, log_no_routable_station};
+use super::request_failures::{
+    NoRoutableStationParams, log_client_body_read_error, log_no_routable_station,
+};
 use super::request_preparation::{
     CommonRequestPreparationError, CommonRequestPreparationParams, RequestFlavor,
     detect_request_flavor, load_request_config_context, prepare_common_request,
@@ -154,16 +156,16 @@ pub(super) async fn prepare_proxy_request(
             let client_headers_entries = client_headers_entries_cache
                 .get_or_init(|| header_map_to_entries(&client_headers))
                 .clone();
-            return Err(log_no_routable_station(
+            return Err(log_no_routable_station(NoRoutableStationParams {
                 proxy,
-                &method,
-                uri.path(),
-                client_uri.as_str(),
+                method: &method,
+                path: uri.path(),
+                client_uri: client_uri.as_str(),
                 session_id,
                 session_identity_source,
-                client_headers_entries,
-                dur,
-            ));
+                client_headers: client_headers_entries,
+                duration_ms: dur,
+            }));
         }
     };
 

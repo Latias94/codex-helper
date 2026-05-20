@@ -68,6 +68,15 @@ pub(super) fn spawn_proxy_service(proxy: ProxyService) -> TestProxyServer {
     TestProxyServer { addr, handle }
 }
 
+pub(super) fn proxy_service(config: ProxyConfig) -> ProxyService {
+    ProxyService::new(
+        Client::new(),
+        Arc::new(config),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    )
+}
+
 pub(super) fn upstream_config(base_url: impl Into<String>) -> UpstreamConfig {
     UpstreamConfig {
         base_url: base_url.into(),
@@ -119,6 +128,102 @@ pub(super) async fn find_finished_request(
         sleep(Duration::from_millis(20)).await;
     }
     None
+}
+
+#[derive(Debug)]
+pub(super) struct BeginRequestTestBuilder<'a> {
+    state: &'a crate::state::ProxyState,
+    service: &'static str,
+    method: &'static str,
+    path: &'static str,
+    session_id: Option<String>,
+    session_identity_source: Option<crate::state::SessionIdentitySource>,
+    client_name: Option<String>,
+    client_addr: Option<String>,
+    cwd: Option<String>,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    service_tier: Option<String>,
+    started_at_ms: u64,
+}
+
+impl<'a> BeginRequestTestBuilder<'a> {
+    pub(super) fn new(state: &'a crate::state::ProxyState) -> Self {
+        Self {
+            state,
+            service: "codex",
+            method: "POST",
+            path: "/v1/responses",
+            session_id: None,
+            session_identity_source: None,
+            client_name: None,
+            client_addr: None,
+            cwd: None,
+            model: None,
+            reasoning_effort: None,
+            service_tier: None,
+            started_at_ms: 0,
+        }
+    }
+
+    pub(super) fn session_id(mut self, value: impl Into<String>) -> Self {
+        self.session_id = Some(value.into());
+        self
+    }
+
+    pub(super) fn client_name(mut self, value: impl Into<String>) -> Self {
+        self.client_name = Some(value.into());
+        self
+    }
+
+    pub(super) fn client_addr(mut self, value: impl Into<String>) -> Self {
+        self.client_addr = Some(value.into());
+        self
+    }
+
+    pub(super) fn cwd(mut self, value: impl Into<String>) -> Self {
+        self.cwd = Some(value.into());
+        self
+    }
+
+    pub(super) fn model(mut self, value: impl Into<String>) -> Self {
+        self.model = Some(value.into());
+        self
+    }
+
+    pub(super) fn reasoning_effort(mut self, value: impl Into<String>) -> Self {
+        self.reasoning_effort = Some(value.into());
+        self
+    }
+
+    pub(super) fn service_tier(mut self, value: impl Into<String>) -> Self {
+        self.service_tier = Some(value.into());
+        self
+    }
+
+    pub(super) fn started_at_ms(mut self, value: u64) -> Self {
+        self.started_at_ms = value;
+        self
+    }
+
+    pub(super) async fn begin(self) -> u64 {
+        self.state
+            .begin_request(
+                self.service,
+                self.method,
+                self.path,
+                self.session_id,
+                self.session_identity_source,
+                self.client_name,
+                self.client_addr,
+                self.cwd,
+                self.model,
+                self.reasoning_effort,
+                self.service_tier,
+                self.started_at_ms,
+            )
+            .await
+    }
 }
 
 fn path_with_leading_slash(path: &str) -> String {
