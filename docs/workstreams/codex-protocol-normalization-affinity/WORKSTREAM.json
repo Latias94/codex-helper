@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "slug": "codex-protocol-normalization-affinity",
+  "title": "Codex Protocol Normalization And Affinity",
+  "status": "complete",
+  "updated": "2026-05-20",
+  "scope_kind": "execution",
+  "problem": "codex-helper should preserve sub2api-like relay capability by normalizing compressed request bodies and using prompt_cache_key for session affinity, without synthesizing upstream features.",
+  "authoritative_docs": [
+    {
+      "role": "design",
+      "path": "docs/workstreams/codex-protocol-normalization-affinity/DESIGN.md"
+    },
+    {
+      "role": "execution",
+      "path": "docs/workstreams/codex-protocol-normalization-affinity/TODO.md"
+    },
+    {
+      "role": "gates",
+      "path": "docs/workstreams/codex-protocol-normalization-affinity/EVIDENCE_AND_GATES.md"
+    },
+    {
+      "role": "handoff",
+      "path": "docs/workstreams/codex-protocol-normalization-affinity/HANDOFF.md"
+    }
+  ],
+  "gates": [
+    "cargo fmt --check",
+    "cargo nextest run -p codex-helper-core request_content_encoding prompt_cache_key_affinity --no-fail-fast",
+    "cargo nextest run -p codex-helper-core"
+  ],
+  "evidence": [
+    "docs/workstreams/codex-protocol-normalization-affinity/EVIDENCE_AND_GATES.md"
+  ],
+  "adr_refs": [],
+  "continue_policy": {
+    "default_action": "close",
+    "notes": "Closed after request content-encoding normalization, prompt_cache_key affinity, docs, and closeout gates passed. Split vendor fingerprinting, compact fallback, persisted passthrough config, or WebSocket frame compression into separate lanes."
+  },
+  "current_task": null
+}

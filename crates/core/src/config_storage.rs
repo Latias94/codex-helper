@@ -415,6 +415,10 @@ version = 5
 #                      supports_websockets = true，让 Codex 可选择 Responses WebSocket v2。
 #                      只应与 official-relay / official-imagegen 搭配，
 #                      且仅在 helper 与所选中转都支持 WebSocket relay 时开启。
+# 请求体 Content-Encoding 默认自动归一化（zstd / gzip / br / deflate），并会把
+# body.prompt_cache_key 作为缺省 session affinity 信号。极少数中转若必须接收
+# 原始 Codex 压缩体，请在启动 helper 的环境里设置：
+# CODEX_HELPER_REQUEST_BODY_ENCODING=passthrough
 # 兼容性：旧配置键 mode 仍会被读取；保存/生成配置时统一写 preset。
 #
 # [codex.client_patch]

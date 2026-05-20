@@ -10,8 +10,12 @@ use crate::routing_ir::RouteRequestContext;
 use crate::state::SessionBinding;
 
 use super::ProxyService;
-use super::client_identity::{extract_client_addr, extract_client_name, extract_session_id};
+use super::client_identity::{
+    extract_client_addr, extract_client_name, extract_prompt_cache_key_session_id,
+    extract_session_id,
+};
 use super::headers::header_map_to_entries;
+use super::request_encoding::normalize_request_content_encoding;
 use super::request_failures::{log_client_body_read_error, log_no_routable_station};
 use super::request_preparation::{
     RequestFlavor, build_body_previews, detect_request_flavor, prepare_request_body,
@@ -62,10 +66,10 @@ pub(super) async fn prepare_proxy_request(
     let uri = parts.uri;
     let client_uri = uri.to_string();
     let method = parts.method;
-    let client_headers = parts.headers;
+    let mut client_headers = parts.headers;
     let client_headers_entries_cache: OnceLock<Vec<HeaderEntry>> = OnceLock::new();
 
-    let session_id = extract_session_id(&client_headers);
+    let header_session_id = extract_session_id(&client_headers);
     let client_name = extract_client_name(&client_headers);
 
     let config_reloaded = proxy.config.maybe_reload_from_disk().await;
@@ -79,13 +83,6 @@ pub(super) async fn prepare_proxy_request(
             .prune_runtime_observability_for_service(proxy.service_name, mgr)
             .await;
     }
-    let session_binding = if let Some(id) = session_id.as_deref() {
-        proxy
-            .ensure_default_session_binding(mgr, id, started_at_ms)
-            .await
-    } else {
-        None
-    };
     let codex_client_patch_mode = if proxy.service_name == "codex" {
         crate::codex_integration::codex_switch_status()
             .ok()
@@ -101,18 +98,6 @@ pub(super) async fn prepare_proxy_request(
         uri.path(),
         codex_client_patch_mode,
     );
-    let cwd = resolve_and_touch_session_state(proxy, session_id.as_deref(), started_at_ms).await;
-    let session_override_config = if !route_graph_config && let Some(id) = session_id.as_deref() {
-        proxy.state.get_session_station_override(id).await
-    } else {
-        None
-    };
-    let global_station_override = if route_graph_config {
-        None
-    } else {
-        proxy.state.get_global_station_override().await
-    };
-
     let raw_body = match to_bytes(body, 10 * 1024 * 1024).await {
         Ok(body) => body,
         Err(error) => {
@@ -126,14 +111,58 @@ pub(super) async fn prepare_proxy_request(
                     method: &method,
                     path: uri.path(),
                     client_uri: client_uri.as_str(),
-                    session_id: session_id.clone(),
-                    cwd: cwd.clone(),
+                    session_id: header_session_id.clone(),
+                    cwd: None,
                     client_headers: client_headers_entries,
                     duration_ms: dur,
                     error_message: error.to_string(),
                 },
             ));
         }
+    };
+    let raw_body = match normalize_request_content_encoding(&mut client_headers, raw_body) {
+        Ok(body) => body,
+        Err(error) => {
+            let dur = start.elapsed().as_millis() as u64;
+            let client_headers_entries = client_headers_entries_cache
+                .get_or_init(|| header_map_to_entries(&client_headers))
+                .clone();
+            return Err(log_client_body_read_error(
+                super::request_failures::ClientBodyReadErrorParams {
+                    proxy,
+                    method: &method,
+                    path: uri.path(),
+                    client_uri: client_uri.as_str(),
+                    session_id: header_session_id.clone(),
+                    cwd: None,
+                    client_headers: client_headers_entries,
+                    duration_ms: dur,
+                    error_message: error.to_string(),
+                },
+            ));
+        }
+    };
+
+    let session_id = header_session_id
+        .clone()
+        .or_else(|| extract_prompt_cache_key_session_id(raw_body.as_ref()));
+    let session_binding = if let Some(id) = session_id.as_deref() {
+        proxy
+            .ensure_default_session_binding(mgr, id, started_at_ms)
+            .await
+    } else {
+        None
+    };
+    let cwd = resolve_and_touch_session_state(proxy, session_id.as_deref(), started_at_ms).await;
+    let session_override_config = if !route_graph_config && let Some(id) = session_id.as_deref() {
+        proxy.state.get_session_station_override(id).await
+    } else {
+        None
+    };
+    let global_station_override = if route_graph_config {
+        None
+    } else {
+        proxy.state.get_global_station_override().await
     };
 
     let override_effort = if let Some(id) = session_id.as_deref() {

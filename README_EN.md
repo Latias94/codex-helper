@@ -122,6 +122,8 @@ Preset choices:
 
 `official-relay` and `official-imagegen` are experimental. They only change how Codex chooses client-side capabilities; the relay still has to support the underlying endpoints. Real request credentials come from `~/.codex-helper/config.toml`, and the bridge presets do not forward Codex ChatGPT tokens to third-party relays that do not have helper-side credentials. Legacy names `official-relay-bridge` / `official-imagegen-bridge` are still accepted as aliases, but are no longer the recommended spelling.
 
+To avoid degrading capable relays, codex-helper normalizes compressed HTTP request bodies before routing by default (`zstd`, `gzip` / `x-gzip`, `br`, and `deflate`) and falls back to `body.prompt_cache_key` for session affinity when no stronger session header is present. This keeps sub2api-style stickiness through `/responses` and `/responses/compact`; it does not add compact or WebSocket support to relays that lack those endpoints. For rare relays that require the original compressed Codex body, run helper with `CODEX_HELPER_REQUEST_BODY_ENCODING=passthrough`.
+
 Assuming the upstream supports the required endpoints, `official-imagegen` is the most complete preset. If the upstream also passes Responses WebSocket v2 smoke, adding `responses_websocket` is the closest current setup to the official experience:
 
 ```text

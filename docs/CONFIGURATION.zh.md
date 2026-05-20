@@ -75,6 +75,10 @@ codex-helper switch on --preset default
 
 `official-relay` 是实验性的官方中转预设，适合能转发 OpenAI Responses 语义的中转，尤其是支持 `/responses/compact` 的 sub2api 风格中转。它会在 `~/.codex/config.toml` 写入 `name = "OpenAI"`，让 Codex 选择官方 remote compaction v1；默认仍写 `supports_websockets = false`，保持 WebSocket 关闭。它不会写 `requires_openai_auth`，也不会 patch `auth.json`；真实上游凭据仍必须来自 codex-helper routing。如果中转对 `/responses/compact` 返回 404/405/501 或 compact unsupported 这类错误，请切回 `default`，或改用明确支持 compact 的中转账号。
 
+所有预设下，codex-helper 默认都会在检查或转发请求前归一化 HTTP request `Content-Encoding`。支持的请求编码包括 `zstd`、`gzip` / `x-gzip`、`br` 和 `deflate`；解码成功后，helper 会向上游转发普通 JSON，并移除过期的 `Content-Encoding` / `Content-Length`。这只是传输兼容层，不是 compact fallback：`/responses/compact`、hosted tool 或 WebSocket 仍必须由上游中转自己支持。如果遇到极少数必须接收原始 Codex 压缩 body 的中转，可在启动 helper 前设置 `CODEX_HELPER_REQUEST_BODY_ENCODING=passthrough`，让 helper 保留原始 body 和 header。
+
+当 Codex 没有发送更强的 session header（`session_id`、`session-id`、`conversation_id` 或 `thread-id`）时，codex-helper 还会把已解码 JSON 里的 `prompt_cache_key` 作为 session affinity key。这会对齐 sub2api 风格的粘性，让普通 `/responses` 和之后的 `/responses/compact` 留在同一条已选 route 上，而不要求用户判断自己用的是哪种中转实现。
+
 `official-imagegen` 是混合实验预设，适合背后确实是官方订阅账号的中转。它会像 `official-relay` 一样把 provider 声明成 `OpenAI`，让 Codex 走官方 remote compaction v1；同时像 `imagegen-bridge` 一样写入 `{}` auth facade，让 Codex 暴露 hosted `image_generation`。它默认保持 `supports_websockets = false`，不写 `requires_openai_auth`，且除非选中的上游配置了 helper 侧凭据，否则仍会剥离 Codex 客户端 auth。该预设只负责让 Codex 暴露并发送官方 hosted tool；中转账号本身仍必须同时支持 `/responses/compact` 和 hosted image generation 调用。
 
 `responses_websocket = true` 是传输开关，不是新的 preset。它只允许搭配 `official-relay` 和 `official-imagegen`。启用后，codex-helper 会在 Codex provider 配置里写入 `supports_websockets = true`，并由 helper 自己处理 `/responses`、`/v1/responses`、`/backend-api/codex/responses` 的 WebSocket upgrade。relay 会读取第一个 `response.create` frame，复用普通 helper 请求的 model override、model mapping、request filter、routing selection、session affinity、concurrency snapshot 和 auth injection，注入 `OpenAI-Beta: responses_websockets=2026-02-06`，然后和选中的上游做双向 frame 转发。除非你的上游中转也支持 Responses WebSocket v2，否则保持关闭。

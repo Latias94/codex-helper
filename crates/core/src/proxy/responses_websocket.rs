@@ -276,7 +276,6 @@ async fn prepare_responses_websocket(
     started_at_ms: u64,
 ) -> Result<ResponsesWebSocketPrepared, (StatusCode, String)> {
     let method = Method::GET;
-    let session_id = super::client_identity::extract_session_id(&client_headers);
     let client_name = client_headers
         .get(CLIENT_NAME_HEADER)
         .and_then(|value| value.to_str().ok())
@@ -293,14 +292,6 @@ async fn prepare_responses_websocket(
             .prune_runtime_observability_for_service(proxy.service_name, mgr)
             .await;
     }
-    let session_binding = if let Some(id) = session_id.as_deref() {
-        proxy
-            .ensure_default_session_binding(mgr, id, started_at_ms)
-            .await
-    } else {
-        None
-    };
-    let cwd = resolve_and_touch_session_state(proxy, session_id.as_deref(), started_at_ms).await;
     let codex_patch_mode = crate::codex_integration::codex_switch_status()
         .ok()
         .and_then(|status| status.patch_mode)
@@ -324,6 +315,19 @@ async fn prepare_responses_websocket(
             "first WebSocket data message must be response.create".to_string(),
         ));
     }
+
+    let session_id = super::client_identity::extract_session_id_with_body_fallback(
+        &client_headers,
+        raw_body.as_ref(),
+    );
+    let session_binding = if let Some(id) = session_id.as_deref() {
+        proxy
+            .ensure_default_session_binding(mgr, id, started_at_ms)
+            .await
+    } else {
+        None
+    };
+    let cwd = resolve_and_touch_session_state(proxy, session_id.as_deref(), started_at_ms).await;
 
     let override_effort = if let Some(id) = session_id.as_deref() {
         proxy.state.get_session_effort_override(id).await

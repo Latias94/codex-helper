@@ -134,6 +134,8 @@ codex-helper switch off
 
 `official-relay` 和 `official-imagegen` 都是实验预设。它们只负责让 Codex 使用更接近官方的客户端能力选择；中转站本身仍必须真正支持对应接口。真实请求密钥来自 `~/.codex-helper/config.toml` 的 provider 配置，bridge 预设不会把 Codex 的 ChatGPT token 透传给没有 helper 侧密钥的第三方 relay。旧的 `official-relay-bridge` / `official-imagegen-bridge` 仍作为 alias 接受，但不再作为推荐写法。
 
+为了不拖能力较强的中转后腿，codex-helper 默认会在路由前归一化压缩 HTTP 请求体（`zstd`、`gzip` / `x-gzip`、`br`、`deflate`），并在没有更强 session header 时用 `body.prompt_cache_key` 作为 session affinity 兜底。这样 sub2api 风格的粘性可以贯穿 `/responses` 和 `/responses/compact`；但这不会替上游补出 compact 或 WebSocket 能力。极少数中转如果必须接收原始 Codex 压缩 body，可用 `CODEX_HELPER_REQUEST_BODY_ENCODING=passthrough` 启动 helper。
+
 在上游能力满足的前提下，能力最完整的是 `official-imagegen`；如果再确认上游支持 Responses WebSocket v2，可以额外开启 `responses_websocket`，这就是当前最接近官方体验的组合：
 
 ```text

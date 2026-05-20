@@ -9,6 +9,8 @@ All notable changes to this project will be documented in this file.
 
 #### Codex 中转和 ChatGPT 原生体验
 
+- Codex 本地代理现在会默认归一化请求体 `Content-Encoding`（`zstd`、`gzip` / `x-gzip`、`br`、`deflate`），在路由、model override 和转发前得到普通 JSON，并移除过期的 `Content-Encoding` / `Content-Length`；极少数需要原始压缩体的中转可用 `CODEX_HELPER_REQUEST_BODY_ENCODING=passthrough` 启动 helper 作为逃生口。
+- 当请求缺少 `session_id` / `session-id` / `conversation_id` / `thread-id` 这类强 session header 时，helper 会把已解码 JSON 的 `prompt_cache_key` 作为 session affinity 兜底，让 `/responses` 与 `/responses/compact` 在多中转路由下保持 sub2api 风格粘性。
 - 新增 Codex client preset 体系，用来处理“Codex 客户端想要官方/ChatGPT 形态，但模型流量要走中转”的场景。用户侧推荐使用 `[codex.client_patch].preset = "..."` 和 `codex-helper switch on --preset ...`；旧配置 `mode = "..."` 和 CLI `--mode ...` 仍兼容读取，但 helper 保存/生成配置时统一写 `preset`。
 - `chatgpt-bridge` 适合已经在官方 Codex 登录 ChatGPT 的用户。Codex 仍看到 ChatGPT 登录态，桌面端和手机端账号能力可以继续按官方路径判断；模型请求由 codex-helper 路由到你的 relay。
 - `imagegen-bridge` 适合 relay 不支持 official provider 身份，但你想让 Codex 暴露 hosted `image_generation` 的场景。它会写入 `{}` auth facade，真实上游密钥仍来自 codex-helper 配置。
@@ -57,6 +59,8 @@ All notable changes to this project will be documented in this file.
 
 #### Codex relays and native ChatGPT behavior
 
+- The local Codex proxy now normalizes request-body `Content-Encoding` by default (`zstd`, `gzip` / `x-gzip`, `br`, and `deflate`) before routing, model overrides, and forwarding, then removes stale `Content-Encoding` / `Content-Length`; rare relays that require the original compressed body can start helper with `CODEX_HELPER_REQUEST_BODY_ENCODING=passthrough`.
+- When no stronger session header is present (`session_id`, `session-id`, `conversation_id`, or `thread-id`), helper uses decoded JSON `prompt_cache_key` as the session-affinity fallback so `/responses` and `/responses/compact` keep sub2api-style stickiness across relay routing.
 - Added Codex client presets for setups where Codex should keep an official or ChatGPT-like client shape while model traffic goes through codex-helper relays. Use `[codex.client_patch].preset = "..."` and `codex-helper switch on --preset ...`; legacy `mode = "..."` and CLI `--mode ...` are still accepted, but helper writes saved/generated config as `preset`.
 - `chatgpt-bridge` is for users already signed in to ChatGPT in official Codex. Codex keeps seeing ChatGPT account state, while model requests are routed through codex-helper.
 - `imagegen-bridge` exposes hosted `image_generation` for relays that do not support official provider identity. It writes the empty `{}` auth facade; real upstream credentials still come from helper config.

@@ -41,6 +41,7 @@ mod provider_orchestration;
 mod providers_api;
 mod request_body;
 mod request_context;
+mod request_encoding;
 mod request_failures;
 mod request_preparation;
 mod request_routing;

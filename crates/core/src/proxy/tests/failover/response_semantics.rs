@@ -1,4 +1,5 @@
 use super::*;
+use std::io::Cursor;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 #[tokio::test]
@@ -909,6 +910,206 @@ async fn proxy_forwards_responses_compact_to_upstream_v1_compact_path() {
 }
 
 #[tokio::test]
+async fn proxy_request_content_encoding_normalizes_zstd_body_before_forwarding() {
+    let upstream_hits = Arc::new(AtomicUsize::new(0));
+    let upstream_content_encoding = Arc::new(std::sync::Mutex::new(None::<String>));
+    let upstream_body = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+
+    let hits = upstream_hits.clone();
+    let seen_encoding = upstream_content_encoding.clone();
+    let seen_body = upstream_body.clone();
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        post(move |headers: axum::http::HeaderMap, body: Bytes| {
+            let hits = hits.clone();
+            let seen_encoding = seen_encoding.clone();
+            let seen_body = seen_body.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                *seen_encoding.lock().expect("lock") = headers
+                    .get(axum::http::header::CONTENT_ENCODING)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                *seen_body.lock().expect("lock") = body.to_vec();
+                (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+            }
+        }),
+    );
+    let (u_addr, u_handle) = spawn_axum_server(upstream);
+
+    let retry = retry_config(1, "502", Vec::new(), RetryStrategy::Failover);
+    let cfg = make_proxy_config(
+        vec![UpstreamConfig {
+            base_url: format!("http://{}/v1", u_addr),
+            auth: UpstreamAuth::default(),
+            tags: HashMap::new(),
+            supported_models: HashMap::new(),
+            model_mapping: HashMap::new(),
+        }],
+        retry,
+    );
+    let proxy = ProxyService::new(
+        Client::new(),
+        Arc::new(cfg),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let body = br#"{"model":"gpt-5","input":"hi"}"#;
+    let compressed = zstd::stream::encode_all(Cursor::new(body), 0).expect("zstd encode");
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .header("content-type", "application/json")
+        .header("content-encoding", "zstd")
+        .body(compressed)
+        .send()
+        .await
+        .expect("send");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+    let upstream_json: serde_json::Value =
+        serde_json::from_slice(&upstream_body.lock().expect("lock")).expect("upstream json");
+    assert_eq!(
+        upstream_json,
+        serde_json::json!({ "model": "gpt-5", "input": "hi" })
+    );
+    assert_eq!(*upstream_content_encoding.lock().expect("lock"), None);
+
+    proxy_handle.abort();
+    u_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_request_content_encoding_passthrough_env_preserves_zstd_body_for_upstream() {
+    let _lock = env_lock().await;
+    let mut env = ScopedEnv::default();
+    unsafe {
+        env.set("CODEX_HELPER_REQUEST_BODY_ENCODING", "passthrough");
+    }
+
+    let upstream_content_encoding = Arc::new(std::sync::Mutex::new(None::<String>));
+    let upstream_body = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+
+    let seen_encoding = upstream_content_encoding.clone();
+    let seen_body = upstream_body.clone();
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        post(move |headers: axum::http::HeaderMap, body: Bytes| {
+            let seen_encoding = seen_encoding.clone();
+            let seen_body = seen_body.clone();
+            async move {
+                *seen_encoding.lock().expect("lock") = headers
+                    .get(axum::http::header::CONTENT_ENCODING)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                *seen_body.lock().expect("lock") = body.to_vec();
+                (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+            }
+        }),
+    );
+    let (u_addr, u_handle) = spawn_axum_server(upstream);
+
+    let retry = retry_config(1, "502", Vec::new(), RetryStrategy::Failover);
+    let cfg = make_proxy_config(
+        vec![UpstreamConfig {
+            base_url: format!("http://{}/v1", u_addr),
+            auth: UpstreamAuth::default(),
+            tags: HashMap::new(),
+            supported_models: HashMap::new(),
+            model_mapping: HashMap::new(),
+        }],
+        retry,
+    );
+    let proxy = ProxyService::new(
+        Client::new(),
+        Arc::new(cfg),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let body = br#"{"model":"gpt-5","input":"hi"}"#;
+    let compressed = zstd::stream::encode_all(Cursor::new(body), 0).expect("zstd encode");
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .header("content-type", "application/json")
+        .header("content-encoding", "zstd")
+        .body(compressed.clone())
+        .send()
+        .await
+        .expect("send");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(*upstream_body.lock().expect("lock"), compressed);
+    assert_eq!(
+        upstream_content_encoding.lock().expect("lock").as_deref(),
+        Some("zstd")
+    );
+
+    proxy_handle.abort();
+    u_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_request_content_encoding_rejects_corrupt_zstd_body() {
+    let upstream_hits = Arc::new(AtomicUsize::new(0));
+
+    let hits = upstream_hits.clone();
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let hits = hits.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+            }
+        }),
+    );
+    let (u_addr, u_handle) = spawn_axum_server(upstream);
+
+    let retry = retry_config(1, "502", Vec::new(), RetryStrategy::Failover);
+    let cfg = make_proxy_config(
+        vec![UpstreamConfig {
+            base_url: format!("http://{}/v1", u_addr),
+            auth: UpstreamAuth::default(),
+            tags: HashMap::new(),
+            supported_models: HashMap::new(),
+            model_mapping: HashMap::new(),
+        }],
+        retry,
+    );
+    let proxy = ProxyService::new(
+        Client::new(),
+        Arc::new(cfg),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .header("content-type", "application/json")
+        .header("content-encoding", "zstd")
+        .body("not a zstd frame")
+        .send()
+        .await
+        .expect("send");
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let text = resp.text().await.expect("text");
+    assert!(text.contains("Content-Encoding"));
+    assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+
+    proxy_handle.abort();
+    u_handle.abort();
+}
+
+#[tokio::test]
 async fn proxy_uses_official_session_id_affinity_for_responses_compact() {
     let a_responses_hits = Arc::new(AtomicUsize::new(0));
     let a_compact_hits = Arc::new(AtomicUsize::new(0));
@@ -1071,6 +1272,187 @@ async fn proxy_uses_official_session_id_affinity_for_responses_compact() {
     assert_eq!(compact["compact"].as_bool(), Some(true));
     assert_eq!(a_compact_hits.load(Ordering::SeqCst), 0);
     assert_eq!(b_compact_hits.load(Ordering::SeqCst), 1);
+    proxy_handle.abort();
+    a_handle.abort();
+    b_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_uses_prompt_cache_key_affinity_when_session_headers_are_absent() {
+    let a_responses_hits = Arc::new(AtomicUsize::new(0));
+    let a_compact_hits = Arc::new(AtomicUsize::new(0));
+    let b_responses_hits = Arc::new(AtomicUsize::new(0));
+    let b_compact_hits = Arc::new(AtomicUsize::new(0));
+
+    let a_responses_counter = a_responses_hits.clone();
+    let a_compact_counter = a_compact_hits.clone();
+    let upstream_a = axum::Router::new()
+        .route(
+            "/v1/responses",
+            post(move || {
+                let a_responses_counter = a_responses_counter.clone();
+                async move {
+                    a_responses_counter.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({ "provider": "a", "err": "quota" })),
+                    )
+                }
+            }),
+        )
+        .route(
+            "/v1/responses/compact",
+            post(move || {
+                let a_compact_counter = a_compact_counter.clone();
+                async move {
+                    a_compact_counter.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({ "provider": "a", "compact": true })),
+                    )
+                }
+            }),
+        );
+    let (a_addr, a_handle) = spawn_axum_server(upstream_a);
+
+    let b_responses_counter = b_responses_hits.clone();
+    let b_compact_counter = b_compact_hits.clone();
+    let upstream_b = axum::Router::new()
+        .route(
+            "/v1/responses",
+            post(move || {
+                let b_responses_counter = b_responses_counter.clone();
+                async move {
+                    b_responses_counter.fetch_add(1, Ordering::SeqCst);
+                    (StatusCode::OK, Json(serde_json::json!({ "provider": "b" })))
+                }
+            }),
+        )
+        .route(
+            "/v1/responses/compact",
+            post(move || {
+                let b_compact_counter = b_compact_counter.clone();
+                async move {
+                    b_compact_counter.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({ "provider": "b", "compact": true })),
+                    )
+                }
+            }),
+        );
+    let (b_addr, b_handle) = spawn_axum_server(upstream_b);
+
+    let retry = RetryConfig {
+        upstream: Some(retry_layer_config(
+            1,
+            "502",
+            Vec::new(),
+            RetryStrategy::Failover,
+        )),
+        provider: Some(retry_layer_config(
+            2,
+            "502",
+            Vec::new(),
+            RetryStrategy::Failover,
+        )),
+        transport_cooldown_secs: Some(0),
+        cooldown_backoff_factor: Some(1),
+        cooldown_backoff_max_secs: Some(0),
+        ..RetryConfig::default()
+    };
+    let mut routing = RoutingConfigV4::ordered_failover(vec!["a".to_string(), "b".to_string()]);
+    routing.affinity_policy = crate::config::RoutingAffinityPolicyV5::FallbackSticky;
+    let v4 = ProxyConfigV4 {
+        retry,
+        codex: ServiceViewV4 {
+            providers: std::collections::BTreeMap::from([
+                (
+                    "a".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some(format!("http://{a_addr}/v1")),
+                        inline_auth: UpstreamAuth::default(),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+                (
+                    "b".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some(format!("http://{b_addr}/v1")),
+                        inline_auth: UpstreamAuth::default(),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+            ]),
+            routing: Some(routing),
+            ..ServiceViewV4::default()
+        },
+        ..ProxyConfigV4::default()
+    };
+    let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compile v4");
+    let proxy = ProxyService::new_with_v4_source(
+        Client::new(),
+        Arc::new(runtime),
+        Some(Arc::new(v4)),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let state = proxy.state.clone();
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let client = reqwest::Client::new();
+    let first_body = br#"{"model":"gpt-5","prompt_cache_key":"pcache-affinity","input":"hi"}"#;
+    let first_compressed =
+        zstd::stream::encode_all(Cursor::new(first_body), 0).expect("zstd encode");
+    let first = client
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .header("content-type", "application/json")
+        .header("content-encoding", "zstd")
+        .body(first_compressed)
+        .send()
+        .await
+        .expect("send responses")
+        .error_for_status()
+        .expect("responses status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("responses json");
+    assert_eq!(first["provider"].as_str(), Some("b"));
+
+    let affinity = state
+        .get_session_route_affinity("pcache-affinity")
+        .await
+        .expect("route affinity recorded from prompt_cache_key");
+    assert_eq!(affinity.provider_endpoint.provider_id.as_str(), "b");
+
+    let compact = client
+        .post(format!("http://{proxy_addr}/responses/compact"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt-5","prompt_cache_key":"pcache-affinity","input":[{"role":"user","content":"compact me"}]}"#)
+        .send()
+        .await
+        .expect("send compact")
+        .error_for_status()
+        .expect("compact status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("compact json");
+    assert_eq!(compact["provider"].as_str(), Some("b"));
+    assert_eq!(compact["compact"].as_bool(), Some(true));
+    assert_eq!(a_compact_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(b_compact_hits.load(Ordering::SeqCst), 1);
+    let affinity_after_compact = state
+        .get_session_route_affinity("pcache-affinity")
+        .await
+        .expect("route affinity still keyed by prompt_cache_key after compact");
+    assert_eq!(
+        affinity_after_compact
+            .provider_endpoint
+            .provider_id
+            .as_str(),
+        "b"
+    );
 
     proxy_handle.abort();
     a_handle.abort();
