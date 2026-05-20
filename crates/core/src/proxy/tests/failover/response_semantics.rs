@@ -1,4 +1,9 @@
 use super::*;
+use crate::proxy::tests::harness::{
+    find_finished_request, post_compact_json, post_responses_json, spawn_proxy_service,
+    spawn_test_proxy, spawn_test_upstream,
+};
+use crate::state::SessionIdentitySource;
 use std::io::Cursor;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
@@ -839,44 +844,29 @@ async fn proxy_forwards_responses_compact_to_upstream_v1_compact_path() {
             )
         }),
     );
-    let (u_addr, u_handle) = spawn_axum_server(upstream);
+    let upstream = spawn_test_upstream(upstream);
 
-    let proxy_client = Client::new();
-    let retry = retry_config(1, "502", Vec::new(), RetryStrategy::Failover);
     let cfg = make_proxy_config(
-        vec![UpstreamConfig {
-            base_url: format!("http://{}/v1", u_addr),
-            auth: UpstreamAuth {
-                auth_token: None,
-                auth_token_env: None,
-                api_key: None,
-                api_key_env: None,
-            },
-            tags: HashMap::new(),
-            supported_models: HashMap::new(),
-            model_mapping: HashMap::new(),
-        }],
-        retry,
+        vec![upstream.upstream_config()],
+        retry_config(1, "502", Vec::new(), RetryStrategy::Failover),
     );
 
     let proxy = ProxyService::new(
-        proxy_client,
+        Client::new(),
         Arc::new(cfg),
         "codex",
         Arc::new(std::sync::Mutex::new(HashMap::new())),
     );
     let state = proxy.state.clone();
-    let app = crate::proxy::router(proxy);
-    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let proxy = spawn_proxy_service(proxy);
 
     let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("http://{}/responses/compact", proxy_addr))
-        .header("content-type", "application/json")
-        .body(r#"{"model":"gpt-5","input":[{"role":"user","content":"compact me"}]}"#)
-        .send()
-        .await
-        .expect("send");
+    let resp = post_compact_json(
+        &client,
+        &proxy,
+        r#"{"model":"gpt-5","input":[{"role":"user","content":"compact me"}]}"#,
+    )
+    .await;
 
     assert_eq!(resp.status(), StatusCode::OK);
     let body = resp
@@ -887,26 +877,9 @@ async fn proxy_forwards_responses_compact_to_upstream_v1_compact_path() {
     assert_eq!(body["model"], "gpt-5");
     assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
 
-    let mut finished = Vec::new();
-    for _ in 0..100 {
-        finished = state.list_recent_finished(10).await;
-        if finished
-            .iter()
-            .any(|request| request.path == "/responses/compact")
-        {
-            break;
-        }
-        sleep(Duration::from_millis(20)).await;
-    }
-    assert!(
-        finished
-            .iter()
-            .any(|request| request.path == "/responses/compact"),
-        "expected compact request path to be visible in finished requests"
-    );
-
-    proxy_handle.abort();
-    u_handle.abort();
+    find_finished_request(&state, 10, |request| request.path == "/responses/compact")
+        .await
+        .expect("expected compact request path to be visible in finished requests");
 }
 
 #[tokio::test]
@@ -935,32 +908,18 @@ async fn proxy_request_content_encoding_normalizes_zstd_body_before_forwarding()
             }
         }),
     );
-    let (u_addr, u_handle) = spawn_axum_server(upstream);
+    let upstream = spawn_test_upstream(upstream);
 
-    let retry = retry_config(1, "502", Vec::new(), RetryStrategy::Failover);
     let cfg = make_proxy_config(
-        vec![UpstreamConfig {
-            base_url: format!("http://{}/v1", u_addr),
-            auth: UpstreamAuth::default(),
-            tags: HashMap::new(),
-            supported_models: HashMap::new(),
-            model_mapping: HashMap::new(),
-        }],
-        retry,
+        vec![upstream.upstream_config()],
+        retry_config(1, "502", Vec::new(), RetryStrategy::Failover),
     );
-    let proxy = ProxyService::new(
-        Client::new(),
-        Arc::new(cfg),
-        "codex",
-        Arc::new(std::sync::Mutex::new(HashMap::new())),
-    );
-    let app = crate::proxy::router(proxy);
-    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let proxy = spawn_test_proxy(cfg);
 
     let body = br#"{"model":"gpt-5","input":"hi"}"#;
     let compressed = zstd::stream::encode_all(Cursor::new(body), 0).expect("zstd encode");
     let resp = reqwest::Client::new()
-        .post(format!("http://{proxy_addr}/v1/responses"))
+        .post(proxy.responses_url())
         .header("content-type", "application/json")
         .header("content-encoding", "zstd")
         .body(compressed)
@@ -977,9 +936,6 @@ async fn proxy_request_content_encoding_normalizes_zstd_body_before_forwarding()
         serde_json::json!({ "model": "gpt-5", "input": "hi" })
     );
     assert_eq!(*upstream_content_encoding.lock().expect("lock"), None);
-
-    proxy_handle.abort();
-    u_handle.abort();
 }
 
 #[tokio::test]
@@ -1010,32 +966,18 @@ async fn proxy_request_content_encoding_passthrough_env_preserves_zstd_body_for_
             }
         }),
     );
-    let (u_addr, u_handle) = spawn_axum_server(upstream);
+    let upstream = spawn_test_upstream(upstream);
 
-    let retry = retry_config(1, "502", Vec::new(), RetryStrategy::Failover);
     let cfg = make_proxy_config(
-        vec![UpstreamConfig {
-            base_url: format!("http://{}/v1", u_addr),
-            auth: UpstreamAuth::default(),
-            tags: HashMap::new(),
-            supported_models: HashMap::new(),
-            model_mapping: HashMap::new(),
-        }],
-        retry,
+        vec![upstream.upstream_config()],
+        retry_config(1, "502", Vec::new(), RetryStrategy::Failover),
     );
-    let proxy = ProxyService::new(
-        Client::new(),
-        Arc::new(cfg),
-        "codex",
-        Arc::new(std::sync::Mutex::new(HashMap::new())),
-    );
-    let app = crate::proxy::router(proxy);
-    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let proxy = spawn_test_proxy(cfg);
 
     let body = br#"{"model":"gpt-5","input":"hi"}"#;
     let compressed = zstd::stream::encode_all(Cursor::new(body), 0).expect("zstd encode");
     let resp = reqwest::Client::new()
-        .post(format!("http://{proxy_addr}/v1/responses"))
+        .post(proxy.responses_url())
         .header("content-type", "application/json")
         .header("content-encoding", "zstd")
         .body(compressed.clone())
@@ -1049,9 +991,6 @@ async fn proxy_request_content_encoding_passthrough_env_preserves_zstd_body_for_
         upstream_content_encoding.lock().expect("lock").as_deref(),
         Some("zstd")
     );
-
-    proxy_handle.abort();
-    u_handle.abort();
 }
 
 #[tokio::test]
@@ -1069,30 +1008,16 @@ async fn proxy_request_content_encoding_rejects_corrupt_zstd_body() {
             }
         }),
     );
-    let (u_addr, u_handle) = spawn_axum_server(upstream);
+    let upstream = spawn_test_upstream(upstream);
 
-    let retry = retry_config(1, "502", Vec::new(), RetryStrategy::Failover);
     let cfg = make_proxy_config(
-        vec![UpstreamConfig {
-            base_url: format!("http://{}/v1", u_addr),
-            auth: UpstreamAuth::default(),
-            tags: HashMap::new(),
-            supported_models: HashMap::new(),
-            model_mapping: HashMap::new(),
-        }],
-        retry,
+        vec![upstream.upstream_config()],
+        retry_config(1, "502", Vec::new(), RetryStrategy::Failover),
     );
-    let proxy = ProxyService::new(
-        Client::new(),
-        Arc::new(cfg),
-        "codex",
-        Arc::new(std::sync::Mutex::new(HashMap::new())),
-    );
-    let app = crate::proxy::router(proxy);
-    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let proxy = spawn_test_proxy(cfg);
 
     let resp = reqwest::Client::new()
-        .post(format!("http://{proxy_addr}/v1/responses"))
+        .post(proxy.responses_url())
         .header("content-type", "application/json")
         .header("content-encoding", "zstd")
         .body("not a zstd frame")
@@ -1104,9 +1029,6 @@ async fn proxy_request_content_encoding_rejects_corrupt_zstd_body() {
     let text = resp.text().await.expect("text");
     assert!(text.contains("Content-Encoding"));
     assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
-
-    proxy_handle.abort();
-    u_handle.abort();
 }
 
 #[tokio::test]
@@ -1254,6 +1176,10 @@ async fn proxy_uses_official_session_id_affinity_for_responses_compact() {
         .await
         .expect("route affinity recorded from official session-id");
     assert_eq!(affinity.provider_endpoint.provider_id.as_str(), "b");
+    assert_eq!(
+        affinity.session_identity_source,
+        Some(SessionIdentitySource::Header)
+    );
 
     let compact = client
         .post(format!("http://{proxy_addr}/responses/compact"))
@@ -1272,6 +1198,29 @@ async fn proxy_uses_official_session_id_affinity_for_responses_compact() {
     assert_eq!(compact["compact"].as_bool(), Some(true));
     assert_eq!(a_compact_hits.load(Ordering::SeqCst), 0);
     assert_eq!(b_compact_hits.load(Ordering::SeqCst), 1);
+    let recent = state.list_recent_finished(20).await;
+    assert!(
+        recent.iter().any(|request| {
+            request.session_id.as_deref() == Some("sid-official")
+                && request.session_identity_source == Some(SessionIdentitySource::Header)
+        }),
+        "finished requests should preserve official header session source"
+    );
+    let cards = state.list_session_identity_cards(20).await;
+    let card = cards
+        .iter()
+        .find(|card| card.session_id.as_deref() == Some("sid-official"))
+        .expect("session card for official session");
+    assert_eq!(
+        card.session_identity_source,
+        Some(SessionIdentitySource::Header)
+    );
+    assert_eq!(
+        card.route_affinity
+            .as_ref()
+            .and_then(|affinity| affinity.session_identity_source),
+        Some(SessionIdentitySource::Header)
+    );
     proxy_handle.abort();
     a_handle.abort();
     b_handle.abort();
@@ -1425,6 +1374,10 @@ async fn proxy_uses_prompt_cache_key_affinity_when_session_headers_are_absent() 
         .await
         .expect("route affinity recorded from prompt_cache_key");
     assert_eq!(affinity.provider_endpoint.provider_id.as_str(), "b");
+    assert_eq!(
+        affinity.session_identity_source,
+        Some(SessionIdentitySource::PromptCacheKey)
+    );
 
     let compact = client
         .post(format!("http://{proxy_addr}/responses/compact"))
@@ -1452,6 +1405,33 @@ async fn proxy_uses_prompt_cache_key_affinity_when_session_headers_are_absent() 
             .provider_id
             .as_str(),
         "b"
+    );
+    assert_eq!(
+        affinity_after_compact.session_identity_source,
+        Some(SessionIdentitySource::PromptCacheKey)
+    );
+    let recent = state.list_recent_finished(20).await;
+    assert!(
+        recent.iter().any(|request| {
+            request.session_id.as_deref() == Some("pcache-affinity")
+                && request.session_identity_source == Some(SessionIdentitySource::PromptCacheKey)
+        }),
+        "finished requests should preserve prompt_cache_key session source"
+    );
+    let cards = state.list_session_identity_cards(20).await;
+    let card = cards
+        .iter()
+        .find(|card| card.session_id.as_deref() == Some("pcache-affinity"))
+        .expect("session card for prompt_cache_key fallback");
+    assert_eq!(
+        card.session_identity_source,
+        Some(SessionIdentitySource::PromptCacheKey)
+    );
+    assert_eq!(
+        card.route_affinity
+            .as_ref()
+            .and_then(|affinity| affinity.session_identity_source),
+        Some(SessionIdentitySource::PromptCacheKey)
     );
 
     proxy_handle.abort();
@@ -1521,20 +1501,8 @@ async fn proxy_records_responses_compact_unsupported_status_for_fallback_diagnos
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
 
-    let mut finished = Vec::new();
-    for _ in 0..100 {
-        finished = state.list_recent_finished(10).await;
-        if finished
-            .iter()
-            .any(|request| request.path == "/responses/compact")
-        {
-            break;
-        }
-        sleep(Duration::from_millis(20)).await;
-    }
-    let compact = finished
-        .iter()
-        .find(|request| request.path == "/responses/compact")
+    let compact = find_finished_request(&state, 10, |request| request.path == "/responses/compact")
+        .await
         .expect("expected compact request path to be visible in finished requests");
     assert_eq!(compact.status_code, StatusCode::NOT_FOUND.as_u16());
 
@@ -1558,7 +1526,7 @@ async fn proxy_does_not_retry_or_failover_on_400() {
             )
         }),
     );
-    let (u1_addr, u1_handle) = spawn_axum_server(upstream1);
+    let upstream1 = spawn_test_upstream(upstream1);
 
     let u2_hits = upstream2_hits.clone();
     let upstream2 = axum::Router::new().route(
@@ -1568,9 +1536,8 @@ async fn proxy_does_not_retry_or_failover_on_400() {
             (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
         }),
     );
-    let (u2_addr, u2_handle) = spawn_axum_server(upstream2);
+    let upstream2 = spawn_test_upstream(upstream2);
 
-    let proxy_client = Client::new();
     let retry = RetryConfig {
         upstream: Some(crate::config::RetryLayerConfig {
             max_attempts: Some(2),
@@ -1599,60 +1566,18 @@ async fn proxy_does_not_retry_or_failover_on_400() {
         ..Default::default()
     };
     let cfg = make_proxy_config(
-        vec![
-            UpstreamConfig {
-                base_url: format!("http://{}/v1", u1_addr),
-                auth: UpstreamAuth {
-                    auth_token: None,
-                    auth_token_env: None,
-                    api_key: None,
-                    api_key_env: None,
-                },
-                tags: HashMap::new(),
-                supported_models: HashMap::new(),
-                model_mapping: HashMap::new(),
-            },
-            UpstreamConfig {
-                base_url: format!("http://{}/v1", u2_addr),
-                auth: UpstreamAuth {
-                    auth_token: None,
-                    auth_token_env: None,
-                    api_key: None,
-                    api_key_env: None,
-                },
-                tags: HashMap::new(),
-                supported_models: HashMap::new(),
-                model_mapping: HashMap::new(),
-            },
-        ],
+        vec![upstream1.upstream_config(), upstream2.upstream_config()],
         retry,
     );
 
-    let proxy = ProxyService::new(
-        proxy_client,
-        Arc::new(cfg),
-        "codex",
-        Arc::new(std::sync::Mutex::new(HashMap::new())),
-    );
-    let app = crate::proxy::router(proxy);
-    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let proxy = spawn_test_proxy(cfg);
 
     let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("http://{}/v1/responses", proxy_addr))
-        .header("content-type", "application/json")
-        .body(r#"{"model":"gpt","input":"hi"}"#)
-        .send()
-        .await
-        .expect("send");
+    let resp = post_responses_json(&client, &proxy, r#"{"model":"gpt","input":"hi"}"#).await;
 
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     assert_eq!(upstream1_hits.load(Ordering::SeqCst), 1);
     assert_eq!(upstream2_hits.load(Ordering::SeqCst), 0);
-
-    proxy_handle.abort();
-    u1_handle.abort();
-    u2_handle.abort();
 }
 
 #[tokio::test]
@@ -1668,7 +1593,7 @@ async fn proxy_failover_retries_404_when_enabled() {
             StatusCode::NOT_FOUND
         }),
     );
-    let (u1_addr, u1_handle) = spawn_axum_server(upstream1);
+    let upstream1 = spawn_test_upstream(upstream1);
 
     let u2_hits = upstream2_hits.clone();
     let upstream2 = axum::Router::new().route(
@@ -1678,57 +1603,18 @@ async fn proxy_failover_retries_404_when_enabled() {
             (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
         }),
     );
-    let (u2_addr, u2_handle) = spawn_axum_server(upstream2);
+    let upstream2 = spawn_test_upstream(upstream2);
 
-    let proxy_client = Client::new();
     let retry = retry_config(2, "400-599", Vec::new(), RetryStrategy::Failover);
     let cfg = make_proxy_config(
-        vec![
-            UpstreamConfig {
-                base_url: format!("http://{}/v1", u1_addr),
-                auth: UpstreamAuth {
-                    auth_token: None,
-                    auth_token_env: None,
-                    api_key: None,
-                    api_key_env: None,
-                },
-                tags: HashMap::new(),
-                supported_models: HashMap::new(),
-                model_mapping: HashMap::new(),
-            },
-            UpstreamConfig {
-                base_url: format!("http://{}/v1", u2_addr),
-                auth: UpstreamAuth {
-                    auth_token: None,
-                    auth_token_env: None,
-                    api_key: None,
-                    api_key_env: None,
-                },
-                tags: HashMap::new(),
-                supported_models: HashMap::new(),
-                model_mapping: HashMap::new(),
-            },
-        ],
+        vec![upstream1.upstream_config(), upstream2.upstream_config()],
         retry,
     );
 
-    let proxy = ProxyService::new(
-        proxy_client,
-        Arc::new(cfg),
-        "codex",
-        Arc::new(std::sync::Mutex::new(HashMap::new())),
-    );
-    let app = crate::proxy::router(proxy);
-    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let proxy = spawn_test_proxy(cfg);
 
     let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("http://{}/v1/responses", proxy_addr))
-        .header("content-type", "application/json")
-        .body(r#"{"model":"gpt","input":"hi"}"#)
-        .send()
-        .await
-        .expect("send");
+    let resp = post_responses_json(&client, &proxy, r#"{"model":"gpt","input":"hi"}"#).await;
 
     assert_eq!(resp.status(), StatusCode::OK);
     // Two-layer model: retry current upstream first, then fail over.
@@ -1738,10 +1624,6 @@ async fn proxy_failover_retries_404_when_enabled() {
         matches!(u2, 1 | 2),
         "expected upstream2 hits to be 1..=2 (transport flake tolerance), got {u2}"
     );
-
-    proxy_handle.abort();
-    u1_handle.abort();
-    u2_handle.abort();
 }
 
 #[tokio::test]
@@ -1765,7 +1647,7 @@ async fn proxy_does_not_failover_on_non_retryable_client_error_class() {
             )
         }),
     );
-    let (u1_addr, u1_handle) = spawn_axum_server(upstream1);
+    let upstream1 = spawn_test_upstream(upstream1);
 
     let u2_hits = upstream2_hits.clone();
     let upstream2 = axum::Router::new().route(
@@ -1775,65 +1657,22 @@ async fn proxy_does_not_failover_on_non_retryable_client_error_class() {
             (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
         }),
     );
-    let (u2_addr, u2_handle) = spawn_axum_server(upstream2);
+    let upstream2 = spawn_test_upstream(upstream2);
 
-    let proxy_client = Client::new();
     let retry = retry_config(2, "400-599", Vec::new(), RetryStrategy::Failover);
     let cfg = make_proxy_config(
-        vec![
-            UpstreamConfig {
-                base_url: format!("http://{}/v1", u1_addr),
-                auth: UpstreamAuth {
-                    auth_token: None,
-                    auth_token_env: None,
-                    api_key: None,
-                    api_key_env: None,
-                },
-                tags: HashMap::new(),
-                supported_models: HashMap::new(),
-                model_mapping: HashMap::new(),
-            },
-            UpstreamConfig {
-                base_url: format!("http://{}/v1", u2_addr),
-                auth: UpstreamAuth {
-                    auth_token: None,
-                    auth_token_env: None,
-                    api_key: None,
-                    api_key_env: None,
-                },
-                tags: HashMap::new(),
-                supported_models: HashMap::new(),
-                model_mapping: HashMap::new(),
-            },
-        ],
+        vec![upstream1.upstream_config(), upstream2.upstream_config()],
         retry,
     );
 
-    let proxy = ProxyService::new(
-        proxy_client,
-        Arc::new(cfg),
-        "codex",
-        Arc::new(std::sync::Mutex::new(HashMap::new())),
-    );
-    let app = crate::proxy::router(proxy);
-    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let proxy = spawn_test_proxy(cfg);
 
     let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("http://{}/v1/responses", proxy_addr))
-        .header("content-type", "application/json")
-        .body(r#"{"model":"gpt","input":"hi"}"#)
-        .send()
-        .await
-        .expect("send");
+    let resp = post_responses_json(&client, &proxy, r#"{"model":"gpt","input":"hi"}"#).await;
 
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     assert_eq!(upstream1_hits.load(Ordering::SeqCst), 1);
     assert_eq!(upstream2_hits.load(Ordering::SeqCst), 0);
-
-    proxy_handle.abort();
-    u1_handle.abort();
-    u2_handle.abort();
 }
 
 #[tokio::test]
@@ -1852,7 +1691,7 @@ async fn proxy_skips_upstreams_that_do_not_support_model() {
             )
         }),
     );
-    let (u1_addr, u1_handle) = spawn_axum_server(upstream1);
+    let upstream1 = spawn_test_upstream(upstream1);
 
     let u2_hits = upstream2_hits.clone();
     let upstream2 = axum::Router::new().route(
@@ -1865,73 +1704,39 @@ async fn proxy_skips_upstreams_that_do_not_support_model() {
             )
         }),
     );
-    let (u2_addr, u2_handle) = spawn_axum_server(upstream2);
+    let upstream2 = spawn_test_upstream(upstream2);
 
-    let proxy_client = Client::new();
     let retry = retry_config(1, "502", Vec::new(), RetryStrategy::Failover);
     let cfg = make_proxy_config(
         vec![
             UpstreamConfig {
-                base_url: format!("http://{}/v1", u1_addr),
-                auth: UpstreamAuth {
-                    auth_token: None,
-                    auth_token_env: None,
-                    api_key: None,
-                    api_key_env: None,
-                },
-                tags: HashMap::new(),
                 supported_models: {
                     let mut m = HashMap::new();
                     m.insert("other-*".to_string(), true);
                     m
                 },
-                model_mapping: HashMap::new(),
+                ..upstream1.upstream_config()
             },
             UpstreamConfig {
-                base_url: format!("http://{}/v1", u2_addr),
-                auth: UpstreamAuth {
-                    auth_token: None,
-                    auth_token_env: None,
-                    api_key: None,
-                    api_key_env: None,
-                },
-                tags: HashMap::new(),
                 supported_models: {
                     let mut m = HashMap::new();
                     m.insert("gpt-*".to_string(), true);
                     m
                 },
-                model_mapping: HashMap::new(),
+                ..upstream2.upstream_config()
             },
         ],
         retry,
     );
 
-    let proxy = ProxyService::new(
-        proxy_client,
-        Arc::new(cfg),
-        "codex",
-        Arc::new(std::sync::Mutex::new(HashMap::new())),
-    );
-    let app = crate::proxy::router(proxy);
-    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let proxy = spawn_test_proxy(cfg);
 
     let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("http://{}/v1/responses", proxy_addr))
-        .header("content-type", "application/json")
-        .body(r#"{"model":"gpt-4","input":"hi"}"#)
-        .send()
-        .await
-        .expect("send");
+    let resp = post_responses_json(&client, &proxy, r#"{"model":"gpt-4","input":"hi"}"#).await;
 
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(upstream1_hits.load(Ordering::SeqCst), 0);
     assert_eq!(upstream2_hits.load(Ordering::SeqCst), 1);
-
-    proxy_handle.abort();
-    u1_handle.abort();
-    u2_handle.abort();
 }
 
 #[tokio::test]
@@ -1956,20 +1761,10 @@ async fn proxy_applies_model_mapping_to_request_body() {
             }
         }),
     );
-    let (u_addr, u_handle) = spawn_axum_server(upstream);
+    let upstream = spawn_test_upstream(upstream);
 
-    let proxy_client = Client::new();
-    let retry = retry_config(1, "502", Vec::new(), RetryStrategy::Failover);
     let cfg = make_proxy_config(
         vec![UpstreamConfig {
-            base_url: format!("http://{}/v1", u_addr),
-            auth: UpstreamAuth {
-                auth_token: None,
-                auth_token_env: None,
-                api_key: None,
-                api_key_env: None,
-            },
-            tags: HashMap::new(),
             supported_models: {
                 let mut m = HashMap::new();
                 m.insert("anthropic/claude-*".to_string(), true);
@@ -1980,33 +1775,22 @@ async fn proxy_applies_model_mapping_to_request_body() {
                 m.insert("claude-*".to_string(), "anthropic/claude-*".to_string());
                 m
             },
+            ..upstream.upstream_config()
         }],
-        retry,
+        retry_config(1, "502", Vec::new(), RetryStrategy::Failover),
     );
-
-    let proxy = ProxyService::new(
-        proxy_client,
-        Arc::new(cfg),
-        "codex",
-        Arc::new(std::sync::Mutex::new(HashMap::new())),
-    );
-    let app = crate::proxy::router(proxy);
-    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let proxy = spawn_test_proxy(cfg);
 
     let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("http://{}/v1/responses", proxy_addr))
-        .header("content-type", "application/json")
-        .body(r#"{"model":"claude-sonnet-4","input":"hi"}"#)
-        .send()
-        .await
-        .expect("send");
+    let resp = post_responses_json(
+        &client,
+        &proxy,
+        r#"{"model":"claude-sonnet-4","input":"hi"}"#,
+    )
+    .await;
 
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
-
-    proxy_handle.abort();
-    u_handle.abort();
 }
 
 #[tokio::test]

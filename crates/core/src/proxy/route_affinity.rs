@@ -1,6 +1,6 @@
 use crate::logging::{RouteAttemptLog, now_ms};
 use crate::routing_ir::{RoutePlanRuntimeState, RoutePlanTemplate};
-use crate::state::SessionRouteAffinityTarget;
+use crate::state::{SessionIdentitySource, SessionRouteAffinityTarget};
 
 use super::ProxyService;
 use super::attempt_target::AttemptTarget;
@@ -42,6 +42,7 @@ pub(super) async fn apply_session_route_affinity_to_runtime(
 pub(super) async fn record_session_route_affinity_success(
     proxy: &ProxyService,
     session_id: Option<&str>,
+    session_identity_source: Option<SessionIdentitySource>,
     route_graph_key: Option<&str>,
     target: &AttemptTarget,
     route_attempts: &[RouteAttemptLog],
@@ -58,6 +59,7 @@ pub(super) async fn record_session_route_affinity_success(
     };
     let target = SessionRouteAffinityTarget {
         route_graph_key: route_graph_key.to_string(),
+        session_identity_source,
         provider_endpoint,
         upstream_base_url: target.upstream().base_url.clone(),
         route_path: target.route_path(),

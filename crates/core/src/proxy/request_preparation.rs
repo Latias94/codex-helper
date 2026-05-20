@@ -1,14 +1,24 @@
+use std::sync::Arc;
+
 use axum::body::Bytes;
-use axum::http::{HeaderMap, Method};
+use axum::http::{HeaderMap, Method, Uri};
 
 use crate::codex_integration::CodexPatchMode;
+use crate::config::{ProxyConfig, ProxyConfigV4};
+use crate::lb::CooldownBackoff;
 use crate::logging::{BodyPreview, CodexBridgeLog, ServiceTierLog, make_body_preview};
+use crate::routing_ir::RouteRequestContext;
+use crate::state::{SessionBinding, SessionIdentitySource};
 
+use super::ProxyService;
+use super::client_identity::{ClientSessionIdentity, extract_session_identity_with_body_fallback};
 use super::request_body::{
     apply_model_override_value, apply_reasoning_effort_override_value,
     apply_service_tier_override_value, extract_model_from_value,
     extract_reasoning_effort_from_value, extract_service_tier_from_value,
 };
+use super::request_routing::RequestRouteSelection;
+use super::retry::{RetryPlan, retry_plan};
 
 #[derive(Debug, Clone)]
 pub(super) struct RequestFlavor {
@@ -33,6 +43,274 @@ pub(super) struct PreparedRequestBody {
 pub(super) struct BodyPreviewSet {
     pub debug: Option<BodyPreview>,
     pub warn: Option<BodyPreview>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct RequestConfigContext {
+    pub(super) cfg_snapshot: Arc<ProxyConfig>,
+    pub(super) v4_snapshot: Option<Arc<ProxyConfigV4>>,
+    pub(super) route_graph_config: bool,
+    pub(super) codex_patch_mode: CodexPatchMode,
+}
+
+pub(super) struct CommonPreparedRequest {
+    pub(super) session_id: Option<String>,
+    pub(super) session_identity_source: Option<SessionIdentitySource>,
+    pub(super) session_binding: Option<SessionBinding>,
+    pub(super) route_selection: RequestRouteSelection,
+    pub(super) cwd: Option<String>,
+    pub(super) session_override_config: Option<String>,
+    pub(super) global_station_override: Option<String>,
+    pub(super) override_effort: Option<String>,
+    pub(super) override_model: Option<String>,
+    pub(super) override_service_tier: Option<String>,
+    pub(super) body_for_upstream: Bytes,
+    pub(super) request_model: Option<String>,
+    pub(super) effective_effort: Option<String>,
+    pub(super) effective_service_tier: Option<String>,
+    pub(super) base_service_tier: ServiceTierLog,
+    pub(super) request_body_len: usize,
+    pub(super) request_body_previews: bool,
+    pub(super) debug_max: usize,
+    pub(super) warn_max: usize,
+    pub(super) client_body_debug: Option<BodyPreview>,
+    pub(super) client_body_warn: Option<BodyPreview>,
+    pub(super) request_id: u64,
+    pub(super) plan: RetryPlan,
+    pub(super) cooldown_backoff: CooldownBackoff,
+}
+
+#[derive(Debug, Clone)]
+pub(super) enum CommonRequestPreparationError {
+    NoRoutableStation {
+        session_id: Option<String>,
+        session_identity_source: Option<SessionIdentitySource>,
+    },
+}
+
+pub(super) struct CommonRequestPreparationParams<'a> {
+    pub(super) proxy: &'a ProxyService,
+    pub(super) config: &'a RequestConfigContext,
+    pub(super) method: &'a Method,
+    pub(super) uri: &'a Uri,
+    pub(super) client_headers: &'a HeaderMap,
+    pub(super) raw_body: &'a Bytes,
+    pub(super) client_name: Option<String>,
+    pub(super) client_addr: Option<String>,
+    pub(super) started_at_ms: u64,
+    pub(super) client_content_type: Option<&'a str>,
+    pub(super) request_body_previews: bool,
+}
+
+fn codex_patch_mode_for_proxy(proxy: &ProxyService) -> CodexPatchMode {
+    if proxy.service_name != "codex" {
+        return CodexPatchMode::Default;
+    }
+    crate::codex_integration::codex_switch_status()
+        .ok()
+        .and_then(|status| status.patch_mode)
+        .unwrap_or(CodexPatchMode::Default)
+}
+
+pub(super) async fn load_request_config_context(proxy: &ProxyService) -> RequestConfigContext {
+    let config_reloaded = proxy.config.maybe_reload_from_disk().await;
+    let cfg_snapshot = proxy.config.snapshot().await;
+    let v4_snapshot = proxy.config.v4_snapshot().await;
+    let route_graph_config = v4_snapshot.is_some();
+    let mgr = proxy.service_manager(cfg_snapshot.as_ref());
+    if config_reloaded {
+        proxy
+            .state
+            .prune_runtime_observability_for_service(proxy.service_name, mgr)
+            .await;
+    }
+
+    RequestConfigContext {
+        cfg_snapshot,
+        v4_snapshot,
+        route_graph_config,
+        codex_patch_mode: codex_patch_mode_for_proxy(proxy),
+    }
+}
+
+pub(super) async fn prepare_common_request(
+    params: CommonRequestPreparationParams<'_>,
+) -> Result<CommonPreparedRequest, CommonRequestPreparationError> {
+    let CommonRequestPreparationParams {
+        proxy,
+        config,
+        method,
+        uri,
+        client_headers,
+        raw_body,
+        client_name,
+        client_addr,
+        started_at_ms,
+        client_content_type,
+        request_body_previews,
+    } = params;
+    let mgr = proxy.service_manager(config.cfg_snapshot.as_ref());
+    let session_identity =
+        extract_session_identity_with_body_fallback(client_headers, raw_body.as_ref());
+    let session_id = session_identity_value(session_identity.as_ref());
+    let session_identity_source = session_identity_source(session_identity.as_ref());
+    let session_binding = if let Some(id) = session_id.as_deref() {
+        proxy
+            .ensure_default_session_binding(mgr, id, started_at_ms)
+            .await
+    } else {
+        None
+    };
+    let cwd = resolve_and_touch_session_state(proxy, session_id.as_deref(), started_at_ms).await;
+    let session_override_config = if !config.route_graph_config
+        && let Some(id) = session_id.as_deref()
+    {
+        proxy.state.get_session_station_override(id).await
+    } else {
+        None
+    };
+    let global_station_override = if config.route_graph_config {
+        None
+    } else {
+        proxy.state.get_global_station_override().await
+    };
+
+    let override_effort = if let Some(id) = session_id.as_deref() {
+        proxy.state.get_session_effort_override(id).await
+    } else {
+        None
+    };
+    let override_model = if let Some(id) = session_id.as_deref() {
+        proxy.state.get_session_model_override(id).await
+    } else {
+        None
+    };
+    let override_service_tier = if let Some(id) = session_id.as_deref() {
+        proxy.state.get_session_service_tier_override(id).await
+    } else {
+        None
+    };
+    let binding_effort = session_binding
+        .as_ref()
+        .and_then(|binding| binding.reasoning_effort.as_deref());
+    let binding_model = session_binding
+        .as_ref()
+        .and_then(|binding| binding.model.as_deref());
+    let binding_service_tier = session_binding
+        .as_ref()
+        .and_then(|binding| binding.service_tier.as_deref());
+
+    let prepared_request = prepare_request_body(
+        raw_body,
+        override_effort.as_deref(),
+        binding_effort,
+        override_model.as_deref(),
+        binding_model,
+        override_service_tier.as_deref(),
+        binding_service_tier,
+    );
+    let body_for_upstream = prepared_request.body_for_upstream.clone();
+    let request_model = prepared_request.request_model.clone();
+    let effective_effort = prepared_request.effective_effort.clone();
+    let effective_service_tier = prepared_request.base_service_tier.effective.clone();
+    let base_service_tier = prepared_request.base_service_tier.clone();
+    let request_body_len = prepared_request.request_body_len;
+
+    let debug_opt = crate::logging::http_debug_options();
+    let warn_opt = crate::logging::http_warn_options();
+    let debug_max = if request_body_previews && debug_opt.enabled {
+        debug_opt.max_body_bytes
+    } else {
+        0
+    };
+    let warn_max = if request_body_previews && warn_opt.enabled {
+        warn_opt.max_body_bytes
+    } else {
+        0
+    };
+    let client_body_previews = build_body_previews(
+        raw_body,
+        client_content_type,
+        request_body_previews,
+        debug_max,
+        warn_max,
+    );
+    let client_body_debug = client_body_previews.debug.clone();
+    let client_body_warn = client_body_previews.warn.clone();
+
+    let request_id = proxy
+        .state
+        .begin_request(
+            proxy.service_name,
+            method.as_str(),
+            uri.path(),
+            session_id.clone(),
+            session_identity_source,
+            client_name,
+            client_addr,
+            cwd.clone(),
+            request_model.clone(),
+            effective_effort.clone(),
+            effective_service_tier.clone(),
+            started_at_ms,
+        )
+        .await;
+
+    let plan = retry_plan(&config.cfg_snapshot.retry.resolve());
+    let cooldown_backoff = CooldownBackoff {
+        factor: plan.cooldown_backoff_factor,
+        max_secs: plan.cooldown_backoff_max_secs,
+    };
+
+    let route_request = route_request_context(
+        method,
+        uri,
+        client_headers,
+        request_model.clone(),
+        effective_effort.clone(),
+        effective_service_tier.clone(),
+    );
+    let route_selection = proxy
+        .lbs_for_request(
+            config.cfg_snapshot.as_ref(),
+            config.v4_snapshot.as_deref(),
+            &route_request,
+            session_id.as_deref(),
+        )
+        .await;
+    if route_selection.is_empty() {
+        return Err(CommonRequestPreparationError::NoRoutableStation {
+            session_id,
+            session_identity_source,
+        });
+    }
+
+    Ok(CommonPreparedRequest {
+        session_id,
+        session_identity_source,
+        session_binding,
+        route_selection,
+        cwd,
+        session_override_config,
+        global_station_override,
+        override_effort,
+        override_model,
+        override_service_tier,
+        body_for_upstream,
+        request_model,
+        effective_effort,
+        effective_service_tier,
+        base_service_tier,
+        request_body_len,
+        request_body_previews,
+        debug_max,
+        warn_max,
+        client_body_debug,
+        client_body_warn,
+        request_id,
+        plan,
+        cooldown_backoff,
+    })
 }
 
 pub(super) fn detect_request_flavor(
@@ -74,6 +352,77 @@ pub(super) fn detect_request_flavor(
         codex_client_patch_mode,
         codex_bridge_log,
     }
+}
+
+pub(super) fn session_identity_value(identity: Option<&ClientSessionIdentity>) -> Option<String> {
+    identity.map(|identity| identity.value().to_string())
+}
+
+pub(super) fn session_identity_source(
+    identity: Option<&ClientSessionIdentity>,
+) -> Option<SessionIdentitySource> {
+    identity.map(|identity| identity.source())
+}
+
+pub(super) fn route_request_context(
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    service_tier: Option<String>,
+) -> RouteRequestContext {
+    RouteRequestContext {
+        model,
+        service_tier,
+        reasoning_effort,
+        path: Some(uri.path().to_string()),
+        method: Some(method.as_str().to_string()),
+        headers: headers
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_string(), value.to_string()))
+            })
+            .collect(),
+    }
+}
+
+pub(super) async fn resolve_and_touch_session_state(
+    proxy: &ProxyService,
+    session_id: Option<&str>,
+    started_at_ms: u64,
+) -> Option<String> {
+    let cwd = if let Some(id) = session_id {
+        proxy.state.resolve_session_cwd(id).await
+    } else {
+        None
+    };
+
+    if let Some(id) = session_id {
+        proxy.state.touch_session_override(id, started_at_ms).await;
+        proxy
+            .state
+            .touch_session_station_override(id, started_at_ms)
+            .await;
+        proxy
+            .state
+            .touch_session_route_target_override(id, started_at_ms)
+            .await;
+        proxy
+            .state
+            .touch_session_model_override(id, started_at_ms)
+            .await;
+        proxy
+            .state
+            .touch_session_service_tier_override(id, started_at_ms)
+            .await;
+        proxy.state.touch_session_binding(id, started_at_ms).await;
+    }
+
+    cwd
 }
 
 pub(super) fn prepare_request_body(
@@ -160,9 +509,16 @@ pub(super) fn build_body_previews(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
     use axum::http::{HeaderMap, HeaderValue};
 
     use super::*;
+    use crate::config::{
+        ProxyConfig, ServiceConfig, ServiceControlProfile, UpstreamAuth, UpstreamConfig,
+    };
+    use crate::lb::LbState;
 
     #[test]
     fn detect_request_flavor_reads_stream_and_turn_shape() {
@@ -256,5 +612,88 @@ mod tests {
         );
         assert!(disabled.debug.is_none());
         assert!(disabled.warn.is_none());
+    }
+
+    fn test_proxy_with_active_station() -> ProxyService {
+        let mut cfg = ProxyConfig::default();
+        cfg.codex.active = Some("test".to_string());
+        cfg.codex.default_profile = Some("default".to_string());
+        cfg.codex.profiles.insert(
+            "default".to_string(),
+            ServiceControlProfile {
+                model: Some("gpt-5.4".to_string()),
+                ..ServiceControlProfile::default()
+            },
+        );
+        cfg.codex.configs.insert(
+            "test".to_string(),
+            ServiceConfig {
+                name: "test".to_string(),
+                alias: None,
+                enabled: true,
+                level: 1,
+                upstreams: vec![UpstreamConfig {
+                    base_url: "https://example.com/v1".to_string(),
+                    auth: UpstreamAuth::default(),
+                    tags: HashMap::new(),
+                    supported_models: HashMap::new(),
+                    model_mapping: HashMap::new(),
+                }],
+            },
+        );
+        ProxyService::new(
+            reqwest::Client::new(),
+            Arc::new(cfg),
+            "codex",
+            Arc::new(Mutex::new(HashMap::<String, LbState>::new())),
+        )
+    }
+
+    #[tokio::test]
+    async fn prepare_common_request_tracks_prompt_cache_identity_and_overrides_body() {
+        let proxy = test_proxy_with_active_station();
+        let config = load_request_config_context(&proxy).await;
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        let method = Method::POST;
+        let uri = "/v1/responses".parse::<Uri>().expect("uri");
+        let raw_body =
+            Bytes::from_static(br#"{"model":"gpt-5","prompt_cache_key":"pcache-shared"}"#);
+
+        let prepared = prepare_common_request(CommonRequestPreparationParams {
+            proxy: &proxy,
+            config: &config,
+            method: &method,
+            uri: &uri,
+            client_headers: &headers,
+            raw_body: &raw_body,
+            client_name: Some("test-client".to_string()),
+            client_addr: None,
+            started_at_ms: 2,
+            client_content_type: Some("application/json"),
+            request_body_previews: false,
+        })
+        .await
+        .expect("prepared");
+
+        assert_eq!(prepared.session_id.as_deref(), Some("pcache-shared"));
+        assert_eq!(
+            prepared.session_identity_source,
+            Some(SessionIdentitySource::PromptCacheKey)
+        );
+        assert_eq!(prepared.request_model.as_deref(), Some("gpt-5.4"));
+        assert!(
+            String::from_utf8_lossy(prepared.body_for_upstream.as_ref()).contains("\"gpt-5.4\"")
+        );
+        assert_eq!(prepared.request_body_previews, false);
+        assert!(!prepared.route_selection.is_empty());
+
+        let active = proxy.state.list_active_requests().await;
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].session_id.as_deref(), Some("pcache-shared"));
+        assert_eq!(
+            active[0].session_identity_source,
+            Some(SessionIdentitySource::PromptCacheKey)
+        );
     }
 }

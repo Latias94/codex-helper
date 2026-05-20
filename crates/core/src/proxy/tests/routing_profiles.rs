@@ -248,6 +248,7 @@ async fn proxy_api_v1_snapshot_works() {
             "POST",
             "/v1/responses",
             Some("sid-1".to_string()),
+            None,
             Some("Frank-Desk".to_string()),
             Some("100.64.0.12".to_string()),
             Some("G:/codes/demo".to_string()),

@@ -45,6 +45,75 @@ pub enum CodexRelayProbeSideEffect {
     ValidationOnly,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::proxy) struct CodexRelayProbeCase {
+    pub kind: CodexRelayProbeKind,
+    pub capability: &'static str,
+    pub method: &'static str,
+    pub path: &'static str,
+    pub side_effect: CodexRelayProbeSideEffect,
+    body: CodexRelayProbeBody,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexRelayProbeBody {
+    None,
+    EmptyJsonObject,
+}
+
+const CODEX_RELAY_PROBE_CASES: &[CodexRelayProbeCase] = &[
+    CodexRelayProbeCase {
+        kind: CodexRelayProbeKind::Models,
+        capability: "model_catalog",
+        method: "GET",
+        path: "/models",
+        side_effect: CodexRelayProbeSideEffect::ReadOnly,
+        body: CodexRelayProbeBody::None,
+    },
+    CodexRelayProbeCase {
+        kind: CodexRelayProbeKind::Responses,
+        capability: "responses",
+        method: "POST",
+        path: "/responses",
+        side_effect: CodexRelayProbeSideEffect::ValidationOnly,
+        body: CodexRelayProbeBody::EmptyJsonObject,
+    },
+    CodexRelayProbeCase {
+        kind: CodexRelayProbeKind::ResponsesCompact,
+        capability: "remote_compaction_v1",
+        method: "POST",
+        path: "/responses/compact",
+        side_effect: CodexRelayProbeSideEffect::ValidationOnly,
+        body: CodexRelayProbeBody::EmptyJsonObject,
+    },
+];
+
+pub(in crate::proxy) fn codex_relay_probe_cases() -> &'static [CodexRelayProbeCase] {
+    CODEX_RELAY_PROBE_CASES
+}
+
+impl CodexRelayProbeCase {
+    pub(in crate::proxy) fn for_kind(kind: CodexRelayProbeKind) -> &'static Self {
+        codex_relay_probe_cases()
+            .iter()
+            .find(|case| case.kind == kind)
+            .expect("Codex relay probe kind must be registered")
+    }
+
+    pub(in crate::proxy) fn spec(&self) -> CodexRelayProbeSpec {
+        CodexRelayProbeSpec {
+            kind: self.kind,
+            method: self.method.to_string(),
+            path: self.path.to_string(),
+            side_effect: self.side_effect,
+            body: match self.body {
+                CodexRelayProbeBody::None => None,
+                CodexRelayProbeBody::EmptyJsonObject => Some(serde_json::json!({})),
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodexRelayProbeSpec {
     pub kind: CodexRelayProbeKind,
@@ -56,29 +125,7 @@ pub struct CodexRelayProbeSpec {
 
 impl CodexRelayProbeSpec {
     pub fn for_kind(kind: CodexRelayProbeKind) -> Self {
-        match kind {
-            CodexRelayProbeKind::Models => Self {
-                kind,
-                method: Method::GET.as_str().to_string(),
-                path: "/models".to_string(),
-                side_effect: CodexRelayProbeSideEffect::ReadOnly,
-                body: None,
-            },
-            CodexRelayProbeKind::Responses => Self {
-                kind,
-                method: Method::POST.as_str().to_string(),
-                path: "/responses".to_string(),
-                side_effect: CodexRelayProbeSideEffect::ValidationOnly,
-                body: Some(serde_json::json!({})),
-            },
-            CodexRelayProbeKind::ResponsesCompact => Self {
-                kind,
-                method: Method::POST.as_str().to_string(),
-                path: "/responses/compact".to_string(),
-                side_effect: CodexRelayProbeSideEffect::ValidationOnly,
-                body: Some(serde_json::json!({})),
-            },
-        }
+        CodexRelayProbeCase::for_kind(kind).spec()
     }
 
     fn method(&self) -> Method {
@@ -520,6 +567,33 @@ mod tests {
             axum::serve(listener, app).await.expect("serve probe test");
         });
         (addr, handle)
+    }
+
+    #[test]
+    fn codex_relay_probe_registry_defines_existing_wire_contracts() {
+        let cases = codex_relay_probe_cases();
+        assert_eq!(cases.len(), 3);
+        assert_eq!(
+            cases.iter().map(|case| case.kind).collect::<Vec<_>>(),
+            vec![
+                CodexRelayProbeKind::Models,
+                CodexRelayProbeKind::Responses,
+                CodexRelayProbeKind::ResponsesCompact,
+            ]
+        );
+        assert_eq!(
+            cases.iter().map(|case| case.capability).collect::<Vec<_>>(),
+            vec!["model_catalog", "responses", "remote_compaction_v1"]
+        );
+
+        let compact = CodexRelayProbeSpec::for_kind(CodexRelayProbeKind::ResponsesCompact);
+        assert_eq!(compact.method, "POST");
+        assert_eq!(compact.path, "/responses/compact");
+        assert_eq!(
+            compact.side_effect,
+            CodexRelayProbeSideEffect::ValidationOnly
+        );
+        assert_eq!(compact.body, Some(serde_json::json!({})));
     }
 
     #[test]

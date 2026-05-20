@@ -7,7 +7,7 @@ use axum::http::{HeaderMap, Method, Response, StatusCode, Uri};
 
 use crate::lb::{CooldownBackoff, LoadBalancer};
 use crate::logging::{BodyPreview, HeaderEntry, RouteAttemptLog, ServiceTierLog, log_retry_trace};
-use crate::state::SessionBinding;
+use crate::state::{SessionBinding, SessionIdentitySource};
 
 use super::ProxyService;
 use super::attempt_response::{
@@ -74,6 +74,7 @@ pub(super) struct ExecuteSelectedUpstreamParams<'a> {
     pub(super) effective_service_tier: Option<&'a str>,
     pub(super) base_service_tier: &'a ServiceTierLog,
     pub(super) session_id: Option<&'a str>,
+    pub(super) session_identity_source: Option<SessionIdentitySource>,
     pub(super) cwd: Option<&'a str>,
     pub(super) request_flavor: &'a RequestFlavor,
     pub(super) request_body_previews: bool,
@@ -125,6 +126,7 @@ pub(super) async fn execute_selected_upstream(
         effective_service_tier,
         base_service_tier,
         session_id,
+        session_identity_source,
         cwd,
         request_flavor,
         request_body_previews,
@@ -280,6 +282,7 @@ pub(super) async fn execute_selected_upstream(
                     model_note: model_note.as_str(),
                     route_graph_key,
                     session_id,
+                    session_identity_source,
                     cwd,
                     effective_effort,
                     base_service_tier,
@@ -338,6 +341,7 @@ pub(super) async fn execute_selected_upstream(
             upstream_headers_ms,
             provider_id: provider_id.as_deref(),
             session_id,
+            session_identity_source,
             cwd,
             effective_effort,
             base_service_tier,

@@ -4,6 +4,8 @@ use axum::extract::ConnectInfo;
 use axum::http::{Extensions, HeaderMap};
 use serde_json::Value;
 
+use crate::state::SessionIdentitySource;
+
 use super::CLIENT_NAME_HEADER;
 
 fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -24,19 +26,55 @@ fn normalize_client_identity_value(value: &str, max_chars: usize) -> Option<Stri
     Some(out)
 }
 
-pub(super) fn extract_session_id(headers: &HeaderMap) -> Option<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ClientSessionIdentity {
+    value: String,
+    source: SessionIdentitySource,
+}
+
+impl ClientSessionIdentity {
+    fn header(value: &str) -> Self {
+        Self {
+            value: value.to_string(),
+            source: SessionIdentitySource::Header,
+        }
+    }
+
+    fn prompt_cache_key(value: String) -> Self {
+        Self {
+            value,
+            source: SessionIdentitySource::PromptCacheKey,
+        }
+    }
+
+    pub(super) fn value(&self) -> &str {
+        self.value.as_str()
+    }
+
+    pub(super) fn source(&self) -> SessionIdentitySource {
+        self.source
+    }
+}
+
+pub(super) fn extract_session_identity(headers: &HeaderMap) -> Option<ClientSessionIdentity> {
     header_str(headers, "session_id")
         .or_else(|| header_str(headers, "session-id"))
         .or_else(|| header_str(headers, "conversation_id"))
         .or_else(|| header_str(headers, "thread-id"))
-        .map(str::to_owned)
+        .map(ClientSessionIdentity::header)
 }
 
-pub(super) fn extract_session_id_with_body_fallback(
+pub(super) fn extract_session_identity_with_body_fallback(
     headers: &HeaderMap,
     body: &[u8],
-) -> Option<String> {
-    extract_session_id(headers).or_else(|| extract_prompt_cache_key_session_id(body))
+) -> Option<ClientSessionIdentity> {
+    extract_session_identity(headers).or_else(|| extract_prompt_cache_key_session_identity(body))
+}
+
+pub(super) fn extract_prompt_cache_key_session_identity(
+    body: &[u8],
+) -> Option<ClientSessionIdentity> {
+    extract_prompt_cache_key_session_id(body).map(ClientSessionIdentity::prompt_cache_key)
 }
 
 pub(super) fn extract_prompt_cache_key_session_id(body: &[u8]) -> Option<String> {
@@ -76,39 +114,64 @@ mod tests {
     use axum::http::{Extensions, HeaderMap, HeaderValue};
 
     use super::{
-        extract_client_addr, extract_client_name, extract_session_id,
-        extract_session_id_with_body_fallback,
+        extract_client_addr, extract_client_name, extract_session_identity,
+        extract_session_identity_with_body_fallback,
     };
     use crate::proxy::CLIENT_NAME_HEADER;
+    use crate::state::SessionIdentitySource;
 
     #[test]
     fn extract_session_id_prefers_session_id_then_conversation_id() {
         let mut headers = HeaderMap::new();
         headers.insert("conversation_id", HeaderValue::from_static("conv-1"));
-        assert_eq!(extract_session_id(&headers).as_deref(), Some("conv-1"));
+        assert_eq!(
+            extract_session_identity(&headers)
+                .as_ref()
+                .map(|identity| identity.value()),
+            Some("conv-1")
+        );
 
         headers.insert("session_id", HeaderValue::from_static("sess-1"));
-        assert_eq!(extract_session_id(&headers).as_deref(), Some("sess-1"));
+        assert_eq!(
+            extract_session_identity(&headers)
+                .as_ref()
+                .map(|identity| identity.value()),
+            Some("sess-1")
+        );
     }
 
     #[test]
     fn extract_session_id_accepts_official_codex_headers() {
         let mut headers = HeaderMap::new();
         headers.insert("thread-id", HeaderValue::from_static("thread-1"));
-        assert_eq!(extract_session_id(&headers).as_deref(), Some("thread-1"));
+        assert_eq!(
+            extract_session_identity(&headers)
+                .as_ref()
+                .map(|identity| identity.value()),
+            Some("thread-1")
+        );
 
         headers.insert("conversation_id", HeaderValue::from_static("conv-1"));
-        assert_eq!(extract_session_id(&headers).as_deref(), Some("conv-1"));
+        assert_eq!(
+            extract_session_identity(&headers)
+                .as_ref()
+                .map(|identity| identity.value()),
+            Some("conv-1")
+        );
 
         headers.insert("session-id", HeaderValue::from_static("sess-hyphen-1"));
         assert_eq!(
-            extract_session_id(&headers).as_deref(),
+            extract_session_identity(&headers)
+                .as_ref()
+                .map(|identity| identity.value()),
             Some("sess-hyphen-1")
         );
 
         headers.insert("session_id", HeaderValue::from_static("sess-underscore-1"));
         assert_eq!(
-            extract_session_id(&headers).as_deref(),
+            extract_session_identity(&headers)
+                .as_ref()
+                .map(|identity| identity.value()),
             Some("sess-underscore-1")
         );
     }
@@ -117,14 +180,13 @@ mod tests {
     fn extract_session_id_uses_prompt_cache_key_body_fallback() {
         let headers = HeaderMap::new();
 
-        assert_eq!(
-            extract_session_id_with_body_fallback(
-                &headers,
-                br#"{"model":"gpt-5","prompt_cache_key":"pcache-1"}"#,
-            )
-            .as_deref(),
-            Some("pcache-1")
-        );
+        let identity = extract_session_identity_with_body_fallback(
+            &headers,
+            br#"{"model":"gpt-5","prompt_cache_key":"pcache-1"}"#,
+        )
+        .expect("identity");
+        assert_eq!(identity.value(), "pcache-1");
+        assert_eq!(identity.source(), SessionIdentitySource::PromptCacheKey);
     }
 
     #[test]
@@ -132,13 +194,16 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("session_id", HeaderValue::from_static("sid-header"));
 
+        let identity = extract_session_identity_with_body_fallback(
+            &headers,
+            br#"{"model":"gpt-5","prompt_cache_key":"pcache-1"}"#,
+        )
+        .expect("identity");
+        assert_eq!(identity.value(), "sid-header");
+        assert_eq!(identity.source(), SessionIdentitySource::Header);
         assert_eq!(
-            extract_session_id_with_body_fallback(
-                &headers,
-                br#"{"model":"gpt-5","prompt_cache_key":"pcache-1"}"#,
-            )
-            .as_deref(),
-            Some("sid-header")
+            extract_session_identity(&headers).map(|identity| identity.source()),
+            Some(SessionIdentitySource::Header)
         );
     }
 

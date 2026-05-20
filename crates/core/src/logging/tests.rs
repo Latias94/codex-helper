@@ -18,6 +18,7 @@ fn request_log_serializes_request_id_when_present() {
         provider_endpoint_key: None,
         upstream_base_url: "https://example.com/v1",
         session_id: Some("sid-1".to_string()),
+        session_identity_source: Some(crate::state::SessionIdentitySource::Header),
         cwd: Some("/workdir".to_string()),
         model: Some("gpt-5".to_string()),
         reasoning_effort: Some("medium".to_string()),
@@ -38,6 +39,7 @@ fn request_log_serializes_request_id_when_present() {
     assert_eq!(value["request_id"].as_u64(), Some(42));
     assert_eq!(value["trace_id"].as_str(), Some("codex-42"));
     assert_eq!(value["model"].as_str(), Some("gpt-5"));
+    assert_eq!(value["session_identity_source"].as_str(), Some("header"));
 }
 
 #[test]
@@ -58,6 +60,7 @@ fn request_log_can_serialize_provider_endpoint_without_station_identity() {
         provider_endpoint_key: Some("codex/input/default".to_string()),
         upstream_base_url: "https://input.example/v1",
         session_id: Some("sid-1".to_string()),
+        session_identity_source: None,
         cwd: Some("/workdir".to_string()),
         model: None,
         reasoning_effort: Some("medium".to_string()),
@@ -98,6 +101,7 @@ fn request_log_serializes_codex_bridge_metadata() {
         provider_endpoint_key: None,
         upstream_base_url: "https://relay.example/v1",
         session_id: Some("sid-1".to_string()),
+        session_identity_source: Some(crate::state::SessionIdentitySource::PromptCacheKey),
         cwd: Some("/workdir".to_string()),
         model: Some("gpt-5".to_string()),
         reasoning_effort: Some("medium".to_string()),

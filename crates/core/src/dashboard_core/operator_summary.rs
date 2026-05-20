@@ -299,6 +299,7 @@ mod tests {
             id: 1,
             trace_id: Some("codex-1".to_string()),
             session_id: None,
+            session_identity_source: None,
             client_name: None,
             client_addr: None,
             cwd: None,

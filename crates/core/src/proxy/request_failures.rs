@@ -4,7 +4,7 @@ use crate::logging::{
     HeaderEntry, HttpDebugLog, RetryInfo, RouteAttemptLog, ServiceTierLog, log_request_with_debug,
     should_include_http_warn,
 };
-use crate::state::FinishRequestParams;
+use crate::state::{FinishRequestParams, SessionIdentitySource};
 
 use super::ProxyService;
 use super::failure_summary::failed_proxy_client_message;
@@ -21,6 +21,7 @@ pub(super) struct ClientBodyReadErrorParams<'a> {
     pub(super) path: &'a str,
     pub(super) client_uri: &'a str,
     pub(super) session_id: Option<String>,
+    pub(super) session_identity_source: Option<SessionIdentitySource>,
     pub(super) cwd: Option<String>,
     pub(super) client_headers: Vec<HeaderEntry>,
     pub(super) duration_ms: u64,
@@ -37,6 +38,7 @@ pub(super) struct FailedProxyRequestParams<'a> {
     pub(super) duration_ms: u64,
     pub(super) started_at_ms: u64,
     pub(super) session_id: Option<String>,
+    pub(super) session_identity_source: Option<SessionIdentitySource>,
     pub(super) cwd: Option<String>,
     pub(super) effective_effort: Option<String>,
     pub(super) service_tier: ServiceTierLog,
@@ -50,6 +52,7 @@ pub(super) fn log_no_routable_station(
     path: &str,
     client_uri: &str,
     session_id: Option<String>,
+    session_identity_source: Option<SessionIdentitySource>,
     client_headers: Vec<HeaderEntry>,
     duration_ms: u64,
 ) -> (StatusCode, String) {
@@ -78,6 +81,7 @@ pub(super) fn log_no_routable_station(
         None,
         EMPTY_TARGET_URL,
         session_id,
+        session_identity_source,
         None,
         None,
         None,
@@ -101,6 +105,7 @@ pub(super) fn log_client_body_read_error(
         path,
         client_uri,
         session_id,
+        session_identity_source,
         cwd,
         client_headers,
         duration_ms,
@@ -131,6 +136,7 @@ pub(super) fn log_client_body_read_error(
         None,
         EMPTY_TARGET_URL,
         session_id,
+        session_identity_source,
         cwd,
         None,
         None,
@@ -158,6 +164,7 @@ pub(super) async fn finish_failed_proxy_request(
         duration_ms,
         started_at_ms,
         session_id,
+        session_identity_source,
         cwd,
         effective_effort,
         service_tier,
@@ -201,6 +208,7 @@ pub(super) async fn finish_failed_proxy_request(
         None,
         EMPTY_TARGET_URL,
         session_id,
+        session_identity_source,
         cwd,
         None,
         effective_effort,

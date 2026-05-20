@@ -3,6 +3,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::codex_integration::CodexPatchMode;
+use crate::codex_patch_plan::{CodexPatchPlan, CodexSwitchOptions};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -54,10 +55,13 @@ pub enum CodexProviderIdentity {
 
 impl CodexProviderIdentity {
     pub fn from_patch_mode(patch_mode: CodexPatchMode) -> Self {
-        if patch_mode.enables_official_relay_features() {
-            Self::OfficialOpenAi
-        } else {
-            Self::HelperRelay
+        let plan = CodexPatchPlan::for_switch_on(patch_mode, Default::default())
+            .expect("default Codex switch options must be valid for every patch mode");
+        match plan.provider().identity() {
+            crate::codex_patch_plan::CodexPatchProviderIdentity::HelperRelay => Self::HelperRelay,
+            crate::codex_patch_plan::CodexPatchProviderIdentity::OfficialOpenAi => {
+                Self::OfficialOpenAi
+            }
         }
     }
 }
@@ -72,12 +76,18 @@ pub enum CodexAuthShape {
 
 impl CodexAuthShape {
     pub fn from_patch_mode(patch_mode: CodexPatchMode) -> Self {
-        match patch_mode {
-            CodexPatchMode::Default | CodexPatchMode::OfficialRelayBridge => Self::None,
-            CodexPatchMode::ImagegenBridge | CodexPatchMode::OfficialImagegenBridge => {
+        let plan = CodexPatchPlan::for_switch_on(patch_mode, Default::default())
+            .expect("default Codex switch options must be valid for every patch mode");
+        match plan.auth() {
+            crate::codex_patch_plan::CodexAuthPatchPlan::RestoreOriginalIfHelperPatched => {
+                Self::None
+            }
+            crate::codex_patch_plan::CodexAuthPatchPlan::PatchImagegenFacade => {
                 Self::EmptyChatGptFacade
             }
-            CodexPatchMode::ChatGptBridge => Self::CompleteChatGptLogin,
+            crate::codex_patch_plan::CodexAuthPatchPlan::PatchChatGptBridge => {
+                Self::CompleteChatGptLogin
+            }
         }
     }
 
@@ -476,6 +486,27 @@ impl CodexCapabilityProfileInput {
             provider_supports_websockets,
             model_catalog,
         }
+    }
+
+    pub fn from_patch_plan(
+        patch_plan: CodexPatchPlan,
+        model_catalog: CodexModelCatalogProfile,
+    ) -> Self {
+        Self::from_patch_mode_with_transport(
+            patch_plan.mode(),
+            patch_plan.options().responses_websocket,
+            model_catalog,
+        )
+    }
+
+    pub fn from_patch_config(
+        patch_mode: CodexPatchMode,
+        options: CodexSwitchOptions,
+        model_catalog: CodexModelCatalogProfile,
+    ) -> Self {
+        let plan = CodexPatchPlan::for_switch_on(patch_mode, options)
+            .expect("validated codex client patch config should produce a capability profile");
+        Self::from_patch_plan(plan, model_catalog)
     }
 }
 

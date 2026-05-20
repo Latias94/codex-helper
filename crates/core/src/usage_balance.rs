@@ -1080,6 +1080,7 @@ mod tests {
             id: 1,
             trace_id: None,
             session_id: None,
+            session_identity_source: None,
             client_name: None,
             client_addr: None,
             cwd: None,

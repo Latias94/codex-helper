@@ -37,9 +37,10 @@ pub use self::runtime_types::{
 pub use self::session_identity::{
     ActiveRequest, FinishRequestParams, FinishedRequest, RequestObservability, ResolvedRouteValue,
     RouteDecisionProvenance, RouteValueSource, SessionBinding, SessionContinuityMode,
-    SessionIdentityCard, SessionIdentityCardBuildInputs, SessionManualOverrides,
-    SessionObservationScope, SessionRouteAffinity, SessionRouteAffinityTarget, SessionStats,
-    build_session_identity_cards_from_parts, enrich_session_identity_cards_with_host_transcripts,
+    SessionIdentityCard, SessionIdentityCardBuildInputs, SessionIdentitySource,
+    SessionManualOverrides, SessionObservationScope, SessionRouteAffinity,
+    SessionRouteAffinityTarget, SessionStats, build_session_identity_cards_from_parts,
+    enrich_session_identity_cards_with_host_transcripts,
     enrich_session_identity_cards_with_runtime,
 };
 use self::session_identity::{
@@ -578,6 +579,9 @@ impl ProxyState {
         let reason = match guard.get_mut(session_id) {
             Some(existing) if target.same_target(existing) => {
                 existing.last_selected_at_ms = now_ms;
+                if target.session_identity_source.is_some() {
+                    existing.session_identity_source = target.session_identity_source;
+                }
                 return existing.clone();
             }
             Some(_) => reason_hint.unwrap_or_else(|| "target_changed".to_string()),
@@ -586,6 +590,7 @@ impl ProxyState {
 
         let affinity = SessionRouteAffinity {
             route_graph_key: target.route_graph_key,
+            session_identity_source: target.session_identity_source,
             provider_endpoint: target.provider_endpoint,
             upstream_base_url: target.upstream_base_url,
             route_path: target.route_path,
@@ -2415,6 +2420,7 @@ impl ProxyState {
         method: &str,
         path: &str,
         session_id: Option<String>,
+        session_identity_source: Option<SessionIdentitySource>,
         client_name: Option<String>,
         client_addr: Option<String>,
         cwd: Option<String>,
@@ -2429,6 +2435,7 @@ impl ProxyState {
             id,
             trace_id,
             session_id,
+            session_identity_source,
             client_name,
             client_addr,
             cwd,
@@ -2493,6 +2500,7 @@ impl ProxyState {
             id: params.id,
             trace_id: req.trace_id,
             session_id: req.session_id,
+            session_identity_source: req.session_identity_source,
             client_name: req.client_name,
             client_addr: req.client_addr,
             cwd: req.cwd,
@@ -2596,6 +2604,9 @@ impl ProxyState {
             let mut stats = self.session_stats.write().await;
             let entry = stats.entry(sid.to_string()).or_default();
             entry.turns_total = entry.turns_total.saturating_add(1);
+            if finished.session_identity_source.is_some() {
+                entry.last_session_identity_source = finished.session_identity_source;
+            }
             entry.last_client_name = finished
                 .client_name
                 .clone()
@@ -3074,6 +3085,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                     Some("gpt-5".to_string()),
                     None,
                     Some("priority".to_string()),
@@ -3141,6 +3153,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                     Some("gpt-5".to_string()),
                     None,
                     None,
@@ -3197,6 +3210,7 @@ mod tests {
                     "codex",
                     "POST",
                     "/v1/responses",
+                    None,
                     None,
                     None,
                     None,
@@ -3261,6 +3275,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                     Some("gpt-5".to_string()),
                     None,
                     None,
@@ -3298,6 +3313,7 @@ mod tests {
                     "codex",
                     "POST",
                     "/v1/responses",
+                    None,
                     None,
                     None,
                     None,
@@ -3354,6 +3370,7 @@ mod tests {
             id: 1,
             trace_id: Some("codex-1".to_string()),
             session_id: Some("sid-active".to_string()),
+            session_identity_source: Some(SessionIdentitySource::Header),
             client_name: Some("Frank-Laptop".to_string()),
             client_addr: Some("100.64.0.8".to_string()),
             cwd: Some("G:/codes/project".to_string()),
@@ -3374,6 +3391,7 @@ mod tests {
                 id: 2,
                 trace_id: Some("codex-2".to_string()),
                 session_id: Some("sid-recent".to_string()),
+                session_identity_source: Some(SessionIdentitySource::PromptCacheKey),
                 client_name: Some("Studio-Mini".to_string()),
                 client_addr: Some("100.64.0.9".to_string()),
                 cwd: Some("G:/codes/other".to_string()),
@@ -3407,6 +3425,7 @@ mod tests {
                 id: 3,
                 trace_id: Some("codex-3".to_string()),
                 session_id: Some("sid-active".to_string()),
+                session_identity_source: Some(SessionIdentitySource::Header),
                 client_name: Some("Frank-Laptop".to_string()),
                 client_addr: Some("100.64.0.8".to_string()),
                 cwd: Some("G:/codes/project".to_string()),
@@ -3441,6 +3460,7 @@ mod tests {
             "sid-active".to_string(),
             SessionStats {
                 turns_total: 3,
+                last_session_identity_source: Some(SessionIdentitySource::Header),
                 last_client_name: Some("Frank-Laptop".to_string()),
                 last_client_addr: Some("100.64.0.8".to_string()),
                 last_model: Some("gpt-5.4".to_string()),
@@ -3481,12 +3501,20 @@ mod tests {
         assert_eq!(cards.len(), 2);
         assert_eq!(cards[0].session_id.as_deref(), Some("sid-recent"));
         assert_eq!(
+            cards[0].session_identity_source,
+            Some(SessionIdentitySource::PromptCacheKey)
+        );
+        assert_eq!(
             cards[0].observation_scope,
             SessionObservationScope::HostLocalEnriched
         );
         assert_eq!(cards[0].last_client_name.as_deref(), Some("Studio-Mini"));
         assert_eq!(cards[0].last_client_addr.as_deref(), Some("100.64.0.9"));
         assert_eq!(cards[1].session_id.as_deref(), Some("sid-active"));
+        assert_eq!(
+            cards[1].session_identity_source,
+            Some(SessionIdentitySource::Header)
+        );
         assert_eq!(
             cards[1].observation_scope,
             SessionObservationScope::HostLocalEnriched
@@ -3550,6 +3578,7 @@ mod tests {
             id: 1,
             trace_id: Some("codex-1".to_string()),
             session_id: Some("sid-bound".to_string()),
+            session_identity_source: Some(SessionIdentitySource::Header),
             client_name: Some("Workstation".to_string()),
             client_addr: Some("100.64.0.10".to_string()),
             cwd: None,
@@ -3639,6 +3668,7 @@ mod tests {
             id: 1,
             trace_id: Some("codex-1".to_string()),
             session_id: Some("sid-bound".to_string()),
+            session_identity_source: Some(SessionIdentitySource::Header),
             client_name: Some("Workstation".to_string()),
             client_addr: Some("100.64.0.10".to_string()),
             cwd: None,
@@ -4326,6 +4356,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                     Some("gpt-5".to_string()),
                     None,
                     None,
@@ -4773,6 +4804,7 @@ mod tests {
                     "sid-expire",
                     SessionRouteAffinityTarget {
                         route_graph_key: "graph".to_string(),
+                        session_identity_source: None,
                         provider_endpoint: ProviderEndpointKey::new("codex", "monthly", "default"),
                         upstream_base_url: "https://monthly.example/v1".to_string(),
                         route_path: vec!["monthly_first".to_string(), "monthly".to_string()],

@@ -2,7 +2,7 @@ use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, Method, Response, StatusCode};
 
 use crate::logging::{CodexBridgeLog, RetryInfo, ServiceTierLog, log_request_with_debug};
-use crate::state::{FinishRequestParams, RouteDecisionProvenance};
+use crate::state::{FinishRequestParams, RouteDecisionProvenance, SessionIdentitySource};
 use crate::usage::UsageMetrics;
 
 use super::ProxyService;
@@ -19,6 +19,7 @@ pub(super) struct FinalizeForwardResponseParams {
     pub provider_endpoint_key: Option<String>,
     pub upstream_base_url: String,
     pub session_id: Option<String>,
+    pub session_identity_source: Option<SessionIdentitySource>,
     pub cwd: Option<String>,
     pub effective_effort: Option<String>,
     pub service_tier: ServiceTierLog,
@@ -48,6 +49,7 @@ pub(super) async fn finish_and_build_forward_response(
         provider_endpoint_key,
         upstream_base_url,
         session_id,
+        session_identity_source,
         cwd,
         effective_effort,
         service_tier,
@@ -88,6 +90,7 @@ pub(super) async fn finish_and_build_forward_response(
         provider_endpoint_key,
         upstream_base_url.as_str(),
         session_id,
+        session_identity_source,
         cwd,
         route_decision
             .as_ref()

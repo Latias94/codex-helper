@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::config::proxy_home_dir;
-use crate::state::RouteDecisionProvenance;
+use crate::state::{RouteDecisionProvenance, SessionIdentitySource};
 use crate::usage::UsageMetrics;
 
 #[path = "logging/control_trace.rs"]
@@ -306,6 +306,8 @@ pub struct RequestLog<'a> {
     pub upstream_base_url: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_identity_source: Option<SessionIdentitySource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -719,6 +721,8 @@ struct HttpDebugLogEntry<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_identity_source: Option<SessionIdentitySource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -863,6 +867,7 @@ pub fn log_request_with_debug(
     provider_endpoint_key: Option<String>,
     upstream_base_url: &str,
     session_id: Option<String>,
+    session_identity_source: Option<SessionIdentitySource>,
     cwd: Option<String>,
     model: Option<String>,
     reasoning_effort: Option<String>,
@@ -916,6 +921,7 @@ pub fn log_request_with_debug(
             provider_endpoint_key: provider_endpoint_key.clone(),
             upstream_base_url,
             session_id: session_id.clone(),
+            session_identity_source,
             cwd: cwd.clone(),
             model: model.clone(),
             reasoning_effort: reasoning_effort.clone(),
@@ -962,6 +968,7 @@ pub fn log_request_with_debug(
         provider_endpoint_key,
         upstream_base_url,
         session_id,
+        session_identity_source,
         cwd,
         model,
         reasoning_effort,

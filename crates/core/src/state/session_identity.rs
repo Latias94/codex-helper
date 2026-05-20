@@ -88,6 +88,8 @@ pub struct ActiveRequest {
     pub trace_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_identity_source: Option<SessionIdentitySource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -121,6 +123,8 @@ pub struct FinishedRequest {
     pub trace_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_identity_source: Option<SessionIdentitySource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -280,6 +284,8 @@ pub struct FinishRequestParams {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct SessionStats {
     pub turns_total: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_session_identity_source: Option<SessionIdentitySource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_client_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -323,6 +329,13 @@ pub enum SessionObservationScope {
     #[default]
     ObservedOnly,
     HostLocalEnriched,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionIdentitySource {
+    Header,
+    PromptCacheKey,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -398,6 +411,8 @@ pub struct RouteDecisionProvenance {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionRouteAffinity {
     pub route_graph_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_identity_source: Option<SessionIdentitySource>,
     pub provider_endpoint: ProviderEndpointKey,
     pub upstream_base_url: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -410,6 +425,7 @@ pub struct SessionRouteAffinity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRouteAffinityTarget {
     pub route_graph_key: String,
+    pub session_identity_source: Option<SessionIdentitySource>,
     pub provider_endpoint: ProviderEndpointKey,
     pub upstream_base_url: String,
     pub route_path: Vec<String>,
@@ -427,6 +443,8 @@ impl SessionRouteAffinityTarget {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct SessionIdentityCard {
     pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_identity_source: Option<SessionIdentitySource>,
     #[serde(default)]
     pub observation_scope: SessionObservationScope,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -572,6 +590,7 @@ pub(super) struct SessionCwdCacheEntry {
 fn empty_session_identity_card(session_id: Option<String>) -> SessionIdentityCard {
     SessionIdentityCard {
         session_id,
+        session_identity_source: None,
         observation_scope: SessionObservationScope::ObservedOnly,
         host_local_transcript_path: None,
         last_client_name: None,
@@ -809,6 +828,15 @@ fn update_card_route_decision(
     }
 }
 
+fn merge_session_identity_source(
+    target: &mut Option<SessionIdentitySource>,
+    source: Option<SessionIdentitySource>,
+) {
+    if source.is_some() {
+        *target = source;
+    }
+}
+
 pub struct SessionIdentityCardBuildInputs<'a> {
     pub active: &'a [ActiveRequest],
     pub recent: &'a [FinishedRequest],
@@ -847,6 +875,10 @@ pub fn build_session_identity_cards_from_parts(
         let entry = map
             .entry(key.clone())
             .or_insert_with(|| empty_session_identity_card(key));
+        merge_session_identity_source(
+            &mut entry.session_identity_source,
+            req.session_identity_source,
+        );
 
         entry.active_count = entry.active_count.saturating_add(1);
         entry.active_started_at_ms_min = Some(
@@ -890,6 +922,10 @@ pub fn build_session_identity_cards_from_parts(
         let entry = map
             .entry(key.clone())
             .or_insert_with(|| empty_session_identity_card(key));
+        merge_session_identity_source(
+            &mut entry.session_identity_source,
+            r.session_identity_source,
+        );
 
         let should_update = entry
             .last_ended_at_ms
@@ -925,6 +961,10 @@ pub fn build_session_identity_cards_from_parts(
         let entry = map
             .entry(key.clone())
             .or_insert_with(|| empty_session_identity_card(key));
+        merge_session_identity_source(
+            &mut entry.session_identity_source,
+            st.last_session_identity_source,
+        );
 
         if entry.turns_total.is_none() {
             entry.turns_total = Some(st.turns_total);
@@ -1008,6 +1048,10 @@ pub fn build_session_identity_cards_from_parts(
         let entry = map
             .entry(key.clone())
             .or_insert_with(|| empty_session_identity_card(key));
+        merge_session_identity_source(
+            &mut entry.session_identity_source,
+            affinity.session_identity_source,
+        );
         entry.route_affinity = Some(affinity.clone());
     }
 
@@ -1063,6 +1107,7 @@ mod tests {
             id: 7,
             trace_id: Some("codex-7".to_string()),
             session_id: Some("sid".to_string()),
+            session_identity_source: Some(SessionIdentitySource::Header),
             client_name: None,
             client_addr: None,
             cwd: None,

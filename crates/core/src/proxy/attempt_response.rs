@@ -6,6 +6,7 @@ use axum::http::{HeaderMap, Method, Response, StatusCode};
 
 use crate::lb::{CooldownBackoff, LoadBalancer};
 use crate::logging::{CodexBridgeLog, RouteAttemptLog, ServiceTierLog, make_body_preview};
+use crate::state::SessionIdentitySource;
 use crate::usage::{UsageMetrics, extract_usage_from_bytes};
 use crate::usage_providers;
 
@@ -53,6 +54,7 @@ pub(super) struct AttemptResponseParams<'a> {
     pub(super) upstream_headers_ms: u64,
     pub(super) provider_id: Option<&'a str>,
     pub(super) session_id: Option<&'a str>,
+    pub(super) session_identity_source: Option<SessionIdentitySource>,
     pub(super) cwd: Option<&'a str>,
     pub(super) effective_effort: Option<&'a str>,
     pub(super) base_service_tier: &'a ServiceTierLog,
@@ -94,6 +96,7 @@ pub(super) struct StreamingAttemptResponseParams<'a> {
     pub(super) route_attempt_index: usize,
     pub(super) model_note: &'a str,
     pub(super) session_id: Option<&'a str>,
+    pub(super) session_identity_source: Option<SessionIdentitySource>,
     pub(super) cwd: Option<&'a str>,
     pub(super) effective_effort: Option<&'a str>,
     pub(super) base_service_tier: &'a ServiceTierLog,
@@ -148,6 +151,7 @@ pub(super) async fn handle_streaming_attempt_success(
         route_attempt_index,
         model_note,
         session_id,
+        session_identity_source,
         cwd,
         effective_effort,
         base_service_tier,
@@ -191,6 +195,7 @@ pub(super) async fn handle_streaming_attempt_success(
     record_session_route_affinity_success(
         proxy,
         session_id,
+        session_identity_source,
         route_graph_key,
         target,
         route_attempts,
@@ -216,6 +221,7 @@ pub(super) async fn handle_streaming_attempt_success(
             debug_base,
             retry,
             session_id: session_id.map(ToOwned::to_owned),
+            session_identity_source,
             cwd: cwd.map(ToOwned::to_owned),
             effective_effort: effective_effort.map(ToOwned::to_owned),
             service_tier: base_service_tier.clone(),
@@ -256,6 +262,7 @@ pub(super) async fn handle_attempt_response(
         upstream_headers_ms,
         provider_id,
         session_id,
+        session_identity_source,
         cwd,
         effective_effort,
         base_service_tier,
@@ -342,6 +349,7 @@ pub(super) async fn handle_attempt_response(
         record_session_route_affinity_success(
             proxy,
             session_id,
+            session_identity_source,
             route_graph_key,
             target,
             route_attempts,
@@ -364,6 +372,7 @@ pub(super) async fn handle_attempt_response(
                 upstream_headers_ms,
                 provider_id,
                 session_id,
+                session_identity_source,
                 cwd,
                 effective_effort,
                 base_service_tier,
@@ -425,6 +434,7 @@ pub(super) async fn handle_attempt_response(
                 upstream_headers_ms,
                 provider_id,
                 session_id,
+                session_identity_source,
                 cwd,
                 effective_effort,
                 base_service_tier,
@@ -509,6 +519,7 @@ pub(super) async fn handle_attempt_response(
             upstream_headers_ms,
             provider_id,
             session_id,
+            session_identity_source,
             cwd,
             effective_effort,
             base_service_tier,
@@ -567,6 +578,7 @@ async fn finish_attempt_forward_response(
     upstream_headers_ms: u64,
     provider_id: Option<&str>,
     session_id: Option<&str>,
+    session_identity_source: Option<SessionIdentitySource>,
     cwd: Option<&str>,
     effective_effort: Option<&str>,
     base_service_tier: &ServiceTierLog,
@@ -601,6 +613,7 @@ async fn finish_attempt_forward_response(
             provider_endpoint_key: target.provider_endpoint_key(),
             upstream_base_url: target.upstream().base_url.clone(),
             session_id: session_id.map(ToOwned::to_owned),
+            session_identity_source,
             cwd: cwd.map(ToOwned::to_owned),
             effective_effort: effective_effort.map(ToOwned::to_owned),
             service_tier: service_tier_for_log,

@@ -2,6 +2,7 @@ pub mod balance;
 mod client_config;
 pub mod codex_capability_profile;
 pub mod codex_integration;
+pub mod codex_patch_plan;
 pub mod config;
 pub mod dashboard_core;
 pub mod doctor;

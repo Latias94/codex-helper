@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "slug": "codex-architecture-deepening",
+  "title": "Codex Architecture Deepening",
+  "status": "complete",
+  "updated": "2026-05-20",
+  "scope_kind": "architecture-refactor",
+  "problem": "codex-helper needs deeper Modules for Codex relay compatibility: session identity semantics, shared request preparation, relay diagnostic case registry, proxy test harness, and Codex patch planning.",
+  "authoritative_docs": [
+    {
+      "role": "design",
+      "path": "docs/workstreams/codex-architecture-deepening/DESIGN.md"
+    },
+    {
+      "role": "execution",
+      "path": "docs/workstreams/codex-architecture-deepening/TODO.md"
+    },
+    {
+      "role": "gates",
+      "path": "docs/workstreams/codex-architecture-deepening/EVIDENCE_AND_GATES.md"
+    },
+    {
+      "role": "handoff",
+      "path": "docs/workstreams/codex-architecture-deepening/HANDOFF.md"
+    }
+  ],
+  "gates": [
+    "cargo fmt --check",
+    "cargo nextest run -p codex-helper-core",
+    "cargo nextest run -p codex-helper-core prompt_cache_key_affinity --no-fail-fast",
+    "cargo nextest run -p codex-helper-core request_content_encoding prompt_cache_key_affinity responses_websocket --no-fail-fast",
+    "cargo nextest run -p codex-helper-core relay_capabilities relay_live_smoke codex_live_smoke --no-fail-fast",
+    "cargo nextest run -p codex-helper-core proxy::tests::failover::response_semantics --no-fail-fast",
+    "cargo nextest run -p codex-helper-core codex_switch codex_bridge codex_client_patch --no-fail-fast"
+  ],
+  "evidence": [
+    "docs/workstreams/codex-architecture-deepening/EVIDENCE_AND_GATES.md"
+  ],
+  "adr_refs": [],
+  "continue_policy": {
+    "default_action": "close",
+    "notes": "All CAD-020..CAD-070 tasks are complete. Do not add compact fallback or relay feature synthesis in this closed lane; open a new workstream for any follow-on."
+  },
+  "current_task": null
+}

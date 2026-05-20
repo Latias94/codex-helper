@@ -7,7 +7,9 @@ use serde_json::Value as JsonValue;
 
 pub use crate::logging::request_log_path;
 use crate::pricing::{CostAdjustments, estimate_request_cost_from_operator_catalog_for_service};
-use crate::state::{FinishedRequest, RequestObservability, RouteDecisionProvenance};
+use crate::state::{
+    FinishedRequest, RequestObservability, RouteDecisionProvenance, SessionIdentitySource,
+};
 use crate::usage::{CacheInputAccounting, UsageMetrics};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -424,11 +426,15 @@ pub fn finished_request_from_request_log_record(record: &JsonValue) -> Option<Fi
     let route_decision = record.get("route_decision").and_then(|route_decision| {
         serde_json::from_value::<RouteDecisionProvenance>(route_decision.clone()).ok()
     });
+    let session_identity_source = record
+        .get("session_identity_source")
+        .and_then(|source| serde_json::from_value::<SessionIdentitySource>(source.clone()).ok());
 
     let mut request = FinishedRequest {
         id: request_id,
         trace_id: str_field(record, "trace_id").map(ToOwned::to_owned),
         session_id: str_field(record, "session_id").map(ToOwned::to_owned),
+        session_identity_source,
         client_name: str_field(record, "client_name").map(ToOwned::to_owned),
         client_addr: str_field(record, "client_addr").map(ToOwned::to_owned),
         cwd: str_field(record, "cwd").map(ToOwned::to_owned),

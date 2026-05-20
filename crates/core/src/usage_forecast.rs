@@ -307,6 +307,7 @@ mod tests {
             id: ended_at_ms,
             trace_id: None,
             session_id: None,
+            session_identity_source: None,
             client_name: None,
             client_addr: None,
             cwd: None,

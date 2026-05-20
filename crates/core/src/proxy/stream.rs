@@ -12,7 +12,7 @@ use crate::logging::{
     CodexBridgeLog, HttpDebugLog, RetryInfo, ServiceTierLog, log_request_with_debug,
     make_body_preview, should_include_http_debug, should_include_http_warn,
 };
-use crate::state::{ProxyState, RouteDecisionProvenance};
+use crate::state::{ProxyState, RouteDecisionProvenance, SessionIdentitySource};
 use crate::usage_providers;
 
 use super::ProxyService;
@@ -88,6 +88,7 @@ struct StreamFinalize {
     upstream_base_url: String,
     retry: Option<RetryInfo>,
     session_id: Option<String>,
+    session_identity_source: Option<SessionIdentitySource>,
     cwd: Option<String>,
     reasoning_effort: Option<String>,
     service_tier: ServiceTierLog,
@@ -236,6 +237,7 @@ impl Drop for StreamFinalize {
                 self.provider_endpoint_key.clone(),
                 &self.upstream_base_url,
                 self.session_id.clone(),
+                self.session_identity_source,
                 self.cwd.clone(),
                 self.route_decision
                     .as_ref()
@@ -414,6 +416,7 @@ pub(super) async fn build_sse_success_response(
         debug_base,
         retry,
         session_id,
+        session_identity_source,
         cwd,
         effective_effort,
         service_tier,
@@ -503,6 +506,7 @@ pub(super) async fn build_sse_success_response(
         upstream_base_url: base_url.clone(),
         retry: retry.clone(),
         session_id: session_id.clone(),
+        session_identity_source,
         cwd: cwd.clone(),
         reasoning_effort: effective_effort.clone(),
         service_tier,
@@ -638,6 +642,7 @@ pub(super) async fn build_sse_success_response(
                         provider_endpoint_key.clone(),
                         &base_url,
                         session_id.clone(),
+                        session_identity_source,
                         cwd.clone(),
                         _finalize
                             .route_decision
@@ -697,6 +702,7 @@ pub(super) struct SseSuccessMeta {
     pub(super) debug_base: Option<HttpDebugBase>,
     pub(super) retry: Option<RetryInfo>,
     pub(super) session_id: Option<String>,
+    pub(super) session_identity_source: Option<SessionIdentitySource>,
     pub(super) cwd: Option<String>,
     pub(super) effective_effort: Option<String>,
     pub(super) service_tier: ServiceTierLog,

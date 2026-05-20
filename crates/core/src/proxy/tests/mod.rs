@@ -167,4 +167,5 @@ async fn send_responses_json(
 
 mod api_admin;
 mod failover;
+mod harness;
 mod routing_profiles;

@@ -8,6 +8,10 @@ use crate::client_config::{
     claude_settings_path, codex_app_db_path, codex_auth_path, codex_config_path,
     codex_switch_state_path,
 };
+use crate::codex_patch_plan::{
+    CodexAuthPatchPlan, CodexPatchPlan, CodexSwitchOnEffectOrder, CodexTomlBoolPatch,
+};
+pub use crate::codex_patch_plan::{CodexPatchMode, CodexSwitchOptions};
 use crate::config::{ProxyConfig, ProxyConfigV2, ProxyConfigV4, RoutingAffinityPolicyV5};
 use crate::file_replace::write_text_file;
 use anyhow::{Context, Result, anyhow};
@@ -82,7 +86,7 @@ fn codex_text_points_to_local_helper(text: &str) -> Result<bool> {
         .is_some_and(|item| local_helper_proxy_item(Some(item))))
 }
 
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
 struct CodexSwitchState {
     version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -188,105 +192,8 @@ pub fn codex_switch_state_exists() -> bool {
     codex_switch_state_path().exists()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum CodexPatchMode {
-    /// Keep the historical codex-helper patch behavior.
-    #[default]
-    Default,
-    /// Keep Codex/ChatGPT account auth for app/mobile features while model traffic goes through
-    /// codex-helper.
-    ChatGptBridge,
-    /// Use a minimal ChatGPT-looking auth facade to expose Codex hosted image generation while
-    /// request credentials still come from codex-helper routing/upstream configuration.
-    ImagegenBridge,
-    /// Advertise the local relay as the official OpenAI Responses provider so Codex can use
-    /// first-party HTTP features that helper can safely forward, starting with remote compaction
-    /// v1. Request credentials still come from codex-helper routing/upstream configuration.
-    #[serde(alias = "official-relay", alias = "official_relay")]
-    OfficialRelayBridge,
-    /// Combine official relay provider identity for remote compaction with the image generation
-    /// ChatGPT auth facade. Request credentials still come from codex-helper routing/upstream
-    /// configuration.
-    #[serde(alias = "official-imagegen", alias = "official_imagegen")]
-    OfficialImagegenBridge,
-}
-
-impl CodexPatchMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Default => "default",
-            Self::ChatGptBridge => "chatgpt-bridge",
-            Self::ImagegenBridge => "imagegen-bridge",
-            Self::OfficialRelayBridge => "official-relay-bridge",
-            Self::OfficialImagegenBridge => "official-imagegen-bridge",
-        }
-    }
-
-    pub fn as_preset_str(self) -> &'static str {
-        match self {
-            Self::Default => "default",
-            Self::ChatGptBridge => "chatgpt-bridge",
-            Self::ImagegenBridge => "imagegen-bridge",
-            Self::OfficialRelayBridge => "official-relay",
-            Self::OfficialImagegenBridge => "official-imagegen",
-        }
-    }
-
-    pub fn is_default(self) -> bool {
-        matches!(self, Self::Default)
-    }
-
-    pub fn strips_codex_client_auth(self) -> bool {
-        matches!(
-            self,
-            Self::ChatGptBridge
-                | Self::ImagegenBridge
-                | Self::OfficialRelayBridge
-                | Self::OfficialImagegenBridge
-        )
-    }
-
-    pub fn enables_official_relay_features(self) -> bool {
-        matches!(
-            self,
-            Self::OfficialRelayBridge | Self::OfficialImagegenBridge
-        )
-    }
-
-    pub fn enables_imagegen_facade(self) -> bool {
-        matches!(self, Self::ImagegenBridge | Self::OfficialImagegenBridge)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize, Default)]
-pub struct CodexSwitchOptions {
-    /// Advertise `model_providers.codex_proxy.supports_websockets = true` so Codex may choose
-    /// Responses WebSocket transport. This is intentionally separate from `CodexPatchMode` to
-    /// avoid mode-combination explosion.
-    #[serde(default, skip_serializing_if = "bool_is_false")]
-    pub responses_websocket: bool,
-}
-
-impl CodexSwitchOptions {
-    fn validate_for_mode(self, mode: CodexPatchMode) -> Result<()> {
-        if self.responses_websocket && !mode.enables_official_relay_features() {
-            return Err(anyhow!(
-                "Responses WebSocket transport currently requires --preset official-relay or --preset official-imagegen"
-            ));
-        }
-        Ok(())
-    }
-}
-
 fn bool_is_false(value: &bool) -> bool {
     !*value
-}
-
-impl std::fmt::Display for CodexPatchMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
 }
 
 enum CodexSwitchOffEdit {
@@ -300,6 +207,7 @@ struct CodexAuthPatch {
     patched_text: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum CodexAuthEdit {
     None,
     Write(String),
@@ -338,19 +246,32 @@ fn apply_codex_auth_edit(edit: CodexAuthEdit) -> Result<()> {
     }
 }
 
-fn auth_restore_edit_from_state(state: &mut CodexSwitchState) -> Result<CodexAuthEdit> {
-    let Some(patched_auth_json) = state.patched_auth_json.as_deref() else {
-        return Ok(CodexAuthEdit::None);
-    };
-
-    let auth_path = codex_auth_path();
-    let current_text = if auth_path.exists() {
-        Some(read_config_text(&auth_path)?)
+fn read_current_codex_auth_text() -> Result<Option<String>> {
+    let path = codex_auth_path();
+    if path.exists() {
+        read_config_text(&path).map(Some)
     } else {
-        None
+        Ok(None)
+    }
+}
+
+fn auth_restore_edit_from_state(state: &mut CodexSwitchState) -> Result<CodexAuthEdit> {
+    let current_text = read_current_codex_auth_text()?;
+    Ok(auth_restore_edit_from_state_and_current(
+        state,
+        current_text.as_deref(),
+    ))
+}
+
+fn auth_restore_edit_from_state_and_current(
+    state: &mut CodexSwitchState,
+    current_text: Option<&str>,
+) -> CodexAuthEdit {
+    let Some(patched_auth_json) = state.patched_auth_json.as_deref() else {
+        return CodexAuthEdit::None;
     };
 
-    let edit = if auth_json_matches_helper_patch(current_text.as_deref(), patched_auth_json) {
+    let edit = if auth_json_matches_helper_patch(current_text, patched_auth_json) {
         if state.original_auth_json_absent {
             CodexAuthEdit::RemoveFile
         } else if let Some(original) = state.original_auth_json.clone() {
@@ -363,27 +284,23 @@ fn auth_restore_edit_from_state(state: &mut CodexSwitchState) -> Result<CodexAut
     };
 
     state.clear_auth_patch();
-    Ok(edit)
+    edit
 }
 
-fn auth_baseline_for_patch(state: &CodexSwitchState) -> Result<(bool, Option<String>)> {
-    let auth_path = codex_auth_path();
-    let current_text = if auth_path.exists() {
-        Some(read_config_text(&auth_path)?)
-    } else {
-        None
-    };
-
+fn auth_baseline_for_patch_from_current(
+    state: &CodexSwitchState,
+    current_text: Option<String>,
+) -> (bool, Option<String>) {
     if let Some(patched_auth_json) = state.patched_auth_json.as_deref()
         && auth_json_matches_helper_patch(current_text.as_deref(), patched_auth_json)
     {
-        return Ok((
+        return (
             state.original_auth_json_absent,
             state.original_auth_json.clone(),
-        ));
+        );
     }
 
-    Ok((current_text.is_none(), current_text))
+    (current_text.is_none(), current_text)
 }
 
 fn switch_off_codex_toml(
@@ -509,13 +426,18 @@ fn switch_on_codex_toml_with_mode(text: &str, port: u16, mode: CodexPatchMode) -
     switch_on_codex_toml_with_options(text, port, mode, CodexSwitchOptions::default())
 }
 
+#[cfg(test)]
 fn switch_on_codex_toml_with_options(
     text: &str,
     port: u16,
     mode: CodexPatchMode,
     options: CodexSwitchOptions,
 ) -> Result<String> {
-    options.validate_for_mode(mode)?;
+    let plan = CodexPatchPlan::for_switch_on(mode, options)?;
+    switch_on_codex_toml_with_plan(text, port, plan)
+}
+
+fn switch_on_codex_toml_with_plan(text: &str, port: u16, plan: CodexPatchPlan) -> Result<String> {
     let mut doc = if text.trim().is_empty() {
         EditableTomlDocument::new()
     } else {
@@ -545,35 +467,28 @@ fn switch_on_codex_toml_with_options(
         .and_then(EditableTomlItem::as_table_mut)
         .ok_or_else(|| anyhow!("model_providers.codex_proxy must be a table"))?;
 
-    let provider_name = match mode {
-        CodexPatchMode::OfficialRelayBridge | CodexPatchMode::OfficialImagegenBridge => "OpenAI",
-        CodexPatchMode::Default
-        | CodexPatchMode::ChatGptBridge
-        | CodexPatchMode::ImagegenBridge => "codex-helper",
-    };
-    set_toml_string(proxy_table, "name", provider_name);
+    let provider = plan.provider();
+    set_toml_string(proxy_table, "name", provider.provider_name());
     set_toml_string(proxy_table, "base_url", format!("http://127.0.0.1:{port}"));
     set_toml_string(proxy_table, "wire_api", "responses");
     if !proxy_table.contains_key("request_max_retries") {
         proxy_table.insert("request_max_retries", editable_toml_value(0));
     }
-    match mode {
-        CodexPatchMode::Default | CodexPatchMode::ImagegenBridge => {
+    match provider.requires_openai_auth() {
+        CodexTomlBoolPatch::Remove => {
             proxy_table.remove("requires_openai_auth");
-            proxy_table.remove("supports_websockets");
         }
-        CodexPatchMode::ChatGptBridge => {
-            proxy_table.insert("requires_openai_auth", editable_toml_value(true));
-            proxy_table.insert("supports_websockets", editable_toml_value(false));
-        }
-        CodexPatchMode::OfficialRelayBridge | CodexPatchMode::OfficialImagegenBridge => {
-            proxy_table.remove("requires_openai_auth");
+        CodexTomlBoolPatch::Set(value) => {
+            proxy_table.insert("requires_openai_auth", editable_toml_value(value));
         }
     }
-    if options.responses_websocket {
-        proxy_table.insert("supports_websockets", editable_toml_value(true));
-    } else if mode.enables_official_relay_features() {
-        proxy_table.insert("supports_websockets", editable_toml_value(false));
+    match provider.supports_websockets() {
+        CodexTomlBoolPatch::Remove => {
+            proxy_table.remove("supports_websockets");
+        }
+        CodexTomlBoolPatch::Set(value) => {
+            proxy_table.insert("supports_websockets", editable_toml_value(value));
+        }
     }
 
     set_toml_string(root, "model_provider", "codex_proxy");
@@ -838,6 +753,66 @@ fn prepare_imagegen_bridge_auth_patch_from_baseline(
         original_text,
         patched_text: imagegen_bridge_auth_json_text()?,
     })
+}
+
+fn auth_edit_for_switch_on_plan(
+    plan: CodexPatchPlan,
+    state: &mut CodexSwitchState,
+) -> Result<CodexAuthEdit> {
+    match plan.auth() {
+        CodexAuthPatchPlan::RestoreOriginalIfHelperPatched => auth_restore_edit_from_state(state),
+        CodexAuthPatchPlan::PatchChatGptBridge | CodexAuthPatchPlan::PatchImagegenFacade => {
+            let current_auth = read_current_codex_auth_text()?;
+            let (original_absent, original_text) =
+                auth_baseline_for_patch_from_current(state, current_auth.clone());
+            let patch = match plan.auth() {
+                CodexAuthPatchPlan::PatchChatGptBridge => {
+                    prepare_chatgpt_bridge_auth_patch_from_baseline(original_absent, original_text)?
+                }
+                CodexAuthPatchPlan::PatchImagegenFacade => {
+                    prepare_imagegen_bridge_auth_patch_from_baseline(
+                        original_absent,
+                        original_text,
+                    )?
+                }
+                CodexAuthPatchPlan::RestoreOriginalIfHelperPatched => {
+                    unreachable!("handled above")
+                }
+            };
+            let auth_edit = if auth_json_matches_helper_patch(
+                current_auth.as_deref(),
+                patch.patched_text.as_str(),
+            ) {
+                CodexAuthEdit::None
+            } else {
+                CodexAuthEdit::Write(patch.patched_text.clone())
+            };
+            state.set_auth_patch(&patch);
+            Ok(auth_edit)
+        }
+    }
+}
+
+fn apply_switch_on_effects(
+    plan: CodexPatchPlan,
+    cfg_path: &Path,
+    new_text: &str,
+    state: &CodexSwitchState,
+    auth_edit: CodexAuthEdit,
+) -> Result<()> {
+    match plan.effect_order() {
+        CodexSwitchOnEffectOrder::ConfigAuthState => {
+            atomic_write(cfg_path, new_text)?;
+            apply_codex_auth_edit(auth_edit)?;
+            write_codex_switch_state(state)?;
+        }
+        CodexSwitchOnEffectOrder::StateConfigAuth => {
+            write_codex_switch_state(state)?;
+            atomic_write(cfg_path, new_text)?;
+            apply_codex_auth_edit(auth_edit)?;
+        }
+    }
+    Ok(())
 }
 
 fn auth_env_is_set(env_name: &str) -> bool {
@@ -1938,9 +1913,9 @@ pub fn switch_on_with_options(
     mode: CodexPatchMode,
     options: CodexSwitchOptions,
 ) -> Result<()> {
-    options.validate_for_mode(mode)?;
-    if mode.strips_codex_client_auth() && mode != CodexPatchMode::ChatGptBridge {
-        ensure_bridge_runtime_ready(mode)?;
+    let plan = CodexPatchPlan::for_switch_on(mode, options)?;
+    if plan.requires_bridge_runtime_ready() {
+        ensure_bridge_runtime_ready(plan.mode())?;
     }
 
     let cfg_path = codex_config_path();
@@ -1962,67 +1937,12 @@ pub fn switch_on_with_options(
     } else {
         CodexSwitchState::from_codex_config_text(&text, !cfg_path.exists())?
     };
-    state.patch_mode = Some(mode);
-    state.responses_websocket = options.responses_websocket;
+    state.patch_mode = Some(plan.mode());
+    state.responses_websocket = plan.options().responses_websocket;
 
-    let auth_edit = match mode {
-        CodexPatchMode::Default | CodexPatchMode::OfficialRelayBridge => {
-            auth_restore_edit_from_state(&mut state)?
-        }
-        CodexPatchMode::ChatGptBridge
-        | CodexPatchMode::ImagegenBridge
-        | CodexPatchMode::OfficialImagegenBridge => {
-            let current_auth = if codex_auth_path().exists() {
-                Some(read_config_text(&codex_auth_path())?)
-            } else {
-                None
-            };
-            let (original_absent, original_text) = auth_baseline_for_patch(&state)?;
-            let patch = match mode {
-                CodexPatchMode::ChatGptBridge => {
-                    prepare_chatgpt_bridge_auth_patch_from_baseline(original_absent, original_text)?
-                }
-                CodexPatchMode::ImagegenBridge => prepare_imagegen_bridge_auth_patch_from_baseline(
-                    original_absent,
-                    original_text,
-                )?,
-                CodexPatchMode::OfficialImagegenBridge => {
-                    prepare_imagegen_bridge_auth_patch_from_baseline(
-                        original_absent,
-                        original_text,
-                    )?
-                }
-                CodexPatchMode::Default | CodexPatchMode::OfficialRelayBridge => {
-                    unreachable!("handled above")
-                }
-            };
-            let auth_edit = if auth_json_matches_helper_patch(
-                current_auth.as_deref(),
-                patch.patched_text.as_str(),
-            ) {
-                CodexAuthEdit::None
-            } else {
-                CodexAuthEdit::Write(patch.patched_text.clone())
-            };
-            state.set_auth_patch(&patch);
-            auth_edit
-        }
-    };
-    let new_text = switch_on_codex_toml_with_options(&text, port, mode, options)?;
-    match mode {
-        CodexPatchMode::Default | CodexPatchMode::OfficialRelayBridge => {
-            atomic_write(&cfg_path, &new_text)?;
-            apply_codex_auth_edit(auth_edit)?;
-            write_codex_switch_state(&state)?;
-        }
-        CodexPatchMode::ChatGptBridge
-        | CodexPatchMode::ImagegenBridge
-        | CodexPatchMode::OfficialImagegenBridge => {
-            write_codex_switch_state(&state)?;
-            atomic_write(&cfg_path, &new_text)?;
-            apply_codex_auth_edit(auth_edit)?;
-        }
-    }
+    let auth_edit = auth_edit_for_switch_on_plan(plan, &mut state)?;
+    let new_text = switch_on_codex_toml_with_plan(&text, port, plan)?;
+    apply_switch_on_effects(plan, &cfg_path, &new_text, &state, auth_edit)?;
     Ok(())
 }
 
@@ -2935,6 +2855,147 @@ request_max_retries = 5
         assert!(updated.contains("request_max_retries = 5"));
         assert!(updated.contains("base_url = \"http://127.0.0.1:3333\""));
         assert!(updated.contains("name = \"codex-helper\""));
+    }
+
+    #[test]
+    fn codex_patch_plan_chatgpt_bridge_keeps_account_auth_shape_and_safe_write_order() {
+        let plan = CodexPatchPlan::for_switch_on(
+            CodexPatchMode::ChatGptBridge,
+            CodexSwitchOptions::default(),
+        )
+        .expect("chatgpt bridge patch plan");
+
+        assert_eq!(plan.provider().provider_name(), "codex-helper");
+        assert_eq!(plan.provider().requires_openai_auth().value(), Some(true));
+        assert_eq!(plan.provider().supports_websockets().value(), Some(false));
+        assert_eq!(plan.auth(), CodexAuthPatchPlan::PatchChatGptBridge);
+        assert_eq!(
+            plan.effect_order(),
+            CodexSwitchOnEffectOrder::StateConfigAuth
+        );
+        assert!(
+            !plan.requires_bridge_runtime_ready(),
+            "chatgpt bridge validates the existing Codex auth.json instead of helper upstream auth"
+        );
+    }
+
+    #[test]
+    fn codex_patch_plan_official_relay_uses_openai_identity_without_auth_facade() {
+        let plan = CodexPatchPlan::for_switch_on(
+            CodexPatchMode::OfficialRelayBridge,
+            CodexSwitchOptions {
+                responses_websocket: true,
+            },
+        )
+        .expect("official relay patch plan");
+
+        assert_eq!(plan.provider().provider_name(), "OpenAI");
+        assert_eq!(plan.provider().requires_openai_auth().value(), None);
+        assert_eq!(plan.provider().supports_websockets().value(), Some(true));
+        assert_eq!(
+            plan.auth(),
+            CodexAuthPatchPlan::RestoreOriginalIfHelperPatched
+        );
+        assert_eq!(
+            plan.effect_order(),
+            CodexSwitchOnEffectOrder::ConfigAuthState
+        );
+        assert!(plan.requires_bridge_runtime_ready());
+    }
+
+    #[test]
+    fn codex_patch_plan_official_imagegen_combines_openai_identity_and_auth_facade() {
+        let plan = CodexPatchPlan::for_switch_on(
+            CodexPatchMode::OfficialImagegenBridge,
+            CodexSwitchOptions::default(),
+        )
+        .expect("official imagegen patch plan");
+
+        assert_eq!(plan.provider().provider_name(), "OpenAI");
+        assert_eq!(plan.provider().requires_openai_auth().value(), None);
+        assert_eq!(plan.provider().supports_websockets().value(), Some(false));
+        assert_eq!(plan.auth(), CodexAuthPatchPlan::PatchImagegenFacade);
+        assert_eq!(
+            plan.effect_order(),
+            CodexSwitchOnEffectOrder::StateConfigAuth
+        );
+        assert!(plan.requires_bridge_runtime_ready());
+    }
+
+    #[test]
+    fn codex_patch_plan_rejects_websocket_transport_without_official_identity() {
+        let err = CodexPatchPlan::for_switch_on(
+            CodexPatchMode::ImagegenBridge,
+            CodexSwitchOptions {
+                responses_websocket: true,
+            },
+        )
+        .expect_err("websocket transport should be official identity only");
+
+        assert!(
+            err.to_string()
+                .contains("requires --preset official-relay or --preset official-imagegen")
+        );
+    }
+
+    #[test]
+    fn codex_switch_on_toml_is_driven_by_patch_plan() {
+        let text = r#"
+model_provider = "codex_proxy"
+
+[model_providers.codex_proxy]
+name = "codex-helper"
+base_url = "http://127.0.0.1:1111"
+wire_api = "responses"
+requires_openai_auth = true
+supports_websockets = false
+"#;
+        let plan = CodexPatchPlan::for_switch_on(
+            CodexPatchMode::OfficialRelayBridge,
+            CodexSwitchOptions {
+                responses_websocket: true,
+            },
+        )
+        .expect("official relay patch plan");
+
+        let updated =
+            switch_on_codex_toml_with_plan(text, 3333, plan).expect("plan-driven TOML patch");
+
+        assert!(updated.contains("name = \"OpenAI\""));
+        assert!(updated.contains("base_url = \"http://127.0.0.1:3333\""));
+        assert!(updated.contains("supports_websockets = true"));
+        assert!(!updated.contains("requires_openai_auth"));
+    }
+
+    #[test]
+    fn codex_auth_edit_for_switch_on_plan_restores_prior_facade_from_current_text() {
+        let original_auth = chatgpt_auth_json("user@example.com", "acct_1", "plus");
+        let mut state = CodexSwitchState {
+            version: 2,
+            patch_mode: Some(CodexPatchMode::OfficialImagegenBridge),
+            responses_websocket: false,
+            original_config_absent: false,
+            original_model_provider: None,
+            original_codex_proxy: None,
+            had_model_providers: false,
+            original_auth_json_absent: false,
+            original_auth_json: Some(original_auth.clone()),
+            patched_auth_json: Some("{}".to_string()),
+        };
+        let plan = CodexPatchPlan::for_switch_on(
+            CodexPatchMode::OfficialRelayBridge,
+            CodexSwitchOptions::default(),
+        )
+        .expect("official relay patch plan");
+
+        let edit = auth_restore_edit_from_state_and_current(&mut state, Some("{}"));
+
+        assert_eq!(
+            plan.auth(),
+            CodexAuthPatchPlan::RestoreOriginalIfHelperPatched
+        );
+        assert_eq!(edit, CodexAuthEdit::Write(original_auth));
+        assert_eq!(state.patched_auth_json, None);
     }
 
     #[test]

@@ -16,7 +16,7 @@ use crate::routing_ir::{
     SkippedStationRouteCandidate, compile_legacy_route_plan_template,
 };
 use crate::runtime_identity::ProviderEndpointKey;
-use crate::state::SessionBinding;
+use crate::state::{SessionBinding, SessionIdentitySource};
 use crate::usage_providers;
 
 use super::ProxyService;
@@ -63,6 +63,7 @@ pub(super) struct ExecuteProviderChainParams<'a> {
     pub(super) effective_service_tier: Option<&'a str>,
     pub(super) base_service_tier: &'a ServiceTierLog,
     pub(super) session_id: Option<&'a str>,
+    pub(super) session_identity_source: Option<SessionIdentitySource>,
     pub(super) cwd: Option<&'a str>,
     pub(super) request_flavor: &'a RequestFlavor,
     pub(super) request_body_previews: bool,
@@ -209,6 +210,7 @@ pub(super) async fn execute_provider_chain_with_route_executor(
         effective_service_tier,
         base_service_tier,
         session_id,
+        session_identity_source,
         cwd,
         request_flavor,
         request_body_previews,
@@ -269,6 +271,7 @@ pub(super) async fn execute_provider_chain_with_route_executor(
                     effective_service_tier,
                     base_service_tier,
                     session_id,
+                    session_identity_source,
                     cwd,
                     request_flavor,
                     request_body_previews,
@@ -364,6 +367,7 @@ pub(super) async fn execute_provider_chain_with_route_executor(
                         effective_service_tier,
                         base_service_tier,
                         session_id,
+                        session_identity_source,
                         cwd,
                         request_flavor,
                         request_body_previews,
@@ -445,6 +449,7 @@ struct ExecuteRouteExecutorStationParams<'a, 'route> {
     effective_service_tier: Option<&'a str>,
     base_service_tier: &'a ServiceTierLog,
     session_id: Option<&'a str>,
+    session_identity_source: Option<SessionIdentitySource>,
     cwd: Option<&'a str>,
     request_flavor: &'a RequestFlavor,
     request_body_previews: bool,
@@ -489,6 +494,7 @@ struct ExecuteRouteGraphExecutorParams<'a, 'route> {
     effective_service_tier: Option<&'a str>,
     base_service_tier: &'a ServiceTierLog,
     session_id: Option<&'a str>,
+    session_identity_source: Option<SessionIdentitySource>,
     cwd: Option<&'a str>,
     request_flavor: &'a RequestFlavor,
     request_body_previews: bool,
@@ -536,6 +542,7 @@ async fn execute_route_graph_candidates_with_route_executor(
         effective_service_tier,
         base_service_tier,
         session_id,
+        session_identity_source,
         cwd,
         request_flavor,
         request_body_previews,
@@ -654,6 +661,7 @@ async fn execute_route_graph_candidates_with_route_executor(
             effective_service_tier,
             base_service_tier,
             session_id,
+            session_identity_source,
             cwd,
             request_flavor,
             request_body_previews,
@@ -719,6 +727,7 @@ async fn execute_station_upstreams_with_route_executor(
         effective_service_tier,
         base_service_tier,
         session_id,
+        session_identity_source,
         cwd,
         request_flavor,
         request_body_previews,
@@ -807,6 +816,7 @@ async fn execute_station_upstreams_with_route_executor(
             effective_service_tier,
             base_service_tier,
             session_id,
+            session_identity_source,
             cwd,
             request_flavor,
             request_body_previews,

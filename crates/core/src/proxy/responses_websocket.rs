@@ -14,11 +14,12 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http as tungstenite_http;
 
 use crate::codex_integration::CodexPatchMode;
-use crate::lb::{COOLDOWN_SECS, CooldownBackoff, LoadBalancer};
+use crate::lb::{COOLDOWN_SECS, LoadBalancer};
 use crate::logging::{CodexBridgeLog, RouteAttemptLog, ServiceTierLog};
 use crate::routing_ir::{RoutePlanAttemptState, RoutePlanExecutor};
 use crate::state::{
     FinishRequestParams, ResolvedRouteValue, RouteDecisionProvenance, RouteValueSource,
+    SessionIdentitySource,
 };
 
 use super::attempt_failures::{TerminalUpstreamFailureParams, apply_terminal_upstream_failure};
@@ -28,11 +29,13 @@ use super::attempt_target::AttemptTarget;
 use super::concurrency_limits::ConcurrencyPermit;
 use super::headers::filter_request_headers;
 use super::passive_health::{record_passive_upstream_failure, record_passive_upstream_success};
-use super::request_context::{resolve_and_touch_session_state, route_request_context};
 use super::request_failures::{FailedProxyRequestParams, finish_failed_proxy_request};
-use super::request_preparation::prepare_request_body;
+use super::request_preparation::{
+    CommonRequestPreparationError, CommonRequestPreparationParams, load_request_config_context,
+    prepare_common_request,
+};
 use super::request_routing::RequestRouteSelection;
-use super::retry::{retry_info_for_failed_attempts, retry_info_for_observed_attempts, retry_plan};
+use super::retry::{RetryPlan, retry_info_for_failed_attempts, retry_info_for_observed_attempts};
 use super::route_affinity::{
     apply_session_route_affinity_to_runtime, record_session_route_affinity_success,
 };
@@ -53,6 +56,7 @@ struct ResponsesWebSocketPrepared {
     uri: Uri,
     client_headers: HeaderMap,
     session_id: Option<String>,
+    session_identity_source: Option<SessionIdentitySource>,
     cwd: Option<String>,
     request_id: u64,
     started_at_ms: u64,
@@ -64,8 +68,8 @@ struct ResponsesWebSocketPrepared {
     effective_effort: Option<String>,
     base_service_tier: ServiceTierLog,
     codex_patch_mode: CodexPatchMode,
-    plan: super::retry::RetryPlan,
-    cooldown_backoff: CooldownBackoff,
+    plan: RetryPlan,
+    cooldown_backoff: crate::lb::CooldownBackoff,
 }
 
 struct ResponsesWebSocketSelected {
@@ -165,6 +169,7 @@ async fn serve_responses_websocket(
                 duration_ms: prepared.start.elapsed().as_millis() as u64,
                 started_at_ms: prepared.started_at_ms,
                 session_id: prepared.session_id.clone(),
+                session_identity_source: prepared.session_identity_source,
                 cwd: prepared.cwd.clone(),
                 effective_effort: prepared.effective_effort.clone(),
                 service_tier: prepared.base_service_tier.clone(),
@@ -282,20 +287,7 @@ async fn prepare_responses_websocket(
         .map(str::to_owned);
     let client_addr = None;
 
-    let config_reloaded = proxy.config.maybe_reload_from_disk().await;
-    let cfg_snapshot = proxy.config.snapshot().await;
-    let v4_snapshot = proxy.config.v4_snapshot().await;
-    let mgr = proxy.service_manager(cfg_snapshot.as_ref());
-    if config_reloaded {
-        proxy
-            .state
-            .prune_runtime_observability_for_service(proxy.service_name, mgr)
-            .await;
-    }
-    let codex_patch_mode = crate::codex_integration::codex_switch_status()
-        .ok()
-        .and_then(|status| status.patch_mode)
-        .unwrap_or(CodexPatchMode::Default);
+    let config = load_request_config_context(proxy).await;
 
     let raw_body = first_message_body_bytes(&first_message).ok_or_else(|| {
         (
@@ -316,122 +308,51 @@ async fn prepare_responses_websocket(
         ));
     }
 
-    let session_id = super::client_identity::extract_session_id_with_body_fallback(
-        &client_headers,
-        raw_body.as_ref(),
-    );
-    let session_binding = if let Some(id) = session_id.as_deref() {
-        proxy
-            .ensure_default_session_binding(mgr, id, started_at_ms)
-            .await
-    } else {
-        None
-    };
-    let cwd = resolve_and_touch_session_state(proxy, session_id.as_deref(), started_at_ms).await;
-
-    let override_effort = if let Some(id) = session_id.as_deref() {
-        proxy.state.get_session_effort_override(id).await
-    } else {
-        None
-    };
-    let override_model = if let Some(id) = session_id.as_deref() {
-        proxy.state.get_session_model_override(id).await
-    } else {
-        None
-    };
-    let override_service_tier = if let Some(id) = session_id.as_deref() {
-        proxy.state.get_session_service_tier_override(id).await
-    } else {
-        None
-    };
-    let binding_effort = session_binding
-        .as_ref()
-        .and_then(|binding| binding.reasoning_effort.as_deref());
-    let binding_model = session_binding
-        .as_ref()
-        .and_then(|binding| binding.model.as_deref());
-    let binding_service_tier = session_binding
-        .as_ref()
-        .and_then(|binding| binding.service_tier.as_deref());
-
-    let prepared_request = prepare_request_body(
-        &raw_body,
-        override_effort.as_deref(),
-        binding_effort,
-        override_model.as_deref(),
-        binding_model,
-        override_service_tier.as_deref(),
-        binding_service_tier,
-    );
-    let body_for_upstream = prepared_request.body_for_upstream.clone();
-    let request_model = prepared_request.request_model.clone();
-    let effective_effort = prepared_request.effective_effort.clone();
-    let base_service_tier = prepared_request.base_service_tier.clone();
-
-    let request_id = proxy
-        .state
-        .begin_request(
-            proxy.service_name,
-            method.as_str(),
-            uri.path(),
-            session_id.clone(),
-            client_name,
-            client_addr,
-            cwd.clone(),
-            request_model.clone(),
-            effective_effort.clone(),
-            base_service_tier.effective.clone(),
-            started_at_ms,
-        )
-        .await;
-
-    let route_request = route_request_context(
-        &method,
-        &uri,
-        &client_headers,
-        request_model.clone(),
-        effective_effort.clone(),
-        base_service_tier.effective.clone(),
-    );
-    let route_selection = proxy
-        .lbs_for_request(
-            cfg_snapshot.as_ref(),
-            v4_snapshot.as_deref(),
-            &route_request,
-            session_id.as_deref(),
-        )
-        .await;
-    if route_selection.is_empty() {
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            "no upstreams available".to_string(),
-        ));
-    }
-
-    let plan = retry_plan(&cfg_snapshot.retry.resolve());
-    let cooldown_backoff = CooldownBackoff {
-        factor: plan.cooldown_backoff_factor,
-        max_secs: plan.cooldown_backoff_max_secs,
+    let prepared = match prepare_common_request(CommonRequestPreparationParams {
+        proxy,
+        config: &config,
+        method: &method,
+        uri: &uri,
+        client_headers: &client_headers,
+        raw_body: &raw_body,
+        client_name,
+        client_addr,
+        started_at_ms,
+        client_content_type: client_headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        request_body_previews: false,
+    })
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(CommonRequestPreparationError::NoRoutableStation { .. }) => {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                "no upstreams available".to_string(),
+            ));
+        }
     };
 
     Ok(ResponsesWebSocketPrepared {
         method,
         uri,
         client_headers,
-        session_id,
-        cwd,
-        request_id,
+        session_id: prepared.session_id,
+        session_identity_source: prepared.session_identity_source,
+        cwd: prepared.cwd,
+        request_id: prepared.request_id,
         started_at_ms,
         start,
-        route_selection,
+        route_selection: prepared.route_selection,
         first_message,
-        body_for_upstream,
-        request_model,
-        effective_effort,
-        base_service_tier,
-        codex_patch_mode,
-        plan,
-        cooldown_backoff,
+        body_for_upstream: prepared.body_for_upstream,
+        request_model: prepared.request_model,
+        effective_effort: prepared.effective_effort,
+        base_service_tier: prepared.base_service_tier,
+        codex_patch_mode: config.codex_patch_mode,
+        plan: prepared.plan,
+        cooldown_backoff: prepared.cooldown_backoff,
     })
 }
 
@@ -811,6 +732,7 @@ async fn relay_websocket_streams(
     record_session_route_affinity_success(
         &proxy,
         prepared.session_id.as_deref(),
+        prepared.session_identity_source,
         selected.route_graph_key.as_deref(),
         &selected.target,
         &selected.route_attempts,
@@ -845,6 +767,7 @@ async fn relay_websocket_streams(
         selected.target.provider_endpoint_key(),
         selected.target.upstream().base_url.as_str(),
         prepared.session_id.clone(),
+        prepared.session_identity_source,
         prepared.cwd.clone(),
         selected
             .route_decision
@@ -961,6 +884,7 @@ async fn finish_websocket_failure(
         duration_ms: prepared.start.elapsed().as_millis() as u64,
         started_at_ms: prepared.started_at_ms,
         session_id: prepared.session_id.clone(),
+        session_identity_source: prepared.session_identity_source,
         cwd: prepared.cwd.clone(),
         effective_effort: prepared.effective_effort.clone(),
         service_tier: prepared.base_service_tier.clone(),

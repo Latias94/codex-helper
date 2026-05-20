@@ -11,11 +11,12 @@ use crate::codex_capability_profile::{
 use crate::codex_integration::CodexPatchMode;
 
 use super::codex_relay_probe::CodexRelayProbeObservation;
+use super::codex_relay_probe::codex_relay_probe_cases;
 use super::codex_relay_target::{CodexRelayTargetSelection, select_codex_relay_target};
 use super::models_compat::maybe_decode_models_response_body;
 use super::{
-    CodexRelayProbeClient, CodexRelayProbeKind, CodexRelayProbeResult, CodexRelayProbeSpec,
-    ProxyControlError, ProxyService,
+    CodexRelayProbeClient, CodexRelayProbeKind, CodexRelayProbeResult, ProxyControlError,
+    ProxyService,
 };
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -121,36 +122,16 @@ pub(super) async fn codex_relay_capabilities_for_proxy(
         .map(ToOwned::to_owned);
 
     let probe_client = CodexRelayProbeClient::new(proxy.client.clone());
-    let models_observation = probe_client
-        .probe_upstream_observation(
-            &target.upstream,
-            &CodexRelayProbeSpec::for_kind(CodexRelayProbeKind::Models),
-        )
-        .await;
-    let responses = probe_client
-        .probe_upstream(
-            &target.upstream,
-            &CodexRelayProbeSpec::for_kind(CodexRelayProbeKind::Responses),
-        )
-        .await;
-    let responses_compact = probe_client
-        .probe_upstream(
-            &target.upstream,
-            &CodexRelayProbeSpec::for_kind(CodexRelayProbeKind::ResponsesCompact),
-        )
-        .await;
+    let observations = run_capability_probe_cases(&probe_client, &target.upstream).await;
+    let models_observation = observation_for_kind(&observations, CodexRelayProbeKind::Models);
 
     let expected = build_expected_profile(
         patch_mode,
         responses_websocket,
         model.as_deref(),
-        &models_observation,
+        models_observation,
     );
-    let observed = CodexRelayCapabilitiesObserved {
-        models: models_observation.result,
-        responses,
-        responses_compact,
-    };
+    let observed = build_observed_from_probe_observations(&observations);
     let recommendation = build_recommendation(patch_mode, &expected, &observed);
     let mismatches = build_mismatches(&expected, &observed);
 
@@ -180,6 +161,50 @@ pub(super) async fn codex_relay_capabilities_for_proxy(
     Ok(response)
 }
 
+async fn run_capability_probe_cases(
+    probe_client: &CodexRelayProbeClient,
+    upstream: &crate::config::UpstreamConfig,
+) -> Vec<CodexRelayProbeObservation> {
+    let mut observations = Vec::with_capacity(codex_relay_probe_cases().len());
+    for case in codex_relay_probe_cases() {
+        observations.push(
+            probe_client
+                .probe_upstream_observation(upstream, &case.spec())
+                .await,
+        );
+    }
+    observations
+}
+
+fn build_observed_from_probe_observations(
+    observations: &[CodexRelayProbeObservation],
+) -> CodexRelayCapabilitiesObserved {
+    CodexRelayCapabilitiesObserved {
+        models: observation_for_kind(observations, CodexRelayProbeKind::Models)
+            .result
+            .clone(),
+        responses: observation_for_kind(observations, CodexRelayProbeKind::Responses)
+            .result
+            .clone(),
+        responses_compact: observation_for_kind(
+            observations,
+            CodexRelayProbeKind::ResponsesCompact,
+        )
+        .result
+        .clone(),
+    }
+}
+
+fn observation_for_kind<'a>(
+    observations: &'a [CodexRelayProbeObservation],
+    kind: CodexRelayProbeKind,
+) -> &'a CodexRelayProbeObservation {
+    observations
+        .iter()
+        .find(|observation| observation.result.kind == kind)
+        .expect("Codex relay probe registry must include all observed response fields")
+}
+
 fn current_codex_switch_patch_mode() -> Option<CodexPatchMode> {
     crate::codex_integration::codex_switch_status()
         .ok()
@@ -201,9 +226,11 @@ fn build_expected_profile(
     let model_catalog = translated_models_catalog(models_observation, model).unwrap_or_else(|| {
         CodexModelCatalogProfile::unknown(models_observation.result.reason.clone())
     });
-    CodexCapabilityProfile::for_input(CodexCapabilityProfileInput::from_patch_mode_with_transport(
+    CodexCapabilityProfile::for_input(CodexCapabilityProfileInput::from_patch_config(
         patch_mode,
-        responses_websocket,
+        crate::codex_integration::CodexSwitchOptions {
+            responses_websocket,
+        },
         model_catalog,
     ))
 }
@@ -343,6 +370,48 @@ mod tests {
         ProviderConfigV4, ProxyConfigV4, RoutingConfigV4, ServiceViewV4, UpstreamAuth,
     };
     use crate::lb::LbState;
+
+    fn probe_result(
+        kind: CodexRelayProbeKind,
+        support: super::super::CodexRelayProbeSupport,
+    ) -> CodexRelayProbeResult {
+        CodexRelayProbeResult {
+            kind,
+            support,
+            confidence: super::super::CodexRelayProbeConfidence::SuccessStatus,
+            status_code: Some(200),
+            response_shape: Some("ok".to_string()),
+            translation_required: false,
+            error_class: None,
+            reason: "ok".to_string(),
+        }
+    }
+
+    fn observation(kind: CodexRelayProbeKind) -> CodexRelayProbeObservation {
+        CodexRelayProbeObservation {
+            result: probe_result(kind, super::super::CodexRelayProbeSupport::Supported),
+            status: Some(StatusCode::OK),
+            headers: axum::http::HeaderMap::new(),
+            body: axum::body::Bytes::new(),
+        }
+    }
+
+    #[test]
+    fn codex_relay_capabilities_observed_shape_is_built_from_probe_registry() {
+        let observations = codex_relay_probe_cases()
+            .iter()
+            .map(|case| observation(case.kind))
+            .collect::<Vec<_>>();
+
+        let observed = build_observed_from_probe_observations(&observations);
+
+        assert_eq!(observed.models.kind, CodexRelayProbeKind::Models);
+        assert_eq!(observed.responses.kind, CodexRelayProbeKind::Responses);
+        assert_eq!(
+            observed.responses_compact.kind,
+            CodexRelayProbeKind::ResponsesCompact
+        );
+    }
 
     #[tokio::test]
     async fn codex_relay_capabilities_targets_route_graph_provider_id() {
