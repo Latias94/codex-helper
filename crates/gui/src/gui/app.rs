@@ -159,10 +159,10 @@ impl eframe::App for GuiApp {
             std::time::Duration::from_millis(self.gui_cfg.ui.refresh_ms.clamp(100, 5_000));
         ctx.request_repaint_after(refresh);
 
-        if self.proxy.poll_running_exit(&self.rt) {
-            if let Some(error) = self.proxy.last_start_error() {
-                self.last_error = Some(error.to_string());
-            }
+        if self.proxy.poll_running_exit(&self.rt)
+            && let Some(error) = self.proxy.last_start_error()
+        {
+            self.last_error = Some(error.to_string());
         }
 
         if self

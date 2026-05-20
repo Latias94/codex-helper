@@ -158,10 +158,11 @@ pub async fn run_attached_dashboard(
             maybe_event = events.next() => {
                 let Some(Ok(event)) = maybe_event else { continue; };
                 match event {
-                    Event::Key(key) if input::should_accept_key_event(&key) => {
-                        if handle_attached_key(&mut ui, &snapshot, &mut providers, key) {
-                            render_invalidation = RenderInvalidation::FullClear;
-                        }
+                    Event::Key(key)
+                        if input::should_accept_key_event(&key)
+                            && handle_attached_key(&mut ui, &snapshot, &mut providers, key) =>
+                    {
+                        render_invalidation = RenderInvalidation::FullClear;
                     }
                     Event::Resize(_, _) => {
                         ui.reset_table_viewports();
