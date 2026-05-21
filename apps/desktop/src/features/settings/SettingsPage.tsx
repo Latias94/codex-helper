@@ -1,3 +1,5 @@
+import { useState } from "react";
+
 import { AlertTriangle, ChevronDown, Copy, FolderOpen, RefreshCw } from "lucide-react";
 
 import { PageHeader } from "@/app/AppShell";
@@ -16,8 +18,11 @@ import {
   SelectBox,
   Switch,
 } from "@/components/ui";
+import { CONTROL_CONFIRMATIONS, useRuntimeActions } from "@/features/runtime/actions";
+import { ActionStatusBanner } from "@/features/runtime/ActionStatusBanner";
 import { useRuntimeSummary } from "@/features/runtime/hooks";
 import { useKnownPaths } from "@/features/settings/hooks";
+import type { CodexPreset } from "@/lib/tauri/commands";
 
 const advancedRows = [
   ["会话覆盖", "为单个会话选择 provider 或模型策略"],
@@ -31,6 +36,12 @@ const advancedRows = [
 export function SettingsPage() {
   const knownPaths = useKnownPaths();
   const runtime = useRuntimeSummary();
+  const actions = useRuntimeActions();
+  const [codexPreset, setCodexPreset] = useState<CodexPreset>("chatgpt-bridge");
+  const [globalRouteTarget, setGlobalRouteTarget] = useState("");
+  const [sessionId, setSessionId] = useState("");
+  const [sessionRouteTarget, setSessionRouteTarget] = useState("");
+  const [stopPhrase, setStopPhrase] = useState("");
   const paths = knownPaths.data;
 
   return (
@@ -45,6 +56,9 @@ export function SettingsPage() {
         healthy={runtime.source === "live" && !runtime.state.isStale}
         onRefresh={runtime.refetch}
       />
+      <div className="mb-4">
+        <ActionStatusBanner status={actions.status} busy={actions.isBusy} />
+      </div>
 
       <div className="grid grid-cols-2 gap-4">
         <SettingsCard title="桌面行为" description="控制应用启动、托盘和窗口关闭方式。">
@@ -94,7 +108,14 @@ export function SettingsPage() {
           </p>
           <div className="flex gap-2 pt-2">
             <Button variant="outline"><Copy className="h-4 w-4" />复制 Endpoint</Button>
-            <Button variant="outline"><RefreshCw className="h-4 w-4" />重新加载运行时</Button>
+            <Button
+              variant="outline"
+              disabled={!runtime.state.canUseLiveActions || actions.reload.isPending}
+              onClick={() => actions.reload.mutate()}
+            >
+              <RefreshCw className="h-4 w-4" />
+              重新加载运行时
+            </Button>
             <Button variant="outline"><FolderOpen className="h-4 w-4" />打开日志目录</Button>
           </div>
         </SettingsCard>
@@ -102,9 +123,16 @@ export function SettingsPage() {
         <SettingsCard title="Codex 连接" description="控制 Codex 是否通过本地代理中转。">
           <ToggleRow label="Codex 中转" checked />
           <FieldRow label="当前预设">
-            <SelectBox defaultValue="chatgpt-bridge" className="w-56">
+            <SelectBox
+              value={codexPreset}
+              onChange={(event) => setCodexPreset(event.currentTarget.value as CodexPreset)}
+              className="w-56"
+            >
+              <option value="default">default</option>
               <option value="chatgpt-bridge">chatgpt-bridge</option>
+              <option value="imagegen-bridge">imagegen-bridge</option>
               <option value="official-relay">official-relay</option>
+              <option value="official-imagegen">official-imagegen</option>
             </SelectBox>
           </FieldRow>
           <FieldRow label="当前供应商">
@@ -120,12 +148,88 @@ export function SettingsPage() {
           </div>
           <div className="flex gap-2 pt-2">
             <Button variant="outline">运行诊断</Button>
-            <Button variant="outline">切换预设</Button>
-            <Button variant="warning">关闭中转</Button>
+            <Button
+              variant="outline"
+              disabled={!runtime.state.canUseLiveActions || actions.switchOn.isPending}
+              onClick={() =>
+                actions.switchOn.mutate({
+                  confirmation: CONTROL_CONFIRMATIONS.switchCodexOn,
+                  preset: codexPreset,
+                })
+              }
+            >
+              切换预设
+            </Button>
+            <Button
+              variant="warning"
+              disabled={actions.switchOff.isPending}
+              onClick={() => actions.switchOff.mutate(CONTROL_CONFIRMATIONS.switchCodexOff)}
+            >
+              关闭中转
+            </Button>
           </div>
         </SettingsCard>
 
         <SettingsCard title="高级工具" description="日常使用不需要打开这些选项。">
+          <div className="rounded-2xl border border-teal-100 bg-teal-50/60 p-3">
+            <div className="text-sm font-medium text-slate-800">全局路由覆盖</div>
+            <div className="mt-2 flex gap-2">
+              <Input
+                value={globalRouteTarget}
+                onChange={(event) => setGlobalRouteTarget(event.currentTarget.value)}
+                placeholder="route target / provider name"
+                className="flex-1"
+              />
+              <Button
+                variant="outline"
+                disabled={!runtime.state.canUseLiveActions || actions.setGlobalRoute.isPending}
+                onClick={() => actions.setGlobalRoute.mutate({ target: globalRouteTarget })}
+              >
+                设置
+              </Button>
+              <Button
+                variant="ghost"
+                disabled={!runtime.state.canUseLiveActions || actions.setGlobalRoute.isPending}
+                onClick={() => actions.setGlobalRoute.mutate({ target: null })}
+              >
+                清除
+              </Button>
+            </div>
+          </div>
+          <div className="rounded-2xl border border-slate-200 bg-slate-50/70 p-3">
+            <div className="text-sm font-medium text-slate-800">会话路由覆盖</div>
+            <div className="mt-2 grid grid-cols-[1fr_1fr_auto_auto] gap-2">
+              <Input
+                value={sessionId}
+                onChange={(event) => setSessionId(event.currentTarget.value)}
+                placeholder="session id"
+              />
+              <Input
+                value={sessionRouteTarget}
+                onChange={(event) => setSessionRouteTarget(event.currentTarget.value)}
+                placeholder="route target"
+              />
+              <Button
+                variant="outline"
+                disabled={!runtime.state.canUseLiveActions || !sessionId || actions.setSessionOverrides.isPending}
+                onClick={() =>
+                  actions.setSessionOverrides.mutate({
+                    sessionId,
+                    routeTarget: sessionRouteTarget,
+                  })
+                }
+              >
+                设置
+              </Button>
+              <Button
+                variant="ghost"
+                disabled={!runtime.state.canUseLiveActions || !sessionId || actions.resetSession.isPending}
+                onClick={() => actions.resetSession.mutate({ sessionId })}
+              >
+                重置
+              </Button>
+            </div>
+          </div>
           <div className="overflow-hidden rounded-2xl border border-slate-200">
             {advancedRows.map(([title, description]) => (
               <div key={title} className="flex items-center justify-between border-b border-slate-100 px-3 py-2.5 last:border-b-0">
@@ -178,7 +282,31 @@ export function SettingsPage() {
               <div className="flex items-center justify-end gap-3">
                 <Button variant="outline">退出应用</Button>
                 <Button variant="outline">Detach</Button>
-                <Button variant="danger">Stop Proxy</Button>
+                <div className="flex flex-col gap-2">
+                  <Input
+                    aria-label="Stop Proxy confirmation"
+                    value={stopPhrase}
+                    onChange={(event) => setStopPhrase(event.currentTarget.value)}
+                    placeholder={runtime.state.ownerMode === "desktop-owned" ? CONTROL_CONFIRMATIONS.stopOwned : CONTROL_CONFIRMATIONS.stopAttached}
+                    className="w-56 border-red-200"
+                  />
+                  <div className="flex gap-2">
+                    <Button
+                      variant="danger"
+                      disabled={!runtime.state.canStopProxy || actions.stopOwned.isPending}
+                      onClick={() => actions.stopOwned.mutate(stopPhrase)}
+                    >
+                      Stop Owned
+                    </Button>
+                    <Button
+                      variant="warning"
+                      disabled={!runtime.state.canUseLiveActions || actions.stopAttached.isPending}
+                      onClick={() => actions.stopAttached.mutate(stopPhrase)}
+                    >
+                      Remote Stop
+                    </Button>
+                  </div>
+                </div>
               </div>
             </div>
           </CardContent>

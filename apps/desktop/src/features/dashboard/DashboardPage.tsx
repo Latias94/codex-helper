@@ -7,10 +7,13 @@ import { MetricCard } from "@/components/page/MetricCard";
 import { StatusStrip } from "@/components/shell/StatusStrip";
 import { Badge, Button, Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui";
 import { useDashboardData } from "@/features/dashboard/hooks";
+import { useRuntimeActions } from "@/features/runtime/actions";
+import { ActionStatusBanner } from "@/features/runtime/ActionStatusBanner";
 import { attachMetricIcons } from "@/lib/api/mappers";
 
 export function DashboardPage() {
   const dashboard = useDashboardData();
+  const actions = useRuntimeActions();
   const { chartBars, providers, recentRequests, runtime } = dashboard.data;
   const metrics = attachMetricIcons(dashboard.data.metrics);
 
@@ -40,25 +43,43 @@ export function DashboardPage() {
             <CardDescription>确认 Codex 是否通过本地代理中转，并执行安全操作。</CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
+            <ActionStatusBanner status={actions.status} busy={actions.isBusy} />
             <WorkRow
               name="Codex"
               status="已连接"
               provider="CodeX Air"
-              action="Switch Off"
+              action="Settings 中确认"
+              disabled
               active
             />
             <WorkRow
               name="Claude Code"
               status="未启用"
               provider="未配置"
-              action="Switch On"
+              action="TDC-090"
+              disabled
             />
             <div className="flex flex-wrap gap-2 rounded-2xl bg-mint-50 p-3">
-              <Button disabled={!dashboard.state.canStartProxy}>
+              <Button
+                disabled={!dashboard.state.canStartProxy || actions.startProxy.isPending}
+                onClick={() => actions.startProxy.mutate()}
+              >
                 <Play className="h-4 w-4" />
                 Start Proxy
               </Button>
-              <Button variant="outline" disabled={!dashboard.state.canUseLiveActions}>
+              <Button
+                variant="outline"
+                disabled={!dashboard.state.canAttachProxy || actions.attachProxy.isPending}
+                onClick={() => actions.attachProxy.mutate()}
+              >
+                <Power className="h-4 w-4" />
+                Attach Existing
+              </Button>
+              <Button
+                variant="outline"
+                disabled
+                title="Switch On/Off 会修改 Codex 配置，请到 Settings 输入确认短语后执行。"
+              >
                 <Power className="h-4 w-4" />
                 Switch On
               </Button>
@@ -73,7 +94,7 @@ export function DashboardPage() {
             </div>
             <div className="flex items-center gap-2 text-sm text-amber-700">
               <AlertTriangle className="h-4 w-4" />
-              Attached mode 示例：关闭窗口只会 Detach，停止代理请到 Settings 使用 Stop Proxy。
+              Switch On/Off 和 Stop Proxy 需要到 Settings 输入确认短语；普通关闭窗口不会远程停止 attached runtime。
             </div>
           </CardContent>
         </Card>
@@ -171,12 +192,16 @@ function WorkRow({
   status,
   provider,
   action,
+  onAction,
+  disabled,
   active,
 }: {
   name: string;
   status: string;
   provider: string;
   action: string;
+  onAction?: () => void;
+  disabled?: boolean;
   active?: boolean;
 }) {
   return (
@@ -192,7 +217,9 @@ function WorkRow({
           </div>
         </div>
       </div>
-      <Button variant={active ? "warning" : "outline"}>{action}</Button>
+      <Button variant={active ? "warning" : "outline"} onClick={onAction} disabled={disabled}>
+        {action}
+      </Button>
     </div>
   );
 }

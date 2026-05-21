@@ -226,6 +226,7 @@ export function mapProviders(
     const active = provider.name === activeProvider || (!activeProvider && index === 0);
 
     return {
+      id: provider.name,
       name: provider.alias || provider.name,
       host: hostFromUrl(primaryEndpoint?.base_url),
       auth: "本机配置 / 环境变量",

@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use codex_helper_core::proxy::{
-    ADMIN_PORT_OFFSET, RuntimeStatusResponse, admin_port_for_proxy_port,
-    local_admin_base_url_for_proxy_port, local_proxy_base_url,
+    ADMIN_PORT_OFFSET, ADMIN_TOKEN_ENV_VAR, ADMIN_TOKEN_HEADER, RuntimeStatusResponse,
+    admin_port_for_proxy_port, local_admin_base_url_for_proxy_port, local_proxy_base_url,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -10,8 +10,9 @@ use serde_json::Value;
 
 use crate::error::{CommandError, DesktopError};
 
-const DEFAULT_PROXY_PORT: u16 = 3211;
+pub(crate) const DEFAULT_PROXY_PORT: u16 = 3211;
 const ADMIN_BASE_ENV: &str = "CODEX_HELPER_DESKTOP_ADMIN_URL";
+const REQUEST_TIMEOUT_MS: u64 = 2_500;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -36,10 +37,7 @@ pub struct AdminReadModel {
 #[tauri::command]
 pub async fn get_admin_read_model() -> Result<AdminReadModel, CommandError> {
     let endpoint = admin_endpoint_config();
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(2_500))
-        .build()
-        .map_err(|err| DesktopError::AdminApi(err.to_string()))?;
+    let client = admin_client()?;
 
     let operator_summary: Value = get_json(
         &client,
@@ -112,18 +110,99 @@ pub async fn get_admin_read_model() -> Result<AdminReadModel, CommandError> {
     })
 }
 
-async fn get_json<T: DeserializeOwned>(
+pub(crate) fn admin_client() -> Result<reqwest::Client, CommandError> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_millis(REQUEST_TIMEOUT_MS))
+        .build()
+        .map_err(|err| DesktopError::AdminApi(err.to_string()).into())
+}
+
+pub(crate) async fn get_json<T: DeserializeOwned>(
     client: &reqwest::Client,
     base_url: &str,
     path: &str,
 ) -> Result<T, CommandError> {
     let url = format!("{}{}", base_url.trim_end_matches('/'), path);
-    let response = client
-        .get(&url)
-        .header(reqwest::header::ACCEPT, "application/json")
-        .send()
-        .await
-        .map_err(|err| DesktopError::AdminApi(format!("{url}: {err}")))?;
+    let response = with_admin_headers(
+        client
+            .get(&url)
+            .header(reqwest::header::ACCEPT, "application/json"),
+    )
+    .send()
+    .await
+    .map_err(|err| DesktopError::AdminApi(format!("{url}: {err}")))?;
+    decode_response(response, &url).await
+}
+
+pub(crate) async fn post_json<T: DeserializeOwned, B: Serialize + ?Sized>(
+    client: &reqwest::Client,
+    base_url: &str,
+    path: &str,
+    body: &B,
+) -> Result<T, CommandError> {
+    let url = format!("{}{}", base_url.trim_end_matches('/'), path);
+    let response = with_admin_headers(
+        client
+            .post(&url)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .json(body),
+    )
+    .send()
+    .await
+    .map_err(|err| DesktopError::AdminApi(format!("{url}: {err}")))?;
+    decode_response(response, &url).await
+}
+
+pub(crate) async fn post_empty(
+    client: &reqwest::Client,
+    base_url: &str,
+    path: &str,
+) -> Result<(), CommandError> {
+    let url = format!("{}{}", base_url.trim_end_matches('/'), path);
+    let response = with_admin_headers(
+        client
+            .post(&url)
+            .header(reqwest::header::ACCEPT, "application/json"),
+    )
+    .send()
+    .await
+    .map_err(|err| DesktopError::AdminApi(format!("{url}: {err}")))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(DesktopError::AdminApi(format!("{url}: HTTP {status} {body}")).into());
+    }
+    Ok(())
+}
+
+pub(crate) async fn post_json_no_response<B: Serialize + ?Sized>(
+    client: &reqwest::Client,
+    base_url: &str,
+    path: &str,
+    body: &B,
+) -> Result<(), CommandError> {
+    let url = format!("{}{}", base_url.trim_end_matches('/'), path);
+    let response = with_admin_headers(
+        client
+            .post(&url)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .json(body),
+    )
+    .send()
+    .await
+    .map_err(|err| DesktopError::AdminApi(format!("{url}: {err}")))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(DesktopError::AdminApi(format!("{url}: HTTP {status} {body}")).into());
+    }
+    Ok(())
+}
+
+async fn decode_response<T: DeserializeOwned>(
+    response: reqwest::Response,
+    url: &str,
+) -> Result<T, CommandError> {
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
@@ -135,7 +214,19 @@ async fn get_json<T: DeserializeOwned>(
         .map_err(|err| DesktopError::AdminApi(format!("{url}: {err}")).into())
 }
 
-fn admin_endpoint_config() -> AdminEndpointConfig {
+fn with_admin_headers(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    if let Some(token) = std::env::var(ADMIN_TOKEN_ENV_VAR)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        request.header(ADMIN_TOKEN_HEADER, token)
+    } else {
+        request
+    }
+}
+
+pub(crate) fn admin_endpoint_config() -> AdminEndpointConfig {
     if let Ok(base) = std::env::var(ADMIN_BASE_ENV) {
         if let Some(config) = config_from_admin_base_url(base.trim()) {
             return config;

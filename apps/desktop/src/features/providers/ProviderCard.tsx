@@ -1,9 +1,15 @@
-import { Activity, CheckCircle2, Edit3, RefreshCw, ShieldCheck, Zap } from "lucide-react";
+import { Activity, Ban, CheckCircle2, RefreshCw, RotateCcw, ShieldCheck, Zap } from "lucide-react";
 
 import { Badge, Button, Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui";
 
 export function ProviderCard({
   provider,
+  onProbe,
+  onRefreshBalance,
+  onSetActive,
+  onDisable,
+  onClearOverride,
+  busy,
 }: {
   provider: {
     name: string;
@@ -17,6 +23,12 @@ export function ProviderCard({
     lastUsed: string;
     active: boolean;
   };
+  onProbe?: () => void;
+  onRefreshBalance?: () => void;
+  onSetActive?: () => void;
+  onDisable?: () => void;
+  onClearOverride?: () => void;
+  busy?: boolean;
 }) {
   const healthy = provider.health === "Healthy";
   return (
@@ -53,19 +65,22 @@ export function ProviderCard({
         <div className="flex items-center justify-between">
           <span className="text-xs text-slate-500">Last used {provider.lastUsed}</span>
           <div className="flex gap-2">
-            <Button variant={provider.active ? "secondary" : "default"}>
+            <Button variant={provider.active ? "secondary" : "default"} onClick={onSetActive} disabled={busy}>
               <Zap className="h-4 w-4" />
               Set Active
             </Button>
-            <Button variant="outline">
+            <Button variant="outline" onClick={onProbe} disabled={busy}>
               <Activity className="h-4 w-4" />
               Probe
             </Button>
-            <Button variant="outline" className="w-9 px-0">
+            <Button variant="outline" className="w-9 px-0" onClick={onRefreshBalance} disabled={busy}>
               <RefreshCw className="h-4 w-4" />
             </Button>
-            <Button variant="outline" className="w-9 px-0">
-              <Edit3 className="h-4 w-4" />
+            <Button variant="warning" className="w-9 px-0" onClick={onDisable} disabled={busy}>
+              <Ban className="h-4 w-4" />
+            </Button>
+            <Button variant="outline" className="w-9 px-0" onClick={onClearOverride} disabled={busy}>
+              <RotateCcw className="h-4 w-4" />
             </Button>
           </div>
         </div>

@@ -77,12 +77,12 @@ Last updated: 2026-05-21
 
 ## M4 — Safe Mutations And Desktop Lifecycle
 
-- [ ] TDC-080 [owner=main-or-worker] [deps=TDC-070] [scope=desktop-frontend/src,src/cli_app.rs-or-tauri-commands]
+- [x] TDC-080 [owner=main-or-worker] [deps=TDC-070] [scope=desktop-frontend/src,src/cli_app.rs-or-tauri-commands]
   Goal: Implement safe actions: attach, start desktop-owned proxy, stop owned proxy, explicit remote stop, switch on/off, reload runtime, probe station, refresh balances, set/clear overrides.
   Validation: targeted frontend tests plus Rust/Tauri command tests where practical.
-  Review: Explicit Stop Proxy and ordinary Quit must remain visibly different.
-  Evidence: tests and manual action matrix.
-  Handoff: Dangerous actions require inline confirmation.
+  Review: DONE_WITH_CONCERNS — Tauri commands now expose typed safe mutations and the UI separates Dashboard quick actions from Settings confirmation actions. Explicit Stop Owned and Remote Stop Attached require different exact phrases; ordinary Quit/Detach remains non-stopping copy and tray semantics are deferred to TDC-090.
+  Evidence: `apps/desktop/src-tauri/src/commands/control.rs`; `apps/desktop/src/features/runtime/actions.ts`; `apps/desktop/src/features/settings/SettingsPage.tsx`; `docs/workstreams/tauri-desktop-client/JOURNAL/2026-05-21-tdc-080.md`; `EVIDENCE_AND_GATES.md` 2026-05-21 TDC-080 entry.
+  Handoff: DONE_WITH_CONCERNS — Start Proxy currently locates/spawns the CLI sibling or `CODEX_HELPER_CLI_PATH`; TDC-090 should harden this as the authoritative tray/sidecar owner path.
 
 - [ ] TDC-090 [owner=main-or-worker] [deps=TDC-080] [scope=desktop-tauri,tray,lifecycle]
   Goal: Implement tray and desktop owner semantics using the hidden desktop-managed sidecar path.

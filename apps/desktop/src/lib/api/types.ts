@@ -23,6 +23,47 @@ export type RuntimeDataStatus =
 export type RuntimeOwnerMode = "desktop-owned" | "attached" | "unknown";
 export type RuntimeDataSeverity = "neutral" | "info" | "success" | "warning" | "danger";
 
+export type DesktopRuntimeConnectionMode = "desktop-owned" | "attached" | "stopped" | "unknown";
+
+export type CodexSwitchSnapshot = {
+  enabled: boolean;
+  modelProvider?: string | null;
+  providerName?: string | null;
+  baseUrl?: string | null;
+  preset?: string | null;
+  requiresOpenaiAuth?: boolean | null;
+  supportsWebsockets?: boolean | null;
+  remoteCompactionV2Enabled: boolean;
+  hasSwitchState: boolean;
+  errorMessage?: string | null;
+};
+
+export type DesktopControlState = {
+  connectionMode: DesktopRuntimeConnectionMode;
+  proxyPort: number;
+  adminPort: number;
+  proxyBaseUrl: string;
+  adminBaseUrl: string;
+  reachable: boolean;
+  shutdownAvailable: boolean;
+  owner?: unknown;
+  codexSwitch: CodexSwitchSnapshot;
+  canStart: boolean;
+  canAttach: boolean;
+  canStopOwned: boolean;
+  canRemoteStop: boolean;
+  canSwitchOn: boolean;
+  canSwitchOff: boolean;
+};
+
+export type DesktopActionResult = {
+  ok: boolean;
+  action: string;
+  message: string;
+  state?: DesktopControlState;
+  payload?: unknown;
+};
+
 export type RuntimeDataState = {
   status: RuntimeDataStatus;
   source: DataSource;
@@ -77,6 +118,7 @@ export type RecentRequestView = {
 };
 
 export type ProviderCardView = {
+  id?: string;
   name: string;
   host: string;
   auth: string;

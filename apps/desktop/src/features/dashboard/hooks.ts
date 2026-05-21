@@ -6,6 +6,7 @@ import { queryKeys } from "@/lib/api/query-keys";
 import type { QueryBackedData } from "@/lib/api/types";
 import { useAdminReadModelState } from "@/lib/api/use-admin-read-model";
 import { getAppMetadata } from "@/lib/tauri/commands";
+import { useDesktopControlState } from "@/features/runtime/actions";
 
 export function useAppMetadata() {
   return useQuery({
@@ -16,8 +17,24 @@ export function useAppMetadata() {
 
 export function useDashboardData(): QueryBackedData<typeof mockDashboardData> {
   const metadata = useAppMetadata();
+  const control = useDesktopControlState();
   const query = useAdminReadModelState();
   const { readModel, state } = query;
+  const ownerMode = control.data
+    ? control.data.connectionMode === "desktop-owned"
+      ? "desktop-owned"
+      : control.data.connectionMode === "attached"
+        ? "attached"
+        : "unknown"
+    : state.ownerMode;
+  const mergedState = {
+    ...state,
+    ownerMode,
+    canStartProxy: control.data?.canStart ?? state.canStartProxy,
+    canAttachProxy: control.data?.canAttach ?? state.canAttachProxy,
+    canStopProxy: control.data?.canStopOwned ?? state.canStopProxy,
+    canUseLiveActions: state.canUseLiveActions && (control.data?.reachable ?? true),
+  };
 
   const appVersion = metadata.data?.version ?? "0.16.0";
   const data = readModel.data
@@ -31,13 +48,20 @@ export function useDashboardData(): QueryBackedData<typeof mockDashboardData> {
         appVersion,
       })
     : mockDashboardData;
+  const dataWithOwner = {
+    ...data,
+    runtime: {
+      ...data.runtime,
+      ownerMode,
+    },
+  };
 
   return {
-    data,
+    data: dataWithOwner,
     source: query.source,
-    state,
+    state: mergedState,
     isLoading: query.isLoading,
-    isRefreshing: query.isRefreshing,
+    isRefreshing: query.isRefreshing || control.isFetching,
     errorMessage: query.errorMessage,
     refetch: query.refetch,
   };

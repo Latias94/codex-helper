@@ -119,11 +119,16 @@
       "date": "2026-05-21",
       "kind": "runtime-state-polish",
       "summary": "Completed TDC-070 with concerns. Added shared runtime data-state taxonomy and read-model hook, upgraded DataStateBanner for loading/unavailable/disconnected/auth-required/empty/stale states, surfaced owner-pending lifecycle uncertainty, and validated with pnpm test/build, cargo fmt --check, cargo check -p codex-helper-desktop, and git diff --check."
+    },
+    {
+      "date": "2026-05-21",
+      "kind": "safe-control-actions",
+      "summary": "Completed TDC-080 with concerns. Added typed Tauri safe mutation commands, admin token propagation, exact confirmation phrases for stop/switch actions, frontend action hooks/status banners, Dashboard/Providers/Settings control wiring, and validation via pnpm build/test, cargo fmt --check, cargo check -p codex-helper-desktop, cargo nextest run -p codex-helper-desktop --lib, and git diff --check."
     }
   ],
   "adr_refs": [],
   "continue_policy": {
     "default_action": "continue",
-    "notes": "Next step is TDC-080 safe mutations: attach, desktop-owned start, stop-owned vs explicit remote stop, switch on/off, reload runtime, probe station, refresh balances, and overrides. Tauri lifecycle owner/tray remains TDC-090."
+    "notes": "Next step is TDC-090 tray and authoritative desktop owner semantics. Harden the current CLI-spawned desktop-managed runtime into a first-class tray/sidecar lifecycle path; no normal GUI close/quit may remote-stop an attached runtime."
   }
 }

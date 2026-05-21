@@ -107,7 +107,19 @@ TDC-070 is complete with concerns:
 - Owner semantics are intentionally shown as pending/uncertain in shell/status/settings copy; the frontend no longer pretends it knows whether the runtime is desktop-owned or attached.
 - Validation passed on 2026-05-21: `pnpm test` (5 files, 20 tests), `pnpm build`, `cargo fmt --check`, `cargo check -p codex-helper-desktop`, and `git diff --check -- .`.
 
-Current next task: TDC-080 safe control actions. Implement attach, desktop-owned start, stop-owned vs explicit remote stop, switch on/off, reload runtime, probe station, refresh balances, and provider/session overrides with confirmation rules. TDC-090 tray and authoritative lifecycle owner semantics remain follow-on work.
+TDC-080 is complete with concerns:
+
+- Tauri safe mutation commands exist for attach, desktop-managed start, owned stop, explicit attached remote stop, Codex switch on/off, runtime reload, station probe, provider balance refresh, provider runtime overrides, global route override, and session overrides.
+- Desktop admin API requests now propagate `CODEX_HELPER_ADMIN_TOKEN` as `x-codex-helper-admin-token`.
+- Frontend action hooks and status banners are wired into Dashboard, Providers, and Settings.
+- Dangerous actions require exact inline phrases:
+  - `STOP OWNED PROXY`
+  - `STOP ATTACHED PROXY`
+  - `SWITCH CODEX`
+  - `SWITCH OFF CODEX`
+- Validation passed on 2026-05-21: `pnpm build`, `pnpm test`, `cargo fmt --check`, `cargo check -p codex-helper-desktop`, `cargo nextest run -p codex-helper-desktop --lib`, and `git diff --check -- .`.
+
+Current next task: TDC-090 tray and desktop owner semantics. Harden the current CLI-spawned desktop-managed runtime into an authoritative tray/sidecar lifecycle path. Ordinary window close/quit must remain visibly different from explicit Stop Proxy, and no normal GUI exit may remote-stop an attached runtime.
 
 ## shadcn/ui Prototype Prompt
 

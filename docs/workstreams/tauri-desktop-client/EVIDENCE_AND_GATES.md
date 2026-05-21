@@ -583,6 +583,99 @@ Result:
 
 - DONE_WITH_CONCERNS — TDC-070 state taxonomy and visual QA are implemented. Next step is TDC-080 safe control actions.
 
+### 2026-05-21 — TDC-080 safe control actions
+
+Evidence:
+
+- Added typed Tauri control commands under `apps/desktop/src-tauri/src/commands/control.rs`:
+  - `get_desktop_control_state`;
+  - `attach_existing_proxy`;
+  - `start_desktop_proxy`;
+  - `stop_proxy`;
+  - `switch_codex`;
+  - `reload_runtime`;
+  - `probe_station`;
+  - `refresh_provider_balances`;
+  - `apply_provider_runtime_override`;
+  - `set_global_route_override`;
+  - `apply_session_overrides`;
+  - `reset_session_overrides`.
+- Reused existing core lifecycle semantics:
+  - `RuntimeOwnerMarker`;
+  - `RuntimeOwnerKind`;
+  - `decide_runtime_stop_action`;
+  - `RuntimeStopIntent::ExplicitStop`.
+- Added admin-token propagation to the desktop admin client path:
+  - reads `CODEX_HELPER_ADMIN_TOKEN`;
+  - sends `x-codex-helper-admin-token` on desktop admin requests.
+- Added exact confirmation phrases for dangerous local mutations:
+  - `STOP OWNED PROXY`;
+  - `STOP ATTACHED PROXY`;
+  - `SWITCH CODEX`;
+  - `SWITCH OFF CODEX`.
+- Added frontend action boundary:
+  - `apps/desktop/src/features/runtime/actions.ts`;
+  - `apps/desktop/src/features/runtime/ActionStatusBanner.tsx`;
+  - command wrappers in `apps/desktop/src/lib/tauri/commands.ts`;
+  - shared control state types in `apps/desktop/src/lib/api/types.ts`.
+- Wired UI surfaces:
+  - Dashboard can start/attach/refresh and routes switch confirmation to Settings instead of silently mutating Codex config.
+  - Providers can probe, refresh balances, set global route target, disable provider runtime, and clear provider runtime overrides.
+  - Settings can reload runtime, switch Codex on/off with confirmation, set/clear global route override, set/reset session route override, and choose owned stop vs remote stop with separate confirmation phrases.
+
+Manual action matrix:
+
+| Action | Behavior | Safety boundary |
+| --- | --- | --- |
+| Attach Existing | Requires reachable admin API and reports attached state. | Does not stop or take ownership of external runtime. |
+| Start Proxy | Spawns `codex-helper serve --codex --host 127.0.0.1 --port <port> --no-tui --desktop-managed` via `CODEX_HELPER_CLI_PATH`/sibling CLI lookup, then polls admin API. | Uses existing desktop owner marker path; tray/sidecar authority remains TDC-090. |
+| Stop Owned | Requires `STOP OWNED PROXY`. | Only maps to `StopOwnedRuntime` for desktop-owned state. |
+| Remote Stop Attached | Requires `STOP ATTACHED PROXY`. | Separate action/copy; falls back to detach-only if shutdown is unavailable. |
+| Codex Switch On | Requires `SWITCH CODEX` in Settings. | Uses non-interactive core switch API; Dashboard quick action is disabled and points to Settings. |
+| Codex Switch Off | Requires `SWITCH OFF CODEX` in Settings. | Uses core switch-state restoration path. |
+| Reload/probe/balance refresh | Exposed as explicit buttons. | Disabled when live admin state is not usable. |
+| Provider/global/session overrides | Exposed in Providers/Settings advanced areas. | Typed payloads through Tauri commands; no secret material is displayed. |
+
+Verification:
+
+- Command: `pnpm build`
+- Scope: `apps/desktop`
+- Result: PASS — TypeScript and Vite production build completed.
+- Output summary:
+  - `dist/index.html`
+  - `dist/assets/index-ConQhKx5.css`
+  - `dist/assets/index-6JIEix8J.js`
+
+- Command: `pnpm test`
+- Scope: `apps/desktop`
+- Result: PASS — Vitest passed: 5 files, 20 tests.
+
+- Command: `cargo fmt --check`
+- Scope: repository workspace
+- Result: PASS.
+
+- Command: `cargo check -p codex-helper-desktop`
+- Scope: `apps/desktop/src-tauri`
+- Result: PASS.
+
+- Command: `cargo nextest run -p codex-helper-desktop --lib`
+- Scope: `apps/desktop/src-tauri`
+- Result: PASS — 6 tests. Covers owner classification, explicit confirmation phrases, stop decision separation, CLI sibling lookup, and balance-refresh query encoding.
+
+- Command: `git diff --check -- .`
+- Scope: full repository diff
+- Result: PASS — no diff whitespace errors reported. Git emitted only Windows LF/CRLF warnings for edited text files.
+
+Concerns / deferred:
+
+- Full Tauri window smoke remains pending; this slice validates command/frontend boundaries but does not run `pnpm tauri:dev`.
+- `start_desktop_proxy` is implemented by locating/spawning the CLI binary; TDC-090 should make the tray/sidecar path authoritative and package-aware.
+- Tray minimize/quit/autostart behavior is still TDC-090.
+
+Result:
+
+- DONE_WITH_CONCERNS — TDC-080 safe mutations are implemented with visible confirmation boundaries. Next step is TDC-090 tray and authoritative desktop owner semantics.
+
 ## Deferred / Not Run Yet
 
 - No full Tauri window smoke has been run yet.
