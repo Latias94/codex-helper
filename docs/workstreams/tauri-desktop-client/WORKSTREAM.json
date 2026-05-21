@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "slug": "tauri-desktop-client",
+  "title": "Tauri Desktop Client",
+  "status": "draft",
+  "updated": "2026-05-21",
+  "scope_kind": "planning-and-execution",
+  "problem": "The existing egui GUI is no longer the desired long-term desktop product surface. codex-helper needs a polished but simple Tauri client that replaces egui, uses React + Tailwind + shadcn/ui, starts from a component prototype, and preserves safe runtime owner semantics without exposing every advanced control-plane concept at top level.",
+  "authoritative_docs": [
+    {
+      "role": "design",
+      "path": "docs/workstreams/tauri-desktop-client/DESIGN.md"
+    },
+    {
+      "role": "execution",
+      "path": "docs/workstreams/tauri-desktop-client/TODO.md"
+    },
+    {
+      "role": "gates",
+      "path": "docs/workstreams/tauri-desktop-client/EVIDENCE_AND_GATES.md"
+    },
+    {
+      "role": "handoff",
+      "path": "docs/workstreams/tauri-desktop-client/HANDOFF.md"
+    }
+  ],
+  "gates": [
+    "shadcn/ui prototype reviewed against simplified product UI requirements",
+    "frontend typecheck/build/lint after scaffold exists",
+    "cargo fmt --check for Rust changes",
+    "cargo check for affected Rust packages",
+    "desktop lifecycle action matrix before replacement claims"
+  ],
+  "evidence": [
+    {
+      "date": "2026-05-20",
+      "kind": "planning",
+      "summary": "Opened workstream and captured replacement intent, React + Tailwind + shadcn/ui stack, component-prototype workflow, and simplified MVP."
+    },
+    {
+      "date": "2026-05-20",
+      "kind": "planning",
+      "summary": "Revised direction after user feedback: default UI should be simple and familiar, with advanced sessions/routing/diagnostics progressively disclosed."
+    },
+    {
+      "date": "2026-05-21",
+      "kind": "reference-review",
+      "summary": "Reviewed repo-ref/aio-coding-hub and adopted its Tauri client shell, sidebar runtime footer, page header, dashboard work-status/recent-request panels, providers card/order layout, usage filter/data-panel pattern, and settings two-column pattern while rejecting its broader top-level navigation for the first GUI."
+    }
+  ],
+  "adr_refs": [],
+  "continue_policy": {
+    "default_action": "continue",
+    "notes": "Next step is a user-generated shadcn/ui component prototype using the simplified prompt in HANDOFF.md. Do not scaffold Tauri until the visual/product direction is accepted."
+  }
+}
