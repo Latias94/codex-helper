@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{App, AppHandle, Manager, Runtime, Window};
+use tauri::{App, AppHandle, Emitter, Listener, Manager, Runtime, WebviewWindow, Window};
 
 use crate::error::{CommandError, DesktopError};
 
@@ -11,6 +11,8 @@ const TRAY_ID: &str = "codex-helper-main-tray";
 const MENU_SHOW_WINDOW: &str = "show-window";
 const MENU_HIDE_TO_TRAY: &str = "hide-to-tray";
 const MENU_QUIT_APP: &str = "quit-app";
+const CLOSE_REQUESTED_EVENT: &str = "codex-helper://close-requested";
+const WINDOW_READY_EVENT: &str = "codex-helper://window-ready";
 
 #[derive(Debug, Default)]
 pub(crate) struct DesktopLifecycleState {
@@ -81,6 +83,13 @@ pub(crate) fn setup_tray<R: Runtime>(app: &mut App<R>) -> tauri::Result<()> {
         })
         .build(app)?;
 
+    Ok(())
+}
+
+pub(crate) fn setup_main_window_lifecycle<R: Runtime>(app: &mut App<R>) -> tauri::Result<()> {
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        register_main_window_close_handler(window);
+    }
     Ok(())
 }
 
@@ -167,6 +176,29 @@ pub(crate) fn quit_app<R: Runtime>(app: &AppHandle<R>) {
     app.exit(0);
 }
 
+fn register_main_window_close_handler<R: Runtime>(window: WebviewWindow<R>) {
+    let app = window.app_handle().clone();
+    let window_for_ready = window.clone();
+    window.listen(WINDOW_READY_EVENT, move |_| {
+        register_main_window_close_handler(window_for_ready.clone());
+    });
+
+    window.on_window_event(move |event| {
+        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+            let lifecycle = app.state::<DesktopLifecycleState>();
+            let decision = decide_window_close(lifecycle.quit_requested());
+            let _ = app.emit(
+                CLOSE_REQUESTED_EVENT,
+                close_decision_label(decision).to_string(),
+            );
+            if decision == WindowCloseDecision::HideToTray {
+                api.prevent_close();
+                let _ = hide_main_window(&app);
+            }
+        }
+    });
+}
+
 fn handle_tray_menu_event<R: Runtime>(app: &AppHandle<R>, menu_id: &str) {
     match menu_id {
         MENU_SHOW_WINDOW => {
@@ -189,6 +221,13 @@ fn should_show_window_for_tray_event(event: &TrayIconEvent) -> bool {
         } => *button == MouseButton::Left && *button_state == MouseButtonState::Up,
         TrayIconEvent::DoubleClick { button, .. } => *button == MouseButton::Left,
         _ => false,
+    }
+}
+
+fn close_decision_label(decision: WindowCloseDecision) -> &'static str {
+    match decision {
+        WindowCloseDecision::HideToTray => "hide-to-tray",
+        WindowCloseDecision::AllowClose => "allow-close",
     }
 }
 

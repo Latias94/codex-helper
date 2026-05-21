@@ -1,4 +1,6 @@
 import { Link, Outlet, useRouterState } from "@tanstack/react-router";
+import { emit } from "@tauri-apps/api/event";
+import { useEffect } from "react";
 import {
   Bell,
   ChevronDown,
@@ -33,6 +35,12 @@ export function AppShell() {
   const pathname = useRouterState({ select: (state) => state.location.pathname });
   const runtime = useRuntimeSummary();
   const runtimeHealthy = runtime.source === "live" && !runtime.state.isStale;
+
+  useEffect(() => {
+    void emit("codex-helper://window-ready").catch((error) => {
+      console.warn("desktop window-ready event failed", error);
+    });
+  }, []);
 
   return (
     <div className="mx-auto flex h-screen max-h-screen max-w-[1600px] overflow-hidden border-x border-slate-200/70 bg-white/35">

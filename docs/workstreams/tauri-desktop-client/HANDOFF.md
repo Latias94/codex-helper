@@ -128,6 +128,7 @@ TDC-090 is complete with concerns:
 - Settings Dangerous Actions now distinguishes Quit App, Detach, and Stop Proxy; Quit App/Detach do not call `stop_proxy`.
 - StatusStrip and Settings now show desktop-owned vs attached owner labels when `get_desktop_control_state` can classify the runtime.
 - Validation passed on 2026-05-22: `pnpm test` (5 files, 22 tests), `pnpm build`, `cargo fmt --check`, `cargo check -p codex-helper-desktop`, `cargo nextest run -p codex-helper-desktop --lib` (9 tests), and `git diff --check -- .`.
+- Follow-up Windows native close smoke also passed after hardening the listener registration: `PostMessage(WM_CLOSE)` left the desktop process alive, hid the window, and kept the existing `127.0.0.1:4211` proxy reachable before close, after close, and after desktop-process cleanup.
 
 Current next task: TDC-100 replacement readiness documentation. Do not remove egui yet. Document that the Tauri client is the preferred replacement path only after parity gaps are explicit, including full interactive Tauri tray/window smoke, packaged sidecar lookup, autostart, signing/installer behavior, and any remaining advanced controls.
 

@@ -87,7 +87,7 @@ Last updated: 2026-05-22
 - [x] TDC-090 [owner=main-or-worker] [deps=TDC-080] [scope=desktop-tauri,tray,lifecycle]
   Goal: Implement tray and desktop owner semantics using the hidden desktop-managed sidecar path.
   Validation: lifecycle smoke: close window, quit app, attach existing resident runtime, explicit stop.
-  Review: DONE_WITH_CONCERNS — Rust lifecycle policy, tray menu, window close interception, frontend titlebar/Settings commands, and tests now enforce that normal GUI close/quit leaves the proxy running. Full interactive OS tray smoke is still pending.
+  Review: DONE_WITH_CONCERNS — Rust lifecycle policy, tray menu, window close interception, frontend titlebar/Settings commands, tests, and Windows native `WM_CLOSE` smoke now enforce that normal GUI close/quit leaves the proxy running. Full manual OS tray menu click smoke is still pending.
   Evidence: `apps/desktop/src-tauri/src/lifecycle.rs`; `apps/desktop/src/app/App.test.tsx`; `docs/workstreams/tauri-desktop-client/JOURNAL/2026-05-22-tdc-090.md`; `EVIDENCE_AND_GATES.md` 2026-05-22 TDC-090 entry.
   Handoff: DONE_WITH_CONCERNS — split OS autostart, packaged sidecar declaration/signing, installer tray smoke, and egui replacement readiness into TDC-100+ follow-up.
 

@@ -8,6 +8,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             lifecycle::setup_tray(app)?;
+            lifecycle::setup_main_window_lifecycle(app)?;
             Ok(())
         })
         .on_window_event(lifecycle::handle_window_event)

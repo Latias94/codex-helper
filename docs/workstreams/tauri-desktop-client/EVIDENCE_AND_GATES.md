@@ -752,9 +752,20 @@ Verification:
 - Scope: full repository diff
 - Result: PASS — no diff whitespace errors reported. Git emitted only Windows LF/CRLF warnings for edited text files.
 
+- Command: Windows native close smoke using `PostMessage(WM_CLOSE)` against `target/debug/codex-helper-desktop.exe`
+- Scope: local Tauri desktop binary with an existing resident runtime reachable at `127.0.0.1:4211`
+- Result: PASS.
+- Output summary:
+  - `before_admin_4211=True`
+  - `desktop_alive_after_wm_close=True`
+  - `window_visible_after_wm_close=False`
+  - `after_wm_close_admin_4211=True`
+  - `after_desktop_process_cleanup_admin_4211=True`
+- Behavior proven: a native OS close request hides the main window instead of exiting the desktop process, and the existing proxy runtime remains reachable before close, after close, and after the smoke script forcibly cleans up only the desktop process.
+
 Concerns / deferred:
 
-- Full interactive OS tray smoke is still pending; this pass validates compile/tests/build and lifecycle policy, but it does not automate `pnpm tauri:dev` window/tray clicks.
+- Full manual OS tray menu click smoke is still pending; this pass validates compile/tests/build, lifecycle policy, and native Windows close behavior.
 - Packaged sidecar declaration/signing/autostart remain out of this slice. Current Start Proxy still uses the hidden desktop-managed CLI path from TDC-080 (`CODEX_HELPER_CLI_PATH` or sibling binary).
 - Import/export is intentionally scoped to simple single-config backup/restore, not heavy multi-profile/workspace configuration management.
 - No egui removal or replacement-readiness claim is made yet; TDC-100 should document parity gaps before promoting Tauri as the replacement path.

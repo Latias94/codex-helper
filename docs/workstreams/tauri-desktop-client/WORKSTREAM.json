@@ -128,7 +128,7 @@
     {
       "date": "2026-05-22",
       "kind": "tray-lifecycle",
-      "summary": "Completed TDC-090 with concerns. Added Tauri tray/window lifecycle boundary, hide-to-tray close behavior, safe app quit semantics that leave proxy runtimes running, frontend titlebar/Settings window commands, owner labels, a Desktop Capability Matrix for residency/tray/update/autostart/single-instance/lightweight single-config import-export/sidecar follow-up, lifecycle tests, and validation via pnpm build/test, cargo fmt --check, cargo check -p codex-helper-desktop, cargo nextest run -p codex-helper-desktop --lib, and git diff --check."
+      "summary": "Completed TDC-090 with concerns. Added Tauri tray/window lifecycle boundary, hide-to-tray close behavior, safe app quit semantics that leave proxy runtimes running, frontend titlebar/Settings window commands, owner labels, a Desktop Capability Matrix for residency/tray/update/autostart/single-instance/lightweight single-config import-export/sidecar follow-up, lifecycle tests, Windows native WM_CLOSE smoke, and validation via pnpm build/test, cargo fmt --check, cargo check -p codex-helper-desktop, cargo nextest run -p codex-helper-desktop --lib, and git diff --check."
     }
   ],
   "adr_refs": [],
