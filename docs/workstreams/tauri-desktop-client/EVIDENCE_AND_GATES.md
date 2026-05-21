@@ -459,8 +459,70 @@ Result:
 
 - PASS — TDC-040 shell and TDC-050 static/mock UI are scaffolded and buildable. Next implementation step is TDC-060 read-only admin API wiring and richer empty/error/loading states.
 
+### 2026-05-21 — TDC-060 read-only admin API wiring
+
+Evidence:
+
+- Added a Tauri-side read-only admin API command:
+  - `get_admin_read_model`;
+  - reads local admin base from `CODEX_HELPER_DESKTOP_ADMIN_URL` or defaults to proxy `3211` / admin `4211`;
+  - fetches `/__codex_helper/api/v1/operator/summary` first, then follows summary links for runtime status, providers, request-ledger recent, and request-ledger summary.
+- Added frontend admin API boundaries:
+  - DTOs in `src/lib/api/admin-types.ts`;
+  - HTTP helper and admin port utilities in `src/lib/api/admin-client.ts`;
+  - Tauri read-model adapter in `src/lib/api/admin-read-model.ts`;
+  - view-model mappers in `src/lib/api/mappers.ts`;
+  - mock fallback data in `src/lib/api/mock-data.ts`.
+- Wired Dashboard, Providers, Usage, Settings, shell runtime footer, status strip, and page header badges through TanStack Query hooks.
+- Added visible fallback/state components:
+  - `DataStateBanner` for loading/refreshing/error/mock fallback;
+  - `EmptyState` for empty recent request/provider/table surfaces.
+- Mock design mode remains available when the Tauri command fails or no local admin API is reachable.
+
+Verification:
+
+- Command: `pnpm test`
+- Scope: `apps/desktop`
+- Result: PASS — Vitest passed: 3 files, 9 tests. Covers route smoke, mock fallback banner, live admin read-model rendering, API client URL/port helpers, and mapper behavior.
+
+- Command: `pnpm build`
+- Scope: `apps/desktop`
+- Result: PASS — TypeScript and Vite production build completed.
+- Output summary:
+  - `dist/index.html`
+  - `dist/assets/index-CagLFIkT.css`
+  - `dist/assets/index-Biz3x66H.js`
+
+- Command: `cargo fmt --check`
+- Scope: repository workspace
+- Result: PASS.
+
+- Command: `cargo check -p codex-helper-desktop`
+- Scope: `apps/desktop/src-tauri`
+- Result: PASS.
+
+- Command: `git diff --check -- .`
+- Scope: full repository diff
+- Result: PASS — no diff whitespace errors reported. Git emitted only Windows LF/CRLF warnings for edited text files.
+
+- Manual admin API smoke:
+  - Command: `Test-NetConnection -ComputerName 127.0.0.1 -Port 4211`
+  - Result: PASS — loopback admin port was reachable.
+  - Command: `Invoke-RestMethod -Uri 'http://127.0.0.1:4211/__codex_helper/api/v1/operator/summary' -TimeoutSec 3`
+  - Result: PASS — returned `api_version = 1`, `service_name = codex`, `counts.providers = 18`, `counts.recent_requests = 200`, and advertised request-ledger/providers/runtime links.
+
+Concerns / deferred:
+
+- Full Tauri window smoke is still pending; this pass validates the command crate, frontend build/tests, and live admin endpoint availability but does not run `pnpm tauri:dev`.
+- Auth-token-required remote admin UX is still generic error copy; TDC-070 should split auth-required, disconnected, stale, and empty states more explicitly.
+- Provider credentials remain read-only/auth-source placeholders because the read-only admin surface does not expose secret material; safe credential/provider mutations belong to TDC-080.
+
+Result:
+
+- DONE_WITH_CONCERNS — Dashboard, Providers, Usage, and Settings now consume real read-only admin data when available and fall back to mock data when unavailable. TDC-070 should refine state taxonomy and visual QA.
+
 ## Deferred / Not Run Yet
 
-- No live admin API wiring has been implemented yet.
+- No full Tauri window smoke has been run yet.
 - No desktop lifecycle owner/tray behavior has been implemented beyond the Tauri shell and placeholder titlebar controls.
 - No egui removal or replacement-readiness claim is made yet.

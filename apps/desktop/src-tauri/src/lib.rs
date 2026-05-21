@@ -5,6 +5,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
+            commands::admin_api::get_admin_read_model,
             commands::app::get_app_metadata,
             commands::paths::get_known_paths,
         ])

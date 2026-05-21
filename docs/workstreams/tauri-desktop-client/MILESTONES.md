@@ -67,6 +67,8 @@ Expected gates:
 - Manual smoke against `codex-helper serve --resident` or a desktop-owned sidecar.
 - Targeted Rust checks if admin API contracts change.
 
+Status: Complete with concerns. Dashboard, Providers, Usage, and Settings now consume a Tauri-proxied read-only admin read model and retain mock fallback; full Tauri window smoke plus more explicit disconnected/auth-token-required/stale-runtime states are deferred to TDC-070/TDC-080.
+
 ## M4 — Safe Mutations And Desktop Lifecycle
 
 Exit criteria:

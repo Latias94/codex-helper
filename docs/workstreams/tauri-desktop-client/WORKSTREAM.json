@@ -109,11 +109,16 @@
       "date": "2026-05-21",
       "kind": "production-scaffold",
       "summary": "User accepted IMPLEMENTATION_BRIEF.md and authorized frontend work. Added apps/desktop React 19 + Tailwind CSS 4 + TanStack production frontend and apps/desktop/src-tauri Tauri v2 crate; imported four-page static/mock UI; pnpm test/build, cargo fmt --check, and cargo check -p codex-helper-desktop pass."
+    },
+    {
+      "date": "2026-05-21",
+      "kind": "read-only-admin-wiring",
+      "summary": "Completed TDC-060 with concerns. Added Tauri get_admin_read_model, frontend admin DTO/client/mapper hooks, Dashboard/Providers/Usage/Settings live read-only data wiring, mock fallback banners, mapper/API tests, and loopback admin API smoke against 127.0.0.1:4211. pnpm test/build, cargo fmt --check, cargo check -p codex-helper-desktop, and git diff --check pass."
     }
   ],
   "adr_refs": [],
   "continue_policy": {
     "default_action": "continue",
-    "notes": "Next step is TDC-060 read-only admin API wiring for Dashboard, Providers, Usage, and Settings in apps/desktop/src, while keeping the UI mockable and adding loading/empty/error states. Tauri lifecycle owner/tray and safe mutations remain later tasks."
+    "notes": "Next step is TDC-070 state polish for loading, empty, disconnected, auth-token-required, and stale-runtime surfaces plus visual QA. Tauri lifecycle owner/tray and safe mutations remain later tasks."
   }
 }

@@ -61,12 +61,12 @@ Last updated: 2026-05-21
 
 ## M3 — Read-Only Admin API Wiring
 
-- [ ] TDC-060 [owner=main-or-worker] [deps=TDC-050] [scope=desktop-frontend/src/api,desktop-frontend/src/pages]
+- [x] TDC-060 [owner=main-or-worker] [deps=TDC-050] [scope=desktop-frontend/src/api,desktop-frontend/src/pages]
   Goal: Wire read-only live data for Dashboard, Providers, Usage, and Settings via admin API links.
   Validation: unit tests for API client mapping; Tauri/manual smoke against a running local proxy.
-  Review: Prefer `/operator/summary` links and capability flags over hard-coded assumptions.
-  Evidence: API client tests and smoke notes.
-  Handoff: Advanced sessions/routing/diagnostics remain collapsed, disabled, or mocked until simple surfaces work.
+  Review: DONE_WITH_CONCERNS — the desktop frontend now reads a Tauri-proxied admin read model built from `/operator/summary` links, `/runtime/status`, `/providers`, `/request-ledger/recent`, and `/request-ledger/summary`; mock fallback remains visible when admin data is unavailable. Full Tauri window smoke and auth-token-required UX remain for TDC-070/TDC-080.
+  Evidence: `EVIDENCE_AND_GATES.md` 2026-05-21 TDC-060 entry.
+  Handoff: DONE_WITH_CONCERNS — advanced sessions/routing/diagnostics remain collapsed, disabled, or mocked until simple surfaces work.
 
 - [ ] TDC-070 [owner=main-or-worker] [deps=TDC-060] [scope=desktop-frontend/src/state,desktop-frontend/src/components]
   Goal: Add loading, empty, disconnected, auth-token-required, and stale-runtime states.

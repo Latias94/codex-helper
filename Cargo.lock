@@ -1153,6 +1153,7 @@ name = "codex-helper-desktop"
 version = "0.16.0"
 dependencies = [
  "codex-helper-core",
+ "reqwest",
  "serde",
  "serde_json",
  "tauri",

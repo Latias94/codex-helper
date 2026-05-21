@@ -1,39 +1,23 @@
 import { useQuery } from "@tanstack/react-query";
 
 import { fetchAdminReadModelFromTauri } from "@/lib/api/admin-read-model";
-import { mapAdminDashboardData } from "@/lib/api/mappers";
-import { mockDashboardData } from "@/lib/api/mock-data";
+import { mapUsageData } from "@/lib/api/mappers";
+import { mockUsageData } from "@/lib/api/mock-data";
 import { queryKeys } from "@/lib/api/query-keys";
 import type { QueryBackedData } from "@/lib/api/types";
-import { getAppMetadata } from "@/lib/tauri/commands";
 
-export function useAppMetadata() {
-  return useQuery({
-    queryFn: getAppMetadata,
-    queryKey: queryKeys.appMetadata,
-  });
-}
-
-export function useDashboardData(): QueryBackedData<typeof mockDashboardData> {
-  const metadata = useAppMetadata();
+export function useUsageData(): QueryBackedData<typeof mockUsageData> {
   const readModel = useQuery({
     queryFn: fetchAdminReadModelFromTauri,
     queryKey: queryKeys.admin.readModel,
     retry: 1,
   });
-
-  const appVersion = metadata.data?.version ?? "0.16.0";
   const data = readModel.data
-    ? mapAdminDashboardData({
-        summary: readModel.data.operatorSummary,
-        runtimeStatus: readModel.data.runtimeStatus,
-        providers: readModel.data.providers,
+    ? mapUsageData({
         recentRequests: readModel.data.recentRequests,
         usageSummary: readModel.data.usageSummary,
-        adminBaseUrl: readModel.data.endpoint.adminBaseUrl,
-        appVersion,
       })
-    : mockDashboardData;
+    : mockUsageData;
 
   return {
     data,

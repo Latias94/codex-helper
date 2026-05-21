@@ -1,11 +1,16 @@
-import { ArrowDown, Plus, Search, SlidersHorizontal } from "lucide-react";
+import { ArrowDown, Database, Plus, Search, SlidersHorizontal } from "lucide-react";
 
 import { PageHeader } from "@/app/AppShell";
+import { DataStateBanner } from "@/components/page/DataStateBanner";
+import { EmptyState } from "@/components/page/EmptyState";
 import { ProviderCard } from "@/features/providers/ProviderCard";
+import { useProvidersData } from "@/features/providers/hooks";
 import { Badge, Button, Card, CardContent, CardDescription, CardHeader, CardTitle, Input, SelectBox } from "@/components/ui";
-import { providers } from "@/mocks/dashboard";
 
 export function ProvidersPage() {
+  const providersState = useProvidersData();
+  const { providers, routeOrder } = providersState.data;
+
   return (
     <div className="flex min-h-[calc(100vh-5rem)] flex-col">
       <PageHeader
@@ -17,6 +22,13 @@ export function ProvidersPage() {
             添加供应商
           </Button>
         }
+      />
+      <DataStateBanner
+        source={providersState.source}
+        isLoading={providersState.isLoading}
+        isRefreshing={providersState.isRefreshing}
+        errorMessage={providersState.errorMessage}
+        onRefresh={providersState.refetch}
       />
 
       <div className="mb-4 flex shrink-0 items-center justify-between rounded-2xl border border-slate-200 bg-white/88 p-4 shadow-sm">
@@ -42,7 +54,15 @@ export function ProvidersPage() {
 
       <div className="grid min-h-0 flex-1 grid-cols-[1fr_320px] gap-4">
         <div className="app-scroll grid min-h-0 grid-cols-2 content-start gap-4 overflow-y-auto pr-1">
-          {providers.map((provider) => (
+          {providers.length === 0 ? (
+            <div className="col-span-2">
+              <EmptyState
+                icon={Database}
+                title="还没有可显示的供应商"
+                description="连接到本地 admin API 后，这里会读取 /providers 与 /operator/summary 的供应商配置。"
+              />
+            </div>
+          ) : providers.map((provider) => (
             <ProviderCard key={provider.name} provider={provider} />
           ))}
         </div>
@@ -54,7 +74,7 @@ export function ProvidersPage() {
               <CardDescription>Codex 请求默认按此顺序尝试 provider。</CardDescription>
             </CardHeader>
             <CardContent className="space-y-3">
-              {providers.map((provider, index) => (
+              {routeOrder.map((provider, index) => (
                 <div key={provider.name} className="flex items-center gap-3 rounded-xl border border-slate-100 bg-slate-50 p-3">
                   <Badge variant={index === 0 ? "teal" : "muted"}>#{index + 1}</Badge>
                   <div className="min-w-0 flex-1">

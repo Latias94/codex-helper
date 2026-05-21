@@ -1,6 +1,7 @@
 import { AlertTriangle, ChevronDown, Copy, FolderOpen, RefreshCw } from "lucide-react";
 
 import { PageHeader } from "@/app/AppShell";
+import { DataStateBanner } from "@/components/page/DataStateBanner";
 import { StatusStrip } from "@/components/shell/StatusStrip";
 import {
   Badge,
@@ -15,6 +16,7 @@ import {
   SelectBox,
   Switch,
 } from "@/components/ui";
+import { useRuntimeSummary } from "@/features/runtime/hooks";
 import { useKnownPaths } from "@/features/settings/hooks";
 
 const advancedRows = [
@@ -28,12 +30,20 @@ const advancedRows = [
 
 export function SettingsPage() {
   const knownPaths = useKnownPaths();
+  const runtime = useRuntimeSummary();
   const paths = knownPaths.data;
 
   return (
     <>
       <PageHeader title="设置" subtitle="配置桌面行为、本地代理、Codex 连接和高级工具" />
-      <StatusStrip />
+      <DataStateBanner
+        source={runtime.source}
+        isLoading={runtime.isLoading}
+        isRefreshing={runtime.isRefreshing}
+        errorMessage={runtime.errorMessage}
+        onRefresh={runtime.refetch}
+      />
+      <StatusStrip runtime={runtime.data} onRefresh={runtime.refetch} />
 
       <div className="grid grid-cols-2 gap-4">
         <SettingsCard title="桌面行为" description="控制应用启动、托盘和窗口关闭方式。">
@@ -63,17 +73,19 @@ export function SettingsPage() {
         <SettingsCard title="本地代理" description="本机代理监听地址和运行时配置。">
           <div className="grid grid-cols-2 gap-3">
             <Field label="Host" value="127.0.0.1" />
-            <Field label="Port" value="3211" />
+            <Field label="Port" value={String(runtime.data.port)} />
           </div>
           <FieldRow label="Endpoint">
             <div className="flex items-center gap-2">
-              <Input value="http://127.0.0.1:3211" readOnly className="w-64 font-mono" />
+              <Input value={runtime.data.endpoint} readOnly className="w-64 font-mono" />
               <Button variant="outline" className="w-9 px-0"><Copy className="h-4 w-4" /></Button>
             </div>
           </FieldRow>
           <div className="flex gap-2">
-            <Badge variant="teal">由此应用启动</Badge>
-            <Badge variant="success">Admin token 已配置</Badge>
+            <Badge variant="teal">{runtime.source === "live" ? "已连接 admin API" : "等待本地运行时"}</Badge>
+            <Badge variant={runtime.source === "live" ? "success" : "warning"}>
+              Admin {runtime.data.adminPort}
+            </Badge>
           </div>
           <div className="flex gap-2 pt-2">
             <Button variant="outline"><Copy className="h-4 w-4" />复制 Endpoint</Button>
@@ -91,8 +103,8 @@ export function SettingsPage() {
             </SelectBox>
           </FieldRow>
           <FieldRow label="当前供应商">
-            <SelectBox defaultValue="codex-air" className="w-56">
-              <option value="codex-air">CodeX Air</option>
+            <SelectBox value={runtime.data.provider} className="w-56" disabled>
+              <option value={runtime.data.provider}>{runtime.data.provider}</option>
             </SelectBox>
           </FieldRow>
           <ToggleRow label="Responses WebSocket" checked />

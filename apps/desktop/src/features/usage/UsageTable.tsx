@@ -1,10 +1,10 @@
 import { createColumnHelper, flexRender, getCoreRowModel, useReactTable } from "@tanstack/react-table";
 import { Info, Search } from "lucide-react";
 
-import { usageRows } from "@/mocks/dashboard";
 import { Badge, Button, Card, Input, SelectBox, TooltipHint } from "@/components/ui";
+import type { UsageRowView } from "@/lib/api/types";
 
-type UsageRow = (typeof usageRows)[number];
+type UsageRow = UsageRowView;
 
 const columnHelper = createColumnHelper<UsageRow>();
 
@@ -40,10 +40,13 @@ const columns = [
         content={
           <div>
             <div className="mb-1 font-semibold">预估成本明细</div>
-            <div>Input estimate: $0.006</div>
-            <div>Output estimate: $0.018</div>
-            <div>Cache read estimate: $0.004</div>
-            <div>Provider multiplier: 1.0x</div>
+            <div>Input estimate: {info.row.original.costBreakdown.input}</div>
+            <div>Output estimate: {info.row.original.costBreakdown.output}</div>
+            <div>Cache read estimate: {info.row.original.costBreakdown.cacheRead}</div>
+            <div>Cache creation estimate: {info.row.original.costBreakdown.cacheCreation}</div>
+            <div>Service tier multiplier: {info.row.original.costBreakdown.serviceTierMultiplier}</div>
+            <div>Provider multiplier: {info.row.original.costBreakdown.providerMultiplier}</div>
+            <div>Confidence: {info.row.original.costBreakdown.confidence}</div>
             <div className="mt-1 border-t border-white/20 pt-1">实际费用以供应商结算为准</div>
           </div>
         }
@@ -60,9 +63,17 @@ const columns = [
   columnHelper.accessor("time", { header: "Time" }),
 ];
 
-export function UsageTable() {
+export function UsageTable({
+  rows,
+  totalRows,
+  onRefresh,
+}: {
+  rows: UsageRow[];
+  totalRows: number;
+  onRefresh?: () => void;
+}) {
   const table = useReactTable({
-    data: usageRows,
+    data: rows,
     columns,
     getCoreRowModel: getCoreRowModel(),
   });
@@ -90,7 +101,7 @@ export function UsageTable() {
         <div className="flex gap-2">
           <Button variant="outline">Reset</Button>
           <Button variant="outline">Export CSV</Button>
-          <Button>Refresh</Button>
+          <Button onClick={onRefresh}>Refresh</Button>
         </div>
       </div>
       <div className="app-scroll min-h-0 flex-1 overflow-auto">
@@ -107,7 +118,13 @@ export function UsageTable() {
             ))}
           </thead>
           <tbody>
-            {table.getRowModel().rows.map((row) => (
+            {table.getRowModel().rows.length === 0 ? (
+              <tr>
+                <td className="px-3 py-12 text-center text-sm text-slate-500" colSpan={columns.length}>
+                  暂无请求历史。Codex 请求通过本地代理后，这里会显示 request-ledger 记录。
+                </td>
+              </tr>
+            ) : table.getRowModel().rows.map((row) => (
               <tr key={row.id} className="hover:bg-mint-50/70">
                 {row.getVisibleCells().map((cell) => (
                   <td key={cell.id} className="border-b border-slate-100 px-3 py-3 text-slate-700">
@@ -120,7 +137,7 @@ export function UsageTable() {
         </table>
       </div>
       <div className="flex shrink-0 items-center justify-between border-t border-slate-100 p-4 text-sm text-slate-500">
-        <span>显示 1 至 20，共 128 条</span>
+        <span>显示 1 至 {rows.length}，共 {totalRows} 条</span>
         <div className="flex items-center gap-2">
           <SelectBox defaultValue="20">
             <option value="20">每页 20</option>

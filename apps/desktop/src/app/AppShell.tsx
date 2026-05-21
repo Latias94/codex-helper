@@ -17,8 +17,8 @@ import {
   X,
 } from "lucide-react";
 
-import { runtimeSummary } from "@/mocks/dashboard";
 import { Badge, Button, Card, Separator, Switch } from "@/components/ui";
+import { useRuntimeSummary } from "@/features/runtime/hooks";
 import { cn } from "@/lib/utils";
 
 const navItems = [
@@ -30,6 +30,7 @@ const navItems = [
 
 export function AppShell() {
   const pathname = useRouterState({ select: (state) => state.location.pathname });
+  const runtime = useRuntimeSummary();
 
   return (
     <div className="mx-auto flex h-screen max-h-screen max-w-[1600px] overflow-hidden border-x border-slate-200/70 bg-white/35">
@@ -85,14 +86,17 @@ export function AppShell() {
               本地代理
             </div>
             <div className="mt-3 font-semibold text-teal-700">
-              {runtimeSummary.proxy} · {runtimeSummary.port}
+              {runtime.data.proxy} · {runtime.data.port}
             </div>
             <div className="mt-3 flex items-center gap-2 text-sm text-slate-500">
               <Globe2 className="h-4 w-4" />
-              已连接 Codex
+              {runtime.data.codex}
             </div>
             <Separator className="my-4" />
-            <div className="text-xs text-slate-400">{runtimeSummary.version}</div>
+            <div className="flex items-center justify-between text-xs text-slate-400">
+              <span>{runtime.data.version}</span>
+              <span>{runtime.source === "live" ? "Live" : "Mock"}</span>
+            </div>
           </Card>
         </div>
       </aside>
@@ -150,6 +154,8 @@ export function PageHeader({
   subtitle: string;
   action?: React.ReactNode;
 }) {
+  const runtime = useRuntimeSummary();
+
   return (
     <div className="mb-5 flex items-start justify-between gap-4">
       <div>
@@ -170,13 +176,13 @@ export function PageHeader({
           中文
           <ChevronDown className="h-4 w-4" />
         </Button>
-        <Badge variant="success">
+        <Badge variant={runtime.source === "live" ? "success" : "warning"}>
           <Circle className="h-2 w-2 fill-emerald-500 text-emerald-500" />
-          Running
+          {runtime.data.proxy}
         </Badge>
         <Badge variant="teal">
           <WalletCards className="h-3.5 w-3.5" />
-          余额 {runtimeSummary.balance}
+          余额 {runtime.data.balance}
         </Badge>
         <Badge variant="muted">本机</Badge>
       </div>

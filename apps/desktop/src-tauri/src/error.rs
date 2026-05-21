@@ -4,6 +4,8 @@ use serde::Serialize;
 pub enum DesktopError {
     #[error("failed to resolve path: {0}")]
     Path(String),
+    #[error("admin API request failed: {0}")]
+    AdminApi(String),
 }
 
 #[derive(Debug, Serialize)]

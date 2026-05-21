@@ -91,7 +91,14 @@ cargo fmt --check
 cargo check -p codex-helper-desktop
 ```
 
-Current next task: TDC-060 read-only admin API wiring for Dashboard, Providers, Usage, and Settings, plus richer loading/empty/error states. Tauri lifecycle, tray, and safe mutations remain follow-on work.
+TDC-060 is complete with concerns:
+
+- `apps/desktop/src-tauri` now exposes `get_admin_read_model`, a read-only Tauri command that fetches the loopback admin API from `CODEX_HELPER_DESKTOP_ADMIN_URL` or the default `127.0.0.1:4211`.
+- The frontend now maps `/operator/summary`, `/runtime/status`, `/providers`, `/request-ledger/recent`, and `/request-ledger/summary` into Dashboard, Providers, Usage, Settings, shell runtime footer, status strip, and page header badges.
+- TanStack Query hooks preserve mock fallback for design iteration and display a visible `DataStateBanner` when showing offline sample data or refresh/error states.
+- Validation passed on 2026-05-21: `pnpm test`, `pnpm build`, `cargo fmt --check`, `cargo check -p codex-helper-desktop`, `git diff --check -- .`, and loopback admin API smoke against `127.0.0.1:4211`.
+
+Current next task: TDC-070 loading/empty/disconnected/auth-token-required/stale-runtime state polish and visual QA. Tauri lifecycle, tray, and safe mutations remain follow-on work.
 
 ## shadcn/ui Prototype Prompt
 

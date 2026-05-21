@@ -1,16 +1,30 @@
-import { AlertTriangle, ArrowRight, CheckCircle2, Play, Power, RefreshCw, Settings2 } from "lucide-react";
+import { AlertTriangle, ArrowRight, CheckCircle2, Database, Play, Power, RefreshCw, Settings2 } from "lucide-react";
 
 import { PageHeader } from "@/app/AppShell";
+import { DataStateBanner } from "@/components/page/DataStateBanner";
+import { EmptyState } from "@/components/page/EmptyState";
 import { MetricCard } from "@/components/page/MetricCard";
 import { StatusStrip } from "@/components/shell/StatusStrip";
 import { Badge, Button, Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui";
-import { chartBars, metrics, providers, recentRequests } from "@/mocks/dashboard";
+import { useDashboardData } from "@/features/dashboard/hooks";
+import { attachMetricIcons } from "@/lib/api/mappers";
 
 export function DashboardPage() {
+  const dashboard = useDashboardData();
+  const { chartBars, providers, recentRequests, runtime } = dashboard.data;
+  const metrics = attachMetricIcons(dashboard.data.metrics);
+
   return (
     <>
       <PageHeader title="仪表盘" subtitle="查看本地代理、Codex 连接、供应商健康和今日用量" />
-      <StatusStrip />
+      <DataStateBanner
+        source={dashboard.source}
+        isLoading={dashboard.isLoading}
+        isRefreshing={dashboard.isRefreshing}
+        errorMessage={dashboard.errorMessage}
+        onRefresh={dashboard.refetch}
+      />
+      <StatusStrip runtime={runtime} onRefresh={dashboard.refetch} />
 
       <div className="grid grid-cols-4 gap-4">
         {metrics.map((metric) => (
@@ -77,11 +91,17 @@ export function DashboardPage() {
             </div>
           </CardHeader>
           <CardContent className="space-y-2">
-            {recentRequests.map((request) => (
+            {recentRequests.length === 0 ? (
+              <EmptyState
+                icon={Database}
+                title="暂无请求记录"
+                description="当 Codex 请求经过本地代理后，这里会显示最近 5 条请求。"
+              />
+            ) : recentRequests.map((request) => (
               <div key={`${request.model}-${request.time}`} className="flex items-center justify-between rounded-xl border border-slate-100 px-3 py-2">
                 <div>
                   <div className="flex items-center gap-2">
-                    <Badge variant={request.status === "ok" ? "success" : "warning"}>
+                    <Badge variant={request.status === "ok" ? "success" : request.status === "error" ? "danger" : "warning"}>
                       {request.status}
                     </Badge>
                     <span className="font-medium text-slate-800">{request.model}</span>
