@@ -365,7 +365,7 @@ async fn proxy_api_v1_snapshot_works() {
 }
 
 #[tokio::test]
-async fn proxy_default_profile_binding_applies_to_new_session() {
+async fn proxy_default_profile_binding_does_not_patch_request_fields() {
     let upstream = axum::Router::new().route(
         "/v1/responses",
         post(|body: Bytes| async move {
@@ -421,7 +421,9 @@ async fn proxy_default_profile_binding_applies_to_new_session() {
         .post(format!("http://{}/v1/responses", proxy_addr))
         .header("content-type", "application/json")
         .header("session_id", "sid-bind")
-        .body(r#"{"input":"hi"}"#)
+        .body(
+            r#"{"input":"hi","model":"client-model","service_tier":"default","reasoning":{"effort":"medium"}}"#,
+        )
         .send()
         .await
         .expect("send bind request")
@@ -433,17 +435,17 @@ async fn proxy_default_profile_binding_applies_to_new_session() {
 
     assert_eq!(
         resp.get("model").and_then(|v| v.as_str()),
-        Some("gpt-5.4-fast")
+        Some("client-model")
     );
     assert_eq!(
         resp.get("service_tier").and_then(|v| v.as_str()),
-        Some("priority")
+        Some("default")
     );
     assert_eq!(
         resp.get("reasoning")
             .and_then(|v| v.get("effort"))
             .and_then(|v| v.as_str()),
-        Some("low")
+        Some("medium")
     );
 
     let snap = client
@@ -471,9 +473,27 @@ async fn proxy_default_profile_binding_applies_to_new_session() {
     );
     assert_eq!(
         card["effective_model"]
+            .get("value")
+            .and_then(|v| v.as_str()),
+        Some("client-model")
+    );
+    assert_eq!(
+        card["effective_model"]
             .get("source")
             .and_then(|v| v.as_str()),
-        Some("profile_default")
+        Some("request_payload")
+    );
+    assert_eq!(
+        card["effective_service_tier"]
+            .get("value")
+            .and_then(|v| v.as_str()),
+        Some("default")
+    );
+    assert_eq!(
+        card["effective_service_tier"]
+            .get("source")
+            .and_then(|v| v.as_str()),
+        Some("request_payload")
     );
     assert_eq!(
         card["effective_station"]
@@ -488,12 +508,43 @@ async fn proxy_default_profile_binding_applies_to_new_session() {
         Some("profile_default")
     );
 
+    let resp = client
+        .post(format!("http://{}/v1/responses", proxy_addr))
+        .header("content-type", "application/json")
+        .header("session_id", "sid-bind-fast")
+        .body(
+            r#"{"input":"hi","model":"codex-client-model","service_tier":"priority","reasoning":{"effort":"high"}}"#,
+        )
+        .send()
+        .await
+        .expect("send fast mode bind request")
+        .error_for_status()
+        .expect("fast mode bind request status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("fast mode bind request json");
+
+    assert_eq!(
+        resp.get("model").and_then(|v| v.as_str()),
+        Some("codex-client-model")
+    );
+    assert_eq!(
+        resp.get("service_tier").and_then(|v| v.as_str()),
+        Some("priority")
+    );
+    assert_eq!(
+        resp.get("reasoning")
+            .and_then(|v| v.get("effort"))
+            .and_then(|v| v.as_str()),
+        Some("high")
+    );
+
     proxy_handle.abort();
     upstream_handle.abort();
 }
 
 #[tokio::test]
-async fn proxy_runtime_default_profile_override_applies_to_new_session() {
+async fn proxy_runtime_default_profile_binding_does_not_patch_request_fields() {
     let upstream = axum::Router::new().route(
         "/v1/responses",
         post(|body: Bytes| async move {
@@ -570,7 +621,9 @@ async fn proxy_runtime_default_profile_override_applies_to_new_session() {
         .post(format!("http://{}/v1/responses", proxy_addr))
         .header("content-type", "application/json")
         .header("session_id", "sid-bind-runtime")
-        .body(r#"{"input":"hi"}"#)
+        .body(
+            r#"{"input":"hi","model":"client-model","service_tier":"default","reasoning":{"effort":"medium"}}"#,
+        )
         .send()
         .await
         .expect("send runtime binding request")
@@ -582,17 +635,17 @@ async fn proxy_runtime_default_profile_override_applies_to_new_session() {
 
     assert_eq!(
         resp.get("model").and_then(|v| v.as_str()),
-        Some("gpt-5.4-fast")
+        Some("client-model")
     );
     assert_eq!(
         resp.get("service_tier").and_then(|v| v.as_str()),
-        Some("priority")
+        Some("default")
     );
     assert_eq!(
         resp.get("reasoning")
             .and_then(|v| v.get("effort"))
             .and_then(|v| v.as_str()),
-        Some("low")
+        Some("medium")
     );
 
     let snap = client
@@ -622,7 +675,13 @@ async fn proxy_runtime_default_profile_override_applies_to_new_session() {
         card["effective_model"]
             .get("value")
             .and_then(|v| v.as_str()),
-        Some("gpt-5.4-fast")
+        Some("client-model")
+    );
+    assert_eq!(
+        card["effective_model"]
+            .get("source")
+            .and_then(|v| v.as_str()),
+        Some("request_payload")
     );
 
     proxy_handle.abort();

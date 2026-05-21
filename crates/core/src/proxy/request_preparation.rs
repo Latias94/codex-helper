@@ -8,7 +8,7 @@ use crate::config::{ProxyConfig, ProxyConfigV4};
 use crate::lb::CooldownBackoff;
 use crate::logging::{BodyPreview, CodexBridgeLog, ServiceTierLog, make_body_preview};
 use crate::routing_ir::RouteRequestContext;
-use crate::state::{SessionBinding, SessionIdentitySource};
+use crate::state::{SessionBinding, SessionContinuityMode, SessionIdentitySource};
 
 use super::ProxyService;
 use super::client_identity::{ClientSessionIdentity, extract_session_identity_with_body_fallback};
@@ -190,15 +190,9 @@ pub(super) async fn prepare_common_request(
     } else {
         None
     };
-    let binding_effort = session_binding
-        .as_ref()
-        .and_then(|binding| binding.reasoning_effort.as_deref());
-    let binding_model = session_binding
-        .as_ref()
-        .and_then(|binding| binding.model.as_deref());
-    let binding_service_tier = session_binding
-        .as_ref()
-        .and_then(|binding| binding.service_tier.as_deref());
+    let binding_effort = binding_reasoning_effort_for_request(session_binding.as_ref());
+    let binding_model = binding_model_for_request(session_binding.as_ref());
+    let binding_service_tier = binding_service_tier_for_request(session_binding.as_ref());
 
     let prepared_request = prepare_request_body(
         raw_body,
@@ -387,6 +381,39 @@ pub(super) fn route_request_context(
                     .map(|value| (name.as_str().to_string(), value.to_string()))
             })
             .collect(),
+    }
+}
+
+fn binding_for_request_body_overrides(binding: Option<&SessionBinding>) -> Option<&SessionBinding> {
+    let binding = binding?;
+    if binding.continuity_mode != SessionContinuityMode::ManualProfile {
+        return None;
+    }
+    Some(binding)
+}
+
+fn binding_reasoning_effort_for_request(binding: Option<&SessionBinding>) -> Option<&str> {
+    binding_for_request_body_overrides(binding)
+        .and_then(|binding| binding.reasoning_effort.as_deref())
+}
+
+fn binding_model_for_request(binding: Option<&SessionBinding>) -> Option<&str> {
+    binding_for_request_body_overrides(binding).and_then(|binding| binding.model.as_deref())
+}
+
+fn binding_service_tier_for_request(binding: Option<&SessionBinding>) -> Option<&str> {
+    let binding = binding_for_request_body_overrides(binding)?;
+    normalize_profile_service_tier(binding.service_tier.as_deref())
+}
+
+fn normalize_profile_service_tier(value: Option<&str>) -> Option<&str> {
+    let value = value?.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("auto") {
+        None
+    } else if value.eq_ignore_ascii_case("fast") {
+        Some("priority")
+    } else {
+        Some(value)
     }
 }
 
@@ -592,6 +619,52 @@ mod tests {
     }
 
     #[test]
+    fn default_profile_binding_fields_are_not_request_overrides() {
+        let binding = SessionBinding {
+            session_id: "sid-fast".to_string(),
+            profile_name: Some("daily".to_string()),
+            station_name: Some("test".to_string()),
+            model: Some("gpt-5.4".to_string()),
+            reasoning_effort: Some("low".to_string()),
+            service_tier: Some("default".to_string()),
+            continuity_mode: SessionContinuityMode::DefaultProfile,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            last_seen_ms: 1,
+        };
+
+        assert_eq!(binding_model_for_request(Some(&binding)), None);
+        assert_eq!(binding_reasoning_effort_for_request(Some(&binding)), None);
+        assert_eq!(binding_service_tier_for_request(Some(&binding)), None);
+    }
+
+    #[test]
+    fn manual_profile_binding_fields_are_request_overrides() {
+        let binding = SessionBinding {
+            session_id: "sid-fast".to_string(),
+            profile_name: Some("fast".to_string()),
+            station_name: Some("test".to_string()),
+            model: Some("gpt-5.4".to_string()),
+            reasoning_effort: Some("low".to_string()),
+            service_tier: Some("fast".to_string()),
+            continuity_mode: SessionContinuityMode::ManualProfile,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            last_seen_ms: 1,
+        };
+
+        assert_eq!(binding_model_for_request(Some(&binding)), Some("gpt-5.4"));
+        assert_eq!(
+            binding_reasoning_effort_for_request(Some(&binding)),
+            Some("low")
+        );
+        assert_eq!(
+            binding_service_tier_for_request(Some(&binding)),
+            Some("priority")
+        );
+    }
+
+    #[test]
     fn build_body_previews_respects_enable_flag_and_limits() {
         let previews = build_body_previews(
             br#"{"input":"hello"}"#,
@@ -650,7 +723,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_common_request_tracks_prompt_cache_identity_and_overrides_body() {
+    async fn prepare_common_request_tracks_prompt_cache_identity_without_default_profile_patch() {
         let proxy = test_proxy_with_active_station();
         let config = load_request_config_context(&proxy).await;
         let mut headers = HeaderMap::new();
@@ -681,9 +754,24 @@ mod tests {
             prepared.session_identity_source,
             Some(SessionIdentitySource::PromptCacheKey)
         );
-        assert_eq!(prepared.request_model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(prepared.request_model.as_deref(), Some("gpt-5"));
+        assert_eq!(
+            prepared
+                .session_binding
+                .as_ref()
+                .and_then(|binding| binding.profile_name.as_deref()),
+            Some("default")
+        );
+        assert_eq!(
+            prepared
+                .session_binding
+                .as_ref()
+                .map(|binding| binding.continuity_mode),
+            Some(SessionContinuityMode::DefaultProfile)
+        );
+        assert!(String::from_utf8_lossy(prepared.body_for_upstream.as_ref()).contains("\"gpt-5\""));
         assert!(
-            String::from_utf8_lossy(prepared.body_for_upstream.as_ref()).contains("\"gpt-5.4\"")
+            !String::from_utf8_lossy(prepared.body_for_upstream.as_ref()).contains("\"gpt-5.4\"")
         );
         assert!(!prepared.request_body_previews);
         assert!(!prepared.route_selection.is_empty());

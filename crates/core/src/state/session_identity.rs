@@ -656,6 +656,17 @@ fn resolve_effective_observed_value(
         .map(|observed| ResolvedRouteValue::new(observed, RouteValueSource::RequestPayload))
 }
 
+fn binding_request_field_value<'a>(
+    binding: Option<&'a SessionBinding>,
+    value: impl FnOnce(&'a SessionBinding) -> Option<&'a str>,
+) -> Option<&'a str> {
+    let binding = binding?;
+    if binding.continuity_mode != SessionContinuityMode::ManualProfile {
+        return None;
+    }
+    value(binding)
+}
+
 fn classify_session_observation_scope(card: &SessionIdentityCard) -> SessionObservationScope {
     if card.cwd.is_some() {
         SessionObservationScope::HostLocalEnriched
@@ -700,17 +711,17 @@ fn apply_basic_effective_route(
     card.effective_model = resolve_effective_observed_value(
         card.override_model.as_deref(),
         card.last_model.as_deref(),
-        binding.and_then(|binding| binding.model.as_deref()),
+        binding_request_field_value(binding, |binding| binding.model.as_deref()),
     );
     card.effective_reasoning_effort = resolve_effective_observed_value(
         card.override_effort.as_deref(),
         card.last_reasoning_effort.as_deref(),
-        binding.and_then(|binding| binding.reasoning_effort.as_deref()),
+        binding_request_field_value(binding, |binding| binding.reasoning_effort.as_deref()),
     );
     card.effective_service_tier = resolve_effective_observed_value(
         card.override_service_tier.as_deref(),
         card.last_service_tier.as_deref(),
-        binding.and_then(|binding| binding.service_tier.as_deref()),
+        binding_request_field_value(binding, |binding| binding.service_tier.as_deref()),
     );
     card.binding_profile_name = binding.and_then(|binding| binding.profile_name.clone());
     card.binding_continuity_mode = binding.map(|binding| binding.continuity_mode);

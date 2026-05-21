@@ -1,5 +1,8 @@
 use crate::model_routing;
-use crate::state::{ResolvedRouteValue, RouteDecisionProvenance, RouteValueSource, SessionBinding};
+use crate::state::{
+    ResolvedRouteValue, RouteDecisionProvenance, RouteValueSource, SessionBinding,
+    SessionContinuityMode,
+};
 
 use super::attempt_target::AttemptTarget;
 
@@ -29,6 +32,16 @@ fn resolve_request_field_provenance(
     }
     trim_non_empty(request_value)
         .map(|value| ResolvedRouteValue::new(value, RouteValueSource::RequestPayload))
+}
+
+fn binding_for_request_field_provenance(
+    binding: Option<&SessionBinding>,
+) -> Option<&SessionBinding> {
+    let binding = binding?;
+    if binding.continuity_mode != SessionContinuityMode::ManualProfile {
+        return None;
+    }
+    Some(binding)
 }
 
 fn resolve_station_provenance(
@@ -92,10 +105,11 @@ pub(super) fn build_route_decision_provenance(
         provider_id,
     } = params;
 
+    let request_field_binding = binding_for_request_field_provenance(session_binding);
     let mut effective_model = resolve_request_field_provenance(
         request_model,
         override_model,
-        session_binding.and_then(|binding| binding.model.as_deref()),
+        request_field_binding.and_then(|binding| binding.model.as_deref()),
     );
     if let Some(current) = effective_model.as_mut() {
         let mapped = model_routing::effective_model(
@@ -115,12 +129,12 @@ pub(super) fn build_route_decision_provenance(
         effective_reasoning_effort: resolve_request_field_provenance(
             effective_effort,
             override_effort,
-            session_binding.and_then(|binding| binding.reasoning_effort.as_deref()),
+            request_field_binding.and_then(|binding| binding.reasoning_effort.as_deref()),
         ),
         effective_service_tier: resolve_request_field_provenance(
             effective_service_tier,
             override_service_tier,
-            session_binding.and_then(|binding| binding.service_tier.as_deref()),
+            request_field_binding.and_then(|binding| binding.service_tier.as_deref()),
         ),
         effective_station: resolve_station_provenance(
             target.compatibility_station_name(),
@@ -297,6 +311,50 @@ mod tests {
             RouteValueSource::ProfileDefault,
         );
         assert_eq!(decision.provider_id, None);
+    }
+
+    #[test]
+    fn route_provenance_ignores_default_profile_for_request_fields() {
+        let mut binding = make_binding();
+        binding.continuity_mode = SessionContinuityMode::DefaultProfile;
+        let selected = make_selected_upstream(&[]);
+        let target = AttemptTarget::legacy(selected);
+
+        let decision = build_route_decision_provenance(RouteDecisionProvenanceParams {
+            decided_at_ms: 8,
+            session_binding: Some(&binding),
+            session_override_config: None,
+            global_config_override: None,
+            override_model: None,
+            override_effort: None,
+            override_service_tier: None,
+            request_model: Some("request-model"),
+            effective_effort: Some("request-effort"),
+            effective_service_tier: Some("request-tier"),
+            target: &target,
+            provider_id: None,
+        });
+
+        assert_route_value(
+            decision.effective_model,
+            "request-model",
+            RouteValueSource::RequestPayload,
+        );
+        assert_route_value(
+            decision.effective_reasoning_effort,
+            "request-effort",
+            RouteValueSource::RequestPayload,
+        );
+        assert_route_value(
+            decision.effective_service_tier,
+            "request-tier",
+            RouteValueSource::RequestPayload,
+        );
+        assert_route_value(
+            decision.effective_station,
+            "bound-station",
+            RouteValueSource::ProfileDefault,
+        );
     }
 
     #[test]

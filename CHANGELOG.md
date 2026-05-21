@@ -3,6 +3,22 @@ All notable changes to this project will be documented in this file.
 
 > Recent entries use **Chinese first, then an English summary**. Older entries keep the previous inline bilingual style.
 
+## Unreleased
+
+### 中文
+
+#### Codex 中转请求字段覆盖
+
+- 修复自动 `default_profile` 会把客户端请求体里的 `model`、`reasoning.effort` 和 `service_tier` 改成 profile 默认值的问题；现在只有显式 session override 或手动 apply 到 session 的 profile binding 才会改写这些请求字段。
+- Codex 本地 fast mode 发出的 `service_tier: "priority"` 不会再被中转的默认 profile 覆盖成 `default`。自动 default profile 仍可用于 session binding 和 station 路由，但不再冒充用户请求字段 override。
+
+### English summary
+
+#### Codex relay request-field overrides
+
+- Fixed automatic `default_profile` bindings rewriting client request-body `model`, `reasoning.effort`, and `service_tier`; only explicit session overrides or manually applied session profile bindings now patch those fields.
+- Codex local fast mode requests with `service_tier: "priority"` are no longer overwritten to `default` by relay default profiles. Automatic default profiles can still bind sessions and station routing, but no longer act as request-field overrides.
+
 ## [0.16.0] - 2026-05-19
 
 ### 中文

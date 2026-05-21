@@ -131,7 +131,7 @@ fn session_override_precedence() -> SessionOverridePrecedence {
     SessionOverridePrecedence {
         request_fields_apply_order: vec![
             "session_override",
-            "profile_default",
+            "manual_profile_binding",
             "request_payload",
             "station_mapping",
             "runtime_fallback",

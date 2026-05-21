@@ -3608,7 +3608,7 @@ mod tests {
     }
 
     #[test]
-    fn build_session_identity_cards_prefers_binding_defaults_for_effective_route() {
+    fn build_session_identity_cards_default_profile_keeps_request_fields() {
         let active = vec![ActiveRequest {
             id: 1,
             trace_id: Some("codex-1".to_string()),
@@ -3672,21 +3672,21 @@ mod tests {
                 .effective_model
                 .as_ref()
                 .map(|value| (value.value.as_str(), value.source)),
-            Some(("gpt-bound", RouteValueSource::ProfileDefault))
+            Some(("gpt-observed", RouteValueSource::RequestPayload))
         );
         assert_eq!(
             cards[0]
                 .effective_reasoning_effort
                 .as_ref()
                 .map(|value| (value.value.as_str(), value.source)),
-            Some(("high", RouteValueSource::ProfileDefault))
+            Some(("medium", RouteValueSource::RequestPayload))
         );
         assert_eq!(
             cards[0]
                 .effective_service_tier
                 .as_ref()
                 .map(|value| (value.value.as_str(), value.source)),
-            Some(("priority", RouteValueSource::ProfileDefault))
+            Some(("default", RouteValueSource::RequestPayload))
         );
         assert_eq!(
             cards[0]
@@ -3698,7 +3698,7 @@ mod tests {
     }
 
     #[test]
-    fn build_session_identity_cards_keeps_binding_values_but_allows_global_config_override() {
+    fn build_session_identity_cards_keeps_request_fields_but_allows_global_config_override() {
         let active = vec![ActiveRequest {
             id: 1,
             trace_id: Some("codex-1".to_string()),
@@ -3754,21 +3754,21 @@ mod tests {
                 .effective_model
                 .as_ref()
                 .map(|value| (value.value.as_str(), value.source)),
-            Some(("gpt-bound", RouteValueSource::ProfileDefault))
+            Some(("gpt-observed", RouteValueSource::RequestPayload))
         );
         assert_eq!(
             cards[0]
                 .effective_reasoning_effort
                 .as_ref()
                 .map(|value| (value.value.as_str(), value.source)),
-            Some(("high", RouteValueSource::ProfileDefault))
+            Some(("medium", RouteValueSource::RequestPayload))
         );
         assert_eq!(
             cards[0]
                 .effective_service_tier
                 .as_ref()
                 .map(|value| (value.value.as_str(), value.source)),
-            Some(("priority", RouteValueSource::ProfileDefault))
+            Some(("default", RouteValueSource::RequestPayload))
         );
         assert_eq!(
             cards[0]
