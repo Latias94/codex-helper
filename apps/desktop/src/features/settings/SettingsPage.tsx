@@ -22,7 +22,7 @@ import { CONTROL_CONFIRMATIONS, useRuntimeActions } from "@/features/runtime/act
 import { ActionStatusBanner } from "@/features/runtime/ActionStatusBanner";
 import { useRuntimeSummary } from "@/features/runtime/hooks";
 import { useKnownPaths } from "@/features/settings/hooks";
-import type { CodexPreset } from "@/lib/tauri/commands";
+import { hideMainWindow, quitApp, type CodexPreset } from "@/lib/tauri/commands";
 
 const advancedRows = [
   ["会话覆盖", "为单个会话选择 provider 或模型策略"],
@@ -43,6 +43,11 @@ export function SettingsPage() {
   const [sessionRouteTarget, setSessionRouteTarget] = useState("");
   const [stopPhrase, setStopPhrase] = useState("");
   const paths = knownPaths.data;
+  const runDesktopCommand = (command: () => Promise<unknown>) => {
+    void command().catch((error) => {
+      console.warn("desktop app command failed", error);
+    });
+  };
 
   return (
     <>
@@ -65,9 +70,9 @@ export function SettingsPage() {
           <ToggleRow label="开机启动" checked={false} />
           <ToggleRow label="启用托盘" checked />
           <FieldRow label="关闭窗口时">
-            <Segment items={["最小化到托盘", "退出应用"]} value="最小化到托盘" />
+            <Badge variant="teal">隐藏到托盘</Badge>
           </FieldRow>
-          <ToggleRow label="启动时自动启动本地代理" checked />
+          <ToggleRow label="启动时自动启动本地代理（待实现）" checked={false} />
         </SettingsCard>
 
         <SettingsCard title="外观与语言" description="调整界面语言和显示偏好。">
@@ -101,10 +106,16 @@ export function SettingsPage() {
             <Badge variant={runtime.source === "live" ? "success" : "warning"}>
               Admin {runtime.data.adminPort}
             </Badge>
-            <Badge variant="warning">Owner 待确认</Badge>
+            <Badge variant={runtime.state.ownerMode === "desktop-owned" ? "teal" : runtime.state.ownerMode === "attached" ? "blue" : "warning"}>
+              {runtime.state.ownerMode === "desktop-owned"
+                ? "桌面托管"
+                : runtime.state.ownerMode === "attached"
+                  ? "附加模式"
+                  : "Owner 待确认"}
+            </Badge>
           </div>
           <p className="text-xs leading-5 text-amber-700">
-            生命周期 owner 还没有由后端明确上报：当前只展示“已连接/可附加”的事实，不会把普通退出误写成停止代理。
+            生命周期规则：关闭窗口只隐藏到托盘，退出桌面端不会停止代理；只有输入确认短语的 Stop Proxy 才会请求 runtime shutdown。
           </p>
           <div className="flex gap-2 pt-2">
             <Button variant="outline"><Copy className="h-4 w-4" />复制 Endpoint</Button>
@@ -269,19 +280,29 @@ export function SettingsPage() {
               危险操作
             </CardTitle>
             <CardDescription>
-              退出应用、Detach 和 Stop Proxy 是不同动作。若只是关闭窗口，请使用退出或最小化到托盘；Stop Proxy 会停止当前本地代理运行时。
+              退出应用、Detach 和 Stop Proxy 是不同动作。关闭窗口会隐藏到托盘；退出桌面端不会停止代理；Stop Proxy 必须显式确认。
             </CardDescription>
           </CardHeader>
           <CardContent>
             <div className="grid grid-cols-[1fr_420px] gap-4">
               <div className="grid grid-cols-3 gap-3">
-                <DangerNote title="退出应用" description="关闭桌面客户端" />
-                <DangerNote title="Detach" description="仅断开当前窗口，不停止已有代理" />
+                <DangerNote title="退出应用" description="退出桌面端，代理保持运行" />
+                <DangerNote title="Detach" description="隐藏窗口到托盘，不停止已有代理" />
                 <DangerNote title="Stop Proxy" description="停止本地代理运行时" />
               </div>
               <div className="flex items-center justify-end gap-3">
-                <Button variant="outline">退出应用</Button>
-                <Button variant="outline">Detach</Button>
+                <Button
+                  variant="outline"
+                  onClick={() => runDesktopCommand(quitApp)}
+                >
+                  退出应用
+                </Button>
+                <Button
+                  variant="outline"
+                  onClick={() => runDesktopCommand(hideMainWindow)}
+                >
+                  Detach
+                </Button>
                 <div className="flex flex-col gap-2">
                   <Input
                     aria-label="Stop Proxy confirmation"

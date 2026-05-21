@@ -19,6 +19,7 @@ import {
 
 import { Badge, Button, Card, Separator, Switch } from "@/components/ui";
 import { useRuntimeSummary } from "@/features/runtime/hooks";
+import { hideMainWindow, minimizeMainWindow, toggleMainWindowMaximized } from "@/lib/tauri/commands";
 import { cn } from "@/lib/utils";
 
 const navItems = [
@@ -118,6 +119,12 @@ export function AppShell() {
 }
 
 function TitleBar() {
+  const handleWindowCommand = (command: () => Promise<unknown>) => {
+    void command().catch((error) => {
+      console.warn("desktop window command failed", error);
+    });
+  };
+
   return (
     <div className="drag-region flex h-8 shrink-0 items-center justify-between border-b border-slate-200/60 bg-white/55">
       <div className="ml-3 flex items-center gap-2 text-xs text-slate-400">
@@ -129,6 +136,7 @@ function TitleBar() {
           className="flex h-full w-10 items-center justify-center text-slate-400 hover:bg-slate-100 hover:text-slate-700"
           type="button"
           aria-label="Minimize window"
+          onClick={() => handleWindowCommand(minimizeMainWindow)}
         >
           <Minus className="h-3.5 w-3.5" />
         </button>
@@ -136,6 +144,7 @@ function TitleBar() {
           className="flex h-full w-10 items-center justify-center text-slate-400 hover:bg-slate-100 hover:text-slate-700"
           type="button"
           aria-label="Maximize window"
+          onClick={() => handleWindowCommand(toggleMainWindowMaximized)}
         >
           <Square className="h-3 w-3" />
         </button>
@@ -143,6 +152,7 @@ function TitleBar() {
           className="flex h-full w-10 items-center justify-center text-slate-400 hover:bg-red-500 hover:text-white"
           type="button"
           aria-label="Close window"
+          onClick={() => handleWindowCommand(hideMainWindow)}
         >
           <X className="h-3.5 w-3.5" />
         </button>

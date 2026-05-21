@@ -1,12 +1,24 @@
 mod commands;
 mod error;
+mod lifecycle;
 
 pub fn run() {
     tauri::Builder::default()
+        .manage(lifecycle::DesktopLifecycleState::default())
         .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            lifecycle::setup_tray(app)?;
+            Ok(())
+        })
+        .on_window_event(lifecycle::handle_window_event)
         .invoke_handler(tauri::generate_handler![
             commands::admin_api::get_admin_read_model,
             commands::app::get_app_metadata,
+            commands::app::hide_main_window,
+            commands::app::minimize_main_window,
+            commands::app::quit_app,
+            commands::app::show_main_window,
+            commands::app::toggle_main_window_maximized,
             commands::control::apply_provider_runtime_override,
             commands::control::apply_session_overrides,
             commands::control::attach_existing_proxy,

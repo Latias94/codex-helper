@@ -1,7 +1,7 @@
 # Tauri Desktop Client — Implementation Brief
 
 Status: Draft
-Last updated: 2026-05-21
+Last updated: 2026-05-22
 
 ## Research Sources
 
@@ -233,6 +233,21 @@ Lifecycle rules:
 - Normal window close does not remote-stop an attached runtime.
 - Quit App, Detach, and Stop Proxy remain separate UI actions.
 - Dangerous actions require inline explanation and stronger visual treatment.
+
+## Desktop Capability Matrix
+
+This matrix records the desktop-client capabilities we expect from a Clash-like local control center. It is intentionally broader than TDC-090 so we do not confuse implemented lifecycle behavior with packaging/update/OS integration work.
+
+| Capability | Product intent | Current support | Recommended implementation path | Notes / gates |
+| --- | --- | --- | --- | --- |
+| Desktop residency | The app can remain a resident local control center while the main window is hidden. | **Partial / implemented in TDC-090** — main-window close hides to tray; Quit App exits only the desktop process. | Keep proxy runtime lifecycle independent from window visibility; use explicit Stop Proxy for runtime shutdown. | Full interactive tray/window smoke still required. |
+| System tray | User can show/hide the window and quit the desktop app from the OS tray. | **Partial / implemented in TDC-090** — tray menu has Show Window, Hide to Tray, Quit App (Proxy Keeps Running). | Continue with Tauri v2 tray API; later add runtime status tooltip/menu state if needed. | Verify on Windows/macOS/Linux packaged builds because tray behavior is OS-specific. |
+| Auto update | Desktop app can check/apply updates safely. | **Not implemented**. | Evaluate `tauri-plugin-updater` after signing/release channel decisions. | Requires release artifact hosting, signature/private-key handling, and rollback policy. |
+| Launch at login | User can enable/disable OS autostart. | **Not implemented**; UI currently marks it as pending. | Evaluate `tauri-plugin-autostart`; persist setting through Tauri command, not mock-only UI. | Must be packaged and manually verified per OS. |
+| Single instance | Opening the app twice should focus the existing window, not spawn duplicate desktop controllers. | **Not implemented**. | Evaluate `tauri-plugin-single-instance`; second-launch callback should show/focus main window. | Important before replacement readiness because duplicate controllers confuse owner semantics. |
+| Simple config import/export | User can back up or restore the single codex-helper config file. | **Not implemented**. | Keep this intentionally lightweight: Tauri file picker + copy/export current config TOML + import/replace with validation and backup. | Do **not** build heavy profile/workspace/rule-management like `repo-ref/aio-coding-hub` or `repo-ref/cc-switch`; no bulk config catalog is needed while the product has one primary config. Secret handling still needs an explicit warning. |
+| Open folders / paths | User can open config/log/cache folders. | **Not implemented beyond read-only path display**. | Use opener/path Tauri commands for config/log/cache directories. | Keep path actions separate from raw config editing. |
+| Packaged sidecar | Start Proxy should work from an installed app without requiring manual CLI env setup. | **Partial** — TDC-080 starts `codex-helper` via `CODEX_HELPER_CLI_PATH` or sibling binary lookup. | Decide packaged sidecar strategy with Tauri bundle resources or documented sibling CLI installation. | Signing/notarization and Windows installer behavior must be tested. |
 
 ## Recommended Repository Layout
 

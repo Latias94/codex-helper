@@ -1,4 +1,5 @@
 import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { invoke } from "@tauri-apps/api/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -96,6 +97,55 @@ describe("desktop app routes", () => {
     expect(screen.getAllByText("live-provider").length).toBeGreaterThan(0);
     expect(screen.queryByText("当前展示离线示例数据")).not.toBeInTheDocument();
   });
+
+  it("routes the custom close button to hide-to-tray instead of quitting the proxy", async () => {
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "仪表盘" })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Close window" }));
+
+    expect(mockedInvoke).toHaveBeenCalledWith("hide_main_window");
+    expect(mockedInvoke).not.toHaveBeenCalledWith("stop_proxy", expect.anything());
+  });
+
+  it("keeps Settings Quit App and Detach separate from Stop Proxy", async () => {
+    window.location.hash = "#/settings";
+    mockedInvoke.mockImplementation(async (command) => {
+      if (command === "get_app_metadata") {
+        return { name: "codex-helper", version: "0.16.0", tauri: "2" };
+      }
+      if (command === "get_admin_read_model") {
+        return liveReadModel();
+      }
+      if (command === "get_desktop_control_state") {
+        return liveControlState();
+      }
+      if (command === "get_known_paths") {
+        return {
+          home: "C:/Users/dev",
+          config: "C:/Users/dev/.codex-helper/config.toml",
+          logs: "C:/Users/dev/.codex-helper/logs",
+          cache: "C:/Users/dev/.codex-helper/cache",
+        };
+      }
+      if (command === "hide_main_window" || command === "quit_app") {
+        return undefined;
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "设置" })).toBeInTheDocument();
+    expect(screen.getAllByText(/退出桌面端不会停止代理/).length).toBeGreaterThanOrEqual(1);
+
+    await userEvent.click(screen.getByRole("button", { name: "Detach" }));
+    await userEvent.click(screen.getByRole("button", { name: "退出应用" }));
+
+    expect(mockedInvoke).toHaveBeenCalledWith("hide_main_window");
+    expect(mockedInvoke).toHaveBeenCalledWith("quit_app");
+    expect(mockedInvoke).not.toHaveBeenCalledWith("stop_proxy", expect.anything());
+  });
 });
 
 function liveReadModel(overrides?: {
@@ -170,5 +220,36 @@ function liveReadModel(overrides?: {
       },
     ],
     usageSummary: overrides?.usageSummary ?? [],
+  };
+}
+
+function liveControlState() {
+  return {
+    connectionMode: "attached",
+    proxyPort: 3211,
+    adminPort: 4211,
+    proxyBaseUrl: "http://127.0.0.1:3211",
+    adminBaseUrl: "http://127.0.0.1:4211",
+    reachable: true,
+    shutdownAvailable: true,
+    owner: null,
+    codexSwitch: {
+      enabled: true,
+      modelProvider: "codex-helper",
+      providerName: "live-provider",
+      baseUrl: "http://127.0.0.1:3211/v1",
+      preset: "chatgpt-bridge",
+      requiresOpenaiAuth: false,
+      supportsWebsockets: true,
+      remoteCompactionV2Enabled: true,
+      hasSwitchState: true,
+      errorMessage: null,
+    },
+    canStart: false,
+    canAttach: true,
+    canStopOwned: false,
+    canRemoteStop: true,
+    canSwitchOn: true,
+    canSwitchOff: true,
   };
 }

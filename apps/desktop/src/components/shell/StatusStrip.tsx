@@ -36,8 +36,19 @@ export function StatusStrip({
           <Clock3 className="h-4 w-4" />
           最近刷新 {runtime.updatedAtLabel}
         </span>
-        <span className="rounded-full border border-amber-200 bg-amber-50 px-2.5 py-1 text-xs font-medium text-amber-700">
-          生命周期 owner 待确认
+        <span
+          className={cn(
+            "rounded-full border px-2.5 py-1 text-xs font-medium",
+            runtime.ownerMode === "desktop-owned" && "border-teal-200 bg-teal-50 text-teal-700",
+            runtime.ownerMode === "attached" && "border-sky-200 bg-sky-50 text-sky-700",
+            runtime.ownerMode === "unknown" && "border-amber-200 bg-amber-50 text-amber-700",
+          )}
+        >
+          {runtime.ownerMode === "desktop-owned"
+            ? "桌面托管"
+            : runtime.ownerMode === "attached"
+              ? "附加模式"
+              : "生命周期 owner 待确认"}
         </span>
       </div>
       <Button variant="outline" onClick={onRefresh}>

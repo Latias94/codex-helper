@@ -3,7 +3,7 @@
   "slug": "tauri-desktop-client",
   "title": "Tauri Desktop Client",
   "status": "draft",
-  "updated": "2026-05-21",
+  "updated": "2026-05-22",
   "scope_kind": "planning-and-execution",
   "problem": "The existing egui GUI is no longer the desired long-term desktop product surface. codex-helper needs a polished but simple Tauri client that replaces egui, uses React + Tailwind + shadcn/ui, starts from a component prototype, and preserves safe runtime owner semantics without exposing every advanced control-plane concept at top level.",
   "authoritative_docs": [
@@ -124,11 +124,16 @@
       "date": "2026-05-21",
       "kind": "safe-control-actions",
       "summary": "Completed TDC-080 with concerns. Added typed Tauri safe mutation commands, admin token propagation, exact confirmation phrases for stop/switch actions, frontend action hooks/status banners, Dashboard/Providers/Settings control wiring, and validation via pnpm build/test, cargo fmt --check, cargo check -p codex-helper-desktop, cargo nextest run -p codex-helper-desktop --lib, and git diff --check."
+    },
+    {
+      "date": "2026-05-22",
+      "kind": "tray-lifecycle",
+      "summary": "Completed TDC-090 with concerns. Added Tauri tray/window lifecycle boundary, hide-to-tray close behavior, safe app quit semantics that leave proxy runtimes running, frontend titlebar/Settings window commands, owner labels, a Desktop Capability Matrix for residency/tray/update/autostart/single-instance/lightweight single-config import-export/sidecar follow-up, lifecycle tests, and validation via pnpm build/test, cargo fmt --check, cargo check -p codex-helper-desktop, cargo nextest run -p codex-helper-desktop --lib, and git diff --check."
     }
   ],
   "adr_refs": [],
   "continue_policy": {
     "default_action": "continue",
-    "notes": "Next step is TDC-090 tray and authoritative desktop owner semantics. Harden the current CLI-spawned desktop-managed runtime into a first-class tray/sidecar lifecycle path; no normal GUI close/quit may remote-stop an attached runtime."
+    "notes": "Next step is TDC-100 replacement readiness documentation. Use IMPLEMENTATION_BRIEF.md Desktop Capability Matrix as source of truth. Do not remove egui until Tauri parity gaps, full interactive tray/window smoke, packaged sidecar lookup, auto update, launch-at-login, single-instance, lightweight single-config import/export, signing/installer behavior, and remaining advanced controls are explicitly documented."
   }
 }

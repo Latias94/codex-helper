@@ -46,6 +46,26 @@ export async function getAppMetadata() {
   return invoke<AppMetadata>("get_app_metadata");
 }
 
+export async function showMainWindow() {
+  return invoke<void>("show_main_window");
+}
+
+export async function hideMainWindow() {
+  return invoke<void>("hide_main_window");
+}
+
+export async function minimizeMainWindow() {
+  return invoke<void>("minimize_main_window");
+}
+
+export async function toggleMainWindowMaximized() {
+  return invoke<void>("toggle_main_window_maximized");
+}
+
+export async function quitApp() {
+  return invoke<void>("quit_app");
+}
+
 export async function getKnownPaths() {
   return invoke<KnownPaths>("get_known_paths");
 }
