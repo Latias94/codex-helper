@@ -12,7 +12,7 @@ repository = "https://github.com/Latias94/codex-helper"
 homepage = "https://github.com/Latias94/codex-helper"
 
 [workspace]
-members = ["crates/core", "crates/tui", "crates/gui"]
+members = ["crates/core", "crates/tui", "crates/gui", "apps/desktop/src-tauri"]
 
 [[bin]]
 name = "codex-helper"

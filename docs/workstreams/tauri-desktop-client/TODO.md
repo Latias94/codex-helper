@@ -1,7 +1,7 @@
 # Tauri Desktop Client — TODO
 
 Status: Draft
-Last updated: 2026-05-20
+Last updated: 2026-05-21
 
 ## M0 — Scope And Evidence Freeze
 
@@ -11,42 +11,58 @@ Last updated: 2026-05-20
   Evidence: docs/workstreams/tauri-desktop-client/DESIGN.md
   Handoff: DONE — workstream opened from user-confirmed constraints on 2026-05-20.
 
-## M1 — shadcn/ui Product Prototype
+## M1 — Image Concept And shadcn/ui Product Prototype
 
-- [ ] TDC-020 [owner=user] [deps=TDC-010] [scope=external-shadcn-prototype,source-or-preview]
-  Goal: Generate or assemble an initial simplified React + Tailwind + shadcn/ui product prototype with the revised workstream prompt and return either source export, images, or a preview URL.
-  Validation: User confirms the generated direction is close enough to import or asks for a revised prompt.
-  Review: Use impeccable critique before implementation if the generated UI looks generic, SaaS-heavy, too neon, or unclear.
+- [x] TDC-015 [owner=planner] [deps=TDC-010] [scope=docs/workstreams/tauri-desktop-client/UI_BRIEF.md]
+  Goal: Build a pre-imagegen UX/design brief from the user-provided reference screenshot, `repo-ref/awesome-design-md`, local product capabilities, admin API contracts, and existing GUI/TUI surfaces.
+  Validation: `UI_BRIEF.md` captures visual direction, page requirements, states, data contract map, copy rules, and an imagegen prompt pack.
+  Evidence: `docs/workstreams/tauri-desktop-client/UI_BRIEF.md`; `EVIDENCE_AND_GATES.md` 2026-05-21 pre-imagegen entry.
+  Handoff: DONE — next visual step is image concept generation and critique before shadcn/ui prototype import.
+
+- [x] TDC-018 [owner=planner-or-user] [deps=TDC-015] [scope=imagegen-concepts,docs/workstreams/tauri-desktop-client/UI_BRIEF.md]
+  Goal: Generate first image concepts from `UI_BRIEF.md`, critique them against the acceptance checklist, and revise the brief if the direction is too generic, SaaS-heavy, too blue, too dense, unclear, or incorrectly treats API keys as a standalone top-level page.
+  Progress: Dashboard, Providers, revised Usage, and revised Settings concepts are accepted. The first Settings concept was rejected as too complex; the accepted Settings baseline is `settings-approved-v1.png`.
+  Validation: User accepted the final Settings concept direction on 2026-05-21.
+  Review: Confirm Dashboard answers proxy/Codex/provider/usage/health/action clearly, Providers owns credentials/auth fields, Usage keeps cost as estimates, and Settings is a simple adaptive settings grid before moving to component code.
+  Evidence: generated concept image(s), critique notes, and any prompt/brief updates in `EVIDENCE_AND_GATES.md`.
+  Handoff: DONE — page-level image direction is accepted; next step is TDC-020 shadcn/ui prototype generation/assembly.
+
+- [x] TDC-020 [owner=user-or-planner] [deps=TDC-018] [scope=external-shadcn-prototype,source-or-preview]
+  Goal: Generate or assemble an initial simplified React 19 + Tailwind CSS 4 + shadcn/ui-style + TanStack product prototype with the revised workstream prompt and return either source export, images, or a preview URL.
+  Progress: Throwaway prototype generated under `docs/workstreams/tauri-desktop-client/prototype/`; after user review, the shell was adjusted for a client-style fixed sidebar and root viewport, with scrolling moved into the main content region.
+  Validation: User confirmed the prototype is good enough on 2026-05-21, with layout guidance that the desktop client must not behave like fully scrolling browser pages.
+  Review: DONE_WITH_CONCERNS — direction accepted, but production implementation must harden fixed app-shell layout, internal table/panel scrolling, and sticky desktop regions.
   Evidence: prototype source/image/URL plus notes in EVIDENCE_AND_GATES.md.
-  Handoff: Final status must be DONE, DONE_WITH_CONCERNS, BLOCKED, or NEEDS_CONTEXT.
+  Handoff: DONE_WITH_CONCERNS — proceed to TDC-030 implementation brief; do not scaffold production Tauri until the stack/layout/repo-structure brief is accepted.
 
-- [ ] TDC-030 [owner=planner] [deps=TDC-020] [scope=docs/workstreams/tauri-desktop-client,frontend-design-brief]
-  Goal: Convert the accepted prototype into an implementation brief: component inventory, page states, data contract map, visual tokens, and import plan.
-  Validation: DESIGN.md or a new UI_BRIEF.md captures accepted decisions and rejected directions.
-  Review: Confirm with user before coding.
-  Evidence: UI brief and selected images or preview notes.
-  Handoff: Blocks implementation until accepted.
+- [x] TDC-030 [owner=planner] [deps=TDC-020] [scope=docs/workstreams/tauri-desktop-client,frontend-design-brief]
+  Goal: Convert the accepted prototype into an implementation brief: component inventory, page states, data contract map, visual tokens, technology choices, and repository layout plan.
+  Progress: `IMPLEMENTATION_BRIEF.md` drafted with React 19, Tailwind CSS 4, shadcn/ui, TanStack Router/Query/Table, React Hook Form + Zod, Recharts, optional Zustand, Tauri command/API boundaries, fixed client-shell layout rules, and recommended `apps/desktop` repository structure.
+  Validation: User accepted the implementation brief and authorized production frontend work on 2026-05-21.
+  Review: DONE — selected third-party libraries are intentionally limited and the `apps/desktop/src-tauri` layout keeps the existing egui replacement fallback intact.
+  Evidence: `docs/workstreams/tauri-desktop-client/IMPLEMENTATION_BRIEF.md`; official-source research notes and local structure audit in `EVIDENCE_AND_GATES.md`.
+  Handoff: DONE — proceed to TDC-040/TDC-050 production shell and static/mock UI.
 
 ## M2 — Tauri Shell And Static App
 
-- [ ] TDC-040 [owner=main-or-worker] [deps=TDC-030] [scope=Cargo.toml,apps/desktop-or-crates/desktop,package.json,tauri-config]
+- [x] TDC-040 [owner=main-or-worker] [deps=TDC-030] [scope=Cargo.toml,apps/desktop,apps/desktop/src-tauri,package.json,tauri-config]
   Goal: Add a runnable Tauri + React + Tailwind shell without wiring live proxy state yet.
-  Validation: desktop dev command starts; frontend typecheck/build passes.
-  Review: Ensure repo layout does not break existing Rust workspace or release flow.
-  Evidence: command output in EVIDENCE_AND_GATES.md.
-  Handoff: Static mock UI should be visible in Tauri.
+  Validation: `pnpm build`, `cargo fmt --check`, and `cargo check -p codex-helper-desktop` pass.
+  Review: DONE — `apps/desktop/src-tauri` is a new workspace member and the existing `crates/gui` fallback remains untouched.
+  Evidence: `EVIDENCE_AND_GATES.md` 2026-05-21 TDC-040/TDC-050 scaffold entry.
+  Handoff: DONE — static shell exists and is ready for live data wiring.
 
-- [ ] TDC-050 [owner=main-or-worker] [deps=TDC-040] [scope=desktop-frontend/src]
+- [x] TDC-050 [owner=main-or-worker] [deps=TDC-040] [scope=apps/desktop/src]
   Goal: Import and harden the accepted shadcn/ui prototype into maintainable React components with mock data for all simplified MVP pages.
-  Validation: frontend lint/typecheck/build; optional visual smoke.
-  Review: Use impeccable product bans: no gradient text, no decorative glass, no identical metric grid, no unsafe modal-first flows.
-  Evidence: visual smoke output and frontend checks.
-  Handoff: UI must remain mockable before API integration.
+  Validation: `pnpm test` and `pnpm build` pass in `apps/desktop`.
+  Review: DONE_WITH_CONCERNS — four-page mock UI is production-structured and avoids banned visual patterns; visual browser smoke is still recommended before live API wiring polish.
+  Evidence: `EVIDENCE_AND_GATES.md` 2026-05-21 TDC-040/TDC-050 scaffold entry.
+  Handoff: DONE_WITH_CONCERNS — UI remains mockable; next step is TDC-060 read-only admin API wiring plus richer loading/empty/error states.
 
 ## M3 — Read-Only Admin API Wiring
 
 - [ ] TDC-060 [owner=main-or-worker] [deps=TDC-050] [scope=desktop-frontend/src/api,desktop-frontend/src/pages]
-  Goal: Wire read-only live data for Dashboard, API Keys, Usage, Providers, and Settings via admin API links.
+  Goal: Wire read-only live data for Dashboard, Providers, Usage, and Settings via admin API links.
   Validation: unit tests for API client mapping; Tauri/manual smoke against a running local proxy.
   Review: Prefer `/operator/summary` links and capability flags over hard-coded assumptions.
   Evidence: API client tests and smoke notes.

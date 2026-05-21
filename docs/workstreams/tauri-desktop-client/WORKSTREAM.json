@@ -22,6 +22,14 @@
     {
       "role": "handoff",
       "path": "docs/workstreams/tauri-desktop-client/HANDOFF.md"
+    },
+    {
+      "role": "ui-brief",
+      "path": "docs/workstreams/tauri-desktop-client/UI_BRIEF.md"
+    },
+    {
+      "role": "implementation-brief",
+      "path": "docs/workstreams/tauri-desktop-client/IMPLEMENTATION_BRIEF.md"
     }
   ],
   "gates": [
@@ -46,11 +54,66 @@
       "date": "2026-05-21",
       "kind": "reference-review",
       "summary": "Reviewed repo-ref/aio-coding-hub and adopted its Tauri client shell, sidebar runtime footer, page header, dashboard work-status/recent-request panels, providers card/order layout, usage filter/data-panel pattern, and settings two-column pattern while rejecting its broader top-level navigation for the first GUI."
+    },
+    {
+      "date": "2026-05-21",
+      "kind": "ui-brief",
+      "summary": "Added UI_BRIEF.md after reviewing the user-provided AIO Coding Hub screenshot, repo-ref/awesome-design-md references, README product capabilities, admin API contracts, and existing egui surfaces. The brief freezes a restrained mint/teal local proxy dashboard direction and includes an imagegen prompt pack."
+    },
+    {
+      "date": "2026-05-21",
+      "kind": "image-concept-review",
+      "summary": "Accepted Dashboard and simplified credential-list concepts as local image references under docs/workstreams/tauri-desktop-client/assets. Reclassified API keys as provider credentials, removed API Keys as a top-level page in the design brief, and updated UI_BRIEF.md with Providers-as-credentials-owner constraints, pagination/table-density rules, and the next Providers page imagegen prompt."
+    },
+    {
+      "date": "2026-05-21",
+      "kind": "image-concept-review",
+      "summary": "Accepted the Providers concept as docs/workstreams/tauri-desktop-client/assets/providers-approved-v1.png. The concept validates provider cards with visible auth/env-var fields and a right-side default route order panel. Added the next Usage page imagegen prompt to UI_BRIEF.md."
+    },
+    {
+      "date": "2026-05-21",
+      "kind": "image-concept-review",
+      "summary": "First Usage concept needs revision. User wants sub2api-style full-width request table, pagination footer, cost tooltip, token direction/icons, and first-token latency, while avoiding a permanent right-side cost panel because costs are only estimates. UI_BRIEF.md Usage prompt was revised accordingly."
+    },
+    {
+      "date": "2026-05-21",
+      "kind": "image-concept-review",
+      "summary": "Accepted the revised Usage concept as docs/workstreams/tauri-desktop-client/assets/usage-approved-v1.png. The concept keeps a full-width request table, estimated-cost tooltip, token/cache indicators, first-token latency, duration, and practical pagination without a permanent cost panel."
+    },
+    {
+      "date": "2026-05-21",
+      "kind": "image-concept-review",
+      "summary": "Rejected the first Settings concept as too complex and saved it only as docs/workstreams/tauri-desktop-client/assets/settings-generated-too-complex-v1.png. Added simpler Settings structure references and revised the brief toward responsive two-column settings cards with no permanent right sidebar or giant control-console form."
+    },
+    {
+      "date": "2026-05-21",
+      "kind": "image-concept-candidate",
+      "summary": "Generated docs/workstreams/tauri-desktop-client/assets/settings-candidate-v2.png from the simplified two-column Settings prompt. It is pending user review before becoming the accepted Settings baseline."
+    },
+    {
+      "date": "2026-05-21",
+      "kind": "image-concept-review",
+      "summary": "User accepted the revised Settings concept and it was copied to docs/workstreams/tauri-desktop-client/assets/settings-approved-v1.png. TDC-018 is complete; Dashboard, Providers, Usage, and Settings now have accepted page-level image baselines."
+    },
+    {
+      "date": "2026-05-21",
+      "kind": "prototype",
+      "summary": "Generated throwaway React 19 + Tailwind CSS 4 + shadcn/ui-style + TanStack prototype under docs/workstreams/tauri-desktop-client/prototype/. It implements Dashboard, Providers, Usage, and Settings with mock data and passes pnpm build."
+    },
+    {
+      "date": "2026-05-21",
+      "kind": "implementation-brief",
+      "summary": "User accepted the prototype direction with desktop layout feedback. Added IMPLEMENTATION_BRIEF.md with official-source-informed stack choices, fixed app-shell layout rules, and recommended apps/desktop repository structure before production Tauri scaffold work."
+    },
+    {
+      "date": "2026-05-21",
+      "kind": "production-scaffold",
+      "summary": "User accepted IMPLEMENTATION_BRIEF.md and authorized frontend work. Added apps/desktop React 19 + Tailwind CSS 4 + TanStack production frontend and apps/desktop/src-tauri Tauri v2 crate; imported four-page static/mock UI; pnpm test/build, cargo fmt --check, and cargo check -p codex-helper-desktop pass."
     }
   ],
   "adr_refs": [],
   "continue_policy": {
     "default_action": "continue",
-    "notes": "Next step is a user-generated shadcn/ui component prototype using the simplified prompt in HANDOFF.md. Do not scaffold Tauri until the visual/product direction is accepted."
+    "notes": "Next step is TDC-060 read-only admin API wiring for Dashboard, Providers, Usage, and Settings in apps/desktop/src, while keeping the UI mockable and adding loading/empty/error states. Tauri lifecycle owner/tray and safe mutations remain later tasks."
   }
 }

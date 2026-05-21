@@ -8,20 +8,90 @@ Last updated: 2026-05-21
 M0 is complete. This workstream is open to design and implement a Tauri desktop client that replaces the existing egui GUI. The user confirmed:
 
 - replacement relationship: Tauri should become the long-term GUI, not merely a parallel experiment;
-- frontend stack: React + Tailwind + shadcn/ui;
+- frontend stack: React 19 + Tailwind CSS 4 + shadcn/ui-style components + TanStack libraries;
 - workflow: first create a simple shadcn/ui component prototype, then have Codex convert/adapt/harden it into Tauri;
-- simplified MVP pages: Dashboard, API Keys, Usage, Providers, Settings;
+- simplified MVP pages: Dashboard, Providers, Usage, Settings;
+- API keys/tokens are provider credentials and should live inside Providers, not as a standalone top-level page;
 - advanced sessions/routing/diagnostics should be progressively disclosed, not top-level in the first GUI.
 
-`repo-ref/aio-coding-hub` was reviewed as a local Tauri gateway-client reference. The useful patterns are its fixed desktop shell, left sidebar with runtime status footer, page header actions, dashboard work-status panels, provider cards plus right-side route order, usage filters plus tabbed data panel, and settings main-column/sidebar structure. Do not copy its broad navigation scope.
+`repo-ref/aio-coding-hub` was reviewed as a local Tauri gateway-client reference. The useful patterns are its fixed desktop shell, left sidebar with runtime status footer, page header actions, dashboard work-status panels, provider cards plus right-side route order, and usage filters plus tabbed data panel. Do not copy its broad navigation scope.
 
-No code has been generated or imported yet.
+No production Tauri code has been generated or imported yet. A throwaway frontend prototype exists only under the workstream docs path.
+
+On 2026-05-21, `UI_BRIEF.md` was added as the current pre-imagegen UX/design brief. It incorporates the user-provided AIO Coding Hub screenshot, selected `repo-ref/awesome-design-md` references, local product capabilities, admin API contracts, and existing egui surface inventory. It also contains the next imagegen prompt pack.
+
+Later on 2026-05-21, the user accepted two concept images as references:
+
+- `docs/workstreams/tauri-desktop-client/assets/dashboard-approved-v1.png`
+- `docs/workstreams/tauri-desktop-client/assets/provider-credentials-list-reference-v1.png`
+
+The accepted Dashboard is the visual shell baseline. The former API Keys concept is retained only as a provider credential list density reference: toolbar + clean table + security note, with no large proxy entrance card, no permanent right detail panel, and no repeated relay switch. `UI_BRIEF.md` now makes Providers the home for credentials and contains pagination/table-density rules plus the next Providers page imagegen prompt.
+
+The user then accepted the Providers and revised Usage concepts:
+
+- `docs/workstreams/tauri-desktop-client/assets/providers-approved-v1.png`
+- `docs/workstreams/tauri-desktop-client/assets/usage-approved-v1.png`
+
+For Settings, the first generated concept was rejected as too complex and saved only as an anti-reference:
+
+- `docs/workstreams/tauri-desktop-client/assets/settings-generated-too-complex-v1.png`
+
+The user prefers a simpler adaptive Settings layout, borrowing structure from:
+
+- `docs/workstreams/tauri-desktop-client/assets/settings-simple-reference-a.png`
+- `docs/workstreams/tauri-desktop-client/assets/settings-simple-reference-b.png`
+
+Settings direction is now: simple responsive two-column setting cards, no permanent right sidebar, no giant full-width control-console form, advanced tools collapsed, and dangerous lifecycle actions compact but clearly separated at the bottom.
+
+A revised Settings candidate was generated and saved as:
+
+- `docs/workstreams/tauri-desktop-client/assets/settings-candidate-v2.png`
+
+The user accepted that revised Settings candidate. It was copied to:
+
+- `docs/workstreams/tauri-desktop-client/assets/settings-approved-v1.png`
+
+TDC-018 is complete: Dashboard, Providers, Usage, and Settings now have accepted image baselines.
 
 ## Next Task
 
-TDC-020: user generates or assembles the initial shadcn/ui prototype using the prompt below, then returns source export, images, or a preview URL.
+TDC-020 is complete with concerns. A throwaway React 19 + Tailwind CSS 4 + shadcn/ui-style + TanStack prototype exists at:
 
-After that, run a product/UI critique before coding. If accepted, write `UI_BRIEF.md` or update `DESIGN.md` with the component inventory, data contracts, and import plan.
+- `docs/workstreams/tauri-desktop-client/prototype/`
+
+Run it with:
+
+```powershell
+cd docs/workstreams/tauri-desktop-client/prototype
+pnpm install
+pnpm dev --host 127.0.0.1
+```
+
+It builds with `pnpm build`. The user reviewed it on 2026-05-21 and said the direction is good, with an important desktop-client layout correction: the sidebar must remain fixed and the app must not behave like a set of full-page scrolling browser pages. The prototype shell was adjusted accordingly: root overflow is hidden, the sidebar is fixed within the app viewport, and scrolling is moved into the main content region.
+
+TDC-030 is complete: the user accepted the implementation brief and authorized production frontend work with fearless refactoring where it improves the architecture.
+
+TDC-040 and TDC-050 are now scaffolded:
+
+- `apps/desktop/` contains the production React 19 + Tailwind CSS 4 + shadcn-style + TanStack frontend.
+- `apps/desktop/src-tauri/` contains the Tauri v2 Rust crate and is now a Cargo workspace member.
+- The accepted Dashboard, Providers, Usage, and Settings prototype has been imported into production-oriented feature folders.
+- The app shell uses a fixed root viewport, fixed sidebar, drag-safe title strip, and bounded main/panel scrolling.
+- Existing `crates/gui` egui remains untouched as a fallback until replacement parity.
+
+Run checks with:
+
+```powershell
+cd apps/desktop
+pnpm install
+pnpm test
+pnpm build
+cd ..\..
+cargo fmt --check
+cargo check -p codex-helper-desktop
+```
+
+Current next task: TDC-060 read-only admin API wiring for Dashboard, Providers, Usage, and Settings, plus richer loading/empty/error states. Tauri lifecycle, tray, and safe mutations remain follow-on work.
 
 ## shadcn/ui Prototype Prompt
 
@@ -32,7 +102,7 @@ Important direction:
 Keep the first version simple, approachable, and familiar. Build it from standard shadcn/ui primitives: Card, Button, Badge, Tabs, Table, DropdownMenu, Select, Input, Tooltip, Popover, Sheet, Switch, Separator, Skeleton. This should look like a clean local desktop dashboard, not a dense observability cockpit.
 
 Product context:
-codex-helper is a local desktop helper for Codex and Claude Code. It starts a local proxy, connects Codex to that proxy, lets the user manage relay providers and local API credentials, shows request usage, token usage, cost estimates, balances, and basic relay health. Advanced routing, session overrides, and relay diagnostics exist, but they should be hidden behind Advanced sections in the first UI.
+codex-helper is a local desktop helper for Codex. It starts a local proxy, connects Codex to that proxy, lets the user manage relay providers and each provider's credential/auth source, shows request usage, token usage, cost estimates, balances, and basic relay health. Advanced routing, session overrides, and relay diagnostics exist, but they should be hidden behind Advanced sections in the first UI.
 
 Reference structure:
 Use the structure of a mature local Tauri control center:
@@ -52,9 +122,11 @@ A developer who mostly wants to know:
 5. Are my providers healthy and do they still have balance?
 
 Technology and output:
-- React components.
-- Tailwind CSS.
+- React 19 components.
+- Tailwind CSS 4.
 - shadcn/ui component style.
+- TanStack Router for page switching and TanStack Table for the Usage table.
+- TanStack Query can be present as the future data-fetching boundary, but this prototype should use mock data only.
 - Use realistic mock data.
 - Desktop Tauri window around 1280 x 820.
 - Prioritize clean static UI and component structure over complex interactions.
@@ -75,10 +147,9 @@ Visual style:
 Navigation:
 Use a simple left sidebar with these top-level pages:
 1. Dashboard
-2. API Keys
+2. Providers
 3. Usage
-4. Providers
-5. Settings
+4. Settings
 
 Sidebar bottom:
 - Dark Mode toggle
@@ -135,34 +206,45 @@ Quick actions should be visible but not overwhelming:
 
 If the app is attached to an existing runtime, show a small calm note: "Attached mode: closing this app only detaches. Use Stop Proxy in Settings to stop the runtime."
 
-Page 2: API Keys
-Goal: familiar local credential management.
-In codex-helper, API Keys represent local provider credentials or env-token entries.
+Page 2: Providers
+Goal: familiar local provider management with credentials included.
+In codex-helper, API keys, tokens, and env vars are provider auth fields. Do not make API Keys a standalone page.
 Include:
 - Search box
-- Group filter
 - Status filter
-- Local API endpoint pill: http://127.0.0.1:3211
-- Buttons: Refresh, Add Key
-- Table columns:
-  - Name
-  - Key or Env Var, masked
-  - Provider/Station
+- Capability tags
+- Provider cards as the default view
+- Right-side Active Order or Default Route panel
+- Provider card fields:
+  - Provider name
+  - Base URL host
+  - Auth source, such as env CODEX_RELAY_API_KEY or masked key
+  - Balance
+  - Health
+  - Latency
+  - Capabilities: responses, compact, imagegen
   - Usage today
   - Last Used
-  - Status
-  - Actions
-- Row actions:
-  - Copy endpoint
+- Actions:
+  - Set Active
   - Probe
+  - Refresh Balance
   - Edit
   - Disable
-  - Delete
+
+Include an optional compact credential list mode inside Providers:
+- Provider
+- Host
+- Key or Env Var, masked
+- Usage today
+- Last Used
+- Status
+- Actions
 
 Use one example row with realistic data:
-- default
-- CODEX_RELAY_API_KEY or sk-...da44
 - CodeX Air
+- ai.input.im
+- env CODEX_RELAY_API_KEY or sk-...da44
 - today's cost and 30-day cost
 - enabled
 
@@ -196,40 +278,19 @@ Table columns:
 
 Include a hover/click cost breakdown popover with input cost, output cost, cache read cost, service tier, multiplier, and final billed cost.
 
-Page 4: Providers
-Goal: simple provider/station health and balance management without exposing route graphs by default.
-Include:
-- Service tabs if useful: Codex, Claude Code, All.
-- Search box and simple tag chips.
-- Provider cards as the default presentation.
-- Right-side “Active Order” or “Default Route” panel showing enabled providers in priority order.
-- Fields:
-  - provider name;
-  - base URL host;
-  - balance;
-  - active/default badge;
-  - health;
-  - latency;
-  - capabilities summary: models, responses, compact, imagegen, websocket;
-  - recent requests.
-- Actions:
-  - Set Active
-  - Probe
-  - Refresh Balance
-  - Edit
-  - Advanced
-
-Advanced can be a collapsed section or side panel containing:
+Advanced provider detail can be a collapsed section or side panel containing:
 - model mapping summary;
 - station/upstream list;
 - route settings link;
 - diagnostics link.
 
-Page 5: Settings
+Page 4: Settings
 Goal: grouped settings, not a giant form.
 Layout:
-- main settings column for editable settings;
-- right sidebar for app/about/runtime summary and quick links.
+- simple responsive two-column settings grid at desktop width;
+- cards stack to one column on narrower widths;
+- no permanent right sidebar for runtime/about;
+- no giant full-width control-console form.
 
 Sections:
 1. Desktop Behavior
@@ -237,24 +298,39 @@ Sections:
    - Tray enabled
    - Close behavior: Exit app / Minimize to tray
    - Startup behavior
-2. Local Proxy
-   - Service: Codex / Claude
+2. Appearance And Language
+   - Language
+   - Theme: Follow system / Light / Dark
+   - Optional density preference
+3. Local Proxy
    - Host
    - Port
+   - Endpoint
+   - Runtime owner
    - Admin token status
    - Reload runtime button
-3. Codex Connection
+4. Codex Connection
    - Switch status
    - Preset: default, chatgpt-bridge, official-relay, official-imagegen
    - Responses websocket toggle
    - Switch On / Switch Off
-4. Advanced Tools, collapsed by default
+5. Advanced Tools, collapsed by default
    - Session overrides
    - Routing graph
    - Relay diagnostics
    - Request trace
    - Raw TOML editor
    - Logs folder
+6. About And Paths
+   - Version
+   - Config path
+   - Logs path
+   - Cache path
+   - Check update
+7. Dangerous Actions
+   - Quit App
+   - Detach
+   - Stop Proxy
 
 Lifecycle copy requirements:
 Use user-friendly terms, not architecture terms.
@@ -275,7 +351,7 @@ States to include somewhere in the design:
 - stale data or failed refresh state.
 
 Output expectation:
-Return a polished multi-page React + Tailwind + shadcn/ui mockup with the five pages above. Keep it spacious, friendly, simple, and not too technical. Advanced codex-helper features should exist as collapsed sections or small entry points, not as top-level pages.
+Return a polished multi-page React + Tailwind + shadcn/ui mockup with the four pages above. Keep it spacious, friendly, simple, and not too technical. Advanced codex-helper features should exist as collapsed sections or small entry points, not as top-level pages.
 
 Implementation structure expectation:
 - Use reusable components such as AppShell, Sidebar, PageHeader, StatusBadge, MetricCard, ProviderCard, UsageTable, EmptyState, QueryErrorCard, SettingsSection, and DetailDrawer.
@@ -286,13 +362,14 @@ Implementation structure expectation:
 ## Review Checklist For Returned Prototype
 
 - Does Dashboard feel simple and friendly rather than like an observability platform?
-- Are top-level pages limited to Dashboard, API Keys, Usage, Providers, Settings?
+- Are top-level pages limited to Dashboard, Providers, Usage, Settings?
+- Are API keys represented as provider credentials instead of a standalone top-level page?
 - Are advanced sessions/routing/diagnostics hidden behind Advanced, detail panels, or Settings?
 - Are Quit, Detach, and Stop Proxy visually/textually distinct?
 - Are tables readable without exposing too many internal fields?
 - Does the sidebar footer clearly show proxy status and port?
 - Does Dashboard include recent requests or work status, not just metric cards?
-- Does Providers use cards plus active order/default route instead of only a dense table?
+- Does Providers use cards plus active order/default route and show credential/auth source clearly?
 - Does Settings avoid dumping raw TOML as the default path?
 - Does the design avoid banned patterns:
   - gradient text;

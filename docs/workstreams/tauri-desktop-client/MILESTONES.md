@@ -1,7 +1,7 @@
 # Tauri Desktop Client — Milestones
 
 Status: Draft
-Last updated: 2026-05-20
+Last updated: 2026-05-21
 
 ## M0 — Scope And Evidence Freeze
 
@@ -14,11 +14,14 @@ Exit criteria:
 
 Status: Complete.
 
-## M1 — shadcn/ui Product Prototype
+## M1 — Image Concept And shadcn/ui Product Prototype
 
 Exit criteria:
 
+- A pre-imagegen UX brief exists and names the visual system, page requirements, required states, and data contracts.
+- One or more image concepts are generated from the brief and critiqued before committing to component code.
 - User generates or assembles a React + Tailwind + shadcn/ui prototype from the prompt.
+- Prototype shell follows desktop-client constraints: fixed sidebar, fixed app viewport, and bounded main/panel scrolling.
 - The returned artifact is one of:
   - source export;
   - images;
@@ -30,10 +33,13 @@ Gate:
 
 - `impeccable critique`-style review against product UI bans and codex-helper requirements.
 
+Status: Complete with concerns. TDC-020 direction is accepted; production layout must preserve fixed desktop shell behavior.
+
 ## M2 — Tauri Shell And Static App
 
 Exit criteria:
 
+- The accepted `IMPLEMENTATION_BRIEF.md` decisions are used for stack, layout, and repository structure.
 - A Tauri + React + Tailwind shell exists in the repo.
 - Static/mock simplified MVP can run locally.
 - Existing Rust workspace checks are not broken.
@@ -44,11 +50,14 @@ Expected gates:
 - `cargo check` for any changed Rust package.
 - Visual smoke by browser/Tauri capture if available.
 
+Status: Complete with concerns. `apps/desktop` and `apps/desktop/src-tauri` exist and pass install/test/build/Rust checks; visual smoke remains recommended before live data polish.
+
 ## M3 — Read-Only Admin API Wiring
 
 Exit criteria:
 
-- Dashboard, API Keys, Usage, Providers, and Settings consume real admin API data when a local proxy is available.
+- Dashboard, Providers, Usage, and Settings consume real admin API data when a local proxy is available.
+- Provider credentials/API keys are represented as provider auth fields, not as a standalone top-level page.
 - Disconnected and auth-token-required states are first-class.
 - Mock mode still works for design iteration.
 

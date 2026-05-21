@@ -1,5 +1,8 @@
 /target
 /dist
+**/node_modules
+**/dist
+**/src-tauri/gen
 /.codex-helper
 /repo-ref
 /.lspi/
