@@ -14,10 +14,7 @@ export function UsagePage() {
     <div className="flex min-h-[calc(100vh-5rem)] flex-col">
       <PageHeader title="用量" subtitle="查看本地请求历史、tokens、首 token 延迟和预估费用" />
       <DataStateBanner
-        source={usage.source}
-        isLoading={usage.isLoading}
-        isRefreshing={usage.isRefreshing}
-        errorMessage={usage.errorMessage}
+        state={usage.state}
         onRefresh={usage.refetch}
       />
 

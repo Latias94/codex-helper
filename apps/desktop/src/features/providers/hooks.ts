@@ -1,17 +1,11 @@
-import { useQuery } from "@tanstack/react-query";
-
-import { fetchAdminReadModelFromTauri } from "@/lib/api/admin-read-model";
 import { mapProvidersData } from "@/lib/api/mappers";
 import { mockProvidersData } from "@/lib/api/mock-data";
-import { queryKeys } from "@/lib/api/query-keys";
 import type { QueryBackedData } from "@/lib/api/types";
+import { useAdminReadModelState } from "@/lib/api/use-admin-read-model";
 
 export function useProvidersData(): QueryBackedData<typeof mockProvidersData> {
-  const readModel = useQuery({
-    queryFn: fetchAdminReadModelFromTauri,
-    queryKey: queryKeys.admin.readModel,
-    retry: 1,
-  });
+  const query = useAdminReadModelState();
+  const { readModel, state } = query;
   const data = readModel.data
     ? mapProvidersData(
         readModel.data.operatorSummary,
@@ -22,12 +16,21 @@ export function useProvidersData(): QueryBackedData<typeof mockProvidersData> {
 
   return {
     data,
-    source: readModel.data ? "live" : "mock",
-    isLoading: readModel.isLoading,
-    isRefreshing: readModel.isFetching,
-    errorMessage: readModel.error instanceof Error ? readModel.error.message : undefined,
-    refetch: () => {
-      void readModel.refetch();
-    },
+    source: query.source,
+    state:
+      state.status === "live" && data.providers.length === 0
+        ? {
+            ...state,
+            status: "empty",
+            severity: "neutral",
+            title: "实时数据已连接，但当前没有供应商",
+            description: "先在配置中添加 provider，或检查 /operator/summary 是否加载了 providers。",
+            badge: "Empty",
+          }
+        : state,
+    isLoading: query.isLoading,
+    isRefreshing: query.isRefreshing,
+    errorMessage: query.errorMessage,
+    refetch: query.refetch,
   };
 }

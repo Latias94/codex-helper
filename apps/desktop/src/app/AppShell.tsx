@@ -31,6 +31,7 @@ const navItems = [
 export function AppShell() {
   const pathname = useRouterState({ select: (state) => state.location.pathname });
   const runtime = useRuntimeSummary();
+  const runtimeHealthy = runtime.source === "live" && !runtime.state.isStale;
 
   return (
     <div className="mx-auto flex h-screen max-h-screen max-w-[1600px] overflow-hidden border-x border-slate-200/70 bg-white/35">
@@ -82,7 +83,12 @@ export function AppShell() {
 
           <Card className="p-4">
             <div className="flex items-center gap-2 text-sm font-medium text-slate-700">
-              <span className="h-2.5 w-2.5 rounded-full bg-emerald-500" />
+              <span
+                className={cn(
+                  "h-2.5 w-2.5 rounded-full",
+                  runtimeHealthy ? "bg-emerald-500" : "bg-amber-500",
+                )}
+              />
               本地代理
             </div>
             <div className="mt-3 font-semibold text-teal-700">
@@ -95,7 +101,7 @@ export function AppShell() {
             <Separator className="my-4" />
             <div className="flex items-center justify-between text-xs text-slate-400">
               <span>{runtime.data.version}</span>
-              <span>{runtime.source === "live" ? "Live" : "Mock"}</span>
+              <span>{runtime.state.badge}</span>
             </div>
           </Card>
         </div>
@@ -155,6 +161,7 @@ export function PageHeader({
   action?: React.ReactNode;
 }) {
   const runtime = useRuntimeSummary();
+  const runtimeHealthy = runtime.source === "live" && !runtime.state.isStale;
 
   return (
     <div className="mb-5 flex items-start justify-between gap-4">
@@ -176,9 +183,14 @@ export function PageHeader({
           中文
           <ChevronDown className="h-4 w-4" />
         </Button>
-        <Badge variant={runtime.source === "live" ? "success" : "warning"}>
-          <Circle className="h-2 w-2 fill-emerald-500 text-emerald-500" />
-          {runtime.data.proxy}
+        <Badge variant={runtimeHealthy ? "success" : "warning"}>
+          <Circle
+            className={cn(
+              "h-2 w-2",
+              runtimeHealthy ? "fill-emerald-500 text-emerald-500" : "fill-amber-500 text-amber-500",
+            )}
+          />
+          {runtimeHealthy ? runtime.data.proxy : runtime.state.badge}
         </Badge>
         <Badge variant="teal">
           <WalletCards className="h-3.5 w-3.5" />

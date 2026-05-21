@@ -186,6 +186,7 @@ export function mapRuntimeSummary(
 
   return {
     mode: "running",
+    ownerMode: "unknown",
     proxy: "Running",
     port: proxyPort,
     adminPort,

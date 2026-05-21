@@ -37,13 +37,14 @@ export function SettingsPage() {
     <>
       <PageHeader title="设置" subtitle="配置桌面行为、本地代理、Codex 连接和高级工具" />
       <DataStateBanner
-        source={runtime.source}
-        isLoading={runtime.isLoading}
-        isRefreshing={runtime.isRefreshing}
-        errorMessage={runtime.errorMessage}
+        state={runtime.state}
         onRefresh={runtime.refetch}
       />
-      <StatusStrip runtime={runtime.data} onRefresh={runtime.refetch} />
+      <StatusStrip
+        runtime={runtime.data}
+        healthy={runtime.source === "live" && !runtime.state.isStale}
+        onRefresh={runtime.refetch}
+      />
 
       <div className="grid grid-cols-2 gap-4">
         <SettingsCard title="桌面行为" description="控制应用启动、托盘和窗口关闭方式。">
@@ -86,7 +87,11 @@ export function SettingsPage() {
             <Badge variant={runtime.source === "live" ? "success" : "warning"}>
               Admin {runtime.data.adminPort}
             </Badge>
+            <Badge variant="warning">Owner 待确认</Badge>
           </div>
+          <p className="text-xs leading-5 text-amber-700">
+            生命周期 owner 还没有由后端明确上报：当前只展示“已连接/可附加”的事实，不会把普通退出误写成停止代理。
+          </p>
           <div className="flex gap-2 pt-2">
             <Button variant="outline"><Copy className="h-4 w-4" />复制 Endpoint</Button>
             <Button variant="outline"><RefreshCw className="h-4 w-4" />重新加载运行时</Button>

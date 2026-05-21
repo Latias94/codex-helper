@@ -19,6 +19,7 @@ import type {
 
 export const mockRuntime: RuntimeSummary = {
   mode: "running",
+  ownerMode: "unknown",
   proxy: mockRuntimeSummary.proxy,
   port: mockRuntimeSummary.port,
   adminPort: mockRuntimeSummary.port + 1000,

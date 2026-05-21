@@ -98,7 +98,16 @@ TDC-060 is complete with concerns:
 - TanStack Query hooks preserve mock fallback for design iteration and display a visible `DataStateBanner` when showing offline sample data or refresh/error states.
 - Validation passed on 2026-05-21: `pnpm test`, `pnpm build`, `cargo fmt --check`, `cargo check -p codex-helper-desktop`, `git diff --check -- .`, and loopback admin API smoke against `127.0.0.1:4211`.
 
-Current next task: TDC-070 loading/empty/disconnected/auth-token-required/stale-runtime state polish and visual QA. Tauri lifecycle, tray, and safe mutations remain follow-on work.
+TDC-070 is complete with concerns:
+
+- `apps/desktop/src/lib/api/data-state.ts` defines the shared frontend state taxonomy for loading, live, refreshing, mock, desktop-runtime-unavailable, disconnected, auth-token-required, empty, and stale states.
+- `apps/desktop/src/lib/api/use-admin-read-model.ts` centralizes the TanStack Query read-model boundary so Dashboard, Providers, Usage, Settings, shell footer, and page headers present consistent state.
+- `DataStateBanner` now renders state-specific severity, badge, copy, icons, and retry actions instead of a single generic fallback message.
+- Empty providers/usage states now teach the next action, and auth/disconnected/stale states explain what to fix before trying control actions.
+- Owner semantics are intentionally shown as pending/uncertain in shell/status/settings copy; the frontend no longer pretends it knows whether the runtime is desktop-owned or attached.
+- Validation passed on 2026-05-21: `pnpm test` (5 files, 20 tests), `pnpm build`, `cargo fmt --check`, `cargo check -p codex-helper-desktop`, and `git diff --check -- .`.
+
+Current next task: TDC-080 safe control actions. Implement attach, desktop-owned start, stop-owned vs explicit remote stop, switch on/off, reload runtime, probe station, refresh balances, and provider/session overrides with confirmation rules. TDC-090 tray and authoritative lifecycle owner semantics remain follow-on work.
 
 ## shadcn/ui Prototype Prompt
 

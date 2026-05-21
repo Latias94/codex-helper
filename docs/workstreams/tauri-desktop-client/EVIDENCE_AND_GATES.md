@@ -521,6 +521,68 @@ Result:
 
 - DONE_WITH_CONCERNS — Dashboard, Providers, Usage, and Settings now consume real read-only admin data when available and fall back to mock data when unavailable. TDC-070 should refine state taxonomy and visual QA.
 
+### 2026-05-21 — TDC-070 runtime data states and visual QA
+
+Evidence:
+
+- Added a unified frontend runtime data-state taxonomy:
+  - `loading`;
+  - `live`;
+  - `refreshing`;
+  - `mock`;
+  - `unavailable`;
+  - `disconnected`;
+  - `auth-required`;
+  - `empty`;
+  - `stale`.
+- Added `apps/desktop/src/lib/api/data-state.ts` to classify Tauri/admin API failures into user-facing states.
+- Added `apps/desktop/src/lib/api/use-admin-read-model.ts` so Dashboard, Providers, Usage, Settings, shell runtime footer, and page headers share one read-model state boundary.
+- Upgraded `DataStateBanner` from a generic mock/error banner into a state-aware banner with distinct copy, severity, badge, icon, and retry affordance.
+- Added explicit next-action copy:
+  - disconnected state tells the user to start the local proxy or attach an existing runtime later;
+  - auth-required state points at `CODEX_HELPER_ADMIN_TOKEN` and `x-codex-helper-admin-token`;
+  - stale state keeps previous live data visible but disables unsafe live actions;
+  - empty usage/providers states explain how to produce records or configure providers.
+- Added visible lifecycle uncertainty:
+  - shell/status/settings now show owner-pending messaging instead of pretending the frontend knows whether the runtime is desktop-owned or attached;
+  - no ordinary quit/close path is represented as stopping an attached runtime.
+
+Verification:
+
+- Command: `pnpm test`
+- Scope: `apps/desktop`
+- Result: PASS — Vitest passed: 5 files, 20 tests. Covers data-state classification, `DataStateBanner` component states, route-level mock fallback, admin-token-required state, empty usage state, and live read-model rendering.
+
+- Command: `pnpm build`
+- Scope: `apps/desktop`
+- Result: PASS — TypeScript and Vite production build completed.
+- Output summary:
+  - `dist/index.html`
+  - `dist/assets/index-ClSUnf_7.css`
+  - `dist/assets/index-DG-9RxYV.js`
+
+- Command: `cargo fmt --check`
+- Scope: repository workspace
+- Result: PASS.
+
+- Command: `cargo check -p codex-helper-desktop`
+- Scope: `apps/desktop/src-tauri`
+- Result: PASS.
+
+- Command: `git diff --check -- .`
+- Scope: full repository diff
+- Result: PASS — no diff whitespace errors reported. Git emitted only Windows LF/CRLF warnings for edited text files.
+
+Concerns / deferred:
+
+- Full Tauri window smoke remains pending; this pass validates browser-rendered React state surfaces through tests/build but does not run `pnpm tauri:dev`.
+- Actual start/attach/stop/switch mutations are intentionally still disabled or placeholder-only until TDC-080.
+- Runtime owner semantics are only surfaced as uncertainty in the UI; authoritative desktop-owned vs attached behavior remains TDC-090.
+
+Result:
+
+- DONE_WITH_CONCERNS — TDC-070 state taxonomy and visual QA are implemented. Next step is TDC-080 safe control actions.
+
 ## Deferred / Not Run Yet
 
 - No full Tauri window smoke has been run yet.

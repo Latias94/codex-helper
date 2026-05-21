@@ -18,13 +18,14 @@ export function DashboardPage() {
     <>
       <PageHeader title="仪表盘" subtitle="查看本地代理、Codex 连接、供应商健康和今日用量" />
       <DataStateBanner
-        source={dashboard.source}
-        isLoading={dashboard.isLoading}
-        isRefreshing={dashboard.isRefreshing}
-        errorMessage={dashboard.errorMessage}
+        state={dashboard.state}
         onRefresh={dashboard.refetch}
       />
-      <StatusStrip runtime={runtime} onRefresh={dashboard.refetch} />
+      <StatusStrip
+        runtime={runtime}
+        healthy={dashboard.source === "live" && !dashboard.state.isStale}
+        onRefresh={dashboard.refetch}
+      />
 
       <div className="grid grid-cols-4 gap-4">
         {metrics.map((metric) => (
@@ -53,15 +54,15 @@ export function DashboardPage() {
               action="Switch On"
             />
             <div className="flex flex-wrap gap-2 rounded-2xl bg-mint-50 p-3">
-              <Button>
+              <Button disabled={!dashboard.state.canStartProxy}>
                 <Play className="h-4 w-4" />
                 Start Proxy
               </Button>
-              <Button variant="outline">
+              <Button variant="outline" disabled={!dashboard.state.canUseLiveActions}>
                 <Power className="h-4 w-4" />
                 Switch On
               </Button>
-              <Button variant="outline">
+              <Button variant="outline" onClick={dashboard.refetch}>
                 <RefreshCw className="h-4 w-4" />
                 Refresh
               </Button>

@@ -9,8 +9,41 @@ export type CostEstimate = {
 
 export type DataSource = "live" | "mock";
 
+export type RuntimeDataStatus =
+  | "loading"
+  | "live"
+  | "refreshing"
+  | "mock"
+  | "unavailable"
+  | "disconnected"
+  | "auth-required"
+  | "empty"
+  | "stale";
+
+export type RuntimeOwnerMode = "desktop-owned" | "attached" | "unknown";
+export type RuntimeDataSeverity = "neutral" | "info" | "success" | "warning" | "danger";
+
+export type RuntimeDataState = {
+  status: RuntimeDataStatus;
+  source: DataSource;
+  severity: RuntimeDataSeverity;
+  title: string;
+  description: string;
+  badge: string;
+  canUseLiveActions: boolean;
+  canStartProxy: boolean;
+  canAttachProxy: boolean;
+  canStopProxy: boolean;
+  isFallback: boolean;
+  isStale: boolean;
+  ownerMode: RuntimeOwnerMode;
+  lastUpdatedAt?: number;
+  errorMessage?: string;
+};
+
 export type RuntimeSummary = {
   mode: RuntimeMode;
+  ownerMode: RuntimeOwnerMode;
   proxy: string;
   port: number;
   adminPort: number;
@@ -116,6 +149,7 @@ export type UsageData = {
 export type QueryBackedData<T> = {
   data: T;
   source: DataSource;
+  state: RuntimeDataState;
   isLoading: boolean;
   isRefreshing: boolean;
   errorMessage?: string;

@@ -114,11 +114,16 @@
       "date": "2026-05-21",
       "kind": "read-only-admin-wiring",
       "summary": "Completed TDC-060 with concerns. Added Tauri get_admin_read_model, frontend admin DTO/client/mapper hooks, Dashboard/Providers/Usage/Settings live read-only data wiring, mock fallback banners, mapper/API tests, and loopback admin API smoke against 127.0.0.1:4211. pnpm test/build, cargo fmt --check, cargo check -p codex-helper-desktop, and git diff --check pass."
+    },
+    {
+      "date": "2026-05-21",
+      "kind": "runtime-state-polish",
+      "summary": "Completed TDC-070 with concerns. Added shared runtime data-state taxonomy and read-model hook, upgraded DataStateBanner for loading/unavailable/disconnected/auth-required/empty/stale states, surfaced owner-pending lifecycle uncertainty, and validated with pnpm test/build, cargo fmt --check, cargo check -p codex-helper-desktop, and git diff --check."
     }
   ],
   "adr_refs": [],
   "continue_policy": {
     "default_action": "continue",
-    "notes": "Next step is TDC-070 state polish for loading, empty, disconnected, auth-token-required, and stale-runtime surfaces plus visual QA. Tauri lifecycle owner/tray and safe mutations remain later tasks."
+    "notes": "Next step is TDC-080 safe mutations: attach, desktop-owned start, stop-owned vs explicit remote stop, switch on/off, reload runtime, probe station, refresh balances, and overrides. Tauri lifecycle owner/tray remains TDC-090."
   }
 }

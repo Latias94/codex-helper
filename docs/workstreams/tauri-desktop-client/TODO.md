@@ -68,12 +68,12 @@ Last updated: 2026-05-21
   Evidence: `EVIDENCE_AND_GATES.md` 2026-05-21 TDC-060 entry.
   Handoff: DONE_WITH_CONCERNS — advanced sessions/routing/diagnostics remain collapsed, disabled, or mocked until simple surfaces work.
 
-- [ ] TDC-070 [owner=main-or-worker] [deps=TDC-060] [scope=desktop-frontend/src/state,desktop-frontend/src/components]
+- [x] TDC-070 [owner=main-or-worker] [deps=TDC-060] [scope=desktop-frontend/src/state,desktop-frontend/src/components]
   Goal: Add loading, empty, disconnected, auth-token-required, and stale-runtime states.
   Validation: component/story/visual checks for key states.
-  Review: Empty states must teach the next action.
-  Evidence: state images or tests.
-  Handoff: Must not hide attached/resident lifecycle uncertainty.
+  Review: DONE_WITH_CONCERNS — state taxonomy is now explicit and empty/fallback banners teach the next action. Visual QA is covered by component and route tests plus production build, but a full interactive Tauri window smoke remains pending.
+  Evidence: `apps/desktop/src/lib/api/data-state.test.ts`, `apps/desktop/src/components/page/DataStateBanner.test.tsx`, `apps/desktop/src/app/App.test.tsx`; `EVIDENCE_AND_GATES.md` 2026-05-21 TDC-070 entry.
+  Handoff: DONE_WITH_CONCERNS — attached/resident lifecycle uncertainty is now visible as owner-pending copy; actual owner semantics and tray behavior remain TDC-090.
 
 ## M4 — Safe Mutations And Desktop Lifecycle
 

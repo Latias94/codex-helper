@@ -1,10 +1,10 @@
 import { useQuery } from "@tanstack/react-query";
 
-import { fetchAdminReadModelFromTauri } from "@/lib/api/admin-read-model";
 import { mapAdminDashboardData } from "@/lib/api/mappers";
 import { mockDashboardData } from "@/lib/api/mock-data";
 import { queryKeys } from "@/lib/api/query-keys";
 import type { QueryBackedData } from "@/lib/api/types";
+import { useAdminReadModelState } from "@/lib/api/use-admin-read-model";
 import { getAppMetadata } from "@/lib/tauri/commands";
 
 export function useAppMetadata() {
@@ -16,11 +16,8 @@ export function useAppMetadata() {
 
 export function useDashboardData(): QueryBackedData<typeof mockDashboardData> {
   const metadata = useAppMetadata();
-  const readModel = useQuery({
-    queryFn: fetchAdminReadModelFromTauri,
-    queryKey: queryKeys.admin.readModel,
-    retry: 1,
-  });
+  const query = useAdminReadModelState();
+  const { readModel, state } = query;
 
   const appVersion = metadata.data?.version ?? "0.16.0";
   const data = readModel.data
@@ -37,12 +34,11 @@ export function useDashboardData(): QueryBackedData<typeof mockDashboardData> {
 
   return {
     data,
-    source: readModel.data ? "live" : "mock",
-    isLoading: readModel.isLoading,
-    isRefreshing: readModel.isFetching,
-    errorMessage: readModel.error instanceof Error ? readModel.error.message : undefined,
-    refetch: () => {
-      void readModel.refetch();
-    },
+    source: query.source,
+    state,
+    isLoading: query.isLoading,
+    isRefreshing: query.isRefreshing,
+    errorMessage: query.errorMessage,
+    refetch: query.refetch,
   };
 }

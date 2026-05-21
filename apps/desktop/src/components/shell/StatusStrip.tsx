@@ -3,19 +3,24 @@ import { Clock3, Database, Link2, RefreshCw, Server } from "lucide-react";
 import { Button, Card } from "@/components/ui";
 import { mockRuntime } from "@/lib/api/mock-data";
 import type { RuntimeSummary } from "@/lib/api/types";
+import { cn } from "@/lib/utils";
 
 export function StatusStrip({
   runtime = mockRuntime,
   onRefresh,
+  healthy = true,
 }: {
   runtime?: RuntimeSummary;
   onRefresh?: () => void;
+  healthy?: boolean;
 }) {
   return (
     <Card className="mb-4 flex items-center justify-between px-5 py-3">
       <div className="flex items-center gap-8 text-sm">
         <span className="flex items-center gap-2 text-slate-700">
-          <span className="h-2.5 w-2.5 rounded-full bg-emerald-500" />
+          <span
+            className={cn("h-2.5 w-2.5 rounded-full", healthy ? "bg-emerald-500" : "bg-amber-500")}
+          />
           <Server className="h-4 w-4 text-slate-400" />
           本地代理 <b className="text-teal-700">{runtime.proxy} · {runtime.port}</b>
         </span>
@@ -30,6 +35,9 @@ export function StatusStrip({
         <span className="flex items-center gap-2 text-slate-500">
           <Clock3 className="h-4 w-4" />
           最近刷新 {runtime.updatedAtLabel}
+        </span>
+        <span className="rounded-full border border-amber-200 bg-amber-50 px-2.5 py-1 text-xs font-medium text-amber-700">
+          生命周期 owner 待确认
         </span>
       </div>
       <Button variant="outline" onClick={onRefresh}>

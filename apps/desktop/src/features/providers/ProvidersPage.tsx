@@ -24,10 +24,7 @@ export function ProvidersPage() {
         }
       />
       <DataStateBanner
-        source={providersState.source}
-        isLoading={providersState.isLoading}
-        isRefreshing={providersState.isRefreshing}
-        errorMessage={providersState.errorMessage}
+        state={providersState.state}
         onRefresh={providersState.refetch}
       />
 
