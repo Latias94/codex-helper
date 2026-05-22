@@ -174,115 +174,293 @@ fn openai_model_display_name(item: &Value) -> Option<String> {
 
 fn codex_model_info_json(slug: &str, display_name: &str, fallback_priority: usize) -> Value {
     let known = known_codex_model(slug);
-    let hidden = known.hidden || slug.starts_with("gpt-image-") || slug == "codex-auto-review";
-    let input_modalities = if slug.contains("spark") || slug.starts_with("gpt-image-") {
-        vec!["text"]
-    } else {
-        vec!["text", "image"]
-    };
-    let context_window = known.context_window;
-    let supports_search_tool = !slug.contains("spark") && !slug.starts_with("gpt-image-");
+    let caps = known.capabilities;
     let priority = known
         .priority
         .unwrap_or_else(|| 10_000 + i32::try_from(fallback_priority).unwrap_or(0));
-    let supports_fast_service_tier = supports_fast_service_tier(slug);
-    let additional_speed_tiers = if supports_fast_service_tier {
-        serde_json::json!(["fast"])
-    } else {
-        serde_json::json!([])
-    };
-    let service_tiers = if supports_fast_service_tier {
-        serde_json::json!([
-            {
-                "id": "priority",
-                "name": "Fast",
-                "description": "1.5x speed, increased usage"
-            }
-        ])
-    } else {
-        serde_json::json!([])
-    };
 
     serde_json::json!({
         "slug": slug,
         "display_name": known.display_name.unwrap_or(display_name),
         "description": known.description,
-        "default_reasoning_level": "medium",
-        "supported_reasoning_levels": [
-            {
-                "effort": "low",
-                "description": "Fast responses with lighter reasoning"
-            },
-            {
-                "effort": "medium",
-                "description": "Balances speed and reasoning depth for everyday tasks"
-            },
-            {
-                "effort": "high",
-                "description": "Greater reasoning depth for complex problems"
-            },
-            {
-                "effort": "xhigh",
-                "description": "Extra high reasoning depth for complex problems"
-            }
-        ],
-        "shell_type": "shell_command",
-        "visibility": if hidden { "hide" } else { "list" },
-        "supported_in_api": !slug.starts_with("gpt-image-"),
+        "default_reasoning_level": caps.default_reasoning_level,
+        "supported_reasoning_levels": caps.reasoning_levels.json(),
+        "shell_type": caps.shell_type,
+        "visibility": if known.hidden { "hide" } else { "list" },
+        "supported_in_api": caps.supported_in_api,
         "priority": priority,
-        "additional_speed_tiers": additional_speed_tiers,
-        "service_tiers": service_tiers,
+        "additional_speed_tiers": caps.additional_speed_tiers_json(),
+        "service_tiers": caps.service_tiers_json(),
         "availability_nux": null,
         "upgrade": null,
         "base_instructions": "You are Codex, a coding agent based on GPT-5.",
         "model_messages": null,
-        "supports_reasoning_summaries": !slug.starts_with("gpt-image-"),
-        "default_reasoning_summary": "auto",
-        "support_verbosity": true,
-        "default_verbosity": "low",
-        "apply_patch_tool_type": "freeform",
-        "web_search_tool_type": if supports_search_tool { "text_and_image" } else { "text" },
+        "supports_reasoning_summaries": caps.supports_reasoning_summaries,
+        "default_reasoning_summary": caps.default_reasoning_summary,
+        "support_verbosity": caps.support_verbosity,
+        "default_verbosity": caps.default_verbosity,
+        "apply_patch_tool_type": caps.apply_patch_tool_type,
+        "web_search_tool_type": caps.web_search_tool_type,
         "truncation_policy": {
-            "mode": "tokens",
-            "limit": 10000
+            "mode": caps.truncation_policy.mode,
+            "limit": caps.truncation_policy.limit
         },
-        "supports_parallel_tool_calls": true,
-        "supports_image_detail_original": input_modalities.contains(&"image"),
-        "context_window": context_window,
-        "max_context_window": context_window,
+        "supports_parallel_tool_calls": caps.supports_parallel_tool_calls,
+        "supports_image_detail_original": caps.supports_image_detail_original,
+        "context_window": known.context_window,
+        "max_context_window": known.max_context_window,
         "auto_compact_token_limit": null,
         "effective_context_window_percent": 95,
         "experimental_supported_tools": [],
-        "input_modalities": input_modalities,
-        "supports_search_tool": supports_search_tool
+        "input_modalities": caps.input_modalities(),
+        "supports_search_tool": caps.supports_search_tool
     })
 }
 
-fn supports_fast_service_tier(slug: &str) -> bool {
-    let normalized = slug.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        // OpenAI Priority processing / Codex Fast is exposed to the TUI as a
-        // service tier with id `priority` and display name `Fast`.
-        "gpt-5.5" | "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.3-codex" => true,
-        _ => infer_future_gpt_fast_service_tier(&normalized),
+#[derive(Clone, Copy)]
+struct ModelCapabilities {
+    reasoning_levels: ReasoningLevels,
+    default_reasoning_level: Option<&'static str>,
+    supports_reasoning_summaries: bool,
+    default_reasoning_summary: &'static str,
+    support_verbosity: bool,
+    default_verbosity: Option<&'static str>,
+    fast_service_tier: bool,
+    text_input: bool,
+    image_input: bool,
+    supports_image_detail_original: bool,
+    shell_type: &'static str,
+    supported_in_api: bool,
+    apply_patch_tool_type: Option<&'static str>,
+    web_search_tool_type: &'static str,
+    supports_search_tool: bool,
+    truncation_policy: TruncationPolicyCompat,
+    supports_parallel_tool_calls: bool,
+}
+
+impl ModelCapabilities {
+    const fn modern_gpt() -> Self {
+        Self {
+            reasoning_levels: ReasoningLevels::Modern,
+            default_reasoning_level: Some("medium"),
+            supports_reasoning_summaries: true,
+            default_reasoning_summary: "none",
+            support_verbosity: true,
+            default_verbosity: Some("low"),
+            fast_service_tier: false,
+            text_input: true,
+            image_input: true,
+            supports_image_detail_original: true,
+            shell_type: "shell_command",
+            supported_in_api: true,
+            apply_patch_tool_type: Some("freeform"),
+            web_search_tool_type: "text_and_image",
+            supports_search_tool: true,
+            truncation_policy: TruncationPolicyCompat::tokens(10_000),
+            supports_parallel_tool_calls: true,
+        }
+    }
+
+    const fn gpt_5_2() -> Self {
+        Self {
+            reasoning_levels: ReasoningLevels::Gpt52,
+            default_reasoning_level: Some("medium"),
+            supports_reasoning_summaries: true,
+            default_reasoning_summary: "auto",
+            support_verbosity: true,
+            default_verbosity: Some("low"),
+            fast_service_tier: false,
+            text_input: true,
+            image_input: true,
+            supports_image_detail_original: false,
+            shell_type: "shell_command",
+            supported_in_api: true,
+            apply_patch_tool_type: Some("freeform"),
+            web_search_tool_type: "text",
+            supports_search_tool: true,
+            truncation_policy: TruncationPolicyCompat::bytes(10_000),
+            supports_parallel_tool_calls: true,
+        }
+    }
+
+    const fn codex_spark() -> Self {
+        Self {
+            image_input: false,
+            supports_image_detail_original: false,
+            web_search_tool_type: "text",
+            supports_search_tool: false,
+            fast_service_tier: false,
+            ..Self::modern_gpt()
+        }
+    }
+
+    const fn gpt_image() -> Self {
+        Self {
+            reasoning_levels: ReasoningLevels::None,
+            default_reasoning_level: None,
+            supports_reasoning_summaries: false,
+            default_reasoning_summary: "auto",
+            support_verbosity: false,
+            default_verbosity: None,
+            fast_service_tier: false,
+            text_input: true,
+            image_input: false,
+            supports_image_detail_original: false,
+            shell_type: "disabled",
+            supported_in_api: false,
+            apply_patch_tool_type: None,
+            web_search_tool_type: "text",
+            supports_search_tool: false,
+            truncation_policy: TruncationPolicyCompat::tokens(10_000),
+            supports_parallel_tool_calls: false,
+        }
+    }
+
+    const fn conservative_coding() -> Self {
+        Self {
+            reasoning_levels: ReasoningLevels::None,
+            default_reasoning_level: None,
+            supports_reasoning_summaries: false,
+            default_reasoning_summary: "auto",
+            support_verbosity: false,
+            default_verbosity: None,
+            fast_service_tier: false,
+            text_input: true,
+            image_input: false,
+            supports_image_detail_original: false,
+            shell_type: "shell_command",
+            supported_in_api: true,
+            apply_patch_tool_type: Some("freeform"),
+            web_search_tool_type: "text",
+            supports_search_tool: false,
+            truncation_policy: TruncationPolicyCompat::tokens(10_000),
+            supports_parallel_tool_calls: false,
+        }
+    }
+
+    const fn with_fast_service_tier(mut self) -> Self {
+        self.fast_service_tier = true;
+        self
+    }
+
+    const fn with_default_verbosity(mut self, default_verbosity: &'static str) -> Self {
+        self.default_verbosity = Some(default_verbosity);
+        self
+    }
+
+    const fn with_web_search_type(mut self, web_search_tool_type: &'static str) -> Self {
+        self.web_search_tool_type = web_search_tool_type;
+        self
+    }
+
+    fn input_modalities(self) -> Vec<&'static str> {
+        let mut modalities = Vec::new();
+        if self.text_input {
+            modalities.push("text");
+        }
+        if self.image_input {
+            modalities.push("image");
+        }
+        modalities
+    }
+
+    fn additional_speed_tiers_json(self) -> Value {
+        if self.fast_service_tier {
+            serde_json::json!(["fast"])
+        } else {
+            serde_json::json!([])
+        }
+    }
+
+    fn service_tiers_json(self) -> Value {
+        if self.fast_service_tier {
+            serde_json::json!([
+                {
+                    "id": "priority",
+                    "name": "Fast",
+                    "description": "1.5x speed, increased usage"
+                }
+            ])
+        } else {
+            serde_json::json!([])
+        }
     }
 }
 
-fn infer_future_gpt_fast_service_tier(slug: &str) -> bool {
-    if !slug.starts_with("gpt-") || is_fast_service_tier_excluded_slug(slug) {
-        return false;
-    }
-
-    let Some((major, minor)) = parse_gpt_version(slug) else {
-        return false;
-    };
-
-    // Conservative fallback: current verified GPT 5.4+ models support Priority
-    // processing, and future GPT major series are expected to keep supporting it.
-    major > 5 || (major == 5 && minor.is_some_and(|minor| minor >= 4))
+#[derive(Clone, Copy)]
+enum ReasoningLevels {
+    None,
+    Modern,
+    Gpt52,
 }
 
-fn is_fast_service_tier_excluded_slug(slug: &str) -> bool {
+impl ReasoningLevels {
+    fn json(self) -> Value {
+        match self {
+            Self::None => serde_json::json!([]),
+            Self::Modern => serde_json::json!([
+                {
+                    "effort": "low",
+                    "description": "Fast responses with lighter reasoning"
+                },
+                {
+                    "effort": "medium",
+                    "description": "Balances speed and reasoning depth for everyday tasks"
+                },
+                {
+                    "effort": "high",
+                    "description": "Greater reasoning depth for complex problems"
+                },
+                {
+                    "effort": "xhigh",
+                    "description": "Extra high reasoning depth for complex problems"
+                }
+            ]),
+            Self::Gpt52 => serde_json::json!([
+                {
+                    "effort": "low",
+                    "description": "Balances speed with some reasoning; useful for straightforward queries and short explanations"
+                },
+                {
+                    "effort": "medium",
+                    "description": "Provides a solid balance of reasoning depth and latency for general-purpose tasks"
+                },
+                {
+                    "effort": "high",
+                    "description": "Maximizes reasoning depth for complex or ambiguous problems"
+                },
+                {
+                    "effort": "xhigh",
+                    "description": "Extra high reasoning for complex problems"
+                }
+            ]),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TruncationPolicyCompat {
+    mode: &'static str,
+    limit: i64,
+}
+
+impl TruncationPolicyCompat {
+    const fn bytes(limit: i64) -> Self {
+        Self {
+            mode: "bytes",
+            limit,
+        }
+    }
+
+    const fn tokens(limit: i64) -> Self {
+        Self {
+            mode: "tokens",
+            limit,
+        }
+    }
+}
+
+fn is_gpt_capability_excluded_slug(slug: &str) -> bool {
     slug.starts_with("gpt-image-")
         || slug.starts_with("gpt-oss-")
         || slug.starts_with("gpt-realtime")
@@ -300,6 +478,16 @@ fn is_fast_service_tier_excluded_slug(slug: &str) -> bool {
         || slug.contains("-nano-")
         || slug.ends_with("-pro")
         || slug.contains("-pro-")
+}
+
+fn infer_future_gpt_capabilities(slug: &str) -> Option<ModelCapabilities> {
+    if !slug.starts_with("gpt-") || is_gpt_capability_excluded_slug(slug) {
+        return None;
+    }
+
+    let (major, minor) = parse_gpt_version(slug)?;
+    let is_future_priority_gpt = major > 5 || (major == 5 && minor.is_some_and(|minor| minor >= 4));
+    is_future_priority_gpt.then(|| ModelCapabilities::modern_gpt().with_fast_service_tier())
 }
 
 fn parse_gpt_version(slug: &str) -> Option<(u32, Option<u32>)> {
@@ -324,73 +512,108 @@ fn parse_ascii_u32_prefix(value: &str) -> Option<(u32, &str)> {
     Some((parsed, rest))
 }
 
-#[derive(Default)]
 struct KnownCodexModel {
     display_name: Option<&'static str>,
     description: Option<&'static str>,
     priority: Option<i32>,
     context_window: i64,
+    max_context_window: i64,
     hidden: bool,
+    capabilities: ModelCapabilities,
 }
 
 fn known_codex_model(slug: &str) -> KnownCodexModel {
-    match slug {
+    let normalized = slug.trim().to_ascii_lowercase();
+    match normalized.as_str() {
         "gpt-5.5" => KnownCodexModel {
             display_name: Some("GPT-5.5"),
             description: Some("Frontier model for complex coding, research, and real-world work."),
             priority: Some(0),
             context_window: 272_000,
+            max_context_window: 272_000,
             hidden: false,
+            capabilities: ModelCapabilities::modern_gpt().with_fast_service_tier(),
         },
         "gpt-5.4" => KnownCodexModel {
             display_name: Some("gpt-5.4"),
             description: Some("Strong model for everyday coding."),
             priority: Some(10),
             context_window: 272_000,
+            max_context_window: 1_000_000,
             hidden: false,
+            capabilities: ModelCapabilities::modern_gpt().with_fast_service_tier(),
         },
         "gpt-5.4-mini" => KnownCodexModel {
             display_name: Some("GPT-5.4-Mini"),
             description: Some("Small, fast, and cost-efficient model for simpler coding tasks."),
             priority: Some(20),
             context_window: 272_000,
+            max_context_window: 272_000,
             hidden: false,
+            capabilities: ModelCapabilities::modern_gpt()
+                .with_default_verbosity("medium")
+                .with_fast_service_tier(),
         },
         "gpt-5.3-codex" => KnownCodexModel {
             display_name: Some("GPT-5.3 Codex"),
             description: Some("Coding-optimized model."),
             priority: Some(30),
             context_window: 272_000,
+            max_context_window: 272_000,
             hidden: false,
+            capabilities: ModelCapabilities::modern_gpt()
+                .with_web_search_type("text")
+                .with_fast_service_tier(),
         },
         "gpt-5.3-codex-spark" => KnownCodexModel {
             display_name: Some("GPT-5.3 Codex Spark"),
             description: Some("Coding-optimized model with limited image support."),
             priority: Some(40),
             context_window: 272_000,
+            max_context_window: 272_000,
             hidden: false,
+            capabilities: ModelCapabilities::codex_spark(),
         },
         "gpt-5.2" => KnownCodexModel {
             display_name: Some("GPT-5.2"),
             description: Some("Optimized for professional work and long-running agents."),
             priority: Some(50),
             context_window: 272_000,
+            max_context_window: 272_000,
             hidden: false,
+            capabilities: ModelCapabilities::gpt_5_2(),
         },
         "codex-auto-review" => KnownCodexModel {
             display_name: Some("Codex Auto Review"),
             description: Some("Internal review model."),
             priority: Some(50_000),
             context_window: 272_000,
+            max_context_window: 272_000,
             hidden: true,
+            capabilities: ModelCapabilities::modern_gpt(),
         },
-        _ => KnownCodexModel {
+        _ if normalized.starts_with("gpt-image-") => KnownCodexModel {
             display_name: None,
-            description: Some("Model served by the configured Codex upstream."),
+            description: Some("Image model served by the configured Codex upstream."),
             priority: None,
             context_window: 272_000,
-            hidden: false,
+            max_context_window: 272_000,
+            hidden: true,
+            capabilities: ModelCapabilities::gpt_image(),
         },
+        _ => {
+            let capabilities = infer_future_gpt_capabilities(&normalized)
+                .unwrap_or_else(ModelCapabilities::conservative_coding);
+            KnownCodexModel {
+                display_name: None,
+                description: Some("Model served by the configured Codex upstream."),
+                priority: None,
+                context_window: 272_000,
+                max_context_window: 272_000,
+                hidden: false,
+                capabilities,
+            }
+        }
     }
 }
 
@@ -534,6 +757,159 @@ mod tests {
         }
     }
 
+    #[test]
+    fn translated_openai_models_list_populates_modern_gpt_capabilities() {
+        let value = translated_models_value(&["gpt-5.5"]);
+        let model = model_by_slug(&value, "gpt-5.5");
+
+        assert_eq!(
+            model.get("default_reasoning_level").and_then(Value::as_str),
+            Some("medium")
+        );
+        assert_reasoning_efforts(model, &["low", "medium", "high", "xhigh"]);
+        assert_eq!(
+            model
+                .get("supports_reasoning_summaries")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            model
+                .get("default_reasoning_summary")
+                .and_then(Value::as_str),
+            Some("none")
+        );
+        assert_eq!(
+            model.get("support_verbosity").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            model.get("default_verbosity").and_then(Value::as_str),
+            Some("low")
+        );
+        assert_eq!(
+            model.get("apply_patch_tool_type").and_then(Value::as_str),
+            Some("freeform")
+        );
+        assert_eq!(
+            model.get("web_search_tool_type").and_then(Value::as_str),
+            Some("text_and_image")
+        );
+        assert_eq!(
+            model
+                .get("supports_parallel_tool_calls")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            model
+                .get("supports_image_detail_original")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_truncation_policy(model, "tokens", 10_000);
+        assert_input_modalities(model, &["text", "image"]);
+        assert_eq!(
+            model.get("supports_search_tool").and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn translated_openai_models_list_preserves_gpt_5_2_capability_differences() {
+        let value = translated_models_value(&["gpt-5.2"]);
+        let model = model_by_slug(&value, "gpt-5.2");
+
+        assert_eq!(
+            model
+                .get("default_reasoning_summary")
+                .and_then(Value::as_str),
+            Some("auto")
+        );
+        assert_eq!(
+            model.get("web_search_tool_type").and_then(Value::as_str),
+            Some("text")
+        );
+        assert_eq!(
+            model
+                .get("supports_image_detail_original")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_truncation_policy(model, "bytes", 10_000);
+        assert!(!model_has_fast_service_tier(model));
+    }
+
+    #[test]
+    fn translated_openai_models_list_uses_modern_capabilities_for_future_gpt_models() {
+        let value = translated_models_value(&["gpt-6-preview"]);
+        let model = model_by_slug(&value, "gpt-6-preview");
+
+        assert!(model_has_fast_service_tier(model));
+        assert_eq!(
+            model
+                .get("supports_reasoning_summaries")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            model.get("support_verbosity").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            model.get("apply_patch_tool_type").and_then(Value::as_str),
+            Some("freeform")
+        );
+        assert_input_modalities(model, &["text", "image"]);
+    }
+
+    #[test]
+    fn translated_openai_models_list_uses_conservative_capabilities_for_unknown_non_gpt_models() {
+        let value = translated_models_value(&["claude-sonnet-4-5"]);
+        let model = model_by_slug(&value, "claude-sonnet-4-5");
+
+        assert_eq!(model.get("default_reasoning_level"), Some(&Value::Null));
+        assert_reasoning_efforts(model, &[]);
+        assert_eq!(
+            model
+                .get("supports_reasoning_summaries")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            model.get("support_verbosity").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            model.get("apply_patch_tool_type").and_then(Value::as_str),
+            Some("freeform")
+        );
+        assert_eq!(
+            model
+                .get("supports_parallel_tool_calls")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_input_modalities(model, &["text"]);
+        assert!(!model_has_fast_service_tier(model));
+    }
+
+    fn translated_models_value(slugs: &[&str]) -> Value {
+        let data = slugs
+            .iter()
+            .map(|slug| serde_json::json!({ "id": slug }))
+            .collect::<Vec<_>>();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "object": "list",
+            "data": data
+        }))
+        .expect("serialize OpenAI models list");
+
+        let translated = maybe_translate_openai_models_list(&body)
+            .expect("OpenAI models list should translate to Codex catalog");
+        serde_json::from_slice(translated.as_ref()).expect("translated JSON")
+    }
+
     fn model_by_slug<'a>(value: &'a Value, slug: &str) -> &'a Value {
         value
             .get("models")
@@ -544,6 +920,47 @@ mod tests {
                     .find(|model| model.get("slug").and_then(Value::as_str) == Some(slug))
             })
             .unwrap_or_else(|| panic!("model {slug} should exist"))
+    }
+
+    fn assert_reasoning_efforts(model: &Value, expected: &[&str]) {
+        let actual = model
+            .get("supported_reasoning_levels")
+            .and_then(Value::as_array)
+            .expect("supported_reasoning_levels should be an array")
+            .iter()
+            .map(|level| {
+                level
+                    .get("effort")
+                    .and_then(Value::as_str)
+                    .expect("effort should be present")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    fn assert_truncation_policy(model: &Value, expected_mode: &str, expected_limit: i64) {
+        let policy = model
+            .get("truncation_policy")
+            .expect("truncation_policy should be present");
+        assert_eq!(
+            policy.get("mode").and_then(Value::as_str),
+            Some(expected_mode)
+        );
+        assert_eq!(
+            policy.get("limit").and_then(Value::as_i64),
+            Some(expected_limit)
+        );
+    }
+
+    fn assert_input_modalities(model: &Value, expected: &[&str]) {
+        let actual = model
+            .get("input_modalities")
+            .and_then(Value::as_array)
+            .expect("input_modalities should be an array")
+            .iter()
+            .map(|modality| modality.as_str().expect("modality should be a string"))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
     }
 
     fn model_has_fast_service_tier(model: &Value) -> bool {
