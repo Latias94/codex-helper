@@ -57,6 +57,21 @@ Environment escape hatches:
 The environment override is only a development fallback. A packaged app should
 not require shell setup to start a desktop-managed proxy.
 
+## OS integration
+
+The desktop app registers the official Tauri autostart plugin for launch at
+login. Settings uses the plugin's JavaScript guest binding to read, enable, and
+disable the OS login item.
+
+Current policy:
+
+- Launch at login starts only the desktop companion.
+- It does not automatically stop, restart, or seize an existing local proxy.
+- Startup-time proxy auto-start remains disabled in the UI until we have
+  packaged lifecycle smoke proving it cannot disturb an existing helper.
+- The plugin supports Windows, macOS, and Linux desktop targets. Android/iOS are
+  intentionally outside this desktop release target.
+
 ## Verification status
 
 Verified on Windows:
@@ -65,6 +80,8 @@ Verified on Windows:
 - The NSIS installer is produced under `target/release/bundle/nsis/`.
 - `7z l target/release/bundle/nsis/codex-helper_0.16.0_x64-setup.exe` lists both
   `codex-helper-desktop.exe` and the bundled `codex-helper.exe` sidecar.
+- Compile/test verification proves the launch-at-login plugin is registered and
+  the Settings switch is wired to the real guest binding.
 
 Still required before egui replacement:
 
@@ -74,7 +91,7 @@ Still required before egui replacement:
   - close-to-tray/show/hide/quit behavior;
   - detach and explicit stop behavior;
   - second launch focus;
+  - launch-at-login enable/disable and login/restart behavior;
   - config export/import.
 - Signing and updater posture.
-- Launch-at-login behavior.
 - Provider edit parity for common single-endpoint providers.

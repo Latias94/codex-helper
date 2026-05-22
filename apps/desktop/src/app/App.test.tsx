@@ -15,6 +15,12 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
   save: vi.fn().mockResolvedValue(null),
 }));
 
+vi.mock("@tauri-apps/plugin-autostart", () => ({
+  disable: vi.fn().mockResolvedValue(undefined),
+  enable: vi.fn().mockResolvedValue(undefined),
+  isEnabled: vi.fn().mockResolvedValue(false),
+}));
+
 const mockedInvoke = vi.mocked(invoke);
 
 beforeEach(() => {
@@ -220,6 +226,47 @@ describe("desktop app routes", () => {
       payload: { source: "C:/Users/dev/Desktop/import.toml" },
     });
     expect(await screen.findByText(/已备份当前配置到/)).toBeInTheDocument();
+  });
+
+  it("wires Settings launch-at-login toggle to the autostart plugin", async () => {
+    const autostart = await import("@tauri-apps/plugin-autostart");
+    vi.mocked(autostart.isEnabled)
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true)
+      .mockResolvedValue(true);
+
+    window.location.hash = "#/settings";
+    mockedInvoke.mockImplementation(async (command) => {
+      if (command === "get_app_metadata") {
+        return { name: "codex-helper", version: "0.16.0", tauri: "2" };
+      }
+      if (command === "get_admin_read_model") {
+        return liveReadModel();
+      }
+      if (command === "get_desktop_control_state") {
+        return liveControlState();
+      }
+      if (command === "get_known_paths") {
+        return {
+          home: "C:/Users/dev/.codex-helper",
+          config: "C:/Users/dev/.codex-helper/config.toml",
+          logs: "C:/Users/dev/.codex-helper/logs",
+          cache: "C:/Users/dev/.codex-helper/cache",
+        };
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    render(<App />);
+
+    const launchAtLoginSwitch = await screen.findByRole("switch", { name: "开机启动" });
+    expect(launchAtLoginSwitch).toHaveAttribute("aria-checked", "false");
+
+    await userEvent.click(launchAtLoginSwitch);
+
+    expect(autostart.enable).toHaveBeenCalledOnce();
+    expect(autostart.disable).not.toHaveBeenCalled();
+    expect(await screen.findByText(/已启用开机启动/)).toBeInTheDocument();
   });
 });
 

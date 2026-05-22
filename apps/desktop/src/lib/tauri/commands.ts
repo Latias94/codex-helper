@@ -1,4 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
+import {
+  disable as disableAutostart,
+  enable as enableAutostart,
+  isEnabled as isAutostartEnabled,
+} from "@tauri-apps/plugin-autostart";
 
 import type { DesktopActionResult, DesktopControlState } from "@/lib/api/types";
 
@@ -92,6 +97,19 @@ export async function exportConfig(payload: { destination: string }) {
 
 export async function importConfig(payload: { source: string }) {
   return invoke<ConfigFileActionResult>("import_config", { payload });
+}
+
+export async function getLaunchAtLoginEnabled() {
+  return isAutostartEnabled();
+}
+
+export async function setLaunchAtLoginEnabled(enabled: boolean) {
+  if (enabled) {
+    await enableAutostart();
+  } else {
+    await disableAutostart();
+  }
+  return isAutostartEnabled();
 }
 
 export async function getAdminReadModel() {

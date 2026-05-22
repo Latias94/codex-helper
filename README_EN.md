@@ -37,7 +37,7 @@ It is probably unnecessary if you only use one official account and do not need 
 - **Balance and plan visibility**: probes common Sub2API, New API, and `/user/balance` endpoints; lookup failures are not treated as exhausted.
 - **Outbound proxy compatibility**: the local proxy and outbound network proxy are separate layers; outbound requests currently follow system/environment proxy variables, with no first-class `config.toml` proxy section yet.
 - **Request observability**: provider, model, tokens, cache tokens, cache hit rate, TTFB, duration, output rate, retry chain, and estimated cost.
-- **TUI and GUI**: built-in TUI for terminal use; the current released egui GUI remains available. A new Tauri desktop client is now the long-term replacement path at source-preview level, but egui stays until installer, tray, sidecar, single-instance, and update parity gates pass.
+- **TUI and GUI**: built-in TUI for terminal use; the current released egui GUI remains available. A new Tauri desktop client is now the long-term replacement path at source-preview level, but egui stays until installer, tray, sidecar, single-instance, launch-at-login, and update parity gates pass.
 
 ## Quick Start
 
@@ -359,7 +359,7 @@ cargo run --release --features gui --bin codex-helper-gui
 
 The GUI can start or explicitly attach to a proxy, edit common single-endpoint providers, route nodes, and routing, and inspect requests, balances, pricing, sessions, health, breaker state, and control-plane status. By default, a GUI-started proxy stops when the GUI exits; attaching to an existing proxy must be selected explicitly, and closing the GUI only detaches instead of stopping someone else’s process. Complex multi-endpoint providers, model mappings, and advanced fields should still be edited through CLI or raw TOML.
 
-The new Tauri desktop client lives under `apps/desktop` and uses React 19, Tailwind CSS 4, shadcn/ui-style components, and TanStack Router/Query/Table. It already implements Dashboard, Providers, Usage, Settings, read-only admin data, safe control actions, close-to-tray semantics, single instance, lightweight single-config import/export, config/log/cache path openers, and a Windows NSIS packaged sidecar build. It still needs launch at login, signing/auto-update posture, common provider edit forms, and full packaged tray lifecycle smoke before it replaces the egui GUI above. See [docs/DESKTOP_RELEASE.md](docs/DESKTOP_RELEASE.md) for the desktop packaging contract.
+The new Tauri desktop client lives under `apps/desktop` and uses React 19, Tailwind CSS 4, shadcn/ui-style components, and TanStack Router/Query/Table. It already implements Dashboard, Providers, Usage, Settings, read-only admin data, safe control actions, close-to-tray semantics, single instance, launch-at-login settings, lightweight single-config import/export, config/log/cache path openers, and a Windows NSIS packaged sidecar build. It still needs signing/auto-update posture, common provider edit forms, and full packaged tray lifecycle smoke before it replaces the egui GUI above. See [docs/DESKTOP_RELEASE.md](docs/DESKTOP_RELEASE.md) for the desktop packaging contract.
 
 ## File Locations
 

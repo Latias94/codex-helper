@@ -22,7 +22,7 @@ import {
 import { CONTROL_CONFIRMATIONS, useRuntimeActions } from "@/features/runtime/actions";
 import { ActionStatusBanner } from "@/features/runtime/ActionStatusBanner";
 import { useRuntimeSummary } from "@/features/runtime/hooks";
-import { useKnownPaths } from "@/features/settings/hooks";
+import { useKnownPaths, useLaunchAtLogin } from "@/features/settings/hooks";
 import {
   exportConfig,
   hideMainWindow,
@@ -45,6 +45,7 @@ const advancedRows = [
 
 export function SettingsPage() {
   const knownPaths = useKnownPaths();
+  const launchAtLogin = useLaunchAtLogin();
   const runtime = useRuntimeSummary();
   const actions = useRuntimeActions();
   const [codexPreset, setCodexPreset] = useState<CodexPreset>("chatgpt-bridge");
@@ -91,6 +92,14 @@ export function SettingsPage() {
       return configActionMessage(await importConfig({ source: selected }));
     });
   };
+  const runLaunchAtLoginChange = (enabled: boolean) => {
+    void runDesktopAction(async () => {
+      const actual = await launchAtLogin.setEnabled(enabled);
+      return actual
+        ? "已启用开机启动；下次登录系统时会自动启动桌面端。"
+        : "已关闭开机启动；下次登录系统时不会自动启动桌面端。";
+    });
+  };
   const runDesktopAction = async (action: () => Promise<string>) => {
     setDesktopBusy(true);
     setDesktopStatus({ kind: "idle", message: "" });
@@ -131,12 +140,27 @@ export function SettingsPage() {
 
       <div className="grid grid-cols-2 gap-4">
         <SettingsCard title="桌面行为" description="控制应用启动、托盘和窗口关闭方式。">
-          <ToggleRow label="开机启动" checked={false} />
-          <ToggleRow label="启用托盘" checked />
+          <ToggleRow
+            label="开机启动"
+            description={
+              launchAtLogin.isError
+                ? "当前系统暂时无法读取开机启动状态。"
+                : "通过系统登录项注册桌面端，不会自动停止或重启本地代理。"
+            }
+            checked={launchAtLogin.data ?? false}
+            disabled={launchAtLogin.isLoading || launchAtLogin.isSaving || desktopBusy}
+            onCheckedChange={runLaunchAtLoginChange}
+          />
+          <ToggleRow label="启用托盘" description="托盘常驻已启用，关闭窗口会隐藏到托盘。" checked disabled />
           <FieldRow label="关闭窗口时">
             <Badge variant="teal">隐藏到托盘</Badge>
           </FieldRow>
-          <ToggleRow label="启动时自动启动本地代理（待实现）" checked={false} />
+          <ToggleRow
+            label="启动时自动启动本地代理"
+            description="保持保守默认：桌面端启动后可手动附加或启动代理，避免登录时抢占正在运行的 helper。"
+            checked={false}
+            disabled
+          />
         </SettingsCard>
 
         <SettingsCard title="外观与语言" description="调整界面语言和显示偏好。">
@@ -418,10 +442,32 @@ function SettingsCard({ title, description, children }: { title: string; descrip
   );
 }
 
-function ToggleRow({ label, checked }: { label: string; checked: boolean }) {
+function ToggleRow({
+  label,
+  checked,
+  description,
+  disabled,
+  onCheckedChange,
+}: {
+  label: string;
+  checked: boolean;
+  description?: string;
+  disabled?: boolean;
+  onCheckedChange?: (checked: boolean) => void;
+}) {
   return (
     <FieldRow label={label}>
-      <Switch checked={checked} />
+      <div className="flex items-center gap-3">
+        {description ? (
+          <span className="max-w-80 text-right text-xs leading-5 text-slate-500">{description}</span>
+        ) : null}
+        <Switch
+          aria-label={label}
+          checked={checked}
+          disabled={disabled}
+          onCheckedChange={onCheckedChange}
+        />
+      </div>
     </FieldRow>
   );
 }

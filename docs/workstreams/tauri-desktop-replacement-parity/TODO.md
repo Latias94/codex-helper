@@ -36,12 +36,12 @@ Last updated: 2026-05-22
   Evidence: `apps/desktop/src-tauri/tauri.conf.json`; `apps/desktop/scripts/prepare-sidecar.mjs`; `apps/desktop/src-tauri/src/commands/control.rs`; `docs/DESKTOP_RELEASE.md`; `EVIDENCE_AND_GATES.md`.
   Handoff: DONE_WITH_CONCERNS — Windows packaging gate is green; installer signing/notarization and full interactive lifecycle smoke remain TDRP-060/TDRP-080.
 
-- [ ] TDRP-050 [owner=main] [deps=TDRP-040] [scope=apps/desktop/src-tauri,apps/desktop/src]
+- [x] TDRP-050 [owner=main] [deps=TDRP-040] [scope=apps/desktop/src-tauri,apps/desktop/src]
   Goal: Implement launch-at-login setting or explicitly mark it unsupported for the first release with honest UI copy.
-  Validation: Tauri command tests/compile plus manual packaged OS verification where supported.
-  Review: UI must not show a working toggle until the OS integration is real.
-  Evidence: EVIDENCE_AND_GATES.md.
-  Handoff: Record per-OS behavior.
+  Validation: DONE_WITH_CONCERNS — `tauri-plugin-autostart` is registered in the Tauri builder, Settings uses the real JS guest binding, frontend tests/build pass, and `cargo check -p codex-helper-desktop` plus `cargo nextest run -p codex-helper-desktop --lib` pass. Manual packaged OS verification remains part of TDRP-080.
+  Review: DONE — UI now shows a working toggle only because the OS integration is real; startup-time proxy auto-start remains disabled with honest conservative copy.
+  Evidence: `apps/desktop/src-tauri/src/lib.rs`; `apps/desktop/src/features/settings/SettingsPage.tsx`; `apps/desktop/src/app/App.test.tsx`; `EVIDENCE_AND_GATES.md`.
+  Handoff: DONE_WITH_CONCERNS — plugin supports Windows/macOS/Linux desktop targets; Android/iOS are excluded by the plugin dependency. Packaged login-item smoke remains TDRP-080.
 
 - [ ] TDRP-060 [owner=planner-or-main] [deps=TDRP-040] [scope=release-docs,apps/desktop/src-tauri]
   Goal: Define signing, installer, and auto-update/release-channel posture; implement updater only if signing/artifact hosting decisions are ready.

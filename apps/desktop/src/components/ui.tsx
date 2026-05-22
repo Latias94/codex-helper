@@ -1,6 +1,11 @@
 import { Slot } from "@radix-ui/react-slot";
 import * as SwitchPrimitives from "@radix-ui/react-switch";
-import { type ButtonHTMLAttributes, type HTMLAttributes, type ReactNode } from "react";
+import {
+  type ButtonHTMLAttributes,
+  type ComponentPropsWithoutRef,
+  type HTMLAttributes,
+  type ReactNode,
+} from "react";
 
 import { cn } from "@/lib/utils";
 
@@ -112,14 +117,16 @@ export function SelectBox({ className, children, ...props }: React.SelectHTMLAtt
   );
 }
 
-export function Switch({ checked }: { checked: boolean }) {
+export function Switch({ checked, className, ...props }: ComponentPropsWithoutRef<typeof SwitchPrimitives.Root>) {
   return (
     <SwitchPrimitives.Root
       checked={checked}
       className={cn(
         "relative h-6 w-11 rounded-full border transition-colors",
         checked ? "border-teal-500 bg-teal-600" : "border-slate-200 bg-slate-200",
+        className,
       )}
+      {...props}
     >
       <SwitchPrimitives.Thumb
         className={cn(

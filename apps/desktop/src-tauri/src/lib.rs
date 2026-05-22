@@ -4,6 +4,7 @@ mod lifecycle;
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_autostart::Builder::new().build())
         .manage(lifecycle::DesktopLifecycleState::default())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             lifecycle::handle_second_instance_launch(app);

@@ -266,3 +266,51 @@ Deferred:
 Result:
 
 - DONE_WITH_CONCERNS — Windows packaged sidecar/installer build is deterministic and verified at artifact/content level. Full interactive packaged runtime smoke remains required before any egui replacement claim.
+
+### 2026-05-22 — TDRP-050 launch at login
+
+Evidence:
+
+- Added the official Tauri autostart plugin:
+  - Rust: `tauri-plugin-autostart` registered in `apps/desktop/src-tauri/src/lib.rs`;
+  - frontend: `@tauri-apps/plugin-autostart` guest binding used by `apps/desktop/src/lib/tauri/commands.ts`.
+- Added a TanStack Query-backed Settings hook for reading and changing launch-at-login state.
+- Replaced the previous inert Settings "开机启动" row with a real switch that calls the autostart plugin and reports success or failure through the existing desktop action banner.
+- Kept "启动时自动启动本地代理" disabled with explicit conservative copy. Launch-at-login starts the desktop companion only; it does not automatically stop, restart, or seize an already-running local proxy.
+- Added a frontend test proving the Settings switch calls the real autostart guest binding.
+
+Review:
+
+- Workstream compliance: PASS_WITH_CONCERNS — the UI no longer advertises a fake launch-at-login toggle. The OS integration is real for Tauri desktop platforms supported by the plugin. Manual packaged login-item verification still belongs to TDRP-080.
+- Code quality: PASS — autostart state is managed through the existing React Query pattern and isolated in `settings/hooks.ts` plus Tauri command wrappers.
+- Safety: PASS — validation did not start, stop, detach, or mutate the developer machine's active codex-helper runtime. Unit tests mock the plugin guest binding and do not touch OS login items.
+
+Verification:
+
+- Command: `pnpm test`
+- Scope: `apps/desktop`.
+- Result: PASS — 5 files, 24 tests.
+
+- Command: `pnpm build`
+- Scope: `apps/desktop`.
+- Result: PASS.
+
+- Command: `cargo check -p codex-helper-desktop`
+- Scope: Tauri desktop crate.
+- Result: PASS.
+
+- Command: `cargo nextest run -p codex-helper-desktop --lib`
+- Scope: Tauri desktop crate.
+- Result: PASS — 15 tests.
+
+- Command: `cargo fmt --check`
+- Scope: repository workspace.
+- Result: PASS.
+
+Deferred:
+
+- Manual packaged OS verification remains TDRP-080. The expected smoke is: enable launch-at-login in the packaged app, confirm the OS login entry is created, restart/login in an isolated environment, confirm the desktop companion starts without auto-stopping an existing proxy, then disable and confirm the OS login entry is removed.
+
+Result:
+
+- DONE_WITH_CONCERNS — launch-at-login is implemented through a real Tauri plugin and verified at compile/test level. Packaged OS smoke remains required before egui replacement.

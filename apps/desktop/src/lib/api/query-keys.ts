@@ -1,5 +1,6 @@
 export const queryKeys = {
   appMetadata: ["desktop", "app-metadata"] as const,
+  launchAtLogin: ["desktop", "launch-at-login"] as const,
   knownPaths: ["desktop", "known-paths"] as const,
   admin: {
     readModel: ["admin", "read-model"] as const,

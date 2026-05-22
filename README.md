@@ -49,7 +49,7 @@ English: [README_EN.md](README_EN.md)
 - **余额/套餐**：支持 Sub2API、New API 和常见 `/user/balance` 探测；失败不计为耗尽。
 - **出站代理兼容**：本地代理和出站网络代理是两层概念；当前出站请求受系统/环境代理变量影响，还没有 `config.toml` 专用代理段。
 - **请求可观测**：记录 provider、model、token、cache token、缓存命中率、TTFB、总耗时、输出速度、重试链和估算成本。
-- **TUI/GUI**：TUI 内置在命令行里；当前发布的 egui GUI 仍可用。新的 Tauri 桌面端已作为长期替代路径进入源码预览阶段，但在安装包、托盘、sidecar、单实例和自动更新等 parity gate 通过前不会移除 egui。
+- **TUI/GUI**：TUI 内置在命令行里；当前发布的 egui GUI 仍可用。新的 Tauri 桌面端已作为长期替代路径进入源码预览阶段，但在安装包、托盘、sidecar、单实例、开机启动和自动更新等 parity gate 通过前不会移除 egui。
 
 ## 快速开始
 
@@ -369,7 +369,7 @@ cargo run --release --features gui --bin codex-helper-gui
 
 GUI 可以启动/附着本地代理，编辑常见单 endpoint provider、route node 和 routing，查看请求、余额、价格目录、session、health、breaker 和控制面板状态。默认行为是 GUI 启动的代理跟随 GUI 退出而停止；附着已有代理必须在界面中显式选择，关闭 GUI 只会取消附着，不会偷偷停止别的进程。复杂多 endpoint provider、模型映射和高级字段仍建议用 CLI 或 raw TOML。
 
-新的 Tauri 桌面端位于 `apps/desktop`，技术栈是 React 19、Tailwind CSS 4、shadcn/ui 风格组件和 TanStack Router/Query/Table。它已经实现 Dashboard、Providers、Usage、Settings、只读 admin 数据、安全控制动作、关闭隐藏到托盘语义、单实例、轻量单配置导入导出、打开配置/日志/缓存路径，以及 Windows NSIS packaged sidecar 构建；但仍需完成开机启动、签名/自动更新策略、Provider 常用编辑表单和完整 packaged 托盘生命周期 smoke，之后才会替换上面的 egui GUI。桌面端打包策略见 [docs/DESKTOP_RELEASE.md](docs/DESKTOP_RELEASE.md)。
+新的 Tauri 桌面端位于 `apps/desktop`，技术栈是 React 19、Tailwind CSS 4、shadcn/ui 风格组件和 TanStack Router/Query/Table。它已经实现 Dashboard、Providers、Usage、Settings、只读 admin 数据、安全控制动作、关闭隐藏到托盘语义、单实例、开机启动设置、轻量单配置导入导出、打开配置/日志/缓存路径，以及 Windows NSIS packaged sidecar 构建；但仍需完成签名/自动更新策略、Provider 常用编辑表单和完整 packaged 托盘生命周期 smoke，之后才会替换上面的 egui GUI。桌面端打包策略见 [docs/DESKTOP_RELEASE.md](docs/DESKTOP_RELEASE.md)。
 
 ## 配置文件位置
 
