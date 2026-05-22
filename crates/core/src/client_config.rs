@@ -38,6 +38,10 @@ pub fn codex_auth_path() -> PathBuf {
     codex_home().join("auth.json")
 }
 
+pub fn codex_models_cache_path() -> PathBuf {
+    codex_home().join("models_cache.json")
+}
+
 pub fn claude_home() -> PathBuf {
     resolve_home_dir("CLAUDE_HOME", ".claude")
 }

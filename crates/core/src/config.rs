@@ -13,7 +13,7 @@ use tracing::{info, warn};
 
 pub use crate::client_config::{
     claude_settings_backup_path, claude_settings_path, codex_auth_path, codex_config_path,
-    codex_switch_state_path,
+    codex_models_cache_path, codex_switch_state_path,
 };
 
 #[path = "config_storage.rs"]

@@ -185,6 +185,23 @@ fn codex_model_info_json(slug: &str, display_name: &str, fallback_priority: usiz
     let priority = known
         .priority
         .unwrap_or_else(|| 10_000 + i32::try_from(fallback_priority).unwrap_or(0));
+    let supports_fast_service_tier = supports_fast_service_tier(slug);
+    let additional_speed_tiers = if supports_fast_service_tier {
+        serde_json::json!(["fast"])
+    } else {
+        serde_json::json!([])
+    };
+    let service_tiers = if supports_fast_service_tier {
+        serde_json::json!([
+            {
+                "id": "priority",
+                "name": "Fast",
+                "description": "1.5x speed, increased usage"
+            }
+        ])
+    } else {
+        serde_json::json!([])
+    };
 
     serde_json::json!({
         "slug": slug,
@@ -213,8 +230,8 @@ fn codex_model_info_json(slug: &str, display_name: &str, fallback_priority: usiz
         "visibility": if hidden { "hide" } else { "list" },
         "supported_in_api": !slug.starts_with("gpt-image-"),
         "priority": priority,
-        "additional_speed_tiers": [],
-        "service_tiers": [],
+        "additional_speed_tiers": additional_speed_tiers,
+        "service_tiers": service_tiers,
         "availability_nux": null,
         "upgrade": null,
         "base_instructions": "You are Codex, a coding agent based on GPT-5.",
@@ -239,6 +256,72 @@ fn codex_model_info_json(slug: &str, display_name: &str, fallback_priority: usiz
         "input_modalities": input_modalities,
         "supports_search_tool": supports_search_tool
     })
+}
+
+fn supports_fast_service_tier(slug: &str) -> bool {
+    let normalized = slug.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        // OpenAI Priority processing / Codex Fast is exposed to the TUI as a
+        // service tier with id `priority` and display name `Fast`.
+        "gpt-5.5" | "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.3-codex" => true,
+        _ => infer_future_gpt_fast_service_tier(&normalized),
+    }
+}
+
+fn infer_future_gpt_fast_service_tier(slug: &str) -> bool {
+    if !slug.starts_with("gpt-") || is_fast_service_tier_excluded_slug(slug) {
+        return false;
+    }
+
+    let Some((major, minor)) = parse_gpt_version(slug) else {
+        return false;
+    };
+
+    // Conservative fallback: current verified GPT 5.4+ models support Priority
+    // processing, and future GPT major series are expected to keep supporting it.
+    major > 5 || (major == 5 && minor.is_some_and(|minor| minor >= 4))
+}
+
+fn is_fast_service_tier_excluded_slug(slug: &str) -> bool {
+    slug.starts_with("gpt-image-")
+        || slug.starts_with("gpt-oss-")
+        || slug.starts_with("gpt-realtime")
+        || slug.starts_with("gpt-audio")
+        || slug.contains("-realtime")
+        || slug.contains("-audio")
+        || slug.contains("-image")
+        || slug.contains("embedding")
+        || slug.contains("moderation")
+        || slug.contains("whisper")
+        || slug.contains("tts")
+        || slug.contains("sora")
+        || slug.contains("spark")
+        || slug.ends_with("-nano")
+        || slug.contains("-nano-")
+        || slug.ends_with("-pro")
+        || slug.contains("-pro-")
+}
+
+fn parse_gpt_version(slug: &str) -> Option<(u32, Option<u32>)> {
+    let rest = slug.strip_prefix("gpt-")?;
+    let (major, rest) = parse_ascii_u32_prefix(rest)?;
+    let Some(rest) = rest.strip_prefix('.') else {
+        return Some((major, None));
+    };
+    let (minor, _) = parse_ascii_u32_prefix(rest)?;
+    Some((major, Some(minor)))
+}
+
+fn parse_ascii_u32_prefix(value: &str) -> Option<(u32, &str)> {
+    let end = value
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(value.len());
+    if end == 0 {
+        return None;
+    }
+    let (digits, rest) = value.split_at(end);
+    let parsed = digits.parse().ok()?;
+    Some((parsed, rest))
 }
 
 #[derive(Default)]
@@ -368,5 +451,117 @@ mod tests {
             profile.remote_compaction_v1.support,
             CodexCapabilitySupport::Supported
         );
+
+        let model = model_by_slug(&value, "gpt-5.5");
+        assert!(model_has_fast_service_tier(model));
+        assert!(model_has_legacy_fast_speed_tier(model));
+    }
+
+    #[test]
+    fn translated_openai_models_list_marks_official_priority_models_as_fast() {
+        let body = br#"{
+            "object": "list",
+            "data": [
+                { "id": "gpt-5.4" },
+                { "id": "gpt-5.4-mini" },
+                { "id": "gpt-5.3-codex" },
+                { "id": "gpt-5.2" }
+            ]
+        }"#;
+
+        let translated = maybe_translate_openai_models_list(body)
+            .expect("OpenAI models list should translate to Codex catalog");
+        let value: serde_json::Value =
+            serde_json::from_slice(translated.as_ref()).expect("translated JSON");
+
+        for slug in ["gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex"] {
+            let model = model_by_slug(&value, slug);
+            assert!(model_has_fast_service_tier(model), "{slug} should be fast");
+            assert!(
+                model_has_legacy_fast_speed_tier(model),
+                "{slug} should expose legacy fast tier"
+            );
+        }
+
+        let model = model_by_slug(&value, "gpt-5.2");
+        assert!(!model_has_fast_service_tier(model));
+        assert!(!model_has_legacy_fast_speed_tier(model));
+    }
+
+    #[test]
+    fn translated_openai_models_list_infers_future_gpt_fast_with_exclusions() {
+        let body = br#"{
+            "object": "list",
+            "data": [
+                { "id": "gpt-6" },
+                { "id": "gpt-5.4-preview" },
+                { "id": "gpt-image-1" },
+                { "id": "gpt-oss-120b" },
+                { "id": "gpt-5.4-nano" },
+                { "id": "gpt-5.3-codex-spark" }
+            ]
+        }"#;
+
+        let translated = maybe_translate_openai_models_list(body)
+            .expect("OpenAI models list should translate to Codex catalog");
+        let value: serde_json::Value =
+            serde_json::from_slice(translated.as_ref()).expect("translated JSON");
+
+        for slug in ["gpt-6", "gpt-5.4-preview"] {
+            let model = model_by_slug(&value, slug);
+            assert!(model_has_fast_service_tier(model), "{slug} should be fast");
+            assert!(
+                model_has_legacy_fast_speed_tier(model),
+                "{slug} should expose legacy fast tier"
+            );
+        }
+
+        for slug in [
+            "gpt-image-1",
+            "gpt-oss-120b",
+            "gpt-5.4-nano",
+            "gpt-5.3-codex-spark",
+        ] {
+            let model = model_by_slug(&value, slug);
+            assert!(
+                !model_has_fast_service_tier(model),
+                "{slug} should not be fast"
+            );
+            assert!(
+                !model_has_legacy_fast_speed_tier(model),
+                "{slug} should not expose legacy fast tier"
+            );
+        }
+    }
+
+    fn model_by_slug<'a>(value: &'a Value, slug: &str) -> &'a Value {
+        value
+            .get("models")
+            .and_then(Value::as_array)
+            .and_then(|models| {
+                models
+                    .iter()
+                    .find(|model| model.get("slug").and_then(Value::as_str) == Some(slug))
+            })
+            .unwrap_or_else(|| panic!("model {slug} should exist"))
+    }
+
+    fn model_has_fast_service_tier(model: &Value) -> bool {
+        model
+            .get("service_tiers")
+            .and_then(Value::as_array)
+            .is_some_and(|service_tiers| {
+                service_tiers.iter().any(|tier| {
+                    tier.get("id").and_then(Value::as_str) == Some("priority")
+                        && tier.get("name").and_then(Value::as_str) == Some("Fast")
+                })
+            })
+    }
+
+    fn model_has_legacy_fast_speed_tier(model: &Value) -> bool {
+        model
+            .get("additional_speed_tiers")
+            .and_then(Value::as_array)
+            .is_some_and(|speed_tiers| speed_tiers.iter().any(|tier| tier.as_str() == Some("fast")))
     }
 }

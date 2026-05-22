@@ -3,11 +3,15 @@ use crate::cli_types::{
     RemoteControlCommand, SwitchCommand,
 };
 use crate::codex_integration;
+use crate::codex_models_cache::{
+    ModelsCacheInvalidation, invalidate_stale_fast_service_tier_cache,
+};
 use crate::commands;
 use crate::config::{
     ServiceKind, claude_settings_backup_path, claude_settings_path, codex_auth_path,
-    codex_client_patch_config_from_config_file, codex_config_path, codex_switch_state_path,
-    load_config, load_or_bootstrap_for_service_with_v4_source, normalize_config_toml_authoring,
+    codex_client_patch_config_from_config_file, codex_config_path, codex_models_cache_path,
+    codex_switch_state_path, load_config, load_or_bootstrap_for_service_with_v4_source,
+    normalize_config_toml_authoring,
 };
 use crate::notify;
 use crate::proxy::admin_loopback_addr_for_proxy_port;
@@ -275,6 +279,26 @@ fn rotate_runtime_log_if_needed(log_dir: &std::path::Path) {
 
 fn read_existing_text(path: &std::path::Path) -> Option<String> {
     std::fs::read_to_string(path).ok()
+}
+
+async fn invalidate_codex_models_cache_if_needed() {
+    let cache_path = codex_models_cache_path();
+    match invalidate_stale_fast_service_tier_cache(&cache_path).await {
+        Ok(ModelsCacheInvalidation::Deleted) => {
+            tracing::info!(
+                "Deleted stale Codex models cache at {:?}; Codex will refetch model capabilities on next TUI startup",
+                cache_path
+            );
+        }
+        Ok(ModelsCacheInvalidation::Missing | ModelsCacheInvalidation::Kept) => {}
+        Err(err) => {
+            tracing::warn!(
+                "Failed to inspect Codex models cache for Fast service_tiers at {:?}: {}",
+                cache_path,
+                err
+            );
+        }
+    }
 }
 
 async fn handle_daemon_cmd(cmd: DaemonCommand) -> CliResult<()> {
@@ -835,6 +859,7 @@ async fn run_server(
         codex_client_state_changed_this_startup = codex_config_before_switch
             != read_existing_text(&codex_config_path())
             || codex_auth_before_switch != read_existing_text(&codex_auth_path());
+        invalidate_codex_models_cache_if_needed().await;
         Some(loaded)
     } else if service_name == "claude" {
         if let Err(err) = codex_integration::guard_claude_settings_before_switch_on_interactive() {
