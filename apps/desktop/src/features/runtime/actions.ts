@@ -12,11 +12,13 @@ import {
   refreshProviderBalances,
   reloadRuntime,
   resetSessionOverrides,
+  saveCommonProvider,
   setGlobalRouteOverride,
   startDesktopProxy,
   stopProxy,
   switchCodex,
   type CodexPreset,
+  type ProviderCommonEditPayload,
   type ProviderRuntimeState,
   type SessionOverrideDimension,
 } from "@/lib/tauri/commands";
@@ -107,6 +109,7 @@ export function useRuntimeActions() {
       clearRuntimeState?: boolean;
     }>(applyProviderRuntimeOverride),
   );
+  const saveProvider = useMutation(mutationOptions<ProviderCommonEditPayload>(saveCommonProvider));
   const setGlobalRoute = useMutation(
     mutationOptions<{ target?: string | null }>(setGlobalRouteOverride),
   );
@@ -134,6 +137,7 @@ export function useRuntimeActions() {
     probe,
     refreshBalances,
     setProviderOverride,
+    saveProvider,
     setGlobalRoute,
     setSessionOverrides,
     resetSession,
@@ -152,6 +156,7 @@ export function useRuntimeActions() {
     probe,
     refreshBalances,
     setProviderOverride,
+    saveProvider,
     setGlobalRoute,
     setSessionOverrides,
     resetSession,

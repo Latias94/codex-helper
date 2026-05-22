@@ -307,6 +307,10 @@ Verification:
 - Scope: repository workspace.
 - Result: PASS.
 
+- Command: `git diff --check -- .`
+- Scope: full repository diff.
+- Result: PASS — no whitespace errors; only Windows LF/CRLF warnings for edited text files.
+
 Deferred:
 
 - Manual packaged OS verification remains TDRP-080. The expected smoke is: enable launch-at-login in the packaged app, confirm the OS login entry is created, restart/login in an isolated environment, confirm the desktop companion starts without auto-stopping an existing proxy, then disable and confirm the OS login entry is removed.
@@ -369,3 +373,70 @@ Deferred:
 Result:
 
 - DONE_WITH_CONCERNS — signing/update posture is explicit and safe for the first replacement release. Auto-update remains disabled until the signed release pipeline exists.
+
+### 2026-05-22 — TDRP-070 provider common edit parity
+
+Evidence:
+
+- Added `apps/desktop/src-tauri/src/commands/providers.rs` with a `save_common_provider` Tauri command.
+- The command edits only safe common fields:
+  - `alias`;
+  - single-endpoint `base_url`;
+  - `enabled`;
+  - optional `auth_token_env` and `api_key_env` env var names.
+- The command rejects unsupported provider shapes instead of flattening them:
+  - v5 route graph config is required;
+  - providers with multiple endpoints remain raw TOML only;
+  - providers that mix provider-level `base_url` with endpoint tables are treated as advanced TOML.
+- The command writes a timestamped backup before replacing `config.toml`.
+- Added Rust tests proving:
+  - single-provider common edits update the intended fields;
+  - advanced provider fields such as `supported_models`, `tags`, and `limits` are preserved;
+  - multi-endpoint providers are rejected without overwriting the config;
+  - non-http(s) base URLs are rejected.
+- Extended provider read-model mapping so cards carry `id`, `baseUrl`, `enabled`, endpoint count, endpoint name, editability, and explicit raw-TOML blocking copy.
+- Added a Provider card inline edit form with Zod validation.
+- Added frontend route tests proving:
+  - a single-endpoint provider invokes `save_common_provider` with the safe field payload;
+  - multi-endpoint providers show raw TOML copy and disable the common edit action.
+
+Review:
+
+- Workstream compliance: PASS_WITH_CONCERNS — TDRP-070 is complete for safe single-endpoint provider edits. Complex multi-endpoint editing is intentionally not claimed and remains raw TOML.
+- Code quality: PASS — the Rust patch path mutates the parsed TOML value surgically and validates the resulting v5 config before writing. It avoids regenerating provider sections from the UI shape.
+- Safety: PASS — validation did not start, stop, detach, reload, or mutate the developer machine's active codex-helper runtime. File-writing behavior is covered by isolated temp-file tests only.
+
+Verification:
+
+- Command: `cargo nextest run -p codex-helper-desktop commands::providers`
+- Scope: TDRP-070 Rust provider config patch tests.
+- Result: PASS — 4 tests.
+
+- Command: `pnpm test`
+- Scope: `apps/desktop`.
+- Result: PASS — 5 files, 27 tests.
+
+- Command: `pnpm build`
+- Scope: `apps/desktop`.
+- Result: PASS.
+
+- Command: `cargo check -p codex-helper-desktop`
+- Scope: Tauri desktop crate.
+- Result: PASS.
+
+- Command: `cargo nextest run -p codex-helper-desktop`
+- Scope: Tauri desktop crate.
+- Result: PASS — 18 tests.
+
+- Command: `cargo fmt --check`
+- Scope: repository workspace.
+- Result: PASS.
+
+Deferred:
+
+- Provider creation, deletion, multi-endpoint editing, route graph editing, inline secret editing, and rich model-mapping editors remain raw TOML or future tasks. This is intentional so the desktop app does not become a heavy config manager.
+- Packaged UI smoke for provider editing remains part of TDRP-080.
+
+Result:
+
+- DONE_WITH_CONCERNS — common provider edit parity is implemented and verified for single-endpoint providers while preserving advanced TOML fields. Multi-endpoint providers remain explicitly advanced/raw TOML.

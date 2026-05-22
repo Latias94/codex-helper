@@ -41,6 +41,7 @@ pub fn run() {
             commands::paths::get_known_paths,
             commands::paths::import_config,
             commands::paths::open_known_path,
+            commands::providers::save_common_provider,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run codex-helper desktop client");

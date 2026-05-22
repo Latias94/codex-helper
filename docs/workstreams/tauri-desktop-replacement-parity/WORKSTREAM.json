@@ -55,6 +55,11 @@
       "date": "2026-05-22",
       "kind": "release",
       "summary": "Completed TDRP-060 with concerns. First replacement release policy is manual GitHub Releases installer download. Auto-update is intentionally deferred until updater signing keypair, HTTPS endpoint, artifact hosting, and rollback operations are real. Settings shows disabled honest update copy."
+    },
+    {
+      "date": "2026-05-22",
+      "kind": "provider-edit",
+      "summary": "Completed TDRP-070 with concerns. Single-endpoint provider common edits now patch alias, base_url, enabled, and optional env var names through a validated Tauri command while preserving advanced TOML fields. Multi-endpoint providers remain explicitly raw TOML."
     }
   ],
   "adr_refs": [],

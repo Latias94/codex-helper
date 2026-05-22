@@ -126,7 +126,10 @@ describe("admin API mappers", () => {
     expect(data.runtime.provider).toBe("codex-air");
     expect(data.providers[0]).toMatchObject({
       name: "CodeX Air",
+      baseUrl: "https://ai.input.im/v1",
       host: "ai.input.im",
+      endpointCount: 1,
+      editable: true,
       health: "Healthy",
       active: true,
     });

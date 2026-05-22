@@ -59,6 +59,25 @@ export type SessionOverrideDimension =
   | "service_tier"
   | "all";
 
+export type ProviderCommonEditPayload = {
+  service: "codex" | "claude";
+  providerName: string;
+  alias?: string;
+  baseUrl: string;
+  enabled: boolean;
+  authTokenEnv?: string;
+  apiKeyEnv?: string;
+};
+
+export type ProviderConfigEditResult = DesktopActionResult & {
+  service: string;
+  providerName: string;
+  config: string;
+  backup?: string;
+  reloadRequired: boolean;
+  advancedFieldsPreserved: boolean;
+};
+
 export async function getAppMetadata() {
   return invoke<AppMetadata>("get_app_metadata");
 }
@@ -162,6 +181,10 @@ export async function applyProviderRuntimeOverride(payload: {
   clearRuntimeState?: boolean;
 }) {
   return invoke<DesktopActionResult>("apply_provider_runtime_override", { payload });
+}
+
+export async function saveCommonProvider(payload: ProviderCommonEditPayload) {
+  return invoke<ProviderConfigEditResult>("save_common_provider", { payload });
 }
 
 export async function setGlobalRouteOverride(payload: { target?: string | null }) {

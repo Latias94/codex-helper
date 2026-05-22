@@ -109,6 +109,140 @@ describe("desktop app routes", () => {
     expect(screen.queryByText("当前展示离线示例数据")).not.toBeInTheDocument();
   });
 
+  it("edits a single-endpoint provider with safe fields and keeps advanced TOML in config", async () => {
+    window.location.hash = "#/providers";
+    mockedInvoke.mockImplementation(async (command, args) => {
+      if (command === "get_app_metadata") {
+        return { name: "codex-helper", version: "0.16.0", tauri: "2" };
+      }
+      if (command === "get_admin_read_model") {
+        return liveReadModel({
+          providers: [
+            {
+              name: "single-provider",
+              alias: "Single Provider",
+              configured_enabled: true,
+              effective_enabled: true,
+              routable_endpoints: 1,
+              endpoints: [
+                {
+                  provider_name: "single-provider",
+                  name: "default",
+                  base_url: "https://old.example/v1",
+                  configured_enabled: true,
+                  effective_enabled: true,
+                  routable: true,
+                  runtime_state: "normal",
+                },
+              ],
+            },
+          ],
+        });
+      }
+      if (command === "get_desktop_control_state") {
+        return liveControlState();
+      }
+      if (command === "save_common_provider") {
+        expect(args).toEqual({
+          payload: {
+            service: "codex",
+            providerName: "single-provider",
+            alias: "New Provider",
+            baseUrl: "https://new.example/v1",
+            enabled: true,
+            authTokenEnv: "NEW_PROVIDER_KEY",
+          },
+        });
+        return {
+          ok: true,
+          action: "edit-provider",
+          message: "已更新 provider single-provider 的常用字段；高级字段已保留。如代理正在运行，请重新加载运行时配置。",
+          service: "codex",
+          providerName: "single-provider",
+          config: "C:/Users/dev/.codex-helper/config.toml",
+          backup: "C:/Users/dev/.codex-helper/config.toml.1779410000.bak",
+          reloadRequired: true,
+          advancedFieldsPreserved: true,
+        };
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "供应商" })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "编辑 Single Provider" }));
+    await userEvent.clear(screen.getByRole("textbox", { name: "Alias for Single Provider" }));
+    await userEvent.type(screen.getByRole("textbox", { name: "Alias for Single Provider" }), "New Provider");
+    await userEvent.clear(screen.getByRole("textbox", { name: "Base URL for Single Provider" }));
+    await userEvent.type(screen.getByRole("textbox", { name: "Base URL for Single Provider" }), "https://new.example/v1");
+    await userEvent.type(screen.getByRole("textbox", { name: "Auth token env for Single Provider" }), "NEW_PROVIDER_KEY");
+    await userEvent.click(screen.getByRole("button", { name: "保存" }));
+
+    expect(mockedInvoke).toHaveBeenCalledWith("save_common_provider", {
+      payload: {
+        service: "codex",
+        providerName: "single-provider",
+        alias: "New Provider",
+        baseUrl: "https://new.example/v1",
+        enabled: true,
+        authTokenEnv: "NEW_PROVIDER_KEY",
+      },
+    });
+    expect(await screen.findByText(/高级字段已保留/)).toBeInTheDocument();
+  });
+
+  it("keeps multi-endpoint providers on the raw TOML path", async () => {
+    window.location.hash = "#/providers";
+    mockedInvoke.mockImplementation(async (command) => {
+      if (command === "get_app_metadata") {
+        return { name: "codex-helper", version: "0.16.0", tauri: "2" };
+      }
+      if (command === "get_admin_read_model") {
+        return liveReadModel({
+          providers: [
+            {
+              name: "multi-provider",
+              configured_enabled: true,
+              effective_enabled: true,
+              routable_endpoints: 2,
+              endpoints: [
+                {
+                  provider_name: "multi-provider",
+                  name: "primary",
+                  base_url: "https://primary.example/v1",
+                  configured_enabled: true,
+                  effective_enabled: true,
+                  routable: true,
+                  runtime_state: "normal",
+                },
+                {
+                  provider_name: "multi-provider",
+                  name: "backup",
+                  base_url: "https://backup.example/v1",
+                  configured_enabled: true,
+                  effective_enabled: true,
+                  routable: true,
+                  runtime_state: "normal",
+                },
+              ],
+            },
+          ],
+        });
+      }
+      if (command === "get_desktop_control_state") {
+        return liveControlState();
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "供应商" })).toBeInTheDocument();
+    expect(await screen.findByText(/多 endpoint provider 暂不提供常用表单/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "编辑 multi-provider" })).toBeDisabled();
+  });
+
   it("routes the custom close button to hide-to-tray instead of quitting the proxy", async () => {
     render(<App />);
 

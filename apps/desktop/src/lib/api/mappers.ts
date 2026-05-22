@@ -224,11 +224,20 @@ export function mapProviders(
       endpoints[0];
     const health = providerHealth(provider);
     const active = provider.name === activeProvider || (!activeProvider && index === 0);
+    const endpointCount = endpoints.length;
+    const editable = endpointCount === 1 && Boolean(primaryEndpoint?.base_url);
 
     return {
       id: provider.name,
       name: provider.alias || provider.name,
+      alias: provider.alias ?? null,
+      baseUrl: primaryEndpoint?.base_url ?? "",
       host: hostFromUrl(primaryEndpoint?.base_url),
+      enabled: provider.configured_enabled ?? true,
+      endpointCount,
+      endpointName: primaryEndpoint?.name,
+      editable,
+      editBlockedReason: providerEditBlockedReason(endpointCount, primaryEndpoint?.base_url),
       auth: "本机配置 / 环境变量",
       balance: "unknown",
       health,
@@ -239,6 +248,16 @@ export function mapProviders(
       active,
     };
   });
+}
+
+function providerEditBlockedReason(endpointCount: number, baseUrl?: string) {
+  if (endpointCount > 1) {
+    return "多 endpoint provider 暂不提供常用表单，请用 raw TOML 编辑高级路由。";
+  }
+  if (!baseUrl) {
+    return "当前 provider 没有可安全编辑的 base_url，请用 raw TOML 补全。";
+  }
+  return undefined;
 }
 
 export function mapRecentRequests(requests: ApiFinishedRequest[]): RecentRequestView[] {

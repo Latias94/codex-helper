@@ -100,6 +100,9 @@ export function ProvidersPage() {
                   clearRuntimeState: true,
                 })
               }
+              onSaveCommonEdit={async (payload) => {
+                await actions.saveProvider.mutateAsync(payload);
+              }}
             />
           ))}
         </div>

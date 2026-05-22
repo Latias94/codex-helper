@@ -52,12 +52,12 @@ Last updated: 2026-05-22
 
 ## M3 — Provider Edit Parity And Packaged Smoke
 
-- [ ] TDRP-070 [owner=main] [deps=TDRP-020] [scope=apps/desktop/src-tauri,apps/desktop/src/features/providers]
+- [x] TDRP-070 [owner=main] [deps=TDRP-020] [scope=apps/desktop/src-tauri,apps/desktop/src/features/providers]
   Goal: Add common provider edit forms for single-endpoint providers with validation and advanced TOML preservation.
-  Validation: frontend form tests, Rust config patch tests, build/check gates.
+  Validation: DONE — `pnpm test`, `pnpm build`, `cargo check -p codex-helper-desktop`, `cargo nextest run -p codex-helper-desktop`, and `cargo fmt --check` pass. Final diff hygiene is recorded in EVIDENCE_AND_GATES.md.
   Review: Saving common fields must not silently drop unknown advanced provider fields.
-  Evidence: tests and EVIDENCE_AND_GATES.md.
-  Handoff: Complex multi-endpoint editing can stay advanced/raw TOML if documented.
+  Evidence: `apps/desktop/src-tauri/src/commands/providers.rs`; `apps/desktop/src/features/providers/ProviderCard.tsx`; `apps/desktop/src/app/App.test.tsx`; `EVIDENCE_AND_GATES.md`.
+  Handoff: DONE_WITH_CONCERNS — complex multi-endpoint editing stays advanced/raw TOML by design. Safe single-endpoint form editing is complete, but TDRP-080 still needs packaged smoke before any replacement claim.
 
 - [ ] TDRP-080 [owner=main] [deps=TDRP-040,TDRP-050,TDRP-060,TDRP-070] [scope=packaged-smoke,docs]
   Goal: Run and record full packaged desktop lifecycle smoke: close window, tray show/hide, Quit App, Detach, Stop Proxy, attach existing resident runtime, start packaged sidecar, second launch focus, config export/import.

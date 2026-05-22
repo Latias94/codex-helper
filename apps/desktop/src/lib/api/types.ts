@@ -120,7 +120,14 @@ export type RecentRequestView = {
 export type ProviderCardView = {
   id?: string;
   name: string;
+  alias?: string | null;
+  baseUrl: string;
   host: string;
+  enabled: boolean;
+  endpointCount: number;
+  endpointName?: string;
+  editable: boolean;
+  editBlockedReason?: string;
   auth: string;
   balance: string;
   health: "Healthy" | "Warning" | "Error" | "Unknown";

@@ -33,8 +33,15 @@ export const mockRuntime: RuntimeSummary = {
 };
 
 export const mockProviderCards = mockProviders.map((provider) => ({ ...provider }));
-export const mockProviderCardViews: ProviderCardView[] = mockProviders.map((provider) => ({
+export const mockProviderCardViews: ProviderCardView[] = mockProviders.map((provider, index) => ({
+  id: provider.name.toLowerCase().replaceAll(" ", "-"),
   ...provider,
+  alias: provider.name,
+  baseUrl: `https://${provider.host}/v1`,
+  enabled: true,
+  endpointCount: 1,
+  endpointName: "default",
+  editable: true,
   health: provider.health as ProviderCardView["health"],
 }));
 
