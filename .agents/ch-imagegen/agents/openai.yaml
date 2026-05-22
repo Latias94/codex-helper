@@ -1,0 +1,4 @@
+interface:
+  display_name: "CH Imagegen"
+  short_description: "Local codex-helper image generation"
+  default_prompt: "Use $ch-imagegen to generate a PNG image from this prompt."
