@@ -372,11 +372,15 @@ impl ModelCapabilities {
         self
     }
 
-    fn with_basellm_metadata(mut self, metadata: &BasellmOpenAiModelMetadata) -> Self {
+    fn with_basellm_metadata(
+        mut self,
+        metadata: &BasellmOpenAiModelMetadata,
+        allow_input_modalities_overlay: bool,
+    ) -> Self {
         if metadata.supports_fast_priority {
             self.fast_service_tier = true;
         }
-        if !metadata.input_modalities.is_empty() {
+        if allow_input_modalities_overlay && !metadata.input_modalities.is_empty() {
             self.text_input = metadata
                 .input_modalities
                 .iter()
@@ -527,6 +531,10 @@ fn is_gpt_capability_excluded_slug(slug: &str) -> bool {
         || slug.contains("-nano-")
         || slug.ends_with("-pro")
         || slug.contains("-pro-")
+}
+
+fn is_codex_text_only_slug(slug: &str) -> bool {
+    slug == "gpt-5.3-codex-spark" || slug.contains("codex-spark")
 }
 
 fn infer_future_gpt_capabilities(slug: &str) -> Option<ModelCapabilities> {
@@ -705,7 +713,11 @@ impl KnownCodexModel {
         if let Some(max_context_window) = metadata.max_context_window.filter(|value| *value > 0) {
             self.max_context_window = max_context_window.max(self.context_window);
         }
-        self.capabilities = self.capabilities.with_basellm_metadata(metadata);
+        let allow_input_modalities_overlay = !is_codex_text_only_slug(&metadata.model_id)
+            && !metadata.model_id.starts_with("gpt-image-");
+        self.capabilities = self
+            .capabilities
+            .with_basellm_metadata(metadata, allow_input_modalities_overlay);
         self
     }
 }
@@ -1088,6 +1100,47 @@ mod tests {
             Some(96_000)
         );
         assert_input_modalities(model, &["text"]);
+    }
+
+    #[test]
+    fn basellm_overlay_does_not_reenable_codex_spark_image_input() {
+        let body = br#"{
+            "object": "list",
+            "data": [
+                { "id": "gpt-5.3-codex-spark" }
+            ]
+        }"#;
+        let basellm_cache = crate::basellm_metadata::parse_basellm_openai_metadata_json(
+            r#"{
+              "openai": {
+                "models": {
+                  "gpt-5.3-codex-spark": {
+                    "name": "GPT-5.3 Codex Spark",
+                    "limit": { "context": 128000, "input": 100000 },
+                    "modalities": { "input": ["text", "image", "pdf"] },
+                    "reasoning": true,
+                    "tool_call": true
+                  }
+                }
+              }
+            }"#,
+        )
+        .expect("parse BaseLLM metadata");
+
+        let translated =
+            translate_openai_models_list_with_basellm_cache(body, Some(&basellm_cache))
+                .expect("OpenAI models list should translate to Codex catalog");
+        let value: serde_json::Value =
+            serde_json::from_slice(translated.as_ref()).expect("translated JSON");
+        let model = model_by_slug(&value, "gpt-5.3-codex-spark");
+
+        assert_input_modalities(model, &["text"]);
+        assert_eq!(
+            model
+                .get("supports_image_detail_original")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
     }
 
     fn translated_models_value(slugs: &[&str]) -> Value {
