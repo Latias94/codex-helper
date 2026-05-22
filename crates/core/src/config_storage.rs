@@ -30,6 +30,7 @@ fn config_toml_backup_path() -> PathBuf {
 pub struct CodexClientPatchConfig {
     pub preset: crate::codex_integration::CodexPatchMode,
     pub options: crate::codex_integration::CodexSwitchOptions,
+    pub translate_models: bool,
 }
 
 impl Default for CodexClientPatchConfig {
@@ -37,6 +38,7 @@ impl Default for CodexClientPatchConfig {
         Self {
             preset: crate::codex_integration::CodexPatchMode::Default,
             options: crate::codex_integration::CodexSwitchOptions::default(),
+            translate_models: false,
         }
     }
 }
@@ -107,10 +109,15 @@ fn codex_client_patch_preset_from_toml_value(
 
 fn codex_client_patch_config_from_toml_value(value: &TomlValue) -> Result<CodexClientPatchConfig> {
     let preset = codex_client_patch_preset_from_toml_value(value)?;
-    let responses_websocket = value
+    let patch = value
         .get("codex")
-        .and_then(|codex| codex.get("client_patch"))
+        .and_then(|codex| codex.get("client_patch"));
+    let responses_websocket = patch
         .and_then(|patch| patch.get("responses_websocket"))
+        .and_then(TomlValue::as_bool)
+        .unwrap_or(false);
+    let translate_models = patch
+        .and_then(|patch| patch.get("translate_models"))
         .and_then(TomlValue::as_bool)
         .unwrap_or(false);
 
@@ -119,6 +126,7 @@ fn codex_client_patch_config_from_toml_value(value: &TomlValue) -> Result<CodexC
         options: crate::codex_integration::CodexSwitchOptions {
             responses_websocket,
         },
+        translate_models,
     })
 }
 
@@ -415,6 +423,10 @@ version = 5
 #                      supports_websockets = true，让 Codex 可选择 Responses WebSocket v2。
 #                      只应与 official-relay / official-imagegen 搭配，
 #                      且仅在 helper 与所选中转都支持 WebSocket relay 时开启。
+# translate_models：默认 false。false 时 helper 只解码 /models 响应压缩体，
+#                   不把 OpenAI data 列表翻译成 Codex models catalog，让 Codex 使用
+#                   自带 models.json / fallback 元数据；true 仅用于确实需要 helper
+#                   合成模型目录的中转，因为 Codex 会把合成后的字段当成权威。
 # 请求体 Content-Encoding 默认自动归一化（zstd / gzip / br / deflate），并会把
 # body.prompt_cache_key 作为缺省 session affinity 信号。极少数中转若必须接收
 # 原始 Codex 压缩体，请在启动 helper 的环境里设置：
@@ -428,6 +440,7 @@ version = 5
 # preset = "official-relay"
 # preset = "official-imagegen"
 # responses_websocket = false
+# translate_models = false
 
 # --- TUI 用量预测（可选） ---
 #

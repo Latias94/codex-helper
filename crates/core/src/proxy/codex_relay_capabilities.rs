@@ -277,7 +277,7 @@ fn build_mismatches(
             capability: "model_catalog".to_string(),
             expected: "codex_models".to_string(),
             observed: "openai_data_list".to_string(),
-            reason: "relay returned an OpenAI models list; helper translation is required before Codex can see model metadata".to_string(),
+            reason: "relay returned an OpenAI models list; helper model translation is disabled by default so Codex can keep using its bundled model metadata. Enable codex.client_patch.translate_models only if you intentionally want helper-synthesized model metadata.".to_string(),
         });
     }
     out

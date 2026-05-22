@@ -1323,6 +1323,33 @@ responses_websocket = true
         crate::codex_integration::CodexPatchMode::OfficialImagegenBridge
     );
     assert!(cfg.options.responses_websocket);
+    assert!(!cfg.translate_models);
+}
+
+#[test]
+fn codex_client_patch_config_parses_models_translation_option() {
+    let _env = setup_temp_codex_home();
+    let dir = super::proxy_home_dir();
+    let toml_path = dir.join("config.toml");
+    write_file(
+        &toml_path,
+        r#"
+version = 5
+
+[codex.client_patch]
+preset = "default"
+translate_models = true
+"#,
+    );
+
+    let cfg =
+        super::codex_client_patch_config_from_config_file().expect("read client patch config");
+    assert_eq!(
+        cfg.preset,
+        crate::codex_integration::CodexPatchMode::Default
+    );
+    assert!(!cfg.options.responses_websocket);
+    assert!(cfg.translate_models);
 }
 
 #[test]

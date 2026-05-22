@@ -15,9 +15,39 @@ pub(super) fn maybe_decode_models_response_body(
     headers: &HeaderMap,
     body: Bytes,
 ) -> Bytes {
+    if service_name != "codex" || path != "/models" {
+        return body;
+    }
+
+    maybe_decode_models_response_body_with_translation(
+        service_name,
+        path,
+        headers,
+        body,
+        codex_models_translation_enabled(),
+    )
+}
+
+fn codex_models_translation_enabled() -> bool {
+    crate::config::codex_client_patch_config_from_config_file()
+        .map(|cfg| cfg.translate_models)
+        .unwrap_or(false)
+}
+
+fn maybe_decode_models_response_body_with_translation(
+    service_name: &str,
+    path: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+    translate_openai_models: bool,
+) -> Bytes {
     let body =
         maybe_decode_models_response_body_without_translation(service_name, path, headers, body);
-    maybe_translate_openai_models_list(body.as_ref()).unwrap_or(body)
+    if translate_openai_models {
+        maybe_translate_openai_models_list(body.as_ref()).unwrap_or(body)
+    } else {
+        body
+    }
 }
 
 pub(super) fn maybe_decode_models_response_body_without_translation(
@@ -707,12 +737,6 @@ impl KnownCodexModel {
                 .filter(|value| !value.is_empty())
                 .map(ToOwned::to_owned);
         }
-        if let Some(context_window) = metadata.context_window.filter(|value| *value > 0) {
-            self.context_window = context_window;
-        }
-        if let Some(max_context_window) = metadata.max_context_window.filter(|value| *value > 0) {
-            self.max_context_window = max_context_window.max(self.context_window);
-        }
         let allow_input_modalities_overlay = !is_codex_text_only_slug(&metadata.model_id)
             && !metadata.model_id.starts_with("gpt-image-");
         self.capabilities = self
@@ -747,6 +771,84 @@ mod tests {
         CodexCapabilityProfile, CodexCapabilitySupport, CodexModelCatalogShape,
     };
     use crate::codex_integration::CodexPatchMode;
+    use axum::http::HeaderValue;
+
+    #[test]
+    fn decode_models_response_does_not_translate_openai_list_when_disabled() {
+        let body = Bytes::from_static(
+            br#"{
+            "object": "list",
+            "data": [
+                { "id": "gpt-5.5", "object": "model", "display_name": "GPT-5.5" }
+            ]
+        }"#,
+        );
+
+        let decoded = maybe_decode_models_response_body_with_translation(
+            "codex",
+            "/models",
+            &HeaderMap::new(),
+            body.clone(),
+            false,
+        );
+        let value: Value = serde_json::from_slice(decoded.as_ref()).expect("decoded JSON");
+
+        assert_eq!(decoded, body);
+        assert!(value.get("models").is_none());
+        assert!(value.get("data").and_then(Value::as_array).is_some());
+    }
+
+    #[test]
+    fn decode_models_response_translates_openai_list_when_enabled() {
+        let body = Bytes::from_static(
+            br#"{
+            "object": "list",
+            "data": [
+                { "id": "gpt-5.5", "object": "model", "display_name": "GPT-5.5" }
+            ]
+        }"#,
+        );
+
+        let decoded = maybe_decode_models_response_body_with_translation(
+            "codex",
+            "/models",
+            &HeaderMap::new(),
+            body,
+            true,
+        );
+        let value: Value = serde_json::from_slice(decoded.as_ref()).expect("decoded JSON");
+
+        assert!(value.get("data").is_none());
+        assert_eq!(
+            model_by_slug(&value, "gpt-5.5")
+                .get("context_window")
+                .and_then(Value::as_i64),
+            Some(272_000)
+        );
+    }
+
+    #[test]
+    fn decode_models_response_still_decodes_compression_when_translation_disabled() {
+        let raw = br#"{"object":"list","data":[{"id":"gpt-5.5"}]}"#;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, raw).expect("write gzip body");
+        let compressed = encoder.finish().expect("finish gzip body");
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+
+        let decoded = maybe_decode_models_response_body_with_translation(
+            "codex",
+            "/models",
+            &headers,
+            Bytes::from(compressed),
+            false,
+        );
+        let value: Value = serde_json::from_slice(decoded.as_ref()).expect("decoded JSON");
+
+        assert_eq!(decoded.as_ref(), raw);
+        assert!(value.get("models").is_none());
+        assert!(value.get("data").and_then(Value::as_array).is_some());
+    }
 
     #[test]
     fn codex_capability_profile_understands_translated_openai_models_list() {
@@ -1046,7 +1148,59 @@ mod tests {
         );
         assert_eq!(
             model.get("max_context_window").and_then(Value::as_i64),
-            Some(400_000)
+            Some(272_000)
+        );
+        assert_input_modalities(model, &["text", "image"]);
+    }
+
+    #[test]
+    fn basellm_overlay_does_not_override_known_codex_model_context_windows() {
+        let body = br#"{
+            "object": "list",
+            "data": [
+                { "id": "gpt-5.5" }
+            ]
+        }"#;
+        let basellm_cache = crate::basellm_metadata::parse_basellm_openai_metadata_json(
+            r#"{
+              "openai": {
+                "models": {
+                  "gpt-5.5": {
+                    "name": "GPT-5.5",
+                    "description": "Metadata sourced from BaseLLM.",
+                    "limit": { "context": 1050000, "input": 922000 },
+                    "modalities": { "input": ["text", "image"] },
+                    "reasoning": true,
+                    "tool_call": true,
+                    "experimental": {
+                      "modes": {
+                        "fast": {
+                          "provider": { "body": { "service_tier": "priority" } }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }"#,
+        )
+        .expect("parse BaseLLM metadata");
+
+        let translated =
+            translate_openai_models_list_with_basellm_cache(body, Some(&basellm_cache))
+                .expect("OpenAI models list should translate to Codex catalog");
+        let value: serde_json::Value =
+            serde_json::from_slice(translated.as_ref()).expect("translated JSON");
+        let model = model_by_slug(&value, "gpt-5.5");
+
+        assert!(model_has_fast_service_tier(model));
+        assert_eq!(
+            model.get("context_window").and_then(Value::as_i64),
+            Some(272_000)
+        );
+        assert_eq!(
+            model.get("max_context_window").and_then(Value::as_i64),
+            Some(272_000)
         );
         assert_input_modalities(model, &["text", "image"]);
     }
@@ -1097,7 +1251,11 @@ mod tests {
         );
         assert_eq!(
             model.get("context_window").and_then(Value::as_i64),
-            Some(96_000)
+            Some(272_000)
+        );
+        assert_eq!(
+            model.get("max_context_window").and_then(Value::as_i64),
+            Some(272_000)
         );
         assert_input_modalities(model, &["text"]);
     }
