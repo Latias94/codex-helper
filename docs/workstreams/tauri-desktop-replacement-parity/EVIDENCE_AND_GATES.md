@@ -440,3 +440,87 @@ Deferred:
 Result:
 
 - DONE_WITH_CONCERNS — common provider edit parity is implemented and verified for single-endpoint providers while preserving advanced TOML fields. Multi-endpoint providers remain explicitly advanced/raw TOML.
+
+### 2026-05-22 — TDRP-080 packaged lifecycle smoke partial automation
+
+Evidence:
+
+- Added a repeatable Windows smoke runner:
+  - `docs/workstreams/tauri-desktop-replacement-parity/scripts/tdrp_080_packaged_smoke.ps1`
+  - The script installs the NSIS artifact into a temporary directory.
+  - It uses an isolated `CODEX_HELPER_HOME` and `CODEX_HELPER_DESKTOP_ADMIN_URL=http://127.0.0.1:6211`.
+  - It clears `CODEX_HELPER_CLI_PATH` and legacy `CODEX_HELPER_CLI` so the packaged installation cannot rely on developer env CLI overrides.
+  - It only stops the desktop process it started from the temporary install directory.
+- The first UI Automation approach was abandoned because broad Windows UIA/WebView/system-tray tree scans can hang on this machine.
+- The smoke runner was changed to a Win32 window-message strategy for stable non-invasive verification.
+
+Verification:
+
+- Command:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File docs/workstreams/tauri-desktop-replacement-parity/scripts/tdrp_080_packaged_smoke.ps1
+```
+
+- Result: PASS for the automated subset.
+- Output:
+
+```json
+{
+  "timestamp": "2026-05-22T14:22:17.6069332+08:00",
+  "installer": "D:\\Projects\\rust\\codex-helper\\target\\release\\bundle\\nsis\\codex-helper_0.16.0_x64-setup.exe",
+  "install_dir": "C:\\Users\\Administrator\\AppData\\Local\\Temp\\codex-helper-tdrp-080-install",
+  "smoke_home": "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\codex-helper-tdrp-080-home-15e2dafc52074ece9f8ed8c53267e541",
+  "admin_url": "http://127.0.0.1:6211",
+  "results": [
+    {
+      "name": "nsis-install",
+      "passed": true,
+      "detail": "exit=0; install=C:\\Users\\Administrator\\AppData\\Local\\Temp\\codex-helper-tdrp-080-install"
+    },
+    {
+      "name": "packaged-files",
+      "passed": true,
+      "detail": "desktop=True; sidecar=True"
+    },
+    {
+      "name": "packaged-window-start",
+      "passed": true,
+      "detail": "pid=24144; hwnd=987176; visible=True"
+    },
+    {
+      "name": "close-hides-to-tray",
+      "passed": true,
+      "detail": "alive=True; hwnd_after_close=987176; visible_after_close=False"
+    },
+    {
+      "name": "second-launch-focuses-existing-window",
+      "passed": true,
+      "detail": "second_pid=53940; second_exited=True; first_alive=True; hwnd=987176; visible=True"
+    }
+  ],
+  "passed": true
+}
+```
+
+Claims proven by this run:
+
+- The Windows NSIS installer can install into an isolated temporary directory.
+- The installed directory contains both `codex-helper-desktop.exe` and bundled `codex-helper.exe`.
+- The installed desktop app starts and creates the main native window.
+- A native `WM_CLOSE` request hides the packaged main window instead of exiting the desktop process.
+- A second launch exits/focuses the already-running packaged instance and makes the hidden main window visible again.
+- The smoke used a separate `CODEX_HELPER_HOME` and admin URL and did not touch the user's active `ch.exe` process.
+
+Not yet proven by this partial automation:
+
+- Real tray menu click paths: Show Window, Hide to Tray, Quit App.
+- Start Proxy through the packaged UI and desktop-managed sidecar startup without developer CLI env overrides.
+- Detach and explicit Stop Proxy behavior in the packaged UI.
+- Packaged config export/import file-dialog behavior.
+- Packaged provider edit UI behavior.
+- Launch-at-login enable/disable and login/restart behavior.
+
+Result:
+
+- PARTIAL — TDRP-080 is not complete. The automated Windows smoke now proves the installer, installed sidecar presence, close-to-tray native window behavior, and packaged single-instance focus path. Remaining TDRP-080 items still need stronger UI automation or manual smoke evidence before egui replacement claims.

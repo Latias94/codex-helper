@@ -35,6 +35,7 @@ The parent readiness report says Tauri is source-preview/internal-dogfood ready,
 - TDRP-050 is implemented with concerns: `tauri-plugin-autostart` is registered, Settings uses the real `@tauri-apps/plugin-autostart` guest binding, and frontend tests prove the switch calls the plugin. Manual packaged login-item smoke remains TDRP-080.
 - TDRP-060 is implemented with concerns: the first replacement release uses manual GitHub Releases installer downloads; auto-update remains disabled until Tauri updater signing keys, HTTPS release endpoint, artifact hosting, and rollback operations are real. Settings shows disabled honest update copy.
 - TDRP-070 is implemented with concerns: single-endpoint provider common edits are available through a validated form and `save_common_provider`; Rust config patch tests prove advanced TOML fields are preserved and multi-endpoint providers are rejected without overwriting. Complex provider editing remains raw TOML.
+- TDRP-080 has partial automated evidence: `scripts/tdrp_080_packaged_smoke.ps1` installs the NSIS artifact into a temporary directory, verifies the installed desktop exe plus bundled sidecar, starts the packaged app, proves native close hides to tray, and proves second launch focuses/restores the existing packaged window. This is not enough to mark TDRP-080 done.
 
 ## Blockers
 
@@ -44,8 +45,14 @@ The parent readiness report says Tauri is source-preview/internal-dogfood ready,
 
 Implement TDRP-080:
 
-1. Prepare an isolated packaged-smoke environment so the user's active local `codex-helper` runtime is not stopped, detached, reconfigured, or otherwise disturbed.
-2. Rebuild/package only if current artifacts are stale.
-3. Smoke close-to-tray, tray show/hide, Quit App, Detach, explicit Stop Proxy, attach existing runtime, packaged sidecar start, second-launch focus, Settings path/config actions, launch-at-login, and provider edit UI.
+1. Keep using an isolated packaged-smoke environment so the user's active local `codex-helper`/`ch.exe` runtime is not stopped, detached, reconfigured, or otherwise disturbed.
+2. Reuse or extend `docs/workstreams/tauri-desktop-replacement-parity/scripts/tdrp_080_packaged_smoke.ps1`; avoid broad Windows UIA tree scans because they hung on this machine.
+3. Remaining smoke coverage needed before TDRP-080 can be marked done:
+   - real tray menu Show Window / Hide to Tray / Quit App;
+   - Start Proxy through the packaged UI and desktop-managed sidecar startup without developer CLI env overrides;
+   - Detach and explicit Stop Proxy behavior in packaged UI;
+   - Settings path/config export/import dialogs;
+   - launch-at-login enable/disable packaged OS behavior;
+   - provider edit UI in packaged app.
 4. Record pass/fail evidence in `EVIDENCE_AND_GATES.md`.
 5. Fix blocking failures or split OS-specific follow-ons before moving to docs/release/egui deprecation tasks.
