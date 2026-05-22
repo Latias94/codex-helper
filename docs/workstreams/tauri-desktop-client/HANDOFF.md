@@ -1,7 +1,7 @@
 # Tauri Desktop Client — Handoff
 
 Status: Draft
-Last updated: 2026-05-21
+Last updated: 2026-05-22
 
 ## Current State
 
@@ -107,7 +107,45 @@ TDC-070 is complete with concerns:
 - Owner semantics are intentionally shown as pending/uncertain in shell/status/settings copy; the frontend no longer pretends it knows whether the runtime is desktop-owned or attached.
 - Validation passed on 2026-05-21: `pnpm test` (5 files, 20 tests), `pnpm build`, `cargo fmt --check`, `cargo check -p codex-helper-desktop`, and `git diff --check -- .`.
 
-Current next task: TDC-080 safe control actions. Implement attach, desktop-owned start, stop-owned vs explicit remote stop, switch on/off, reload runtime, probe station, refresh balances, and provider/session overrides with confirmation rules. TDC-090 tray and authoritative lifecycle owner semantics remain follow-on work.
+TDC-080 is complete with concerns:
+
+- Tauri safe mutation commands exist for attach, desktop-managed start, owned stop, explicit attached remote stop, Codex switch on/off, runtime reload, station probe, provider balance refresh, provider runtime overrides, global route override, and session overrides.
+- Desktop admin API requests now propagate `CODEX_HELPER_ADMIN_TOKEN` as `x-codex-helper-admin-token`.
+- Frontend action hooks and status banners are wired into Dashboard, Providers, and Settings.
+- Dangerous actions require exact inline phrases:
+  - `STOP OWNED PROXY`
+  - `STOP ATTACHED PROXY`
+  - `SWITCH CODEX`
+  - `SWITCH OFF CODEX`
+- Validation passed on 2026-05-21: `pnpm build`, `pnpm test`, `cargo fmt --check`, `cargo check -p codex-helper-desktop`, `cargo nextest run -p codex-helper-desktop --lib`, and `git diff --check -- .`.
+
+TDC-090 is complete with concerns:
+
+- `apps/desktop/src-tauri/src/lifecycle.rs` now owns tray/window/app lifecycle behavior.
+- Native main-window close requests hide to tray unless an explicit app quit was requested.
+- The tray menu exposes Show Window, Hide to Tray, and Quit App (Proxy Keeps Running).
+- Frontend custom titlebar buttons call Tauri window commands; titlebar close maps to hide-to-tray.
+- Settings Dangerous Actions now distinguishes Quit App, Detach, and Stop Proxy; Quit App/Detach do not call `stop_proxy`.
+- StatusStrip and Settings now show desktop-owned vs attached owner labels when `get_desktop_control_state` can classify the runtime.
+- Validation passed on 2026-05-22: `pnpm test` (5 files, 22 tests), `pnpm build`, `cargo fmt --check`, `cargo check -p codex-helper-desktop`, `cargo nextest run -p codex-helper-desktop --lib` (9 tests), and `git diff --check -- .`.
+- Follow-up Windows native close smoke also passed after hardening the listener registration: `PostMessage(WM_CLOSE)` left the desktop process alive, hid the window, and kept the existing `127.0.0.1:4211` proxy reachable before close, after close, and after desktop-process cleanup.
+
+Current next task: TDC-100 replacement readiness documentation. Do not remove egui yet. Document that the Tauri client is the preferred replacement path only after parity gaps are explicit, including full interactive Tauri tray/window smoke, packaged sidecar lookup, autostart, signing/installer behavior, and any remaining advanced controls.
+
+On 2026-05-22, `IMPLEMENTATION_BRIEF.md` gained a Desktop Capability Matrix requested by the user. It tracks:
+
+- desktop residency;
+- system tray;
+- auto update;
+- launch at login;
+- single instance;
+- lightweight single-config import/export;
+- open folders/paths;
+- packaged sidecar.
+
+Use that matrix as the source of truth for TDC-100 follow-up planning. Current support is intentionally marked partial/not implemented for anything beyond TDC-090 tray/window lifecycle behavior.
+
+Important product boundary from the user: import/export should be simple because codex-helper has one primary config. Do not copy the heavier config/profile/workspace management style from `repo-ref/aio-coding-hub` or `repo-ref/cc-switch`; a future implementation should be closer to "export current config / import config with validation and backup".
 
 ## shadcn/ui Prototype Prompt
 

@@ -1,14 +1,17 @@
-import { ArrowDown, Database, Plus, Search, SlidersHorizontal } from "lucide-react";
+import { ArrowDown, Database, Plus, RefreshCw, Search, SlidersHorizontal } from "lucide-react";
 
 import { PageHeader } from "@/app/AppShell";
 import { DataStateBanner } from "@/components/page/DataStateBanner";
 import { EmptyState } from "@/components/page/EmptyState";
 import { ProviderCard } from "@/features/providers/ProviderCard";
 import { useProvidersData } from "@/features/providers/hooks";
+import { useRuntimeActions } from "@/features/runtime/actions";
+import { ActionStatusBanner } from "@/features/runtime/ActionStatusBanner";
 import { Badge, Button, Card, CardContent, CardDescription, CardHeader, CardTitle, Input, SelectBox } from "@/components/ui";
 
 export function ProvidersPage() {
   const providersState = useProvidersData();
+  const actions = useRuntimeActions();
   const { providers, routeOrder } = providersState.data;
 
   return (
@@ -27,6 +30,9 @@ export function ProvidersPage() {
         state={providersState.state}
         onRefresh={providersState.refetch}
       />
+      <div className="mb-4">
+        <ActionStatusBanner status={actions.status} busy={actions.isBusy} />
+      </div>
 
       <div className="mb-4 flex shrink-0 items-center justify-between rounded-2xl border border-slate-200 bg-white/88 p-4 shadow-sm">
         <div className="flex min-w-0 flex-wrap items-center gap-3">
@@ -43,10 +49,20 @@ export function ProvidersPage() {
           <Badge variant="teal">compact</Badge>
           <Badge variant="teal">imagegen</Badge>
         </div>
-        <Button variant="outline">
-          <SlidersHorizontal className="h-4 w-4" />
-          凭证列表模式
-        </Button>
+        <div className="flex gap-2">
+          <Button
+            variant="outline"
+            disabled={!providersState.state.canUseLiveActions || actions.refreshBalances.isPending}
+            onClick={() => actions.refreshBalances.mutate({})}
+          >
+            <RefreshCw className="h-4 w-4" />
+            刷新余额
+          </Button>
+          <Button variant="outline">
+            <SlidersHorizontal className="h-4 w-4" />
+            凭证列表模式
+          </Button>
+        </div>
       </div>
 
       <div className="grid min-h-0 flex-1 grid-cols-[1fr_320px] gap-4">
@@ -60,7 +76,31 @@ export function ProvidersPage() {
               />
             </div>
           ) : providers.map((provider) => (
-            <ProviderCard key={provider.name} provider={provider} />
+            <ProviderCard
+              key={provider.name}
+              provider={provider}
+              busy={actions.isBusy}
+              onProbe={() => actions.probe.mutate({ stationName: provider.id ?? provider.name })}
+              onRefreshBalance={() =>
+                actions.refreshBalances.mutate({ providerId: provider.id ?? provider.name })
+              }
+              onSetActive={() =>
+                actions.setGlobalRoute.mutate({ target: provider.id ?? provider.name })
+              }
+              onDisable={() =>
+                actions.setProviderOverride.mutate({
+                  providerName: provider.id ?? provider.name,
+                  enabled: false,
+                })
+              }
+              onClearOverride={() =>
+                actions.setProviderOverride.mutate({
+                  providerName: provider.id ?? provider.name,
+                  clearEnabled: true,
+                  clearRuntimeState: true,
+                })
+              }
+            />
           ))}
         </div>
 

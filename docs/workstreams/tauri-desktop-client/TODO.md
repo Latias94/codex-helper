@@ -1,7 +1,7 @@
 # Tauri Desktop Client — TODO
 
 Status: Draft
-Last updated: 2026-05-21
+Last updated: 2026-05-22
 
 ## M0 — Scope And Evidence Freeze
 
@@ -77,19 +77,19 @@ Last updated: 2026-05-21
 
 ## M4 — Safe Mutations And Desktop Lifecycle
 
-- [ ] TDC-080 [owner=main-or-worker] [deps=TDC-070] [scope=desktop-frontend/src,src/cli_app.rs-or-tauri-commands]
+- [x] TDC-080 [owner=main-or-worker] [deps=TDC-070] [scope=desktop-frontend/src,src/cli_app.rs-or-tauri-commands]
   Goal: Implement safe actions: attach, start desktop-owned proxy, stop owned proxy, explicit remote stop, switch on/off, reload runtime, probe station, refresh balances, set/clear overrides.
   Validation: targeted frontend tests plus Rust/Tauri command tests where practical.
-  Review: Explicit Stop Proxy and ordinary Quit must remain visibly different.
-  Evidence: tests and manual action matrix.
-  Handoff: Dangerous actions require inline confirmation.
+  Review: DONE_WITH_CONCERNS — Tauri commands now expose typed safe mutations and the UI separates Dashboard quick actions from Settings confirmation actions. Explicit Stop Owned and Remote Stop Attached require different exact phrases; ordinary Quit/Detach remains non-stopping copy and tray semantics are deferred to TDC-090.
+  Evidence: `apps/desktop/src-tauri/src/commands/control.rs`; `apps/desktop/src/features/runtime/actions.ts`; `apps/desktop/src/features/settings/SettingsPage.tsx`; `docs/workstreams/tauri-desktop-client/JOURNAL/2026-05-21-tdc-080.md`; `EVIDENCE_AND_GATES.md` 2026-05-21 TDC-080 entry.
+  Handoff: DONE_WITH_CONCERNS — Start Proxy currently locates/spawns the CLI sibling or `CODEX_HELPER_CLI_PATH`; TDC-090 should harden this as the authoritative tray/sidecar owner path.
 
-- [ ] TDC-090 [owner=main-or-worker] [deps=TDC-080] [scope=desktop-tauri,tray,lifecycle]
+- [x] TDC-090 [owner=main-or-worker] [deps=TDC-080] [scope=desktop-tauri,tray,lifecycle]
   Goal: Implement tray and desktop owner semantics using the hidden desktop-managed sidecar path.
   Validation: lifecycle smoke: close window, quit app, attach existing resident runtime, explicit stop.
-  Review: No normal GUI exit may remote-stop an attached runtime.
-  Evidence: lifecycle matrix in EVIDENCE_AND_GATES.md.
-  Handoff: Split OS autostart/signing if scope grows.
+  Review: DONE_WITH_CONCERNS — Rust lifecycle policy, tray menu, window close interception, frontend titlebar/Settings commands, tests, and Windows native `WM_CLOSE` smoke now enforce that normal GUI close/quit leaves the proxy running. Full manual OS tray menu click smoke is still pending.
+  Evidence: `apps/desktop/src-tauri/src/lifecycle.rs`; `apps/desktop/src/app/App.test.tsx`; `docs/workstreams/tauri-desktop-client/JOURNAL/2026-05-22-tdc-090.md`; `EVIDENCE_AND_GATES.md` 2026-05-22 TDC-090 entry.
+  Handoff: DONE_WITH_CONCERNS — split OS autostart, packaged sidecar declaration/signing, installer tray smoke, and egui replacement readiness into TDC-100+ follow-up.
 
 ## M5 — Replacement Readiness
 
@@ -97,8 +97,8 @@ Last updated: 2026-05-21
   Goal: Document Tauri client as replacement path for egui GUI and state remaining parity gaps.
   Validation: docs review plus targeted checks.
   Review: Do not remove egui until parity and packaging gates pass.
-  Evidence: docs diff and final gate log.
-  Handoff: Split follow-on work for egui removal, installer/signing, or auto-update.
+  Evidence: docs diff and final gate log; desktop capability matrix from `IMPLEMENTATION_BRIEF.md`.
+  Handoff: Split follow-on work for egui removal, installer/signing, auto-update, launch-at-login, single-instance, packaged sidecar, and lightweight single-config import/export.
 
 - [ ] TDC-110 [owner=planner] [deps=TDC-100] [scope=docs/workstreams/tauri-desktop-client]
   Goal: Close this lane or split remaining work.

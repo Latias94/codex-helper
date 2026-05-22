@@ -3,6 +3,7 @@ export const queryKeys = {
   knownPaths: ["desktop", "known-paths"] as const,
   admin: {
     readModel: ["admin", "read-model"] as const,
+    controlState: ["admin", "control-state"] as const,
     operatorSummary: ["admin", "operator-summary"] as const,
     runtimeStatus: ["admin", "runtime-status"] as const,
     providers: ["admin", "providers"] as const,

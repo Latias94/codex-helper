@@ -6,6 +6,10 @@ pub enum DesktopError {
     Path(String),
     #[error("admin API request failed: {0}")]
     AdminApi(String),
+    #[error("desktop lifecycle action failed: {0}")]
+    Lifecycle(String),
+    #[error("client switch action failed: {0}")]
+    Switch(String),
 }
 
 #[derive(Debug, Serialize)]

@@ -1,7 +1,7 @@
 # Tauri Desktop Client — Evidence And Gates
 
 Status: Draft
-Last updated: 2026-05-21
+Last updated: 2026-05-22
 
 ## Required Gates By Phase
 
@@ -583,8 +583,199 @@ Result:
 
 - DONE_WITH_CONCERNS — TDC-070 state taxonomy and visual QA are implemented. Next step is TDC-080 safe control actions.
 
+### 2026-05-21 — TDC-080 safe control actions
+
+Evidence:
+
+- Added typed Tauri control commands under `apps/desktop/src-tauri/src/commands/control.rs`:
+  - `get_desktop_control_state`;
+  - `attach_existing_proxy`;
+  - `start_desktop_proxy`;
+  - `stop_proxy`;
+  - `switch_codex`;
+  - `reload_runtime`;
+  - `probe_station`;
+  - `refresh_provider_balances`;
+  - `apply_provider_runtime_override`;
+  - `set_global_route_override`;
+  - `apply_session_overrides`;
+  - `reset_session_overrides`.
+- Reused existing core lifecycle semantics:
+  - `RuntimeOwnerMarker`;
+  - `RuntimeOwnerKind`;
+  - `decide_runtime_stop_action`;
+  - `RuntimeStopIntent::ExplicitStop`.
+- Added admin-token propagation to the desktop admin client path:
+  - reads `CODEX_HELPER_ADMIN_TOKEN`;
+  - sends `x-codex-helper-admin-token` on desktop admin requests.
+- Added exact confirmation phrases for dangerous local mutations:
+  - `STOP OWNED PROXY`;
+  - `STOP ATTACHED PROXY`;
+  - `SWITCH CODEX`;
+  - `SWITCH OFF CODEX`.
+- Added frontend action boundary:
+  - `apps/desktop/src/features/runtime/actions.ts`;
+  - `apps/desktop/src/features/runtime/ActionStatusBanner.tsx`;
+  - command wrappers in `apps/desktop/src/lib/tauri/commands.ts`;
+  - shared control state types in `apps/desktop/src/lib/api/types.ts`.
+- Wired UI surfaces:
+  - Dashboard can start/attach/refresh and routes switch confirmation to Settings instead of silently mutating Codex config.
+  - Providers can probe, refresh balances, set global route target, disable provider runtime, and clear provider runtime overrides.
+  - Settings can reload runtime, switch Codex on/off with confirmation, set/clear global route override, set/reset session route override, and choose owned stop vs remote stop with separate confirmation phrases.
+
+Manual action matrix:
+
+| Action | Behavior | Safety boundary |
+| --- | --- | --- |
+| Attach Existing | Requires reachable admin API and reports attached state. | Does not stop or take ownership of external runtime. |
+| Start Proxy | Spawns `codex-helper serve --codex --host 127.0.0.1 --port <port> --no-tui --desktop-managed` via `CODEX_HELPER_CLI_PATH`/sibling CLI lookup, then polls admin API. | Uses existing desktop owner marker path; tray/sidecar authority remains TDC-090. |
+| Stop Owned | Requires `STOP OWNED PROXY`. | Only maps to `StopOwnedRuntime` for desktop-owned state. |
+| Remote Stop Attached | Requires `STOP ATTACHED PROXY`. | Separate action/copy; falls back to detach-only if shutdown is unavailable. |
+| Codex Switch On | Requires `SWITCH CODEX` in Settings. | Uses non-interactive core switch API; Dashboard quick action is disabled and points to Settings. |
+| Codex Switch Off | Requires `SWITCH OFF CODEX` in Settings. | Uses core switch-state restoration path. |
+| Reload/probe/balance refresh | Exposed as explicit buttons. | Disabled when live admin state is not usable. |
+| Provider/global/session overrides | Exposed in Providers/Settings advanced areas. | Typed payloads through Tauri commands; no secret material is displayed. |
+
+Verification:
+
+- Command: `pnpm build`
+- Scope: `apps/desktop`
+- Result: PASS — TypeScript and Vite production build completed.
+- Output summary:
+  - `dist/index.html`
+  - `dist/assets/index-ConQhKx5.css`
+  - `dist/assets/index-6JIEix8J.js`
+
+- Command: `pnpm test`
+- Scope: `apps/desktop`
+- Result: PASS — Vitest passed: 5 files, 20 tests.
+
+- Command: `cargo fmt --check`
+- Scope: repository workspace
+- Result: PASS.
+
+- Command: `cargo check -p codex-helper-desktop`
+- Scope: `apps/desktop/src-tauri`
+- Result: PASS.
+
+- Command: `cargo nextest run -p codex-helper-desktop --lib`
+- Scope: `apps/desktop/src-tauri`
+- Result: PASS — 6 tests. Covers owner classification, explicit confirmation phrases, stop decision separation, CLI sibling lookup, and balance-refresh query encoding.
+
+- Command: `git diff --check -- .`
+- Scope: full repository diff
+- Result: PASS — no diff whitespace errors reported. Git emitted only Windows LF/CRLF warnings for edited text files.
+
+Concerns / deferred:
+
+- Full Tauri window smoke remains pending; this slice validates command/frontend boundaries but does not run `pnpm tauri:dev`.
+- `start_desktop_proxy` is implemented by locating/spawning the CLI binary; TDC-090 should make the tray/sidecar path authoritative and package-aware.
+- Tray minimize/quit/autostart behavior is still TDC-090.
+
+Result:
+
+- DONE_WITH_CONCERNS — TDC-080 safe mutations are implemented with visible confirmation boundaries. Next step is TDC-090 tray and authoritative desktop owner semantics.
+
+### 2026-05-22 — TDC-090 tray and desktop lifecycle semantics
+
+Evidence:
+
+- Added `apps/desktop/src-tauri/src/lifecycle.rs` as the desktop lifecycle boundary:
+  - creates a Tauri tray icon with `Show Window`, `Hide to Tray`, and `Quit App (Proxy Keeps Running)`;
+  - intercepts main-window close requests and hides the window to tray unless an explicit app quit has been requested;
+  - records explicit app-quit intent through managed `DesktopLifecycleState`;
+  - exposes a policy assertion that normal app exit leaves the proxy runtime running.
+- Added Tauri window/app commands:
+  - `show_main_window`;
+  - `hide_main_window`;
+  - `minimize_main_window`;
+  - `toggle_main_window_maximized`;
+  - `quit_app`.
+- Added a Desktop Capability Matrix to `IMPLEMENTATION_BRIEF.md` for longer-term desktop support:
+  - desktop residency;
+  - system tray;
+  - auto update;
+  - launch at login;
+  - single instance;
+  - lightweight single-config import/export;
+  - open folders/paths;
+  - packaged sidecar.
+- Wired frontend desktop controls:
+  - custom titlebar minimize/maximize/close now call Tauri commands;
+  - titlebar close maps to hide-to-tray, not process/runtime shutdown;
+  - Settings Dangerous Actions now make Quit App, Detach, and Stop Proxy visibly different;
+  - StatusStrip and Settings display desktop-owned vs attached lifecycle owner labels from control state.
+- Preserved TDC-080 safety boundary:
+  - only `stop_proxy` with exact confirmation phrases can request runtime shutdown;
+  - no normal window close, Detach, or Quit App path invokes `stop_proxy`.
+
+Lifecycle matrix:
+
+| Scenario | Current behavior | Runtime stop behavior | Evidence |
+| --- | --- | --- | --- |
+| Desktop-owned start | `start_desktop_proxy` still spawns `codex-helper serve --codex --host 127.0.0.1 --port <port> --no-tui --desktop-managed` through env/sibling CLI lookup and then polls admin API. | No implicit shutdown is attached to start; explicit Stop Owned remains required. | TDC-080 control command tests plus TDC-090 lifecycle tests. |
+| Window close button | Frontend titlebar close calls `hide_main_window`; native close request is intercepted and hidden to tray. | Does not call admin shutdown or `stop_proxy`. | `App.test.tsx` close-button test; `lifecycle::tests::close_request_hides_to_tray_until_safe_quit_is_requested`. |
+| Tray hide/show | Tray menu and left-click/double-click can show the main window; tray menu can hide it. | Show/hide are window-only operations. | `setup_tray` and window command compile gate. |
+| Tray quit / Settings Quit App | Sets explicit app-quit state and exits the desktop process. Menu label says proxy keeps running. | Leaves runtime running; explicit Stop Proxy remains separate. | `lifecycle::tests::normal_app_exit_never_stops_proxy_runtime`; Settings route test. |
+| Attach existing resident runtime | Attached control state is preserved in UI; attach remains non-owning. | Normal close/quit only detaches/hides/exits UI and never remote-stops attached runtime. | Existing TDC-080 attach/owner tests plus new no-`stop_proxy` frontend tests. |
+| Explicit Stop Proxy | Settings still requires exact `STOP OWNED PROXY` or `STOP ATTACHED PROXY` and calls `stop_proxy`. | Only this path may request admin runtime shutdown. | TDC-080 stop-decision tests plus TDC-090 Settings separation test. |
+| Runtime unavailable | Window/tray commands still compile; data banners remain responsible for disconnected/unavailable admin state. | No runtime stop is attempted. | Existing TDC-070 state tests and TDC-090 build/test gates. |
+| Admin token required | Safe action state remains disabled until token/admin access is usable. | No runtime stop is attempted without explicit stop command. | Existing TDC-070 admin-token test and TDC-080 command boundary. |
+
+Verification:
+
+- Command: `pnpm test`
+- Scope: `apps/desktop`
+- Result: PASS — Vitest passed: 5 files, 22 tests. New coverage verifies titlebar close routes to `hide_main_window` and Settings Quit App/Detach do not invoke `stop_proxy`.
+
+- Command: `pnpm build`
+- Scope: `apps/desktop`
+- Result: PASS — TypeScript and Vite production build completed.
+- Output summary:
+  - `dist/index.html`
+  - `dist/assets/index-ConQhKx5.css`
+  - `dist/assets/index-CfAyaNaZ.js`
+
+- Command: `cargo fmt --check`
+- Scope: repository workspace
+- Result: PASS.
+
+- Command: `cargo check -p codex-helper-desktop`
+- Scope: `apps/desktop/src-tauri`
+- Result: PASS.
+
+- Command: `cargo nextest run -p codex-helper-desktop --lib`
+- Scope: `apps/desktop/src-tauri`
+- Result: PASS — 9 tests. Adds lifecycle close/quit policy tests on top of TDC-080 owner/stop tests.
+
+- Command: `git diff --check -- .`
+- Scope: full repository diff
+- Result: PASS — no diff whitespace errors reported. Git emitted only Windows LF/CRLF warnings for edited text files.
+
+- Command: Windows native close smoke using `PostMessage(WM_CLOSE)` against `target/debug/codex-helper-desktop.exe`
+- Scope: local Tauri desktop binary with an existing resident runtime reachable at `127.0.0.1:4211`
+- Result: PASS.
+- Output summary:
+  - `before_admin_4211=True`
+  - `desktop_alive_after_wm_close=True`
+  - `window_visible_after_wm_close=False`
+  - `after_wm_close_admin_4211=True`
+  - `after_desktop_process_cleanup_admin_4211=True`
+- Behavior proven: a native OS close request hides the main window instead of exiting the desktop process, and the existing proxy runtime remains reachable before close, after close, and after the smoke script forcibly cleans up only the desktop process.
+
+Concerns / deferred:
+
+- Full manual OS tray menu click smoke is still pending; this pass validates compile/tests/build, lifecycle policy, and native Windows close behavior.
+- Packaged sidecar declaration/signing/autostart remain out of this slice. Current Start Proxy still uses the hidden desktop-managed CLI path from TDC-080 (`CODEX_HELPER_CLI_PATH` or sibling binary).
+- Import/export is intentionally scoped to simple single-config backup/restore, not heavy multi-profile/workspace configuration management.
+- No egui removal or replacement-readiness claim is made yet; TDC-100 should document parity gaps before promoting Tauri as the replacement path.
+
+Result:
+
+- DONE_WITH_CONCERNS — TDC-090 tray lifecycle behavior and no-normal-exit-stops-attached-runtime rule are implemented and verified at command/test/build level.
+
 ## Deferred / Not Run Yet
 
-- No full Tauri window smoke has been run yet.
-- No desktop lifecycle owner/tray behavior has been implemented beyond the Tauri shell and placeholder titlebar controls.
+- No full interactive Tauri tray/window smoke has been run yet.
+- No packaged sidecar/autostart/signing smoke has been run yet.
 - No egui removal or replacement-readiness claim is made yet.
