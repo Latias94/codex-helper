@@ -5,6 +5,8 @@ use axum::http::{HeaderMap, header};
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use serde_json::Value;
 
+use crate::basellm_metadata::BasellmOpenAiModelMetadata;
+
 const MAX_DECODED_MODELS_BYTES: usize = 8 * 1024 * 1024;
 
 pub(super) fn maybe_decode_models_response_body(
@@ -126,6 +128,14 @@ fn looks_like_json(bytes: &[u8]) -> bool {
 }
 
 fn maybe_translate_openai_models_list(body: &[u8]) -> Option<Bytes> {
+    let basellm_cache = crate::basellm_metadata::load_cached_basellm_metadata_cache();
+    translate_openai_models_list_with_basellm_cache(body, basellm_cache.as_ref())
+}
+
+fn translate_openai_models_list_with_basellm_cache(
+    body: &[u8],
+    basellm_cache: Option<&crate::basellm_metadata::BasellmMetadataCache>,
+) -> Option<Bytes> {
     let value = serde_json::from_slice::<Value>(body).ok()?;
     if value.get("models").is_some() {
         return None;
@@ -142,10 +152,14 @@ fn maybe_translate_openai_models_list(body: &[u8]) -> Option<Bytes> {
             continue;
         }
         let display_name = openai_model_display_name(item).unwrap_or_else(|| display_name(&slug));
+        let basellm_metadata = basellm_cache
+            .as_ref()
+            .and_then(|cache| cache.openai_models.get(&slug.to_ascii_lowercase()));
         models.push(codex_model_info_json(
             &slug,
             display_name.as_str(),
             models.len(),
+            basellm_metadata,
         ));
     }
 
@@ -172,8 +186,13 @@ fn openai_model_display_name(item: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn codex_model_info_json(slug: &str, display_name: &str, fallback_priority: usize) -> Value {
-    let known = known_codex_model(slug);
+fn codex_model_info_json(
+    slug: &str,
+    display_name: &str,
+    fallback_priority: usize,
+    basellm_metadata: Option<&BasellmOpenAiModelMetadata>,
+) -> Value {
+    let known = known_codex_model(slug, basellm_metadata);
     let caps = known.capabilities;
     let priority = known
         .priority
@@ -181,7 +200,7 @@ fn codex_model_info_json(slug: &str, display_name: &str, fallback_priority: usiz
 
     serde_json::json!({
         "slug": slug,
-        "display_name": known.display_name.unwrap_or(display_name),
+        "display_name": known.display_name.as_deref().unwrap_or(display_name),
         "description": known.description,
         "default_reasoning_level": caps.default_reasoning_level,
         "supported_reasoning_levels": caps.reasoning_levels.json(),
@@ -353,6 +372,36 @@ impl ModelCapabilities {
         self
     }
 
+    fn with_basellm_metadata(mut self, metadata: &BasellmOpenAiModelMetadata) -> Self {
+        if metadata.supports_fast_priority {
+            self.fast_service_tier = true;
+        }
+        if !metadata.input_modalities.is_empty() {
+            self.text_input = metadata
+                .input_modalities
+                .iter()
+                .any(|modality| modality.eq_ignore_ascii_case("text"));
+            self.image_input = metadata
+                .input_modalities
+                .iter()
+                .any(|modality| modality.eq_ignore_ascii_case("image"));
+            if !self.image_input {
+                self.supports_image_detail_original = false;
+            }
+        }
+        if metadata.reasoning == Some(false) {
+            self.reasoning_levels = ReasoningLevels::None;
+            self.default_reasoning_level = None;
+            self.supports_reasoning_summaries = false;
+        }
+        if metadata.tool_call == Some(false) {
+            self.shell_type = "disabled";
+            self.apply_patch_tool_type = None;
+            self.supports_parallel_tool_calls = false;
+        }
+        self
+    }
+
     fn input_modalities(self) -> Vec<&'static str> {
         let mut modalities = Vec::new();
         if self.text_input {
@@ -513,8 +562,8 @@ fn parse_ascii_u32_prefix(value: &str) -> Option<(u32, &str)> {
 }
 
 struct KnownCodexModel {
-    display_name: Option<&'static str>,
-    description: Option<&'static str>,
+    display_name: Option<String>,
+    description: Option<String>,
     priority: Option<i32>,
     context_window: i64,
     max_context_window: i64,
@@ -522,12 +571,17 @@ struct KnownCodexModel {
     capabilities: ModelCapabilities,
 }
 
-fn known_codex_model(slug: &str) -> KnownCodexModel {
+fn known_codex_model(
+    slug: &str,
+    basellm_metadata: Option<&BasellmOpenAiModelMetadata>,
+) -> KnownCodexModel {
     let normalized = slug.trim().to_ascii_lowercase();
-    match normalized.as_str() {
+    let mut known = match normalized.as_str() {
         "gpt-5.5" => KnownCodexModel {
-            display_name: Some("GPT-5.5"),
-            description: Some("Frontier model for complex coding, research, and real-world work."),
+            display_name: Some("GPT-5.5".to_string()),
+            description: Some(
+                "Frontier model for complex coding, research, and real-world work.".to_string(),
+            ),
             priority: Some(0),
             context_window: 272_000,
             max_context_window: 272_000,
@@ -535,8 +589,8 @@ fn known_codex_model(slug: &str) -> KnownCodexModel {
             capabilities: ModelCapabilities::modern_gpt().with_fast_service_tier(),
         },
         "gpt-5.4" => KnownCodexModel {
-            display_name: Some("gpt-5.4"),
-            description: Some("Strong model for everyday coding."),
+            display_name: Some("gpt-5.4".to_string()),
+            description: Some("Strong model for everyday coding.".to_string()),
             priority: Some(10),
             context_window: 272_000,
             max_context_window: 1_000_000,
@@ -544,8 +598,10 @@ fn known_codex_model(slug: &str) -> KnownCodexModel {
             capabilities: ModelCapabilities::modern_gpt().with_fast_service_tier(),
         },
         "gpt-5.4-mini" => KnownCodexModel {
-            display_name: Some("GPT-5.4-Mini"),
-            description: Some("Small, fast, and cost-efficient model for simpler coding tasks."),
+            display_name: Some("GPT-5.4-Mini".to_string()),
+            description: Some(
+                "Small, fast, and cost-efficient model for simpler coding tasks.".to_string(),
+            ),
             priority: Some(20),
             context_window: 272_000,
             max_context_window: 272_000,
@@ -555,8 +611,8 @@ fn known_codex_model(slug: &str) -> KnownCodexModel {
                 .with_fast_service_tier(),
         },
         "gpt-5.3-codex" => KnownCodexModel {
-            display_name: Some("GPT-5.3 Codex"),
-            description: Some("Coding-optimized model."),
+            display_name: Some("GPT-5.3 Codex".to_string()),
+            description: Some("Coding-optimized model.".to_string()),
             priority: Some(30),
             context_window: 272_000,
             max_context_window: 272_000,
@@ -566,8 +622,8 @@ fn known_codex_model(slug: &str) -> KnownCodexModel {
                 .with_fast_service_tier(),
         },
         "gpt-5.3-codex-spark" => KnownCodexModel {
-            display_name: Some("GPT-5.3 Codex Spark"),
-            description: Some("Coding-optimized model with limited image support."),
+            display_name: Some("GPT-5.3 Codex Spark".to_string()),
+            description: Some("Coding-optimized model with limited image support.".to_string()),
             priority: Some(40),
             context_window: 272_000,
             max_context_window: 272_000,
@@ -575,8 +631,10 @@ fn known_codex_model(slug: &str) -> KnownCodexModel {
             capabilities: ModelCapabilities::codex_spark(),
         },
         "gpt-5.2" => KnownCodexModel {
-            display_name: Some("GPT-5.2"),
-            description: Some("Optimized for professional work and long-running agents."),
+            display_name: Some("GPT-5.2".to_string()),
+            description: Some(
+                "Optimized for professional work and long-running agents.".to_string(),
+            ),
             priority: Some(50),
             context_window: 272_000,
             max_context_window: 272_000,
@@ -584,8 +642,8 @@ fn known_codex_model(slug: &str) -> KnownCodexModel {
             capabilities: ModelCapabilities::gpt_5_2(),
         },
         "codex-auto-review" => KnownCodexModel {
-            display_name: Some("Codex Auto Review"),
-            description: Some("Internal review model."),
+            display_name: Some("Codex Auto Review".to_string()),
+            description: Some("Internal review model.".to_string()),
             priority: Some(50_000),
             context_window: 272_000,
             max_context_window: 272_000,
@@ -594,7 +652,7 @@ fn known_codex_model(slug: &str) -> KnownCodexModel {
         },
         _ if normalized.starts_with("gpt-image-") => KnownCodexModel {
             display_name: None,
-            description: Some("Image model served by the configured Codex upstream."),
+            description: Some("Image model served by the configured Codex upstream.".to_string()),
             priority: None,
             context_window: 272_000,
             max_context_window: 272_000,
@@ -606,7 +664,7 @@ fn known_codex_model(slug: &str) -> KnownCodexModel {
                 .unwrap_or_else(ModelCapabilities::conservative_coding);
             KnownCodexModel {
                 display_name: None,
-                description: Some("Model served by the configured Codex upstream."),
+                description: Some("Model served by the configured Codex upstream.".to_string()),
                 priority: None,
                 context_window: 272_000,
                 max_context_window: 272_000,
@@ -614,6 +672,41 @@ fn known_codex_model(slug: &str) -> KnownCodexModel {
                 capabilities,
             }
         }
+    };
+    if let Some(metadata) = basellm_metadata {
+        known = known.with_basellm_metadata(metadata);
+    }
+    known
+}
+
+impl KnownCodexModel {
+    fn with_basellm_metadata(mut self, metadata: &BasellmOpenAiModelMetadata) -> Self {
+        if self.display_name.is_none() {
+            self.display_name = metadata
+                .display_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned);
+        }
+        if self.description.is_none()
+            || self.description.as_deref() == Some("Model served by the configured Codex upstream.")
+        {
+            self.description = metadata
+                .description
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned);
+        }
+        if let Some(context_window) = metadata.context_window.filter(|value| *value > 0) {
+            self.context_window = context_window;
+        }
+        if let Some(max_context_window) = metadata.max_context_window.filter(|value| *value > 0) {
+            self.max_context_window = max_context_window.max(self.context_window);
+        }
+        self.capabilities = self.capabilities.with_basellm_metadata(metadata);
+        self
     }
 }
 
@@ -892,6 +985,109 @@ mod tests {
         );
         assert_input_modalities(model, &["text"]);
         assert!(!model_has_fast_service_tier(model));
+    }
+
+    #[test]
+    fn translated_openai_models_list_uses_basellm_fast_metadata_overlay() {
+        let body = br#"{
+            "object": "list",
+            "data": [
+                { "id": "gpt-5.3-codex" }
+            ]
+        }"#;
+        let basellm_cache = crate::basellm_metadata::parse_basellm_openai_metadata_json(
+            r#"{
+              "openai": {
+                "models": {
+                  "gpt-5.3-codex": {
+                    "name": "GPT-5.3 Codex From BaseLLM",
+                    "description": "Metadata sourced from BaseLLM.",
+                    "limit": { "context": 400000, "input": 272000 },
+                    "modalities": { "input": ["text", "image", "pdf"] },
+                    "reasoning": true,
+                    "tool_call": true,
+                    "experimental": {
+                      "modes": {
+                        "fast": {
+                          "provider": { "body": { "service_tier": "priority" } }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }"#,
+        )
+        .expect("parse BaseLLM metadata");
+
+        let translated =
+            translate_openai_models_list_with_basellm_cache(body, Some(&basellm_cache))
+                .expect("OpenAI models list should translate to Codex catalog");
+        let value: serde_json::Value =
+            serde_json::from_slice(translated.as_ref()).expect("translated JSON");
+        let model = model_by_slug(&value, "gpt-5.3-codex");
+
+        assert!(model_has_fast_service_tier(model));
+        assert_eq!(
+            model.get("context_window").and_then(Value::as_i64),
+            Some(272_000)
+        );
+        assert_eq!(
+            model.get("max_context_window").and_then(Value::as_i64),
+            Some(400_000)
+        );
+        assert_input_modalities(model, &["text", "image"]);
+    }
+
+    #[test]
+    fn translated_openai_models_list_can_discover_fast_for_unknown_basellm_gpt_model() {
+        let body = br#"{
+            "object": "list",
+            "data": [
+                { "id": "gpt-5.3-lab" }
+            ]
+        }"#;
+        let basellm_cache = crate::basellm_metadata::parse_basellm_openai_metadata_json(
+            r#"{
+              "openai": {
+                "models": {
+                  "gpt-5.3-lab": {
+                    "name": "GPT-5.3 Lab",
+                    "limit": { "context": 128000, "input": 96000 },
+                    "modalities": { "input": ["text"] },
+                    "reasoning": true,
+                    "tool_call": true,
+                    "experimental": {
+                      "modes": {
+                        "fast": {
+                          "provider": { "body": { "service_tier": "priority" } }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }"#,
+        )
+        .expect("parse BaseLLM metadata");
+
+        let translated =
+            translate_openai_models_list_with_basellm_cache(body, Some(&basellm_cache))
+                .expect("OpenAI models list should translate to Codex catalog");
+        let value: serde_json::Value =
+            serde_json::from_slice(translated.as_ref()).expect("translated JSON");
+        let model = model_by_slug(&value, "gpt-5.3-lab");
+
+        assert!(model_has_fast_service_tier(model));
+        assert_eq!(
+            model.get("display_name").and_then(Value::as_str),
+            Some("GPT-5.3 Lab")
+        );
+        assert_eq!(
+            model.get("context_window").and_then(Value::as_i64),
+            Some(96_000)
+        );
+        assert_input_modalities(model, &["text"]);
     }
 
     fn translated_models_value(slugs: &[&str]) -> Value {

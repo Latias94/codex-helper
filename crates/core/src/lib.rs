@@ -1,4 +1,5 @@
 pub mod balance;
+pub mod basellm_metadata;
 mod client_config;
 pub mod codex_capability_profile;
 pub mod codex_integration;
