@@ -1,6 +1,6 @@
 # Tauri Desktop Client — Evidence And Gates
 
-Status: Draft
+Status: Closed with follow-ups
 Last updated: 2026-05-22
 
 ## Required Gates By Phase
@@ -38,6 +38,12 @@ Lifecycle:
   - explicit Stop Proxy;
   - runtime unavailable;
   - admin token required.
+
+Closeout:
+
+- Replacement-readiness docs state whether Tauri is source-preview, dogfood, released, or egui-removal ready.
+- Follow-on split covers packaged sidecar, installer/signing, auto-update, launch-at-login, single instance, lightweight single-config import/export, open paths, provider edit parity, tray smoke, and egui deprecation.
+- Final targeted frontend/Rust gates are run before closing the lane.
 
 ## Evidence Log
 
@@ -774,8 +780,91 @@ Result:
 
 - DONE_WITH_CONCERNS — TDC-090 tray lifecycle behavior and no-normal-exit-stops-attached-runtime rule are implemented and verified at command/test/build level.
 
+### 2026-05-22 — TDC-100/TDC-110 replacement readiness and closeout
+
+Evidence:
+
+- Added `docs/workstreams/tauri-desktop-client/REPLACEMENT_READINESS.md`.
+- Updated root user-facing docs:
+  - `README.md`;
+  - `README_EN.md`;
+  - `CHANGELOG.md`.
+- Updated workstream closeout docs:
+  - `DESIGN.md`;
+  - `TODO.md`;
+  - `MILESTONES.md`;
+  - `HANDOFF.md`;
+  - `WORKSTREAM.json`;
+  - `JOURNAL/2026-05-22-tdc-100-110.md`.
+- Replacement decision:
+  - Tauri desktop client is the preferred long-term GUI replacement path.
+  - Current state is source-preview/internal dogfood, not released replacement.
+  - `crates/gui` and `codex-helper-gui` remain until parity and packaging gates pass.
+- Follow-on split:
+  - packaged sidecar and installer behavior;
+  - single instance;
+  - launch at login;
+  - signing and auto-update;
+  - lightweight single-config import/export;
+  - open config/log/cache paths;
+  - provider edit parity;
+  - full packaged tray/window lifecycle smoke;
+  - egui deprecation/removal.
+- Import/export boundary:
+  - one primary config file;
+  - export/import through validation and backup;
+  - explicit warning for inline secrets;
+  - no heavy profile/workspace/config-catalog layer.
+
+Review:
+
+- Workstream compliance: PASS — TDC-100 documents replacement status and parity gaps; TDC-110 closes the lane with follow-ups rather than claiming egui removal.
+- Code quality: PASS — this closeout is docs/metadata only after the TDC-090 code was already verified; no production code changed in this slice.
+- Missing gates: none for the closeout claim. Packaged sidecar, interactive OS tray smoke, launch-at-login, auto-update, signing, single instance, and import/export are explicitly deferred follow-ons, not hidden blockers.
+- Residual risk: Tauri should not be described as a released egui replacement until the follow-on gates pass.
+
+Verification:
+
+- Command: `pnpm test`
+- Scope: `apps/desktop`
+- Result: PASS — Vitest passed: 5 files, 22 tests.
+
+- Command: `pnpm build`
+- Scope: `apps/desktop`
+- Result: PASS — TypeScript and Vite production build completed.
+- Output summary:
+  - `dist/index.html`
+  - `dist/assets/index-ConQhKx5.css`
+  - `dist/assets/index-CnB2Kfoz.js`
+
+- Command: `cargo fmt --check`
+- Scope: repository workspace
+- Result: PASS.
+
+- Command: `cargo check -p codex-helper-desktop`
+- Scope: `apps/desktop/src-tauri`
+- Result: PASS.
+
+- Command: `cargo nextest run -p codex-helper-desktop --lib`
+- Scope: `apps/desktop/src-tauri`
+- Result: PASS — 9 tests.
+
+- Command: `git diff --check -- .`
+- Scope: full repository diff
+- Result: PASS — no diff whitespace errors reported. Git emitted only Windows LF/CRLF warnings for edited text files.
+
+Skipped broader gates:
+
+- Full interactive packaged tray menu smoke was not rerun because no Tauri code changed in TDC-100/TDC-110; the TDC-090 native `WM_CLOSE` smoke remains the latest code-level close behavior proof.
+- `pnpm tauri:build` and installer/signing checks were not run because packaging work is explicitly split into follow-ons.
+- Workspace-wide Rust tests were not run because this closeout changed docs/metadata only after the targeted desktop package gates passed.
+
+Result:
+
+- PASS — TDC-100/TDC-110 close the Tauri desktop client readiness lane with follow-ups. No egui removal is approved by this closeout.
+
 ## Deferred / Not Run Yet
 
 - No full interactive Tauri tray/window smoke has been run yet.
 - No packaged sidecar/autostart/signing smoke has been run yet.
-- No egui removal or replacement-readiness claim is made yet.
+- No egui removal or released replacement claim is made yet.

@@ -1,6 +1,6 @@
 # Tauri Desktop Client — TODO
 
-Status: Draft
+Status: Closed with follow-ups
 Last updated: 2026-05-22
 
 ## M0 — Scope And Evidence Freeze
@@ -93,16 +93,16 @@ Last updated: 2026-05-22
 
 ## M5 — Replacement Readiness
 
-- [ ] TDC-100 [owner=planner] [deps=TDC-090] [scope=docs,README,release-notes]
+- [x] TDC-100 [owner=planner] [deps=TDC-090] [scope=docs,README,release-notes]
   Goal: Document Tauri client as replacement path for egui GUI and state remaining parity gaps.
-  Validation: docs review plus targeted checks.
-  Review: Do not remove egui until parity and packaging gates pass.
-  Evidence: docs diff and final gate log; desktop capability matrix from `IMPLEMENTATION_BRIEF.md`.
-  Handoff: Split follow-on work for egui removal, installer/signing, auto-update, launch-at-login, single-instance, packaged sidecar, and lightweight single-config import/export.
+  Validation: DONE — `REPLACEMENT_READINESS.md`, README/README_EN, and CHANGELOG now describe the source-preview replacement path and non-removal boundary.
+  Review: DONE — egui stays until parity and packaging gates pass.
+  Evidence: `docs/workstreams/tauri-desktop-client/REPLACEMENT_READINESS.md`; desktop capability matrix in `IMPLEMENTATION_BRIEF.md`; final gate log in `EVIDENCE_AND_GATES.md`.
+  Handoff: DONE — follow-on work is split for egui removal, installer/signing, auto-update, launch-at-login, single-instance, packaged sidecar, open paths, provider edit parity, full tray smoke, and lightweight single-config import/export.
 
-- [ ] TDC-110 [owner=planner] [deps=TDC-100] [scope=docs/workstreams/tauri-desktop-client]
+- [x] TDC-110 [owner=planner] [deps=TDC-100] [scope=docs/workstreams/tauri-desktop-client]
   Goal: Close this lane or split remaining work.
-  Validation: verify-rust-workstream records fresh final evidence.
-  Review: review-workstream has no blocking findings.
-  Evidence: EVIDENCE_AND_GATES.md, WORKSTREAM.json
-  Handoff: Summarize risks in HANDOFF.md.
+  Validation: DONE — fresh closeout evidence recorded in `EVIDENCE_AND_GATES.md` after final targeted gates.
+  Review: DONE — closeout review has no blocking findings; remaining gaps are explicit follow-ons, not blockers for this readiness lane.
+  Evidence: `EVIDENCE_AND_GATES.md`, `WORKSTREAM.json`, `HANDOFF.md`, and `JOURNAL/2026-05-22-tdc-100-110.md`.
+  Handoff: DONE — risks summarized in `HANDOFF.md`; workstream status is closed with follow-ups.

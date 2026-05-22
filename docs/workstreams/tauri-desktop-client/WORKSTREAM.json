@@ -2,7 +2,7 @@
   "schema_version": 1,
   "slug": "tauri-desktop-client",
   "title": "Tauri Desktop Client",
-  "status": "draft",
+  "status": "closed-with-followups",
   "updated": "2026-05-22",
   "scope_kind": "planning-and-execution",
   "problem": "The existing egui GUI is no longer the desired long-term desktop product surface. codex-helper needs a polished but simple Tauri client that replaces egui, uses React + Tailwind + shadcn/ui, starts from a component prototype, and preserves safe runtime owner semantics without exposing every advanced control-plane concept at top level.",
@@ -30,6 +30,10 @@
     {
       "role": "implementation-brief",
       "path": "docs/workstreams/tauri-desktop-client/IMPLEMENTATION_BRIEF.md"
+    },
+    {
+      "role": "replacement-readiness",
+      "path": "docs/workstreams/tauri-desktop-client/REPLACEMENT_READINESS.md"
     }
   ],
   "gates": [
@@ -37,7 +41,10 @@
     "frontend typecheck/build/lint after scaffold exists",
     "cargo fmt --check for Rust changes",
     "cargo check for affected Rust packages",
-    "desktop lifecycle action matrix before replacement claims"
+    "desktop lifecycle action matrix before replacement claims",
+    "replacement readiness docs state source-preview status and egui non-removal boundary",
+    "follow-on split covers packaged sidecar, installer/signing, auto-update, launch-at-login, single-instance, lightweight single-config import/export, open paths, provider edit parity, tray smoke, and egui deprecation",
+    "final targeted frontend and Rust gates recorded before closeout"
   ],
   "evidence": [
     {
@@ -129,11 +136,16 @@
       "date": "2026-05-22",
       "kind": "tray-lifecycle",
       "summary": "Completed TDC-090 with concerns. Added Tauri tray/window lifecycle boundary, hide-to-tray close behavior, safe app quit semantics that leave proxy runtimes running, frontend titlebar/Settings window commands, owner labels, a Desktop Capability Matrix for residency/tray/update/autostart/single-instance/lightweight single-config import-export/sidecar follow-up, lifecycle tests, Windows native WM_CLOSE smoke, and validation via pnpm build/test, cargo fmt --check, cargo check -p codex-helper-desktop, cargo nextest run -p codex-helper-desktop --lib, and git diff --check."
+    },
+    {
+      "date": "2026-05-22",
+      "kind": "replacement-readiness-closeout",
+      "summary": "Completed TDC-100/TDC-110. Added REPLACEMENT_READINESS.md, updated README/README_EN/CHANGELOG and workstream docs, marked the Tauri client as the preferred source-preview replacement path while keeping egui until parity gates pass, and split follow-ons for packaged sidecar, installer/signing, auto-update, launch-at-login, single-instance, lightweight single-config import/export, open paths, provider edit parity, full tray smoke, and egui deprecation/removal."
     }
   ],
   "adr_refs": [],
   "continue_policy": {
-    "default_action": "continue",
-    "notes": "Next step is TDC-100 replacement readiness documentation. Use IMPLEMENTATION_BRIEF.md Desktop Capability Matrix as source of truth. Do not remove egui until Tauri parity gaps, full interactive tray/window smoke, packaged sidecar lookup, auto update, launch-at-login, single-instance, lightweight single-config import/export, signing/installer behavior, and remaining advanced controls are explicitly documented."
+    "default_action": "open-follow-on",
+    "notes": "This workstream is closed with follow-ups. Continue desktop work by opening bounded follow-on workstreams from REPLACEMENT_READINESS.md. Do not remove egui until packaged sidecar lookup, full interactive packaged tray/window smoke, auto update/release policy, launch-at-login, single-instance, lightweight single-config import/export, signing/installer behavior, open path actions, provider edit parity, and remaining advanced-control parity are complete and verified."
   }
 }

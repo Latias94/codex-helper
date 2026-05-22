@@ -37,7 +37,7 @@ It is probably unnecessary if you only use one official account and do not need 
 - **Balance and plan visibility**: probes common Sub2API, New API, and `/user/balance` endpoints; lookup failures are not treated as exhausted.
 - **Outbound proxy compatibility**: the local proxy and outbound network proxy are separate layers; outbound requests currently follow system/environment proxy variables, with no first-class `config.toml` proxy section yet.
 - **Request observability**: provider, model, tokens, cache tokens, cache hit rate, TTFB, duration, output rate, retry chain, and estimated cost.
-- **TUI and GUI**: built-in TUI for terminal use; GUI owns and stops its local proxy by default, with explicit attach support for existing proxies.
+- **TUI and GUI**: built-in TUI for terminal use; the current released egui GUI remains available. A new Tauri desktop client is now the long-term replacement path at source-preview level, but egui stays until installer, tray, sidecar, single-instance, and update parity gates pass.
 
 ## Quick Start
 
@@ -108,6 +108,8 @@ codex-helper tui --codex
 By default, `codex-helper serve` and the GUI follow “the console owns the proxy”: exiting the UI stops the proxy it started and restores the local client patch. `daemon status/stop` is only for resident proxies you explicitly started. The `tui` subcommand attaches read-only to an existing resident proxy, so exiting that attached TUI does not stop the proxy. For automatic restart after child crashes, run `codex-helper daemon supervise --codex`; the supervisor records lightweight crash markers under `~/.codex-helper/run/`.
 
 `daemon status` best-effort shows the resident proxy owner marker (manual CLI, supervisor, or a future desktop/tray owner). The marker is only observability metadata: read or cleanup failures never block proxy startup or shutdown. A hidden managed sidecar mode is reserved for the future desktop shell, so ordinary users do not need to choose it manually.
+
+The in-development Tauri desktop client uses a more Clash-like resident-client lifecycle: closing the main window hides it to the tray, `Quit App` exits only the desktop process, and stopping the proxy remains an explicit `Stop Proxy` action. This path is currently source-level/internal dogfood, not a released replacement installer.
 
 Manage the Codex proxy patch explicitly:
 
@@ -355,6 +357,8 @@ cargo run --release --features gui --bin codex-helper-gui
 
 The GUI can start or explicitly attach to a proxy, edit common single-endpoint providers, route nodes, and routing, and inspect requests, balances, pricing, sessions, health, breaker state, and control-plane status. By default, a GUI-started proxy stops when the GUI exits; attaching to an existing proxy must be selected explicitly, and closing the GUI only detaches instead of stopping someone else’s process. Complex multi-endpoint providers, model mappings, and advanced fields should still be edited through CLI or raw TOML.
 
+The new Tauri desktop client lives under `apps/desktop` and uses React 19, Tailwind CSS 4, shadcn/ui-style components, and TanStack Router/Query/Table. It already implements Dashboard, Providers, Usage, Settings, read-only admin data, safe control actions, and close-to-tray semantics. It still needs packaged sidecar behavior, installer/signing, single instance, launch at login, auto-update, lightweight single-config import/export, and full tray smoke before it replaces the egui GUI above.
+
 ## File Locations
 
 - Main config: `~/.codex-helper/config.toml`
@@ -387,6 +391,7 @@ codex-helper intentionally avoids:
 - [docs/CONFIGURATION.md](docs/CONFIGURATION.md): English configuration reference, routing, balance adapters, pricing, migration.
 - [docs/CONFIGURATION.zh.md](docs/CONFIGURATION.zh.md): Chinese configuration reference with routing recipes, balance adapters, proxy notes, and migration.
 - [CHANGELOG.md](CHANGELOG.md): release notes and upgrade notes.
+- [docs/workstreams/tauri-desktop-client/REPLACEMENT_READINESS.md](docs/workstreams/tauri-desktop-client/REPLACEMENT_READINESS.md): Tauri desktop readiness, parity gaps, and follow-on split before egui removal.
 - [docs/workstreams/codex-operator-experience-refactor/GAP_MATRIX.md](docs/workstreams/codex-operator-experience-refactor/GAP_MATRIX.md): comparison against cc-switch, aio-coding-hub, and all-api-hub.
 - [docs/workstreams/codex-control-plane-refactor/README.md](docs/workstreams/codex-control-plane-refactor/README.md): control-plane design notes.
 

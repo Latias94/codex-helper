@@ -1,6 +1,6 @@
 # Tauri Desktop Client — Implementation Brief
 
-Status: Draft
+Status: Accepted / implemented through TDC-090
 Last updated: 2026-05-22
 
 ## Research Sources
@@ -41,7 +41,9 @@ Recommended production stack:
 - Client-only state: prefer React local state and URL/search params first; add Zustand only for small persisted shell preferences if the app outgrows local state.
 - Desktop API boundary: use the existing loopback admin API for runtime/product data; use Tauri commands only for host-local desktop capabilities.
 
-Do not scaffold production Tauri code until this brief is accepted.
+This brief was accepted and implemented through the production scaffold under
+`apps/desktop`. Use `REPLACEMENT_READINESS.md` for the current replacement
+decision and the follow-on parity gates before egui removal.
 
 ## Client Layout Rules
 
@@ -446,10 +448,11 @@ TDC-060+ integration gates:
 - Manual smoke against resident local proxy.
 - Lifecycle matrix before any replacement claim.
 
-## Open Decisions Before TDC-040
+## Resolved TDC-040 Decisions
 
-- Confirm final production app path: recommended `apps/desktop`.
-- Confirm package manager: recommended `pnpm`.
-- Confirm whether Tauri router should use hash history for packaged static assets.
-- Confirm app identifier and window defaults.
-- Decide whether production scaffold should import the current prototype directly or recreate components with official shadcn generated files first.
+- Production app path: `apps/desktop`.
+- Package manager: `pnpm`.
+- Frontend stack: React 19, Tailwind CSS 4, shadcn/ui-style source components, TanStack Router/Query/Table, React Hook Form + Zod, and Recharts.
+- Tauri crate path: `apps/desktop/src-tauri` as Cargo package `codex-helper-desktop`.
+- Prototype import strategy: import and harden the accepted prototype into production feature folders rather than keeping the workstream prototype as release code.
+- Remaining replacement-readiness decisions are tracked in `REPLACEMENT_READINESS.md`, especially packaged sidecar, signing/update channels, launch-at-login, single instance, and lightweight config import/export.

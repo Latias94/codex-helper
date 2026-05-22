@@ -7,12 +7,24 @@ All notable changes to this project will be documented in this file.
 
 ### 中文
 
+#### Tauri 桌面端替代路径（开发中）
+
+- 新增 `apps/desktop` Tauri v2 + React 19 + Tailwind CSS 4 + shadcn/ui 风格桌面端，作为长期替代当前 egui GUI 的开发路径。
+- 桌面端已具备 Dashboard、Providers、Usage、Settings、只读 admin 数据、安全控制动作和关闭隐藏到托盘语义；`Quit App` 只退出桌面进程，停止代理仍需显式 `Stop Proxy`。
+- 当前仍是源码预览/内部 dogfood 阶段；在 packaged sidecar、安装包/签名、单实例、开机启动、自动更新、轻量单配置导入导出和完整托盘 smoke 完成前，不移除 `codex-helper-gui`/egui。
+
 #### Codex 中转请求字段覆盖
 
 - 修复自动 `default_profile` 会把客户端请求体里的 `model`、`reasoning.effort` 和 `service_tier` 改成 profile 默认值的问题；现在只有显式 session override 或手动 apply 到 session 的 profile binding 才会改写这些请求字段。
 - Codex 本地 fast mode 发出的 `service_tier: "priority"` 不会再被中转的默认 profile 覆盖成 `default`。自动 default profile 仍可用于 session binding 和 station 路由，但不再冒充用户请求字段 override。
 
 ### English summary
+
+#### Tauri desktop replacement path (in development)
+
+- Added the `apps/desktop` Tauri v2 + React 19 + Tailwind CSS 4 + shadcn/ui-style desktop client as the long-term replacement path for the current egui GUI.
+- The desktop client now has Dashboard, Providers, Usage, Settings, read-only admin data, safe control actions, and close-to-tray semantics; `Quit App` exits only the desktop process, while proxy shutdown remains an explicit `Stop Proxy` action.
+- This is still source-preview/internal dogfood. `codex-helper-gui`/egui stays until packaged sidecar behavior, installer/signing, single instance, launch at login, auto-update, lightweight single-config import/export, and full tray smoke are complete.
 
 #### Codex relay request-field overrides
 

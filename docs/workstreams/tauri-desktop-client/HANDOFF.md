@@ -1,11 +1,13 @@
 # Tauri Desktop Client — Handoff
 
-Status: Draft
+Status: Closed with follow-ups
 Last updated: 2026-05-22
 
 ## Current State
 
-M0 is complete. This workstream is open to design and implement a Tauri desktop client that replaces the existing egui GUI. The user confirmed:
+This workstream has reached replacement-readiness closeout. The Tauri desktop client is the preferred long-term replacement path for the existing egui GUI, but the released egui GUI remains in place until desktop parity and packaging gates pass. See `REPLACEMENT_READINESS.md` for the current decision, parity gaps, and follow-on split.
+
+The user confirmed:
 
 - replacement relationship: Tauri should become the long-term GUI, not merely a parallel experiment;
 - frontend stack: React 19 + Tailwind CSS 4 + shadcn/ui-style components + TanStack libraries;
@@ -16,7 +18,7 @@ M0 is complete. This workstream is open to design and implement a Tauri desktop 
 
 `repo-ref/aio-coding-hub` was reviewed as a local Tauri gateway-client reference. The useful patterns are its fixed desktop shell, left sidebar with runtime status footer, page header actions, dashboard work-status panels, provider cards plus right-side route order, and usage filters plus tabbed data panel. Do not copy its broad navigation scope.
 
-No production Tauri code has been generated or imported yet. A throwaway frontend prototype exists only under the workstream docs path.
+Production Tauri code now exists under `apps/desktop`, and the original throwaway frontend prototype remains only as a historical design artifact under the workstream docs path.
 
 On 2026-05-21, `UI_BRIEF.md` was added as the current pre-imagegen UX/design brief. It incorporates the user-provided AIO Coding Hub screenshot, selected `repo-ref/awesome-design-md` references, local product capabilities, admin API contracts, and existing egui surface inventory. It also contains the next imagegen prompt pack.
 
@@ -53,7 +55,7 @@ The user accepted that revised Settings candidate. It was copied to:
 
 TDC-018 is complete: Dashboard, Providers, Usage, and Settings now have accepted image baselines.
 
-## Next Task
+## Closeout State
 
 TDC-020 is complete with concerns. A throwaway React 19 + Tailwind CSS 4 + shadcn/ui-style + TanStack prototype exists at:
 
@@ -130,7 +132,7 @@ TDC-090 is complete with concerns:
 - Validation passed on 2026-05-22: `pnpm test` (5 files, 22 tests), `pnpm build`, `cargo fmt --check`, `cargo check -p codex-helper-desktop`, `cargo nextest run -p codex-helper-desktop --lib` (9 tests), and `git diff --check -- .`.
 - Follow-up Windows native close smoke also passed after hardening the listener registration: `PostMessage(WM_CLOSE)` left the desktop process alive, hid the window, and kept the existing `127.0.0.1:4211` proxy reachable before close, after close, and after desktop-process cleanup.
 
-Current next task: TDC-100 replacement readiness documentation. Do not remove egui yet. Document that the Tauri client is the preferred replacement path only after parity gaps are explicit, including full interactive Tauri tray/window smoke, packaged sidecar lookup, autostart, signing/installer behavior, and any remaining advanced controls.
+TDC-100/TDC-110 are complete. Do not remove egui yet. The Tauri client is documented as the preferred replacement path, but egui removal is explicitly blocked on parity gaps: full interactive packaged tray/window smoke, packaged sidecar lookup, single instance, launch at login, signing/installer behavior, auto-update policy, lightweight single-config import/export, open path actions, provider edit parity, and any remaining advanced controls.
 
 On 2026-05-22, `IMPLEMENTATION_BRIEF.md` gained a Desktop Capability Matrix requested by the user. It tracks:
 
@@ -146,6 +148,22 @@ On 2026-05-22, `IMPLEMENTATION_BRIEF.md` gained a Desktop Capability Matrix requ
 Use that matrix as the source of truth for TDC-100 follow-up planning. Current support is intentionally marked partial/not implemented for anything beyond TDC-090 tray/window lifecycle behavior.
 
 Important product boundary from the user: import/export should be simple because codex-helper has one primary config. Do not copy the heavier config/profile/workspace management style from `repo-ref/aio-coding-hub` or `repo-ref/cc-switch`; a future implementation should be closer to "export current config / import config with validation and backup".
+
+## Follow-on Work
+
+Open new workstreams or bounded tasks for:
+
+- packaged sidecar and installer behavior;
+- single instance;
+- launch at login;
+- signing and auto-update;
+- lightweight single-config import/export with validation, backup, and secret warning;
+- config/log/cache open-path actions;
+- provider edit parity for common single-endpoint providers;
+- full packaged tray/window lifecycle smoke;
+- egui deprecation/removal after the above gates pass.
+
+If a future agent resumes desktop work, start from `REPLACEMENT_READINESS.md`, not from the older prototype prompt below.
 
 ## shadcn/ui Prototype Prompt
 

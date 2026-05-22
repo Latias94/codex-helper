@@ -1,7 +1,7 @@
 # Tauri Desktop Client
 
-Status: Draft
-Last updated: 2026-05-21
+Status: Closed with follow-ups
+Last updated: 2026-05-22
 
 ## Why This Lane Exists
 
@@ -69,8 +69,8 @@ The first Tauri GUI should reduce cognitive load:
 When this workstream closes:
 
 - A simplified Tauri desktop client direction is documented as the replacement path for the current egui GUI.
-- The first implementation slice starts from a React + Tailwind + shadcn/ui component prototype.
-- The production frontend stack and repository layout are documented before Tauri scaffold work starts.
+- The accepted React + Tailwind + shadcn/ui component prototype has been imported into a production Tauri app under `apps/desktop`.
+- The production frontend stack and repository layout are documented and implemented for the first desktop slice.
 - The simple MVP sitemap is:
   - Dashboard
   - Providers
@@ -84,10 +84,11 @@ When this workstream closes:
   - raw TOML editor;
   - desktop lifecycle internals.
 - Runtime lifecycle behavior still matches the owner model:
-  - ordinary close stops only desktop-owned runtime;
-  - attached mode detaches without remote shutdown;
+  - ordinary close hides the window to tray and does not stop any proxy runtime;
+  - attached mode detaches/hides without remote shutdown;
   - explicit Stop Proxy is clearly distinguished from Quit;
-  - future tray sidecar maps to the hidden desktop-managed semantics.
+  - the tray/desktop path maps to the hidden desktop-managed semantics.
+- Remaining installer, signing, autostart, updater, packaged sidecar, single-instance, lightweight import/export, and egui removal work is split into follow-ons.
 
 ## In Scope
 
@@ -101,8 +102,8 @@ When this workstream closes:
 
 ## Out Of Scope
 
-- Implementing the Tauri app in this planning slice.
 - Removing the egui GUI immediately.
+- Claiming a packaged desktop release before installer/signing/sidecar gates pass.
 - Payment, user management, subscription purchase, affiliate, or promo-code features.
 - Exposing the full route graph or every session override as top-level navigation in the first version.
 - OS-specific signing, auto-update, and installer UX beyond noting them as follow-ons.
@@ -433,3 +434,7 @@ This lane can close when:
 - targeted frontend/Tauri/Rust gates pass;
 - docs reflect replacement status and advanced feature placement;
 - remaining egui removal or installer/signing work is split into follow-on workstreams.
+
+Closeout status on 2026-05-22: met with follow-ups. See
+`REPLACEMENT_READINESS.md` for the replacement decision, parity gates, and
+follow-on split. `crates/gui` remains a release fallback until those gates pass.

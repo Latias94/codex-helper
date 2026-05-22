@@ -1,7 +1,7 @@
 # Tauri Desktop Client — Milestones
 
-Status: Draft
-Last updated: 2026-05-21
+Status: Closed with follow-ups
+Last updated: 2026-05-22
 
 ## M0 — Scope And Evidence Freeze
 
@@ -84,6 +84,8 @@ Expected gates:
 - Targeted frontend tests for action enablement/confirmation.
 - Rust/Tauri command tests where possible.
 
+Status: Complete with concerns. TDC-080/TDC-090 implemented safe mutations, owner-aware stop boundaries, tray menu, close-to-tray behavior, and native Windows `WM_CLOSE` smoke. Full interactive packaged tray smoke remains a follow-on.
+
 ## M5 — Replacement Readiness
 
 Exit criteria:
@@ -96,3 +98,5 @@ Expected gates:
 
 - Final targeted frontend and Rust gates.
 - Workstream closeout docs updated.
+
+Status: Complete with follow-ups. `REPLACEMENT_READINESS.md` now documents the Tauri client as the preferred long-term replacement path, the non-removal boundary for egui, and the follow-on split for packaged sidecar, installer/signing, auto-update, launch-at-login, single instance, lightweight single-config import/export, open paths, provider edit parity, full tray smoke, and egui deprecation/removal.
