@@ -26,6 +26,7 @@ use super::attempt_failures::{TerminalUpstreamFailureParams, apply_terminal_upst
 use super::attempt_health::record_attempt_success;
 use super::attempt_request::inject_auth_headers;
 use super::attempt_target::AttemptTarget;
+use super::client_identity::extract_session_identity_with_body_fallback;
 use super::concurrency_limits::ConcurrencyPermit;
 use super::headers::filter_request_headers;
 use super::passive_health::{record_passive_upstream_failure, record_passive_upstream_success};
@@ -315,6 +316,10 @@ async fn prepare_responses_websocket(
         uri: &uri,
         client_headers: &client_headers,
         raw_body: &raw_body,
+        session_identity_hint: extract_session_identity_with_body_fallback(
+            &client_headers,
+            raw_body.as_ref(),
+        ),
         client_name,
         client_addr,
         started_at_ms,

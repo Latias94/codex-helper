@@ -11,7 +11,7 @@ use crate::routing_ir::RouteRequestContext;
 use crate::state::{SessionBinding, SessionContinuityMode, SessionIdentitySource};
 
 use super::ProxyService;
-use super::client_identity::{ClientSessionIdentity, extract_session_identity_with_body_fallback};
+use super::client_identity::ClientSessionIdentity;
 use super::request_body::{
     apply_model_override_value, apply_reasoning_effort_override_value,
     apply_service_tier_override_value, extract_model_from_value,
@@ -95,6 +95,7 @@ pub(super) struct CommonRequestPreparationParams<'a> {
     pub(super) uri: &'a Uri,
     pub(super) client_headers: &'a HeaderMap,
     pub(super) raw_body: &'a Bytes,
+    pub(super) session_identity_hint: Option<ClientSessionIdentity>,
     pub(super) client_name: Option<String>,
     pub(super) client_addr: Option<String>,
     pub(super) started_at_ms: u64,
@@ -143,6 +144,7 @@ pub(super) async fn prepare_common_request(
         uri,
         client_headers,
         raw_body,
+        session_identity_hint,
         client_name,
         client_addr,
         started_at_ms,
@@ -150,8 +152,8 @@ pub(super) async fn prepare_common_request(
         request_body_previews,
     } = params;
     let mgr = proxy.service_manager(config.cfg_snapshot.as_ref());
-    let session_identity =
-        extract_session_identity_with_body_fallback(client_headers, raw_body.as_ref());
+    let _ = client_headers;
+    let session_identity = session_identity_hint;
     let session_id = session_identity_value(session_identity.as_ref());
     let session_identity_source = session_identity_source(session_identity.as_ref());
     let session_binding = if let Some(id) = session_id.as_deref() {
@@ -740,6 +742,11 @@ mod tests {
             uri: &uri,
             client_headers: &headers,
             raw_body: &raw_body,
+            session_identity_hint:
+                super::super::client_identity::extract_session_identity_with_body_fallback(
+                    &headers,
+                    raw_body.as_ref(),
+                ),
             client_name: Some("test-client".to_string()),
             client_addr: None,
             started_at_ms: 2,

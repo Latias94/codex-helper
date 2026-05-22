@@ -47,6 +47,7 @@ mod request_failures;
 mod request_preparation;
 mod request_routing;
 mod response_finalization;
+mod response_fixer;
 mod responses_websocket;
 mod retry;
 mod route_affinity;

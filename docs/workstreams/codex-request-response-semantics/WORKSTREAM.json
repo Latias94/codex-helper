@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "slug": "codex-request-response-semantics",
+  "title": "Codex Request Response Semantics",
+  "status": "complete",
+  "updated": "2026-05-22",
+  "scope_kind": "execution",
+  "problem": "Codex relay requests need deeper continuity recovery, service-tier observability, and bounded response repair without overriding user intent.",
+  "authoritative_docs": [
+    {
+      "role": "design",
+      "path": "docs/workstreams/codex-request-response-semantics/DESIGN.md"
+    },
+    {
+      "role": "execution",
+      "path": "docs/workstreams/codex-request-response-semantics/TODO.md"
+    },
+    {
+      "role": "gates",
+      "path": "docs/workstreams/codex-request-response-semantics/EVIDENCE_AND_GATES.md"
+    }
+  ],
+  "gates": [
+    "cargo fmt --package codex-helper-core",
+    "cargo nextest run -p codex-helper-core previous_response_id",
+    "cargo nextest run -p codex-helper-core session_completion",
+    "cargo nextest run -p codex-helper-core service_tier",
+    "cargo nextest run -p codex-helper-core response_fixer",
+    "cargo nextest run -p codex-helper-core"
+  ],
+  "evidence": [
+    {
+      "kind": "format",
+      "command": "cargo fmt --package codex-helper-core",
+      "result": "passed"
+    },
+    {
+      "kind": "test",
+      "command": "cargo nextest run -p codex-helper-core previous_response_id",
+      "result": "2 passed"
+    },
+    {
+      "kind": "test",
+      "command": "cargo nextest run -p codex-helper-core session_completion",
+      "result": "1 passed"
+    },
+    {
+      "kind": "test",
+      "command": "cargo nextest run -p codex-helper-core service_tier",
+      "result": "3 passed"
+    },
+    {
+      "kind": "test",
+      "command": "cargo nextest run -p codex-helper-core response_fixer",
+      "result": "4 passed"
+    },
+    {
+      "kind": "test",
+      "command": "cargo nextest run -p codex-helper-core",
+      "result": "624 passed"
+    }
+  ],
+  "adr_refs": [],
+  "continue_policy": {
+    "default_action": "continue",
+    "notes": "Continue this lane while the four scoped Codex semantics improvements remain the target. Split ChatGPT backend upstream compatibility into a follow-on."
+  }
+}

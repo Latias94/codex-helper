@@ -47,6 +47,27 @@ impl ClientSessionIdentity {
         }
     }
 
+    fn body_session_id(value: String) -> Self {
+        Self {
+            value,
+            source: SessionIdentitySource::BodySessionId,
+        }
+    }
+
+    fn metadata_session_id(value: String) -> Self {
+        Self {
+            value,
+            source: SessionIdentitySource::MetadataSessionId,
+        }
+    }
+
+    fn previous_response_id(value: String) -> Self {
+        Self {
+            value,
+            source: SessionIdentitySource::PreviousResponseId,
+        }
+    }
+
     pub(super) fn value(&self) -> &str {
         self.value.as_str()
     }
@@ -58,6 +79,7 @@ impl ClientSessionIdentity {
 
 pub(super) fn extract_session_identity(headers: &HeaderMap) -> Option<ClientSessionIdentity> {
     header_str(headers, "session_id")
+        .or_else(|| header_str(headers, "x-session-id"))
         .or_else(|| header_str(headers, "session-id"))
         .or_else(|| header_str(headers, "conversation_id"))
         .or_else(|| header_str(headers, "thread-id"))
@@ -68,7 +90,7 @@ pub(super) fn extract_session_identity_with_body_fallback(
     headers: &HeaderMap,
     body: &[u8],
 ) -> Option<ClientSessionIdentity> {
-    extract_session_identity(headers).or_else(|| extract_prompt_cache_key_session_identity(body))
+    extract_session_identity(headers).or_else(|| extract_body_session_identity(body))
 }
 
 pub(super) fn extract_prompt_cache_key_session_identity(
@@ -78,13 +100,38 @@ pub(super) fn extract_prompt_cache_key_session_identity(
 }
 
 pub(super) fn extract_prompt_cache_key_session_id(body: &[u8]) -> Option<String> {
+    extract_body_string_field(body, &["prompt_cache_key"])
+}
+
+fn extract_body_session_identity(body: &[u8]) -> Option<ClientSessionIdentity> {
+    extract_body_string_field(body, &["session_id"])
+        .map(ClientSessionIdentity::body_session_id)
+        .or_else(|| {
+            extract_body_string_field(body, &["x-session-id"])
+                .map(ClientSessionIdentity::body_session_id)
+        })
+        .or_else(|| extract_prompt_cache_key_session_identity(body))
+        .or_else(|| {
+            extract_body_string_field(body, &["metadata", "session_id"])
+                .map(ClientSessionIdentity::metadata_session_id)
+        })
+        .or_else(|| {
+            extract_body_string_field(body, &["previous_response_id"])
+                .map(ClientSessionIdentity::previous_response_id)
+        })
+}
+
+fn extract_body_string_field(body: &[u8], path: &[&str]) -> Option<String> {
     if body.is_empty() {
         return None;
     }
     let value = serde_json::from_slice::<Value>(body).ok()?;
-    value
-        .get("prompt_cache_key")
-        .and_then(Value::as_str)
+    let mut current = &value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current
+        .as_str()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
@@ -174,6 +221,18 @@ mod tests {
                 .map(|identity| identity.value()),
             Some("sess-underscore-1")
         );
+
+        headers.insert("x-session-id", HeaderValue::from_static("x-sess-1"));
+        headers.remove("session_id");
+        headers.remove("session-id");
+        headers.remove("conversation_id");
+        headers.remove("thread-id");
+        assert_eq!(
+            extract_session_identity(&headers)
+                .as_ref()
+                .map(|identity| identity.value()),
+            Some("x-sess-1")
+        );
     }
 
     #[test]
@@ -205,6 +264,35 @@ mod tests {
             extract_session_identity(&headers).map(|identity| identity.source()),
             Some(SessionIdentitySource::Header)
         );
+    }
+
+    #[test]
+    fn extract_session_id_uses_body_session_metadata_and_previous_response_fallbacks() {
+        let headers = HeaderMap::new();
+
+        let identity = extract_session_identity_with_body_fallback(
+            &headers,
+            br#"{"model":"gpt-5","metadata":{"session_id":"meta-1"}}"#,
+        )
+        .expect("metadata identity");
+        assert_eq!(identity.value(), "meta-1");
+        assert_eq!(identity.source(), SessionIdentitySource::MetadataSessionId);
+
+        let identity = extract_session_identity_with_body_fallback(
+            &headers,
+            br#"{"model":"gpt-5","previous_response_id":"resp-123"}"#,
+        )
+        .expect("previous response identity");
+        assert_eq!(identity.value(), "resp-123");
+        assert_eq!(identity.source(), SessionIdentitySource::PreviousResponseId);
+
+        let identity = extract_session_identity_with_body_fallback(
+            &headers,
+            br#"{"model":"gpt-5","session_id":"body-1","prompt_cache_key":"pcache-1"}"#,
+        )
+        .expect("body identity");
+        assert_eq!(identity.value(), "body-1");
+        assert_eq!(identity.source(), SessionIdentitySource::BodySessionId);
     }
 
     #[test]

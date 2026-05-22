@@ -7,12 +7,26 @@ All notable changes to this project will be documented in this file.
 
 ### 中文
 
+#### Codex 请求/响应语义增强
+
+- Codex `/responses` 和 `/responses/compact` 请求现在会从已有请求证据补齐缺失的 `session_id`、`x-session-id` 和 `prompt_cache_key`；来源包括 header session、body `session_id`、`prompt_cache_key`、`metadata.session_id` 和 `previous_response_id`。helper 不会凭空生成 session id，也不会覆盖客户端已发送的 session 字段。
+- 如果上游 400/404 明确表示 `previous_response_id` 对应 response 不存在，helper 会移除 `previous_response_id` 并对同一个上游重试一次，同时在 route attempts 中记录 `codex_stale_previous_response_id`，方便排查 relay 状态不同步。
+- Codex 非流式响应新增受控 gzip JSON 修复：当 relay 无视 `Accept-Encoding: identity` 返回 gzip JSON 时，helper 会解压后转发普通 JSON，并继续复用现有响应头过滤去掉过期的 `Content-Encoding` / `Content-Length`。
+- `service_tier` 观测补齐代理级回归测试：请求日志会保留 requested / effective / actual 三段，确认 fast mode 仍只由客户端或显式 override 决定，不由 helper 默认配置偷偷改写。
+
 #### Codex 中转请求字段覆盖
 
 - 修复自动 `default_profile` 会把客户端请求体里的 `model`、`reasoning.effort` 和 `service_tier` 改成 profile 默认值的问题；现在只有显式 session override 或手动 apply 到 session 的 profile binding 才会改写这些请求字段。
 - Codex 本地 fast mode 发出的 `service_tier: "priority"` 不会再被中转的默认 profile 覆盖成 `default`。自动 default profile 仍可用于 session binding 和 station 路由，但不再冒充用户请求字段 override。
 
 ### English summary
+
+#### Codex request/response semantics
+
+- Codex `/responses` and `/responses/compact` requests now complete missing `session_id`, `x-session-id`, and `prompt_cache_key` fields from existing request evidence: header session ids, body `session_id`, `prompt_cache_key`, `metadata.session_id`, or `previous_response_id`. Helper does not invent synthetic session ids or overwrite client-provided session fields.
+- If an upstream 400/404 explicitly says the `previous_response_id` response no longer exists, helper removes `previous_response_id` and retries the same upstream once. Route attempts record `codex_stale_previous_response_id` for relay-state debugging.
+- Added bounded gzip JSON repair for non-streaming Codex responses. If a relay ignores `Accept-Encoding: identity` and returns gzip JSON, helper decodes it before forwarding plain JSON and keeps filtering stale `Content-Encoding` / `Content-Length`.
+- Added proxy-level regression coverage for `service_tier` attribution: request logs preserve requested / effective / actual values, confirming fast mode is driven by the client or explicit overrides, not by helper defaults.
 
 #### Codex relay request-field overrides
 
