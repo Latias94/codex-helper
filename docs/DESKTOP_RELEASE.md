@@ -1,8 +1,9 @@
 # Desktop Release Packaging
 
 This document records the current desktop packaging contract. It is intentionally
-separate from the final replacement announcement: the Tauri app must still pass
-the full packaged lifecycle smoke before it can replace the egui GUI.
+scoped to packaged desktop release mechanics: Windows packaged lifecycle smoke
+has passed, while macOS/Linux packaged parity and signed auto-update operations
+remain separate release follow-ups.
 
 ## Current target
 
@@ -103,10 +104,22 @@ Current policy:
 
 - Launch at login starts only the desktop companion.
 - It does not automatically stop, restart, or seize an existing local proxy.
-- Startup-time proxy auto-start remains disabled in the UI until we have
-  packaged lifecycle smoke proving it cannot disturb an existing helper.
+- Startup-time proxy auto-start remains explicit; the companion can start a
+  desktop-managed sidecar, but proxy shutdown still requires the user-facing
+  `Stop Proxy` action.
 - The plugin supports Windows, macOS, and Linux desktop targets. Android/iOS are
   intentionally outside this desktop release target.
+
+## Replacement posture
+
+The Windows NSIS packaged Tauri app is the desktop GUI replacement path. The
+legacy `codex-helper-gui` egui binary remains available as a deprecated fallback
+for rollback and for platforms where packaged Tauri parity has not yet been
+smoked.
+
+Do not claim cross-platform replacement until macOS/Linux packaged smoke has
+covered the same lifecycle behavior. Do not enable or advertise automatic
+updates until signed updater artifacts and rollback operations are proven.
 
 ## Verification status
 
@@ -118,20 +131,24 @@ Verified on Windows:
   `codex-helper-desktop.exe` and the bundled `codex-helper.exe` sidecar.
 - Compile/test verification proves the launch-at-login plugin is registered and
   the Settings switch is wired to the real guest binding.
+- Packaged lifecycle smoke runs in isolated `CODEX_HELPER_HOME` / `CODEX_HOME`
+  directories and clears developer CLI overrides.
+- The installed desktop app starts its bundled sidecar without
+  `CODEX_HELPER_CLI_PATH`.
+- Native close hides to tray, native tray menu Show Window / Hide to Tray / Quit
+  App paths work, and Quit App exits only the desktop process.
+- Detach, explicit Stop Proxy, second-launch focus/restore, config
+  export/import, and Provider common edit UI pass in the packaged app.
+- Launch-at-login enable/disable registers and unregisters the Windows HKCU Run
+  entry during smoke cleanup.
 - Release posture is defined: manual GitHub Releases for the first replacement
   release; auto-update is disabled until signing, endpoint, artifact hosting, and
   rollback are real.
 
-Still required before egui replacement:
+Still required before broader release claims:
 
-- Full packaged lifecycle smoke in an isolated environment:
-  - start packaged app;
-  - start desktop-managed proxy without `CODEX_HELPER_CLI_PATH`;
-  - close-to-tray/show/hide/quit behavior;
-  - detach and explicit stop behavior;
-  - second launch focus;
-  - launch-at-login enable/disable and login/restart behavior;
-  - config export/import.
 - Signing key escrow, updater endpoint, and signed update smoke before enabling
   automatic updates.
-- Provider edit parity for common single-endpoint providers.
+- macOS/Linux packaged lifecycle smoke before claiming cross-platform GUI
+  replacement.
+- A release rollback checklist before removing the legacy egui fallback entirely.

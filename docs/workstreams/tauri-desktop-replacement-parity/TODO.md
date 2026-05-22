@@ -1,7 +1,7 @@
 # Tauri Desktop Replacement Parity — TODO
 
-Status: Draft
-Last updated: 2026-05-22
+Status: Complete
+Last updated: 2026-05-23
 
 ## M0 — Scope And Evidence Freeze
 
@@ -59,25 +59,25 @@ Last updated: 2026-05-22
   Evidence: `apps/desktop/src-tauri/src/commands/providers.rs`; `apps/desktop/src/features/providers/ProviderCard.tsx`; `apps/desktop/src/app/App.test.tsx`; `EVIDENCE_AND_GATES.md`.
   Handoff: DONE_WITH_CONCERNS — complex multi-endpoint editing stays advanced/raw TOML by design. Safe single-endpoint form editing is complete, but TDRP-080 still needs packaged smoke before any replacement claim.
 
-- [ ] TDRP-080 [owner=main] [deps=TDRP-040,TDRP-050,TDRP-060,TDRP-070] [scope=packaged-smoke,docs]
+- [x] TDRP-080 [owner=main] [deps=TDRP-040,TDRP-050,TDRP-060,TDRP-070] [scope=packaged-smoke,docs]
   Goal: Run and record full packaged desktop lifecycle smoke: close window, tray show/hide, Quit App, Detach, Stop Proxy, attach existing resident runtime, start packaged sidecar, second launch focus, config export/import.
-  Validation: Smoke evidence in EVIDENCE_AND_GATES.md.
-  Review: Any failed smoke blocks egui removal.
-  Evidence: packaged smoke logs/screenshots/manual notes.
-  Handoff: Fix failures or split OS-specific follow-ons.
+  Validation: DONE — rebuilt the Windows NSIS installer, then `tdrp_080_packaged_smoke.ps1 -SkipDevToolsSmoke`, `tdrp_080_packaged_smoke.ps1`, and `tdrp_080_packaged_smoke.ps1 -RunAutostartSmoke` all passed against isolated install/config/Codex homes.
+  Review: DONE_WITH_CONCERNS — Windows packaged parity is now proven, including real tray menu Show Window / Hide to Tray / Quit App via the native Shell notification icon callback. macOS/Linux packaged smoke remains a future platform expansion before claiming parity on those OSes.
+  Evidence: `apps/desktop/src-tauri/src/lifecycle.rs`; `docs/workstreams/tauri-desktop-replacement-parity/scripts/tdrp_080_packaged_smoke.ps1`; `EVIDENCE_AND_GATES.md`.
+  Handoff: DONE — proceed to TDRP-090 user-facing replacement docs/release notes and egui deprecation/removal decision.
 
 ## M4 — Replacement Release And egui Deprecation/Removal
 
-- [ ] TDRP-090 [owner=planner] [deps=TDRP-080] [scope=README,CHANGELOG,release-notes,crates/gui-or-package-metadata]
+- [x] TDRP-090 [owner=planner] [deps=TDRP-080] [scope=README,CHANGELOG,release-notes,crates/gui-or-package-metadata]
   Goal: Update user-facing docs and release notes so Tauri is the GUI replacement path and egui is deprecated or removed behind verified gates.
-  Validation: docs review plus build/package gates for any binary/package metadata changes.
-  Review: Do not remove egui unless TDRP-080 is green; otherwise document deprecation only.
-  Evidence: README/CHANGELOG/release notes and final gate log.
-  Handoff: Communicate rollback/fallback behavior.
+  Validation: DONE — README/README_EN/CHANGELOG/docs/DESKTOP_RELEASE now describe Windows Tauri as the verified packaged replacement path, `codex-helper-gui`/egui as a deprecated legacy fallback, and auto-update/macOS/Linux packaged parity as follow-ons. `cargo fmt --check`, `cargo check --features gui --bin codex-helper-gui`, `python -m json.tool WORKSTREAM.json`, and `git diff --check -- .` pass.
+  Review: DONE_WITH_CONCERNS — egui is deprecated but not removed because Windows packaged parity is green while macOS/Linux packaged parity and rollback policy still benefit from a retained fallback.
+  Evidence: `README.md`; `README_EN.md`; `CHANGELOG.md`; `docs/DESKTOP_RELEASE.md`; `src/bin/codex-helper-gui.rs`; `EVIDENCE_AND_GATES.md`.
+  Handoff: DONE — proceed to TDRP-100 final verification/review/closeout.
 
-- [ ] TDRP-100 [owner=planner] [deps=TDRP-090] [scope=docs/workstreams/tauri-desktop-replacement-parity]
+- [x] TDRP-100 [owner=planner] [deps=TDRP-090] [scope=docs/workstreams/tauri-desktop-replacement-parity]
   Goal: Close this lane only after the full objective is verified against current evidence.
-  Validation: verify-rust-workstream records fresh final evidence.
-  Review: review-workstream has no blocking findings.
-  Evidence: EVIDENCE_AND_GATES.md, WORKSTREAM.json.
-  Handoff: Summarize remaining risks, if any.
+  Validation: DONE — final closeout verification passed: `cargo fmt --check`, `cargo check -p codex-helper-desktop`, `cargo nextest run -p codex-helper-desktop --lib`, `cargo check --features gui --bin codex-helper-gui`, `python -m json.tool WORKSTREAM.json`, and `git diff --check -- .`.
+  Review: DONE_WITH_CONCERNS — no blocking findings. Residual concerns are intentionally split follow-ons: macOS/Linux packaged smoke, signed updater release pipeline, and eventual egui removal after rollback policy is settled.
+  Evidence: `EVIDENCE_AND_GATES.md`; `WORKSTREAM.json`; `HANDOFF.md`.
+  Handoff: DONE — lane closed for Windows packaged replacement scope.

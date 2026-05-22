@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
-use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{App, AppHandle, Emitter, Listener, Manager, Runtime, WebviewWindow, Window};
 
 use crate::error::{CommandError, DesktopError};
@@ -18,6 +18,9 @@ const WINDOW_READY_EVENT: &str = "codex-helper://window-ready";
 pub(crate) struct DesktopLifecycleState {
     quit_requested: AtomicBool,
 }
+
+#[allow(dead_code)]
+pub(crate) struct DesktopTrayIcon<R: Runtime>(TrayIcon<R>);
 
 impl DesktopLifecycleState {
     pub(crate) fn request_quit(&self) {
@@ -74,7 +77,8 @@ pub(crate) fn setup_tray<R: Runtime>(app: &mut App<R>) -> tauri::Result<()> {
         tray = tray.icon(icon);
     }
 
-    tray.tooltip("codex-helper local proxy control center")
+    let tray_icon = tray
+        .tooltip("codex-helper local proxy control center")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| {
@@ -86,6 +90,7 @@ pub(crate) fn setup_tray<R: Runtime>(app: &mut App<R>) -> tauri::Result<()> {
             }
         })
         .build(app)?;
+    app.manage(DesktopTrayIcon(tray_icon));
 
     Ok(())
 }

@@ -50,7 +50,7 @@ English: [README_EN.md](README_EN.md)
 - **余额/套餐**：支持 Sub2API、New API 和常见 `/user/balance` 探测；失败不计为耗尽。
 - **出站代理兼容**：本地代理和出站网络代理是两层概念；当前出站请求受系统/环境代理变量影响，还没有 `config.toml` 专用代理段。
 - **请求可观测**：记录 provider、model、token、cache token、缓存命中率、TTFB、总耗时、输出速度、重试链和估算成本。
-- **TUI/GUI**：TUI 内置在命令行里；当前发布的 egui GUI 仍可用。新的 Tauri 桌面端已作为长期替代路径进入源码预览阶段，但在安装包、托盘、sidecar、单实例、开机启动和自动更新等 parity gate 通过前不会移除 egui。
+- **TUI/GUI**：TUI 内置在命令行里；Windows packaged Tauri 桌面端已通过 sidecar、托盘、单实例、开机启动、Provider 常用编辑和打包生命周期 smoke，作为新的桌面 GUI 替代路径。`codex-helper-gui`/egui 仍可用，但已定位为 legacy fallback；自动更新仍等待签名发布链路，不作为首个替代版本承诺。
 
 ## 快速开始
 
@@ -70,7 +70,7 @@ Windows PowerShell:
 powershell -ExecutionPolicy Bypass -c "irm https://github.com/Latias94/codex-helper/releases/download/v0.16.0/codex-helper-installer.ps1 | iex"
 ```
 
-安装后会得到三个命令：`codex-helper`、短别名 `ch`，以及可选 GUI 入口 `codex-helper-gui`。
+安装后会得到三个命令：`codex-helper`、短别名 `ch`，以及可选 legacy GUI 入口 `codex-helper-gui`（egui，已弃用但保留）。Windows Tauri 桌面安装包由 `apps/desktop` 的 `pnpm tauri:build` 生成；首个替代版本按 GitHub Releases 手动下载安装，不启用自动更新。
 
 如果不想 pipe shell，可以到 [GitHub Releases](https://github.com/Latias94/codex-helper/releases) 下载对应平台压缩包，并使用同名 `.sha256` 文件校验。
 
@@ -122,7 +122,7 @@ codex-helper tui --codex
 
 `daemon status` 会尽量显示当前 resident proxy 的 owner marker（manual CLI、supervisor 或未来桌面/托盘 owner）；marker 只用于可观测性，读取或清理失败不会阻断代理启动/退出。面向未来桌面端的 sidecar 语义已经预留为隐藏的 managed 启动模式，普通用户无需手动判断或使用。
 
-开发中的 Tauri 桌面端采用更接近 Clash 的常驻客户端语义：关闭主窗口隐藏到托盘，`Quit App` 只退出桌面进程，真正停止代理必须走显式 `Stop Proxy`。这条路径目前是源码预览/内部 dogfood，不是已发布 GUI 的替代安装包。
+Tauri 桌面端采用更接近 Clash 的常驻客户端语义：关闭主窗口隐藏到托盘，`Quit App` 只退出桌面进程，真正停止代理必须走显式 `Stop Proxy`。Windows NSIS packaged 路径已通过隔离生命周期 smoke，是新的桌面 GUI 替代路径；macOS/Linux packaged parity 和自动更新签名发布链路仍需单独完成。
 
 显式开关 Codex 代理 patch：
 
@@ -385,9 +385,9 @@ codex-helper-gui
 cargo run --release --features gui --bin codex-helper-gui
 ```
 
-GUI 可以启动/附着本地代理，编辑常见单 endpoint provider、route node 和 routing，查看请求、余额、价格目录、session、health、breaker 和控制面板状态。默认行为是 GUI 启动的代理跟随 GUI 退出而停止；附着已有代理必须在界面中显式选择，关闭 GUI 只会取消附着，不会偷偷停止别的进程。复杂多 endpoint provider、模型映射和高级字段仍建议用 CLI 或 raw TOML。
+这个 egui GUI 已弃用并保留为 legacy fallback。它仍可以启动/附着本地代理，编辑常见单 endpoint provider、route node 和 routing，查看请求、余额、价格目录、session、health、breaker 和控制面板状态。默认行为是 GUI 启动的代理跟随 GUI 退出而停止；附着已有代理必须在界面中显式选择，关闭 GUI 只会取消附着，不会偷偷停止别的进程。复杂多 endpoint provider、模型映射和高级字段仍建议用 CLI 或 raw TOML。
 
-新的 Tauri 桌面端位于 `apps/desktop`，技术栈是 React 19、Tailwind CSS 4、shadcn/ui 风格组件和 TanStack Router/Query/Table。它已经实现 Dashboard、Providers、Usage、Settings、只读 admin 数据、安全控制动作、关闭隐藏到托盘语义、单实例、开机启动设置、轻量单配置导入导出、打开配置/日志/缓存路径，以及 Windows NSIS packaged sidecar 构建；首个替代版本的发布策略是 GitHub Releases 手动下载安装，自动更新会等 Tauri updater 签名密钥、HTTPS 发布端点、artifact hosting 和回滚流程都就绪后再启用。因此仍需完成 Provider 常用编辑表单和完整 packaged 托盘生命周期 smoke，之后才会替换上面的 egui GUI。桌面端打包策略见 [docs/DESKTOP_RELEASE.md](docs/DESKTOP_RELEASE.md)。
+新的 Tauri 桌面端位于 `apps/desktop`，技术栈是 React 19、Tailwind CSS 4、shadcn/ui 风格组件和 TanStack Router/Query/Table。它已经实现 Dashboard、Providers、Usage、Settings、只读 admin 数据、安全控制动作、关闭隐藏到托盘语义、单实例、开机启动设置、轻量单配置导入导出、打开配置/日志/缓存路径、Provider 常用编辑表单和 Windows NSIS packaged sidecar 构建。Windows packaged smoke 已覆盖安装包启动、托盘 Show/Hide/Quit、显式 Stop Proxy、Detach、第二次启动聚焦、开机启动注册、配置导入导出和 Provider 编辑；首个替代版本按 GitHub Releases 手动下载安装，自动更新会等 Tauri updater 签名密钥、HTTPS 发布端点、artifact hosting 和回滚流程都就绪后再启用。桌面端打包策略见 [docs/DESKTOP_RELEASE.md](docs/DESKTOP_RELEASE.md)。
 
 ## 配置文件位置
 

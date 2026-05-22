@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Permissions required by the main desktop window for local companion controls.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "autostart:default",
+    "dialog:default",
+    "opener:default"
+  ]
+}

@@ -1,7 +1,7 @@
 # Tauri Desktop Replacement Parity — Milestones
 
-Status: Draft
-Last updated: 2026-05-22
+Status: Complete
+Last updated: 2026-05-23
 
 ## M0 — Scope And Evidence Freeze
 
@@ -60,6 +60,8 @@ Primary gates:
 - Frontend/Rust tests for provider forms and config patching.
 - Packaged smoke evidence.
 
+Status: Complete on Windows. macOS/Linux packaged parity remains a future platform expansion.
+
 ## M4 — Replacement Release And egui Deprecation/Removal
 
 Exit criteria:
@@ -68,3 +70,7 @@ Exit criteria:
 - egui is deprecated or removed only if packaged parity evidence supports it.
 - Final gate evidence is fresh.
 - Workstream status is updated.
+
+Status: Complete for the Windows packaged replacement scope. egui is deprecated
+and retained as a legacy fallback. macOS/Linux packaged smoke, signed updater
+operations, and eventual egui removal are follow-ons.

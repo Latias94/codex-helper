@@ -38,7 +38,7 @@ It is probably unnecessary if you only use one official account and do not need 
 - **Balance and plan visibility**: probes common Sub2API, New API, and `/user/balance` endpoints; lookup failures are not treated as exhausted.
 - **Outbound proxy compatibility**: the local proxy and outbound network proxy are separate layers; outbound requests currently follow system/environment proxy variables, with no first-class `config.toml` proxy section yet.
 - **Request observability**: provider, model, tokens, cache tokens, cache hit rate, TTFB, duration, output rate, retry chain, and estimated cost.
-- **TUI and GUI**: built-in TUI for terminal use; the current released egui GUI remains available. A new Tauri desktop client is now the long-term replacement path at source-preview level, but egui stays until installer, tray, sidecar, single-instance, launch-at-login, and update parity gates pass.
+- **TUI and GUI**: built-in TUI for terminal use; Windows packaged Tauri desktop now covers the replacement path after sidecar, tray, single-instance, launch-at-login, common provider edit, and packaged smoke gates passed. `codex-helper-gui`/egui still exists as a deprecated legacy fallback; auto-update remains deferred until the signed release pipeline is ready.
 
 ## Quick Start
 
@@ -58,7 +58,7 @@ Windows PowerShell:
 powershell -ExecutionPolicy Bypass -c "irm https://github.com/Latias94/codex-helper/releases/download/v0.16.0/codex-helper-installer.ps1 | iex"
 ```
 
-This installs `codex-helper`, the short alias `ch`, and the optional GUI entrypoint `codex-helper-gui`.
+This installs `codex-helper`, the short alias `ch`, and the optional legacy GUI entrypoint `codex-helper-gui` (egui, deprecated but retained). The Windows Tauri desktop installer is produced by `apps/desktop` via `pnpm tauri:build`; the first replacement release is shipped as a manual GitHub Releases download, with auto-update still disabled.
 
 If you do not want to pipe a shell script, download the archive for your platform from [GitHub Releases](https://github.com/Latias94/codex-helper/releases) and verify it with the matching `.sha256` file.
 
@@ -110,7 +110,7 @@ By default, `codex-helper serve` and the GUI follow “the console owns the prox
 
 `daemon status` best-effort shows the resident proxy owner marker (manual CLI, supervisor, or a future desktop/tray owner). The marker is only observability metadata: read or cleanup failures never block proxy startup or shutdown. A hidden managed sidecar mode is reserved for the future desktop shell, so ordinary users do not need to choose it manually.
 
-The in-development Tauri desktop client uses a more Clash-like resident-client lifecycle: closing the main window hides it to the tray, `Quit App` exits only the desktop process, and stopping the proxy remains an explicit `Stop Proxy` action. This path is currently source-level/internal dogfood, not a released replacement installer.
+The Tauri desktop client uses a more Clash-like resident-client lifecycle: closing the main window hides it to the tray, `Quit App` exits only the desktop process, and stopping the proxy remains an explicit `Stop Proxy` action. The Windows NSIS packaged path has passed isolated lifecycle smoke and is now the replacement route; macOS/Linux packaged parity and the signed auto-update chain still need separate follow-up work.
 
 Manage the Codex proxy patch explicitly:
 
@@ -375,9 +375,9 @@ codex-helper-gui
 cargo run --release --features gui --bin codex-helper-gui
 ```
 
-The GUI can start or explicitly attach to a proxy, edit common single-endpoint providers, route nodes, and routing, and inspect requests, balances, pricing, sessions, health, breaker state, and control-plane status. By default, a GUI-started proxy stops when the GUI exits; attaching to an existing proxy must be selected explicitly, and closing the GUI only detaches instead of stopping someone else’s process. Complex multi-endpoint providers, model mappings, and advanced fields should still be edited through CLI or raw TOML.
+The egui GUI is deprecated and kept as a legacy fallback. It can still start or explicitly attach to a proxy, edit common single-endpoint providers, route nodes, and routing, and inspect requests, balances, pricing, sessions, health, breaker state, and control-plane status. By default, a GUI-started proxy stops when the GUI exits; attaching to an existing proxy must be selected explicitly, and closing the GUI only detaches instead of stopping someone else’s process. Complex multi-endpoint providers, model mappings, and advanced fields should still be edited through CLI or raw TOML.
 
-The new Tauri desktop client lives under `apps/desktop` and uses React 19, Tailwind CSS 4, shadcn/ui-style components, and TanStack Router/Query/Table. It already implements Dashboard, Providers, Usage, Settings, read-only admin data, safe control actions, close-to-tray semantics, single instance, launch-at-login settings, lightweight single-config import/export, config/log/cache path openers, and a Windows NSIS packaged sidecar build. The first replacement release policy is manual installer download from GitHub Releases; auto-update stays disabled until Tauri updater signing keys, HTTPS release endpoint, artifact hosting, and rollback operations are real. It still needs common provider edit forms and full packaged tray lifecycle smoke before it replaces the egui GUI above. See [docs/DESKTOP_RELEASE.md](docs/DESKTOP_RELEASE.md) for the desktop packaging contract.
+The new Tauri desktop client lives under `apps/desktop` and uses React 19, Tailwind CSS 4, shadcn/ui-style components, and TanStack Router/Query/Table. It already implements Dashboard, Providers, Usage, Settings, read-only admin data, safe control actions, close-to-tray semantics, single instance, launch-at-login settings, lightweight single-config import/export, config/log/cache path openers, common provider edit forms, and a Windows NSIS packaged sidecar build. Windows packaged smoke now covers tray Show/Hide/Quit, Detach, Stop Proxy, second-launch focus, launch-at-login registration, config import/export, and provider editing. The first replacement release policy is manual installer download from GitHub Releases; auto-update stays disabled until Tauri updater signing keys, HTTPS release endpoint, artifact hosting, and rollback operations are real. See [docs/DESKTOP_RELEASE.md](docs/DESKTOP_RELEASE.md) for the desktop packaging contract.
 
 ## File Locations
 

@@ -2,10 +2,10 @@
   "schema_version": 1,
   "slug": "tauri-desktop-replacement-parity",
   "title": "Tauri Desktop Replacement Parity",
-  "status": "draft",
-  "updated": "2026-05-22",
+  "status": "complete",
+  "updated": "2026-05-23",
   "scope_kind": "execution",
-  "problem": "The Tauri desktop client is the desired egui replacement, but packaged sidecar, OS integration, config/path actions, provider edit parity, packaged smoke, and egui deprecation/removal gates remain incomplete.",
+  "problem": "The Tauri desktop client is the desired egui replacement. Windows packaged replacement gates are implemented and closed; macOS/Linux packaged parity, signed updater operations, and eventual egui removal remain follow-ons.",
   "authoritative_docs": [
     {
       "role": "design",
@@ -60,11 +60,26 @@
       "date": "2026-05-22",
       "kind": "provider-edit",
       "summary": "Completed TDRP-070 with concerns. Single-endpoint provider common edits now patch alias, base_url, enabled, and optional env var names through a validated Tauri command while preserving advanced TOML fields. Multi-endpoint providers remain explicitly raw TOML."
+    },
+    {
+      "date": "2026-05-23",
+      "kind": "packaged-smoke",
+      "summary": "Completed TDRP-080 with concerns. Windows NSIS packaged smoke now proves installed sidecar startup, close-to-tray, native tray Show/Hide/Quit menu paths, config export/import, Provider common edit UI, launch-at-login registration, detach, owned Stop Proxy, second-launch restore, and Quit App leaving the sidecar running in isolated temp homes."
+    },
+    {
+      "date": "2026-05-23",
+      "kind": "release-docs",
+      "summary": "Completed TDRP-090 with concerns. README, README_EN, CHANGELOG, and docs/DESKTOP_RELEASE now present Tauri as the verified Windows packaged GUI replacement path, keep macOS/Linux packaged parity and signed auto-update as explicit follow-ons, and mark codex-helper-gui/egui as a deprecated legacy fallback."
+    },
+    {
+      "date": "2026-05-23",
+      "kind": "closeout",
+      "summary": "Completed TDRP-100 with concerns. Final verification passed for the current diff. The lane is closed for the Windows packaged replacement scope; macOS/Linux packaged smoke, signed updater operations, and eventual egui removal are explicit follow-ons."
     }
   ],
   "adr_refs": [],
   "continue_policy": {
-    "default_action": "continue",
-    "notes": "Continue until the Tauri desktop app satisfies the replacement gates in REPLACEMENT_READINESS.md. Do not remove egui until packaged parity evidence is recorded."
+    "default_action": "closed",
+    "notes": "Closed for Windows packaged replacement scope. Open follow-on workstreams for macOS/Linux packaged smoke, signed updater release operations, or eventual egui removal when ready."
   }
 }

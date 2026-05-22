@@ -1,7 +1,7 @@
 # Tauri Desktop Replacement Parity
 
-Status: Draft
-Last updated: 2026-05-22
+Status: Complete
+Last updated: 2026-05-23
 
 ## Why This Lane Exists
 
@@ -110,3 +110,12 @@ This lane can close only when:
 - packaged desktop smoke evidence exists for the replacement claim;
 - README/CHANGELOG/release notes match the shipped behavior;
 - and egui removal/deprecation is supported by evidence rather than intent.
+
+## Closeout Status
+
+Closed on 2026-05-23 for the Windows packaged replacement scope.
+
+- Windows NSIS packaged Tauri is the documented GUI replacement path.
+- `codex-helper-gui`/egui is deprecated and retained as a legacy fallback rather than removed.
+- Automatic updates are explicitly deferred until signed updater artifacts, HTTPS release metadata, and rollback operations exist.
+- macOS/Linux packaged lifecycle parity is a follow-on before any cross-platform replacement claim.
