@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "slug": "tauri-desktop-replacement-parity",
+  "title": "Tauri Desktop Replacement Parity",
+  "status": "draft",
+  "updated": "2026-05-22",
+  "scope_kind": "execution",
+  "problem": "The Tauri desktop client is the desired egui replacement, but packaged sidecar, OS integration, config/path actions, provider edit parity, packaged smoke, and egui deprecation/removal gates remain incomplete.",
+  "authoritative_docs": [
+    {
+      "role": "design",
+      "path": "docs/workstreams/tauri-desktop-replacement-parity/DESIGN.md"
+    },
+    {
+      "role": "execution",
+      "path": "docs/workstreams/tauri-desktop-replacement-parity/TODO.md"
+    },
+    {
+      "role": "gates",
+      "path": "docs/workstreams/tauri-desktop-replacement-parity/EVIDENCE_AND_GATES.md"
+    },
+    {
+      "role": "handoff",
+      "path": "docs/workstreams/tauri-desktop-replacement-parity/HANDOFF.md"
+    },
+    {
+      "role": "parent-readiness",
+      "path": "docs/workstreams/tauri-desktop-client/REPLACEMENT_READINESS.md"
+    }
+  ],
+  "gates": [
+    "pnpm test and pnpm build in apps/desktop for frontend changes",
+    "cargo fmt --check, cargo check -p codex-helper-desktop, and cargo nextest run -p codex-helper-desktop --lib for Tauri changes",
+    "git diff --check -- . for diff hygiene",
+    "pnpm tauri:build and packaged lifecycle smoke before replacement claims",
+    "review-workstream and verify-rust-workstream before lane closeout"
+  ],
+  "evidence": [
+    {
+      "date": "2026-05-22",
+      "kind": "planning",
+      "summary": "Opened replacement parity lane from the closed Tauri desktop readiness report and user goal. First executable task is TDRP-020: path opener actions plus lightweight single-config export/import."
+    }
+  ],
+  "adr_refs": [],
+  "continue_policy": {
+    "default_action": "continue",
+    "notes": "Continue until the Tauri desktop app satisfies the replacement gates in REPLACEMENT_READINESS.md. Do not remove egui until packaged parity evidence is recorded."
+  }
+}

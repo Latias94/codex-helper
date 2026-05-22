@@ -5,6 +5,7 @@ mod lifecycle;
 pub fn run() {
     tauri::Builder::default()
         .manage(lifecycle::DesktopLifecycleState::default())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             lifecycle::setup_tray(app)?;
@@ -32,7 +33,10 @@ pub fn run() {
             commands::control::start_desktop_proxy,
             commands::control::stop_proxy,
             commands::control::switch_codex,
+            commands::paths::export_config,
             commands::paths::get_known_paths,
+            commands::paths::import_config,
+            commands::paths::open_known_path,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run codex-helper desktop client");

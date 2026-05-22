@@ -21,6 +21,7 @@
     "@tanstack/react-router": "1.170.6",
     "@tanstack/react-table": "8.21.3",
     "@tauri-apps/api": "2.11.0",
+    "@tauri-apps/plugin-dialog": "2.7.1",
     "class-variance-authority": "0.7.1",
     "clsx": "2.1.1",
     "lucide-react": "1.16.0",
@@ -36,8 +37,8 @@
   "devDependencies": {
     "@tailwindcss/vite": "4.3.0",
     "@tauri-apps/cli": "2.11.2",
-    "@testing-library/react": "16.3.2",
     "@testing-library/jest-dom": "6.9.1",
+    "@testing-library/react": "16.3.2",
     "@testing-library/user-event": "14.6.1",
     "@types/node": "latest",
     "@types/react": "19.2.15",

@@ -10,6 +10,11 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn().mockRejectedValue(new Error("tauri runtime unavailable in unit tests")),
 }));
 
+vi.mock("@tauri-apps/plugin-dialog", () => ({
+  open: vi.fn().mockResolvedValue(null),
+  save: vi.fn().mockResolvedValue(null),
+}));
+
 const mockedInvoke = vi.mocked(invoke);
 
 beforeEach(() => {
@@ -145,6 +150,76 @@ describe("desktop app routes", () => {
     expect(mockedInvoke).toHaveBeenCalledWith("hide_main_window");
     expect(mockedInvoke).toHaveBeenCalledWith("quit_app");
     expect(mockedInvoke).not.toHaveBeenCalledWith("stop_proxy", expect.anything());
+  });
+
+  it("wires Settings path and config backup actions to desktop commands", async () => {
+    const dialog = await import("@tauri-apps/plugin-dialog");
+    vi.mocked(dialog.save).mockResolvedValue("C:/Users/dev/Desktop/config-export.toml");
+    vi.mocked(dialog.open).mockResolvedValue("C:/Users/dev/Desktop/import.toml");
+
+    window.location.hash = "#/settings";
+    mockedInvoke.mockImplementation(async (command, args) => {
+      if (command === "get_app_metadata") {
+        return { name: "codex-helper", version: "0.16.0", tauri: "2" };
+      }
+      if (command === "get_admin_read_model") {
+        return liveReadModel();
+      }
+      if (command === "get_desktop_control_state") {
+        return liveControlState();
+      }
+      if (command === "get_known_paths") {
+        return {
+          home: "C:/Users/dev/.codex-helper",
+          config: "C:/Users/dev/.codex-helper/config.toml",
+          logs: "C:/Users/dev/.codex-helper/logs",
+          cache: "C:/Users/dev/.codex-helper/cache",
+        };
+      }
+      if (command === "open_known_path") {
+        return undefined;
+      }
+      if (command === "export_config") {
+        expect(args).toEqual({ payload: { destination: "C:/Users/dev/Desktop/config-export.toml" } });
+        return {
+          ok: true,
+          action: "export-config",
+          message: "已导出当前 codex-helper config.toml；如果文件中包含 inline token，请按密钥文件保管。",
+          source: "C:/Users/dev/.codex-helper/config.toml",
+          destination: "C:/Users/dev/Desktop/config-export.toml",
+          secretWarning: true,
+        };
+      }
+      if (command === "import_config") {
+        expect(args).toEqual({ payload: { source: "C:/Users/dev/Desktop/import.toml" } });
+        return {
+          ok: true,
+          action: "import-config",
+          message: "已导入 config.toml；如本地代理正在运行，请重新加载运行时配置。",
+          source: "C:/Users/dev/Desktop/import.toml",
+          destination: "C:/Users/dev/.codex-helper/config.toml",
+          backup: "C:/Users/dev/.codex-helper/config.toml.1779410000.bak",
+          secretWarning: true,
+        };
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "设置" })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "打开配置目录" }));
+    await userEvent.click(screen.getByRole("button", { name: "导出配置" }));
+    await userEvent.click(screen.getByRole("button", { name: "导入配置" }));
+
+    expect(mockedInvoke).toHaveBeenCalledWith("open_known_path", { payload: { kind: "home" } });
+    expect(mockedInvoke).toHaveBeenCalledWith("export_config", {
+      payload: { destination: "C:/Users/dev/Desktop/config-export.toml" },
+    });
+    expect(mockedInvoke).toHaveBeenCalledWith("import_config", {
+      payload: { source: "C:/Users/dev/Desktop/import.toml" },
+    });
+    expect(await screen.findByText(/已备份当前配置到/)).toBeInTheDocument();
   });
 });
 

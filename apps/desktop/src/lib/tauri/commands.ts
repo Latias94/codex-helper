@@ -15,6 +15,18 @@ export type KnownPaths = {
   cache: string;
 };
 
+export type KnownPathKind = "home" | "config" | "logs" | "cache";
+
+export type ConfigFileActionResult = {
+  ok: boolean;
+  action: "export-config" | "import-config";
+  message: string;
+  source: string;
+  destination: string;
+  backup?: string;
+  secretWarning: boolean;
+};
+
 export type AdminEndpointConfig = {
   proxyPort: number;
   adminPort: number;
@@ -68,6 +80,18 @@ export async function quitApp() {
 
 export async function getKnownPaths() {
   return invoke<KnownPaths>("get_known_paths");
+}
+
+export async function openKnownPath(payload: { kind: KnownPathKind }) {
+  return invoke<void>("open_known_path", { payload });
+}
+
+export async function exportConfig(payload: { destination: string }) {
+  return invoke<ConfigFileActionResult>("export_config", { payload });
+}
+
+export async function importConfig(payload: { source: string }) {
+  return invoke<ConfigFileActionResult>("import_config", { payload });
 }
 
 export async function getAdminReadModel() {

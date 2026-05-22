@@ -1,5 +1,6 @@
 import { useState } from "react";
 
+import { open, save } from "@tauri-apps/plugin-dialog";
 import { AlertTriangle, ChevronDown, Copy, FolderOpen, RefreshCw } from "lucide-react";
 
 import { PageHeader } from "@/app/AppShell";
@@ -22,7 +23,16 @@ import { CONTROL_CONFIRMATIONS, useRuntimeActions } from "@/features/runtime/act
 import { ActionStatusBanner } from "@/features/runtime/ActionStatusBanner";
 import { useRuntimeSummary } from "@/features/runtime/hooks";
 import { useKnownPaths } from "@/features/settings/hooks";
-import { hideMainWindow, quitApp, type CodexPreset } from "@/lib/tauri/commands";
+import {
+  exportConfig,
+  hideMainWindow,
+  importConfig,
+  openKnownPath,
+  quitApp,
+  type CodexPreset,
+  type ConfigFileActionResult,
+  type KnownPathKind,
+} from "@/lib/tauri/commands";
 
 const advancedRows = [
   ["会话覆盖", "为单个会话选择 provider 或模型策略"],
@@ -42,7 +52,58 @@ export function SettingsPage() {
   const [sessionId, setSessionId] = useState("");
   const [sessionRouteTarget, setSessionRouteTarget] = useState("");
   const [stopPhrase, setStopPhrase] = useState("");
+  const [desktopStatus, setDesktopStatus] = useState<{ kind: "idle" | "success" | "error"; message: string }>({
+    kind: "idle",
+    message: "",
+  });
+  const [desktopBusy, setDesktopBusy] = useState(false);
   const paths = knownPaths.data;
+  const runPathAction = (kind: KnownPathKind) => {
+    void runDesktopAction(async () => {
+      await openKnownPath({ kind });
+      return `已打开 ${knownPathLabel(kind)}。`;
+    });
+  };
+  const runExportConfig = () => {
+    void runDesktopAction(async () => {
+      const destination = await save({
+        title: "导出 codex-helper config.toml",
+        defaultPath: "codex-helper-config.toml",
+        filters: [{ name: "TOML", extensions: ["toml"] }],
+      });
+      if (!destination) {
+        return "已取消导出配置。";
+      }
+      return configActionMessage(await exportConfig({ destination }));
+    });
+  };
+  const runImportConfig = () => {
+    void runDesktopAction(async () => {
+      const selected = await open({
+        title: "导入 codex-helper config.toml",
+        multiple: false,
+        directory: false,
+        filters: [{ name: "TOML", extensions: ["toml"] }],
+      });
+      if (!selected || Array.isArray(selected)) {
+        return "已取消导入配置。";
+      }
+      return configActionMessage(await importConfig({ source: selected }));
+    });
+  };
+  const runDesktopAction = async (action: () => Promise<string>) => {
+    setDesktopBusy(true);
+    setDesktopStatus({ kind: "idle", message: "" });
+    try {
+      const message = await action();
+      setDesktopStatus({ kind: "success", message });
+      await Promise.all([runtime.refetch(), knownPaths.refetch()]);
+    } catch (error) {
+      setDesktopStatus({ kind: "error", message: errorMessage(error) });
+    } finally {
+      setDesktopBusy(false);
+    }
+  };
   const runDesktopCommand = (command: () => Promise<unknown>) => {
     void command().catch((error) => {
       console.warn("desktop app command failed", error);
@@ -63,6 +124,9 @@ export function SettingsPage() {
       />
       <div className="mb-4">
         <ActionStatusBanner status={actions.status} busy={actions.isBusy} />
+      </div>
+      <div className="mb-4">
+        <ActionStatusBanner status={desktopStatus} busy={desktopBusy} />
       </div>
 
       <div className="grid grid-cols-2 gap-4">
@@ -127,7 +191,7 @@ export function SettingsPage() {
               <RefreshCw className="h-4 w-4" />
               重新加载运行时
             </Button>
-            <Button variant="outline"><FolderOpen className="h-4 w-4" />打开日志目录</Button>
+            <Button variant="outline" onClick={() => runPathAction("logs")}><FolderOpen className="h-4 w-4" />打开日志目录</Button>
           </div>
         </SettingsCard>
 
@@ -259,16 +323,21 @@ export function SettingsPage() {
 
         <SettingsCard title="关于与路径" description="版本、本机路径和更新信息。">
           <PathRow label="Version" value="v0.16.0" />
-          <PathRow label="Config" value={paths?.config ?? "~/.codex-helper/config.toml"} />
-          <PathRow label="Logs" value={paths?.logs ?? "~/.codex-helper/logs"} />
-          <PathRow label="Cache" value={paths?.cache ?? "~/.codex-helper/cache"} />
+          <PathRow label="Config" value={paths?.config ?? "~/.codex-helper/config.toml"} onOpen={() => runPathAction("config")} />
+          <PathRow label="Logs" value={paths?.logs ?? "~/.codex-helper/logs"} onOpen={() => runPathAction("logs")} />
+          <PathRow label="Cache" value={paths?.cache ?? "~/.codex-helper/cache"} onOpen={() => runPathAction("cache")} />
           {knownPaths.isError ? (
             <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">
               暂时无法读取桌面路径，当前展示默认路径占位。
             </div>
           ) : null}
+          <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-700">
+            导出的 config.toml 可能包含 inline token；请像密钥文件一样保存。导入会先校验 TOML，并在替换前备份当前配置。
+          </div>
           <div className="flex gap-2 pt-2">
-            <Button variant="outline"><FolderOpen className="h-4 w-4" />打开配置目录</Button>
+            <Button variant="outline" onClick={() => runPathAction("home")}><FolderOpen className="h-4 w-4" />打开配置目录</Button>
+            <Button variant="outline" onClick={runExportConfig}>导出配置</Button>
+            <Button variant="outline" onClick={runImportConfig}>导入配置</Button>
             <Button variant="outline"><RefreshCw className="h-4 w-4" />检查更新</Button>
           </div>
         </SettingsCard>
@@ -375,12 +444,18 @@ function Field({ label, value }: { label: string; value: string }) {
   );
 }
 
-function PathRow({ label, value }: { label: string; value: string }) {
+function PathRow({ label, value, onOpen }: { label: string; value: string; onOpen?: () => void }) {
   return (
     <div className="grid grid-cols-[90px_1fr_auto] items-center gap-3 text-sm">
       <span className="text-slate-500">{label}</span>
       <span className="truncate font-mono text-slate-700">{value}</span>
-      <Copy className="h-4 w-4 text-slate-400" />
+      {onOpen ? (
+        <Button aria-label={`Open ${label}`} variant="ghost" className="h-8 w-8 px-0" onClick={onOpen}>
+          <FolderOpen className="h-4 w-4" />
+        </Button>
+      ) : (
+        <Copy className="h-4 w-4 text-slate-400" />
+      )}
     </div>
   );
 }
@@ -392,4 +467,33 @@ function DangerNote({ title, description }: { title: string; description: string
       <div className="mt-1 text-xs text-slate-500">{description}</div>
     </div>
   );
+}
+
+function knownPathLabel(kind: KnownPathKind) {
+  return {
+    home: "配置目录",
+    config: "配置文件",
+    logs: "日志目录",
+    cache: "缓存目录",
+  }[kind];
+}
+
+function configActionMessage(result: ConfigFileActionResult) {
+  if (result.backup) {
+    return `${result.message} 已备份当前配置到 ${result.backup}`;
+  }
+  return result.message;
+}
+
+function errorMessage(error: unknown) {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  if (typeof error === "object" && error !== null) {
+    const message = (error as { message?: unknown }).message;
+    if (typeof message === "string") {
+      return message;
+    }
+  }
+  return String(error);
 }

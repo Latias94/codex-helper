@@ -4,6 +4,8 @@ use serde::Serialize;
 pub enum DesktopError {
     #[error("failed to resolve path: {0}")]
     Path(String),
+    #[error("desktop config action failed: {0}")]
+    Config(String),
     #[error("admin API request failed: {0}")]
     AdminApi(String),
     #[error("desktop lifecycle action failed: {0}")]
@@ -14,7 +16,7 @@ pub enum DesktopError {
 
 #[derive(Debug, Serialize)]
 pub struct CommandError {
-    message: String,
+    pub(crate) message: String,
 }
 
 impl From<DesktopError> for CommandError {
