@@ -149,7 +149,9 @@ codex-helper switch off
 
 `official-relay` 和 `official-imagegen` 都是实验预设。它们只负责让 Codex 使用更接近官方的客户端能力选择；中转站本身仍必须真正支持对应接口。真实请求密钥来自 `~/.codex-helper/config.toml` 的 provider 配置，bridge 预设不会把 Codex 的 ChatGPT token 透传给没有 helper 侧密钥的第三方 relay。旧的 `official-relay-bridge` / `official-imagegen-bridge` 仍作为 alias 接受，但不再作为推荐写法。
 
-为了不拖能力较强的中转后腿，codex-helper 默认会在路由前归一化压缩 HTTP 请求体（`zstd`、`gzip` / `x-gzip`、`br`、`deflate`），并在没有更强 session header 时用 `body.prompt_cache_key` 作为 session affinity 兜底。这样 sub2api 风格的粘性可以贯穿 `/responses` 和 `/responses/compact`；但这不会替上游补出 compact 或 WebSocket 能力。极少数中转如果必须接收原始 Codex 压缩 body，可用 `CODEX_HELPER_REQUEST_BODY_ENCODING=passthrough` 启动 helper。
+为了不拖能力较强的中转后腿，codex-helper 默认会在路由前归一化压缩 HTTP 请求体（`zstd`、`gzip` / `x-gzip`、`br`、`deflate`）。对 Codex `/responses` 和 `/responses/compact`，helper 还会从已有请求证据补齐缺失的 `session_id`、`x-session-id` 和 `prompt_cache_key`，来源包括 header session、body `session_id`、`prompt_cache_key`、`metadata.session_id` 和 `previous_response_id`；它不会凭空生成 session id，也不会覆盖用户已经带上的 session 字段。这样 sub2api 风格的粘性可以贯穿 `/responses` 和 `/responses/compact`；但这不会替上游补出 compact 或 WebSocket 能力。极少数中转如果必须接收原始 Codex 压缩 body，可用 `CODEX_HELPER_REQUEST_BODY_ENCODING=passthrough` 启动 helper。
+
+Codex 请求语义还有两个小修复：如果上游明确返回 `previous_response_id` 对应 response 不存在，helper 会移除该字段并对同一个上游重试一次；如果中转无视 `Accept-Encoding: identity` 返回 gzip JSON，helper 会先解压再转发普通 JSON。`service_tier` 只做观测和日志归因，日志会区分 requested / effective / actual，不会因为 helper 默认配置改写客户端请求里的 fast mode。
 
 在上游能力满足的前提下，能力最完整的是 `official-imagegen`；如果再确认上游支持 Responses WebSocket v2，可以额外开启 `responses_websocket`，这就是当前最接近官方体验的组合：
 

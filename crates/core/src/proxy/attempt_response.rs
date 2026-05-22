@@ -24,6 +24,7 @@ use super::request_body::extract_service_tier_from_response_body;
 use super::response_finalization::{
     FinalizeForwardResponseParams, finish_and_build_forward_response,
 };
+use super::response_fixer::maybe_repair_codex_response_body;
 use super::retry::{
     RetryLayerOptions, RetryPlan, retry_info_for_observed_attempts, retry_sleep,
     should_never_retry, should_retry_class, should_retry_status,
@@ -284,6 +285,12 @@ pub(super) async fn handle_attempt_response(
         is_codex_service,
     } = params;
 
+    let response_body = maybe_repair_codex_response_body(
+        proxy.service_name,
+        path,
+        &response_headers,
+        response_body,
+    );
     let response_body = if status.is_success() {
         maybe_decode_models_response_body(
             proxy.service_name,

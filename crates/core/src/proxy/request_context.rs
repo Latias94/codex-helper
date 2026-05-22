@@ -8,7 +8,10 @@ use crate::logging::{BodyPreview, HeaderEntry, ServiceTierLog};
 use crate::state::{SessionBinding, SessionIdentitySource};
 
 use super::ProxyService;
-use super::client_identity::{extract_client_addr, extract_client_name, extract_session_identity};
+use super::client_identity::{
+    extract_client_addr, extract_client_name, extract_session_identity,
+    extract_session_identity_with_body_fallback,
+};
 use super::headers::header_map_to_entries;
 use super::request_encoding::normalize_request_content_encoding;
 use super::request_failures::{
@@ -130,6 +133,16 @@ pub(super) async fn prepare_proxy_request(
             ));
         }
     };
+    let session_identity_hint =
+        extract_session_identity_with_body_fallback(&client_headers, raw_body.as_ref());
+    let raw_body = if request_flavor.is_codex_service
+        && method == Method::POST
+        && (uri.path().ends_with("/responses") || uri.path().ends_with("/responses/compact"))
+    {
+        super::request_body::complete_codex_session_fields(&mut client_headers, &raw_body).0
+    } else {
+        raw_body
+    };
 
     let request_body_previews = crate::logging::should_log_request_body_preview();
     let prepared = match prepare_common_request(CommonRequestPreparationParams {
@@ -139,6 +152,7 @@ pub(super) async fn prepare_proxy_request(
         uri: &uri,
         client_headers: &client_headers,
         raw_body: &raw_body,
+        session_identity_hint,
         client_name,
         client_addr,
         started_at_ms,

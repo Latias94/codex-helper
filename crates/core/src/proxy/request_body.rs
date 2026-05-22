@@ -1,3 +1,6 @@
+use axum::body::Bytes;
+use axum::http::{HeaderMap, HeaderValue};
+
 pub(super) fn extract_reasoning_effort_from_value(value: &serde_json::Value) -> Option<String> {
     value
         .get("reasoning")
@@ -80,6 +83,145 @@ pub(super) fn apply_service_tier_override_value(value: &mut serde_json::Value, s
     );
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct CodexSessionCompletion {
+    pub completed: bool,
+    pub session_id: Option<String>,
+}
+
+pub(super) fn complete_codex_session_fields(
+    headers: &mut HeaderMap,
+    raw_body: &Bytes,
+) -> (Bytes, CodexSessionCompletion) {
+    let Some(session_id) = session_completion_candidate(headers, raw_body.as_ref()) else {
+        return (raw_body.clone(), CodexSessionCompletion::default());
+    };
+
+    let mut completed = false;
+    if !has_header_value(headers, "session_id")
+        && let Ok(value) = HeaderValue::from_str(session_id.as_str())
+    {
+        headers.insert("session_id", value);
+        completed = true;
+    }
+    if !has_header_value(headers, "x-session-id")
+        && let Ok(value) = HeaderValue::from_str(session_id.as_str())
+    {
+        headers.insert("x-session-id", value);
+        completed = true;
+    }
+
+    let body = serde_json::from_slice::<serde_json::Value>(raw_body.as_ref())
+        .ok()
+        .and_then(|mut value| {
+            let object = value.as_object_mut()?;
+            let missing_prompt_cache_key = object
+                .get("prompt_cache_key")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .is_none_or(str::is_empty);
+            if missing_prompt_cache_key {
+                object.insert(
+                    "prompt_cache_key".to_string(),
+                    serde_json::Value::String(session_id.clone()),
+                );
+                completed = true;
+            }
+            serde_json::to_vec(&value).ok().map(Bytes::from)
+        })
+        .unwrap_or_else(|| raw_body.clone());
+
+    (
+        body,
+        CodexSessionCompletion {
+            completed,
+            session_id: Some(session_id),
+        },
+    )
+}
+
+pub(super) fn remove_previous_response_id_from_body(body: &Bytes) -> Option<Bytes> {
+    let mut value = serde_json::from_slice::<serde_json::Value>(body.as_ref()).ok()?;
+    let object = value.as_object_mut()?;
+    object.remove("previous_response_id")?;
+    serde_json::to_vec(&value).ok().map(Bytes::from)
+}
+
+pub(super) fn is_stale_previous_response_error(
+    status: axum::http::StatusCode,
+    body: &[u8],
+) -> bool {
+    if status != axum::http::StatusCode::BAD_REQUEST && status != axum::http::StatusCode::NOT_FOUND
+    {
+        return false;
+    }
+    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
+    let mentions_previous = text.contains("previous_response_id")
+        || text.contains("previous response")
+        || text.contains("previous_response");
+    let missing = text.contains("not found")
+        || text.contains("does not exist")
+        || text.contains("doesn't exist")
+        || text.contains("no response")
+        || text.contains("not exist")
+        || text.contains("missing");
+    mentions_previous && missing
+}
+
+fn session_completion_candidate(headers: &HeaderMap, body: &[u8]) -> Option<String> {
+    header_string(headers, "session_id")
+        .or_else(|| header_string(headers, "x-session-id"))
+        .or_else(|| header_string(headers, "session-id"))
+        .or_else(|| header_string(headers, "conversation_id"))
+        .or_else(|| header_string(headers, "thread-id"))
+        .or_else(|| body_string_field(body, &["session_id"]))
+        .or_else(|| body_string_field(body, &["x-session-id"]))
+        .or_else(|| body_string_field(body, &["prompt_cache_key"]))
+        .or_else(|| body_string_field(body, &["metadata", "session_id"]))
+        .or_else(|| body_string_field(body, &["previous_response_id"]))
+        .and_then(normalize_session_completion_value)
+}
+
+fn header_string(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn has_header_value(headers: &HeaderMap, name: &str) -> bool {
+    header_string(headers, name).is_some()
+}
+
+fn body_string_field(body: &[u8], path: &[&str]) -> Option<String> {
+    if body.is_empty() {
+        return None;
+    }
+    let value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+    let mut current = &value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn normalize_session_completion_value(value: String) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 256 {
+        return None;
+    }
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
+        .then(|| value.to_string())
+}
+
 pub(super) fn scan_service_tier_from_sse_bytes_incremental(
     data: &[u8],
     scan_pos: &mut usize,
@@ -128,10 +270,13 @@ pub(super) fn scan_service_tier_from_sse_bytes_incremental(
 mod tests {
     use super::{
         apply_model_override_value, apply_reasoning_effort_override_value,
-        apply_service_tier_override_value, extract_model_from_value,
+        apply_service_tier_override_value, complete_codex_session_fields, extract_model_from_value,
         extract_reasoning_effort_from_value, extract_service_tier_from_response_body,
-        extract_service_tier_from_value, scan_service_tier_from_sse_bytes_incremental,
+        extract_service_tier_from_value, is_stale_previous_response_error,
+        remove_previous_response_id_from_body, scan_service_tier_from_sse_bytes_incremental,
     };
+    use axum::body::Bytes;
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
 
     #[test]
     fn extracts_request_fields() {
@@ -170,6 +315,76 @@ mod tests {
             extract_service_tier_from_value(&value).as_deref(),
             Some("flex")
         );
+    }
+
+    #[test]
+    fn completes_codex_session_fields_without_overwriting_existing_values() {
+        let mut headers = HeaderMap::new();
+        let raw = Bytes::from_static(
+            br#"{"model":"gpt-5","metadata":{"session_id":"meta-1"},"prompt_cache_key":"pcache-1"}"#,
+        );
+
+        let (body, completion) = complete_codex_session_fields(&mut headers, &raw);
+
+        assert!(completion.completed);
+        assert_eq!(completion.session_id.as_deref(), Some("pcache-1"));
+        assert_eq!(
+            headers.get("session_id"),
+            Some(&HeaderValue::from_static("pcache-1"))
+        );
+        assert_eq!(
+            headers.get("x-session-id"),
+            Some(&HeaderValue::from_static("pcache-1"))
+        );
+        let value: serde_json::Value = serde_json::from_slice(body.as_ref()).expect("json body");
+        assert_eq!(value["prompt_cache_key"].as_str(), Some("pcache-1"));
+    }
+
+    #[test]
+    fn completes_prompt_cache_key_from_metadata_session_id() {
+        let mut headers = HeaderMap::new();
+        let raw = Bytes::from_static(br#"{"model":"gpt-5","metadata":{"session_id":"meta-1"}}"#);
+
+        let (body, completion) = complete_codex_session_fields(&mut headers, &raw);
+
+        assert!(completion.completed);
+        assert_eq!(completion.session_id.as_deref(), Some("meta-1"));
+        let value: serde_json::Value = serde_json::from_slice(body.as_ref()).expect("json body");
+        assert_eq!(value["prompt_cache_key"].as_str(), Some("meta-1"));
+    }
+
+    #[test]
+    fn removes_previous_response_id_from_json_body() {
+        let body = Bytes::from_static(
+            br#"{"model":"gpt-5","previous_response_id":"resp-1","input":"hi"}"#,
+        );
+
+        let repaired = remove_previous_response_id_from_body(&body).expect("repaired body");
+
+        let value: serde_json::Value =
+            serde_json::from_slice(repaired.as_ref()).expect("json body");
+        assert!(value.get("previous_response_id").is_none());
+        assert_eq!(value["model"].as_str(), Some("gpt-5"));
+    }
+
+    #[test]
+    fn stale_previous_response_error_detection_is_conservative() {
+        assert!(is_stale_previous_response_error(
+            StatusCode::BAD_REQUEST,
+            br#"{"error":{"message":"No response found for previous_response_id resp-1"}}"#
+        ));
+        assert!(is_stale_previous_response_error(
+            StatusCode::NOT_FOUND,
+            br#"previous response does not exist"#
+        ));
+        assert!(!is_stale_previous_response_error(
+            StatusCode::BAD_REQUEST,
+            br#"{"error":"invalid model"}"#
+        ));
+        assert!(!is_stale_previous_response_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            br#"No response found for previous_response_id resp-1"#
+        ));
     }
 
     #[test]

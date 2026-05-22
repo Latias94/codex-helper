@@ -21,9 +21,15 @@ use super::attempt_transport::{
 };
 use super::concurrency_limits::ConcurrencyPermit;
 use super::headers::filter_response_headers;
+use super::request_body::{
+    is_stale_previous_response_error, remove_previous_response_id_from_body,
+};
 use super::request_preparation::RequestFlavor;
 use super::retry::{RetryLayerOptions, RetryPlan};
-use super::route_attempts::{StartRouteAttemptParams, start_selected_route_attempt};
+use super::route_attempts::{
+    StartRouteAttemptParams, StatusRouteAttemptParams, record_status_route_attempt,
+    start_selected_route_attempt,
+};
 use super::selected_upstream_request::{
     SelectedUpstreamRequestSetupParams, prepare_selected_upstream_request,
 };
@@ -171,203 +177,261 @@ pub(super) async fn execute_selected_upstream(
     let model_note = selected_setup.model_note;
     let provider_id = selected_setup.provider_id;
     let route_decision = selected_setup.route_decision;
-    let filtered_body = selected_setup.filtered_body;
-    let upstream_request_body_len = selected_setup.upstream_request_body_len;
-    let upstream_request_body_debug = selected_setup.upstream_request_body_debug;
-    let upstream_request_body_warn = selected_setup.upstream_request_body_warn;
+    let selected_filtered_body = selected_setup.filtered_body;
+    let selected_upstream_request_body_len = selected_setup.upstream_request_body_len;
+    let selected_upstream_request_body_debug = selected_setup.upstream_request_body_debug;
+    let selected_upstream_request_body_warn = selected_setup.upstream_request_body_warn;
+    let rectified_previous_response_body =
+        remove_previous_response_id_from_body(&selected_filtered_body);
 
     for upstream_attempt in 0..upstream_opt.max_attempts {
+        let mut current_filtered_body = selected_filtered_body.clone();
+        let mut current_upstream_request_body_len = selected_upstream_request_body_len;
+        let mut current_upstream_request_body_debug = selected_upstream_request_body_debug.clone();
+        let mut current_upstream_request_body_warn = selected_upstream_request_body_warn.clone();
+        let mut previous_response_rectified = false;
+
         *global_attempt = global_attempt.saturating_add(1);
-        log_attempt_select(AttemptSelectLogParams {
-            service_name: proxy.service_name,
-            request_id,
-            global_attempt: *global_attempt,
-            provider_attempt,
-            upstream_attempt,
-            provider_opt,
-            upstream_opt,
-            target,
-            provider_id: provider_id.as_deref(),
-            avoid_set,
-            avoided_total: *avoided_total,
-            total_upstreams,
-            model_note: model_note.as_str(),
-        });
-        let route_attempt_index = start_selected_route_attempt(
-            route_attempts,
-            StartRouteAttemptParams {
-                target,
-                provider_id: provider_id.as_deref(),
+        loop {
+            log_attempt_select(AttemptSelectLogParams {
+                service_name: proxy.service_name,
+                request_id,
+                global_attempt: *global_attempt,
                 provider_attempt,
                 upstream_attempt,
-                provider_max_attempts: provider_opt.max_attempts,
-                upstream_max_attempts: upstream_opt.max_attempts,
-                model_note: model_note.as_str(),
+                provider_opt,
+                upstream_opt,
+                target,
+                provider_id: provider_id.as_deref(),
                 avoid_set,
                 avoided_total: *avoided_total,
                 total_upstreams,
-            },
-        );
-
-        let transport = handle_attempt_transport(AttemptTransportParams {
-            proxy,
-            legacy_lb,
-            target,
-            method,
-            uri,
-            client_headers,
-            codex_client_patch_mode: request_flavor.codex_client_patch_mode,
-            client_headers_entries_cache,
-            request_body_len,
-            upstream_request_body_len,
-            debug_max,
-            warn_max,
-            client_uri,
-            client_body_debug,
-            upstream_request_body_debug: upstream_request_body_debug.as_ref(),
-            client_body_warn,
-            upstream_request_body_warn: upstream_request_body_warn.as_ref(),
-            request_id,
-            provider_id: provider_id.as_deref(),
-            route_decision: &route_decision,
-            filtered_body: &filtered_body,
-            upstream_opt,
-            upstream_attempt,
-            transport_cooldown_secs: plan.transport_cooldown_secs,
-            cooldown_backoff,
-            avoid_set,
-            avoided_total,
-            last_err,
-            upstream_chain,
-            route_attempts,
-            route_attempt_index,
-            model_note: model_note.as_str(),
-        })
-        .await;
-        let (resp, upstream_start, upstream_headers_ms, debug_base) = match transport {
-            AttemptTransportOutcome::RetrySameUpstream => continue,
-            AttemptTransportOutcome::TryNextUpstream => break,
-            AttemptTransportOutcome::Continue(success) => (
-                success.response,
-                success.upstream_start,
-                success.upstream_headers_ms,
-                success.debug_base,
-            ),
-        };
-        let status = resp.status();
-        let success = status.is_success();
-        let resp_headers = resp.headers().clone();
-        let resp_headers_filtered = filter_response_headers(&resp_headers);
-
-        if request_flavor.is_stream && success {
-            return SelectedUpstreamExecutionOutcome::Return(
-                handle_streaming_attempt_success(StreamingAttemptResponseParams {
-                    proxy,
-                    legacy_lb,
+                model_note: model_note.as_str(),
+            });
+            let route_attempt_index = start_selected_route_attempt(
+                route_attempts,
+                StartRouteAttemptParams {
                     target,
-                    response: resp,
-                    status,
-                    response_headers: resp_headers,
-                    response_headers_filtered: resp_headers_filtered,
-                    start: *start,
-                    started_at_ms,
-                    upstream_start,
-                    upstream_headers_ms,
-                    request_body_len,
-                    upstream_request_body_len,
-                    debug_base,
+                    provider_id: provider_id.as_deref(),
+                    provider_attempt,
+                    upstream_attempt,
+                    provider_max_attempts: provider_opt.max_attempts,
+                    upstream_max_attempts: upstream_opt.max_attempts,
+                    model_note: model_note.as_str(),
+                    avoid_set,
+                    avoided_total: *avoided_total,
+                    total_upstreams,
+                },
+            );
+
+            let transport = handle_attempt_transport(AttemptTransportParams {
+                proxy,
+                legacy_lb,
+                target,
+                method,
+                uri,
+                client_headers,
+                codex_client_patch_mode: request_flavor.codex_client_patch_mode,
+                client_headers_entries_cache,
+                request_body_len,
+                upstream_request_body_len: current_upstream_request_body_len,
+                debug_max,
+                warn_max,
+                client_uri,
+                client_body_debug,
+                upstream_request_body_debug: current_upstream_request_body_debug.as_ref(),
+                client_body_warn,
+                upstream_request_body_warn: current_upstream_request_body_warn.as_ref(),
+                request_id,
+                provider_id: provider_id.as_deref(),
+                route_decision: &route_decision,
+                filtered_body: &current_filtered_body,
+                upstream_opt,
+                upstream_attempt,
+                transport_cooldown_secs: plan.transport_cooldown_secs,
+                cooldown_backoff,
+                avoid_set,
+                avoided_total,
+                last_err,
+                upstream_chain,
+                route_attempts,
+                route_attempt_index,
+                model_note: model_note.as_str(),
+            })
+            .await;
+            let (resp, upstream_start, upstream_headers_ms, debug_base) = match transport {
+                AttemptTransportOutcome::RetrySameUpstream => break,
+                AttemptTransportOutcome::TryNextUpstream => {
+                    return SelectedUpstreamExecutionOutcome::ContinueStation;
+                }
+                AttemptTransportOutcome::Continue(success) => (
+                    success.response,
+                    success.upstream_start,
+                    success.upstream_headers_ms,
+                    success.debug_base,
+                ),
+            };
+            let status = resp.status();
+            let success = status.is_success();
+            let resp_headers = resp.headers().clone();
+            let resp_headers_filtered = filter_response_headers(&resp_headers);
+
+            if request_flavor.is_stream && success {
+                return SelectedUpstreamExecutionOutcome::Return(
+                    handle_streaming_attempt_success(StreamingAttemptResponseParams {
+                        proxy,
+                        legacy_lb,
+                        target,
+                        response: resp,
+                        status,
+                        response_headers: resp_headers,
+                        response_headers_filtered: resp_headers_filtered,
+                        start: *start,
+                        started_at_ms,
+                        upstream_start,
+                        upstream_headers_ms,
+                        request_body_len,
+                        upstream_request_body_len: current_upstream_request_body_len,
+                        debug_base,
+                        upstream_chain,
+                        route_attempts,
+                        route_attempt_index,
+                        model_note: model_note.as_str(),
+                        route_graph_key,
+                        session_id,
+                        session_identity_source,
+                        cwd,
+                        effective_effort,
+                        base_service_tier,
+                        codex_bridge: request_flavor.codex_bridge_log.clone(),
+                        request_id,
+                        is_user_turn: request_flavor.is_user_turn,
+                        is_codex_service: request_flavor.is_codex_service,
+                        transport_cooldown_secs: plan.transport_cooldown_secs,
+                        cooldown_backoff,
+                        method,
+                        path: uri.path(),
+                        concurrency_permit: concurrency_permit.take(),
+                    })
+                    .await,
+                );
+            }
+
+            let bytes = match read_attempt_response_body(AttemptReadBodyParams {
+                proxy,
+                legacy_lb,
+                target,
+                response: resp,
+                upstream_opt,
+                upstream_attempt,
+                transport_cooldown_secs: plan.transport_cooldown_secs,
+                cooldown_backoff,
+                avoid_set,
+                avoided_total,
+                last_err,
+                upstream_chain,
+                route_attempts,
+                route_attempt_index,
+                model_note: model_note.as_str(),
+            })
+            .await
+            {
+                AttemptReadBodyOutcome::RetrySameUpstream => break,
+                AttemptReadBodyOutcome::TryNextUpstream => {
+                    return SelectedUpstreamExecutionOutcome::ContinueStation;
+                }
+                AttemptReadBodyOutcome::Continue(bytes) => bytes,
+            };
+
+            if request_flavor.is_codex_service
+                && !previous_response_rectified
+                && !success
+                && is_stale_previous_response_error(status, bytes.as_ref())
+                && let Some(rectified_body) = rectified_previous_response_body.as_ref()
+            {
+                record_status_route_attempt(
                     upstream_chain,
                     route_attempts,
-                    route_attempt_index,
-                    model_note: model_note.as_str(),
-                    route_graph_key,
-                    session_id,
-                    session_identity_source,
-                    cwd,
-                    effective_effort,
-                    base_service_tier,
-                    codex_bridge: request_flavor.codex_bridge_log.clone(),
+                    StatusRouteAttemptParams {
+                        target,
+                        route_attempt_index,
+                        status_code: status.as_u16(),
+                        error_class: Some("codex_stale_previous_response_id"),
+                        model_note: model_note.as_str(),
+                        upstream_headers_ms,
+                        duration_ms: start.elapsed().as_millis() as u64,
+                        cooldown_secs: None,
+                        cooldown_reason: None,
+                    },
+                );
+                tracing::info!(
                     request_id,
-                    is_user_turn: request_flavor.is_user_turn,
-                    is_codex_service: request_flavor.is_codex_service,
-                    transport_cooldown_secs: plan.transport_cooldown_secs,
-                    cooldown_backoff,
-                    method,
-                    path: uri.path(),
-                    concurrency_permit: concurrency_permit.take(),
-                })
-                .await,
-            );
-        }
+                    status = status.as_u16(),
+                    "retrying Codex request once without stale previous_response_id"
+                );
+                current_filtered_body = rectified_body.clone();
+                current_upstream_request_body_len = current_filtered_body.len();
+                let previews = super::request_preparation::build_body_previews(
+                    current_filtered_body.as_ref(),
+                    request_flavor.client_content_type.as_deref(),
+                    request_body_previews,
+                    debug_max,
+                    warn_max,
+                );
+                current_upstream_request_body_debug = previews.debug;
+                current_upstream_request_body_warn = previews.warn;
+                previous_response_rectified = true;
+                *global_attempt = global_attempt.saturating_add(1);
+                continue;
+            }
 
-        let bytes = match read_attempt_response_body(AttemptReadBodyParams {
-            proxy,
-            legacy_lb,
-            target,
-            response: resp,
-            upstream_opt,
-            upstream_attempt,
-            transport_cooldown_secs: plan.transport_cooldown_secs,
-            cooldown_backoff,
-            avoid_set,
-            avoided_total,
-            last_err,
-            upstream_chain,
-            route_attempts,
-            route_attempt_index,
-            model_note: model_note.as_str(),
-        })
-        .await
-        {
-            AttemptReadBodyOutcome::RetrySameUpstream => continue,
-            AttemptReadBodyOutcome::TryNextUpstream => break,
-            AttemptReadBodyOutcome::Continue(bytes) => bytes,
-        };
-
-        let dur = start.elapsed().as_millis() as u64;
-        match handle_attempt_response(AttemptResponseParams {
-            proxy,
-            legacy_lb,
-            target,
-            method,
-            path: uri.path(),
-            status,
-            response_headers: resp_headers,
-            response_headers_filtered: resp_headers_filtered,
-            response_body: bytes,
-            request_id,
-            duration_ms: dur,
-            started_at_ms,
-            upstream_headers_ms,
-            provider_id: provider_id.as_deref(),
-            session_id,
-            session_identity_source,
-            cwd,
-            effective_effort,
-            base_service_tier,
-            codex_bridge: request_flavor.codex_bridge_log.clone(),
-            upstream_chain,
-            route_attempts,
-            route_attempt_index,
-            model_note: model_note.as_str(),
-            route_graph_key,
-            plan,
-            upstream_opt,
-            provider_opt,
-            upstream_attempt,
-            avoid_set,
-            avoided_total,
-            last_err,
-            cooldown_backoff,
-            is_user_turn: request_flavor.is_user_turn,
-            is_codex_service: request_flavor.is_codex_service,
-        })
-        .await
-        {
-            AttemptResponseOutcome::RetrySameUpstream => continue,
-            AttemptResponseOutcome::TryNextUpstream => break,
-            AttemptResponseOutcome::Return(response) => {
-                return SelectedUpstreamExecutionOutcome::Return(response);
+            let dur = start.elapsed().as_millis() as u64;
+            match handle_attempt_response(AttemptResponseParams {
+                proxy,
+                legacy_lb,
+                target,
+                method,
+                path: uri.path(),
+                status,
+                response_headers: resp_headers,
+                response_headers_filtered: resp_headers_filtered,
+                response_body: bytes,
+                request_id,
+                duration_ms: dur,
+                started_at_ms,
+                upstream_headers_ms,
+                provider_id: provider_id.as_deref(),
+                session_id,
+                session_identity_source,
+                cwd,
+                effective_effort,
+                base_service_tier,
+                codex_bridge: request_flavor.codex_bridge_log.clone(),
+                upstream_chain,
+                route_attempts,
+                route_attempt_index,
+                model_note: model_note.as_str(),
+                route_graph_key,
+                plan,
+                upstream_opt,
+                provider_opt,
+                upstream_attempt,
+                avoid_set,
+                avoided_total,
+                last_err,
+                cooldown_backoff,
+                is_user_turn: request_flavor.is_user_turn,
+                is_codex_service: request_flavor.is_codex_service,
+            })
+            .await
+            {
+                AttemptResponseOutcome::RetrySameUpstream => break,
+                AttemptResponseOutcome::TryNextUpstream => {
+                    return SelectedUpstreamExecutionOutcome::ContinueStation;
+                }
+                AttemptResponseOutcome::Return(response) => {
+                    return SelectedUpstreamExecutionOutcome::Return(response);
+                }
             }
         }
     }

@@ -4,7 +4,10 @@ use crate::proxy::tests::harness::{
     spawn_proxy_service, spawn_test_proxy, spawn_test_upstream,
 };
 use crate::state::SessionIdentitySource;
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use std::io::Cursor;
+use std::io::Write;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 #[tokio::test]
@@ -1790,4 +1793,279 @@ supports_websockets = true
     proxy_handle.abort();
     u_handle.abort();
     let _ = std::fs::remove_dir_all(codex_home);
+}
+
+#[tokio::test]
+async fn proxy_previous_response_id_rectifier_retries_once_without_stale_id() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let seen_bodies = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+
+    let hits_for_route = hits.clone();
+    let bodies_for_route = seen_bodies.clone();
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        post(move |body: String| {
+            let hits = hits_for_route.clone();
+            let seen_bodies = bodies_for_route.clone();
+            async move {
+                let value: serde_json::Value = serde_json::from_str(&body).expect("json body");
+                seen_bodies.lock().expect("bodies lock").push(value.clone());
+                let attempt = hits.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": {
+                                "message": "No response found for previous_response_id resp-stale"
+                            }
+                        })),
+                    )
+                } else {
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "ok": true,
+                            "previous_present": value.get("previous_response_id").is_some()
+                        })),
+                    )
+                }
+            }
+        }),
+    );
+    let upstream = spawn_test_upstream(upstream);
+    let retry = retry_config(1, "502", Vec::new(), RetryStrategy::Failover);
+    let cfg = make_proxy_config(vec![upstream.upstream_config()], retry);
+    let proxy = proxy_service(cfg);
+    let state = proxy.state.clone();
+    let proxy = spawn_proxy_service(proxy);
+
+    let client = reqwest::Client::new();
+    let resp = post_responses_json(
+        &client,
+        &proxy,
+        r#"{"model":"gpt-5","previous_response_id":"resp-stale","input":"hi"}"#,
+    )
+    .await
+    .error_for_status()
+    .expect("rectified status")
+    .json::<serde_json::Value>()
+    .await
+    .expect("json response");
+
+    assert_eq!(resp["ok"].as_bool(), Some(true));
+    assert_eq!(resp["previous_present"].as_bool(), Some(false));
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+    let bodies = seen_bodies.lock().expect("bodies lock").clone();
+    assert!(bodies[0].get("previous_response_id").is_some());
+    assert!(bodies[1].get("previous_response_id").is_none());
+
+    let finished = find_finished_request(&state, 10, |request| request.path == "/v1/responses")
+        .await
+        .expect("finished request");
+    let retry = finished.retry.expect("retry info");
+    assert_eq!(retry.attempts, 2);
+    assert!(
+        retry
+            .route_attempts_or_derived()
+            .iter()
+            .any(|attempt| attempt.error_class.as_deref()
+                == Some("codex_stale_previous_response_id"))
+    );
+}
+
+#[tokio::test]
+async fn proxy_codex_session_completion_fills_headers_and_prompt_cache_key() {
+    let seen_headers = Arc::new(std::sync::Mutex::new(None::<HeaderMap>));
+    let seen_body = Arc::new(std::sync::Mutex::new(None::<serde_json::Value>));
+
+    let seen_headers_for_route = seen_headers.clone();
+    let seen_body_for_route = seen_body.clone();
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        post(move |headers: HeaderMap, body: String| {
+            let seen_headers = seen_headers_for_route.clone();
+            let seen_body = seen_body_for_route.clone();
+            async move {
+                *seen_headers.lock().expect("headers lock") = Some(headers);
+                *seen_body.lock().expect("body lock") =
+                    Some(serde_json::from_str(&body).expect("json body"));
+                Json(serde_json::json!({ "ok": true }))
+            }
+        }),
+    );
+    let upstream = spawn_test_upstream(upstream);
+    let retry = retry_config(1, "502", Vec::new(), RetryStrategy::Failover);
+    let cfg = make_proxy_config(vec![upstream.upstream_config()], retry);
+    let proxy = proxy_service(cfg);
+    let state = proxy.state.clone();
+    let proxy = spawn_proxy_service(proxy);
+
+    let client = reqwest::Client::new();
+    let resp = post_responses_json(
+        &client,
+        &proxy,
+        r#"{"model":"gpt-5","metadata":{"session_id":"meta-session-1"},"input":"hi"}"#,
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let headers = seen_headers
+        .lock()
+        .expect("headers lock")
+        .clone()
+        .expect("upstream headers");
+    assert_eq!(
+        headers.get("session_id"),
+        Some(&HeaderValue::from_static("meta-session-1"))
+    );
+    assert_eq!(
+        headers.get("x-session-id"),
+        Some(&HeaderValue::from_static("meta-session-1"))
+    );
+    let body = seen_body
+        .lock()
+        .expect("body lock")
+        .clone()
+        .expect("upstream body");
+    assert_eq!(body["prompt_cache_key"].as_str(), Some("meta-session-1"));
+
+    let finished = find_finished_request(&state, 10, |request| {
+        request.session_id.as_deref() == Some("meta-session-1")
+    })
+    .await
+    .expect("finished session request");
+    assert_eq!(
+        finished.session_identity_source,
+        Some(SessionIdentitySource::MetadataSessionId)
+    );
+}
+
+#[tokio::test]
+async fn proxy_response_fixer_decodes_gzip_codex_response_json() {
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        post(|| async move {
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder
+                .write_all(br#"{"ok":true,"response":{"service_tier":"priority"}}"#)
+                .expect("gzip write");
+            let compressed = encoder.finish().expect("gzip finish");
+
+            let mut response = Response::new(Body::from(compressed));
+            *response.status_mut() = StatusCode::OK;
+            response.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            response.headers_mut().insert(
+                axum::http::header::CONTENT_ENCODING,
+                HeaderValue::from_static("gzip"),
+            );
+            response
+        }),
+    );
+    let upstream = spawn_test_upstream(upstream);
+    let retry = retry_config(1, "502", Vec::new(), RetryStrategy::Failover);
+    let cfg = make_proxy_config(vec![upstream.upstream_config()], retry);
+    let proxy = proxy_service(cfg);
+    let state = proxy.state.clone();
+    let proxy = spawn_proxy_service(proxy);
+
+    let client = reqwest::Client::builder()
+        .no_gzip()
+        .build()
+        .expect("client");
+    let resp = post_responses_json(
+        &client,
+        &proxy,
+        r#"{"model":"gpt-5","service_tier":"default","input":"hi"}"#,
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        !resp
+            .headers()
+            .contains_key(axum::http::header::CONTENT_ENCODING)
+    );
+    let body = resp.bytes().await.expect("body");
+    let value: serde_json::Value = serde_json::from_slice(body.as_ref()).expect("json response");
+    assert_eq!(value["ok"].as_bool(), Some(true));
+    assert_eq!(value["response"]["service_tier"].as_str(), Some("priority"));
+
+    let finished = find_finished_request(&state, 10, |request| request.path == "/v1/responses")
+        .await
+        .expect("finished request");
+    assert_eq!(finished.service_tier.as_deref(), Some("priority"));
+}
+
+#[tokio::test]
+async fn proxy_service_tier_log_preserves_requested_effective_and_actual_values() {
+    let _env_lock = env_lock().await;
+    let temp_dir = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
+    }
+
+    let seen_body = Arc::new(std::sync::Mutex::new(None::<serde_json::Value>));
+    let seen_body_for_route = seen_body.clone();
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        post(move |body: String| {
+            let seen_body = seen_body_for_route.clone();
+            async move {
+                let value: serde_json::Value = serde_json::from_str(&body).expect("json body");
+                *seen_body.lock().expect("body lock") = Some(value);
+                Json(serde_json::json!({
+                    "id": "resp-1",
+                    "response": { "service_tier": "priority" }
+                }))
+            }
+        }),
+    );
+    let upstream = spawn_test_upstream(upstream);
+    let retry = retry_config(1, "502", Vec::new(), RetryStrategy::Failover);
+    let cfg = make_proxy_config(vec![upstream.upstream_config()], retry);
+    let proxy = spawn_test_proxy(cfg);
+
+    let client = reqwest::Client::new();
+    let resp = post_responses_json(
+        &client,
+        &proxy,
+        r#"{"model":"gpt-5","service_tier":"default","input":"hi"}"#,
+    )
+    .await
+    .error_for_status()
+    .expect("status")
+    .json::<serde_json::Value>()
+    .await
+    .expect("json response");
+
+    assert_eq!(resp["response"]["service_tier"].as_str(), Some("priority"));
+    let upstream_body = seen_body
+        .lock()
+        .expect("body lock")
+        .clone()
+        .expect("upstream body");
+    assert_eq!(upstream_body["service_tier"].as_str(), Some("default"));
+
+    let request_log =
+        std::fs::read_to_string(crate::logging::request_log_path()).expect("read request log");
+    let record: serde_json::Value = request_log
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|record| record["path"].as_str() == Some("/v1/responses"))
+        .expect("request log record");
+
+    assert_eq!(
+        record["service_tier"]["requested"].as_str(),
+        Some("default")
+    );
+    assert_eq!(
+        record["service_tier"]["effective"].as_str(),
+        Some("default")
+    );
+    assert_eq!(record["service_tier"]["actual"].as_str(), Some("priority"));
 }

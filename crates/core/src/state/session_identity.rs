@@ -335,7 +335,10 @@ pub enum SessionObservationScope {
 #[serde(rename_all = "snake_case")]
 pub enum SessionIdentitySource {
     Header,
+    BodySessionId,
     PromptCacheKey,
+    MetadataSessionId,
+    PreviousResponseId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
