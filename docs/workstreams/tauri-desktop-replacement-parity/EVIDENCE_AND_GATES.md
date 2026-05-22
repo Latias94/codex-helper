@@ -192,3 +192,77 @@ Verification:
 Result:
 
 - DONE_WITH_CONCERNS — single-instance plugin is wired and the second-launch callback focuses the existing main window without touching proxy lifecycle. Packaged second-launch smoke remains a replacement gate.
+
+### 2026-05-22 — TDRP-040 packaged sidecar and Windows NSIS build
+
+Evidence:
+
+- Chose a first-class Tauri external binary sidecar instead of requiring a documented sibling CLI install.
+- Added `apps/desktop/scripts/prepare-sidecar.mjs`:
+  - builds `cargo build --release --bin codex-helper`;
+  - infers or accepts the Tauri target triple;
+  - copies the CLI to `apps/desktop/src-tauri/sidecars/codex-helper-$TARGET_TRIPLE(.exe)`.
+- Added `apps/desktop/src-tauri/sidecars/.gitignore` so generated sidecar binaries are not committed.
+- Updated `apps/desktop/src-tauri/tauri.conf.json`:
+  - `bundle.active = true`;
+  - Windows target is `nsis`;
+  - `bundle.externalBin = ["sidecars/codex-helper"]`;
+  - `beforeBuildCommand = "pnpm tauri:build:assets"`.
+- Updated `start_desktop_proxy` sidecar lookup:
+  - packaged resource directory sidecar first;
+  - sibling development binary second;
+  - `CODEX_HELPER_CLI_PATH` / legacy `CODEX_HELPER_CLI` only as developer fallback.
+- Added Rust tests proving packaged sidecar lookup wins over env overrides and env lookup remains a final fallback.
+- Added `docs/DESKTOP_RELEASE.md` with packaging contract, sidecar lookup order, and remaining release gates.
+
+Verification:
+
+- Command: `pnpm prepare:sidecar`
+- Scope: `apps/desktop`
+- Result: PASS — release CLI was built and copied to `apps/desktop/src-tauri/sidecars/codex-helper-x86_64-pc-windows-msvc.exe`.
+
+- Command: `pnpm tauri:build`
+- Scope: `apps/desktop`
+- Result: PASS — produced `target/release/bundle/nsis/codex-helper_0.16.0_x64-setup.exe`.
+
+- Command: `7z l target\release\bundle\nsis\codex-helper_0.16.0_x64-setup.exe`
+- Scope: Windows NSIS installer contents.
+- Result: PASS — installer lists `codex-helper-desktop.exe` and bundled `codex-helper.exe`.
+
+- Command: `cargo nextest run -p codex-helper-desktop --lib control::tests::cli_resolution`
+- Scope: deterministic sidecar resolution.
+- Result: PASS — 2 tests.
+
+- Command: `pnpm test`
+- Scope: `apps/desktop`.
+- Result: PASS — 5 files, 23 tests.
+
+- Command: `pnpm build`
+- Scope: `apps/desktop`.
+- Result: PASS.
+
+- Command: `cargo check -p codex-helper-desktop`
+- Scope: Tauri desktop crate.
+- Result: PASS.
+
+- Command: `cargo nextest run -p codex-helper-desktop --lib`
+- Scope: Tauri desktop crate.
+- Result: PASS — 15 tests.
+
+- Command: `cargo fmt --check`
+- Scope: repository workspace.
+- Result: PASS.
+
+- Command: `git diff --check -- .`
+- Scope: full repository diff.
+- Result: PASS — no whitespace errors; only Windows LF/CRLF warnings for edited text files.
+
+Deferred:
+
+- Full live packaged lifecycle smoke is still TDRP-080. It was not completed in this slice because the developer machine already had a live codex-helper runtime; replacement smoke must run in an isolated environment and must not stop or mutate the user's active local helper.
+- Signing/notarization and updater posture remain TDRP-060.
+- Launch-at-login remains TDRP-050.
+
+Result:
+
+- DONE_WITH_CONCERNS — Windows packaged sidecar/installer build is deterministic and verified at artifact/content level. Full interactive packaged runtime smoke remains required before any egui replacement claim.

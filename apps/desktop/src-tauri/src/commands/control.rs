@@ -12,6 +12,7 @@ use codex_helper_core::runtime_manager::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tauri::{AppHandle, Manager};
 
 use super::admin_api::{
     admin_client, admin_endpoint_config, get_json, post_empty, post_json, post_json_no_response,
@@ -225,7 +226,7 @@ pub async fn attach_existing_proxy() -> Result<DesktopActionResult, CommandError
 }
 
 #[tauri::command]
-pub async fn start_desktop_proxy() -> Result<DesktopActionResult, CommandError> {
+pub async fn start_desktop_proxy(app: AppHandle) -> Result<DesktopActionResult, CommandError> {
     let before = load_control_state().await?;
     if before.reachable {
         return Ok(result_with_state(
@@ -236,7 +237,7 @@ pub async fn start_desktop_proxy() -> Result<DesktopActionResult, CommandError> 
     }
 
     let endpoint = admin_endpoint_config();
-    let cli_path = resolve_cli_path()?;
+    let cli_path = resolve_cli_path(&app)?;
     let mut command = Command::new(&cli_path);
     let port_arg = endpoint.proxy_port.to_string();
     command
@@ -765,29 +766,48 @@ fn provider_balance_refresh_path(payload: ProviderBalanceRefreshPayload) -> Stri
     }
 }
 
-fn resolve_cli_path() -> Result<PathBuf, CommandError> {
-    let env_path = std::env::var(CLI_PATH_ENV)
-        .ok()
-        .or_else(|| std::env::var(CLI_PATH_ENV_LEGACY).ok())
-        .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty());
-    if let Some(path) = env_path {
-        return ensure_executable_path(path, "CODEX_HELPER_CLI_PATH");
-    }
-
+fn resolve_cli_path(app: &AppHandle) -> Result<PathBuf, CommandError> {
+    let resource_dir = app.path().resource_dir().ok();
     let current = std::env::current_exe()
         .map_err(|err| DesktopError::Lifecycle(format!("无法定位当前桌面进程路径: {err}")))?;
+    resolve_cli_path_from_sources(resource_dir.as_deref(), &current, env_cli_path())
+}
+
+fn resolve_cli_path_from_sources(
+    resource_dir: Option<&Path>,
+    current: &Path,
+    env_path: Option<PathBuf>,
+) -> Result<PathBuf, CommandError> {
+    if let Some(resource_dir) = resource_dir {
+        for candidate in cli_candidates_from_resource_dir(resource_dir) {
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+
     for candidate in cli_candidates_from_current_exe(&current) {
         if candidate.is_file() {
             return Ok(candidate);
         }
     }
 
+    if let Some(path) = env_path {
+        return ensure_executable_path(path, "CODEX_HELPER_CLI_PATH");
+    }
+
     Err(DesktopError::Lifecycle(
-        "未找到 codex-helper CLI；请先构建 codex-helper.exe，或设置 CODEX_HELPER_CLI_PATH。"
-            .to_string(),
+        "未找到 codex-helper CLI sidecar；请运行 pnpm tauri:build 生成安装包，或在开发环境设置 CODEX_HELPER_CLI_PATH。".to_string(),
     )
     .into())
+}
+
+fn env_cli_path() -> Option<PathBuf> {
+    std::env::var(CLI_PATH_ENV)
+        .ok()
+        .or_else(|| std::env::var(CLI_PATH_ENV_LEGACY).ok())
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
 }
 
 fn ensure_executable_path(path: PathBuf, source: &str) -> Result<PathBuf, CommandError> {
@@ -802,21 +822,28 @@ fn ensure_executable_path(path: PathBuf, source: &str) -> Result<PathBuf, Comman
 }
 
 fn cli_candidates_from_current_exe(current: &Path) -> Vec<PathBuf> {
-    let exe = if cfg!(windows) {
-        "codex-helper.exe"
-    } else {
-        "codex-helper"
-    };
     let mut candidates = Vec::new();
     if let Some(dir) = current.parent() {
-        candidates.push(dir.join(exe));
+        candidates.push(dir.join(cli_executable_name()));
         if dir.file_name().is_some_and(|name| name == "deps") {
             if let Some(parent) = dir.parent() {
-                candidates.push(parent.join(exe));
+                candidates.push(parent.join(cli_executable_name()));
             }
         }
     }
     candidates
+}
+
+fn cli_candidates_from_resource_dir(resource_dir: &Path) -> Vec<PathBuf> {
+    vec![resource_dir.join(cli_executable_name())]
+}
+
+fn cli_executable_name() -> &'static str {
+    if cfg!(windows) {
+        "codex-helper.exe"
+    } else {
+        "codex-helper"
+    }
 }
 
 #[cfg(test)]
@@ -869,6 +896,47 @@ mod tests {
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.starts_with("codex-helper"))
         }));
+    }
+
+    #[test]
+    fn cli_resolution_prefers_packaged_sidecar_over_env_override() {
+        let root = unique_temp_dir("packaged-sidecar-order");
+        let resource_dir = root.join("resources");
+        let env_dir = root.join("env");
+        std::fs::create_dir_all(&resource_dir).expect("create resource dir");
+        std::fs::create_dir_all(&env_dir).expect("create env dir");
+
+        let packaged_cli = resource_dir.join(cli_executable_name());
+        let env_cli = env_dir.join(cli_executable_name());
+        std::fs::write(&packaged_cli, b"packaged").expect("write packaged sidecar");
+        std::fs::write(&env_cli, b"env").expect("write env sidecar");
+
+        let current = root.join("codex-helper-desktop.exe");
+        let resolved = resolve_cli_path_from_sources(Some(&resource_dir), &current, Some(env_cli))
+            .expect("resolve packaged sidecar");
+
+        assert_eq!(resolved, packaged_cli);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cli_resolution_uses_env_only_after_packaged_and_sibling_candidates() {
+        let root = unique_temp_dir("env-sidecar-fallback");
+        let resource_dir = root.join("resources");
+        let env_dir = root.join("env");
+        std::fs::create_dir_all(&resource_dir).expect("create resource dir");
+        std::fs::create_dir_all(&env_dir).expect("create env dir");
+
+        let env_cli = env_dir.join(cli_executable_name());
+        std::fs::write(&env_cli, b"env").expect("write env sidecar");
+
+        let current = root.join("codex-helper-desktop.exe");
+        let resolved =
+            resolve_cli_path_from_sources(Some(&resource_dir), &current, Some(env_cli.clone()))
+                .expect("resolve env fallback");
+
+        assert_eq!(resolved, env_cli);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -931,5 +999,19 @@ mod tests {
             path,
             "/__codex_helper/api/v1/providers/balances/refresh?station_name=route+alpha&provider_id=provider%2Fone"
         );
+    }
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let mut dir = std::env::temp_dir();
+        let unique = format!(
+            "codex-helper-desktop-{prefix}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time after epoch")
+                .as_nanos()
+        );
+        dir.push(unique);
+        dir
     }
 }

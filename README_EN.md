@@ -359,7 +359,7 @@ cargo run --release --features gui --bin codex-helper-gui
 
 The GUI can start or explicitly attach to a proxy, edit common single-endpoint providers, route nodes, and routing, and inspect requests, balances, pricing, sessions, health, breaker state, and control-plane status. By default, a GUI-started proxy stops when the GUI exits; attaching to an existing proxy must be selected explicitly, and closing the GUI only detaches instead of stopping someone else’s process. Complex multi-endpoint providers, model mappings, and advanced fields should still be edited through CLI or raw TOML.
 
-The new Tauri desktop client lives under `apps/desktop` and uses React 19, Tailwind CSS 4, shadcn/ui-style components, and TanStack Router/Query/Table. It already implements Dashboard, Providers, Usage, Settings, read-only admin data, safe control actions, and close-to-tray semantics. It still needs packaged sidecar behavior, installer/signing, single instance, launch at login, auto-update, lightweight single-config import/export, and full tray smoke before it replaces the egui GUI above.
+The new Tauri desktop client lives under `apps/desktop` and uses React 19, Tailwind CSS 4, shadcn/ui-style components, and TanStack Router/Query/Table. It already implements Dashboard, Providers, Usage, Settings, read-only admin data, safe control actions, close-to-tray semantics, single instance, lightweight single-config import/export, config/log/cache path openers, and a Windows NSIS packaged sidecar build. It still needs launch at login, signing/auto-update posture, common provider edit forms, and full packaged tray lifecycle smoke before it replaces the egui GUI above. See [docs/DESKTOP_RELEASE.md](docs/DESKTOP_RELEASE.md) for the desktop packaging contract.
 
 ## File Locations
 
@@ -393,6 +393,7 @@ codex-helper intentionally avoids:
 - [docs/CONFIGURATION.md](docs/CONFIGURATION.md): English configuration reference, routing, balance adapters, pricing, migration.
 - [docs/CONFIGURATION.zh.md](docs/CONFIGURATION.zh.md): Chinese configuration reference with routing recipes, balance adapters, proxy notes, and migration.
 - [CHANGELOG.md](CHANGELOG.md): release notes and upgrade notes.
+- [docs/DESKTOP_RELEASE.md](docs/DESKTOP_RELEASE.md): Tauri desktop packaging, sidecar, and release-gate notes.
 - [docs/workstreams/tauri-desktop-client/REPLACEMENT_READINESS.md](docs/workstreams/tauri-desktop-client/REPLACEMENT_READINESS.md): Tauri desktop readiness, parity gaps, and follow-on split before egui removal.
 - [docs/workstreams/codex-operator-experience-refactor/GAP_MATRIX.md](docs/workstreams/codex-operator-experience-refactor/GAP_MATRIX.md): comparison against cc-switch, aio-coding-hub, and all-api-hub.
 - [docs/workstreams/codex-control-plane-refactor/README.md](docs/workstreams/codex-control-plane-refactor/README.md): control-plane design notes.

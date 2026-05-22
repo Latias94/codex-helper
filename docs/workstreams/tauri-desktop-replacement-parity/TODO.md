@@ -29,12 +29,12 @@ Last updated: 2026-05-22
 
 ## M2 — Packaged Runtime And OS Integration
 
-- [ ] TDRP-040 [owner=main] [deps=TDRP-020,TDRP-030] [scope=apps/desktop/src-tauri,apps/desktop/src-tauri/tauri.conf.json,release-docs]
+- [x] TDRP-040 [owner=main] [deps=TDRP-020,TDRP-030] [scope=apps/desktop/src-tauri,apps/desktop/src-tauri/tauri.conf.json,release-docs]
   Goal: Decide and implement packaged sidecar/installer strategy so installed Tauri can start or attach to codex-helper without manual `CODEX_HELPER_CLI_PATH`.
-  Validation: `pnpm tauri:build` or documented platform-specific fallback; packaged app smoke on Windows at minimum.
-  Review: Sidecar lookup must be deterministic and documented; no hidden dependence on developer shell env.
-  Evidence: build output, smoke output, EVIDENCE_AND_GATES.md.
-  Handoff: Split per-OS signing/notarization if required.
+  Validation: DONE_WITH_CONCERNS — `pnpm tauri:build` produced the Windows NSIS installer and `7z l` confirmed `codex-helper-desktop.exe` plus bundled `codex-helper.exe`; full live packaged lifecycle smoke is deferred to TDRP-080 because the developer machine already had a running codex-helper instance and must not be disturbed.
+  Review: DONE — packaged resource sidecar lookup is first, sibling development lookup is second, and `CODEX_HELPER_CLI_PATH`/legacy env lookup is only a developer fallback.
+  Evidence: `apps/desktop/src-tauri/tauri.conf.json`; `apps/desktop/scripts/prepare-sidecar.mjs`; `apps/desktop/src-tauri/src/commands/control.rs`; `docs/DESKTOP_RELEASE.md`; `EVIDENCE_AND_GATES.md`.
+  Handoff: DONE_WITH_CONCERNS — Windows packaging gate is green; installer signing/notarization and full interactive lifecycle smoke remain TDRP-060/TDRP-080.
 
 - [ ] TDRP-050 [owner=main] [deps=TDRP-040] [scope=apps/desktop/src-tauri,apps/desktop/src]
   Goal: Implement launch-at-login setting or explicitly mark it unsupported for the first release with honest UI copy.

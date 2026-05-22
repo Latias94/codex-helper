@@ -369,7 +369,7 @@ cargo run --release --features gui --bin codex-helper-gui
 
 GUI 可以启动/附着本地代理，编辑常见单 endpoint provider、route node 和 routing，查看请求、余额、价格目录、session、health、breaker 和控制面板状态。默认行为是 GUI 启动的代理跟随 GUI 退出而停止；附着已有代理必须在界面中显式选择，关闭 GUI 只会取消附着，不会偷偷停止别的进程。复杂多 endpoint provider、模型映射和高级字段仍建议用 CLI 或 raw TOML。
 
-新的 Tauri 桌面端位于 `apps/desktop`，技术栈是 React 19、Tailwind CSS 4、shadcn/ui 风格组件和 TanStack Router/Query/Table。它已经实现 Dashboard、Providers、Usage、Settings、只读 admin 数据、安全控制动作和关闭隐藏到托盘语义；但仍需完成 packaged sidecar、安装包/签名、单实例、开机启动、自动更新、轻量单配置导入导出和完整托盘 smoke，之后才会替换上面的 egui GUI。
+新的 Tauri 桌面端位于 `apps/desktop`，技术栈是 React 19、Tailwind CSS 4、shadcn/ui 风格组件和 TanStack Router/Query/Table。它已经实现 Dashboard、Providers、Usage、Settings、只读 admin 数据、安全控制动作、关闭隐藏到托盘语义、单实例、轻量单配置导入导出、打开配置/日志/缓存路径，以及 Windows NSIS packaged sidecar 构建；但仍需完成开机启动、签名/自动更新策略、Provider 常用编辑表单和完整 packaged 托盘生命周期 smoke，之后才会替换上面的 egui GUI。桌面端打包策略见 [docs/DESKTOP_RELEASE.md](docs/DESKTOP_RELEASE.md)。
 
 ## 配置文件位置
 
@@ -403,6 +403,7 @@ codex-helper 刻意避免这些做法：
 - [docs/CONFIGURATION.zh.md](docs/CONFIGURATION.zh.md)：中文完整配置参考，包含 routing 模板、余额适配、代理说明和迁移。
 - [docs/CONFIGURATION.md](docs/CONFIGURATION.md)：English configuration reference, routing, balance adapters, pricing, migration.
 - [CHANGELOG.md](CHANGELOG.md)：版本变更和升级注意事项。
+- [docs/DESKTOP_RELEASE.md](docs/DESKTOP_RELEASE.md)：Tauri 桌面端打包、sidecar 和 release gate 说明。
 - [docs/workstreams/codex-tui-operator-polish/README.md](docs/workstreams/codex-tui-operator-polish/README.md)：TUI 用量、路由、窄终端和快捷键操作体验优化计划。
 - [docs/workstreams/tauri-desktop-client/REPLACEMENT_READINESS.md](docs/workstreams/tauri-desktop-client/REPLACEMENT_READINESS.md)：Tauri 桌面端替代 egui 前的 readiness、parity gaps 和后续任务拆分。
 - [docs/workstreams/codex-operator-experience-refactor/GAP_MATRIX.md](docs/workstreams/codex-operator-experience-refactor/GAP_MATRIX.md)：与 cc-switch、aio-coding-hub、all-api-hub 的差距分析。

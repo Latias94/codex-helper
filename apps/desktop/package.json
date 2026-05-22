@@ -9,6 +9,8 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview --host 127.0.0.1",
     "test": "vitest run",
+    "prepare:sidecar": "node ./scripts/prepare-sidecar.mjs",
+    "tauri:build:assets": "pnpm build && pnpm prepare:sidecar",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build"

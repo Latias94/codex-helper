@@ -40,6 +40,11 @@
       "date": "2026-05-22",
       "kind": "planning",
       "summary": "Opened replacement parity lane from the closed Tauri desktop readiness report and user goal. First executable task is TDRP-020: path opener actions plus lightweight single-config export/import."
+    },
+    {
+      "date": "2026-05-22",
+      "kind": "packaging",
+      "summary": "Completed TDRP-040 with concerns. Windows NSIS packaging now bundles codex-helper as a Tauri external binary sidecar, start_desktop_proxy resolves packaged resources before development fallbacks, pnpm tauri:build produced the installer, and 7z confirmed the bundled sidecar. Full live packaged lifecycle smoke remains TDRP-080."
     }
   ],
   "adr_refs": [],
