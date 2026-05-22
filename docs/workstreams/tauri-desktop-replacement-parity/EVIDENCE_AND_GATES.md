@@ -143,3 +143,52 @@ Deferred:
 Result:
 
 - DONE_WITH_CONCERNS — TDRP-020 is implemented and verified at command/build/test level; packaged smoke remains a later gate.
+
+### 2026-05-22 — TDRP-030 single instance
+
+Evidence:
+
+- Added `tauri-plugin-single-instance`.
+- Registered the plugin during Tauri builder setup.
+- The second-instance callback calls the existing lifecycle path that shows, unminimizes, and focuses the main window.
+- Added a lifecycle assertion that second-instance launch leaves any proxy runtime running and does not request Stop Proxy or app shutdown.
+
+Review:
+
+- Workstream compliance: PASS_WITH_CONCERNS — code-level single-instance behavior is wired. The remaining concern is packaged second-launch smoke, which belongs to TDRP-080.
+- Code quality: PASS — reuse of `lifecycle::show_main_window` keeps behavior consistent with tray Show Window and avoids duplicate focus logic.
+- Missing gates: packaged smoke is not expected for this code slice but remains required before egui replacement.
+
+Verification:
+
+- Command: `cargo check -p codex-helper-desktop`
+- Scope: Tauri desktop crate.
+- Result: PASS.
+
+- Command: `cargo nextest run -p codex-helper-desktop --lib lifecycle::tests::second_instance_launch_never_stops_proxy_runtime`
+- Scope: targeted lifecycle policy.
+- Result: PASS — 1 test.
+
+- Command: `pnpm test`
+- Scope: `apps/desktop`.
+- Result: PASS — 5 files, 23 tests.
+
+- Command: `pnpm build`
+- Scope: `apps/desktop`.
+- Result: PASS.
+
+- Command: `cargo fmt --check`
+- Scope: repository workspace.
+- Result: PASS.
+
+- Command: `cargo nextest run -p codex-helper-desktop --lib`
+- Scope: Tauri desktop crate.
+- Result: PASS — 13 tests.
+
+- Command: `git diff --check -- .`
+- Scope: full repository diff.
+- Result: PASS — no whitespace errors; only Windows LF/CRLF warnings for edited text files.
+
+Result:
+
+- DONE_WITH_CONCERNS — single-instance plugin is wired and the second-launch callback focuses the existing main window without touching proxy lifecycle. Packaged second-launch smoke remains a replacement gate.

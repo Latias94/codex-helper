@@ -20,12 +20,12 @@ Last updated: 2026-05-22
   Evidence: `apps/desktop/src-tauri/src/commands/paths.rs`; `apps/desktop/src/features/settings/SettingsPage.tsx`; `apps/desktop/src/app/App.test.tsx`; `EVIDENCE_AND_GATES.md`.
   Handoff: DONE_WITH_CONCERNS — UI copy warns that exported TOML may contain inline secrets. File picker UX now depends on `@tauri-apps/plugin-dialog`; packaged validation remains TDRP-040/TDRP-080.
 
-- [ ] TDRP-030 [owner=main] [deps=TDRP-010] [scope=apps/desktop/src-tauri]
+- [x] TDRP-030 [owner=main] [deps=TDRP-010] [scope=apps/desktop/src-tauri]
   Goal: Add single-instance behavior so a second launch focuses/restores the existing main window instead of spawning another desktop controller.
-  Validation: Rust compile gate plus a documented manual/dev smoke for second launch behavior.
-  Review: Single-instance callback must show/focus the main window and must not start a duplicate proxy.
-  Evidence: lifecycle tests where possible, manual smoke note, and EVIDENCE_AND_GATES.md.
-  Handoff: Required before egui replacement claim.
+  Validation: DONE — `cargo check -p codex-helper-desktop` and targeted lifecycle test passed; full gate recorded in EVIDENCE_AND_GATES.md.
+  Review: DONE_WITH_CONCERNS — callback shows/unminimizes/focuses the main window and does not touch proxy lifecycle. Packaged second-launch smoke remains TDRP-080.
+  Evidence: `apps/desktop/src-tauri/src/lib.rs`; `apps/desktop/src-tauri/src/lifecycle.rs`; `EVIDENCE_AND_GATES.md`.
+  Handoff: DONE_WITH_CONCERNS — required code path is installed; packaged behavior still needs real smoke before egui replacement claim.
 
 ## M2 — Packaged Runtime And OS Integration
 

@@ -52,6 +52,10 @@ pub(crate) fn normal_app_exit_runtime_effect() -> AppExitRuntimeEffect {
     AppExitRuntimeEffect::LeaveRuntimeRunning
 }
 
+pub(crate) fn second_instance_launch_runtime_effect() -> AppExitRuntimeEffect {
+    AppExitRuntimeEffect::LeaveRuntimeRunning
+}
+
 pub(crate) fn setup_tray<R: Runtime>(app: &mut App<R>) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, MENU_SHOW_WINDOW, "Show Window", true, None::<&str>)?;
     let hide = MenuItem::with_id(app, MENU_HIDE_TO_TRAY, "Hide to Tray", true, None::<&str>)?;
@@ -176,6 +180,19 @@ pub(crate) fn quit_app<R: Runtime>(app: &AppHandle<R>) {
     app.exit(0);
 }
 
+pub(crate) fn handle_second_instance_launch<R: Runtime>(app: &AppHandle<R>) {
+    debug_assert_eq!(
+        second_instance_launch_runtime_effect(),
+        AppExitRuntimeEffect::LeaveRuntimeRunning
+    );
+    if let Err(err) = show_main_window(app) {
+        eprintln!(
+            "failed to focus existing main window after second launch: {}",
+            err.message
+        );
+    }
+}
+
 fn register_main_window_close_handler<R: Runtime>(window: WebviewWindow<R>) {
     let app = window.app_handle().clone();
     let window_for_ready = window.clone();
@@ -249,6 +266,14 @@ mod tests {
     fn normal_app_exit_never_stops_proxy_runtime() {
         assert_eq!(
             normal_app_exit_runtime_effect(),
+            AppExitRuntimeEffect::LeaveRuntimeRunning
+        );
+    }
+
+    #[test]
+    fn second_instance_launch_never_stops_proxy_runtime() {
+        assert_eq!(
+            second_instance_launch_runtime_effect(),
             AppExitRuntimeEffect::LeaveRuntimeRunning
         );
     }

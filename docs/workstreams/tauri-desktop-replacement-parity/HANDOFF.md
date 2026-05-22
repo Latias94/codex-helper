@@ -11,19 +11,17 @@ The parent readiness report says Tauri is source-preview/internal-dogfood ready,
 
 ## Active Task
 
-- Task ID: TDRP-030
+- Task ID: TDRP-040
 - Owner: main
 - Files:
   - `apps/desktop/src-tauri/Cargo.toml`
-  - `apps/desktop/src-tauri/src/lib.rs`
-  - `apps/desktop/src-tauri/src/lifecycle.rs`
+  - `apps/desktop/src-tauri/tauri.conf.json`
+  - packaged smoke/release docs
 - Validation:
-  - `cargo fmt --check`
-  - `cargo check -p codex-helper-desktop`
-  - `cargo nextest run -p codex-helper-desktop --lib`
-  - documented dev/manual smoke for second launch behavior if the plugin cannot be unit-tested
+  - `pnpm tauri:build` or documented packaging blocker
+  - packaged app smoke on Windows at minimum
 - Status: READY
-- Review: Single-instance callback must show/focus the main window and must not start a duplicate proxy.
+- Review: Sidecar lookup must be deterministic and documented; no hidden dependence on developer shell env.
 - Evidence: update `EVIDENCE_AND_GATES.md`.
 
 ## Decisions Since Last Update
@@ -31,6 +29,7 @@ The parent readiness report says Tauri is source-preview/internal-dogfood ready,
 - Start with local desktop parity primitives because they are useful immediately and reduce replacement risk without waiting for installer work.
 - Packaged sidecar remains the highest-risk release gate and follows after the first primitives.
 - TDRP-020 is implemented: Settings can open known paths and can export/import the single primary config with validation, backup, and secret warning. It uses `tauri-plugin-dialog` for file pickers and `tauri-plugin-opener` for opening paths.
+- TDRP-030 is implemented: `tauri-plugin-single-instance` is registered and second launch focuses/restores the existing main window without touching proxy lifecycle.
 
 ## Blockers
 
@@ -38,9 +37,9 @@ The parent readiness report says Tauri is source-preview/internal-dogfood ready,
 
 ## Next Recommended Action
 
-Implement TDRP-030:
+Implement TDRP-040:
 
-1. Add Tauri single-instance plugin or equivalent native guard.
-2. On second launch, show/unminimize/focus the existing main window.
-3. Ensure the callback does not start or stop proxy runtimes.
-4. Record fresh evidence and commit if clean.
+1. Decide whether the bundled app ships `codex-helper` as a Tauri sidecar or requires a documented sibling CLI installation.
+2. Make `start_desktop_proxy` use the packaged strategy before falling back to developer env lookup.
+3. Run `pnpm tauri:build` or document/fix the exact packaging blocker.
+4. Record packaged smoke evidence before claiming replacement parity.
