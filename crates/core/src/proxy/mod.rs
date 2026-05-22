@@ -34,6 +34,7 @@ mod headers;
 mod healthcheck_api;
 mod http_debug;
 mod models_compat;
+mod openai_images;
 mod passive_health;
 mod persisted_registry_api;
 mod profile_defaults;

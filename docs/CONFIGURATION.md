@@ -99,6 +99,33 @@ default
 
 `official-imagegen` is the most complete preset, but it is also the most demanding: the relay must support `/responses`, `/responses/compact`, and hosted `image_generation`. Only enable `responses_websocket` after a WebSocket live smoke passes for the selected upstream.
 
+## OpenAI Images-Compatible Generation Endpoint
+
+The proxy also exposes `POST /v1/images/generations` and `/images/generations` for local skills
+or scripts that want a simple OpenAI Images-style interface. codex-helper translates the request
+into a non-streaming `/v1/responses` call with a hosted `image_generation` tool, then converts a
+successful `image_generation_call.result` back into `data[0].b64_json`.
+
+Example:
+
+```bash
+curl 'http://127.0.0.1:3211/v1/images/generations' \
+  -X POST \
+  -H 'Content-Type: application/json' \
+  --data-raw '{
+    "model": "gpt-image-2",
+    "prompt": "a cat under neon lights on a rainy night",
+    "size": "3840x2160",
+    "output_format": "png",
+    "quality": "high"
+  }'
+```
+
+This endpoint intentionally reuses normal provider routing, model mapping, retry/fallback, auth
+injection, and request logging. The selected upstream must still support hosted Responses image
+generation. The first version supports one image per request (`n` absent or `1`) and does not
+implement `/v1/images/edits`.
+
 You can actively inspect a relay's Codex capability profile through the local admin API:
 
 In the built-in TUI, open Settings (`6`) and press `C` to run the same bounded relay diagnostic

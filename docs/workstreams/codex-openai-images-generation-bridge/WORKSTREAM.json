@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "slug": "codex-openai-images-generation-bridge",
+  "title": "Codex OpenAI Images Generation Bridge",
+  "status": "complete",
+  "updated": "2026-05-22",
+  "scope_kind": "feature",
+  "problem": "Expose an OpenAI-compatible images generation endpoint that reuses codex-helper provider routing and install a local ch-imagegen skill for stable image requests.",
+  "authoritative_docs": [
+    {
+      "role": "design",
+      "path": "docs/workstreams/codex-openai-images-generation-bridge/DESIGN.md"
+    },
+    {
+      "role": "execution",
+      "path": "docs/workstreams/codex-openai-images-generation-bridge/TODO.md"
+    },
+    {
+      "role": "gates",
+      "path": "docs/workstreams/codex-openai-images-generation-bridge/EVIDENCE_AND_GATES.md"
+    },
+    {
+      "role": "handoff",
+      "path": "docs/workstreams/codex-openai-images-generation-bridge/HANDOFF.md"
+    }
+  ],
+  "gates": [
+    "cargo fmt --check",
+    "cargo nextest run -p codex-helper-core openai_images_generation",
+    "python C:/Users/Administrator/.codex/skills/.system/skill-creator/scripts/quick_validate.py C:/Users/Administrator/.codex/skills/ch-imagegen",
+    "python C:/Users/Administrator/.codex/skills/ch-imagegen/scripts/generate_image.py --prompt \"dry run cat\" --dry-run"
+  ],
+  "evidence": [
+    {
+      "kind": "format",
+      "command": "cargo fmt --package codex-helper-core",
+      "result": "passed"
+    },
+    {
+      "kind": "test",
+      "command": "cargo nextest run -p codex-helper-core openai_images_generation",
+      "result": "passed, 7 tests"
+    },
+    {
+      "kind": "skill-validation",
+      "command": "python C:/Users/Administrator/.codex/skills/.system/skill-creator/scripts/quick_validate.py C:/Users/Administrator/.codex/skills/ch-imagegen",
+      "result": "passed"
+    },
+    {
+      "kind": "skill-dry-run",
+      "command": "python C:/Users/Administrator/.codex/skills/ch-imagegen/scripts/generate_image.py --prompt \"dry run cat\" --dry-run",
+      "result": "passed"
+    },
+    {
+      "kind": "skill-validation",
+      "command": "python C:/Users/Administrator/.codex/skills/.system/skill-creator/scripts/quick_validate.py .agents/ch-imagegen",
+      "result": "passed"
+    },
+    {
+      "kind": "skill-dry-run",
+      "command": "python .agents/ch-imagegen/scripts/generate_image.py --prompt \"dry run cat\" --dry-run",
+      "result": "passed"
+    }
+  ],
+  "adr_refs": [],
+  "continue_policy": {
+    "default_action": "continue",
+    "notes": "Continue until the proxy endpoint, local skill, focused tests, and docs are complete. Split edits/multi-image support as follow-ons."
+  }
+}

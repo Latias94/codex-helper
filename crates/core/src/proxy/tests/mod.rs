@@ -168,4 +168,5 @@ async fn send_responses_json(
 mod api_admin;
 mod failover;
 mod harness;
+mod openai_images_generation;
 mod routing_profiles;

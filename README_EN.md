@@ -31,6 +31,7 @@ It is probably unnecessary if you only use one official account and do not need 
 - **Local proxy**: listens on `127.0.0.1:3211` by default.
 - **Safe Codex patching**: only touches the local proxy fields in `~/.codex/config.toml`; unrelated Codex edits are preserved.
 - **Native Codex presets**: `chatgpt-bridge` keeps ChatGPT login shape, `imagegen-bridge` exposes hosted image generation, and `official-relay` / `official-imagegen` let relays that forward official Responses semantics try remote compaction v1; `responses_websocket` is a separate transport switch for Responses WebSocket v2.
+- **OpenAI Images-compatible entrypoint**: the local proxy also exposes `POST /v1/images/generations`, translates it into a Responses hosted `image_generation` request, and keeps using the same provider routing / fallback chain for local skills and scripts.
 - **Relay capability diagnostics**: TUI, CLI, and admin API checks for `/models`, `/responses`, and `/responses/compact`, then recommends the preset that matches the selected relay.
 - **Provider / routing config**: `version = 5` route graph schema. Define providers once, then use routing entry/routes for order, pinning, grouping, or tag preference.
 - **Session affinity and failover**: each Codex session tries to keep using the selected provider, then falls through to other route candidates when requests fail, upstreams are unavailable, or trusted balance snapshots are exhausted.
@@ -154,6 +155,23 @@ default
 Do not enable the strongest combination blindly: `official-imagegen` requires the relay to support `/responses`, `/responses/compact`, and hosted `image_generation`; `responses_websocket` additionally requires a passing WebSocket live smoke.
 
 If the upstream is known to support Responses WebSocket v2, enable `responses_websocket = true` or `--responses-websocket` separately; it is a transport switch, not a preset.
+
+The proxy also exposes an OpenAI Images-compatible generation entrypoint for skills or scripts that should not depend on whether the Codex client exposed its hosted tool:
+
+```bash
+curl 'http://127.0.0.1:3211/v1/images/generations' \
+  -X POST \
+  -H 'Content-Type: application/json' \
+  --data-raw '{
+    "model": "gpt-image-2",
+    "prompt": "a cat under neon lights on a rainy night",
+    "size": "3840x2160",
+    "output_format": "png",
+    "quality": "high"
+  }'
+```
+
+Internally this still uses `/v1/responses` plus hosted `image_generation`, so the real upstream must support that capability. The first version supports single-image `n=1` generation only, not `/v1/images/edits`. Responses use the OpenAI Images-style `data[0].b64_json` shape.
 
 Note: any change to `~/.codex/config.toml` is only picked up by newly started Codex sessions. After changing it, fully restart the Codex App, TUI, or `codex exec` session.
 

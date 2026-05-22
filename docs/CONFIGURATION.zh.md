@@ -99,6 +99,32 @@ default
 
 `official-imagegen` 是当前最完整 preset，但也是对中转要求最高的 preset：中转必须支持 `/responses`、`/responses/compact` 和 hosted `image_generation`。只有选中的上游通过 WebSocket live smoke 后，才建议额外开启 `responses_websocket`。
 
+## OpenAI Images 兼容生图入口
+
+本地代理也暴露 `POST /v1/images/generations` 和 `/images/generations`，方便本地 skill 或脚本使用
+简单的 OpenAI Images 风格接口。codex-helper 会把请求转成非流式 `/v1/responses` + hosted
+`image_generation` tool 调用，再把成功响应里的 `image_generation_call.result` 转回
+`data[0].b64_json`。
+
+示例：
+
+```bash
+curl 'http://127.0.0.1:3211/v1/images/generations' \
+  -X POST \
+  -H 'Content-Type: application/json' \
+  --data-raw '{
+    "model": "gpt-image-2",
+    "prompt": "一只猫在雨夜的霓虹灯下",
+    "size": "3840x2160",
+    "output_format": "png",
+    "quality": "high"
+  }'
+```
+
+这个入口刻意复用正常 provider routing、model mapping、retry/fallback、auth 注入和请求日志；
+被选中的真实上游仍必须支持 Responses hosted image generation。当前版本只支持单图生成
+（`n` 不传或为 `1`），不实现 `/v1/images/edits`。
+
 可以通过本地 admin API 主动检查某个中转的 Codex 能力画像：
 
 内置 TUI 也能直接跑同一个诊断：进入 Settings（`6`）后按 `C`，它会针对当前 Codex runtime

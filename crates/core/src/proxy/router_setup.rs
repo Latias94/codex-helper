@@ -11,6 +11,7 @@ use super::ProxyService;
 use super::admin::{ProxyAdminDiscovery, reject_admin_paths_from_proxy, require_admin_path_only};
 use super::control_plane_routes::control_plane_routes;
 use super::handle_proxy;
+use super::openai_images::handle_openai_images_generations;
 use super::responses_websocket::handle_responses_websocket;
 
 pub fn router(proxy: ProxyService) -> Router {
@@ -52,6 +53,20 @@ pub fn proxy_only_router_with_admin_base_url(
 
     let proxy_for_fallback = proxy.clone();
     router
+        .route(
+            "/images/generations",
+            on(MethodFilter::POST, {
+                let proxy = proxy.clone();
+                move |req| handle_openai_images_generations(proxy.clone(), req)
+            }),
+        )
+        .route(
+            "/v1/images/generations",
+            on(MethodFilter::POST, {
+                let proxy = proxy.clone();
+                move |req| handle_openai_images_generations(proxy.clone(), req)
+            }),
+        )
         .route("/responses", responses_websocket_route(proxy.clone()))
         .route("/v1/responses", responses_websocket_route(proxy.clone()))
         .route(
