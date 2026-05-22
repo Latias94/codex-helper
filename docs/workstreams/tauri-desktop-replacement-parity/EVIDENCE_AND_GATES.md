@@ -314,3 +314,58 @@ Deferred:
 Result:
 
 - DONE_WITH_CONCERNS — launch-at-login is implemented through a real Tauri plugin and verified at compile/test level. Packaged OS smoke remains required before egui replacement.
+
+### 2026-05-22 — TDRP-060 signing, installer, and update posture
+
+Evidence:
+
+- Reviewed the Tauri updater requirements and chose not to enable the updater plugin for this slice.
+- Documented the release policy in `docs/DESKTOP_RELEASE.md`:
+  - first replacement release uses GitHub Releases with manual installer download;
+  - updater remains disabled until a signing keypair, CI-held private key, embedded public key, HTTPS endpoint, updater artifacts, and rollback/revocation story exist;
+  - future implementation checklist records the minimum safe path to enable updates.
+- Updated Settings "关于与路径" so update checking is not a fake clickable action:
+  - the button is disabled;
+  - UI copy says auto-update is not enabled and lists the missing release prerequisites.
+- Updated README/README_EN/CHANGELOG to avoid promising automatic updates for the first replacement release.
+- Added a frontend route test proving the Settings update control is disabled and carries honest signing/release-hosting copy.
+
+Review:
+
+- Workstream compliance: PASS_WITH_CONCERNS — TDRP-060 allows an explicit deferral when signing/artifact hosting decisions are not ready. This slice defines the posture and removes misleading update UI.
+- Code quality: PASS — no updater dependency or placeholder command was added, so the desktop app cannot claim an unverified update path.
+- Safety: PASS — validation did not start, stop, detach, install, or mutate the developer machine's active codex-helper runtime.
+
+Verification:
+
+- Command: `pnpm test`
+- Scope: `apps/desktop`.
+- Result: PASS — 5 files, 25 tests.
+
+- Command: `pnpm build`
+- Scope: `apps/desktop`.
+- Result: PASS.
+
+- Command: `cargo check -p codex-helper-desktop`
+- Scope: Tauri desktop crate.
+- Result: PASS.
+
+- Command: `cargo nextest run -p codex-helper-desktop --lib`
+- Scope: Tauri desktop crate.
+- Result: PASS — 15 tests.
+
+- Command: `cargo fmt --check`
+- Scope: repository workspace.
+- Result: PASS.
+
+- Command: `git diff --check -- .`
+- Scope: full repository diff.
+- Result: PASS — no whitespace errors; only Windows LF/CRLF warnings for edited text files.
+
+Deferred:
+
+- Real auto-update implementation remains a future release-operations task. It must include key generation/escrow, CI secret setup, public key config, HTTPS endpoint metadata, updater artifacts/signatures for every target, and signed update smoke from N-1 to N before the Settings button can be enabled.
+
+Result:
+
+- DONE_WITH_CONCERNS — signing/update posture is explicit and safe for the first replacement release. Auto-update remains disabled until the signed release pipeline exists.

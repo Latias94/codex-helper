@@ -11,19 +11,19 @@ The parent readiness report says Tauri is source-preview/internal-dogfood ready,
 
 ## Active Task
 
-- Task ID: TDRP-060
+- Task ID: TDRP-070
 - Owner: main
 - Files:
-  - `apps/desktop/src-tauri/tauri.conf.json`
-  - `docs/DESKTOP_RELEASE.md`
-  - `README.md`
-  - `README_EN.md`
-  - `CHANGELOG.md`
+  - `apps/desktop/src-tauri/src/commands/`
+  - `apps/desktop/src/features/providers/`
+  - `apps/desktop/src/lib/api/`
+  - `apps/desktop/src/app/App.test.tsx`
 - Validation:
-  - docs review
-  - if updater is implemented, signed/dev artifact updater smoke
+  - frontend form tests
+  - Rust config patch tests
+  - desktop build/check gates
 - Status: READY
-- Review: Do not ship auto-update copy without signature/private-key, release artifact hosting, and rollback posture.
+- Review: Provider save must preserve unknown advanced TOML fields and avoid pretending complex multi-endpoint editing is solved.
 - Evidence: update `EVIDENCE_AND_GATES.md`.
 
 ## Decisions Since Last Update
@@ -34,6 +34,7 @@ The parent readiness report says Tauri is source-preview/internal-dogfood ready,
 - TDRP-030 is implemented: `tauri-plugin-single-instance` is registered and second launch focuses/restores the existing main window without touching proxy lifecycle.
 - TDRP-040 is implemented with concerns: Windows NSIS packaging now includes a Tauri external binary sidecar. `pnpm tauri:build` produced `target/release/bundle/nsis/codex-helper_0.16.0_x64-setup.exe`, and `7z l` confirmed both `codex-helper-desktop.exe` and bundled `codex-helper.exe`. Full live packaged lifecycle smoke remains TDRP-080 because the developer machine already had a live codex-helper runtime and must not be disturbed.
 - TDRP-050 is implemented with concerns: `tauri-plugin-autostart` is registered, Settings uses the real `@tauri-apps/plugin-autostart` guest binding, and frontend tests prove the switch calls the plugin. Manual packaged login-item smoke remains TDRP-080.
+- TDRP-060 is implemented with concerns: the first replacement release uses manual GitHub Releases installer downloads; auto-update remains disabled until Tauri updater signing keys, HTTPS release endpoint, artifact hosting, and rollback operations are real. Settings shows disabled honest update copy.
 
 ## Blockers
 
@@ -41,9 +42,10 @@ The parent readiness report says Tauri is source-preview/internal-dogfood ready,
 
 ## Next Recommended Action
 
-Implement TDRP-060:
+Implement TDRP-070:
 
-1. Define signing, installer, release channel, and auto-update posture in `docs/DESKTOP_RELEASE.md`.
-2. Implement updater only if signing/private-key and artifact hosting decisions are ready; otherwise explicitly defer auto-update for the first replacement release with honest UI copy.
-3. Update README/CHANGELOG wording so users do not expect auto-update until the signing/update gate is real.
-4. Do not run live runtime start/stop smoke against the developer machine's active codex-helper process.
+1. Inspect the current provider read model, config schema, and existing provider UI.
+2. Add common single-endpoint provider edit forms for safe fields only.
+3. Implement Rust config patching so unknown advanced provider fields are preserved.
+4. Keep complex multi-endpoint/raw TOML editing explicitly advanced/deferred.
+5. Do not run live runtime start/stop smoke against the developer machine's active codex-helper process.

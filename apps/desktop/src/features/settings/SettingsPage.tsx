@@ -43,6 +43,9 @@ const advancedRows = [
   ["日志与缓存", "打开日志、缓存目录"],
 ];
 
+const updatePolicy =
+  "自动更新暂未启用：Tauri updater 需要签名私钥、固定公钥、HTTPS 发布端点和回滚策略；当前版本请从 GitHub Releases 手动安装。";
+
 export function SettingsPage() {
   const knownPaths = useKnownPaths();
   const launchAtLogin = useLaunchAtLogin();
@@ -358,11 +361,21 @@ export function SettingsPage() {
           <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-700">
             导出的 config.toml 可能包含 inline token；请像密钥文件一样保存。导入会先校验 TOML，并在替换前备份当前配置。
           </div>
+          <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs leading-5 text-slate-600">
+            {updatePolicy}
+          </div>
           <div className="flex gap-2 pt-2">
             <Button variant="outline" onClick={() => runPathAction("home")}><FolderOpen className="h-4 w-4" />打开配置目录</Button>
             <Button variant="outline" onClick={runExportConfig}>导出配置</Button>
             <Button variant="outline" onClick={runImportConfig}>导入配置</Button>
-            <Button variant="outline"><RefreshCw className="h-4 w-4" />检查更新</Button>
+            <Button
+              variant="outline"
+              disabled
+              title={updatePolicy}
+            >
+              <RefreshCw className="h-4 w-4" />
+              检查更新（暂未启用）
+            </Button>
           </div>
         </SettingsCard>
 

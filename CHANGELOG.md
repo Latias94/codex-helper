@@ -18,7 +18,7 @@ All notable changes to this project will be documented in this file.
 
 - 新增 `apps/desktop` Tauri v2 + React 19 + Tailwind CSS 4 + shadcn/ui 风格桌面端，作为长期替代当前 egui GUI 的开发路径。
 - 桌面端已具备 Dashboard、Providers、Usage、Settings、只读 admin 数据、安全控制动作、关闭隐藏到托盘语义、单实例、轻量单配置导入导出、打开配置/日志/缓存路径，以及 Windows NSIS packaged sidecar 构建；`Quit App` 只退出桌面进程，停止代理仍需显式 `Stop Proxy`。
-- 当前仍是源码预览/内部 dogfood 阶段；开机启动设置已接入真实 Tauri autostart 插件，但在签名/自动更新策略、Provider 常用编辑表单和完整 packaged 托盘生命周期 smoke 完成前，不移除 `codex-helper-gui`/egui。
+- 当前仍是源码预览/内部 dogfood 阶段；开机启动设置已接入真实 Tauri autostart 插件，首个替代版本采用 GitHub Releases 手动下载安装，自动更新会等 Tauri updater 签名密钥、HTTPS 发布端点、artifact hosting 和回滚流程就绪后再启用；在 Provider 常用编辑表单和完整 packaged 托盘生命周期 smoke 完成前，不移除 `codex-helper-gui`/egui。
 
 #### Codex 中转请求字段覆盖
 
@@ -38,7 +38,7 @@ All notable changes to this project will be documented in this file.
 
 - Added the `apps/desktop` Tauri v2 + React 19 + Tailwind CSS 4 + shadcn/ui-style desktop client as the long-term replacement path for the current egui GUI.
 - The desktop client now has Dashboard, Providers, Usage, Settings, read-only admin data, safe control actions, close-to-tray semantics, single instance, lightweight single-config import/export, config/log/cache path openers, and a Windows NSIS packaged sidecar build; `Quit App` exits only the desktop process, while proxy shutdown remains an explicit `Stop Proxy` action.
-- This is still source-preview/internal dogfood. Launch-at-login is now backed by the real Tauri autostart plugin, but `codex-helper-gui`/egui stays until signing/auto-update posture, common provider edit forms, and full packaged tray lifecycle smoke are complete.
+- This is still source-preview/internal dogfood. Launch-at-login is now backed by the real Tauri autostart plugin; the first replacement release uses manual GitHub Releases downloads, and auto-update stays disabled until Tauri updater signing keys, HTTPS release endpoint, artifact hosting, and rollback operations are real. `codex-helper-gui`/egui stays until common provider edit forms and full packaged tray lifecycle smoke are complete.
 
 #### Codex relay request-field overrides
 

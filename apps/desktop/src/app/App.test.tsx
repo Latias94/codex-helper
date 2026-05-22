@@ -268,6 +268,37 @@ describe("desktop app routes", () => {
     expect(autostart.disable).not.toHaveBeenCalled();
     expect(await screen.findByText(/已启用开机启动/)).toBeInTheDocument();
   });
+
+  it("shows honest disabled update posture until signing and release hosting are ready", async () => {
+    window.location.hash = "#/settings";
+    mockedInvoke.mockImplementation(async (command) => {
+      if (command === "get_app_metadata") {
+        return { name: "codex-helper", version: "0.16.0", tauri: "2" };
+      }
+      if (command === "get_admin_read_model") {
+        return liveReadModel();
+      }
+      if (command === "get_desktop_control_state") {
+        return liveControlState();
+      }
+      if (command === "get_known_paths") {
+        return {
+          home: "C:/Users/dev/.codex-helper",
+          config: "C:/Users/dev/.codex-helper/config.toml",
+          logs: "C:/Users/dev/.codex-helper/logs",
+          cache: "C:/Users/dev/.codex-helper/cache",
+        };
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    render(<App />);
+
+    const updateButton = await screen.findByRole("button", { name: "检查更新（暂未启用）" });
+    expect(updateButton).toBeDisabled();
+    expect(screen.getByText(/自动更新暂未启用/)).toBeInTheDocument();
+    expect(screen.getByText(/签名私钥、固定公钥、HTTPS 发布端点和回滚策略/)).toBeInTheDocument();
+  });
 });
 
 function liveReadModel(overrides?: {

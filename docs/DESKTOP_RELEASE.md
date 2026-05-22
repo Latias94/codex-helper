@@ -10,6 +10,7 @@ the full packaged lifecycle smoke before it can replace the egui GUI.
 - Tauri version: v2
 - Frontend stack: React 19, Tailwind CSS 4, shadcn/ui-style components, TanStack Router/Query/Table
 - First packaged target: Windows NSIS installer
+- First public replacement channel: GitHub Releases, manual installer download
 - Build command:
 
 ```powershell
@@ -57,6 +58,41 @@ Environment escape hatches:
 The environment override is only a development fallback. A packaged app should
 not require shell setup to start a desktop-managed proxy.
 
+## Signing and release-channel posture
+
+TDRP-060 intentionally does **not** enable automatic updates yet. Tauri's
+updater is a signed-artifact pipeline, not a plain "check an HTTP URL" feature.
+Per the Tauri updater contract, a production updater needs:
+
+1. updater signing keypair;
+2. private key supplied only by CI/release secrets;
+3. public key embedded in `tauri.conf.json`;
+4. HTTPS updater endpoints that return signed metadata;
+5. uploaded updater artifacts for each supported target;
+6. rollback and revocation instructions for a bad release.
+
+Current first replacement release policy:
+
+- Ship Windows NSIS artifacts through GitHub Releases.
+- Keep automatic update checks disabled in the app until the signing key,
+  artifact hosting, release channel, and rollback process exist.
+- Do not add `tauri-plugin-updater` or updater UI that implies a working update
+  path before those release operations are real.
+- The Settings page must show honest disabled copy instead of a clickable
+  placeholder.
+
+Minimum future implementation checklist:
+
+1. Generate and escrow a Tauri updater keypair outside the repository.
+2. Add only the public key to `apps/desktop/src-tauri/tauri.conf.json`.
+3. Store `TAURI_SIGNING_PRIVATE_KEY` and, if needed,
+   `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` as release CI secrets.
+4. Add an HTTPS updater endpoint for stable channel metadata.
+5. Configure CI to upload installer plus updater artifacts and signatures for
+   every target.
+6. Smoke a signed dev/staging release by installing N-1, checking update, applying
+   update, verifying sidecar/startup behavior, and documenting rollback.
+
 ## OS integration
 
 The desktop app registers the official Tauri autostart plugin for launch at
@@ -82,6 +118,9 @@ Verified on Windows:
   `codex-helper-desktop.exe` and the bundled `codex-helper.exe` sidecar.
 - Compile/test verification proves the launch-at-login plugin is registered and
   the Settings switch is wired to the real guest binding.
+- Release posture is defined: manual GitHub Releases for the first replacement
+  release; auto-update is disabled until signing, endpoint, artifact hosting, and
+  rollback are real.
 
 Still required before egui replacement:
 
@@ -93,5 +132,6 @@ Still required before egui replacement:
   - second launch focus;
   - launch-at-login enable/disable and login/restart behavior;
   - config export/import.
-- Signing and updater posture.
+- Signing key escrow, updater endpoint, and signed update smoke before enabling
+  automatic updates.
 - Provider edit parity for common single-endpoint providers.

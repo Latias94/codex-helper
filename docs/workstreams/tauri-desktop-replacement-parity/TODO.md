@@ -43,12 +43,12 @@ Last updated: 2026-05-22
   Evidence: `apps/desktop/src-tauri/src/lib.rs`; `apps/desktop/src/features/settings/SettingsPage.tsx`; `apps/desktop/src/app/App.test.tsx`; `EVIDENCE_AND_GATES.md`.
   Handoff: DONE_WITH_CONCERNS — plugin supports Windows/macOS/Linux desktop targets; Android/iOS are excluded by the plugin dependency. Packaged login-item smoke remains TDRP-080.
 
-- [ ] TDRP-060 [owner=planner-or-main] [deps=TDRP-040] [scope=release-docs,apps/desktop/src-tauri]
+- [x] TDRP-060 [owner=planner-or-main] [deps=TDRP-040] [scope=release-docs,apps/desktop/src-tauri]
   Goal: Define signing, installer, and auto-update/release-channel posture; implement updater only if signing/artifact hosting decisions are ready.
-  Validation: docs review; if implemented, updater smoke on signed/dev artifacts.
-  Review: Do not ship auto-update copy without signature/private-key and rollback story.
-  Evidence: release notes, EVIDENCE_AND_GATES.md.
-  Handoff: May close as explicit deferral if the first replacement release intentionally excludes auto-update.
+  Validation: DONE_WITH_CONCERNS — release posture is documented; Settings shows a disabled honest update control; `pnpm test`, `pnpm build`, `cargo fmt --check`, `cargo check -p codex-helper-desktop`, `cargo nextest run -p codex-helper-desktop --lib`, and `git diff --check -- .` pass.
+  Review: DONE — auto-update is intentionally deferred because there is no updater signing keypair, HTTPS endpoint, artifact hosting, or rollback process yet.
+  Evidence: `docs/DESKTOP_RELEASE.md`; `apps/desktop/src/features/settings/SettingsPage.tsx`; `apps/desktop/src/app/App.test.tsx`; `EVIDENCE_AND_GATES.md`.
+  Handoff: DONE_WITH_CONCERNS — first replacement release policy is manual GitHub Releases installer download; future updater work must complete signed artifact smoke before enabling the UI.
 
 ## M3 — Provider Edit Parity And Packaged Smoke
 

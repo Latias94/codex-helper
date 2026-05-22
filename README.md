@@ -369,7 +369,7 @@ cargo run --release --features gui --bin codex-helper-gui
 
 GUI 可以启动/附着本地代理，编辑常见单 endpoint provider、route node 和 routing，查看请求、余额、价格目录、session、health、breaker 和控制面板状态。默认行为是 GUI 启动的代理跟随 GUI 退出而停止；附着已有代理必须在界面中显式选择，关闭 GUI 只会取消附着，不会偷偷停止别的进程。复杂多 endpoint provider、模型映射和高级字段仍建议用 CLI 或 raw TOML。
 
-新的 Tauri 桌面端位于 `apps/desktop`，技术栈是 React 19、Tailwind CSS 4、shadcn/ui 风格组件和 TanStack Router/Query/Table。它已经实现 Dashboard、Providers、Usage、Settings、只读 admin 数据、安全控制动作、关闭隐藏到托盘语义、单实例、开机启动设置、轻量单配置导入导出、打开配置/日志/缓存路径，以及 Windows NSIS packaged sidecar 构建；但仍需完成签名/自动更新策略、Provider 常用编辑表单和完整 packaged 托盘生命周期 smoke，之后才会替换上面的 egui GUI。桌面端打包策略见 [docs/DESKTOP_RELEASE.md](docs/DESKTOP_RELEASE.md)。
+新的 Tauri 桌面端位于 `apps/desktop`，技术栈是 React 19、Tailwind CSS 4、shadcn/ui 风格组件和 TanStack Router/Query/Table。它已经实现 Dashboard、Providers、Usage、Settings、只读 admin 数据、安全控制动作、关闭隐藏到托盘语义、单实例、开机启动设置、轻量单配置导入导出、打开配置/日志/缓存路径，以及 Windows NSIS packaged sidecar 构建；首个替代版本的发布策略是 GitHub Releases 手动下载安装，自动更新会等 Tauri updater 签名密钥、HTTPS 发布端点、artifact hosting 和回滚流程都就绪后再启用。因此仍需完成 Provider 常用编辑表单和完整 packaged 托盘生命周期 smoke，之后才会替换上面的 egui GUI。桌面端打包策略见 [docs/DESKTOP_RELEASE.md](docs/DESKTOP_RELEASE.md)。
 
 ## 配置文件位置
 

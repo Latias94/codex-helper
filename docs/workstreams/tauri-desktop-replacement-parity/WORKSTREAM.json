@@ -50,6 +50,11 @@
       "date": "2026-05-22",
       "kind": "os-integration",
       "summary": "Completed TDRP-050 with concerns. Launch-at-login now uses tauri-plugin-autostart and the Settings switch is backed by the real plugin guest binding. Frontend tests/build and desktop Rust check/nextest pass. Manual packaged login-item smoke remains TDRP-080."
+    },
+    {
+      "date": "2026-05-22",
+      "kind": "release",
+      "summary": "Completed TDRP-060 with concerns. First replacement release policy is manual GitHub Releases installer download. Auto-update is intentionally deferred until updater signing keypair, HTTPS endpoint, artifact hosting, and rollback operations are real. Settings shows disabled honest update copy."
     }
   ],
   "adr_refs": [],
