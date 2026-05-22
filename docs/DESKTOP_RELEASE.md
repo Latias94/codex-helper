@@ -11,7 +11,9 @@ remain separate release follow-ups.
 - Tauri version: v2
 - Frontend stack: React 19, Tailwind CSS 4, shadcn/ui-style components, TanStack Router/Query/Table
 - First packaged target: Windows NSIS installer
-- First public replacement channel: GitHub Releases, manual installer download
+- First public replacement channel: GitHub Releases, manual installer download.
+  The tag release workflow builds and uploads this installer alongside the
+  existing cargo-dist CLI artifacts.
 - Build command:
 
 ```powershell
@@ -74,7 +76,10 @@ Per the Tauri updater contract, a production updater needs:
 
 Current first replacement release policy:
 
-- Ship Windows NSIS artifacts through GitHub Releases.
+- Ship Windows NSIS artifacts through GitHub Releases. `.github/workflows/release.yml`
+  has a `build-tauri-windows-installer` job that runs on `windows-2025`, installs
+  the desktop pnpm dependencies, runs `pnpm tauri:build` from `apps/desktop`, and
+  uploads `target/release/bundle/nsis/*.exe` as a release artifact.
 - Keep automatic update checks disabled in the app until the signing key,
   artifact hosting, release channel, and rollback process exist.
 - Do not add `tauri-plugin-updater` or updater UI that implies a working update
@@ -127,6 +132,8 @@ Verified on Windows:
 
 - `pnpm tauri:build` completes.
 - The NSIS installer is produced under `target/release/bundle/nsis/`.
+- The GitHub tag release workflow includes the Windows Tauri installer artifact
+  in the final Release upload set.
 - `7z l target/release/bundle/nsis/codex-helper_0.16.0_x64-setup.exe` lists both
   `codex-helper-desktop.exe` and the bundled `codex-helper.exe` sidecar.
 - Compile/test verification proves the launch-at-login plugin is registered and

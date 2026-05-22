@@ -19,7 +19,7 @@ All notable changes to this project will be documented in this file.
 
 - 新增 `apps/desktop` Tauri v2 + React 19 + Tailwind CSS 4 + shadcn/ui 风格桌面端，作为当前 egui GUI 的替代路径。
 - Windows packaged 路径已具备 Dashboard、Providers、Usage、Settings、只读 admin 数据、安全控制动作、关闭隐藏到托盘语义、单实例、开机启动、轻量单配置导入导出、打开配置/日志/缓存路径、Provider 常用编辑表单，以及 NSIS packaged sidecar 构建；`Quit App` 只退出桌面进程，停止代理仍需显式 `Stop Proxy`。
-- Windows packaged smoke 已完成并覆盖托盘 Show/Hide/Quit、Detach、Stop Proxy、第二次启动聚焦、开机启动注册、配置导入导出和 Provider 编辑。`codex-helper-gui`/egui 现在作为 legacy fallback 保留；自动更新仍会等 Tauri updater 签名密钥、HTTPS 发布端点、artifact hosting 和回滚流程就绪后再启用。
+- Windows packaged smoke 已完成并覆盖托盘 Show/Hide/Quit、Detach、Stop Proxy、第二次启动聚焦、开机启动注册、配置导入导出和 Provider 编辑。tag release CI 现在会构建并上传 Windows Tauri NSIS 安装包到 GitHub Release。`codex-helper-gui`/egui 现在作为 legacy fallback 保留；自动更新仍会等 Tauri updater 签名密钥、HTTPS 发布端点、artifact hosting 和回滚流程就绪后再启用。
 
 #### Codex 中转请求字段覆盖
 
@@ -40,7 +40,7 @@ All notable changes to this project will be documented in this file.
 
 - Added the `apps/desktop` Tauri v2 + React 19 + Tailwind CSS 4 + shadcn/ui-style desktop client as the replacement path for the current egui GUI.
 - The desktop client now has Dashboard, Providers, Usage, Settings, read-only admin data, safe control actions, close-to-tray semantics, single instance, launch-at-login, lightweight single-config import/export, config/log/cache path openers, common provider edit forms, and a Windows NSIS packaged sidecar build; `Quit App` exits only the desktop process, while proxy shutdown remains an explicit `Stop Proxy` action.
-- Windows packaged smoke now passes, including tray Show/Hide/Quit, Detach, Stop Proxy, second-launch focus, launch-at-login registration, config import/export, and provider editing. The first replacement release still uses manual GitHub Releases downloads, and auto-update stays disabled until Tauri updater signing keys, HTTPS release endpoint, artifact hosting, and rollback operations are real. `codex-helper-gui`/egui remains as a deprecated legacy fallback.
+- Windows packaged smoke now passes, including tray Show/Hide/Quit, Detach, Stop Proxy, second-launch focus, launch-at-login registration, config import/export, and provider editing. Tag release CI now builds and uploads the Windows Tauri NSIS installer to GitHub Releases. The first replacement release still uses manual GitHub Releases downloads, and auto-update stays disabled until Tauri updater signing keys, HTTPS release endpoint, artifact hosting, and rollback operations are real. `codex-helper-gui`/egui remains as a deprecated legacy fallback.
 
 #### Codex relay request-field overrides
 
