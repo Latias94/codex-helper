@@ -19,8 +19,9 @@ use super::request_failures::{
 };
 use super::request_preparation::{
     CommonRequestPreparationError, CommonRequestPreparationParams, RequestFlavor,
-    detect_request_flavor, load_request_config_context, prepare_common_request,
-    session_identity_source, session_identity_value,
+    codex_path_is_responses_compact, codex_path_is_responses_or_compact, detect_request_flavor,
+    load_request_config_context, prepare_common_request, session_identity_source,
+    session_identity_value,
 };
 use super::request_routing::RequestRouteSelection;
 use super::retry::RetryPlan;
@@ -137,7 +138,7 @@ pub(super) async fn prepare_proxy_request(
         extract_session_identity_with_body_fallback(&client_headers, raw_body.as_ref());
     let raw_body = if request_flavor.is_codex_service
         && method == Method::POST
-        && (uri.path().ends_with("/responses") || uri.path().ends_with("/responses/compact"))
+        && codex_path_is_responses_or_compact(uri.path())
     {
         super::request_body::complete_codex_session_fields(&mut client_headers, &raw_body).0
     } else {
@@ -152,7 +153,7 @@ pub(super) async fn prepare_proxy_request(
         uri: &uri,
         client_headers: &client_headers,
         raw_body: &raw_body,
-        compact_request: uri.path().ends_with("/responses/compact"),
+        compact_request: codex_path_is_responses_compact(uri.path()),
         session_identity_hint,
         client_name,
         client_addr,

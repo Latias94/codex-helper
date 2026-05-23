@@ -10,6 +10,7 @@ use super::ProxyService;
 use super::auth_resolution::{resolve_api_key_with_source, resolve_auth_token_with_source};
 use super::headers::{filter_request_headers, header_map_to_entries};
 use super::http_debug::HttpDebugBase;
+use super::request_preparation::codex_path_is_responses_compact;
 
 pub(super) struct AttemptRequestSetup {
     pub(super) headers: HeaderMap,
@@ -83,6 +84,7 @@ pub(super) fn prepare_attempt_request(
         codex_client_patch_mode,
         &mut headers,
     );
+    normalize_codex_compact_headers(proxy.service_name, client_uri, &mut headers);
 
     let debug_base = build_http_debug_base(HttpDebugBaseParams {
         client_headers,
@@ -104,6 +106,19 @@ pub(super) fn prepare_attempt_request(
         headers,
         debug_base,
     }
+}
+
+fn normalize_codex_compact_headers(service_name: &str, client_uri: &str, headers: &mut HeaderMap) {
+    if service_name == "codex" && codex_path_is_responses_compact(client_uri_path(client_uri)) {
+        headers.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
+    }
+}
+
+fn client_uri_path(client_uri: &str) -> &str {
+    client_uri
+        .split_once('?')
+        .map(|(path, _query)| path)
+        .unwrap_or(client_uri)
 }
 
 pub(super) fn inject_auth_headers(
@@ -435,6 +450,130 @@ mod tests {
         assert!(!setup.headers.contains_key("x-api-key"));
         assert!(!setup.headers.contains_key("chatgpt-account-id"));
         assert!(!setup.headers.contains_key("x-openai-fedramp"));
+    }
+
+    #[tokio::test]
+    async fn prepare_attempt_request_forces_json_accept_for_codex_compact() {
+        let proxy = test_proxy_service();
+        let mut client_headers = HeaderMap::new();
+        client_headers.insert("accept", HeaderValue::from_static("text/event-stream"));
+
+        let cache = OnceLock::new();
+        let setup = prepare_attempt_request(AttemptRequestSetupParams {
+            proxy: &proxy,
+            auth: &UpstreamAuth::default(),
+            codex_client_patch_mode: CodexPatchMode::Default,
+            client_headers: &client_headers,
+            client_headers_entries_cache: &cache,
+            request_body_len: 12,
+            upstream_request_body_len: 12,
+            debug_max: 0,
+            warn_max: 0,
+            client_uri: "/v1/responses/compact",
+            target_url: "https://third-party.example/v1/responses/compact",
+            client_body_debug: None,
+            upstream_request_body_debug: None,
+            client_body_warn: None,
+            upstream_request_body_warn: None,
+        });
+
+        assert_eq!(
+            setup.headers.get(header::ACCEPT),
+            Some(&HeaderValue::from_static("application/json"))
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_attempt_request_forces_json_accept_for_codex_compact_with_trailing_slash() {
+        let proxy = test_proxy_service();
+        let mut client_headers = HeaderMap::new();
+        client_headers.insert("accept", HeaderValue::from_static("text/event-stream"));
+
+        let cache = OnceLock::new();
+        let setup = prepare_attempt_request(AttemptRequestSetupParams {
+            proxy: &proxy,
+            auth: &UpstreamAuth::default(),
+            codex_client_patch_mode: CodexPatchMode::Default,
+            client_headers: &client_headers,
+            client_headers_entries_cache: &cache,
+            request_body_len: 12,
+            upstream_request_body_len: 12,
+            debug_max: 0,
+            warn_max: 0,
+            client_uri: "/v1/responses/compact/",
+            target_url: "https://third-party.example/v1/responses/compact/",
+            client_body_debug: None,
+            upstream_request_body_debug: None,
+            client_body_warn: None,
+            upstream_request_body_warn: None,
+        });
+
+        assert_eq!(
+            setup.headers.get(header::ACCEPT),
+            Some(&HeaderValue::from_static("application/json"))
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_attempt_request_forces_json_accept_for_codex_compact_with_query() {
+        let proxy = test_proxy_service();
+        let mut client_headers = HeaderMap::new();
+        client_headers.insert("accept", HeaderValue::from_static("text/event-stream"));
+
+        let cache = OnceLock::new();
+        let setup = prepare_attempt_request(AttemptRequestSetupParams {
+            proxy: &proxy,
+            auth: &UpstreamAuth::default(),
+            codex_client_patch_mode: CodexPatchMode::Default,
+            client_headers: &client_headers,
+            client_headers_entries_cache: &cache,
+            request_body_len: 12,
+            upstream_request_body_len: 12,
+            debug_max: 0,
+            warn_max: 0,
+            client_uri: "/v1/responses/compact?trace=1",
+            target_url: "https://third-party.example/v1/responses/compact?trace=1",
+            client_body_debug: None,
+            upstream_request_body_debug: None,
+            client_body_warn: None,
+            upstream_request_body_warn: None,
+        });
+
+        assert_eq!(
+            setup.headers.get(header::ACCEPT),
+            Some(&HeaderValue::from_static("application/json"))
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_attempt_request_preserves_accept_for_codex_responses() {
+        let proxy = test_proxy_service();
+        let mut client_headers = HeaderMap::new();
+        client_headers.insert("accept", HeaderValue::from_static("text/event-stream"));
+
+        let cache = OnceLock::new();
+        let setup = prepare_attempt_request(AttemptRequestSetupParams {
+            proxy: &proxy,
+            auth: &UpstreamAuth::default(),
+            codex_client_patch_mode: CodexPatchMode::Default,
+            client_headers: &client_headers,
+            client_headers_entries_cache: &cache,
+            request_body_len: 12,
+            upstream_request_body_len: 12,
+            debug_max: 0,
+            warn_max: 0,
+            client_uri: "/v1/responses",
+            target_url: "https://third-party.example/v1/responses",
+            client_body_debug: None,
+            upstream_request_body_debug: None,
+            client_body_warn: None,
+            upstream_request_body_warn: None,
+        });
+
+        assert_eq!(
+            setup.headers.get(header::ACCEPT),
+            Some(&HeaderValue::from_static("text/event-stream"))
+        );
     }
 
     #[tokio::test]

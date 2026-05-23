@@ -38,7 +38,7 @@ pub(super) fn maybe_repair_codex_compact_sse_response(
     body: &Bytes,
 ) -> Option<CodexCompactSseRepair> {
     if service_name != "codex"
-        || !path.ends_with("/responses/compact")
+        || !path.trim_end_matches('/').ends_with("/responses/compact")
         || looks_like_json(body.as_ref())
         || !(response_content_type_contains(headers, "text/event-stream")
             || looks_like_sse(body.as_ref()))
@@ -90,6 +90,7 @@ pub(super) fn maybe_repair_codex_compact_sse_response(
 }
 
 fn is_codex_responses_path(path: &str) -> bool {
+    let path = path.trim_end_matches('/');
     path.ends_with("/responses") || path.ends_with("/responses/compact")
 }
 
@@ -297,6 +298,43 @@ data: [DONE]
 
         assert_eq!(value["id"].as_str(), Some("resp_1"));
         assert_eq!(value["output"][0]["type"].as_str(), Some("compaction"));
+    }
+
+    #[test]
+    fn response_fixer_rebuilds_compact_output_from_done_items_when_final_output_is_empty() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        let body = Bytes::from_static(
+            br#"event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"summary-from-item"}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_1","output":[]}}
+
+"#,
+        );
+
+        let Some(CodexCompactSseRepair::FinalJson(repaired)) =
+            maybe_repair_codex_compact_sse_response(
+                "codex",
+                "/v1/responses/compact",
+                &headers,
+                &body,
+            )
+        else {
+            panic!("expected compact SSE final response repair");
+        };
+        let value: Value = serde_json::from_slice(repaired.as_ref()).expect("json");
+
+        assert_eq!(value["id"].as_str(), Some("resp_1"));
+        assert_eq!(value["output"][0]["type"].as_str(), Some("compaction"));
+        assert_eq!(
+            value["output"][0]["encrypted_content"].as_str(),
+            Some("summary-from-item")
+        );
     }
 
     #[test]

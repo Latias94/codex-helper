@@ -331,8 +331,8 @@ pub(super) fn detect_request_flavor(
         .map(|value| value.contains("text/event-stream"))
         .unwrap_or(false);
 
-    let is_responses_path = path.ends_with("/responses");
-    let is_remote_compaction_v1_request = path.ends_with("/responses/compact");
+    let is_responses_path = codex_path_is_responses(path);
+    let is_remote_compaction_v1_request = codex_path_is_responses_compact(path);
     let is_user_turn = *method == Method::POST && is_responses_path;
     let is_codex_service = service_name == "codex";
     let codex_bridge_log = (is_codex_service
@@ -352,6 +352,18 @@ pub(super) fn detect_request_flavor(
         codex_client_patch_mode,
         codex_bridge_log,
     }
+}
+
+pub(super) fn codex_path_is_responses(path: &str) -> bool {
+    path.trim_end_matches('/').ends_with("/responses")
+}
+
+pub(super) fn codex_path_is_responses_compact(path: &str) -> bool {
+    path.trim_end_matches('/').ends_with("/responses/compact")
+}
+
+pub(super) fn codex_path_is_responses_or_compact(path: &str) -> bool {
+    codex_path_is_responses(path) || codex_path_is_responses_compact(path)
 }
 
 pub(super) fn session_identity_value(identity: Option<&ClientSessionIdentity>) -> Option<String> {
@@ -597,6 +609,26 @@ mod tests {
         assert_eq!(bridge.patch_mode, "official-imagegen-bridge");
         assert!(bridge.remote_compaction_v1_request);
         assert!(bridge.strips_client_auth);
+    }
+
+    #[test]
+    fn detect_request_flavor_marks_trailing_slash_compact_request() {
+        let headers = HeaderMap::new();
+
+        let flavor = detect_request_flavor(
+            "codex",
+            &Method::POST,
+            &headers,
+            "/v1/responses/compact/",
+            CodexPatchMode::OfficialRelayBridge,
+        );
+
+        assert!(
+            flavor
+                .codex_bridge_log
+                .expect("bridge log")
+                .remote_compaction_v1_request
+        );
     }
 
     #[test]
