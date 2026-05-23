@@ -227,10 +227,10 @@ fn with_admin_headers(request: reqwest::RequestBuilder) -> reqwest::RequestBuild
 }
 
 pub(crate) fn admin_endpoint_config() -> AdminEndpointConfig {
-    if let Ok(base) = std::env::var(ADMIN_BASE_ENV) {
-        if let Some(config) = config_from_admin_base_url(base.trim()) {
-            return config;
-        }
+    if let Ok(base) = std::env::var(ADMIN_BASE_ENV)
+        && let Some(config) = config_from_admin_base_url(base.trim())
+    {
+        return config;
     }
 
     AdminEndpointConfig {

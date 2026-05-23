@@ -786,7 +786,7 @@ fn resolve_cli_path_from_sources(
         }
     }
 
-    for candidate in cli_candidates_from_current_exe(&current) {
+    for candidate in cli_candidates_from_current_exe(current) {
         if candidate.is_file() {
             return Ok(candidate);
         }
@@ -825,10 +825,10 @@ fn cli_candidates_from_current_exe(current: &Path) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(dir) = current.parent() {
         candidates.push(dir.join(cli_executable_name()));
-        if dir.file_name().is_some_and(|name| name == "deps") {
-            if let Some(parent) = dir.parent() {
-                candidates.push(parent.join(cli_executable_name()));
-            }
+        if dir.file_name().is_some_and(|name| name == "deps")
+            && let Some(parent) = dir.parent()
+        {
+            candidates.push(parent.join(cli_executable_name()));
         }
     }
     candidates
