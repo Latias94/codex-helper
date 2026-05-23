@@ -77,6 +77,7 @@ pub(super) struct AttemptResponseParams<'a> {
     pub(super) last_err: &'a mut Option<(StatusCode, String)>,
     pub(super) cooldown_backoff: CooldownBackoff,
     pub(super) is_user_turn: bool,
+    pub(super) is_remote_compaction_v1_request: bool,
     pub(super) is_codex_service: bool,
 }
 
@@ -285,6 +286,7 @@ pub(super) async fn handle_attempt_response(
         last_err,
         cooldown_backoff,
         is_user_turn,
+        is_remote_compaction_v1_request,
         is_codex_service,
     } = params;
 
@@ -346,10 +348,11 @@ pub(super) async fn handle_attempt_response(
         upstream_retryable && upstream_attempt + 1 < upstream_opt.max_attempts;
     let provider_retryable = should_retry_status(provider_opt, status_code)
         || should_retry_class(provider_opt, cls.as_deref());
-    let provider_failover = !response_status.is_success()
+    let provider_penalty = !response_status.is_success()
         && !never_retry
         && !can_retry_same_upstream
         && provider_retryable;
+    let provider_failover = provider_penalty && !is_remote_compaction_v1_request;
     let should_probe_codex_usage =
         status_code == StatusCode::TOO_MANY_REQUESTS.as_u16() && is_user_turn && is_codex_service;
     let cooldown_reason = format!("status_{status_code}");
@@ -364,8 +367,8 @@ pub(super) async fn handle_attempt_response(
             model_note,
             upstream_headers_ms,
             duration_ms,
-            cooldown_secs: provider_failover.then_some(plan.transport_cooldown_secs),
-            cooldown_reason: provider_failover.then_some(cooldown_reason.as_str()),
+            cooldown_secs: provider_penalty.then_some(plan.transport_cooldown_secs),
+            cooldown_reason: provider_penalty.then_some(cooldown_reason.as_str()),
         },
     );
 
@@ -501,7 +504,7 @@ pub(super) async fn handle_attempt_response(
         return AttemptResponseOutcome::RetrySameUpstream;
     }
 
-    if provider_retryable {
+    if provider_penalty {
         if !class_is_health_neutral(cls.as_deref()) {
             let penalty_reason = format!("status_{status_code}");
             penalize_attempt_target(
@@ -529,10 +532,44 @@ pub(super) async fn handle_attempt_response(
         }
         *last_err = Some((response_status, response_text));
 
-        if avoid_set.insert(target.attempt_avoid_index()) {
-            *avoided_total = avoided_total.saturating_add(1);
+        if provider_failover {
+            if avoid_set.insert(target.attempt_avoid_index()) {
+                *avoided_total = avoided_total.saturating_add(1);
+            }
+            return AttemptResponseOutcome::TryNextUpstream;
         }
-        return AttemptResponseOutcome::TryNextUpstream;
+
+        let retry = retry_info_for_observed_attempts(upstream_chain, route_attempts);
+        return AttemptResponseOutcome::Return(
+            finish_attempt_forward_response(
+                proxy,
+                method,
+                path,
+                target,
+                request_id,
+                response_status,
+                duration_ms,
+                started_at_ms,
+                upstream_headers_ms,
+                provider_id,
+                session_id,
+                session_identity_source,
+                cwd,
+                effective_effort,
+                base_service_tier,
+                observed_service_tier,
+                codex_bridge.clone(),
+                None,
+                Some(route_decision_from_model_note(
+                    route_attempts,
+                    route_attempt_index,
+                )),
+                retry,
+                response_headers_filtered,
+                response_body,
+            )
+            .await,
+        );
     }
 
     let retry = retry_info_for_observed_attempts(upstream_chain, route_attempts);

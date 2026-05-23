@@ -24,6 +24,22 @@ impl RouteUnavailableReport {
     pub(super) fn failure_status_message(&self) -> (StatusCode, String) {
         (StatusCode::BAD_GATEWAY, self.message.clone())
     }
+
+    pub(super) fn short_cooldown_wait_secs(&self, max_secs: u64) -> Option<u64> {
+        let wait_secs = self
+            .route_attempts
+            .iter()
+            .filter(|attempt| attempt.decision == "route_unavailable")
+            .filter(|attempt| {
+                attempt
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.split(',').any(|part| part == "cooldown"))
+            })
+            .filter_map(|attempt| attempt.cooldown_secs)
+            .min()?;
+        (wait_secs <= max_secs).then_some(wait_secs.max(1))
+    }
 }
 
 pub(super) fn route_unavailable_report(

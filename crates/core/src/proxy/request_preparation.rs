@@ -26,6 +26,7 @@ pub(super) struct RequestFlavor {
     pub client_content_type: Option<String>,
     pub is_stream: bool,
     pub is_user_turn: bool,
+    pub is_remote_compaction_v1_request: bool,
     pub is_codex_service: bool,
     pub codex_client_patch_mode: CodexPatchMode,
     pub codex_bridge_log: Option<CodexBridgeLog>,
@@ -348,6 +349,7 @@ pub(super) fn detect_request_flavor(
         client_content_type,
         is_stream,
         is_user_turn,
+        is_remote_compaction_v1_request,
         is_codex_service,
         codex_client_patch_mode,
         codex_bridge_log,
@@ -589,6 +591,7 @@ mod tests {
         );
         assert!(flavor.is_stream);
         assert!(flavor.is_user_turn);
+        assert!(!flavor.is_remote_compaction_v1_request);
         assert!(flavor.is_codex_service);
     }
 
@@ -605,6 +608,7 @@ mod tests {
         );
 
         assert!(!flavor.is_user_turn);
+        assert!(flavor.is_remote_compaction_v1_request);
         let bridge = flavor.codex_bridge_log.expect("bridge log");
         assert_eq!(bridge.patch_mode, "official-imagegen-bridge");
         assert!(bridge.remote_compaction_v1_request);
@@ -623,6 +627,7 @@ mod tests {
             CodexPatchMode::OfficialRelayBridge,
         );
 
+        assert!(flavor.is_remote_compaction_v1_request);
         assert!(
             flavor
                 .codex_bridge_log

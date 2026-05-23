@@ -421,6 +421,7 @@ pub(super) async fn execute_selected_upstream(
                 last_err,
                 cooldown_backoff,
                 is_user_turn: request_flavor.is_user_turn,
+                is_remote_compaction_v1_request: request_flavor.is_remote_compaction_v1_request,
                 is_codex_service: request_flavor.is_codex_service,
             })
             .await

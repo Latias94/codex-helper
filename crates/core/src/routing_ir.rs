@@ -643,6 +643,71 @@ impl<'a> RoutePlanExecutor<'a> {
         }
     }
 
+    pub fn select_affinity_candidate_with_runtime_state(
+        &self,
+        state: &mut RoutePlanAttemptState,
+        runtime: &RoutePlanRuntimeState,
+        request_model: Option<&str>,
+    ) -> RoutePlanAttemptSelection<'_> {
+        let total_upstreams = self.template.candidates.len();
+        let mut skipped = Vec::new();
+
+        loop {
+            if self.candidates_exhausted(state) {
+                return RoutePlanAttemptSelection {
+                    selected: None,
+                    skipped,
+                    avoided_candidate_indices: state.route_avoid_candidate_indices(self.template),
+                    avoided_total: state.avoided_total(),
+                    total_upstreams,
+                };
+            }
+
+            let route_candidates = self
+                .template
+                .candidates
+                .iter()
+                .filter(|candidate| !state.avoids_candidate(self.template, candidate))
+                .collect::<Vec<_>>();
+            let Some(candidate) = affinity_candidate(self.template, runtime, &route_candidates)
+            else {
+                return RoutePlanAttemptSelection {
+                    selected: None,
+                    skipped,
+                    avoided_candidate_indices: state.route_avoid_candidate_indices(self.template),
+                    avoided_total: state.avoided_total(),
+                    total_upstreams,
+                };
+            };
+            if let Some(requested_model) = request_model
+                && !candidate_supports_model(candidate, requested_model)
+            {
+                state.avoid_candidate(self.template, candidate);
+                let avoided_candidate_indices = state.route_avoid_candidate_indices(self.template);
+                skipped.push(SkippedRouteCandidate {
+                    candidate,
+                    provider_endpoint: candidate_provider_endpoint_key(self.template, candidate),
+                    reason: RoutePlanSkipReason::UnsupportedModel {
+                        requested_model: requested_model.to_string(),
+                    },
+                    avoided_candidate_indices,
+                    avoided_total: state.avoided_total(),
+                    total_upstreams,
+                });
+                continue;
+            }
+
+            let avoided_candidate_indices = state.route_avoid_candidate_indices(self.template);
+            return RoutePlanAttemptSelection {
+                selected: Some(self.selected_route_candidate_for_candidate(candidate)),
+                skipped,
+                avoided_candidate_indices,
+                avoided_total: state.avoided_total(),
+                total_upstreams,
+            };
+        }
+    }
+
     pub fn select_supported_station_candidate_with_runtime_state(
         &self,
         state: &mut RoutePlanAttemptState,
@@ -4021,6 +4086,99 @@ mod tests {
             selected.provider_endpoint,
             endpoint_key("codex", "monthly", "default")
         );
+    }
+
+    #[test]
+    fn route_plan_executor_affinity_selection_ignores_preferred_group_primary() {
+        let mut routing =
+            RoutingConfigV4::ordered_failover(vec!["monthly".to_string(), "chili".to_string()]);
+        routing.affinity_policy = RoutingAffinityPolicyV5::PreferredGroup;
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([
+                (
+                    "monthly".to_string(),
+                    tagged_provider("https://monthly.example/v1", "billing", "monthly"),
+                ),
+                (
+                    "chili".to_string(),
+                    tagged_provider("https://chili.example/v1", "billing", "paygo"),
+                ),
+            ]),
+            routing: Some(routing),
+            ..ServiceViewV4::default()
+        };
+        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let executor = RoutePlanExecutor::new(&template);
+        let mut runtime = RoutePlanRuntimeState::default();
+        runtime.set_affinity_provider_endpoint(Some(endpoint_key("codex", "chili", "default")));
+
+        let normal = executor.select_supported_candidate_with_runtime_state(
+            &mut RoutePlanAttemptState::default(),
+            &runtime,
+            None,
+        );
+        let normal_selected = normal.selected.expect("normal primary selected");
+        assert_eq!(normal_selected.candidate.provider_id, "monthly");
+
+        let affinity = executor.select_affinity_candidate_with_runtime_state(
+            &mut RoutePlanAttemptState::default(),
+            &runtime,
+            None,
+        );
+        let affinity_selected = affinity.selected.expect("affinity candidate selected");
+        assert_eq!(affinity_selected.candidate.provider_id, "chili");
+        assert_eq!(
+            affinity_selected.provider_endpoint,
+            endpoint_key("codex", "chili", "default")
+        );
+    }
+
+    #[test]
+    fn route_plan_executor_affinity_selection_stops_when_affinity_is_unavailable() {
+        let mut routing =
+            RoutingConfigV4::ordered_failover(vec!["monthly".to_string(), "chili".to_string()]);
+        routing.affinity_policy = RoutingAffinityPolicyV5::PreferredGroup;
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([
+                (
+                    "monthly".to_string(),
+                    tagged_provider("https://monthly.example/v1", "billing", "monthly"),
+                ),
+                (
+                    "chili".to_string(),
+                    tagged_provider("https://chili.example/v1", "billing", "paygo"),
+                ),
+            ]),
+            routing: Some(routing),
+            ..ServiceViewV4::default()
+        };
+        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let executor = RoutePlanExecutor::new(&template);
+        let mut runtime = RoutePlanRuntimeState::default();
+        runtime.set_affinity_provider_endpoint(Some(endpoint_key("codex", "chili", "default")));
+        runtime.set_provider_endpoint(
+            endpoint_key("codex", "chili", "default"),
+            RoutePlanUpstreamRuntimeState {
+                cooldown_active: true,
+                cooldown_remaining_secs: Some(5),
+                ..RoutePlanUpstreamRuntimeState::default()
+            },
+        );
+
+        let normal = executor.select_supported_candidate_with_runtime_state(
+            &mut RoutePlanAttemptState::default(),
+            &runtime,
+            None,
+        );
+        let normal_selected = normal.selected.expect("normal primary selected");
+        assert_eq!(normal_selected.candidate.provider_id, "monthly");
+
+        let affinity = executor.select_affinity_candidate_with_runtime_state(
+            &mut RoutePlanAttemptState::default(),
+            &runtime,
+            None,
+        );
+        assert!(affinity.selected.is_none());
     }
 
     #[test]

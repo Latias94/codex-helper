@@ -39,6 +39,8 @@ use super::route_attempts::{UnsupportedModelSkipParams, record_unsupported_model
 use super::route_executor_runtime::route_plan_runtime_state_from_lbs_with_overrides;
 use super::route_unavailability::route_unavailable_report;
 
+const COMPACT_ROUTE_UNAVAILABLE_WAIT_MAX_SECS: u64 = 10;
+
 pub(super) struct ExecuteProviderChainParams<'a> {
     pub(super) proxy: &'a ProxyService,
     pub(super) route_selection: &'a RequestRouteSelection,
@@ -112,6 +114,28 @@ pub(super) fn apply_concurrency_snapshots_to_runtime(
         state.concurrency_limit = Some(snapshot.limit);
         runtime.set_provider_endpoint(provider_endpoint, state);
     }
+}
+
+async fn refresh_route_graph_runtime_for_request(
+    proxy: &ProxyService,
+    template: &crate::routing_ir::RoutePlanTemplate,
+    route_graph_key: &str,
+    session_id: Option<&str>,
+) -> RoutePlanRuntimeState {
+    let mut runtime = proxy
+        .state
+        .route_plan_runtime_state_for_provider_endpoints(proxy.service_name)
+        .await;
+    apply_concurrency_snapshots_to_runtime(proxy, template, &mut runtime);
+    apply_session_route_affinity_to_runtime(
+        proxy,
+        session_id,
+        template,
+        route_graph_key,
+        &mut runtime,
+    )
+    .await;
+    runtime
 }
 
 pub(super) fn try_acquire_candidate_concurrency_permit(
@@ -228,17 +252,11 @@ pub(super) async fn execute_provider_chain_with_route_executor(
             let executor = RoutePlanExecutor::new(template);
             let route_graph_key = template.route_graph_key();
             let total_upstreams = template.candidates.len();
-            let mut runtime = proxy
-                .state
-                .route_plan_runtime_state_for_provider_endpoints(proxy.service_name)
-                .await;
-            apply_concurrency_snapshots_to_runtime(proxy, template, &mut runtime);
-            apply_session_route_affinity_to_runtime(
+            let mut runtime = refresh_route_graph_runtime_for_request(
                 proxy,
-                session_id,
                 template,
                 route_graph_key.as_str(),
-                &mut runtime,
+                session_id,
             )
             .await;
             let mut route_state = RoutePlanAttemptState::default();
@@ -285,7 +303,7 @@ pub(super) async fn execute_provider_chain_with_route_executor(
                     total_upstreams,
                     cooldown_backoff,
                     executor: &executor,
-                    runtime: &runtime,
+                    runtime: &mut runtime,
                     route_state: &mut route_state,
                     global_attempt: &mut global_attempt,
                     last_err: &mut last_err,
@@ -508,7 +526,7 @@ struct ExecuteRouteGraphExecutorParams<'a, 'route> {
     total_upstreams: usize,
     cooldown_backoff: CooldownBackoff,
     executor: &'a RoutePlanExecutor<'route>,
-    runtime: &'a RoutePlanRuntimeState,
+    runtime: &'a mut RoutePlanRuntimeState,
     route_state: &'a mut RoutePlanAttemptState,
     global_attempt: &'a mut u32,
     last_err: &'a mut Option<(StatusCode, String)>,
@@ -564,12 +582,23 @@ async fn execute_route_graph_candidates_with_route_executor(
         route_attempts,
     } = params;
 
+    let mut compact_route_unavailable_waited = false;
     loop {
-        let selection = executor.select_supported_candidate_with_runtime_state(
-            route_state,
-            runtime,
-            request_model,
-        );
+        let selection = if request_flavor.is_remote_compaction_v1_request
+            && runtime.affinity_provider_endpoint().is_some()
+        {
+            executor.select_affinity_candidate_with_runtime_state(
+                route_state,
+                &*runtime,
+                request_model,
+            )
+        } else {
+            executor.select_supported_candidate_with_runtime_state(
+                route_state,
+                &*runtime,
+                request_model,
+            )
+        };
         record_executor_unsupported_model_skips(
             proxy.service_name,
             upstream_chain,
@@ -586,10 +615,34 @@ async fn execute_route_graph_candidates_with_route_executor(
                 proxy.service_name,
                 request_id,
                 executor,
-                runtime,
+                &*runtime,
                 route_state,
                 request_model,
             ) {
+                if request_flavor.is_remote_compaction_v1_request
+                    && !compact_route_unavailable_waited
+                    && let Some(route_graph_key) = route_graph_key
+                    && let Some(wait_secs) =
+                        report.short_cooldown_wait_secs(COMPACT_ROUTE_UNAVAILABLE_WAIT_MAX_SECS)
+                {
+                    compact_route_unavailable_waited = true;
+                    log_retry_trace(serde_json::json!({
+                        "event": "compact_route_unavailable_wait",
+                        "service": proxy.service_name,
+                        "request_id": request_id,
+                        "wait_secs": wait_secs,
+                        "reason": "short_cooldown",
+                    }));
+                    tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+                    *runtime = refresh_route_graph_runtime_for_request(
+                        proxy,
+                        executor.template(),
+                        route_graph_key,
+                        session_id,
+                    )
+                    .await;
+                    continue;
+                }
                 enqueue_usage_probes_for_provider_endpoints(
                     proxy,
                     report.provider_endpoints_to_probe.iter(),
@@ -604,7 +657,7 @@ async fn execute_route_graph_candidates_with_route_executor(
             proxy.service_name,
             request_id,
             executor,
-            runtime,
+            &*runtime,
             route_state,
             request_model,
             &selected,
