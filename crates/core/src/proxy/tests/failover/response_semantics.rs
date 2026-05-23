@@ -778,6 +778,80 @@ async fn proxy_forwards_responses_compact_to_upstream_v1_compact_path() {
 }
 
 #[tokio::test]
+async fn proxy_normalizes_responses_compact_body_before_forwarding() {
+    let upstream_body = Arc::new(std::sync::Mutex::new(None::<serde_json::Value>));
+
+    let seen_body = upstream_body.clone();
+    let upstream = axum::Router::new().route(
+        "/v1/responses/compact",
+        post(move |body: axum::body::Bytes| {
+            let seen_body = seen_body.clone();
+            async move {
+                *seen_body.lock().expect("body lock") =
+                    Some(serde_json::from_slice(&body).expect("compact body should parse"));
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "output": [
+                            { "type": "compaction", "encrypted_content": "summary" }
+                        ]
+                    })),
+                )
+            }
+        }),
+    );
+    let upstream = spawn_test_upstream(upstream);
+
+    let cfg = make_proxy_config(
+        vec![upstream.upstream_config()],
+        retry_config(1, "502", Vec::new(), RetryStrategy::Failover),
+    );
+    let proxy = spawn_test_proxy(cfg);
+
+    let client = reqwest::Client::new();
+    let resp = post_compact_json(
+        &client,
+        &proxy,
+        r#"{
+            "model":"gpt-5.5",
+            "input":[{"type":"message","role":"user","content":"compact me"}],
+            "instructions":"compact-test",
+            "tools":[{"type":"function","name":"shell"}],
+            "parallel_tool_calls":true,
+            "reasoning":{"effort":"high"},
+            "text":{"verbosity":"low"},
+            "previous_response_id":"resp_123",
+            "store":true,
+            "stream":true,
+            "service_tier":"flex",
+            "prompt_cache_key":"cache_123",
+            "include":["reasoning.encrypted_content"]
+        }"#,
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = upstream_body
+        .lock()
+        .expect("body lock")
+        .clone()
+        .expect("upstream compact body");
+
+    assert_eq!(body["model"].as_str(), Some("gpt-5.5"));
+    assert_eq!(body["instructions"].as_str(), Some("compact-test"));
+    assert!(body.get("tools").is_some());
+    assert_eq!(body["parallel_tool_calls"].as_bool(), Some(true));
+    assert_eq!(body["reasoning"]["effort"].as_str(), Some("high"));
+    assert_eq!(body["text"]["verbosity"].as_str(), Some("low"));
+    assert_eq!(body["previous_response_id"].as_str(), Some("resp_123"));
+    assert!(body.get("store").is_none());
+    assert!(body.get("stream").is_none());
+    assert!(body.get("service_tier").is_none());
+    assert!(body.get("prompt_cache_key").is_none());
+    assert!(body.get("include").is_none());
+}
+
+#[tokio::test]
 async fn proxy_request_content_encoding_normalizes_zstd_body_before_forwarding() {
     let upstream_hits = Arc::new(AtomicUsize::new(0));
     let upstream_content_encoding = Arc::new(std::sync::Mutex::new(None::<String>));

@@ -152,6 +152,7 @@ pub(super) async fn prepare_proxy_request(
         uri: &uri,
         client_headers: &client_headers,
         raw_body: &raw_body,
+        compact_request: uri.path().ends_with("/responses/compact"),
         session_identity_hint,
         client_name,
         client_addr,

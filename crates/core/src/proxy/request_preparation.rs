@@ -16,6 +16,7 @@ use super::request_body::{
     apply_model_override_value, apply_reasoning_effort_override_value,
     apply_service_tier_override_value, extract_model_from_value,
     extract_reasoning_effort_from_value, extract_service_tier_from_value,
+    normalize_codex_compact_request_value,
 };
 use super::request_routing::RequestRouteSelection;
 use super::retry::{RetryPlan, retry_plan};
@@ -95,6 +96,7 @@ pub(super) struct CommonRequestPreparationParams<'a> {
     pub(super) uri: &'a Uri,
     pub(super) client_headers: &'a HeaderMap,
     pub(super) raw_body: &'a Bytes,
+    pub(super) compact_request: bool,
     pub(super) session_identity_hint: Option<ClientSessionIdentity>,
     pub(super) client_name: Option<String>,
     pub(super) client_addr: Option<String>,
@@ -144,6 +146,7 @@ pub(super) async fn prepare_common_request(
         uri,
         client_headers,
         raw_body,
+        compact_request,
         session_identity_hint,
         client_name,
         client_addr,
@@ -198,6 +201,7 @@ pub(super) async fn prepare_common_request(
 
     let prepared_request = prepare_request_body(
         raw_body,
+        compact_request,
         override_effort.as_deref(),
         binding_effort,
         override_model.as_deref(),
@@ -456,6 +460,7 @@ pub(super) async fn resolve_and_touch_session_state(
 
 pub(super) fn prepare_request_body(
     raw_body: &Bytes,
+    compact_request: bool,
     override_effort: Option<&str>,
     binding_effort: Option<&str>,
     override_model: Option<&str>,
@@ -483,6 +488,9 @@ pub(super) fn prepare_request_body(
         }
         if let Some(service_tier) = override_service_tier.or(binding_service_tier) {
             apply_service_tier_override_value(value, service_tier);
+        }
+        if compact_request {
+            normalize_codex_compact_request_value(value);
         }
     }
 
@@ -599,6 +607,7 @@ mod tests {
 
         let prepared = prepare_request_body(
             &raw_body,
+            false,
             Some("high"),
             Some("medium"),
             Some("gpt-5.4"),
@@ -742,6 +751,7 @@ mod tests {
             uri: &uri,
             client_headers: &headers,
             raw_body: &raw_body,
+            compact_request: false,
             session_identity_hint:
                 super::super::client_identity::extract_session_identity_with_body_fallback(
                     &headers,

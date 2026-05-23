@@ -316,6 +316,7 @@ async fn prepare_responses_websocket(
         uri: &uri,
         client_headers: &client_headers,
         raw_body: &raw_body,
+        compact_request: false,
         session_identity_hint: extract_session_identity_with_body_fallback(
             &client_headers,
             raw_body.as_ref(),

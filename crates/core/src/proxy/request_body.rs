@@ -83,6 +83,30 @@ pub(super) fn apply_service_tier_override_value(value: &mut serde_json::Value, s
     );
 }
 
+pub(super) fn normalize_codex_compact_request_value(value: &mut serde_json::Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+
+    let mut normalized = serde_json::Map::new();
+    for field in [
+        "model",
+        "input",
+        "instructions",
+        "tools",
+        "parallel_tool_calls",
+        "reasoning",
+        "text",
+        "previous_response_id",
+    ] {
+        if let Some(value) = object.get(field) {
+            normalized.insert(field.to_string(), value.clone());
+        }
+    }
+
+    *object = normalized;
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct CodexSessionCompletion {
     pub completed: bool,
@@ -273,7 +297,8 @@ mod tests {
         apply_service_tier_override_value, complete_codex_session_fields, extract_model_from_value,
         extract_reasoning_effort_from_value, extract_service_tier_from_response_body,
         extract_service_tier_from_value, is_stale_previous_response_error,
-        remove_previous_response_id_from_body, scan_service_tier_from_sse_bytes_incremental,
+        normalize_codex_compact_request_value, remove_previous_response_id_from_body,
+        scan_service_tier_from_sse_bytes_incremental,
     };
     use axum::body::Bytes;
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -351,6 +376,39 @@ mod tests {
         assert_eq!(completion.session_id.as_deref(), Some("meta-1"));
         let value: serde_json::Value = serde_json::from_slice(body.as_ref()).expect("json body");
         assert_eq!(value["prompt_cache_key"].as_str(), Some("meta-1"));
+    }
+
+    #[test]
+    fn normalizes_codex_compact_body_to_supported_payload_fields() {
+        let mut value: serde_json::Value = serde_json::json!({
+            "model": "gpt-5.5",
+            "input": [{"type": "message", "role": "user", "content": "compact me"}],
+            "instructions": "compact-test",
+            "tools": [{"type": "function", "name": "shell"}],
+            "parallel_tool_calls": true,
+            "reasoning": {"effort": "high"},
+            "text": {"verbosity": "low"},
+            "previous_response_id": "resp_123",
+            "store": true,
+            "stream": true,
+            "prompt_cache_key": "cache_123",
+            "service_tier": "flex",
+            "include": ["reasoning.encrypted_content"]
+        });
+
+        normalize_codex_compact_request_value(&mut value);
+
+        assert_eq!(value["model"].as_str(), Some("gpt-5.5"));
+        assert!(value.get("tools").is_some());
+        assert_eq!(value["parallel_tool_calls"].as_bool(), Some(true));
+        assert_eq!(value["reasoning"]["effort"].as_str(), Some("high"));
+        assert_eq!(value["text"]["verbosity"].as_str(), Some("low"));
+        assert_eq!(value["previous_response_id"].as_str(), Some("resp_123"));
+        assert!(value.get("store").is_none());
+        assert!(value.get("stream").is_none());
+        assert!(value.get("prompt_cache_key").is_none());
+        assert!(value.get("service_tier").is_none());
+        assert!(value.get("include").is_none());
     }
 
     #[test]
