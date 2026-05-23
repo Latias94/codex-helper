@@ -2075,6 +2075,98 @@ async fn proxy_response_fixer_decodes_gzip_codex_response_json() {
 }
 
 #[tokio::test]
+async fn proxy_response_fixer_converts_compact_sse_terminal_response_to_json() {
+    let upstream = axum::Router::new().route(
+        "/v1/responses/compact",
+        post(|| async move {
+            let mut response = Response::new(Body::from(concat!(
+                "event: response.output_item.done\n",
+                "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ignored\"}]}}\n\n",
+                "event: response.completed\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_compact\",\"output\":[{\"type\":\"compaction\",\"encrypted_content\":\"summary\"}]}}\n\n",
+                "data: [DONE]\n\n",
+            )));
+            *response.status_mut() = StatusCode::OK;
+            response.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("text/event-stream"),
+            );
+            response
+        }),
+    );
+    let upstream = spawn_test_upstream(upstream);
+    let retry = retry_config(1, "502", Vec::new(), RetryStrategy::Failover);
+    let cfg = make_proxy_config(vec![upstream.upstream_config()], retry);
+    let proxy = spawn_test_proxy(cfg);
+
+    let client = reqwest::Client::new();
+    let resp = post_compact_json(
+        &client,
+        &proxy,
+        r#"{"model":"gpt-5","input":[{"role":"user","content":"compact me"}]}"#,
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    let body = resp.bytes().await.expect("body");
+    let value: serde_json::Value = serde_json::from_slice(body.as_ref()).expect("json response");
+    assert_eq!(value["id"].as_str(), Some("resp_compact"));
+    assert_eq!(value["output"][0]["type"].as_str(), Some("compaction"));
+    assert_eq!(
+        value["output"][0]["encrypted_content"].as_str(),
+        Some("summary")
+    );
+}
+
+#[tokio::test]
+async fn proxy_response_fixer_converts_compact_sse_failed_terminal_to_bad_gateway_json() {
+    let upstream = axum::Router::new().route(
+        "/v1/responses/compact",
+        post(|| async move {
+            let mut response = Response::new(Body::from(concat!(
+                "event: response.failed\n",
+                "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"compact rejected\"}}}\n\n",
+            )));
+            *response.status_mut() = StatusCode::OK;
+            response.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("text/event-stream"),
+            );
+            response
+        }),
+    );
+    let upstream = spawn_test_upstream(upstream);
+    let retry = retry_config(1, "", Vec::new(), RetryStrategy::Failover);
+    let cfg = make_proxy_config(vec![upstream.upstream_config()], retry);
+    let proxy = spawn_test_proxy(cfg);
+
+    let client = reqwest::Client::new();
+    let resp = post_compact_json(
+        &client,
+        &proxy,
+        r#"{"model":"gpt-5","input":[{"role":"user","content":"compact me"}]}"#,
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        resp.headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    let body = resp.bytes().await.expect("body");
+    let value: serde_json::Value = serde_json::from_slice(body.as_ref()).expect("json response");
+    assert_eq!(value["error"]["message"].as_str(), Some("compact rejected"));
+}
+
+#[tokio::test]
 async fn proxy_service_tier_log_preserves_requested_effective_and_actual_values() {
     let _env_lock = env_lock().await;
     let temp_dir = make_temp_test_dir();

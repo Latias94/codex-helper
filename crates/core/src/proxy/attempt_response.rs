@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use axum::body::{Body, Bytes};
-use axum::http::{HeaderMap, Method, Response, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Method, Response, StatusCode, header};
 
 use crate::lb::{CooldownBackoff, LoadBalancer};
 use crate::logging::{CodexBridgeLog, RouteAttemptLog, ServiceTierLog, make_body_preview};
@@ -24,7 +24,10 @@ use super::request_body::extract_service_tier_from_response_body;
 use super::response_finalization::{
     FinalizeForwardResponseParams, finish_and_build_forward_response,
 };
-use super::response_fixer::maybe_repair_codex_response_body;
+use super::response_fixer::{
+    CodexCompactSseRepair, maybe_repair_codex_compact_sse_response,
+    maybe_repair_codex_response_body,
+};
 use super::retry::{
     RetryLayerOptions, RetryPlan, retry_info_for_observed_attempts, retry_sleep,
     should_never_retry, should_retry_class, should_retry_status,
@@ -285,13 +288,43 @@ pub(super) async fn handle_attempt_response(
         is_codex_service,
     } = params;
 
-    let response_body = maybe_repair_codex_response_body(
+    let mut response_headers_filtered = response_headers_filtered;
+    let mut response_status = status;
+    let mut response_body = maybe_repair_codex_response_body(
         proxy.service_name,
         path,
         &response_headers,
         response_body,
     );
-    let response_body = if status.is_success() {
+    let compact_sse_repair = maybe_repair_codex_compact_sse_response(
+        proxy.service_name,
+        path,
+        &response_headers,
+        &response_body,
+    );
+    let compact_protocol_failure = compact_sse_repair
+        .as_ref()
+        .is_some_and(|repair| matches!(repair, CodexCompactSseRepair::UpstreamFailureJson(_)));
+    if let Some(repair) = compact_sse_repair {
+        match repair {
+            CodexCompactSseRepair::FinalJson(body) => {
+                response_body = body;
+                response_headers_filtered.insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                );
+            }
+            CodexCompactSseRepair::UpstreamFailureJson(body) => {
+                response_body = body;
+                response_headers_filtered.insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                );
+                response_status = StatusCode::BAD_GATEWAY;
+            }
+        }
+    }
+    let response_body = if response_status.is_success() {
         maybe_decode_models_response_body(
             proxy.service_name,
             path,
@@ -301,10 +334,11 @@ pub(super) async fn handle_attempt_response(
     } else {
         response_body
     };
-    let status_code = status.as_u16();
+    let status_code = response_status.as_u16();
     let (cls, _hint, _cf_ray) =
         classify_upstream_response(status_code, &response_headers, response_body.as_ref());
-    let never_retry = should_never_retry(plan, status_code, cls.as_deref());
+    let never_retry =
+        should_never_retry(plan, status_code, cls.as_deref()) || compact_protocol_failure;
     let observed_service_tier = extract_service_tier_from_response_body(response_body.as_ref());
     let upstream_retryable = should_retry_status(upstream_opt, status_code)
         || should_retry_class(upstream_opt, cls.as_deref());
@@ -312,8 +346,10 @@ pub(super) async fn handle_attempt_response(
         upstream_retryable && upstream_attempt + 1 < upstream_opt.max_attempts;
     let provider_retryable = should_retry_status(provider_opt, status_code)
         || should_retry_class(provider_opt, cls.as_deref());
-    let provider_failover =
-        !status.is_success() && !never_retry && !can_retry_same_upstream && provider_retryable;
+    let provider_failover = !response_status.is_success()
+        && !never_retry
+        && !can_retry_same_upstream
+        && provider_retryable;
     let should_probe_codex_usage =
         status_code == StatusCode::TOO_MANY_REQUESTS.as_u16() && is_user_turn && is_codex_service;
     let cooldown_reason = format!("status_{status_code}");
@@ -333,7 +369,7 @@ pub(super) async fn handle_attempt_response(
         },
     );
 
-    if status.is_success() {
+    if response_status.is_success() {
         record_attempt_success(
             proxy.state.as_ref(),
             proxy.service_name,
@@ -373,7 +409,7 @@ pub(super) async fn handle_attempt_response(
                 path,
                 target,
                 request_id,
-                status,
+                response_status,
                 duration_ms,
                 started_at_ms,
                 upstream_headers_ms,
@@ -435,7 +471,7 @@ pub(super) async fn handle_attempt_response(
                 path,
                 target,
                 request_id,
-                status,
+                response_status,
                 duration_ms,
                 started_at_ms,
                 upstream_headers_ms,
@@ -491,7 +527,7 @@ pub(super) async fn handle_attempt_response(
             )
             .await;
         }
-        *last_err = Some((status, response_text));
+        *last_err = Some((response_status, response_text));
 
         if avoid_set.insert(target.attempt_avoid_index()) {
             *avoided_total = avoided_total.saturating_add(1);
@@ -520,7 +556,7 @@ pub(super) async fn handle_attempt_response(
             path,
             target,
             request_id,
-            status,
+            response_status,
             duration_ms,
             started_at_ms,
             upstream_headers_ms,
