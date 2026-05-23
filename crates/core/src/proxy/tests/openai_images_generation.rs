@@ -68,6 +68,67 @@ async fn openai_images_generation_endpoint_translates_request_and_response() {
 }
 
 #[tokio::test]
+async fn openai_images_generation_endpoint_strips_client_user_agent_before_upstream() {
+    let seen_user_agent = Arc::new(Mutex::new(None::<Option<String>>));
+    let seen_user_agent_for_route = seen_user_agent.clone();
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        post(move |headers: HeaderMap| {
+            let seen_user_agent_for_route = seen_user_agent_for_route.clone();
+            async move {
+                let seen = headers
+                    .get(axum::http::header::USER_AGENT)
+                    .and_then(|value| value.to_str().ok())
+                    .map(|value| value.to_string());
+                *seen_user_agent_for_route.lock().expect("lock") = Some(seen);
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "id": "resp_image",
+                        "created": 42,
+                        "output": [
+                            {
+                                "type": "image_generation_call",
+                                "id": "ig_1",
+                                "status": "completed",
+                                "result": "Zm9v",
+                                "revised_prompt": "A neon rain cat"
+                            }
+                        ]
+                    })),
+                )
+            }
+        }),
+    );
+    let upstream = spawn_test_upstream(upstream);
+    let cfg = make_proxy_config(vec![upstream.upstream_config()], RetryConfig::default());
+    let proxy = spawn_test_proxy(cfg);
+    let client = Client::new();
+
+    let response = client
+        .post(proxy.images_generations_url())
+        .header("content-type", "application/json")
+        .header(axum::http::header::USER_AGENT, "Python-urllib/3.13")
+        .body(r#"{"model":"gpt-image-2","prompt":"cat"}"#)
+        .send()
+        .await
+        .expect("send images request");
+
+    let response = response.error_for_status().expect("images status");
+    response
+        .json::<serde_json::Value>()
+        .await
+        .expect("images json");
+
+    let seen = seen_user_agent
+        .lock()
+        .expect("lock")
+        .clone()
+        .expect("upstream user-agent");
+    assert_ne!(seen.as_deref(), Some("Python-urllib/3.13"));
+}
+
+#[tokio::test]
 async fn openai_images_generation_endpoint_rejects_n_greater_than_one_before_upstream() {
     let hit_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let hit_count_for_route = hit_count.clone();

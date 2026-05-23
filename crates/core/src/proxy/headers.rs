@@ -17,6 +17,13 @@ fn is_hop_by_hop_header(name_lower: &str) -> bool {
     )
 }
 
+fn is_request_header_to_strip(name_lower: &str) -> bool {
+    name_lower == "host"
+        || name_lower == "content-length"
+        || name_lower == "user-agent"
+        || is_hop_by_hop_header(name_lower)
+}
+
 fn hop_by_hop_connection_tokens(headers: &HeaderMap) -> Vec<String> {
     let mut out = Vec::new();
     for value in headers.get_all("connection").iter() {
@@ -39,10 +46,7 @@ pub(super) fn filter_request_headers(src: &HeaderMap) -> HeaderMap {
     let mut out = HeaderMap::new();
     for (name, value) in src.iter() {
         let name_lower = name.as_str().to_ascii_lowercase();
-        if name_lower == "host"
-            || name_lower == "content-length"
-            || is_hop_by_hop_header(&name_lower)
-        {
+        if is_request_header_to_strip(&name_lower) {
             continue;
         }
         if extra.iter().any(|token| token == &name_lower) {
@@ -113,6 +117,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("host", HeaderValue::from_static("example.com"));
         headers.insert("content-length", HeaderValue::from_static("123"));
+        headers.insert("user-agent", HeaderValue::from_static("Python-urllib/3.13"));
         headers.insert(
             "connection",
             HeaderValue::from_static("keep-alive, x-remove-me"),
@@ -126,6 +131,7 @@ mod tests {
 
         assert!(!filtered.contains_key("host"));
         assert!(!filtered.contains_key("content-length"));
+        assert!(!filtered.contains_key("user-agent"));
         assert!(!filtered.contains_key("connection"));
         assert!(!filtered.contains_key("keep-alive"));
         assert!(!filtered.contains_key("x-remove-me"));
