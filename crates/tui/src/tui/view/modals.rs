@@ -288,8 +288,8 @@ pub(super) fn render_session_transcript_modal(f: &mut Frame<'_>, p: Palette, ui:
         }
     }
 
-    let inner_h = area.height.saturating_sub(2) as usize;
-    let max_scroll = lines.len().saturating_sub(inner_h).min(u16::MAX as usize) as u16;
+    let inner = block.inner(area);
+    let max_scroll = transcript_max_scroll(&lines, inner.width, inner.height);
     ui.session_transcript_scroll = ui.session_transcript_scroll.min(max_scroll);
 
     let content = Paragraph::new(Text::from(lines))
@@ -298,6 +298,33 @@ pub(super) fn render_session_transcript_modal(f: &mut Frame<'_>, p: Palette, ui:
         .scroll((ui.session_transcript_scroll, 0))
         .wrap(Wrap { trim: false });
     f.render_widget(content, area);
+}
+
+fn transcript_max_scroll(lines: &[Line<'_>], text_width: u16, viewport_height: u16) -> u16 {
+    if text_width == 0 || viewport_height == 0 {
+        return 0;
+    }
+    wrapped_visual_line_count(lines, usize::from(text_width))
+        .saturating_sub(usize::from(viewport_height))
+        .min(usize::from(u16::MAX)) as u16
+}
+
+fn wrapped_visual_line_count(lines: &[Line<'_>], text_width: usize) -> usize {
+    if text_width == 0 {
+        return 0;
+    }
+
+    lines
+        .iter()
+        .map(|line| {
+            let width = line.width();
+            if width == 0 {
+                1
+            } else {
+                width.div_ceil(text_width)
+            }
+        })
+        .sum()
 }
 
 pub(super) fn render_startup_alert_modal(f: &mut Frame<'_>, p: Palette, ui: &UiState) {
