@@ -12,6 +12,13 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 #[tokio::test]
 async fn proxy_decodes_unlabeled_gzip_models_response_before_forwarding() {
+    let _env_guard = env_lock().await;
+    let temp_dir = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
+    }
+
     static GZIPPED_MODELS_JSON: &[u8] = &[
         0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xab, 0x56, 0x4a, 0x49, 0x2c,
         0x49, 0x54, 0xb2, 0x8a, 0xae, 0x56, 0xca, 0x4c, 0x51, 0xb2, 0x52, 0x4a, 0x2f, 0x28, 0xd1,
@@ -67,7 +74,7 @@ async fn proxy_decodes_unlabeled_gzip_models_response_before_forwarding() {
             .contains_key(axum::http::header::CONTENT_ENCODING)
     );
     let body = resp.bytes().await.expect("body");
-    assert_codex_models_response(body.as_ref(), "gpt-5.5", true);
+    assert_openai_models_response(body.as_ref(), "gpt-5.5");
     assert_eq!(
         upstream_accept_encoding.lock().expect("lock").as_deref(),
         Some("identity")
@@ -76,6 +83,13 @@ async fn proxy_decodes_unlabeled_gzip_models_response_before_forwarding() {
 
 #[tokio::test]
 async fn proxy_decodes_brotli_models_response_before_forwarding() {
+    let _env_guard = env_lock().await;
+    let temp_dir = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
+    }
+
     static BROTLI_MODELS_JSON: &[u8] = &[
         0x8b, 0x15, 0x80, 0x7b, 0x22, 0x64, 0x61, 0x74, 0x61, 0x22, 0x3a, 0x5b, 0x7b, 0x22, 0x69,
         0x64, 0x22, 0x3a, 0x22, 0x67, 0x70, 0x74, 0x2d, 0x35, 0x2e, 0x35, 0x22, 0x2c, 0x22, 0x6f,
@@ -134,7 +148,7 @@ async fn proxy_decodes_brotli_models_response_before_forwarding() {
             .contains_key(axum::http::header::CONTENT_ENCODING)
     );
     let body = resp.bytes().await.expect("body");
-    assert_codex_models_response(body.as_ref(), "gpt-5.5", true);
+    assert_openai_models_response(body.as_ref(), "gpt-5.5");
     assert_eq!(
         upstream_accept_encoding.lock().expect("lock").as_deref(),
         Some("identity")
@@ -142,7 +156,60 @@ async fn proxy_decodes_brotli_models_response_before_forwarding() {
 }
 
 #[tokio::test]
-async fn proxy_translates_openai_models_list_to_codex_models_response() {
+async fn proxy_does_not_translate_openai_models_list_by_default() {
+    let _env_guard = env_lock().await;
+    let temp_dir = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
+    }
+
+    let upstream = axum::Router::new().route(
+        "/v1/models",
+        get(|| async move {
+            Json(serde_json::json!({
+                "object": "list",
+                "data": [
+                    { "id": "codex-auto-review", "object": "model" },
+                    { "id": "gpt-5.5", "object": "model", "display_name": "GPT-5.5" },
+                    { "id": "gpt-image-1", "object": "model" }
+                ]
+            }))
+        }),
+    );
+    let upstream = spawn_test_upstream(upstream);
+    let retry = retry_config(1, "502", Vec::new(), RetryStrategy::Failover);
+    let cfg = make_proxy_config(vec![upstream.upstream_config()], retry);
+
+    let proxy = spawn_test_proxy(cfg);
+
+    let resp = Client::new()
+        .get(proxy.url("/models"))
+        .send()
+        .await
+        .expect("send");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.bytes().await.expect("body");
+    assert_openai_models_response(body.as_ref(), "gpt-5.5");
+}
+
+#[tokio::test]
+async fn proxy_translates_openai_models_list_to_codex_models_response_when_enabled() {
+    let _env_guard = env_lock().await;
+    let temp_dir = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
+    }
+    write_text_file(
+        &temp_dir.join("config.toml"),
+        r#"
+[codex.client_patch]
+translate_models = true
+"#,
+    );
+
     let upstream = axum::Router::new().route(
         "/v1/models",
         get(|| async move {
@@ -206,6 +273,16 @@ fn assert_codex_models_response(
             .any(|modality| modality.as_str() == Some("image")),
         expect_image_modality
     );
+    value
+}
+
+fn assert_openai_models_response(body: &[u8], expected_slug: &str) -> serde_json::Value {
+    let value: serde_json::Value = serde_json::from_slice(body).expect("json body");
+    assert!(value.get("models").is_none());
+    let data = value["data"].as_array().expect("data array");
+    data.iter()
+        .find(|model| model["id"].as_str() == Some(expected_slug))
+        .expect("expected model");
     value
 }
 
