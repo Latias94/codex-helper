@@ -38,7 +38,7 @@ impl RouteUnavailableReport {
             })
             .filter_map(|attempt| attempt.cooldown_secs)
             .min()?;
-        (wait_secs <= max_secs).then_some(wait_secs.max(1))
+        (wait_secs <= max_secs).then_some(wait_secs.saturating_add(1).max(1))
     }
 }
 
