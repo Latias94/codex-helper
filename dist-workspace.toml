@@ -22,7 +22,10 @@ install-updater = false
 
 [dist.dependencies.apt]
 "pkg-config" = "*"
+"libssl-dev" = "*"
 "libpango1.0-dev" = "*"
 "libgtk-3-dev" = "*"
+"libwebkit2gtk-4.1-dev" = "*"
+"librsvg2-dev" = "*"
 "libayatana-appindicator3-dev" = "*"
 "libxdo-dev" = "*"
