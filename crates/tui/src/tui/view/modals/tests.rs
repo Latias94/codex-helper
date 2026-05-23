@@ -1,11 +1,12 @@
 use super::{
     current_page_help_lines, help_quit_line_for_tests, help_text_for_tests,
-    profile_declared_summary, profile_resolved_summary,
+    profile_declared_summary, profile_resolved_summary, transcript_max_scroll,
 };
 use crate::dashboard_core::ControlProfileOption;
 use crate::tui::Language;
 use crate::tui::model::Palette;
 use crate::tui::types::Page;
+use ratatui::prelude::Line;
 
 fn make_profile(name: &str) -> ControlProfileOption {
     ControlProfileOption {
@@ -205,4 +206,16 @@ fn help_quit_line_reflects_attached_observer_lifecycle() {
         "{attached}"
     );
     assert!(integrated.contains("request shutdown"), "{integrated}");
+}
+
+#[test]
+fn transcript_scroll_limit_counts_wrapped_visual_lines() {
+    let lines = vec![Line::from("12345678901234567890")];
+
+    let max_scroll = transcript_max_scroll(&lines, 5, 3);
+
+    assert_eq!(
+        max_scroll, 1,
+        "a single logical line that wraps to four terminal rows must still be scrollable"
+    );
 }
