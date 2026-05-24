@@ -26,11 +26,10 @@ use super::attempt_failures::{TerminalUpstreamFailureParams, apply_terminal_upst
 use super::attempt_health::record_attempt_success;
 use super::attempt_request::inject_auth_headers;
 use super::attempt_target::AttemptTarget;
-use super::client_identity::extract_session_identity_with_body_fallback;
 use super::concurrency_limits::ConcurrencyPermit;
 use super::headers::filter_request_headers;
 use super::passive_health::{record_passive_upstream_failure, record_passive_upstream_success};
-use super::request_body::complete_codex_session_fields;
+use super::request_body::codex_session_identity_and_completed_body;
 use super::request_failures::{FailedProxyRequestParams, finish_failed_proxy_request};
 use super::request_preparation::{
     CommonRequestPreparationError, CommonRequestPreparationParams, load_request_config_context,
@@ -310,9 +309,8 @@ async fn prepare_responses_websocket(
             "first WebSocket data message must be response.create".to_string(),
         ));
     }
-    let session_identity_hint =
-        extract_session_identity_with_body_fallback(&client_headers, raw_body.as_ref());
-    let raw_body = complete_codex_session_fields(&mut client_headers, &raw_body).0;
+    let (session_identity_hint, raw_body) =
+        codex_session_identity_and_completed_body(&mut client_headers, &raw_body);
 
     let prepared = match prepare_common_request(CommonRequestPreparationParams {
         proxy,

@@ -13,7 +13,9 @@ use super::client_identity::{
     extract_session_identity_with_body_fallback,
 };
 use super::headers::header_map_to_entries;
-use super::request_body::{codex_compact_request_requires_affinity, complete_codex_session_fields};
+use super::request_body::{
+    codex_compact_request_requires_affinity, codex_session_identity_and_completed_body,
+};
 use super::request_encoding::normalize_request_content_encoding;
 use super::request_failures::{
     NoRoutableStationParams, log_client_body_read_error, log_no_routable_station,
@@ -135,15 +137,16 @@ pub(super) async fn prepare_proxy_request(
             ));
         }
     };
-    let session_identity_hint =
-        extract_session_identity_with_body_fallback(&client_headers, raw_body.as_ref());
-    let raw_body = if request_flavor.is_codex_service
+    let (session_identity_hint, raw_body) = if request_flavor.is_codex_service
         && method == Method::POST
         && codex_path_is_responses_or_compact(uri.path())
     {
-        complete_codex_session_fields(&mut client_headers, &raw_body).0
+        codex_session_identity_and_completed_body(&mut client_headers, &raw_body)
     } else {
-        raw_body
+        (
+            extract_session_identity_with_body_fallback(&client_headers, raw_body.as_ref()),
+            raw_body,
+        )
     };
     if request_flavor.is_remote_compaction_v1_request {
         request_flavor.remote_compaction_requires_affinity =

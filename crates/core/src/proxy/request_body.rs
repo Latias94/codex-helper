@@ -184,6 +184,22 @@ pub(super) fn complete_codex_session_fields(
     )
 }
 
+pub(super) fn codex_session_identity_and_completed_body(
+    headers: &mut HeaderMap,
+    raw_body: &Bytes,
+) -> (
+    Option<crate::proxy::client_identity::ClientSessionIdentity>,
+    Bytes,
+) {
+    let session_identity_hint =
+        crate::proxy::client_identity::extract_session_identity_with_body_fallback(
+            headers,
+            raw_body.as_ref(),
+        );
+    let completed_body = complete_codex_session_fields(headers, raw_body).0;
+    (session_identity_hint, completed_body)
+}
+
 fn insert_missing_session_header(headers: &mut HeaderMap, name: &'static str, value: &str) -> bool {
     if has_header_value(headers, name) {
         return false;
