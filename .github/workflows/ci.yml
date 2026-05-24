@@ -43,11 +43,15 @@ jobs:
         with:
           cache-bin: false
 
-      - name: Prepare Linux Tauri sidecar
-        if: runner.os == 'Linux'
-        run: |
-          cargo build --release --locked --bin codex-helper
-          install -Dm755 target/release/codex-helper apps/desktop/src-tauri/sidecars/codex-helper-x86_64-unknown-linux-gnu
+      - name: Setup Node.js
+        if: runner.os != 'Windows'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Prepare Tauri sidecar
+        if: runner.os != 'Windows'
+        run: node apps/desktop/scripts/prepare-sidecar.mjs
 
       - name: Format
         run: cargo fmt --all -- --check
@@ -78,12 +82,6 @@ jobs:
         with:
           cache-bin: false
 
-      - name: Prepare Linux Tauri sidecar
-        if: runner.os == 'Linux'
-        run: |
-          cargo build --release --locked --bin codex-helper
-          install -Dm755 target/release/codex-helper apps/desktop/src-tauri/sidecars/codex-helper-x86_64-unknown-linux-gnu
-
       - name: Install Linux GUI dependencies
         if: runner.os == 'Linux'
         run: |
@@ -97,6 +95,16 @@ jobs:
             librsvg2-dev \
             libayatana-appindicator3-dev \
             libxdo-dev
+
+      - name: Setup Node.js
+        if: runner.os != 'Windows'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Prepare Tauri sidecar
+        if: runner.os != 'Windows'
+        run: node apps/desktop/scripts/prepare-sidecar.mjs
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
