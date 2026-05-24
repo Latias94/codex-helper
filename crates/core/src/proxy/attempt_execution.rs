@@ -315,6 +315,8 @@ pub(super) async fn execute_selected_upstream(
                         is_user_turn: request_flavor.is_user_turn,
                         is_codex_service: request_flavor.is_codex_service,
                         transport_cooldown_secs: plan.transport_cooldown_secs,
+                        cloudflare_challenge_cooldown_secs: plan.cloudflare_challenge_cooldown_secs,
+                        cloudflare_timeout_cooldown_secs: plan.cloudflare_timeout_cooldown_secs,
                         cooldown_backoff,
                         method,
                         path: uri.path(),

@@ -189,6 +189,19 @@ pub(super) fn should_never_retry(plan: &RetryPlan, status_code: u16, class: Opti
     !class_is_explicitly_retryable
 }
 
+pub(super) fn response_penalty_cooldown_secs(
+    cloudflare_challenge_cooldown_secs: u64,
+    cloudflare_timeout_cooldown_secs: u64,
+    transport_cooldown_secs: u64,
+    class: Option<&str>,
+) -> u64 {
+    match class {
+        Some("cloudflare_challenge") => cloudflare_challenge_cooldown_secs,
+        Some("cloudflare_timeout") => cloudflare_timeout_cooldown_secs,
+        _ => transport_cooldown_secs,
+    }
+}
+
 fn retry_after_ms(headers: &HeaderMap, opt: &RetryLayerOptions) -> Option<u64> {
     let raw = headers.get("retry-after")?.to_str().ok()?.trim();
     if raw.is_empty() {

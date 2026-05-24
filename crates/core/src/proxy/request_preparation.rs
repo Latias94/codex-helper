@@ -14,8 +14,8 @@ use super::ProxyService;
 use super::client_identity::ClientSessionIdentity;
 use super::request_body::{
     apply_model_override_value, apply_reasoning_effort_override_value,
-    apply_service_tier_override_value, extract_model_from_value,
-    extract_reasoning_effort_from_value, extract_service_tier_from_value,
+    apply_service_tier_override_value, codex_compact_request_requires_affinity,
+    extract_model_from_value, extract_reasoning_effort_from_value, extract_service_tier_from_value,
     normalize_codex_compact_request_value,
 };
 use super::request_routing::RequestRouteSelection;
@@ -31,6 +31,17 @@ pub(super) struct RequestFlavor {
     pub is_codex_service: bool,
     pub codex_client_patch_mode: CodexPatchMode,
     pub codex_bridge_log: Option<CodexBridgeLog>,
+}
+
+impl RequestFlavor {
+    pub(super) fn with_remote_compaction_affinity_from_body(self, raw_body: &[u8]) -> Self {
+        let remote_compaction_requires_affinity = self.is_remote_compaction_v1_request
+            && codex_compact_request_requires_affinity(raw_body);
+        Self {
+            remote_compaction_requires_affinity,
+            ..self
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -648,6 +659,24 @@ mod tests {
                 .expect("bridge log")
                 .remote_compaction_v1_request
         );
+    }
+
+    #[test]
+    fn request_flavor_finalizes_remote_compaction_affinity_from_body() {
+        let headers = HeaderMap::new();
+
+        let flavor = detect_request_flavor(
+            "codex",
+            &Method::POST,
+            &headers,
+            "/v1/responses/compact",
+            CodexPatchMode::Default,
+        )
+        .with_remote_compaction_affinity_from_body(
+            br#"{"input":[{"type":"reasoning","encrypted_content":"state"}]}"#,
+        );
+
+        assert!(flavor.remote_compaction_requires_affinity);
     }
 
     #[test]

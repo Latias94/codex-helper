@@ -29,8 +29,8 @@ use super::response_fixer::{
     maybe_repair_codex_response_body,
 };
 use super::retry::{
-    RetryLayerOptions, RetryPlan, retry_info_for_observed_attempts, retry_sleep,
-    should_never_retry, should_retry_class, should_retry_status,
+    RetryLayerOptions, RetryPlan, response_penalty_cooldown_secs, retry_info_for_observed_attempts,
+    retry_sleep, should_never_retry, should_retry_class, should_retry_status,
 };
 use super::route_affinity::record_session_route_affinity_success;
 use super::route_attempts::{StatusRouteAttemptParams, record_status_route_attempt};
@@ -111,6 +111,8 @@ pub(super) struct StreamingAttemptResponseParams<'a> {
     pub(super) is_user_turn: bool,
     pub(super) is_codex_service: bool,
     pub(super) transport_cooldown_secs: u64,
+    pub(super) cloudflare_challenge_cooldown_secs: u64,
+    pub(super) cloudflare_timeout_cooldown_secs: u64,
     pub(super) cooldown_backoff: CooldownBackoff,
     pub(super) method: &'a Method,
     pub(super) path: &'a str,
@@ -130,6 +132,71 @@ fn summarize_upstream_error_body(response_body: &Bytes, response_headers: &Heade
         }
     } else {
         format!("binary response body ({} bytes)", preview.original_len)
+    }
+}
+
+struct AttemptResponseDecision {
+    never_retry: bool,
+    retry_same_upstream: bool,
+    provider_penalty: bool,
+    provider_failover: bool,
+    penalty_cooldown_secs: u64,
+    should_probe_codex_usage: bool,
+}
+
+struct AttemptResponseDecisionParams<'a> {
+    plan: &'a RetryPlan,
+    upstream_opt: &'a RetryLayerOptions,
+    provider_opt: &'a RetryLayerOptions,
+    status: StatusCode,
+    class: Option<&'a str>,
+    upstream_attempt: u32,
+    allow_provider_failover: bool,
+    compact_protocol_failure: bool,
+    is_user_turn: bool,
+    is_codex_service: bool,
+}
+
+fn decide_attempt_response(params: AttemptResponseDecisionParams<'_>) -> AttemptResponseDecision {
+    let AttemptResponseDecisionParams {
+        plan,
+        upstream_opt,
+        provider_opt,
+        status,
+        class,
+        upstream_attempt,
+        allow_provider_failover,
+        compact_protocol_failure,
+        is_user_turn,
+        is_codex_service,
+    } = params;
+    let status_code = status.as_u16();
+    let never_retry = should_never_retry(plan, status_code, class) || compact_protocol_failure;
+    let upstream_retryable =
+        should_retry_status(upstream_opt, status_code) || should_retry_class(upstream_opt, class);
+    let retry_same_upstream =
+        upstream_retryable && upstream_attempt + 1 < upstream_opt.max_attempts;
+    let provider_retryable =
+        should_retry_status(provider_opt, status_code) || should_retry_class(provider_opt, class);
+    let provider_penalty =
+        !status.is_success() && !never_retry && !retry_same_upstream && provider_retryable;
+    let provider_failover = provider_penalty && allow_provider_failover;
+    let penalty_cooldown_secs = response_penalty_cooldown_secs(
+        plan.cloudflare_challenge_cooldown_secs,
+        plan.cloudflare_timeout_cooldown_secs,
+        plan.transport_cooldown_secs,
+        class,
+    );
+    let should_probe_codex_usage =
+        status_code == StatusCode::TOO_MANY_REQUESTS.as_u16() && is_user_turn && is_codex_service;
+
+    AttemptResponseDecision {
+        never_retry,
+        retry_same_upstream,
+        provider_penalty,
+        provider_failover,
+        penalty_cooldown_secs,
+        should_probe_codex_usage,
     }
 }
 
@@ -166,6 +233,8 @@ pub(super) async fn handle_streaming_attempt_success(
         is_user_turn,
         is_codex_service,
         transport_cooldown_secs,
+        cloudflare_challenge_cooldown_secs,
+        cloudflare_timeout_cooldown_secs,
         cooldown_backoff,
         method,
         path,
@@ -239,6 +308,8 @@ pub(super) async fn handle_streaming_attempt_success(
             is_user_turn,
             is_codex_service,
             transport_cooldown_secs,
+            cloudflare_challenge_cooldown_secs,
+            cloudflare_timeout_cooldown_secs,
             cooldown_backoff,
             method: method.clone(),
             path: path.to_string(),
@@ -339,22 +410,20 @@ pub(super) async fn handle_attempt_response(
     let status_code = response_status.as_u16();
     let (cls, _hint, _cf_ray) =
         classify_upstream_response(status_code, &response_headers, response_body.as_ref());
-    let never_retry =
-        should_never_retry(plan, status_code, cls.as_deref()) || compact_protocol_failure;
     let observed_service_tier = extract_service_tier_from_response_body(response_body.as_ref());
-    let upstream_retryable = should_retry_status(upstream_opt, status_code)
-        || should_retry_class(upstream_opt, cls.as_deref());
-    let can_retry_same_upstream =
-        upstream_retryable && upstream_attempt + 1 < upstream_opt.max_attempts;
-    let provider_retryable = should_retry_status(provider_opt, status_code)
-        || should_retry_class(provider_opt, cls.as_deref());
-    let provider_penalty = !response_status.is_success()
-        && !never_retry
-        && !can_retry_same_upstream
-        && provider_retryable;
-    let provider_failover = provider_penalty && allow_provider_failover;
-    let should_probe_codex_usage =
-        status_code == StatusCode::TOO_MANY_REQUESTS.as_u16() && is_user_turn && is_codex_service;
+    let decision = decide_attempt_response(AttemptResponseDecisionParams {
+        plan,
+        upstream_opt,
+        provider_opt,
+        status: response_status,
+        class: cls.as_deref(),
+        upstream_attempt,
+        allow_provider_failover,
+        compact_protocol_failure,
+        is_user_turn,
+        is_codex_service,
+    });
+    let penalty_cooldown_secs = decision.penalty_cooldown_secs;
     let cooldown_reason = format!("status_{status_code}");
     record_status_route_attempt(
         upstream_chain,
@@ -367,8 +436,10 @@ pub(super) async fn handle_attempt_response(
             model_note,
             upstream_headers_ms,
             duration_ms,
-            cooldown_secs: provider_penalty.then_some(plan.transport_cooldown_secs),
-            cooldown_reason: provider_penalty.then_some(cooldown_reason.as_str()),
+            cooldown_secs: decision.provider_penalty.then_some(penalty_cooldown_secs),
+            cooldown_reason: decision
+                .provider_penalty
+                .then_some(cooldown_reason.as_str()),
         },
     );
 
@@ -438,10 +509,10 @@ pub(super) async fn handle_attempt_response(
     }
 
     let response_text = summarize_upstream_error_body(&response_body, &response_headers);
-    if should_probe_codex_usage {
+    if decision.should_probe_codex_usage {
         enqueue_usage_probe_for_target(proxy, target).await;
     }
-    if never_retry {
+    if decision.never_retry {
         if !class_is_health_neutral(cls.as_deref()) {
             record_attempt_failure(
                 proxy.state.as_ref(),
@@ -499,12 +570,12 @@ pub(super) async fn handle_attempt_response(
         );
     }
 
-    if can_retry_same_upstream {
+    if decision.retry_same_upstream {
         retry_sleep(upstream_opt, upstream_attempt, &response_headers).await;
         return AttemptResponseOutcome::RetrySameUpstream;
     }
 
-    if provider_penalty {
+    if decision.provider_penalty {
         if !class_is_health_neutral(cls.as_deref()) {
             let penalty_reason = format!("status_{status_code}");
             penalize_attempt_target(
@@ -512,7 +583,7 @@ pub(super) async fn handle_attempt_response(
                 proxy.service_name,
                 legacy_lb,
                 target,
-                plan.transport_cooldown_secs,
+                penalty_cooldown_secs,
                 penalty_reason.as_str(),
                 cooldown_backoff,
             )
@@ -532,7 +603,7 @@ pub(super) async fn handle_attempt_response(
         }
         *last_err = Some((response_status, response_text));
 
-        if provider_failover {
+        if decision.provider_failover {
             if avoid_set.insert(target.attempt_avoid_index()) {
                 *avoided_total = avoided_total.saturating_add(1);
             }

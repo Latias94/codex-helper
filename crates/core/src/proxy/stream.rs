@@ -26,6 +26,7 @@ use super::headers::header_map_to_entries;
 use super::http_debug::{HttpDebugBase, warn_http_debug};
 use super::passive_health::{record_passive_upstream_failure, record_passive_upstream_success};
 use super::request_body::scan_service_tier_from_sse_bytes_incremental;
+use super::retry::response_penalty_cooldown_secs;
 
 fn stream_buffer_max_bytes() -> usize {
     static MAX: OnceLock<usize> = OnceLock::new();
@@ -56,7 +57,109 @@ struct StreamUsageState {
 enum StreamHealthUpdate {
     Success,
     Failure,
-    FailureAndPenalty { error_reason: &'static str },
+    FailureAndPenalty {
+        error_reason: &'static str,
+        cooldown_secs: u64,
+    },
+}
+
+struct StreamPassiveFailure {
+    status_code: Option<u16>,
+    error_class: Option<String>,
+    error: Option<String>,
+}
+
+struct StreamTerminalDecision {
+    health_update: Option<StreamHealthUpdate>,
+    passive_failure: Option<StreamPassiveFailure>,
+}
+
+struct StreamTerminalDecisionParams<'a> {
+    status_code: u16,
+    stream_error: bool,
+    resp_headers: &'a HeaderMap,
+    resp_content_type: Option<&'a str>,
+    response_body: &'a [u8],
+    transport_cooldown_secs: u64,
+    cloudflare_challenge_cooldown_secs: u64,
+    cloudflare_timeout_cooldown_secs: u64,
+}
+
+fn stream_cloudflare_penalty_reason(class: Option<&str>) -> &'static str {
+    match class {
+        Some("cloudflare_challenge") => "cloudflare_challenge",
+        Some("cloudflare_timeout") => "cloudflare_timeout",
+        _ => "upstream_response_error",
+    }
+}
+
+fn decide_stream_terminal_response(
+    params: StreamTerminalDecisionParams<'_>,
+) -> StreamTerminalDecision {
+    let StreamTerminalDecisionParams {
+        status_code,
+        stream_error,
+        resp_headers,
+        resp_content_type,
+        response_body,
+        transport_cooldown_secs,
+        cloudflare_challenge_cooldown_secs,
+        cloudflare_timeout_cooldown_secs,
+    } = params;
+
+    if stream_error {
+        return StreamTerminalDecision {
+            health_update: Some(StreamHealthUpdate::FailureAndPenalty {
+                error_reason: "upstream_stream_error",
+                cooldown_secs: transport_cooldown_secs,
+            }),
+            passive_failure: Some(StreamPassiveFailure {
+                status_code: Some(status_code),
+                error_class: Some("upstream_stream_error".to_string()),
+                error: summarize_error_body(response_body, resp_content_type),
+            }),
+        };
+    }
+
+    if (200..300).contains(&status_code) {
+        return StreamTerminalDecision {
+            health_update: Some(StreamHealthUpdate::Success),
+            passive_failure: None,
+        };
+    }
+
+    let (cls, _hint, _cf_ray) =
+        classify_upstream_response(status_code, resp_headers, response_body);
+    let error_class = cls.clone();
+    let penalty_cooldown_secs = response_penalty_cooldown_secs(
+        cloudflare_challenge_cooldown_secs,
+        cloudflare_timeout_cooldown_secs,
+        transport_cooldown_secs,
+        cls.as_deref(),
+    );
+    let health_update = if matches!(
+        cls.as_deref(),
+        Some("cloudflare_challenge") | Some("cloudflare_timeout")
+    ) {
+        Some(StreamHealthUpdate::FailureAndPenalty {
+            error_reason: stream_cloudflare_penalty_reason(cls.as_deref()),
+            cooldown_secs: penalty_cooldown_secs,
+        })
+    } else if status_code >= 500 || cls.is_some() {
+        Some(StreamHealthUpdate::Failure)
+    } else {
+        None
+    };
+    let passive_failure = Some(StreamPassiveFailure {
+        status_code: Some(status_code),
+        error_class,
+        error: summarize_error_body(response_body, resp_content_type),
+    });
+
+    StreamTerminalDecision {
+        health_update,
+        passive_failure,
+    }
 }
 
 fn trim_stream_buffer(state: &mut StreamUsageState, max_keep: usize) {
@@ -102,6 +205,8 @@ struct StreamFinalize {
     legacy_lb: Option<LoadBalancer>,
     target: AttemptTarget,
     transport_cooldown_secs: u64,
+    cloudflare_challenge_cooldown_secs: u64,
+    cloudflare_timeout_cooldown_secs: u64,
     cooldown_backoff: crate::lb::CooldownBackoff,
     _concurrency_permit: Option<ConcurrencyPermit>,
 }
@@ -259,46 +364,19 @@ impl Drop for StreamFinalize {
             .resp_headers
             .get("content-type")
             .and_then(|value| value.to_str().ok());
-
-        let health_update = if stream_error {
-            Some(StreamHealthUpdate::FailureAndPenalty {
-                error_reason: "upstream_stream_error",
-            })
-        } else if (200..300).contains(&status_code) {
-            Some(StreamHealthUpdate::Success)
-        } else {
-            let (cls, _hint, _cf_ray) = classify_upstream_response(
-                status_code,
-                &self.resp_headers,
-                response_body.as_slice(),
-            );
-            if status_code >= 500 || cls.is_some() {
-                Some(StreamHealthUpdate::Failure)
-            } else {
-                None
-            }
-        };
-
-        let passive_failure = if stream_error {
-            Some((
-                Some(status_code),
-                Some("upstream_stream_error".to_string()),
-                summarize_error_body(response_body.as_slice(), resp_ct),
-            ))
-        } else if (200..300).contains(&status_code) {
-            None
-        } else {
-            let (cls, _hint, _cf_ray) = classify_upstream_response(
-                status_code,
-                &self.resp_headers,
-                response_body.as_slice(),
-            );
-            Some((
-                Some(status_code),
-                cls,
-                summarize_error_body(response_body.as_slice(), resp_ct),
-            ))
-        };
+        let transport_cooldown_secs = self.transport_cooldown_secs;
+        let terminal_decision = decide_stream_terminal_response(StreamTerminalDecisionParams {
+            status_code,
+            stream_error,
+            resp_headers: &self.resp_headers,
+            resp_content_type: resp_ct,
+            response_body: response_body.as_slice(),
+            transport_cooldown_secs,
+            cloudflare_challenge_cooldown_secs: self.cloudflare_challenge_cooldown_secs,
+            cloudflare_timeout_cooldown_secs: self.cloudflare_timeout_cooldown_secs,
+        });
+        let health_update = terminal_decision.health_update;
+        let passive_failure = terminal_decision.passive_failure;
 
         let state_for_passive = state.clone();
         let service_name_for_passive = self.service_name.clone();
@@ -306,7 +384,6 @@ impl Drop for StreamFinalize {
         let base_url_for_passive = self.upstream_base_url.clone();
         let legacy_lb_for_health = self.legacy_lb.clone();
         let target_for_health = self.target.clone();
-        let transport_cooldown_secs = self.transport_cooldown_secs;
         let cooldown_backoff = self.cooldown_backoff;
 
         tokio::spawn(async move {
@@ -333,7 +410,10 @@ impl Drop for StreamFinalize {
                     )
                     .await;
                 }
-                Some(StreamHealthUpdate::FailureAndPenalty { error_reason }) => {
+                Some(StreamHealthUpdate::FailureAndPenalty {
+                    error_reason,
+                    cooldown_secs,
+                }) => {
                     record_attempt_failure(
                         state.as_ref(),
                         service_name_for_passive.as_str(),
@@ -348,7 +428,7 @@ impl Drop for StreamFinalize {
                         service_name_for_passive.as_str(),
                         legacy_lb_for_health.as_ref(),
                         &target_for_health,
-                        transport_cooldown_secs,
+                        cooldown_secs,
                         error_reason,
                         cooldown_backoff,
                     )
@@ -357,15 +437,15 @@ impl Drop for StreamFinalize {
                 None => {}
             }
             if let Some(station_name_for_passive) = station_name_for_passive.as_deref() {
-                if let Some((status_code, error_class, error)) = passive_failure {
+                if let Some(passive_failure) = passive_failure {
                     record_passive_upstream_failure(
                         &state_for_passive,
                         &service_name_for_passive,
                         station_name_for_passive,
                         &base_url_for_passive,
-                        status_code,
-                        error_class.as_deref(),
-                        error,
+                        passive_failure.status_code,
+                        passive_failure.error_class.as_deref(),
+                        passive_failure.error,
                     )
                     .await;
                 } else {
@@ -425,6 +505,8 @@ pub(super) async fn build_sse_success_response(
         is_user_turn,
         is_codex_service,
         transport_cooldown_secs,
+        cloudflare_challenge_cooldown_secs,
+        cloudflare_timeout_cooldown_secs,
         cooldown_backoff,
         method,
         path,
@@ -520,6 +602,8 @@ pub(super) async fn build_sse_success_response(
         legacy_lb: legacy_lb.clone(),
         target: target.clone(),
         transport_cooldown_secs,
+        cloudflare_challenge_cooldown_secs,
+        cloudflare_timeout_cooldown_secs,
         cooldown_backoff,
         _concurrency_permit: concurrency_permit,
     };
@@ -712,6 +796,8 @@ pub(super) struct SseSuccessMeta {
     pub(super) is_user_turn: bool,
     pub(super) is_codex_service: bool,
     pub(super) transport_cooldown_secs: u64,
+    pub(super) cloudflare_challenge_cooldown_secs: u64,
+    pub(super) cloudflare_timeout_cooldown_secs: u64,
     pub(super) cooldown_backoff: crate::lb::CooldownBackoff,
     pub(super) method: Method,
     pub(super) path: String,
