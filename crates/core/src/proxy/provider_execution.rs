@@ -583,8 +583,11 @@ async fn execute_route_graph_candidates_with_route_executor(
     } = params;
 
     let mut compact_route_unavailable_waited = false;
-    let allow_compact_provider_failover = !request_flavor.is_remote_compaction_v1_request
-        || executor.template().affinity_policy != RoutingAffinityPolicyV5::Hard;
+    let compact_requires_strict_affinity = request_flavor.is_remote_compaction_v1_request
+        && (request_flavor.remote_compaction_requires_affinity
+            || executor.template().affinity_policy == RoutingAffinityPolicyV5::Hard);
+    let allow_compact_provider_failover =
+        !request_flavor.is_remote_compaction_v1_request || !compact_requires_strict_affinity;
     loop {
         let selection = if request_flavor.is_remote_compaction_v1_request
             && runtime.affinity_provider_endpoint().is_some()
@@ -594,9 +597,7 @@ async fn execute_route_graph_candidates_with_route_executor(
                 &*runtime,
                 request_model,
             );
-            if affinity_selection.selected.is_some()
-                || executor.template().affinity_policy == RoutingAffinityPolicyV5::Hard
-            {
+            if affinity_selection.selected.is_some() || compact_requires_strict_affinity {
                 affinity_selection
             } else {
                 executor.select_supported_candidate_with_runtime_state(

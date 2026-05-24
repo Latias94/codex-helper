@@ -96,6 +96,8 @@ pub(super) fn normalize_codex_compact_request_value(value: &mut serde_json::Valu
         "tools",
         "parallel_tool_calls",
         "reasoning",
+        "service_tier",
+        "prompt_cache_key",
         "text",
         "previous_response_id",
     ] {
@@ -105,6 +107,29 @@ pub(super) fn normalize_codex_compact_request_value(value: &mut serde_json::Valu
     }
 
     *object = normalized;
+}
+
+pub(super) fn codex_compact_request_requires_affinity(body: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    value_mentions_state_bound_compact_field(&value)
+}
+
+fn value_mentions_state_bound_compact_field(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(object) => object.iter().any(|(key, value)| {
+            let state_bound_field = matches!(
+                key.as_str(),
+                "encrypted_content" | "previous_response_id" | "compaction_summary"
+            ) && !value.is_null();
+            state_bound_field || value_mentions_state_bound_compact_field(value)
+        }),
+        serde_json::Value::Array(items) => {
+            items.iter().any(value_mentions_state_bound_compact_field)
+        }
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -294,7 +319,8 @@ pub(super) fn scan_service_tier_from_sse_bytes_incremental(
 mod tests {
     use super::{
         apply_model_override_value, apply_reasoning_effort_override_value,
-        apply_service_tier_override_value, complete_codex_session_fields, extract_model_from_value,
+        apply_service_tier_override_value, codex_compact_request_requires_affinity,
+        complete_codex_session_fields, extract_model_from_value,
         extract_reasoning_effort_from_value, extract_service_tier_from_response_body,
         extract_service_tier_from_value, is_stale_previous_response_error,
         normalize_codex_compact_request_value, remove_previous_response_id_from_body,
@@ -406,9 +432,22 @@ mod tests {
         assert_eq!(value["previous_response_id"].as_str(), Some("resp_123"));
         assert!(value.get("store").is_none());
         assert!(value.get("stream").is_none());
-        assert!(value.get("prompt_cache_key").is_none());
-        assert!(value.get("service_tier").is_none());
+        assert_eq!(value["prompt_cache_key"].as_str(), Some("cache_123"));
+        assert_eq!(value["service_tier"].as_str(), Some("flex"));
         assert!(value.get("include").is_none());
+    }
+
+    #[test]
+    fn detects_state_bound_codex_compact_body() {
+        assert!(codex_compact_request_requires_affinity(
+            br#"{"model":"gpt-5","input":[{"type":"reasoning","encrypted_content":"state"}]}"#
+        ));
+        assert!(codex_compact_request_requires_affinity(
+            br#"{"model":"gpt-5","previous_response_id":"resp_123","input":"hi"}"#
+        ));
+        assert!(!codex_compact_request_requires_affinity(
+            br#"{"model":"gpt-5","prompt_cache_key":"cache","input":"hi"}"#
+        ));
     }
 
     #[test]

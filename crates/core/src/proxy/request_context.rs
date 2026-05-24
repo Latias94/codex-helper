@@ -13,6 +13,7 @@ use super::client_identity::{
     extract_session_identity_with_body_fallback,
 };
 use super::headers::header_map_to_entries;
+use super::request_body::{codex_compact_request_requires_affinity, complete_codex_session_fields};
 use super::request_encoding::normalize_request_content_encoding;
 use super::request_failures::{
     NoRoutableStationParams, log_client_body_read_error, log_no_routable_station,
@@ -77,7 +78,7 @@ pub(super) async fn prepare_proxy_request(
     let client_name = extract_client_name(&client_headers);
 
     let config = load_request_config_context(proxy).await;
-    let request_flavor = detect_request_flavor(
+    let mut request_flavor = detect_request_flavor(
         proxy.service_name,
         &method,
         &client_headers,
@@ -140,10 +141,14 @@ pub(super) async fn prepare_proxy_request(
         && method == Method::POST
         && codex_path_is_responses_or_compact(uri.path())
     {
-        super::request_body::complete_codex_session_fields(&mut client_headers, &raw_body).0
+        complete_codex_session_fields(&mut client_headers, &raw_body).0
     } else {
         raw_body
     };
+    if request_flavor.is_remote_compaction_v1_request {
+        request_flavor.remote_compaction_requires_affinity =
+            codex_compact_request_requires_affinity(raw_body.as_ref());
+    }
 
     let request_body_previews = crate::logging::should_log_request_body_preview();
     let prepared = match prepare_common_request(CommonRequestPreparationParams {
