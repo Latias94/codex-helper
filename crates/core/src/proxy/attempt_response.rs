@@ -77,7 +77,7 @@ pub(super) struct AttemptResponseParams<'a> {
     pub(super) last_err: &'a mut Option<(StatusCode, String)>,
     pub(super) cooldown_backoff: CooldownBackoff,
     pub(super) is_user_turn: bool,
-    pub(super) is_remote_compaction_v1_request: bool,
+    pub(super) allow_provider_failover: bool,
     pub(super) is_codex_service: bool,
 }
 
@@ -286,7 +286,7 @@ pub(super) async fn handle_attempt_response(
         last_err,
         cooldown_backoff,
         is_user_turn,
-        is_remote_compaction_v1_request,
+        allow_provider_failover,
         is_codex_service,
     } = params;
 
@@ -352,7 +352,7 @@ pub(super) async fn handle_attempt_response(
         && !never_retry
         && !can_retry_same_upstream
         && provider_retryable;
-    let provider_failover = provider_penalty && !is_remote_compaction_v1_request;
+    let provider_failover = provider_penalty && allow_provider_failover;
     let should_probe_codex_usage =
         status_code == StatusCode::TOO_MANY_REQUESTS.as_u16() && is_user_turn && is_codex_service;
     let cooldown_reason = format!("status_{status_code}");

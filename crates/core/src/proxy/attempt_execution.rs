@@ -92,6 +92,7 @@ pub(super) struct ExecuteSelectedUpstreamParams<'a> {
     pub(super) route_graph_key: Option<&'a str>,
     pub(super) upstream_opt: &'a RetryLayerOptions,
     pub(super) provider_opt: &'a RetryLayerOptions,
+    pub(super) allow_provider_failover: bool,
     pub(super) provider_attempt: u32,
     pub(super) total_upstreams: usize,
     pub(super) cooldown_backoff: CooldownBackoff,
@@ -144,6 +145,7 @@ pub(super) async fn execute_selected_upstream(
         route_graph_key,
         upstream_opt,
         provider_opt,
+        allow_provider_failover,
         provider_attempt,
         total_upstreams,
         cooldown_backoff,
@@ -421,7 +423,7 @@ pub(super) async fn execute_selected_upstream(
                 last_err,
                 cooldown_backoff,
                 is_user_turn: request_flavor.is_user_turn,
-                is_remote_compaction_v1_request: request_flavor.is_remote_compaction_v1_request,
+                allow_provider_failover,
                 is_codex_service: request_flavor.is_codex_service,
             })
             .await

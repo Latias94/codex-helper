@@ -583,15 +583,28 @@ async fn execute_route_graph_candidates_with_route_executor(
     } = params;
 
     let mut compact_route_unavailable_waited = false;
+    let allow_compact_provider_failover = !request_flavor.is_remote_compaction_v1_request
+        || executor.template().affinity_policy != RoutingAffinityPolicyV5::Hard;
     loop {
         let selection = if request_flavor.is_remote_compaction_v1_request
             && runtime.affinity_provider_endpoint().is_some()
         {
-            executor.select_affinity_candidate_with_runtime_state(
+            let affinity_selection = executor.select_affinity_candidate_with_runtime_state(
                 route_state,
                 &*runtime,
                 request_model,
-            )
+            );
+            if affinity_selection.selected.is_some()
+                || executor.template().affinity_policy == RoutingAffinityPolicyV5::Hard
+            {
+                affinity_selection
+            } else {
+                executor.select_supported_candidate_with_runtime_state(
+                    route_state,
+                    &*runtime,
+                    request_model,
+                )
+            }
         } else {
             executor.select_supported_candidate_with_runtime_state(
                 route_state,
@@ -726,6 +739,7 @@ async fn execute_route_graph_candidates_with_route_executor(
             route_graph_key,
             upstream_opt: &plan.upstream,
             provider_opt: &plan.route,
+            allow_provider_failover: allow_compact_provider_failover,
             provider_attempt,
             total_upstreams,
             cooldown_backoff,
@@ -881,6 +895,7 @@ async fn execute_station_upstreams_with_route_executor(
             route_graph_key,
             upstream_opt: &plan.upstream,
             provider_opt: &plan.route,
+            allow_provider_failover: true,
             provider_attempt,
             total_upstreams,
             cooldown_backoff,
