@@ -179,6 +179,127 @@ async fn proxy_api_v1_routing_explain_returns_selected_route_and_structured_skip
 }
 
 #[tokio::test]
+async fn proxy_api_v1_routing_explain_uses_legacy_session_affinity() {
+    let _env_lock = env_lock().await;
+    let temp_dir = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
+    }
+
+    let old_url = "http://127.0.0.1:9/v1".to_string();
+    let new_url = "http://127.0.0.1:10/v1".to_string();
+    let cfg = make_proxy_config(
+        vec![
+            UpstreamConfig {
+                base_url: old_url.clone(),
+                auth: UpstreamAuth::default(),
+                tags: HashMap::from([
+                    ("provider_id".to_string(), "old".to_string()),
+                    ("endpoint_id".to_string(), "legacy".to_string()),
+                ]),
+                supported_models: HashMap::from([("gpt-5".to_string(), true)]),
+                model_mapping: HashMap::new(),
+            },
+            UpstreamConfig {
+                base_url: new_url.clone(),
+                auth: UpstreamAuth::default(),
+                tags: HashMap::from([
+                    ("provider_id".to_string(), "new".to_string()),
+                    ("endpoint_id".to_string(), "modern".to_string()),
+                ]),
+                supported_models: HashMap::from([("gpt-5".to_string(), true)]),
+                model_mapping: HashMap::new(),
+            },
+        ],
+        RetryConfig::default(),
+    );
+
+    let proxy = ProxyService::new(
+        Client::new(),
+        Arc::new(cfg.clone()),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let request = crate::routing_ir::RouteRequestContext {
+        model: Some("gpt-5".to_string()),
+        service_tier: None,
+        reasoning_effort: None,
+        path: Some("/v1/chat/completions".to_string()),
+        method: Some("POST".to_string()),
+        headers: Default::default(),
+    };
+    let selection = proxy
+        .lbs_for_request(&cfg, None, &request, Some("sid-route"))
+        .await;
+    let lbs = match selection {
+        crate::proxy::request_routing::RequestRouteSelection::Legacy { lbs } => lbs,
+        crate::proxy::request_routing::RequestRouteSelection::RouteGraph { .. } => {
+            panic!("expected legacy route selection")
+        }
+    };
+    let legacy_template = crate::routing_ir::compile_legacy_route_plan_template(
+        "codex",
+        lbs.iter().map(|lb| lb.service.as_ref()),
+    );
+    let target_candidate = legacy_template
+        .candidates
+        .iter()
+        .find(|candidate| candidate.provider_id == "new")
+        .expect("legacy candidate for new provider");
+    proxy
+        .state
+        .record_session_route_affinity_success(
+            "sid-route",
+            crate::state::SessionRouteAffinityTarget {
+                route_graph_key: legacy_template.route_graph_key().to_string(),
+                session_identity_source: Some(crate::state::SessionIdentitySource::Header),
+                provider_endpoint: crate::runtime_identity::ProviderEndpointKey::new(
+                    "codex", "new", "modern",
+                ),
+                upstream_base_url: new_url.clone(),
+                route_path: target_candidate.route_path.clone(),
+            },
+            Some("test".to_string()),
+            crate::logging::now_ms(),
+        )
+        .await;
+
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let client = reqwest::Client::new();
+
+    let explain = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/routing/explain?model=gpt-5&session=sid-route&path=/v1/chat/completions&method=POST",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("routing explain send")
+        .error_for_status()
+        .expect("routing explain status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("routing explain json");
+
+    assert_eq!(
+        explain["selected_route"]["provider_endpoint_key"].as_str(),
+        Some("codex/new/modern")
+    );
+    assert_eq!(
+        explain["selected_route"]["provider_id"].as_str(),
+        Some("new")
+    );
+    assert_eq!(
+        explain["selected_route"]["endpoint_id"].as_str(),
+        Some("modern")
+    );
+
+    proxy_handle.abort();
+}
+
+#[tokio::test]
 async fn proxy_api_v1_routing_explain_uses_provider_endpoint_runtime_health_for_v4_routes() {
     let _env_lock = env_lock().await;
     let temp_dir = make_temp_test_dir();

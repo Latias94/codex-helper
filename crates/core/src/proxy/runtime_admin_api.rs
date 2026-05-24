@@ -21,7 +21,7 @@ use super::api_responses::{
 use super::control_plane_service::save_runtime_proxy_settings_and_reload;
 use super::provider_execution::apply_concurrency_snapshots_to_runtime;
 use super::request_routing::RequestRouteSelection;
-use super::route_affinity::apply_session_route_affinity_to_runtime;
+use super::route_affinity::apply_session_route_affinity_for_template;
 use super::route_executor_runtime::route_plan_runtime_state_from_lbs_with_overrides;
 use super::routing_plan::{
     PinnedRoutingSelection, build_station_routing_plan, resolve_pinned_station_selection,
@@ -254,12 +254,10 @@ pub(super) async fn routing_explain_for_proxy(
                 .route_plan_runtime_state_for_provider_endpoints(proxy.service_name)
                 .await;
             apply_concurrency_snapshots_to_runtime(proxy, template, &mut runtime);
-            let route_graph_key = template.route_graph_key();
-            apply_session_route_affinity_to_runtime(
+            apply_session_route_affinity_for_template(
                 proxy,
                 session_id.as_deref(),
                 template,
-                route_graph_key.as_str(),
                 &mut runtime,
             )
             .await;
@@ -281,11 +279,18 @@ pub(super) async fn routing_explain_for_proxy(
                 .state
                 .get_upstream_meta_overrides(proxy.service_name)
                 .await;
-            let runtime = route_plan_runtime_state_from_lbs_with_overrides(
+            let mut runtime = route_plan_runtime_state_from_lbs_with_overrides(
                 proxy.service_name,
                 lbs,
                 &upstream_overrides,
             );
+            apply_session_route_affinity_for_template(
+                proxy,
+                session_id.as_deref(),
+                &legacy_template,
+                &mut runtime,
+            )
+            .await;
             Ok(build_routing_explain_response_with_request(
                 proxy.service_name,
                 Some(proxy.config.last_loaded_at_ms()),

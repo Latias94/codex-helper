@@ -34,7 +34,7 @@ use super::provider_orchestration::{
 use super::request_preparation::RequestFlavor;
 use super::request_routing::RequestRouteSelection;
 use super::retry::{RetryPlan, backoff_sleep};
-use super::route_affinity::apply_session_route_affinity_to_runtime;
+use super::route_affinity::apply_session_route_affinity_for_template;
 use super::route_attempts::{UnsupportedModelSkipParams, record_unsupported_model_skip};
 use super::route_executor_runtime::route_plan_runtime_state_from_lbs_with_overrides;
 use super::route_unavailability::route_unavailable_report;
@@ -119,7 +119,6 @@ pub(super) fn apply_concurrency_snapshots_to_runtime(
 async fn refresh_route_graph_runtime_for_request(
     proxy: &ProxyService,
     template: &crate::routing_ir::RoutePlanTemplate,
-    route_graph_key: &str,
     session_id: Option<&str>,
 ) -> RoutePlanRuntimeState {
     let mut runtime = proxy
@@ -127,14 +126,7 @@ async fn refresh_route_graph_runtime_for_request(
         .route_plan_runtime_state_for_provider_endpoints(proxy.service_name)
         .await;
     apply_concurrency_snapshots_to_runtime(proxy, template, &mut runtime);
-    apply_session_route_affinity_to_runtime(
-        proxy,
-        session_id,
-        template,
-        route_graph_key,
-        &mut runtime,
-    )
-    .await;
+    apply_session_route_affinity_for_template(proxy, session_id, template, &mut runtime).await;
     runtime
 }
 
@@ -252,13 +244,8 @@ pub(super) async fn execute_provider_chain_with_route_executor(
             let executor = RoutePlanExecutor::new(template);
             let route_graph_key = template.route_graph_key();
             let total_upstreams = template.candidates.len();
-            let mut runtime = refresh_route_graph_runtime_for_request(
-                proxy,
-                template,
-                route_graph_key.as_str(),
-                session_id,
-            )
-            .await;
+            let mut runtime =
+                refresh_route_graph_runtime_for_request(proxy, template, session_id).await;
             let mut route_state = RoutePlanAttemptState::default();
             let mut upstream_chain: Vec<String> = Vec::new();
             let mut route_attempts: Vec<RouteAttemptLog> = Vec::new();
@@ -342,11 +329,10 @@ pub(super) async fn execute_provider_chain_with_route_executor(
                 lbs,
                 &upstream_overrides,
             );
-            apply_session_route_affinity_to_runtime(
+            apply_session_route_affinity_for_template(
                 proxy,
                 session_id,
                 &legacy_template,
-                route_graph_key.as_str(),
                 &mut runtime,
             )
             .await;
@@ -658,7 +644,7 @@ async fn execute_route_graph_candidates_with_route_executor(
             ) {
                 if request_flavor.is_remote_compaction_v1_request
                     && !compact_route_unavailable_waited
-                    && let Some(route_graph_key) = route_graph_key
+                    && route_graph_key.is_some()
                     && let Some(wait_secs) =
                         report.short_cooldown_wait_secs(COMPACT_ROUTE_UNAVAILABLE_WAIT_MAX_SECS)
                 {
@@ -674,7 +660,6 @@ async fn execute_route_graph_candidates_with_route_executor(
                     *runtime = refresh_route_graph_runtime_for_request(
                         proxy,
                         executor.template(),
-                        route_graph_key,
                         session_id,
                     )
                     .await;

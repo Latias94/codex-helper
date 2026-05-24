@@ -39,7 +39,7 @@ use super::request_preparation::{
 use super::request_routing::RequestRouteSelection;
 use super::retry::{RetryPlan, retry_info_for_failed_attempts, retry_info_for_observed_attempts};
 use super::route_affinity::{
-    apply_session_route_affinity_to_runtime, record_session_route_affinity_success,
+    apply_session_route_affinity_for_template, record_session_route_affinity_success,
 };
 use super::route_attempts::{
     ErrorRouteAttemptParams, RouteAttemptErrorKind, StartRouteAttemptParams,
@@ -381,11 +381,10 @@ async fn select_responses_websocket_target(
                 template,
                 &mut runtime,
             );
-            apply_session_route_affinity_to_runtime(
+            apply_session_route_affinity_for_template(
                 proxy,
                 prepared.session_id.as_deref(),
                 template,
-                route_graph_key.as_str(),
                 &mut runtime,
             )
             .await;

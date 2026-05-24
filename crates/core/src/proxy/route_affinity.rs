@@ -40,6 +40,23 @@ pub(super) async fn apply_session_route_affinity_to_runtime(
     );
 }
 
+pub(super) async fn apply_session_route_affinity_for_template(
+    proxy: &ProxyService,
+    session_id: Option<&str>,
+    template: &RoutePlanTemplate,
+    runtime: &mut RoutePlanRuntimeState,
+) {
+    let route_graph_key = template.route_graph_key();
+    apply_session_route_affinity_to_runtime(
+        proxy,
+        session_id,
+        template,
+        route_graph_key.as_str(),
+        runtime,
+    )
+    .await;
+}
+
 pub(super) async fn record_session_route_affinity_success(
     proxy: &ProxyService,
     session_id: Option<&str>,
