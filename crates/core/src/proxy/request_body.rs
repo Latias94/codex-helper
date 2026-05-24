@@ -99,7 +99,6 @@ pub(super) fn normalize_codex_compact_request_value(value: &mut serde_json::Valu
         "service_tier",
         "prompt_cache_key",
         "text",
-        "previous_response_id",
     ] {
         if let Some(value) = object.get(field) {
             normalized.insert(field.to_string(), value.clone());
@@ -429,11 +428,12 @@ mod tests {
         assert_eq!(value["parallel_tool_calls"].as_bool(), Some(true));
         assert_eq!(value["reasoning"]["effort"].as_str(), Some("high"));
         assert_eq!(value["text"]["verbosity"].as_str(), Some("low"));
-        assert_eq!(value["previous_response_id"].as_str(), Some("resp_123"));
+        assert!(value.get("previous_response_id").is_none());
         assert!(value.get("store").is_none());
         assert!(value.get("stream").is_none());
         assert_eq!(value["prompt_cache_key"].as_str(), Some("cache_123"));
         assert_eq!(value["service_tier"].as_str(), Some("flex"));
+        assert!(value.get("previous_response_id").is_none());
         assert!(value.get("include").is_none());
     }
 

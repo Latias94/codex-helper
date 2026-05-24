@@ -920,7 +920,7 @@ async fn proxy_normalizes_responses_compact_body_before_forwarding() {
     assert_eq!(body["parallel_tool_calls"].as_bool(), Some(true));
     assert_eq!(body["reasoning"]["effort"].as_str(), Some("high"));
     assert_eq!(body["text"]["verbosity"].as_str(), Some("low"));
-    assert_eq!(body["previous_response_id"].as_str(), Some("resp_123"));
+    assert!(body.get("previous_response_id").is_none());
     assert!(body.get("store").is_none());
     assert!(body.get("stream").is_none());
     assert_eq!(body["service_tier"].as_str(), Some("flex"));
