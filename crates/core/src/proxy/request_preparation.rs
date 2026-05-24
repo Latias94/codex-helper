@@ -200,16 +200,16 @@ pub(super) async fn prepare_common_request(
     let binding_model = binding_model_for_request(session_binding.as_ref());
     let binding_service_tier = binding_service_tier_for_request(session_binding.as_ref());
 
-    let prepared_request = prepare_request_body(
+    let prepared_request = prepare_request_body(PrepareRequestBodyParams {
         raw_body,
         compact_request,
-        override_effort.as_deref(),
+        override_effort: override_effort.as_deref(),
         binding_effort,
-        override_model.as_deref(),
+        override_model: override_model.as_deref(),
         binding_model,
-        override_service_tier.as_deref(),
+        override_service_tier: override_service_tier.as_deref(),
         binding_service_tier,
-    );
+    });
     let body_for_upstream = prepared_request.body_for_upstream.clone();
     let request_model = prepared_request.request_model.clone();
     let effective_effort = prepared_request.effective_effort.clone();
@@ -472,16 +472,28 @@ pub(super) async fn resolve_and_touch_session_state(
     cwd
 }
 
-pub(super) fn prepare_request_body(
-    raw_body: &Bytes,
+pub(super) struct PrepareRequestBodyParams<'a> {
+    raw_body: &'a Bytes,
     compact_request: bool,
-    override_effort: Option<&str>,
-    binding_effort: Option<&str>,
-    override_model: Option<&str>,
-    binding_model: Option<&str>,
-    override_service_tier: Option<&str>,
-    binding_service_tier: Option<&str>,
-) -> PreparedRequestBody {
+    override_effort: Option<&'a str>,
+    binding_effort: Option<&'a str>,
+    override_model: Option<&'a str>,
+    binding_model: Option<&'a str>,
+    override_service_tier: Option<&'a str>,
+    binding_service_tier: Option<&'a str>,
+}
+
+pub(super) fn prepare_request_body(params: PrepareRequestBodyParams<'_>) -> PreparedRequestBody {
+    let PrepareRequestBodyParams {
+        raw_body,
+        compact_request,
+        override_effort,
+        binding_effort,
+        override_model,
+        binding_model,
+        override_service_tier,
+        binding_service_tier,
+    } = params;
     let mut request_json = serde_json::from_slice::<serde_json::Value>(raw_body).ok();
     let original_effort = request_json
         .as_ref()
@@ -642,16 +654,16 @@ mod tests {
             br#"{"model":"gpt-5","service_tier":"priority","reasoning":{"effort":"low"}}"#,
         );
 
-        let prepared = prepare_request_body(
-            &raw_body,
-            false,
-            Some("high"),
-            Some("medium"),
-            Some("gpt-5.4"),
-            Some("gpt-5-mini"),
-            Some("flex"),
-            Some("default"),
-        );
+        let prepared = prepare_request_body(PrepareRequestBodyParams {
+            raw_body: &raw_body,
+            compact_request: false,
+            override_effort: Some("high"),
+            binding_effort: Some("medium"),
+            override_model: Some("gpt-5.4"),
+            binding_model: Some("gpt-5-mini"),
+            override_service_tier: Some("flex"),
+            binding_service_tier: Some("default"),
+        });
 
         assert_eq!(prepared.request_model.as_deref(), Some("gpt-5.4"));
         assert_eq!(prepared.effective_effort.as_deref(), Some("high"));
