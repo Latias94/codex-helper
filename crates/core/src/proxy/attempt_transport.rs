@@ -32,12 +32,14 @@ pub(super) struct AttemptTransportSuccess {
 pub(super) enum AttemptTransportOutcome {
     RetrySameUpstream,
     TryNextUpstream,
+    StopProviderChain,
     Continue(Box<AttemptTransportSuccess>),
 }
 
 pub(super) enum AttemptReadBodyOutcome {
     RetrySameUpstream,
     TryNextUpstream,
+    StopProviderChain,
     Continue(Bytes),
 }
 
@@ -154,6 +156,7 @@ pub(super) struct AttemptTransportParams<'a> {
     pub(super) route_attempts: &'a mut Vec<RouteAttemptLog>,
     pub(super) route_attempt_index: usize,
     pub(super) model_note: &'a str,
+    pub(super) allow_provider_failover: bool,
 }
 
 pub(super) struct AttemptReadBodyParams<'a> {
@@ -172,6 +175,7 @@ pub(super) struct AttemptReadBodyParams<'a> {
     pub(super) route_attempts: &'a mut Vec<RouteAttemptLog>,
     pub(super) route_attempt_index: usize,
     pub(super) model_note: &'a str,
+    pub(super) allow_provider_failover: bool,
 }
 
 pub(super) async fn handle_attempt_transport(
@@ -210,6 +214,7 @@ pub(super) async fn handle_attempt_transport(
         route_attempts,
         route_attempt_index,
         model_note,
+        allow_provider_failover,
     } = params;
 
     let target_url = match proxy.build_target(target, uri) {
@@ -244,7 +249,11 @@ pub(super) async fn handle_attempt_transport(
                     cooldown_reason: Some("target_build_error"),
                 },
             );
-            return AttemptTransportOutcome::TryNextUpstream;
+            return if allow_provider_failover {
+                AttemptTransportOutcome::TryNextUpstream
+            } else {
+                AttemptTransportOutcome::StopProviderChain
+            };
         }
     };
 
@@ -326,7 +335,11 @@ pub(super) async fn handle_attempt_transport(
                 last_err,
             })
             .await;
-            return AttemptTransportOutcome::TryNextUpstream;
+            return if allow_provider_failover {
+                AttemptTransportOutcome::TryNextUpstream
+            } else {
+                AttemptTransportOutcome::StopProviderChain
+            };
         }
     };
 
@@ -357,6 +370,7 @@ pub(super) async fn read_attempt_response_body(
         route_attempts,
         route_attempt_index,
         model_note,
+        allow_provider_failover,
     } = params;
 
     match read_response_body_with_limit(response).await {
@@ -414,7 +428,11 @@ pub(super) async fn read_attempt_response_body(
                 last_err,
             })
             .await;
-            AttemptReadBodyOutcome::TryNextUpstream
+            if allow_provider_failover {
+                AttemptReadBodyOutcome::TryNextUpstream
+            } else {
+                AttemptReadBodyOutcome::StopProviderChain
+            }
         }
     }
 }

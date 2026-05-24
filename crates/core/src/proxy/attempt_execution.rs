@@ -36,6 +36,7 @@ use super::selected_upstream_request::{
 
 pub(super) enum SelectedUpstreamExecutionOutcome {
     ContinueStation,
+    StopProviderChain,
     Return(Response<Body>),
 }
 
@@ -259,12 +260,16 @@ pub(super) async fn execute_selected_upstream(
                 route_attempts,
                 route_attempt_index,
                 model_note: model_note.as_str(),
+                allow_provider_failover,
             })
             .await;
             let (resp, upstream_start, upstream_headers_ms, debug_base) = match transport {
                 AttemptTransportOutcome::RetrySameUpstream => break,
                 AttemptTransportOutcome::TryNextUpstream => {
                     return SelectedUpstreamExecutionOutcome::ContinueStation;
+                }
+                AttemptTransportOutcome::StopProviderChain => {
+                    return SelectedUpstreamExecutionOutcome::StopProviderChain;
                 }
                 AttemptTransportOutcome::Continue(success) => (
                     success.response,
@@ -335,12 +340,16 @@ pub(super) async fn execute_selected_upstream(
                 route_attempts,
                 route_attempt_index,
                 model_note: model_note.as_str(),
+                allow_provider_failover,
             })
             .await
             {
                 AttemptReadBodyOutcome::RetrySameUpstream => break,
                 AttemptReadBodyOutcome::TryNextUpstream => {
                     return SelectedUpstreamExecutionOutcome::ContinueStation;
+                }
+                AttemptReadBodyOutcome::StopProviderChain => {
+                    return SelectedUpstreamExecutionOutcome::StopProviderChain;
                 }
                 AttemptReadBodyOutcome::Continue(bytes) => bytes,
             };

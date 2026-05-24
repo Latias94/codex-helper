@@ -347,6 +347,8 @@ pub(super) async fn execute_provider_chain_with_route_executor(
             let strict_multi_config = lbs.len() > 1;
             let cross_station_failover_enabled =
                 cross_station_failover_enabled(strict_multi_config, plan, provider_opt);
+            let allow_provider_failover = !request_flavor.is_remote_compaction_v1_request
+                || !request_flavor.remote_compaction_requires_affinity;
             let provider_attempt_limit =
                 provider_attempt_limit(cross_station_failover_enabled, provider_opt.max_attempts);
             let mut global_attempt: u32 = 0;
@@ -359,7 +361,7 @@ pub(super) async fn execute_provider_chain_with_route_executor(
                 };
                 let station_name = lb.service.name.clone();
 
-                if let Some(response) = execute_station_upstreams_with_route_executor(
+                match execute_station_upstreams_with_route_executor(
                     ExecuteRouteExecutorStationParams {
                         proxy,
                         lb: &lb,
@@ -405,11 +407,22 @@ pub(super) async fn execute_provider_chain_with_route_executor(
                         last_err: &mut last_err,
                         upstream_chain: &mut upstream_chain,
                         route_attempts: &mut route_attempts,
+                        allow_provider_failover,
                     },
                 )
                 .await
                 {
-                    return ProviderExecutionOutcome::Return(response);
+                    SelectedUpstreamExecutionOutcome::ContinueStation => {}
+                    SelectedUpstreamExecutionOutcome::StopProviderChain => {
+                        return ProviderExecutionOutcome::Exhausted(ProviderExecutionState {
+                            upstream_chain,
+                            route_attempts,
+                            last_err,
+                        });
+                    }
+                    SelectedUpstreamExecutionOutcome::Return(response) => {
+                        return ProviderExecutionOutcome::Return(response);
+                    }
                 }
 
                 tried_stations.insert(station_name.clone());
@@ -487,6 +500,7 @@ struct ExecuteRouteExecutorStationParams<'a, 'route> {
     last_err: &'a mut Option<(StatusCode, String)>,
     upstream_chain: &'a mut Vec<String>,
     route_attempts: &'a mut Vec<RouteAttemptLog>,
+    allow_provider_failover: bool,
 }
 
 struct ExecuteRouteGraphExecutorParams<'a, 'route> {
@@ -755,7 +769,12 @@ async fn execute_route_graph_candidates_with_route_executor(
         .await
         {
             SelectedUpstreamExecutionOutcome::ContinueStation => {}
-            SelectedUpstreamExecutionOutcome::Return(response) => return Some(response),
+            SelectedUpstreamExecutionOutcome::StopProviderChain => {
+                return None;
+            }
+            SelectedUpstreamExecutionOutcome::Return(response) => {
+                return Some(response);
+            }
         }
 
         if avoid_set.contains(&selected_candidate.stable_index) {
@@ -769,7 +788,7 @@ async fn execute_route_graph_candidates_with_route_executor(
 
 async fn execute_station_upstreams_with_route_executor(
     params: ExecuteRouteExecutorStationParams<'_, '_>,
-) -> Option<Response<Body>> {
+) -> SelectedUpstreamExecutionOutcome {
     let ExecuteRouteExecutorStationParams {
         proxy,
         lb,
@@ -815,6 +834,7 @@ async fn execute_station_upstreams_with_route_executor(
         last_err,
         upstream_chain,
         route_attempts,
+        allow_provider_failover,
     } = params;
 
     'upstreams: loop {
@@ -896,7 +916,7 @@ async fn execute_station_upstreams_with_route_executor(
             route_graph_key,
             upstream_opt: &plan.upstream,
             provider_opt: &plan.route,
-            allow_provider_failover: true,
+            allow_provider_failover,
             provider_attempt,
             total_upstreams,
             cooldown_backoff,
@@ -911,7 +931,12 @@ async fn execute_station_upstreams_with_route_executor(
         .await
         {
             SelectedUpstreamExecutionOutcome::ContinueStation => {}
-            SelectedUpstreamExecutionOutcome::Return(response) => return Some(response),
+            SelectedUpstreamExecutionOutcome::StopProviderChain => {
+                return SelectedUpstreamExecutionOutcome::StopProviderChain;
+            }
+            SelectedUpstreamExecutionOutcome::Return(response) => {
+                return SelectedUpstreamExecutionOutcome::Return(response);
+            }
         }
 
         sync_route_state_from_avoid_set(route_state, selected_station_name.as_str(), &avoid_set);
@@ -928,7 +953,7 @@ async fn execute_station_upstreams_with_route_executor(
         }
     }
 
-    None
+    SelectedUpstreamExecutionOutcome::ContinueStation
 }
 
 fn log_route_graph_selection_explain(

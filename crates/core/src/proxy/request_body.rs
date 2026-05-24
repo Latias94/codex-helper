@@ -109,9 +109,10 @@ pub(super) fn normalize_codex_compact_request_value(value: &mut serde_json::Valu
 }
 
 pub(super) fn codex_compact_request_requires_affinity(body: &[u8]) -> bool {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
         return false;
     };
+    normalize_codex_compact_request_value(&mut value);
     value_mentions_state_bound_compact_field(&value)
 }
 
@@ -216,6 +217,9 @@ pub(super) fn is_stale_previous_response_error(
     mentions_previous && missing
 }
 
+// Keep Codex session completion aligned with stable session anchors.
+// `previous_response_id` is a turn-local continuation token, not a stable
+// session key, so it must not be promoted to `prompt_cache_key`.
 fn session_completion_candidate(headers: &HeaderMap, body: &[u8]) -> Option<String> {
     header_string(headers, "session_id")
         .or_else(|| header_string(headers, "x-session-id"))
@@ -226,7 +230,6 @@ fn session_completion_candidate(headers: &HeaderMap, body: &[u8]) -> Option<Stri
         .or_else(|| body_string_field(body, &["x-session-id"]))
         .or_else(|| body_string_field(body, &["prompt_cache_key"]))
         .or_else(|| body_string_field(body, &["metadata", "session_id"]))
-        .or_else(|| body_string_field(body, &["previous_response_id"]))
         .and_then(normalize_session_completion_value)
 }
 
@@ -404,6 +407,23 @@ mod tests {
     }
 
     #[test]
+    fn does_not_complete_codex_session_fields_from_previous_response_id() {
+        let mut headers = HeaderMap::new();
+        let raw = Bytes::from_static(
+            br#"{"model":"gpt-5","previous_response_id":"resp-1","input":"hi"}"#,
+        );
+
+        let (body, completion) = complete_codex_session_fields(&mut headers, &raw);
+
+        assert!(!completion.completed);
+        assert!(completion.session_id.is_none());
+        assert!(headers.get("session_id").is_none());
+        assert!(headers.get("x-session-id").is_none());
+        let value: serde_json::Value = serde_json::from_slice(body.as_ref()).expect("json body");
+        assert!(value.get("prompt_cache_key").is_none());
+    }
+
+    #[test]
     fn normalizes_codex_compact_body_to_supported_payload_fields() {
         let mut value: serde_json::Value = serde_json::json!({
             "model": "gpt-5.5",
@@ -442,8 +462,11 @@ mod tests {
         assert!(codex_compact_request_requires_affinity(
             br#"{"model":"gpt-5","input":[{"type":"reasoning","encrypted_content":"state"}]}"#
         ));
-        assert!(codex_compact_request_requires_affinity(
+        assert!(!codex_compact_request_requires_affinity(
             br#"{"model":"gpt-5","previous_response_id":"resp_123","input":"hi"}"#
+        ));
+        assert!(codex_compact_request_requires_affinity(
+            br#"{"model":"gpt-5","input":[{"type":"reasoning","previous_response_id":"resp_123"}]}"#
         ));
         assert!(!codex_compact_request_requires_affinity(
             br#"{"model":"gpt-5","prompt_cache_key":"cache","input":"hi"}"#

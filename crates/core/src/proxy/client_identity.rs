@@ -115,10 +115,6 @@ fn extract_body_session_identity(body: &[u8]) -> Option<ClientSessionIdentity> {
             extract_body_string_field(body, &["metadata", "session_id"])
                 .map(ClientSessionIdentity::metadata_session_id)
         })
-        .or_else(|| {
-            extract_body_string_field(body, &["previous_response_id"])
-                .map(ClientSessionIdentity::previous_response_id)
-        })
 }
 
 fn extract_body_string_field(body: &[u8], path: &[&str]) -> Option<String> {
@@ -267,7 +263,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_session_id_uses_body_session_metadata_and_previous_response_fallbacks() {
+    fn extract_session_id_uses_body_session_metadata_and_ignores_previous_response_id() {
         let headers = HeaderMap::new();
 
         let identity = extract_session_identity_with_body_fallback(
@@ -278,13 +274,13 @@ mod tests {
         assert_eq!(identity.value(), "meta-1");
         assert_eq!(identity.source(), SessionIdentitySource::MetadataSessionId);
 
-        let identity = extract_session_identity_with_body_fallback(
-            &headers,
-            br#"{"model":"gpt-5","previous_response_id":"resp-123"}"#,
-        )
-        .expect("previous response identity");
-        assert_eq!(identity.value(), "resp-123");
-        assert_eq!(identity.source(), SessionIdentitySource::PreviousResponseId);
+        assert!(
+            extract_session_identity_with_body_fallback(
+                &headers,
+                br#"{"model":"gpt-5","previous_response_id":"resp-123"}"#
+            )
+            .is_none()
+        );
 
         let identity = extract_session_identity_with_body_fallback(
             &headers,
