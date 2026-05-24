@@ -2320,6 +2320,109 @@ async fn proxy_does_not_fallback_responses_compact_on_legacy_when_request_is_sta
 }
 
 #[tokio::test]
+async fn proxy_legacy_route_affinity_is_session_scoped() {
+    let upstream_a_hits = Arc::new(AtomicUsize::new(0));
+    let upstream_b_hits = Arc::new(AtomicUsize::new(0));
+
+    let upstream_a_counter = upstream_a_hits.clone();
+    let upstream_a = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let upstream_a_counter = upstream_a_counter.clone();
+            async move {
+                let hit = upstream_a_counter.fetch_add(1, Ordering::SeqCst) + 1;
+                if hit == 2 {
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({ "provider": "a", "err": "quota" })),
+                    )
+                } else {
+                    (StatusCode::OK, Json(serde_json::json!({ "provider": "a" })))
+                }
+            }
+        }),
+    );
+    let upstream_a = spawn_test_upstream(upstream_a);
+
+    let upstream_b_counter = upstream_b_hits.clone();
+    let upstream_b = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let upstream_b_counter = upstream_b_counter.clone();
+            async move {
+                upstream_b_counter.fetch_add(1, Ordering::SeqCst);
+                (StatusCode::OK, Json(serde_json::json!({ "provider": "b" })))
+            }
+        }),
+    );
+    let upstream_b = spawn_test_upstream(upstream_b);
+
+    let mut upstream_a_config = upstream_a.upstream_config();
+    upstream_a_config
+        .tags
+        .insert("provider_id".to_string(), "a".to_string());
+    let mut upstream_b_config = upstream_b.upstream_config();
+    upstream_b_config
+        .tags
+        .insert("provider_id".to_string(), "b".to_string());
+
+    let cfg = make_proxy_config(
+        vec![upstream_a_config, upstream_b_config],
+        retry_config(1, "502", Vec::new(), RetryStrategy::Failover),
+    );
+    let proxy = proxy_service(cfg);
+    let state = proxy.state.clone();
+    let proxy = spawn_proxy_service(proxy);
+    let client = reqwest::Client::new();
+
+    let send = |session_id: &'static str, client: reqwest::Client, url: String| async move {
+        client
+            .post(url)
+            .header("content-type", "application/json")
+            .header("session-id", session_id)
+            .body(r#"{"model":"gpt-5","input":"hi"}"#)
+            .send()
+            .await
+            .expect("send responses request")
+            .json::<serde_json::Value>()
+            .await
+            .expect("json response")
+    };
+
+    let first_a = send("sid-a", client.clone(), proxy.responses_url()).await;
+    assert_eq!(first_a["provider"].as_str(), Some("a"));
+
+    let fallback_b = send("sid-b", client.clone(), proxy.responses_url()).await;
+    assert_eq!(fallback_b["provider"].as_str(), Some("b"));
+
+    let sticky_a = send("sid-a", client.clone(), proxy.responses_url()).await;
+    assert_eq!(sticky_a["provider"].as_str(), Some("a"));
+
+    assert_eq!(upstream_a_hits.load(Ordering::SeqCst), 3);
+    assert_eq!(upstream_b_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        state
+            .get_session_route_affinity("sid-a")
+            .await
+            .expect("sid-a affinity")
+            .provider_endpoint
+            .provider_id
+            .as_str(),
+        "a"
+    );
+    assert_eq!(
+        state
+            .get_session_route_affinity("sid-b")
+            .await
+            .expect("sid-b affinity")
+            .provider_endpoint
+            .provider_id
+            .as_str(),
+        "b"
+    );
+}
+
+#[tokio::test]
 async fn proxy_waits_short_affinity_cooldown_before_responses_compact_under_hard_policy() {
     let b_responses_hits = Arc::new(AtomicUsize::new(0));
     let b_compact_hits = Arc::new(AtomicUsize::new(0));
@@ -3104,7 +3207,7 @@ supports_websockets = true
         .expect("connect proxy websocket");
     socket
         .send(tokio_tungstenite::tungstenite::Message::Text(
-            r#"{"type":"response.create","model":"gpt-5","stream":true}"#.into(),
+            r#"{"type":"response.create","model":"gpt-5","stream":true,"prompt_cache_key":"ws-cache"}"#.into(),
         ))
         .await
         .expect("send first frame");
@@ -3132,6 +3235,14 @@ supports_websockets = true
         headers.get("openai-beta"),
         Some(&HeaderValue::from_static("responses_websockets=2026-02-06"))
     );
+    assert_eq!(
+        headers.get("session-id"),
+        Some(&HeaderValue::from_static("ws-cache"))
+    );
+    assert_eq!(
+        headers.get("thread-id"),
+        Some(&HeaderValue::from_static("ws-cache"))
+    );
 
     let body = seen_first_body
         .lock()
@@ -3140,6 +3251,7 @@ supports_websockets = true
         .expect("upstream first body");
     assert_eq!(body["type"].as_str(), Some("response.create"));
     assert_eq!(body["model"].as_str(), Some("relay-gpt-5"));
+    assert_eq!(body["prompt_cache_key"].as_str(), Some("ws-cache"));
 
     proxy_handle.abort();
     u_handle.abort();
@@ -3272,6 +3384,14 @@ async fn proxy_codex_session_completion_fills_headers_and_prompt_cache_key() {
     );
     assert_eq!(
         headers.get("x-session-id"),
+        Some(&HeaderValue::from_static("meta-session-1"))
+    );
+    assert_eq!(
+        headers.get("session-id"),
+        Some(&HeaderValue::from_static("meta-session-1"))
+    );
+    assert_eq!(
+        headers.get("thread-id"),
         Some(&HeaderValue::from_static("meta-session-1"))
     );
     let body = seen_body

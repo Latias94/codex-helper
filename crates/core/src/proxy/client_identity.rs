@@ -61,13 +61,6 @@ impl ClientSessionIdentity {
         }
     }
 
-    fn previous_response_id(value: String) -> Self {
-        Self {
-            value,
-            source: SessionIdentitySource::PreviousResponseId,
-        }
-    }
-
     pub(super) fn value(&self) -> &str {
         self.value.as_str()
     }

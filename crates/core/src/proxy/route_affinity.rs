@@ -1,5 +1,6 @@
 use crate::logging::{RouteAttemptLog, now_ms};
 use crate::routing_ir::{RoutePlanRuntimeState, RoutePlanTemplate};
+use crate::runtime_identity::ProviderEndpointKey;
 use crate::state::{SessionIdentitySource, SessionRouteAffinityTarget};
 
 use super::ProxyService;
@@ -54,9 +55,22 @@ pub(super) async fn record_session_route_affinity_success(
     let Some(route_graph_key) = route_graph_key else {
         return;
     };
-    let Some(provider_endpoint) = target.provider_endpoint_ref().cloned() else {
+    let Some(provider_id) = target
+        .provider_id()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
         return;
     };
+    let Some(endpoint_id) = target
+        .endpoint_id()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    let provider_endpoint =
+        ProviderEndpointKey::new(proxy.service_name, provider_id.to_string(), endpoint_id);
     let target = SessionRouteAffinityTarget {
         route_graph_key: route_graph_key.to_string(),
         session_identity_source,

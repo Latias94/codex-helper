@@ -328,6 +328,7 @@ pub(super) async fn execute_provider_chain_with_route_executor(
                 lbs.iter().map(|lb| lb.service.as_ref()),
             );
             let executor = RoutePlanExecutor::new(&legacy_template);
+            let route_graph_key = legacy_template.route_graph_key();
             let total_upstreams = lbs
                 .iter()
                 .map(|lb| lb.service.upstreams.len())
@@ -336,11 +337,19 @@ pub(super) async fn execute_provider_chain_with_route_executor(
                 .state
                 .get_upstream_meta_overrides(proxy.service_name)
                 .await;
-            let runtime = route_plan_runtime_state_from_lbs_with_overrides(
+            let mut runtime = route_plan_runtime_state_from_lbs_with_overrides(
                 proxy.service_name,
                 lbs,
                 &upstream_overrides,
             );
+            apply_session_route_affinity_to_runtime(
+                proxy,
+                session_id,
+                &legacy_template,
+                route_graph_key.as_str(),
+                &mut runtime,
+            )
+            .await;
             let mut route_state = RoutePlanAttemptState::default();
             let mut upstream_chain: Vec<String> = Vec::new();
             let mut route_attempts: Vec<RouteAttemptLog> = Vec::new();
@@ -396,7 +405,7 @@ pub(super) async fn execute_provider_chain_with_route_executor(
                         client_body_debug,
                         client_body_warn,
                         plan,
-                        route_graph_key: None,
+                        route_graph_key: Some(route_graph_key.as_str()),
                         provider_attempt,
                         total_upstreams,
                         cooldown_backoff,

@@ -145,20 +145,15 @@ pub(super) fn complete_codex_session_fields(
     let Some(session_id) = session_completion_candidate(headers, raw_body.as_ref()) else {
         return (raw_body.clone(), CodexSessionCompletion::default());
     };
+    let thread_id = body_string_field(raw_body.as_ref(), &["prompt_cache_key"])
+        .and_then(normalize_session_completion_value)
+        .unwrap_or_else(|| session_id.clone());
 
     let mut completed = false;
-    if !has_header_value(headers, "session_id")
-        && let Ok(value) = HeaderValue::from_str(session_id.as_str())
-    {
-        headers.insert("session_id", value);
-        completed = true;
-    }
-    if !has_header_value(headers, "x-session-id")
-        && let Ok(value) = HeaderValue::from_str(session_id.as_str())
-    {
-        headers.insert("x-session-id", value);
-        completed = true;
-    }
+    completed |= insert_missing_session_header(headers, "session_id", session_id.as_str());
+    completed |= insert_missing_session_header(headers, "x-session-id", session_id.as_str());
+    completed |= insert_missing_session_header(headers, "session-id", session_id.as_str());
+    completed |= insert_missing_session_header(headers, "thread-id", thread_id.as_str());
 
     let body = serde_json::from_slice::<serde_json::Value>(raw_body.as_ref())
         .ok()
@@ -187,6 +182,17 @@ pub(super) fn complete_codex_session_fields(
             session_id: Some(session_id),
         },
     )
+}
+
+fn insert_missing_session_header(headers: &mut HeaderMap, name: &'static str, value: &str) -> bool {
+    if has_header_value(headers, name) {
+        return false;
+    }
+    let Ok(value) = HeaderValue::from_str(value) else {
+        return false;
+    };
+    headers.insert(name, value);
+    true
 }
 
 pub(super) fn remove_previous_response_id_from_body(body: &Bytes) -> Option<Bytes> {
@@ -389,6 +395,14 @@ mod tests {
             headers.get("x-session-id"),
             Some(&HeaderValue::from_static("pcache-1"))
         );
+        assert_eq!(
+            headers.get("session-id"),
+            Some(&HeaderValue::from_static("pcache-1"))
+        );
+        assert_eq!(
+            headers.get("thread-id"),
+            Some(&HeaderValue::from_static("pcache-1"))
+        );
         let value: serde_json::Value = serde_json::from_slice(body.as_ref()).expect("json body");
         assert_eq!(value["prompt_cache_key"].as_str(), Some("pcache-1"));
     }
@@ -402,6 +416,14 @@ mod tests {
 
         assert!(completion.completed);
         assert_eq!(completion.session_id.as_deref(), Some("meta-1"));
+        assert_eq!(
+            headers.get("session-id"),
+            Some(&HeaderValue::from_static("meta-1"))
+        );
+        assert_eq!(
+            headers.get("thread-id"),
+            Some(&HeaderValue::from_static("meta-1"))
+        );
         let value: serde_json::Value = serde_json::from_slice(body.as_ref()).expect("json body");
         assert_eq!(value["prompt_cache_key"].as_str(), Some("meta-1"));
     }
@@ -419,6 +441,8 @@ mod tests {
         assert!(completion.session_id.is_none());
         assert!(headers.get("session_id").is_none());
         assert!(headers.get("x-session-id").is_none());
+        assert!(headers.get("session-id").is_none());
+        assert!(headers.get("thread-id").is_none());
         let value: serde_json::Value = serde_json::from_slice(body.as_ref()).expect("json body");
         assert!(value.get("prompt_cache_key").is_none());
     }

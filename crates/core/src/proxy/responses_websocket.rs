@@ -30,6 +30,7 @@ use super::client_identity::extract_session_identity_with_body_fallback;
 use super::concurrency_limits::ConcurrencyPermit;
 use super::headers::filter_request_headers;
 use super::passive_health::{record_passive_upstream_failure, record_passive_upstream_success};
+use super::request_body::complete_codex_session_fields;
 use super::request_failures::{FailedProxyRequestParams, finish_failed_proxy_request};
 use super::request_preparation::{
     CommonRequestPreparationError, CommonRequestPreparationParams, load_request_config_context,
@@ -282,6 +283,7 @@ async fn prepare_responses_websocket(
     started_at_ms: u64,
 ) -> Result<ResponsesWebSocketPrepared, (StatusCode, String)> {
     let method = Method::GET;
+    let mut client_headers = client_headers;
     let client_name = client_headers
         .get(CLIENT_NAME_HEADER)
         .and_then(|value| value.to_str().ok())
@@ -308,6 +310,9 @@ async fn prepare_responses_websocket(
             "first WebSocket data message must be response.create".to_string(),
         ));
     }
+    let session_identity_hint =
+        extract_session_identity_with_body_fallback(&client_headers, raw_body.as_ref());
+    let raw_body = complete_codex_session_fields(&mut client_headers, &raw_body).0;
 
     let prepared = match prepare_common_request(CommonRequestPreparationParams {
         proxy,
@@ -317,10 +322,7 @@ async fn prepare_responses_websocket(
         client_headers: &client_headers,
         raw_body: &raw_body,
         compact_request: false,
-        session_identity_hint: extract_session_identity_with_body_fallback(
-            &client_headers,
-            raw_body.as_ref(),
-        ),
+        session_identity_hint,
         client_name,
         client_addr,
         started_at_ms,
