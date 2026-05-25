@@ -23,6 +23,13 @@ pub(super) fn extract_service_tier_from_value(value: &serde_json::Value) -> Opti
         .map(ToOwned::to_owned)
 }
 
+pub(super) fn codex_responses_body_requests_stream(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("stream").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false)
+}
+
 fn extract_service_tier_from_response_value(value: &serde_json::Value) -> Option<String> {
     value
         .get("service_tier")
@@ -344,11 +351,11 @@ mod tests {
     use super::{
         apply_model_override_value, apply_reasoning_effort_override_value,
         apply_service_tier_override_value, codex_compact_request_requires_affinity,
-        complete_codex_session_fields, extract_model_from_value,
-        extract_reasoning_effort_from_value, extract_service_tier_from_response_body,
-        extract_service_tier_from_value, is_stale_previous_response_error,
-        normalize_codex_compact_request_value, remove_previous_response_id_from_body,
-        scan_service_tier_from_sse_bytes_incremental,
+        codex_responses_body_requests_stream, complete_codex_session_fields,
+        extract_model_from_value, extract_reasoning_effort_from_value,
+        extract_service_tier_from_response_body, extract_service_tier_from_value,
+        is_stale_previous_response_error, normalize_codex_compact_request_value,
+        remove_previous_response_id_from_body, scan_service_tier_from_sse_bytes_incremental,
     };
     use axum::body::Bytes;
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -495,6 +502,19 @@ mod tests {
         assert_eq!(value["service_tier"].as_str(), Some("flex"));
         assert!(value.get("previous_response_id").is_none());
         assert!(value.get("include").is_none());
+    }
+
+    #[test]
+    fn detects_responses_stream_flag_from_body() {
+        assert!(codex_responses_body_requests_stream(
+            br#"{"model":"gpt-5","input":"hi","stream":true}"#
+        ));
+        assert!(!codex_responses_body_requests_stream(
+            br#"{"model":"gpt-5","input":"hi","stream":false}"#
+        ));
+        assert!(!codex_responses_body_requests_stream(
+            br#"{"model":"gpt-5","input":"hi"}"#
+        ));
     }
 
     #[test]

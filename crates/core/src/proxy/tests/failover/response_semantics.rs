@@ -412,6 +412,10 @@ async fn proxy_codex_stream_route_unavailable_returns_retryable_response_failed_
     let body = resp.text().await.expect("body");
     assert!(body.contains("event: response.failed"), "{body}");
     assert!(body.contains(r#""code":"rate_limit_exceeded""#), "{body}");
+    assert!(
+        body.contains(r#""codex_helper_error":"route_unavailable""#),
+        "{body}"
+    );
     assert!(body.contains("try again in"), "{body}");
     assert_eq!(primary_hits.load(Ordering::SeqCst), 0);
     assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
@@ -447,6 +451,243 @@ async fn proxy_codex_stream_route_unavailable_returns_retryable_response_failed_
     proxy_handle.abort();
     primary_handle.abort();
     backup_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_codex_body_stream_route_unavailable_returns_retryable_response_failed_sse() {
+    let primary = axum::Router::new().route(
+        "/v1/responses",
+        post(move || async move {
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "provider": "primary" })),
+            )
+        }),
+    );
+    let (primary_addr, primary_handle) = spawn_axum_server(primary);
+
+    let retry = RetryConfig {
+        transport_cooldown_secs: Some(30),
+        cooldown_backoff_factor: Some(1),
+        cooldown_backoff_max_secs: Some(0),
+        ..RetryConfig::default()
+    };
+    let v4 = ProxyConfigV4 {
+        retry,
+        codex: ServiceViewV4 {
+            providers: std::collections::BTreeMap::from([(
+                "probe-primary".to_string(),
+                ProviderConfigV4 {
+                    base_url: Some(format!("http://{primary_addr}/v1")),
+                    inline_auth: UpstreamAuth::default(),
+                    ..ProviderConfigV4::default()
+                },
+            )]),
+            routing: Some(RoutingConfigV4::ordered_failover(vec![
+                "probe-primary".to_string(),
+            ])),
+            ..ServiceViewV4::default()
+        },
+        ..ProxyConfigV4::default()
+    };
+    let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compile v4");
+    let proxy = ProxyService::new_with_v4_source(
+        Client::new(),
+        Arc::new(runtime),
+        Some(Arc::new(v4)),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let state = proxy.state.clone();
+    state
+        .penalize_provider_endpoint_attempt(
+            "codex",
+            crate::runtime_identity::ProviderEndpointKey::new("codex", "probe-primary", "default"),
+            30,
+            crate::lb::CooldownBackoff {
+                factor: 1,
+                max_secs: 0,
+            },
+        )
+        .await;
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let resp = Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt-5","input":"hi","stream":true}"#)
+        .send()
+        .await
+        .expect("send");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.starts_with("text/event-stream")),
+        Some(true)
+    );
+    let body = resp.text().await.expect("body");
+    assert!(body.contains("event: response.failed"), "{body}");
+    assert!(
+        body.contains(r#""codex_helper_error":"route_unavailable""#),
+        "{body}"
+    );
+    assert!(body.contains("try again in"), "{body}");
+
+    proxy_handle.abort();
+    primary_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_codex_stream_mixed_upstream_failure_and_cooldown_reports_route_unavailable_sse() {
+    let failing_hits = Arc::new(AtomicUsize::new(0));
+    let failing_counter = failing_hits.clone();
+    let failing = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let failing_counter = failing_counter.clone();
+            async move {
+                failing_counter.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({ "err": "failing 502" })),
+                )
+            }
+        }),
+    );
+    let (failing_addr, failing_handle) = spawn_axum_server(failing);
+
+    let cooldown = axum::Router::new().route(
+        "/v1/responses",
+        post(move || async move {
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "provider": "cooldown" })),
+            )
+        }),
+    );
+    let (cooldown_addr, cooldown_handle) = spawn_axum_server(cooldown);
+
+    let retry = RetryConfig {
+        upstream: Some(crate::config::RetryLayerConfig {
+            max_attempts: Some(1),
+            backoff_ms: Some(0),
+            backoff_max_ms: Some(0),
+            jitter_ms: Some(0),
+            on_status: Some("502".to_string()),
+            on_class: Some(Vec::new()),
+            strategy: Some(RetryStrategy::SameUpstream),
+        }),
+        provider: Some(crate::config::RetryLayerConfig {
+            max_attempts: Some(1),
+            backoff_ms: Some(0),
+            backoff_max_ms: Some(0),
+            jitter_ms: Some(0),
+            on_status: Some("502".to_string()),
+            on_class: Some(Vec::new()),
+            strategy: Some(RetryStrategy::Failover),
+        }),
+        transport_cooldown_secs: Some(30),
+        cooldown_backoff_factor: Some(1),
+        cooldown_backoff_max_secs: Some(0),
+        ..RetryConfig::default()
+    };
+    let v4 = ProxyConfigV4 {
+        retry,
+        codex: ServiceViewV4 {
+            providers: std::collections::BTreeMap::from([
+                (
+                    "failing".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some(format!("http://{failing_addr}/v1")),
+                        inline_auth: UpstreamAuth::default(),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+                (
+                    "cooldown".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some(format!("http://{cooldown_addr}/v1")),
+                        inline_auth: UpstreamAuth::default(),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+            ]),
+            routing: Some(RoutingConfigV4::ordered_failover(vec![
+                "failing".to_string(),
+                "cooldown".to_string(),
+            ])),
+            ..ServiceViewV4::default()
+        },
+        ..ProxyConfigV4::default()
+    };
+    let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compile v4");
+    let proxy = ProxyService::new_with_v4_source(
+        Client::new(),
+        Arc::new(runtime),
+        Some(Arc::new(v4)),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let state = proxy.state.clone();
+    state
+        .penalize_provider_endpoint_attempt(
+            "codex",
+            crate::runtime_identity::ProviderEndpointKey::new("codex", "cooldown", "default"),
+            30,
+            crate::lb::CooldownBackoff {
+                factor: 1,
+                max_secs: 0,
+            },
+        )
+        .await;
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let resp = Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .body(r#"{"model":"gpt-5","input":"hi","stream":true}"#)
+        .send()
+        .await
+        .expect("send");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.text().await.expect("body");
+    assert!(body.contains("event: response.failed"), "{body}");
+    assert!(body.contains(r#""code":"rate_limit_exceeded""#), "{body}");
+    assert!(
+        body.contains(r#""codex_helper_error":"route_unavailable""#),
+        "{body}"
+    );
+    assert!(body.contains("all upstream attempts failed"), "{body}");
+    assert_eq!(failing_hits.load(Ordering::SeqCst), 1);
+
+    let finished = state.list_recent_finished(1).await;
+    let retry = finished
+        .first()
+        .and_then(|request| request.retry.as_ref())
+        .expect("retry trace");
+    assert!(
+        retry
+            .route_attempts
+            .iter()
+            .any(|attempt| attempt.decision == "failed_status")
+    );
+    assert!(
+        retry
+            .route_attempts
+            .iter()
+            .any(|attempt| attempt.decision == "route_unavailable")
+    );
+
+    proxy_handle.abort();
+    failing_handle.abort();
+    cooldown_handle.abort();
 }
 
 #[tokio::test]

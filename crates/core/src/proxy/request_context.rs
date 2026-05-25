@@ -146,8 +146,9 @@ pub(super) async fn prepare_proxy_request(
             raw_body,
         )
     };
-    let request_flavor =
-        request_flavor.with_remote_compaction_affinity_from_body(raw_body.as_ref());
+    let request_flavor = request_flavor
+        .with_remote_compaction_affinity_from_body(raw_body.as_ref())
+        .with_responses_stream_from_body(raw_body.as_ref());
 
     let request_body_previews = crate::logging::should_log_request_body_preview();
     let prepared = match prepare_common_request(CommonRequestPreparationParams {

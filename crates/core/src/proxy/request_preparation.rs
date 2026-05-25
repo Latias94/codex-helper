@@ -42,6 +42,16 @@ impl RequestFlavor {
             ..self
         }
     }
+
+    pub(super) fn with_responses_stream_from_body(self, raw_body: &[u8]) -> Self {
+        let body_requests_stream = self.is_codex_service
+            && self.is_user_turn
+            && crate::proxy::request_body::codex_responses_body_requests_stream(raw_body);
+        Self {
+            is_stream: self.is_stream || body_requests_stream,
+            ..self
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -341,7 +351,7 @@ pub(super) fn detect_request_flavor(
     let is_stream = headers
         .get("accept")
         .and_then(|value| value.to_str().ok())
-        .map(|value| value.contains("text/event-stream"))
+        .map(|value| value.to_ascii_lowercase().contains("text/event-stream"))
         .unwrap_or(false);
 
     let is_responses_path = codex_path_is_responses(path);
@@ -599,7 +609,10 @@ mod tests {
     #[test]
     fn detect_request_flavor_reads_stream_and_turn_shape() {
         let mut headers = HeaderMap::new();
-        headers.insert("accept", HeaderValue::from_static("text/event-stream"));
+        headers.insert(
+            "accept",
+            HeaderValue::from_static("Text/Event-Stream, application/json"),
+        );
         headers.insert("content-type", HeaderValue::from_static("application/json"));
 
         let flavor = detect_request_flavor(

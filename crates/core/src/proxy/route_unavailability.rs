@@ -13,6 +13,32 @@ use super::request_preparation::RequestFlavor;
 const DEFAULT_ROUTE_UNAVAILABLE_RETRY_SECS: u64 = 8;
 const MAX_ROUTE_UNAVAILABLE_RETRY_SECS: u64 = 60;
 
+#[derive(Debug, Clone, Copy)]
+enum CodexStreamFailureKind {
+    RouteUnavailable,
+    UpstreamFailure,
+}
+
+impl CodexStreamFailureKind {
+    fn metadata_value(self) -> &'static str {
+        match self {
+            Self::RouteUnavailable => "route_unavailable",
+            Self::UpstreamFailure => "upstream_failure",
+        }
+    }
+
+    fn error_code(self) -> &'static str {
+        "rate_limit_exceeded"
+    }
+
+    fn response_id_prefix(self) -> &'static str {
+        match self {
+            Self::RouteUnavailable => "resp_codex_helper_route_unavailable",
+            Self::UpstreamFailure => "resp_codex_helper_upstream_failure",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct RouteUnavailableReport {
     pub(super) route_attempts: Vec<RouteAttemptLog>,
@@ -153,13 +179,27 @@ pub(super) fn route_unavailable_response_for_request(
     {
         return None;
     }
-    if !route_attempts
+    let failure_kind = codex_stream_failure_kind(route_attempts)?;
+    Some(codex_stream_response(message, route_attempts, failure_kind))
+}
+
+fn codex_stream_failure_kind(route_attempts: &[RouteAttemptLog]) -> Option<CodexStreamFailureKind> {
+    let has_route_unavailable = route_attempts
         .iter()
-        .any(|attempt| attempt.decision == "route_unavailable")
-    {
-        return None;
+        .any(|attempt| attempt.decision == "route_unavailable");
+    if has_route_unavailable {
+        return Some(CodexStreamFailureKind::RouteUnavailable);
     }
-    Some(codex_stream_response(message, route_attempts))
+
+    route_attempts
+        .iter()
+        .any(|attempt| {
+            matches!(
+                attempt.decision.as_str(),
+                "failed_status" | "failed_transport" | "failed_body_read" | "failed_body_too_large"
+            )
+        })
+        .then_some(CodexStreamFailureKind::UpstreamFailure)
 }
 
 fn route_unavailable_attempt(
@@ -231,10 +271,14 @@ fn reason_counts_for_log(route_attempts: &[RouteAttemptLog]) -> serde_json::Valu
     serde_json::to_value(counts).unwrap_or(serde_json::Value::Null)
 }
 
-fn codex_stream_response(message: &str, route_attempts: &[RouteAttemptLog]) -> Response<Body> {
+fn codex_stream_response(
+    message: &str,
+    route_attempts: &[RouteAttemptLog],
+    failure_kind: CodexStreamFailureKind,
+) -> Response<Body> {
     let retry_after_secs = route_unavailable_retry_after_secs(route_attempts)
         .unwrap_or(DEFAULT_ROUTE_UNAVAILABLE_RETRY_SECS);
-    let body = synthetic_codex_rate_limit_sse(message, retry_after_secs);
+    let body = synthetic_codex_failure_sse(message, retry_after_secs, failure_kind);
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
@@ -243,24 +287,28 @@ fn codex_stream_response(message: &str, route_attempts: &[RouteAttemptLog]) -> R
         .expect("synthetic SSE response should build")
 }
 
-fn synthetic_codex_rate_limit_sse(message: &str, retry_after_secs: u64) -> String {
+fn synthetic_codex_failure_sse(
+    message: &str,
+    retry_after_secs: u64,
+    failure_kind: CodexStreamFailureKind,
+) -> String {
     let payload = serde_json::json!({
         "type": "response.failed",
         "sequence_number": 1,
         "response": {
-            "id": format!("resp_codex_helper_route_unavailable_{}", crate::logging::now_ms()),
+            "id": format!("{}_{}", failure_kind.response_id_prefix(), crate::logging::now_ms()),
             "object": "response",
             "created_at": crate::logging::now_ms() / 1000,
             "status": "failed",
             "background": false,
             "error": {
-                "code": "rate_limit_exceeded",
+                "code": failure_kind.error_code(),
                 "message": message,
             },
             "usage": null,
             "user": null,
             "metadata": {
-                "codex_helper_error": "route_unavailable",
+                "codex_helper_error": failure_kind.metadata_value(),
                 "retry_after_secs": retry_after_secs,
             },
         },

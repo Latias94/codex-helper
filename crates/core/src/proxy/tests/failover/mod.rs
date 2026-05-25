@@ -2173,6 +2173,7 @@ async fn proxy_retries_each_upstream_once_and_stops_when_all_avoided() {
         "codex",
         Arc::new(std::sync::Mutex::new(HashMap::new())),
     );
+    let state = proxy.state.clone();
     let app = crate::proxy::router(proxy);
     let (proxy_addr, proxy_handle) = spawn_axum_server(app);
 
@@ -2181,27 +2182,41 @@ async fn proxy_retries_each_upstream_once_and_stops_when_all_avoided() {
         .post(format!("http://{}/v1/responses", proxy_addr))
         .header("content-type", "application/json")
         .header("accept", "text/event-stream")
-        .body(r#"{"model":"gpt","input":"hi"}"#)
+        .body(r#"{"model":"gpt","input":"hi","stream":true}"#)
         .send()
         .await
         .expect("send");
 
-    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(resp.status(), StatusCode::OK);
     let body = resp.text().await.expect("read body");
+    assert!(body.contains("event: response.failed"), "{body}");
+    assert!(body.contains(r#""code":"rate_limit_exceeded""#), "{body}");
     assert!(
-        body.contains("all upstream attempts failed"),
-        "expected aggregated failure summary, got: {body}"
+        body.contains(r#""codex_helper_error":"upstream_failure""#),
+        "{body}"
     );
+    assert!(body.contains("all upstream attempts failed"), "{body}");
     assert!(
         body.contains("upstream[0]") && body.contains("upstream[1]"),
-        "expected both upstream attempts in failure summary, got: {body}"
-    );
-    assert!(
-        body.contains("last_error:") && body.contains("u2 502"),
-        "expected final upstream error body in failure summary, got: {body}"
+        "{body}"
     );
     assert_eq!(upstream1_hits.load(Ordering::SeqCst), 1);
     assert_eq!(upstream2_hits.load(Ordering::SeqCst), 1);
+
+    let finished = state.list_recent_finished(1).await;
+    let failed = finished
+        .first()
+        .expect("failed request should remain recorded as a 502");
+    assert_eq!(failed.status_code, 502);
+    let retry = failed.retry.as_ref().expect("retry trace");
+    assert_eq!(
+        retry
+            .route_attempts
+            .iter()
+            .map(|attempt| attempt.decision.as_str())
+            .collect::<Vec<_>>(),
+        vec!["failed_status", "failed_status"]
+    );
 
     proxy_handle.abort();
     u1_handle.abort();
