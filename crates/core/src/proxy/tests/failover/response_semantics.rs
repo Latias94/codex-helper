@@ -433,6 +433,7 @@ async fn proxy_codex_stream_route_unavailable_returns_retryable_response_failed_
         .find(|request| request.status_code == 502)
         .expect("failed request should be finalized");
     let retry = failed.retry.as_ref().expect("retry trace");
+    assert_eq!(retry.attempts, 0);
     assert_eq!(
         retry
             .route_attempts
@@ -3493,6 +3494,124 @@ supports_websockets = true
     assert_eq!(body["type"].as_str(), Some("response.create"));
     assert_eq!(body["model"].as_str(), Some("relay-gpt-5"));
     assert_eq!(body["prompt_cache_key"].as_str(), Some("ws-cache"));
+
+    proxy_handle.abort();
+    u_handle.abort();
+    let _ = std::fs::remove_dir_all(codex_home);
+}
+
+#[tokio::test]
+async fn responses_websocket_route_unavailable_records_route_attempts() {
+    let _env_guard = env_lock().await;
+    let codex_home = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HOME", &codex_home);
+    }
+    write_text_file(
+        &codex_home.join("config.toml"),
+        r#"
+model_provider = "codex_proxy"
+
+[model_providers.codex_proxy]
+name = "OpenAI"
+base_url = "http://127.0.0.1:1"
+wire_api = "responses"
+supports_websockets = true
+"#,
+    );
+
+    let upstream =
+        axum::Router::new().route(
+            "/v1/responses",
+            get(|ws: axum::extract::ws::WebSocketUpgrade| async move {
+                ws.on_upgrade(|_| async move {})
+            }),
+        );
+    let (u_addr, u_handle) = spawn_axum_server(upstream);
+
+    let retry = RetryConfig {
+        transport_cooldown_secs: Some(30),
+        cooldown_backoff_factor: Some(1),
+        cooldown_backoff_max_secs: Some(0),
+        ..RetryConfig::default()
+    };
+    let v4 = ProxyConfigV4 {
+        retry,
+        codex: ServiceViewV4 {
+            providers: std::collections::BTreeMap::from([(
+                "ws-provider".to_string(),
+                ProviderConfigV4 {
+                    base_url: Some(format!("http://{u_addr}/v1")),
+                    inline_auth: UpstreamAuth::default(),
+                    ..ProviderConfigV4::default()
+                },
+            )]),
+            routing: Some(RoutingConfigV4::ordered_failover(vec![
+                "ws-provider".to_string(),
+            ])),
+            ..ServiceViewV4::default()
+        },
+        ..ProxyConfigV4::default()
+    };
+    let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compile v4");
+    let proxy = ProxyService::new_with_v4_source(
+        Client::new(),
+        Arc::new(runtime),
+        Some(Arc::new(v4)),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let state = proxy.state.clone();
+    state
+        .penalize_provider_endpoint_attempt(
+            "codex",
+            crate::runtime_identity::ProviderEndpointKey::new("codex", "ws-provider", "default"),
+            30,
+            crate::lb::CooldownBackoff {
+                factor: 1,
+                max_secs: 0,
+            },
+        )
+        .await;
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let request = format!("ws://{proxy_addr}/v1/responses")
+        .into_client_request()
+        .expect("ws request");
+    let (mut socket, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("connect proxy websocket");
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"response.create","model":"gpt-5","stream":true,"prompt_cache_key":"ws-route-unavailable"}"#.into(),
+        ))
+        .await
+        .expect("send first frame");
+
+    let close = socket.next().await.expect("close frame").expect("close ok");
+    assert!(matches!(
+        close,
+        tokio_tungstenite::tungstenite::Message::Close(_)
+    ));
+
+    let finished = find_finished_request(&state, 10, |request| {
+        request.session_id.as_deref() == Some("ws-route-unavailable")
+    })
+    .await
+    .expect("finished websocket request");
+    assert_eq!(finished.status_code, 502);
+    let retry = finished.retry.as_ref().expect("retry trace");
+    assert_eq!(retry.attempts, 0);
+    assert_eq!(
+        retry
+            .route_attempts
+            .iter()
+            .map(|attempt| attempt.decision.as_str())
+            .collect::<Vec<_>>(),
+        vec!["route_unavailable"]
+    );
 
     proxy_handle.abort();
     u_handle.abort();

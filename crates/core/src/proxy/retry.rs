@@ -112,7 +112,8 @@ fn retry_info_with_min_attempts(
     min_attempts: u32,
 ) -> Option<RetryInfo> {
     let attempts = observed_attempt_count(chain, route_attempts);
-    if attempts < min_attempts {
+    let has_structured_route_attempts = !route_attempts.is_empty();
+    if attempts < min_attempts && !has_structured_route_attempts {
         return None;
     }
 
@@ -131,7 +132,7 @@ fn observed_attempt_count(chain: &[String], route_attempts: &[RouteAttemptLog]) 
     if !route_attempts.is_empty() {
         return route_attempts
             .iter()
-            .filter(|attempt| attempt.decision != "all_upstreams_avoided")
+            .filter(|attempt| !attempt.skipped && attempt.decision != "all_upstreams_avoided")
             .count() as u32;
     }
 
@@ -348,6 +349,24 @@ mod tests {
             Some("provider-b")
         );
         assert_eq!(info.route_attempts[1].upstream_headers_ms, Some(42));
+    }
+
+    #[test]
+    fn retry_info_preserves_skipped_route_decisions_without_counting_them_as_attempts() {
+        let route_attempts = vec![RouteAttemptLog {
+            attempt_index: 0,
+            provider_id: Some("provider-a".to_string()),
+            decision: "route_unavailable".to_string(),
+            reason: Some("cooldown".to_string()),
+            skipped: true,
+            raw: "endpoint=provider-a unavailable reason=cooldown".to_string(),
+            ..Default::default()
+        }];
+
+        let info = retry_info_for_failed_attempts(&[], &route_attempts).unwrap();
+
+        assert_eq!(info.attempts, 0);
+        assert_eq!(info.route_attempts, route_attempts);
     }
 
     #[test]

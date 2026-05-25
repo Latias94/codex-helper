@@ -88,6 +88,22 @@ struct ResponsesWebSocketSelected {
     _concurrency_permit: Option<ConcurrencyPermit>,
 }
 
+struct ResponsesWebSocketSelectionFailure {
+    status: StatusCode,
+    message: String,
+    route_attempts: Vec<RouteAttemptLog>,
+}
+
+impl ResponsesWebSocketSelectionFailure {
+    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+            route_attempts: Vec::new(),
+        }
+    }
+}
+
 pub(super) async fn handle_responses_websocket(
     proxy: ProxyService,
     ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
@@ -159,14 +175,14 @@ async fn serve_responses_websocket(
 
     let selected = match select_responses_websocket_target(&proxy, &prepared).await {
         Ok(selected) => selected,
-        Err((status, message)) => {
+        Err(failure) => {
             let _ = finish_failed_proxy_request(FailedProxyRequestParams {
                 proxy: &proxy,
                 method: &prepared.method,
                 path: prepared.uri.path(),
                 request_id: prepared.request_id,
-                status,
-                message: message.clone(),
+                status: failure.status,
+                message: failure.message.clone(),
                 duration_ms: prepared.start.elapsed().as_millis() as u64,
                 started_at_ms: prepared.started_at_ms,
                 session_id: prepared.session_id.clone(),
@@ -174,11 +190,16 @@ async fn serve_responses_websocket(
                 cwd: prepared.cwd.clone(),
                 effective_effort: prepared.effective_effort.clone(),
                 service_tier: prepared.base_service_tier.clone(),
-                retry: None,
-                failure_route_attempts: Vec::new(),
+                retry: retry_info_for_failed_attempts(&[], &failure.route_attempts),
+                failure_route_attempts: failure.route_attempts,
             })
             .await;
-            close_client_ws(client_socket, close_code_for_status(status), message).await;
+            close_client_ws(
+                client_socket,
+                close_code_for_status(failure.status),
+                failure.message,
+            )
+            .await;
             return;
         }
     };
@@ -365,7 +386,7 @@ async fn prepare_responses_websocket(
 async fn select_responses_websocket_target(
     proxy: &ProxyService,
     prepared: &ResponsesWebSocketPrepared,
-) -> Result<ResponsesWebSocketSelected, (StatusCode, String)> {
+) -> Result<ResponsesWebSocketSelected, ResponsesWebSocketSelectionFailure> {
     match &prepared.route_selection {
         RequestRouteSelection::RouteGraph { template } => {
             let executor = RoutePlanExecutor::new(template);
@@ -432,7 +453,6 @@ async fn select_responses_websocket_target(
                 }
 
                 let mut route_attempts = Vec::new();
-                let mut last_err = None;
                 if let Some(report) = route_unavailable_report(
                     proxy.service_name,
                     prepared.request_id,
@@ -442,17 +462,20 @@ async fn select_responses_websocket_target(
                     prepared.request_model.as_deref(),
                 ) {
                     route_attempts.extend(report.route_attempts.clone());
-                    last_err = Some(report.failure_status_message());
+                    let (status, message) = report.failure_status_message();
+                    return Err(ResponsesWebSocketSelectionFailure {
+                        status,
+                        message,
+                        route_attempts,
+                    });
                 }
-                return Err(last_err.unwrap_or_else(|| {
-                    (
-                        StatusCode::BAD_GATEWAY,
-                        format!(
-                            "no route candidate supports model {:?}",
-                            prepared.request_model
-                        ),
-                    )
-                }));
+                return Err(ResponsesWebSocketSelectionFailure::new(
+                    StatusCode::BAD_GATEWAY,
+                    format!(
+                        "no route candidate supports model {:?}",
+                        prepared.request_model
+                    ),
+                ));
             }
         }
         RequestRouteSelection::Legacy { lbs } => {
@@ -528,7 +551,7 @@ async fn select_responses_websocket_target(
                 tried_stations.insert(station_name);
             }
 
-            Err((
+            Err(ResponsesWebSocketSelectionFailure::new(
                 StatusCode::BAD_GATEWAY,
                 format!("no upstream supports model {:?}", prepared.request_model),
             ))
@@ -550,7 +573,7 @@ struct BuildSelectedParams<'a> {
 
 async fn build_selected(
     params: BuildSelectedParams<'_>,
-) -> Result<ResponsesWebSocketSelected, (StatusCode, String)> {
+) -> Result<ResponsesWebSocketSelected, ResponsesWebSocketSelectionFailure> {
     let BuildSelectedParams {
         proxy,
         prepared,
@@ -571,9 +594,9 @@ async fn build_selected(
     let upstream_first_message =
         replace_data_message_body(&prepared.first_message, filtered_body.as_ref()).ok_or_else(
             || {
-                (
+                ResponsesWebSocketSelectionFailure::new(
                     StatusCode::BAD_REQUEST,
-                    "first response.create message must be text or binary JSON".to_string(),
+                    "first response.create message must be text or binary JSON",
                 )
             },
         )?;
@@ -593,14 +616,15 @@ async fn build_selected(
     let upstream_url = proxy
         .build_target(&target, &prepared.uri)
         .map_err(|error| {
-            (
+            ResponsesWebSocketSelectionFailure::new(
                 StatusCode::BAD_GATEWAY,
                 format!("invalid upstream websocket target: {error}"),
             )
         })?
         .0;
-    let upstream_url =
-        http_url_to_ws(upstream_url).map_err(|message| (StatusCode::BAD_GATEWAY, message))?;
+    let upstream_url = http_url_to_ws(upstream_url).map_err(|message| {
+        ResponsesWebSocketSelectionFailure::new(StatusCode::BAD_GATEWAY, message)
+    })?;
 
     let avoid_set = avoided_indices.into_iter().collect::<HashSet<_>>();
     let mut route_attempts = Vec::new();
