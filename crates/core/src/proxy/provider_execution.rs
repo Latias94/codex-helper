@@ -66,7 +66,7 @@ fn request_continuity_decision(
     request_flavor: &RequestFlavor,
     affinity_policy: Option<RoutingAffinityPolicyV5>,
 ) -> RequestContinuityDecision {
-    if request_flavor.is_remote_compaction_v1_request
+    if request_flavor.is_remote_compaction_request()
         && (request_flavor.remote_compaction_requires_affinity
             || matches!(affinity_policy, Some(RoutingAffinityPolicyV5::Hard)))
     {
@@ -88,8 +88,7 @@ fn compact_provider_failover_policy(
     );
     CompactProviderFailoverPolicy {
         strict_affinity,
-        allow_provider_failover: !request_flavor.is_remote_compaction_v1_request
-            || !strict_affinity,
+        allow_provider_failover: !request_flavor.is_remote_compaction_request() || !strict_affinity,
     }
 }
 
@@ -766,7 +765,7 @@ impl<'a, 'route> RouteGraphAttemptLoop<'a, 'route> {
         } = params;
 
         loop {
-            let selection = if ctx.request_flavor.is_remote_compaction_v1_request
+            let selection = if ctx.request_flavor.is_remote_compaction_request()
                 && runtime.affinity_provider_endpoint().is_some()
             {
                 let affinity_selection = executor.select_affinity_candidate_with_runtime_state(
@@ -810,7 +809,7 @@ impl<'a, 'route> RouteGraphAttemptLoop<'a, 'route> {
                     route_state,
                     ctx.request_model,
                 ) {
-                    if ctx.request_flavor.is_remote_compaction_v1_request
+                    if ctx.request_flavor.is_remote_compaction_request()
                         && !compact_route_unavailable_waited
                         && route_graph_key.is_some()
                         && let Some(wait_secs) =
@@ -1262,6 +1261,7 @@ mod tests {
             is_stream: false,
             is_user_turn: false,
             is_remote_compaction_v1_request,
+            is_remote_compaction_v2_request: false,
             remote_compaction_requires_affinity,
             is_codex_service: false,
             codex_client_patch_mode: CodexPatchMode::Default,
@@ -1282,6 +1282,26 @@ mod tests {
             Some(RoutingAffinityPolicyV5::Off),
         );
         assert!(relaxed_policy.allow_provider_failover());
+    }
+
+    #[test]
+    fn route_graph_policy_treats_remote_compaction_v2_as_state_bound() {
+        let mut request_flavor = test_request_flavor(false, true);
+        request_flavor.is_remote_compaction_v2_request = true;
+        request_flavor.is_user_turn = true;
+
+        let policy = ProviderChainAttemptPolicy::route_graph(
+            &request_flavor,
+            Some(RoutingAffinityPolicyV5::Off),
+        );
+
+        assert_eq!(policy.continuity_class(), "provider_state_bound");
+        assert!(policy.requires_known_affinity());
+        assert!(!policy.allow_provider_failover());
+        assert_eq!(
+            policy.provider_failover_blocked_reason(),
+            Some("provider_state_bound")
+        );
     }
 
     #[test]

@@ -1,8 +1,8 @@
 use axum::http::{Method, StatusCode};
 
 use crate::logging::{
-    HeaderEntry, HttpDebugLog, RetryInfo, RouteAttemptLog, ServiceTierLog, log_request_with_debug,
-    should_include_http_warn,
+    CodexBridgeLog, HeaderEntry, HttpDebugLog, RetryInfo, RouteAttemptLog, ServiceTierLog,
+    log_request_with_debug, should_include_http_warn,
 };
 use crate::state::{FinishRequestParams, SessionIdentitySource};
 
@@ -40,6 +40,7 @@ pub(super) struct FailedProxyRequestParams<'a> {
     pub(super) cwd: Option<String>,
     pub(super) effective_effort: Option<String>,
     pub(super) service_tier: ServiceTierLog,
+    pub(super) codex_bridge: Option<CodexBridgeLog>,
     pub(super) retry: Option<RetryInfo>,
     pub(super) failure_route_attempts: Vec<RouteAttemptLog>,
 }
@@ -116,6 +117,7 @@ pub(super) async fn finish_failed_proxy_request(
         cwd,
         effective_effort,
         service_tier,
+        codex_bridge,
         retry,
         failure_route_attempts,
     } = params;
@@ -161,7 +163,7 @@ pub(super) async fn finish_failed_proxy_request(
         None,
         effective_effort,
         service_tier,
-        None,
+        codex_bridge,
         None,
         None,
         retry,

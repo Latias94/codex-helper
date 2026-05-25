@@ -94,6 +94,7 @@ pub async fn handle_proxy(
         cwd: prepared.cwd.clone(),
         effective_effort: prepared.effective_effort.clone(),
         service_tier: prepared.base_service_tier.clone(),
+        codex_bridge: prepared.request_flavor.codex_bridge_log.clone(),
         retry,
         failure_route_attempts: route_attempts.clone(),
     })

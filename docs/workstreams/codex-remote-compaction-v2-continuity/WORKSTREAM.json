@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "slug": "codex-remote-compaction-v2-continuity",
+  "title": "Codex Remote Compaction V2 Continuity",
+  "status": "complete",
+  "updated": "2026-05-26",
+  "scope_kind": "execution",
+  "problem": "Codex remote_compaction_v2 is sent as ordinary /responses with compaction_trigger, so the proxy currently cannot classify, log, or apply compact continuity semantics to it.",
+  "authoritative_docs": [
+    {
+      "role": "design",
+      "path": "docs/workstreams/codex-remote-compaction-v2-continuity/DESIGN.md"
+    },
+    {
+      "role": "execution",
+      "path": "docs/workstreams/codex-remote-compaction-v2-continuity/TODO.md"
+    },
+    {
+      "role": "gates",
+      "path": "docs/workstreams/codex-remote-compaction-v2-continuity/EVIDENCE_AND_GATES.md"
+    },
+    {
+      "role": "handoff",
+      "path": "docs/workstreams/codex-remote-compaction-v2-continuity/HANDOFF.md"
+    }
+  ],
+  "gates": [
+    "cargo nextest run -p codex-helper-core remote_compaction_v2 request_logs --no-fail-fast",
+    "cargo nextest run -p codex-helper-core remote_compaction_v2 route_affinity --no-fail-fast",
+    "cargo nextest run -p codex-helper-core responses_compact route_affinity --no-fail-fast",
+    "cargo fmt --all --check",
+    "cargo nextest run -p codex-helper-core"
+  ],
+  "evidence": [
+    "docs/workstreams/codex-remote-compaction-v2-continuity/EVIDENCE_AND_GATES.md"
+  ],
+  "adr_refs": [],
+  "continue_policy": {
+    "default_action": "closed",
+    "notes": "Core target complete. Future work should open a new lane for explicit continuity-domain support or v2 live-smoke diagnostics."
+  },
+  "current_task": null
+}

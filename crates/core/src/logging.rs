@@ -273,6 +273,8 @@ pub struct CodexBridgeLog {
     #[serde(default, skip_serializing_if = "bool_is_false")]
     pub remote_compaction_v1_request: bool,
     #[serde(default, skip_serializing_if = "bool_is_false")]
+    pub remote_compaction_v2_request: bool,
+    #[serde(default, skip_serializing_if = "bool_is_false")]
     pub responses_websocket_request: bool,
     #[serde(default, skip_serializing_if = "bool_is_false")]
     pub strips_client_auth: bool,

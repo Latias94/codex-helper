@@ -194,6 +194,7 @@ async fn serve_responses_websocket(
                 cwd: prepared.cwd.clone(),
                 effective_effort: prepared.effective_effort.clone(),
                 service_tier: prepared.base_service_tier.clone(),
+                codex_bridge: None,
                 retry: retry_info_for_failed_attempts(&[], &failure.route_attempts),
                 failure_route_attempts: failure.route_attempts,
             })
@@ -380,6 +381,7 @@ async fn prepare_responses_websocket(
                 cwd,
                 effective_effort,
                 service_tier,
+                codex_bridge: None,
                 retry: None,
                 failure_route_attempts: Vec::new(),
             })
@@ -850,6 +852,7 @@ async fn relay_websocket_streams(
     let codex_bridge = (!prepared.codex_patch_mode.is_default()).then(|| CodexBridgeLog {
         patch_mode: prepared.codex_patch_mode.as_str().to_string(),
         remote_compaction_v1_request: false,
+        remote_compaction_v2_request: false,
         responses_websocket_request: true,
         strips_client_auth: prepared.codex_patch_mode.strips_codex_client_auth(),
     });
@@ -991,6 +994,7 @@ async fn finish_websocket_failure(
         cwd: prepared.cwd.clone(),
         effective_effort: prepared.effective_effort.clone(),
         service_tier: prepared.base_service_tier.clone(),
+        codex_bridge: None,
         retry,
         failure_route_attempts: selected.route_attempts,
     })

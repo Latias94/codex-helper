@@ -147,7 +147,7 @@ pub(super) async fn prepare_proxy_request(
         )
     };
     let request_flavor = request_flavor
-        .with_remote_compaction_affinity_from_body(raw_body.as_ref())
+        .with_remote_compaction_context_from_body(raw_body.as_ref())
         .with_responses_stream_from_body(raw_body.as_ref());
 
     let request_body_previews = crate::logging::should_log_request_body_preview();
@@ -192,6 +192,7 @@ pub(super) async fn prepare_proxy_request(
                 cwd,
                 effective_effort,
                 service_tier,
+                codex_bridge: request_flavor.codex_bridge_log.clone(),
                 retry: None,
                 failure_route_attempts: Vec::new(),
             })

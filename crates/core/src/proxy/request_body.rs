@@ -30,6 +30,29 @@ pub(super) fn codex_responses_body_requests_stream(body: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
+pub(super) fn codex_responses_body_has_compaction_trigger(body: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    value
+        .get("input")
+        .is_some_and(value_mentions_compaction_trigger)
+}
+
+fn value_mentions_compaction_trigger(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(object) => {
+            let is_compaction_trigger = object
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| value == "compaction_trigger");
+            is_compaction_trigger || object.values().any(value_mentions_compaction_trigger)
+        }
+        serde_json::Value::Array(items) => items.iter().any(value_mentions_compaction_trigger),
+        _ => false,
+    }
+}
+
 fn extract_service_tier_from_response_value(value: &serde_json::Value) -> Option<String> {
     value
         .get("service_tier")
@@ -351,11 +374,12 @@ mod tests {
     use super::{
         apply_model_override_value, apply_reasoning_effort_override_value,
         apply_service_tier_override_value, codex_compact_request_requires_affinity,
-        codex_responses_body_requests_stream, complete_codex_session_fields,
-        extract_model_from_value, extract_reasoning_effort_from_value,
-        extract_service_tier_from_response_body, extract_service_tier_from_value,
-        is_stale_previous_response_error, normalize_codex_compact_request_value,
-        remove_previous_response_id_from_body, scan_service_tier_from_sse_bytes_incremental,
+        codex_responses_body_has_compaction_trigger, codex_responses_body_requests_stream,
+        complete_codex_session_fields, extract_model_from_value,
+        extract_reasoning_effort_from_value, extract_service_tier_from_response_body,
+        extract_service_tier_from_value, is_stale_previous_response_error,
+        normalize_codex_compact_request_value, remove_previous_response_id_from_body,
+        scan_service_tier_from_sse_bytes_incremental,
     };
     use axum::body::Bytes;
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -515,6 +539,26 @@ mod tests {
         assert!(!codex_responses_body_requests_stream(
             br#"{"model":"gpt-5","input":"hi"}"#
         ));
+    }
+
+    #[test]
+    fn detects_structured_compaction_trigger_from_responses_body() {
+        assert!(codex_responses_body_has_compaction_trigger(
+            br#"{"model":"gpt-5","input":[{"type":"message","role":"user"},{"type":"compaction_trigger"}]}"#
+        ));
+        assert!(codex_responses_body_has_compaction_trigger(
+            br#"{"model":"gpt-5","input":[{"content":[{"type":"compaction_trigger"}]}]}"#
+        ));
+        assert!(!codex_responses_body_has_compaction_trigger(
+            br#"{"model":"gpt-5","input":"please mention compaction_trigger"}"#
+        ));
+        assert!(!codex_responses_body_has_compaction_trigger(
+            br#"{"model":"gpt-5","input":[{"type":"message","name":"compaction_trigger"}]}"#
+        ));
+        assert!(!codex_responses_body_has_compaction_trigger(
+            br#"{"model":"gpt-5","metadata":{"type":"compaction_trigger"},"input":"hi"}"#
+        ));
+        assert!(!codex_responses_body_has_compaction_trigger(b"not json"));
     }
 
     #[test]

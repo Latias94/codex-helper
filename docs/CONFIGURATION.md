@@ -179,7 +179,10 @@ metadata does not prove image input, the recommendation will not assume hosted i
 Hosted `image_generation` is not actively probed by this diagnostic endpoint because that can spend
 quota or create image artifacts. Responses WebSocket support is opt-in through
 `responses_websocket = true` / `--responses-websocket`; bridge presets keep it disabled by default.
-Remote compaction v2 remains diagnostic-only and is not enabled by these presets.
+Remote compaction v2 is still not enabled by these presets. If you enable Codex
+`[features].remote_compaction_v2 = true` yourself, helper recognizes the
+`compaction_trigger` request shape for logging and route-continuity protection,
+but the upstream relay must still support v2 compaction response items.
 
 When validation-only diagnostics are inconclusive, you can run a stronger live smoke check. This is
 a real upstream request, not a background health check. It is manual, cost-bearing, and requires the
@@ -287,7 +290,7 @@ codex-helper usage find --path responses/compact --limit 20
 codex-helper usage find --path responses --limit 20
 ```
 
-An official compact hit normally appears as `POST /responses/compact` in codex-helper logs. Ordinary local fallback compaction appears as a normal `POST /responses` request. Remote compaction v2, when Codex enables it, also travels through ordinary `/responses` with a `compaction_trigger` payload/event shape rather than `/responses/compact`; this helper preset does not enable v2. When `responses_websocket` is enabled, normal turn streaming uses a WebSocket `GET /responses`-style upgrade rather than an HTTP `POST /responses`.
+An official compact hit normally appears as `POST /responses/compact` in codex-helper logs. Ordinary local fallback compaction appears as a normal `POST /responses` request. Remote compaction v2, when Codex enables it, also travels through ordinary `/responses` with a structured `compaction_trigger` input item rather than `/responses/compact`; helper logs it with `codex_bridge.remote_compaction_v2_request = true` and applies state-bound route-continuity rules. This helper preset does not enable v2. When `responses_websocket` is enabled, normal turn streaming uses a WebSocket `GET /responses`-style upgrade rather than an HTTP `POST /responses`.
 
 Switching back to `default` removes the bridge-only fields from `codex_proxy` and restores helper-managed auth patches when it is safe to do so.
 
@@ -397,7 +400,7 @@ Successful route affinity is also persisted to:
 
 The ledger stores helper-owned provider endpoint identity only; it does not store or infer upstream relay implementation details. Set `CODEX_HELPER_SESSION_ROUTE_AFFINITY_LEDGER=off` to disable this persistence, or set it to a path to use a custom ledger file.
 
-For Codex remote compaction, helper treats compact requests that mention state-bound fields such as `encrypted_content`, `previous_response_id`, or `compaction_summary` as provider-state-bound. These requests must use a known route affinity. If no affinity exists after startup or config changes, helper returns an explicit continuity error instead of silently choosing a different provider endpoint. If the known affinity endpoint itself fails, provider-state-bound compact stays fail-closed; non-state-bound compact can still use normal provider fallback according to the route policy.
+For Codex remote compaction, helper treats compact v1 requests that mention state-bound fields such as `encrypted_content`, `previous_response_id`, or `compaction_summary`, and compact v2 requests with a structured `compaction_trigger`, as provider-state-bound. These requests must use a known route affinity. If no affinity exists after startup or config changes, helper returns an explicit continuity error instead of silently choosing a different provider endpoint. If the known affinity endpoint itself fails, provider-state-bound compact stays fail-closed; non-state-bound compact can still use normal provider fallback according to the route policy.
 
 Affinity is not a hard pin:
 

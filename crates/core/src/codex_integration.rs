@@ -1303,9 +1303,9 @@ pub fn codex_bridge_diagnostics() -> CodexBridgeDiagnostics {
                     &mut checks,
                     "codex_bridge.remote_compaction_v2",
                     CodexBridgeDiagnosticStatus::Warn,
-                    "Codex remote_compaction_v2 is enabled; current relay compatibility is less stable than v1 /responses/compact.".to_string(),
+                    "Codex remote_compaction_v2 is enabled; helper will detect compaction_trigger requests, but relay compatibility is still less stable than v1 /responses/compact.".to_string(),
                     Some(
-                        "Prefer leaving [features].remote_compaction_v2 unset/false unless your relay explicitly supports compaction_trigger and compaction response items.".to_string(),
+                        "Only keep [features].remote_compaction_v2 = true when your relay explicitly supports compaction_trigger requests and compaction response items.".to_string(),
                     ),
                 );
             } else {

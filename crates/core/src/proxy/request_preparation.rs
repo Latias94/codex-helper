@@ -15,7 +15,8 @@ use super::client_identity::ClientSessionIdentity;
 use super::request_body::{
     apply_model_override_value, apply_reasoning_effort_override_value,
     apply_service_tier_override_value, codex_compact_request_requires_affinity,
-    extract_model_from_value, extract_reasoning_effort_from_value, extract_service_tier_from_value,
+    codex_responses_body_has_compaction_trigger, extract_model_from_value,
+    extract_reasoning_effort_from_value, extract_service_tier_from_value,
     normalize_codex_compact_request_value,
 };
 use super::request_routing::RequestRouteSelection;
@@ -27,6 +28,7 @@ pub(super) struct RequestFlavor {
     pub is_stream: bool,
     pub is_user_turn: bool,
     pub is_remote_compaction_v1_request: bool,
+    pub is_remote_compaction_v2_request: bool,
     pub remote_compaction_requires_affinity: bool,
     pub is_codex_service: bool,
     pub codex_client_patch_mode: CodexPatchMode,
@@ -34,13 +36,31 @@ pub(super) struct RequestFlavor {
 }
 
 impl RequestFlavor {
-    pub(super) fn with_remote_compaction_affinity_from_body(self, raw_body: &[u8]) -> Self {
-        let remote_compaction_requires_affinity = self.is_remote_compaction_v1_request
-            && codex_compact_request_requires_affinity(raw_body);
-        Self {
-            remote_compaction_requires_affinity,
-            ..self
+    pub(super) fn is_remote_compaction_request(&self) -> bool {
+        self.is_remote_compaction_v1_request || self.is_remote_compaction_v2_request
+    }
+
+    pub(super) fn with_remote_compaction_context_from_body(mut self, raw_body: &[u8]) -> Self {
+        let is_remote_compaction_v2_request = self.is_codex_service
+            && self.is_user_turn
+            && codex_responses_body_has_compaction_trigger(raw_body);
+        self.is_remote_compaction_v2_request = is_remote_compaction_v2_request;
+        self.remote_compaction_requires_affinity = (self.is_remote_compaction_v1_request
+            && codex_compact_request_requires_affinity(raw_body))
+            || is_remote_compaction_v2_request;
+        if is_remote_compaction_v2_request {
+            let patch_mode = self.codex_client_patch_mode.as_str().to_string();
+            let strips_client_auth = self.codex_client_patch_mode.strips_codex_client_auth();
+            let bridge = self.codex_bridge_log.get_or_insert_with(|| CodexBridgeLog {
+                patch_mode,
+                remote_compaction_v1_request: false,
+                remote_compaction_v2_request: false,
+                responses_websocket_request: false,
+                strips_client_auth,
+            });
+            bridge.remote_compaction_v2_request = true;
         }
+        self
     }
 
     pub(super) fn with_responses_stream_from_body(self, raw_body: &[u8]) -> Self {
@@ -371,6 +391,7 @@ pub(super) fn detect_request_flavor(
         .then(|| CodexBridgeLog {
             patch_mode: codex_client_patch_mode.as_str().to_string(),
             remote_compaction_v1_request: is_remote_compaction_v1_request,
+            remote_compaction_v2_request: false,
             responses_websocket_request: false,
             strips_client_auth: codex_client_patch_mode.strips_codex_client_auth(),
         });
@@ -380,6 +401,7 @@ pub(super) fn detect_request_flavor(
         is_stream,
         is_user_turn,
         is_remote_compaction_v1_request,
+        is_remote_compaction_v2_request: false,
         remote_compaction_requires_affinity: false,
         is_codex_service,
         codex_client_patch_mode,
@@ -638,6 +660,8 @@ mod tests {
         assert!(flavor.is_stream);
         assert!(flavor.is_user_turn);
         assert!(!flavor.is_remote_compaction_v1_request);
+        assert!(!flavor.is_remote_compaction_v2_request);
+        assert!(!flavor.is_remote_compaction_request());
         assert!(flavor.is_codex_service);
     }
 
@@ -658,6 +682,7 @@ mod tests {
         let bridge = flavor.codex_bridge_log.expect("bridge log");
         assert_eq!(bridge.patch_mode, "official-imagegen-bridge");
         assert!(bridge.remote_compaction_v1_request);
+        assert!(!bridge.remote_compaction_v2_request);
         assert!(bridge.strips_client_auth);
     }
 
@@ -693,11 +718,38 @@ mod tests {
             "/v1/responses/compact",
             CodexPatchMode::Default,
         )
-        .with_remote_compaction_affinity_from_body(
+        .with_remote_compaction_context_from_body(
             br#"{"input":[{"type":"reasoning","encrypted_content":"state"}]}"#,
         );
 
         assert!(flavor.remote_compaction_requires_affinity);
+    }
+
+    #[test]
+    fn request_flavor_finalizes_remote_compaction_v2_from_body() {
+        let headers = HeaderMap::new();
+
+        let flavor = detect_request_flavor(
+            "codex",
+            &Method::POST,
+            &headers,
+            "/v1/responses",
+            CodexPatchMode::Default,
+        )
+        .with_remote_compaction_context_from_body(
+            br#"{"input":[{"type":"message"},{"type":"compaction_trigger"}],"stream":true}"#,
+        );
+
+        assert!(flavor.is_user_turn);
+        assert!(!flavor.is_remote_compaction_v1_request);
+        assert!(flavor.is_remote_compaction_v2_request);
+        assert!(flavor.is_remote_compaction_request());
+        assert!(flavor.remote_compaction_requires_affinity);
+        let bridge = flavor.codex_bridge_log.expect("bridge log");
+        assert_eq!(bridge.patch_mode, "default");
+        assert!(!bridge.remote_compaction_v1_request);
+        assert!(bridge.remote_compaction_v2_request);
+        assert!(!bridge.strips_client_auth);
     }
 
     #[test]
