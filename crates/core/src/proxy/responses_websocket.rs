@@ -16,7 +16,7 @@ use tokio_tungstenite::tungstenite::http as tungstenite_http;
 use crate::codex_integration::CodexPatchMode;
 use crate::lb::{COOLDOWN_SECS, LoadBalancer};
 use crate::logging::{CodexBridgeLog, RouteAttemptLog, ServiceTierLog};
-use crate::routing_ir::{RoutePlanAttemptState, RoutePlanExecutor};
+use crate::routing_ir::{RouteCandidate, RoutePlanAttemptState, RoutePlanExecutor};
 use crate::state::{
     FinishRequestParams, ResolvedRouteValue, RouteDecisionProvenance, RouteValueSource,
     SessionIdentitySource,
@@ -46,6 +46,10 @@ use super::route_attempts::{
     start_selected_route_attempt,
 };
 use super::route_executor_runtime::route_plan_runtime_state_from_lbs_with_overrides;
+use super::route_metadata::{
+    ENDPOINT_ID_TAG, PREFERENCE_GROUP_TAG, PROVIDER_ENDPOINT_KEY_TAG, PROVIDER_ID_TAG,
+    ROUTE_PATH_TAG,
+};
 use super::route_unavailability::route_unavailable_report;
 use super::selected_upstream_request::apply_selected_model_mapping;
 use super::{CLIENT_NAME_HEADER, ProxyService};
@@ -488,11 +492,19 @@ async fn select_responses_websocket_target(
                 lbs.iter().map(|lb| lb.service.as_ref()),
             );
             let executor = RoutePlanExecutor::new(&legacy_template);
-            let runtime = route_plan_runtime_state_from_lbs_with_overrides(
+            let route_graph_key = legacy_template.route_graph_key();
+            let mut runtime = route_plan_runtime_state_from_lbs_with_overrides(
                 proxy.service_name,
                 lbs,
                 &upstream_overrides,
             );
+            apply_session_route_affinity_for_template(
+                proxy,
+                prepared.session_id.as_deref(),
+                &legacy_template,
+                &mut runtime,
+            )
+            .await;
             let mut route_state = RoutePlanAttemptState::default();
             let total_upstreams = legacy_template.candidates.len();
             let mut tried_stations = HashSet::new();
@@ -530,9 +542,13 @@ async fn select_responses_websocket_target(
                     match build_selected(BuildSelectedParams {
                         proxy,
                         prepared,
-                        target: AttemptTarget::legacy(selected_upstream.clone()),
+                        target: AttemptTarget::legacy(selected_upstream_with_route_metadata(
+                            proxy.service_name,
+                            selected_upstream.clone(),
+                            selected_candidate,
+                        )),
                         legacy_lb: Some(lb.clone()),
-                        route_graph_key: None,
+                        route_graph_key: Some(route_graph_key.clone()),
                         avoided_indices,
                         avoided_total: selection.avoided_total,
                         total_upstreams,
@@ -557,6 +573,41 @@ async fn select_responses_websocket_target(
             ))
         }
     }
+}
+
+fn selected_upstream_with_route_metadata(
+    service_name: &str,
+    mut selected: crate::lb::SelectedUpstream,
+    candidate: &RouteCandidate,
+) -> crate::lb::SelectedUpstream {
+    let provider_endpoint = crate::runtime_identity::ProviderEndpointKey::new(
+        service_name,
+        candidate.provider_id.clone(),
+        candidate.endpoint_id.clone(),
+    );
+    selected
+        .upstream
+        .tags
+        .insert(PROVIDER_ID_TAG.to_string(), candidate.provider_id.clone());
+    selected
+        .upstream
+        .tags
+        .insert(ENDPOINT_ID_TAG.to_string(), candidate.endpoint_id.clone());
+    selected.upstream.tags.insert(
+        PROVIDER_ENDPOINT_KEY_TAG.to_string(),
+        provider_endpoint.stable_key(),
+    );
+    selected.upstream.tags.insert(
+        PREFERENCE_GROUP_TAG.to_string(),
+        candidate.preference_group.to_string(),
+    );
+    if let Ok(route_path) = serde_json::to_string(&candidate.route_path) {
+        selected
+            .upstream
+            .tags
+            .insert(ROUTE_PATH_TAG.to_string(), route_path);
+    }
+    selected
 }
 
 struct BuildSelectedParams<'a> {

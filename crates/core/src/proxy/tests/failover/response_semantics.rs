@@ -3,7 +3,8 @@ use crate::proxy::tests::harness::{
     find_finished_request, post_compact_json, post_responses_json, proxy_service,
     spawn_proxy_service, spawn_test_proxy, spawn_test_upstream,
 };
-use crate::state::SessionIdentitySource;
+use crate::runtime_identity::ProviderEndpointKey;
+use crate::state::{SessionIdentitySource, SessionRouteAffinityTarget};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use std::io::Cursor;
@@ -3615,6 +3616,154 @@ supports_websockets = true
 
     proxy_handle.abort();
     u_handle.abort();
+    let _ = std::fs::remove_dir_all(codex_home);
+}
+
+#[tokio::test]
+async fn responses_websocket_success_records_legacy_route_affinity() {
+    let _env_guard = env_lock().await;
+    let codex_home = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HOME", &codex_home);
+    }
+    write_text_file(
+        &codex_home.join("config.toml"),
+        r#"
+model_provider = "codex_proxy"
+
+[model_providers.codex_proxy]
+name = "OpenAI"
+base_url = "http://127.0.0.1:1"
+wire_api = "responses"
+supports_websockets = true
+"#,
+    );
+
+    let first_hits = Arc::new(AtomicUsize::new(0));
+    let first_hits_for_route = first_hits.clone();
+    let first_upstream = axum::Router::new().route(
+        "/v1/responses",
+        get(move |ws: axum::extract::ws::WebSocketUpgrade| {
+            let first_hits = first_hits_for_route.clone();
+            async move {
+                ws.on_upgrade(move |mut socket| async move {
+                    first_hits.fetch_add(1, Ordering::SeqCst);
+                    if socket.recv().await.is_some() {
+                        let _ = socket
+                            .send(axum::extract::ws::Message::Text(
+                                r#"{"type":"response.created","response":{"id":"resp-first"}}"#
+                                    .into(),
+                            ))
+                            .await;
+                    }
+                })
+            }
+        }),
+    );
+    let first_upstream = spawn_test_upstream(first_upstream);
+
+    let second_hits = Arc::new(AtomicUsize::new(0));
+    let second_hits_for_route = second_hits.clone();
+    let second_upstream = axum::Router::new().route(
+        "/v1/responses",
+        get(move |ws: axum::extract::ws::WebSocketUpgrade| {
+            let second_hits = second_hits_for_route.clone();
+            async move {
+                ws.on_upgrade(move |mut socket| async move {
+                    second_hits.fetch_add(1, Ordering::SeqCst);
+                    if socket.recv().await.is_some() {
+                        let _ = socket
+                            .send(axum::extract::ws::Message::Text(
+                                r#"{"type":"response.created","response":{"id":"resp-affinity"}}"#
+                                    .into(),
+                            ))
+                            .await;
+                    }
+                })
+            }
+        }),
+    );
+    let second_upstream = spawn_test_upstream(second_upstream);
+
+    let cfg = make_proxy_config(
+        vec![
+            first_upstream.upstream_config(),
+            second_upstream.upstream_config(),
+        ],
+        retry_config(1, "502", Vec::new(), RetryStrategy::Failover),
+    );
+    let legacy_template =
+        crate::routing_ir::compile_legacy_route_plan_template("codex", cfg.codex.configs.values());
+    let route_graph_key = legacy_template.route_graph_key();
+    let proxy = proxy_service(cfg);
+    let state = proxy.state.clone();
+    state
+        .record_session_route_affinity_success(
+            "ws-legacy-affinity",
+            SessionRouteAffinityTarget {
+                route_graph_key: route_graph_key.clone(),
+                session_identity_source: Some(SessionIdentitySource::PromptCacheKey),
+                provider_endpoint: ProviderEndpointKey::new("codex", "test#1", "1"),
+                upstream_base_url: second_upstream.base_url(),
+                route_path: vec![
+                    "legacy".to_string(),
+                    "test".to_string(),
+                    "test#1".to_string(),
+                ],
+            },
+            Some("test_seed".to_string()),
+            crate::logging::now_ms(),
+        )
+        .await;
+    let proxy = spawn_proxy_service(proxy);
+
+    let request = format!("ws://{}/v1/responses", proxy.addr)
+        .into_client_request()
+        .expect("ws request");
+    let (mut socket, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("connect proxy websocket");
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"response.create","model":"gpt-5","stream":true,"prompt_cache_key":"ws-legacy-affinity"}"#.into(),
+        ))
+        .await
+        .expect("send first frame");
+
+    let event = socket
+        .next()
+        .await
+        .expect("event")
+        .expect("event ok")
+        .to_text()
+        .expect("event text")
+        .to_string();
+    assert!(event.contains("response.created"), "{event}");
+
+    socket.close(None).await.expect("close websocket");
+    let finished = find_finished_request(&state, 10, |request| {
+        request.session_id.as_deref() == Some("ws-legacy-affinity")
+    })
+    .await
+    .expect("finished websocket request");
+    assert_eq!(
+        finished.status_code,
+        StatusCode::SWITCHING_PROTOCOLS.as_u16()
+    );
+    let affinity = state
+        .get_session_route_affinity("ws-legacy-affinity")
+        .await
+        .expect("websocket success should record route affinity");
+    assert_eq!(affinity.route_graph_key, route_graph_key);
+    assert_eq!(affinity.provider_endpoint.provider_id.as_str(), "test#1");
+    assert_eq!(
+        affinity.session_identity_source,
+        Some(SessionIdentitySource::PromptCacheKey)
+    );
+    assert_eq!(first_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(second_hits.load(Ordering::SeqCst), 1);
+
     let _ = std::fs::remove_dir_all(codex_home);
 }
 
