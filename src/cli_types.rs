@@ -316,9 +316,9 @@ pub(crate) enum SwitchCommand {
         /// Listen port for local proxy; defaults to 3211
         #[arg(long, default_value_t = 3211)]
         port: u16,
-        /// Codex client preset; default preserves historical behavior
-        #[arg(long = "preset", alias = "mode", value_enum, default_value_t = CodexClientPatchPresetArg::Default)]
-        preset: CodexClientPatchPresetArg,
+        /// Codex client preset; if omitted, use the preset from ~/.codex-helper/config.toml
+        #[arg(long = "preset", alias = "mode", value_enum)]
+        preset: Option<CodexClientPatchPresetArg>,
         /// Enable Responses WebSocket transport advertising for official bridge presets
         #[arg(long)]
         responses_websocket: bool,
@@ -1008,6 +1008,56 @@ pub enum PricingCommand {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn switch_on_without_preset_leaves_preset_unset_for_config_fallback() {
+        let cli = Cli::try_parse_from(["codex-helper", "switch", "on"])
+            .expect("parse switch on without explicit preset");
+
+        let Some(Command::Switch {
+            cmd:
+                SwitchCommand::On {
+                    preset,
+                    responses_websocket,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected switch on command");
+        };
+        assert_eq!(preset, None);
+        assert!(!responses_websocket);
+    }
+
+    #[test]
+    fn switch_on_with_explicit_preset_keeps_requested_preset() {
+        let cli = Cli::try_parse_from([
+            "codex-helper",
+            "switch",
+            "on",
+            "--preset",
+            "official-imagegen",
+            "--responses-websocket",
+        ])
+        .expect("parse switch on with explicit preset");
+
+        let Some(Command::Switch {
+            cmd:
+                SwitchCommand::On {
+                    preset,
+                    responses_websocket,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected switch on command");
+        };
+        assert_eq!(
+            preset,
+            Some(CodexClientPatchPresetArg::OfficialImagegenBridge)
+        );
+        assert!(responses_websocket);
+    }
 
     #[test]
     fn codex_relay_cli_parses_capability_diagnostics() {

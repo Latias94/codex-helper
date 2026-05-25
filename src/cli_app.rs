@@ -1381,7 +1381,7 @@ fn parse_unix_lsof_owners(output: &str) -> Vec<PortOwner> {
 
 fn do_switch_on(
     port: u16,
-    preset: CodexClientPatchPresetArg,
+    preset: Option<CodexClientPatchPresetArg>,
     responses_websocket: bool,
     codex: bool,
     claude: bool,
@@ -1391,26 +1391,8 @@ fn do_switch_on(
             "Please specify at most one of --codex / --claude".to_string(),
         ));
     }
-    let mode = match preset {
-        CodexClientPatchPresetArg::Default => codex_integration::CodexPatchMode::Default,
-        CodexClientPatchPresetArg::ChatgptBridge => {
-            codex_integration::CodexPatchMode::ChatGptBridge
-        }
-        CodexClientPatchPresetArg::ImagegenBridge => {
-            codex_integration::CodexPatchMode::ImagegenBridge
-        }
-        CodexClientPatchPresetArg::OfficialRelayBridge => {
-            codex_integration::CodexPatchMode::OfficialRelayBridge
-        }
-        CodexClientPatchPresetArg::OfficialImagegenBridge => {
-            codex_integration::CodexPatchMode::OfficialImagegenBridge
-        }
-    };
-    let switch_options = codex_integration::CodexSwitchOptions {
-        responses_websocket,
-    };
     if claude {
-        if !mode.is_default() {
+        if preset.is_some() {
             return Err(CliError::Other(
                 "--preset is only supported for Codex switch on".to_string(),
             ));
@@ -1427,18 +1409,31 @@ fn do_switch_on(
             .map_err(|e| CliError::CodexConfig(e.to_string()))?;
     } else {
         codex_integration::guard_codex_config_before_switch_on_interactive()?;
-        codex_integration::switch_on_with_options(port, mode, switch_options)
+        let (effective_mode, effective_options) = match preset {
+            Some(preset) => (
+                codex_helper_core::codex_integration::CodexPatchMode::from(preset),
+                codex_helper_core::codex_integration::CodexSwitchOptions {
+                    responses_websocket,
+                },
+            ),
+            None => {
+                let configured = codex_client_patch_config_from_config_file()
+                    .map_err(|e| CliError::CodexConfig(e.to_string()))?;
+                (configured.preset, configured.options)
+            }
+        };
+        codex_integration::switch_on_with_options(port, effective_mode, effective_options)
             .map_err(|e| CliError::CodexConfig(e.to_string()))?;
-        println!("Codex client preset: {}", mode.as_preset_str());
+        println!("Codex client preset: {}", effective_mode.as_preset_str());
         println!(
             "Responses WebSocket: {}",
-            if responses_websocket {
+            if effective_options.responses_websocket {
                 "enabled"
             } else {
                 "disabled"
             }
         );
-        match mode {
+        match effective_mode {
             codex_integration::CodexPatchMode::Default => {}
             codex_integration::CodexPatchMode::ChatGptBridge => {
                 println!(

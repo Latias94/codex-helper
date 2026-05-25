@@ -1901,6 +1901,14 @@ pub fn switch_on(port: u16) -> Result<()> {
     switch_on_with_mode(port, CodexPatchMode::Default)
 }
 
+/// Switch Codex to use the local codex-helper model provider using the preset configured in
+/// `~/.codex-helper/config.toml`.
+pub fn switch_on_with_configured_preset(port: u16) -> Result<()> {
+    let client_patch = crate::config::codex_client_patch_config_from_config_file()
+        .context("read codex.client_patch from codex-helper config before switch on")?;
+    switch_on_with_options(port, client_patch.preset, client_patch.options)
+}
+
 /// Switch Codex to use the local codex-helper model provider with an explicit client preset.
 pub fn switch_on_with_mode(port: u16, mode: CodexPatchMode) -> Result<()> {
     switch_on_with_options(port, mode, CodexSwitchOptions::default())
@@ -4085,6 +4093,74 @@ base_url = "https://api.openai.com/v1"
             Some(CodexPatchMode::OfficialImagegenBridge)
         );
         assert_eq!(status.requires_openai_auth, None);
+        assert_eq!(status.supports_websockets, Some(true));
+    }
+
+    #[test]
+    fn codex_switch_on_with_configured_preset_uses_helper_client_patch() {
+        let env = setup_temp_env();
+        write_helper_codex_config(
+            &env,
+            r#"
+version = 5
+
+[codex.client_patch]
+preset = "official-imagegen"
+responses_websocket = true
+
+[codex.providers.relay]
+base_url = "https://relay.example/v1"
+auth_token_env = "CODEX_HELPER_IMAGEGEN_TEST_KEY"
+
+[codex.routing]
+entry = "main"
+
+[codex.routing.routes.main]
+strategy = "ordered-failover"
+children = ["relay"]
+"#,
+        );
+        let cfg_path = env.codex_home.join("config.toml");
+        let auth_path = env.codex_home.join("auth.json");
+        let original_auth = chatgpt_auth_json("user@example.com", "acct_1", "plus");
+
+        write_file(
+            &cfg_path,
+            r#"
+model_provider = "openai"
+
+[model_providers.openai]
+name = "openai"
+base_url = "https://api.openai.com/v1"
+"#
+            .trim_start(),
+        );
+        write_file(&auth_path, &original_auth);
+
+        switch_on_with_configured_preset(3211)
+            .expect("configured official-imagegen preset should patch config and auth");
+
+        let updated_cfg = read_file(&cfg_path);
+        assert!(updated_cfg.contains("model_provider = \"codex_proxy\""));
+        assert!(updated_cfg.contains("name = \"OpenAI\""));
+        assert!(updated_cfg.contains("base_url = \"http://127.0.0.1:3211\""));
+        assert!(updated_cfg.contains("supports_websockets = true"));
+        assert!(!updated_cfg.contains("requires_openai_auth"));
+
+        let updated_auth: serde_json::Value =
+            serde_json::from_str(&read_file(&auth_path)).expect("valid auth json");
+        assert!(
+            updated_auth
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty)
+        );
+
+        let status = codex_switch_status().expect("status should load");
+        assert_eq!(
+            status.patch_mode,
+            Some(CodexPatchMode::OfficialImagegenBridge)
+        );
+        assert_eq!(status.provider_name.as_deref(), Some("OpenAI"));
         assert_eq!(status.supports_websockets, Some(true));
     }
 

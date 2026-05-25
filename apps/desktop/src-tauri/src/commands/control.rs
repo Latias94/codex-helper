@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use codex_helper_core::codex_integration::{
     self, CodexPatchMode, CodexSwitchOptions, CodexSwitchStatus,
 };
+use codex_helper_core::config::codex_client_patch_config_from_config_file;
 use codex_helper_core::proxy::RuntimeStatusResponse;
 use codex_helper_core::runtime_manager::{
     RuntimeConnectionMode, RuntimeOwnerKind, RuntimeOwnerMarker, RuntimeStopAction,
@@ -339,15 +340,21 @@ pub async fn switch_codex(
     let endpoint = admin_endpoint_config();
     if payload.enabled {
         require_confirmation(payload.confirmation.as_str(), CODEX_SWITCH_ON_CONFIRMATION)?;
-        let mode = payload.preset.unwrap_or(CodexPatchMode::Default);
-        codex_integration::switch_on_with_options(
-            endpoint.proxy_port,
-            mode,
-            CodexSwitchOptions {
-                responses_websocket: payload.responses_websocket,
-            },
-        )
-        .map_err(|err| DesktopError::Switch(err.to_string()))?;
+        let (mode, options) = match payload.preset {
+            Some(mode) => (
+                mode,
+                CodexSwitchOptions {
+                    responses_websocket: payload.responses_websocket,
+                },
+            ),
+            None => {
+                let configured = codex_client_patch_config_from_config_file()
+                    .map_err(|err| DesktopError::Switch(err.to_string()))?;
+                (configured.preset, configured.options)
+            }
+        };
+        codex_integration::switch_on_with_options(endpoint.proxy_port, mode, options)
+            .map_err(|err| DesktopError::Switch(err.to_string()))?;
         let state = load_control_state().await?;
         Ok(result_with_state(
             "switch-codex-on",

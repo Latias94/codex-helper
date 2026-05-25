@@ -370,7 +370,7 @@ impl eframe::App for GuiApp {
                             crate::config::ServiceKind::Claude => {
                                 crate::codex_integration::claude_switch_on(port)
                             }
-                            _ => crate::codex_integration::switch_on(port),
+                            _ => crate::codex_integration::switch_on_with_configured_preset(port),
                         };
                         match result {
                             Ok(()) => {

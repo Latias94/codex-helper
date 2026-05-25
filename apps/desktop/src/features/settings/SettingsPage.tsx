@@ -46,12 +46,14 @@ const advancedRows = [
 const updatePolicy =
   "自动更新暂未启用：Tauri updater 需要签名私钥、固定公钥、HTTPS 发布端点和回滚策略；当前版本请从 GitHub Releases 手动安装。";
 
+type CodexPresetSelection = "config" | CodexPreset;
+
 export function SettingsPage() {
   const knownPaths = useKnownPaths();
   const launchAtLogin = useLaunchAtLogin();
   const runtime = useRuntimeSummary();
   const actions = useRuntimeActions();
-  const [codexPreset, setCodexPreset] = useState<CodexPreset>("chatgpt-bridge");
+  const [codexPreset, setCodexPreset] = useState<CodexPresetSelection>("config");
   const [globalRouteTarget, setGlobalRouteTarget] = useState("");
   const [sessionId, setSessionId] = useState("");
   const [sessionRouteTarget, setSessionRouteTarget] = useState("");
@@ -227,9 +229,10 @@ export function SettingsPage() {
           <FieldRow label="当前预设">
             <SelectBox
               value={codexPreset}
-              onChange={(event) => setCodexPreset(event.currentTarget.value as CodexPreset)}
+              onChange={(event) => setCodexPreset(event.currentTarget.value as CodexPresetSelection)}
               className="w-56"
             >
+              <option value="config">config.toml</option>
               <option value="default">default</option>
               <option value="chatgpt-bridge">chatgpt-bridge</option>
               <option value="imagegen-bridge">imagegen-bridge</option>
@@ -256,7 +259,7 @@ export function SettingsPage() {
               onClick={() =>
                 actions.switchOn.mutate({
                   confirmation: CONTROL_CONFIRMATIONS.switchCodexOn,
-                  preset: codexPreset,
+                  preset: codexPreset === "config" ? undefined : codexPreset,
                 })
               }
             >
