@@ -25,6 +25,7 @@ use crate::usage::UsageMetrics;
 
 mod runtime_types;
 mod session_identity;
+mod session_route_ledger;
 
 use self::runtime_types::{
     ConfigMetaOverride, RuntimeDefaultProfileOverride, UsageRollup, merge_station_health,
@@ -47,6 +48,7 @@ use self::session_identity::{
     SessionBindingEntry, SessionCwdCacheEntry, SessionEffortOverride, SessionModelOverride,
     SessionRouteTargetOverride, SessionServiceTierOverride, SessionStationOverride,
 };
+use self::session_route_ledger::SessionRouteAffinityStore;
 
 type PassiveStationHealthMap =
     HashMap<String, HashMap<String, HashMap<String, PassiveUpstreamHealth>>>;
@@ -71,13 +73,14 @@ struct SessionTranscriptPathCacheEntry {
     last_seen_ms: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct RuntimePolicy {
     session_override_ttl_ms: u64,
     session_binding_ttl_ms: u64,
     session_binding_max_entries: usize,
     session_route_affinity_ttl_ms: u64,
     session_route_affinity_max_entries: usize,
+    session_route_affinity_store: SessionRouteAffinityStore,
     session_cwd_cache_ttl_ms: u64,
     session_cwd_cache_max_entries: usize,
     session_transcript_path_cache_ttl_ms: u64,
@@ -131,6 +134,26 @@ fn prune_lru_cache<T>(
     for (key, _) in keys.into_iter().take(remove_count) {
         cache.remove(&key);
     }
+}
+
+fn session_route_affinity_is_expired_with_ttl(
+    ttl_ms: u64,
+    affinity: &SessionRouteAffinity,
+    now_ms: u64,
+) -> bool {
+    ttl_ms > 0 && now_ms.saturating_sub(affinity.last_selected_at_ms) >= ttl_ms
+}
+
+fn prune_session_route_affinity_map(
+    affinities: &mut HashMap<String, SessionRouteAffinity>,
+    ttl_ms: u64,
+    max_entries: usize,
+    now_ms: u64,
+) {
+    affinities.retain(|_, affinity| {
+        !session_route_affinity_is_expired_with_ttl(ttl_ms, affinity, now_ms)
+    });
+    prune_lru_cache(affinities, max_entries, |entry| entry.last_selected_at_ms);
 }
 
 fn service_layout_signature(mgr: &ServiceConfigManager) -> ServiceLayoutSignature {
@@ -189,7 +212,8 @@ fn changed_service_layout_stations(
 
 /// Runtime-only state for the proxy process.
 ///
-/// This state is intentionally not persisted across restarts.
+/// Most state is process-local. Session route affinity is persisted separately
+/// because Codex remote compaction can depend on provider-endpoint continuity.
 #[derive(Debug)]
 pub struct ProxyState {
     next_request_id: AtomicU64,
@@ -200,6 +224,7 @@ pub struct ProxyState {
     session_binding_max_entries: usize,
     session_route_affinity_ttl_ms: u64,
     session_route_affinity_max_entries: usize,
+    session_route_affinity_store: SessionRouteAffinityStore,
     session_cwd_cache_ttl_ms: u64,
     session_cwd_cache_max_entries: usize,
     session_transcript_path_cache_ttl_ms: u64,
@@ -304,6 +329,7 @@ impl ProxyState {
                 session_binding_max_entries: binding_max_entries,
                 session_route_affinity_ttl_ms: route_affinity_ttl_ms,
                 session_route_affinity_max_entries: route_affinity_max_entries,
+                session_route_affinity_store: SessionRouteAffinityStore::from_env(),
                 session_cwd_cache_ttl_ms: cwd_cache_ttl_ms,
                 session_cwd_cache_max_entries: cwd_cache_max_entries,
                 session_transcript_path_cache_ttl_ms: transcript_path_cache_ttl_ms,
@@ -316,6 +342,14 @@ impl ProxyState {
         lb_states: Option<Arc<Mutex<HashMap<String, LbState>>>>,
         policy: RuntimePolicy,
     ) -> Arc<Self> {
+        let mut restored_session_route_affinities = policy.session_route_affinity_store.load();
+        prune_session_route_affinity_map(
+            &mut restored_session_route_affinities,
+            policy.session_route_affinity_ttl_ms,
+            policy.session_route_affinity_max_entries,
+            unix_now_ms(),
+        );
+
         Arc::new(Self {
             next_request_id: AtomicU64::new(1),
             session_override_ttl_ms: policy.session_override_ttl_ms,
@@ -323,6 +357,7 @@ impl ProxyState {
             session_binding_max_entries: policy.session_binding_max_entries,
             session_route_affinity_ttl_ms: policy.session_route_affinity_ttl_ms,
             session_route_affinity_max_entries: policy.session_route_affinity_max_entries,
+            session_route_affinity_store: policy.session_route_affinity_store,
             session_cwd_cache_ttl_ms: policy.session_cwd_cache_ttl_ms,
             session_cwd_cache_max_entries: policy.session_cwd_cache_max_entries,
             session_transcript_path_cache_ttl_ms: policy.session_transcript_path_cache_ttl_ms,
@@ -334,7 +369,7 @@ impl ProxyState {
             session_model_overrides: RwLock::new(HashMap::new()),
             session_service_tier_overrides: RwLock::new(HashMap::new()),
             session_bindings: RwLock::new(HashMap::new()),
-            session_route_affinities: RwLock::new(HashMap::new()),
+            session_route_affinities: RwLock::new(restored_session_route_affinities),
             global_station_override: RwLock::new(None),
             global_route_target_override: RwLock::new(None),
             runtime_default_profiles: RwLock::new(HashMap::new()),
@@ -552,20 +587,36 @@ impl ProxyState {
         &self,
         session_id: &str,
     ) -> Option<SessionRouteAffinity> {
-        let mut guard = self.session_route_affinities.write().await;
-        let affinity = guard.get(session_id).cloned()?;
-        if self.session_route_affinity_is_expired(&affinity, unix_now_ms()) {
-            guard.remove(session_id);
-            return None;
+        let (affinity, snapshot) = {
+            let mut guard = self.session_route_affinities.write().await;
+            let affinity = guard.get(session_id).cloned()?;
+            if self.session_route_affinity_is_expired(&affinity, unix_now_ms()) {
+                guard.remove(session_id);
+                (None, Some(guard.clone()))
+            } else {
+                (Some(affinity), None)
+            }
+        };
+        if let Some(snapshot) = snapshot {
+            self.persist_session_route_affinities(snapshot).await;
         }
-        Some(affinity)
+        affinity
     }
 
     pub async fn list_session_route_affinities(&self) -> HashMap<String, SessionRouteAffinity> {
-        let mut guard = self.session_route_affinities.write().await;
-        let now_ms = unix_now_ms();
-        guard.retain(|_, affinity| !self.session_route_affinity_is_expired(affinity, now_ms));
-        guard.clone()
+        let (affinities, snapshot) = {
+            let mut guard = self.session_route_affinities.write().await;
+            let now_ms = unix_now_ms();
+            let before_len = guard.len();
+            guard.retain(|_, affinity| !self.session_route_affinity_is_expired(affinity, now_ms));
+            let affinities = guard.clone();
+            let snapshot = (guard.len() != before_len).then(|| guard.clone());
+            (affinities, snapshot)
+        };
+        if let Some(snapshot) = snapshot {
+            self.persist_session_route_affinities(snapshot).await;
+        }
+        affinities
     }
 
     pub async fn record_session_route_affinity_success(
@@ -575,35 +626,55 @@ impl ProxyState {
         reason_hint: Option<String>,
         now_ms: u64,
     ) -> SessionRouteAffinity {
-        let mut guard = self.session_route_affinities.write().await;
-        let reason = match guard.get_mut(session_id) {
-            Some(existing) if target.same_target(existing) => {
-                existing.last_selected_at_ms = now_ms;
-                if target.session_identity_source.is_some() {
-                    existing.session_identity_source = target.session_identity_source;
+        let (affinity, snapshot) = {
+            let mut guard = self.session_route_affinities.write().await;
+            let affinity = match guard.get_mut(session_id) {
+                Some(existing) if target.same_target(existing) => {
+                    existing.last_selected_at_ms = now_ms;
+                    if target.session_identity_source.is_some() {
+                        existing.session_identity_source = target.session_identity_source;
+                    }
+                    existing.clone()
                 }
-                return existing.clone();
-            }
-            Some(_) => reason_hint.unwrap_or_else(|| "target_changed".to_string()),
-            None => reason_hint.unwrap_or_else(|| "first_success".to_string()),
+                Some(_) => {
+                    let reason = reason_hint.unwrap_or_else(|| "target_changed".to_string());
+                    let affinity = SessionRouteAffinity {
+                        route_graph_key: target.route_graph_key,
+                        session_identity_source: target.session_identity_source,
+                        provider_endpoint: target.provider_endpoint,
+                        upstream_base_url: target.upstream_base_url,
+                        route_path: target.route_path,
+                        last_selected_at_ms: now_ms,
+                        last_changed_at_ms: now_ms,
+                        change_reason: reason,
+                    };
+                    guard.insert(session_id.to_string(), affinity.clone());
+                    affinity
+                }
+                None => {
+                    let reason = reason_hint.unwrap_or_else(|| "first_success".to_string());
+                    let affinity = SessionRouteAffinity {
+                        route_graph_key: target.route_graph_key,
+                        session_identity_source: target.session_identity_source,
+                        provider_endpoint: target.provider_endpoint,
+                        upstream_base_url: target.upstream_base_url,
+                        route_path: target.route_path,
+                        last_selected_at_ms: now_ms,
+                        last_changed_at_ms: now_ms,
+                        change_reason: reason,
+                    };
+                    guard.insert(session_id.to_string(), affinity.clone());
+                    affinity
+                }
+            };
+            prune_lru_cache(
+                &mut guard,
+                self.session_route_affinity_max_entries,
+                |entry| entry.last_selected_at_ms,
+            );
+            (affinity, guard.clone())
         };
-
-        let affinity = SessionRouteAffinity {
-            route_graph_key: target.route_graph_key,
-            session_identity_source: target.session_identity_source,
-            provider_endpoint: target.provider_endpoint,
-            upstream_base_url: target.upstream_base_url,
-            route_path: target.route_path,
-            last_selected_at_ms: now_ms,
-            last_changed_at_ms: now_ms,
-            change_reason: reason,
-        };
-        guard.insert(session_id.to_string(), affinity.clone());
-        prune_lru_cache(
-            &mut guard,
-            self.session_route_affinity_max_entries,
-            |entry| entry.last_selected_at_ms,
-        );
+        self.persist_session_route_affinities(snapshot).await;
         self.notify_state_changed();
         affinity
     }
@@ -613,9 +684,24 @@ impl ProxyState {
         affinity: &SessionRouteAffinity,
         now_ms: u64,
     ) -> bool {
-        self.session_route_affinity_ttl_ms > 0
-            && now_ms.saturating_sub(affinity.last_selected_at_ms)
-                >= self.session_route_affinity_ttl_ms
+        session_route_affinity_is_expired_with_ttl(
+            self.session_route_affinity_ttl_ms,
+            affinity,
+            now_ms,
+        )
+    }
+
+    async fn persist_session_route_affinities(
+        &self,
+        snapshot: HashMap<String, SessionRouteAffinity>,
+    ) {
+        if let Err(err) = self
+            .session_route_affinity_store
+            .save(&snapshot, unix_now_ms())
+            .await
+        {
+            tracing::warn!(error = %err, "failed to persist session route affinity ledger");
+        }
     }
 
     pub async fn set_session_binding(&self, binding: SessionBinding) {
@@ -3135,6 +3221,52 @@ mod tests {
 
     use crate::config::{ServiceConfig, ServiceConfigManager, UpstreamAuth, UpstreamConfig};
     use crate::runtime_identity::ProviderEndpointKey;
+    use std::path::Path;
+    use std::sync::OnceLock;
+
+    async fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await
+    }
+
+    #[derive(Default)]
+    struct ScopedEnv {
+        saved: Vec<(String, Option<String>)>,
+    }
+
+    impl ScopedEnv {
+        unsafe fn set(&mut self, key: &str, value: &str) {
+            if !self.saved.iter().any(|(saved_key, _)| saved_key == key) {
+                self.saved.push((key.to_string(), std::env::var(key).ok()));
+            }
+            unsafe {
+                std::env::set_var(key, value);
+            }
+        }
+
+        unsafe fn set_path(&mut self, key: &str, value: &Path) {
+            unsafe {
+                self.set(key, value.to_string_lossy().as_ref());
+            }
+        }
+    }
+
+    impl Drop for ScopedEnv {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.iter().rev() {
+                match value {
+                    Some(value) => unsafe {
+                        std::env::set_var(key, value);
+                    },
+                    None => unsafe {
+                        std::env::remove_var(key);
+                    },
+                }
+            }
+        }
+    }
 
     fn test_runtime_policy(
         session_override_ttl_ms: u64,
@@ -3147,6 +3279,7 @@ mod tests {
             session_binding_max_entries,
             session_route_affinity_ttl_ms: 0,
             session_route_affinity_max_entries: 5_000,
+            session_route_affinity_store: SessionRouteAffinityStore::from_env(),
             session_cwd_cache_ttl_ms: 0,
             session_cwd_cache_max_entries: 0,
             session_transcript_path_cache_ttl_ms: 30_000,
@@ -4847,6 +4980,49 @@ mod tests {
                     .is_none()
             );
             assert!(state.list_session_route_affinities().await.is_empty());
+        });
+    }
+
+    #[test]
+    fn session_route_affinity_ledger_does_not_restore_expired_entries() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let _home = env_lock().await;
+            let temp_dir = std::env::temp_dir().join(format!(
+                "codex-helper-route-ledger-test-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&temp_dir).expect("create temp dir");
+            let mut scoped = ScopedEnv::default();
+            unsafe {
+                scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
+            }
+
+            let mut policy = test_runtime_policy(0, 0, 2_000);
+            policy.session_route_affinity_ttl_ms = 1;
+            let first_state = ProxyState::new_with_runtime_policy(None, policy.clone());
+            first_state
+                .record_session_route_affinity_success(
+                    "sid-expired-ledger",
+                    SessionRouteAffinityTarget {
+                        route_graph_key: "graph".to_string(),
+                        session_identity_source: None,
+                        provider_endpoint: ProviderEndpointKey::new("codex", "monthly", "default"),
+                        upstream_base_url: "https://monthly.example/v1".to_string(),
+                        route_path: vec!["monthly_first".to_string(), "monthly".to_string()],
+                    },
+                    Some("first_success".to_string()),
+                    0,
+                )
+                .await;
+
+            let second_state = ProxyState::new_with_runtime_policy(None, policy);
+            assert!(
+                second_state
+                    .get_session_route_affinity("sid-expired-ledger")
+                    .await
+                    .is_none()
+            );
         });
     }
 

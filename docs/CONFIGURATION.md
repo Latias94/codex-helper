@@ -380,7 +380,7 @@ Most users should prefer `ordered-failover` for fixed priority and `tag-preferre
 
 ## Session Affinity
 
-Route graph session affinity is runtime state. The TOML config chooses the affinity policy and can optionally bound fallback stickiness:
+Route graph session affinity is runtime state with a small durable ledger for Codex route continuity. The TOML config chooses the affinity policy and can optionally bound fallback stickiness:
 
 - `fallback-sticky` is the default used by the generated config template and Codex bootstrap import. It keeps a session on the last successful fallback provider while that provider remains viable, which is safer for official relay features such as remote compaction that may carry upstream-account-bound encrypted state. Set `fallback_ttl_ms` to cap how long a lower-priority fallback affinity can be reused, or `reprobe_preferred_after_ms` to force a preferred-group reprobe after a fallback target change.
 - `preferred-group` applies session affinity only inside the currently best available preference group, so a session that temporarily falls back to paygo returns to monthly as soon as a monthly provider is viable again.
@@ -389,10 +389,21 @@ Route graph session affinity is runtime state. The TOML config chooses the affin
 
 For each request with a session id, codex-helper keys affinity by `session_id + service + route_graph_key`. While the route graph is unchanged, the same session can keep using the previously selected provider/endpoint according to the policy. This improves upstream prompt-cache locality for relay providers that cache by account or upstream target without letting automatic stickiness override user preference by default.
 
+Successful route affinity is also persisted to:
+
+```text
+~/.codex-helper/state/session-route-affinities.json
+```
+
+The ledger stores helper-owned provider endpoint identity only; it does not store or infer upstream relay implementation details. Set `CODEX_HELPER_SESSION_ROUTE_AFFINITY_LEDGER=off` to disable this persistence, or set it to a path to use a custom ledger file.
+
+For Codex remote compaction, helper treats compact requests that mention state-bound fields such as `encrypted_content`, `previous_response_id`, or `compaction_summary` as provider-state-bound. These requests must use a known route affinity. If no affinity exists after startup or config changes, helper returns an explicit continuity error instead of silently choosing a different provider endpoint. If the known affinity endpoint itself fails, provider-state-bound compact stays fail-closed; non-state-bound compact can still use normal provider fallback according to the route policy.
+
 Affinity is not a hard pin:
 
 - request retry, provider health, capability mismatch, cooldown, and trusted balance exhaustion still apply;
-- if the sticky provider fails, the request continues through the current route graph and then sticks to the next successful provider;
+- if the sticky provider fails, ordinary and non-state-bound requests continue through the current route graph and then stick to the next successful provider;
+- provider-state-bound compact does not cross provider endpoints unless a future explicit continuity-domain feature is configured;
 - if provider tags, route node strategy, children, entry, or provider endpoint identity change, the route graph key changes and old affinity no longer matches;
 - legacy station overrides are disabled for route graph configs; use route/provider/endpoint controls instead.
 
@@ -1142,6 +1153,16 @@ The control trace is enabled by default and is written to:
 ```
 
 It records routing selection events such as the compiled route plan, provider endpoint, preference group, skipped higher-priority groups, pinned-route decisions, retry options, and failover reasons. When a lower-priority preference group is selected, the `route_graph_selection_explain` event lists each higher-priority provider endpoint that was skipped and the structured reasons such as `unsupported_model`, `cooldown`, `usage_exhausted`, `runtime_disabled`, or `attempt_avoided`. Set `CODEX_HELPER_CONTROL_TRACE=0` to turn it off, or `CODEX_HELPER_CONTROL_TRACE_PATH` to write it somewhere else. The older `retry_trace.jsonl` file is only written when `CODEX_HELPER_RETRY_TRACE=1`.
+
+For route-continuity diagnosis, control trace fields are intentionally provider-opaque:
+
+- `continuity.class` / `continuity_class`: `stateless_or_session_preferred` or `provider_state_bound`.
+- `affinity.source`: `session_route_affinity` when a known affinity constrained selection, or `none`.
+- `provider_failover_allowed`: whether helper may move to another provider endpoint for this request.
+- `provider_failover_blocked_reason`: why provider failover was blocked, for example `provider_state_bound` or `state_bound_compact_missing_affinity`.
+- `balance_signal_authoritative`: currently `false` for compact continuity blocks. A balance probe can explain routing demotion, but it does not prove that a state-bound compact request is safe to move to another provider endpoint.
+
+If a state-bound compact request has no restored route affinity, look for a `route_continuity_blocked` event with `reason = "state_bound_compact_missing_affinity"`. That means helper refused to guess a provider endpoint; it does not mean helper identified the relay as sub2api, New API, OpenAI, or any other backend.
 
 ## Troubleshoot Monthly-First Routing
 

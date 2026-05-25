@@ -339,7 +339,7 @@ children = ["monthly_pool", "codex_for"]
 
 ## 会话粘性
 
-Route graph 的会话粘性是运行时状态。TOML 配置选择 affinity policy，并且可以选择性约束 fallback 粘性的边界：
+Route graph 的会话粘性是运行时状态，但为了 Codex 路由连续性，helper 会额外维护一个很小的持久 ledger。TOML 配置选择 affinity policy，并且可以选择性约束 fallback 粘性的边界：
 
 - `fallback-sticky` 是生成配置模板和 Codex 自动导入使用的默认值。它会在 fallback provider 仍可用时继续让同一会话使用上次成功的 fallback provider；对于 remote compaction 这类可能携带上游账号绑定 encrypted state 的 official relay 功能更稳。设置 `fallback_ttl_ms` 可以限制低优先级 fallback affinity 的复用时长；设置 `reprobe_preferred_after_ms` 可以在 fallback target 变化后强制 reprobe 高优先级组。
 - `preferred-group` 只会在当前最佳可用 preference group 内应用会话粘性，所以一个临时 fallback 到 paygo 的会话，会在月包 provider 再次可用时回到月包组。
@@ -348,10 +348,21 @@ Route graph 的会话粘性是运行时状态。TOML 配置选择 affinity polic
 
 对于带 session id 的每个请求，codex-helper 使用 `session_id + service + route_graph_key` 作为 affinity key。只要 route graph 不变，同一会话就可以按 policy 继续使用之前选中的 provider/endpoint。这能提高一些 relay provider 的上游 prompt-cache 命中率，同时默认不会让自动粘性覆盖用户偏好。
 
+成功的 route affinity 也会持久化到：
+
+```text
+~/.codex-helper/state/session-route-affinities.json
+```
+
+这个 ledger 只保存 helper 自己拥有的 provider endpoint identity，不保存也不推断上游 relay 的实现细节。设置 `CODEX_HELPER_SESSION_ROUTE_AFFINITY_LEDGER=off` 可以关闭该持久化；也可以把这个环境变量设成一个路径，使用自定义 ledger 文件。
+
+对 Codex remote compaction，helper 会把带有 `encrypted_content`、`previous_response_id` 或 `compaction_summary` 这类字段的 compact 请求视为 provider-state-bound。这类请求必须使用已知 route affinity。如果 helper 重启或配置变化后没有可证明的 affinity，helper 会返回明确的连续性错误，而不是静默选择另一个 provider endpoint。如果已知 affinity endpoint 自身失败，provider-state-bound compact 仍会 fail closed；不带这类状态字段的 compact 仍可按 route policy 走普通 provider fallback。
+
 Affinity 不是硬 pin：
 
 - request retry、provider health、capability mismatch、cooldown 和可信余额耗尽仍然生效；
-- 如果 sticky provider 失败，请求会继续沿当前 route graph 尝试，然后粘到下一个成功的 provider；
+- 如果 sticky provider 失败，普通请求和非 state-bound 请求会继续沿当前 route graph 尝试，然后粘到下一个成功的 provider；
+- provider-state-bound compact 不会跨 provider endpoint，除非未来显式配置了安全的 continuity domain；
 - 如果 provider tags、route node strategy、children、entry 或 provider endpoint identity 改变，route graph key 会改变，旧 affinity 不再匹配；
 - route graph 配置下 legacy station overrides 会被禁用；请使用 route/provider/endpoint 控制。
 
@@ -1130,6 +1141,16 @@ codex-helper routing explain --model <MODEL> --json
 ```
 
 查找 `route_graph_selection_explain`。它记录 selected provider endpoint、selected preference group、skipped higher-priority groups 和 per-candidate skip reasons。临时 steering 请使用 route/provider/endpoint controls；route graph configs 会拒绝 legacy station overrides。
+
+诊断 route continuity 时，control trace 字段刻意保持 provider-opaque：
+
+- `continuity.class` / `continuity_class`：`stateless_or_session_preferred` 或 `provider_state_bound`。
+- `affinity.source`：`session_route_affinity` 表示已知 affinity 约束了选择；`none` 表示没有 affinity。
+- `provider_failover_allowed`：本次请求是否允许 helper 切换到另一个 provider endpoint。
+- `provider_failover_blocked_reason`：provider failover 被阻止的原因，例如 `provider_state_bound` 或 `state_bound_compact_missing_affinity`。
+- `balance_signal_authoritative`：compact 连续性阻断里目前是 `false`。余额探测可以解释 routing 降级，但不能证明 state-bound compact 可以安全换到另一个 provider endpoint。
+
+如果 state-bound compact 没有恢复到 route affinity，查找 `route_continuity_blocked` 事件和 `reason = "state_bound_compact_missing_affinity"`。这表示 helper 拒绝猜测 provider endpoint；它不代表 helper 判断出了 relay 背后是 sub2api、New API、OpenAI 或任何其它实现。
 
 ## UI 编辑
 

@@ -60,7 +60,12 @@ pub enum ControlTraceDetail {
     },
     RouteGraphSelectionExplain {
         request_model: Option<String>,
+        continuity_class: Option<String>,
+        provider_failover_allowed: Option<bool>,
+        provider_failover_blocked_reason: Option<String>,
+        balance_signal_authoritative: Option<bool>,
         affinity_policy: Option<String>,
+        affinity_source: Option<String>,
         affinity_provider_endpoint_key: Option<String>,
         selected_matches_affinity: Option<bool>,
         selected_provider_id: Option<String>,
@@ -409,7 +414,19 @@ fn infer_retry_control_trace_detail(
 fn route_graph_selection_explain_detail(payload: &JsonValue) -> ControlTraceDetail {
     ControlTraceDetail::RouteGraphSelectionExplain {
         request_model: json_string_field(payload, "request_model"),
+        continuity_class: json_nested_string_field(payload, &["continuity", "class"]),
+        provider_failover_allowed: payload
+            .get("continuity")
+            .and_then(|continuity| json_bool_field(continuity, "provider_failover_allowed")),
+        provider_failover_blocked_reason: json_nested_string_field(
+            payload,
+            &["continuity", "provider_failover_blocked_reason"],
+        ),
+        balance_signal_authoritative: payload
+            .get("continuity")
+            .and_then(|continuity| json_bool_field(continuity, "balance_signal_authoritative")),
         affinity_policy: json_nested_string_field(payload, &["affinity", "policy"]),
+        affinity_source: json_nested_string_field(payload, &["affinity", "source"]),
         affinity_provider_endpoint_key: json_nested_string_field(
             payload,
             &["affinity", "provider_endpoint_key"],
@@ -767,9 +784,16 @@ mod tests {
                 "service": "codex",
                 "request_id": 42,
                 "request_model": "gpt-5.4",
+                "continuity": {
+                    "class": "stateless_or_session_preferred",
+                    "provider_failover_allowed": true,
+                    "provider_failover_blocked_reason": null,
+                    "balance_signal_authoritative": false
+                },
                 "affinity": {
                     "policy": "preferred_group",
                     "provider_endpoint_key": "codex/chili/default",
+                    "source": "session_route_affinity",
                     "selected_matches_affinity": false
                 },
                 "selected": {
@@ -798,7 +822,12 @@ mod tests {
             entry.resolved_detail(),
             Some(ControlTraceDetail::RouteGraphSelectionExplain {
                 request_model: Some("gpt-5.4".to_string()),
+                continuity_class: Some("stateless_or_session_preferred".to_string()),
+                provider_failover_allowed: Some(true),
+                provider_failover_blocked_reason: None,
+                balance_signal_authoritative: Some(false),
                 affinity_policy: Some("preferred_group".to_string()),
+                affinity_source: Some("session_route_affinity".to_string()),
                 affinity_provider_endpoint_key: Some("codex/chili/default".to_string()),
                 selected_matches_affinity: Some(false),
                 selected_provider_id: Some("chili".to_string()),

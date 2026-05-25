@@ -47,25 +47,58 @@ struct CompactProviderFailoverPolicy {
     allow_provider_failover: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RequestContinuityDecision {
+    StatelessOrSessionPreferred,
+    ProviderStateBound { requires_known_affinity: bool },
+}
+
 #[derive(Clone, Copy)]
 struct ProviderChainAttemptPolicy {
     compact: CompactProviderFailoverPolicy,
+    continuity: RequestContinuityDecision,
     strict_multi_config: bool,
     cross_station_failover_enabled: bool,
     provider_attempt_limit: u32,
+}
+
+fn request_continuity_decision(
+    request_flavor: &RequestFlavor,
+    affinity_policy: Option<RoutingAffinityPolicyV5>,
+) -> RequestContinuityDecision {
+    if request_flavor.is_remote_compaction_v1_request
+        && (request_flavor.remote_compaction_requires_affinity
+            || matches!(affinity_policy, Some(RoutingAffinityPolicyV5::Hard)))
+    {
+        RequestContinuityDecision::ProviderStateBound {
+            requires_known_affinity: request_flavor.remote_compaction_requires_affinity,
+        }
+    } else {
+        RequestContinuityDecision::StatelessOrSessionPreferred
+    }
 }
 
 fn compact_provider_failover_policy(
     request_flavor: &RequestFlavor,
     affinity_policy: Option<RoutingAffinityPolicyV5>,
 ) -> CompactProviderFailoverPolicy {
-    let strict_affinity = request_flavor.is_remote_compaction_v1_request
-        && (request_flavor.remote_compaction_requires_affinity
-            || matches!(affinity_policy, Some(RoutingAffinityPolicyV5::Hard)));
+    let strict_affinity = matches!(
+        request_continuity_decision(request_flavor, affinity_policy),
+        RequestContinuityDecision::ProviderStateBound { .. }
+    );
     CompactProviderFailoverPolicy {
         strict_affinity,
         allow_provider_failover: !request_flavor.is_remote_compaction_v1_request
             || !strict_affinity,
+    }
+}
+
+impl RequestContinuityDecision {
+    fn trace_label(self) -> &'static str {
+        match self {
+            Self::StatelessOrSessionPreferred => "stateless_or_session_preferred",
+            Self::ProviderStateBound { .. } => "provider_state_bound",
+        }
     }
 }
 
@@ -74,8 +107,10 @@ impl ProviderChainAttemptPolicy {
         request_flavor: &RequestFlavor,
         affinity_policy: Option<RoutingAffinityPolicyV5>,
     ) -> Self {
+        let continuity = request_continuity_decision(request_flavor, affinity_policy);
         Self {
             compact: compact_provider_failover_policy(request_flavor, affinity_policy),
+            continuity,
             strict_multi_config: false,
             cross_station_failover_enabled: false,
             provider_attempt_limit: 1,
@@ -92,8 +127,10 @@ impl ProviderChainAttemptPolicy {
             cross_station_failover_enabled(strict_multi_config, plan, provider_opt);
         let provider_attempt_limit_value =
             provider_attempt_limit(cross_station_failover_enabled, provider_opt.max_attempts);
+        let continuity = request_continuity_decision(request_flavor, None);
         Self {
             compact: compact_provider_failover_policy(request_flavor, None),
+            continuity,
             strict_multi_config,
             cross_station_failover_enabled,
             provider_attempt_limit: provider_attempt_limit_value,
@@ -102,6 +139,37 @@ impl ProviderChainAttemptPolicy {
 
     fn allow_provider_failover(self) -> bool {
         self.compact.allow_provider_failover
+    }
+
+    fn requires_known_affinity(self) -> bool {
+        matches!(
+            self.continuity,
+            RequestContinuityDecision::ProviderStateBound {
+                requires_known_affinity: true
+            }
+        )
+    }
+
+    fn continuity_class(self) -> &'static str {
+        self.continuity.trace_label()
+    }
+
+    fn provider_failover_blocked_reason(self) -> Option<&'static str> {
+        if self.allow_provider_failover() {
+            None
+        } else if matches!(
+            self.continuity,
+            RequestContinuityDecision::ProviderStateBound { .. }
+        ) {
+            Some("provider_state_bound")
+        } else {
+            Some("provider_failover_disabled")
+        }
+    }
+
+    fn missing_affinity_trace_reason(self) -> &'static str {
+        debug_assert!(self.requires_known_affinity());
+        "state_bound_compact_missing_affinity"
     }
 }
 
@@ -443,6 +511,32 @@ pub(super) async fn execute_provider_chain_with_route_executor(
             let mut global_attempt: u32 = 0;
             let mut last_err: Option<(StatusCode, String)> = None;
 
+            if provider_chain_policy.requires_known_affinity()
+                && runtime.affinity_provider_endpoint().is_none()
+            {
+                let reason = provider_chain_policy.missing_affinity_trace_reason();
+                last_err = Some((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "state-bound compact request requires existing route affinity".to_string(),
+                ));
+                log_retry_trace(serde_json::json!({
+                    "event": "route_continuity_blocked",
+                    "service": ctx.proxy.service_name,
+                    "request_id": ctx.request_id,
+                    "reason": reason,
+                    "continuity_class": provider_chain_policy.continuity_class(),
+                    "affinity_source": "none",
+                    "provider_failover_allowed": provider_chain_policy.allow_provider_failover(),
+                    "provider_failover_blocked_reason": reason,
+                    "balance_signal_authoritative": false,
+                }));
+                return ProviderExecutionOutcome::Exhausted(ProviderExecutionState {
+                    upstream_chain,
+                    route_attempts,
+                    last_err,
+                });
+            }
+
             let route_graph_loop = RouteGraphAttemptLoop {
                 params: ExecuteRouteGraphExecutorParams {
                     ctx,
@@ -511,6 +605,32 @@ pub(super) async fn execute_provider_chain_with_route_executor(
             let mut global_attempt: u32 = 0;
             let mut last_err: Option<(StatusCode, String)> = None;
             let mut tried_stations: HashSet<String> = HashSet::new();
+
+            if provider_chain_policy.requires_known_affinity()
+                && runtime.affinity_provider_endpoint().is_none()
+            {
+                let reason = provider_chain_policy.missing_affinity_trace_reason();
+                last_err = Some((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "state-bound compact request requires existing route affinity".to_string(),
+                ));
+                log_retry_trace(serde_json::json!({
+                    "event": "route_continuity_blocked",
+                    "service": ctx.proxy.service_name,
+                    "request_id": ctx.request_id,
+                    "reason": reason,
+                    "continuity_class": provider_chain_policy.continuity_class(),
+                    "affinity_source": "none",
+                    "provider_failover_allowed": provider_chain_policy.allow_provider_failover(),
+                    "provider_failover_blocked_reason": reason,
+                    "balance_signal_authoritative": false,
+                }));
+                return ProviderExecutionOutcome::Exhausted(ProviderExecutionState {
+                    upstream_chain,
+                    route_attempts,
+                    last_err,
+                });
+            }
 
             for provider_attempt in 0..provider_chain_policy.provider_attempt_limit {
                 let Some(lb) = next_provider_load_balancer(lbs, &tried_stations) else {
@@ -731,6 +851,7 @@ impl<'a, 'route> RouteGraphAttemptLoop<'a, 'route> {
                 route_state,
                 ctx.request_model,
                 &selected,
+                policy,
             );
             let selected_candidate = selected.candidate;
             let mut avoid_set = hash_set_from_indices(&avoided_candidate_indices);
@@ -915,6 +1036,7 @@ fn log_route_graph_selection_explain(
     route_state: &RoutePlanAttemptState,
     request_model: Option<&str>,
     selected: &SelectedRouteCandidate<'_>,
+    policy: ProviderChainAttemptPolicy,
 ) {
     let selected_group = selected.candidate.preference_group;
     if selected_group == 0 {
@@ -974,6 +1096,11 @@ fn log_route_graph_selection_explain(
     let affinity_provider_endpoint_key = runtime
         .affinity_provider_endpoint()
         .map(|key| key.stable_key());
+    let affinity_source = if affinity_provider_endpoint_key.is_some() {
+        "session_route_affinity"
+    } else {
+        "none"
+    };
     let selected_matches_affinity = affinity_provider_endpoint_key
         .as_deref()
         .is_some_and(|key| key == selected_provider_endpoint_key);
@@ -983,9 +1110,16 @@ fn log_route_graph_selection_explain(
         "service": service_name,
         "request_id": request_id,
         "request_model": request_model,
+        "continuity": {
+            "class": policy.continuity_class(),
+            "provider_failover_allowed": policy.allow_provider_failover(),
+            "provider_failover_blocked_reason": policy.provider_failover_blocked_reason(),
+            "balance_signal_authoritative": false,
+        },
         "affinity": {
             "policy": routing_affinity_policy_trace_label(template.affinity_policy),
             "provider_endpoint_key": affinity_provider_endpoint_key,
+            "source": affinity_source,
             "selected_matches_affinity": selected_matches_affinity,
         },
         "selected": {

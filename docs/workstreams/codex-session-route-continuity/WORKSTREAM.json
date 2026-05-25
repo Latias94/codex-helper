@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "slug": "codex-session-route-continuity",
+  "title": "Codex Session Route Continuity",
+  "status": "complete",
+  "updated": "2026-05-25",
+  "scope_kind": "execution",
+  "problem": "Codex state-bound remote compaction can lose provider endpoint affinity across helper restarts because session route affinity is runtime-only state.",
+  "authoritative_docs": [
+    {
+      "role": "design",
+      "path": "docs/workstreams/codex-session-route-continuity/DESIGN.md"
+    },
+    {
+      "role": "execution",
+      "path": "docs/workstreams/codex-session-route-continuity/TODO.md"
+    },
+    {
+      "role": "gates",
+      "path": "docs/workstreams/codex-session-route-continuity/EVIDENCE_AND_GATES.md"
+    },
+    {
+      "role": "handoff",
+      "path": "docs/workstreams/codex-session-route-continuity/HANDOFF.md"
+    }
+  ],
+  "gates": [
+    "cargo nextest run -p codex-helper-core session_route_affinity --no-fail-fast",
+    "cargo nextest run -p codex-helper-core responses_compact route_affinity --no-fail-fast",
+    "cargo fmt --all --check",
+    "cargo nextest run -p codex-helper-core"
+  ],
+  "evidence": [
+    "docs/workstreams/codex-session-route-continuity/EVIDENCE_AND_GATES.md"
+  ],
+  "adr_refs": [],
+  "continue_policy": {
+    "default_action": "closed",
+    "notes": "Core target complete. Future work should open a new lane for explicit continuity-domain support before allowing state-bound compact to cross provider endpoints."
+  },
+  "current_task": null
+}
