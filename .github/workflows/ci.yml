@@ -44,13 +44,11 @@ jobs:
           cache-bin: false
 
       - name: Setup Node.js
-        if: runner.os != 'Windows'
         uses: actions/setup-node@v4
         with:
           node-version: 24
 
       - name: Prepare Tauri sidecar
-        if: runner.os != 'Windows'
         run: node apps/desktop/scripts/prepare-sidecar.mjs
 
       - name: Format
@@ -97,13 +95,11 @@ jobs:
             libxdo-dev
 
       - name: Setup Node.js
-        if: runner.os != 'Windows'
         uses: actions/setup-node@v4
         with:
           node-version: 24
 
       - name: Prepare Tauri sidecar
-        if: runner.os != 'Windows'
         run: node apps/desktop/scripts/prepare-sidecar.mjs
 
       - name: Install cargo-nextest
