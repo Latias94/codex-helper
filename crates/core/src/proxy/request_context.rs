@@ -16,7 +16,7 @@ use super::headers::header_map_to_entries;
 use super::request_body::codex_session_identity_and_completed_body;
 use super::request_encoding::normalize_request_content_encoding;
 use super::request_failures::{
-    NoRoutableStationParams, log_client_body_read_error, log_no_routable_station,
+    FailedProxyRequestParams, finish_failed_proxy_request, log_client_body_read_error,
 };
 use super::request_preparation::{
     CommonRequestPreparationError, CommonRequestPreparationParams, RequestFlavor,
@@ -170,23 +170,32 @@ pub(super) async fn prepare_proxy_request(
     {
         Ok(prepared) => prepared,
         Err(CommonRequestPreparationError::NoRoutableStation {
+            request_id,
             session_id,
             session_identity_source,
+            cwd,
+            effective_effort,
+            service_tier,
         }) => {
             let dur = start.elapsed().as_millis() as u64;
-            let client_headers_entries = client_headers_entries_cache
-                .get_or_init(|| header_map_to_entries(&client_headers))
-                .clone();
-            return Err(log_no_routable_station(NoRoutableStationParams {
+            return Err(finish_failed_proxy_request(FailedProxyRequestParams {
                 proxy,
                 method: &method,
                 path: uri.path(),
-                client_uri: client_uri.as_str(),
-                session_id,
-                session_identity_source,
-                client_headers: client_headers_entries,
+                request_id,
+                status: StatusCode::BAD_GATEWAY,
+                message: "no routable station".to_string(),
                 duration_ms: dur,
-            }));
+                started_at_ms,
+                session_id: session_id.clone(),
+                session_identity_source,
+                cwd,
+                effective_effort,
+                service_tier,
+                retry: None,
+                failure_route_attempts: Vec::new(),
+            })
+            .await);
         }
     };
 

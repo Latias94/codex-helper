@@ -357,11 +357,34 @@ async fn prepare_responses_websocket(
     .await
     {
         Ok(prepared) => prepared,
-        Err(CommonRequestPreparationError::NoRoutableStation { .. }) => {
-            return Err((
-                StatusCode::BAD_GATEWAY,
-                "no upstreams available".to_string(),
-            ));
+        Err(CommonRequestPreparationError::NoRoutableStation {
+            request_id,
+            session_id,
+            session_identity_source,
+            cwd,
+            effective_effort,
+            service_tier,
+        }) => {
+            let message = "no upstreams available".to_string();
+            let _ = finish_failed_proxy_request(FailedProxyRequestParams {
+                proxy,
+                method: &method,
+                path: uri.path(),
+                request_id,
+                status: StatusCode::BAD_GATEWAY,
+                message: message.clone(),
+                duration_ms: start.elapsed().as_millis() as u64,
+                started_at_ms,
+                session_id,
+                session_identity_source,
+                cwd,
+                effective_effort,
+                service_tier,
+                retry: None,
+                failure_route_attempts: Vec::new(),
+            })
+            .await;
+            return Err((StatusCode::BAD_GATEWAY, message));
         }
     };
 

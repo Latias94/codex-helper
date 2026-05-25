@@ -107,8 +107,12 @@ pub(super) struct CommonPreparedRequest {
 #[derive(Debug, Clone)]
 pub(super) enum CommonRequestPreparationError {
     NoRoutableStation {
+        request_id: u64,
         session_id: Option<String>,
         session_identity_source: Option<SessionIdentitySource>,
+        cwd: Option<String>,
+        effective_effort: Option<String>,
+        service_tier: ServiceTierLog,
     },
 }
 
@@ -303,8 +307,12 @@ pub(super) async fn prepare_common_request(
         .await;
     if route_selection.is_empty() {
         return Err(CommonRequestPreparationError::NoRoutableStation {
+            request_id,
             session_id,
             session_identity_source,
+            cwd,
+            effective_effort,
+            service_tier: base_service_tier,
         });
     }
 

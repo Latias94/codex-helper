@@ -10,8 +10,6 @@ use super::ProxyService;
 use super::failure_summary::failed_proxy_client_message;
 
 const EMPTY_TARGET_URL: &str = "-";
-const NO_ROUTABLE_STATION_HINT: &str =
-    "未找到任何可用的上游站点（active_station 未设置，或目标站点没有可用 upstream）。";
 const CLIENT_BODY_READ_ERROR_HINT: &str =
     "读取客户端请求 body 失败（可能超过大小限制或连接中断）。";
 
@@ -44,58 +42,6 @@ pub(super) struct FailedProxyRequestParams<'a> {
     pub(super) service_tier: ServiceTierLog,
     pub(super) retry: Option<RetryInfo>,
     pub(super) failure_route_attempts: Vec<RouteAttemptLog>,
-}
-
-pub(super) struct NoRoutableStationParams<'a> {
-    pub(super) proxy: &'a ProxyService,
-    pub(super) method: &'a Method,
-    pub(super) path: &'a str,
-    pub(super) client_uri: &'a str,
-    pub(super) session_id: Option<String>,
-    pub(super) session_identity_source: Option<SessionIdentitySource>,
-    pub(super) client_headers: Vec<HeaderEntry>,
-    pub(super) duration_ms: u64,
-}
-
-pub(super) fn log_no_routable_station(params: NoRoutableStationParams<'_>) -> (StatusCode, String) {
-    let status = StatusCode::BAD_GATEWAY;
-    let message = "no routable station".to_string();
-    let http_debug = build_early_error_http_debug(
-        status,
-        params.client_uri,
-        params.client_headers,
-        "no_routable_station",
-        NO_ROUTABLE_STATION_HINT,
-        message.as_str(),
-    );
-
-    log_request_with_debug(
-        None,
-        params.proxy.service_name,
-        params.method.as_str(),
-        params.path,
-        status.as_u16(),
-        params.duration_ms,
-        None,
-        None,
-        None,
-        None,
-        None,
-        EMPTY_TARGET_URL,
-        params.session_id,
-        params.session_identity_source,
-        None,
-        None,
-        None,
-        ServiceTierLog::default(),
-        None,
-        None,
-        None,
-        None,
-        http_debug,
-    );
-
-    (status, message)
 }
 
 pub(super) fn log_client_body_read_error(

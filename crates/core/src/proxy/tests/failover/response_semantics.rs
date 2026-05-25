@@ -4,7 +4,7 @@ use crate::proxy::tests::harness::{
     spawn_proxy_service, spawn_test_proxy, spawn_test_upstream,
 };
 use crate::runtime_identity::ProviderEndpointKey;
-use crate::state::{SessionIdentitySource, SessionRouteAffinityTarget};
+use crate::state::{RuntimeConfigState, SessionIdentitySource, SessionRouteAffinityTarget};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use std::io::Cursor;
@@ -3306,6 +3306,48 @@ async fn proxy_skips_upstreams_that_do_not_support_model() {
 }
 
 #[tokio::test]
+async fn proxy_no_routable_station_finishes_active_request() {
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        post(|| async move {
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "err": "should not route" })),
+            )
+        }),
+    );
+    let upstream = spawn_test_upstream(upstream);
+
+    let cfg = make_proxy_config(
+        vec![upstream.upstream_config()],
+        retry_config(1, "502", Vec::new(), RetryStrategy::Failover),
+    );
+    let proxy = proxy_service(cfg);
+    let state = proxy.state.clone();
+    state
+        .set_station_runtime_state_override(
+            "codex",
+            "test".to_string(),
+            RuntimeConfigState::BreakerOpen,
+            crate::logging::now_ms(),
+        )
+        .await;
+    let proxy = spawn_proxy_service(proxy);
+
+    let client = reqwest::Client::new();
+    let resp = post_responses_json(&client, &proxy, r#"{"model":"gpt-5","input":"hi"}"#).await;
+
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    assert!(
+        state.list_active_requests().await.is_empty(),
+        "no-routable preparation failure must not leak active requests"
+    );
+    let finished = state.list_recent_finished(1).await;
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0].status_code, StatusCode::BAD_GATEWAY.as_u16());
+}
+
+#[tokio::test]
 async fn proxy_applies_model_mapping_to_request_body() {
     let upstream_hits = Arc::new(AtomicUsize::new(0));
 
@@ -3616,6 +3658,84 @@ supports_websockets = true
 
     proxy_handle.abort();
     u_handle.abort();
+    let _ = std::fs::remove_dir_all(codex_home);
+}
+
+#[tokio::test]
+async fn responses_websocket_no_routable_station_finishes_active_request() {
+    let _env_guard = env_lock().await;
+    let codex_home = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HOME", &codex_home);
+    }
+    write_text_file(
+        &codex_home.join("config.toml"),
+        r#"
+model_provider = "codex_proxy"
+
+[model_providers.codex_proxy]
+name = "OpenAI"
+base_url = "http://127.0.0.1:1"
+wire_api = "responses"
+supports_websockets = true
+"#,
+    );
+
+    let upstream =
+        axum::Router::new().route(
+            "/v1/responses",
+            get(|ws: axum::extract::ws::WebSocketUpgrade| async move {
+                ws.on_upgrade(|_| async move {})
+            }),
+        );
+    let upstream = spawn_test_upstream(upstream);
+
+    let cfg = make_proxy_config(
+        vec![upstream.upstream_config()],
+        retry_config(1, "502", Vec::new(), RetryStrategy::Failover),
+    );
+    let proxy = proxy_service(cfg);
+    let state = proxy.state.clone();
+    state
+        .set_station_runtime_state_override(
+            "codex",
+            "test".to_string(),
+            RuntimeConfigState::BreakerOpen,
+            crate::logging::now_ms(),
+        )
+        .await;
+    let proxy = spawn_proxy_service(proxy);
+
+    let request = format!("ws://{}/v1/responses", proxy.addr)
+        .into_client_request()
+        .expect("ws request");
+    let (mut socket, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("connect proxy websocket");
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"response.create","model":"gpt-5","stream":true,"prompt_cache_key":"ws-no-routable"}"#.into(),
+        ))
+        .await
+        .expect("send first frame");
+
+    let close = socket.next().await.expect("close frame").expect("close ok");
+    assert!(matches!(
+        close,
+        tokio_tungstenite::tungstenite::Message::Close(_)
+    ));
+    assert!(
+        state.list_active_requests().await.is_empty(),
+        "websocket no-routable preparation failure must not leak active requests"
+    );
+    let finished = find_finished_request(&state, 10, |request| {
+        request.session_id.as_deref() == Some("ws-no-routable")
+    })
+    .await
+    .expect("finished websocket request");
+    assert_eq!(finished.status_code, StatusCode::BAD_GATEWAY.as_u16());
+
     let _ = std::fs::remove_dir_all(codex_home);
 }
 
