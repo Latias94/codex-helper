@@ -172,6 +172,7 @@ pub(super) fn control_trace_summary(entry: &ControlTraceLogEntry, lang: Language
             selected_preference_group,
             skipped_higher_priority_groups,
             skipped_higher_priority_candidates,
+            ..
         }) => {
             let model = request_model.unwrap_or_else(|| "-".to_string());
             let policy = affinity_policy.unwrap_or_else(|| "-".to_string());

@@ -842,16 +842,16 @@ impl<'a, 'route> RouteGraphAttemptLoop<'a, 'route> {
                 }
                 break;
             };
-            log_route_graph_selection_explain(
-                ctx.proxy.service_name,
-                ctx.request_id,
+            log_route_graph_selection_explain(RouteGraphSelectionExplain {
+                service_name: ctx.proxy.service_name,
+                request_id: ctx.request_id,
                 executor,
-                &*runtime,
+                runtime: &*runtime,
                 route_state,
-                ctx.request_model,
-                &selected,
+                request_model: ctx.request_model,
+                selected: &selected,
                 policy,
-            );
+            });
             let selected_candidate = selected.candidate;
             let mut avoid_set = hash_set_from_indices(&avoided_candidate_indices);
 
@@ -1027,16 +1027,28 @@ impl<'a, 'route> LegacyAttemptLoop<'a, 'route> {
     }
 }
 
-fn log_route_graph_selection_explain(
-    service_name: &str,
+struct RouteGraphSelectionExplain<'a> {
+    service_name: &'a str,
     request_id: u64,
-    executor: &RoutePlanExecutor<'_>,
-    runtime: &RoutePlanRuntimeState,
-    route_state: &RoutePlanAttemptState,
-    request_model: Option<&str>,
-    selected: &SelectedRouteCandidate<'_>,
+    executor: &'a RoutePlanExecutor<'a>,
+    runtime: &'a RoutePlanRuntimeState,
+    route_state: &'a RoutePlanAttemptState,
+    request_model: Option<&'a str>,
+    selected: &'a SelectedRouteCandidate<'a>,
     policy: ProviderChainAttemptPolicy,
-) {
+}
+
+fn log_route_graph_selection_explain(args: RouteGraphSelectionExplain<'_>) {
+    let RouteGraphSelectionExplain {
+        service_name,
+        request_id,
+        executor,
+        runtime,
+        route_state,
+        request_model,
+        selected,
+        policy,
+    } = args;
     let selected_group = selected.candidate.preference_group;
     if selected_group == 0 {
         return;

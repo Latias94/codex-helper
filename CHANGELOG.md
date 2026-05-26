@@ -7,6 +7,16 @@ All notable changes to this project will be documented in this file.
 
 ### 中文
 
+- 暂无。
+
+### English summary
+
+- None yet.
+
+## [0.17.0] - 2026-05-26
+
+### 中文
+
 #### Codex 请求/响应语义增强
 
 - 本地代理新增 OpenAI Images 兼容入口 `POST /v1/images/generations` / `/images/generations`，会把 `model`、`prompt`、`size`、`output_format`、`quality` 等字段转成 `/v1/responses` hosted `image_generation` 请求，并继续复用既有 provider routing、重试、fallback、auth 注入和请求日志。成功响应会转换为 `data[0].b64_json`，当前仅支持单图 `n=1`。

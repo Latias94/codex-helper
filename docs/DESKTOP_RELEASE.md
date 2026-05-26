@@ -11,9 +11,10 @@ remain separate release follow-ups.
 - Tauri version: v2
 - Frontend stack: React 19, Tailwind CSS 4, shadcn/ui-style components, TanStack Router/Query/Table
 - First packaged target: Windows NSIS installer
-- First public replacement channel: GitHub Releases, manual installer download.
-  The tag release workflow builds and uploads this installer alongside the
-  existing cargo-dist CLI artifacts.
+- First public replacement channel: not enabled yet. The current tag release
+  workflow intentionally publishes only the cargo-dist CLI artifacts; the
+  desktop installer remains a local/manual validation artifact until the signed
+  release channel and rollback process are ready.
 - Build command:
 
 ```powershell
@@ -76,10 +77,12 @@ Per the Tauri updater contract, a production updater needs:
 
 Current first replacement release policy:
 
-- Ship Windows NSIS artifacts through GitHub Releases. `.github/workflows/release.yml`
-  has a `build-tauri-windows-installer` job that runs on `windows-2025`, installs
-  the desktop pnpm dependencies, runs `pnpm tauri:build` from `apps/desktop`, and
-  uploads `target/release/bundle/nsis/*.exe` as a release artifact.
+- Do not ship Windows NSIS artifacts through the public GitHub tag release yet.
+  `.github/workflows/release.yml` intentionally omits the Tauri installer job for
+  v0.17.0, so the public release contains the cargo-dist CLI artifacts only.
+- Keep `pnpm tauri:build` available for local/manual validation from
+  `apps/desktop`, but do not upload those installers as release artifacts until
+  signing, release-channel, and rollback operations are proven.
 - Keep automatic update checks disabled in the app until the signing key,
   artifact hosting, release channel, and rollback process exist.
 - Do not add `tauri-plugin-updater` or updater UI that implies a working update
@@ -117,10 +120,10 @@ Current policy:
 
 ## Replacement posture
 
-The Windows NSIS packaged Tauri app is the desktop GUI replacement path. The
-legacy `codex-helper-gui` egui binary remains available as a deprecated fallback
-for rollback and for platforms where packaged Tauri parity has not yet been
-smoked.
+The Windows NSIS packaged Tauri app is the intended desktop GUI replacement
+path, but it is not part of the v0.17.0 public release. The legacy
+`codex-helper-gui` egui binary remains available as a deprecated fallback for
+rollback and for platforms where packaged Tauri parity has not yet been smoked.
 
 Do not claim cross-platform replacement until macOS/Linux packaged smoke has
 covered the same lifecycle behavior. Do not enable or advertise automatic
@@ -132,8 +135,8 @@ Verified on Windows:
 
 - `pnpm tauri:build` completes.
 - The NSIS installer is produced under `target/release/bundle/nsis/`.
-- The GitHub tag release workflow includes the Windows Tauri installer artifact
-  in the final Release upload set.
+- The GitHub tag release workflow intentionally does not upload the Windows
+  Tauri installer for v0.17.0; CLI artifacts remain the public release surface.
 - `7z l target/release/bundle/nsis/codex-helper_0.16.0_x64-setup.exe` lists both
   `codex-helper-desktop.exe` and the bundled `codex-helper.exe` sidecar.
 - Compile/test verification proves the launch-at-login plugin is registered and

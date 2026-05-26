@@ -51,7 +51,7 @@ impl RequestFlavor {
         if is_remote_compaction_v2_request {
             let patch_mode = self.codex_client_patch_mode.as_str().to_string();
             let strips_client_auth = self.codex_client_patch_mode.strips_codex_client_auth();
-            let bridge = self.codex_bridge_log.get_or_insert_with(|| CodexBridgeLog {
+            let bridge = self.codex_bridge_log.get_or_insert(CodexBridgeLog {
                 patch_mode,
                 remote_compaction_v1_request: false,
                 remote_compaction_v2_request: false,

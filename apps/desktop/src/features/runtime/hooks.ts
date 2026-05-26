@@ -26,7 +26,7 @@ export function useRuntimeSummary(): QueryBackedData<RuntimeSummary> {
   const data = readModel.data
     ? mapRuntimeSummary(readModel.data.operatorSummary, {
         adminBaseUrl: readModel.data.endpoint.adminBaseUrl,
-        appVersion: "0.16.0",
+        appVersion: "0.17.0",
         runtimeStatus: readModel.data.runtimeStatus,
         recentRequests: readModel.data.recentRequests,
       })

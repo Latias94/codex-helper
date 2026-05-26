@@ -1327,6 +1327,13 @@ async fn proxy_request_content_encoding_rejects_corrupt_zstd_body() {
 
 #[tokio::test]
 async fn proxy_uses_official_session_id_affinity_for_responses_compact() {
+    let _env_guard = env_lock().await;
+    let temp_dir = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
+    }
+
     let a_responses_hits = Arc::new(AtomicUsize::new(0));
     let a_compact_hits = Arc::new(AtomicUsize::new(0));
     let b_responses_hits = Arc::new(AtomicUsize::new(0));
