@@ -198,6 +198,14 @@ fn render_attached_provider_endpoint_row(
             endpoint.name.as_str(),
         ));
         ui.small(format!("base={}", shorten_middle(&endpoint.base_url, 56)));
+        ui.small(format!(
+            "continuity={}",
+            endpoint
+                .effective_continuity_domain
+                .as_deref()
+                .or(endpoint.continuity_domain.as_deref())
+                .unwrap_or("provider_endpoint")
+        ));
         if !endpoint.routable {
             ui.colored_label(
                 egui::Color32::from_rgb(200, 120, 40),

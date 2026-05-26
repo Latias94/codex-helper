@@ -455,6 +455,19 @@ pub(in crate::tui::view) fn render_station_info_modal(
                     ),
                     Span::styled(auth.to_string(), Style::default().fg(p.text)),
                     Span::raw("   "),
+                    Span::styled("continuity: ", Style::default().fg(p.muted)),
+                    Span::styled(
+                        up.continuity_domain
+                            .as_deref()
+                            .unwrap_or("provider_endpoint")
+                            .to_string(),
+                        Style::default().fg(if up.continuity_domain.is_some() {
+                            p.accent
+                        } else {
+                            p.muted
+                        }),
+                    ),
+                    Span::raw("   "),
                     Span::styled(models_text, Style::default().fg(p.muted)),
                 ]));
                 lines.push(Line::from(vec![

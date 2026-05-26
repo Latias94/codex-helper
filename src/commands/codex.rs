@@ -13,6 +13,7 @@ use crate::proxy::{
     codex_relay_evidence_path, read_recent_codex_relay_evidence,
 };
 use crate::{CliError, CliResult};
+use codex_helper_core::codex_capability_profile::CodexCapabilitySupport;
 
 pub(crate) async fn handle_codex_cmd(cmd: CodexCommand) -> CliResult<()> {
     match cmd {
@@ -173,6 +174,20 @@ fn print_capabilities_text(response: &CodexRelayCapabilitiesResponse) {
         response.model.as_deref().unwrap_or("<none>")
     );
     println!(
+        "Expected: compact={} ({:?}); continuity identity={} state_sharing={} ({:?})",
+        support_label(response.expected.remote_compaction_v1.support),
+        response.expected.provider_identity,
+        support_label(
+            response
+                .expected
+                .continuity
+                .identity_sets_compact_path
+                .support
+        ),
+        support_label(response.expected.continuity.state_sharing.support),
+        response.expected.continuity.state_sharing.support
+    );
+    println!(
         "Observed: models={:?}/{:?}, responses={:?}/{:?}, compact={:?}/{:?}",
         response.observed.models.support,
         response.observed.models.confidence,
@@ -181,6 +196,22 @@ fn print_capabilities_text(response: &CodexRelayCapabilitiesResponse) {
         response.observed.responses_compact.support,
         response.observed.responses_compact.confidence
     );
+    println!(
+        "Continuity: domain={} explicit={} same_domain_endpoints={} configured_endpoints={} affinity={} state_bound_failover={}",
+        response.continuity.selected_domain.key,
+        response.continuity.selected_domain.explicit,
+        response.continuity.same_domain_endpoint_count,
+        response.continuity.configured_endpoint_count,
+        response
+            .continuity
+            .affinity_policy
+            .as_deref()
+            .unwrap_or("<unknown>"),
+        response.continuity.can_state_bound_failover_within_domain
+    );
+    for warning in &response.continuity.warnings {
+        println!("{} {}", "Continuity warning:".yellow(), warning);
+    }
     println!(
         "Recommendation: {} ({:?})",
         response
@@ -200,6 +231,14 @@ fn print_capabilities_text(response: &CodexRelayCapabilitiesResponse) {
         );
     }
     println!("Evidence: {:?}", codex_relay_evidence_path());
+}
+
+fn support_label(support: CodexCapabilitySupport) -> &'static str {
+    match support {
+        CodexCapabilitySupport::Unknown => "unknown",
+        CodexCapabilitySupport::Supported => "supported",
+        CodexCapabilitySupport::Unsupported => "unsupported",
+    }
 }
 
 fn print_live_smoke_text(response: &CodexRelayLiveSmokeResponse) {

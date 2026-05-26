@@ -222,6 +222,10 @@ pub struct ProviderEndpointOption {
     pub provider_name: String,
     pub name: String,
     pub base_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continuity_domain: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_continuity_domain: Option<String>,
     #[serde(default)]
     pub priority: u32,
     #[serde(default)]

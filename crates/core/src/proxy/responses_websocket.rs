@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 use std::time::Instant;
 
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
@@ -648,16 +648,10 @@ fn websocket_state_bound_request_requires_existing_affinity(
         .request_continuity
         .remote_compaction_requires_affinity
         && runtime.affinity_provider_endpoint().is_none()
-        && configured_provider_endpoint_count(template) > 1
-}
-
-fn configured_provider_endpoint_count(template: &RoutePlanTemplate) -> usize {
-    template
-        .candidates
-        .iter()
-        .map(|candidate| template.candidate_provider_endpoint_key(candidate))
-        .collect::<BTreeSet<_>>()
-        .len()
+        && template
+            .continuity_topology()
+            .configured_provider_endpoint_count()
+            > 1
 }
 
 fn log_websocket_route_continuity_blocked(

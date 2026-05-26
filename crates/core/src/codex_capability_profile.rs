@@ -46,6 +46,12 @@ impl CodexCapabilityDecision {
     }
 }
 
+impl Default for CodexCapabilityDecision {
+    fn default() -> Self {
+        Self::unknown("capability was not reported by this response")
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CodexProviderIdentity {
@@ -251,6 +257,7 @@ pub struct CodexCapabilityProfile {
     pub provider_identity: CodexProviderIdentity,
     pub auth_shape: CodexAuthShape,
     pub provider_supports_websockets: bool,
+    #[serde(default)]
     pub continuity: CodexContinuityCapabilityProfile,
     pub model_catalog: CodexModelCatalogProfile,
     pub remote_compaction_v1: CodexCapabilityDecision,
@@ -266,6 +273,18 @@ pub struct CodexContinuityCapabilityProfile {
     pub identity_sets_compact_path: CodexCapabilityDecision,
     pub state_sharing: CodexCapabilityDecision,
     pub operator_guidance: String,
+}
+
+impl Default for CodexContinuityCapabilityProfile {
+    fn default() -> Self {
+        Self {
+            identity_sets_compact_path: CodexCapabilityDecision::default(),
+            state_sharing: CodexCapabilityDecision::unknown(
+                "continuity profile was not reported by this response",
+            ),
+            operator_guidance: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -788,6 +807,22 @@ mod tests {
         assert_eq!(
             profile.hosted_image_generation.support,
             CodexCapabilitySupport::Unsupported
+        );
+        assert_eq!(
+            profile.continuity.state_sharing.support,
+            CodexCapabilitySupport::Unknown
+        );
+        assert!(
+            profile
+                .continuity
+                .operator_guidance
+                .contains("sub2api or New API")
+        );
+        assert!(
+            profile
+                .continuity
+                .operator_guidance
+                .contains("continuity_domain only for endpoints")
         );
     }
 

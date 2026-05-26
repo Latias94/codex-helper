@@ -31,6 +31,8 @@ export type ApiProviderEndpointOption = {
   provider_name: string;
   name: string;
   base_url: string;
+  continuity_domain?: string | null;
+  effective_continuity_domain?: string | null;
   priority?: number;
   configured_enabled?: boolean;
   effective_enabled?: boolean;

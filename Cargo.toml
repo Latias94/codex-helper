@@ -13,6 +13,7 @@ homepage = "https://github.com/Latias94/codex-helper"
 
 [workspace]
 members = ["crates/core", "crates/tui", "crates/gui", "apps/desktop/src-tauri"]
+default-members = ["."]
 
 [[bin]]
 name = "codex-helper"
@@ -77,6 +78,9 @@ bin-dir = "{ name }-{ target }/{ bin }{ binary-ext }"
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.zip"
 pkg-fmt = "zip"
 bin-dir = "{ bin }{ binary-ext }"
+
+[package.metadata.dist]
+dist = true
 
 # The profile that 'dist' will build with
 [profile.dist]

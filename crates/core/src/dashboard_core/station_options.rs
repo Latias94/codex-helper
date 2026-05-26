@@ -197,11 +197,17 @@ fn build_provider_endpoint_option(
     let configured_enabled = provider.enabled && endpoint.enabled;
     let effective_enabled = configured_enabled && runtime_enabled_override.unwrap_or(true);
     let routable = effective_enabled && runtime_state == RuntimeConfigState::Normal;
+    let continuity_domain = normalized_tag_value(endpoint.tags.get("continuity_domain"));
+    let effective_continuity_domain = continuity_domain
+        .clone()
+        .or_else(|| normalized_tag_value(endpoint.tags.get("provider_continuity_domain")));
 
     ProviderEndpointOption {
         provider_name: provider_name.to_string(),
         name: endpoint_name.to_string(),
         base_url: endpoint.base_url.clone(),
+        continuity_domain,
+        effective_continuity_domain,
         priority: endpoint.priority,
         configured_enabled,
         effective_enabled,
@@ -210,6 +216,14 @@ fn build_provider_endpoint_option(
         runtime_state,
         runtime_state_override,
     }
+}
+
+fn normalized_tag_value(value: Option<&String>) -> Option<String> {
+    value
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn aggregate_capability_support(
@@ -496,7 +510,12 @@ mod tests {
                             base_url: "https://alpha.example/v1".to_string(),
                             enabled: true,
                             priority: 0,
-                            tags: Default::default(),
+                            tags: [(
+                                "continuity_domain".to_string(),
+                                "relay-cluster-a".to_string(),
+                            )]
+                            .into_iter()
+                            .collect(),
                             supported_models: Default::default(),
                             model_mapping: Default::default(),
                         },
@@ -545,6 +564,10 @@ mod tests {
         assert_eq!(provider.routable_endpoints, 1);
         assert_eq!(provider.endpoints.len(), 2);
         assert_eq!(provider.endpoints[0].name, "default");
+        assert_eq!(
+            provider.endpoints[0].effective_continuity_domain.as_deref(),
+            Some("relay-cluster-a")
+        );
         assert_eq!(provider.endpoints[0].runtime_enabled_override, Some(true));
         assert_eq!(
             provider.endpoints[0].runtime_state_override,

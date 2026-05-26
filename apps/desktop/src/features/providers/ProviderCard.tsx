@@ -54,9 +54,9 @@ export function ProviderCard({
       <CardContent className="space-y-4">
         <div className="grid grid-cols-2 gap-3 text-sm">
           <Info label="Auth" value={provider.auth} mono />
+          <Info label="Continuity" value={provider.continuityDomain || "endpoint"} mono />
           <Info label="Balance" value={provider.balance} />
           <Info label="Latency" value={provider.latency} />
-          <Info label="Usage today" value={provider.usage} />
         </div>
         <div className="flex flex-wrap gap-2">
           {provider.capabilities.map((capability) => (
@@ -131,6 +131,7 @@ function ProviderEditForm({
 }) {
   const [alias, setAlias] = useState(provider.alias ?? provider.name);
   const [baseUrl, setBaseUrl] = useState(provider.baseUrl);
+  const [continuityDomain, setContinuityDomain] = useState(provider.continuityDomain ?? "");
   const [enabled, setEnabled] = useState(provider.enabled);
   const [authTokenEnv, setAuthTokenEnv] = useState("");
   const [apiKeyEnv, setApiKeyEnv] = useState("");
@@ -143,6 +144,7 @@ function ProviderEditForm({
       providerName: provider.id ?? provider.name,
       alias: alias.trim(),
       baseUrl: baseUrl.trim(),
+      ...(continuityDomain.trim() ? { continuityDomain: continuityDomain.trim() } : {}),
       enabled,
       ...(authTokenEnv.trim() ? { authTokenEnv: authTokenEnv.trim() } : {}),
       ...(apiKeyEnv.trim() ? { apiKeyEnv: apiKeyEnv.trim() } : {}),
@@ -190,6 +192,15 @@ function ProviderEditForm({
             placeholder="PROVIDER_API_KEY"
           />
         </Field>
+        <Field label="Continuity domain">
+          <Input
+            aria-label={`Continuity domain for ${provider.name}`}
+            id={`provider-continuity-domain-${provider.id ?? provider.name}`}
+            value={continuityDomain}
+            onChange={(event) => setContinuityDomain(event.target.value)}
+            placeholder="relay-cluster-a"
+          />
+        </Field>
         <Field label="API key env">
           <Input
             aria-label={`API key env for ${provider.name}`}
@@ -213,9 +224,8 @@ function ProviderEditForm({
       </label>
       {error && <p className="text-xs text-red-600">{error}</p>}
       <p className="text-xs leading-5 text-slate-500">
-        常用表单只修改 alias、base_url、enabled 和 env 名称；env 输入留空会保留现有设置。
-        tags、limits、model mapping 等高级字段会留在 config.toml 中。多 endpoint provider
-        继续使用 raw TOML。
+        常用表单只修改 alias、base_url、continuity_domain、enabled 和 env 名称；env 输入留空会保留现有设置。
+        tags、limits、model mapping 等高级字段会留在 config.toml 中。多 endpoint provider 继续使用 raw TOML。
       </p>
       <div className="flex justify-end gap-2">
         <Button type="button" variant="ghost" onClick={onCancel} disabled={busy}>

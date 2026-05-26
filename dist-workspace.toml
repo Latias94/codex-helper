@@ -8,6 +8,9 @@ packages = ["codex-helper"]
 cargo-dist-version = "0.31.0"
 # Features to pass to cargo build
 features = ["gui"]
+# Build only packages selected for distribution. This keeps the unpublished
+# Tauri desktop workspace member out of release artifact builds.
+precise-builds = true
 # CI backends to support
 ci = "github"
 # The installers to generate for each app

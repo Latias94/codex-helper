@@ -20,6 +20,7 @@ pub struct ProviderCommonEditPayload {
     pub provider_name: String,
     pub alias: Option<String>,
     pub base_url: String,
+    pub continuity_domain: Option<String>,
     pub enabled: bool,
     pub auth_token_env: Option<String>,
     pub api_key_env: Option<String>,
@@ -132,6 +133,11 @@ fn patch_single_endpoint_provider(
     match (provider_has_base_url, endpoint_names.as_slice()) {
         (true, []) => {
             provider_table.insert("base_url".to_string(), Value::String(base_url.to_string()));
+            set_optional_string(
+                provider_table,
+                "continuity_domain",
+                payload.continuity_domain.as_deref(),
+            );
         }
         (true, _) => {
             return Err(DesktopError::Config(
@@ -154,6 +160,11 @@ fn patch_single_endpoint_provider(
                     DesktopError::Config(format!("endpoint {endpoint_name} must be a table"))
                 })?;
             endpoint.insert("base_url".to_string(), Value::String(base_url.to_string()));
+            set_optional_string(
+                endpoint,
+                "continuity_domain",
+                payload.continuity_domain.as_deref(),
+            );
         }
         (false, []) => {
             return Err(DesktopError::Config(
@@ -396,6 +407,10 @@ region = "eu"
             Some("https://new.example/v1")
         );
         assert_eq!(
+            provider.get("continuity_domain").and_then(Value::as_str),
+            Some("relay-cluster-a")
+        );
+        assert_eq!(
             provider.get("enabled").and_then(Value::as_bool),
             Some(false)
         );
@@ -472,6 +487,10 @@ region = "eu"
             Some("https://new.example/v1")
         );
         assert_eq!(
+            endpoint.get("continuity_domain").and_then(Value::as_str),
+            Some("relay-cluster-a")
+        );
+        assert_eq!(
             endpoint.get("priority").and_then(Value::as_integer),
             Some(0)
         );
@@ -506,6 +525,7 @@ region = "eu"
             provider_name: "relay".to_string(),
             alias: Some("New Relay".to_string()),
             base_url: "https://new.example/v1".to_string(),
+            continuity_domain: Some("relay-cluster-a".to_string()),
             enabled: false,
             auth_token_env: Some("NEW_TOKEN".to_string()),
             api_key_env: Some(String::new()),

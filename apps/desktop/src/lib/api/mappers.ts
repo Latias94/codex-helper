@@ -232,6 +232,7 @@ export function mapProviders(
       name: provider.alias || provider.name,
       alias: provider.alias ?? null,
       baseUrl: primaryEndpoint?.base_url ?? "",
+      continuityDomain: primaryEndpoint?.effective_continuity_domain ?? primaryEndpoint?.continuity_domain ?? null,
       host: hostFromUrl(primaryEndpoint?.base_url),
       enabled: provider.configured_enabled ?? true,
       endpointCount,
@@ -373,6 +374,9 @@ function providerCapabilities(provider: ApiProviderOption) {
     }
     if (text.includes("image") || text.includes("img")) {
       capabilities.add("imagegen");
+    }
+    if (endpoint.effective_continuity_domain || endpoint.continuity_domain) {
+      capabilities.add("continuity domain");
     }
   }
   if (capabilities.size === 0) {

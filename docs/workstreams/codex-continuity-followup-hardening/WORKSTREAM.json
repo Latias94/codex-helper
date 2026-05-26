@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "slug": "codex-continuity-followup-hardening",
+  "title": "Codex Continuity Follow-Up Hardening",
+  "status": "complete",
+  "updated": "2026-05-26",
+  "scope_kind": "execution",
+  "problem": "Continuity routing fixes need release, topology, test, UI, diagnostics, and official-OpenAI hardening before they are operator-safe.",
+  "authoritative_docs": [
+    {
+      "role": "design",
+      "path": "docs/workstreams/codex-continuity-followup-hardening/DESIGN.md"
+    },
+    {
+      "role": "execution",
+      "path": "docs/workstreams/codex-continuity-followup-hardening/TODO.md"
+    },
+    {
+      "role": "milestones",
+      "path": "docs/workstreams/codex-continuity-followup-hardening/MILESTONES.md"
+    },
+    {
+      "role": "gates",
+      "path": "docs/workstreams/codex-continuity-followup-hardening/EVIDENCE_AND_GATES.md"
+    },
+    {
+      "role": "handoff",
+      "path": "docs/workstreams/codex-continuity-followup-hardening/HANDOFF.md"
+    }
+  ],
+  "gates": [
+    "dist host --steps=create --tag=v0.17.0 --output-format=json > plan-dist-manifest.json",
+    "cargo nextest run -p codex-helper-core continuity_domain route_affinity capabilities --no-fail-fast",
+    "cargo nextest run -p codex-helper-core response_semantics remote_compaction_v2 responses_websocket --no-fail-fast",
+    "cargo nextest run -p codex-helper-core persisted_crud runtime_overrides --no-fail-fast",
+    "cargo nextest run -p codex-helper-core codex_capability_profile capabilities continuity_domain --no-fail-fast",
+    "pnpm --dir apps/desktop test -- --run",
+    "cargo fmt --all --check",
+    "cargo nextest run -p codex-helper-core --no-fail-fast",
+    "cargo check -p codex-helper",
+    "git diff --check"
+  ],
+  "evidence": [
+    "docs/workstreams/codex-continuity-followup-hardening/EVIDENCE_AND_GATES.md"
+  ],
+  "adr_refs": [],
+  "continue_policy": {
+    "default_action": "continue",
+    "notes": "Continue through the six requested follow-ups. Split only if desktop publication, official credential identity, or unrelated route graph scoring grows beyond this lane."
+  },
+  "current_task": null
+}

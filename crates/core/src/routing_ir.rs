@@ -90,6 +90,10 @@ impl RoutePlanTemplate {
             .collect()
     }
 
+    pub fn continuity_topology(&self) -> RoutePlanContinuityTopology<'_> {
+        RoutePlanContinuityTopology { template: self }
+    }
+
     pub fn candidate_compatibility_key(
         &self,
         candidate: &RouteCandidate,
@@ -110,6 +114,74 @@ impl RoutePlanTemplate {
                     })
             })
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RoutePlanContinuityTopology<'a> {
+    template: &'a RoutePlanTemplate,
+}
+
+impl RoutePlanContinuityTopology<'_> {
+    pub fn configured_provider_endpoint_count(&self) -> usize {
+        self.template
+            .candidates
+            .iter()
+            .map(|candidate| self.template.candidate_provider_endpoint_key(candidate))
+            .collect::<BTreeSet<_>>()
+            .len()
+    }
+
+    pub fn candidate_domain(&self, candidate: &RouteCandidate) -> ContinuityDomainKey {
+        self.template.candidate_continuity_domain_key(candidate)
+    }
+
+    pub fn find_candidate_by_provider_endpoint_stable_key(
+        &self,
+        provider_endpoint_stable_key: &str,
+    ) -> Option<&RouteCandidate> {
+        self.template.candidates.iter().find(|candidate| {
+            self.template
+                .candidate_provider_endpoint_key(candidate)
+                .stable_key()
+                == provider_endpoint_stable_key
+        })
+    }
+
+    pub fn find_candidate_by_provider_endpoint(
+        &self,
+        provider_endpoint: &ProviderEndpointKey,
+    ) -> Option<&RouteCandidate> {
+        self.template.candidates.iter().find(|candidate| {
+            self.template.candidate_provider_endpoint_key(candidate) == *provider_endpoint
+        })
+    }
+
+    pub fn same_domain_candidate_count(&self, domain: &ContinuityDomainKey) -> usize {
+        self.template
+            .candidates
+            .iter()
+            .filter(|candidate| self.template.candidate_continuity_domain_key(candidate) == *domain)
+            .count()
+    }
+
+    pub fn selected_domain_summary(
+        &self,
+        provider_endpoint_stable_key: &str,
+    ) -> Option<RoutePlanContinuityDomainSummary> {
+        let selected =
+            self.find_candidate_by_provider_endpoint_stable_key(provider_endpoint_stable_key)?;
+        let domain = self.candidate_domain(selected);
+        Some(RoutePlanContinuityDomainSummary {
+            domain: domain.clone(),
+            same_domain_endpoint_count: self.same_domain_candidate_count(&domain).max(1),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutePlanContinuityDomainSummary {
+    pub domain: ContinuityDomainKey,
+    pub same_domain_endpoint_count: usize,
 }
 
 fn candidate_provider_endpoint_key(
@@ -3527,6 +3599,88 @@ mod tests {
                     Some("isolated-cluster"),
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn routing_ir_continuity_topology_summarizes_endpoint_and_domain_counts() {
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([
+                (
+                    "alpha".to_string(),
+                    ProviderConfigV4 {
+                        continuity_domain: Some("shared-relay".to_string()),
+                        endpoints: BTreeMap::from([
+                            (
+                                "one".to_string(),
+                                ProviderEndpointV4 {
+                                    base_url: "https://alpha-one.example/v1".to_string(),
+                                    continuity_domain: None,
+                                    enabled: true,
+                                    priority: 0,
+                                    tags: BTreeMap::new(),
+                                    supported_models: BTreeMap::new(),
+                                    model_mapping: BTreeMap::new(),
+                                    limits: ProviderConcurrencyLimits::default(),
+                                },
+                            ),
+                            (
+                                "two".to_string(),
+                                ProviderEndpointV4 {
+                                    base_url: "https://alpha-two.example/v1".to_string(),
+                                    continuity_domain: None,
+                                    enabled: true,
+                                    priority: 1,
+                                    tags: BTreeMap::new(),
+                                    supported_models: BTreeMap::new(),
+                                    model_mapping: BTreeMap::new(),
+                                    limits: ProviderConcurrencyLimits::default(),
+                                },
+                            ),
+                        ]),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+                (
+                    "beta".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some("https://beta.example/v1".to_string()),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+            ]),
+            routing: Some(RoutingConfigV4::ordered_failover(vec![
+                "alpha".to_string(),
+                "beta".to_string(),
+            ])),
+            ..ServiceViewV4::default()
+        };
+        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let topology = template.continuity_topology();
+
+        assert_eq!(topology.configured_provider_endpoint_count(), 3);
+
+        let alpha_summary = topology
+            .selected_domain_summary("codex/alpha/one")
+            .expect("alpha domain summary");
+        assert_eq!(
+            alpha_summary.domain.stable_key(),
+            "explicit:codex/shared-relay"
+        );
+        assert_eq!(alpha_summary.same_domain_endpoint_count, 2);
+
+        let beta_summary = topology
+            .selected_domain_summary("codex/beta/default")
+            .expect("beta domain summary");
+        assert_eq!(
+            beta_summary.domain.stable_key(),
+            "provider_endpoint:codex/beta/default"
+        );
+        assert_eq!(beta_summary.same_domain_endpoint_count, 1);
+        assert!(
+            topology
+                .selected_domain_summary("codex/missing/default")
+                .is_none()
         );
     }
 

@@ -6,6 +6,9 @@ license = "MIT OR Apache-2.0"
 authors = ["Mingzhen Zhuang <superfrankie621@gmail.com>"]
 description = "Tauri desktop client for codex-helper."
 
+[package.metadata.dist]
+dist = false
+
 [lib]
 name = "codex_helper_desktop"
 crate-type = ["staticlib", "cdylib", "rlib"]

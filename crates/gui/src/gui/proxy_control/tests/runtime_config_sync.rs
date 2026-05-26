@@ -38,6 +38,7 @@ fn v4_config(base_url: &str) -> ProxyConfig {
                     endpoints: BTreeMap::new(),
                     alias: Some("Monthly".to_string()),
                     enabled: true,
+                    continuity_domain: None,
                 },
             )]),
             routing: Some(RoutingConfigV4::ordered_failover(vec![

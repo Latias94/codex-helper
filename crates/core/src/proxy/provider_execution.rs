@@ -172,16 +172,10 @@ fn state_bound_request_requires_existing_affinity(
 ) -> bool {
     policy.requires_known_affinity()
         && runtime.affinity_provider_endpoint().is_none()
-        && configured_provider_endpoint_count(template) > 1
-}
-
-fn configured_provider_endpoint_count(template: &RoutePlanTemplate) -> usize {
-    template
-        .candidates
-        .iter()
-        .map(|candidate| template.candidate_provider_endpoint_key(candidate))
-        .collect::<BTreeSet<_>>()
-        .len()
+        && template
+            .continuity_topology()
+            .configured_provider_endpoint_count()
+            > 1
 }
 
 fn restrict_route_state_to_affinity_continuity_domain(
@@ -196,12 +190,12 @@ fn restrict_route_state_to_affinity_continuity_domain(
     let Some(affinity_provider_endpoint) = runtime.affinity_provider_endpoint() else {
         return;
     };
-    let Some(candidate) = template.candidates.iter().find(|candidate| {
-        template.candidate_provider_endpoint_key(candidate) == *affinity_provider_endpoint
-    }) else {
+    let topology = template.continuity_topology();
+    let Some(candidate) = topology.find_candidate_by_provider_endpoint(affinity_provider_endpoint)
+    else {
         return;
     };
-    route_state.restrict_to_continuity_domain(template.candidate_continuity_domain_key(candidate));
+    route_state.restrict_to_continuity_domain(topology.candidate_domain(candidate));
 }
 
 pub(super) struct ExecuteProviderChainParams<'a> {

@@ -696,6 +696,7 @@ mod tests {
     fn endpoint(base_url: &str, enabled: bool) -> ProviderEndpointV4 {
         ProviderEndpointV4 {
             base_url: base_url.to_string(),
+            continuity_domain: None,
             enabled,
             priority: 0,
             tags: BTreeMap::new(),

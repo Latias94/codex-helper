@@ -129,6 +129,8 @@ describe("desktop app routes", () => {
                   provider_name: "single-provider",
                   name: "default",
                   base_url: "https://old.example/v1",
+                  continuity_domain: "relay-cluster-a",
+                  effective_continuity_domain: "relay-cluster-a",
                   configured_enabled: true,
                   effective_enabled: true,
                   routable: true,
@@ -149,6 +151,7 @@ describe("desktop app routes", () => {
             providerName: "single-provider",
             alias: "New Provider",
             baseUrl: "https://new.example/v1",
+            continuityDomain: "relay-cluster-b",
             enabled: true,
             authTokenEnv: "NEW_PROVIDER_KEY",
           },
@@ -176,6 +179,11 @@ describe("desktop app routes", () => {
     await userEvent.type(screen.getByRole("textbox", { name: "Alias for Single Provider" }), "New Provider");
     await userEvent.clear(screen.getByRole("textbox", { name: "Base URL for Single Provider" }));
     await userEvent.type(screen.getByRole("textbox", { name: "Base URL for Single Provider" }), "https://new.example/v1");
+    await userEvent.clear(screen.getByRole("textbox", { name: "Continuity domain for Single Provider" }));
+    await userEvent.type(
+      screen.getByRole("textbox", { name: "Continuity domain for Single Provider" }),
+      "relay-cluster-b",
+    );
     await userEvent.type(screen.getByRole("textbox", { name: "Auth token env for Single Provider" }), "NEW_PROVIDER_KEY");
     await userEvent.click(screen.getByRole("button", { name: "保存" }));
 
@@ -185,6 +193,7 @@ describe("desktop app routes", () => {
         providerName: "single-provider",
         alias: "New Provider",
         baseUrl: "https://new.example/v1",
+        continuityDomain: "relay-cluster-b",
         enabled: true,
         authTokenEnv: "NEW_PROVIDER_KEY",
       },

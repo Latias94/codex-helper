@@ -372,13 +372,34 @@ fn push_codex_relay_diagnostics_result_lines(
     )]));
     lines.push(Line::from(vec![Span::styled(
         format!(
-            "  expected: compact={}  image_generation={}  web_search={}  apply_patch={}",
+            "  expected: compact={}  image_generation={}  web_search={}  apply_patch={}  continuity_state={}",
             decision_brief(&response.expected.remote_compaction_v1),
             decision_brief(&response.expected.hosted_image_generation),
             decision_brief(&response.expected.web_search),
-            decision_brief(&response.expected.apply_patch)
+            decision_brief(&response.expected.apply_patch),
+            decision_brief(&response.expected.continuity.state_sharing)
         ),
         Style::default().fg(p.muted),
+    )]));
+    lines.push(Line::from(vec![Span::styled(
+        format!(
+            "  continuity: domain={} explicit={} same_domain={} configured={} affinity={} state_bound_failover={}",
+            shorten_middle(&response.continuity.selected_domain.key, 56),
+            response.continuity.selected_domain.explicit,
+            response.continuity.same_domain_endpoint_count,
+            response.continuity.configured_endpoint_count,
+            response
+                .continuity
+                .affinity_policy
+                .as_deref()
+                .unwrap_or("-"),
+            response.continuity.can_state_bound_failover_within_domain
+        ),
+        Style::default().fg(if response.continuity.selected_domain.explicit {
+            p.accent
+        } else {
+            p.muted
+        }),
     )]));
     lines.push(Line::from(vec![Span::styled(
         format!(
@@ -454,6 +475,12 @@ fn push_codex_relay_diagnostics_result_lines(
     for warning in recommendation.warnings.iter().take(3) {
         lines.push(Line::from(vec![Span::styled(
             format!("    warning: {}", shorten(warning, 96)),
+            Style::default().fg(p.warn),
+        )]));
+    }
+    for warning in response.continuity.warnings.iter().take(3) {
+        lines.push(Line::from(vec![Span::styled(
+            format!("    continuity warning: {}", shorten(warning, 96)),
             Style::default().fg(p.warn),
         )]));
     }
@@ -1417,6 +1444,20 @@ mod tests {
             expected,
             observed,
             recommendation,
+            continuity: crate::proxy::CodexRelayContinuityDiagnostics {
+                selected_domain: crate::proxy::CodexRelayContinuityDomainSummary {
+                    key: "explicit:codex/relay-cluster-a".to_string(),
+                    explicit: true,
+                },
+                same_domain_endpoint_count: 2,
+                configured_endpoint_count: 3,
+                affinity_policy: Some("fallback-sticky".to_string()),
+                can_state_bound_failover_within_domain: true,
+                warnings: vec![
+                    "official relay preset should only share continuity_domain for endpoints that share encrypted state".to_string(),
+                ],
+                recommendations: Vec::new(),
+            },
             mismatches: vec![crate::proxy::CodexRelayCapabilityMismatch {
                 capability: "remote_compaction_v1".to_string(),
                 expected: "supported".to_string(),
@@ -1553,6 +1594,11 @@ mod tests {
         let text = lines_text(&codex_relay_diagnostics_lines(Palette::default(), &ui));
 
         assert!(text.contains("Codex Relay Diagnostics"), "{text}");
+        assert!(
+            text.contains("continuity: domain=explicit:codex/relay-cluster-a"),
+            "{text}"
+        );
+        assert!(text.contains("continuity warning:"), "{text}");
         assert!(text.contains("observed /responses/compact"), "{text}");
         assert!(text.contains("mismatches: 1"), "{text}");
         assert!(

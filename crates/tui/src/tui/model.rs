@@ -23,6 +23,7 @@ use crate::usage::UsageMetrics;
 pub struct UpstreamSummary {
     pub base_url: String,
     pub provider_id: Option<String>,
+    pub continuity_domain: Option<String>,
     pub auth: String,
     pub tags: Vec<(String, String)>,
     pub supported_models: Vec<String>,
@@ -541,6 +542,14 @@ pub fn build_provider_options(
         UpstreamSummary {
             base_url: u.base_url.clone(),
             provider_id: u.tags.get("provider_id").cloned(),
+            continuity_domain: u
+                .tags
+                .get("continuity_domain")
+                .or_else(|| u.tags.get("provider_continuity_domain"))
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned),
             auth,
             tags,
             supported_models,
@@ -1497,6 +1506,8 @@ pub(in crate::tui) fn provider_tags_brief(
                 && key.as_str() != "provider_id"
                 && key.as_str() != "source"
                 && key.as_str() != "requires_openai_auth"
+                && key.as_str() != "continuity_domain"
+                && key.as_str() != "provider_continuity_domain"
         })
         .map(|(key, value)| format!("{key}={value}"))
         .collect::<Vec<_>>();

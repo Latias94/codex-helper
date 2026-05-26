@@ -64,6 +64,7 @@ export type ProviderCommonEditPayload = {
   providerName: string;
   alias?: string;
   baseUrl: string;
+  continuityDomain?: string;
   enabled: boolean;
   authTokenEnv?: string;
   apiKeyEnv?: string;

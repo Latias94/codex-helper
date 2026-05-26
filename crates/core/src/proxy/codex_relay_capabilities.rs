@@ -61,6 +61,7 @@ pub struct CodexRelayCapabilitiesResponse {
     pub expected: CodexCapabilityProfile,
     pub observed: CodexRelayCapabilitiesObserved,
     pub recommendation: CodexPatchModeRecommendation,
+    #[serde(default)]
     pub continuity: CodexRelayContinuityDiagnostics,
     pub mismatches: Vec<CodexRelayCapabilityMismatch>,
 }
@@ -91,10 +92,33 @@ pub struct CodexRelayContinuityDiagnostics {
     pub recommendations: Vec<String>,
 }
 
+impl Default for CodexRelayContinuityDiagnostics {
+    fn default() -> Self {
+        Self {
+            selected_domain: CodexRelayContinuityDomainSummary::default(),
+            same_domain_endpoint_count: 1,
+            configured_endpoint_count: 1,
+            affinity_policy: None,
+            can_state_bound_failover_within_domain: false,
+            warnings: Vec::new(),
+            recommendations: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodexRelayContinuityDomainSummary {
     pub key: String,
     pub explicit: bool,
+}
+
+impl Default for CodexRelayContinuityDomainSummary {
+    fn default() -> Self {
+        Self {
+            key: "unknown".to_string(),
+            explicit: false,
+        }
+    }
 }
 
 pub(super) async fn codex_relay_capabilities_for_proxy(
@@ -345,25 +369,13 @@ fn build_continuity_diagnostics(
         affinity_policy = Some(routing_affinity_policy_label(routing.affinity_policy).to_string());
         if let Ok(template) = compile_v4_route_plan_template_for_compat_runtime(service_name, view)
         {
-            configured_endpoint_count = template.candidates.len().max(1);
+            let topology = template.continuity_topology();
+            configured_endpoint_count = topology.configured_provider_endpoint_count().max(1);
             if let Some(provider_endpoint_key) = target.provider_endpoint_key.as_deref()
-                && let Some(selected) = template.candidates.iter().find(|candidate| {
-                    template
-                        .candidate_provider_endpoint_key(candidate)
-                        .stable_key()
-                        == provider_endpoint_key
-                })
+                && let Some(summary) = topology.selected_domain_summary(provider_endpoint_key)
             {
-                let domain = template.candidate_continuity_domain_key(selected);
-                selected_domain = domain_summary(&domain);
-                same_domain_endpoint_count = template
-                    .candidates
-                    .iter()
-                    .filter(|candidate| {
-                        template.candidate_continuity_domain_key(candidate) == domain
-                    })
-                    .count()
-                    .max(1);
+                selected_domain = domain_summary(&summary.domain);
+                same_domain_endpoint_count = summary.same_domain_endpoint_count;
             }
         }
     }
@@ -685,6 +697,72 @@ mod tests {
         );
         assert!(!response.continuity.selected_domain.explicit);
         assert_eq!(response.continuity.configured_endpoint_count, 2);
+        assert_eq!(response.continuity.same_domain_endpoint_count, 1);
+        assert!(!response.continuity.can_state_bound_failover_within_domain);
+        assert!(
+            response
+                .continuity
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("no explicit continuity_domain"))
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_relay_capabilities_does_not_infer_official_openai_domain_from_same_host() {
+        let v4 = ProxyConfigV4 {
+            codex: ServiceViewV4 {
+                providers: BTreeMap::from([
+                    (
+                        "openai-a".to_string(),
+                        ProviderConfigV4 {
+                            base_url: Some("https://api.openai.com/v1".to_string()),
+                            inline_auth: UpstreamAuth::default(),
+                            ..ProviderConfigV4::default()
+                        },
+                    ),
+                    (
+                        "openai-b".to_string(),
+                        ProviderConfigV4 {
+                            base_url: Some("https://api.openai.com/v1".to_string()),
+                            inline_auth: UpstreamAuth::default(),
+                            ..ProviderConfigV4::default()
+                        },
+                    ),
+                ]),
+                routing: Some(RoutingConfigV4::ordered_failover(vec![
+                    "openai-a".to_string(),
+                    "openai-b".to_string(),
+                ])),
+                ..ServiceViewV4::default()
+            },
+            ..ProxyConfigV4::default()
+        };
+        let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compile v4 runtime");
+        let proxy = ProxyService::new_with_v4_source(
+            Client::new(),
+            Arc::new(runtime),
+            Some(Arc::new(v4)),
+            "codex",
+            Arc::new(Mutex::new(HashMap::<String, LbState>::new())),
+        );
+
+        let response = codex_relay_capabilities_for_proxy(
+            &proxy,
+            CodexRelayCapabilitiesRequest {
+                provider_id: Some("openai-a".to_string()),
+                patch_mode: Some(CodexPatchMode::OfficialRelayBridge),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("capabilities response");
+
+        assert_eq!(
+            response.continuity.selected_domain.key,
+            "provider_endpoint:codex/openai-a/default"
+        );
+        assert!(!response.continuity.selected_domain.explicit);
         assert_eq!(response.continuity.same_domain_endpoint_count, 1);
         assert!(!response.continuity.can_state_bound_failover_within_domain);
         assert!(

@@ -119,6 +119,14 @@ pub(super) fn render_v4_provider_editor(
             );
         });
         ui.horizontal(|ui| {
+            ui.label("continuity_domain");
+            ui.add(
+                egui::TextEdit::singleline(&mut editor.continuity_domain)
+                    .desired_width(220.0)
+                    .hint_text("relay-cluster-a"),
+            );
+        });
+        ui.horizontal(|ui| {
             ui.label("auth_token_env");
             ui.add(
                 egui::TextEdit::singleline(&mut editor.auth_token_env)
@@ -1644,6 +1652,7 @@ fn reset_provider_editor_draft(editor: &mut ProxySettingsProviderEditorState) {
     editor.draft_name.clear();
     editor.alias.clear();
     editor.base_url.clear();
+    editor.continuity_domain.clear();
     editor.auth_token_env.clear();
     editor.api_key_env.clear();
     editor.tags.clear();
@@ -1672,6 +1681,7 @@ fn load_provider_editor_draft(
     editor.draft_name = name;
     editor.alias = provider.alias.clone().unwrap_or_default();
     editor.base_url = provider.base_url.clone().unwrap_or_default();
+    editor.continuity_domain = provider.continuity_domain.clone().unwrap_or_default();
     editor.auth_token_env = provider
         .inline_auth
         .auth_token_env
@@ -1733,6 +1743,8 @@ fn save_provider_from_editor(
     provider.alias = normalize_optional_provider_editor_field(&editor.alias);
     provider.enabled = editor.enabled;
     provider.base_url = Some(base_url);
+    provider.continuity_domain =
+        normalize_optional_provider_editor_field(&editor.continuity_domain);
     provider.auth = crate::config::UpstreamAuth::default();
     provider.inline_auth = crate::config::UpstreamAuth {
         auth_token: None,
@@ -1921,6 +1933,7 @@ mod tests {
         let mut editor = ProxySettingsProviderEditorState {
             draft_name: "input".to_string(),
             base_url: "https://ai.input.im/v1".to_string(),
+            continuity_domain: "relay-cluster-a".to_string(),
             auth_token_env: "INPUT_API_KEY".to_string(),
             tags: "billing=monthly, vendor=input".to_string(),
             ..ProxySettingsProviderEditorState::default()
@@ -1931,6 +1944,10 @@ mod tests {
 
         let provider = cfg.codex.providers.get("input").expect("provider exists");
         assert_eq!(provider.base_url.as_deref(), Some("https://ai.input.im/v1"));
+        assert_eq!(
+            provider.continuity_domain.as_deref(),
+            Some("relay-cluster-a")
+        );
         assert_eq!(
             provider.inline_auth.auth_token_env.as_deref(),
             Some("INPUT_API_KEY")

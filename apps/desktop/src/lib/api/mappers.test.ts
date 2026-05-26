@@ -39,6 +39,8 @@ const operatorSummary: ApiOperatorSummary = {
           provider_name: "codex-air",
           name: "responses-compact",
           base_url: "https://ai.input.im/v1",
+          continuity_domain: "relay-cluster-a",
+          effective_continuity_domain: "relay-cluster-a",
           configured_enabled: true,
           effective_enabled: true,
           routable: true,
@@ -127,6 +129,7 @@ describe("admin API mappers", () => {
     expect(data.providers[0]).toMatchObject({
       name: "CodeX Air",
       baseUrl: "https://ai.input.im/v1",
+      continuityDomain: "relay-cluster-a",
       host: "ai.input.im",
       endpointCount: 1,
       editable: true,
@@ -145,6 +148,7 @@ describe("admin API mappers", () => {
     const data = mapProvidersData(operatorSummary);
 
     expect(data.providers).toHaveLength(2);
+    expect(data.providers[0].capabilities).toContain("continuity domain");
     expect(data.providers[1].health).toBe("Error");
     expect(data.routeOrder[0].active).toBe(true);
   });

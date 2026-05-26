@@ -223,6 +223,16 @@ fn provider_tags_for_balance(
     tags
 }
 
+fn insert_optional_tag(tags: &mut HashMap<String, String>, key: &str, value: Option<&String>) {
+    if let Some(value) = value
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        tags.insert(key.to_string(), value.to_string());
+    }
+}
+
 fn service_manager_from_v4_provider_catalog(view: &ServiceViewV4) -> ServiceConfigManager {
     let mut configs = HashMap::new();
     for (provider_name, provider) in &view.providers {
@@ -238,15 +248,26 @@ fn service_manager_from_v4_provider_catalog(view: &ServiceViewV4) -> ServiceConf
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
+            let mut tags = provider_tags_for_balance(
+                provider_name,
+                "default",
+                &provider.tags,
+                &BTreeMap::new(),
+            );
+            insert_optional_tag(
+                &mut tags,
+                "continuity_domain",
+                provider.continuity_domain.as_ref(),
+            );
+            insert_optional_tag(
+                &mut tags,
+                "provider_continuity_domain",
+                provider.continuity_domain.as_ref(),
+            );
             upstreams.push(UpstreamConfig {
                 base_url: base_url.to_string(),
                 auth: auth.clone(),
-                tags: provider_tags_for_balance(
-                    provider_name,
-                    "default",
-                    &provider.tags,
-                    &BTreeMap::new(),
-                ),
+                tags,
                 supported_models: provider
                     .supported_models
                     .iter()
@@ -271,15 +292,26 @@ fn service_manager_from_v4_provider_catalog(view: &ServiceViewV4) -> ServiceConf
             if !endpoint.enabled {
                 continue;
             }
+            let mut tags = provider_tags_for_balance(
+                provider_name,
+                endpoint_name,
+                &provider.tags,
+                &endpoint.tags,
+            );
+            insert_optional_tag(
+                &mut tags,
+                "continuity_domain",
+                endpoint.continuity_domain.as_ref(),
+            );
+            insert_optional_tag(
+                &mut tags,
+                "provider_continuity_domain",
+                provider.continuity_domain.as_ref(),
+            );
             upstreams.push(UpstreamConfig {
                 base_url: endpoint.base_url.clone(),
                 auth: auth.clone(),
-                tags: provider_tags_for_balance(
-                    provider_name,
-                    endpoint_name,
-                    &provider.tags,
-                    &endpoint.tags,
-                ),
+                tags,
                 supported_models: merge_bool_maps(
                     &provider.supported_models,
                     &endpoint.supported_models,

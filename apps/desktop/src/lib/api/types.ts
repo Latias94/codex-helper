@@ -122,6 +122,7 @@ export type ProviderCardView = {
   name: string;
   alias?: string | null;
   baseUrl: string;
+  continuityDomain?: string | null;
   host: string;
   enabled: boolean;
   endpointCount: number;

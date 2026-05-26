@@ -11,6 +11,7 @@ export const providerCommonEditSchema = z.object({
   providerName: z.string().trim().min(1, "providerName 不能为空"),
   alias: z.string().trim(),
   baseUrl: z.string().trim().refine(isHttpUrl, "Base URL 必须是 http(s) 绝对地址"),
+  continuityDomain: z.string().trim().optional(),
   enabled: z.boolean(),
   authTokenEnv: z.string().trim().optional(),
   apiKeyEnv: z.string().trim().optional(),
