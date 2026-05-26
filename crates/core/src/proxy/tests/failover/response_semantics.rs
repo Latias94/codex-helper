@@ -3172,6 +3172,109 @@ async fn proxy_rejects_remote_compaction_v2_without_route_affinity() {
 }
 
 #[tokio::test]
+async fn proxy_allows_remote_compaction_v2_without_prior_affinity_when_route_has_one_endpoint() {
+    let _env_guard = env_lock().await;
+    let temp_dir = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
+    }
+
+    let responses_hits = Arc::new(AtomicUsize::new(0));
+    let responses_counter = responses_hits.clone();
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let responses_counter = responses_counter.clone();
+            async move {
+                responses_counter.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "provider": "solo", "compact_v2": true })),
+                )
+            }
+        }),
+    );
+    let (upstream_addr, upstream_handle) = spawn_axum_server(upstream);
+
+    let retry = RetryConfig {
+        upstream: Some(retry_layer_config(
+            1,
+            "502",
+            Vec::new(),
+            RetryStrategy::Failover,
+        )),
+        provider: Some(retry_layer_config(
+            2,
+            "502",
+            Vec::new(),
+            RetryStrategy::Failover,
+        )),
+        transport_cooldown_secs: Some(0),
+        cooldown_backoff_factor: Some(1),
+        cooldown_backoff_max_secs: Some(0),
+        ..RetryConfig::default()
+    };
+    let mut routing = RoutingConfigV4::ordered_failover(vec!["solo".to_string()]);
+    routing.affinity_policy = crate::config::RoutingAffinityPolicyV5::FallbackSticky;
+    let v4 = ProxyConfigV4 {
+        retry,
+        codex: ServiceViewV4 {
+            providers: std::collections::BTreeMap::from([(
+                "solo".to_string(),
+                ProviderConfigV4 {
+                    base_url: Some(format!("http://{upstream_addr}/v1")),
+                    inline_auth: UpstreamAuth::default(),
+                    ..ProviderConfigV4::default()
+                },
+            )]),
+            routing: Some(routing),
+            ..ServiceViewV4::default()
+        },
+        ..ProxyConfigV4::default()
+    };
+    let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compile v4");
+    let proxy = ProxyService::new_with_v4_source(
+        Client::new(),
+        Arc::new(runtime),
+        Some(Arc::new(v4)),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let state = proxy.state.clone();
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let compact = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .header("content-type", "application/json")
+        .header("session-id", "sid-single-v2-affinity")
+        .body(
+            r#"{"model":"gpt-5","input":[{"type":"message","role":"user","content":"compact me"},{"type":"compaction_trigger"}],"stream":true}"#,
+        )
+        .send()
+        .await
+        .expect("send v2 compact")
+        .error_for_status()
+        .expect("v2 compact status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("v2 compact json");
+
+    assert_eq!(compact["provider"].as_str(), Some("solo"));
+    assert_eq!(compact["compact_v2"].as_bool(), Some(true));
+    assert_eq!(responses_hits.load(Ordering::SeqCst), 1);
+    let affinity = state
+        .get_session_route_affinity("sid-single-v2-affinity")
+        .await
+        .expect("single endpoint affinity recorded");
+    assert_eq!(affinity.provider_endpoint.provider_id.as_str(), "solo");
+
+    proxy_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
 async fn proxy_does_not_fallback_responses_compact_on_transport_error_when_request_is_state_bound()
 {
     let b_responses_hits = Arc::new(AtomicUsize::new(0));
@@ -3381,6 +3484,68 @@ async fn proxy_rejects_legacy_state_bound_responses_compact_without_route_affini
     );
     assert_eq!(upstream1_hits.load(Ordering::SeqCst), 0);
     assert_eq!(upstream2_hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn proxy_allows_legacy_state_bound_compact_without_prior_affinity_for_single_endpoint() {
+    let _env_guard = env_lock().await;
+    let temp_dir = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
+    }
+
+    let compact_hits = Arc::new(AtomicUsize::new(0));
+    let compact_counter = compact_hits.clone();
+    let upstream = axum::Router::new().route(
+        "/v1/responses/compact",
+        post(move || {
+            let compact_counter = compact_counter.clone();
+            async move {
+                compact_counter.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "provider": "solo", "compact": true })),
+                )
+            }
+        }),
+    );
+    let upstream = spawn_test_upstream(upstream);
+    let mut upstream_config = upstream.upstream_config();
+    upstream_config
+        .tags
+        .insert("provider_id".to_string(), "solo".to_string());
+
+    let cfg = make_proxy_config(
+        vec![upstream_config],
+        retry_config(2, "502", Vec::new(), RetryStrategy::Failover),
+    );
+    let proxy = proxy_service(cfg);
+    let state = proxy.state.clone();
+    let proxy = spawn_proxy_service(proxy);
+
+    let compact = reqwest::Client::new()
+        .post(proxy.compact_url())
+        .header("content-type", "application/json")
+        .header("session-id", "sid-single-legacy-compact")
+        .body(r#"{"model":"gpt-5","input":[{"type":"reasoning","encrypted_content":"state"}]}"#)
+        .send()
+        .await
+        .expect("send compact")
+        .error_for_status()
+        .expect("compact status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("compact json");
+
+    assert_eq!(compact["provider"].as_str(), Some("solo"));
+    assert_eq!(compact["compact"].as_bool(), Some(true));
+    assert_eq!(compact_hits.load(Ordering::SeqCst), 1);
+    let affinity = state
+        .get_session_route_affinity("sid-single-legacy-compact")
+        .await
+        .expect("single legacy endpoint affinity recorded");
+    assert_eq!(affinity.provider_endpoint.provider_id.as_str(), "solo");
 }
 
 #[tokio::test]

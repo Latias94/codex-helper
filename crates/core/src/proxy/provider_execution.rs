@@ -12,7 +12,7 @@ use crate::lb::{CooldownBackoff, LoadBalancer};
 use crate::logging::{BodyPreview, HeaderEntry, RouteAttemptLog, ServiceTierLog, log_retry_trace};
 use crate::routing_ir::{
     RouteCandidate, RoutePlanAttemptState, RoutePlanExecutor, RoutePlanRuntimeState,
-    RoutePlanSkipReason, SelectedRouteCandidate, SkippedRouteCandidate,
+    RoutePlanSkipReason, RoutePlanTemplate, SelectedRouteCandidate, SkippedRouteCandidate,
     SkippedStationRouteCandidate, compile_legacy_route_plan_template,
 };
 use crate::runtime_identity::ProviderEndpointKey;
@@ -170,6 +170,25 @@ impl ProviderChainAttemptPolicy {
         debug_assert!(self.requires_known_affinity());
         "state_bound_compact_missing_affinity"
     }
+}
+
+fn state_bound_request_requires_existing_affinity(
+    policy: ProviderChainAttemptPolicy,
+    runtime: &RoutePlanRuntimeState,
+    template: &RoutePlanTemplate,
+) -> bool {
+    policy.requires_known_affinity()
+        && runtime.affinity_provider_endpoint().is_none()
+        && configured_provider_endpoint_count(template) > 1
+}
+
+fn configured_provider_endpoint_count(template: &RoutePlanTemplate) -> usize {
+    template
+        .candidates
+        .iter()
+        .map(|candidate| template.candidate_provider_endpoint_key(candidate))
+        .collect::<BTreeSet<_>>()
+        .len()
 }
 
 pub(super) struct ExecuteProviderChainParams<'a> {
@@ -510,9 +529,11 @@ pub(super) async fn execute_provider_chain_with_route_executor(
             let mut global_attempt: u32 = 0;
             let mut last_err: Option<(StatusCode, String)> = None;
 
-            if provider_chain_policy.requires_known_affinity()
-                && runtime.affinity_provider_endpoint().is_none()
-            {
+            if state_bound_request_requires_existing_affinity(
+                provider_chain_policy,
+                &runtime,
+                template,
+            ) {
                 let reason = provider_chain_policy.missing_affinity_trace_reason();
                 last_err = Some((
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -605,9 +626,11 @@ pub(super) async fn execute_provider_chain_with_route_executor(
             let mut last_err: Option<(StatusCode, String)> = None;
             let mut tried_stations: HashSet<String> = HashSet::new();
 
-            if provider_chain_policy.requires_known_affinity()
-                && runtime.affinity_provider_endpoint().is_none()
-            {
+            if state_bound_request_requires_existing_affinity(
+                provider_chain_policy,
+                &runtime,
+                &legacy_template,
+            ) {
                 let reason = provider_chain_policy.missing_affinity_trace_reason();
                 last_err = Some((
                     StatusCode::SERVICE_UNAVAILABLE,
