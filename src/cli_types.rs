@@ -259,6 +259,9 @@ pub(crate) enum CodexCommand {
         /// Run hosted image_generation smoke instead of the default compact smoke
         #[arg(long)]
         image: bool,
+        /// Run remote_compaction_v2 streaming smoke instead of the default compact smoke
+        #[arg(long = "compact-v2", alias = "remote-compaction-v2")]
+        compact_v2: bool,
         /// Run Responses WebSocket smoke instead of the default compact smoke
         #[arg(long)]
         websocket: bool,
@@ -1158,6 +1161,7 @@ mod tests {
                     acknowledgement,
                     model,
                     image,
+                    compact_v2,
                     websocket,
                     ..
                 },
@@ -1168,6 +1172,7 @@ mod tests {
         assert_eq!(acknowledgement, "run-live-codex-relay-smoke");
         assert_eq!(model, "gpt-5.5");
         assert!(image);
+        assert!(!compact_v2);
         assert!(!websocket);
     }
 
@@ -1192,6 +1197,7 @@ mod tests {
                 CodexCommand::LiveSmoke {
                     model,
                     provider,
+                    compact_v2,
                     websocket,
                     ..
                 },
@@ -1201,7 +1207,34 @@ mod tests {
         };
         assert_eq!(model, "gpt-5.5");
         assert_eq!(provider.as_deref(), Some("input8"));
+        assert!(!compact_v2);
         assert!(websocket);
+    }
+
+    #[test]
+    fn codex_relay_cli_parses_live_smoke_compact_v2_flag() {
+        let cli = Cli::try_parse_from([
+            "codex-helper",
+            "codex",
+            "relay-live-smoke",
+            "--acknowledgement",
+            "run-live-codex-relay-smoke",
+            "--model",
+            "gpt-5.5",
+            "--compact-v2",
+        ])
+        .expect("parse codex relay live smoke compact v2 flag");
+
+        let Some(Command::Codex {
+            cmd: CodexCommand::LiveSmoke {
+                model, compact_v2, ..
+            },
+        }) = cli.command
+        else {
+            panic!("expected codex relay live smoke command");
+        };
+        assert_eq!(model, "gpt-5.5");
+        assert!(compact_v2);
     }
 
     #[test]

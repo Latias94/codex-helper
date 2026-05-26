@@ -1519,3 +1519,122 @@ async fn codex_live_smoke_api_runs_compact_live_smoke() {
     proxy_handle.abort();
     upstream_handle.abort();
 }
+
+#[tokio::test]
+async fn codex_live_smoke_api_runs_remote_compaction_v2_live_smoke() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let seen_body = Arc::new(std::sync::Mutex::new(None::<serde_json::Value>));
+    let seen_beta = Arc::new(std::sync::Mutex::new(None::<String>));
+
+    let hits_for_route = hits.clone();
+    let seen_body_for_route = seen_body.clone();
+    let seen_beta_for_route = seen_beta.clone();
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        post(move |request: Request<Body>| {
+            let hits = hits_for_route.clone();
+            let seen_body = seen_body_for_route.clone();
+            let seen_beta = seen_beta_for_route.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                *seen_beta.lock().expect("lock beta") = request
+                    .headers()
+                    .get("x-codex-beta-features")
+                    .and_then(|value| value.to_str().ok())
+                    .map(ToOwned::to_owned);
+                let body = to_bytes(request.into_body(), 16 * 1024)
+                    .await
+                    .expect("body");
+                let body: serde_json::Value =
+                    serde_json::from_slice(body.as_ref()).expect("json body");
+                *seen_body.lock().expect("lock body") = Some(body);
+                (
+                    [(
+                        axum::http::header::CONTENT_TYPE,
+                        HeaderValue::from_static("text/event-stream"),
+                    )],
+                    concat!(
+                        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",\"encrypted_content\":\"summary\"}}\n\n",
+                        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_compact_v2\",\"output\":[]}}\n\n",
+                        "data: [DONE]\n\n",
+                    ),
+                )
+            }
+        }),
+    );
+    let (upstream_addr, upstream_handle) = spawn_axum_server(upstream);
+    let cfg = make_proxy_config(
+        vec![UpstreamConfig {
+            base_url: format!("http://{upstream_addr}/v1"),
+            auth: UpstreamAuth::default(),
+            tags: HashMap::new(),
+            supported_models: HashMap::new(),
+            model_mapping: HashMap::new(),
+        }],
+        RetryConfig::default(),
+    );
+    let proxy = ProxyService::new(
+        Client::new(),
+        Arc::new(cfg),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let result = reqwest::Client::new()
+        .post(format!(
+            "http://{proxy_addr}/__codex_helper/api/v1/codex/relay-live-smoke"
+        ))
+        .json(&serde_json::json!({
+            "acknowledgement": crate::proxy::CODEX_RELAY_LIVE_SMOKE_ACK,
+            "model": "gpt-5.5",
+            "cases": ["remote_compaction_v2"]
+        }))
+        .send()
+        .await
+        .expect("live smoke send")
+        .error_for_status()
+        .expect("live smoke status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("live smoke json");
+
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        seen_beta.lock().expect("lock beta").as_deref(),
+        Some("remote_compaction_v2")
+    );
+    let body = seen_body
+        .lock()
+        .expect("lock body")
+        .clone()
+        .expect("captured body");
+    assert_eq!(body["stream"].as_bool(), Some(true));
+    assert_eq!(
+        body["input"]
+            .as_array()
+            .expect("input")
+            .iter()
+            .filter(|item| item["type"].as_str() == Some("compaction_trigger"))
+            .count(),
+        1
+    );
+    assert_eq!(result["cases"][0].as_str(), Some("remote_compaction_v2"));
+    assert_eq!(result["results"][0]["outcome"].as_str(), Some("passed"));
+    assert_eq!(
+        result["results"][0]["response_shape"].as_str(),
+        Some("remote_compaction_v2_compaction_stream")
+    );
+    assert_eq!(
+        result["results"][0]["compaction_output_items_seen"].as_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        result["results"][0]["response_completed_seen"].as_bool(),
+        Some(true)
+    );
+
+    proxy_handle.abort();
+    upstream_handle.abort();
+}

@@ -76,6 +76,7 @@ fn probe_confidence_label(confidence: CodexRelayProbeConfidence) -> &'static str
 fn live_smoke_case_label(case: CodexRelayLiveSmokeCase) -> &'static str {
     match case {
         CodexRelayLiveSmokeCase::ResponsesCompact => "responses_compact",
+        CodexRelayLiveSmokeCase::RemoteCompactionV2 => "remote_compaction_v2",
         CodexRelayLiveSmokeCase::HostedImageGeneration => "hosted_image_generation",
         CodexRelayLiveSmokeCase::ResponsesWebSocket => "responses_websocket",
     }
@@ -122,6 +123,15 @@ fn live_smoke_result_brief(result: &CodexRelayLiveSmokeResult) -> String {
     }
     if result.output_items_seen > 0 {
         parts.push(format!("items={}", result.output_items_seen));
+    }
+    if result.compaction_output_items_seen > 0 {
+        parts.push(format!(
+            "compaction_items={}",
+            result.compaction_output_items_seen
+        ));
+    }
+    if result.response_completed_seen {
+        parts.push("completed=true".to_string());
     }
     if result.image_generation_call_seen {
         parts.push("image_call=true".to_string());
@@ -1441,6 +1451,9 @@ mod tests {
                     status_code: Some(200),
                     response_shape: Some("compact_output_compaction_item".to_string()),
                     output_items_seen: 1,
+                    compaction_output_seen: true,
+                    compaction_output_items_seen: 1,
+                    response_completed_seen: false,
                     image_generation_call_seen: false,
                     image_result_present: false,
                     accepted_by_responses: false,
@@ -1455,6 +1468,9 @@ mod tests {
                     status_code: Some(200),
                     response_shape: Some("image_generation_call".to_string()),
                     output_items_seen: 1,
+                    compaction_output_seen: false,
+                    compaction_output_items_seen: 0,
+                    response_completed_seen: false,
                     image_generation_call_seen: true,
                     image_result_present: true,
                     accepted_by_responses: true,

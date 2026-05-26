@@ -22,6 +22,7 @@ const LIVE_SMOKE_API_VERSION: u32 = 1;
 const MAX_LIVE_SMOKE_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const ERROR_SNIPPET_LIMIT: usize = 512;
 const RESPONSES_WS_BETA_HEADER: &str = "responses_websockets=2026-02-06";
+const REMOTE_COMPACTION_V2_BETA_FEATURE: &str = "remote_compaction_v2";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CodexRelayLiveSmokeRequest {
@@ -47,6 +48,12 @@ pub struct CodexRelayLiveSmokeRequest {
 #[serde(rename_all = "snake_case")]
 pub enum CodexRelayLiveSmokeCase {
     ResponsesCompact,
+    #[serde(
+        rename = "remote_compaction_v2",
+        alias = "responses_compact_v2",
+        alias = "responses_compaction_v2"
+    )]
+    RemoteCompactionV2,
     HostedImageGeneration,
     #[serde(rename = "responses_websocket", alias = "responses_web_socket")]
     ResponsesWebSocket,
@@ -85,6 +92,9 @@ pub struct CodexRelayLiveSmokeResult {
     pub status_code: Option<u16>,
     pub response_shape: Option<String>,
     pub output_items_seen: usize,
+    pub compaction_output_seen: bool,
+    pub compaction_output_items_seen: usize,
+    pub response_completed_seen: bool,
     pub image_generation_call_seen: bool,
     pub image_result_present: bool,
     pub accepted_by_responses: bool,
@@ -170,6 +180,9 @@ impl CodexRelayLiveSmokeClient {
                 axum::http::header::ACCEPT,
                 HeaderValue::from_static("text/event-stream, application/json"),
             );
+        }
+        for &(name, value) in spec.headers {
+            headers.insert(name, HeaderValue::from_static(value));
         }
         apply_upstream_auth_headers(upstream, &mut headers);
 
@@ -427,6 +440,7 @@ enum LiveSmokeExecutor {
 struct LiveSmokeHttpDescriptor {
     method: &'static str,
     path: &'static str,
+    headers: &'static [(&'static str, &'static str)],
     stream: bool,
     timeout_secs: u64,
     body: fn(&str, Option<&str>) -> Value,
@@ -451,10 +465,28 @@ const CODEX_RELAY_LIVE_SMOKE_CASES: &[CodexRelayLiveSmokeCaseDescriptor] = &[
         executor: LiveSmokeExecutor::Http(LiveSmokeHttpDescriptor {
             method: "POST",
             path: "/responses/compact",
+            headers: &[],
             stream: false,
             timeout_secs: 30,
             body: compact_live_smoke_body,
             classify: classify_compact_live_smoke_response,
+        }),
+    },
+    CodexRelayLiveSmokeCaseDescriptor {
+        case: CodexRelayLiveSmokeCase::RemoteCompactionV2,
+        default_enabled: false,
+        acknowledgement_required: true,
+        explicit_only_warning: Some(
+            "remote compaction v2 was not tested because compact v2 smoke is explicit-only",
+        ),
+        executor: LiveSmokeExecutor::Http(LiveSmokeHttpDescriptor {
+            method: "POST",
+            path: "/responses",
+            headers: &[("x-codex-beta-features", REMOTE_COMPACTION_V2_BETA_FEATURE)],
+            stream: true,
+            timeout_secs: 60,
+            body: remote_compaction_v2_live_smoke_body,
+            classify: classify_remote_compaction_v2_live_smoke_response,
         }),
     },
     CodexRelayLiveSmokeCaseDescriptor {
@@ -467,6 +499,7 @@ const CODEX_RELAY_LIVE_SMOKE_CASES: &[CodexRelayLiveSmokeCaseDescriptor] = &[
         executor: LiveSmokeExecutor::Http(LiveSmokeHttpDescriptor {
             method: "POST",
             path: "/responses",
+            headers: &[],
             stream: true,
             timeout_secs: 60,
             body: image_generation_live_smoke_body,
@@ -506,6 +539,7 @@ fn live_smoke_case_descriptor(
 struct LiveSmokeSpec {
     method: Method,
     path: &'static str,
+    headers: &'static [(&'static str, &'static str)],
     body: Value,
     stream: bool,
     timeout: std::time::Duration,
@@ -525,6 +559,7 @@ impl LiveSmokeSpec {
         Some(Self {
             method: Method::from_bytes(http.method.as_bytes()).unwrap_or(Method::POST),
             path: http.path,
+            headers: http.headers,
             body: (http.body)(model, service_tier),
             stream: http.stream,
             timeout: std::time::Duration::from_secs(http.timeout_secs),
@@ -561,6 +596,47 @@ fn compact_live_smoke_body(model: &str, service_tier: Option<&str>) -> Value {
         "instructions": "Return a compacted Codex conversation history for this diagnostic request.",
         "tools": [],
         "parallel_tool_calls": false,
+        "prompt_cache_key": "codex-helper-live-smoke"
+    });
+    if let Some(service_tier) = service_tier {
+        body["service_tier"] = Value::String(service_tier.to_string());
+    }
+    body
+}
+
+fn remote_compaction_v2_live_smoke_body(model: &str, service_tier: Option<&str>) -> Value {
+    let mut body = json!({
+        "model": model,
+        "instructions": "Return exactly one Codex compaction output item for this diagnostic request.",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "Codex relay remote_compaction_v2 live smoke. Compact this short diagnostic conversation."
+                    }
+                ]
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "Diagnostic reply for remote compaction v2 live smoke."
+                    }
+                ]
+            },
+            {
+                "type": "compaction_trigger"
+            }
+        ],
+        "tools": [],
+        "parallel_tool_calls": false,
+        "store": false,
+        "stream": true,
         "prompt_cache_key": "codex-helper-live-smoke"
     });
     if let Some(service_tier) = service_tier {
@@ -763,6 +839,9 @@ fn classify_websocket_live_smoke_message_for_case(
     };
     result.response_shape = Some(event_type.to_string());
     result.output_items_seen = count_output_items(&value);
+    result.compaction_output_items_seen = compaction_output_done_item_count(&value);
+    result.compaction_output_seen = result.compaction_output_items_seen > 0;
+    result.response_completed_seen = value_is_response_completed(&value);
     result.accepted_by_responses =
         event_type.starts_with("response.") || event_type == "codex.rate_limits";
     result
@@ -826,6 +905,10 @@ fn classify_compact_live_smoke_response(
         );
     };
 
+    let compaction_output_items_seen = output
+        .iter()
+        .filter(|item| value_is_compaction_item(item))
+        .count();
     let mut result = base_result(
         CodexRelayLiveSmokeCase::ResponsesCompact,
         CodexRelayLiveSmokeOutcome::Passed,
@@ -834,11 +917,139 @@ fn classify_compact_live_smoke_response(
         "compact endpoint returned a live output array",
     );
     result.output_items_seen = output.len();
-    result.response_shape = Some(if output.iter().any(value_mentions_compaction_item) {
+    result.compaction_output_items_seen = compaction_output_items_seen;
+    result.compaction_output_seen = compaction_output_items_seen > 0;
+    result.response_shape = Some(if compaction_output_items_seen > 0 {
         "compact_output_compaction_item".to_string()
     } else {
         "compact_output".to_string()
     });
+    result
+}
+
+fn classify_remote_compaction_v2_live_smoke_response(
+    status: StatusCode,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> CodexRelayLiveSmokeResult {
+    if !status.is_success() {
+        return classify_live_smoke_error(
+            CodexRelayLiveSmokeCase::RemoteCompactionV2,
+            status,
+            headers,
+            body,
+        );
+    }
+
+    let values = parse_response_values(headers, body);
+    if values.is_empty() {
+        return base_result(
+            CodexRelayLiveSmokeCase::RemoteCompactionV2,
+            CodexRelayLiveSmokeOutcome::Unknown,
+            CodexRelayLiveSmokeConfidence::Malformed,
+            Some(status.as_u16()),
+            "remote compaction v2 live smoke returned success but no parseable JSON or SSE data",
+        );
+    }
+
+    if let Some(error_event) = values.iter().find(|value| value_is_error_event(value)) {
+        let event_type = value_event_type(error_event).unwrap_or("<missing type>");
+        let mut result = base_result(
+            CodexRelayLiveSmokeCase::RemoteCompactionV2,
+            CodexRelayLiveSmokeOutcome::Failed,
+            CodexRelayLiveSmokeConfidence::LiveError,
+            Some(status.as_u16()),
+            match websocket_error_event_message(error_event) {
+                Some(message) => {
+                    format!("remote compaction v2 stream returned {event_type}: {message}")
+                }
+                None => format!("remote compaction v2 stream returned {event_type}"),
+            },
+        );
+        result.error_class = Some("responses_error_event".to_string());
+        result.response_shape = Some(event_type.to_string());
+        result.accepted_by_responses = event_type.starts_with("response.");
+        return result;
+    }
+
+    let output_items_seen = values
+        .iter()
+        .map(count_output_items)
+        .max()
+        .unwrap_or_default();
+    let compaction_done_items_seen = values
+        .iter()
+        .map(compaction_output_done_item_count)
+        .sum::<usize>();
+    let json_compaction_items_seen = values
+        .iter()
+        .map(json_compaction_output_item_count)
+        .sum::<usize>();
+    let response_completed_seen = values.iter().any(value_is_response_completed);
+    let accepted_by_responses = values.iter().any(|value| {
+        value_event_type(value).is_some_and(|event_type| event_type.starts_with("response."))
+    });
+    let compaction_output_items_seen = if compaction_done_items_seen > 0 {
+        compaction_done_items_seen
+    } else {
+        json_compaction_items_seen
+    };
+
+    let mut result = if compaction_done_items_seen == 1 && response_completed_seen {
+        base_result(
+            CodexRelayLiveSmokeCase::RemoteCompactionV2,
+            CodexRelayLiveSmokeOutcome::Passed,
+            CodexRelayLiveSmokeConfidence::LiveOutputShape,
+            Some(status.as_u16()),
+            "remote compaction v2 stream returned exactly one compaction output item and response.completed",
+        )
+    } else if compaction_done_items_seen > 1 {
+        base_result(
+            CodexRelayLiveSmokeCase::RemoteCompactionV2,
+            CodexRelayLiveSmokeOutcome::Failed,
+            CodexRelayLiveSmokeConfidence::Malformed,
+            Some(status.as_u16()),
+            format!(
+                "remote compaction v2 stream returned {compaction_done_items_seen} compaction output items; Codex expects exactly one"
+            ),
+        )
+    } else if compaction_done_items_seen == 1 {
+        base_result(
+            CodexRelayLiveSmokeCase::RemoteCompactionV2,
+            CodexRelayLiveSmokeOutcome::Unknown,
+            CodexRelayLiveSmokeConfidence::Malformed,
+            Some(status.as_u16()),
+            "remote compaction v2 stream returned one compaction output item but no response.completed event",
+        )
+    } else if json_compaction_items_seen > 0 {
+        base_result(
+            CodexRelayLiveSmokeCase::RemoteCompactionV2,
+            CodexRelayLiveSmokeOutcome::Unknown,
+            CodexRelayLiveSmokeConfidence::LiveAccepted,
+            Some(status.as_u16()),
+            "remote compaction v2 request returned a compaction JSON payload but not the expected streaming output_item.done shape",
+        )
+    } else {
+        base_result(
+            CodexRelayLiveSmokeCase::RemoteCompactionV2,
+            CodexRelayLiveSmokeOutcome::Unknown,
+            CodexRelayLiveSmokeConfidence::LiveAccepted,
+            Some(status.as_u16()),
+            "remote compaction v2 request was accepted but did not return a compaction stream shape",
+        )
+    };
+
+    result.response_shape = Some(remote_compaction_v2_response_shape(
+        compaction_done_items_seen,
+        json_compaction_items_seen,
+        response_completed_seen,
+    ));
+    result.output_items_seen = output_items_seen;
+    result.compaction_output_seen = compaction_output_items_seen > 0;
+    result.compaction_output_items_seen = compaction_output_items_seen;
+    result.response_completed_seen = response_completed_seen;
+    result.accepted_by_responses =
+        accepted_by_responses || response_completed_seen || !values.is_empty();
     result
 }
 
@@ -938,6 +1149,7 @@ fn live_smoke_error_reason(
 ) -> String {
     let prefix = match case {
         CodexRelayLiveSmokeCase::ResponsesCompact => "compact live smoke failed",
+        CodexRelayLiveSmokeCase::RemoteCompactionV2 => "remote compaction v2 live smoke failed",
         CodexRelayLiveSmokeCase::HostedImageGeneration => "image live smoke failed",
         CodexRelayLiveSmokeCase::ResponsesWebSocket => "responses websocket live smoke failed",
     };
@@ -953,6 +1165,12 @@ fn body_mentions_unsupported(case: CodexRelayLiveSmokeCase, body: &[u8]) -> bool
     let capability_terms = match case {
         CodexRelayLiveSmokeCase::ResponsesCompact => {
             text.contains("compact") || text.contains("compaction")
+        }
+        CodexRelayLiveSmokeCase::RemoteCompactionV2 => {
+            text.contains("remote_compaction_v2")
+                || text.contains("compaction_trigger")
+                || text.contains("compact")
+                || text.contains("compaction")
         }
         CodexRelayLiveSmokeCase::HostedImageGeneration => {
             text.contains("image_generation") || text.contains("image generation")
@@ -1027,8 +1245,82 @@ fn count_output_items(value: &Value) -> usize {
     0
 }
 
-fn value_mentions_compaction_item(value: &Value) -> bool {
-    value_mentions_type(value, "compaction") || value_mentions_type(value, "context_compaction")
+fn value_event_type(value: &Value) -> Option<&str> {
+    value.get("type").and_then(Value::as_str)
+}
+
+fn value_is_response_completed(value: &Value) -> bool {
+    value_event_type(value) == Some("response.completed")
+}
+
+fn value_is_error_event(value: &Value) -> bool {
+    matches!(
+        value_event_type(value),
+        Some("error" | "response.failed" | "response.incomplete")
+    )
+}
+
+fn value_is_compaction_item(value: &Value) -> bool {
+    value
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|item_type| matches!(item_type, "compaction" | "context_compaction"))
+}
+
+fn compaction_output_done_item_count(value: &Value) -> usize {
+    if value_event_type(value) != Some("response.output_item.done") {
+        return 0;
+    }
+    value
+        .get("item")
+        .filter(|item| value_is_compaction_item(item))
+        .map(|_| 1)
+        .unwrap_or_default()
+}
+
+fn json_compaction_output_item_count(value: &Value) -> usize {
+    let top_level = value
+        .get("output")
+        .and_then(Value::as_array)
+        .map(|output| {
+            output
+                .iter()
+                .filter(|item| value_is_compaction_item(item))
+                .count()
+        })
+        .unwrap_or_default();
+    let response = value
+        .get("response")
+        .and_then(|response| response.get("output"))
+        .and_then(Value::as_array)
+        .map(|output| {
+            output
+                .iter()
+                .filter(|item| value_is_compaction_item(item))
+                .count()
+        })
+        .unwrap_or_default();
+    top_level + response
+}
+
+fn remote_compaction_v2_response_shape(
+    compaction_done_items_seen: usize,
+    json_compaction_items_seen: usize,
+    response_completed_seen: bool,
+) -> String {
+    if compaction_done_items_seen == 1 && response_completed_seen {
+        "remote_compaction_v2_compaction_stream".to_string()
+    } else if compaction_done_items_seen > 1 {
+        "remote_compaction_v2_duplicate_compaction_items".to_string()
+    } else if compaction_done_items_seen == 1 {
+        "remote_compaction_v2_compaction_without_completed".to_string()
+    } else if json_compaction_items_seen > 0 {
+        "remote_compaction_v2_json_compaction_item".to_string()
+    } else if response_completed_seen {
+        "remote_compaction_v2_completed_without_compaction".to_string()
+    } else {
+        "remote_compaction_v2_responses_success".to_string()
+    }
 }
 
 fn value_mentions_image_generation_call(value: &Value) -> bool {
@@ -1109,6 +1401,9 @@ fn base_result(
         status_code,
         response_shape: None,
         output_items_seen: 0,
+        compaction_output_seen: false,
+        compaction_output_items_seen: 0,
+        response_completed_seen: false,
         image_generation_call_seen: false,
         image_result_present: false,
         accepted_by_responses: false,
@@ -1481,6 +1776,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 CodexRelayLiveSmokeCase::ResponsesCompact,
+                CodexRelayLiveSmokeCase::RemoteCompactionV2,
                 CodexRelayLiveSmokeCase::HostedImageGeneration,
                 CodexRelayLiveSmokeCase::ResponsesWebSocket,
             ]
@@ -1499,6 +1795,7 @@ mod tests {
             vec![
                 "live smoke sends real upstream requests and may consume tokens or credits",
                 "results do not update routing, affinity, passive health, balance, or retry state",
+                "remote compaction v2 was not tested because compact v2 smoke is explicit-only",
                 "hosted image generation was not tested because image smoke is explicit-only",
                 "Responses WebSocket was not tested because websocket smoke is explicit-only",
             ]
@@ -1520,6 +1817,34 @@ mod tests {
         assert_eq!(compact.body["model"].as_str(), Some("gpt-5.5"));
         assert_eq!(compact.body["service_tier"].as_str(), Some("flex"));
         assert!(compact.body.get("stream").is_none());
+
+        let compact_v2 = LiveSmokeSpec::for_case(
+            CodexRelayLiveSmokeCase::RemoteCompactionV2,
+            "gpt-5.5",
+            Some("flex"),
+        )
+        .expect("compact v2 HTTP spec");
+        assert_eq!(compact_v2.method, Method::POST);
+        assert_eq!(compact_v2.path, "/responses");
+        assert!(compact_v2.stream);
+        assert_eq!(compact_v2.timeout, std::time::Duration::from_secs(60));
+        assert_eq!(
+            compact_v2.headers,
+            &[("x-codex-beta-features", REMOTE_COMPACTION_V2_BETA_FEATURE)]
+        );
+        assert_eq!(compact_v2.body["model"].as_str(), Some("gpt-5.5"));
+        assert_eq!(compact_v2.body["stream"].as_bool(), Some(true));
+        assert_eq!(compact_v2.body["store"].as_bool(), Some(false));
+        assert_eq!(compact_v2.body["service_tier"].as_str(), Some("flex"));
+        assert_eq!(
+            compact_v2.body["input"]
+                .as_array()
+                .expect("input")
+                .iter()
+                .filter(|item| item["type"].as_str() == Some("compaction_trigger"))
+                .count(),
+            1
+        );
 
         let image = LiveSmokeSpec::for_case(
             CodexRelayLiveSmokeCase::HostedImageGeneration,
@@ -1569,6 +1894,94 @@ mod tests {
             Some("compact_output_compaction_item")
         );
         assert_eq!(result.output_items_seen, 1);
+        assert!(result.compaction_output_seen);
+        assert_eq!(result.compaction_output_items_seen, 1);
+    }
+
+    #[test]
+    fn codex_relay_live_smoke_classifies_remote_compaction_v2_sse() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        let body = concat!(
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",\"encrypted_content\":\"summary\"}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_compact_v2\",\"output\":[]}}\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        let result = classify_remote_compaction_v2_live_smoke_response(
+            StatusCode::OK,
+            &headers,
+            body.as_bytes(),
+        );
+
+        assert_eq!(result.outcome, CodexRelayLiveSmokeOutcome::Passed);
+        assert_eq!(
+            result.confidence,
+            CodexRelayLiveSmokeConfidence::LiveOutputShape
+        );
+        assert!(result.accepted_by_responses);
+        assert!(result.compaction_output_seen);
+        assert_eq!(result.compaction_output_items_seen, 1);
+        assert!(result.response_completed_seen);
+        assert_eq!(
+            result.response_shape.as_deref(),
+            Some("remote_compaction_v2_compaction_stream")
+        );
+    }
+
+    #[test]
+    fn codex_relay_live_smoke_classifies_remote_compaction_v2_duplicate_items_as_failure() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        let body = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",\"encrypted_content\":\"one\"}}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",\"encrypted_content\":\"two\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_compact_v2\",\"output\":[]}}\n\n",
+        );
+
+        let result = classify_remote_compaction_v2_live_smoke_response(
+            StatusCode::OK,
+            &headers,
+            body.as_bytes(),
+        );
+
+        assert_eq!(result.outcome, CodexRelayLiveSmokeOutcome::Failed);
+        assert_eq!(result.compaction_output_items_seen, 2);
+        assert!(result.response_completed_seen);
+        assert_eq!(
+            result.response_shape.as_deref(),
+            Some("remote_compaction_v2_duplicate_compaction_items")
+        );
+    }
+
+    #[test]
+    fn codex_relay_live_smoke_classifies_remote_compaction_v2_json_as_not_stream_proven() {
+        let result = classify_remote_compaction_v2_live_smoke_response(
+            StatusCode::OK,
+            &HeaderMap::new(),
+            br#"{"output":[{"type":"compaction","encrypted_content":"summary"}]}"#,
+        );
+
+        assert_eq!(result.outcome, CodexRelayLiveSmokeOutcome::Unknown);
+        assert_eq!(
+            result.confidence,
+            CodexRelayLiveSmokeConfidence::LiveAccepted
+        );
+        assert!(result.compaction_output_seen);
+        assert_eq!(result.compaction_output_items_seen, 1);
+        assert!(!result.response_completed_seen);
+        assert_eq!(
+            result.response_shape.as_deref(),
+            Some("remote_compaction_v2_json_compaction_item")
+        );
     }
 
     #[test]
@@ -1743,6 +2156,141 @@ mod tests {
             response.results[0].outcome,
             CodexRelayLiveSmokeOutcome::Passed
         );
+
+        upstream_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_relay_live_smoke_remote_compaction_v2_sends_trigger_stream_and_beta() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen_body = Arc::new(Mutex::new(None::<Value>));
+        let seen_beta = Arc::new(Mutex::new(None::<String>));
+        let seen_accept = Arc::new(Mutex::new(None::<String>));
+        let seen_authorization = Arc::new(Mutex::new(None::<String>));
+        let seen_api_key = Arc::new(Mutex::new(None::<String>));
+
+        let hits_for_route = hits.clone();
+        let seen_body_for_route = seen_body.clone();
+        let seen_beta_for_route = seen_beta.clone();
+        let seen_accept_for_route = seen_accept.clone();
+        let seen_authorization_for_route = seen_authorization.clone();
+        let seen_api_key_for_route = seen_api_key.clone();
+        let upstream_app = axum::Router::new().route(
+            "/v1/responses",
+            post(move |request: Request<Body>| {
+                let hits = hits_for_route.clone();
+                let seen_body = seen_body_for_route.clone();
+                let seen_beta = seen_beta_for_route.clone();
+                let seen_accept = seen_accept_for_route.clone();
+                let seen_authorization = seen_authorization_for_route.clone();
+                let seen_api_key = seen_api_key_for_route.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    *seen_beta.lock().expect("lock beta") = request
+                        .headers()
+                        .get("x-codex-beta-features")
+                        .and_then(|value| value.to_str().ok())
+                        .map(ToOwned::to_owned);
+                    *seen_accept.lock().expect("lock accept") = request
+                        .headers()
+                        .get(axum::http::header::ACCEPT)
+                        .and_then(|value| value.to_str().ok())
+                        .map(ToOwned::to_owned);
+                    *seen_authorization.lock().expect("lock auth") = request
+                        .headers()
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .map(ToOwned::to_owned);
+                    *seen_api_key.lock().expect("lock api key") = request
+                        .headers()
+                        .get("x-api-key")
+                        .and_then(|value| value.to_str().ok())
+                        .map(ToOwned::to_owned);
+                    let body = axum::body::to_bytes(request.into_body(), 16 * 1024)
+                        .await
+                        .expect("body");
+                    let body: Value = serde_json::from_slice(body.as_ref()).expect("json body");
+                    *seen_body.lock().expect("lock body") = Some(body);
+                    (
+                        [(
+                            axum::http::header::CONTENT_TYPE,
+                            HeaderValue::from_static("text/event-stream"),
+                        )],
+                        concat!(
+                            "event: response.output_item.done\n",
+                            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",\"encrypted_content\":\"summary\"}}\n\n",
+                            "event: response.completed\n",
+                            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_compact_v2\",\"output\":[]}}\n\n",
+                            "data: [DONE]\n\n",
+                        ),
+                    )
+                }
+            }),
+        );
+        let (upstream_addr, upstream_handle) = spawn_axum_server(upstream_app);
+        let mut upstream = upstream(format!("http://{upstream_addr}/v1"));
+        upstream.auth.auth_token = Some("live-token".to_string());
+        upstream.auth.api_key = Some("live-api-key".to_string());
+        let proxy = proxy_for_upstreams(vec![upstream]);
+
+        let response = codex_relay_live_smoke_for_proxy(
+            &proxy,
+            request("gpt-5.5", vec![CodexRelayLiveSmokeCase::RemoteCompactionV2]),
+        )
+        .await
+        .expect("live smoke");
+
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            seen_beta.lock().expect("lock beta").as_deref(),
+            Some(REMOTE_COMPACTION_V2_BETA_FEATURE)
+        );
+        assert_eq!(
+            seen_accept.lock().expect("lock accept").as_deref(),
+            Some("text/event-stream, application/json")
+        );
+        assert_eq!(
+            seen_authorization.lock().expect("lock auth").as_deref(),
+            Some("Bearer live-token")
+        );
+        assert_eq!(
+            seen_api_key.lock().expect("lock api key").as_deref(),
+            Some("live-api-key")
+        );
+        let body = seen_body
+            .lock()
+            .expect("lock body")
+            .clone()
+            .expect("captured body");
+        assert_eq!(body["model"].as_str(), Some("gpt-5.5"));
+        assert_eq!(body["stream"].as_bool(), Some(true));
+        assert_eq!(body["store"].as_bool(), Some(false));
+        assert_eq!(body["tools"], json!([]));
+        assert_eq!(body["parallel_tool_calls"].as_bool(), Some(false));
+        assert_eq!(
+            body["input"]
+                .as_array()
+                .expect("input")
+                .iter()
+                .filter(|item| item["type"].as_str() == Some("compaction_trigger"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            response.cases,
+            vec![CodexRelayLiveSmokeCase::RemoteCompactionV2]
+        );
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(
+            response.results[0].case,
+            CodexRelayLiveSmokeCase::RemoteCompactionV2
+        );
+        assert_eq!(
+            response.results[0].outcome,
+            CodexRelayLiveSmokeOutcome::Passed
+        );
+        assert_eq!(response.results[0].compaction_output_items_seen, 1);
+        assert!(response.results[0].response_completed_seen);
 
         upstream_handle.abort();
     }

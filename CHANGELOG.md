@@ -15,18 +15,21 @@ All notable changes to this project will be documented in this file.
 - Codex `/responses/compact` 现在会保留官方 compaction 输入里的 `service_tier` 和 `prompt_cache_key`，转发体会去掉 `previous_response_id` 以贴近官方 compact 形状；如果请求体里带有 `encrypted_content` 或 `previous_response_id` 这类状态字段，就会把 compact 视为 state-bound 请求，避免跨账号兜底把 502 误变成上游状态错误。
 - Session route affinity 现在会以 provider endpoint identity 形式持久化到 helper state。helper 重启后，Codex remote compaction 会继续使用之前已证明的 provider endpoint；如果 state-bound compact 缺少可恢复 affinity，会返回明确连续性错误，而不是静默切到另一个 provider。
 - Codex remote compaction v2 现在会在普通 `POST /responses` 请求里识别结构化 `compaction_trigger`，并在日志中写入 `codex_bridge.remote_compaction_v2_request`。v2 compact 会按 provider-state-bound 处理：有 route affinity 就继续粘住原 provider endpoint；缺失 affinity 或粘住的 endpoint 失败时保持 fail-closed，不假设背后 relay 是 sub2api、OpenAI、New API 或其它实现。
+- Relay live smoke 新增显式 `remote_compaction_v2` / `--compact-v2` case：会发送真实 `/responses` stream 请求、带 `compaction_trigger` 和 `x-codex-beta-features: remote_compaction_v2`，只有看到一个 compaction output item 和 `response.completed` 才算通过；默认 live smoke 仍只测 `/responses/compact`。
 - Control trace 新增 provider-opaque 的连续性诊断字段：continuity class、affinity source、provider failover 是否允许、阻断原因，以及余额信号是否对该连续性决策具有权威性。helper 不会从这些信号推断 relay 背后是 OpenAI、sub2api、New API 或其它实现。
 - Codex routing explain 现在会和实际执行路径一致：HTTP、Responses WebSocket 和 legacy 路径都会应用同一套 session route affinity，legacy explain 不再因为遗漏 session affinity 而和真实路由结果不一致。
 - 如果上游 400/404 明确表示 `previous_response_id` 对应 response 不存在，helper 会移除 `previous_response_id` 并对同一个上游重试一次，同时在 route attempts 中记录 `codex_stale_previous_response_id`，方便排查 relay 状态不同步。
 - Codex 非流式响应新增受控 gzip JSON 修复：当 relay 无视 `Accept-Encoding: identity` 返回 gzip JSON 时，helper 会解压后转发普通 JSON，并继续复用现有响应头过滤去掉过期的 `Content-Encoding` / `Content-Length`。
+- 当 Codex stream 请求在选路前失败（例如所有候选都因余额耗尽、cooldown 或无可路由目标被阻断）时，helper 会返回 Codex 可解析的 `response.failed` SSE，而不是裸 HTTP 错误，避免客户端流式解析卡在异常形态上。
 - `service_tier` 观测补齐代理级回归测试：请求日志会保留 requested / effective / actual 三段，确认 fast mode 仍只由客户端或显式 override 决定，不由 helper 默认配置偷偷改写。
+- OpenAI 风格 `/models` 到 Codex `models` catalog 的翻译改为显式 `translate_models = true` 开关；启用时会补充 image/search/apply_patch、context window 和 fast `service_tier` 等 metadata，并可叠加 Basellm 模型 metadata，但默认不再把合成目录当作权威返回给 Codex。
+- OpenAI Images 兼容入口现在会在转发 hosted image generation 请求前去掉客户端 `User-Agent`，避免部分上游把本地脚本或 Codex 客户端 UA 当成能力/风控信号。
+- 新增仓库分发的 `ch-imagegen` skill：通过本地 `/v1/images/generations` 入口生成图片，自动计算 `gpt-image-2` 的 2K/4K 尺寸，保存并校验新生成的文件。
 
-#### Tauri 桌面端替代路径
+#### Codex 客户端与 TUI
 
-- 新增 `apps/desktop` Tauri v2 + React 19 + Tailwind CSS 4 + shadcn/ui 风格桌面端，作为当前 egui GUI 的替代路径。
-- Windows packaged 路径已具备 Dashboard、Providers、Usage、Settings、只读 admin 数据、安全控制动作、关闭隐藏到托盘语义、单实例、开机启动、轻量单配置导入导出、打开配置/日志/缓存路径、Provider 常用编辑表单，以及 NSIS packaged sidecar 构建；`Quit App` 只退出桌面进程，停止代理仍需显式 `Stop Proxy`。
-- Windows packaged smoke 已完成并覆盖托盘 Show/Hide/Quit、Detach、Stop Proxy、第二次启动聚焦、开机启动注册、配置导入导出和 Provider 编辑。tag release CI 现在会构建并上传 Windows Tauri NSIS 安装包到 GitHub Release。`codex-helper-gui`/egui 现在作为 legacy fallback 保留；自动更新仍会等 Tauri updater 签名密钥、HTTPS 发布端点、artifact hosting 和回滚流程就绪后再启用。
-- Linux CI/cargo-dist 依赖补齐 Tauri v2 所需的 WebKitGTK 4.1 / JavaScriptCoreGTK 4.1 开发包，避免 `javascriptcoregtk-4.1.pc` 缺失导致 clippy/build 失败。
+- `codex-helper switch on` 不带显式 preset 时现在会读取 `[codex.client_patch]` 配置，正确应用配置中的 `preset`、`responses_websocket` 等选项；显式 `--preset` 仍可覆盖配置。
+- TUI transcript 弹窗现在可以按实际换行后的内容滚动，长消息折行后不再出现无法滚到被包裹行的问题。
 
 #### Codex 中转请求字段覆盖
 
@@ -43,18 +46,21 @@ All notable changes to this project will be documented in this file.
 - Codex `/responses/compact` now preserves the official input fields `service_tier` and `prompt_cache_key`, strips `previous_response_id` from the forwarded payload to match the official compact shape, and treats requests carrying `encrypted_content` or `previous_response_id` as state-bound so compact fallback does not cross accounts when upstream state might be pinned to one relay identity.
 - Session route affinity is now persisted by provider endpoint identity under helper state. After a helper restart, Codex remote compaction keeps using the previously proven provider endpoint; if a state-bound compact request has no restorable affinity, helper returns an explicit continuity error instead of silently moving to another provider.
 - Codex remote compaction v2 is now recognized on ordinary `POST /responses` requests with a structured `compaction_trigger` input item and logged as `codex_bridge.remote_compaction_v2_request`. V2 compact is treated as provider-state-bound: it uses known route affinity, fails closed when affinity is missing or the sticky endpoint fails, and does not infer whether the relay backend is sub2api, OpenAI, New API, or something else.
+- Relay live smoke now has an explicit `remote_compaction_v2` / `--compact-v2` case. It sends a real streaming `/responses` request with `compaction_trigger` and `x-codex-beta-features: remote_compaction_v2`, and only passes after one compaction output item plus `response.completed`; the default live smoke still checks only `/responses/compact`.
 - Control trace now includes provider-opaque continuity diagnostics: continuity class, affinity source, whether provider failover is allowed, the blocked reason, and whether balance signals are authoritative for that continuity decision. Helper does not infer whether the relay backend is OpenAI, sub2api, New API, or something else.
 - Codex routing explain now matches the actual execution path: HTTP, Responses WebSocket, and legacy paths all apply the same session route affinity, so legacy explain no longer diverges from the real route selection.
 - If an upstream 400/404 explicitly says the `previous_response_id` response no longer exists, helper removes `previous_response_id` and retries the same upstream once. Route attempts record `codex_stale_previous_response_id` for relay-state debugging.
 - Added bounded gzip JSON repair for non-streaming Codex responses. If a relay ignores `Accept-Encoding: identity` and returns gzip JSON, helper decodes it before forwarding plain JSON and keeps filtering stale `Content-Encoding` / `Content-Length`.
+- When Codex streaming requests fail before an upstream is selected, such as all candidates being blocked by trusted balance exhaustion, cooldown, or no routable target, helper now returns a Codex-parseable `response.failed` SSE instead of a bare HTTP error.
 - Added proxy-level regression coverage for `service_tier` attribution: request logs preserve requested / effective / actual values, confirming fast mode is driven by the client or explicit overrides, not by helper defaults.
+- OpenAI-style `/models` to Codex `models` catalog translation is now behind the explicit `translate_models = true` switch. When enabled, helper adds metadata such as image/search/apply_patch support, context windows, and fast `service_tier`, with optional Basellm metadata overlay, but it no longer treats synthesized catalogs as authoritative by default.
+- The OpenAI Images-compatible entrypoint now strips the client `User-Agent` before forwarding hosted image generation requests, avoiding relays that treat local script or Codex client UAs as capability or policy signals.
+- Added the repository-distributed `ch-imagegen` skill. It calls the local `/v1/images/generations` entrypoint, computes valid `gpt-image-2` 2K/4K sizes, saves the generated file, and validates only the new output.
 
-#### Tauri desktop replacement path
+#### Codex client and TUI
 
-- Added the `apps/desktop` Tauri v2 + React 19 + Tailwind CSS 4 + shadcn/ui-style desktop client as the replacement path for the current egui GUI.
-- The desktop client now has Dashboard, Providers, Usage, Settings, read-only admin data, safe control actions, close-to-tray semantics, single instance, launch-at-login, lightweight single-config import/export, config/log/cache path openers, common provider edit forms, and a Windows NSIS packaged sidecar build; `Quit App` exits only the desktop process, while proxy shutdown remains an explicit `Stop Proxy` action.
-- Windows packaged smoke now passes, including tray Show/Hide/Quit, Detach, Stop Proxy, second-launch focus, launch-at-login registration, config import/export, and provider editing. Tag release CI now builds and uploads the Windows Tauri NSIS installer to GitHub Releases. The first replacement release still uses manual GitHub Releases downloads, and auto-update stays disabled until Tauri updater signing keys, HTTPS release endpoint, artifact hosting, and rollback operations are real. `codex-helper-gui`/egui remains as a deprecated legacy fallback.
-- Non-Windows CI/cargo-dist dependencies now include the WebKitGTK 4.1 / JavaScriptCoreGTK 4.1 development packages required by Tauri v2, avoiding `javascriptcoregtk-4.1.pc` build failures during clippy/build. Non-Windows CI also now prebuilds and stages the Tauri sidecar before `cargo clippy` / `cargo build`, so `tauri_build` no longer aborts on a missing `externalBin` artifact.
+- `codex-helper switch on` without an explicit preset now reads `[codex.client_patch]` and applies configured `preset`, `responses_websocket`, and related options; explicit `--preset` still overrides config.
+- TUI transcript modals now scroll by rendered wrapped lines, so long wrapped messages no longer hide unreachable content.
 
 #### Codex relay request-field overrides
 

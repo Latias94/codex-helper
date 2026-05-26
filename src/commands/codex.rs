@@ -52,12 +52,13 @@ pub(crate) async fn handle_codex_cmd(cmd: CodexCommand) -> CliResult<()> {
             upstream_index,
             model,
             image,
+            compact_v2,
             websocket,
             service_tier,
             json,
         } => {
             let proxy = build_codex_proxy_for_cli().await?;
-            let cases = live_smoke_cases(image, websocket);
+            let cases = live_smoke_cases(image, compact_v2, websocket);
             let response = proxy
                 .codex_relay_live_smoke(CodexRelayLiveSmokeRequest {
                     acknowledgement: Some(acknowledgement),
@@ -101,10 +102,17 @@ pub(crate) async fn handle_codex_cmd(cmd: CodexCommand) -> CliResult<()> {
     Ok(())
 }
 
-fn live_smoke_cases(image: bool, websocket: bool) -> Vec<CodexRelayLiveSmokeCase> {
+fn live_smoke_cases(
+    image: bool,
+    compact_v2: bool,
+    websocket: bool,
+) -> Vec<CodexRelayLiveSmokeCase> {
     let mut cases = Vec::new();
     if image {
         cases.push(CodexRelayLiveSmokeCase::HostedImageGeneration);
+    }
+    if compact_v2 {
+        cases.push(CodexRelayLiveSmokeCase::RemoteCompactionV2);
     }
     if websocket {
         cases.push(CodexRelayLiveSmokeCase::ResponsesWebSocket);
@@ -211,12 +219,14 @@ fn print_live_smoke_text(response: &CodexRelayLiveSmokeResponse) {
     );
     for result in &response.results {
         println!(
-            "{:?}: {:?}/{:?} status={:?} items={} image_call={} image_result={} reason={}",
+            "{:?}: {:?}/{:?} status={:?} items={} compaction_items={} completed={} image_call={} image_result={} reason={}",
             result.case,
             result.outcome,
             result.confidence,
             result.status_code,
             result.output_items_seen,
+            result.compaction_output_items_seen,
+            result.response_completed_seen,
             result.image_generation_call_seen,
             result.image_result_present,
             result.reason
@@ -308,7 +318,7 @@ mod tests {
     #[test]
     fn live_smoke_cases_defaults_to_compact() {
         assert_eq!(
-            live_smoke_cases(false, false),
+            live_smoke_cases(false, false, false),
             vec![CodexRelayLiveSmokeCase::ResponsesCompact]
         );
     }
@@ -316,7 +326,7 @@ mod tests {
     #[test]
     fn live_smoke_cases_websocket_flag_runs_websocket_only() {
         assert_eq!(
-            live_smoke_cases(false, true),
+            live_smoke_cases(false, false, true),
             vec![CodexRelayLiveSmokeCase::ResponsesWebSocket]
         );
     }
@@ -324,17 +334,26 @@ mod tests {
     #[test]
     fn live_smoke_cases_image_flag_runs_image_only() {
         assert_eq!(
-            live_smoke_cases(true, false),
+            live_smoke_cases(true, false, false),
             vec![CodexRelayLiveSmokeCase::HostedImageGeneration]
+        );
+    }
+
+    #[test]
+    fn live_smoke_cases_compact_v2_flag_runs_compact_v2_only() {
+        assert_eq!(
+            live_smoke_cases(false, true, false),
+            vec![CodexRelayLiveSmokeCase::RemoteCompactionV2]
         );
     }
 
     #[test]
     fn live_smoke_cases_combines_explicit_optional_smokes_without_compact() {
         assert_eq!(
-            live_smoke_cases(true, true),
+            live_smoke_cases(true, true, true),
             vec![
                 CodexRelayLiveSmokeCase::HostedImageGeneration,
+                CodexRelayLiveSmokeCase::RemoteCompactionV2,
                 CodexRelayLiveSmokeCase::ResponsesWebSocket,
             ]
         );

@@ -176,7 +176,21 @@ curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-live-smoke \
   }'
 ```
 
-不传 `cases` 时，live smoke 只会通过 `/responses/compact` 检查 remote compaction v1。Hosted image generation 和 Responses WebSocket 永远不属于默认 case。要显式测试 hosted tool 请求链路，可以传：
+不传 `cases` 时，live smoke 只会通过 `/responses/compact` 检查 remote compaction v1。Remote compaction v2、Hosted image generation 和 Responses WebSocket 永远不属于默认 case。要显式测试选中 relay/provider 链路是否真的支持 Codex remote compaction v2，可以传 `remote_compaction_v2`。这个 smoke 会发送 `POST /responses`，带 `stream: true`、一个 `compaction_trigger` input item，以及 `x-codex-beta-features: remote_compaction_v2`；只有响应流里刚好出现一个 compaction output item，并且出现 `response.completed`，才算通过：
+
+```bash
+curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-live-smoke \
+  -H 'content-type: application/json' \
+  -d '{
+    "acknowledgement": "run-live-codex-relay-smoke",
+    "model": "gpt-5.5",
+    "provider_id": "ciii",
+    "endpoint_id": "default",
+    "cases": ["remote_compaction_v2"]
+  }'
+```
+
+要显式测试 hosted tool 请求链路，可以传：
 
 ```bash
 curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-live-smoke \
@@ -220,6 +234,12 @@ codex-helper codex relay-live-smoke \
 codex-helper codex relay-live-smoke \
   --acknowledgement run-live-codex-relay-smoke \
   --model gpt-5.5 \
+  --provider ciii \
+  --compact-v2
+
+codex-helper codex relay-live-smoke \
+  --acknowledgement run-live-codex-relay-smoke \
+  --model gpt-5.5 \
   --image
 
 codex-helper codex relay-live-smoke \
@@ -231,7 +251,7 @@ codex-helper codex relay-live-smoke \
 codex-helper codex relay-evidence --limit 20
 ```
 
-CLI 里不带可选 case 参数时会跑默认 compact smoke；传 `--image`、`--websocket` 或两者同时传时，只跑这些显式可选 case，避免为了测某个可选能力而额外消耗一次 compact 请求。
+CLI 里不带可选 case 参数时会跑默认 compact smoke；传 `--compact-v2`、`--image`、`--websocket` 或任意组合时，只跑这些显式可选 case，避免为了测某个可选能力而额外消耗一次 compact 请求。
 
 默认目标仍是当前 runtime 选中的上游。Route graph 配置下，也可以通过 API 请求体里的 `provider_id` / `endpoint_id`，或 CLI 的 `--provider` / `--endpoint` 直接指定 provider endpoint。旧的 `--station` / `--upstream-index` 仍用于 station 形态配置，但不能和 provider 目标混用。
 

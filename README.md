@@ -357,6 +357,7 @@ codex-helper status
 codex-helper doctor
 codex-helper codex relay-capabilities --preset official-imagegen --model gpt-5.5
 codex-helper codex relay-live-smoke --acknowledgement run-live-codex-relay-smoke --model gpt-5.5
+codex-helper codex relay-live-smoke --acknowledgement run-live-codex-relay-smoke --model gpt-5.5 --provider ciii --compact-v2
 codex-helper codex relay-evidence --limit 20
 codex-helper --version
 ```

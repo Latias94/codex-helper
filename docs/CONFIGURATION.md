@@ -198,8 +198,26 @@ curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-live-smoke \
 ```
 
 With no `cases` field, live smoke only checks remote compaction v1 through `/responses/compact`.
-Hosted image generation and Responses WebSocket are never part of the default case set. To
-explicitly test the hosted tool request path:
+Remote compaction v2, hosted image generation, and Responses WebSocket are never part of the default
+case set. To explicitly test Codex remote compaction v2 compatibility for the selected
+relay/provider chain, include `remote_compaction_v2`. The smoke sends `POST /responses` with
+`stream: true`, one `compaction_trigger` input item, and `x-codex-beta-features:
+remote_compaction_v2`; it passes only when the stream contains exactly one compaction output item
+and `response.completed`:
+
+```bash
+curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-live-smoke \
+  -H 'content-type: application/json' \
+  -d '{
+    "acknowledgement": "run-live-codex-relay-smoke",
+    "model": "gpt-5.5",
+    "provider_id": "ciii",
+    "endpoint_id": "default",
+    "cases": ["remote_compaction_v2"]
+  }'
+```
+
+To explicitly test the hosted tool request path:
 
 ```bash
 curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-live-smoke \
@@ -250,6 +268,12 @@ codex-helper codex relay-live-smoke \
 codex-helper codex relay-live-smoke \
   --acknowledgement run-live-codex-relay-smoke \
   --model gpt-5.5 \
+  --provider ciii \
+  --compact-v2
+
+codex-helper codex relay-live-smoke \
+  --acknowledgement run-live-codex-relay-smoke \
+  --model gpt-5.5 \
   --image
 
 codex-helper codex relay-live-smoke \
@@ -261,8 +285,8 @@ codex-helper codex relay-live-smoke \
 codex-helper codex relay-evidence --limit 20
 ```
 
-For the CLI, omitting optional case flags runs the default compact smoke. Supplying `--image`,
-`--websocket`, or both runs only those explicit optional cases, so an optional smoke does not
+For the CLI, omitting optional case flags runs the default compact smoke. Supplying `--compact-v2`,
+`--image`, `--websocket`, or any combination runs only those explicit optional cases, so an optional smoke does not
 accidentally spend an additional compact request.
 
 Targeting uses the normal selected runtime target by default. For route-graph configs, diagnostics
