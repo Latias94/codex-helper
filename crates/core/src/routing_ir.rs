@@ -156,12 +156,14 @@ impl RoutePlanContinuityTopology<'_> {
         })
     }
 
-    pub fn same_domain_candidate_count(&self, domain: &ContinuityDomainKey) -> usize {
+    pub fn same_domain_provider_endpoint_count(&self, domain: &ContinuityDomainKey) -> usize {
         self.template
             .candidates
             .iter()
             .filter(|candidate| self.template.candidate_continuity_domain_key(candidate) == *domain)
-            .count()
+            .map(|candidate| self.template.candidate_provider_endpoint_key(candidate))
+            .collect::<BTreeSet<_>>()
+            .len()
     }
 
     pub fn selected_domain_summary(
@@ -173,7 +175,7 @@ impl RoutePlanContinuityTopology<'_> {
         let domain = self.candidate_domain(selected);
         Some(RoutePlanContinuityDomainSummary {
             domain: domain.clone(),
-            same_domain_endpoint_count: self.same_domain_candidate_count(&domain).max(1),
+            same_domain_endpoint_count: self.same_domain_provider_endpoint_count(&domain).max(1),
         })
     }
 }
@@ -3682,6 +3684,73 @@ mod tests {
                 .selected_domain_summary("codex/missing/default")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn routing_ir_continuity_topology_counts_unique_provider_endpoints_not_route_occurrences() {
+        let template = RoutePlanTemplate {
+            service_name: "codex".to_string(),
+            entry: "main".to_string(),
+            affinity_policy: RoutingAffinityPolicyV5::FallbackSticky,
+            fallback_ttl_ms: None,
+            reprobe_preferred_after_ms: None,
+            nodes: BTreeMap::new(),
+            expanded_provider_order: vec!["relay".to_string()],
+            compatibility_station_name: None,
+            candidates: vec![
+                RouteCandidate {
+                    provider_id: "relay".to_string(),
+                    provider_alias: None,
+                    endpoint_id: "default".to_string(),
+                    base_url: "https://relay.example/v1".to_string(),
+                    continuity_domain: Some("relay-cluster".to_string()),
+                    auth: UpstreamAuth::default(),
+                    tags: BTreeMap::new(),
+                    supported_models: BTreeMap::new(),
+                    model_mapping: BTreeMap::new(),
+                    route_path: vec!["main".to_string(), "preferred".to_string()],
+                    preference_group: 0,
+                    stable_index: 0,
+                    concurrency: RouteCandidateConcurrency::default(),
+                    compatibility_station_name: None,
+                    compatibility_upstream_index: None,
+                },
+                RouteCandidate {
+                    provider_id: "relay".to_string(),
+                    provider_alias: None,
+                    endpoint_id: "default".to_string(),
+                    base_url: "https://relay.example/v1".to_string(),
+                    continuity_domain: Some("relay-cluster".to_string()),
+                    auth: UpstreamAuth::default(),
+                    tags: BTreeMap::new(),
+                    supported_models: BTreeMap::new(),
+                    model_mapping: BTreeMap::new(),
+                    route_path: vec!["main".to_string(), "fallback".to_string()],
+                    preference_group: 1,
+                    stable_index: 1,
+                    concurrency: RouteCandidateConcurrency::default(),
+                    compatibility_station_name: None,
+                    compatibility_upstream_index: None,
+                },
+            ],
+        };
+        assert_eq!(
+            template
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.provider_id == "relay")
+                .count(),
+            2,
+            "route graph intentionally expands the same provider endpoint twice"
+        );
+
+        let topology = template.continuity_topology();
+        assert_eq!(topology.configured_provider_endpoint_count(), 1);
+        let summary = topology
+            .selected_domain_summary("codex/relay/default")
+            .expect("relay summary");
+        assert_eq!(summary.domain.stable_key(), "explicit:codex/relay-cluster");
+        assert_eq!(summary.same_domain_endpoint_count, 1);
     }
 
     #[test]

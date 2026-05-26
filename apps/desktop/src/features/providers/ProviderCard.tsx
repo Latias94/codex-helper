@@ -144,7 +144,7 @@ function ProviderEditForm({
       providerName: provider.id ?? provider.name,
       alias: alias.trim(),
       baseUrl: baseUrl.trim(),
-      ...(continuityDomain.trim() ? { continuityDomain: continuityDomain.trim() } : {}),
+      continuityDomain: continuityDomain.trim(),
       enabled,
       ...(authTokenEnv.trim() ? { authTokenEnv: authTokenEnv.trim() } : {}),
       ...(apiKeyEnv.trim() ? { apiKeyEnv: apiKeyEnv.trim() } : {}),

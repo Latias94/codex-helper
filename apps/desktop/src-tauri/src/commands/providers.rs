@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use codex_helper_core::config::{ProxyConfigV4, config_file_path, proxy_home_dir};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use toml::Value;
 use toml::map::Map;
 
@@ -20,10 +21,18 @@ pub struct ProviderCommonEditPayload {
     pub provider_name: String,
     pub alias: Option<String>,
     pub base_url: String,
-    pub continuity_domain: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_patch")]
+    pub continuity_domain: OptionalStringPatch,
     pub enabled: bool,
     pub auth_token_env: Option<String>,
     pub api_key_env: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum OptionalStringPatch {
+    #[default]
+    Preserve,
+    Set(Option<String>),
 }
 
 #[derive(Debug, Serialize)]
@@ -133,10 +142,10 @@ fn patch_single_endpoint_provider(
     match (provider_has_base_url, endpoint_names.as_slice()) {
         (true, []) => {
             provider_table.insert("base_url".to_string(), Value::String(base_url.to_string()));
-            set_optional_string(
+            patch_optional_string(
                 provider_table,
                 "continuity_domain",
-                payload.continuity_domain.as_deref(),
+                &payload.continuity_domain,
             );
         }
         (true, _) => {
@@ -160,11 +169,7 @@ fn patch_single_endpoint_provider(
                     DesktopError::Config(format!("endpoint {endpoint_name} must be a table"))
                 })?;
             endpoint.insert("base_url".to_string(), Value::String(base_url.to_string()));
-            set_optional_string(
-                endpoint,
-                "continuity_domain",
-                payload.continuity_domain.as_deref(),
-            );
+            patch_optional_string(endpoint, "continuity_domain", &payload.continuity_domain);
         }
         (false, []) => {
             return Err(DesktopError::Config(
@@ -282,6 +287,29 @@ fn set_optional_string(table: &mut Map<String, Value>, key: &str, value: Option<
     }
 }
 
+fn patch_optional_string(table: &mut Map<String, Value>, key: &str, patch: &OptionalStringPatch) {
+    match patch {
+        OptionalStringPatch::Preserve => {}
+        OptionalStringPatch::Set(value) => set_optional_string(table, key, value.as_deref()),
+    }
+}
+
+fn deserialize_optional_string_patch<'de, D>(
+    deserializer: D,
+) -> Result<OptionalStringPatch, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = JsonValue::deserialize(deserializer)?;
+    match value {
+        JsonValue::Null => Ok(OptionalStringPatch::Set(None)),
+        JsonValue::String(value) => Ok(OptionalStringPatch::Set(Some(value))),
+        other => Err(serde::de::Error::custom(format!(
+            "expected string or null for optional string patch, got {other}"
+        ))),
+    }
+}
+
 fn config_path() -> PathBuf {
     let path = config_file_path();
     if path.extension().and_then(|ext| ext.to_str()) == Some("toml") {
@@ -314,7 +342,8 @@ mod tests {
     use toml::Value;
 
     use super::{
-        ProviderCommonEditPayload, apply_common_provider_edit_to_text, edit_provider_config_file,
+        OptionalStringPatch, ProviderCommonEditPayload, apply_common_provider_edit_to_text,
+        edit_provider_config_file,
     };
 
     const SINGLE_PROVIDER_CONFIG: &str = r#"
@@ -339,6 +368,24 @@ region = "us"
 
 [codex.providers.relay.limits]
 max_concurrent_requests = 3
+"#;
+
+    const SINGLE_PROVIDER_WITH_CONTINUITY_CONFIG: &str = r#"
+version = 5
+
+[codex.routing]
+entry = "relay"
+
+[codex.routing.routes.relay]
+strategy = "ordered-failover"
+children = ["relay"]
+
+[codex.providers.relay]
+alias = "Old Relay"
+base_url = "https://old.example/v1"
+continuity_domain = "relay-cluster-existing"
+auth_token_env = "OLD_TOKEN"
+enabled = true
 "#;
 
     const MULTI_ENDPOINT_CONFIG: &str = r#"
@@ -505,6 +552,87 @@ region = "eu"
     }
 
     #[test]
+    fn common_edit_preserves_continuity_domain_when_payload_field_is_missing() {
+        let mut payload = payload();
+        payload.continuity_domain = OptionalStringPatch::Preserve;
+
+        let updated =
+            apply_common_provider_edit_to_text(SINGLE_PROVIDER_WITH_CONTINUITY_CONFIG, &payload)
+                .expect("edit");
+        let value = toml::from_str::<Value>(&updated).expect("valid toml");
+        let provider = value
+            .get("codex")
+            .and_then(Value::as_table)
+            .and_then(|service| service.get("providers"))
+            .and_then(Value::as_table)
+            .and_then(|providers| providers.get("relay"))
+            .and_then(Value::as_table)
+            .expect("provider table");
+
+        assert_eq!(
+            provider.get("continuity_domain").and_then(Value::as_str),
+            Some("relay-cluster-existing")
+        );
+        assert_eq!(
+            provider.get("base_url").and_then(Value::as_str),
+            Some("https://new.example/v1")
+        );
+    }
+
+    #[test]
+    fn common_edit_clears_continuity_domain_when_payload_field_is_blank() {
+        let mut payload = payload();
+        payload.continuity_domain = OptionalStringPatch::Set(Some(String::new()));
+
+        let updated =
+            apply_common_provider_edit_to_text(SINGLE_PROVIDER_WITH_CONTINUITY_CONFIG, &payload)
+                .expect("edit");
+        let value = toml::from_str::<Value>(&updated).expect("valid toml");
+        let provider = value
+            .get("codex")
+            .and_then(Value::as_table)
+            .and_then(|service| service.get("providers"))
+            .and_then(Value::as_table)
+            .and_then(|providers| providers.get("relay"))
+            .and_then(Value::as_table)
+            .expect("provider table");
+
+        assert!(provider.get("continuity_domain").is_none());
+    }
+
+    #[test]
+    fn common_edit_payload_deserializes_continuity_domain_as_three_state_patch() {
+        let missing = serde_json::from_value::<ProviderCommonEditPayload>(serde_json::json!({
+            "providerName": "relay",
+            "baseUrl": "https://new.example/v1",
+            "enabled": true
+        }))
+        .expect("missing field payload");
+        assert_eq!(missing.continuity_domain, OptionalStringPatch::Preserve);
+
+        let blank = serde_json::from_value::<ProviderCommonEditPayload>(serde_json::json!({
+            "providerName": "relay",
+            "baseUrl": "https://new.example/v1",
+            "continuityDomain": "",
+            "enabled": true
+        }))
+        .expect("blank field payload");
+        assert_eq!(
+            blank.continuity_domain,
+            OptionalStringPatch::Set(Some(String::new()))
+        );
+
+        let null = serde_json::from_value::<ProviderCommonEditPayload>(serde_json::json!({
+            "providerName": "relay",
+            "baseUrl": "https://new.example/v1",
+            "continuityDomain": null,
+            "enabled": true
+        }))
+        .expect("null field payload");
+        assert_eq!(null.continuity_domain, OptionalStringPatch::Set(None));
+    }
+
+    #[test]
     fn common_edit_rejects_non_http_base_url() {
         let mut payload = payload();
         payload.base_url = "file:///tmp/provider".to_string();
@@ -525,7 +653,7 @@ region = "eu"
             provider_name: "relay".to_string(),
             alias: Some("New Relay".to_string()),
             base_url: "https://new.example/v1".to_string(),
-            continuity_domain: Some("relay-cluster-a".to_string()),
+            continuity_domain: OptionalStringPatch::Set(Some("relay-cluster-a".to_string())),
             enabled: false,
             auth_token_env: Some("NEW_TOKEN".to_string()),
             api_key_env: Some(String::new()),
