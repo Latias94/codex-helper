@@ -549,6 +549,76 @@ async fn proxy_codex_body_stream_route_unavailable_returns_retryable_response_fa
 }
 
 #[tokio::test]
+async fn proxy_codex_stream_upstream_read_error_emits_response_failed_terminal_event() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind raw upstream");
+    let upstream_addr = listener.local_addr().expect("upstream addr");
+    let upstream_handle = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept raw upstream");
+        let mut request_buf = [0_u8; 2048];
+        let _ = socket.read(&mut request_buf).await;
+        let first_chunk = b": upstream-started\n\n";
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n{:X}\r\n",
+            first_chunk.len()
+        );
+        socket
+            .write_all(headers.as_bytes())
+            .await
+            .expect("write headers");
+        socket.write_all(first_chunk).await.expect("write chunk");
+        socket
+            .write_all(b"\r\n10\r\npartial")
+            .await
+            .expect("write partial chunk");
+    });
+    let retry = retry_config(1, "502", Vec::new(), RetryStrategy::Failover);
+    let cfg = make_proxy_config(
+        vec![UpstreamConfig {
+            base_url: format!("http://{upstream_addr}/v1"),
+            auth: UpstreamAuth::default(),
+            tags: HashMap::new(),
+            supported_models: HashMap::new(),
+            model_mapping: HashMap::new(),
+        }],
+        retry,
+    );
+    let proxy = ProxyService::new(
+        Client::new(),
+        Arc::new(cfg),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let resp = Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .body(r#"{"model":"gpt-5","input":"hi","stream":true}"#)
+        .send()
+        .await
+        .expect("send");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.text().await.expect("body should remain readable");
+    assert!(body.contains("event: response.failed"), "{body}");
+    assert!(body.contains(r#""code":"upstream_error""#), "{body}");
+    assert!(
+        body.contains(r#""codex_helper_error":"upstream_stream_error""#),
+        "{body}"
+    );
+    assert!(body.contains("Upstream stream failed:"), "{body}");
+
+    proxy_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
 async fn proxy_codex_stream_mixed_upstream_failure_and_cooldown_reports_route_unavailable_sse() {
     let failing_hits = Arc::new(AtomicUsize::new(0));
     let failing_counter = failing_hits.clone();
