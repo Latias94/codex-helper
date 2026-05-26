@@ -251,6 +251,7 @@ pub struct CodexCapabilityProfile {
     pub provider_identity: CodexProviderIdentity,
     pub auth_shape: CodexAuthShape,
     pub provider_supports_websockets: bool,
+    pub continuity: CodexContinuityCapabilityProfile,
     pub model_catalog: CodexModelCatalogProfile,
     pub remote_compaction_v1: CodexCapabilityDecision,
     pub hosted_image_generation: CodexCapabilityDecision,
@@ -258,6 +259,13 @@ pub struct CodexCapabilityProfile {
     pub web_search: CodexCapabilityDecision,
     pub apply_patch: CodexCapabilityDecision,
     pub reasoning_summaries: CodexCapabilityDecision,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexContinuityCapabilityProfile {
+    pub identity_sets_compact_path: CodexCapabilityDecision,
+    pub state_sharing: CodexCapabilityDecision,
+    pub operator_guidance: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -532,6 +540,7 @@ impl CodexCapabilityProfile {
         let remote_compaction_v1 = remote_compaction_v1_support(provider_identity);
         let hosted_image_generation = hosted_image_generation_support(auth_shape, &model_catalog);
         let responses_websocket = responses_websocket_support(provider_supports_websockets);
+        let continuity = continuity_capability_profile(provider_identity);
         let web_search = model_catalog.selected_web_search_support();
         let apply_patch = model_catalog.selected_apply_patch_support();
         let reasoning_summaries = model_catalog.selected_reasoning_summary_support();
@@ -541,6 +550,7 @@ impl CodexCapabilityProfile {
             provider_identity,
             auth_shape,
             provider_supports_websockets,
+            continuity,
             model_catalog,
             remote_compaction_v1,
             hosted_image_generation,
@@ -568,11 +578,38 @@ fn remote_compaction_v1_support(
 ) -> CodexCapabilityDecision {
     match provider_identity {
         CodexProviderIdentity::OfficialOpenAi => CodexCapabilityDecision::supported(
-            "provider identity is OpenAI, which makes Codex choose /responses/compact",
+            "provider identity is OpenAI, which makes Codex choose the /responses/compact path; this does not prove that relay endpoints share encrypted provider state",
         ),
         CodexProviderIdentity::HelperRelay => CodexCapabilityDecision::unsupported(
             "provider identity is codex-helper, so Codex uses local compaction fallback",
         ),
+    }
+}
+
+fn continuity_capability_profile(
+    provider_identity: CodexProviderIdentity,
+) -> CodexContinuityCapabilityProfile {
+    match provider_identity {
+        CodexProviderIdentity::OfficialOpenAi => CodexContinuityCapabilityProfile {
+            identity_sets_compact_path: CodexCapabilityDecision::supported(
+                "Codex sees the provider as OpenAI and can choose remote compact transport",
+            ),
+            state_sharing: CodexCapabilityDecision::unknown(
+                "OpenAI identity only selects the client protocol; relay continuity depends on the selected upstream account and must not be inferred from host or base_url",
+            ),
+            operator_guidance:
+                "For direct api.openai.com with one authenticated account, provider-endpoint affinity is usually sufficient. For relay chains such as sub2api or New API, configure the same continuity_domain only for endpoints that intentionally share encrypted response state.".to_string(),
+        },
+        CodexProviderIdentity::HelperRelay => CodexContinuityCapabilityProfile {
+            identity_sets_compact_path: CodexCapabilityDecision::unsupported(
+                "Codex sees codex-helper identity and keeps local compaction fallback",
+            ),
+            state_sharing: CodexCapabilityDecision::unknown(
+                "helper relay identity does not prove upstream state sharing",
+            ),
+            operator_guidance:
+                "State-bound remote compact is not expected in the default helper identity path; if official relay presets are enabled later, review continuity_domain before allowing cross-provider failover.".to_string(),
+        },
     }
 }
 
@@ -706,6 +743,17 @@ mod tests {
             CodexCapabilitySupport::Supported
         );
         assert_eq!(
+            profile.continuity.state_sharing.support,
+            CodexCapabilitySupport::Unknown
+        );
+        assert!(
+            profile
+                .continuity
+                .state_sharing
+                .reason
+                .contains("must not be inferred")
+        );
+        assert_eq!(
             profile.hosted_image_generation.support,
             CodexCapabilitySupport::Supported
         );
@@ -755,6 +803,10 @@ mod tests {
 
         assert_eq!(
             profile.remote_compaction_v1.support,
+            CodexCapabilitySupport::Unsupported
+        );
+        assert_eq!(
+            profile.continuity.identity_sets_compact_path.support,
             CodexCapabilitySupport::Unsupported
         );
         assert_eq!(

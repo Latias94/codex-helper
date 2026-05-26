@@ -9,10 +9,15 @@ use crate::codex_capability_profile::{
     CodexPatchModeRecommendationInput,
 };
 use crate::codex_integration::CodexPatchMode;
+use crate::config::{ServiceViewV4, effective_v4_routing};
+use crate::routing_ir::compile_v4_route_plan_template_for_compat_runtime;
+use crate::runtime_identity::ContinuityDomainKey;
 
 use super::codex_relay_probe::CodexRelayProbeObservation;
 use super::codex_relay_probe::codex_relay_probe_cases;
-use super::codex_relay_target::{CodexRelayTargetSelection, select_codex_relay_target};
+use super::codex_relay_target::{
+    CodexRelayTargetSelection, SelectedCodexRelayTarget, select_codex_relay_target,
+};
 use super::models_compat::maybe_decode_models_response_body;
 use super::{
     CodexRelayProbeClient, CodexRelayProbeKind, CodexRelayProbeResult, ProxyControlError,
@@ -56,6 +61,7 @@ pub struct CodexRelayCapabilitiesResponse {
     pub expected: CodexCapabilityProfile,
     pub observed: CodexRelayCapabilitiesObserved,
     pub recommendation: CodexPatchModeRecommendation,
+    pub continuity: CodexRelayContinuityDiagnostics,
     pub mismatches: Vec<CodexRelayCapabilityMismatch>,
 }
 
@@ -72,6 +78,23 @@ pub struct CodexRelayCapabilityMismatch {
     pub expected: String,
     pub observed: String,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexRelayContinuityDiagnostics {
+    pub selected_domain: CodexRelayContinuityDomainSummary,
+    pub same_domain_endpoint_count: usize,
+    pub configured_endpoint_count: usize,
+    pub affinity_policy: Option<String>,
+    pub can_state_bound_failover_within_domain: bool,
+    pub warnings: Vec<String>,
+    pub recommendations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexRelayContinuityDomainSummary {
+    pub key: String,
+    pub explicit: bool,
 }
 
 pub(super) async fn codex_relay_capabilities_for_proxy(
@@ -134,6 +157,14 @@ pub(super) async fn codex_relay_capabilities_for_proxy(
     let observed = build_observed_from_probe_observations(&observations);
     let recommendation = build_recommendation(patch_mode, &expected, &observed);
     let mismatches = build_mismatches(&expected, &observed);
+    let v4_source = proxy.config.v4_snapshot().await;
+    let continuity = build_continuity_diagnostics(
+        proxy.service_name,
+        v4_source.as_deref().map(|cfg| &cfg.codex),
+        &target,
+        patch_mode,
+        responses_websocket,
+    );
 
     let response = CodexRelayCapabilitiesResponse {
         api_version: 1,
@@ -150,6 +181,7 @@ pub(super) async fn codex_relay_capabilities_for_proxy(
         expected,
         observed,
         recommendation,
+        continuity,
         mismatches,
     };
     if let Err(error) = super::codex_relay_evidence::append_codex_relay_capabilities_evidence(
@@ -281,6 +313,129 @@ fn build_mismatches(
         });
     }
     out
+}
+
+fn build_continuity_diagnostics(
+    service_name: &str,
+    view: Option<&ServiceViewV4>,
+    target: &SelectedCodexRelayTarget,
+    patch_mode: CodexPatchMode,
+    responses_websocket: bool,
+) -> CodexRelayContinuityDiagnostics {
+    let fallback_domain = target
+        .provider_endpoint_key
+        .as_deref()
+        .map(|key| format!("provider_endpoint:{key}"))
+        .unwrap_or_else(|| {
+            format!(
+                "legacy:{}/{}/{}",
+                service_name, target.station_name, target.upstream_index
+            )
+        });
+    let mut selected_domain = CodexRelayContinuityDomainSummary {
+        key: fallback_domain,
+        explicit: false,
+    };
+    let mut same_domain_endpoint_count = 1usize;
+    let mut configured_endpoint_count = 1usize;
+    let mut affinity_policy = None;
+
+    if let Some(view) = view {
+        let routing = effective_v4_routing(view);
+        affinity_policy = Some(routing_affinity_policy_label(routing.affinity_policy).to_string());
+        if let Ok(template) = compile_v4_route_plan_template_for_compat_runtime(service_name, view)
+        {
+            configured_endpoint_count = template.candidates.len().max(1);
+            if let Some(provider_endpoint_key) = target.provider_endpoint_key.as_deref()
+                && let Some(selected) = template.candidates.iter().find(|candidate| {
+                    template
+                        .candidate_provider_endpoint_key(candidate)
+                        .stable_key()
+                        == provider_endpoint_key
+                })
+            {
+                let domain = template.candidate_continuity_domain_key(selected);
+                selected_domain = domain_summary(&domain);
+                same_domain_endpoint_count = template
+                    .candidates
+                    .iter()
+                    .filter(|candidate| {
+                        template.candidate_continuity_domain_key(candidate) == domain
+                    })
+                    .count()
+                    .max(1);
+            }
+        }
+    }
+
+    let official_relay = patch_mode.enables_official_relay_features();
+    let can_state_bound_failover_within_domain =
+        selected_domain.explicit && same_domain_endpoint_count > 1;
+    let mut warnings = Vec::new();
+    let mut recommendations = Vec::new();
+
+    if official_relay && !selected_domain.explicit && configured_endpoint_count > 1 {
+        warnings.push(
+            "official relay preset is active with multiple configured provider endpoints, but the selected endpoint has no explicit continuity_domain".to_string(),
+        );
+        recommendations.push(
+            "Set the same continuity_domain only on provider endpoints that intentionally share encrypted response state; otherwise keep provider-endpoint isolation.".to_string(),
+        );
+    }
+
+    if can_state_bound_failover_within_domain {
+        recommendations.push(format!(
+            "State-bound compact may fail over across {same_domain_endpoint_count} endpoints in explicit continuity domain {}.",
+            selected_domain.key
+        ));
+    } else {
+        recommendations.push(
+            "State-bound compact stays isolated to the selected provider endpoint unless a shared continuity_domain is configured.".to_string(),
+        );
+    }
+
+    if matches!(
+        affinity_policy.as_deref(),
+        Some("preferred-group") | Some("off")
+    ) && official_relay
+        && configured_endpoint_count > 1
+    {
+        warnings.push(
+            "official relay presets with multiple provider endpoints should use fallback-sticky or hard affinity when encrypted compact state matters".to_string(),
+        );
+    }
+
+    if responses_websocket && !selected_domain.explicit && configured_endpoint_count > 1 {
+        warnings.push(
+            "Responses WebSocket compact uses the same state-bound continuity rules; do not enable cross-provider continuity without explicit continuity_domain".to_string(),
+        );
+    }
+
+    CodexRelayContinuityDiagnostics {
+        selected_domain,
+        same_domain_endpoint_count,
+        configured_endpoint_count,
+        affinity_policy,
+        can_state_bound_failover_within_domain,
+        warnings,
+        recommendations,
+    }
+}
+
+fn domain_summary(domain: &ContinuityDomainKey) -> CodexRelayContinuityDomainSummary {
+    CodexRelayContinuityDomainSummary {
+        key: domain.stable_key(),
+        explicit: domain.is_explicit(),
+    }
+}
+
+fn routing_affinity_policy_label(policy: crate::config::RoutingAffinityPolicyV5) -> &'static str {
+    match policy {
+        crate::config::RoutingAffinityPolicyV5::Off => "off",
+        crate::config::RoutingAffinityPolicyV5::PreferredGroup => "preferred-group",
+        crate::config::RoutingAffinityPolicyV5::FallbackSticky => "fallback-sticky",
+        crate::config::RoutingAffinityPolicyV5::Hard => "hard",
+    }
 }
 
 fn build_recommendation(
@@ -472,5 +627,140 @@ mod tests {
             Some("codex/ciii/default")
         );
         assert_eq!(response.upstream_base_url, "http://127.0.0.1:10/v1");
+    }
+
+    #[tokio::test]
+    async fn codex_relay_capabilities_recommends_explicit_continuity_domain_for_multi_relay() {
+        let v4 = ProxyConfigV4 {
+            codex: ServiceViewV4 {
+                providers: BTreeMap::from([
+                    (
+                        "relay-a".to_string(),
+                        ProviderConfigV4 {
+                            base_url: Some("http://127.0.0.1:9/v1".to_string()),
+                            inline_auth: UpstreamAuth::default(),
+                            ..ProviderConfigV4::default()
+                        },
+                    ),
+                    (
+                        "relay-b".to_string(),
+                        ProviderConfigV4 {
+                            base_url: Some("http://127.0.0.1:10/v1".to_string()),
+                            inline_auth: UpstreamAuth::default(),
+                            ..ProviderConfigV4::default()
+                        },
+                    ),
+                ]),
+                routing: Some(RoutingConfigV4::ordered_failover(vec![
+                    "relay-a".to_string(),
+                    "relay-b".to_string(),
+                ])),
+                ..ServiceViewV4::default()
+            },
+            ..ProxyConfigV4::default()
+        };
+        let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compile v4 runtime");
+        let proxy = ProxyService::new_with_v4_source(
+            Client::new(),
+            Arc::new(runtime),
+            Some(Arc::new(v4)),
+            "codex",
+            Arc::new(Mutex::new(HashMap::<String, LbState>::new())),
+        );
+
+        let response = codex_relay_capabilities_for_proxy(
+            &proxy,
+            CodexRelayCapabilitiesRequest {
+                provider_id: Some("relay-a".to_string()),
+                patch_mode: Some(CodexPatchMode::OfficialRelayBridge),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("capabilities response");
+
+        assert_eq!(
+            response.continuity.selected_domain.key,
+            "provider_endpoint:codex/relay-a/default"
+        );
+        assert!(!response.continuity.selected_domain.explicit);
+        assert_eq!(response.continuity.configured_endpoint_count, 2);
+        assert_eq!(response.continuity.same_domain_endpoint_count, 1);
+        assert!(!response.continuity.can_state_bound_failover_within_domain);
+        assert!(
+            response
+                .continuity
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("no explicit continuity_domain"))
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_relay_capabilities_reports_shared_explicit_continuity_domain() {
+        let v4 = ProxyConfigV4 {
+            codex: ServiceViewV4 {
+                providers: BTreeMap::from([
+                    (
+                        "relay-a".to_string(),
+                        ProviderConfigV4 {
+                            base_url: Some("http://127.0.0.1:9/v1".to_string()),
+                            continuity_domain: Some("relay-cluster".to_string()),
+                            inline_auth: UpstreamAuth::default(),
+                            ..ProviderConfigV4::default()
+                        },
+                    ),
+                    (
+                        "relay-b".to_string(),
+                        ProviderConfigV4 {
+                            base_url: Some("http://127.0.0.1:10/v1".to_string()),
+                            continuity_domain: Some("relay-cluster".to_string()),
+                            inline_auth: UpstreamAuth::default(),
+                            ..ProviderConfigV4::default()
+                        },
+                    ),
+                ]),
+                routing: Some(RoutingConfigV4::ordered_failover(vec![
+                    "relay-a".to_string(),
+                    "relay-b".to_string(),
+                ])),
+                ..ServiceViewV4::default()
+            },
+            ..ProxyConfigV4::default()
+        };
+        let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compile v4 runtime");
+        let proxy = ProxyService::new_with_v4_source(
+            Client::new(),
+            Arc::new(runtime),
+            Some(Arc::new(v4)),
+            "codex",
+            Arc::new(Mutex::new(HashMap::<String, LbState>::new())),
+        );
+
+        let response = codex_relay_capabilities_for_proxy(
+            &proxy,
+            CodexRelayCapabilitiesRequest {
+                provider_id: Some("relay-a".to_string()),
+                patch_mode: Some(CodexPatchMode::OfficialRelayBridge),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("capabilities response");
+
+        assert_eq!(
+            response.continuity.selected_domain.key,
+            "explicit:codex/relay-cluster"
+        );
+        assert!(response.continuity.selected_domain.explicit);
+        assert_eq!(response.continuity.same_domain_endpoint_count, 2);
+        assert!(response.continuity.can_state_bound_failover_within_domain);
+        assert!(
+            response
+                .continuity
+                .recommendations
+                .iter()
+                .any(|recommendation| recommendation.contains("may fail over across 2 endpoints"))
+        );
     }
 }

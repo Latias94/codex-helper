@@ -646,6 +646,8 @@ pub struct ProviderConfigV4 {
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuity_domain: Option<String>,
     #[serde(default, skip_serializing_if = "is_default_upstream_auth")]
     pub auth: UpstreamAuth,
     #[serde(default, flatten)]
@@ -679,6 +681,7 @@ impl Default for ProviderConfigV4 {
             alias: None,
             enabled: default_service_config_enabled(),
             base_url: None,
+            continuity_domain: None,
             auth: UpstreamAuth::default(),
             inline_auth: UpstreamAuth::default(),
             tags: BTreeMap::new(),
@@ -693,6 +696,8 @@ impl Default for ProviderConfigV4 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderEndpointV4 {
     pub base_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuity_domain: Option<String>,
     #[serde(
         default = "default_service_config_enabled",
         skip_serializing_if = "is_default_service_config_enabled"

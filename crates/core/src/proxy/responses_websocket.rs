@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::time::Instant;
 
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
@@ -15,8 +15,11 @@ use tokio_tungstenite::tungstenite::http as tungstenite_http;
 
 use crate::codex_integration::CodexPatchMode;
 use crate::lb::{COOLDOWN_SECS, LoadBalancer};
-use crate::logging::{CodexBridgeLog, RouteAttemptLog, ServiceTierLog};
-use crate::routing_ir::{RouteCandidate, RoutePlanAttemptState, RoutePlanExecutor};
+use crate::logging::{CodexBridgeLog, RouteAttemptLog, ServiceTierLog, log_retry_trace};
+use crate::routing_ir::{
+    RouteCandidate, RoutePlanAttemptState, RoutePlanExecutor, RoutePlanRuntimeState,
+    RoutePlanTemplate,
+};
 use crate::state::{
     FinishRequestParams, ResolvedRouteValue, RouteDecisionProvenance, RouteValueSource,
     SessionIdentitySource,
@@ -30,6 +33,10 @@ use super::concurrency_limits::ConcurrencyPermit;
 use super::headers::filter_request_headers;
 use super::passive_health::{record_passive_upstream_failure, record_passive_upstream_success};
 use super::request_body::codex_session_identity_and_completed_body;
+use super::request_continuity::{
+    RequestContinuityClassification, RequestContinuityClassificationInput, RequestTransport,
+    classify_request_continuity,
+};
 use super::request_failures::{FailedProxyRequestParams, finish_failed_proxy_request};
 use super::request_preparation::{
     CommonRequestPreparationError, CommonRequestPreparationParams, load_request_config_context,
@@ -73,6 +80,7 @@ struct ResponsesWebSocketPrepared {
     effective_effort: Option<String>,
     base_service_tier: ServiceTierLog,
     codex_patch_mode: CodexPatchMode,
+    request_continuity: RequestContinuityClassification,
     plan: RetryPlan,
     cooldown_backoff: crate::lb::CooldownBackoff,
 }
@@ -337,6 +345,13 @@ async fn prepare_responses_websocket(
     }
     let (session_identity_hint, raw_body) =
         codex_session_identity_and_completed_body(&mut client_headers, &raw_body);
+    let request_continuity = classify_request_continuity(RequestContinuityClassificationInput {
+        transport: RequestTransport::ResponsesWebSocket,
+        is_codex_service: proxy.service_name == "codex",
+        is_user_turn: true,
+        is_remote_compaction_v1_request: false,
+        raw_body: raw_body.as_ref(),
+    });
 
     let prepared = match prepare_common_request(CommonRequestPreparationParams {
         proxy,
@@ -407,6 +422,7 @@ async fn prepare_responses_websocket(
         effective_effort: prepared.effective_effort,
         base_service_tier: prepared.base_service_tier,
         codex_patch_mode: config.codex_patch_mode,
+        request_continuity,
         plan: prepared.plan,
         cooldown_backoff: prepared.cooldown_backoff,
     })
@@ -437,6 +453,16 @@ async fn select_responses_websocket_target(
             )
             .await;
             let mut route_state = RoutePlanAttemptState::default();
+
+            if websocket_state_bound_request_requires_existing_affinity(
+                prepared, &runtime, template,
+            ) {
+                log_websocket_route_continuity_blocked(proxy, prepared);
+                return Err(ResponsesWebSocketSelectionFailure::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "state-bound compact request requires existing route affinity",
+                ));
+            }
 
             loop {
                 let selection = executor.select_supported_candidate_with_runtime_state(
@@ -531,6 +557,19 @@ async fn select_responses_websocket_target(
             )
             .await;
             let mut route_state = RoutePlanAttemptState::default();
+
+            if websocket_state_bound_request_requires_existing_affinity(
+                prepared,
+                &runtime,
+                &legacy_template,
+            ) {
+                log_websocket_route_continuity_blocked(proxy, prepared);
+                return Err(ResponsesWebSocketSelectionFailure::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "state-bound compact request requires existing route affinity",
+                ));
+            }
+
             let total_upstreams = legacy_template.candidates.len();
             let mut tried_stations = HashSet::new();
             let provider_attempt_limit = if lbs.len() > 1 {
@@ -598,6 +637,46 @@ async fn select_responses_websocket_target(
             ))
         }
     }
+}
+
+fn websocket_state_bound_request_requires_existing_affinity(
+    prepared: &ResponsesWebSocketPrepared,
+    runtime: &RoutePlanRuntimeState,
+    template: &RoutePlanTemplate,
+) -> bool {
+    prepared
+        .request_continuity
+        .remote_compaction_requires_affinity
+        && runtime.affinity_provider_endpoint().is_none()
+        && configured_provider_endpoint_count(template) > 1
+}
+
+fn configured_provider_endpoint_count(template: &RoutePlanTemplate) -> usize {
+    template
+        .candidates
+        .iter()
+        .map(|candidate| template.candidate_provider_endpoint_key(candidate))
+        .collect::<BTreeSet<_>>()
+        .len()
+}
+
+fn log_websocket_route_continuity_blocked(
+    proxy: &ProxyService,
+    prepared: &ResponsesWebSocketPrepared,
+) {
+    let reason = "state_bound_compact_missing_affinity";
+    log_retry_trace(serde_json::json!({
+        "event": "route_continuity_blocked",
+        "service": proxy.service_name,
+        "request_id": prepared.request_id,
+        "reason": reason,
+        "continuity_class": prepared.request_continuity.class.trace_label(),
+        "affinity_source": "none",
+        "provider_failover_allowed": false,
+        "provider_failover_blocked_reason": reason,
+        "transport": "responses_websocket",
+        "balance_signal_authoritative": false,
+    }));
 }
 
 fn selected_upstream_with_route_metadata(
@@ -849,13 +928,17 @@ async fn relay_websocket_streams(
         actual: None,
         ..prepared.base_service_tier.clone()
     };
-    let codex_bridge = (!prepared.codex_patch_mode.is_default()).then(|| CodexBridgeLog {
-        patch_mode: prepared.codex_patch_mode.as_str().to_string(),
-        remote_compaction_v1_request: false,
-        remote_compaction_v2_request: false,
-        responses_websocket_request: true,
-        strips_client_auth: prepared.codex_patch_mode.strips_codex_client_auth(),
-    });
+    let codex_bridge = (!prepared.codex_patch_mode.is_default()
+        || prepared.request_continuity.is_remote_compaction_v2_request)
+        .then(|| CodexBridgeLog {
+            patch_mode: prepared.codex_patch_mode.as_str().to_string(),
+            remote_compaction_v1_request: false,
+            remote_compaction_v2_request: prepared
+                .request_continuity
+                .is_remote_compaction_v2_request,
+            responses_websocket_request: true,
+            strips_client_auth: prepared.codex_patch_mode.strips_codex_client_auth(),
+        });
 
     crate::logging::log_request_with_debug(
         Some(prepared.request_id),

@@ -218,7 +218,8 @@ mod tests {
     };
     use crate::codex_integration::CodexPatchMode;
     use crate::proxy::{
-        CodexRelayCapabilitiesObserved, CodexRelayLiveSmokeCase, CodexRelayLiveSmokeConfidence,
+        CodexRelayCapabilitiesObserved, CodexRelayContinuityDiagnostics,
+        CodexRelayContinuityDomainSummary, CodexRelayLiveSmokeCase, CodexRelayLiveSmokeConfidence,
         CodexRelayLiveSmokeOutcome, CodexRelayLiveSmokeResult, CodexRelayLiveSmokeSideEffect,
         CodexRelayProbeConfidence, CodexRelayProbeKind, CodexRelayProbeResult,
         CodexRelayProbeSupport,
@@ -291,6 +292,18 @@ mod tests {
                 ),
             },
             recommendation,
+            continuity: CodexRelayContinuityDiagnostics {
+                selected_domain: CodexRelayContinuityDomainSummary {
+                    key: "provider_endpoint:codex/input/default".to_string(),
+                    explicit: false,
+                },
+                same_domain_endpoint_count: 1,
+                configured_endpoint_count: 1,
+                affinity_policy: Some("fallback-sticky".to_string()),
+                can_state_bound_failover_within_domain: false,
+                warnings: Vec::new(),
+                recommendations: Vec::new(),
+            },
             mismatches: Vec::new(),
         }
     }

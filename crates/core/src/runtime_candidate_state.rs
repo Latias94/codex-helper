@@ -242,6 +242,7 @@ mod tests {
             "slow".to_string(),
             ProviderEndpointV4 {
                 base_url: "https://slow.example/v1".to_string(),
+                continuity_domain: None,
                 enabled: true,
                 priority: 10,
                 tags: BTreeMap::new(),
@@ -254,6 +255,7 @@ mod tests {
             "fast".to_string(),
             ProviderEndpointV4 {
                 base_url: "https://fast.example/v1".to_string(),
+                continuity_domain: None,
                 enabled: true,
                 priority: 0,
                 tags: BTreeMap::new(),

@@ -326,6 +326,7 @@ async fn proxy_api_v1_v4_persisted_control_plane_edits_v4_document() {
                 "hk".to_string(),
                 crate::config::ProviderEndpointV4 {
                     base_url: "https://backup-hk.example.com/v1".to_string(),
+                    continuity_domain: None,
                     enabled: true,
                     priority: 1,
                     tags: [("region".to_string(), "hk".to_string())]

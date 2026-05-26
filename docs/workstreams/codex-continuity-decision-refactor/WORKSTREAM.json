@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "slug": "codex-continuity-decision-refactor",
+  "title": "Codex Continuity Decision Refactor",
+  "status": "complete",
+  "updated": "2026-05-26",
+  "scope_kind": "execution",
+  "problem": "Codex route continuity decisions are split across HTTP, WebSocket, affinity, and provider execution paths, causing both false 502 risk for ordinary turns and under-protection for WebSocket compact.",
+  "authoritative_docs": [
+    {
+      "role": "design",
+      "path": "docs/workstreams/codex-continuity-decision-refactor/DESIGN.md"
+    },
+    {
+      "role": "execution",
+      "path": "docs/workstreams/codex-continuity-decision-refactor/TODO.md"
+    },
+    {
+      "role": "milestones",
+      "path": "docs/workstreams/codex-continuity-decision-refactor/MILESTONES.md"
+    },
+    {
+      "role": "gates",
+      "path": "docs/workstreams/codex-continuity-decision-refactor/EVIDENCE_AND_GATES.md"
+    },
+    {
+      "role": "handoff",
+      "path": "docs/workstreams/codex-continuity-decision-refactor/HANDOFF.md"
+    }
+  ],
+  "gates": [
+    "cargo nextest run -p codex-helper-core remote_compaction_v2 responses_websocket route_affinity --no-fail-fast",
+    "cargo nextest run -p codex-helper-core session_route_affinity route_unavailable --no-fail-fast",
+    "cargo nextest run -p codex-helper-core continuity_domain route_affinity --no-fail-fast",
+    "cargo nextest run -p codex-helper-core capabilities codex_capability_profile --no-fail-fast",
+    "cargo fmt --all --check",
+    "cargo nextest run -p codex-helper-core",
+    "cargo check -p codex-helper"
+  ],
+  "evidence": [
+    "docs/workstreams/codex-continuity-decision-refactor/EVIDENCE_AND_GATES.md"
+  ],
+  "adr_refs": [],
+  "continue_policy": {
+    "default_action": "continue",
+    "notes": "Continue while the lane remains focused on continuity decision unification, soft affinity escape, and explicit continuity domains. Split transport-profile-only work if it grows beyond diagnostics and official OpenAI guidance."
+  },
+  "current_task": null
+}

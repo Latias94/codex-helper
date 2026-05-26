@@ -780,7 +780,9 @@ fn v4_default_endpoint_can_be_inlined(
         && crate::config::ProviderConcurrencyLimits::default() == final_limits
         && existing_endpoint
             .map(|endpoint| {
-                endpoint.supported_models.is_empty() && endpoint.model_mapping.is_empty()
+                endpoint.continuity_domain.is_none()
+                    && endpoint.supported_models.is_empty()
+                    && endpoint.model_mapping.is_empty()
             })
             .unwrap_or(true)
 }
@@ -794,6 +796,7 @@ fn merge_persisted_provider_spec_v4(
         alias: spec.alias.clone(),
         enabled: spec.enabled,
         base_url: None,
+        continuity_domain: existing.and_then(|provider| provider.continuity_domain.clone()),
         auth: existing
             .map(|provider| provider.auth.clone())
             .unwrap_or_default(),
@@ -844,6 +847,8 @@ fn merge_persisted_provider_spec_v4(
                     endpoint.name.clone(),
                     crate::config::ProviderEndpointV4 {
                         base_url: endpoint.base_url.clone(),
+                        continuity_domain: existing_endpoint
+                            .and_then(|endpoint| endpoint.continuity_domain.clone()),
                         enabled: endpoint.enabled,
                         priority: endpoint.priority,
                         tags: if provider

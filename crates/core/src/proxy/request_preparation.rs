@@ -14,10 +14,12 @@ use super::ProxyService;
 use super::client_identity::ClientSessionIdentity;
 use super::request_body::{
     apply_model_override_value, apply_reasoning_effort_override_value,
-    apply_service_tier_override_value, codex_compact_request_requires_affinity,
-    codex_responses_body_has_compaction_trigger, extract_model_from_value,
+    apply_service_tier_override_value, extract_model_from_value,
     extract_reasoning_effort_from_value, extract_service_tier_from_value,
     normalize_codex_compact_request_value,
+};
+use super::request_continuity::{
+    RequestContinuityClassificationInput, RequestTransport, classify_request_continuity,
 };
 use super::request_routing::RequestRouteSelection;
 use super::retry::{RetryPlan, retry_plan};
@@ -41,14 +43,17 @@ impl RequestFlavor {
     }
 
     pub(super) fn with_remote_compaction_context_from_body(mut self, raw_body: &[u8]) -> Self {
-        let is_remote_compaction_v2_request = self.is_codex_service
-            && self.is_user_turn
-            && codex_responses_body_has_compaction_trigger(raw_body);
-        self.is_remote_compaction_v2_request = is_remote_compaction_v2_request;
-        self.remote_compaction_requires_affinity = (self.is_remote_compaction_v1_request
-            && codex_compact_request_requires_affinity(raw_body))
-            || is_remote_compaction_v2_request;
-        if is_remote_compaction_v2_request {
+        let continuity = classify_request_continuity(RequestContinuityClassificationInput {
+            transport: RequestTransport::Http,
+            is_codex_service: self.is_codex_service,
+            is_user_turn: self.is_user_turn,
+            is_remote_compaction_v1_request: self.is_remote_compaction_v1_request,
+            raw_body,
+        });
+        self.is_remote_compaction_v1_request = continuity.is_remote_compaction_v1_request;
+        self.is_remote_compaction_v2_request = continuity.is_remote_compaction_v2_request;
+        self.remote_compaction_requires_affinity = continuity.remote_compaction_requires_affinity;
+        if continuity.is_remote_compaction_v2_request {
             let patch_mode = self.codex_client_patch_mode.as_str().to_string();
             let strips_client_auth = self.codex_client_patch_mode.strips_codex_client_auth();
             let bridge = self.codex_bridge_log.get_or_insert(CodexBridgeLog {

@@ -38,6 +38,60 @@ impl fmt::Display for ProviderEndpointKey {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ContinuityDomainKey {
+    ProviderEndpoint {
+        provider_endpoint: ProviderEndpointKey,
+    },
+    Explicit {
+        service_name: String,
+        domain: String,
+    },
+}
+
+impl ContinuityDomainKey {
+    pub fn provider_endpoint(provider_endpoint: ProviderEndpointKey) -> Self {
+        Self::ProviderEndpoint { provider_endpoint }
+    }
+
+    pub fn explicit(service_name: impl Into<String>, domain: impl Into<String>) -> Option<Self> {
+        let domain = domain.into();
+        let domain = domain.trim();
+        if domain.is_empty() {
+            return None;
+        }
+        Some(Self::Explicit {
+            service_name: service_name.into(),
+            domain: domain.to_string(),
+        })
+    }
+
+    pub fn stable_key(&self) -> String {
+        match self {
+            Self::ProviderEndpoint { provider_endpoint } => {
+                format!("provider_endpoint:{}", provider_endpoint.stable_key())
+            }
+            Self::Explicit {
+                service_name,
+                domain,
+            } => {
+                format!("explicit:{service_name}/{domain}")
+            }
+        }
+    }
+
+    pub fn is_explicit(&self) -> bool {
+        matches!(self, Self::Explicit { .. })
+    }
+}
+
+impl fmt::Display for ContinuityDomainKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.stable_key().as_str())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LegacyUpstreamKey {
     pub service_name: String,
     pub station_name: String,
@@ -77,6 +131,8 @@ pub struct RuntimeUpstreamIdentity {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compatibility: Option<LegacyUpstreamKey>,
     pub base_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuity_domain: Option<String>,
 }
 
 impl RuntimeUpstreamIdentity {
@@ -89,6 +145,23 @@ impl RuntimeUpstreamIdentity {
             provider_endpoint,
             compatibility,
             base_url: base_url.into(),
+            continuity_domain: None,
+        }
+    }
+
+    pub fn new_with_continuity_domain(
+        provider_endpoint: ProviderEndpointKey,
+        compatibility: Option<LegacyUpstreamKey>,
+        base_url: impl Into<String>,
+        continuity_domain: Option<String>,
+    ) -> Self {
+        Self {
+            provider_endpoint,
+            compatibility,
+            base_url: base_url.into(),
+            continuity_domain: continuity_domain
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
         }
     }
 }
@@ -118,7 +191,11 @@ pub fn plan_runtime_upstream_identity_migration(
 
     for current_identity in current_by_endpoint.values() {
         match previous_by_endpoint.get(&current_identity.provider_endpoint) {
-            Some(previous_identity) if previous_identity.base_url == current_identity.base_url => {
+            Some(previous_identity)
+                if previous_identity.base_url == current_identity.base_url
+                    && previous_identity.continuity_domain
+                        == current_identity.continuity_domain =>
+            {
                 plan.retained.push(current_identity.clone());
                 if previous_identity.compatibility != current_identity.compatibility {
                     plan.compatibility_changed
@@ -135,7 +212,10 @@ pub fn plan_runtime_upstream_identity_migration(
 
     for previous_identity in previous_by_endpoint.values() {
         match current_by_endpoint.get(&previous_identity.provider_endpoint) {
-            Some(current_identity) if current_identity.base_url == previous_identity.base_url => {}
+            Some(current_identity)
+                if current_identity.base_url == previous_identity.base_url
+                    && current_identity.continuity_domain
+                        == previous_identity.continuity_domain => {}
             _ => plan.removed.push(previous_identity.clone()),
         }
     }
@@ -173,11 +253,34 @@ mod tests {
     }
 
     #[test]
+    fn continuity_domain_key_distinguishes_default_endpoint_from_explicit_domain() {
+        let endpoint = ProviderEndpointKey::new("codex", "relay-a", "default");
+        let default_domain = ContinuityDomainKey::provider_endpoint(endpoint.clone());
+        let explicit_domain =
+            ContinuityDomainKey::explicit("codex", "shared-relay").expect("explicit domain");
+
+        assert_eq!(
+            default_domain.stable_key(),
+            "provider_endpoint:codex/relay-a/default"
+        );
+        assert_eq!(explicit_domain.stable_key(), "explicit:codex/shared-relay");
+        assert!(!default_domain.is_explicit());
+        assert!(explicit_domain.is_explicit());
+        assert_ne!(
+            default_domain,
+            ContinuityDomainKey::provider_endpoint(ProviderEndpointKey::new(
+                "codex", "relay-b", "default"
+            ))
+        );
+    }
+
+    #[test]
     fn runtime_identity_serializes_both_target_and_compatibility_keys() {
-        let identity = RuntimeUpstreamIdentity::new(
+        let identity = RuntimeUpstreamIdentity::new_with_continuity_domain(
             ProviderEndpointKey::new("codex", "openai", "default"),
             Some(LegacyUpstreamKey::new("codex", "routing", 0)),
             "https://api.openai.com/v1",
+            Some("official-openai:acct-1".to_string()),
         );
 
         let value = serde_json::to_value(identity).expect("serialize identity");
@@ -194,6 +297,10 @@ mod tests {
         assert_eq!(
             value["base_url"].as_str(),
             Some("https://api.openai.com/v1")
+        );
+        assert_eq!(
+            value["continuity_domain"].as_str(),
+            Some("official-openai:acct-1")
         );
     }
 
@@ -249,6 +356,29 @@ mod tests {
             ProviderEndpointKey::new("codex", "input", "default"),
             Some(LegacyUpstreamKey::new("codex", "routing", 0)),
             "https://new.example/v1",
+        )];
+
+        let plan = plan_runtime_upstream_identity_migration(&previous, &current);
+
+        assert!(plan.retained.is_empty());
+        assert_eq!(plan.added, current);
+        assert_eq!(plan.removed, previous);
+        assert!(plan.compatibility_changed.is_empty());
+    }
+
+    #[test]
+    fn migration_plan_replaces_provider_endpoint_state_when_continuity_domain_changes() {
+        let previous = vec![RuntimeUpstreamIdentity::new_with_continuity_domain(
+            ProviderEndpointKey::new("codex", "input", "default"),
+            Some(LegacyUpstreamKey::new("codex", "routing", 0)),
+            "https://api.example/v1",
+            Some("old-domain".to_string()),
+        )];
+        let current = vec![RuntimeUpstreamIdentity::new_with_continuity_domain(
+            ProviderEndpointKey::new("codex", "input", "default"),
+            Some(LegacyUpstreamKey::new("codex", "routing", 0)),
+            "https://api.example/v1",
+            Some("new-domain".to_string()),
         )];
 
         let plan = plan_runtime_upstream_identity_migration(&previous, &current);

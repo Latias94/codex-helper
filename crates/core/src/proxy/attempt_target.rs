@@ -1,7 +1,7 @@
 use crate::config::UpstreamConfig;
 use crate::lb::SelectedUpstream;
 use crate::routing_ir::RouteCandidate;
-use crate::runtime_identity::{LegacyUpstreamKey, ProviderEndpointKey};
+use crate::runtime_identity::{ContinuityDomainKey, LegacyUpstreamKey, ProviderEndpointKey};
 
 use super::route_metadata::{
     ENDPOINT_ID_TAG, PREFERENCE_GROUP_TAG, PROVIDER_ENDPOINT_KEY_TAG, PROVIDER_ID_TAG,
@@ -11,6 +11,7 @@ use super::route_metadata::{
 #[derive(Debug, Clone)]
 pub(super) struct ProviderEndpointAttemptTarget {
     pub(super) provider_endpoint: ProviderEndpointKey,
+    pub(super) continuity_domain: ContinuityDomainKey,
     pub(super) compatibility: Option<LegacyUpstreamKey>,
     pub(super) upstream: UpstreamConfig,
     pub(super) route_path: Vec<String>,
@@ -35,6 +36,11 @@ impl AttemptTarget {
             candidate.provider_id.clone(),
             candidate.endpoint_id.clone(),
         );
+        let continuity_domain = candidate
+            .continuity_domain
+            .as_ref()
+            .and_then(|domain| ContinuityDomainKey::explicit(service_name, domain))
+            .unwrap_or_else(|| ContinuityDomainKey::provider_endpoint(provider_endpoint.clone()));
         let mut upstream = candidate.to_upstream_config();
         upstream
             .tags
@@ -71,6 +77,7 @@ impl AttemptTarget {
 
         Self::ProviderEndpoint(ProviderEndpointAttemptTarget {
             provider_endpoint: provider_endpoint.clone(),
+            continuity_domain,
             compatibility,
             upstream,
             route_path: candidate.route_path.clone(),
@@ -175,6 +182,13 @@ impl AttemptTarget {
         match self {
             Self::Legacy(_) => None,
             Self::ProviderEndpoint(target) => Some(&target.provider_endpoint),
+        }
+    }
+
+    pub(super) fn continuity_domain_ref(&self) -> Option<&ContinuityDomainKey> {
+        match self {
+            Self::Legacy(_) => None,
+            Self::ProviderEndpoint(target) => Some(&target.continuity_domain),
         }
     }
 

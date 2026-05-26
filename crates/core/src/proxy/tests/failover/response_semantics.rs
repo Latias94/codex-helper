@@ -1971,6 +1971,138 @@ async fn proxy_pins_remote_compaction_v2_responses_to_route_affinity() {
 }
 
 #[tokio::test]
+async fn proxy_softens_hard_route_affinity_for_ordinary_responses_when_endpoint_unavailable() {
+    let b_hits = Arc::new(AtomicUsize::new(0));
+    let c_hits = Arc::new(AtomicUsize::new(0));
+
+    let b_counter = b_hits.clone();
+    let upstream_b = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let b_counter = b_counter.clone();
+            async move {
+                b_counter.fetch_add(1, Ordering::SeqCst);
+                (StatusCode::OK, Json(serde_json::json!({ "provider": "b" })))
+            }
+        }),
+    );
+    let (b_addr, b_handle) = spawn_axum_server(upstream_b);
+
+    let c_counter = c_hits.clone();
+    let upstream_c = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let c_counter = c_counter.clone();
+            async move {
+                c_counter.fetch_add(1, Ordering::SeqCst);
+                (StatusCode::OK, Json(serde_json::json!({ "provider": "c" })))
+            }
+        }),
+    );
+    let (c_addr, c_handle) = spawn_axum_server(upstream_c);
+
+    let mut routing = RoutingConfigV4::ordered_failover(vec!["b".to_string(), "c".to_string()]);
+    routing.affinity_policy = crate::config::RoutingAffinityPolicyV5::Hard;
+    let v4 = ProxyConfigV4 {
+        codex: ServiceViewV4 {
+            providers: std::collections::BTreeMap::from([
+                (
+                    "b".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some(format!("http://{b_addr}/v1")),
+                        inline_auth: UpstreamAuth::default(),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+                (
+                    "c".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some(format!("http://{c_addr}/v1")),
+                        inline_auth: UpstreamAuth::default(),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+            ]),
+            routing: Some(routing),
+            ..ServiceViewV4::default()
+        },
+        ..ProxyConfigV4::default()
+    };
+    let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compile v4");
+    let proxy = ProxyService::new_with_v4_source(
+        Client::new(),
+        Arc::new(runtime),
+        Some(Arc::new(v4)),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let state = proxy.state.clone();
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let client = reqwest::Client::new();
+    let first = client
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .header("content-type", "application/json")
+        .header("session-id", "sid-hard-ordinary-soft")
+        .body(r#"{"model":"gpt-5","input":"hi"}"#)
+        .send()
+        .await
+        .expect("send first ordinary response")
+        .error_for_status()
+        .expect("first ordinary response status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("first ordinary response json");
+    assert_eq!(first["provider"].as_str(), Some("b"));
+
+    let affinity = state
+        .get_session_route_affinity("sid-hard-ordinary-soft")
+        .await
+        .expect("route affinity recorded");
+    assert_eq!(affinity.provider_endpoint.provider_id.as_str(), "b");
+
+    state
+        .set_provider_endpoint_runtime_state_override(
+            "codex",
+            ProviderEndpointKey::new("codex", "b", "default"),
+            RuntimeConfigState::BreakerOpen,
+            crate::logging::now_ms(),
+        )
+        .await;
+
+    let second = client
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .header("content-type", "application/json")
+        .header("session-id", "sid-hard-ordinary-soft")
+        .body(r#"{"model":"gpt-5","input":"still ordinary"}"#)
+        .send()
+        .await
+        .expect("send second ordinary response")
+        .error_for_status()
+        .expect("second ordinary response should escape unavailable affinity")
+        .json::<serde_json::Value>()
+        .await
+        .expect("second ordinary response json");
+    assert_eq!(second["provider"].as_str(), Some("c"));
+    assert_eq!(b_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(c_hits.load(Ordering::SeqCst), 1);
+
+    let affinity_after_escape = state
+        .get_session_route_affinity("sid-hard-ordinary-soft")
+        .await
+        .expect("route affinity updated after escape");
+    assert_eq!(
+        affinity_after_escape.provider_endpoint.provider_id.as_str(),
+        "c"
+    );
+
+    proxy_handle.abort();
+    b_handle.abort();
+    c_handle.abort();
+}
+
+#[tokio::test]
 async fn proxy_restores_route_affinity_after_restart_for_responses_compact() {
     let _env_guard = env_lock().await;
     let temp_dir = make_temp_test_dir();
@@ -2486,6 +2618,332 @@ async fn proxy_falls_back_responses_compact_after_affinity_failure_under_fallbac
 
     let affinity_after_compact = state
         .get_session_route_affinity("sid-compact-failure")
+        .await
+        .expect("route affinity updated");
+    assert_eq!(
+        affinity_after_compact
+            .provider_endpoint
+            .provider_id
+            .as_str(),
+        "c"
+    );
+
+    proxy_handle.abort();
+    b_handle.abort();
+    c_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_does_not_infer_continuity_domain_from_same_base_url_for_state_bound_compact() {
+    let b_responses_hits = Arc::new(AtomicUsize::new(0));
+    let b_compact_hits = Arc::new(AtomicUsize::new(0));
+    let c_compact_hits = Arc::new(AtomicUsize::new(0));
+
+    let b_responses_counter = b_responses_hits.clone();
+    let b_compact_counter = b_compact_hits.clone();
+    let c_compact_counter = c_compact_hits.clone();
+    let upstream = axum::Router::new()
+        .route(
+            "/v1/responses",
+            post(move || {
+                let b_responses_counter = b_responses_counter.clone();
+                async move {
+                    b_responses_counter.fetch_add(1, Ordering::SeqCst);
+                    (StatusCode::OK, Json(serde_json::json!({ "provider": "b" })))
+                }
+            }),
+        )
+        .route(
+            "/v1/responses/compact",
+            post(move |headers: axum::http::HeaderMap| {
+                let b_compact_counter = b_compact_counter.clone();
+                let c_compact_counter = c_compact_counter.clone();
+                async move {
+                    let provider = headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("")
+                        .strip_prefix("Bearer ")
+                        .unwrap_or("");
+                    if provider == "c-token" {
+                        c_compact_counter.fetch_add(1, Ordering::SeqCst);
+                        return (
+                            StatusCode::OK,
+                            Json(serde_json::json!({ "provider": "c", "compact": true })),
+                        );
+                    }
+                    b_compact_counter.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({ "provider": "b", "err": "compact failed" })),
+                    )
+                }
+            }),
+        );
+    let (upstream_addr, upstream_handle) = spawn_axum_server(upstream);
+
+    let retry = RetryConfig {
+        upstream: Some(retry_layer_config(
+            1,
+            "502",
+            Vec::new(),
+            RetryStrategy::Failover,
+        )),
+        provider: Some(retry_layer_config(
+            2,
+            "502",
+            Vec::new(),
+            RetryStrategy::Failover,
+        )),
+        transport_cooldown_secs: Some(0),
+        cooldown_backoff_factor: Some(1),
+        cooldown_backoff_max_secs: Some(0),
+        ..RetryConfig::default()
+    };
+    let mut routing = RoutingConfigV4::ordered_failover(vec!["b".to_string(), "c".to_string()]);
+    routing.affinity_policy = crate::config::RoutingAffinityPolicyV5::FallbackSticky;
+    let shared_base_url = format!("http://{upstream_addr}/v1");
+    let v4 = ProxyConfigV4 {
+        retry,
+        codex: ServiceViewV4 {
+            providers: std::collections::BTreeMap::from([
+                (
+                    "b".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some(shared_base_url.clone()),
+                        inline_auth: UpstreamAuth {
+                            auth_token: Some("b-token".to_string()),
+                            ..UpstreamAuth::default()
+                        },
+                        tags: std::collections::BTreeMap::from([(
+                            "x-provider".to_string(),
+                            "b".to_string(),
+                        )]),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+                (
+                    "c".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some(shared_base_url),
+                        inline_auth: UpstreamAuth {
+                            auth_token: Some("c-token".to_string()),
+                            ..UpstreamAuth::default()
+                        },
+                        tags: std::collections::BTreeMap::from([(
+                            "x-provider".to_string(),
+                            "c".to_string(),
+                        )]),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+            ]),
+            routing: Some(routing),
+            ..ServiceViewV4::default()
+        },
+        ..ProxyConfigV4::default()
+    };
+    let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compile v4");
+    let proxy = ProxyService::new_with_v4_source(
+        Client::new(),
+        Arc::new(runtime),
+        Some(Arc::new(v4)),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let client = reqwest::Client::new();
+    let first = client
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .header("content-type", "application/json")
+        .header("session-id", "sid-same-base-no-domain")
+        .body(r#"{"model":"gpt-5","input":"hi"}"#)
+        .send()
+        .await
+        .expect("send responses")
+        .error_for_status()
+        .expect("responses status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("responses json");
+    assert_eq!(first["provider"].as_str(), Some("b"));
+
+    let compact = client
+        .post(format!("http://{proxy_addr}/responses/compact"))
+        .header("content-type", "application/json")
+        .header("session-id", "sid-same-base-no-domain")
+        .body(r#"{"model":"gpt-5","input":[{"type":"reasoning","encrypted_content":"ciphertext"},{"role":"user","content":"compact me"}]}"#)
+        .send()
+        .await
+        .expect("send compact");
+    assert_eq!(compact.status(), StatusCode::BAD_GATEWAY);
+    let body = compact.text().await.expect("compact text");
+    assert!(
+        body.contains("compact failed"),
+        "expected affine provider error body, got: {body}"
+    );
+    assert_eq!(b_compact_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(c_compact_hits.load(Ordering::SeqCst), 0);
+
+    proxy_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_allows_state_bound_compact_failover_with_explicit_continuity_domain() {
+    let b_responses_hits = Arc::new(AtomicUsize::new(0));
+    let b_compact_hits = Arc::new(AtomicUsize::new(0));
+    let c_compact_hits = Arc::new(AtomicUsize::new(0));
+
+    let b_responses_counter = b_responses_hits.clone();
+    let b_compact_counter = b_compact_hits.clone();
+    let upstream_b = axum::Router::new()
+        .route(
+            "/v1/responses",
+            post(move || {
+                let b_responses_counter = b_responses_counter.clone();
+                async move {
+                    b_responses_counter.fetch_add(1, Ordering::SeqCst);
+                    (StatusCode::OK, Json(serde_json::json!({ "provider": "b" })))
+                }
+            }),
+        )
+        .route(
+            "/v1/responses/compact",
+            post(move || {
+                let b_compact_counter = b_compact_counter.clone();
+                async move {
+                    b_compact_counter.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({ "provider": "b", "err": "compact failed" })),
+                    )
+                }
+            }),
+        );
+    let (b_addr, b_handle) = spawn_axum_server(upstream_b);
+
+    let c_compact_counter = c_compact_hits.clone();
+    let upstream_c =
+        axum::Router::new()
+            .route(
+                "/v1/responses",
+                post(move || async move {
+                    (StatusCode::OK, Json(serde_json::json!({ "provider": "c" })))
+                }),
+            )
+            .route(
+                "/v1/responses/compact",
+                post(move || {
+                    let c_compact_counter = c_compact_counter.clone();
+                    async move {
+                        c_compact_counter.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({ "provider": "c", "compact": true })),
+                        )
+                    }
+                }),
+            );
+    let (c_addr, c_handle) = spawn_axum_server(upstream_c);
+
+    let retry = RetryConfig {
+        upstream: Some(retry_layer_config(
+            1,
+            "502",
+            Vec::new(),
+            RetryStrategy::Failover,
+        )),
+        provider: Some(retry_layer_config(
+            2,
+            "502",
+            Vec::new(),
+            RetryStrategy::Failover,
+        )),
+        transport_cooldown_secs: Some(0),
+        cooldown_backoff_factor: Some(1),
+        cooldown_backoff_max_secs: Some(0),
+        ..RetryConfig::default()
+    };
+    let mut routing = RoutingConfigV4::ordered_failover(vec!["b".to_string(), "c".to_string()]);
+    routing.affinity_policy = crate::config::RoutingAffinityPolicyV5::FallbackSticky;
+    let v4 = ProxyConfigV4 {
+        retry,
+        codex: ServiceViewV4 {
+            providers: std::collections::BTreeMap::from([
+                (
+                    "b".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some(format!("http://{b_addr}/v1")),
+                        continuity_domain: Some("relay-cluster-a".to_string()),
+                        inline_auth: UpstreamAuth::default(),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+                (
+                    "c".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some(format!("http://{c_addr}/v1")),
+                        continuity_domain: Some("relay-cluster-a".to_string()),
+                        inline_auth: UpstreamAuth::default(),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+            ]),
+            routing: Some(routing),
+            ..ServiceViewV4::default()
+        },
+        ..ProxyConfigV4::default()
+    };
+    let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compile v4");
+    let proxy = ProxyService::new_with_v4_source(
+        Client::new(),
+        Arc::new(runtime),
+        Some(Arc::new(v4)),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let state = proxy.state.clone();
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let client = reqwest::Client::new();
+    let first = client
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .header("content-type", "application/json")
+        .header("session-id", "sid-explicit-domain")
+        .body(r#"{"model":"gpt-5","input":"hi"}"#)
+        .send()
+        .await
+        .expect("send responses")
+        .error_for_status()
+        .expect("responses status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("responses json");
+    assert_eq!(first["provider"].as_str(), Some("b"));
+
+    let compact = client
+        .post(format!("http://{proxy_addr}/responses/compact"))
+        .header("content-type", "application/json")
+        .header("session-id", "sid-explicit-domain")
+        .body(r#"{"model":"gpt-5","input":[{"type":"reasoning","encrypted_content":"ciphertext"},{"role":"user","content":"compact me"}]}"#)
+        .send()
+        .await
+        .expect("send compact")
+        .error_for_status()
+        .expect("compact status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("compact json");
+    assert_eq!(compact["provider"].as_str(), Some("c"));
+    assert_eq!(b_compact_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(c_compact_hits.load(Ordering::SeqCst), 1);
+
+    let affinity_after_compact = state
+        .get_session_route_affinity("sid-explicit-domain")
         .await
         .expect("route affinity updated");
     assert_eq!(
@@ -4640,6 +5098,308 @@ supports_websockets = true
             .map(|attempt| attempt.decision.as_str())
             .collect::<Vec<_>>(),
         vec!["route_unavailable"]
+    );
+
+    proxy_handle.abort();
+    u_handle.abort();
+    let _ = std::fs::remove_dir_all(codex_home);
+}
+
+#[tokio::test]
+async fn responses_websocket_rejects_compaction_trigger_without_route_affinity() {
+    let _env_guard = env_lock().await;
+    let temp_dir = make_temp_test_dir();
+    let codex_home = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HOME", &codex_home);
+        scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
+        scoped.set_path(
+            "CODEX_HELPER_CONTROL_TRACE_PATH",
+            temp_dir.join("logs").join("control_trace.jsonl").as_path(),
+        );
+        scoped.set("CODEX_HELPER_CONTROL_TRACE", "1");
+    }
+    write_text_file(
+        &codex_home.join("config.toml"),
+        r#"
+model_provider = "codex_proxy"
+
+[model_providers.codex_proxy]
+name = "OpenAI"
+base_url = "http://127.0.0.1:1"
+wire_api = "responses"
+supports_websockets = true
+"#,
+    );
+
+    let b_hits = Arc::new(AtomicUsize::new(0));
+    let b_hits_for_route = b_hits.clone();
+    let upstream_b = axum::Router::new().route(
+        "/v1/responses",
+        get(move |ws: axum::extract::ws::WebSocketUpgrade| {
+            let b_hits = b_hits_for_route.clone();
+            async move {
+                ws.on_upgrade(move |mut socket| async move {
+                    b_hits.fetch_add(1, Ordering::SeqCst);
+                    if socket.recv().await.is_some() {
+                        let _ = socket
+                            .send(axum::extract::ws::Message::Text(
+                                r#"{"type":"response.created","response":{"id":"resp-b"}}"#.into(),
+                            ))
+                            .await;
+                    }
+                })
+            }
+        }),
+    );
+    let (b_addr, b_handle) = spawn_axum_server(upstream_b);
+
+    let c_hits = Arc::new(AtomicUsize::new(0));
+    let c_hits_for_route = c_hits.clone();
+    let upstream_c = axum::Router::new().route(
+        "/v1/responses",
+        get(move |ws: axum::extract::ws::WebSocketUpgrade| {
+            let c_hits = c_hits_for_route.clone();
+            async move {
+                ws.on_upgrade(move |mut socket| async move {
+                    c_hits.fetch_add(1, Ordering::SeqCst);
+                    if socket.recv().await.is_some() {
+                        let _ = socket
+                            .send(axum::extract::ws::Message::Text(
+                                r#"{"type":"response.created","response":{"id":"resp-c"}}"#.into(),
+                            ))
+                            .await;
+                    }
+                })
+            }
+        }),
+    );
+    let (c_addr, c_handle) = spawn_axum_server(upstream_c);
+
+    let retry = RetryConfig {
+        upstream: Some(retry_layer_config(
+            1,
+            "502",
+            Vec::new(),
+            RetryStrategy::Failover,
+        )),
+        provider: Some(retry_layer_config(
+            2,
+            "502",
+            Vec::new(),
+            RetryStrategy::Failover,
+        )),
+        transport_cooldown_secs: Some(0),
+        cooldown_backoff_factor: Some(1),
+        cooldown_backoff_max_secs: Some(0),
+        ..RetryConfig::default()
+    };
+    let mut routing = RoutingConfigV4::ordered_failover(vec!["b".to_string(), "c".to_string()]);
+    routing.affinity_policy = crate::config::RoutingAffinityPolicyV5::FallbackSticky;
+    let v4 = ProxyConfigV4 {
+        retry,
+        codex: ServiceViewV4 {
+            providers: std::collections::BTreeMap::from([
+                (
+                    "b".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some(format!("http://{b_addr}/v1")),
+                        inline_auth: UpstreamAuth::default(),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+                (
+                    "c".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some(format!("http://{c_addr}/v1")),
+                        inline_auth: UpstreamAuth::default(),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+            ]),
+            routing: Some(routing),
+            ..ServiceViewV4::default()
+        },
+        ..ProxyConfigV4::default()
+    };
+    let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compile v4");
+    let proxy = ProxyService::new_with_v4_source(
+        Client::new(),
+        Arc::new(runtime),
+        Some(Arc::new(v4)),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let state = proxy.state.clone();
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let request = format!("ws://{proxy_addr}/v1/responses")
+        .into_client_request()
+        .expect("ws request");
+    let (mut socket, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("connect proxy websocket");
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"response.create","model":"gpt-5","stream":true,"prompt_cache_key":"ws-missing-v2-affinity","input":[{"role":"user","content":"compact me"},{"type":"compaction_trigger"}]}"#.into(),
+        ))
+        .await
+        .expect("send first frame");
+
+    let close = socket.next().await.expect("close frame").expect("close ok");
+    assert!(matches!(
+        close,
+        tokio_tungstenite::tungstenite::Message::Close(_)
+    ));
+    assert_eq!(b_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(c_hits.load(Ordering::SeqCst), 0);
+
+    let finished = find_finished_request(&state, 10, |request| {
+        request.session_id.as_deref() == Some("ws-missing-v2-affinity")
+    })
+    .await
+    .expect("finished websocket request");
+    assert_eq!(
+        finished.status_code,
+        StatusCode::SERVICE_UNAVAILABLE.as_u16()
+    );
+
+    let traces = crate::logging::read_recent_control_trace_entries(20)
+        .expect("read recent control trace entries");
+    let block = traces
+        .iter()
+        .rev()
+        .find(|entry| entry.event.as_deref() == Some("route_continuity_blocked"))
+        .expect("route continuity blocked trace");
+    assert_eq!(
+        block.payload["continuity_class"].as_str(),
+        Some("provider_state_bound")
+    );
+    assert_eq!(
+        block.payload["reason"].as_str(),
+        Some("state_bound_compact_missing_affinity")
+    );
+    assert_eq!(
+        block.payload["transport"].as_str(),
+        Some("responses_websocket")
+    );
+
+    proxy_handle.abort();
+    b_handle.abort();
+    c_handle.abort();
+    let _ = std::fs::remove_dir_all(codex_home);
+    let _ = std::fs::remove_dir_all(temp_dir);
+}
+
+#[tokio::test]
+async fn responses_websocket_allows_compaction_trigger_without_prior_affinity_for_single_endpoint()
+{
+    let _env_guard = env_lock().await;
+    let codex_home = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HOME", &codex_home);
+    }
+    write_text_file(
+        &codex_home.join("config.toml"),
+        r#"
+model_provider = "codex_proxy"
+
+[model_providers.codex_proxy]
+name = "OpenAI"
+base_url = "http://127.0.0.1:1"
+wire_api = "responses"
+supports_websockets = true
+"#,
+    );
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_for_route = hits.clone();
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        get(move |ws: axum::extract::ws::WebSocketUpgrade| {
+            let hits = hits_for_route.clone();
+            async move {
+                ws.on_upgrade(move |mut socket| async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    if socket.recv().await.is_some() {
+                        let _ = socket
+                            .send(axum::extract::ws::Message::Text(
+                                r#"{"type":"response.created","response":{"id":"resp-single"}}"#
+                                    .into(),
+                            ))
+                            .await;
+                    }
+                })
+            }
+        }),
+    );
+    let (u_addr, u_handle) = spawn_axum_server(upstream);
+
+    let mut routing = RoutingConfigV4::ordered_failover(vec!["single".to_string()]);
+    routing.affinity_policy = crate::config::RoutingAffinityPolicyV5::FallbackSticky;
+    let v4 = ProxyConfigV4 {
+        codex: ServiceViewV4 {
+            providers: std::collections::BTreeMap::from([(
+                "single".to_string(),
+                ProviderConfigV4 {
+                    base_url: Some(format!("http://{u_addr}/v1")),
+                    inline_auth: UpstreamAuth::default(),
+                    ..ProviderConfigV4::default()
+                },
+            )]),
+            routing: Some(routing),
+            ..ServiceViewV4::default()
+        },
+        ..ProxyConfigV4::default()
+    };
+    let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compile v4");
+    let proxy = ProxyService::new_with_v4_source(
+        Client::new(),
+        Arc::new(runtime),
+        Some(Arc::new(v4)),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let state = proxy.state.clone();
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let request = format!("ws://{proxy_addr}/v1/responses")
+        .into_client_request()
+        .expect("ws request");
+    let (mut socket, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("connect proxy websocket");
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"response.create","model":"gpt-5","stream":true,"prompt_cache_key":"ws-single-v2-affinity","input":[{"role":"user","content":"compact me"},{"type":"compaction_trigger"}]}"#.into(),
+        ))
+        .await
+        .expect("send first frame");
+
+    let event = socket
+        .next()
+        .await
+        .expect("event")
+        .expect("event ok")
+        .to_text()
+        .expect("event text")
+        .to_string();
+    assert!(event.contains("response.created"), "{event}");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    socket.close(None).await.expect("close websocket");
+    let finished = find_finished_request(&state, 10, |request| {
+        request.session_id.as_deref() == Some("ws-single-v2-affinity")
+    })
+    .await
+    .expect("finished websocket request");
+    assert_eq!(
+        finished.status_code,
+        StatusCode::SWITCHING_PROTOCOLS.as_u16()
     );
 
     proxy_handle.abort();

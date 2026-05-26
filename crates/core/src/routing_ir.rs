@@ -10,7 +10,9 @@ use crate::config::{
 };
 use crate::lb::{FAILURE_THRESHOLD, SelectedUpstream};
 use crate::model_routing;
-use crate::runtime_identity::{LegacyUpstreamKey, ProviderEndpointKey, RuntimeUpstreamIdentity};
+use crate::runtime_identity::{
+    ContinuityDomainKey, LegacyUpstreamKey, ProviderEndpointKey, RuntimeUpstreamIdentity,
+};
 
 const V4_COMPATIBILITY_STATION_NAME: &str = "routing";
 
@@ -60,11 +62,24 @@ impl RoutePlanTemplate {
         candidate_provider_endpoint_key(self, candidate)
     }
 
+    pub fn candidate_continuity_domain_key(
+        &self,
+        candidate: &RouteCandidate,
+    ) -> ContinuityDomainKey {
+        let provider_endpoint = candidate_provider_endpoint_key(self, candidate);
+        candidate
+            .continuity_domain
+            .as_ref()
+            .and_then(|domain| ContinuityDomainKey::explicit(self.service_name.clone(), domain))
+            .unwrap_or_else(|| ContinuityDomainKey::provider_endpoint(provider_endpoint))
+    }
+
     pub fn candidate_identity(&self, candidate: &RouteCandidate) -> RuntimeUpstreamIdentity {
-        RuntimeUpstreamIdentity::new(
+        RuntimeUpstreamIdentity::new_with_continuity_domain(
             candidate_provider_endpoint_key(self, candidate),
             self.candidate_compatibility_key(candidate),
             candidate.base_url.clone(),
+            candidate.continuity_domain.clone(),
         )
     }
 
@@ -133,6 +148,7 @@ fn hash_route_candidate<H: Hasher>(candidate: &RouteCandidate, hasher: &mut H) {
     candidate.provider_id.hash(hasher);
     candidate.endpoint_id.hash(hasher);
     candidate.base_url.hash(hasher);
+    candidate.continuity_domain.hash(hasher);
     candidate.tags.hash(hasher);
     candidate.supported_models.hash(hasher);
     candidate.model_mapping.hash(hasher);
@@ -182,6 +198,7 @@ pub struct RouteCandidate {
     pub provider_alias: Option<String>,
     pub endpoint_id: String,
     pub base_url: String,
+    pub continuity_domain: Option<String>,
     pub auth: UpstreamAuth,
     pub tags: BTreeMap<String, String>,
     pub supported_models: BTreeMap<String, bool>,
@@ -253,6 +270,7 @@ pub struct SelectedRouteCandidate<'a> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RoutePlanAttemptState {
     avoided_provider_endpoints: BTreeSet<ProviderEndpointKey>,
+    allowed_continuity_domain: Option<ContinuityDomainKey>,
     avoid_by_station: BTreeMap<String, BTreeSet<usize>>,
     avoided_total: usize,
 }
@@ -270,6 +288,20 @@ impl RoutePlanAttemptState {
         self.avoided_provider_endpoints.contains(key)
     }
 
+    pub fn restrict_to_continuity_domain(&mut self, continuity_domain: ContinuityDomainKey) {
+        self.allowed_continuity_domain = Some(continuity_domain);
+    }
+
+    pub fn allowed_continuity_domain(&self) -> Option<&ContinuityDomainKey> {
+        self.allowed_continuity_domain.as_ref()
+    }
+
+    pub fn allows_explicit_continuity_domain_failover(&self) -> bool {
+        self.allowed_continuity_domain
+            .as_ref()
+            .is_some_and(ContinuityDomainKey::is_explicit)
+    }
+
     pub fn avoid_candidate(
         &mut self,
         template: &RoutePlanTemplate,
@@ -284,6 +316,12 @@ impl RoutePlanAttemptState {
         candidate: &RouteCandidate,
     ) -> bool {
         self.avoids_provider_endpoint(&candidate_provider_endpoint_key(template, candidate))
+            || self
+                .allowed_continuity_domain
+                .as_ref()
+                .is_some_and(|domain| {
+                    template.candidate_continuity_domain_key(candidate) != *domain
+                })
     }
 
     pub fn avoid_upstream(&mut self, station_name: &str, upstream_index: usize) -> bool {
@@ -530,6 +568,12 @@ pub struct RoutePlanExecutor<'a> {
     template: &'a RoutePlanTemplate,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoutePlanAffinitySelectionMode {
+    Configured,
+    SoftSessionPreferred,
+}
+
 impl<'a> RoutePlanExecutor<'a> {
     pub fn new(template: &'a RoutePlanTemplate) -> Self {
         Self { template }
@@ -591,6 +635,35 @@ impl<'a> RoutePlanExecutor<'a> {
         runtime: &RoutePlanRuntimeState,
         request_model: Option<&str>,
     ) -> RoutePlanAttemptSelection<'_> {
+        self.select_supported_candidate_with_affinity_mode(
+            state,
+            runtime,
+            request_model,
+            RoutePlanAffinitySelectionMode::Configured,
+        )
+    }
+
+    pub fn select_supported_candidate_with_soft_affinity_runtime_state(
+        &self,
+        state: &mut RoutePlanAttemptState,
+        runtime: &RoutePlanRuntimeState,
+        request_model: Option<&str>,
+    ) -> RoutePlanAttemptSelection<'_> {
+        self.select_supported_candidate_with_affinity_mode(
+            state,
+            runtime,
+            request_model,
+            RoutePlanAffinitySelectionMode::SoftSessionPreferred,
+        )
+    }
+
+    fn select_supported_candidate_with_affinity_mode(
+        &self,
+        state: &mut RoutePlanAttemptState,
+        runtime: &RoutePlanRuntimeState,
+        request_model: Option<&str>,
+        affinity_mode: RoutePlanAffinitySelectionMode,
+    ) -> RoutePlanAttemptSelection<'_> {
         let total_upstreams = self.template.candidates.len();
         let mut skipped = Vec::new();
 
@@ -605,7 +678,8 @@ impl<'a> RoutePlanExecutor<'a> {
                 };
             }
 
-            let Some(candidate) = self.next_unavoided_candidate(state, runtime) else {
+            let Some(candidate) = self.next_unavoided_candidate(state, runtime, affinity_mode)
+            else {
                 return RoutePlanAttemptSelection {
                     selected: None,
                     skipped,
@@ -715,6 +789,39 @@ impl<'a> RoutePlanExecutor<'a> {
         station_name: &str,
         request_model: Option<&str>,
     ) -> RoutePlanStationAttemptSelection<'_> {
+        self.select_supported_station_candidate_with_affinity_mode(
+            state,
+            runtime,
+            station_name,
+            request_model,
+            RoutePlanAffinitySelectionMode::Configured,
+        )
+    }
+
+    pub fn select_supported_station_candidate_with_soft_affinity_runtime_state(
+        &self,
+        state: &mut RoutePlanAttemptState,
+        runtime: &RoutePlanRuntimeState,
+        station_name: &str,
+        request_model: Option<&str>,
+    ) -> RoutePlanStationAttemptSelection<'_> {
+        self.select_supported_station_candidate_with_affinity_mode(
+            state,
+            runtime,
+            station_name,
+            request_model,
+            RoutePlanAffinitySelectionMode::SoftSessionPreferred,
+        )
+    }
+
+    fn select_supported_station_candidate_with_affinity_mode(
+        &self,
+        state: &mut RoutePlanAttemptState,
+        runtime: &RoutePlanRuntimeState,
+        station_name: &str,
+        request_model: Option<&str>,
+        affinity_mode: RoutePlanAffinitySelectionMode,
+    ) -> RoutePlanStationAttemptSelection<'_> {
         let total_upstreams = self.template.candidates.len();
         let mut skipped = Vec::new();
 
@@ -731,7 +838,7 @@ impl<'a> RoutePlanExecutor<'a> {
             }
 
             let Some(candidate) =
-                self.next_unavoided_station_candidate(state, runtime, station_name)
+                self.next_unavoided_station_candidate(state, runtime, station_name, affinity_mode)
             else {
                 return RoutePlanStationAttemptSelection {
                     selected: None,
@@ -814,6 +921,7 @@ impl<'a> RoutePlanExecutor<'a> {
         &self,
         state: &RoutePlanAttemptState,
         runtime: &RoutePlanRuntimeState,
+        affinity_mode: RoutePlanAffinitySelectionMode,
     ) -> Option<&'a RouteCandidate> {
         let route_candidates = self
             .template
@@ -822,7 +930,12 @@ impl<'a> RoutePlanExecutor<'a> {
             .filter(|candidate| !state.avoids_candidate(self.template, candidate))
             .collect::<Vec<_>>();
 
-        best_candidate_by_affinity_policy(self.template, runtime, &route_candidates)
+        best_candidate_by_affinity_selection_mode(
+            self.template,
+            runtime,
+            &route_candidates,
+            affinity_mode,
+        )
     }
 
     fn candidates_exhausted(&self, state: &RoutePlanAttemptState) -> bool {
@@ -883,6 +996,7 @@ impl<'a> RoutePlanExecutor<'a> {
         state: &RoutePlanAttemptState,
         runtime: &RoutePlanRuntimeState,
         station_name: &str,
+        affinity_mode: RoutePlanAffinitySelectionMode,
     ) -> Option<&'a RouteCandidate> {
         let station_candidates = self
             .template
@@ -899,16 +1013,23 @@ impl<'a> RoutePlanExecutor<'a> {
             })
             .collect::<Vec<_>>();
 
-        best_candidate_by_affinity_policy(self.template, runtime, &station_candidates)
+        best_candidate_by_affinity_selection_mode(
+            self.template,
+            runtime,
+            &station_candidates,
+            affinity_mode,
+        )
     }
 }
 
-fn best_candidate_by_affinity_policy<'a>(
+fn best_candidate_by_affinity_selection_mode<'a>(
     template: &RoutePlanTemplate,
     runtime: &RoutePlanRuntimeState,
     station_candidates: &[&'a RouteCandidate],
+    affinity_mode: RoutePlanAffinitySelectionMode,
 ) -> Option<&'a RouteCandidate> {
-    match template.affinity_policy {
+    let affinity_policy = affinity_policy_for_selection(template.affinity_policy, affinity_mode);
+    match affinity_policy {
         RoutingAffinityPolicyV5::Off => {
             first_candidate_in_best_preference_group(template, runtime, station_candidates)
         }
@@ -940,6 +1061,18 @@ fn best_candidate_by_affinity_policy<'a>(
                 first_candidate_in_best_preference_group(template, runtime, station_candidates)
             }
         }
+    }
+}
+
+fn affinity_policy_for_selection(
+    configured: RoutingAffinityPolicyV5,
+    affinity_mode: RoutePlanAffinitySelectionMode,
+) -> RoutingAffinityPolicyV5 {
+    match (configured, affinity_mode) {
+        (RoutingAffinityPolicyV5::Hard, RoutePlanAffinitySelectionMode::SoftSessionPreferred) => {
+            RoutingAffinityPolicyV5::FallbackSticky
+        }
+        _ => configured,
     }
 }
 
@@ -1125,6 +1258,7 @@ struct RouteLeaf {
 struct EndpointParts {
     endpoint_id: String,
     base_url: String,
+    continuity_domain: Option<String>,
     enabled: bool,
     priority: u32,
     tags: BTreeMap<String, String>,
@@ -1246,6 +1380,11 @@ pub fn compile_legacy_route_plan_template<'a>(
                 provider_alias: service.alias.clone(),
                 endpoint_id,
                 base_url: upstream.base_url.clone(),
+                continuity_domain: upstream
+                    .tags
+                    .get("continuity_domain")
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty()),
                 auth: upstream.auth.clone(),
                 tags: hash_string_map_to_btree(&upstream.tags),
                 supported_models: hash_bool_map_to_btree(&upstream.supported_models),
@@ -1985,6 +2124,7 @@ fn route_candidates_from_leaves(
                 provider_alias: provider.alias.clone(),
                 endpoint_id: endpoint.endpoint_id,
                 base_url: endpoint.base_url,
+                continuity_domain: endpoint.continuity_domain,
                 auth: auth.clone(),
                 tags: merge_string_maps_with_provider_id(
                     leaf.provider_id.as_str(),
@@ -2046,6 +2186,11 @@ fn ordered_provider_endpoints(
         endpoints.push(EndpointParts {
             endpoint_id: "default".to_string(),
             base_url: base_url.to_string(),
+            continuity_domain: provider
+                .continuity_domain
+                .as_ref()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
             enabled: true,
             priority: 0,
             tags: BTreeMap::new(),
@@ -2064,6 +2209,12 @@ fn ordered_provider_endpoints(
         endpoints.push(EndpointParts {
             endpoint_id: endpoint_id.clone(),
             base_url: endpoint.base_url.trim().to_string(),
+            continuity_domain: endpoint
+                .continuity_domain
+                .as_ref()
+                .or(provider.continuity_domain.as_ref())
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
             enabled: endpoint.enabled,
             priority: endpoint.priority,
             tags: endpoint.tags.clone(),
@@ -3179,6 +3330,7 @@ mod tests {
             "slow".to_string(),
             ProviderEndpointV4 {
                 base_url: "https://slow.example/v1".to_string(),
+                continuity_domain: None,
                 enabled: true,
                 priority: 10,
                 tags: BTreeMap::from([("region".to_string(), "us".to_string())]),
@@ -3191,6 +3343,7 @@ mod tests {
             "fast".to_string(),
             ProviderEndpointV4 {
                 base_url: "https://fast.example/v1".to_string(),
+                continuity_domain: None,
                 enabled: true,
                 priority: 0,
                 tags: BTreeMap::from([("region".to_string(), "hk".to_string())]),
@@ -3288,6 +3441,96 @@ mod tests {
     }
 
     #[test]
+    fn routing_ir_continuity_domain_defaults_to_endpoint_and_supports_explicit_overrides() {
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([
+                (
+                    "opaque".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some("https://same.example/v1".to_string()),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+                (
+                    "shared".to_string(),
+                    ProviderConfigV4 {
+                        continuity_domain: Some(" shared-cluster ".to_string()),
+                        endpoints: BTreeMap::from([
+                            (
+                                "default".to_string(),
+                                ProviderEndpointV4 {
+                                    base_url: "https://shared-default.example/v1".to_string(),
+                                    continuity_domain: None,
+                                    enabled: true,
+                                    priority: 0,
+                                    tags: BTreeMap::new(),
+                                    supported_models: BTreeMap::new(),
+                                    model_mapping: BTreeMap::new(),
+                                    limits: ProviderConcurrencyLimits::default(),
+                                },
+                            ),
+                            (
+                                "isolated".to_string(),
+                                ProviderEndpointV4 {
+                                    base_url: "https://shared-isolated.example/v1".to_string(),
+                                    continuity_domain: Some("isolated-cluster".to_string()),
+                                    enabled: true,
+                                    priority: 1,
+                                    tags: BTreeMap::new(),
+                                    supported_models: BTreeMap::new(),
+                                    model_mapping: BTreeMap::new(),
+                                    limits: ProviderConcurrencyLimits::default(),
+                                },
+                            ),
+                        ]),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+            ]),
+            routing: Some(RoutingConfigV4::ordered_failover(vec![
+                "opaque".to_string(),
+                "shared".to_string(),
+            ])),
+            ..ServiceViewV4::default()
+        };
+        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let domains = template
+            .candidates
+            .iter()
+            .map(|candidate| {
+                (
+                    format!("{}/{}", candidate.provider_id, candidate.endpoint_id),
+                    template
+                        .candidate_continuity_domain_key(candidate)
+                        .stable_key(),
+                    candidate.continuity_domain.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            domains,
+            vec![
+                (
+                    "opaque/default".to_string(),
+                    "provider_endpoint:codex/opaque/default".to_string(),
+                    None,
+                ),
+                (
+                    "shared/default".to_string(),
+                    "explicit:codex/shared-cluster".to_string(),
+                    Some("shared-cluster"),
+                ),
+                (
+                    "shared/isolated".to_string(),
+                    "explicit:codex/isolated-cluster".to_string(),
+                    Some("isolated-cluster"),
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn routing_ir_endpoint_concurrency_limit_overrides_provider_limit() {
         let view = ServiceViewV4 {
             providers: BTreeMap::from([(
@@ -3301,6 +3544,7 @@ mod tests {
                         "hk".to_string(),
                         ProviderEndpointV4 {
                             base_url: "https://hk.relay.example/v1".to_string(),
+                            continuity_domain: None,
                             enabled: true,
                             priority: 0,
                             tags: BTreeMap::new(),
@@ -3374,6 +3618,7 @@ mod tests {
                             "fast".to_string(),
                             ProviderEndpointV4 {
                                 base_url: "https://fast.example/v1".to_string(),
+                                continuity_domain: None,
                                 enabled: true,
                                 priority: 0,
                                 tags: BTreeMap::new(),
@@ -3386,6 +3631,7 @@ mod tests {
                             "slow".to_string(),
                             ProviderEndpointV4 {
                                 base_url: "https://slow.example/v1".to_string(),
+                                continuity_domain: None,
                                 enabled: true,
                                 priority: 10,
                                 tags: BTreeMap::new(),
@@ -3436,6 +3682,7 @@ mod tests {
                         "fast".to_string(),
                         ProviderEndpointV4 {
                             base_url: "https://fast.example/v1".to_string(),
+                            continuity_domain: None,
                             enabled: false,
                             priority: 0,
                             tags: BTreeMap::new(),
@@ -3582,6 +3829,7 @@ mod tests {
             "slow".to_string(),
             ProviderEndpointV4 {
                 base_url: "https://slow.example/v1".to_string(),
+                continuity_domain: None,
                 enabled: true,
                 priority: 10,
                 tags: BTreeMap::from([("region".to_string(), "us".to_string())]),
@@ -3594,6 +3842,7 @@ mod tests {
             "fast".to_string(),
             ProviderEndpointV4 {
                 base_url: "https://fast.example/v1".to_string(),
+                continuity_domain: None,
                 enabled: true,
                 priority: 0,
                 tags: BTreeMap::from([("region".to_string(), "hk".to_string())]),
@@ -4567,6 +4816,57 @@ mod tests {
 
         assert_eq!(template.affinity_policy, RoutingAffinityPolicyV5::Hard);
         assert!(selection.selected.is_none());
+    }
+
+    #[test]
+    fn route_plan_executor_soft_affinity_escapes_unavailable_hard_affinity() {
+        let mut routing = RoutingConfigV4::tag_preferred(
+            vec!["monthly".to_string(), "chili".to_string()],
+            vec![BTreeMap::from([(
+                "billing".to_string(),
+                "monthly".to_string(),
+            )])],
+            RoutingExhaustedActionV4::Continue,
+        );
+        routing.affinity_policy = RoutingAffinityPolicyV5::Hard;
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([
+                (
+                    "monthly".to_string(),
+                    tagged_provider("https://monthly.example/v1", "billing", "monthly"),
+                ),
+                (
+                    "chili".to_string(),
+                    tagged_provider("https://chili.example/v1", "billing", "paygo"),
+                ),
+            ]),
+            routing: Some(routing),
+            ..ServiceViewV4::default()
+        };
+        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let executor = RoutePlanExecutor::new(&template);
+        let mut runtime = RoutePlanRuntimeState::default();
+        runtime.set_affinity_provider_endpoint(Some(endpoint_key("codex", "chili", "default")));
+        runtime.set_provider_endpoint(
+            endpoint_key("codex", "chili", "default"),
+            RoutePlanUpstreamRuntimeState {
+                runtime_disabled: true,
+                ..RoutePlanUpstreamRuntimeState::default()
+            },
+        );
+        let mut state = RoutePlanAttemptState::default();
+
+        let selection = executor.select_supported_candidate_with_soft_affinity_runtime_state(
+            &mut state, &runtime, None,
+        );
+        let selected = selection.selected.expect("soft fallback selected");
+
+        assert_eq!(template.affinity_policy, RoutingAffinityPolicyV5::Hard);
+        assert_eq!(selected.candidate.provider_id, "monthly");
+        assert_eq!(
+            selected.provider_endpoint,
+            endpoint_key("codex", "monthly", "default")
+        );
     }
 
     #[test]

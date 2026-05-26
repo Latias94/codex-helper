@@ -157,6 +157,8 @@ The response includes:
   `/responses/compact`, including confidence and whether helper translation is required.
 - `mismatches`: places where Codex will try a capability that the relay did not prove.
 - `recommendation`: the conservative preset recommendation for the observed relay.
+- `continuity`: the selected provider endpoint's state-continuity domain, whether that domain was
+  explicit, and warnings for official relay presets that may carry encrypted compact state.
 
 Recommendation rules are intentionally conservative:
 
@@ -183,6 +185,36 @@ Remote compaction v2 is still not enabled by these presets. If you enable Codex
 `[features].remote_compaction_v2 = true` yourself, helper recognizes the
 `compaction_trigger` request shape for logging and route-continuity protection,
 but the upstream relay must still support v2 compaction response items.
+
+Official relay presets deliberately separate two ideas:
+
+- `name = "OpenAI"` tells Codex to use the official Responses protocol surface, including
+  `/responses/compact` for remote compaction v1.
+- It does not prove that two helper provider endpoints share upstream encrypted response state.
+
+By default, each provider endpoint is its own continuity domain. For relay chains such as sub2api,
+New API, or another OpenAI-compatible gateway, do not use host name, base URL, provider brand, or
+same-domain routing as proof that encrypted compact state can move across endpoints. If two
+configured endpoints intentionally front the same upstream account/state store, set the same
+`continuity_domain` on those providers or endpoints:
+
+```toml
+[codex.providers.relay_hk]
+base_url = "https://hk.relay.example/v1"
+auth_token_env = "RELAY_HK_KEY"
+continuity_domain = "relay-cluster-a"
+
+[codex.providers.relay_us]
+base_url = "https://us.relay.example/v1"
+auth_token_env = "RELAY_US_KEY"
+continuity_domain = "relay-cluster-a"
+```
+
+Only endpoints with the same explicit `continuity_domain` are allowed to fail over for
+provider-state-bound compact after a known affinity exists. Leave the field unset when each endpoint
+represents a different relay account, different upstream OpenAI account, or an opaque reseller.
+Direct `https://api.openai.com/v1` setups with a single authenticated account usually do not need
+this field because provider-endpoint affinity is already the domain boundary.
 
 When validation-only diagnostics are inconclusive, you can run a stronger live smoke check. This is
 a real upstream request, not a background health check. It is manual, cost-bearing, and requires the
@@ -430,7 +462,7 @@ Affinity is not a hard pin:
 
 - request retry, provider health, capability mismatch, cooldown, and trusted balance exhaustion still apply;
 - if the sticky provider fails, ordinary and non-state-bound requests continue through the current route graph and then stick to the next successful provider;
-- provider-state-bound compact does not cross provider endpoints unless a future explicit continuity-domain feature is configured;
+- provider-state-bound compact does not cross provider endpoints unless they share the same explicit `continuity_domain`;
 - if provider tags, route node strategy, children, entry, or provider endpoint identity change, the route graph key changes and old affinity no longer matches;
 - legacy station overrides are disabled for route graph configs; use route/provider/endpoint controls instead.
 

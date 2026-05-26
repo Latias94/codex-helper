@@ -853,6 +853,7 @@ async fn proxy_api_v1_provider_runtime_override_filters_v4_route_plan_routing() 
                             "default".to_string(),
                             ProviderEndpointV4 {
                                 base_url: format!("http://{default_addr}/v1"),
+                                continuity_domain: None,
                                 enabled: true,
                                 priority: 0,
                                 tags: BTreeMap::new(),
@@ -865,6 +866,7 @@ async fn proxy_api_v1_provider_runtime_override_filters_v4_route_plan_routing() 
                             "backup".to_string(),
                             ProviderEndpointV4 {
                                 base_url: format!("http://{backup_addr}/v1"),
+                                continuity_domain: None,
                                 enabled: true,
                                 priority: 1,
                                 tags: BTreeMap::new(),

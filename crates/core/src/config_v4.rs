@@ -666,6 +666,7 @@ pub fn compile_v4_to_runtime(v4: &ProxyConfigV4) -> Result<ProxyConfig> {
 fn endpoint_v2_to_v4(endpoint: &ProviderEndpointV2) -> ProviderEndpointV4 {
     ProviderEndpointV4 {
         base_url: endpoint.base_url.clone(),
+        continuity_domain: None,
         enabled: endpoint.enabled,
         priority: endpoint.priority,
         tags: endpoint.tags.clone(),
@@ -689,6 +690,7 @@ fn provider_v2_to_v4(provider: &ProviderConfigV2) -> ProviderConfigV4 {
         alias: provider.alias.clone(),
         enabled: provider.enabled,
         base_url: None,
+        continuity_domain: None,
         auth: UpstreamAuth::default(),
         inline_auth: provider.auth.clone(),
         tags: provider.tags.clone(),

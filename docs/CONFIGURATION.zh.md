@@ -149,6 +149,7 @@ curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-capabilities \
 - `observed`：中转对 `/models`、`/responses`、`/responses/compact` 的实际响应、置信度，以及是否需要 helper 翻译模型列表。
 - `mismatches`：Codex 会尝试使用、但中转没有证明支持的能力。
 - `recommendation`：基于观测结果给出的保守 preset 建议。
+- `continuity`：当前选中 provider endpoint 的状态连续性域、该域是否显式配置，以及 official relay 预设下和 encrypted compact state 相关的 warning。
 
 推荐矩阵刻意保守：
 
@@ -164,6 +165,27 @@ curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-capabilities \
 对 sub2api 风格中转来说，原始 OpenAI `/models` 响应（`data: [...]`）本身可以接受，但前提是 codex-helper 在 Codex 看到之前把它翻译成 Codex 的 `models: [...]` catalog。诊断响应会把这类情况标成 `observed.models.translation_required = true`。非 sub2api 中转也按同一套规则处理：它可以直接返回 Codex 形态的模型 metadata，也可以返回 helper 能翻译的 OpenAI model list。如果选中模型缺失，或 metadata 无法证明 image input，推荐器不会假设 hosted image generation 可用。
 
 该诊断端点不会主动探测 hosted `image_generation`，因为这可能消耗额度或生成实际图片。Responses WebSocket 通过 `responses_websocket = true` / `--responses-websocket` 显式启用；bridge 预设默认仍保持关闭。Remote compaction v2 仍不会由这些预设启用；如果你自己在 Codex 配置里启用 `[features].remote_compaction_v2 = true`，helper 会识别 `compaction_trigger` 请求形态用于日志和 route-continuity 保护，但上游 relay 仍必须真正支持 v2 compaction response item。
+
+official relay 预设刻意区分两件事：
+
+- `name = "OpenAI"` 只表示 Codex 会选择官方 Responses 协议面，包括 remote compaction v1 的 `/responses/compact`。
+- 它不证明两个 helper provider endpoint 能共享上游 encrypted response state。
+
+默认情况下，每个 provider endpoint 都是自己的 continuity domain。对于 sub2api、New API 或其他 OpenAI-compatible gateway 这类中转链路，不要用 host name、base URL、provider 品牌名或“域名一致”来证明 encrypted compact state 可以跨 endpoint 移动。如果两个 endpoint 明确指向同一套上游账号或同一状态存储，才给它们配置相同的 `continuity_domain`：
+
+```toml
+[codex.providers.relay_hk]
+base_url = "https://hk.relay.example/v1"
+auth_token_env = "RELAY_HK_KEY"
+continuity_domain = "relay-cluster-a"
+
+[codex.providers.relay_us]
+base_url = "https://us.relay.example/v1"
+auth_token_env = "RELAY_US_KEY"
+continuity_domain = "relay-cluster-a"
+```
+
+只有相同显式 `continuity_domain` 的 endpoints，才允许 provider-state-bound compact 在已有 route affinity 后跨 endpoint failover。每个 endpoint 代表不同中转账号、不同上游 OpenAI 账号或不透明 reseller 时，请保持未配置。直连 `https://api.openai.com/v1` 且只有一个认证账号的场景通常不需要这个字段，因为 provider-endpoint affinity 已经是连续性边界。
 
 当 validation-only 诊断还不能解释问题时，可以手动跑更强的 live smoke 检查。它是真实上游请求，不是后台健康检查；可能消耗额度，也可能触发上游生成图片。codex-helper 在发送任何上游请求前，必须先收到固定确认字符串：
 
@@ -382,7 +404,7 @@ Affinity 不是硬 pin：
 
 - request retry、provider health、capability mismatch、cooldown 和可信余额耗尽仍然生效；
 - 如果 sticky provider 失败，普通请求和非 state-bound 请求会继续沿当前 route graph 尝试，然后粘到下一个成功的 provider；
-- provider-state-bound compact 不会跨 provider endpoint，除非未来显式配置了安全的 continuity domain；
+- provider-state-bound compact 不会跨 provider endpoint，除非这些 endpoints 配置了相同的显式 `continuity_domain`；
 - 如果 provider tags、route node strategy、children、entry 或 provider endpoint identity 改变，route graph key 会改变，旧 affinity 不再匹配；
 - route graph 配置下 legacy station overrides 会被禁用；请使用 route/provider/endpoint 控制。
 

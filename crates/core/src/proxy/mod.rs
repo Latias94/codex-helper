@@ -43,6 +43,7 @@ mod provider_orchestration;
 mod providers_api;
 mod request_body;
 mod request_context;
+mod request_continuity;
 mod request_encoding;
 mod request_failures;
 mod request_preparation;
@@ -83,7 +84,8 @@ pub use self::admin::{
 pub use self::api_responses::{ProfilesResponse, ReloadResult, RuntimeStatusResponse};
 pub use self::codex_relay_capabilities::{
     CodexRelayCapabilitiesObserved, CodexRelayCapabilitiesRequest, CodexRelayCapabilitiesResponse,
-    CodexRelayCapabilityMismatch,
+    CodexRelayCapabilityMismatch, CodexRelayContinuityDiagnostics,
+    CodexRelayContinuityDomainSummary,
 };
 pub use self::codex_relay_evidence::{
     CodexRelayEvidenceEntry, CodexRelayEvidenceFilters, CodexRelayEvidenceKind,

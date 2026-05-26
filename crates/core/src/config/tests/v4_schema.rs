@@ -242,6 +242,7 @@ fn compile_v4_to_runtime_direct_path_matches_v2_bridge_for_compat_state() {
                                 "slow".to_string(),
                                 ProviderEndpointV4 {
                                     base_url: "https://slow.example.com/v1".to_string(),
+                                    continuity_domain: None,
                                     enabled: true,
                                     priority: 10,
                                     tags: BTreeMap::from([(
@@ -257,6 +258,7 @@ fn compile_v4_to_runtime_direct_path_matches_v2_bridge_for_compat_state() {
                                 "fast".to_string(),
                                 ProviderEndpointV4 {
                                     base_url: "https://fast.example.com/v1".to_string(),
+                                    continuity_domain: None,
                                     enabled: true,
                                     priority: 0,
                                     tags: BTreeMap::from([(
