@@ -195,6 +195,11 @@ fn extract_usage_obj(payload: &Value) -> Option<&Value> {
     if let Some(u) = payload.get("usage") {
         return Some(u);
     }
+    if let Some(msg) = payload.get("message")
+        && let Some(u) = msg.get("usage")
+    {
+        return Some(u);
+    }
     if let Some(resp) = payload.get("response")
         && let Some(u) = resp.get("usage")
     {
@@ -346,6 +351,51 @@ fn usage_from_value(usage_obj: &Value) -> Option<UsageMetrics> {
     Some(m)
 }
 
+fn merge_usage_update(last: &mut Option<UsageMetrics>, update: UsageMetrics) {
+    let Some(existing) = last.as_mut() else {
+        *last = Some(update);
+        return;
+    };
+
+    if update.input_tokens != 0 {
+        existing.input_tokens = update.input_tokens;
+    }
+    if update.output_tokens != 0 {
+        existing.output_tokens = update.output_tokens;
+    }
+    if update.reasoning_tokens != 0 {
+        existing.reasoning_tokens = update.reasoning_tokens;
+    }
+    if update.reasoning_output_tokens != 0 {
+        existing.reasoning_output_tokens = update.reasoning_output_tokens;
+    }
+    if update.cached_input_tokens != 0 {
+        existing.cached_input_tokens = update.cached_input_tokens;
+    }
+    if update.cache_read_input_tokens != 0 {
+        existing.cache_read_input_tokens = update.cache_read_input_tokens;
+    }
+    if update.cache_creation_input_tokens != 0 {
+        existing.cache_creation_input_tokens = update.cache_creation_input_tokens;
+    }
+    if update.cache_creation_5m_input_tokens != 0 {
+        existing.cache_creation_5m_input_tokens = update.cache_creation_5m_input_tokens;
+    }
+    if update.cache_creation_1h_input_tokens != 0 {
+        existing.cache_creation_1h_input_tokens = update.cache_creation_1h_input_tokens;
+    }
+
+    existing.cache_creation_input_tokens = existing.cache_creation_input_tokens.max(
+        existing
+            .cache_creation_5m_input_tokens
+            .saturating_add(existing.cache_creation_1h_input_tokens),
+    );
+    existing.total_tokens = update
+        .total_tokens
+        .max(existing.total_tokens)
+        .max(existing.derived_total_tokens());
+}
+
 pub fn extract_usage_from_bytes(data: &[u8]) -> Option<UsageMetrics> {
     let text = std::str::from_utf8(data).ok()?.trim();
     if text.is_empty() {
@@ -377,7 +427,7 @@ pub fn extract_usage_from_sse_bytes(data: &[u8]) -> Option<UsageMetrics> {
                     && let Some(usage_obj) = extract_usage_obj(&json)
                     && let Some(u) = usage_from_value(usage_obj)
                 {
-                    last = Some(u);
+                    merge_usage_update(&mut last, u);
                 }
             }
         }
@@ -431,7 +481,7 @@ pub fn scan_usage_from_sse_bytes_incremental(
             && let Some(usage_obj) = extract_usage_obj(&json)
             && let Some(u) = usage_from_value(usage_obj)
         {
-            *last = Some(u);
+            merge_usage_update(last, u);
         }
     }
 
@@ -485,6 +535,64 @@ mod tests {
                 ..UsageMetrics::default()
             })
         );
+    }
+
+    #[test]
+    fn parses_anthropic_message_start_usage() {
+        let json = r#"{
+          "type":"message_start",
+          "message":{
+            "usage":{
+              "input_tokens":100,
+              "cache_read_input_tokens":30,
+              "cache_creation":{
+                "ephemeral_5m_input_tokens":20,
+                "ephemeral_1h_input_tokens":40
+              }
+            }
+          }
+        }"#;
+
+        assert_eq!(
+            extract_usage_from_bytes(json.as_bytes()),
+            Some(UsageMetrics {
+                input_tokens: 100,
+                cache_read_input_tokens: 30,
+                cache_creation_input_tokens: 60,
+                cache_creation_5m_input_tokens: 20,
+                cache_creation_1h_input_tokens: 40,
+                total_tokens: 190,
+                ..UsageMetrics::default()
+            })
+        );
+    }
+
+    #[test]
+    fn sse_scan_merges_message_start_and_delta_usage() {
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":30,\"cache_creation\":{\"ephemeral_5m_input_tokens\":20}}}}\n",
+            "\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":7}}\n",
+            "\n"
+        );
+        let expected = Some(UsageMetrics {
+            input_tokens: 100,
+            output_tokens: 7,
+            cache_read_input_tokens: 30,
+            cache_creation_input_tokens: 20,
+            cache_creation_5m_input_tokens: 20,
+            total_tokens: 157,
+            ..UsageMetrics::default()
+        });
+
+        assert_eq!(extract_usage_from_sse_bytes(sse.as_bytes()), expected);
+
+        let mut pos = 0usize;
+        let mut last = None;
+        scan_usage_from_sse_bytes_incremental(sse.as_bytes(), &mut pos, &mut last);
+        assert_eq!(last, expected);
     }
 
     #[test]
