@@ -74,10 +74,8 @@ fn compact_provider_failover_policy(
     request_flavor: &RequestFlavor,
     affinity_policy: Option<RoutingAffinityPolicyV5>,
 ) -> CompactProviderFailoverPolicy {
-    let strict_affinity = matches!(
-        request_continuity_decision(request_flavor, affinity_policy),
-        RequestContinuityDecision::ProviderStateBound { .. }
-    );
+    let strict_affinity = request_flavor.is_remote_compaction_request()
+        && matches!(affinity_policy, Some(RoutingAffinityPolicyV5::Hard));
     CompactProviderFailoverPolicy {
         strict_affinity,
         allow_provider_failover: !request_flavor.is_remote_compaction_request() || !strict_affinity,
@@ -109,9 +107,10 @@ impl ProviderChainAttemptPolicy {
             cross_station_failover_enabled(strict_multi_config, plan, provider_opt);
         let provider_attempt_limit_value =
             provider_attempt_limit(cross_station_failover_enabled, provider_opt.max_attempts);
-        let continuity = request_continuity_decision(request_flavor, None);
+        let legacy_affinity_policy = Some(RoutingAffinityPolicyV5::Hard);
+        let continuity = request_continuity_decision(request_flavor, legacy_affinity_policy);
         Self {
-            compact: compact_provider_failover_policy(request_flavor, None),
+            compact: compact_provider_failover_policy(request_flavor, legacy_affinity_policy),
             continuity,
             strict_multi_config,
             cross_station_failover_enabled,
@@ -184,7 +183,7 @@ fn restrict_route_state_to_affinity_continuity_domain(
     template: &RoutePlanTemplate,
     runtime: &RoutePlanRuntimeState,
 ) {
-    if !policy.is_provider_state_bound() {
+    if !policy.compact.strict_affinity {
         return;
     }
     let Some(affinity_provider_endpoint) = runtime.affinity_provider_endpoint() else {
@@ -961,7 +960,7 @@ impl<'a, 'route> RouteGraphAttemptLoop<'a, 'route> {
             if avoid_set.contains(&selected_candidate.stable_index) {
                 route_state.avoid_candidate(executor.template(), selected_candidate);
             }
-            if policy.is_provider_state_bound()
+            if policy.compact.strict_affinity
                 && let Some(domain) = target.continuity_domain_ref().cloned()
             {
                 route_state.restrict_to_continuity_domain(domain);
@@ -1354,33 +1353,37 @@ mod tests {
             &test_request_flavor(true, true),
             Some(RoutingAffinityPolicyV5::Off),
         );
-        assert!(!policy.allow_provider_failover());
+        assert!(policy.allow_provider_failover());
 
         let relaxed_policy = ProviderChainAttemptPolicy::route_graph(
             &test_request_flavor(true, false),
             Some(RoutingAffinityPolicyV5::Off),
         );
         assert!(relaxed_policy.allow_provider_failover());
+
+        let hard_policy = ProviderChainAttemptPolicy::route_graph(
+            &test_request_flavor(true, true),
+            Some(RoutingAffinityPolicyV5::Hard),
+        );
+        assert!(hard_policy.requires_known_affinity());
+        assert!(!hard_policy.allow_provider_failover());
     }
 
     #[test]
-    fn route_graph_policy_treats_remote_compaction_v2_as_state_bound() {
+    fn route_graph_policy_treats_remote_compaction_v2_as_tryable_state_bound_by_default() {
         let mut request_flavor = test_request_flavor(false, true);
         request_flavor.is_remote_compaction_v2_request = true;
         request_flavor.is_user_turn = true;
 
         let policy = ProviderChainAttemptPolicy::route_graph(
             &request_flavor,
-            Some(RoutingAffinityPolicyV5::Off),
+            Some(RoutingAffinityPolicyV5::FallbackSticky),
         );
 
         assert_eq!(policy.continuity_class(), "provider_state_bound");
-        assert!(policy.requires_known_affinity());
-        assert!(!policy.allow_provider_failover());
-        assert_eq!(
-            policy.provider_failover_blocked_reason(),
-            Some("provider_state_bound")
-        );
+        assert!(!policy.requires_known_affinity());
+        assert!(policy.allow_provider_failover());
+        assert_eq!(policy.provider_failover_blocked_reason(), None);
     }
 
     #[test]

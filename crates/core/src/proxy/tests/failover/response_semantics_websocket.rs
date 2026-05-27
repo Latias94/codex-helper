@@ -261,7 +261,7 @@ supports_websockets = true
 }
 
 #[tokio::test]
-async fn responses_websocket_rejects_compaction_trigger_without_route_affinity() {
+async fn responses_websocket_allows_fallback_sticky_compaction_without_route_affinity() {
     let _env_guard = env_lock().await;
     let temp_dir = make_temp_test_dir();
     let codex_home = make_temp_test_dir();
@@ -403,14 +403,19 @@ supports_websockets = true
         .await
         .expect("send first frame");
 
-    let close = socket.next().await.expect("close frame").expect("close ok");
-    assert!(matches!(
-        close,
-        tokio_tungstenite::tungstenite::Message::Close(_)
-    ));
-    assert_eq!(b_hits.load(Ordering::SeqCst), 0);
+    let event = socket
+        .next()
+        .await
+        .expect("event")
+        .expect("event ok")
+        .to_text()
+        .expect("event text")
+        .to_string();
+    assert!(event.contains("response.created"), "{event}");
+    assert_eq!(b_hits.load(Ordering::SeqCst), 1);
     assert_eq!(c_hits.load(Ordering::SeqCst), 0);
 
+    socket.close(None).await.expect("close websocket");
     let finished = find_finished_request(&state, 10, |request| {
         request.session_id.as_deref() == Some("ws-missing-v2-affinity")
     })
@@ -418,28 +423,14 @@ supports_websockets = true
     .expect("finished websocket request");
     assert_eq!(
         finished.status_code,
-        StatusCode::SERVICE_UNAVAILABLE.as_u16()
+        StatusCode::SWITCHING_PROTOCOLS.as_u16()
     );
 
-    let traces = crate::logging::read_recent_control_trace_entries(20)
-        .expect("read recent control trace entries");
-    let block = traces
-        .iter()
-        .rev()
-        .find(|entry| entry.event.as_deref() == Some("route_continuity_blocked"))
-        .expect("route continuity blocked trace");
-    assert_eq!(
-        block.payload["continuity_class"].as_str(),
-        Some("provider_state_bound")
-    );
-    assert_eq!(
-        block.payload["reason"].as_str(),
-        Some("state_bound_compact_missing_affinity")
-    );
-    assert_eq!(
-        block.payload["transport"].as_str(),
-        Some("responses_websocket")
-    );
+    let affinity = state
+        .get_session_route_affinity("ws-missing-v2-affinity")
+        .await
+        .expect("route affinity recorded after first websocket compact");
+    assert_eq!(affinity.provider_endpoint.provider_id.as_str(), "b");
 
     proxy_handle.abort();
     b_handle.abort();

@@ -14,6 +14,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http as tungstenite_http;
 
 use crate::codex_integration::CodexPatchMode;
+use crate::config::RoutingAffinityPolicyV5;
 use crate::lb::{COOLDOWN_SECS, LoadBalancer};
 use crate::logging::{CodexBridgeLog, RouteAttemptLog, ServiceTierLog, log_retry_trace};
 use crate::routing_ir::{
@@ -455,7 +456,10 @@ async fn select_responses_websocket_target(
             let mut route_state = RoutePlanAttemptState::default();
 
             if websocket_state_bound_request_requires_existing_affinity(
-                prepared, &runtime, template,
+                prepared,
+                &runtime,
+                template,
+                template.affinity_policy,
             ) {
                 log_websocket_route_continuity_blocked(proxy, prepared);
                 return Err(ResponsesWebSocketSelectionFailure::new(
@@ -562,6 +566,7 @@ async fn select_responses_websocket_target(
                 prepared,
                 &runtime,
                 &legacy_template,
+                RoutingAffinityPolicyV5::Hard,
             ) {
                 log_websocket_route_continuity_blocked(proxy, prepared);
                 return Err(ResponsesWebSocketSelectionFailure::new(
@@ -643,10 +648,12 @@ fn websocket_state_bound_request_requires_existing_affinity(
     prepared: &ResponsesWebSocketPrepared,
     runtime: &RoutePlanRuntimeState,
     template: &RoutePlanTemplate,
+    affinity_policy: RoutingAffinityPolicyV5,
 ) -> bool {
     prepared
         .request_continuity
         .remote_compaction_requires_affinity
+        && matches!(affinity_policy, RoutingAffinityPolicyV5::Hard)
         && runtime.affinity_provider_endpoint().is_none()
         && template
             .continuity_topology()

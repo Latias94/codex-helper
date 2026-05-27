@@ -106,12 +106,12 @@ pub(super) struct RouteContinuityDecisionInput {
 pub(super) fn route_continuity_decision(
     input: RouteContinuityDecisionInput,
 ) -> RequestContinuityDecision {
+    let hard_affinity = matches!(input.affinity_policy, Some(RoutingAffinityPolicyV5::Hard));
     if input.is_remote_compaction_request
-        && (input.remote_compaction_requires_affinity
-            || matches!(input.affinity_policy, Some(RoutingAffinityPolicyV5::Hard)))
+        && (input.remote_compaction_requires_affinity || hard_affinity)
     {
         RequestContinuityDecision::ProviderStateBound {
-            requires_known_affinity: input.remote_compaction_requires_affinity,
+            requires_known_affinity: input.remote_compaction_requires_affinity && hard_affinity,
         }
     } else {
         RequestContinuityDecision::StatelessOrSessionPreferred
@@ -204,6 +204,22 @@ mod tests {
             is_remote_compaction_request: true,
             remote_compaction_requires_affinity: false,
             affinity_policy: Some(RoutingAffinityPolicyV5::Hard),
+        });
+
+        assert_eq!(
+            decision,
+            RequestContinuityDecision::ProviderStateBound {
+                requires_known_affinity: false
+            }
+        );
+    }
+
+    #[test]
+    fn route_continuity_treats_fallback_sticky_compact_as_tryable_state_bound() {
+        let decision = route_continuity_decision(RouteContinuityDecisionInput {
+            is_remote_compaction_request: true,
+            remote_compaction_requires_affinity: true,
+            affinity_policy: Some(RoutingAffinityPolicyV5::FallbackSticky),
         });
 
         assert_eq!(
