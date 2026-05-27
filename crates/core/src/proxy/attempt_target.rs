@@ -21,13 +21,13 @@ pub(super) struct ProviderEndpointAttemptTarget {
 
 #[derive(Debug, Clone)]
 pub(super) enum AttemptTarget {
-    Legacy(SelectedUpstream),
-    ProviderEndpoint(ProviderEndpointAttemptTarget),
+    Legacy(Box<SelectedUpstream>),
+    ProviderEndpoint(Box<ProviderEndpointAttemptTarget>),
 }
 
 impl AttemptTarget {
     pub(super) fn legacy(selected: SelectedUpstream) -> Self {
-        Self::Legacy(selected)
+        Self::Legacy(Box::new(selected))
     }
 
     pub(super) fn from_candidate(service_name: &str, candidate: &RouteCandidate) -> Self {
@@ -75,7 +75,7 @@ impl AttemptTarget {
                     })
             });
 
-        Self::ProviderEndpoint(ProviderEndpointAttemptTarget {
+        Self::ProviderEndpoint(Box::new(ProviderEndpointAttemptTarget {
             provider_endpoint: provider_endpoint.clone(),
             continuity_domain,
             compatibility,
@@ -83,7 +83,7 @@ impl AttemptTarget {
             route_path: candidate.route_path.clone(),
             preference_group: candidate.preference_group,
             stable_candidate_index: candidate.stable_index,
-        })
+        }))
     }
 
     pub(super) fn upstream(&self) -> &UpstreamConfig {

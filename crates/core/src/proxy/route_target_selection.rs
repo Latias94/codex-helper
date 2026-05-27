@@ -27,6 +27,17 @@ pub(super) struct RouteGraphSelectionFailure {
     pub(super) route_attempts: Vec<RouteAttemptLog>,
 }
 
+pub(super) struct WebSocketRouteGraphSelectionParams<'a, 'b> {
+    pub(super) proxy: &'b ProxyService,
+    pub(super) executor: &'a RoutePlanExecutor<'a>,
+    pub(super) runtime: &'b RoutePlanRuntimeState,
+    pub(super) route_state: &'b mut RoutePlanAttemptState,
+    pub(super) request_id: u64,
+    pub(super) request_model: Option<&'b str>,
+    pub(super) request_is_remote_compaction: bool,
+    pub(super) continuity_contract: RequestContinuityContract,
+}
+
 impl RouteGraphSelectionFailure {
     fn new(status: StatusCode, message: impl Into<String>) -> Self {
         Self {
@@ -217,16 +228,20 @@ pub(super) fn log_route_continuity_blocked(
     log_retry_trace(payload);
 }
 
-pub(super) async fn select_websocket_route_graph_target<'a>(
-    proxy: &ProxyService,
-    executor: &'a RoutePlanExecutor<'a>,
-    runtime: &RoutePlanRuntimeState,
-    route_state: &mut RoutePlanAttemptState,
-    request_id: u64,
-    request_model: Option<&str>,
-    request_is_remote_compaction: bool,
-    continuity_contract: RequestContinuityContract,
+pub(super) async fn select_websocket_route_graph_target(
+    params: WebSocketRouteGraphSelectionParams<'_, '_>,
 ) -> Result<RouteGraphTargetSelection, RouteGraphSelectionFailure> {
+    let WebSocketRouteGraphSelectionParams {
+        proxy,
+        executor,
+        runtime,
+        route_state,
+        request_id,
+        request_model,
+        request_is_remote_compaction,
+        continuity_contract,
+    } = params;
+
     loop {
         let selection = select_route_graph_candidate(
             executor,

@@ -57,7 +57,8 @@ use super::route_metadata::{
     ROUTE_PATH_TAG,
 };
 use super::route_target_selection::{
-    log_route_continuity_blocked, restrict_route_state_to_affinity_continuity_domain,
+    WebSocketRouteGraphSelectionParams, log_route_continuity_blocked,
+    restrict_route_state_to_affinity_continuity_domain,
     route_graph_request_requires_existing_affinity, route_graph_runtime_for_request,
     select_websocket_route_graph_target,
 };
@@ -469,22 +470,25 @@ async fn select_responses_websocket_target(
                 &runtime,
             );
 
-            let selected = select_websocket_route_graph_target(
-                proxy,
-                &executor,
-                &runtime,
-                &mut route_state,
-                prepared.request_id,
-                prepared.request_model.as_deref(),
-                prepared.request_continuity.is_remote_compaction_request(),
-                continuity_contract,
-            )
-            .await
-            .map_err(|failure| ResponsesWebSocketSelectionFailure {
-                status: failure.status,
-                message: failure.message,
-                route_attempts: failure.route_attempts,
-            })?;
+            let selected =
+                select_websocket_route_graph_target(WebSocketRouteGraphSelectionParams {
+                    proxy,
+                    executor: &executor,
+                    runtime: &runtime,
+                    route_state: &mut route_state,
+                    request_id: prepared.request_id,
+                    request_model: prepared.request_model.as_deref(),
+                    request_is_remote_compaction: prepared
+                        .request_continuity
+                        .is_remote_compaction_request(),
+                    continuity_contract,
+                })
+                .await
+                .map_err(|failure| ResponsesWebSocketSelectionFailure {
+                    status: failure.status,
+                    message: failure.message,
+                    route_attempts: failure.route_attempts,
+                })?;
 
             build_selected(BuildSelectedParams {
                 proxy,
