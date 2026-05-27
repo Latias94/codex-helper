@@ -578,14 +578,10 @@ fn record_finished_into_bucket(bucket: &mut UsageBucket, request: &FinishedReque
     bucket.duration_ms_with_usage_total = bucket
         .duration_ms_with_usage_total
         .saturating_add(request.duration_ms);
-    let generation_ms = match request.ttfb_ms {
-        Some(ttfb) if ttfb > 0 && ttfb < request.duration_ms => {
-            request.duration_ms.saturating_sub(ttfb)
-        }
-        _ => request.duration_ms,
-    };
+    let observability = request.observability_view();
+    let generation_ms = observability.generation_ms.unwrap_or(request.duration_ms);
     bucket.generation_ms_total = bucket.generation_ms_total.saturating_add(generation_ms);
-    if let Some(ttfb) = request.ttfb_ms.filter(|value| *value > 0) {
+    if let Some(ttfb) = observability.ttfb_ms.filter(|value| *value > 0) {
         bucket.ttfb_ms_total = bucket.ttfb_ms_total.saturating_add(ttfb);
         bucket.ttfb_samples = bucket.ttfb_samples.saturating_add(1);
     }

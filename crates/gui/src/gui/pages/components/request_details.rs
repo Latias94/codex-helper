@@ -165,6 +165,7 @@ pub(in super::super) fn request_route_decision_reason(
 }
 
 fn render_request_summary_card(ui: &mut egui::Ui, lang: Language, request: &FinishedRequest) {
+    let observability = request.observability_view();
     let request_rows = vec![
         ("service".to_string(), request.service.clone()),
         (
@@ -175,7 +176,7 @@ fn render_request_summary_card(ui: &mut egui::Ui, lang: Language, request: &Fini
         ("total".to_string(), format_duration_ms(request.duration_ms)),
         (
             "first token".to_string(),
-            format_duration_ms_opt(request.ttfb_ms),
+            format_duration_ms_opt(observability.ttfb_ms),
         ),
         (
             "session".to_string(),

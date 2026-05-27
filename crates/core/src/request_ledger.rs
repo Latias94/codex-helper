@@ -358,15 +358,28 @@ pub fn format_request_log_record_lines(record: &JsonValue) -> Vec<String> {
     let duration_ms = u64_field(record, "duration_ms").unwrap_or(0);
     let ttfb_ms = u64_field(record, "ttfb_ms");
     let usage = usage_metrics(record);
-    let speed = usage
+    let finished_request = finished_request_from_request_log_record(record);
+    let observability = finished_request
         .as_ref()
-        .and_then(|usage| output_tokens_per_second(usage, duration_ms, ttfb_ms));
+        .map(|request| request.observability_view());
+    let effective_ttfb_ms = observability
+        .as_ref()
+        .and_then(|observability| observability.ttfb_ms)
+        .or(ttfb_ms);
+    let speed = observability
+        .as_ref()
+        .and_then(|observability| observability.output_tokens_per_second)
+        .or_else(|| {
+            usage
+                .as_ref()
+                .and_then(|usage| output_tokens_per_second(usage, duration_ms, effective_ttfb_ms))
+        });
     let cost = request_cost_display(service, model.as_str(), usage.as_ref());
 
     lines.push(format!(
         "    timing duration={} ttfb={} output_speed={} cost={}",
         format_ms(duration_ms),
-        format_optional_ms(ttfb_ms),
+        format_optional_ms(effective_ttfb_ms),
         format_optional_speed(speed),
         cost
     ));
@@ -549,6 +562,7 @@ fn output_tokens_per_second(
     duration_ms: u64,
     ttfb_ms: Option<u64>,
 ) -> Option<f64> {
+    const OUTPUT_RATE_SANITY_CEIL: f64 = 5_000.0;
     let output_tokens = usage.output_tokens.max(0);
     if output_tokens == 0 || duration_ms == 0 {
         return None;
@@ -560,7 +574,11 @@ fn output_tokens_per_second(
     if generation_ms == 0 {
         return None;
     }
-    Some(output_tokens as f64 / (generation_ms as f64 / 1000.0))
+    let rate = output_tokens as f64 / (generation_ms as f64 / 1000.0);
+    if generation_ms.saturating_mul(10) < duration_ms && rate > OUTPUT_RATE_SANITY_CEIL {
+        return Some(output_tokens as f64 / (duration_ms as f64 / 1000.0));
+    }
+    Some(rate)
 }
 
 fn request_model(record: &JsonValue) -> Option<String> {
@@ -764,6 +782,50 @@ mod tests {
         assert!(lines[2].contains("cache_read=10"));
         assert!(lines[2].contains("cache_create=5"));
         assert!(lines[2].contains("reasoning=7"));
+    }
+
+    #[test]
+    fn display_lines_use_corrected_ttfb_for_attempt_relative_stream_logs() {
+        let record = json!({
+            "timestamp_ms": 123,
+            "service": "codex",
+            "method": "POST",
+            "path": "/v1/responses",
+            "status_code": 200,
+            "duration_ms": 10000,
+            "ttfb_ms": 1210,
+            "usage": {
+                "output_tokens": 100,
+                "total_tokens": 100
+            },
+            "retry": {
+                "attempts": 2,
+                "upstream_chain": [],
+                "route_attempts": [
+                    {
+                        "attempt_index": 0,
+                        "decision": "failed_status",
+                        "status_code": 429,
+                        "upstream_headers_ms": 50,
+                        "duration_ms": 500,
+                        "raw": "failed"
+                    },
+                    {
+                        "attempt_index": 1,
+                        "decision": "completed",
+                        "status_code": 200,
+                        "upstream_headers_ms": 1200,
+                        "duration_ms": 2200,
+                        "raw": "completed"
+                    }
+                ]
+            }
+        });
+
+        let lines = format_request_log_record_lines(&record);
+
+        assert!(lines[1].contains("ttfb=2210ms"));
+        assert!(lines[1].contains("output_speed=12.84 tok/s"));
     }
 
     #[test]

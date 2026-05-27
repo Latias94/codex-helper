@@ -2618,6 +2618,7 @@ impl ProxyState {
         finished.refresh_observability();
 
         {
+            let effective_ttfb_ms = finished.observability.ttfb_ms;
             let day = (finished.ended_at_ms / 86_400_000) as i32;
             let cfg_key = finished
                 .station_name
@@ -2635,21 +2636,21 @@ impl ProxyState {
                 finished.duration_ms,
                 finished.usage.as_ref(),
                 Some(&finished.cost),
-                finished.ttfb_ms,
+                effective_ttfb_ms,
             );
             rollup.by_day.entry(day).or_default().record(
                 finished.status_code,
                 finished.duration_ms,
                 finished.usage.as_ref(),
                 Some(&finished.cost),
-                finished.ttfb_ms,
+                effective_ttfb_ms,
             );
             rollup.by_config.entry(cfg_key.clone()).or_default().record(
                 finished.status_code,
                 finished.duration_ms,
                 finished.usage.as_ref(),
                 Some(&finished.cost),
-                finished.ttfb_ms,
+                effective_ttfb_ms,
             );
             rollup
                 .by_config_day
@@ -2662,7 +2663,7 @@ impl ProxyState {
                     finished.duration_ms,
                     finished.usage.as_ref(),
                     Some(&finished.cost),
-                    finished.ttfb_ms,
+                    effective_ttfb_ms,
                 );
 
             rollup
@@ -2674,7 +2675,7 @@ impl ProxyState {
                     finished.duration_ms,
                     finished.usage.as_ref(),
                     Some(&finished.cost),
-                    finished.ttfb_ms,
+                    effective_ttfb_ms,
                 );
             rollup
                 .by_provider_day
@@ -2687,7 +2688,7 @@ impl ProxyState {
                     finished.duration_ms,
                     finished.usage.as_ref(),
                     Some(&finished.cost),
-                    finished.ttfb_ms,
+                    effective_ttfb_ms,
                 );
         }
 

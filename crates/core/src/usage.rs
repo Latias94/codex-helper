@@ -286,6 +286,9 @@ fn usage_from_value(usage_obj: &Value) -> Option<UsageMetrics> {
     } else if let Some(v) = usage_obj.get("cached_input_tokens") {
         m.cached_input_tokens = to_i64(v);
         recognized = true;
+    } else if let Some(v) = usage_obj.get("cached_tokens") {
+        m.cached_input_tokens = to_i64(v);
+        recognized = true;
     } else if let Some(v) = usage_obj
         .get("cache_read_input_tokens")
         .or_else(|| usage_obj.get("cache_read_tokens"))
@@ -303,8 +306,26 @@ fn usage_from_value(usage_obj: &Value) -> Option<UsageMetrics> {
     if let Some(v) = usage_obj.get("cache_creation_5m_input_tokens") {
         m.cache_creation_5m_input_tokens = to_i64(v);
         recognized = true;
+    } else if let Some(v) = usage_obj
+        .get("cache_creation")
+        .and_then(|v| v.get("ephemeral_5m_input_tokens"))
+    {
+        m.cache_creation_5m_input_tokens = to_i64(v);
+        recognized = true;
+    } else if let Some(v) = usage_obj.get("claude_cache_creation_5_m_tokens") {
+        m.cache_creation_5m_input_tokens = to_i64(v);
+        recognized = true;
     }
     if let Some(v) = usage_obj.get("cache_creation_1h_input_tokens") {
+        m.cache_creation_1h_input_tokens = to_i64(v);
+        recognized = true;
+    } else if let Some(v) = usage_obj
+        .get("cache_creation")
+        .and_then(|v| v.get("ephemeral_1h_input_tokens"))
+    {
+        m.cache_creation_1h_input_tokens = to_i64(v);
+        recognized = true;
+    } else if let Some(v) = usage_obj.get("claude_cache_creation_1_h_tokens") {
         m.cache_creation_1h_input_tokens = to_i64(v);
         recognized = true;
     }
@@ -557,6 +578,58 @@ mod tests {
                 output_tokens: 5,
                 total_tokens: 105,
                 cache_read_input_tokens: 30,
+                cache_creation_input_tokens: 60,
+                cache_creation_5m_input_tokens: 20,
+                cache_creation_1h_input_tokens: 40,
+                ..UsageMetrics::default()
+            })
+        );
+    }
+
+    #[test]
+    fn parses_cache_creation_aliases_used_by_relay_bridges() {
+        let json = r#"{
+          "usage":{
+            "input_tokens":10,
+            "output_tokens":5,
+            "cached_tokens":4,
+            "cache_creation":{
+              "ephemeral_5m_input_tokens":20,
+              "ephemeral_1h_input_tokens":40
+            }
+          }
+        }"#;
+        assert_eq!(
+            extract_usage_from_bytes(json.as_bytes()),
+            Some(UsageMetrics {
+                input_tokens: 10,
+                output_tokens: 5,
+                cached_input_tokens: 4,
+                total_tokens: 75,
+                cache_creation_input_tokens: 60,
+                cache_creation_5m_input_tokens: 20,
+                cache_creation_1h_input_tokens: 40,
+                ..UsageMetrics::default()
+            })
+        );
+    }
+
+    #[test]
+    fn parses_claude_cache_creation_aliases() {
+        let json = r#"{
+          "usage":{
+            "input_tokens":10,
+            "output_tokens":5,
+            "claude_cache_creation_5_m_tokens":20,
+            "claude_cache_creation_1_h_tokens":40
+          }
+        }"#;
+        assert_eq!(
+            extract_usage_from_bytes(json.as_bytes()),
+            Some(UsageMetrics {
+                input_tokens: 10,
+                output_tokens: 5,
+                total_tokens: 75,
                 cache_creation_input_tokens: 60,
                 cache_creation_5m_input_tokens: 20,
                 cache_creation_1h_input_tokens: 40,

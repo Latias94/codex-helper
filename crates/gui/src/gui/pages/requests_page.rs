@@ -149,7 +149,7 @@ fn request_list_metrics(request: &FinishedRequest) -> String {
 }
 
 fn request_list_ttfb(request: &FinishedRequest) -> String {
-    format_duration_ms_opt(request.ttfb_ms)
+    format_duration_ms_opt(request.observability_view().ttfb_ms)
 }
 
 fn compact_count(value: i64) -> String {

@@ -543,7 +543,8 @@ fn render_requests_panel(
                 r.status_code.to_string(),
                 status_style(p, Some(r.status_code)),
             );
-            let ttfb = r
+            let observability = r.observability_view();
+            let ttfb = observability
                 .ttfb_ms
                 .map(duration_short)
                 .unwrap_or_else(|| "-".to_string());

@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::config::ServiceConfigManager;
+use crate::logging::RetryInfo;
 use crate::pricing::CostBreakdown;
 use crate::runtime_identity::ProviderEndpointKey;
 use crate::sessions;
@@ -11,6 +12,8 @@ use crate::usage::{CacheInputAccounting, UsageMetrics};
 fn bool_is_false(value: &bool) -> bool {
     !*value
 }
+
+const OUTPUT_RATE_SANITY_CEIL: f64 = 5_000.0;
 
 fn service_tier_is_fast(value: Option<&str>) -> bool {
     value
@@ -28,6 +31,69 @@ fn generation_ms_from_duration(duration_ms: u64, ttfb_ms: Option<u64>) -> Option
     } else {
         Some(duration_ms)
     }
+}
+
+fn effective_ttfb_ms_for_request(
+    duration_ms: u64,
+    ttfb_ms: Option<u64>,
+    retry: Option<&RetryInfo>,
+) -> Option<u64> {
+    let raw_ttfb = ttfb_ms.filter(|value| *value > 0)?;
+    let Some(retry) = retry else {
+        return Some(raw_ttfb);
+    };
+    if duration_ms == 0 {
+        return Some(raw_ttfb);
+    }
+
+    let attempts = retry.route_attempts_or_derived();
+    let Some(final_attempt) = attempts.iter().rev().find(|attempt| {
+        !attempt.skipped
+            && (attempt.decision == "completed"
+                || attempt
+                    .status_code
+                    .is_some_and(|status| (200..300).contains(&status)))
+    }) else {
+        return Some(raw_ttfb);
+    };
+    let (Some(final_attempt_elapsed_ms), Some(final_attempt_headers_ms)) =
+        (final_attempt.duration_ms, final_attempt.upstream_headers_ms)
+    else {
+        return Some(raw_ttfb);
+    };
+
+    if final_attempt_elapsed_ms <= final_attempt_headers_ms
+        || final_attempt_elapsed_ms >= duration_ms
+        || raw_ttfb >= final_attempt_elapsed_ms
+    {
+        return Some(raw_ttfb);
+    }
+
+    let elapsed_before_final_attempt =
+        final_attempt_elapsed_ms.saturating_sub(final_attempt_headers_ms);
+    let corrected = elapsed_before_final_attempt.saturating_add(raw_ttfb);
+    if corrected > raw_ttfb && corrected < duration_ms {
+        Some(corrected)
+    } else {
+        Some(raw_ttfb)
+    }
+}
+
+fn output_tokens_per_second(
+    output_tokens: i64,
+    duration_ms: u64,
+    generation_ms: u64,
+) -> Option<f64> {
+    if output_tokens <= 0 || duration_ms == 0 || generation_ms == 0 {
+        return None;
+    }
+    let rate = output_tokens as f64 / (generation_ms as f64 / 1000.0);
+    let rate = if generation_ms.saturating_mul(10) < duration_ms && rate > OUTPUT_RATE_SANITY_CEIL {
+        output_tokens as f64 / (duration_ms as f64 / 1000.0)
+    } else {
+        rate
+    };
+    rate.is_finite().then_some(rate).filter(|rate| *rate > 0.0)
 }
 
 fn default_attempt_count() -> u32 {
@@ -230,7 +296,12 @@ impl RequestObservability {
         });
         let retried = attempt_count > 1;
         let same_station_retry = retried && has_station_context && !cross_station_failover;
-        let generation_ms = generation_ms_from_duration(request.duration_ms, request.ttfb_ms);
+        let ttfb_ms = effective_ttfb_ms_for_request(
+            request.duration_ms,
+            request.ttfb_ms,
+            request.retry.as_ref(),
+        );
+        let generation_ms = generation_ms_from_duration(request.duration_ms, ttfb_ms);
         let output_tokens_per_second = request.usage.as_ref().and_then(|usage| {
             if usage.output_tokens == 0 {
                 return None;
@@ -239,8 +310,7 @@ impl RequestObservability {
             if generation_ms == 0 {
                 return None;
             }
-            let rate = (usage.output_tokens as f64) / (generation_ms as f64 / 1000.0);
-            rate.is_finite().then_some(rate).filter(|rate| *rate > 0.0)
+            output_tokens_per_second(usage.output_tokens, request.duration_ms, generation_ms)
         });
         let decided_fast = request
             .route_decision
@@ -254,7 +324,7 @@ impl RequestObservability {
                 .clone()
                 .or_else(|| request.observability.trace_id.clone()),
             duration_ms: Some(request.duration_ms),
-            ttfb_ms: request.ttfb_ms.filter(|value| *value > 0),
+            ttfb_ms,
             generation_ms,
             output_tokens_per_second,
             attempt_count,
@@ -1112,7 +1182,7 @@ pub async fn enrich_session_identity_cards_with_host_transcripts(
 mod tests {
     use super::*;
 
-    use crate::logging::RetryInfo;
+    use crate::logging::{RetryInfo, RouteAttemptLog};
     use crate::pricing::CostBreakdown;
     use crate::usage::UsageMetrics;
 
@@ -1231,5 +1301,73 @@ mod tests {
         assert_eq!(observability.output_tokens_per_second, Some(100.0));
         assert_eq!(observability.attempt_count, 1);
         assert!(!observability.fast_mode);
+    }
+
+    #[test]
+    fn finished_request_corrects_legacy_attempt_relative_stream_ttfb() {
+        let mut request = sample_finished_request();
+        request.duration_ms = 10_000;
+        request.ttfb_ms = Some(1_210);
+        request.usage = Some(UsageMetrics {
+            output_tokens: 100,
+            total_tokens: 100,
+            ..UsageMetrics::default()
+        });
+        request.retry = Some(RetryInfo {
+            attempts: 2,
+            upstream_chain: Vec::new(),
+            route_attempts: vec![
+                RouteAttemptLog {
+                    attempt_index: 0,
+                    decision: "failed_status".to_string(),
+                    status_code: Some(429),
+                    upstream_headers_ms: Some(50),
+                    duration_ms: Some(500),
+                    raw: "failed".to_string(),
+                    ..RouteAttemptLog::default()
+                },
+                RouteAttemptLog {
+                    attempt_index: 1,
+                    decision: "completed".to_string(),
+                    status_code: Some(200),
+                    upstream_headers_ms: Some(1_200),
+                    duration_ms: Some(2_200),
+                    raw: "completed".to_string(),
+                    ..RouteAttemptLog::default()
+                },
+            ],
+        });
+
+        let observability = request.observability_view();
+
+        assert_eq!(observability.ttfb_ms, Some(2_210));
+        assert_eq!(observability.generation_ms, Some(7_790));
+        let rate = observability.output_tokens_per_second.expect("output rate");
+        assert!((rate - (100.0 / 7.79)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn finished_request_does_not_double_correct_global_stream_ttfb() {
+        let mut request = sample_finished_request();
+        request.duration_ms = 10_000;
+        request.ttfb_ms = Some(2_210);
+        request.retry = Some(RetryInfo {
+            attempts: 2,
+            upstream_chain: Vec::new(),
+            route_attempts: vec![RouteAttemptLog {
+                attempt_index: 1,
+                decision: "completed".to_string(),
+                status_code: Some(200),
+                upstream_headers_ms: Some(1_200),
+                duration_ms: Some(2_200),
+                raw: "completed".to_string(),
+                ..RouteAttemptLog::default()
+            }],
+        });
+
+        let observability = request.observability_view();
+
+        assert_eq!(observability.ttfb_ms, Some(2_210));
+        assert_eq!(observability.generation_ms, Some(7_790));
     }
 }
