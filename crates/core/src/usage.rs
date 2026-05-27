@@ -401,7 +401,10 @@ pub fn extract_usage_from_bytes(data: &[u8]) -> Option<UsageMetrics> {
     if text.is_empty() {
         return None;
     }
-    let json: Value = serde_json::from_str(text).ok()?;
+    let json: Value = match serde_json::from_str(text) {
+        Ok(json) => json,
+        Err(_) => return extract_usage_from_sse_bytes(data),
+    };
     let usage_obj = extract_usage_obj(&json)?;
     usage_from_value(usage_obj)
 }
@@ -593,6 +596,25 @@ mod tests {
         let mut last = None;
         scan_usage_from_sse_bytes_incremental(sse.as_bytes(), &mut pos, &mut last);
         assert_eq!(last, expected);
+    }
+
+    #[test]
+    fn extract_usage_from_bytes_falls_back_to_sse_body() {
+        let sse = concat!(
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"usage\":{\"input_tokens\":3,\"output_tokens\":4}}\n",
+            "\n"
+        );
+
+        assert_eq!(
+            extract_usage_from_bytes(sse.as_bytes()),
+            Some(UsageMetrics {
+                input_tokens: 3,
+                output_tokens: 4,
+                total_tokens: 7,
+                ..UsageMetrics::default()
+            })
+        );
     }
 
     #[test]
