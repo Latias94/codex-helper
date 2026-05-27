@@ -16,11 +16,8 @@ use tokio_tungstenite::tungstenite::http as tungstenite_http;
 use crate::codex_integration::CodexPatchMode;
 use crate::config::RoutingAffinityPolicyV5;
 use crate::lb::{COOLDOWN_SECS, LoadBalancer};
-use crate::logging::{CodexBridgeLog, RouteAttemptLog, ServiceTierLog, log_retry_trace};
-use crate::routing_ir::{
-    RouteCandidate, RoutePlanAttemptState, RoutePlanExecutor, RoutePlanRuntimeState,
-    RoutePlanTemplate,
-};
+use crate::logging::{CodexBridgeLog, RouteAttemptLog, ServiceTierLog};
+use crate::routing_ir::{RouteCandidate, RoutePlanAttemptState, RoutePlanExecutor};
 use crate::state::{
     FinishRequestParams, ResolvedRouteValue, RouteDecisionProvenance, RouteValueSource,
     SessionIdentitySource,
@@ -35,7 +32,8 @@ use super::headers::filter_request_headers;
 use super::passive_health::{record_passive_upstream_failure, record_passive_upstream_success};
 use super::request_body::codex_session_identity_and_completed_body;
 use super::request_continuity::{
-    RequestContinuityClassification, RequestContinuityClassificationInput, RequestTransport,
+    RequestContinuityClassification, RequestContinuityClassificationInput,
+    RequestContinuityContract, RequestTransport, RouteContinuityDecisionInput,
     classify_request_continuity,
 };
 use super::request_failures::{FailedProxyRequestParams, finish_failed_proxy_request};
@@ -58,7 +56,11 @@ use super::route_metadata::{
     ENDPOINT_ID_TAG, PREFERENCE_GROUP_TAG, PROVIDER_ENDPOINT_KEY_TAG, PROVIDER_ID_TAG,
     ROUTE_PATH_TAG,
 };
-use super::route_unavailability::route_unavailable_report;
+use super::route_target_selection::{
+    log_route_continuity_blocked, restrict_route_state_to_affinity_continuity_domain,
+    route_graph_request_requires_existing_affinity, route_graph_runtime_for_request,
+    select_websocket_route_graph_target,
+};
 use super::selected_upstream_request::apply_selected_model_mapping;
 use super::{CLIENT_NAME_HEADER, ProxyService};
 
@@ -437,105 +439,65 @@ async fn select_responses_websocket_target(
         RequestRouteSelection::RouteGraph { template } => {
             let executor = RoutePlanExecutor::new(template);
             let route_graph_key = template.route_graph_key();
-            let mut runtime = proxy
-                .state
-                .route_plan_runtime_state_for_provider_endpoints(proxy.service_name)
-                .await;
-            super::provider_execution::apply_concurrency_snapshots_to_runtime(
-                proxy,
-                template,
-                &mut runtime,
-            );
-            apply_session_route_affinity_for_template(
-                proxy,
-                prepared.session_id.as_deref(),
-                template,
-                &mut runtime,
-            )
-            .await;
+            let runtime =
+                route_graph_runtime_for_request(proxy, template, prepared.session_id.as_deref())
+                    .await;
             let mut route_state = RoutePlanAttemptState::default();
+            let continuity_contract =
+                websocket_continuity_contract(prepared, template.affinity_policy);
 
-            if websocket_state_bound_request_requires_existing_affinity(
-                prepared,
+            if route_graph_request_requires_existing_affinity(
+                continuity_contract,
                 &runtime,
                 template,
-                template.affinity_policy,
             ) {
-                log_websocket_route_continuity_blocked(proxy, prepared);
+                log_route_continuity_blocked(
+                    proxy.service_name,
+                    prepared.request_id,
+                    continuity_contract,
+                    Some("responses_websocket"),
+                );
                 return Err(ResponsesWebSocketSelectionFailure::new(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "state-bound compact request requires existing route affinity",
                 ));
             }
+            restrict_route_state_to_affinity_continuity_domain(
+                continuity_contract,
+                &mut route_state,
+                template,
+                &runtime,
+            );
 
-            loop {
-                let selection = executor.select_supported_candidate_with_runtime_state(
-                    &mut route_state,
-                    &runtime,
-                    prepared.request_model.as_deref(),
-                );
-                if let Some(selected) = selection.selected {
-                    let candidate = selected.candidate;
-                    let concurrency_permit =
-                        match super::provider_execution::try_acquire_candidate_concurrency_permit(
-                            proxy,
-                            executor.template(),
-                            candidate,
-                        ) {
-                            Ok(permit) => permit,
-                            Err(error) => {
-                                let provider_endpoint = executor
-                                    .template()
-                                    .candidate_provider_endpoint_key(candidate);
-                                route_state.avoid_provider_endpoint(provider_endpoint);
-                                tracing::debug!(
-                                    ?error,
-                                    "responses websocket route candidate concurrency saturated"
-                                );
-                                continue;
-                            }
-                        };
+            let selected = select_websocket_route_graph_target(
+                proxy,
+                &executor,
+                &runtime,
+                &mut route_state,
+                prepared.request_id,
+                prepared.request_model.as_deref(),
+                prepared.request_continuity.is_remote_compaction_request(),
+                continuity_contract,
+            )
+            .await
+            .map_err(|failure| ResponsesWebSocketSelectionFailure {
+                status: failure.status,
+                message: failure.message,
+                route_attempts: failure.route_attempts,
+            })?;
 
-                    let target = AttemptTarget::from_candidate(proxy.service_name, candidate);
-                    return build_selected(BuildSelectedParams {
-                        proxy,
-                        prepared,
-                        target,
-                        legacy_lb: None,
-                        route_graph_key: Some(route_graph_key),
-                        avoided_indices: selection.avoided_candidate_indices,
-                        avoided_total: selection.avoided_total,
-                        total_upstreams: selection.total_upstreams,
-                        concurrency_permit,
-                    })
-                    .await;
-                }
-
-                let mut route_attempts = Vec::new();
-                if let Some(report) = route_unavailable_report(
-                    proxy.service_name,
-                    prepared.request_id,
-                    &executor,
-                    &runtime,
-                    &route_state,
-                    prepared.request_model.as_deref(),
-                ) {
-                    route_attempts.extend(report.route_attempts.clone());
-                    let (status, message) = report.failure_status_message();
-                    return Err(ResponsesWebSocketSelectionFailure {
-                        status,
-                        message,
-                        route_attempts,
-                    });
-                }
-                return Err(ResponsesWebSocketSelectionFailure::new(
-                    StatusCode::BAD_GATEWAY,
-                    format!(
-                        "no route candidate supports model {:?}",
-                        prepared.request_model
-                    ),
-                ));
-            }
+            build_selected(BuildSelectedParams {
+                proxy,
+                prepared,
+                target: selected.target,
+                legacy_lb: None,
+                route_graph_key: Some(route_graph_key),
+                avoided_indices: selected.avoided_candidate_indices,
+                avoided_total: selected.avoided_total,
+                total_upstreams: selected.total_upstreams,
+                concurrency_permit: selected.concurrency_permit,
+            })
+            .await
         }
         RequestRouteSelection::Legacy { lbs } => {
             let upstream_overrides = proxy
@@ -561,19 +523,31 @@ async fn select_responses_websocket_target(
             )
             .await;
             let mut route_state = RoutePlanAttemptState::default();
+            let continuity_contract =
+                websocket_continuity_contract(prepared, RoutingAffinityPolicyV5::Hard);
 
-            if websocket_state_bound_request_requires_existing_affinity(
-                prepared,
+            if route_graph_request_requires_existing_affinity(
+                continuity_contract,
                 &runtime,
                 &legacy_template,
-                RoutingAffinityPolicyV5::Hard,
             ) {
-                log_websocket_route_continuity_blocked(proxy, prepared);
+                log_route_continuity_blocked(
+                    proxy.service_name,
+                    prepared.request_id,
+                    continuity_contract,
+                    Some("responses_websocket"),
+                );
                 return Err(ResponsesWebSocketSelectionFailure::new(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "state-bound compact request requires existing route affinity",
                 ));
             }
+            restrict_route_state_to_affinity_continuity_domain(
+                continuity_contract,
+                &mut route_state,
+                &legacy_template,
+                &runtime,
+            );
 
             let total_upstreams = legacy_template.candidates.len();
             let mut tried_stations = HashSet::new();
@@ -644,40 +618,17 @@ async fn select_responses_websocket_target(
     }
 }
 
-fn websocket_state_bound_request_requires_existing_affinity(
+fn websocket_continuity_contract(
     prepared: &ResponsesWebSocketPrepared,
-    runtime: &RoutePlanRuntimeState,
-    template: &RoutePlanTemplate,
     affinity_policy: RoutingAffinityPolicyV5,
-) -> bool {
-    prepared
-        .request_continuity
-        .remote_compaction_requires_affinity
-        && matches!(affinity_policy, RoutingAffinityPolicyV5::Hard)
-        && runtime.affinity_provider_endpoint().is_none()
-        && template
-            .continuity_topology()
-            .configured_provider_endpoint_count()
-            > 1
-}
-
-fn log_websocket_route_continuity_blocked(
-    proxy: &ProxyService,
-    prepared: &ResponsesWebSocketPrepared,
-) {
-    let reason = "state_bound_compact_missing_affinity";
-    log_retry_trace(serde_json::json!({
-        "event": "route_continuity_blocked",
-        "service": proxy.service_name,
-        "request_id": prepared.request_id,
-        "reason": reason,
-        "continuity_class": prepared.request_continuity.class.trace_label(),
-        "affinity_source": "none",
-        "provider_failover_allowed": false,
-        "provider_failover_blocked_reason": reason,
-        "transport": "responses_websocket",
-        "balance_signal_authoritative": false,
-    }));
+) -> RequestContinuityContract {
+    RequestContinuityContract::from_route(RouteContinuityDecisionInput {
+        is_remote_compaction_request: prepared.request_continuity.is_remote_compaction_request(),
+        remote_compaction_requires_affinity: prepared
+            .request_continuity
+            .remote_compaction_requires_affinity,
+        affinity_policy: Some(affinity_policy),
+    })
 }
 
 fn selected_upstream_with_route_metadata(

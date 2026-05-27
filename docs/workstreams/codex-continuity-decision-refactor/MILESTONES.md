@@ -28,8 +28,11 @@ Status: Done for CDC-020 and CDC-030.
 Exit criteria:
 
 - Ordinary conversation turns use soft session affinity and can route to another healthy endpoint when the pinned endpoint is unavailable.
-- State-bound compact remains fail-closed outside one known continuity domain.
-- Missing affinity bootstraps only in single-domain execution.
+- State-bound compact follows the active affinity policy: fallback-sticky can
+  bootstrap through the configured route graph, while hard remains fail-closed
+  outside one known continuity domain.
+- Missing affinity bootstrap is explicit policy behavior, not an accidental
+  route fallback.
 - Explicit `continuity_domain` is represented in config/runtime identity or the scope is split with a documented deferral.
 
 Status: Done for CDC-040 and CDC-050.

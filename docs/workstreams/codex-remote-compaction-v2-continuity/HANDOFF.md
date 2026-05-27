@@ -3,6 +3,10 @@
 Status: Complete
 Last updated: 2026-05-26
 
+Update, 2026-05-27: current route-graph behavior is policy-sensitive. `fallback-sticky` may
+bootstrap missing v2 compact affinity through the configured route graph, while `hard` and legacy
+multi-upstream routing still fail closed when state-bound affinity is missing.
+
 ## Current Task
 
 None. Workstream complete.
@@ -42,8 +46,8 @@ Passed gates:
 
 ## Residual Risks And Follow-Ups
 
-- State-bound v2 compact will fail closed when no route affinity is known.
-  Operators who know two provider endpoints share upstream state still need a
-  future explicit continuity-domain feature before cross-provider fallback can
-  be made safe.
+- State-bound v2 compact follows the active affinity policy when no route
+  affinity is known: `fallback-sticky` can bootstrap, while `hard` fails closed.
+  Operators who need hard cross-endpoint movement still need an explicit
+  continuity domain.
 - This lane does not live-smoke v2 relay support.

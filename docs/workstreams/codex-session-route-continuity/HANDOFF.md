@@ -3,6 +3,11 @@
 Status: Complete
 Last updated: 2026-05-25
 
+Update, 2026-05-27: later route-continuity work made route-graph fallback behavior
+policy-sensitive. `fallback-sticky` may bootstrap missing state-bound compact affinity by trying
+the configured route and recording the successful endpoint; `hard` and legacy multi-upstream paths
+still fail closed when state-bound compact affinity is missing.
+
 ## Current Task
 
 None. Workstream closed.
@@ -18,9 +23,10 @@ or any specific relay implementation. The proxy should persist and restore only
 provider-opaque facts it owns.
 
 Compact failure fallback is a separate CSRC-030 concern. Non-state-bound compact
-can use normal provider fallback. State-bound compact should fail closed or stay
-on the affinity endpoint unless a future explicit continuity-domain feature
-proves multiple endpoints share safe upstream state.
+can use normal provider fallback. State-bound compact now follows the active
+affinity policy: `fallback-sticky` can continue through the route graph and
+update affinity, while `hard` stays on the affinity endpoint unless an explicit
+continuity domain proves multiple endpoints share safe upstream state.
 
 ## Next Step
 
@@ -50,9 +56,10 @@ Final gates:
 
 ## Residual Risks And Follow-Ups
 
-- State-bound compact only uses the known provider endpoint or fails closed.
-  Cross-provider fallback for state-bound compact should be a new workstream
-  with an explicit operator-configured continuity domain.
+- State-bound compact either uses known route affinity, bootstraps through an
+  explicitly tryable policy such as `fallback-sticky`, or fails closed. Hard
+  cross-provider movement still requires an explicit operator-configured
+  continuity domain.
 - Balance probes remain routing/runtime hints, not proof that compact state can
   safely move between provider endpoints.
 - The route affinity ledger is provider-opaque and can be disabled with

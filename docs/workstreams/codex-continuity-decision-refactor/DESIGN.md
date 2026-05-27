@@ -3,6 +3,11 @@
 Status: Complete
 Last updated: 2026-05-26
 
+Update, 2026-05-27: later fallback-sticky work relaxed the missing-affinity bootstrap rule for
+route-graph compact requests. `fallback-sticky` compact can now try the configured route without
+prior affinity and record the successful endpoint; `hard` compact and legacy multi-upstream compact
+retain fail-closed missing-affinity behavior.
+
 ## Why This Lane Exists
 
 Codex helper now supports ordinary Responses HTTP, remote compaction v1, remote compaction v2, and Responses WebSocket relay. These paths all need route continuity decisions, but the decision is currently spread across request body parsing, request flavor flags, provider execution, route affinity, and WebSocket target selection.
@@ -29,8 +34,11 @@ State-bound Codex requests can be over-pinned, under-pinned, or pinned in differ
 
 - HTTP and Responses WebSocket derive continuity from one module.
 - Ordinary conversation turns use soft session affinity: prefer the last successful endpoint, but escape when the endpoint is unavailable.
-- Compact and encrypted-state requests use hard continuity: stay within a proven continuity domain, fail closed otherwise.
-- A missing affinity can bootstrap only when exactly one continuity domain is configured or selected.
+- Compact and encrypted-state requests use policy-sensitive continuity:
+  `fallback-sticky` may bootstrap through the route graph, while `hard` stays
+  within a proven continuity domain and fails closed otherwise.
+- Missing affinity bootstrap is explicit policy behavior, not an accidental
+  preference-group fallback.
 - `continuity_domain` is explicit operator configuration. Domain-name equality is a diagnostic hint, not sufficient proof for relay state sharing.
 - Official OpenAI direct endpoints may later gain a conservative canonical domain heuristic based on official profile, canonical base URL, credential source, and org/project identity. Relay endpoints do not get this heuristic.
 - Route failure reporting distinguishes route unavailable, hard affinity unavailable, missing state-bound affinity, invalid state, and upstream transport/status failures.

@@ -30,9 +30,9 @@ Last updated: 2026-05-25
   continuity decision for stateless, session-preferred, and provider-state-bound
   requests, including what happens when the affinity provider endpoint fails.
   Validation: cargo nextest run -p codex-helper-core responses_compact route_affinity --no-fail-fast
-  Review: Non-state-bound compact may fallback like a normal session request; state-bound compact must not silently choose a new provider endpoint when durable affinity is missing or the affinity endpoint fails.
+  Review: Non-state-bound compact may fallback like a normal session request; state-bound compact must either follow explicit policy bootstrap/fallback rules or fail closed when durable affinity is missing or the affinity endpoint fails.
   Evidence: `cargo nextest run -p codex-helper-core responses_compact route_affinity --no-fail-fast`.
-  Handoff: DONE. Provider-state-bound compact now fails closed when affinity is missing, while non-state-bound compact fallback remains intact.
+  Handoff: DONE. Provider-state-bound compact behavior is explicit. Later route-continuity work made missing-affinity behavior policy-sensitive: fallback-sticky can bootstrap; hard still fails closed.
 
 ## M3 - Provider-Opaque Runtime Signals
 

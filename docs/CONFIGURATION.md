@@ -456,13 +456,13 @@ Successful route affinity is also persisted to:
 
 The ledger stores helper-owned provider endpoint identity only; it does not store or infer upstream relay implementation details. Set `CODEX_HELPER_SESSION_ROUTE_AFFINITY_LEDGER=off` to disable this persistence, or set it to a path to use a custom ledger file.
 
-For Codex remote compaction, helper treats compact v1 requests that mention state-bound fields such as `encrypted_content`, `previous_response_id`, or `compaction_summary`, and compact v2 requests with a structured `compaction_trigger`, as provider-state-bound. These requests must use a known route affinity. If no affinity exists after startup or config changes, helper returns an explicit continuity error instead of silently choosing a different provider endpoint. If the known affinity endpoint itself fails, provider-state-bound compact stays fail-closed; non-state-bound compact can still use normal provider fallback according to the route policy.
+For Codex remote compaction, helper treats compact v1 requests that mention state-bound fields such as `encrypted_content`, `previous_response_id`, or `compaction_summary`, and compact v2 requests with a structured `compaction_trigger`, as provider-state-bound. Under the default `fallback-sticky` route affinity policy, a state-bound compact request without existing route affinity is still tryable: helper follows the configured route graph, records the successful provider endpoint as the session affinity, and lets upstream decide whether the compact state is valid. Under `hard` affinity, or on the legacy multi-upstream path, missing affinity remains fail-closed with an explicit continuity error. If a known affinity endpoint itself fails, `fallback-sticky` may continue along the route graph and update affinity, while `hard` blocks cross-endpoint movement unless an explicit shared `continuity_domain` permits it. Non-state-bound compact can still use normal provider fallback according to the route policy.
 
 Affinity is not a hard pin:
 
 - request retry, provider health, capability mismatch, cooldown, and trusted balance exhaustion still apply;
 - if the sticky provider fails, ordinary and non-state-bound requests continue through the current route graph and then stick to the next successful provider;
-- provider-state-bound compact does not cross provider endpoints unless they share the same explicit `continuity_domain`;
+- provider-state-bound compact honors the route affinity policy: `fallback-sticky` stays tryable and updates affinity after a successful fallback, while `hard` stays within the affinity continuity domain unless an explicit shared `continuity_domain` permits movement;
 - if provider tags, route node strategy, children, entry, or provider endpoint identity change, the route graph key changes and old affinity no longer matches;
 - legacy station overrides are disabled for route graph configs; use route/provider/endpoint controls instead.
 
@@ -1221,7 +1221,7 @@ For route-continuity diagnosis, control trace fields are intentionally provider-
 - `provider_failover_blocked_reason`: why provider failover was blocked, for example `provider_state_bound` or `state_bound_compact_missing_affinity`.
 - `balance_signal_authoritative`: currently `false` for compact continuity blocks. A balance probe can explain routing demotion, but it does not prove that a state-bound compact request is safe to move to another provider endpoint.
 
-If a state-bound compact request has no restored route affinity, look for a `route_continuity_blocked` event with `reason = "state_bound_compact_missing_affinity"`. That means helper refused to guess a provider endpoint; it does not mean helper identified the relay as sub2api, New API, OpenAI, or any other backend.
+If a state-bound compact request has no restored route affinity and the request returns a local continuity error, look for a `route_continuity_blocked` event with `reason = "state_bound_compact_missing_affinity"`. That means the active policy refused to bootstrap by choosing a provider endpoint; it does not mean helper identified the relay as sub2api, New API, OpenAI, or any other backend. Under `fallback-sticky`, no-affinity compact requests are normally sent through the configured route graph instead of producing this local block.
 
 ## Troubleshoot Monthly-First Routing
 

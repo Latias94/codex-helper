@@ -3,11 +3,15 @@
 Status: Complete
 Last updated: 2026-05-26
 
+Update, 2026-05-27: state-bound compact missing-affinity behavior is now policy-sensitive.
+`fallback-sticky` compact can bootstrap through the configured route graph; `hard` affinity and
+legacy multi-upstream compact still fail closed when state-bound affinity is missing.
+
 ## Why This Lane Exists
 
 `codex-continuity-decision-refactor` closed the core routing behavior: state-bound compact
-requests now fail closed outside explicit continuity domains, and ordinary turns can escape an
-unhealthy soft affinity. This follow-up lane handles the integration debt that would otherwise
+requests now honor explicit continuity policy, and ordinary turns can escape an unhealthy soft
+affinity. This follow-up lane handles the integration debt that would otherwise
 turn that core fix into an operator footgun: release CI still tries to package the desktop app,
 the largest regression file is hard to review, topology counting is duplicated, configuration
 surfaces do not expose `continuity_domain` consistently, and diagnostics need to remain readable

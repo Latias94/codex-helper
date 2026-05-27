@@ -440,6 +440,219 @@ supports_websockets = true
 }
 
 #[tokio::test]
+async fn responses_websocket_hard_compaction_fallback_stays_inside_explicit_continuity_domain() {
+    let _env_guard = env_lock().await;
+    let codex_home = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HOME", &codex_home);
+    }
+    write_text_file(
+        &codex_home.join("config.toml"),
+        r#"
+model_provider = "codex_proxy"
+
+[model_providers.codex_proxy]
+name = "OpenAI"
+base_url = "http://127.0.0.1:1"
+wire_api = "responses"
+supports_websockets = true
+"#,
+    );
+
+    let upstream_b =
+        axum::Router::new().route(
+            "/v1/responses",
+            get(|ws: axum::extract::ws::WebSocketUpgrade| async move {
+                ws.on_upgrade(|_| async move {})
+            }),
+        );
+    let (b_addr, b_handle) = spawn_axum_server(upstream_b);
+
+    let c_hits = Arc::new(AtomicUsize::new(0));
+    let c_hits_for_route = c_hits.clone();
+    let upstream_c = axum::Router::new().route(
+        "/v1/responses",
+        get(move |ws: axum::extract::ws::WebSocketUpgrade| {
+            let c_hits = c_hits_for_route.clone();
+            async move {
+                ws.on_upgrade(move |mut socket| async move {
+                    c_hits.fetch_add(1, Ordering::SeqCst);
+                    if socket.recv().await.is_some() {
+                        let _ = socket
+                            .send(axum::extract::ws::Message::Text(
+                                r#"{"type":"response.created","response":{"id":"resp-c"}}"#.into(),
+                            ))
+                            .await;
+                    }
+                })
+            }
+        }),
+    );
+    let (c_addr, c_handle) = spawn_axum_server(upstream_c);
+
+    let d_hits = Arc::new(AtomicUsize::new(0));
+    let d_hits_for_route = d_hits.clone();
+    let upstream_d = axum::Router::new().route(
+        "/v1/responses",
+        get(move |ws: axum::extract::ws::WebSocketUpgrade| {
+            let d_hits = d_hits_for_route.clone();
+            async move {
+                ws.on_upgrade(move |mut socket| async move {
+                    d_hits.fetch_add(1, Ordering::SeqCst);
+                    if socket.recv().await.is_some() {
+                        let _ = socket
+                            .send(axum::extract::ws::Message::Text(
+                                r#"{"type":"response.created","response":{"id":"resp-d"}}"#.into(),
+                            ))
+                            .await;
+                    }
+                })
+            }
+        }),
+    );
+    let (d_addr, d_handle) = spawn_axum_server(upstream_d);
+
+    let retry = RetryConfig {
+        upstream: Some(retry_layer_config(
+            1,
+            "502",
+            Vec::new(),
+            RetryStrategy::Failover,
+        )),
+        provider: Some(retry_layer_config(
+            3,
+            "502",
+            Vec::new(),
+            RetryStrategy::Failover,
+        )),
+        transport_cooldown_secs: Some(0),
+        cooldown_backoff_factor: Some(1),
+        cooldown_backoff_max_secs: Some(0),
+        ..RetryConfig::default()
+    };
+    let mut routing =
+        RoutingConfigV4::ordered_failover(vec!["b".to_string(), "c".to_string(), "d".to_string()]);
+    routing.affinity_policy = crate::config::RoutingAffinityPolicyV5::Hard;
+    let v4 = ProxyConfigV4 {
+        retry,
+        codex: ServiceViewV4 {
+            providers: std::collections::BTreeMap::from([
+                (
+                    "b".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some(format!("http://{b_addr}/v1")),
+                        continuity_domain: Some("relay-cluster-a".to_string()),
+                        inline_auth: UpstreamAuth::default(),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+                (
+                    "c".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some(format!("http://{c_addr}/v1")),
+                        continuity_domain: Some("relay-cluster-a".to_string()),
+                        inline_auth: UpstreamAuth::default(),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+                (
+                    "d".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some(format!("http://{d_addr}/v1")),
+                        continuity_domain: Some("relay-cluster-b".to_string()),
+                        inline_auth: UpstreamAuth::default(),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+            ]),
+            routing: Some(routing),
+            ..ServiceViewV4::default()
+        },
+        ..ProxyConfigV4::default()
+    };
+    let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compile v4");
+    let route_graph_key = crate::routing_ir::compile_v4_route_plan_template("codex", &v4.codex)
+        .expect("route template")
+        .route_graph_key();
+    let proxy = ProxyService::new_with_v4_source(
+        Client::new(),
+        Arc::new(runtime),
+        Some(Arc::new(v4)),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let state = proxy.state.clone();
+    state
+        .record_session_route_affinity_success(
+            "ws-explicit-domain",
+            SessionRouteAffinityTarget {
+                route_graph_key: route_graph_key.clone(),
+                session_identity_source: Some(SessionIdentitySource::PromptCacheKey),
+                provider_endpoint: ProviderEndpointKey::new("codex", "b", "default"),
+                upstream_base_url: format!("http://{b_addr}/v1"),
+                route_path: vec!["b".to_string()],
+            },
+            Some("test_seed".to_string()),
+            crate::logging::now_ms(),
+        )
+        .await;
+    state
+        .penalize_provider_endpoint_attempt(
+            "codex",
+            ProviderEndpointKey::new("codex", "b", "default"),
+            30,
+            crate::lb::CooldownBackoff {
+                factor: 1,
+                max_secs: 0,
+            },
+        )
+        .await;
+
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let request = format!("ws://{proxy_addr}/v1/responses")
+        .into_client_request()
+        .expect("ws request");
+    let (mut socket, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("connect proxy websocket");
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"response.create","model":"gpt-5","stream":true,"prompt_cache_key":"ws-explicit-domain","input":[{"role":"user","content":"compact me"},{"type":"compaction_trigger"}]}"#.into(),
+        ))
+        .await
+        .expect("send first frame");
+
+    let event = socket
+        .next()
+        .await
+        .expect("event")
+        .expect("event ok")
+        .to_text()
+        .expect("event text")
+        .to_string();
+    assert!(event.contains("response.created"), "{event}");
+    assert_eq!(c_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(d_hits.load(Ordering::SeqCst), 0);
+
+    socket.close(None).await.expect("close websocket");
+    let affinity = state
+        .get_session_route_affinity("ws-explicit-domain")
+        .await
+        .expect("route affinity updated");
+    assert_eq!(affinity.route_graph_key, route_graph_key);
+    assert_eq!(affinity.provider_endpoint.provider_id.as_str(), "c");
+
+    proxy_handle.abort();
+    b_handle.abort();
+    c_handle.abort();
+    d_handle.abort();
+    let _ = std::fs::remove_dir_all(codex_home);
+}
+
+#[tokio::test]
 async fn responses_websocket_allows_compaction_trigger_without_prior_affinity_for_single_endpoint()
 {
     let _env_guard = env_lock().await;

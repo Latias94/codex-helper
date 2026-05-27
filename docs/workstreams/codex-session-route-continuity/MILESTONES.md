@@ -25,12 +25,13 @@ Exit criteria:
 
 - Request continuity is represented explicitly rather than as scattered compact
   booleans.
-- State-bound compact with missing affinity fails closed or reports a clear
-  continuity error.
+- State-bound compact with missing affinity either bootstraps through an
+  explicitly tryable policy or reports a clear continuity error.
 - Non-state-bound compact keeps the existing safe fallback behavior when the
   affinity endpoint fails.
-- State-bound compact does not silently fallback after affinity endpoint
-  failure unless a future explicit continuity domain allows it.
+- State-bound compact follows the active affinity policy after affinity endpoint
+  failure; hard cross-endpoint movement still requires an explicit continuity
+  domain.
 
 ## M3 - Provider-Opaque Runtime Signals
 

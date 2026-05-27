@@ -16,15 +16,6 @@ pub(super) enum RequestContinuityClass {
     ProviderStateBound,
 }
 
-impl RequestContinuityClass {
-    pub(super) fn trace_label(self) -> &'static str {
-        match self {
-            Self::StatelessOrSessionPreferred => "stateless_or_session_preferred",
-            Self::ProviderStateBound => "provider_state_bound",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RequestContinuityReason {
     Ordinary,
@@ -40,6 +31,12 @@ pub(super) struct RequestContinuityClassification {
     pub(super) is_remote_compaction_v1_request: bool,
     pub(super) is_remote_compaction_v2_request: bool,
     pub(super) remote_compaction_requires_affinity: bool,
+}
+
+impl RequestContinuityClassification {
+    pub(super) fn is_remote_compaction_request(self) -> bool {
+        self.is_remote_compaction_v1_request || self.is_remote_compaction_v2_request
+    }
 }
 
 pub(super) struct RequestContinuityClassificationInput<'a> {
@@ -97,15 +94,93 @@ impl RequestContinuityDecision {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct RouteContinuityDecisionInput {
     pub(super) is_remote_compaction_request: bool,
     pub(super) remote_compaction_requires_affinity: bool,
     pub(super) affinity_policy: Option<RoutingAffinityPolicyV5>,
 }
 
-pub(super) fn route_continuity_decision(
-    input: RouteContinuityDecisionInput,
-) -> RequestContinuityDecision {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct RequestContinuityContract {
+    decision: RequestContinuityDecision,
+    strict_affinity: bool,
+    allow_provider_failover: bool,
+}
+
+impl RequestContinuityContract {
+    pub(super) fn from_route(input: RouteContinuityDecisionInput) -> Self {
+        let decision = route_continuity_decision(input);
+        let strict_affinity = input.is_remote_compaction_request
+            && matches!(input.affinity_policy, Some(RoutingAffinityPolicyV5::Hard));
+        Self {
+            decision,
+            strict_affinity,
+            allow_provider_failover: !input.is_remote_compaction_request || !strict_affinity,
+        }
+    }
+
+    pub(super) fn requires_known_affinity(self) -> bool {
+        matches!(
+            self.decision,
+            RequestContinuityDecision::ProviderStateBound {
+                requires_known_affinity: true
+            }
+        )
+    }
+
+    pub(super) fn requires_existing_route_affinity(
+        self,
+        has_affinity: bool,
+        configured_provider_endpoint_count: usize,
+    ) -> bool {
+        self.requires_known_affinity() && !has_affinity && configured_provider_endpoint_count > 1
+    }
+
+    pub(super) fn should_restrict_to_affinity_continuity_domain(self) -> bool {
+        self.strict_affinity
+    }
+
+    pub(super) fn allow_provider_failover(self) -> bool {
+        self.allow_provider_failover
+    }
+
+    pub(super) fn allow_provider_failover_with_explicit_domain(
+        self,
+        explicit_domain_failover_allowed: bool,
+    ) -> bool {
+        self.allow_provider_failover()
+            || (self.is_provider_state_bound() && explicit_domain_failover_allowed)
+    }
+
+    pub(super) fn continuity_class(self) -> &'static str {
+        self.decision.trace_label()
+    }
+
+    pub(super) fn is_provider_state_bound(self) -> bool {
+        matches!(
+            self.decision,
+            RequestContinuityDecision::ProviderStateBound { .. }
+        )
+    }
+
+    pub(super) fn provider_failover_blocked_reason(self) -> Option<&'static str> {
+        if self.allow_provider_failover() {
+            None
+        } else if self.is_provider_state_bound() {
+            Some("provider_state_bound")
+        } else {
+            Some("provider_failover_disabled")
+        }
+    }
+
+    pub(super) fn missing_affinity_trace_reason(self) -> &'static str {
+        debug_assert!(self.requires_known_affinity());
+        "state_bound_compact_missing_affinity"
+    }
+}
+
+fn route_continuity_decision(input: RouteContinuityDecisionInput) -> RequestContinuityDecision {
     let hard_affinity = matches!(input.affinity_policy, Some(RoutingAffinityPolicyV5::Hard));
     if input.is_remote_compaction_request
         && (input.remote_compaction_requires_affinity || hard_affinity)
@@ -200,33 +275,51 @@ mod tests {
 
     #[test]
     fn route_continuity_keeps_existing_hard_affinity_semantics_for_compact() {
-        let decision = route_continuity_decision(RouteContinuityDecisionInput {
+        let contract = RequestContinuityContract::from_route(RouteContinuityDecisionInput {
             is_remote_compaction_request: true,
             remote_compaction_requires_affinity: false,
             affinity_policy: Some(RoutingAffinityPolicyV5::Hard),
         });
 
-        assert_eq!(
-            decision,
-            RequestContinuityDecision::ProviderStateBound {
-                requires_known_affinity: false
-            }
-        );
+        assert_eq!(contract.continuity_class(), "provider_state_bound");
+        assert!(!contract.requires_known_affinity());
+        assert!(!contract.allow_provider_failover());
+        assert!(!contract.requires_existing_route_affinity(false, 2));
+        assert!(contract.should_restrict_to_affinity_continuity_domain());
     }
 
     #[test]
     fn route_continuity_treats_fallback_sticky_compact_as_tryable_state_bound() {
-        let decision = route_continuity_decision(RouteContinuityDecisionInput {
+        let contract = RequestContinuityContract::from_route(RouteContinuityDecisionInput {
             is_remote_compaction_request: true,
             remote_compaction_requires_affinity: true,
             affinity_policy: Some(RoutingAffinityPolicyV5::FallbackSticky),
         });
 
+        assert_eq!(contract.continuity_class(), "provider_state_bound");
+        assert!(!contract.requires_known_affinity());
+        assert!(contract.allow_provider_failover());
+        assert!(!contract.requires_existing_route_affinity(false, 2));
+        assert!(!contract.should_restrict_to_affinity_continuity_domain());
+    }
+
+    #[test]
+    fn route_continuity_hard_compact_requires_known_affinity_when_state_bound() {
+        let contract = RequestContinuityContract::from_route(RouteContinuityDecisionInput {
+            is_remote_compaction_request: true,
+            remote_compaction_requires_affinity: true,
+            affinity_policy: Some(RoutingAffinityPolicyV5::Hard),
+        });
+
+        assert_eq!(contract.continuity_class(), "provider_state_bound");
+        assert!(contract.requires_known_affinity());
+        assert!(!contract.allow_provider_failover());
+        assert!(contract.requires_existing_route_affinity(false, 2));
+        assert!(!contract.requires_existing_route_affinity(true, 2));
+        assert!(!contract.requires_existing_route_affinity(false, 1));
         assert_eq!(
-            decision,
-            RequestContinuityDecision::ProviderStateBound {
-                requires_known_affinity: false
-            }
+            contract.provider_failover_blocked_reason(),
+            Some("provider_state_bound")
         );
     }
 }

@@ -26,8 +26,10 @@ Exit criteria:
 
 - V2 compact is included in the common remote-compaction predicate.
 - Known route affinity is honored for v2 compact.
-- Missing route affinity fails closed with the existing continuity error path.
-- Cross-provider fallback remains blocked for state-bound compact.
+- Missing route affinity follows the active policy: `fallback-sticky` can
+  bootstrap; `hard` fails closed with the existing continuity error path.
+- Hard cross-provider fallback remains blocked for state-bound compact unless
+  an explicit continuity domain allows it.
 
 ## M3 - Documentation And Gates
 

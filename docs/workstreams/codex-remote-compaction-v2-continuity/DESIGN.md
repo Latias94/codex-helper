@@ -3,6 +3,11 @@
 Status: Draft
 Last updated: 2026-05-26
 
+Update, 2026-05-27: later route-continuity work made missing-affinity behavior
+policy-sensitive. Under `fallback-sticky`, v2 compact without prior route affinity is tryable
+through the configured route graph and records affinity after success. Under `hard` affinity and
+legacy multi-upstream routing, missing state-bound affinity still fails closed.
+
 ## Why This Lane Exists
 
 Codex `remote_compaction_v2` no longer uses `POST /responses/compact`. It sends
@@ -47,8 +52,9 @@ creates three operator problems:
 - Treat v2 compact as provider-state-bound by default because the request is
   compacting the current session state and may depend on prior encrypted
   content.
-- Reuse the existing provider-opaque continuity policy: use known route affinity
-  when available; fail closed when state-bound affinity is missing; do not
+- Reuse the provider-opaque continuity policy: use known route affinity when
+  available; allow policy-controlled bootstrap when the active route policy is
+  tryable; fail closed when hard/legacy state-bound affinity is missing; do not
   infer relay internals from provider name, base URL, balance probes, or 429.
 - Keep v1 `/responses/compact` behavior intact.
 
@@ -66,8 +72,8 @@ creates three operator problems:
 - Implementing relay-specific behavior for sub2api, new-api, OpenAI, or any
   other intermediary.
 - Proving a relay supports v2 compact with a live smoke test.
-- Cross-provider fallback for state-bound compact. That requires a future
-  explicit continuity-domain feature controlled by the operator.
+- Hard cross-provider fallback for state-bound compact without an explicit
+  continuity domain. That remains controlled by operator configuration.
 
 ## Starting Assumptions
 
@@ -92,11 +98,14 @@ Provider execution should consume a single "remote compaction request" predicate
 covering v1 and v2, rather than duplicating v1-specific booleans.
 
 V2 compact is state-bound by default. If a session already has route affinity,
-the request stays on that provider endpoint. If no affinity is known, the proxy
-returns a continuity error instead of silently re-entering provider preference
-routing. If the affinity endpoint fails, existing state-bound compact behavior
-continues to block cross-provider fallback unless a future continuity-domain
-feature explicitly proves that multiple endpoints share safe upstream state.
+the request stays on that provider endpoint. Under `fallback-sticky`, a
+missing-affinity v2 compact request is intentionally tryable through the route
+graph so the successful endpoint can become the session affinity. Under `hard`
+affinity and legacy multi-upstream routing, missing affinity still returns a
+continuity error instead of silently re-entering provider preference routing. If
+the affinity endpoint fails, fallback behavior follows the active affinity
+policy; hard cross-endpoint movement still requires a shared explicit
+continuity domain.
 
 ## Closeout Condition
 

@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "slug": "codex-route-continuity-fearless-refactor",
+  "title": "Codex Route Continuity Fearless Refactor",
+  "status": "complete",
+  "updated": "2026-05-27",
+  "scope_kind": "architecture-refactor",
+  "problem": "Fallback-sticky compact routing now intentionally tries providers without pre-existing affinity, but continuity policy, route target selection, and compact tests remain shallow and duplicated across HTTP and Responses WebSocket.",
+  "authoritative_docs": [
+    {
+      "role": "design",
+      "path": "docs/workstreams/codex-route-continuity-fearless-refactor/DESIGN.md"
+    },
+    {
+      "role": "execution",
+      "path": "docs/workstreams/codex-route-continuity-fearless-refactor/TODO.md"
+    },
+    {
+      "role": "milestones",
+      "path": "docs/workstreams/codex-route-continuity-fearless-refactor/MILESTONES.md"
+    },
+    {
+      "role": "gates",
+      "path": "docs/workstreams/codex-route-continuity-fearless-refactor/EVIDENCE_AND_GATES.md"
+    },
+    {
+      "role": "handoff",
+      "path": "docs/workstreams/codex-route-continuity-fearless-refactor/HANDOFF.md"
+    }
+  ],
+  "gates": [
+    "cargo fmt --all --check",
+    "cargo nextest run -p codex-helper-core -E 'test(route_continuity) | test(route_graph_policy) | test(response_semantics_compact) | test(response_semantics_websocket)'",
+    "cargo nextest run -p codex-helper-core -E 'test(response_semantics_compact) | test(response_semantics_websocket) | test(route_unavailable) | test(concurrency)'",
+    "cargo nextest run -p codex-helper-core"
+  ],
+  "evidence": [
+    "docs/workstreams/codex-route-continuity-fearless-refactor/EVIDENCE_AND_GATES.md"
+  ],
+  "adr_refs": [],
+  "continue_policy": {
+    "default_action": "ready_for_commit",
+    "notes": "RCF-020, RCF-030, RCF-040, and RCF-050 are complete. No residual follow-on is required for this lane."
+  },
+  "current_task": null
+}

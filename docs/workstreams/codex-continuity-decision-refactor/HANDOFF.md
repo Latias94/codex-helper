@@ -3,6 +3,10 @@
 Status: Complete
 Last updated: 2026-05-26
 
+Update, 2026-05-27: the later `codex-route-continuity-fearless-refactor` lane made
+fallback-sticky compact missing affinity tryable through the configured route graph. Hard affinity
+and legacy multi-upstream compact still fail closed when state-bound affinity is missing.
+
 ## Current State
 
 Workstream opened for the global continuity/affinity refactor.
@@ -15,10 +19,14 @@ CDC-020, CDC-030, CDC-040, CDC-050, CDC-060, and CDC-070 are complete. This lane
 - Relay endpoints remain provider-opaque by default.
 - `continuity_domain` should be explicit before state-bound fallback crosses provider endpoints.
 - Ordinary conversation affinity should be soft.
-- Compact and encrypted-state affinity should be hard unless one continuity domain is proven.
+- Compact and encrypted-state affinity is now policy-sensitive: fallback-sticky can bootstrap or
+  fall through the configured route graph, while hard affinity stays within a proven continuity
+  domain.
 - Configured `Hard` affinity is now interpreted through request continuity: provider-state-bound compact keeps hard/configured selection, while ordinary conversation turns use soft session preference and can escape an unavailable pinned endpoint.
 - `continuity_domain` is explicit only. Provider/endpoint config can set it; endpoint values override provider values. When absent, the effective domain is the provider endpoint itself, so same host/base URL/domain never proves encrypted state sharing.
-- State-bound provider failover is allowed only after route selection is restricted to an explicit shared `continuity_domain`.
+- Hard state-bound provider failover is allowed only after route selection is restricted to an
+  explicit shared `continuity_domain`; fallback-sticky can remain tryable and update affinity after
+  success.
 - Runtime upstream identity migration treats continuity-domain changes like base URL changes and resets retained state.
 - Capability/profile diagnostics now state that OpenAI identity selects the compact protocol path but does not prove upstream encrypted-state sharing.
 - Relay capability diagnostics report the selected continuity domain, whether it is explicit, how many configured endpoints share it, and operator warnings/recommendations.
@@ -54,4 +62,6 @@ Completed CDC-070:
 
 - Public capability diagnostics now include new `expected.continuity` and top-level `continuity` fields. JSON clients should tolerate additive fields.
 - State-bound failover inside explicit `continuity_domain` trusts operator configuration; wrong domains can still move encrypted state to an incompatible relay account.
-- Multiple provider endpoints without prior affinity still fail closed for state-bound compact. A future bootstrap-over-one-explicit-domain behavior would need its own design and tests.
+- Multiple provider endpoints without prior affinity are policy-sensitive: fallback-sticky compact
+  can bootstrap through the configured route graph, but hard affinity and legacy multi-upstream
+  compact still fail closed.

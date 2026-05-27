@@ -27,9 +27,9 @@ Last updated: 2026-05-26
   Goal: Apply provider-state-bound continuity and fail-closed behavior to v2
   compact using the existing provider-opaque route affinity contract.
   Validation: cargo nextest run -p codex-helper-core remote_compaction_v2 route_affinity --no-fail-fast
-  Review: V2 compact must use known provider affinity or fail closed; it must not silently fallback across provider endpoints.
+  Review: V2 compact must use known provider affinity, explicitly bootstrap under a tryable policy, or fail closed; it must not accidentally fallback across provider endpoints.
   Evidence: `cargo nextest run -p codex-helper-core remote_compaction_v2 route_affinity --no-fail-fast`; `cargo nextest run -p codex-helper-core responses_compact route_affinity --no-fail-fast`.
-  Handoff: DONE. Common remote-compaction policy now covers v1 and v2, pins v2 compact to restored route affinity, and fails closed when affinity is missing.
+  Handoff: DONE. Common remote-compaction policy covers v1 and v2. Later route-continuity work made missing-affinity behavior policy-sensitive: fallback-sticky can bootstrap; hard still fails closed.
 
 ## M3 - Documentation And Gates
 
@@ -39,4 +39,4 @@ Last updated: 2026-05-26
   Validation: cargo fmt --all --check && cargo nextest run -p codex-helper-core
   Review: Docs must not imply the proxy can identify sub2api/new-api/OpenAI behind an opaque provider.
   Evidence: `cargo fmt --all --check`; `cargo nextest run -p codex-helper-core`.
-  Handoff: DONE. Docs explain v2 compact `/responses` logging, fail-closed route continuity, and the fact that presets still do not enable v2 automatically.
+  Handoff: DONE. Docs explain v2 compact `/responses` logging, policy-sensitive route continuity, and the fact that presets still do not enable v2 automatically.

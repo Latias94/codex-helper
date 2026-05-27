@@ -58,6 +58,7 @@ mod route_executor_runtime;
 mod route_executor_shadow;
 mod route_metadata;
 mod route_provenance;
+mod route_target_selection;
 mod route_unavailability;
 mod router_setup;
 mod routing_plan;

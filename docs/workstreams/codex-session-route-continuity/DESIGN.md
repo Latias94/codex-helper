@@ -3,6 +3,11 @@
 Status: Draft
 Last updated: 2026-05-25
 
+Update, 2026-05-27: this lane records the earlier provider-opaque baseline. The current shipped
+route-graph behavior is policy-sensitive: `fallback-sticky` may bootstrap missing affinity by
+trying the configured route and recording the successful endpoint, while `hard` and legacy
+multi-upstream paths remain fail-closed on missing state-bound compact affinity.
+
 ## Why This Lane Exists
 
 Codex remote compaction can carry provider-bound state such as encrypted
@@ -36,12 +41,14 @@ runtime health into boolean decisions that are hard to diagnose.
 - Session route affinity needed for Codex continuity survives helper restarts.
 - Provider endpoints remain opaque; the proxy does not assume whether a relay
   is OpenAI, sub2api, new-api, or another intermediary.
-- State-bound compact requests either use the known provider endpoint or fail
-  with an explicit continuity error instead of silently selecting a new one.
+- State-bound compact requests either use the known provider endpoint, bootstrap
+  a new endpoint when the active policy explicitly allows it, or fail with an
+  explicit continuity error instead of silently selecting a new one.
 - Compact requests whose affinity provider endpoint fails have explicit
   fallback semantics based on continuity class: non-state-bound compact may
-  fallback like a normal session request, while state-bound compact may only
-  fallback inside an explicitly configured safe continuity domain.
+  fallback like a normal session request, while state-bound compact follows the
+  active affinity policy and may require an explicitly configured safe
+  continuity domain.
 - Route logs explain the continuity class, affinity source, and failover
   decision.
 - Balance probes and runtime health signals are kept separate.
@@ -94,11 +101,13 @@ It is a continuity decision:
 
 - Stateless or session-preferred requests may continue through the existing
   provider failover path.
-- Provider-state-bound requests stay on the affinity endpoint unless a future
-  operator-configured continuity domain proves that multiple endpoints share
-  the same upstream state.
-- Missing affinity for provider-state-bound requests should not silently
-  re-enter preference-group routing.
+- Provider-state-bound requests follow the active affinity policy: `fallback-sticky`
+  can continue through the configured route graph and update affinity, while
+  `hard` stays on the affinity endpoint unless an operator-configured continuity
+  domain proves that multiple endpoints share the same upstream state.
+- Missing affinity for provider-state-bound requests should either be an
+  explicit policy bootstrap or an explicit continuity error, not an accidental
+  preference-group re-entry.
 
 Provider internals stay opaque. Relay-specific adapters may contribute balance
 or observed health data, but they must not become routing truth unless the

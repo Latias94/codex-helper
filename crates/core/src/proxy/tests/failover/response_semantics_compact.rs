@@ -1,5 +1,269 @@
 use super::*;
 
+#[derive(Clone, Copy)]
+enum CompactPolicyTransport {
+    ResponsesCompact,
+    RemoteCompactionV2,
+}
+
+impl CompactPolicyTransport {
+    fn proxy_path(self) -> &'static str {
+        match self {
+            Self::ResponsesCompact => "/responses/compact",
+            Self::RemoteCompactionV2 => "/v1/responses",
+        }
+    }
+
+    fn request_body(self) -> &'static str {
+        match self {
+            Self::ResponsesCompact => {
+                r#"{"model":"gpt-5","input":[{"type":"reasoning","encrypted_content":"state"}]}"#
+            }
+            Self::RemoteCompactionV2 => {
+                r#"{"model":"gpt-5","input":[{"type":"message","role":"user","content":"compact me"},{"type":"compaction_trigger"}],"stream":true}"#
+            }
+        }
+    }
+
+    fn provider_counter(self, counters: &CompactProviderCounters) -> &AtomicUsize {
+        match self {
+            Self::ResponsesCompact => &counters.compact,
+            Self::RemoteCompactionV2 => &counters.responses,
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct CompactProviderCounters {
+    responses: Arc<AtomicUsize>,
+    compact: Arc<AtomicUsize>,
+}
+
+struct CompactPolicyFixture {
+    _scoped: ScopedEnv,
+    _temp_dir: std::path::PathBuf,
+    client: reqwest::Client,
+    proxy_addr: std::net::SocketAddr,
+    proxy_handle: tokio::task::JoinHandle<()>,
+    b_handle: tokio::task::JoinHandle<()>,
+    c_handle: tokio::task::JoinHandle<()>,
+    state: Arc<crate::state::ProxyState>,
+    b_counters: CompactProviderCounters,
+    c_counters: CompactProviderCounters,
+}
+
+impl CompactPolicyFixture {
+    async fn new(affinity_policy: crate::config::RoutingAffinityPolicyV5) -> Self {
+        let temp_dir = make_temp_test_dir();
+        let mut scoped = ScopedEnv::default();
+        unsafe {
+            scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
+            scoped.set_path(
+                "CODEX_HELPER_CONTROL_TRACE_PATH",
+                temp_dir.join("logs").join("control_trace.jsonl").as_path(),
+            );
+            scoped.set("CODEX_HELPER_CONTROL_TRACE", "1");
+        }
+
+        let b_counters = CompactProviderCounters::default();
+        let c_counters = CompactProviderCounters::default();
+        let (b_addr, b_handle) =
+            spawn_axum_server(compact_policy_upstream("b", b_counters.clone()));
+        let (c_addr, c_handle) =
+            spawn_axum_server(compact_policy_upstream("c", c_counters.clone()));
+
+        let retry = RetryConfig {
+            upstream: Some(retry_layer_config(
+                1,
+                "502",
+                Vec::new(),
+                RetryStrategy::Failover,
+            )),
+            provider: Some(retry_layer_config(
+                2,
+                "502",
+                Vec::new(),
+                RetryStrategy::Failover,
+            )),
+            transport_cooldown_secs: Some(0),
+            cooldown_backoff_factor: Some(1),
+            cooldown_backoff_max_secs: Some(0),
+            ..RetryConfig::default()
+        };
+        let mut routing = RoutingConfigV4::ordered_failover(vec!["b".to_string(), "c".to_string()]);
+        routing.affinity_policy = affinity_policy;
+        let v4 = ProxyConfigV4 {
+            retry,
+            codex: ServiceViewV4 {
+                providers: std::collections::BTreeMap::from([
+                    (
+                        "b".to_string(),
+                        ProviderConfigV4 {
+                            base_url: Some(format!("http://{b_addr}/v1")),
+                            inline_auth: UpstreamAuth::default(),
+                            ..ProviderConfigV4::default()
+                        },
+                    ),
+                    (
+                        "c".to_string(),
+                        ProviderConfigV4 {
+                            base_url: Some(format!("http://{c_addr}/v1")),
+                            inline_auth: UpstreamAuth::default(),
+                            ..ProviderConfigV4::default()
+                        },
+                    ),
+                ]),
+                routing: Some(routing),
+                ..ServiceViewV4::default()
+            },
+            ..ProxyConfigV4::default()
+        };
+        let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compile v4");
+        let proxy = ProxyService::new_with_v4_source(
+            Client::new(),
+            Arc::new(runtime),
+            Some(Arc::new(v4)),
+            "codex",
+            Arc::new(std::sync::Mutex::new(HashMap::new())),
+        );
+        let state = proxy.state.clone();
+        let app = crate::proxy::router(proxy);
+        let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+        Self {
+            _scoped: scoped,
+            _temp_dir: temp_dir,
+            client: reqwest::Client::new(),
+            proxy_addr,
+            proxy_handle,
+            b_handle,
+            c_handle,
+            state,
+            b_counters,
+            c_counters,
+        }
+    }
+
+    async fn post_compaction(
+        &self,
+        transport: CompactPolicyTransport,
+        session_id: &str,
+    ) -> reqwest::Response {
+        self.client
+            .post(format!(
+                "http://{}{}",
+                self.proxy_addr,
+                transport.proxy_path()
+            ))
+            .header("content-type", "application/json")
+            .header("session-id", session_id)
+            .body(transport.request_body())
+            .send()
+            .await
+            .expect("send compact policy request")
+    }
+
+    fn hits(&self, provider: &str, transport: CompactPolicyTransport) -> usize {
+        let counters = match provider {
+            "b" => &self.b_counters,
+            "c" => &self.c_counters,
+            provider => panic!("unknown compact policy provider: {provider}"),
+        };
+        transport.provider_counter(counters).load(Ordering::SeqCst)
+    }
+
+    async fn assert_affinity_provider(&self, session_id: &str, provider: &str) {
+        let affinity = self
+            .state
+            .get_session_route_affinity(session_id)
+            .await
+            .expect("route affinity recorded after compact request");
+        assert_eq!(affinity.provider_endpoint.provider_id.as_str(), provider);
+    }
+
+    fn request_log_record(&self, path: &str, status: StatusCode) -> serde_json::Value {
+        let request_log =
+            std::fs::read_to_string(crate::logging::request_log_path()).expect("read request log");
+        request_log
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|record| {
+                record["path"].as_str() == Some(path)
+                    && record["status_code"].as_u64() == Some(status.as_u16() as u64)
+            })
+            .expect("compact request log record")
+    }
+
+    fn latest_route_continuity_block_trace(&self) -> serde_json::Value {
+        crate::logging::read_recent_control_trace_entries(20)
+            .expect("read recent control trace entries")
+            .iter()
+            .rev()
+            .find(|entry| entry.event.as_deref() == Some("route_continuity_blocked"))
+            .expect("route continuity blocked trace")
+            .payload
+            .clone()
+    }
+}
+
+impl Drop for CompactPolicyFixture {
+    fn drop(&mut self) {
+        self.proxy_handle.abort();
+        self.b_handle.abort();
+        self.c_handle.abort();
+    }
+}
+
+fn compact_policy_upstream(
+    provider: &'static str,
+    counters: CompactProviderCounters,
+) -> axum::Router {
+    let responses_counter = counters.responses.clone();
+    let compact_counter = counters.compact.clone();
+    axum::Router::new()
+        .route(
+            "/v1/responses",
+            post(move |body: axum::body::Bytes| {
+                let responses_counter = responses_counter.clone();
+                async move {
+                    responses_counter.fetch_add(1, Ordering::SeqCst);
+                    let is_remote_compaction_v2 =
+                        serde_json::from_slice::<serde_json::Value>(&body)
+                            .ok()
+                            .and_then(|body| {
+                                body.get("input")
+                                    .and_then(serde_json::Value::as_array)
+                                    .cloned()
+                            })
+                            .is_some_and(|items| {
+                                items.iter().any(|item| {
+                                    item.get("type").and_then(serde_json::Value::as_str)
+                                        == Some("compaction_trigger")
+                                })
+                            });
+                    let mut response = serde_json::json!({ "provider": provider });
+                    if is_remote_compaction_v2 {
+                        response["compact_v2"] = serde_json::Value::Bool(true);
+                    }
+                    (StatusCode::OK, Json(response))
+                }
+            }),
+        )
+        .route(
+            "/v1/responses/compact",
+            post(move || {
+                let compact_counter = compact_counter.clone();
+                async move {
+                    compact_counter.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({ "provider": provider, "compact": true })),
+                    )
+                }
+            }),
+        )
+}
+
 #[tokio::test]
 async fn proxy_forwards_responses_compact_to_upstream_v1_compact_path() {
     let upstream_hits = Arc::new(AtomicUsize::new(0));
@@ -2173,129 +2437,12 @@ async fn proxy_does_not_fallback_responses_compact_when_hard_state_bound() {
 #[tokio::test]
 async fn proxy_allows_state_bound_responses_compact_without_route_affinity_under_fallback_sticky() {
     let _env_guard = env_lock().await;
-    let temp_dir = make_temp_test_dir();
-    let mut scoped = ScopedEnv::default();
-    unsafe {
-        scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
-    }
+    let fixture =
+        CompactPolicyFixture::new(crate::config::RoutingAffinityPolicyV5::FallbackSticky).await;
+    let transport = CompactPolicyTransport::ResponsesCompact;
+    let session_id = "sid-missing-state-bound-affinity";
 
-    let b_compact_hits = Arc::new(AtomicUsize::new(0));
-    let c_compact_hits = Arc::new(AtomicUsize::new(0));
-
-    let b_compact_counter = b_compact_hits.clone();
-    let upstream_b =
-        axum::Router::new()
-            .route(
-                "/v1/responses",
-                post(move || async move {
-                    (StatusCode::OK, Json(serde_json::json!({ "provider": "b" })))
-                }),
-            )
-            .route(
-                "/v1/responses/compact",
-                post(move || {
-                    let b_compact_counter = b_compact_counter.clone();
-                    async move {
-                        b_compact_counter.fetch_add(1, Ordering::SeqCst);
-                        (
-                            StatusCode::OK,
-                            Json(serde_json::json!({ "provider": "b", "compact": true })),
-                        )
-                    }
-                }),
-            );
-    let (b_addr, b_handle) = spawn_axum_server(upstream_b);
-
-    let c_compact_counter = c_compact_hits.clone();
-    let upstream_c =
-        axum::Router::new()
-            .route(
-                "/v1/responses",
-                post(move || async move {
-                    (StatusCode::OK, Json(serde_json::json!({ "provider": "c" })))
-                }),
-            )
-            .route(
-                "/v1/responses/compact",
-                post(move || {
-                    let c_compact_counter = c_compact_counter.clone();
-                    async move {
-                        c_compact_counter.fetch_add(1, Ordering::SeqCst);
-                        (
-                            StatusCode::OK,
-                            Json(serde_json::json!({ "provider": "c", "compact": true })),
-                        )
-                    }
-                }),
-            );
-    let (c_addr, c_handle) = spawn_axum_server(upstream_c);
-
-    let retry = RetryConfig {
-        upstream: Some(retry_layer_config(
-            1,
-            "502",
-            Vec::new(),
-            RetryStrategy::Failover,
-        )),
-        provider: Some(retry_layer_config(
-            2,
-            "502",
-            Vec::new(),
-            RetryStrategy::Failover,
-        )),
-        transport_cooldown_secs: Some(0),
-        cooldown_backoff_factor: Some(1),
-        cooldown_backoff_max_secs: Some(0),
-        ..RetryConfig::default()
-    };
-    let mut routing = RoutingConfigV4::ordered_failover(vec!["b".to_string(), "c".to_string()]);
-    routing.affinity_policy = crate::config::RoutingAffinityPolicyV5::FallbackSticky;
-    let v4 = ProxyConfigV4 {
-        retry,
-        codex: ServiceViewV4 {
-            providers: std::collections::BTreeMap::from([
-                (
-                    "b".to_string(),
-                    ProviderConfigV4 {
-                        base_url: Some(format!("http://{b_addr}/v1")),
-                        inline_auth: UpstreamAuth::default(),
-                        ..ProviderConfigV4::default()
-                    },
-                ),
-                (
-                    "c".to_string(),
-                    ProviderConfigV4 {
-                        base_url: Some(format!("http://{c_addr}/v1")),
-                        inline_auth: UpstreamAuth::default(),
-                        ..ProviderConfigV4::default()
-                    },
-                ),
-            ]),
-            routing: Some(routing),
-            ..ServiceViewV4::default()
-        },
-        ..ProxyConfigV4::default()
-    };
-    let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compile v4");
-    let proxy = ProxyService::new_with_v4_source(
-        Client::new(),
-        Arc::new(runtime),
-        Some(Arc::new(v4)),
-        "codex",
-        Arc::new(std::sync::Mutex::new(HashMap::new())),
-    );
-    let state = proxy.state.clone();
-    let app = crate::proxy::router(proxy);
-    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
-
-    let compact = reqwest::Client::new()
-        .post(format!("http://{proxy_addr}/responses/compact"))
-        .header("content-type", "application/json")
-        .header("session-id", "sid-missing-state-bound-affinity")
-        .body(r#"{"model":"gpt-5","input":[{"type":"reasoning","encrypted_content":"state"}]}"#)
-        .send()
-        .await
-        .expect("send compact");
+    let compact = fixture.post_compaction(transport, session_id).await;
 
     assert_eq!(compact.status(), StatusCode::OK);
     let body = compact
@@ -2303,137 +2450,20 @@ async fn proxy_allows_state_bound_responses_compact_without_route_affinity_under
         .await
         .expect("compact json");
     assert_eq!(body["provider"].as_str(), Some("b"));
-    assert_eq!(b_compact_hits.load(Ordering::SeqCst), 1);
-    assert_eq!(c_compact_hits.load(Ordering::SeqCst), 0);
-
-    let affinity = state
-        .get_session_route_affinity("sid-missing-state-bound-affinity")
-        .await
-        .expect("route affinity recorded after first compact");
-    assert_eq!(affinity.provider_endpoint.provider_id.as_str(), "b");
-
-    proxy_handle.abort();
-    b_handle.abort();
-    c_handle.abort();
+    assert_eq!(fixture.hits("b", transport), 1);
+    assert_eq!(fixture.hits("c", transport), 0);
+    fixture.assert_affinity_provider(session_id, "b").await;
 }
 
 #[tokio::test]
 async fn proxy_allows_remote_compaction_v2_without_route_affinity_under_fallback_sticky() {
     let _env_guard = env_lock().await;
-    let temp_dir = make_temp_test_dir();
-    let mut scoped = ScopedEnv::default();
-    unsafe {
-        scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
-        scoped.set_path(
-            "CODEX_HELPER_CONTROL_TRACE_PATH",
-            temp_dir.join("logs").join("control_trace.jsonl").as_path(),
-        );
-        scoped.set("CODEX_HELPER_CONTROL_TRACE", "1");
-    }
+    let fixture =
+        CompactPolicyFixture::new(crate::config::RoutingAffinityPolicyV5::FallbackSticky).await;
+    let transport = CompactPolicyTransport::RemoteCompactionV2;
+    let session_id = "sid-missing-v2-affinity";
 
-    let b_responses_hits = Arc::new(AtomicUsize::new(0));
-    let c_responses_hits = Arc::new(AtomicUsize::new(0));
-
-    let b_responses_counter = b_responses_hits.clone();
-    let upstream_b = axum::Router::new().route(
-        "/v1/responses",
-        post(move || {
-            let b_responses_counter = b_responses_counter.clone();
-            async move {
-                b_responses_counter.fetch_add(1, Ordering::SeqCst);
-                (
-                    StatusCode::OK,
-                    Json(serde_json::json!({ "provider": "b", "compact_v2": true })),
-                )
-            }
-        }),
-    );
-    let (b_addr, b_handle) = spawn_axum_server(upstream_b);
-
-    let c_responses_counter = c_responses_hits.clone();
-    let upstream_c = axum::Router::new().route(
-        "/v1/responses",
-        post(move || {
-            let c_responses_counter = c_responses_counter.clone();
-            async move {
-                c_responses_counter.fetch_add(1, Ordering::SeqCst);
-                (
-                    StatusCode::OK,
-                    Json(serde_json::json!({ "provider": "c", "compact_v2": true })),
-                )
-            }
-        }),
-    );
-    let (c_addr, c_handle) = spawn_axum_server(upstream_c);
-
-    let retry = RetryConfig {
-        upstream: Some(retry_layer_config(
-            1,
-            "502",
-            Vec::new(),
-            RetryStrategy::Failover,
-        )),
-        provider: Some(retry_layer_config(
-            2,
-            "502",
-            Vec::new(),
-            RetryStrategy::Failover,
-        )),
-        transport_cooldown_secs: Some(0),
-        cooldown_backoff_factor: Some(1),
-        cooldown_backoff_max_secs: Some(0),
-        ..RetryConfig::default()
-    };
-    let mut routing = RoutingConfigV4::ordered_failover(vec!["b".to_string(), "c".to_string()]);
-    routing.affinity_policy = crate::config::RoutingAffinityPolicyV5::FallbackSticky;
-    let v4 = ProxyConfigV4 {
-        retry,
-        codex: ServiceViewV4 {
-            providers: std::collections::BTreeMap::from([
-                (
-                    "b".to_string(),
-                    ProviderConfigV4 {
-                        base_url: Some(format!("http://{b_addr}/v1")),
-                        inline_auth: UpstreamAuth::default(),
-                        ..ProviderConfigV4::default()
-                    },
-                ),
-                (
-                    "c".to_string(),
-                    ProviderConfigV4 {
-                        base_url: Some(format!("http://{c_addr}/v1")),
-                        inline_auth: UpstreamAuth::default(),
-                        ..ProviderConfigV4::default()
-                    },
-                ),
-            ]),
-            routing: Some(routing),
-            ..ServiceViewV4::default()
-        },
-        ..ProxyConfigV4::default()
-    };
-    let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compile v4");
-    let proxy = ProxyService::new_with_v4_source(
-        Client::new(),
-        Arc::new(runtime),
-        Some(Arc::new(v4)),
-        "codex",
-        Arc::new(std::sync::Mutex::new(HashMap::new())),
-    );
-    let state = proxy.state.clone();
-    let app = crate::proxy::router(proxy);
-    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
-
-    let compact = reqwest::Client::new()
-        .post(format!("http://{proxy_addr}/v1/responses"))
-        .header("content-type", "application/json")
-        .header("session-id", "sid-missing-v2-affinity")
-        .body(
-            r#"{"model":"gpt-5","input":[{"type":"message","role":"user","content":"compact me"},{"type":"compaction_trigger"}],"stream":true}"#,
-        )
-        .send()
-        .await
-        .expect("send v2 compact");
+    let compact = fixture.post_compaction(transport, session_id).await;
 
     assert_eq!(compact.status(), StatusCode::OK);
     let body = compact
@@ -2441,151 +2471,26 @@ async fn proxy_allows_remote_compaction_v2_without_route_affinity_under_fallback
         .await
         .expect("compact json");
     assert_eq!(body["provider"].as_str(), Some("b"));
-    assert_eq!(b_responses_hits.load(Ordering::SeqCst), 1);
-    assert_eq!(c_responses_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.hits("b", transport), 1);
+    assert_eq!(fixture.hits("c", transport), 0);
 
-    let request_log =
-        std::fs::read_to_string(crate::logging::request_log_path()).expect("read request log");
-    let compact_record: serde_json::Value = request_log
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .find(|record| {
-            record["path"].as_str() == Some("/v1/responses")
-                && record["status_code"].as_u64() == Some(StatusCode::OK.as_u16() as u64)
-        })
-        .expect("v2 compact request log record");
+    let compact_record = fixture.request_log_record("/v1/responses", StatusCode::OK);
     assert_eq!(
         compact_record["codex_bridge"]["remote_compaction_v2_request"].as_bool(),
         Some(true)
     );
-
-    let affinity = state
-        .get_session_route_affinity("sid-missing-v2-affinity")
-        .await
-        .expect("route affinity recorded after first compact");
-    assert_eq!(affinity.provider_endpoint.provider_id.as_str(), "b");
-
-    proxy_handle.abort();
-    b_handle.abort();
-    c_handle.abort();
+    fixture.assert_affinity_provider(session_id, "b").await;
 }
 
 #[tokio::test]
 async fn proxy_rejects_remote_compaction_v2_without_route_affinity_under_hard_policy() {
     let _env_guard = env_lock().await;
-    let temp_dir = make_temp_test_dir();
-    let mut scoped = ScopedEnv::default();
-    unsafe {
-        scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
-        scoped.set_path(
-            "CODEX_HELPER_CONTROL_TRACE_PATH",
-            temp_dir.join("logs").join("control_trace.jsonl").as_path(),
-        );
-        scoped.set("CODEX_HELPER_CONTROL_TRACE", "1");
-    }
+    let fixture = CompactPolicyFixture::new(crate::config::RoutingAffinityPolicyV5::Hard).await;
+    let transport = CompactPolicyTransport::RemoteCompactionV2;
 
-    let b_responses_hits = Arc::new(AtomicUsize::new(0));
-    let c_responses_hits = Arc::new(AtomicUsize::new(0));
-
-    let b_responses_counter = b_responses_hits.clone();
-    let upstream_b = axum::Router::new().route(
-        "/v1/responses",
-        post(move || {
-            let b_responses_counter = b_responses_counter.clone();
-            async move {
-                b_responses_counter.fetch_add(1, Ordering::SeqCst);
-                (
-                    StatusCode::OK,
-                    Json(serde_json::json!({ "provider": "b", "compact_v2": true })),
-                )
-            }
-        }),
-    );
-    let (b_addr, b_handle) = spawn_axum_server(upstream_b);
-
-    let c_responses_counter = c_responses_hits.clone();
-    let upstream_c = axum::Router::new().route(
-        "/v1/responses",
-        post(move || {
-            let c_responses_counter = c_responses_counter.clone();
-            async move {
-                c_responses_counter.fetch_add(1, Ordering::SeqCst);
-                (
-                    StatusCode::OK,
-                    Json(serde_json::json!({ "provider": "c", "compact_v2": true })),
-                )
-            }
-        }),
-    );
-    let (c_addr, c_handle) = spawn_axum_server(upstream_c);
-
-    let retry = RetryConfig {
-        upstream: Some(retry_layer_config(
-            1,
-            "502",
-            Vec::new(),
-            RetryStrategy::Failover,
-        )),
-        provider: Some(retry_layer_config(
-            2,
-            "502",
-            Vec::new(),
-            RetryStrategy::Failover,
-        )),
-        transport_cooldown_secs: Some(0),
-        cooldown_backoff_factor: Some(1),
-        cooldown_backoff_max_secs: Some(0),
-        ..RetryConfig::default()
-    };
-    let mut routing = RoutingConfigV4::ordered_failover(vec!["b".to_string(), "c".to_string()]);
-    routing.affinity_policy = crate::config::RoutingAffinityPolicyV5::Hard;
-    let v4 = ProxyConfigV4 {
-        retry,
-        codex: ServiceViewV4 {
-            providers: std::collections::BTreeMap::from([
-                (
-                    "b".to_string(),
-                    ProviderConfigV4 {
-                        base_url: Some(format!("http://{b_addr}/v1")),
-                        inline_auth: UpstreamAuth::default(),
-                        ..ProviderConfigV4::default()
-                    },
-                ),
-                (
-                    "c".to_string(),
-                    ProviderConfigV4 {
-                        base_url: Some(format!("http://{c_addr}/v1")),
-                        inline_auth: UpstreamAuth::default(),
-                        ..ProviderConfigV4::default()
-                    },
-                ),
-            ]),
-            routing: Some(routing),
-            ..ServiceViewV4::default()
-        },
-        ..ProxyConfigV4::default()
-    };
-    let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compile v4");
-    let proxy = ProxyService::new_with_v4_source(
-        Client::new(),
-        Arc::new(runtime),
-        Some(Arc::new(v4)),
-        "codex",
-        Arc::new(std::sync::Mutex::new(HashMap::new())),
-    );
-    let app = crate::proxy::router(proxy);
-    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
-
-    let compact = reqwest::Client::new()
-        .post(format!("http://{proxy_addr}/v1/responses"))
-        .header("content-type", "application/json")
-        .header("session-id", "sid-hard-missing-v2-affinity")
-        .body(
-            r#"{"model":"gpt-5","input":[{"type":"message","role":"user","content":"compact me"},{"type":"compaction_trigger"}],"stream":true}"#,
-        )
-        .send()
-        .await
-        .expect("send hard v2 compact");
+    let compact = fixture
+        .post_compaction(transport, "sid-hard-missing-v2-affinity")
+        .await;
 
     assert_eq!(compact.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body = compact.text().await.expect("compact text");
@@ -2593,33 +2498,20 @@ async fn proxy_rejects_remote_compaction_v2_without_route_affinity_under_hard_po
         body.contains("state-bound compact") && body.contains("route affinity"),
         "expected hard-policy continuity error body, got: {body}"
     );
-    assert_eq!(b_responses_hits.load(Ordering::SeqCst), 0);
-    assert_eq!(c_responses_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.hits("b", transport), 0);
+    assert_eq!(fixture.hits("c", transport), 0);
 
-    let traces = crate::logging::read_recent_control_trace_entries(20)
-        .expect("read recent control trace entries");
-    let block = traces
-        .iter()
-        .rev()
-        .find(|entry| entry.event.as_deref() == Some("route_continuity_blocked"))
-        .expect("route continuity blocked trace");
+    let block = fixture.latest_route_continuity_block_trace();
     assert_eq!(
-        block.payload["continuity_class"].as_str(),
+        block["continuity_class"].as_str(),
         Some("provider_state_bound")
     );
     assert_eq!(
-        block.payload["reason"].as_str(),
+        block["reason"].as_str(),
         Some("state_bound_compact_missing_affinity")
     );
-    assert_eq!(block.payload["affinity_source"].as_str(), Some("none"));
-    assert_eq!(
-        block.payload["provider_failover_allowed"].as_bool(),
-        Some(false)
-    );
-
-    proxy_handle.abort();
-    b_handle.abort();
-    c_handle.abort();
+    assert_eq!(block["affinity_source"].as_str(), Some("none"));
+    assert_eq!(block["provider_failover_allowed"].as_bool(), Some(false));
 }
 
 #[tokio::test]
