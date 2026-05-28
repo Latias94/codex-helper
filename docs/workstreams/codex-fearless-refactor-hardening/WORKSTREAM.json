@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "slug": "codex-fearless-refactor-hardening",
+  "title": "Codex Fearless Refactor Hardening",
+  "status": "active",
+  "updated": "2026-05-28",
+  "scope_kind": "architecture-refactor",
+  "problem": "codex-helper has append-only local logs and several compatibility/read-model/diagnostic boundaries that need deeper modules after the runtime log growth incident.",
+  "authoritative_docs": [
+    {
+      "role": "design",
+      "path": "docs/workstreams/codex-fearless-refactor-hardening/DESIGN.md"
+    },
+    {
+      "role": "execution",
+      "path": "docs/workstreams/codex-fearless-refactor-hardening/TODO.md"
+    },
+    {
+      "role": "gates",
+      "path": "docs/workstreams/codex-fearless-refactor-hardening/EVIDENCE_AND_GATES.md"
+    },
+    {
+      "role": "handoff",
+      "path": "docs/workstreams/codex-fearless-refactor-hardening/HANDOFF.md"
+    }
+  ],
+  "gates": [
+    "cargo fmt --check",
+    "cargo nextest run -p codex-helper runtime_log --no-fail-fast",
+    "cargo nextest run -p codex-helper-core logging codex_relay_evidence --no-fail-fast",
+    "cargo nextest run -p codex-helper-core config route routing --no-fail-fast",
+    "cargo nextest run -p codex-helper-core request_ledger logging --no-fail-fast",
+    "cargo nextest run -p codex-helper-core relay_live_smoke codex_live_smoke --no-fail-fast"
+  ],
+  "evidence": [
+    "docs/workstreams/codex-fearless-refactor-hardening/EVIDENCE_AND_GATES.md"
+  ],
+  "adr_refs": [],
+  "continue_policy": {
+    "default_action": "continue",
+    "notes": "Complete CFR-020 first; split later tasks only if their compatibility risk expands beyond this lane."
+  },
+  "current_task": "CFR-030"
+}

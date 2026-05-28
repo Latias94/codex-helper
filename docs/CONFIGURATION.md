@@ -1213,6 +1213,14 @@ The control trace is enabled by default and is written to:
 
 It records routing selection events such as the compiled route plan, provider endpoint, preference group, skipped higher-priority groups, pinned-route decisions, retry options, and failover reasons. When a lower-priority preference group is selected, the `route_graph_selection_explain` event lists each higher-priority provider endpoint that was skipped and the structured reasons such as `unsupported_model`, `cooldown`, `usage_exhausted`, `runtime_disabled`, or `attempt_avoided`. Set `CODEX_HELPER_CONTROL_TRACE=0` to turn it off, or `CODEX_HELPER_CONTROL_TRACE_PATH` to write it somewhere else. The older `retry_trace.jsonl` file is only written when `CODEX_HELPER_RETRY_TRACE=1`.
 
+Request/debug logs, `control_trace.jsonl`, and the optional `retry_trace.jsonl` share the bounded JSONL retention controlled by `CODEX_HELPER_REQUEST_LOG_MAX_BYTES` and `CODEX_HELPER_REQUEST_LOG_MAX_FILES` (defaults: 50 MiB per active file and 10 rotated files). Oversized active JSONL files rotate on first write, and rotated files are pruned by count and total budget.
+
+Other local helper logs use the same bounded storage primitive with separate knobs:
+
+- `runtime.log`: `CODEX_HELPER_RUNTIME_LOG_MAX_BYTES` / `CODEX_HELPER_RUNTIME_LOG_MAX_FILES` (defaults: 20 MiB, 10 files).
+- `gui.log`: `CODEX_HELPER_GUI_LOG_MAX_BYTES` / `CODEX_HELPER_GUI_LOG_MAX_FILES` (defaults: 20 MiB, 10 files).
+- `codex_relay_evidence.jsonl`: `CODEX_HELPER_RELAY_EVIDENCE_LOG_MAX_BYTES` / `CODEX_HELPER_RELAY_EVIDENCE_LOG_MAX_FILES` (defaults: 20 MiB, 10 files).
+
 For route-continuity diagnosis, control trace fields are intentionally provider-opaque:
 
 - `continuity.class` / `continuity_class`: `stateless_or_session_preferred` or `provider_state_bound`.

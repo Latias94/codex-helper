@@ -1,5 +1,5 @@
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -8,12 +8,15 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::config::proxy_home_dir;
+use crate::local_log_store::{LogRetention, append_line};
 use crate::logging::now_ms;
 
 use super::{CodexRelayCapabilitiesResponse, CodexRelayLiveSmokeResponse};
 
 const CODEX_RELAY_EVIDENCE_SCHEMA_VERSION: u32 = 1;
 const CODEX_RELAY_EVIDENCE_FILE: &str = "codex_relay_evidence.jsonl";
+const DEFAULT_CODEX_RELAY_EVIDENCE_MAX_BYTES: u64 = 20 * 1024 * 1024;
+const DEFAULT_CODEX_RELAY_EVIDENCE_MAX_FILES: usize = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -154,17 +157,12 @@ fn append_codex_relay_evidence_entry(
     path: &Path,
     entry: &CodexRelayEvidenceEntry,
 ) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    let line = serde_json::to_string(entry).map_err(std::io::Error::other)?;
     let _guard = match evidence_lock().lock() {
         Ok(guard) => guard,
         Err(error) => error.into_inner(),
     };
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    let line = serde_json::to_string(entry).map_err(std::io::Error::other)?;
-    writeln!(file, "{line}")?;
-    Ok(())
+    append_line(path, codex_relay_evidence_retention(), &line)
 }
 
 fn read_recent_codex_relay_evidence_from_path(
@@ -192,6 +190,18 @@ fn read_recent_codex_relay_evidence_from_path(
 fn evidence_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn codex_relay_evidence_retention() -> LogRetention {
+    static RETENTION: OnceLock<LogRetention> = OnceLock::new();
+    *RETENTION.get_or_init(|| {
+        LogRetention::from_env(
+            "CODEX_HELPER_RELAY_EVIDENCE_LOG_MAX_BYTES",
+            "CODEX_HELPER_RELAY_EVIDENCE_LOG_MAX_FILES",
+            DEFAULT_CODEX_RELAY_EVIDENCE_MAX_BYTES,
+            DEFAULT_CODEX_RELAY_EVIDENCE_MAX_FILES,
+        )
+    })
 }
 
 fn normalize_source(source: &str) -> String {
@@ -404,5 +414,43 @@ mod tests {
         let entries =
             read_recent_codex_relay_evidence_from_path(&path, 10, &Default::default()).unwrap();
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn codex_relay_evidence_uses_bounded_jsonl_rotation() {
+        let path = temp_evidence_path();
+        std::fs::write(&path, vec![b'x'; 32]).expect("seed oversized evidence log");
+        let entry = capability_evidence_entry(&capabilities_response(), "unit").unwrap();
+
+        append_line(
+            &path,
+            LogRetention::new(16, 2),
+            &serde_json::to_string(&entry).unwrap(),
+        )
+        .expect("append evidence through bounded store");
+
+        assert!(
+            path.exists(),
+            "bounded append should recreate active evidence log"
+        );
+        let rotated = crate::local_log_store::collect_rotated_logs(&path);
+        assert_eq!(rotated.len(), 1);
+        let rotated_name = rotated[0]
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("rotated evidence name");
+        let expected_prefix = format!(
+            "{}.",
+            path.file_stem()
+                .and_then(|name| name.to_str())
+                .expect("active evidence stem")
+        );
+        assert!(rotated_name.starts_with(&expected_prefix));
+        assert!(rotated_name.ends_with(".jsonl"));
+        let _ = std::fs::remove_file(path);
+        for file in rotated {
+            let _ = std::fs::remove_file(file.path);
+        }
     }
 }

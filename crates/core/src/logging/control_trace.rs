@@ -515,7 +515,6 @@ pub(super) fn append_control_trace_payload(
         return;
     }
     let path = control_trace_path();
-    ensure_log_parent(&path);
     let entry = make_control_trace_entry(kind, service, request_id, event, ts_ms, payload);
     if let Ok(line) = serde_json::to_string(&entry) {
         let _ = append_json_line(&path, opt, &line);
@@ -568,7 +567,6 @@ pub fn log_retry_trace(mut event: JsonValue) {
 
     if legacy_enabled {
         let path = retry_trace_path();
-        ensure_log_parent(&path);
         if let Ok(line) = serde_json::to_string(&event) {
             let _ = append_json_line(&path, opt, &line);
         }

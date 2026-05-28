@@ -1,6 +1,5 @@
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::fs;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::config::proxy_home_dir;
+use crate::local_log_store::{LogRetention, append_line};
 use crate::state::{RouteDecisionProvenance, SessionIdentitySource};
 use crate::usage::UsageMetrics;
 
@@ -745,8 +745,7 @@ struct HttpDebugLogEntry<'a> {
 
 #[derive(Debug, Clone, Copy)]
 struct RequestLogOptions {
-    max_bytes: u64,
-    max_files: usize,
+    retention: LogRetention,
     only_errors: bool,
 }
 
@@ -772,86 +771,22 @@ fn http_debug_split_enabled() -> bool {
 fn request_log_options() -> RequestLogOptions {
     static OPT: OnceLock<RequestLogOptions> = OnceLock::new();
     *OPT.get_or_init(|| {
-        let max_bytes = std::env::var("CODEX_HELPER_REQUEST_LOG_MAX_BYTES")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(50 * 1024 * 1024);
-        let max_files = std::env::var("CODEX_HELPER_REQUEST_LOG_MAX_FILES")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(10);
+        let retention = LogRetention::from_env(
+            "CODEX_HELPER_REQUEST_LOG_MAX_BYTES",
+            "CODEX_HELPER_REQUEST_LOG_MAX_FILES",
+            50 * 1024 * 1024,
+            10,
+        );
         let only_errors = env_bool("CODEX_HELPER_REQUEST_LOG_ONLY_ERRORS");
         RequestLogOptions {
-            max_bytes,
-            max_files,
+            retention,
             only_errors,
         }
     })
 }
 
-fn ensure_log_parent(path: &Path) {
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-}
-
 fn append_json_line(path: &PathBuf, opt: RequestLogOptions, line: &str) -> bool {
-    rotate_and_prune_if_needed(path, opt);
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        return writeln!(file, "{}", line).is_ok();
-    }
-    false
-}
-
-fn rotate_and_prune_if_needed(path: &PathBuf, opt: RequestLogOptions) {
-    if opt.max_bytes == 0 {
-        return;
-    }
-    let Ok(meta) = fs::metadata(path) else {
-        return;
-    };
-    if meta.len() < opt.max_bytes {
-        return;
-    }
-
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    let prefix = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("requests");
-    let rotated_name = format!("{prefix}.{ts}.jsonl");
-    let rotated_path = path.with_file_name(rotated_name);
-    let _ = fs::rename(path, &rotated_path);
-
-    let Some(dir) = path.parent() else {
-        return;
-    };
-    let Ok(rd) = fs::read_dir(dir) else {
-        return;
-    };
-    let mut rotated: Vec<PathBuf> = rd
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .map(|s| s.starts_with(&format!("{prefix}.")) && s.ends_with(".jsonl"))
-                .unwrap_or(false)
-        })
-        .collect();
-    if rotated.len() <= opt.max_files {
-        return;
-    }
-    rotated.sort();
-    let remove_count = rotated.len().saturating_sub(opt.max_files);
-    for p in rotated.into_iter().take(remove_count) {
-        let _ = fs::remove_file(p);
-    }
+    append_line(path, opt.retention, line).is_ok()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -893,7 +828,6 @@ pub fn log_request_with_debug(
     let mut http_debug_ref: Option<HttpDebugRef> = None;
 
     let log_file_path = request_log_path();
-    ensure_log_parent(&log_file_path);
 
     let _guard = match log_lock().lock() {
         Ok(g) => g,
@@ -936,7 +870,6 @@ pub fn log_request_with_debug(
         };
 
         let debug_path = debug_log_path();
-        ensure_log_parent(&debug_path);
         let mut wrote_debug = false;
         if let Ok(line) = serde_json::to_string(&debug_entry) {
             wrote_debug = append_json_line(&debug_path, opt, &line);

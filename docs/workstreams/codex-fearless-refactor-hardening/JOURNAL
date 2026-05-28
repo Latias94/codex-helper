@@ -1,0 +1,5 @@
+2026-05-28
+- Opened workstream for the user-approved fearless refactor goal.
+- First executable task is CFR-020: shared bounded local log storage, including control_trace.
+- Completed CFR-020. Added `local_log_store`, removed bespoke runtime/request rotation code, bounded GUI logs and relay evidence, and documented retention knobs.
+- Validation passed: `cargo fmt --check`, `cargo nextest run -p codex-helper-core local_log_store codex_relay_evidence logging --no-fail-fast`, `cargo nextest run -p codex-helper --no-fail-fast`, and `cargo check -p codex-helper-gui`.

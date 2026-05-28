@@ -12,6 +12,7 @@ mod file_replace;
 pub mod filter;
 pub mod healthcheck;
 pub mod lb;
+pub mod local_log_store;
 pub mod logging;
 pub mod model_routing;
 pub mod notify;

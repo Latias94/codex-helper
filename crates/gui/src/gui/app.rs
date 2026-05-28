@@ -1,3 +1,4 @@
+use codex_helper_core::local_log_store::{LogRetention, RotatingLogWriter, repair_log};
 use eframe::egui;
 
 use tracing_subscriber::EnvFilter;
@@ -11,6 +12,10 @@ use super::tray::{TrayAction, TrayController, TrayMenuModel};
 use super::util::open_in_file_manager;
 
 type LogGuard = tracing_appender::non_blocking::WorkerGuard;
+
+const GUI_LOG_FILE_NAME: &str = "gui.log";
+const DEFAULT_GUI_LOG_MAX_BYTES: u64 = 20 * 1024 * 1024;
+const DEFAULT_GUI_LOG_MAX_FILES: usize = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StartupBehavior {
@@ -568,7 +573,16 @@ fn init_gui_tracing() -> Option<LogGuard> {
     let log_dir = crate::config::proxy_home_dir().join("logs");
     let _ = std::fs::create_dir_all(&log_dir);
 
-    let file_appender = tracing_appender::rolling::never(&log_dir, "gui.log");
+    let retention = LogRetention::from_env(
+        "CODEX_HELPER_GUI_LOG_MAX_BYTES",
+        "CODEX_HELPER_GUI_LOG_MAX_FILES",
+        DEFAULT_GUI_LOG_MAX_BYTES,
+        DEFAULT_GUI_LOG_MAX_FILES,
+    );
+    let path = log_dir.join(GUI_LOG_FILE_NAME);
+    repair_log(&path, retention);
+
+    let file_appender = RotatingLogWriter::new(path, retention);
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)

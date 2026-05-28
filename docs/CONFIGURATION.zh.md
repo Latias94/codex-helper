@@ -1150,6 +1150,14 @@ Control trace 默认启用，写入：
 
 它记录 routing selection events，例如 compiled route plan、provider endpoint、preference group、skipped higher-priority groups、pinned-route decisions、retry options 和 failover reasons。当选中低优先级 preference group 时，`route_graph_selection_explain` event 会列出每个被跳过的高优先级 provider endpoint，以及 `unsupported_model`、`cooldown`、`usage_exhausted`、`runtime_disabled` 或 `attempt_avoided` 这样的结构化原因。设置 `CODEX_HELPER_CONTROL_TRACE=0` 可以关闭；设置 `CODEX_HELPER_CONTROL_TRACE_PATH` 可以写到其他路径。旧的 `retry_trace.jsonl` 只有在 `CODEX_HELPER_RETRY_TRACE=1` 时才写入。
 
+request/debug 日志、`control_trace.jsonl` 和可选的 `retry_trace.jsonl` 共用有界 JSONL 保留策略，由 `CODEX_HELPER_REQUEST_LOG_MAX_BYTES` 和 `CODEX_HELPER_REQUEST_LOG_MAX_FILES` 控制（默认：active file 50 MiB，保留 10 个轮转文件）。过大的 active JSONL 文件会在首次写入时轮转，轮转文件会按数量和总预算清理。
+
+其它 helper 本地日志使用同一套有界存储实现，但有独立开关：
+
+- `runtime.log`：`CODEX_HELPER_RUNTIME_LOG_MAX_BYTES` / `CODEX_HELPER_RUNTIME_LOG_MAX_FILES`（默认 20 MiB、10 个文件）。
+- `gui.log`：`CODEX_HELPER_GUI_LOG_MAX_BYTES` / `CODEX_HELPER_GUI_LOG_MAX_FILES`（默认 20 MiB、10 个文件）。
+- `codex_relay_evidence.jsonl`：`CODEX_HELPER_RELAY_EVIDENCE_LOG_MAX_BYTES` / `CODEX_HELPER_RELAY_EVIDENCE_LOG_MAX_FILES`（默认 20 MiB、10 个文件）。
+
 ## 排查包月优先 Routing
 
 如果一个本应优先 monthly providers 的 route fallback 到 paygo，先检查运行时状态，再修改配置：
