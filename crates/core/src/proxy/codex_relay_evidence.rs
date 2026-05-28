@@ -170,6 +170,21 @@ fn read_recent_codex_relay_evidence_from_path(
     limit: usize,
     filters: &CodexRelayEvidenceFilters,
 ) -> std::io::Result<Vec<CodexRelayEvidenceEntry>> {
+    read_recent_codex_relay_evidence_from_path_with_retention(
+        path,
+        limit,
+        filters,
+        codex_relay_evidence_retention(),
+    )
+}
+
+fn read_recent_codex_relay_evidence_from_path_with_retention(
+    path: &Path,
+    limit: usize,
+    filters: &CodexRelayEvidenceFilters,
+    retention: LogRetention,
+) -> std::io::Result<Vec<CodexRelayEvidenceEntry>> {
+    crate::local_log_store::repair_log(path, retention);
     let file = match File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -414,6 +429,31 @@ mod tests {
         let entries =
             read_recent_codex_relay_evidence_from_path(&path, 10, &Default::default()).unwrap();
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn codex_relay_evidence_repairs_oversized_active_log_before_reading() {
+        let path = temp_evidence_path();
+        std::fs::write(&path, vec![b'x'; 32]).expect("seed oversized evidence log");
+
+        let entries = read_recent_codex_relay_evidence_from_path_with_retention(
+            &path,
+            10,
+            &Default::default(),
+            LogRetention::new(16, 1),
+        )
+        .expect("read repaired evidence log");
+
+        assert!(entries.is_empty());
+        assert!(
+            !path.exists(),
+            "oversized active evidence log should be rotated away before reading"
+        );
+        assert!(
+            crate::local_log_store::collect_rotated_logs(&path).is_empty(),
+            "oversized rotated evidence log should be pruned by retention budget"
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

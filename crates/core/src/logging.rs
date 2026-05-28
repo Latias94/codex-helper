@@ -785,6 +785,10 @@ fn request_log_options() -> RequestLogOptions {
     })
 }
 
+pub fn request_log_retention() -> LogRetention {
+    request_log_options().retention
+}
+
 fn append_json_line(path: &PathBuf, opt: RequestLogOptions, line: &str) -> bool {
     append_line(path, opt.retention, line).is_ok()
 }

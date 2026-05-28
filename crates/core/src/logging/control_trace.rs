@@ -164,15 +164,27 @@ fn control_trace_read_window(limit: usize) -> usize {
 pub fn read_recent_control_trace_entries(
     limit: usize,
 ) -> anyhow::Result<Vec<ControlTraceLogEntry>> {
+    read_recent_control_trace_entries_from_path(
+        &control_trace_path(),
+        limit,
+        request_log_retention(),
+    )
+}
+
+fn read_recent_control_trace_entries_from_path(
+    path: &std::path::Path,
+    limit: usize,
+    retention: LogRetention,
+) -> anyhow::Result<Vec<ControlTraceLogEntry>> {
     use std::collections::VecDeque;
     use std::io::{BufRead, BufReader};
 
-    let path = control_trace_path();
+    crate::local_log_store::repair_log(path, retention);
     if !path.exists() {
         return Ok(Vec::new());
     }
 
-    let file = fs::File::open(&path)?;
+    let file = fs::File::open(path)?;
     let reader = BufReader::new(file);
     let mut ring = VecDeque::with_capacity(control_trace_read_window(limit));
     for line in reader.lines() {
@@ -587,6 +599,16 @@ pub fn log_retry_trace(mut event: JsonValue) {
 mod tests {
     use super::*;
 
+    fn temp_control_trace_path(test_name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "codex-helper-control-trace-{test_name}-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
     #[test]
     fn json_field_helpers_extract_string_and_numeric_values() {
         let event = serde_json::json!({
@@ -674,6 +696,27 @@ mod tests {
                 model: None,
             })
         );
+    }
+
+    #[test]
+    fn read_recent_control_trace_repairs_oversized_active_log_before_scan() {
+        let path = temp_control_trace_path("read-repair");
+        std::fs::write(&path, vec![b'x'; 32]).expect("seed oversized control trace");
+
+        let entries =
+            read_recent_control_trace_entries_from_path(&path, 10, LogRetention::new(16, 1))
+                .expect("read repaired control trace");
+
+        assert!(entries.is_empty());
+        assert!(
+            !path.exists(),
+            "oversized active control trace should be rotated away before reading"
+        );
+        assert!(
+            crate::local_log_store::collect_rotated_logs(&path).is_empty(),
+            "oversized rotated control trace should be pruned by retention budget"
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

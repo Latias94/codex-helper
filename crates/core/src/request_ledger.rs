@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value as JsonValue;
 
+use crate::local_log_store::{LogRetention, repair_log};
 pub use crate::logging::request_log_path;
+use crate::logging::request_log_retention;
 use crate::pricing::{CostAdjustments, estimate_request_cost_from_operator_catalog_for_service};
 use crate::state::{
     FinishedRequest, RequestObservability, RouteDecisionProvenance, SessionIdentitySource,
@@ -221,6 +223,7 @@ pub struct RequestUsageSummaryRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestLedgerStore {
     path: PathBuf,
+    retention: LogRetention,
 }
 
 impl Default for RequestLedgerStore {
@@ -231,11 +234,22 @@ impl Default for RequestLedgerStore {
 
 impl RequestLedgerStore {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            retention: request_log_retention(),
+        }
     }
 
     pub fn from_path(path: impl AsRef<Path>) -> Self {
         Self::new(path.as_ref().to_path_buf())
+    }
+
+    #[cfg(test)]
+    fn with_retention(path: impl Into<PathBuf>, retention: LogRetention) -> Self {
+        Self {
+            path: path.into(),
+            retention,
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -246,8 +260,23 @@ impl RequestLedgerStore {
         self.path.exists()
     }
 
+    fn repair_before_read(&self) {
+        repair_log(&self.path, self.retention);
+    }
+
+    fn open_after_repair(&self) -> std::io::Result<Option<File>> {
+        self.repair_before_read();
+        match File::open(&self.path) {
+            Ok(file) => Ok(Some(file)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn read_lines(&self) -> std::io::Result<Vec<RequestLogLine>> {
-        let file = File::open(&self.path)?;
+        let Some(file) = self.open_after_repair()? else {
+            return Ok(Vec::new());
+        };
         let reader = BufReader::new(file);
         Ok(reader
             .lines()
@@ -260,7 +289,9 @@ impl RequestLedgerStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let file = File::open(&self.path)?;
+        let Some(file) = self.open_after_repair()? else {
+            return Ok(Vec::new());
+        };
         let reader = BufReader::new(file);
         let mut ring = VecDeque::with_capacity(limit);
         for line in reader.lines().map_while(Result::ok) {
@@ -293,7 +324,9 @@ impl RequestLedgerStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let file = File::open(&self.path)?;
+        let Some(file) = self.open_after_repair()? else {
+            return Ok(Vec::new());
+        };
         let reader = BufReader::new(file);
         let mut ring = VecDeque::with_capacity(limit);
         for line in reader.lines().map_while(Result::ok) {
@@ -1109,6 +1142,26 @@ mod tests {
                 .value()
                 .and_then(|record| str_field(record, "path")),
             Some("/three")
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn request_ledger_store_repairs_oversized_active_log_before_reading() {
+        let path = temp_request_log_path("read-repair");
+        std::fs::write(&path, vec![b'x'; 32]).expect("seed oversized request log");
+        let store = RequestLedgerStore::with_retention(&path, LogRetention::new(16, 1));
+
+        let lines = store.tail_lines(10).expect("tail repaired request log");
+
+        assert!(lines.is_empty());
+        assert!(
+            !path.exists(),
+            "oversized active request log should be rotated away before reading"
+        );
+        assert!(
+            crate::local_log_store::collect_rotated_logs(&path).is_empty(),
+            "oversized rotated request log should be pruned by retention budget"
         );
         let _ = std::fs::remove_file(path);
     }
