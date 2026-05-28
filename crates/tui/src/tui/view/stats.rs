@@ -34,7 +34,7 @@ pub(super) fn render_stats_page(
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(6),
+            Constraint::Length(7),
             Constraint::Length(7),
             Constraint::Min(0),
         ])
@@ -185,6 +185,7 @@ fn render_kpis(
         .borders(Borders::ALL)
         .border_style(Style::default().fg(p.border));
     let forecast = usage_spend_forecast(snapshot, ctx.usage_forecast, crate::tui::model::now_ms());
+    let forecast_source = usage_forecast_source_line(snapshot, lang);
     let forecast_style = if forecast.projected_exhaustion {
         Style::default().fg(p.warn)
     } else {
@@ -232,6 +233,13 @@ fn render_kpis(
                 forecast_style,
             ),
         ]),
+        Line::from(vec![
+            Span::styled("src ", Style::default().fg(p.muted)),
+            Span::styled(
+                shorten(&forecast_source, live_value_width),
+                Style::default().fg(p.muted),
+            ),
+        ]),
     ]);
     f.render_widget(
         Paragraph::new(live_text)
@@ -239,6 +247,25 @@ fn render_kpis(
             .wrap(Wrap { trim: true }),
         cols[3],
     );
+}
+
+fn usage_forecast_source_line(snapshot: &Snapshot, lang: Language) -> String {
+    let runtime = snapshot.recent.len();
+    let has_ledger_tail = snapshot.forecast_recent.len() > runtime;
+    match lang {
+        Language::Zh if !has_ledger_tail => {
+            format!("当前 runtime {runtime} 条")
+        }
+        Language::En if !has_ledger_tail => {
+            format!("runtime {runtime}")
+        }
+        Language::Zh => {
+            format!("当前 runtime {runtime} + 本地 request ledger")
+        }
+        Language::En => {
+            format!("runtime {runtime} + local request ledger")
+        }
+    }
 }
 
 fn render_sparkline(
@@ -1267,11 +1294,7 @@ fn render_recent_breakdown(
             .block(
                 Block::default()
                     .title(Span::styled(
-                        format!(
-                            "{} (loaded <= {}) + Tips",
-                            l("Recent sample"),
-                            snapshot.recent.len()
-                        ),
+                        recent_sample_title(snapshot, lang),
                         Style::default().fg(p.muted).add_modifier(Modifier::DIM),
                     ))
                     .borders(Borders::ALL)
@@ -1280,6 +1303,25 @@ fn render_recent_breakdown(
             .wrap(Wrap { trim: true }),
         area,
     );
+}
+
+fn recent_sample_title(snapshot: &Snapshot, lang: Language) -> String {
+    let runtime = snapshot.recent.len();
+    let has_ledger_tail = snapshot.forecast_recent.len() > runtime;
+    match lang {
+        Language::Zh if !has_ledger_tail => {
+            format!("最近样本 (runtime {runtime}) + 提示")
+        }
+        Language::En if !has_ledger_tail => {
+            format!("Recent sample (runtime {runtime}) + Tips")
+        }
+        Language::Zh => {
+            format!("最近样本 (runtime {runtime}, 本地 request ledger) + 提示")
+        }
+        Language::En => {
+            format!("Recent sample (runtime {runtime}, local request ledger) + Tips")
+        }
+    }
 }
 
 #[cfg(test)]

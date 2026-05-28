@@ -187,7 +187,7 @@ fn current_page_help_includes_usage_detail_actions() {
     let lines = current_page_help_lines(Language::En, Page::Stats, true, true, Palette::default());
     let text = help_text_for_tests(&lines);
 
-    assert!(text.contains("Current page: Providers"), "{text}");
+    assert!(text.contains("Current page: Usage"), "{text}");
     assert!(text.contains("PgUp/PgDn"), "{text}");
     assert!(text.contains("refresh provider balances"), "{text}");
 }

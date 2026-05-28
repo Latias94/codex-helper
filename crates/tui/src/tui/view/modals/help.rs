@@ -22,7 +22,7 @@ fn help_current_page_title(lang: Language, page: Page, is_route_graph: bool) -> 
         (Language::Zh, Page::Stations, false) => "当前页面：站点",
         (Language::Zh, Page::Sessions, _) => "当前页面：会话",
         (Language::Zh, Page::Requests, _) => "当前页面：请求",
-        (Language::Zh, Page::Stats, _) => "当前页面：提供商",
+        (Language::Zh, Page::Stats, _) => "当前页面：用量",
         (Language::Zh, Page::Settings, _) => "当前页面：设置",
         (Language::Zh, Page::History, _) => "当前页面：历史",
         (Language::Zh, Page::Recent, _) => "当前页面：最近",
@@ -31,7 +31,7 @@ fn help_current_page_title(lang: Language, page: Page, is_route_graph: bool) -> 
         (Language::En, Page::Stations, false) => "Current page: Stations",
         (Language::En, Page::Sessions, _) => "Current page: Sessions",
         (Language::En, Page::Requests, _) => "Current page: Requests",
-        (Language::En, Page::Stats, _) => "Current page: Providers",
+        (Language::En, Page::Stats, _) => "Current page: Usage",
         (Language::En, Page::Settings, _) => "Current page: Settings",
         (Language::En, Page::History, _) => "Current page: History",
         (Language::En, Page::Recent, _) => "Current page: Recent",
@@ -251,7 +251,7 @@ pub(in crate::tui::view) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui:
             Line::from("  ↑/↓, j/k   移动选中项"),
             Line::from("  1-8        切换页面"),
             Line::from(
-                "            1 总览  2 站点/路由  3 会话  4 请求  5 提供商  6 设置  7 历史  8 最近",
+                "            1 总览  2 站点/路由  3 会话  4 请求  5 用量  6 设置  7 历史  8 最近",
             ),
             Line::from("  L          切换语言（中/英，自动落盘）"),
             Line::from("  6 设置     查看运行态与关键配置入口"),
@@ -386,7 +386,7 @@ pub(in crate::tui::view) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui:
             Line::from("  s/f/h      打开到 Sessions / Requests / History"),
             Line::from(""),
             Line::from(vec![Span::styled(
-                "提供商页（Providers）",
+                "用量页（Usage / Balance）",
                 Style::default().fg(p.text).add_modifier(Modifier::BOLD),
             )]),
             Line::from("  Tab        切换焦点（station vs provider）"),
@@ -417,7 +417,7 @@ pub(in crate::tui::view) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui:
             Line::from("  ↑/↓, j/k   move selection"),
             Line::from("  1-8        switch page"),
             Line::from(
-                "            1 Dashboard  2 Stations/Routing  3 Sessions  4 Requests  5 Providers  6 Settings  7 History  8 Recent",
+                "            1 Dashboard  2 Stations/Routing  3 Sessions  4 Requests  5 Usage  6 Settings  7 History  8 Recent",
             ),
             Line::from("  L          toggle language (zh/en, persisted)"),
             Line::from("  6 Settings show runtime + station overview"),
@@ -553,7 +553,7 @@ pub(in crate::tui::view) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui:
             Line::from("  s/f/h      open in Sessions / Requests / History"),
             Line::from(""),
             Line::from(vec![Span::styled(
-                "Providers page",
+                "Usage / Balance page",
                 Style::default().fg(p.text).add_modifier(Modifier::BOLD),
             )]),
             Line::from("  Tab        switch focus (station vs provider)"),

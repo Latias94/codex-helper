@@ -2085,6 +2085,19 @@ pub(in crate::tui) fn request_page_focus_session_id(
     })
 }
 
+pub(in crate::tui) fn request_page_focus_is_runtime_observed(
+    snapshot: &Snapshot,
+    focused_sid: Option<&str>,
+) -> bool {
+    let Some(sid) = focused_sid else {
+        return true;
+    };
+    snapshot
+        .rows
+        .iter()
+        .any(|row| row.session_id.as_deref() == Some(sid))
+}
+
 pub(in crate::tui) fn request_matches_page_filters(
     request: &FinishedRequest,
     errors_only: bool,
@@ -2719,6 +2732,42 @@ mod tests {
         assert_eq!(merged[0].trace_id.as_deref(), Some("codex-20"));
         assert_eq!(merged[0].session_id.as_deref(), Some("sid-memory"));
         assert_eq!(merged[1].trace_id.as_deref(), Some("codex-5"));
+    }
+
+    #[test]
+    fn request_page_focus_observation_distinguishes_history_only_session() {
+        let snapshot = Snapshot {
+            rows: vec![empty_session_row()],
+            recent: Vec::new(),
+            forecast_recent: Vec::new(),
+            model_overrides: HashMap::new(),
+            overrides: HashMap::new(),
+            station_overrides: HashMap::new(),
+            route_target_overrides: HashMap::new(),
+            service_tier_overrides: HashMap::new(),
+            global_station_override: None,
+            global_route_target_override: None,
+            station_meta_overrides: HashMap::new(),
+            usage_rollup: UsageRollupView::default(),
+            provider_balances: HashMap::new(),
+            station_health: HashMap::new(),
+            health_checks: HashMap::new(),
+            lb_view: HashMap::new(),
+            stats_5m: WindowStats::default(),
+            stats_1h: WindowStats::default(),
+            pricing_catalog: crate::pricing::bundled_model_price_catalog_snapshot(),
+            refreshed_at: Instant::now(),
+        };
+
+        assert!(request_page_focus_is_runtime_observed(&snapshot, None));
+        assert!(request_page_focus_is_runtime_observed(
+            &snapshot,
+            Some("sid")
+        ));
+        assert!(!request_page_focus_is_runtime_observed(
+            &snapshot,
+            Some("history-only")
+        ));
     }
 
     #[test]

@@ -7,8 +7,8 @@ use unicode_width::UnicodeWidthStr;
 use crate::tui::i18n;
 use crate::tui::model::{
     Palette, Snapshot, duration_short, format_age, now_ms, request_cache_hit_rate_label,
-    request_matches_page_filters, request_page_focus_session_id, shorten, shorten_middle,
-    status_style, usage_line_lang,
+    request_matches_page_filters, request_page_focus_is_runtime_observed,
+    request_page_focus_session_id, shorten, shorten_middle, status_style, usage_line_lang,
 };
 use crate::tui::state::UiState;
 
@@ -31,6 +31,8 @@ pub(super) fn render_requests_page(
         ui.focused_request_session_id.as_deref(),
         ui.selected_session_idx,
     );
+    let focused_sid_observed =
+        request_page_focus_is_runtime_observed(snapshot, focused_sid.as_deref());
 
     let filtered = snapshot
         .recent
@@ -398,7 +400,12 @@ pub(super) fn render_requests_page(
         }));
     } else {
         lines.push(Line::from(Span::styled(
-            l("No requests match the current filters."),
+            request_page_empty_message(
+                lang,
+                ui.request_page_scope_session,
+                focused_sid.as_deref(),
+                focused_sid_observed,
+            ),
             Style::default().fg(p.muted),
         )));
     }
@@ -416,6 +423,25 @@ pub(super) fn render_requests_page(
         .style(Style::default().fg(p.text))
         .wrap(Wrap { trim: false });
     f.render_widget(content, columns[1]);
+}
+
+fn request_page_empty_message(
+    lang: crate::tui::Language,
+    scope_session: bool,
+    focused_sid: Option<&str>,
+    focused_sid_observed: bool,
+) -> &'static str {
+    if scope_session && focused_sid.is_some() && !focused_sid_observed {
+        return match lang {
+            crate::tui::Language::Zh => {
+                "该会话来自 Codex 历史；当前 proxy runtime 尚未观测到请求。"
+            }
+            crate::tui::Language::En => {
+                "This session came from Codex history; the current proxy runtime has not observed requests for it."
+            }
+        };
+    }
+    i18n::label(lang, "No requests match the current filters.")
 }
 
 fn request_service_tier_label(value: Option<&str>) -> String {
@@ -587,6 +613,85 @@ fn request_route_attempt_line(attempt: &crate::logging::RouteAttemptLog) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+
+    use crate::dashboard_core::WindowStats;
+    use crate::state::UsageRollupView;
+
+    fn empty_snapshot() -> Snapshot {
+        Snapshot {
+            rows: Vec::new(),
+            recent: Vec::new(),
+            forecast_recent: Vec::new(),
+            model_overrides: HashMap::new(),
+            overrides: HashMap::new(),
+            station_overrides: HashMap::new(),
+            route_target_overrides: HashMap::new(),
+            service_tier_overrides: HashMap::new(),
+            global_station_override: None,
+            global_route_target_override: None,
+            station_meta_overrides: HashMap::new(),
+            usage_rollup: UsageRollupView::default(),
+            provider_balances: HashMap::new(),
+            station_health: HashMap::new(),
+            health_checks: HashMap::new(),
+            lb_view: HashMap::new(),
+            stats_5m: WindowStats::default(),
+            stats_1h: WindowStats::default(),
+            pricing_catalog: crate::pricing::bundled_model_price_catalog_snapshot(),
+            refreshed_at: Instant::now(),
+        }
+    }
+
+    fn buffer_text(buffer: &Buffer) -> String {
+        let mut out = String::new();
+        for y in buffer.area.y..buffer.area.y.saturating_add(buffer.area.height) {
+            for x in buffer.area.x..buffer.area.x.saturating_add(buffer.area.width) {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn render_requests_text(
+        width: u16,
+        height: u16,
+        ui: &mut UiState,
+        snapshot: &Snapshot,
+    ) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let frame = terminal
+            .draw(|frame| {
+                render_requests_page(frame, Palette::default(), ui, snapshot, frame.area());
+            })
+            .expect("draw");
+        buffer_text(frame.buffer)
+    }
+
+    #[test]
+    fn requests_empty_state_distinguishes_history_only_session_focus() {
+        let snapshot = empty_snapshot();
+        let mut ui = UiState {
+            page: crate::tui::types::Page::Requests,
+            language: crate::tui::Language::En,
+            request_page_scope_session: true,
+            focused_request_session_id: Some("history-only-session".to_string()),
+            ..UiState::default()
+        };
+
+        let text = render_requests_text(120, 18, &mut ui, &snapshot);
+
+        assert!(text.contains("came from Codex history"), "{text}");
+        assert!(text.contains("current proxy runtime"), "{text}");
+    }
 
     #[test]
     fn request_route_attempt_line_prefers_provider_endpoint_identity() {

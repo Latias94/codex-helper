@@ -346,6 +346,32 @@ fn stats_kpis_show_spend_projection_only_when_sample_is_confident() {
 }
 
 #[test]
+fn stats_kpis_label_forecast_sample_sources() {
+    let now = crate::tui::model::now_ms();
+    let mut snapshot = sample_snapshot(HashMap::new());
+    snapshot.recent = vec![sample_priced_request(now.saturating_sub(30 * 60_000), "1")];
+    snapshot.forecast_recent = vec![
+        sample_priced_request(now.saturating_sub(59 * 60_000), "1"),
+        sample_priced_request(now.saturating_sub(30 * 60_000), "1"),
+        sample_priced_request(now.saturating_sub(10 * 60_000), "1"),
+    ];
+    let mut ui = UiState {
+        page: crate::tui::types::Page::Stats,
+        usage_forecast: crate::config::UsageForecastConfig {
+            rate_window_minutes: 60,
+            min_priced_requests: 2,
+            reset_utc_offset: "+08:00".to_string(),
+            ..Default::default()
+        },
+        ..UiState::default()
+    };
+
+    let text = render_stats_text(140, 28, &mut ui, &snapshot);
+
+    assert!(text.contains("runtime 1 + local request ledger"), "{text}");
+}
+
+#[test]
 fn spend_forecast_prefers_ledger_backed_sample_over_display_recent() {
     let now = crate::tui::model::now_ms();
     let mut snapshot = sample_snapshot(HashMap::new());

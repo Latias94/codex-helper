@@ -7,6 +7,10 @@ All notable changes to this project will be documented in this file.
 
 ### 中文
 
+#### 变更
+
+- TUI 第 5 页用户可见名称统一为 `Usage / 用量` 口径；Recent/History 都明确标注为 Codex 全局会话，Recent 页 footer 也补齐 `s/f/h` 跳转提示。Usage / Balance 预测现在会显示样本来源来自当前 runtime 还是本地 request ledger，Requests 页在从 Codex 历史会话跳入且当前 runtime 未观测到请求时会给出明确空态说明，避免启动后把历史数据误认成当前会话请求。
+
 #### 修复
 
 - 修复交互式 TUI/runtime 日志只在启动时检查大小的问题；`runtime.log` 现在会在运行过程中按 `CODEX_HELPER_RUNTIME_LOG_MAX_BYTES` / `CODEX_HELPER_RUNTIME_LOG_MAX_FILES` 持续轮转，并且升级后会在下次启动时清理超过保留预算的历史 `runtime.log.*`，避免老用户遗留的巨型日志继续占用磁盘。
@@ -31,6 +35,7 @@ All notable changes to this project will be documented in this file.
 
 #### Changed
 
+- Standardized the TUI page-5 user-facing label around `Usage` / `Usage / Balance`. Recent and History now both identify their Codex-global session scope, the Recent footer advertises the `s/f/h` navigation keys, Usage / Balance spend forecasts show whether their sample comes from the current runtime or the local request ledger, and Requests explains when a focused Codex-history session has no requests observed by the current runtime.
 - Consolidated the route graph and legacy routing compatibility authoring boundary. CLI, GUI, and admin API callers now update entry routes, provider references, and manual targets through semantic `RoutingConfigV4` / `ServiceViewV4` methods instead of mutating fields and synchronizing compatibility state at each call site.
 - Added `RequestLedgerStore` as the request ledger read-model boundary. CLI, TUI, GUI, and admin API consumers now read tail, filter, and summary data through one store, and recent/filter queries use a streaming bounded window instead of loading the full `requests.jsonl` just to return the newest records.
 - Split the Codex relay live-smoke case registry. Case descriptors, HTTP specs, and diagnostic request bodies now live in a dedicated `codex_relay_live_smoke::cases` module while the main module keeps proxy orchestration, transport, and response classification.

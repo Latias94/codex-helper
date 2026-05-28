@@ -738,7 +738,7 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
             ui.toast = Some((
                 format!(
                     "{}: {}={}",
-                    i18n::label(ui.language, "Stats page"),
+                    i18n::label(ui.language, "Usage page"),
                     i18n::label(ui.language, "attention only"),
                     ui.stats_attention_only
                 ),
@@ -751,7 +751,7 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
             ui.toast = Some((
                 format!(
                     "{}: {}={}",
-                    i18n::label(ui.language, "Stats page"),
+                    i18n::label(ui.language, "Usage page"),
                     i18n::label(ui.language, "errors_only"),
                     ui.stats_errors_only
                 ),
