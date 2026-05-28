@@ -1,9 +1,9 @@
 # Codex Fearless Refactor Hardening — Handoff
 
-Status: Active
+Status: Complete
 Last updated: 2026-05-28
 
-Current task: CFR-050
+Current task: none
 
 ## Continuation Notes
 
@@ -12,7 +12,8 @@ Current task: CFR-050
 - request/debug/control/retry trace JSONL and relay evidence now use bounded append helpers.
 - CFR-030 is complete: high-level CLI, GUI, and admin call sites now use semantic routing authoring methods instead of manual compat sync.
 - CFR-040 is complete: `RequestLedgerStore` owns tail, find, finished request projection, and summary reads while compatibility wrapper functions remain.
-- Continue with CFR-050 by splitting relay live-smoke diagnostics by case without changing response shape.
+- CFR-050 is complete: live-smoke case descriptors, wire specs, and request bodies now live in `codex_relay_live_smoke/cases.rs`.
+- CFR-060 is complete: changelog and evidence are updated.
 
 ## Risks
 

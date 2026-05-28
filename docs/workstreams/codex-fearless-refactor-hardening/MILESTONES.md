@@ -1,6 +1,6 @@
 # Codex Fearless Refactor Hardening — Milestones
 
-Status: Active
+Status: Complete
 Last updated: 2026-05-28
 
 ## M0 — Scope Frozen

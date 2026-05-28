@@ -1,6 +1,6 @@
 # Codex Fearless Refactor Hardening — Evidence And Gates
 
-Status: Active
+Status: Complete
 Last updated: 2026-05-28
 
 ## Required Gates
@@ -32,3 +32,8 @@ Last updated: 2026-05-28
 - 2026-05-28: `cargo nextest run -p codex-helper-core request_ledger logging --no-fail-fast` passed: 30 tests.
 - 2026-05-28: `cargo nextest run -p codex-helper --no-fail-fast` passed: 40 tests.
 - 2026-05-28: `cargo check -p codex-helper-gui` passed.
+- 2026-05-28: CFR-050 split live-smoke case descriptors, HTTP specs, and request bodies into `crates/core/src/proxy/codex_relay_live_smoke/cases.rs`.
+- 2026-05-28: `cargo nextest run -p codex-helper-core relay_live_smoke codex_live_smoke --no-fail-fast` passed: 22 tests.
+- 2026-05-28: `cargo nextest run -p codex-helper --no-fail-fast` passed: 40 tests.
+- 2026-05-28: `cargo check -p codex-helper-gui` passed.
+- 2026-05-28: `cargo fmt --check` passed.

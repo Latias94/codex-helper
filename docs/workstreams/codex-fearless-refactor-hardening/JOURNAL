@@ -7,3 +7,6 @@
 - Validation passed: `cargo nextest run -p codex-helper-core config route routing --no-fail-fast`, `cargo nextest run -p codex-helper --no-fail-fast`, `cargo check -p codex-helper-gui`, and `cargo fmt --check`.
 - Completed CFR-040. Added `RequestLedgerStore`, routed CLI/TUI/GUI/admin consumers through it, and made recent/filter reads streaming bounded-window operations.
 - Validation passed: `cargo nextest run -p codex-helper-core request_ledger logging --no-fail-fast`, `cargo nextest run -p codex-helper --no-fail-fast`, `cargo check -p codex-helper-gui`, and `cargo fmt --check`.
+- Completed CFR-050. Split live-smoke case descriptors, HTTP specs, and request bodies into `codex_relay_live_smoke/cases.rs`.
+- Completed CFR-060 closeout. Changelog and evidence updated; workstream status is complete.
+- Validation passed: `cargo nextest run -p codex-helper-core relay_live_smoke codex_live_smoke --no-fail-fast`, `cargo nextest run -p codex-helper --no-fail-fast`, `cargo check -p codex-helper-gui`, and `cargo fmt --check`.

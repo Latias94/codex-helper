@@ -1,6 +1,6 @@
 # Codex Fearless Refactor Hardening — TODO
 
-Status: Active
+Status: Complete
 Last updated: 2026-05-28
 
 ## M0 — Scope And Evidence Freeze
@@ -40,18 +40,18 @@ Last updated: 2026-05-28
 
 ## M4 — Relay Diagnostics Split
 
-- [ ] CFR-050 [owner=codex] [deps=CFR-020] [scope=crates/core/src/proxy/codex_relay_live_smoke.rs,crates/core/src/proxy/codex_relay_*]
+- [x] CFR-050 [owner=codex] [deps=CFR-020] [scope=crates/core/src/proxy/codex_relay_live_smoke.rs,crates/core/src/proxy/codex_relay_*]
   Goal: Split relay live-smoke diagnostics by case while keeping registry/orchestration behavior intact.
   Validation: cargo nextest run -p codex-helper-core relay_live_smoke codex_live_smoke --no-fail-fast.
   Review: New case modules must be behavior-preserving.
   Evidence: EVIDENCE_AND_GATES.md.
-  Handoff: Leave case-specific follow-ups as separate tasks.
+  Handoff: DONE. Case registry/spec/request-body code moved into `codex_relay_live_smoke/cases.rs`.
 
 ## M5 — Closeout
 
-- [ ] CFR-060 [owner=codex] [deps=CFR-030,CFR-040,CFR-050] [scope=docs/workstreams/codex-fearless-refactor-hardening,CHANGELOG.md]
+- [x] CFR-060 [owner=codex] [deps=CFR-030,CFR-040,CFR-050] [scope=docs/workstreams/codex-fearless-refactor-hardening,CHANGELOG.md]
   Goal: Record final evidence, update changelog, and close or split remaining work.
   Validation: cargo fmt --check; cargo nextest run --workspace --no-fail-fast when practical.
   Review: Workstream compliance and code quality review before final commit.
   Evidence: EVIDENCE_AND_GATES.md, WORKSTREAM.json.
-  Handoff: Summarize residual risks.
+  Handoff: DONE. All planned slices landed with targeted validation; no follow-on split required for this lane.

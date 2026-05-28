@@ -2,7 +2,7 @@
   "schema_version": 1,
   "slug": "codex-fearless-refactor-hardening",
   "title": "Codex Fearless Refactor Hardening",
-  "status": "active",
+  "status": "complete",
   "updated": "2026-05-28",
   "scope_kind": "architecture-refactor",
   "problem": "codex-helper has append-only local logs and several compatibility/read-model/diagnostic boundaries that need deeper modules after the runtime log growth incident.",
@@ -40,5 +40,5 @@
     "default_action": "continue",
     "notes": "Complete CFR-020 first; split later tasks only if their compatibility risk expands beyond this lane."
   },
-  "current_task": "CFR-050"
+  "current_task": null
 }
