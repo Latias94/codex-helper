@@ -19,12 +19,12 @@ pub use routing_posture::{
 pub use snapshot::{ApiV1Snapshot, build_dashboard_snapshot};
 pub use station_options::{
     build_model_options_from_mgr, build_profile_options_from_mgr, build_provider_options_from_view,
-    build_station_options_from_mgr,
+    build_runtime_provider_options_from_mgr, build_station_options_from_mgr,
 };
 pub use types::{
     ApiV1Capabilities, CapabilitySupport, ControlPlaneSurfaceCapabilities, ControlProfileOption,
     HostLocalControlPlaneCapabilities, ModelCatalogKind, ProviderEndpointOption, ProviderOption,
-    RemoteAdminAccessCapabilities, SharedControlPlaneCapabilities, StationCapabilitySummary,
-    StationOption,
+    RemoteAdminAccessCapabilities, RuntimeProviderOption, RuntimeUpstreamOption,
+    SharedControlPlaneCapabilities, StationCapabilitySummary, StationOption,
 };
 pub use window_stats::WindowStats;

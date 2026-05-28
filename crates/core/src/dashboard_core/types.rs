@@ -198,6 +198,37 @@ pub struct StationOption {
     pub capabilities: StationCapabilitySummary,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct RuntimeUpstreamOption {
+    pub base_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continuity_domain: Option<String>,
+    pub auth: String,
+    #[serde(default)]
+    pub tags: Vec<(String, String)>,
+    #[serde(default)]
+    pub supported_models: Vec<String>,
+    #[serde(default)]
+    pub model_mapping: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct RuntimeProviderOption {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub level: u8,
+    #[serde(default)]
+    pub active: bool,
+    #[serde(default)]
+    pub upstreams: Vec<RuntimeUpstreamOption>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ControlProfileOption {
     pub name: String,

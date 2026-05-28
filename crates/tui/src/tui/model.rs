@@ -19,26 +19,8 @@ use crate::tui::Language;
 use crate::tui::i18n;
 use crate::usage::UsageMetrics;
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct UpstreamSummary {
-    pub base_url: String,
-    pub provider_id: Option<String>,
-    pub continuity_domain: Option<String>,
-    pub auth: String,
-    pub tags: Vec<(String, String)>,
-    pub supported_models: Vec<String>,
-    pub model_mapping: Vec<(String, String)>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ProviderOption {
-    pub name: String,
-    pub alias: Option<String>,
-    pub enabled: bool,
-    pub level: u8,
-    pub active: bool,
-    pub upstreams: Vec<UpstreamSummary>,
-}
+pub type UpstreamSummary = crate::dashboard_core::RuntimeUpstreamOption;
+pub type ProviderOption = crate::dashboard_core::RuntimeProviderOption;
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq, Default)]
 pub(in crate::tui) struct RoutingProviderRef {
@@ -502,98 +484,11 @@ pub fn build_provider_options(
     cfg: &crate::config::ProxyConfig,
     service_name: &str,
 ) -> Vec<ProviderOption> {
-    let upstream_summary = |u: &crate::config::UpstreamConfig| -> UpstreamSummary {
-        let auth = if let Some(env) = u.auth.auth_token_env.as_deref()
-            && !env.trim().is_empty()
-        {
-            format!("bearer env {env}")
-        } else if u
-            .auth
-            .auth_token
-            .as_deref()
-            .is_some_and(|s| !s.trim().is_empty())
-        {
-            "bearer inline".to_string()
-        } else if let Some(env) = u.auth.api_key_env.as_deref()
-            && !env.trim().is_empty()
-        {
-            format!("x-api-key env {env}")
-        } else if u
-            .auth
-            .api_key
-            .as_deref()
-            .is_some_and(|s| !s.trim().is_empty())
-        {
-            "x-api-key inline".to_string()
-        } else {
-            "-".to_string()
-        };
-
-        let mut tags = u
-            .tags
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect::<Vec<_>>();
-        tags.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-
-        let mut supported_models = u.supported_models.keys().cloned().collect::<Vec<_>>();
-        supported_models.sort();
-
-        let mut model_mapping = u
-            .model_mapping
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect::<Vec<_>>();
-        model_mapping.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-
-        UpstreamSummary {
-            base_url: u.base_url.clone(),
-            provider_id: u.tags.get("provider_id").cloned(),
-            continuity_domain: u
-                .tags
-                .get("continuity_domain")
-                .or_else(|| u.tags.get("provider_continuity_domain"))
-                .map(String::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned),
-            auth,
-            tags,
-            supported_models,
-            model_mapping,
-        }
+    let mgr = match service_name {
+        "claude" => &cfg.claude,
+        _ => &cfg.codex,
     };
-
-    let mut providers: Vec<ProviderOption> = match service_name {
-        "claude" => cfg
-            .claude
-            .stations()
-            .iter()
-            .map(|(name, svc)| ProviderOption {
-                name: name.clone(),
-                alias: svc.alias.clone(),
-                enabled: svc.enabled,
-                level: svc.level.clamp(1, 10),
-                active: cfg.claude.active.as_deref() == Some(name.as_str()),
-                upstreams: svc.upstreams.iter().map(upstream_summary).collect(),
-            })
-            .collect(),
-        _ => cfg
-            .codex
-            .stations()
-            .iter()
-            .map(|(name, svc)| ProviderOption {
-                name: name.clone(),
-                alias: svc.alias.clone(),
-                enabled: svc.enabled,
-                level: svc.level.clamp(1, 10),
-                active: cfg.codex.active.as_deref() == Some(name.as_str()),
-                upstreams: svc.upstreams.iter().map(upstream_summary).collect(),
-            })
-            .collect(),
-    };
-    providers.sort_by(|a, b| a.level.cmp(&b.level).then_with(|| a.name.cmp(&b.name)));
-    providers
+    crate::dashboard_core::build_runtime_provider_options_from_mgr(mgr)
 }
 
 pub(in crate::tui) fn balance_status_style(p: Palette, status: BalanceSnapshotStatus) -> Style {

@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "slug": "codex-tui-operator-read-model",
+  "title": "Codex TUI Operator Read Model Refactor",
+  "status": "active",
+  "updated": "2026-05-28",
+  "scope_kind": "execution",
+  "problem": "The TUI still mirrors operator provider/station read-model semantics that already belong in core dashboard_core, which makes attached TUI, integrated TUI, GUI, and admin clients drift over provider identity, enablement, routing posture, and endpoint metadata.",
+  "authoritative_docs": [
+    {
+      "role": "design",
+      "path": "docs/workstreams/codex-tui-operator-read-model/DESIGN.md"
+    },
+    {
+      "role": "execution",
+      "path": "docs/workstreams/codex-tui-operator-read-model/TODO.md"
+    },
+    {
+      "role": "milestones",
+      "path": "docs/workstreams/codex-tui-operator-read-model/MILESTONES.md"
+    },
+    {
+      "role": "gates",
+      "path": "docs/workstreams/codex-tui-operator-read-model/EVIDENCE_AND_GATES.md"
+    },
+    {
+      "role": "handoff",
+      "path": "docs/workstreams/codex-tui-operator-read-model/HANDOFF.md"
+    }
+  ],
+  "gates": [
+    "cargo fmt --check",
+    "cargo nextest run -p codex-helper-core -p codex-helper-tui --no-fail-fast",
+    "cargo check -p codex-helper-tui",
+    "git diff --check"
+  ],
+  "evidence": [
+    "docs/workstreams/codex-tui-operator-read-model/DESIGN.md",
+    "docs/workstreams/codex-tui-operator-read-model/TODO.md",
+    "docs/workstreams/codex-tui-operator-read-model/MILESTONES.md",
+    "docs/workstreams/codex-tui-operator-read-model/EVIDENCE_AND_GATES.md",
+    "docs/workstreams/codex-tui-operator-read-model/HANDOFF.md"
+  ],
+  "adr_refs": [],
+  "continue_policy": {
+    "default_action": "continue",
+    "notes": "Continue until the TUI provider/station read model is backed by core-owned dashboard_core contracts and the old TUI mirror is either deleted or reduced to presentation-only adaptation."
+  },
+  "current_task": "ORM-200"
+}

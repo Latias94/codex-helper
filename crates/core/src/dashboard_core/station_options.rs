@@ -8,7 +8,8 @@ use crate::state::RuntimeConfigState;
 
 use super::types::{
     CapabilitySupport, ControlProfileOption, ModelCatalogKind, ProviderEndpointOption,
-    ProviderOption, StationCapabilitySummary, StationOption,
+    ProviderOption, RuntimeProviderOption, RuntimeUpstreamOption, StationCapabilitySummary,
+    StationOption,
 };
 
 pub fn build_station_options_from_mgr(
@@ -88,6 +89,95 @@ pub fn build_model_options_from_mgr(mgr: &ServiceConfigManager) -> Vec<String> {
     }
 
     models.into_iter().collect()
+}
+
+pub fn build_runtime_provider_options_from_mgr(
+    mgr: &ServiceConfigManager,
+) -> Vec<RuntimeProviderOption> {
+    let mut providers = mgr
+        .stations()
+        .iter()
+        .map(|(name, svc)| RuntimeProviderOption {
+            name: name.clone(),
+            alias: svc.alias.clone(),
+            enabled: svc.enabled,
+            level: svc.level.clamp(1, 10),
+            active: mgr.active.as_deref() == Some(name.as_str()),
+            upstreams: svc
+                .upstreams
+                .iter()
+                .map(build_runtime_upstream_option)
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    providers.sort_by(|a, b| a.level.cmp(&b.level).then_with(|| a.name.cmp(&b.name)));
+    providers
+}
+
+fn build_runtime_upstream_option(upstream: &UpstreamConfig) -> RuntimeUpstreamOption {
+    let mut tags = upstream
+        .tags
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    tags.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+    let mut supported_models = upstream
+        .supported_models
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    supported_models.sort();
+
+    let mut model_mapping = upstream
+        .model_mapping
+        .iter()
+        .map(|(external, internal)| (external.clone(), internal.clone()))
+        .collect::<Vec<_>>();
+    model_mapping.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+    RuntimeUpstreamOption {
+        base_url: upstream.base_url.clone(),
+        provider_id: upstream.tags.get("provider_id").cloned(),
+        continuity_domain: normalized_tag_value(upstream.tags.get("continuity_domain"))
+            .or_else(|| normalized_tag_value(upstream.tags.get("provider_continuity_domain"))),
+        auth: runtime_upstream_auth_label(&upstream.auth),
+        tags,
+        supported_models,
+        model_mapping,
+    }
+}
+
+fn runtime_upstream_auth_label(auth: &crate::config::UpstreamAuth) -> String {
+    if let Some(env) = auth
+        .auth_token_env
+        .as_deref()
+        .map(str::trim)
+        .filter(|env| !env.is_empty())
+    {
+        format!("bearer env {env}")
+    } else if auth
+        .auth_token
+        .as_deref()
+        .is_some_and(|token| !token.trim().is_empty())
+    {
+        "bearer inline".to_string()
+    } else if let Some(env) = auth
+        .api_key_env
+        .as_deref()
+        .map(str::trim)
+        .filter(|env| !env.is_empty())
+    {
+        format!("x-api-key env {env}")
+    } else if auth
+        .api_key
+        .as_deref()
+        .is_some_and(|key| !key.trim().is_empty())
+    {
+        "x-api-key inline".to_string()
+    } else {
+        "-".to_string()
+    }
 }
 
 pub fn build_provider_options_from_view(
@@ -488,6 +578,106 @@ mod tests {
                 "gpt-5.4-mini".to_string(),
                 "gpt-5.5-preview".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn build_runtime_provider_options_from_mgr_owns_tui_station_metadata() {
+        let mut mgr = ServiceConfigManager {
+            active: Some("beta".to_string()),
+            ..ServiceConfigManager::default()
+        };
+        mgr.configs.insert(
+            "beta".to_string(),
+            ServiceConfig {
+                name: "beta".to_string(),
+                alias: Some("Beta".to_string()),
+                enabled: true,
+                level: 20,
+                upstreams: vec![UpstreamConfig {
+                    base_url: "https://beta.example/v1".to_string(),
+                    auth: UpstreamAuth {
+                        auth_token_env: Some("BETA_TOKEN".to_string()),
+                        ..UpstreamAuth::default()
+                    },
+                    tags: HashMap::from([
+                        ("zone".to_string(), "apac".to_string()),
+                        ("provider_id".to_string(), "beta-relay".to_string()),
+                        (
+                            "provider_continuity_domain".to_string(),
+                            " relay-shared ".to_string(),
+                        ),
+                    ]),
+                    supported_models: HashMap::from([
+                        ("gpt-5".to_string(), true),
+                        ("gpt-4.1".to_string(), false),
+                    ]),
+                    model_mapping: HashMap::from([(
+                        "gpt-5-fast".to_string(),
+                        "relay-gpt-5".to_string(),
+                    )]),
+                }],
+            },
+        );
+        mgr.configs.insert(
+            "alpha".to_string(),
+            ServiceConfig {
+                name: "alpha".to_string(),
+                alias: None,
+                enabled: false,
+                level: 1,
+                upstreams: vec![UpstreamConfig {
+                    base_url: "https://alpha.example/v1".to_string(),
+                    auth: UpstreamAuth {
+                        api_key: Some("inline".to_string()),
+                        ..UpstreamAuth::default()
+                    },
+                    tags: HashMap::new(),
+                    supported_models: HashMap::new(),
+                    model_mapping: HashMap::new(),
+                }],
+            },
+        );
+
+        let providers = build_runtime_provider_options_from_mgr(&mgr);
+
+        assert_eq!(providers.len(), 2);
+        assert_eq!(providers[0].name, "alpha");
+        assert!(!providers[0].enabled);
+        assert_eq!(providers[0].level, 1);
+        assert!(!providers[0].active);
+        assert_eq!(providers[0].upstreams[0].auth, "x-api-key inline");
+
+        let beta = &providers[1];
+        assert_eq!(beta.name, "beta");
+        assert_eq!(beta.alias.as_deref(), Some("Beta"));
+        assert_eq!(beta.level, 10);
+        assert!(beta.active);
+        assert_eq!(beta.upstreams.len(), 1);
+
+        let upstream = &beta.upstreams[0];
+        assert_eq!(upstream.base_url, "https://beta.example/v1");
+        assert_eq!(upstream.provider_id.as_deref(), Some("beta-relay"));
+        assert_eq!(upstream.continuity_domain.as_deref(), Some("relay-shared"));
+        assert_eq!(upstream.auth, "bearer env BETA_TOKEN");
+        assert_eq!(
+            upstream.tags,
+            vec![
+                (
+                    "provider_continuity_domain".to_string(),
+                    " relay-shared ".to_string()
+                ),
+                ("provider_id".to_string(), "beta-relay".to_string()),
+                ("zone".to_string(), "apac".to_string()),
+            ]
+        );
+        assert_eq!(
+            upstream.supported_models,
+            vec!["gpt-4.1".to_string(), "gpt-5".to_string()]
+        );
+        assert_eq!(
+            upstream.model_mapping,
+            vec![("gpt-5-fast".to_string(), "relay-gpt-5".to_string())]
         );
     }
 
