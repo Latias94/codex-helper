@@ -635,6 +635,18 @@ pub struct ServiceViewV4 {
     pub routing: Option<RoutingConfigV4>,
 }
 
+impl ServiceViewV4 {
+    pub fn ensure_routing_mut(&mut self) -> &mut RoutingConfigV4 {
+        self.routing.get_or_insert_with(RoutingConfigV4::default)
+    }
+
+    pub fn normalize_routing_authoring(&mut self) {
+        if let Some(routing) = self.routing.as_mut() {
+            routing.normalize_authoring();
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfigV4 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -777,13 +789,13 @@ impl Default for RoutingConfigV4 {
 }
 
 impl ProxyConfigV4 {
+    pub fn normalize_routing_authoring(&mut self) {
+        self.codex.normalize_routing_authoring();
+        self.claude.normalize_routing_authoring();
+    }
+
     pub fn sync_routing_compat_from_graph(&mut self) {
-        if let Some(routing) = self.codex.routing.as_mut() {
-            routing.sync_compat_from_graph();
-        }
-        if let Some(routing) = self.claude.routing.as_mut() {
-            routing.sync_compat_from_graph();
-        }
+        self.normalize_routing_authoring();
     }
 }
 
@@ -855,6 +867,95 @@ impl RoutingConfigV4 {
 
     pub fn entry_node_mut(&mut self) -> Option<&mut RoutingNodeV4> {
         self.routes.get_mut(self.entry.as_str())
+    }
+
+    pub fn normalize_authoring(&mut self) {
+        if self.routes.is_empty() {
+            self.sync_graph_from_compat();
+        }
+        self.sync_compat_from_graph();
+    }
+
+    pub fn ensure_graph_from_compat(&mut self) {
+        if self.routes.is_empty() {
+            self.sync_graph_from_compat();
+        }
+    }
+
+    pub fn ensure_entry_node_mut(&mut self) -> &mut RoutingNodeV4 {
+        self.ensure_graph_from_compat();
+        let entry = self.entry.clone();
+        self.routes.entry(entry).or_default()
+    }
+
+    pub fn set_entry_routing(
+        &mut self,
+        policy: RoutingPolicyV4,
+        target: Option<String>,
+        children: Vec<String>,
+        prefer_tags: Vec<BTreeMap<String, String>>,
+        on_exhausted: RoutingExhaustedActionV4,
+    ) {
+        let node = self.ensure_entry_node_mut();
+        node.strategy = policy;
+        node.children = children;
+        node.target = target;
+        node.prefer_tags = prefer_tags;
+        node.on_exhausted = on_exhausted;
+        if !matches!(node.strategy, RoutingPolicyV4::ManualSticky) {
+            node.target = None;
+        }
+        if !matches!(node.strategy, RoutingPolicyV4::TagPreferred) {
+            node.prefer_tags.clear();
+        }
+        self.sync_compat_from_graph();
+    }
+
+    pub fn clear_entry_target(&mut self, children: Vec<String>) {
+        self.set_entry_routing(
+            RoutingPolicyV4::OrderedFailover,
+            None,
+            children,
+            Vec::new(),
+            RoutingExhaustedActionV4::Continue,
+        );
+    }
+
+    pub fn ensure_entry_order_contains(&mut self, provider_name: &str) {
+        let node = self.ensure_entry_node_mut();
+        if !node.children.iter().any(|name| name == provider_name) {
+            node.children.push(provider_name.to_string());
+        }
+        self.sync_compat_from_graph();
+    }
+
+    pub fn clear_manual_target_for(&mut self, provider_name: &str) -> bool {
+        let node = self.ensure_entry_node_mut();
+        let should_clear = matches!(node.strategy, RoutingPolicyV4::ManualSticky)
+            && node.target.as_deref() == Some(provider_name);
+        if !should_clear {
+            return false;
+        }
+        node.strategy = RoutingPolicyV4::OrderedFailover;
+        node.target = None;
+        node.prefer_tags.clear();
+        node.on_exhausted = RoutingExhaustedActionV4::Continue;
+        self.sync_compat_from_graph();
+        true
+    }
+
+    pub fn remove_provider_references(&mut self, provider_name: &str) {
+        self.ensure_graph_from_compat();
+        for node in self.routes.values_mut() {
+            node.children.retain(|name| name != provider_name);
+            if node.target.as_deref() == Some(provider_name) {
+                node.target = None;
+                if matches!(node.strategy, RoutingPolicyV4::ManualSticky) {
+                    node.strategy = RoutingPolicyV4::OrderedFailover;
+                }
+            }
+        }
+        self.sync_compat_from_graph();
     }
 
     pub fn sync_compat_from_graph(&mut self) {

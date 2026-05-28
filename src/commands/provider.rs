@@ -289,20 +289,7 @@ fn build_provider_view(view: &ServiceViewV4, name: &str) -> Option<ProviderView>
 }
 
 fn clear_manual_target_for_provider(view: &mut ServiceViewV4, provider_name: &str) -> bool {
-    let routing = ensure_v4_routing(view);
-    let entry = routing.entry.clone();
-    let node = routing.routes.entry(entry).or_default();
-    if matches!(node.strategy, crate::config::RoutingPolicyV4::ManualSticky)
-        && node.target.as_deref() == Some(provider_name)
-    {
-        node.strategy = crate::config::RoutingPolicyV4::OrderedFailover;
-        node.target = None;
-        node.prefer_tags.clear();
-        node.on_exhausted = crate::config::RoutingExhaustedActionV4::Continue;
-        routing.sync_compat_from_graph();
-        return true;
-    }
-    false
+    ensure_v4_routing(view).clear_manual_target_for(provider_name)
 }
 
 fn provider_endpoints(provider: &ProviderConfigV4) -> Vec<ProviderEndpointView> {

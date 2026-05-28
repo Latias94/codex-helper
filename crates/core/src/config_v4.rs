@@ -47,10 +47,7 @@ fn compact_service_view_v4_for_write(view: &mut ServiceViewV4) {
         }
     }
     if let Some(routing) = view.routing.as_mut() {
-        if routing.routes.is_empty() {
-            routing.sync_graph_from_compat();
-        }
-        routing.sync_compat_from_graph();
+        routing.normalize_authoring();
     }
 }
 
@@ -536,10 +533,7 @@ pub fn effective_v4_routing(view: &ServiceViewV4) -> RoutingConfigV4 {
         .routing
         .clone()
         .unwrap_or_else(|| default_routing_for_view(view));
-    if routing.routes.is_empty() {
-        routing.sync_graph_from_compat();
-    }
-    routing.sync_compat_from_graph();
+    routing.normalize_authoring();
     routing
 }
 
@@ -1232,7 +1226,7 @@ pub mod legacy {
             routes,
             ..RoutingConfigV4::default()
         };
-        routing.sync_compat_from_graph();
+        routing.normalize_authoring();
         Ok(routing)
     }
 
@@ -1289,12 +1283,7 @@ pub mod legacy {
             default_service: legacy.default_service,
             ui: legacy.ui.clone(),
         };
-        if let Some(routing) = config.codex.routing.as_mut() {
-            routing.sync_compat_from_graph();
-        }
-        if let Some(routing) = config.claude.routing.as_mut() {
-            routing.sync_compat_from_graph();
-        }
+        config.normalize_routing_authoring();
         Ok(ConfigV4MigrationReport { config, warnings })
     }
 }

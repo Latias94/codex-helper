@@ -22,12 +22,12 @@ Last updated: 2026-05-28
 
 ## M2 — Routing Compatibility Boundary
 
-- [ ] CFR-030 [owner=codex] [deps=CFR-020] [scope=crates/core/src/config*.rs,src/commands/routing.rs,src/commands/route_view.rs,crates/gui/src/gui/pages]
+- [x] CFR-030 [owner=codex] [deps=CFR-020] [scope=crates/core/src/config*.rs,src/commands/routing.rs,src/commands/route_view.rs,crates/gui/src/gui/pages]
   Goal: Move graph/compat sync behind a persisted routing document boundary so callers stop manually coordinating legacy fields.
   Validation: cargo nextest run -p codex-helper-core config route routing --no-fail-fast.
   Review: No route selection behavior changes without explicit tests.
   Evidence: EVIDENCE_AND_GATES.md.
-  Handoff: Split if config migration scope expands.
+  Handoff: DONE. Config, CLI, GUI, and admin call sites now use semantic authoring helpers for entry route and provider-reference updates.
 
 ## M3 — Request Ledger Read Model
 

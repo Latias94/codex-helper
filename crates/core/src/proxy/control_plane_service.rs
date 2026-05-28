@@ -138,7 +138,7 @@ pub(super) async fn load_persisted_proxy_settings_document()
             Some(version) if is_supported_route_graph_config_version(version) => {
                 let mut cfg = toml::from_str::<ProxyConfigV4>(&text)
                     .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-                cfg.sync_routing_compat_from_graph();
+                cfg.normalize_routing_authoring();
                 crate::config::compile_v4_to_runtime(&cfg)
                     .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
                 return Ok(PersistedProxySettingsDocument::V4(Box::new(cfg)));
@@ -149,7 +149,7 @@ pub(super) async fn load_persisted_proxy_settings_document()
                 let migrated = crate::config::legacy::migrate_v3_legacy_to_v4(&legacy)
                     .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
                 let mut cfg = migrated.config;
-                cfg.sync_routing_compat_from_graph();
+                cfg.normalize_routing_authoring();
                 crate::config::compile_v4_to_runtime(&cfg)
                     .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
                 return Ok(PersistedProxySettingsDocument::V4(Box::new(cfg)));

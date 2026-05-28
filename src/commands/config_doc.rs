@@ -127,14 +127,14 @@ pub(super) async fn load_config_document() -> anyhow::Result<ConfigDocument> {
 
     if version.is_some_and(is_supported_route_graph_config_version) {
         let mut cfg = toml::from_str::<ProxyConfigV4>(&text)?;
-        cfg.sync_routing_compat_from_graph();
+        cfg.normalize_routing_authoring();
         compile_v4_to_runtime(&cfg)?;
         Ok(ConfigDocument::V4(Box::new(cfg)))
     } else if version == Some(3) {
         let legacy = toml::from_str::<crate::config::legacy::ProxyConfigV3Legacy>(&text)?;
         let migrated = crate::config::legacy::migrate_v3_legacy_to_v4(&legacy)?;
         let mut cfg = migrated.config;
-        cfg.sync_routing_compat_from_graph();
+        cfg.normalize_routing_authoring();
         compile_v4_to_runtime(&cfg)?;
         Ok(ConfigDocument::V4(Box::new(cfg)))
     } else if version == Some(2) {
@@ -201,29 +201,12 @@ pub(super) fn select_v4_service_view<'a>(
 }
 
 pub(super) fn ensure_v4_routing(view: &mut ServiceViewV4) -> &mut RoutingConfigV4 {
-    view.routing.get_or_insert_with(RoutingConfigV4::default)
+    view.ensure_routing_mut()
 }
 
 pub(super) fn ensure_v4_routing_order_contains(view: &mut ServiceViewV4, provider_name: &str) {
-    let routing = ensure_v4_routing(view);
-    let entry_name = routing.entry.clone();
-    if !routing.routes.contains_key(entry_name.as_str()) {
-        routing
-            .routes
-            .insert(entry_name.clone(), crate::config::RoutingNodeV4::default());
-    }
-    let node = routing
-        .routes
-        .get_mut(entry_name.as_str())
-        .expect("entry route");
-    if !node
-        .children
-        .iter()
-        .any(|candidate| candidate == provider_name)
-    {
-        node.children.push(provider_name.to_string());
-    }
-    routing.sync_compat_from_graph();
+    view.ensure_routing_mut()
+        .ensure_entry_order_contains(provider_name);
 }
 
 pub(super) fn parse_cli_tags(raw_tags: &[String]) -> anyhow::Result<BTreeMap<String, String>> {

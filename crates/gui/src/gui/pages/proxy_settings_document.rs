@@ -32,14 +32,14 @@ pub(super) fn parse_proxy_settings_document(
             });
         if version == Some(4) {
             let mut cfg = toml::from_str::<crate::config::ProxyConfigV4>(text)?;
-            cfg.sync_routing_compat_from_graph();
+            cfg.normalize_routing_authoring();
             crate::config::compile_v4_to_runtime(&cfg)?;
             return Ok(ProxySettingsWorkingDocument::V4(cfg));
         } else if version == Some(3) {
             let legacy = toml::from_str::<crate::config::legacy::ProxyConfigV3Legacy>(text)?;
             let migrated = crate::config::legacy::migrate_v3_legacy_to_v4(&legacy)?;
             let mut cfg = migrated.config;
-            cfg.sync_routing_compat_from_graph();
+            cfg.normalize_routing_authoring();
             crate::config::compile_v4_to_runtime(&cfg)?;
             return Ok(ProxySettingsWorkingDocument::V4(cfg));
         }

@@ -294,18 +294,7 @@ pub async fn handle_routing_cmd(cmd: RoutingCommand) -> CliResult<()> {
                 let next_order =
                     normalize_complete_order(view, current_entry.children.clone(), None)
                         .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
-                let routing = view
-                    .routing
-                    .as_mut()
-                    .expect("routing existence was checked above");
-                let entry_name = routing.entry.clone();
-                let node = routing.routes.entry(entry_name).or_default();
-                node.strategy = RoutingPolicyV4::OrderedFailover;
-                node.target = None;
-                node.children = next_order;
-                node.prefer_tags.clear();
-                node.on_exhausted = RoutingExhaustedActionV4::Continue;
-                routing.sync_compat_from_graph();
+                view.ensure_routing_mut().clear_entry_target(next_order);
             }
 
             save_config_v4(&cfg)
@@ -671,21 +660,7 @@ fn set_v4_entry_routing(
     prefer_tags: Vec<BTreeMap<String, String>>,
     on_exhausted: RoutingExhaustedActionV4,
 ) {
-    let routing = ensure_v4_routing(view);
-    let entry_name = routing.entry.clone();
-    let node = routing.routes.entry(entry_name).or_default();
-    node.strategy = policy;
-    node.children = order;
-    node.target = target;
-    node.prefer_tags = prefer_tags;
-    node.on_exhausted = on_exhausted;
-    if !matches!(node.strategy, RoutingPolicyV4::ManualSticky) {
-        node.target = None;
-    }
-    if !matches!(node.strategy, RoutingPolicyV4::TagPreferred) {
-        node.prefer_tags.clear();
-    }
-    routing.sync_compat_from_graph();
+    ensure_v4_routing(view).set_entry_routing(policy, target, order, prefer_tags, on_exhausted);
 }
 
 #[cfg(test)]

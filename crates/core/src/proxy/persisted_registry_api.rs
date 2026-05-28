@@ -629,7 +629,7 @@ fn sanitize_routing_spec_request(
         }
     }
 
-    routing.sync_compat_from_graph();
+    routing.normalize_authoring();
     Ok(routing)
 }
 

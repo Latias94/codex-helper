@@ -23,3 +23,8 @@ Last updated: 2026-05-28
 - 2026-05-28: `cargo nextest run -p codex-helper-core local_log_store codex_relay_evidence logging --no-fail-fast` passed: 24 tests.
 - 2026-05-28: `cargo nextest run -p codex-helper --no-fail-fast` passed: 40 tests.
 - 2026-05-28: `cargo check -p codex-helper-gui` passed.
+- 2026-05-28: CFR-030 added semantic routing authoring helpers on `ServiceViewV4` and
+  `RoutingConfigV4`, then replaced high-level CLI, GUI, and admin API compat-sync call sites.
+- 2026-05-28: `cargo nextest run -p codex-helper-core config route routing --no-fail-fast` passed: 260 tests.
+- 2026-05-28: `cargo nextest run -p codex-helper --no-fail-fast` passed: 40 tests.
+- 2026-05-28: `cargo check -p codex-helper-gui` passed.

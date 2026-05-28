@@ -12,12 +12,20 @@ All notable changes to this project will be documented in this file.
 - 修复交互式 TUI/runtime 日志只在启动时检查大小的问题；`runtime.log` 现在会在运行过程中按 `CODEX_HELPER_RUNTIME_LOG_MAX_BYTES` / `CODEX_HELPER_RUNTIME_LOG_MAX_FILES` 持续轮转，并且升级后会在下次启动时清理超过保留预算的历史 `runtime.log.*`，避免老用户遗留的巨型日志继续占用磁盘。
 - 将 runtime、GUI、request/debug、control trace、retry trace 和 Codex relay evidence 统一到有界本地日志存储；`control_trace.jsonl` 等 JSONL 日志现在会在首次写入时按 `CODEX_HELPER_REQUEST_LOG_MAX_BYTES` / `CODEX_HELPER_REQUEST_LOG_MAX_FILES` 轮转并清理历史轮转文件，`gui.log` 和 relay evidence 也新增独立大小上限，降低老用户日志目录继续膨胀的风险。
 
+#### 重构
+
+- 收口 route graph 与 legacy routing compat 的 authoring 边界；CLI、GUI 和 admin API 现在通过 `RoutingConfigV4` / `ServiceViewV4` 的语义方法更新 entry route、provider 引用和手动 target，而不是在调用点手动修改字段后同步兼容字段。
+
 ### English summary
 
 #### Fixed
 
 - Fixed interactive TUI/runtime log rotation only checking file size at startup. `runtime.log` now rotates while the process is running according to `CODEX_HELPER_RUNTIME_LOG_MAX_BYTES` / `CODEX_HELPER_RUNTIME_LOG_MAX_FILES`, and upgrades clean up historical `runtime.log.*` files that exceed the retention budget on the next startup so oversized legacy logs do not keep consuming disk space.
 - Unified runtime, GUI, request/debug, control trace, retry trace, and Codex relay evidence writes behind a bounded local log store. JSONL logs such as `control_trace.jsonl` now rotate and prune historical rotated files on first write according to `CODEX_HELPER_REQUEST_LOG_MAX_BYTES` / `CODEX_HELPER_REQUEST_LOG_MAX_FILES`, while `gui.log` and relay evidence gained their own size limits to reduce continued log directory growth for existing users.
+
+#### Changed
+
+- Consolidated the route graph and legacy routing compatibility authoring boundary. CLI, GUI, and admin API callers now update entry routes, provider references, and manual targets through semantic `RoutingConfigV4` / `ServiceViewV4` methods instead of mutating fields and synchronizing compatibility state at each call site.
 
 ## [0.17.0] - 2026-05-26
 

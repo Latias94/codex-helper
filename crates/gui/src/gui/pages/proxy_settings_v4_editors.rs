@@ -738,7 +738,7 @@ fn load_route_node_editor_from_service(
 ) {
     let routing = service.routing.as_ref().map(|routing| {
         let mut routing = routing.clone();
-        routing.sync_graph_from_compat();
+        routing.ensure_graph_from_compat();
         routing
     });
     let selected = editor.selected_route.clone();
@@ -785,7 +785,7 @@ fn save_route_node_from_editor(
         .clone()
         .or_else(|| service.routing.clone())
         .unwrap_or_default();
-    routing.sync_graph_from_compat();
+    routing.ensure_graph_from_compat();
     let selected = editor.selected_route.clone();
 
     if service.providers.contains_key(name.as_str()) {
@@ -916,7 +916,7 @@ fn save_route_node_from_editor(
         }
     }
 
-    routing.sync_compat_from_graph();
+    routing.normalize_authoring();
     service.routing = Some(routing);
     editor.selected_route = Some(name.clone());
     editor.source_signature = None;
@@ -943,7 +943,7 @@ fn delete_route_node_from_editor(
         .clone()
         .or_else(|| service.routing.clone())
         .unwrap_or_default();
-    routing.sync_graph_from_compat();
+    routing.ensure_graph_from_compat();
     routing
         .delete_route_node(name.as_str())
         .map_err(|err| err.to_string())?;
@@ -1026,7 +1026,7 @@ fn build_routing_from_editor(
         node.then = None;
         node.default_route = None;
     }
-    routing.sync_compat_from_graph();
+    routing.normalize_authoring();
     Ok(routing)
 }
 
@@ -1794,32 +1794,17 @@ fn ensure_provider_editor_routing_order_contains(
     service: &mut crate::config::ServiceViewV4,
     provider_name: &str,
 ) {
-    let routing = service
-        .routing
-        .get_or_insert_with(crate::config::RoutingConfigV4::default);
-    let entry = routing.entry.clone();
-    let node = routing.routes.entry(entry).or_default();
-    if !node.children.iter().any(|name| name == provider_name) {
-        node.children.push(provider_name.to_string());
-    }
-    routing.sync_compat_from_graph();
+    service
+        .ensure_routing_mut()
+        .ensure_entry_order_contains(provider_name);
 }
 
 fn clear_provider_editor_manual_target(
     service: &mut crate::config::ServiceViewV4,
     provider_name: &str,
 ) {
-    let Some(routing) = service.routing.as_mut() else {
-        return;
-    };
-    if routing.entry_node().and_then(|node| node.target.as_deref()) == Some(provider_name) {
-        let entry = routing.entry.clone();
-        let node = routing.routes.entry(entry).or_default();
-        node.strategy = crate::config::RoutingPolicyV4::OrderedFailover;
-        node.target = None;
-        node.prefer_tags.clear();
-        node.on_exhausted = crate::config::RoutingExhaustedActionV4::Continue;
-        routing.sync_compat_from_graph();
+    if let Some(routing) = service.routing.as_mut() {
+        routing.clear_manual_target_for(provider_name);
     }
 }
 
@@ -1827,16 +1812,7 @@ fn remove_provider_from_route_nodes(
     routing: &mut crate::config::RoutingConfigV4,
     provider_name: &str,
 ) {
-    for node in routing.routes.values_mut() {
-        node.children.retain(|name| name != provider_name);
-        if node.target.as_deref() == Some(provider_name) {
-            node.target = None;
-            if matches!(node.strategy, crate::config::RoutingPolicyV4::ManualSticky) {
-                node.strategy = crate::config::RoutingPolicyV4::OrderedFailover;
-            }
-        }
-    }
-    routing.sync_compat_from_graph();
+    routing.remove_provider_references(provider_name);
 }
 
 fn normalize_provider_editor_name(raw: &str) -> Result<String, String> {

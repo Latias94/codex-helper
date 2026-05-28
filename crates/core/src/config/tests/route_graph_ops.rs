@@ -124,3 +124,43 @@ fn sync_graph_from_compat_ignores_default_compat_fields_for_existing_graph() {
         )])]
     );
 }
+
+#[test]
+fn entry_routing_authoring_syncs_legacy_compat_fields() {
+    let mut routing = RoutingConfigV4::default();
+
+    routing.set_entry_routing(
+        RoutingPolicyV4::ManualSticky,
+        Some("monthly".to_string()),
+        vec!["monthly".to_string(), "paygo".to_string()],
+        Vec::new(),
+        RoutingExhaustedActionV4::Continue,
+    );
+
+    let entry = routing.entry_node().expect("entry route should exist");
+    assert_eq!(entry.strategy, RoutingPolicyV4::ManualSticky);
+    assert_eq!(entry.target.as_deref(), Some("monthly"));
+    assert_eq!(
+        routing.order,
+        vec!["monthly".to_string(), "paygo".to_string()]
+    );
+    assert_eq!(routing.target.as_deref(), Some("monthly"));
+}
+
+#[test]
+fn provider_reference_authoring_updates_entry_and_compat_fields() {
+    let mut routing = RoutingConfigV4::manual_sticky(
+        "monthly".to_string(),
+        vec!["monthly".to_string(), "paygo".to_string()],
+    );
+
+    assert!(routing.clear_manual_target_for("monthly"));
+    routing.remove_provider_references("monthly");
+
+    let entry = routing.entry_node().expect("entry route should exist");
+    assert_eq!(entry.strategy, RoutingPolicyV4::OrderedFailover);
+    assert_eq!(entry.target, None);
+    assert_eq!(entry.children, vec!["paygo".to_string()]);
+    assert_eq!(routing.target, None);
+    assert_eq!(routing.order, vec!["paygo".to_string()]);
+}
