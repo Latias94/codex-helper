@@ -1998,10 +1998,9 @@ fn usage_forecast_log_tail_limit() -> usize {
 async fn load_forecast_recent_requests(
     memory_recent: Vec<FinishedRequest>,
 ) -> Vec<FinishedRequest> {
-    let path = crate::request_ledger::request_log_path();
     let limit = usage_forecast_log_tail_limit();
     let ledger_recent = tokio::task::spawn_blocking(move || {
-        crate::request_ledger::tail_finished_requests_from_log(&path, limit)
+        crate::request_ledger::RequestLedgerStore::default().tail_finished_requests(limit)
     })
     .await
     .ok()

@@ -40,5 +40,5 @@
     "default_action": "continue",
     "notes": "Complete CFR-020 first; split later tasks only if their compatibility risk expands beyond this lane."
   },
-  "current_task": "CFR-040"
+  "current_task": "CFR-050"
 }

@@ -31,12 +31,12 @@ Last updated: 2026-05-28
 
 ## M3 — Request Ledger Read Model
 
-- [ ] CFR-040 [owner=codex] [deps=CFR-020] [scope=crates/core/src/request_ledger.rs,crates/core/src/logging.rs,crates/tui/src,crates/gui/src]
+- [x] CFR-040 [owner=codex] [deps=CFR-020] [scope=crates/core/src/request_ledger.rs,crates/core/src/logging.rs,crates/tui/src,crates/gui/src]
   Goal: Introduce a request ledger store/read-model boundary for tail, summary, filtering, and UI consumers.
   Validation: cargo nextest run -p codex-helper-core request_ledger logging --no-fail-fast.
   Review: Preserve JSONL compatibility and UI-visible summaries.
   Evidence: EVIDENCE_AND_GATES.md.
-  Handoff: Split storage backend changes into a follow-on lane.
+  Handoff: DONE. JSONL compatibility is preserved; recent/filter reads now use a bounded streaming window.
 
 ## M4 — Relay Diagnostics Split
 

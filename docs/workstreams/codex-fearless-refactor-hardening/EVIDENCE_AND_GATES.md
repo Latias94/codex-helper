@@ -28,3 +28,7 @@ Last updated: 2026-05-28
 - 2026-05-28: `cargo nextest run -p codex-helper-core config route routing --no-fail-fast` passed: 260 tests.
 - 2026-05-28: `cargo nextest run -p codex-helper --no-fail-fast` passed: 40 tests.
 - 2026-05-28: `cargo check -p codex-helper-gui` passed.
+- 2026-05-28: CFR-040 added `RequestLedgerStore`, routed CLI/TUI/GUI/admin consumers through it, and changed recent/filter reads to bounded streaming windows.
+- 2026-05-28: `cargo nextest run -p codex-helper-core request_ledger logging --no-fail-fast` passed: 30 tests.
+- 2026-05-28: `cargo nextest run -p codex-helper --no-fail-fast` passed: 40 tests.
+- 2026-05-28: `cargo check -p codex-helper-gui` passed.

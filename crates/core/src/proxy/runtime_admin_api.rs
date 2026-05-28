@@ -309,11 +309,11 @@ pub(super) async fn get_request_ledger_recent(
 ) -> Result<Json<Vec<crate::state::FinishedRequest>>, (StatusCode, String)> {
     let limit = q.limit.unwrap_or(1000).clamp(20, 5000);
     let filters = q.filters();
-    let path = crate::request_ledger::request_log_path();
+    let store = crate::request_ledger::RequestLedgerStore::default();
     let records = if filters.is_empty() {
-        crate::request_ledger::tail_finished_requests_from_log(&path, limit)
+        store.tail_finished_requests(limit)
     } else {
-        crate::request_ledger::find_finished_requests_from_log(&path, &filters, limit)
+        store.find_finished_requests(&filters, limit)
     };
     records
         .map(Json)
@@ -411,8 +411,8 @@ pub(super) async fn get_request_ledger_summary(
         _ => crate::request_ledger::RequestUsageSummaryGroup::Station,
     };
     let filters = q.filters();
-    let path = crate::request_ledger::request_log_path();
-    crate::request_ledger::summarize_request_log(&path, group, &filters, limit)
+    crate::request_ledger::RequestLedgerStore::default()
+        .summarize(group, &filters, limit)
         .map(Json)
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
 }

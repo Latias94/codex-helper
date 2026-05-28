@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value as JsonValue;
 
@@ -218,37 +218,141 @@ pub struct RequestUsageSummaryRow {
     pub aggregate: RequestUsageAggregate,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestLedgerStore {
+    path: PathBuf,
+}
+
+impl Default for RequestLedgerStore {
+    fn default() -> Self {
+        Self::new(request_log_path())
+    }
+}
+
+impl RequestLedgerStore {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    pub fn from_path(path: impl AsRef<Path>) -> Self {
+        Self::new(path.as_ref().to_path_buf())
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn exists(&self) -> bool {
+        self.path.exists()
+    }
+
+    pub fn read_lines(&self) -> std::io::Result<Vec<RequestLogLine>> {
+        let file = File::open(&self.path)?;
+        let reader = BufReader::new(file);
+        Ok(reader
+            .lines()
+            .map_while(Result::ok)
+            .map(RequestLogLine::from_raw)
+            .collect())
+    }
+
+    pub fn tail_lines(&self, limit: usize) -> std::io::Result<Vec<RequestLogLine>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let file = File::open(&self.path)?;
+        let reader = BufReader::new(file);
+        let mut ring = VecDeque::with_capacity(limit);
+        for line in reader.lines().map_while(Result::ok) {
+            if ring.len() == limit {
+                ring.pop_front();
+            }
+            ring.push_back(RequestLogLine::from_raw(line));
+        }
+        Ok(ring.into_iter().collect())
+    }
+
+    pub fn tail_finished_requests(&self, limit: usize) -> std::io::Result<Vec<FinishedRequest>> {
+        let lines = self.tail_lines(limit)?;
+        let mut requests = lines
+            .iter()
+            .filter_map(|line| {
+                line.value()
+                    .and_then(finished_request_from_request_log_record)
+            })
+            .collect::<Vec<_>>();
+        requests.reverse();
+        Ok(requests)
+    }
+
+    pub fn find_lines(
+        &self,
+        filters: &RequestLogFilters,
+        limit: usize,
+    ) -> std::io::Result<Vec<RequestLogLine>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let file = File::open(&self.path)?;
+        let reader = BufReader::new(file);
+        let mut ring = VecDeque::with_capacity(limit);
+        for line in reader.lines().map_while(Result::ok) {
+            let line = RequestLogLine::from_raw(line);
+            if !line.value().is_some_and(|record| filters.matches(record)) {
+                continue;
+            }
+            if ring.len() == limit {
+                ring.pop_front();
+            }
+            ring.push_back(line);
+        }
+        Ok(ring.into_iter().rev().collect())
+    }
+
+    pub fn find_finished_requests(
+        &self,
+        filters: &RequestLogFilters,
+        limit: usize,
+    ) -> std::io::Result<Vec<FinishedRequest>> {
+        let lines = self.find_lines(filters, limit)?;
+        Ok(lines
+            .iter()
+            .filter_map(|line| {
+                line.value()
+                    .and_then(finished_request_from_request_log_record)
+            })
+            .collect())
+    }
+
+    pub fn summarize(
+        &self,
+        group: RequestUsageSummaryGroup,
+        filters: &RequestLogFilters,
+        limit: usize,
+    ) -> std::io::Result<Vec<RequestUsageSummaryRow>> {
+        let lines = self.read_lines()?;
+        Ok(summarize_request_log_lines(
+            lines.iter(),
+            group,
+            filters,
+            limit,
+        ))
+    }
+}
+
 pub fn read_request_log_lines(path: &Path) -> std::io::Result<Vec<RequestLogLine>> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    Ok(reader
-        .lines()
-        .map_while(Result::ok)
-        .map(RequestLogLine::from_raw)
-        .collect())
+    RequestLedgerStore::from_path(path).read_lines()
 }
 
 pub fn tail_request_log(path: &Path, limit: usize) -> std::io::Result<Vec<RequestLogLine>> {
-    let lines = read_request_log_lines(path)?;
-    let total = lines.len();
-    let start = total.saturating_sub(limit);
-    Ok(lines[start..].to_vec())
+    RequestLedgerStore::from_path(path).tail_lines(limit)
 }
 
 pub fn tail_finished_requests_from_log(
     path: &Path,
     limit: usize,
 ) -> std::io::Result<Vec<FinishedRequest>> {
-    let lines = tail_request_log(path, limit)?;
-    let mut requests = lines
-        .iter()
-        .filter_map(|line| {
-            line.value()
-                .and_then(finished_request_from_request_log_record)
-        })
-        .collect::<Vec<_>>();
-    requests.reverse();
-    Ok(requests)
+    RequestLedgerStore::from_path(path).tail_finished_requests(limit)
 }
 
 pub fn find_finished_requests_from_log(
@@ -256,14 +360,7 @@ pub fn find_finished_requests_from_log(
     filters: &RequestLogFilters,
     limit: usize,
 ) -> std::io::Result<Vec<FinishedRequest>> {
-    let lines = find_request_log(path, filters, limit)?;
-    Ok(lines
-        .iter()
-        .filter_map(|line| {
-            line.value()
-                .and_then(finished_request_from_request_log_record)
-        })
-        .collect())
+    RequestLedgerStore::from_path(path).find_finished_requests(filters, limit)
 }
 
 pub fn summarize_request_log(
@@ -272,13 +369,7 @@ pub fn summarize_request_log(
     filters: &RequestLogFilters,
     limit: usize,
 ) -> std::io::Result<Vec<RequestUsageSummaryRow>> {
-    let lines = read_request_log_lines(path)?;
-    Ok(summarize_request_log_lines(
-        lines.iter(),
-        group,
-        filters,
-        limit,
-    ))
+    RequestLedgerStore::from_path(path).summarize(group, filters, limit)
 }
 
 pub fn find_request_log(
@@ -286,14 +377,7 @@ pub fn find_request_log(
     filters: &RequestLogFilters,
     limit: usize,
 ) -> std::io::Result<Vec<RequestLogLine>> {
-    let lines = read_request_log_lines(path)?;
-    Ok(lines
-        .iter()
-        .rev()
-        .filter(|line| line.value().is_some_and(|record| filters.matches(record)))
-        .take(limit)
-        .cloned()
-        .collect())
+    RequestLedgerStore::from_path(path).find_lines(filters, limit)
 }
 
 fn summarize_request_log_lines<'a>(
@@ -986,6 +1070,82 @@ mod tests {
         assert_eq!(rows[0].aggregate.total_tokens, 7);
         assert_eq!(rows[1].group_value, "b");
         assert_eq!(rows[1].aggregate.total_tokens, 3);
+    }
+
+    fn temp_request_log_path(test_name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "codex-helper-request-ledger-{test_name}-{}-{}.jsonl",
+            std::process::id(),
+            crate::logging::now_ms()
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    fn write_request_log_lines(path: &Path, lines: &[&str]) {
+        std::fs::write(path, lines.join("\n")).expect("write request log lines");
+    }
+
+    #[test]
+    fn request_ledger_store_tails_recent_lines_without_losing_raw_invalid_entries() {
+        let path = temp_request_log_path("tail-lines");
+        write_request_log_lines(
+            &path,
+            &[
+                r#"{"path":"/one","status_code":200}"#,
+                "not-json",
+                r#"{"path":"/three","status_code":201}"#,
+            ],
+        );
+
+        let store = RequestLedgerStore::from_path(&path);
+        let lines = store.tail_lines(2).expect("tail request log");
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].raw(), "not-json");
+        assert!(!lines[0].is_valid_json());
+        assert_eq!(
+            lines[1]
+                .value()
+                .and_then(|record| str_field(record, "path")),
+            Some("/three")
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn request_ledger_store_find_lines_returns_newest_matching_records() {
+        let path = temp_request_log_path("find-lines");
+        write_request_log_lines(
+            &path,
+            &[
+                r#"{"path":"/v1/responses","provider_id":"a","status_code":200}"#,
+                r#"{"path":"/v1/responses","provider_id":"b","status_code":429}"#,
+                r#"{"path":"/v1/models","provider_id":"b","status_code":200}"#,
+                r#"{"path":"/v1/responses","provider_id":"c","status_code":503}"#,
+            ],
+        );
+
+        let store = RequestLedgerStore::from_path(&path);
+        let lines = store
+            .find_lines(
+                &RequestLogFilters {
+                    path: Some("responses".to_string()),
+                    status_min: Some(400),
+                    ..RequestLogFilters::default()
+                },
+                1,
+            )
+            .expect("find request log");
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0]
+                .value()
+                .and_then(|record| str_field(record, "provider_id")),
+            Some("c")
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

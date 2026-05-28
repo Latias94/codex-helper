@@ -1,21 +1,18 @@
-use crate::request_ledger::{
-    RequestLogFilters, RequestUsageSummaryGroup, find_request_log, request_log_path,
-    summarize_request_log, tail_request_log,
-};
+use crate::request_ledger::{RequestLedgerStore, RequestLogFilters, RequestUsageSummaryGroup};
 use crate::{CliError, CliResult, UsageCommand, UsageSummaryBy};
 use owo_colors::OwoColorize;
 
 pub async fn handle_usage_cmd(cmd: UsageCommand) -> CliResult<()> {
-    let log_path = request_log_path();
-    if !log_path.exists() {
-        println!("No request logs found at {:?}", log_path);
+    let store = RequestLedgerStore::default();
+    if !store.exists() {
+        println!("No request logs found at {:?}", store.path());
         return Ok(());
     }
 
     match cmd {
         UsageCommand::Tail { limit, raw } => {
-            let lines = tail_request_log(&log_path, limit).map_err(|err| {
-                CliError::Usage(format!("无法打开请求日志 {:?}: {}", log_path, err))
+            let lines = store.tail_lines(limit).map_err(|err| {
+                CliError::Usage(format!("无法打开请求日志 {:?}: {}", store.path(), err))
             })?;
             for line in lines {
                 if raw {
@@ -29,18 +26,18 @@ pub async fn handle_usage_cmd(cmd: UsageCommand) -> CliResult<()> {
         }
         UsageCommand::Summary { limit, by } => {
             let group = RequestUsageSummaryGroup::from(by);
-            let rows =
-                summarize_request_log(&log_path, group, &RequestLogFilters::default(), limit)
-                    .map_err(|err| {
-                        CliError::Usage(format!("无法打开请求日志 {:?}: {}", log_path, err))
-                    })?;
+            let rows = store
+                .summarize(group, &RequestLogFilters::default(), limit)
+                .map_err(|err| {
+                    CliError::Usage(format!("无法打开请求日志 {:?}: {}", store.path(), err))
+                })?;
 
             println!(
                 "{}",
                 format!(
                     "Usage summary by {} (from {:?})",
                     group.column_name(),
-                    log_path
+                    store.path()
                 )
                 .bold()
             );
@@ -81,8 +78,8 @@ pub async fn handle_usage_cmd(cmd: UsageCommand) -> CliResult<()> {
                 fast,
                 retried,
             };
-            let lines = find_request_log(&log_path, &filters, limit).map_err(|err| {
-                CliError::Usage(format!("无法打开请求日志 {:?}: {}", log_path, err))
+            let lines = store.find_lines(&filters, limit).map_err(|err| {
+                CliError::Usage(format!("无法打开请求日志 {:?}: {}", store.path(), err))
             })?;
 
             for line in &lines {
@@ -95,7 +92,10 @@ pub async fn handle_usage_cmd(cmd: UsageCommand) -> CliResult<()> {
                 }
             }
             if lines.is_empty() && !raw {
-                println!("No request records matched the filters in {:?}.", log_path);
+                println!(
+                    "No request records matched the filters in {:?}.",
+                    store.path()
+                );
             }
         }
     }

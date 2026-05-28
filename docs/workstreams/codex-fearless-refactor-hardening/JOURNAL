@@ -5,3 +5,5 @@
 - Validation passed: `cargo fmt --check`, `cargo nextest run -p codex-helper-core local_log_store codex_relay_evidence logging --no-fail-fast`, `cargo nextest run -p codex-helper --no-fail-fast`, and `cargo check -p codex-helper-gui`.
 - Completed CFR-030. Added semantic routing authoring helpers and removed high-level manual compat-sync call sites from CLI, GUI, and admin surfaces.
 - Validation passed: `cargo nextest run -p codex-helper-core config route routing --no-fail-fast`, `cargo nextest run -p codex-helper --no-fail-fast`, `cargo check -p codex-helper-gui`, and `cargo fmt --check`.
+- Completed CFR-040. Added `RequestLedgerStore`, routed CLI/TUI/GUI/admin consumers through it, and made recent/filter reads streaming bounded-window operations.
+- Validation passed: `cargo nextest run -p codex-helper-core request_ledger logging --no-fail-fast`, `cargo nextest run -p codex-helper --no-fail-fast`, `cargo check -p codex-helper-gui`, and `cargo fmt --check`.

@@ -15,6 +15,7 @@ All notable changes to this project will be documented in this file.
 #### 重构
 
 - 收口 route graph 与 legacy routing compat 的 authoring 边界；CLI、GUI 和 admin API 现在通过 `RoutingConfigV4` / `ServiceViewV4` 的语义方法更新 entry route、provider 引用和手动 target，而不是在调用点手动修改字段后同步兼容字段。
+- 新增 `RequestLedgerStore` 作为 request ledger 读模型边界；CLI、TUI、GUI 和 admin API 现在通过统一 store 读取 tail、filter 和 summary，最近记录与过滤查询改为流式保留窗口，避免只为读取最近 N 条就加载完整 `requests.jsonl`。
 
 ### English summary
 
@@ -26,6 +27,7 @@ All notable changes to this project will be documented in this file.
 #### Changed
 
 - Consolidated the route graph and legacy routing compatibility authoring boundary. CLI, GUI, and admin API callers now update entry routes, provider references, and manual targets through semantic `RoutingConfigV4` / `ServiceViewV4` methods instead of mutating fields and synchronizing compatibility state at each call site.
+- Added `RequestLedgerStore` as the request ledger read-model boundary. CLI, TUI, GUI, and admin API consumers now read tail, filter, and summary data through one store, and recent/filter queries use a streaming bounded window instead of loading the full `requests.jsonl` just to return the newest records.
 
 ## [0.17.0] - 2026-05-26
 

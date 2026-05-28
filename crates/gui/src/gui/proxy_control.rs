@@ -7,8 +7,7 @@ use crate::dashboard_core::{
 use crate::logging::{ControlTraceLogEntry, control_trace_path, read_recent_control_trace_entries};
 use crate::proxy::local_proxy_base_url;
 use crate::request_ledger::{
-    RequestLogFilters, RequestUsageSummaryGroup, request_log_path, summarize_request_log,
-    tail_finished_requests_from_log,
+    RequestLedgerStore, RequestLogFilters, RequestUsageSummaryGroup, request_log_path,
 };
 use crate::runtime_manager::{
     RuntimeConnectionMode, RuntimeStopAction, RuntimeStopIntent, decide_runtime_stop_action,
@@ -240,7 +239,7 @@ impl ProxyController {
         Ok(async move {
             let records = match &source {
                 RequestLedgerDataSource::LocalFile { path } => {
-                    tail_finished_requests_from_log(path, limit)?
+                    RequestLedgerStore::from_path(path).tail_finished_requests(limit)?
                 }
                 RequestLedgerDataSource::AttachedApi { admin_base_url } => {
                     send_admin_request(
@@ -297,7 +296,7 @@ impl ProxyController {
         Ok(async move {
             let rows = match &source {
                 RequestLedgerDataSource::LocalFile { path } => {
-                    summarize_request_log(path, group, &filters, limit)?
+                    RequestLedgerStore::from_path(path).summarize(group, &filters, limit)?
                 }
                 RequestLedgerDataSource::AttachedApi { admin_base_url } => {
                     let by = match group {
