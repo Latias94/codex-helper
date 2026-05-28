@@ -7,11 +7,15 @@ All notable changes to this project will be documented in this file.
 
 ### 中文
 
-- 暂无。
+#### 修复
+
+- 修复交互式 TUI/runtime 日志只在启动时检查大小的问题；`runtime.log` 现在会在运行过程中按 `CODEX_HELPER_RUNTIME_LOG_MAX_BYTES` / `CODEX_HELPER_RUNTIME_LOG_MAX_FILES` 持续轮转，并且升级后会在下次启动时清理超过保留预算的历史 `runtime.log.*`，避免老用户遗留的巨型日志继续占用磁盘。
 
 ### English summary
 
-- None yet.
+#### Fixed
+
+- Fixed interactive TUI/runtime log rotation only checking file size at startup. `runtime.log` now rotates while the process is running according to `CODEX_HELPER_RUNTIME_LOG_MAX_BYTES` / `CODEX_HELPER_RUNTIME_LOG_MAX_FILES`, and upgrades clean up historical `runtime.log.*` files that exceed the retention budget on the next startup so oversized legacy logs do not keep consuming disk space.
 
 ## [0.17.0] - 2026-05-26
 

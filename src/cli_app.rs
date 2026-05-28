@@ -29,7 +29,8 @@ use clap::Parser;
 use owo_colors::OwoColorize;
 use reqwest::Client;
 use serde_json::Value as JsonValue;
-use std::io::ErrorKind;
+use std::fs::{self, File, OpenOptions};
+use std::io::{ErrorKind, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -203,9 +204,10 @@ fn init_tracing(cli: &Cli) -> Option<WorkerGuard> {
         let log_dir = crate::config::proxy_home_dir().join("logs");
         let _ = std::fs::create_dir_all(&log_dir);
 
-        rotate_runtime_log_if_needed(&log_dir);
+        let runtime_log_retention = RuntimeLogRetention::from_env();
+        repair_runtime_logs(&log_dir, runtime_log_retention);
 
-        let file_appender = tracing_appender::rolling::never(&log_dir, "runtime.log");
+        let file_appender = RuntimeLogWriter::new(log_dir, runtime_log_retention);
         let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
         tracing_subscriber::fmt()
             .with_env_filter(env_filter)
@@ -219,62 +221,218 @@ fn init_tracing(cli: &Cli) -> Option<WorkerGuard> {
     }
 }
 
-fn rotate_runtime_log_if_needed(log_dir: &std::path::Path) {
-    fn parse_u64_env(key: &str) -> Option<u64> {
-        std::env::var(key)
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .filter(|&n| n > 0)
+const RUNTIME_LOG_FILE_NAME: &str = "runtime.log";
+const DEFAULT_RUNTIME_LOG_MAX_BYTES: u64 = 20 * 1024 * 1024;
+const DEFAULT_RUNTIME_LOG_MAX_FILES: usize = 10;
+
+#[derive(Debug, Clone, Copy)]
+struct RuntimeLogRetention {
+    max_bytes: u64,
+    max_files: usize,
+}
+
+impl RuntimeLogRetention {
+    fn from_env() -> Self {
+        Self {
+            max_bytes: parse_u64_env("CODEX_HELPER_RUNTIME_LOG_MAX_BYTES")
+                .unwrap_or(DEFAULT_RUNTIME_LOG_MAX_BYTES),
+            max_files: parse_usize_env("CODEX_HELPER_RUNTIME_LOG_MAX_FILES")
+                .unwrap_or(DEFAULT_RUNTIME_LOG_MAX_FILES),
+        }
     }
 
-    fn parse_usize_env(key: &str) -> Option<usize> {
-        std::env::var(key)
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .filter(|&n| n > 0)
+    fn enabled(self) -> bool {
+        self.max_bytes > 0 && self.max_files > 0
     }
 
-    let max_bytes = parse_u64_env("CODEX_HELPER_RUNTIME_LOG_MAX_BYTES").unwrap_or(20 * 1024 * 1024);
-    let max_files = parse_usize_env("CODEX_HELPER_RUNTIME_LOG_MAX_FILES").unwrap_or(10);
-    if max_bytes == 0 || max_files == 0 {
+    fn rotated_budget_bytes(self) -> u64 {
+        self.max_bytes.saturating_mul(self.max_files as u64)
+    }
+}
+
+fn parse_u64_env(key: &str) -> Option<u64> {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+}
+
+fn parse_usize_env(key: &str) -> Option<usize> {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+}
+
+fn repair_runtime_logs(log_dir: &std::path::Path, retention: RuntimeLogRetention) {
+    if !retention.enabled() {
         return;
     }
 
-    let path = log_dir.join("runtime.log");
-    let Ok(meta) = std::fs::metadata(&path) else {
+    rotate_runtime_log_if_needed(log_dir, retention);
+    prune_runtime_log_files(log_dir, retention);
+}
+
+fn rotate_runtime_log_if_needed(log_dir: &std::path::Path, retention: RuntimeLogRetention) {
+    let path = log_dir.join(RUNTIME_LOG_FILE_NAME);
+    let Ok(meta) = fs::metadata(&path) else {
         return;
     };
-    if meta.len() < max_bytes {
-        return;
+    if meta.len() >= retention.max_bytes {
+        let _ = rotate_runtime_log_path(log_dir, &path);
     }
+}
 
+fn rotate_runtime_log_path(
+    log_dir: &std::path::Path,
+    path: &std::path::Path,
+) -> std::io::Result<()> {
+    for attempt in 0..100 {
+        let rotated_path = runtime_log_rotated_path(log_dir, attempt);
+        if rotated_path.exists() {
+            continue;
+        }
+        return fs::rename(path, rotated_path);
+    }
+    Err(std::io::Error::new(
+        ErrorKind::AlreadyExists,
+        "could not allocate runtime log rotation file name",
+    ))
+}
+
+fn runtime_log_rotated_path(log_dir: &std::path::Path, attempt: u32) -> PathBuf {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
+        .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let rotated_path = log_dir.join(format!("runtime.log.{ts}"));
-    let _ = std::fs::rename(&path, &rotated_path);
+    if attempt == 0 {
+        log_dir.join(format!("{RUNTIME_LOG_FILE_NAME}.{ts}"))
+    } else {
+        log_dir.join(format!("{RUNTIME_LOG_FILE_NAME}.{ts}.{attempt}"))
+    }
+}
 
-    let Ok(rd) = std::fs::read_dir(log_dir) else {
-        return;
+#[derive(Debug)]
+struct RuntimeLogFile {
+    path: PathBuf,
+    bytes: u64,
+    modified: std::time::SystemTime,
+}
+
+fn collect_rotated_runtime_logs(log_dir: &std::path::Path) -> Vec<RuntimeLogFile> {
+    let Ok(rd) = fs::read_dir(log_dir) else {
+        return Vec::new();
     };
-    let mut rotated: Vec<std::path::PathBuf> = rd
+    let mut rotated: Vec<RuntimeLogFile> = rd
         .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .map(|s| s.starts_with("runtime.log.") && s != "runtime.log")
-                .unwrap_or(false)
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?;
+            if !name.starts_with(&format!("{RUNTIME_LOG_FILE_NAME}."))
+                || name == RUNTIME_LOG_FILE_NAME
+            {
+                return None;
+            }
+            let meta = entry.metadata().ok()?;
+            Some(RuntimeLogFile {
+                path,
+                bytes: meta.len(),
+                modified: meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+            })
         })
         .collect();
-    if rotated.len() <= max_files {
+    rotated.sort_by(|left, right| {
+        left.modified
+            .cmp(&right.modified)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    rotated
+}
+
+fn prune_runtime_log_files(log_dir: &std::path::Path, retention: RuntimeLogRetention) {
+    if !retention.enabled() {
         return;
     }
-    rotated.sort();
-    let remove_count = rotated.len().saturating_sub(max_files);
-    for p in rotated.into_iter().take(remove_count) {
-        let _ = std::fs::remove_file(p);
+    let mut rotated = collect_rotated_runtime_logs(log_dir);
+    let mut total_bytes = rotated
+        .iter()
+        .fold(0_u64, |acc, file| acc.saturating_add(file.bytes));
+    let budget_bytes = retention.rotated_budget_bytes();
+
+    while rotated.len() > retention.max_files || total_bytes > budget_bytes {
+        let file = rotated.remove(0);
+        total_bytes = total_bytes.saturating_sub(file.bytes);
+        let _ = fs::remove_file(file.path);
+    }
+}
+
+struct RuntimeLogWriter {
+    log_dir: PathBuf,
+    path: PathBuf,
+    retention: RuntimeLogRetention,
+    file: Option<File>,
+    current_len: u64,
+}
+
+impl RuntimeLogWriter {
+    fn new(log_dir: PathBuf, retention: RuntimeLogRetention) -> Self {
+        let path = log_dir.join(RUNTIME_LOG_FILE_NAME);
+        let current_len = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        Self {
+            log_dir,
+            path,
+            retention,
+            file: None,
+            current_len,
+        }
+    }
+
+    fn ensure_file(&mut self) -> std::io::Result<&mut File> {
+        if self.file.is_none() {
+            fs::create_dir_all(&self.log_dir)?;
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)?;
+            self.current_len = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+            self.file = Some(file);
+        }
+        Ok(self.file.as_mut().expect("runtime log file just opened"))
+    }
+
+    fn rotate_before_write(&mut self, incoming_len: usize) {
+        if !self.retention.enabled() || self.current_len == 0 {
+            return;
+        }
+        let incoming_len = incoming_len as u64;
+        if self.current_len.saturating_add(incoming_len) < self.retention.max_bytes {
+            return;
+        }
+        self.file.take();
+        if rotate_runtime_log_path(&self.log_dir, &self.path).is_ok() {
+            self.current_len = 0;
+            prune_runtime_log_files(&self.log_dir, self.retention);
+        } else {
+            self.current_len = fs::metadata(&self.path).map(|meta| meta.len()).unwrap_or(0);
+        }
+    }
+}
+
+impl Write for RuntimeLogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.rotate_before_write(buf.len());
+        let file = self.ensure_file()?;
+        let written = file.write(buf)?;
+        self.current_len = self.current_len.saturating_add(written as u64);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if let Some(file) = self.file.as_mut() {
+            file.flush()
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -1825,6 +1983,107 @@ async fn wait_for_shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod runtime_log_tests {
+    use super::*;
+
+    fn temp_runtime_log_dir(test_name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "codex-helper-runtime-log-{test_name}-{}-{}",
+            std::process::id(),
+            crate::logging::now_ms()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create temp runtime log dir");
+        dir
+    }
+
+    fn write_test_file(path: &Path, bytes: usize) {
+        let mut file = File::create(path).expect("create test runtime log file");
+        file.write_all(&vec![b'x'; bytes])
+            .expect("write test runtime log file");
+        file.flush().expect("flush test runtime log file");
+    }
+
+    #[test]
+    fn repair_runtime_logs_removes_legacy_rotated_file_over_budget() {
+        let dir = temp_runtime_log_dir("legacy-rotated-budget");
+        let legacy = dir.join("runtime.log.legacy");
+        write_test_file(&legacy, 64);
+
+        repair_runtime_logs(
+            &dir,
+            RuntimeLogRetention {
+                max_bytes: 10,
+                max_files: 2,
+            },
+        );
+
+        assert!(
+            !legacy.exists(),
+            "oversized legacy rotated runtime log should be removed"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn repair_runtime_logs_rotates_and_prunes_oversized_active_file() {
+        let dir = temp_runtime_log_dir("active-oversized");
+        let active = dir.join(RUNTIME_LOG_FILE_NAME);
+        write_test_file(&active, 64);
+
+        repair_runtime_logs(
+            &dir,
+            RuntimeLogRetention {
+                max_bytes: 10,
+                max_files: 2,
+            },
+        );
+
+        assert!(
+            !active.exists(),
+            "oversized active runtime log should be rotated away before tracing starts"
+        );
+        assert!(
+            collect_rotated_runtime_logs(&dir).is_empty(),
+            "rotated oversized active runtime log should be pruned by total budget"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn runtime_log_writer_rotates_while_process_is_running() {
+        let dir = temp_runtime_log_dir("writer-rotates");
+        let retention = RuntimeLogRetention {
+            max_bytes: 16,
+            max_files: 2,
+        };
+        let mut writer = RuntimeLogWriter::new(dir.clone(), retention);
+
+        writer
+            .write_all(b"first-line-000\n")
+            .expect("write first line");
+        writer
+            .write_all(b"second-line-00\n")
+            .expect("write second line");
+        writer.flush().expect("flush runtime log writer");
+        drop(writer);
+
+        let active = dir.join(RUNTIME_LOG_FILE_NAME);
+        assert!(active.exists(), "new active runtime log should exist");
+        assert!(
+            fs::metadata(&active).expect("active metadata").len() <= retention.max_bytes,
+            "active runtime log should stay under the configured size after rotation"
+        );
+        assert_eq!(
+            collect_rotated_runtime_logs(&dir).len(),
+            1,
+            "first active runtime log should be rotated during the same process"
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 }
 
