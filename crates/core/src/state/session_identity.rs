@@ -1129,14 +1129,13 @@ pub fn build_session_identity_cards_from_parts(
 
     for (sid, affinity) in route_affinities {
         let key = Some(sid.clone());
-        let entry = map
-            .entry(key.clone())
-            .or_insert_with(|| empty_session_identity_card(key));
-        merge_session_identity_source(
-            &mut entry.session_identity_source,
-            affinity.session_identity_source,
-        );
-        entry.route_affinity = Some(affinity.clone());
+        if let Some(entry) = map.get_mut(&key) {
+            merge_session_identity_source(
+                &mut entry.session_identity_source,
+                affinity.session_identity_source,
+            );
+            entry.route_affinity = Some(affinity.clone());
+        }
     }
 
     let mut cards = map.into_values().collect::<Vec<_>>();
@@ -1185,6 +1184,50 @@ mod tests {
     use crate::logging::{RetryInfo, RouteAttemptLog};
     use crate::pricing::CostBreakdown;
     use crate::usage::UsageMetrics;
+
+    #[test]
+    fn session_identity_cards_do_not_surface_affinity_only_sessions() {
+        let active = Vec::<ActiveRequest>::new();
+        let recent = Vec::<FinishedRequest>::new();
+        let overrides = HashMap::<String, String>::new();
+        let station_overrides = HashMap::<String, String>::new();
+        let model_overrides = HashMap::<String, String>::new();
+        let service_tier_overrides = HashMap::<String, String>::new();
+        let bindings = HashMap::<String, SessionBinding>::new();
+        let stats = HashMap::<String, SessionStats>::new();
+        let mut route_affinities = HashMap::<String, SessionRouteAffinity>::new();
+        route_affinities.insert(
+            "sid-old".to_string(),
+            SessionRouteAffinity {
+                route_graph_key: "codex/default".to_string(),
+                session_identity_source: Some(SessionIdentitySource::Header),
+                provider_endpoint: ProviderEndpointKey::new("codex", "old", "default"),
+                upstream_base_url: "https://old.example/v1".to_string(),
+                route_path: vec!["entry".to_string()],
+                last_selected_at_ms: 10,
+                last_changed_at_ms: 10,
+                change_reason: "restored".to_string(),
+            },
+        );
+
+        let cards = build_session_identity_cards_from_parts(SessionIdentityCardBuildInputs {
+            active: &active,
+            recent: &recent,
+            overrides: &overrides,
+            station_overrides: &station_overrides,
+            model_overrides: &model_overrides,
+            service_tier_overrides: &service_tier_overrides,
+            bindings: &bindings,
+            route_affinities: &route_affinities,
+            global_station_override: None,
+            stats: &stats,
+        });
+
+        assert!(
+            cards.is_empty(),
+            "restored route affinity alone should not appear as an observed TUI session"
+        );
+    }
 
     fn sample_finished_request() -> FinishedRequest {
         FinishedRequest {

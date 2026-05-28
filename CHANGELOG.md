@@ -12,6 +12,7 @@ All notable changes to this project will be documented in this file.
 - 修复交互式 TUI/runtime 日志只在启动时检查大小的问题；`runtime.log` 现在会在运行过程中按 `CODEX_HELPER_RUNTIME_LOG_MAX_BYTES` / `CODEX_HELPER_RUNTIME_LOG_MAX_FILES` 持续轮转，并且升级后会在下次启动时清理超过保留预算的历史 `runtime.log.*`，避免老用户遗留的巨型日志继续占用磁盘。
 - 将 runtime、GUI、request/debug、control trace、retry trace 和 Codex relay evidence 统一到有界本地日志存储；`control_trace.jsonl` 等 JSONL 日志现在会在首次写入时按 `CODEX_HELPER_REQUEST_LOG_MAX_BYTES` / `CODEX_HELPER_REQUEST_LOG_MAX_FILES` 轮转并清理历史轮转文件，`gui.log` 和 relay evidence 也新增独立大小上限，降低老用户日志目录继续膨胀的风险。
 - request ledger、control trace 和 Codex relay evidence 的读取入口现在也会先执行同一套有界日志修复；老用户升级后即使先打开 GUI/管理 API/CLI 查看日志、尚未产生新的写入，遗留的超大 active JSONL 也会按保留策略轮转清理，避免读取最近记录时完整扫描巨型文件。
+- TUI/管理 API 的 Sessions 列表不再把仅由持久化 route affinity 恢复出来的旧 session 当作当前运行期已观测会话展示；恢复的 affinity 仍保留用于后续 remote compaction 连续性，但只有 session 被当前运行期请求、统计或显式 override 触达后才会显示。
 
 #### 重构
 
@@ -26,6 +27,7 @@ All notable changes to this project will be documented in this file.
 - Fixed interactive TUI/runtime log rotation only checking file size at startup. `runtime.log` now rotates while the process is running according to `CODEX_HELPER_RUNTIME_LOG_MAX_BYTES` / `CODEX_HELPER_RUNTIME_LOG_MAX_FILES`, and upgrades clean up historical `runtime.log.*` files that exceed the retention budget on the next startup so oversized legacy logs do not keep consuming disk space.
 - Unified runtime, GUI, request/debug, control trace, retry trace, and Codex relay evidence writes behind a bounded local log store. JSONL logs such as `control_trace.jsonl` now rotate and prune historical rotated files on first write according to `CODEX_HELPER_REQUEST_LOG_MAX_BYTES` / `CODEX_HELPER_REQUEST_LOG_MAX_FILES`, while `gui.log` and relay evidence gained their own size limits to reduce continued log directory growth for existing users.
 - Request ledger, control trace, and Codex relay evidence readers now run the same bounded-log repair before scanning. Existing users who open the GUI, admin API, or CLI before a new write is produced will still have oversized active JSONL logs rotated and pruned instead of fully scanned for recent records.
+- TUI/admin Sessions no longer display old sessions that were restored only from persisted route affinity. The restored affinity is still kept for later remote-compaction continuity, but a session is shown only after the current runtime observes requests, stats, or explicit overrides for it.
 
 #### Changed
 
