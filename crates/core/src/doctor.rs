@@ -68,11 +68,11 @@ pub async fn run_doctor(lang: DoctorLang) -> DoctorReport {
                     status: DoctorStatus::Ok,
                     message: match lang {
                         DoctorLang::Zh => format!(
-                            "已从 ~/.codex-helper/config.toml/json 读取到 {} 条 Codex 路由候选（runtime active_station = {:?}）",
+                            "已从 ~/.codex-helper/config.toml/json 读取到 {} 条 Codex 路由候选（runtime default station = {:?}）",
                             codex_count, cfg.codex.active
                         ),
                         DoctorLang::En => format!(
-                            "Loaded {} Codex routing candidates from ~/.codex-helper/config.toml/json (runtime active_station = {:?})",
+                            "Loaded {} Codex routing candidates from ~/.codex-helper/config.toml/json (runtime default station = {:?})",
                             codex_count, cfg.codex.active
                         ),
                     },

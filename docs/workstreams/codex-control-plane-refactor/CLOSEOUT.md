@@ -1,6 +1,6 @@
 # Fearless Refactor Closeout Assessment: Codex Control Plane
 
-> Quick read: the first usable control-plane refactor milestone is closed. Profile/station control, session override aggregation, session identity APIs, precedence alignment, active/passive health, same-station failover, guarded cross-station failover before first output, hybrid session lifecycle semantics, LAN/Tailscale relay boundaries, the session-card-first Sessions page, the first GUI page/helper split, the first grouped operator information architecture, the initial GUI layout refresh/design primitives, the attach compatibility matrix, and the new `operator/summary` home payload are all in place. `CP-103`, `CP-408`, `CP-601`, `CP-611`, `CP-612`, `CP-613`, and `CP-704` are now closed. The vocabulary audit/mapping is now explicit via `VOCABULARY.md`, and remaining work is concentrated in the last compatibility-only terminology/export/docs cleanup around `CP-002` / `CP-401`; the runtime/operator code path is effectively already in place.
+> Quick read: the first usable control-plane refactor milestone and the `CP-002` / `CP-401` station/config semantic closeout are closed. Profile/station control, session override aggregation, session identity APIs, precedence alignment, active/passive health, same-station failover, guarded cross-station failover before first output, hybrid session lifecycle semantics, LAN/Tailscale relay boundaries, the session-card-first Sessions page, the first GUI page/helper split, the first grouped operator information architecture, the initial GUI layout refresh/design primitives, the attach compatibility matrix, and the new `operator/summary` home payload are all in place. `CP-103`, `CP-408`, `CP-601`, `CP-611`, `CP-612`, `CP-613`, and `CP-704` are closed. The vocabulary audit/mapping is explicit via `VOCABULARY.md`; runtime/operator/API/GUI/TUI surfaces are now station-first, with `config` retained only for persisted config documents, explicit legacy/v2 migration compatibility, tests, or historical design material.
 
 ## Current Position
 
@@ -36,6 +36,8 @@ What is already materially in place:
 - remote-safe capability gating and LAN-oriented access boundaries exist
 - the Sessions page now centers the operator flow on the session identity card, effective route explanation, and last route decision snapshot
 - attach consumers now have an explicit compatibility matrix across full v1 snapshots, partial v1 station surfaces, and explicit pre-v1 rejection behavior
+- GUI/TUI/tray/request-route summaries now use default/effective/last station wording instead of exposing `active_station`, `legacy`, or `config` labels in operator-facing text
+- `operator/summary` regression coverage asserts station-first session-card, link, and capability keys while rejecting legacy `config` aliases
 
 What is not yet true:
 
@@ -46,16 +48,16 @@ What is not yet true:
 
 ### M0 - Vocabulary and Compatibility Baseline
 
-Status: **partial**
+Status: **complete**
 
 Remaining gap:
 
-- CP-002 complete the last compatibility-only `config` wording/export cleanup in internal/runtime/UI surfaces
+- none for the CP-002 station/config semantic scope
 
 Impact:
 
-- not a blocker for a usable beta
-- the audit/mapping baseline is now explicit, but the final compatibility-only wording/export tail still blocks claiming the refactor is semantically finished
+- `config` is no longer public control-plane language except where it literally means a persisted config document or explicit migration/compatibility material
+- regression coverage now pins absence of representative legacy home-payload keys and routes
 
 ### M1 - Session Identity and Effective Route
 
@@ -100,11 +102,11 @@ Impact:
 
 ### M4 - Station Management and HA
 
-Status: **substantially complete**
+Status: **complete for the current control-plane scope**
 
 Remaining gap:
 
-- CP-401 final compatibility-only cleanup around the remaining `config` wording/export aliases
+- none for the CP-401 station/config naming scope
 
 Impact:
 
@@ -115,7 +117,7 @@ Impact:
 - shared/core request-session payloads are now station-first across core, GUI, and TUI
 - core proxy routing internals and streaming finalize/logging flow are now station-first and covered by `cargo nextest run -p codex-helper-core`
 - runtime state storage, healthcheck execution flow, and local GUI/TUI operator calls are now station-first and covered by `cargo nextest run -p codex-helper-core -p codex-helper-gui -p codex-helper-tui`
-- the remaining rename work is now mostly compatibility shims, exported type aliases, and docs/examples/historical wording cleanup; the runtime/operator code path and public attach/API surface already expose station-first canonical routes/fields with regression coverage
+- compatibility shims and historical examples are explicit; the runtime/operator code path and public attach/API surface expose station-first canonical routes/fields with regression coverage
 - retry/failover guardrails are now explicit: same-station first, cross-station opt-in only before first output
 
 ### M5 - LAN-ready Shared Relay
@@ -138,7 +140,7 @@ Remaining gap:
 Impact:
 
 - current GUI is functional and the Sessions page now follows the session identity card model
-- the remaining UI-facing work is mostly terminology cleanup and future external/WebUI stabilization rather than a missing operator workflow
+- future UI-facing work is external/WebUI stabilization rather than station/config terminology cleanup or a missing operator workflow
 
 ## Recommended Closeout Buckets
 
@@ -150,17 +152,15 @@ The first usable milestone is now fully closed.
 
 ### Bucket B - Full Semantic Refactor Closeout
 
-These are the items that should land before declaring the control-plane refactor fully complete rather than merely "usable".
+Status: **complete for CP-002 / CP-401 station/config semantics**
 
-- apply the documented vocabulary contract from `VOCABULARY.md` across the last compatibility-only surfaces
-- CP-401 final closeout of the remaining compatibility-only `config` terminology/export tail
-- explicit closeout of the remaining compatibility-only tail:
-  - remove the last helper aliases such as `active_config()` after station-first call sites are settled
-  - remove legacy routes such as `/stations/config-active` instead of keeping hidden compatibility aliases
-  - remove legacy capability keys such as `station_persisted_config` instead of keeping deserialize-only aliases
-  - historical docs/examples that intentionally still mention legacy `configs`
-  - tests/assertions that verify old field names are absent or compatibility-only
-  - attach-side endpoint fallback should treat legacy aliases as compatibility-only and avoid over-advertising partial writable surfaces
+Landed closeout items:
+
+- applied the documented vocabulary contract from `VOCABULARY.md` across runtime/operator/API/GUI/TUI surfaces
+- removed public helper/export/user-facing tails around `active_config`, `/stations/config-active`, and `station_persisted_config`
+- kept historical docs/examples that mention legacy `configs` explicitly scoped to compatibility or migration
+- strengthened tests/assertions that verify old field names and old paths are absent from the station-first home payload
+- kept attach-side fallback behavior explicit without advertising partial legacy writable surfaces
 
 Why this bucket matters:
 
@@ -170,11 +170,10 @@ Why this bucket matters:
 
 ## Suggested Execution Order
 
-If the goal is momentum with minimal rework, the recommended next sequence is:
+With semantic closeout landed, the recommended next sequence is:
 
-1. Close the remaining semantic cleanup:
-   - terminology cleanup
-   - CP-401 compatibility/docs closeout
+1. Keep future clients on the `operator/summary` layering contract.
+2. Revisit long-horizon audit/export or post-output failover only as separate product decisions.
 
 See `MILESTONES.md` for the more explicit `P0 / P1 / P2` closeout ladder that turns this recommendation into execution priority.
 
@@ -183,16 +182,15 @@ See `MILESTONES.md` for the more explicit `P0 / P1 / P2` closeout ladder that tu
 If we split the remaining work by outcome rather than ticket count:
 
 - **Core usable closeout**: closed
-- **Full semantic closeout**: a final narrow closeout phase remains
+- **Full semantic closeout**: closed for the station/config semantic scope
 
-The biggest remaining risks are not raw implementation volume, but semantic coherence:
+The biggest remaining risks are no longer station/config semantic drift; they are future product decisions:
 
 - long-horizon route provenance/audit completeness
 - advanced/post-output failover boundaries
 - external/client-facing API stability
-- final vocabulary consistency across runtime, API, UI, and historical docs/examples
 
-In other words: the refactor is already past the "can this direction work" stage, but it is not yet at the "semantics are fully closed and externally stable" stage.
+In other words: the refactor is past the "can this direction work" and station/config semantic-closeout stages. Future work should be treated as product hardening or new capability design, not as unresolved CP-002 / CP-401 rename debt.
 
 ## Parallel Follow-up Track
 

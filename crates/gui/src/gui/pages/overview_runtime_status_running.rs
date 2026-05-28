@@ -74,11 +74,7 @@ pub(super) fn render_running_proxy_summary(ui: &mut egui::Ui, ctx: &mut PageCtx<
         .unwrap_or_else(|| "-".to_string());
     ui.label(format!(
         "{}: {}",
-        pick(
-            ctx.lang,
-            "配置 active_station(兼容)",
-            "Configured active_station (compat)"
-        ),
+        pick(ctx.lang, "配置默认站点", "Configured default station"),
         active_display
     ));
 
@@ -88,8 +84,8 @@ pub(super) fn render_running_proxy_summary(ui: &mut egui::Ui, ctx: &mut PageCtx<
             egui::Color32::from_rgb(120, 120, 120),
             pick(
                 ctx.lang,
-                "运行时 route target / 兼容 active_station / drain / breaker 已移到 Stations 页集中操作。",
-                "Runtime route target / compatible active_station / drain / breaker now live in the Stations page.",
+                "运行时 route target / 默认站点 / drain / breaker 已移到 Stations 页集中操作。",
+                "Runtime route target / default station / drain / breaker now live in the Stations page.",
             ),
         );
         if ui

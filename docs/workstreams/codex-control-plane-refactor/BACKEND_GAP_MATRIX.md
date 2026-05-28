@@ -1,6 +1,6 @@
 # Backend Gap Matrix
 
-> Quick read: the backend control plane is no longer missing the core operator primitives. The remaining gaps are mostly in productization, semantic closure, and external-client stability rather than raw CRUD coverage.
+> Quick read: the backend control plane is no longer missing the core operator primitives, and the CP-002 / CP-401 station/config semantic closeout is closed. The remaining gaps are mostly in productization and external-client stability rather than raw CRUD or naming coverage.
 
 ## Why This Document Exists
 
@@ -190,28 +190,26 @@ Remaining gap:
 
 - more clients still need to combine `operator/summary` with deeper detail endpoints for full editing and observability flows
 - `operator/summary` is now strong enough to be the top-level read entry point, but it is not intended to replace station/provider spec CRUD or deep request/session observability endpoints
-- the remaining terminology edges are now mostly limited to compatibility-only aliases and historical docs/examples
+- future clients still need to preserve the station-first layering contract instead of reintroducing legacy `config` terminology
 
 Recommendation:
 
 - before building a broader WebUI, treat `operator/summary` plus `OPERATOR_SUMMARY_CONTRACT.md` as the top-level entry point instead of letting each client rebuild the same runtime explanation logic
-- finish station-first terminology closeout before calling the backend externally stable
+- keep station-first terminology as an API/UI invariant for future clients
 
 ## What Is Actually Left Before Backend Closeout
 
-If we narrow the remaining backend work to the items that materially block semantic closeout, the list is short:
+The `CP-002` / `CP-401` station/config semantic blocker is closed. Remaining backend work is productization rather than naming closeout:
 
-1. finish the remaining terminology cleanup from `config` to `station`
-2. define whether "fast mode" needs an explicit summary alias in backend contracts
-3. decide whether remote shared-relay use needs stronger per-device identity/auth
-4. roll future clients onto the documented `operator/summary` layering contract without reintroducing duplicated runtime-explanation logic
-5. decide whether control-trace needs durable retention/export semantics beyond the current local-file model
+1. define whether "fast mode" needs an explicit summary alias in backend contracts
+2. decide whether remote shared-relay use needs stronger per-device identity/auth
+3. roll future clients onto the documented `operator/summary` layering contract without reintroducing duplicated runtime-explanation logic
+4. decide whether control-trace needs durable retention/export semantics beyond the current local-file model
 
 ## Recommended Order
 
-1. Finish terminology closeout first.
-2. Adopt the documented operator-summary contract in future WebUI/backend clients.
-3. Revisit remote auth and longer-horizon audit only when there is real multi-device/operator pressure.
+1. Adopt the documented operator-summary contract in future WebUI/backend clients.
+2. Revisit remote auth and longer-horizon audit only when there is real multi-device/operator pressure.
 
 ## Bottom Line
 

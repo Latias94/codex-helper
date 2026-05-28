@@ -295,10 +295,7 @@ fn build_menu_base(
 
         if let Some(active) = model.active_display.as_deref() {
             menu.append(&MenuItem::new(
-                format!(
-                    "{}: {active}",
-                    pick(lang, "active_station", "active_station")
-                ),
+                format!("{}: {active}", pick(lang, "默认站点", "Default station")),
                 false,
                 None,
             ))?;

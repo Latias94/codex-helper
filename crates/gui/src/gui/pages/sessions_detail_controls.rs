@@ -15,11 +15,11 @@ pub(super) fn render_session_detail_controls(
     action_clear_session_manual_overrides: &mut Option<String>,
 ) {
     let override_model = row.override_model.as_deref().unwrap_or("-");
-    let override_cfg = row.override_station_name().unwrap_or("-");
+    let override_station = row.override_station_name().unwrap_or("-");
     let override_route_target = row.override_route_target().unwrap_or("-");
     let override_eff = row.override_effort.as_deref().unwrap_or("-");
     let override_service_tier = row.override_service_tier.as_deref().unwrap_or("-");
-    let global_cfg = global_station_override.unwrap_or("-");
+    let global_station = global_station_override.unwrap_or("-");
     let global_route_target = snapshot
         .global_route_target_override
         .as_deref()
@@ -27,10 +27,10 @@ pub(super) fn render_session_detail_controls(
     let global_label = if snapshot.supports_global_route_target_override {
         format!("global_route_target={global_route_target}")
     } else {
-        format!("global_station={global_cfg}")
+        format!("global_station={global_station}")
     };
     ui.label(format!(
-        "{}: model={override_model}, effort={override_eff}, station={override_cfg}, route_target={override_route_target}, tier={override_service_tier}, {global_label}",
+        "{}: model={override_model}, effort={override_eff}, station={override_station}, route_target={override_route_target}, tier={override_service_tier}, {global_label}",
         pick(ctx.lang, "覆盖", "Overrides")
     ));
 

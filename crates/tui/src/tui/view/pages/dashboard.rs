@@ -243,7 +243,7 @@ fn render_session_details(
     let override_effort = selected
         .and_then(|r| r.override_effort.as_deref())
         .unwrap_or("-");
-    let override_cfg = selected
+    let override_station = selected
         .and_then(|r| r.override_station_name.as_deref())
         .unwrap_or("-");
     let override_route_target = selected
@@ -274,7 +274,7 @@ fn render_session_details(
         Some(balance) => balance.to_string(),
         None => provider.to_string(),
     };
-    let cfg = selected
+    let station = selected
         .and_then(|r| r.last_station_name.as_deref())
         .unwrap_or("-");
     let effort = selected
@@ -389,7 +389,7 @@ fn render_session_details(
         kv_line(
             p,
             l("station"),
-            cfg.to_string(),
+            station.to_string(),
             Style::default().fg(p.text),
         ),
         kv_line(
@@ -416,12 +416,12 @@ fn render_session_details(
             p,
             l("override"),
             format!(
-                "model={override_model}, effort={override_effort}, station={override_cfg}, route_target={override_route_target}, tier={override_service_tier}"
+                "model={override_model}, effort={override_effort}, station={override_station}, route_target={override_route_target}, tier={override_service_tier}"
             ),
             Style::default().fg(
                 if override_model != "-"
                     || override_effort != "-"
-                    || override_cfg != "-"
+                    || override_station != "-"
                     || override_route_target != "-"
                     || override_service_tier != "-"
                 {

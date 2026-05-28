@@ -515,11 +515,14 @@ fn request_route_attempt_line(attempt: &crate::logging::RouteAttemptLog) -> Stri
                 attempt.upstream_base_url.as_deref(),
             ) {
                 (Some(station), Some(upstream)) => {
-                    format!("legacy={station}:{}", shorten_middle(upstream, 50))
+                    format!(
+                        "station={station} upstream={}",
+                        shorten_middle(upstream, 50)
+                    )
                 }
-                (Some(station), None) => format!("legacy={station}"),
-                (None, Some(upstream)) => format!("legacy={}", shorten_middle(upstream, 58)),
-                (None, None) => "legacy=-".to_string(),
+                (Some(station), None) => format!("station={station}"),
+                (None, Some(upstream)) => format!("upstream={}", shorten_middle(upstream, 58)),
+                (None, None) => "target=-".to_string(),
             }
         });
     let mut parts = vec![attempt.decision.clone()];

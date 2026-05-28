@@ -30,6 +30,8 @@ The intended end state is:
   - Exit-gap assessment for the refactor, including what is already closed and what still blocks a full semantic closeout.
 - `BACKEND_GAP_MATRIX.md`
   - Backend-focused readiness assessment for session/profile/station/provider/retry/LAN control-plane surfaces, plus the remaining productization gaps for future external clients.
+- `EVIDENCE_AND_GATES.md`
+  - Latest validation evidence and regression gates for closing bounded refactor tasks.
 - `CENTRAL_RELAY.md`
   - Product-shape notes for LAN / Tailscale shared-relay deployment and remote-safe capability boundaries.
 - `PHASE1_IMPLEMENTATION.md`

@@ -30,7 +30,7 @@ pub(super) fn render_station_identity_summary(
                 "current global route target",
             )
         } else if effective_active_station == Some(cfg.name.as_str()) {
-            pick(ctx.lang, "当前 active_station", "current active_station")
+            pick(ctx.lang, "当前生效站点", "current effective station")
         } else if snapshot.global_station_override.as_deref() == Some(cfg.name.as_str()) {
             pick(ctx.lang, "当前 global pin", "current global pin")
         } else {
@@ -42,8 +42,8 @@ pub(super) fn render_station_identity_summary(
     {
         ui.small(pick(
             ctx.lang,
-            "该站点是配置 active_station，但当前生效路由已被 fallback / pin / runtime 状态改变。",
-            "This station is the configured active_station, but the effective route currently differs because of fallback, pin, or runtime state.",
+            "该站点是配置默认站点，但当前生效路由已被 fallback / pin / runtime 状态改变。",
+            "This station is the configured default station, but the effective route currently differs because of fallback, pin, or runtime state.",
         ));
     }
     ui.label(format!(

@@ -173,6 +173,9 @@ The payload should not emit legacy runtime terminology such as:
 - `active_config`
 - `configured_active_config`
 - `effective_active_config`
+- `effective_config`
+- `config_active`
+- `station_persisted_config`
 
 ## Remote-safe Interpretation Rules
 
@@ -206,8 +209,10 @@ That test checks:
 
 This document closes the "first API payload sketches are stable enough for GUI consumption" part of the workstream.
 
-What still remains is narrower:
+The CP-002 / CP-401 station/config naming closeout is now covered by regression assertions:
 
-- finish the last compatibility-only terminology/export cleanup
-- keep future clients on top of this home-payload layering contract
-- only add new backend surfaces when they remove real client complexity
+- session cards expose `effective_station`, not `effective_config`
+- `links` do not expose `config_active` or `/stations/config-active`
+- capabilities expose `station_persisted_settings`, not `station_persisted_config`
+
+Future clients should keep using this home-payload layering contract and only add backend surfaces when they remove real client complexity.

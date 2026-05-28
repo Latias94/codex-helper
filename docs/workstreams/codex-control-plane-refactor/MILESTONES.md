@@ -17,17 +17,17 @@ The milestones are ordered by semantic leverage:
 As of the current refactor state:
 
 - `M1`, `M2`, `M5`, and the current GUI/control-plane scope of `M6` are effectively usable.
-- `M3` and `M4` are substantially complete.
+- `M3` and `M4` are complete for the current control-plane scope.
 - `CP-000` / `CP-001` are now documented explicitly via `VOCABULARY.md`.
-- The main remaining semantic gap is now the last `CP-002` / `CP-401` compatibility-only terminology/export cleanup.
-- The code-side runtime/UI route is now largely station-first across core / GUI / TUI:
-  - remaining `config` wording is mostly compatibility shims, persisted document concepts, tests, or historical design material
+- The `CP-002` / `CP-401` station/config semantic closeout is now closed.
+- Runtime/operator/API/GUI/TUI surfaces are station-first across core / GUI / TUI:
+  - remaining `config` wording is limited to persisted config documents, explicit legacy/v2 migration compatibility, tests, or historical design material
 - Fast mode / priority-processing observability is no longer a blocker:
   - request logs now distinguish requested / effective / actual `service_tier`
   - recent/session observed values now prefer the actual upstream response when available
 - `operator/summary` is now strong enough to act as a real operator home payload, including lightweight runtime health/failover posture
 
-This means the workstream is past "can this direction work" and is now in a structured closeout phase.
+This means the workstream is past semantic closeout and is now in a hardening/productization phase.
 
 ## M0 - Vocabulary and Compatibility Baseline
 
@@ -180,9 +180,11 @@ GUI and future WebUI can build on stable control semantics rather than inventing
 
 ## Endgame Priorities
 
-The remaining work should be driven by closeout priority rather than by the original milestone order.
+Post-closeout work should be driven by product risk and hardening priority rather than by the original milestone order.
 
 ### P0 - Semantic Closeout
+
+Status: **closed for the CP-002 / CP-401 station/config semantic scope**
 
 Goal:
 
@@ -190,17 +192,17 @@ Goal:
 
 Scope:
 
-- complete the remaining `CP-002` application of the documented vocabulary contract
-- apply the documented `CP-000` / `CP-001` vocabulary contract consistently across the remaining surfaces
-- complete the remaining `CP-002` / `CP-401` compatibility-only runtime/public rename tail
+- complete the `CP-002` application of the documented vocabulary contract
+- apply the documented `CP-000` / `CP-001` vocabulary contract consistently across runtime/operator/API/GUI/TUI surfaces
+- complete the `CP-002` / `CP-401` compatibility-only runtime/public rename tail
 - finish the vocabulary cleanup from legacy `config` language to station-first language
 - keep `config` only where it literally means persisted config/document concepts or historical design material
-- reduce the remaining compatibility-only tail explicitly:
-  - remove dead shims such as `active_config()` once no internal call sites remain
-  - compatibility tests/assertions for legacy fields/routes
-  - migration/docs examples that intentionally show legacy `configs` input
-- treat runtime/operator-facing code paths as effectively closed, with the remaining work focused on docs/examples/export wording and explicit compatibility boundaries
-- finish the remaining runtime/admin wording tail after the proxy routing internals closeout:
+- close the compatibility-only tail explicitly:
+  - dead helper shims such as `active_config()` are removed once station-first call sites are settled
+  - compatibility tests/assertions verify legacy fields/routes stay absent from canonical payloads
+  - migration/docs examples that intentionally show legacy `configs` input are scoped as compatibility material
+- treat runtime/operator-facing code paths as closed for station/config naming, with docs/examples kept explicit about compatibility boundaries
+- finish runtime/admin wording after the proxy routing internals closeout:
   - exported runtime/admin type naming
   - finish the last operator/admin wording cleanup on station-first surfaces
 - run a stability pass after the rename:

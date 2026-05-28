@@ -38,9 +38,11 @@ See `VOCABULARY.md` for the canonical term mapping and compatibility-only wordin
   - documented the canonical vs compatibility-only use of `config`, `active`, `pinned`, `override`, and `session` in `VOCABULARY.md`
 - [x] CP-001 Define vocabulary mapping from legacy terms to target terms:
   - documented the legacy `config` -> station/profile/persisted-config bridge in `VOCABULARY.md`
-- [~] CP-002 Decide whether `config` remains public API language or becomes compatibility-only wording
+- [x] CP-002 Decide whether `config` remains public API language or becomes compatibility-only wording
   - [x] public attach/API surface is now station-first and canonical-v1-only
-  - [~] internal runtime/public UI model is now station-first; the remaining tail is now mostly compatibility-only wording, docs/examples, and export cleanup
+  - [x] internal runtime/public UI model is now station-first; `config` remains only for persisted config documents, explicit legacy/v2 migration compatibility, tests, or historical examples
+  - [x] GUI/TUI/tray/request-route summaries now present default/effective/last station wording instead of operator-facing `active_station`, `legacy`, or `config` labels
+  - [x] operator-summary regression coverage asserts legacy session-card, link, and capability keys are absent from the station-first home payload
 - [x] CP-003 Reject or migrate invalid values like `active = "true"`
 - [x] CP-004 Add migration note for legacy TOML layout
 
@@ -88,14 +90,14 @@ See `VOCABULARY.md` for the canonical term mapping and compatibility-only wordin
 ## WS4 - Station Registry and HA
 
 - [x] CP-400 Add runtime station metadata overrides for `enabled` / `level`
-- [~] CP-401 Introduce explicit `Station` runtime model
+- [x] CP-401 Introduce explicit `Station` runtime model
   - [x] add explicit `/api/v1/stations` and `/api/v1/stations/runtime` aliases
   - [x] add persisted station config API for `active_station` / `enabled` / `level`
   - [x] add persisted station structure API for alias / members / create / delete
   - [x] add persisted provider structure API for alias / auth env refs / endpoints / create / delete
   - [x] prefer station API in attach mode with legacy `configs` fallback
   - [x] align operator-facing GUI/tray labels with station terminology where semantics are already station-first
-  - [~] rename internal runtime/public UI model from `config` to `station`
+  - [x] rename internal runtime/public UI model from `config` to `station`
     - [x] dashboard_core canonical option/capability types are now station-first
     - [x] GUI runtime snapshot / tray / Stations page now use station-first runtime model names
     - [x] GUI session/history presentation helpers now consume station-first accessors and pass `cargo nextest run -p codex-helper-gui`
@@ -103,7 +105,7 @@ See `VOCABULARY.md` for the canonical term mapping and compatibility-only wordin
     - [x] shared/core request-session snapshot payloads are now station-first across core / GUI / TUI
     - [x] proxy routing internals, `SelectedUpstream`, SSE finalize path, and retry/failover traces are now station-first and pass `cargo nextest run -p codex-helper-core`
     - [x] runtime state storage, healthcheck execution flow, and request logging helpers are now station-first across core / GUI / TUI and pass `cargo nextest run -p codex-helper-core -p codex-helper-gui -p codex-helper-tui`
-    - [~] exported type naming and the remaining wording/doc cleanup still need final cleanup
+    - [x] exported type naming and the remaining wording/doc cleanup are closed for the station/config semantic scope
       - [x] public attach/API surface now exposes station-first snapshot fields and v1 route aliases:
         - `global_station_override`
         - `station_health`
@@ -114,7 +116,7 @@ See `VOCABULARY.md` for the canonical term mapping and compatibility-only wordin
       - [x] built-in GUI attach now targets station-first v1 routes only and explicitly rejects pre-v1 attach surfaces
       - [x] GUI/TUI runtime snapshot, tray, and page-facing models now propagate `global_station_override` / `station_health` / `StationHealth`
       - [x] compatibility tests now cover the station-first v1 surface and explicit pre-v1 attach rejection
-      - [~] exported type naming is largely done; the remaining internal/public cleanup tail is now mostly compatibility-only exports plus docs/examples wording
+      - [x] exported type naming is station-first on the current control-plane surface; remaining `config` mentions are persisted config, explicit legacy/v2 migration compatibility, tests, or historical material
       - [x] core health type now exports station-first `StationHealth`, with legacy `ConfigHealth` removed
       - [x] `DashboardSnapshot` now exposes station-first accessors and no longer carries legacy dual fields
       - [x] public v1 request payloads and dashboard-core type aliases now use station-first naming (`station_name` / `station_names`, `StationOption`, `StationCapabilitySummary`)
@@ -128,7 +130,7 @@ See `VOCABULARY.md` for the canonical term mapping and compatibility-only wordin
       - [x] core bootstrap/auth-sync/storage/usage/proxy flows now consume station-first manager accessors (`stations()`, `station()`, `contains_station()`)
       - [x] TUI station page module naming now matches semantics (`view/pages/stations.rs`, `apply_global_active_station`, station-first snapshot fields)
       - [x] Phase 1 / design docs now describe station-first session identity, override, and fallback terminology
-      - [~] remaining closeout tail is now limited to wording/doc/export cleanup on a few operator/admin surfaces plus historical docs/examples
+      - [x] CP-002 / CP-401 semantic closeout is complete for runtime/operator/API/GUI/TUI surfaces; old `config` keys are covered by absence assertions or retained only as explicit compatibility/migration material
 - [x] CP-402 Add capability summary per station:
   - [x] supported models
   - [x] fast/service tier support

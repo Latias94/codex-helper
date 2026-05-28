@@ -31,8 +31,8 @@ pub(super) fn render_stations_routing_preview(
         } else {
             pick(
                 ctx.lang,
-                "按当前运行态解释新请求会如何选择 route/provider、哪些候选被排除，以及 legacy station 兼容状态如何影响 pin / retry。",
-                "Explain how new requests choose routes/providers under the current runtime, which candidates are excluded, and how legacy station compatibility affects pins and retry.",
+                "按当前运行态解释新请求会如何选择 route/provider、哪些候选被排除，以及默认站点与 pin 如何影响 retry。",
+                "Explain how new requests choose routes/providers under the current runtime, which candidates are excluded, and how the default station and pins affect retry.",
             )
         });
         if let Some(explain) = snapshot.routing_explain.as_ref() {
@@ -163,7 +163,7 @@ fn format_routing_source(lang: Language, source: &StationRoutingSource) -> Strin
         StationRoutingSource::SessionPin(station) => format!("session pin={station}"),
         StationRoutingSource::GlobalPin(station) => format!("global pin={station}"),
         StationRoutingSource::ConfiguredActiveStation(station) => {
-            format!("configured active_station={station}")
+            format!("default station={station}")
         }
         StationRoutingSource::Auto => pick(
             lang,

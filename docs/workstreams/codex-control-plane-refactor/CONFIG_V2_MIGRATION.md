@@ -213,7 +213,7 @@ Current compatibility rules:
 
 - Legacy `version = 1` TOML still loads.
 - Legacy `v2` names `active_group` and `groups` still load.
-- Public control-plane APIs now prefer `station` naming, while legacy `config` API paths remain hidden compatibility aliases.
+- Public control-plane APIs emit station-first names. Legacy `config` input remains a persisted-file migration concern; legacy `config` API path aliases are not advertised and are removed where station-first v1 replacements exist.
 
 ## Recommended Upgrade Path
 

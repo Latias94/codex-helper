@@ -52,7 +52,7 @@ pub(super) fn render_stations_runtime_summary(
             ));
             ui.label(format!(
                 "{}: {}",
-                pick(ctx.lang, "配置 active_station", "Configured active_station"),
+                pick(ctx.lang, "配置默认站点", "Configured default station"),
                 configured_active_station.unwrap_or_else(|| pick(ctx.lang, "<无>", "<none>"))
             ));
             ui.label(format!(

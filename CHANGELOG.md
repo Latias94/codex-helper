@@ -9,6 +9,7 @@ All notable changes to this project will be documented in this file.
 
 #### 变更
 
+- control-plane 的 `station/config` 语义收口到 station-first 口径；GUI/TUI/tray/请求详情不再把默认站点、上次观测站点或旧 route-attempt 投影显示成 `active_station` / `legacy` / `config` 文案，`operator/summary` 回归断言也补强为显式拒绝旧 session-card、link 和 capability key。
 - TUI 第 5 页用户可见名称统一为 `Usage / 用量` 口径；Recent/History 都明确标注为 Codex 全局会话，Recent 页 footer 也补齐 `s/f/h` 跳转提示。Usage / Balance 预测现在会显示样本来源来自当前 runtime 还是本地 request ledger，Requests 页在从 Codex 历史会话跳入且当前 runtime 未观测到请求时会给出明确空态说明，避免启动后把历史数据误认成当前会话请求。
 
 #### 修复
@@ -37,6 +38,7 @@ All notable changes to this project will be documented in this file.
 
 #### Changed
 
+- Closed the control-plane `station/config` semantic tail around station-first wording. GUI/TUI/tray/request-detail surfaces no longer present default stations, last observed stations, or legacy route-attempt projections as `active_station` / `legacy` / `config` labels, and `operator/summary` regressions now explicitly reject old session-card, link, and capability keys.
 - Standardized the TUI page-5 user-facing label around `Usage` / `Usage / Balance`. Recent and History now both identify their Codex-global session scope, the Recent footer advertises the `s/f/h` navigation keys, Usage / Balance spend forecasts show whether their sample comes from the current runtime or the local request ledger, and Requests explains when a focused Codex-history session has no requests observed by the current runtime.
 - Consolidated the route graph and legacy routing compatibility authoring boundary. CLI, GUI, and admin API callers now update entry routes, provider references, and manual targets through semantic `RoutingConfigV4` / `ServiceViewV4` methods instead of mutating fields and synchronizing compatibility state at each call site.
 - Added `RequestLedgerStore` as the request ledger read-model boundary. CLI, TUI, GUI, and admin API consumers now read tail, filter, and summary data through one store, and recent/filter queries use a streaming bounded window instead of loading the full `requests.jsonl` just to return the newest records.

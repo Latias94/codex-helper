@@ -224,7 +224,7 @@ pub(super) fn render_sessions_page(
             session_observed_provider_balance_snapshot(row, &snapshot.provider_balances)
                 .map(|snapshot| balance_snapshot_status_style(p, snapshot))
                 .unwrap_or_else(|| Style::default().fg(p.muted));
-        let observed_cfg = row.last_station_name.as_deref().unwrap_or("-");
+        let observed_station = row.last_station_name.as_deref().unwrap_or("-");
         let observed_upstream = row.last_upstream_base_url.as_deref().unwrap_or("-");
         let observed_effort = row.last_reasoning_effort.as_deref().unwrap_or("-");
         let observed_service_tier = row.last_service_tier.as_deref().unwrap_or("-");
@@ -234,7 +234,7 @@ pub(super) fn render_sessions_page(
             .map(|mode| format!("{mode:?}").to_ascii_lowercase())
             .unwrap_or_else(|| "-".to_string());
         let effective_model = format_resolved_route_value(row.effective_model.as_ref(), lang);
-        let effective_cfg = format_resolved_route_value(row.effective_station.as_ref(), lang);
+        let effective_station = format_resolved_route_value(row.effective_station.as_ref(), lang);
         let effective_upstream =
             format_resolved_route_value(row.effective_upstream_base_url.as_ref(), lang);
         let effective_effort =
@@ -243,10 +243,10 @@ pub(super) fn render_sessions_page(
             format_resolved_route_value(row.effective_service_tier.as_ref(), lang);
         let override_model = row.override_model.as_deref().unwrap_or("-");
         let override_effort = row.override_effort.as_deref().unwrap_or("-");
-        let override_cfg = row.override_station_name.as_deref().unwrap_or("-");
+        let override_station = row.override_station_name.as_deref().unwrap_or("-");
         let override_route_target = row.override_route_target.as_deref().unwrap_or("-");
         let override_service_tier = row.override_service_tier.as_deref().unwrap_or("-");
-        let global_cfg = snapshot.global_station_override.as_deref().unwrap_or("-");
+        let global_station = snapshot.global_station_override.as_deref().unwrap_or("-");
         let global_route_target = snapshot
             .global_route_target_override
             .as_deref()
@@ -260,12 +260,12 @@ pub(super) fn render_sessions_page(
         );
         let routing = if session_row_has_any_override(row) {
             format!(
-                "session(model={override_model}, station={override_cfg}, route_target={override_route_target}, tier={override_service_tier})"
+                "session(model={override_model}, station={override_station}, route_target={override_route_target}, tier={override_service_tier})"
             )
         } else if global_route_target != "-" {
             format!("global_route_target={global_route_target}")
-        } else if global_cfg != "-" {
-            format!("pinned(global-station)={global_cfg}")
+        } else if global_station != "-" {
+            format!("pinned(global-station)={global_station}")
         } else {
             "auto".to_string()
         };
@@ -364,13 +364,13 @@ pub(super) fn render_sessions_page(
         lines.push(kv_line(p, "balance", balance, balance_style));
         lines.push(kv_line(
             p,
-            "station(last legacy)",
-            observed_cfg.to_string(),
+            "station(last)",
+            observed_station.to_string(),
             Style::default().fg(p.text),
         ));
         lines.push(kv_line(
             p,
-            "upstream(last legacy)",
+            "upstream(last)",
             observed_upstream.to_string(),
             Style::default().fg(p.text),
         ));
@@ -400,7 +400,7 @@ pub(super) fn render_sessions_page(
         lines.push(kv_line(
             p,
             "station",
-            effective_cfg,
+            effective_station,
             Style::default().fg(p.text),
         ));
         lines.push(kv_line(
@@ -425,10 +425,10 @@ pub(super) fn render_sessions_page(
             p,
             l("override"),
             format!(
-                "model={override_model}, effort={override_effort}, station={override_cfg}, route_target={override_route_target}, tier={override_service_tier}, global_station={global_cfg}, global_route_target={global_route_target}"
+                "model={override_model}, effort={override_effort}, station={override_station}, route_target={override_route_target}, tier={override_service_tier}, global_station={global_station}, global_route_target={global_route_target}"
             ),
             Style::default().fg(if session_row_has_any_override(row)
-                || global_cfg != "-"
+                || global_station != "-"
                 || global_route_target != "-"
             {
                 p.accent

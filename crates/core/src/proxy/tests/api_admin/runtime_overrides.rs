@@ -487,7 +487,31 @@ async fn proxy_api_v1_operator_summary_reports_runtime_target_and_retry() {
             "operator summary runtime should not expose legacy field: {legacy_key}"
         );
     }
-    assert!(summary["session_cards"][0]["effective_config"].is_null());
+    let session_card_obj = summary["session_cards"][0]
+        .as_object()
+        .expect("session card object");
+    assert!(
+        session_card_obj.contains_key("effective_station"),
+        "operator summary session card should expose station-first effective route"
+    );
+    for legacy_key in [
+        "effective_config",
+        "last_config_name",
+        "override_config_name",
+    ] {
+        assert!(
+            !session_card_obj.contains_key(legacy_key),
+            "operator summary session card should not expose legacy field: {legacy_key}"
+        );
+    }
+    let links_obj = summary["links"].as_object().expect("links object");
+    let surface_capabilities_obj = summary["surface_capabilities"]
+        .as_object()
+        .expect("surface capabilities object");
+    assert!(
+        !surface_capabilities_obj.contains_key("station_persisted_config"),
+        "operator summary capabilities should not expose legacy station_persisted_config"
+    );
     assert_eq!(
         summary["links"]["snapshot"].as_str(),
         Some("/__codex_helper/api/v1/snapshot")
@@ -548,7 +572,17 @@ async fn proxy_api_v1_operator_summary_reports_runtime_target_and_retry() {
         summary["links"]["persisted_default_profile"].as_str(),
         Some("/__codex_helper/api/v1/profiles/default/persisted")
     );
-    assert!(summary["links"]["config_active"].is_null());
+    assert!(
+        !links_obj.contains_key("config_active"),
+        "operator summary links should not expose legacy config_active alias"
+    );
+    assert!(
+        links_obj
+            .values()
+            .filter_map(|value| value.as_str())
+            .all(|path| !path.contains("config-active")),
+        "operator summary links should not advertise legacy config-active paths"
+    );
 
     proxy_handle.abort();
 }
