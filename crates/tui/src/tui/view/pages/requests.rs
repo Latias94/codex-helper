@@ -7,8 +7,8 @@ use unicode_width::UnicodeWidthStr;
 use crate::tui::i18n;
 use crate::tui::model::{
     Palette, Snapshot, duration_short, format_age, now_ms, request_cache_hit_rate_label,
-    request_matches_page_filters, request_page_focus_is_runtime_observed,
-    request_page_focus_session_id, shorten, shorten_middle, status_style, usage_line_lang,
+    request_page_focus_is_runtime_observed, request_page_focus_session_id, shorten, shorten_middle,
+    status_style, usage_line_lang,
 };
 use crate::tui::state::UiState;
 
@@ -34,27 +34,7 @@ pub(super) fn render_requests_page(
     let focused_sid_observed =
         request_page_focus_is_runtime_observed(snapshot, focused_sid.as_deref());
 
-    let filtered = snapshot
-        .recent
-        .iter()
-        .filter(|r| {
-            request_matches_page_filters(
-                r,
-                ui.request_page_errors_only,
-                ui.request_page_scope_session,
-                focused_sid.as_deref(),
-            )
-        })
-        .collect::<Vec<_>>();
-
-    if filtered.is_empty() {
-        ui.selected_request_page_idx = 0;
-        ui.request_page_table.select(None);
-    } else {
-        ui.selected_request_page_idx = ui.selected_request_page_idx.min(filtered.len() - 1);
-        ui.request_page_table
-            .select(Some(ui.selected_request_page_idx));
-    }
+    let filtered = ui.request_page_filtered_indices(snapshot);
 
     let scope_label = if ui.request_page_scope_session {
         focused_sid
@@ -100,6 +80,7 @@ pub(super) fn render_requests_page(
     let now = now_ms();
     let rows = filtered
         .iter()
+        .filter_map(|idx| snapshot.recent.get(*idx))
         .map(|r| {
             let age = format_age(now, Some(r.ended_at_ms));
             let status = Span::styled(
@@ -150,7 +131,9 @@ pub(super) fn render_requests_page(
     .highlight_spacing(HighlightSpacing::Always);
     f.render_stateful_widget(table, columns[0], &mut ui.request_page_table);
 
-    let selected = filtered.get(ui.selected_request_page_idx);
+    let selected = filtered
+        .get(ui.selected_request_page_idx)
+        .and_then(|idx| snapshot.recent.get(*idx));
     let mut lines = Vec::new();
     if let Some(r) = selected {
         let observability = r.observability_view();
@@ -629,6 +612,7 @@ mod tests {
             rows: Vec::new(),
             recent: Vec::new(),
             forecast_recent: Vec::new(),
+            forecast_recent_source: crate::tui::model::UsageForecastSampleSource::RuntimeOnly,
             model_overrides: HashMap::new(),
             overrides: HashMap::new(),
             station_overrides: HashMap::new(),

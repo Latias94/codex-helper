@@ -21,7 +21,9 @@
 - [x] Should attention filters be global across TUI pages or scoped to
   Usage / Balance first?
 - [x] Should the help overlay become page-aware before or after footer cleanup?
-- [ ] What is the minimum supported terminal width for full-page operation?
+- [x] What is the minimum supported terminal width for full-page operation?
+  - 76 columns is the minimum usable width for full-page operation; 110
+    columns remains the normal-width smoke target.
 - [x] Should route candidate chains use horizontal scrolling, folded summaries,
   or both?
 
@@ -123,6 +125,18 @@
     order differs.
   - Added route graph row-model tests for refresh shrink, reorder movement,
     and viewport clamp keeping selected detail rows aligned.
+- [x] TUI-404 Move Recent/History/Requests/Sessions selection synchronization
+  out of render helpers and into the UiState/page sync boundary.
+  - Recent, Requests, Sessions, and History now sync from `UiState` before
+    render, while render helpers consume prepared selection state.
+- [x] TUI-405 Make Usage forecast sample provenance explicit instead of
+  inferring it from `Vec` length.
+  - `Snapshot` now carries an explicit forecast sample source, and the stats
+    copy no longer infers provenance from sample count.
+- [x] TUI-406 Close out the operator polish lane with machine-readable evidence
+  and a documented minimum terminal width.
+  - Added workstream metadata, evidence, and handoff artifacts; narrow-width
+    smoke remains manually required.
 
 ## WS5 - Validation
 

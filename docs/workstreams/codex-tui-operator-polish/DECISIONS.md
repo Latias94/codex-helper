@@ -94,3 +94,22 @@ Consequence:
 - Tests should assert visibility, atomic formatting, selected/detail alignment,
   and footer fallback behavior.
 - Full snapshots are still acceptable for small, stable render helpers.
+
+## D006 - Treat 76 Columns As The Minimum Usable Width
+
+Decision:
+
+Use 76 columns as the minimum usable terminal width for full-page operator
+behavior, while keeping 110 columns as the normal-width smoke target.
+
+Rationale:
+
+- 110 columns matches the comfortable validation profile for the full layout.
+- 76 columns is the lowest width that still exercises the compacted page
+  contracts we care about.
+
+Consequence:
+
+- Documentation and smoke checks should name both widths explicitly.
+- Render regressions that only show up below 76 columns are out of scope for
+  the current operator contract.

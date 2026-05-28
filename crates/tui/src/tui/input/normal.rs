@@ -20,8 +20,8 @@ use crate::tui::codex_relay_live_smoke::{
 use crate::tui::i18n::{self, msg};
 use crate::tui::model::{
     CODEX_RECENT_WINDOWS, ProviderOption, Snapshot, codex_recent_window_label,
-    codex_recent_window_threshold_ms, filtered_request_page_len, filtered_requests_len,
-    find_session_idx, now_ms, session_row_has_any_override, short_sid,
+    codex_recent_window_threshold_ms, filtered_requests_len, find_session_idx, now_ms,
+    session_row_has_any_override, short_sid,
 };
 use crate::tui::report::build_stats_report;
 use crate::tui::state::{CodexHistoryExternalFocusOrigin, UiState, adjust_table_selection};
@@ -2150,19 +2150,13 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
         }
         KeyCode::Up | KeyCode::Char('k') if ui.page == Page::Recent => {
             let now = now_ms();
-            let threshold_ms = codex_recent_window_threshold_ms(now, ui.codex_recent_window_idx);
-            let len = ui
-                .codex_recent_rows
-                .iter()
-                .filter(|r| r.mtime_ms >= threshold_ms)
-                .count();
+            let visible = ui.codex_recent_visible_indices(now);
+            let len = visible.len();
             if let Some(next) = adjust_table_selection(&mut ui.codex_recent_table, -1, len) {
                 ui.codex_recent_selected_idx = next;
                 ui.codex_recent_selected_id = ui
                     .codex_recent_rows
-                    .iter()
-                    .filter(|r| r.mtime_ms >= threshold_ms)
-                    .nth(next)
+                    .get(visible[next])
                     .map(|r| r.session_id.clone());
                 return true;
             }
@@ -2170,44 +2164,20 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
         }
         KeyCode::Down | KeyCode::Char('j') if ui.page == Page::Recent => {
             let now = now_ms();
-            let threshold_ms = codex_recent_window_threshold_ms(now, ui.codex_recent_window_idx);
-            let len = ui
-                .codex_recent_rows
-                .iter()
-                .filter(|r| r.mtime_ms >= threshold_ms)
-                .count();
+            let visible = ui.codex_recent_visible_indices(now);
+            let len = visible.len();
             if let Some(next) = adjust_table_selection(&mut ui.codex_recent_table, 1, len) {
                 ui.codex_recent_selected_idx = next;
                 ui.codex_recent_selected_id = ui
                     .codex_recent_rows
-                    .iter()
-                    .filter(|r| r.mtime_ms >= threshold_ms)
-                    .nth(next)
+                    .get(visible[next])
                     .map(|r| r.session_id.clone());
                 return true;
             }
             false
         }
         KeyCode::Up | KeyCode::Char('k') if ui.page == Page::Sessions => {
-            let filtered = snapshot
-                .rows
-                .iter()
-                .enumerate()
-                .filter(|(_, row)| {
-                    if ui.sessions_page_active_only && row.active_count == 0 {
-                        return false;
-                    }
-                    if ui.sessions_page_errors_only && row.last_status.is_some_and(|s| s < 400) {
-                        return false;
-                    }
-                    if ui.sessions_page_overrides_only && !session_row_has_any_override(row) {
-                        return false;
-                    }
-                    true
-                })
-                .take(200)
-                .map(|(idx, _)| idx)
-                .collect::<Vec<_>>();
+            let filtered = ui.filtered_sessions_page_indices(snapshot);
 
             let len = filtered.len();
             if let Some(next) = adjust_table_selection(&mut ui.sessions_page_table, -1, len) {
@@ -2220,25 +2190,7 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
             false
         }
         KeyCode::Down | KeyCode::Char('j') if ui.page == Page::Sessions => {
-            let filtered = snapshot
-                .rows
-                .iter()
-                .enumerate()
-                .filter(|(_, row)| {
-                    if ui.sessions_page_active_only && row.active_count == 0 {
-                        return false;
-                    }
-                    if ui.sessions_page_errors_only && row.last_status.is_some_and(|s| s < 400) {
-                        return false;
-                    }
-                    if ui.sessions_page_overrides_only && !session_row_has_any_override(row) {
-                        return false;
-                    }
-                    true
-                })
-                .take(200)
-                .map(|(idx, _)| idx)
-                .collect::<Vec<_>>();
+            let filtered = ui.filtered_sessions_page_indices(snapshot);
 
             let len = filtered.len();
             if let Some(next) = adjust_table_selection(&mut ui.sessions_page_table, 1, len) {
@@ -2381,13 +2333,7 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
             true
         }
         KeyCode::Up | KeyCode::Char('k') if ui.page == Page::Requests => {
-            let filtered_len = filtered_request_page_len(
-                snapshot,
-                ui.focused_request_session_id.as_deref(),
-                ui.selected_session_idx,
-                ui.request_page_errors_only,
-                ui.request_page_scope_session,
-            );
+            let filtered_len = ui.request_page_filtered_indices(snapshot).len();
             if let Some(next) = adjust_table_selection(&mut ui.request_page_table, -1, filtered_len)
             {
                 ui.selected_request_page_idx = next;
@@ -2396,13 +2342,7 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
             false
         }
         KeyCode::Down | KeyCode::Char('j') if ui.page == Page::Requests => {
-            let filtered_len = filtered_request_page_len(
-                snapshot,
-                ui.focused_request_session_id.as_deref(),
-                ui.selected_session_idx,
-                ui.request_page_errors_only,
-                ui.request_page_scope_session,
-            );
+            let filtered_len = ui.request_page_filtered_indices(snapshot).len();
             if let Some(next) = adjust_table_selection(&mut ui.request_page_table, 1, filtered_len)
             {
                 ui.selected_request_page_idx = next;

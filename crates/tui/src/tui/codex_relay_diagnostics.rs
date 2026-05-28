@@ -234,6 +234,7 @@ mod tests {
             rows: Vec::new(),
             recent: Vec::new(),
             forecast_recent: Vec::new(),
+            forecast_recent_source: crate::tui::model::UsageForecastSampleSource::RuntimeOnly,
             model_overrides: HashMap::new(),
             overrides: HashMap::new(),
             station_overrides: HashMap::new(),

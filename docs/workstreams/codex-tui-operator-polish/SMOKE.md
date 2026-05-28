@@ -29,7 +29,7 @@ non-interactive run.
 
 ## Normal Width
 
-Use a terminal at least 110 columns wide.
+Use a terminal at least 110 columns wide for the normal-width pass.
 
 - Open Usage and confirm provider identity, balance/quota state, refresh
   summary, and provider detail are visible.
@@ -42,8 +42,9 @@ Use a terminal at least 110 columns wide.
 
 ## Narrow Width
 
-Resize the same terminal to roughly 76 columns, or the smallest width the
-terminal profile allows while staying usable.
+Resize the same terminal to 76 columns for the minimum usable-width pass, or
+the smallest width the terminal profile allows while staying usable if it is
+narrower.
 
 - Switch repeatedly between Usage, Routing, Stations, and Settings.
 - Confirm CJK provider labels still identify the provider, even if surrounding

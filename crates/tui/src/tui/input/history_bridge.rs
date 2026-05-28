@@ -2,10 +2,7 @@ use std::path::PathBuf;
 
 use crate::sessions::{SessionSummary, SessionSummarySource};
 use crate::state::FinishedRequest;
-use crate::tui::model::{
-    SessionRow, Snapshot, codex_recent_window_threshold_ms, format_age, now_ms,
-    request_matches_page_filters, request_page_focus_session_id,
-};
+use crate::tui::model::{SessionRow, Snapshot, format_age, now_ms};
 use crate::tui::state::{CodexHistoryExternalFocusOrigin, RecentCodexRow, UiState};
 use crate::tui::types::{Focus, Page};
 
@@ -13,24 +10,9 @@ pub(super) fn selected_request_page_request<'a>(
     snapshot: &'a Snapshot,
     ui: &UiState,
 ) -> Option<&'a FinishedRequest> {
-    let focused_sid = request_page_focus_session_id(
-        snapshot,
-        ui.focused_request_session_id.as_deref(),
-        ui.selected_session_idx,
-    );
-
-    snapshot
-        .recent
-        .iter()
-        .filter(|request| {
-            request_matches_page_filters(
-                request,
-                ui.request_page_errors_only,
-                ui.request_page_scope_session,
-                focused_sid.as_deref(),
-            )
-        })
-        .nth(ui.selected_request_page_idx)
+    ui.request_page_filtered_indices(snapshot)
+        .get(ui.selected_request_page_idx)
+        .and_then(|idx| snapshot.recent.get(*idx))
 }
 
 pub(super) fn selected_dashboard_request<'a>(
@@ -58,11 +40,9 @@ pub(super) fn selected_dashboard_request<'a>(
 
 pub(super) fn selected_recent_row(ui: &UiState) -> Option<RecentCodexRow> {
     let now = now_ms();
-    let threshold_ms = codex_recent_window_threshold_ms(now, ui.codex_recent_window_idx);
-    ui.codex_recent_rows
-        .iter()
-        .filter(|row| row.mtime_ms >= threshold_ms)
-        .nth(ui.codex_recent_selected_idx)
+    ui.codex_recent_visible_indices(now)
+        .get(ui.codex_recent_selected_idx)
+        .and_then(|idx| ui.codex_recent_rows.get(*idx))
         .cloned()
 }
 

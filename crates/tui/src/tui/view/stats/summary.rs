@@ -8,8 +8,8 @@ use crate::state::{BalanceSnapshotStatus, ProviderBalanceSnapshot, UsageBucket};
 use crate::tui::Language;
 use crate::tui::i18n;
 use crate::tui::model::{
-    Palette, Snapshot, duration_short, provider_balance_compact_lang, shorten_middle,
-    station_balance_brief_lang,
+    Palette, Snapshot, UsageForecastSampleSource, duration_short, provider_balance_compact_lang,
+    shorten_middle, station_balance_brief_lang,
 };
 use crate::tui::types::StatsFocus;
 use crate::usage::UsageMetrics;
@@ -460,10 +460,9 @@ pub(super) fn usage_spend_forecast(
         .flatten()
         .cloned()
         .collect::<Vec<_>>();
-    let recent = if snapshot.forecast_recent.is_empty() {
-        &snapshot.recent
-    } else {
-        &snapshot.forecast_recent
+    let recent = match snapshot.forecast_recent_source {
+        UsageForecastSampleSource::RuntimeOnly => &snapshot.recent,
+        UsageForecastSampleSource::RuntimeAndRequestLedger => &snapshot.forecast_recent,
     };
     build_usage_spend_forecast(config, recent, &balances, now_ms)
 }

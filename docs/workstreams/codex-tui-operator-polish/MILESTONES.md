@@ -136,6 +136,33 @@ Suggested verification:
 - `cargo nextest run --locked --workspace --features gui --no-fail-fast`
 - `cargo clippy --locked --workspace --all-targets --features gui -- -D warnings`
 
+## P5 - Operator Width And Evidence Closeout
+
+Goal:
+
+- Lock the operator polish lane to a clear minimum usable width and keep the
+  evidence trail machine-readable.
+
+Scope:
+
+- minimum usable width decision;
+- workstream metadata and handoff artifacts;
+- evidence and changelog updates;
+- remaining manual smoke confirmation.
+
+Acceptance:
+
+- The minimum usable width is documented separately from the normal smoke
+  width.
+- The workstream has explicit metadata, evidence, and handoff files.
+- Manual smoke remains called out where automation cannot prove the terminal
+  claim.
+
+Suggested verification:
+
+- `cargo nextest run -p codex-helper-tui stats requests recent history help chrome --no-fail-fast`
+- `cargo check -p codex-helper-tui`
+
 ## Exit Criteria
 
 This workstream can be considered complete when:

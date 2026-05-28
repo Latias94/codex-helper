@@ -36,8 +36,6 @@ pub(super) fn render_history_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiStat
     .style(Style::default().fg(p.muted))
     .height(1);
 
-    ui.sync_codex_history_selection();
-
     let rows = ui
         .codex_history_sessions
         .iter()

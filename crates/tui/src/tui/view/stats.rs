@@ -9,7 +9,9 @@ use crate::state::UsageBucket;
 use crate::tui::Language;
 use crate::tui::ProviderOption;
 use crate::tui::i18n;
-use crate::tui::model::{Palette, Snapshot, shorten, shorten_middle, tokens_short};
+use crate::tui::model::{
+    Palette, Snapshot, UsageForecastSampleSource, shorten, shorten_middle, tokens_short,
+};
 use crate::tui::state::UiState;
 use crate::tui::types::StatsFocus;
 use crate::usage_balance::{UsageBalanceEndpointRow, UsageBalanceProviderRow, UsageBalanceView};
@@ -251,18 +253,17 @@ fn render_kpis(
 
 fn usage_forecast_source_line(snapshot: &Snapshot, lang: Language) -> String {
     let runtime = snapshot.recent.len();
-    let has_ledger_tail = snapshot.forecast_recent.len() > runtime;
-    match lang {
-        Language::Zh if !has_ledger_tail => {
+    match (snapshot.forecast_recent_source, lang) {
+        (UsageForecastSampleSource::RuntimeOnly, Language::Zh) => {
             format!("当前 runtime {runtime} 条")
         }
-        Language::En if !has_ledger_tail => {
+        (UsageForecastSampleSource::RuntimeOnly, Language::En) => {
             format!("runtime {runtime}")
         }
-        Language::Zh => {
+        (UsageForecastSampleSource::RuntimeAndRequestLedger, Language::Zh) => {
             format!("当前 runtime {runtime} + 本地 request ledger")
         }
-        Language::En => {
+        (UsageForecastSampleSource::RuntimeAndRequestLedger, Language::En) => {
             format!("runtime {runtime} + local request ledger")
         }
     }
@@ -1307,18 +1308,17 @@ fn render_recent_breakdown(
 
 fn recent_sample_title(snapshot: &Snapshot, lang: Language) -> String {
     let runtime = snapshot.recent.len();
-    let has_ledger_tail = snapshot.forecast_recent.len() > runtime;
-    match lang {
-        Language::Zh if !has_ledger_tail => {
+    match (snapshot.forecast_recent_source, lang) {
+        (UsageForecastSampleSource::RuntimeOnly, Language::Zh) => {
             format!("最近样本 (runtime {runtime}) + 提示")
         }
-        Language::En if !has_ledger_tail => {
+        (UsageForecastSampleSource::RuntimeOnly, Language::En) => {
             format!("Recent sample (runtime {runtime}) + Tips")
         }
-        Language::Zh => {
+        (UsageForecastSampleSource::RuntimeAndRequestLedger, Language::Zh) => {
             format!("最近样本 (runtime {runtime}, 本地 request ledger) + 提示")
         }
-        Language::En => {
+        (UsageForecastSampleSource::RuntimeAndRequestLedger, Language::En) => {
             format!("Recent sample (runtime {runtime}, local request ledger) + Tips")
         }
     }

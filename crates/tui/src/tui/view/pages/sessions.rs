@@ -30,45 +30,7 @@ pub(super) fn render_sessions_page(
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(area);
 
-    let filtered = snapshot
-        .rows
-        .iter()
-        .enumerate()
-        .filter(|(_, row)| {
-            if ui.sessions_page_active_only && row.active_count == 0 {
-                return false;
-            }
-            if ui.sessions_page_errors_only && row.last_status.is_some_and(|s| s < 400) {
-                return false;
-            }
-            if ui.sessions_page_overrides_only && !session_row_has_any_override(row) {
-                return false;
-            }
-            true
-        })
-        .take(200)
-        .collect::<Vec<_>>();
-
-    let selected_idx_in_filtered = ui
-        .selected_session_id
-        .as_deref()
-        .and_then(|sid| {
-            filtered
-                .iter()
-                .position(|(_, row)| row.session_id.as_deref() == Some(sid))
-        })
-        .unwrap_or(
-            ui.selected_sessions_page_idx
-                .min(filtered.len().saturating_sub(1)),
-        );
-
-    ui.selected_sessions_page_idx = selected_idx_in_filtered;
-    if filtered.is_empty() {
-        ui.sessions_page_table.select(None);
-    } else {
-        ui.sessions_page_table
-            .select(Some(ui.selected_sessions_page_idx));
-    }
+    let filtered = ui.filtered_sessions_page_indices(snapshot);
 
     let title = format!(
         "{}  ({}: {}, {}: {}, {}: {})",
@@ -117,7 +79,8 @@ pub(super) fn render_sessions_page(
     let now = now_ms();
     let rows = filtered
         .iter()
-        .map(|(_, row)| {
+        .filter_map(|idx| snapshot.rows.get(*idx))
+        .map(|row| {
             let sid = row
                 .session_id
                 .as_deref()
@@ -211,7 +174,7 @@ pub(super) fn render_sessions_page(
 
     let selected = filtered
         .get(ui.selected_sessions_page_idx)
-        .map(|(_, row)| *row);
+        .and_then(|idx| snapshot.rows.get(*idx));
     let mut lines = Vec::new();
     if let Some(row) = selected {
         let sid_full = row.session_id.as_deref().unwrap_or("-");

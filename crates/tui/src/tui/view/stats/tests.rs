@@ -17,6 +17,7 @@ fn sample_snapshot(provider_balances: HashMap<String, Vec<ProviderBalanceSnapsho
         rows: Vec::new(),
         recent: Vec::new(),
         forecast_recent: Vec::new(),
+        forecast_recent_source: crate::tui::model::UsageForecastSampleSource::RuntimeOnly,
         model_overrides: HashMap::new(),
         overrides: HashMap::new(),
         station_overrides: HashMap::new(),
@@ -349,12 +350,14 @@ fn stats_kpis_show_spend_projection_only_when_sample_is_confident() {
 fn stats_kpis_label_forecast_sample_sources() {
     let now = crate::tui::model::now_ms();
     let mut snapshot = sample_snapshot(HashMap::new());
-    snapshot.recent = vec![sample_priced_request(now.saturating_sub(30 * 60_000), "1")];
-    snapshot.forecast_recent = vec![
+    snapshot.recent = vec![
         sample_priced_request(now.saturating_sub(59 * 60_000), "1"),
         sample_priced_request(now.saturating_sub(30 * 60_000), "1"),
         sample_priced_request(now.saturating_sub(10 * 60_000), "1"),
     ];
+    snapshot.forecast_recent = snapshot.recent.clone();
+    snapshot.forecast_recent_source =
+        crate::tui::model::UsageForecastSampleSource::RuntimeAndRequestLedger;
     let mut ui = UiState {
         page: crate::tui::types::Page::Stats,
         usage_forecast: crate::config::UsageForecastConfig {
@@ -368,7 +371,34 @@ fn stats_kpis_label_forecast_sample_sources() {
 
     let text = render_stats_text(140, 28, &mut ui, &snapshot);
 
-    assert!(text.contains("runtime 1 + local request ledger"), "{text}");
+    assert!(text.contains("runtime 3 + local request ledger"), "{text}");
+}
+
+#[test]
+fn stats_kpis_use_explicit_forecast_sample_source_not_sample_length() {
+    let now = crate::tui::model::now_ms();
+    let mut snapshot = sample_snapshot(HashMap::new());
+    snapshot.recent = vec![
+        sample_priced_request(now.saturating_sub(59 * 60_000), "1"),
+        sample_priced_request(now.saturating_sub(30 * 60_000), "1"),
+    ];
+    snapshot.forecast_recent = snapshot.recent.clone();
+    snapshot.forecast_recent_source =
+        crate::tui::model::UsageForecastSampleSource::RuntimeAndRequestLedger;
+    let mut ui = UiState {
+        page: crate::tui::types::Page::Stats,
+        usage_forecast: crate::config::UsageForecastConfig {
+            rate_window_minutes: 60,
+            min_priced_requests: 2,
+            reset_utc_offset: "+08:00".to_string(),
+            ..Default::default()
+        },
+        ..UiState::default()
+    };
+
+    let text = render_stats_text(140, 28, &mut ui, &snapshot);
+
+    assert!(text.contains("runtime 2 + local request ledger"), "{text}");
 }
 
 #[test]
@@ -381,6 +411,8 @@ fn spend_forecast_prefers_ledger_backed_sample_over_display_recent() {
         sample_priced_request(now.saturating_sub(30 * 60_000), "1"),
         sample_priced_request(now.saturating_sub(10 * 60_000), "1"),
     ];
+    snapshot.forecast_recent_source =
+        crate::tui::model::UsageForecastSampleSource::RuntimeAndRequestLedger;
     let config = crate::config::UsageForecastConfig {
         rate_window_minutes: 60,
         min_priced_requests: 2,
@@ -396,6 +428,29 @@ fn spend_forecast_prefers_ledger_backed_sample_over_display_recent() {
         crate::usage_forecast::UsageForecastConfidence::Estimated
     );
     assert!(forecast.projected_until_reset_usd.is_some());
+}
+
+#[test]
+fn spend_forecast_uses_explicit_sample_source_not_forecast_vec_fallback() {
+    let now = crate::tui::model::now_ms();
+    let mut snapshot = sample_snapshot(HashMap::new());
+    snapshot.recent = vec![
+        sample_priced_request(now.saturating_sub(30 * 60_000), "1"),
+        sample_priced_request(now.saturating_sub(10 * 60_000), "1"),
+    ];
+    snapshot.forecast_recent = Vec::new();
+    snapshot.forecast_recent_source =
+        crate::tui::model::UsageForecastSampleSource::RuntimeAndRequestLedger;
+    let config = crate::config::UsageForecastConfig {
+        rate_window_minutes: 60,
+        min_priced_requests: 1,
+        reset_utc_offset: "+08:00".to_string(),
+        ..Default::default()
+    };
+
+    let forecast = usage_spend_forecast(&snapshot, &config, now);
+
+    assert_eq!(forecast.priced_requests, 0);
 }
 
 #[test]

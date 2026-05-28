@@ -314,11 +314,18 @@ pub(in crate::tui) struct SessionRow {
     pub(in crate::tui) override_service_tier: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::tui) enum UsageForecastSampleSource {
+    RuntimeOnly,
+    RuntimeAndRequestLedger,
+}
+
 #[derive(Debug, Clone)]
 pub(in crate::tui) struct Snapshot {
     pub(in crate::tui) rows: Vec<SessionRow>,
     pub(in crate::tui) recent: Vec<FinishedRequest>,
     pub(in crate::tui) forecast_recent: Vec<FinishedRequest>,
+    pub(in crate::tui) forecast_recent_source: UsageForecastSampleSource,
     pub(in crate::tui) model_overrides: HashMap<String, String>,
     pub(in crate::tui) overrides: HashMap<String, String>,
     pub(in crate::tui) station_overrides: HashMap<String, String>,
@@ -1919,11 +1926,13 @@ pub(in crate::tui) async fn refresh_snapshot(
                 snap.session_route_target_overrides.get(session_id).cloned();
         }
     }
-    let forecast_recent = load_forecast_recent_requests(snap.recent.clone()).await;
+    let (forecast_recent, forecast_recent_source) =
+        load_forecast_recent_requests(snap.recent.clone()).await;
     Snapshot {
         rows,
         recent: snap.recent,
         forecast_recent,
+        forecast_recent_source,
         model_overrides: snap.session_model_overrides,
         overrides: snap.session_effort_overrides,
         station_overrides: snap.session_station_overrides,
@@ -1958,11 +1967,13 @@ pub(in crate::tui) async fn snapshot_from_api_v1(api: ApiV1Snapshot) -> Snapshot
                 snap.session_route_target_overrides.get(session_id).cloned();
         }
     }
-    let forecast_recent = load_forecast_recent_requests(snap.recent.clone()).await;
+    let (forecast_recent, forecast_recent_source) =
+        load_forecast_recent_requests(snap.recent.clone()).await;
     Snapshot {
         rows,
         recent: snap.recent,
         forecast_recent,
+        forecast_recent_source,
         model_overrides: snap.session_model_overrides,
         overrides: snap.session_effort_overrides,
         station_overrides: snap.session_station_overrides,
@@ -1997,7 +2008,7 @@ fn usage_forecast_log_tail_limit() -> usize {
 
 async fn load_forecast_recent_requests(
     memory_recent: Vec<FinishedRequest>,
-) -> Vec<FinishedRequest> {
+) -> (Vec<FinishedRequest>, UsageForecastSampleSource) {
     let limit = usage_forecast_log_tail_limit();
     let ledger_recent = tokio::task::spawn_blocking(move || {
         crate::request_ledger::RequestLedgerStore::default().tail_finished_requests(limit)
@@ -2006,8 +2017,20 @@ async fn load_forecast_recent_requests(
     .ok()
     .and_then(Result::ok)
     .unwrap_or_default();
+    let source = forecast_recent_sample_source(&ledger_recent);
 
-    merge_forecast_recent_requests(memory_recent, ledger_recent, limit)
+    (
+        merge_forecast_recent_requests(memory_recent, ledger_recent, limit),
+        source,
+    )
+}
+
+fn forecast_recent_sample_source(recent: &[FinishedRequest]) -> UsageForecastSampleSource {
+    if recent.is_empty() {
+        UsageForecastSampleSource::RuntimeOnly
+    } else {
+        UsageForecastSampleSource::RuntimeAndRequestLedger
+    }
 }
 
 fn merge_forecast_recent_requests(
@@ -2585,6 +2608,7 @@ mod tests {
             }],
             recent: Vec::new(),
             forecast_recent: Vec::new(),
+            forecast_recent_source: UsageForecastSampleSource::RuntimeOnly,
             model_overrides: HashMap::new(),
             overrides: HashMap::new(),
             station_overrides: HashMap::new(),
@@ -2656,6 +2680,7 @@ mod tests {
                 finished_request(2, Some("sid-explicit")),
             ],
             forecast_recent: Vec::new(),
+            forecast_recent_source: UsageForecastSampleSource::RuntimeOnly,
             model_overrides: HashMap::new(),
             overrides: HashMap::new(),
             station_overrides: HashMap::new(),
@@ -2691,6 +2716,7 @@ mod tests {
                 finished_request(2, Some("sid-known")),
             ],
             forecast_recent: Vec::new(),
+            forecast_recent_source: UsageForecastSampleSource::RuntimeOnly,
             model_overrides: HashMap::new(),
             overrides: HashMap::new(),
             station_overrides: HashMap::new(),
@@ -2735,11 +2761,24 @@ mod tests {
     }
 
     #[test]
+    fn forecast_recent_sample_source_tracks_ledger_presence() {
+        assert_eq!(
+            forecast_recent_sample_source(&[]),
+            UsageForecastSampleSource::RuntimeOnly
+        );
+        assert_eq!(
+            forecast_recent_sample_source(&[finished_request(1, Some("sid"))]),
+            UsageForecastSampleSource::RuntimeAndRequestLedger
+        );
+    }
+
+    #[test]
     fn request_page_focus_observation_distinguishes_history_only_session() {
         let snapshot = Snapshot {
             rows: vec![empty_session_row()],
             recent: Vec::new(),
             forecast_recent: Vec::new(),
+            forecast_recent_source: UsageForecastSampleSource::RuntimeOnly,
             model_overrides: HashMap::new(),
             overrides: HashMap::new(),
             station_overrides: HashMap::new(),

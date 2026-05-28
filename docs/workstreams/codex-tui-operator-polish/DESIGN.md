@@ -157,8 +157,9 @@ that would be brittle. They should assert invariants:
 
 Before marking a TUI polish slice done, run a short manual smoke test:
 
-1. open a normal-width terminal and inspect Usage, Routing, Stations, Settings;
-2. resize to a narrow width and switch pages repeatedly;
+1. open a normal-width terminal at 110 columns or wider and inspect Usage,
+   Routing, Stations, Settings;
+2. resize to 76 columns and switch pages repeatedly;
 3. use long provider names and at least one CJK provider label;
 4. trigger balance refresh success and failure;
 5. scroll provider and endpoint details;

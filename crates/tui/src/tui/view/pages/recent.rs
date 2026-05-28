@@ -5,8 +5,7 @@ use ratatui::widgets::{Block, Borders, Cell, HighlightSpacing, Paragraph, Row, T
 
 use crate::tui::i18n::{self, msg};
 use crate::tui::model::{
-    CODEX_RECENT_WINDOWS, Palette, codex_recent_window_label, codex_recent_window_threshold_ms,
-    format_age, now_ms, shorten_middle,
+    CODEX_RECENT_WINDOWS, Palette, codex_recent_window_label, format_age, now_ms, shorten_middle,
 };
 use crate::tui::state::UiState;
 
@@ -19,30 +18,7 @@ pub(super) fn render_recent_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiState
         .split(area);
 
     let now = now_ms();
-    let threshold_ms = codex_recent_window_threshold_ms(now, ui.codex_recent_window_idx);
-    let visible = ui
-        .codex_recent_rows
-        .iter()
-        .filter(|r| r.mtime_ms >= threshold_ms)
-        .take(300)
-        .collect::<Vec<_>>();
-
-    let selected_idx_in_visible = ui
-        .codex_recent_selected_id
-        .as_deref()
-        .and_then(|sid| visible.iter().position(|r| r.session_id.as_str() == sid))
-        .unwrap_or(ui.codex_recent_selected_idx)
-        .min(visible.len().saturating_sub(1));
-    ui.codex_recent_selected_idx = selected_idx_in_visible;
-    ui.codex_recent_selected_id = visible
-        .get(ui.codex_recent_selected_idx)
-        .map(|r| r.session_id.clone());
-    if visible.is_empty() {
-        ui.codex_recent_table.select(None);
-    } else {
-        ui.codex_recent_table
-            .select(Some(ui.codex_recent_selected_idx));
-    }
+    let visible = ui.codex_recent_visible_indices(now);
 
     let title = format!(
         "{}  ({}: {}, {}: {})",
@@ -90,6 +66,7 @@ pub(super) fn render_recent_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiState
 
     let rows = visible
         .iter()
+        .filter_map(|idx| ui.codex_recent_rows.get(*idx))
         .map(|r| {
             let root = shorten_middle(r.root.as_str(), 120);
             let branch = r.branch.as_deref().unwrap_or("-");
@@ -157,7 +134,10 @@ pub(super) fn render_recent_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiState
             },
             Style::default().fg(p.muted),
         )));
-    } else if let Some(r) = visible.get(ui.codex_recent_selected_idx) {
+    } else if let Some(r) = visible
+        .get(ui.codex_recent_selected_idx)
+        .and_then(|idx| ui.codex_recent_rows.get(*idx))
+    {
         let branch = r.branch.as_deref().unwrap_or("-");
         lines.push(Line::from(vec![
             Span::styled(format!("{}: ", l("root")), Style::default().fg(p.muted)),

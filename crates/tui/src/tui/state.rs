@@ -17,7 +17,11 @@ use crate::usage_providers::UsageProviderRefreshSummary;
 use std::collections::{BTreeMap, HashMap};
 
 use super::Language;
-use super::model::{RoutingSpecView, Snapshot, filtered_requests_len, routing_provider_names};
+use super::model::{
+    RoutingSpecView, Snapshot, codex_recent_window_threshold_ms, filtered_requests_len, now_ms,
+    request_matches_page_filters, request_page_focus_session_id, routing_provider_names,
+    session_row_has_any_override,
+};
 use super::types::{Focus, Overlay, Page, StatsFocus};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -538,14 +542,114 @@ impl UiState {
         .unwrap_or(0);
     }
 
+    pub(in crate::tui) fn sync_rendered_page_state(&mut self, snapshot: &Snapshot) {
+        match self.page {
+            Page::Sessions => self.sync_sessions_page_selection(snapshot),
+            Page::Requests => self.sync_request_page_selection(snapshot),
+            Page::History => self.sync_codex_history_selection(),
+            Page::Recent => self.sync_codex_recent_selection(now_ms()),
+            _ => {}
+        }
+    }
+
+    pub(in crate::tui) fn filtered_sessions_page_indices(&self, snapshot: &Snapshot) -> Vec<usize> {
+        snapshot
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                if self.sessions_page_active_only && row.active_count == 0 {
+                    return false;
+                }
+                if self.sessions_page_errors_only && row.last_status.is_some_and(|s| s < 400) {
+                    return false;
+                }
+                if self.sessions_page_overrides_only && !session_row_has_any_override(row) {
+                    return false;
+                }
+                true
+            })
+            .take(200)
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    pub(in crate::tui) fn sync_sessions_page_selection(&mut self, snapshot: &Snapshot) {
+        let visible = self.filtered_sessions_page_indices(snapshot);
+        let selected_idx = self
+            .selected_session_id
+            .as_deref()
+            .and_then(|sid| {
+                visible.iter().position(|row_idx| {
+                    snapshot
+                        .rows
+                        .get(*row_idx)
+                        .and_then(|row| row.session_id.as_deref())
+                        == Some(sid)
+                })
+            })
+            .unwrap_or(
+                self.selected_sessions_page_idx
+                    .min(visible.len().saturating_sub(1)),
+            );
+
+        self.selected_sessions_page_idx = clamp_table_selection(
+            &mut self.sessions_page_table,
+            Some(selected_idx),
+            visible.len(),
+        )
+        .unwrap_or(0);
+
+        if let Some(row_idx) = visible.get(self.selected_sessions_page_idx).copied() {
+            self.selected_session_idx = row_idx;
+            self.selected_session_id = snapshot
+                .rows
+                .get(row_idx)
+                .and_then(|row| row.session_id.clone());
+        }
+    }
+
+    pub(in crate::tui) fn request_page_filtered_indices(&self, snapshot: &Snapshot) -> Vec<usize> {
+        let focused_sid = request_page_focus_session_id(
+            snapshot,
+            self.focused_request_session_id.as_deref(),
+            self.selected_session_idx,
+        );
+        snapshot
+            .recent
+            .iter()
+            .enumerate()
+            .filter(|(_, request)| {
+                request_matches_page_filters(
+                    request,
+                    self.request_page_errors_only,
+                    self.request_page_scope_session,
+                    focused_sid.as_deref(),
+                )
+            })
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    pub(in crate::tui) fn sync_request_page_selection(&mut self, snapshot: &Snapshot) {
+        let len = self.request_page_filtered_indices(snapshot).len();
+        self.selected_request_page_idx = clamp_table_selection(
+            &mut self.request_page_table,
+            Some(self.selected_request_page_idx),
+            len,
+        )
+        .unwrap_or(0);
+    }
+
     pub(in crate::tui) fn sync_codex_history_selection(&mut self) {
-        let len = self.codex_history_sessions.len();
+        let len = self.codex_history_sessions.len().min(300);
         let selected_idx = self
             .selected_codex_history_id
             .as_deref()
             .and_then(|sid| {
                 self.codex_history_sessions
                     .iter()
+                    .take(300)
                     .position(|summary| summary.id == sid)
             })
             .unwrap_or(self.selected_codex_history_idx.min(len.saturating_sub(1)));
@@ -558,9 +662,50 @@ impl UiState {
         self.selected_codex_history_idx = clamp_table_selection(
             &mut self.codex_history_table,
             Some(self.selected_codex_history_idx),
-            self.codex_history_sessions.len(),
+            len,
         )
         .unwrap_or(0);
+    }
+
+    pub(in crate::tui) fn codex_recent_visible_indices(&self, now_ms: u64) -> Vec<usize> {
+        let threshold_ms = codex_recent_window_threshold_ms(now_ms, self.codex_recent_window_idx);
+        self.codex_recent_rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.mtime_ms >= threshold_ms)
+            .take(300)
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    pub(in crate::tui) fn sync_codex_recent_selection(&mut self, now_ms: u64) {
+        let visible = self.codex_recent_visible_indices(now_ms);
+        let selected_idx = self
+            .codex_recent_selected_id
+            .as_deref()
+            .and_then(|sid| {
+                visible.iter().position(|row_idx| {
+                    self.codex_recent_rows
+                        .get(*row_idx)
+                        .map(|row| row.session_id.as_str())
+                        == Some(sid)
+                })
+            })
+            .unwrap_or(
+                self.codex_recent_selected_idx
+                    .min(visible.len().saturating_sub(1)),
+            );
+
+        self.codex_recent_selected_idx = clamp_table_selection(
+            &mut self.codex_recent_table,
+            Some(selected_idx),
+            visible.len(),
+        )
+        .unwrap_or(0);
+        self.codex_recent_selected_id = visible
+            .get(self.codex_recent_selected_idx)
+            .and_then(|idx| self.codex_recent_rows.get(*idx))
+            .map(|row| row.session_id.clone());
     }
 
     pub(in crate::tui) fn prepare_codex_history_external_focus(
@@ -751,9 +896,11 @@ mod tests {
 
     use super::*;
     use crate::state::{
-        BalanceSnapshotStatus, ProviderBalanceSnapshot, UsageBucket, UsageRollupView,
+        BalanceSnapshotStatus, FinishedRequest, ProviderBalanceSnapshot, SessionObservationScope,
+        UsageBucket, UsageRollupView,
     };
     use crate::tui::model::RoutingProviderRef;
+    use crate::tui::model::{SessionRow, UsageForecastSampleSource};
     use crate::tui::types::StatsFocus;
 
     fn sample_summary(id: &str, path: &str, source: SessionSummarySource) -> SessionSummary {
@@ -778,6 +925,7 @@ mod tests {
             rows: Vec::new(),
             recent: Vec::new(),
             forecast_recent: Vec::new(),
+            forecast_recent_source: UsageForecastSampleSource::RuntimeOnly,
             model_overrides: HashMap::new(),
             overrides: HashMap::new(),
             station_overrides: HashMap::new(),
@@ -813,6 +961,79 @@ mod tests {
             stats_1h: crate::dashboard_core::WindowStats::default(),
             pricing_catalog: crate::pricing::ModelPriceCatalogSnapshot::default(),
             refreshed_at: std::time::Instant::now(),
+        }
+    }
+
+    fn empty_session_row(id: &str) -> SessionRow {
+        SessionRow {
+            session_id: Some(id.to_string()),
+            observation_scope: SessionObservationScope::ObservedOnly,
+            host_local_transcript_path: None,
+            last_client_name: None,
+            last_client_addr: None,
+            cwd: None,
+            active_count: 0,
+            active_started_at_ms_min: None,
+            active_last_method: None,
+            active_last_path: None,
+            last_status: None,
+            last_duration_ms: None,
+            last_ended_at_ms: None,
+            last_model: None,
+            last_reasoning_effort: None,
+            last_service_tier: None,
+            last_provider_id: None,
+            last_station_name: None,
+            last_upstream_base_url: None,
+            last_usage: None,
+            total_usage: None,
+            turns_total: None,
+            turns_with_usage: None,
+            binding_profile_name: None,
+            binding_continuity_mode: None,
+            last_route_decision: None,
+            route_affinity: None,
+            effective_model: None,
+            effective_reasoning_effort: None,
+            effective_service_tier: None,
+            effective_station: None,
+            effective_upstream_base_url: None,
+            override_model: None,
+            override_effort: None,
+            override_station_name: None,
+            override_route_target: None,
+            override_service_tier: None,
+        }
+    }
+
+    fn finished_request(id: u64, session_id: Option<&str>, status_code: u16) -> FinishedRequest {
+        FinishedRequest {
+            id,
+            trace_id: None,
+            session_id: session_id.map(ToOwned::to_owned),
+            session_identity_source: None,
+            client_name: None,
+            client_addr: None,
+            cwd: None,
+            model: None,
+            reasoning_effort: None,
+            service_tier: None,
+            upstream_base_url: None,
+            route_decision: None,
+            usage: None,
+            cost: crate::pricing::CostBreakdown::default(),
+            retry: None,
+            observability: crate::state::RequestObservability::default(),
+            service: "codex".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/responses".to_string(),
+            status_code,
+            duration_ms: 10,
+            ttfb_ms: None,
+            streaming: false,
+            ended_at_ms: id,
+            provider_id: None,
+            station_name: None,
         }
     }
 
@@ -853,6 +1074,86 @@ mod tests {
         assert_eq!(ui.selected_codex_history_idx, 1);
         assert_eq!(ui.selected_codex_history_id.as_deref(), Some("sid-b"));
         assert_eq!(ui.codex_history_table.selected(), Some(1));
+    }
+
+    #[test]
+    fn sync_codex_recent_selection_uses_visible_window_and_clears_hidden_id() {
+        let now = 3_600_001;
+        let mut ui = UiState {
+            codex_recent_rows: vec![
+                RecentCodexRow {
+                    root: "old-root".to_string(),
+                    branch: None,
+                    session_id: "sid-old".to_string(),
+                    cwd: None,
+                    mtime_ms: 0,
+                },
+                RecentCodexRow {
+                    root: "new-root".to_string(),
+                    branch: None,
+                    session_id: "sid-new".to_string(),
+                    cwd: None,
+                    mtime_ms: now,
+                },
+            ],
+            codex_recent_window_idx: 0,
+            codex_recent_selected_idx: 9,
+            codex_recent_selected_id: Some("sid-old".to_string()),
+            ..Default::default()
+        };
+
+        ui.sync_codex_recent_selection(now);
+
+        assert_eq!(ui.codex_recent_selected_idx, 0);
+        assert_eq!(ui.codex_recent_selected_id.as_deref(), Some("sid-new"));
+        assert_eq!(ui.codex_recent_table.selected(), Some(0));
+    }
+
+    #[test]
+    fn sync_sessions_page_selection_updates_global_selection_after_filter() {
+        let mut inactive = empty_session_row("sid-inactive");
+        inactive.active_count = 0;
+        let mut active = empty_session_row("sid-active");
+        active.active_count = 1;
+        let snapshot = Snapshot {
+            rows: vec![inactive, active],
+            ..sample_usage_snapshot()
+        };
+        let mut ui = UiState {
+            sessions_page_active_only: true,
+            selected_session_idx: 0,
+            selected_session_id: Some("sid-inactive".to_string()),
+            selected_sessions_page_idx: 8,
+            ..Default::default()
+        };
+
+        ui.sync_sessions_page_selection(&snapshot);
+
+        assert_eq!(ui.selected_sessions_page_idx, 0);
+        assert_eq!(ui.selected_session_idx, 1);
+        assert_eq!(ui.selected_session_id.as_deref(), Some("sid-active"));
+        assert_eq!(ui.sessions_page_table.selected(), Some(0));
+    }
+
+    #[test]
+    fn sync_request_page_selection_clamps_filtered_selection() {
+        let snapshot = Snapshot {
+            recent: vec![
+                finished_request(1, Some("sid"), 200),
+                finished_request(2, Some("sid"), 500),
+            ],
+            ..sample_usage_snapshot()
+        };
+        let mut ui = UiState {
+            request_page_errors_only: true,
+            selected_request_page_idx: 7,
+            ..Default::default()
+        };
+
+        ui.sync_request_page_selection(&snapshot);
+
+        assert_eq!(ui.selected_request_page_idx, 0);
+        assert_eq!(ui.request_page_table.selected(), Some(0));
     }
 
     #[test]

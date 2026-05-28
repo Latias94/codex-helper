@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "slug": "codex-tui-operator-polish",
+  "title": "Codex TUI Operator Polish",
+  "status": "active",
+  "updated": "2026-05-28",
+  "scope_kind": "execution",
+  "problem": "TUI render helpers still own too much selection/state syncing, Usage forecast provenance is implicit, and the operator polish lane lacks machine-readable handoff artifacts.",
+  "authoritative_docs": [
+    {
+      "role": "design",
+      "path": "docs/workstreams/codex-tui-operator-polish/DESIGN.md"
+    },
+    {
+      "role": "execution",
+      "path": "docs/workstreams/codex-tui-operator-polish/TODO.md"
+    },
+    {
+      "role": "milestones",
+      "path": "docs/workstreams/codex-tui-operator-polish/MILESTONES.md"
+    },
+    {
+      "role": "gates",
+      "path": "docs/workstreams/codex-tui-operator-polish/EVIDENCE_AND_GATES.md"
+    },
+    {
+      "role": "handoff",
+      "path": "docs/workstreams/codex-tui-operator-polish/HANDOFF.md"
+    }
+  ],
+  "gates": [
+    "cargo fmt --check",
+    "cargo nextest run -p codex-helper-tui stats requests recent history help chrome --no-fail-fast",
+    "cargo nextest run -p codex-helper-tui --no-fail-fast",
+    "cargo check -p codex-helper-tui",
+    "git diff --check"
+  ],
+  "evidence": [
+    "docs/workstreams/codex-tui-operator-polish/DESIGN.md",
+    "docs/workstreams/codex-tui-operator-polish/TODO.md",
+    "docs/workstreams/codex-tui-operator-polish/MILESTONES.md",
+    "docs/workstreams/codex-tui-operator-polish/EVIDENCE_AND_GATES.md",
+    "docs/workstreams/codex-tui-operator-polish/HANDOFF.md"
+  ],
+  "adr_refs": [],
+  "continue_policy": {
+    "default_action": "continue",
+    "notes": "Keep this lane active until the three refactor slices are verified and documented."
+  },
+  "current_task": "manual-smoke-closeout"
+}

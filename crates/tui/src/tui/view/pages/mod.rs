@@ -27,6 +27,8 @@ pub(super) fn render_body(
         vertical: 1,
     });
 
+    ui.sync_rendered_page_state(snapshot);
+
     match ui.page {
         Page::Dashboard => dashboard::render_dashboard(f, p, ui, snapshot, providers, area),
         Page::Stations => stations::render_stations_page(f, p, ui, snapshot, providers, area),
