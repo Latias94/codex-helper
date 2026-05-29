@@ -81,6 +81,14 @@ pub fn rotate_and_prune_if_needed(path: impl AsRef<Path>, retention: LogRetentio
 
 pub fn prune_rotated_logs(path: impl AsRef<Path>, retention: LogRetention) {
     let path = path.as_ref();
+    prune_rotated_logs_with_remover(path, retention, |candidate| fs::remove_file(candidate));
+}
+
+fn prune_rotated_logs_with_remover(
+    path: &Path,
+    retention: LogRetention,
+    mut remove_file: impl FnMut(&Path) -> io::Result<()>,
+) {
     if !retention.enabled() {
         return;
     }
@@ -90,10 +98,18 @@ pub fn prune_rotated_logs(path: impl AsRef<Path>, retention: LogRetention) {
         .fold(0_u64, |acc, file| acc.saturating_add(file.bytes));
     let budget_bytes = retention.rotated_budget_bytes();
 
-    while rotated.len() > retention.max_files || total_bytes > budget_bytes {
+    while !rotated.is_empty() && (rotated.len() > retention.max_files || total_bytes > budget_bytes)
+    {
         let file = rotated.remove(0);
-        total_bytes = total_bytes.saturating_sub(file.bytes);
-        let _ = fs::remove_file(file.path);
+        match remove_file(&file.path) {
+            Ok(()) => {
+                total_bytes = total_bytes.saturating_sub(file.bytes);
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                total_bytes = total_bytes.saturating_sub(file.bytes);
+            }
+            Err(_) => {}
+        }
     }
 }
 
@@ -324,6 +340,44 @@ mod tests {
         assert!(
             collect_rotated_logs(&active).is_empty(),
             "rotated oversized active log should be pruned by total budget"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn prune_rotated_logs_keeps_budget_pressure_when_delete_fails() {
+        let dir = temp_log_dir("delete-fail-budget-pressure");
+        let active = dir.join("runtime.log");
+        let locked = dir.join("runtime.log.0-locked");
+        let spill = dir.join("runtime.log.1-spill");
+        write_test_file(&locked, 64);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        write_test_file(&spill, 8);
+
+        prune_rotated_logs_with_remover(
+            &active,
+            LogRetention::new(10, 1),
+            |path| -> io::Result<()> {
+                if path == locked {
+                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, "locked"));
+                }
+                fs::remove_file(path)
+            },
+        );
+
+        assert!(
+            locked.exists(),
+            "failed delete should leave the locked rotated log for a later repair"
+        );
+        assert!(
+            !spill.exists(),
+            "failed delete must not be counted as recovered budget"
+        );
+
+        prune_rotated_logs(&active, LogRetention::new(10, 1));
+        assert!(
+            !locked.exists(),
+            "next repair should remove the previously locked oversized log"
         );
         let _ = fs::remove_dir_all(dir);
     }
