@@ -1,10 +1,12 @@
+use std::io;
+use std::pin::Pin;
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, Method, Response, StatusCode};
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt, stream};
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -41,12 +43,37 @@ fn stream_buffer_max_bytes() -> usize {
     })
 }
 
+const DEFAULT_CODEX_STREAM_IDLE_TIMEOUT_SECS: u64 = 15 * 60;
+const MAX_CODEX_STREAM_IDLE_TIMEOUT_SECS: u64 = 24 * 60 * 60;
+
+fn codex_responses_stream_idle_timeout(is_codex_service: bool, path: &str) -> Option<Duration> {
+    if !is_codex_service || !is_codex_responses_sse_path(path) {
+        return None;
+    }
+
+    let secs = std::env::var("CODEX_HELPER_STREAM_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_CODEX_STREAM_IDLE_TIMEOUT_SECS);
+    if secs == 0 {
+        return None;
+    }
+
+    Some(Duration::from_secs(
+        secs.clamp(1, MAX_CODEX_STREAM_IDLE_TIMEOUT_SECS),
+    ))
+}
+
 fn is_codex_responses_sse_path(path: &str) -> bool {
     let path = path.trim_end_matches('/');
     path.ends_with("/responses") || path.ends_with("/responses/compact")
 }
 
-fn synthetic_codex_stream_failure_sse(message: &str, model: Option<&str>) -> String {
+fn synthetic_codex_stream_failure_sse(
+    message: &str,
+    model: Option<&str>,
+    helper_error: &str,
+) -> String {
     let now_ms = crate::logging::now_ms();
     let mut response = json!({
         "id": format!("resp_codex_helper_stream_error_{now_ms}"),
@@ -62,7 +89,7 @@ fn synthetic_codex_stream_failure_sse(message: &str, model: Option<&str>) -> Str
         "usage": null,
         "user": null,
         "metadata": {
-            "codex_helper_error": "upstream_stream_error",
+            "codex_helper_error": helper_error,
         },
     });
     if let (Some(model), Some(object)) = (model, response.as_object_mut())
@@ -77,12 +104,18 @@ fn synthetic_codex_stream_failure_sse(message: &str, model: Option<&str>) -> Str
     format!("\n\nevent: response.failed\ndata: {payload}\n\n")
 }
 
+#[derive(Clone, Debug)]
+struct StreamErrorInfo {
+    class: &'static str,
+    message: String,
+}
+
 #[derive(Default)]
 struct StreamUsageState {
     buffer: Vec<u8>,
     logged: bool,
     finished: bool,
-    stream_error: bool,
+    stream_error: Option<StreamErrorInfo>,
     warned_non_success: bool,
     first_chunk_ms: Option<u64>,
     usage: Option<crate::usage::UsageMetrics>,
@@ -113,7 +146,7 @@ struct StreamTerminalDecision {
 
 struct StreamTerminalDecisionParams<'a> {
     status_code: u16,
-    stream_error: bool,
+    stream_error: Option<&'a StreamErrorInfo>,
     resp_headers: &'a HeaderMap,
     resp_content_type: Option<&'a str>,
     response_body: &'a [u8],
@@ -144,16 +177,17 @@ fn decide_stream_terminal_response(
         cloudflare_timeout_cooldown_secs,
     } = params;
 
-    if stream_error {
+    if let Some(stream_error) = stream_error {
         return StreamTerminalDecision {
             health_update: Some(StreamHealthUpdate::FailureAndPenalty {
-                error_reason: "upstream_stream_error",
+                error_reason: stream_error.class,
                 cooldown_secs: transport_cooldown_secs,
             }),
             passive_failure: Some(StreamPassiveFailure {
                 status_code: Some(status_code),
-                error_class: Some("upstream_stream_error".to_string()),
-                error: summarize_error_body(response_body, resp_content_type),
+                error_class: Some(stream_error.class.to_string()),
+                error: Some(stream_error.message.clone())
+                    .or_else(|| summarize_error_body(response_body, resp_content_type)),
             }),
         };
     }
@@ -341,7 +375,7 @@ impl Drop for StreamFinalize {
         let retry_for_state = self.retry.clone();
         let ttfb_ms_for_state = guard.first_chunk_ms;
         let service_tier_for_state = guard.service_tier.clone();
-        let stream_error = guard.stream_error;
+        let stream_error = guard.stream_error.clone();
 
         let dur = self.start.elapsed().as_millis() as u64;
 
@@ -404,7 +438,7 @@ impl Drop for StreamFinalize {
         let transport_cooldown_secs = self.transport_cooldown_secs;
         let terminal_decision = decide_stream_terminal_response(StreamTerminalDecisionParams {
             status_code,
-            stream_error,
+            stream_error: stream_error.as_ref(),
             resp_headers: &self.resp_headers,
             resp_content_type: resp_ct,
             response_body: response_body.as_slice(),
@@ -513,6 +547,211 @@ impl Drop for StreamFinalize {
     }
 }
 
+struct StreamForwardState {
+    upstream: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
+    finalize: StreamFinalize,
+    idle_timeout: Option<Duration>,
+    terminal_after_current_item: bool,
+    max_keep: usize,
+}
+
+impl StreamForwardState {
+    async fn next_body_item(mut self) -> Option<(Result<Bytes, io::Error>, Self)> {
+        if self.terminal_after_current_item {
+            return None;
+        }
+
+        let upstream_item = match self.idle_timeout {
+            Some(timeout) => match tokio::time::timeout(timeout, self.upstream.next()).await {
+                Ok(item) => item,
+                Err(_) => {
+                    let item = self.handle_idle_timeout(timeout);
+                    return Some((item, self));
+                }
+            },
+            None => self.upstream.next().await,
+        };
+
+        match upstream_item {
+            Some(Ok(chunk)) => Some((Ok(self.handle_chunk(chunk)), self)),
+            Some(Err(error)) => {
+                let item = self.handle_read_error(error);
+                Some((item, self))
+            }
+            None => None,
+        }
+    }
+
+    fn handle_chunk(&mut self, chunk: Bytes) -> Bytes {
+        let finalize = &self.finalize;
+        let mut guard = match finalize.usage_state.lock() {
+            Ok(g) => g,
+            Err(_) => return chunk,
+        };
+        if guard.first_chunk_ms.is_none() {
+            guard.first_chunk_ms = Some(finalize.upstream_start.elapsed().as_millis() as u64);
+        }
+
+        if chunk.len() > self.max_keep {
+            // Extremely large chunks are unexpected; keep the tail to avoid unbounded growth.
+            guard.buffer.clear();
+            guard
+                .buffer
+                .extend_from_slice(&chunk[chunk.len().saturating_sub(self.max_keep)..]);
+            guard.usage_scan_pos = 0;
+            guard.service_tier_scan_pos = 0;
+        } else {
+            guard.buffer.extend_from_slice(&chunk);
+            trim_stream_buffer(&mut guard, self.max_keep);
+        }
+        if !guard.warned_non_success && !(200..300).contains(&finalize.status_code) {
+            if should_include_http_warn(finalize.status_code)
+                && let Some(h) =
+                    finalize.build_http_debug(&guard.buffer, guard.first_chunk_ms, true)
+            {
+                warn_http_debug(finalize.status_code, &h);
+            } else {
+                warn!(
+                    "upstream returned non-2xx status {} for {} {} (target: {}); set CODEX_HELPER_HTTP_WARN=0 to disable preview logs (or CODEX_HELPER_HTTP_DEBUG=1 for full debug)",
+                    finalize.status_code,
+                    finalize.method,
+                    finalize.path,
+                    finalize.target.log_target_label()
+                );
+            }
+            guard.warned_non_success = true;
+        }
+        if guard.logged {
+            return chunk;
+        }
+        {
+            let StreamUsageState {
+                buffer,
+                usage_scan_pos,
+                usage,
+                service_tier_scan_pos,
+                service_tier,
+                ..
+            } = &mut *guard;
+            crate::usage::scan_usage_from_sse_bytes_incremental(
+                buffer.as_slice(),
+                usage_scan_pos,
+                usage,
+            );
+            scan_service_tier_from_sse_bytes_incremental(
+                buffer.as_slice(),
+                service_tier_scan_pos,
+                service_tier,
+            );
+        }
+        if let Some(usage) = guard.usage.clone() {
+            guard.logged = true;
+            let dur = finalize.start.elapsed().as_millis() as u64;
+            let http_debug = if should_include_http_debug(finalize.status_code) {
+                finalize.build_http_debug(&guard.buffer, guard.first_chunk_ms, false)
+            } else {
+                None
+            };
+            let service_tier = ServiceTierLog {
+                actual: guard.service_tier.clone(),
+                ..finalize.service_tier.clone()
+            };
+            log_request_with_debug(
+                Some(finalize.request_id),
+                &finalize.service_name,
+                &finalize.method,
+                &finalize.path,
+                finalize.status_code,
+                dur,
+                guard.first_chunk_ms,
+                finalize.compatibility_station_name.as_deref(),
+                finalize.provider_id.clone(),
+                finalize.endpoint_id.clone(),
+                finalize.provider_endpoint_key.clone(),
+                &finalize.upstream_base_url,
+                finalize.session_id.clone(),
+                finalize.session_identity_source,
+                finalize.cwd.clone(),
+                finalize
+                    .route_decision
+                    .as_ref()
+                    .and_then(|decision| decision.effective_model.as_ref())
+                    .map(|model| model.value.clone()),
+                finalize.reasoning_effort.clone(),
+                service_tier,
+                finalize.codex_bridge.clone(),
+                Some(usage),
+                finalize.route_decision.clone(),
+                finalize.retry.clone(),
+                http_debug,
+            );
+        }
+
+        chunk
+    }
+
+    fn handle_read_error(&mut self, error: reqwest::Error) -> Result<Bytes, io::Error> {
+        let message = format!("Upstream stream failed: {error}");
+        self.handle_stream_failure("upstream_stream_error", message, io::ErrorKind::Other)
+    }
+
+    fn handle_idle_timeout(&mut self, timeout: Duration) -> Result<Bytes, io::Error> {
+        let message = format!(
+            "Upstream stream idle timeout after {}s without bytes",
+            timeout.as_secs()
+        );
+        self.handle_stream_failure(
+            "upstream_stream_idle_timeout",
+            message,
+            io::ErrorKind::TimedOut,
+        )
+    }
+
+    fn handle_stream_failure(
+        &mut self,
+        class: &'static str,
+        message: String,
+        io_kind: io::ErrorKind,
+    ) -> Result<Bytes, io::Error> {
+        if let Ok(mut guard) = self.finalize.usage_state.lock() {
+            guard.stream_error = Some(StreamErrorInfo {
+                class,
+                message: message.clone(),
+            });
+        }
+
+        warn!(
+            "upstream stream error: request_id={} trace_id=codex-{} session_id={} {} {} status={} target={} base_url={} class={} err={}",
+            self.finalize.request_id,
+            self.finalize.request_id,
+            self.finalize.session_id.as_deref().unwrap_or("-"),
+            self.finalize.method,
+            self.finalize.path,
+            self.finalize.status_code,
+            self.finalize.target.log_target_label(),
+            self.finalize.upstream_base_url,
+            class,
+            message
+        );
+
+        self.terminal_after_current_item = true;
+        if self.finalize.service_name == "codex" && is_codex_responses_sse_path(&self.finalize.path)
+        {
+            let model = self
+                .finalize
+                .route_decision
+                .as_ref()
+                .and_then(|decision| decision.effective_model.as_ref())
+                .map(|model| model.value.as_str());
+            return Ok(Bytes::from(synthetic_codex_stream_failure_sse(
+                &message, model, class,
+            )));
+        }
+
+        Err(io::Error::new(io_kind, message))
+    }
+}
+
 pub(super) async fn build_sse_success_response(
     proxy: &ProxyService,
     legacy_lb: Option<LoadBalancer>,
@@ -593,26 +832,23 @@ pub(super) async fn build_sse_success_response(
 
     let max_keep = stream_buffer_max_bytes();
     let usage_state = Arc::new(Mutex::new(StreamUsageState::default()));
-    let usage_state_inner = usage_state.clone();
     let method_s = method.to_string();
     let path_s = path.clone();
-    let target_label = target.log_target_label();
     let compatibility_station_name = target.compatibility_station_name().map(ToOwned::to_owned);
-    let compatibility_station_name_for_stream = compatibility_station_name.clone();
     let provider_id = target.provider_id().map(ToOwned::to_owned);
     let endpoint_id = target.endpoint_id();
     let provider_endpoint_key = target.provider_endpoint_key();
     let base_url = target.upstream().base_url.clone();
     let service_name = proxy.service_name.to_string();
-    let start_time = start;
     let status_code = status.as_u16();
+    let stream_idle_timeout = codex_responses_stream_idle_timeout(is_codex_service, &path_s);
 
     let finalize = StreamFinalize {
         service_name: service_name.clone(),
         method: method_s.clone(),
         path: path_s.clone(),
         status_code,
-        start: start_time,
+        start,
         started_at_ms,
         upstream_start,
         upstream_headers_ms,
@@ -676,139 +912,17 @@ pub(super) async fn build_sse_success_response(
         }
     }
 
-    let stream = resp.bytes_stream().map(move |item| {
-        let _finalize = &finalize;
-
-        match item {
-            Ok(chunk) => {
-                let mut guard = match usage_state_inner.lock() {
-                    Ok(g) => g,
-                    Err(_) => return Ok(chunk),
-                };
-                if guard.first_chunk_ms.is_none() {
-                    guard.first_chunk_ms = Some(_finalize.upstream_start.elapsed().as_millis() as u64);
-                }
-
-                if chunk.len() > max_keep {
-                    // Extremely large chunks are unexpected; keep the tail to avoid unbounded growth.
-                    guard.buffer.clear();
-                    guard.buffer
-                        .extend_from_slice(&chunk[chunk.len().saturating_sub(max_keep)..]);
-                    guard.usage_scan_pos = 0;
-                    guard.service_tier_scan_pos = 0;
-                } else {
-                    guard.buffer.extend_from_slice(&chunk);
-                    trim_stream_buffer(&mut guard, max_keep);
-                }
-                if !guard.warned_non_success && !(200..300).contains(&status_code) {
-                    if should_include_http_warn(status_code)
-                        && let Some(h) =
-                            _finalize.build_http_debug(&guard.buffer, guard.first_chunk_ms, true)
-                    {
-                        warn_http_debug(status_code, &h);
-                    } else {
-                        warn!(
-                            "upstream returned non-2xx status {} for {} {} (target: {}); set CODEX_HELPER_HTTP_WARN=0 to disable preview logs (or CODEX_HELPER_HTTP_DEBUG=1 for full debug)",
-                            status_code, method_s, path_s, target_label
-                        );
-                    }
-                    guard.warned_non_success = true;
-                }
-                if guard.logged {
-                    return Ok(chunk);
-                }
-                {
-                    let StreamUsageState {
-                        buffer,
-                        usage_scan_pos,
-                        usage,
-                        service_tier_scan_pos,
-                        service_tier,
-                        ..
-                    } = &mut *guard;
-                    crate::usage::scan_usage_from_sse_bytes_incremental(
-                        buffer.as_slice(),
-                        usage_scan_pos,
-                        usage,
-                    );
-                    scan_service_tier_from_sse_bytes_incremental(
-                        buffer.as_slice(),
-                        service_tier_scan_pos,
-                        service_tier,
-                    );
-                }
-                if let Some(usage) = guard.usage.clone() {
-                    guard.logged = true;
-                    let dur = start_time.elapsed().as_millis() as u64;
-                    let http_debug = if should_include_http_debug(status_code) {
-                        _finalize.build_http_debug(&guard.buffer, guard.first_chunk_ms, false)
-                    } else {
-                        None
-                    };
-                    let service_tier = ServiceTierLog {
-                        actual: guard.service_tier.clone(),
-                        .._finalize.service_tier.clone()
-                    };
-                    log_request_with_debug(
-                        Some(request_id),
-                        &service_name,
-                        &method_s,
-                        &path_s,
-                        status.as_u16(),
-                        dur,
-                        guard.first_chunk_ms,
-                        compatibility_station_name_for_stream.as_deref(),
-                        provider_id.clone(),
-                        endpoint_id.clone(),
-                        provider_endpoint_key.clone(),
-                        &base_url,
-                        session_id.clone(),
-                        session_identity_source,
-                        cwd.clone(),
-                        _finalize
-                            .route_decision
-                            .as_ref()
-                            .and_then(|decision| decision.effective_model.as_ref())
-                            .map(|model| model.value.clone()),
-                        effective_effort.clone(),
-                        service_tier,
-                        codex_bridge.clone(),
-                        Some(usage),
-                        _finalize.route_decision.clone(),
-                        retry.clone(),
-                        http_debug,
-                    );
-                }
-
-                Ok(chunk)
-            }
-            Err(e) => {
-                {
-                    let mut guard = match usage_state_inner.lock() {
-                        Ok(g) => g,
-                        Err(_) => return Err(e),
-                    };
-                    guard.stream_error = true;
-                }
-                warn!(
-                    "upstream stream error: {} {} status={} target={} base_url={} err={}",
-                    method_s, path_s, status_code, target_label, base_url, e
-                );
-                if is_codex_service && is_codex_responses_sse_path(&path_s) {
-                    let model = _finalize
-                        .route_decision
-                        .as_ref()
-                        .and_then(|decision| decision.effective_model.as_ref())
-                        .map(|model| model.value.as_str());
-                    return Ok(Bytes::from(synthetic_codex_stream_failure_sse(
-                        &format!("Upstream stream failed: {e}"),
-                        model,
-                    )));
-                }
-                Err(e)
-            }
-        }
-    });
+    let stream_state = StreamForwardState {
+        upstream: Box::pin(resp.bytes_stream()),
+        finalize,
+        idle_timeout: stream_idle_timeout,
+        terminal_after_current_item: false,
+        max_keep,
+    };
+    let stream = stream::unfold(
+        stream_state,
+        |state| async move { state.next_body_item().await },
+    );
 
     let body = Body::from_stream(stream);
     let mut builder = Response::builder().status(status);

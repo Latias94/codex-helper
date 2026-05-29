@@ -1076,6 +1076,16 @@ How to read it:
 - A single provider balance refresh failure only updates that provider's error/unknown state. It does not interrupt other provider refreshes, TUI redraw, or snapshot refresh.
 - The `Routing` page keeps compact balance context only. Use `Usage / Balance` to answer which provider is used most, which one is running out, or which endpoint is failing.
 
+## Runtime Safeguards
+
+Codex `/responses` and `/responses/compact` SSE streams have an idle watchdog so an upstream that returns HTTP 200 and then stops producing bytes does not leave Codex waiting forever.
+
+- `CODEX_HELPER_STREAM_IDLE_TIMEOUT_SECS` controls the per-chunk idle timeout for Codex Responses SSE streams.
+- Default: `900` seconds.
+- `0` disables the watchdog.
+- Values above `86400` seconds are clamped to 24 hours.
+- On timeout, codex-helper finishes the client stream with a synthetic `response.failed` SSE event and records `codex_helper_error=upstream_stream_idle_timeout`.
+
 ## Outbound Proxy
 
 codex-helper is itself a local proxy, but it may still need an outbound proxy to reach some relays or dashboard balance APIs.

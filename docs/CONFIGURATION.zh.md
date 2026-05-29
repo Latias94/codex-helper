@@ -1013,6 +1013,16 @@ TUI 第 5 页现在显示为 `Usage`，GUI 的统计页标题为 `Usage / Balanc
 - 单个 provider 的余额刷新失败只更新该 provider 的错误/unknown 状态，不会打断其他 provider 刷新、TUI redraw 或 snapshot 刷新。
 - `Routing` 页面只保留紧凑余额上下文；如果要判断谁用得最多、谁快耗尽、哪个 endpoint 报错，应看 `Usage / Balance`。
 
+## 运行时保护
+
+Codex `/responses` 和 `/responses/compact` SSE 流带有 idle watchdog，避免上游已经返回 HTTP 200、但之后长时间不再输出字节时让 Codex 一直 waiting。
+
+- `CODEX_HELPER_STREAM_IDLE_TIMEOUT_SECS` 控制 Codex Responses SSE 流的逐 chunk idle timeout。
+- 默认值：`900` 秒。
+- 设置为 `0` 会关闭 watchdog。
+- 超过 `86400` 秒的值会被限制为 24 小时。
+- 超时后，codex-helper 会用合成的 `response.failed` SSE event 结束客户端流，并记录 `codex_helper_error=upstream_stream_idle_timeout`。
+
 ## 出站代理
 
 codex-helper 本身是一个本地代理，但它可能仍然需要出站代理才能访问某些 relays 或 dashboard balance APIs。

@@ -7,6 +7,10 @@ All notable changes to this project will be documented in this file.
 
 ### 中文
 
+#### 新增
+
+- 新增仓库内 `codex-session-diagnostics` skill，可按 Codex session key 只读收集 `~/.codex-helper` 日志/状态/配置和 `~/.codex` 会话 JSONL，辅助定位 waiting、resume、stream、routing affinity 和 relay 连续性问题。
+
 #### 变更
 
 - control-plane 的 `station/config` 语义收口到 station-first 口径；GUI/TUI/tray/请求详情不再把默认站点、上次观测站点或旧 route-attempt 投影显示成 `active_station` / `legacy` / `config` 文案，`operator/summary` 回归断言也补强为显式拒绝旧 session-card、link 和 capability key。
@@ -14,6 +18,7 @@ All notable changes to this project will be documented in this file.
 
 #### 修复
 
+- 修复 Codex `/responses` / `/responses/compact` 流式请求在上游已返回 HTTP 200 但后续 SSE body 长时间无字节时会无限 waiting 的问题；现在默认 900 秒 idle watchdog 会用 Codex 可解析的 `response.failed` 结束流，并在日志中记录 `codex_helper_error=upstream_stream_idle_timeout`。可用 `CODEX_HELPER_STREAM_IDLE_TIMEOUT_SECS=0` 关闭，或设置秒数覆盖默认值。
 - TUI 的 Recent/History/Requests/Sessions 现在先在 `UiState` 里同步选择和表格状态，再交给 render 消费；Usage 预测样本来源也改成显式模型，不再通过 `Vec` 长度推断是否带上本地 request ledger。
 - 修复交互式 TUI/runtime 日志只在启动时检查大小的问题；`runtime.log` 现在会在运行过程中按 `CODEX_HELPER_RUNTIME_LOG_MAX_BYTES` / `CODEX_HELPER_RUNTIME_LOG_MAX_FILES` 持续轮转，并且升级后会在下次启动时清理超过保留预算的历史 `runtime.log.*`，避免老用户遗留的巨型日志继续占用磁盘。
 - 修复轮转日志清理在 Windows 上遇到占用或删除失败时会把文件大小误算为已释放的问题；删除失败的 `runtime.log.*` / `control_trace.*.jsonl` 会继续保留预算压力，清理会尝试后续候选，并在下次 repair 时重试，避免旧用户升级后仍残留超大轮转文件。
@@ -29,8 +34,13 @@ All notable changes to this project will be documented in this file.
 
 ### English summary
 
+#### Added
+
+- Added the repository `codex-session-diagnostics` skill for read-only collection of `~/.codex-helper` logs/state/config and `~/.codex` session JSONL files from a Codex session key, helping diagnose waiting, resume, stream, routing-affinity, and relay-continuity failures.
+
 #### Fixed
 
+- Fixed Codex `/responses` / `/responses/compact` streams waiting forever when an upstream returns HTTP 200 and then stops producing SSE body bytes. A 900-second idle watchdog now finishes the client stream with a Codex-parseable `response.failed` event and logs `codex_helper_error=upstream_stream_idle_timeout`; set `CODEX_HELPER_STREAM_IDLE_TIMEOUT_SECS=0` to disable it or set a custom timeout in seconds.
 - TUI Recent/History/Requests/Sessions now sync selection and table state inside `UiState` before render consumes them; Usage forecast sample provenance is now explicit instead of inferred from `Vec` length.
 - Fixed interactive TUI/runtime log rotation only checking file size at startup. `runtime.log` now rotates while the process is running according to `CODEX_HELPER_RUNTIME_LOG_MAX_BYTES` / `CODEX_HELPER_RUNTIME_LOG_MAX_FILES`, and upgrades clean up historical `runtime.log.*` files that exceed the retention budget on the next startup so oversized legacy logs do not keep consuming disk space.
 - Fixed bounded-log pruning accounting when Windows cannot delete a rotated file because it is still open. Failed deletes no longer count as recovered budget, later rotated candidates are still pruned, and the oversized file is retried on the next repair.

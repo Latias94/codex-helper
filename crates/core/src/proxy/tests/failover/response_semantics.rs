@@ -626,6 +626,75 @@ async fn proxy_codex_stream_upstream_read_error_emits_response_failed_terminal_e
 }
 
 #[tokio::test]
+async fn proxy_codex_stream_idle_timeout_emits_response_failed_terminal_event() {
+    let _env_guard = env_lock().await;
+    let temp_dir = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
+        scoped.set("CODEX_HELPER_STREAM_IDLE_TIMEOUT_SECS", "1");
+    }
+
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        post(|| async move {
+            let first = stream::once(async {
+                Ok::<Bytes, Infallible>(Bytes::from_static(
+                    b": upstream-started\n\ndata: {\"response\":{\"service_tier\":\"default\"}}\n\n",
+                ))
+            });
+            let stalled = stream::pending::<Result<Bytes, Infallible>>();
+            let mut response = Response::new(Body::from_stream(first.chain(stalled)));
+            *response.status_mut() = StatusCode::OK;
+            response
+                .headers_mut()
+                .insert("content-type", HeaderValue::from_static("text/event-stream"));
+            response
+        }),
+    );
+    let upstream = spawn_test_upstream(upstream);
+    let retry = retry_config(1, "502", Vec::new(), RetryStrategy::Failover);
+    let cfg = make_proxy_config(vec![upstream.upstream_config()], retry);
+    let proxy_service = proxy_service(cfg);
+    let state = proxy_service.state_handle();
+    let proxy = spawn_proxy_service(proxy_service);
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("client");
+    let resp = post_responses_json(
+        &client,
+        &proxy,
+        r#"{"model":"gpt-5","input":"hi","stream":true}"#,
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.text().await.expect("idle timeout should finish body");
+    assert!(body.contains("event: response.failed"), "{body}");
+    assert!(
+        body.contains(r#""codex_helper_error":"upstream_stream_idle_timeout""#),
+        "{body}"
+    );
+    assert!(
+        body.contains("Upstream stream idle timeout after 1s without bytes"),
+        "{body}"
+    );
+
+    let finished = find_finished_request(&state, 10, |request| request.path == "/v1/responses")
+        .await
+        .expect("finished request");
+    assert_eq!(finished.status_code, StatusCode::OK.as_u16());
+    assert!(finished.streaming);
+    assert!(finished.usage.is_none());
+    assert!(
+        finished.duration_ms < 3_000,
+        "duration should be bounded by idle watchdog: {finished:?}"
+    );
+}
+
+#[tokio::test]
 async fn proxy_codex_stream_mixed_upstream_failure_and_cooldown_reports_route_unavailable_sse() {
     let failing_hits = Arc::new(AtomicUsize::new(0));
     let failing_counter = failing_hits.clone();
