@@ -23,7 +23,7 @@ use super::attempt_health::{
 };
 use super::attempt_target::AttemptTarget;
 use super::classify::classify_upstream_response;
-use super::codex_failure_sse::CodexFailureSse;
+use super::codex_failure::CodexFailureSse;
 use super::concurrency_limits::ConcurrencyPermit;
 use super::headers::header_map_to_entries;
 use super::http_debug::{HttpDebugBase, warn_http_debug};

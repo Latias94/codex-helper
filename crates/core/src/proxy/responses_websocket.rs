@@ -27,6 +27,7 @@ use super::attempt_failures::{TerminalUpstreamFailureParams, apply_terminal_upst
 use super::attempt_health::record_attempt_success;
 use super::attempt_request::inject_auth_headers;
 use super::attempt_target::AttemptTarget;
+use super::codex_failure::CodexFailureKind;
 use super::concurrency_limits::ConcurrencyPermit;
 use super::headers::filter_request_headers;
 use super::passive_health::{record_passive_upstream_failure, record_passive_upstream_success};
@@ -852,7 +853,9 @@ async fn relay_websocket_streams(
     }
 
     let duration_ms = prepared.start.elapsed().as_millis() as u64;
-    let error_class = stream_error.as_ref().map(|_| "upstream_stream_error");
+    let error_class = stream_error
+        .as_ref()
+        .map(|_| CodexFailureKind::StreamError.helper_error());
     let mut upstream_chain = Vec::new();
     record_status_route_attempt(
         &mut upstream_chain,

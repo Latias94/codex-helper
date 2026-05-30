@@ -8,7 +8,7 @@ use crate::routing_ir::{
 };
 use crate::runtime_identity::ProviderEndpointKey;
 
-use super::codex_failure_sse::{CodexFailureSse, CodexFailureSseKind};
+use super::codex_failure::{CodexFailureKind, CodexFailureSse};
 use super::request_preparation::RequestFlavor;
 
 const DEFAULT_ROUTE_UNAVAILABLE_RETRY_SECS: u64 = 8;
@@ -158,12 +158,12 @@ pub(super) fn route_unavailable_response_for_request(
     Some(codex_stream_response(message, route_attempts, failure_kind))
 }
 
-fn codex_stream_failure_kind(route_attempts: &[RouteAttemptLog]) -> Option<CodexFailureSseKind> {
+fn codex_stream_failure_kind(route_attempts: &[RouteAttemptLog]) -> Option<CodexFailureKind> {
     let has_route_unavailable = route_attempts
         .iter()
         .any(|attempt| attempt.decision == "route_unavailable");
     if has_route_unavailable {
-        return Some(CodexFailureSseKind::RouteUnavailable);
+        return Some(CodexFailureKind::RouteUnavailable);
     }
 
     route_attempts
@@ -174,7 +174,7 @@ fn codex_stream_failure_kind(route_attempts: &[RouteAttemptLog]) -> Option<Codex
                 "failed_status" | "failed_transport" | "failed_body_read" | "failed_body_too_large"
             )
         })
-        .then_some(CodexFailureSseKind::UpstreamFailure)
+        .then_some(CodexFailureKind::UpstreamFailure)
 }
 
 fn route_unavailable_attempt(
@@ -249,7 +249,7 @@ fn reason_counts_for_log(route_attempts: &[RouteAttemptLog]) -> serde_json::Valu
 fn codex_stream_response(
     message: &str,
     route_attempts: &[RouteAttemptLog],
-    failure_kind: CodexFailureSseKind,
+    failure_kind: CodexFailureKind,
 ) -> Response<Body> {
     let retry_after_secs = route_unavailable_retry_after_secs(route_attempts)
         .unwrap_or(DEFAULT_ROUTE_UNAVAILABLE_RETRY_SECS);

@@ -3,14 +3,14 @@ use axum::http::{Response, StatusCode, header};
 use serde_json::{Map, Value, json};
 
 #[derive(Debug, Clone, Copy)]
-pub(super) enum CodexFailureSseKind {
+pub(super) enum CodexFailureKind {
     RouteUnavailable,
     UpstreamFailure,
     StreamError,
 }
 
-impl CodexFailureSseKind {
-    fn metadata_value(self) -> &'static str {
+impl CodexFailureKind {
+    pub(super) fn helper_error(self) -> &'static str {
         match self {
             Self::RouteUnavailable => "route_unavailable",
             Self::UpstreamFailure => "upstream_failure",
@@ -47,7 +47,7 @@ impl CodexFailureSseKind {
 }
 
 pub(super) struct CodexFailureSse<'a> {
-    kind: CodexFailureSseKind,
+    kind: CodexFailureKind,
     message: &'a str,
     retry_after_secs: Option<u64>,
     model: Option<&'a str>,
@@ -58,11 +58,11 @@ impl<'a> CodexFailureSse<'a> {
     pub(super) fn route_failure(
         message: &'a str,
         retry_after_secs: u64,
-        kind: CodexFailureSseKind,
+        kind: CodexFailureKind,
     ) -> Self {
         debug_assert!(matches!(
             kind,
-            CodexFailureSseKind::RouteUnavailable | CodexFailureSseKind::UpstreamFailure
+            CodexFailureKind::RouteUnavailable | CodexFailureKind::UpstreamFailure
         ));
         Self {
             kind,
@@ -79,7 +79,7 @@ impl<'a> CodexFailureSse<'a> {
         helper_error: &'a str,
     ) -> Self {
         Self {
-            kind: CodexFailureSseKind::StreamError,
+            kind: CodexFailureKind::StreamError,
             message,
             retry_after_secs: None,
             model,
@@ -91,7 +91,7 @@ impl<'a> CodexFailureSse<'a> {
         let now_ms = crate::logging::now_ms();
         let helper_error = self
             .helper_error
-            .unwrap_or_else(|| self.kind.metadata_value());
+            .unwrap_or_else(|| self.kind.helper_error());
 
         let mut metadata = Map::new();
         metadata.insert("codex_helper_error".to_string(), json!(helper_error));
@@ -170,7 +170,7 @@ mod tests {
         let event = CodexFailureSse::route_failure(
             "No upstreams are currently routable; try again in 8 seconds",
             8,
-            CodexFailureSseKind::RouteUnavailable,
+            CodexFailureKind::RouteUnavailable,
         )
         .to_event_string();
         let payload = event_payload(&event);
