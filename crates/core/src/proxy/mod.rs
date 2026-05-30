@@ -18,6 +18,7 @@ mod attempt_transport;
 mod auth_resolution;
 mod classify;
 mod client_identity;
+mod codex_failure_sse;
 mod codex_relay_capabilities;
 mod codex_relay_evidence;
 mod codex_relay_live_smoke;

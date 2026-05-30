@@ -582,13 +582,10 @@ pub(super) fn route_chain_summary(
     lang: Language,
 ) -> String {
     let total = segments.len();
-    let selected = selected
-        .and_then(|selected| {
-            segments
-                .iter()
-                .position(|segment| segment == selected)
-                .map(|idx| (idx, selected))
-        })
+    let selected = segments
+        .iter()
+        .position(|segment| selected.is_some_and(|selected| segment == selected))
+        .zip(selected)
         .map(|(idx, selected)| match lang {
             Language::Zh => format!("选中 {selected} #{}/{}", idx + 1, total),
             Language::En => format!("selected {selected} #{}/{}", idx + 1, total),

@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, Method, Response, StatusCode};
 use futures_util::{Stream, StreamExt, stream};
-use serde_json::json;
 use tracing::{info, warn};
 
 use crate::lb::LoadBalancer;
@@ -24,6 +23,7 @@ use super::attempt_health::{
 };
 use super::attempt_target::AttemptTarget;
 use super::classify::classify_upstream_response;
+use super::codex_failure_sse::CodexFailureSse;
 use super::concurrency_limits::ConcurrencyPermit;
 use super::headers::header_map_to_entries;
 use super::http_debug::{HttpDebugBase, warn_http_debug};
@@ -67,41 +67,6 @@ fn codex_responses_stream_idle_timeout(is_codex_service: bool, path: &str) -> Op
 fn is_codex_responses_sse_path(path: &str) -> bool {
     let path = path.trim_end_matches('/');
     path.ends_with("/responses") || path.ends_with("/responses/compact")
-}
-
-fn synthetic_codex_stream_failure_sse(
-    message: &str,
-    model: Option<&str>,
-    helper_error: &str,
-) -> String {
-    let now_ms = crate::logging::now_ms();
-    let mut response = json!({
-        "id": format!("resp_codex_helper_stream_error_{now_ms}"),
-        "object": "response",
-        "created_at": now_ms / 1000,
-        "status": "failed",
-        "background": false,
-        "output": [],
-        "error": {
-            "code": "upstream_error",
-            "message": message,
-        },
-        "usage": null,
-        "user": null,
-        "metadata": {
-            "codex_helper_error": helper_error,
-        },
-    });
-    if let (Some(model), Some(object)) = (model, response.as_object_mut())
-        && !model.trim().is_empty()
-    {
-        object.insert("model".to_string(), json!(model));
-    }
-    let payload = json!({
-        "type": "response.failed",
-        "response": response,
-    });
-    format!("\n\nevent: response.failed\ndata: {payload}\n\n")
 }
 
 #[derive(Clone, Debug)]
@@ -743,9 +708,9 @@ impl StreamForwardState {
                 .as_ref()
                 .and_then(|decision| decision.effective_model.as_ref())
                 .map(|model| model.value.as_str());
-            return Ok(Bytes::from(synthetic_codex_stream_failure_sse(
-                &message, model, class,
-            )));
+            return Ok(Bytes::from(
+                CodexFailureSse::stream_error(&message, model, class).to_event_string(),
+            ));
         }
 
         Err(io::Error::new(io_kind, message))

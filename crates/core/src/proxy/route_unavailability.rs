@@ -1,5 +1,5 @@
 use axum::body::Body;
-use axum::http::{Response, StatusCode, header};
+use axum::http::{Response, StatusCode};
 
 use crate::logging::{RouteAttemptLog, log_retry_trace};
 use crate::routing_ir::{
@@ -8,36 +8,11 @@ use crate::routing_ir::{
 };
 use crate::runtime_identity::ProviderEndpointKey;
 
+use super::codex_failure_sse::{CodexFailureSse, CodexFailureSseKind};
 use super::request_preparation::RequestFlavor;
 
 const DEFAULT_ROUTE_UNAVAILABLE_RETRY_SECS: u64 = 8;
 const MAX_ROUTE_UNAVAILABLE_RETRY_SECS: u64 = 60;
-
-#[derive(Debug, Clone, Copy)]
-enum CodexStreamFailureKind {
-    RouteUnavailable,
-    UpstreamFailure,
-}
-
-impl CodexStreamFailureKind {
-    fn metadata_value(self) -> &'static str {
-        match self {
-            Self::RouteUnavailable => "route_unavailable",
-            Self::UpstreamFailure => "upstream_failure",
-        }
-    }
-
-    fn error_code(self) -> &'static str {
-        "rate_limit_exceeded"
-    }
-
-    fn response_id_prefix(self) -> &'static str {
-        match self {
-            Self::RouteUnavailable => "resp_codex_helper_route_unavailable",
-            Self::UpstreamFailure => "resp_codex_helper_upstream_failure",
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub(super) struct RouteUnavailableReport {
@@ -183,12 +158,12 @@ pub(super) fn route_unavailable_response_for_request(
     Some(codex_stream_response(message, route_attempts, failure_kind))
 }
 
-fn codex_stream_failure_kind(route_attempts: &[RouteAttemptLog]) -> Option<CodexStreamFailureKind> {
+fn codex_stream_failure_kind(route_attempts: &[RouteAttemptLog]) -> Option<CodexFailureSseKind> {
     let has_route_unavailable = route_attempts
         .iter()
         .any(|attempt| attempt.decision == "route_unavailable");
     if has_route_unavailable {
-        return Some(CodexStreamFailureKind::RouteUnavailable);
+        return Some(CodexFailureSseKind::RouteUnavailable);
     }
 
     route_attempts
@@ -199,7 +174,7 @@ fn codex_stream_failure_kind(route_attempts: &[RouteAttemptLog]) -> Option<Codex
                 "failed_status" | "failed_transport" | "failed_body_read" | "failed_body_too_large"
             )
         })
-        .then_some(CodexStreamFailureKind::UpstreamFailure)
+        .then_some(CodexFailureSseKind::UpstreamFailure)
 }
 
 fn route_unavailable_attempt(
@@ -274,46 +249,11 @@ fn reason_counts_for_log(route_attempts: &[RouteAttemptLog]) -> serde_json::Valu
 fn codex_stream_response(
     message: &str,
     route_attempts: &[RouteAttemptLog],
-    failure_kind: CodexStreamFailureKind,
+    failure_kind: CodexFailureSseKind,
 ) -> Response<Body> {
     let retry_after_secs = route_unavailable_retry_after_secs(route_attempts)
         .unwrap_or(DEFAULT_ROUTE_UNAVAILABLE_RETRY_SECS);
-    let body = synthetic_codex_failure_sse(message, retry_after_secs, failure_kind);
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .body(Body::from(body))
-        .expect("synthetic SSE response should build")
-}
-
-fn synthetic_codex_failure_sse(
-    message: &str,
-    retry_after_secs: u64,
-    failure_kind: CodexStreamFailureKind,
-) -> String {
-    let payload = serde_json::json!({
-        "type": "response.failed",
-        "sequence_number": 1,
-        "response": {
-            "id": format!("{}_{}", failure_kind.response_id_prefix(), crate::logging::now_ms()),
-            "object": "response",
-            "created_at": crate::logging::now_ms() / 1000,
-            "status": "failed",
-            "background": false,
-            "error": {
-                "code": failure_kind.error_code(),
-                "message": message,
-            },
-            "usage": null,
-            "user": null,
-            "metadata": {
-                "codex_helper_error": failure_kind.metadata_value(),
-                "retry_after_secs": retry_after_secs,
-            },
-        },
-    });
-    format!("event: response.failed\ndata: {payload}\n\n")
+    CodexFailureSse::route_failure(message, retry_after_secs, failure_kind).into_response()
 }
 
 fn route_unavailable_retry_after_secs(route_attempts: &[RouteAttemptLog]) -> Option<u64> {
