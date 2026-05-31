@@ -344,38 +344,6 @@ pub fn service_name_for_kind(service_kind: ServiceKind) -> &'static str {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn admin_discovery_url_is_not_advertised_for_unspecified_bind() {
-        let admin_addr = SocketAddr::from(([0, 0, 0, 0], 4211));
-
-        assert_eq!(admin_discovery_base_url(admin_addr, None), None);
-    }
-
-    #[test]
-    fn admin_discovery_url_uses_explicit_bind_address() {
-        let admin_addr = SocketAddr::from(([192, 168, 1, 10], 4211));
-
-        assert_eq!(
-            admin_discovery_base_url(admin_addr, None),
-            Some("http://192.168.1.10:4211".to_string())
-        );
-    }
-
-    #[test]
-    fn admin_discovery_url_uses_advertised_url_when_provided() {
-        let admin_addr = SocketAddr::from(([0, 0, 0, 0], 4211));
-
-        assert_eq!(
-            admin_discovery_base_url(admin_addr, Some("http://nas.local:4211/")),
-            Some("http://nas.local:4211".to_string())
-        );
-    }
-}
-
 pub fn service_kind_for_name(service_name: &str) -> ServiceKind {
     match service_name {
         "claude" => ServiceKind::Claude,
@@ -439,4 +407,36 @@ fn spawn_proxy_runtime_servers(
         )?;
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn admin_discovery_url_is_not_advertised_for_unspecified_bind() {
+        let admin_addr = SocketAddr::from(([0, 0, 0, 0], 4211));
+
+        assert_eq!(admin_discovery_base_url(admin_addr, None), None);
+    }
+
+    #[test]
+    fn admin_discovery_url_uses_explicit_bind_address() {
+        let admin_addr = SocketAddr::from(([192, 168, 1, 10], 4211));
+
+        assert_eq!(
+            admin_discovery_base_url(admin_addr, None),
+            Some("http://192.168.1.10:4211".to_string())
+        );
+    }
+
+    #[test]
+    fn admin_discovery_url_uses_advertised_url_when_provided() {
+        let admin_addr = SocketAddr::from(([0, 0, 0, 0], 4211));
+
+        assert_eq!(
+            admin_discovery_base_url(admin_addr, Some("http://nas.local:4211/")),
+            Some("http://nas.local:4211".to_string())
+        );
+    }
 }

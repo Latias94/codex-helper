@@ -1,16 +1,11 @@
 use std::path::Path;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum HostLocalSessionHistoryMode {
+    #[default]
     Auto,
     Disabled,
     Enabled,
-}
-
-impl Default for HostLocalSessionHistoryMode {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 pub fn host_local_session_history_available() -> bool {
