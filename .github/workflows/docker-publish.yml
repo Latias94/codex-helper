@@ -15,6 +15,9 @@ on:
   push:
     tags:
       - "v*"
+  release:
+    types:
+      - published
   pull_request:
     paths:
       - "Dockerfile"
@@ -38,7 +41,7 @@ jobs:
     name: Build Docker image
     runs-on: ubuntu-24.04
     env:
-      DOCKER_PUBLISH: ${{ github.event_name == 'push' || inputs.publish == true }}
+      DOCKER_PUBLISH: ${{ github.event_name == 'push' || github.event_name == 'release' || inputs.publish == true }}
     steps:
       - name: Resolve release ref
         id: release
@@ -46,21 +49,36 @@ jobs:
         run: |
           set -euo pipefail
 
-          ref="${{ inputs.release_ref }}"
-          if [[ -z "$ref" ]]; then
-            ref="$GITHUB_REF_NAME"
-          fi
+          case "$GITHUB_EVENT_NAME" in
+            pull_request)
+              ref="$GITHUB_SHA"
+              tag="$GITHUB_SHA"
+              version="pr-${{ github.event.pull_request.number }}"
+              ;;
+            release)
+              ref="${{ github.event.release.tag_name }}"
+              tag="$ref"
+              version="${tag#v}"
+              ;;
+            workflow_dispatch)
+              ref="${{ inputs.release_ref }}"
+              tag="${ref#refs/tags/}"
+              version="${tag#v}"
+              ;;
+            *)
+              ref="$GITHUB_REF_NAME"
+              tag="${ref#refs/tags/}"
+              version="${tag#v}"
+              ;;
+          esac
 
-          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
+          if [[ "${GITHUB_EVENT_NAME}" != "pull_request" ]]; then
             tag="${ref#refs/tags/}"
             if [[ "$tag" != v* ]]; then
               echo "Docker releases must be built from a v* tag, got: $ref" >&2
               exit 64
             fi
             version="${tag#v}"
-          else
-            tag="$GITHUB_SHA"
-            version="pr-${{ github.event.pull_request.number }}"
           fi
 
           owner="${GITHUB_REPOSITORY_OWNER,,}"
@@ -73,7 +91,7 @@ jobs:
             echo "image=$image"
           } >>"$GITHUB_OUTPUT"
 
-      - name: Checkout
+      - name: Checkout release ref
         uses: actions/checkout@v6
         with:
           ref: ${{ github.event_name == 'pull_request' && github.sha || steps.release.outputs.ref }}
@@ -112,7 +130,7 @@ jobs:
             type=semver,pattern={{version}},value=${{ steps.release.outputs.tag }},enable=${{ github.event_name != 'pull_request' }}
             type=semver,pattern={{major}}.{{minor}},value=${{ steps.release.outputs.tag }},enable=${{ github.event_name != 'pull_request' }}
             type=raw,value=${{ steps.release.outputs.version }},enable=${{ github.event_name == 'pull_request' }}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(steps.release.outputs.version, '-') }}
+            type=raw,value=latest,enable=${{ github.event_name != 'pull_request' && startsWith(steps.release.outputs.tag, 'v') && !contains(steps.release.outputs.version, '-') }}
             type=sha
           labels: |
             org.opencontainers.image.title=codex-helper-server
