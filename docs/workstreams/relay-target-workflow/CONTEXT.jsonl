@@ -1,0 +1,9 @@
+{"role":"adr","path":"docs/adr/0001-central-relay-container-runtime.md","reason":"Defines central relay runtime semantics and host-local limits."}
+{"role":"prior_workstream","path":"docs/workstreams/runtime-boundary-refactor/DESIGN.md","reason":"Explains runtime options, advertised admin URL, and host-local policy boundaries."}
+{"role":"prior_workstream","path":"docs/workstreams/codex-server-container-deployment/DESIGN.md","reason":"Defines container deployment target state."}
+{"role":"prior_workstream","path":"docs/workstreams/resident-proxy-attach-first/DESIGN.md","reason":"Preserves local resident and attached observer semantics."}
+{"role":"related_workstream","path":"docs/workstreams/tauri-desktop-client/HANDOFF.md","reason":"Shows existing GUI attached and remote-control expectations."}
+{"role":"design","path":"docs/workstreams/relay-target-workflow/DESIGN.md","reason":"Primary target-state authority for this lane."}
+{"role":"tasks","path":"docs/workstreams/relay-target-workflow/TODO.md","reason":"Task ledger and validation slices."}
+{"role":"evidence","path":"docs/workstreams/relay-target-workflow/EVIDENCE_AND_GATES.md","reason":"Fresh validation evidence."}
+{"role":"closeout","path":"docs/workstreams/relay-target-workflow/JOURNAL/2026-05-31-closeout.md","reason":"Completion summary, gates, and follow-on note."}

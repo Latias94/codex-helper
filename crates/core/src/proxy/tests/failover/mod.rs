@@ -1715,6 +1715,7 @@ async fn proxy_multi_config_failover_across_requests_respects_cooldown() {
         retry,
         notify: Default::default(),
         default_service: None,
+        relay_targets: std::collections::BTreeMap::new(),
         ui: UiConfig::default(),
     };
 
@@ -1890,6 +1891,7 @@ async fn proxy_multi_config_does_not_cross_station_failover_when_pre_output_guar
         retry,
         notify: Default::default(),
         default_service: None,
+        relay_targets: std::collections::BTreeMap::new(),
         ui: UiConfig::default(),
     };
 

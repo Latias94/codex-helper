@@ -103,6 +103,7 @@ fn v4_tag_preferred_stop_excludes_non_matching_fallbacks() {
         retry: RetryConfig::default(),
         notify: NotifyConfig::default(),
         default_service: Some(ServiceKind::Codex),
+        relay_targets: std::collections::BTreeMap::new(),
         ui: UiConfig::default(),
     };
 
@@ -190,6 +191,7 @@ fn v4_nested_route_graph_expands_monthly_pool_before_paygo() {
         retry: RetryConfig::default(),
         notify: NotifyConfig::default(),
         default_service: Some(ServiceKind::Codex),
+        relay_targets: std::collections::BTreeMap::new(),
         ui: UiConfig::default(),
     };
 
@@ -304,6 +306,7 @@ fn compile_v4_to_runtime_direct_path_matches_v2_bridge_for_compat_state() {
         retry: RetryConfig::default(),
         notify: NotifyConfig::default(),
         default_service: Some(ServiceKind::Codex),
+        relay_targets: std::collections::BTreeMap::new(),
         ui: UiConfig::default(),
     };
 
@@ -594,6 +597,7 @@ fn migrate_v2_to_v4_emits_route_graph_and_inline_simple_providers() {
         retry: RetryConfig::default(),
         notify: NotifyConfig::default(),
         default_service: Some(ServiceKind::Codex),
+        relay_targets: std::collections::BTreeMap::new(),
         ui: UiConfig::default(),
     };
 
@@ -725,6 +729,7 @@ fn migrate_v2_to_v4_report_warns_when_flattening_endpoint_scoped_groups() {
         retry: RetryConfig::default(),
         notify: NotifyConfig::default(),
         default_service: Some(ServiceKind::Codex),
+        relay_targets: std::collections::BTreeMap::new(),
         ui: UiConfig::default(),
     };
 
@@ -923,6 +928,7 @@ fn migrate_v2_to_v4_omits_disabled_inactive_groups_from_route_graph() {
         retry: RetryConfig::default(),
         notify: NotifyConfig::default(),
         default_service: Some(ServiceKind::Codex),
+        relay_targets: std::collections::BTreeMap::new(),
         ui: UiConfig::default(),
     };
 
@@ -1694,6 +1700,7 @@ fn station_shaped_v2_config_migrates_to_route_graph_without_profile_station_bind
         retry: RetryConfig::default(),
         notify: NotifyConfig::default(),
         default_service: Some(ServiceKind::Codex),
+        relay_targets: std::collections::BTreeMap::new(),
         ui: UiConfig::default(),
     };
 

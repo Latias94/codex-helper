@@ -238,6 +238,7 @@ pub fn compile_v2_to_runtime(v2: &ProxyConfigV2) -> Result<ProxyConfig> {
         retry: v2.retry.clone(),
         notify: v2.notify.clone(),
         default_service: v2.default_service,
+        relay_targets: v2.relay_targets.clone(),
         ui: v2.ui.clone(),
     })
 }
@@ -332,6 +333,7 @@ pub fn migrate_legacy_to_v2(old: &ProxyConfig) -> ProxyConfigV2 {
         retry: old.retry.clone(),
         notify: old.notify.clone(),
         default_service: old.default_service,
+        relay_targets: old.relay_targets.clone(),
         ui: old.ui.clone(),
     }
 }
@@ -936,6 +938,7 @@ pub fn compact_v2_config(v2: &ProxyConfigV2) -> Result<ProxyConfigV2> {
         retry: v2.retry.clone(),
         notify: v2.notify.clone(),
         default_service: v2.default_service,
+        relay_targets: v2.relay_targets.clone(),
         ui: v2.ui.clone(),
     })
 }

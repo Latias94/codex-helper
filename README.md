@@ -136,6 +136,27 @@ codex-helper switch status
 codex-helper switch off
 ```
 
+NAS / 远端 relay target：
+
+```bash
+ch relay add nas \
+  --proxy-url http://nas.local:3211 \
+  --admin-url http://nas.local:4211 \
+  --admin-token-env CODEX_HELPER_NAS_ADMIN_TOKEN \
+  --preset official-relay
+
+ch relay list
+ch relay status nas
+ch relay nas
+ch relay nas --no-tui
+ch relay nas --attach-only
+ch relay off
+```
+
+`ch` 仍然是本机前台启动入口；`ch relay local` 是同一行为的显式 target 写法。`ch relay <name>` 会把本机 Codex patch 到远端 proxy，并附着一个本地 TUI 去看远端 admin API；`--no-tui` 只切换客户端，`--attach-only` 只看远端 TUI 不改本机 Codex 配置。admin token 只从 `--admin-token-env` 指定的环境变量读取，值不会写进 `~/.codex-helper/config.toml`。容器/NAS 端应设置 `advertised-admin-base-url`，或在 `relay add` 时显式给 `--admin-url`。
+
+远端 target 不等于远端拥有本机 Codex 会话文件。容器默认不会声明 host-local transcript/session 访问能力，除非你明确挂载并启用对应 server policy。
+
 预设怎么选：
 
 | 预设 | 适合什么情况 | 效果 |

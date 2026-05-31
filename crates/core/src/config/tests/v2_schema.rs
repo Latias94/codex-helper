@@ -102,6 +102,7 @@ fn compile_v2_to_runtime_orders_preferred_members() {
         retry: RetryConfig::default(),
         notify: NotifyConfig::default(),
         default_service: Some(ServiceKind::Codex),
+        relay_targets: std::collections::BTreeMap::new(),
         ui: UiConfig::default(),
     };
 
@@ -192,6 +193,7 @@ fn compile_v2_to_runtime_orders_provider_endpoints_by_priority() {
         retry: RetryConfig::default(),
         notify: NotifyConfig::default(),
         default_service: Some(ServiceKind::Codex),
+        relay_targets: std::collections::BTreeMap::new(),
         ui: UiConfig::default(),
     };
 
@@ -364,6 +366,7 @@ fn compact_v2_config_preserves_explicit_provider_alias() {
         retry: RetryConfig::default(),
         notify: NotifyConfig::default(),
         default_service: None,
+        relay_targets: std::collections::BTreeMap::new(),
         ui: UiConfig::default(),
     };
     v2.codex.providers.insert(

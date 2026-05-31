@@ -124,6 +124,27 @@ codex-helper switch status
 codex-helper switch off
 ```
 
+NAS / remote relay targets:
+
+```bash
+ch relay add nas \
+  --proxy-url http://nas.local:3211 \
+  --admin-url http://nas.local:4211 \
+  --admin-token-env CODEX_HELPER_NAS_ADMIN_TOKEN \
+  --preset official-relay
+
+ch relay list
+ch relay status nas
+ch relay nas
+ch relay nas --no-tui
+ch relay nas --attach-only
+ch relay off
+```
+
+Plain `ch` still starts the local foreground helper. `ch relay local` is the explicit target form for the same local flow. `ch relay <name>` patches the local Codex client to the remote proxy and attaches a local TUI to that target's admin API. Use `--no-tui` for switch-only and `--attach-only` for observe-only. Admin tokens are read from the environment variable named by `--admin-token-env`; token values are not written to `~/.codex-helper/config.toml`. The container/NAS side should set `advertised-admin-base-url`, or the client should pass `--admin-url` when adding the target.
+
+A remote target does not give the server access to this client's local Codex transcript/session files. Container deployments keep host-local transcript/session capabilities disabled unless those paths are explicitly mounted and enabled by server policy.
+
 Preset choices:
 
 | Preset | Use it when | Effect |

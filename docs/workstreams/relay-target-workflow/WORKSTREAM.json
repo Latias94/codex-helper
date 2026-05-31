@@ -1,0 +1,105 @@
+{
+  "schema_version": 1,
+  "slug": "relay-target-workflow",
+  "title": "Relay Target Workflow",
+  "status": "complete",
+  "updated": "2026-05-31",
+  "scope_kind": "execution",
+  "problem": "Local CLI and TUI flows still assume loopback admin access even though Synology and other central relay targets should be first-class daily targets.",
+  "authoritative_docs": [
+    {
+      "role": "design",
+      "path": "docs/workstreams/relay-target-workflow/DESIGN.md"
+    },
+    {
+      "role": "execution",
+      "path": "docs/workstreams/relay-target-workflow/TODO.md"
+    },
+    {
+      "role": "gates",
+      "path": "docs/workstreams/relay-target-workflow/EVIDENCE_AND_GATES.md"
+    },
+    {
+      "role": "context_manifest",
+      "path": "docs/workstreams/relay-target-workflow/CONTEXT.jsonl"
+    }
+  ],
+  "context_manifest": "docs/workstreams/relay-target-workflow/CONTEXT.jsonl",
+  "gates": [
+    "cargo fmt --all -- --check",
+    "cargo check --locked -p codex-helper",
+    "cargo check --locked -p codex-helper-core",
+    "cargo check --locked -p codex-helper-tui"
+  ],
+  "evidence": [
+    {
+      "date": "2026-05-31",
+      "command": "cargo fmt --all -- --check",
+      "result": "pass"
+    },
+    {
+      "date": "2026-05-31",
+      "command": "cargo check --locked -p codex-helper-core",
+      "result": "pass"
+    },
+    {
+      "date": "2026-05-31",
+      "command": "cargo check --locked -p codex-helper-tui",
+      "result": "pass"
+    },
+    {
+      "date": "2026-05-31",
+      "command": "cargo check --locked -p codex-helper",
+      "result": "pass"
+    },
+    {
+      "date": "2026-05-31",
+      "command": "cargo nextest run --locked -p codex-helper-core relay_target control_plane --no-fail-fast",
+      "result": "pass"
+    },
+    {
+      "date": "2026-05-31",
+      "command": "cargo nextest run --locked -p codex-helper-core v2_schema v4_schema --no-fail-fast",
+      "result": "pass"
+    },
+    {
+      "date": "2026-05-31",
+      "command": "cargo nextest run --locked -p codex-helper relay_cli --no-fail-fast",
+      "result": "pass"
+    },
+    {
+      "date": "2026-05-31",
+      "command": "cargo nextest run --locked -p codex-helper-tui attached --no-fail-fast",
+      "result": "pass"
+    },
+    {
+      "date": "2026-05-31",
+      "command": "docker compose --env-file deploy/compose/.env.example -f deploy/compose/codex-helper.yml config --quiet",
+      "result": "pass"
+    },
+    {
+      "date": "2026-05-31",
+      "command": "git diff --check",
+      "result": "pass"
+    }
+  ],
+  "adr_refs": [
+    "docs/adr/0001-central-relay-container-runtime.md"
+  ],
+  "architecture_refs": [
+    "docs/workstreams/runtime-boundary-refactor/DESIGN.md",
+    "docs/workstreams/resident-proxy-attach-first/DESIGN.md"
+  ],
+  "capability_tags": [
+    "relay-targets",
+    "remote-control-plane",
+    "tui-attach",
+    "codex-client-patching",
+    "synology"
+  ],
+  "lane_slug": null,
+  "continue_policy": {
+    "default_action": "continue",
+    "notes": "Continue while target-first relay UX and compatibility constraints remain valid. Split GUI redesign or remote transcript work into follow-ons."
+  }
+}

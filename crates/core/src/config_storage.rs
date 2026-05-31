@@ -442,6 +442,30 @@ version = 5
 # responses_websocket = false
 # translate_models = false
 
+# --- Relay targets（可选，本机客户端入口） ---
+#
+# Relay target 是本机保存的本地/远端 helper runtime 书签，给 `ch relay ...` 使用。
+# 它不替代下面的 provider/routing；真正处理请求的 server runtime 仍使用自己的
+# provider/routing 配置。
+#
+# local 是内置 target：`ch relay local` 等同于显式选择本机前台 helper。
+# 命名 target 通常指 NAS、Tailscale 或 LAN 上的 codex-helper-server：
+#
+# [relay_targets.nas]
+# service = "codex"
+# proxy_url = "http://nas.local:3211"
+# admin_url = "http://nas.local:4211"
+# admin_token_env = "CODEX_HELPER_NAS_ADMIN_TOKEN"
+# client_preset = "official-relay"
+# responses_websocket = false
+#
+# 常用命令：
+#   ch relay add nas --proxy-url http://nas.local:3211 --admin-url http://nas.local:4211 --admin-token-env CODEX_HELPER_NAS_ADMIN_TOKEN --preset official-relay
+#   ch relay nas
+#   ch relay nas --no-tui
+#   ch relay nas --attach-only
+#   ch relay off
+
 # --- TUI 用量预测（可选） ---
 #
 # TUI Stats 页会按最近窗口的已计价请求估算 USD/h，并外推到下次配额刷新时间。
@@ -967,6 +991,7 @@ async fn save_existing_v4_if_only_runtime_metadata_changed(
     existing.retry = requested.retry;
     existing.notify = requested.notify;
     existing.default_service = requested.default_service;
+    existing.relay_targets = requested.relay_targets;
     existing.ui = requested.ui;
     save_config_v4(&existing).await.map(Some)
 }

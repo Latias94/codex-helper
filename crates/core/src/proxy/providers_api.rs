@@ -416,6 +416,7 @@ fn provider_catalog_runtime_from_v4(cfg: &ProxyConfigV4, service_name: &str) -> 
         retry: cfg.retry.clone(),
         notify: cfg.notify.clone(),
         default_service: cfg.default_service,
+        relay_targets: cfg.relay_targets.clone(),
         ui: cfg.ui.clone(),
         ..ProxyConfig::default()
     };
@@ -433,6 +434,7 @@ fn provider_catalog_runtime_from_v2(cfg: &ProxyConfigV2, service_name: &str) -> 
         retry: cfg.retry.clone(),
         notify: cfg.notify.clone(),
         default_service: cfg.default_service,
+        relay_targets: cfg.relay_targets.clone(),
         ui: cfg.ui.clone(),
         ..ProxyConfig::default()
     };

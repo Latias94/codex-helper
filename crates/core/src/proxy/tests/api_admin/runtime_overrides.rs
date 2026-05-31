@@ -630,6 +630,7 @@ async fn proxy_api_v1_provider_runtime_override_filters_real_routing() {
         retry: RetryConfig::default(),
         notify: Default::default(),
         default_service: None,
+        relay_targets: std::collections::BTreeMap::new(),
         ui: UiConfig::default(),
     };
     cfg.codex.active_group = Some("main".to_string());
@@ -920,6 +921,7 @@ async fn proxy_api_v1_provider_runtime_override_filters_v4_route_plan_routing() 
         retry: RetryConfig::default(),
         notify: Default::default(),
         default_service: None,
+        relay_targets: std::collections::BTreeMap::new(),
         ui: UiConfig::default(),
     };
 

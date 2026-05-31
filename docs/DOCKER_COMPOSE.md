@@ -21,7 +21,23 @@ The first start copies `/config/config.toml` into `/data/config.toml`. Later sta
 
 ## Client Configuration
 
-On each client machine that should use the NAS relay, point Codex at the NAS proxy:
+On each client machine that should use the NAS relay, prefer saving a relay target:
+
+```bash
+export CODEX_HELPER_NAS_ADMIN_TOKEN='same-long-token-as-compose'
+
+ch relay add nas \
+  --proxy-url http://NAS_IP_OR_TAILSCALE_IP:3211 \
+  --admin-url http://NAS_IP_OR_TAILSCALE_IP:4211 \
+  --admin-token-env CODEX_HELPER_NAS_ADMIN_TOKEN \
+  --preset official-relay
+
+ch relay nas
+```
+
+`ch relay nas` patches that client machine's Codex config to the NAS proxy and opens a local attached TUI backed by the NAS admin API. Use `ch relay nas --no-tui` when you only want to switch Codex, or `ch relay nas --attach-only` when you only want to inspect the NAS runtime. Use `ch relay off` to restore the local Codex/Claude client patch.
+
+Manual Codex config is still possible, but it does not give you target status or attached TUI:
 
 ```toml
 model_provider = "codex_proxy"

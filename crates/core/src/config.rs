@@ -516,6 +516,22 @@ fn is_default_usage_forecast_config(value: &UsageForecastConfig) -> bool {
     value == &UsageForecastConfig::default()
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct RelayTargetConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service: Option<ServiceKind>,
+    pub proxy_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admin_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admin_token_env: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_preset: Option<crate::codex_integration::CodexPatchMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub responses_websocket: Option<bool>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProxyConfig {
     /// Optional config schema version for future migrations
@@ -536,6 +552,9 @@ pub struct ProxyConfig {
     /// 默认目标服务（用于 CLI 默认选择 codex/claude）
     #[serde(default)]
     pub default_service: Option<ServiceKind>,
+    /// Named local or remote relay targets used by daily CLI/TUI workflows.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub relay_targets: BTreeMap<String, RelayTargetConfig>,
     /// UI settings (mainly for the built-in TUI).
     #[serde(default)]
     pub ui: UiConfig,
@@ -573,6 +592,8 @@ pub struct ProxyConfigV2 {
     pub notify: NotifyConfig,
     #[serde(default)]
     pub default_service: Option<ServiceKind>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub relay_targets: BTreeMap<String, RelayTargetConfig>,
     #[serde(default)]
     pub ui: UiConfig,
 }
@@ -586,6 +607,7 @@ impl Default for ProxyConfigV2 {
             retry: RetryConfig::default(),
             notify: NotifyConfig::default(),
             default_service: None,
+            relay_targets: BTreeMap::new(),
             ui: UiConfig::default(),
         }
     }
@@ -605,6 +627,8 @@ pub struct ProxyConfigV4 {
     pub notify: NotifyConfig,
     #[serde(default)]
     pub default_service: Option<ServiceKind>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub relay_targets: BTreeMap<String, RelayTargetConfig>,
     #[serde(default)]
     pub ui: UiConfig,
 }
@@ -618,6 +642,7 @@ impl Default for ProxyConfigV4 {
             retry: RetryConfig::default(),
             notify: NotifyConfig::default(),
             default_service: None,
+            relay_targets: BTreeMap::new(),
             ui: UiConfig::default(),
         }
     }

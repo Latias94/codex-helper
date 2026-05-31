@@ -1430,6 +1430,7 @@ mod tests {
             retry: RetryConfig::default(),
             notify: Default::default(),
             default_service: None,
+            relay_targets: std::collections::BTreeMap::new(),
             ui: UiConfig::default(),
         };
         ProxyService::new(

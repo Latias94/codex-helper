@@ -41,6 +41,34 @@ Codex 自己的文件仍由 Codex 维护：
 
 `switch on/off` 和一键启动只会 patch Codex 配置中的本地代理片段。它们不会覆盖无关的 Codex 配置改动。
 
+## Relay Targets
+
+Relay target 是本机客户端保存的本地/远端 codex-helper runtime 书签，配置在 `~/.codex-helper/config.toml`，供 `ch relay ...` 使用；真正的 provider/routing 配置仍然属于接收请求的 server runtime。
+
+```toml
+[relay_targets.nas]
+service = "codex"
+proxy_url = "http://nas.local:3211"
+admin_url = "http://nas.local:4211"
+admin_token_env = "CODEX_HELPER_NAS_ADMIN_TOKEN"
+client_preset = "official-relay"
+responses_websocket = false
+```
+
+等价 CLI：
+
+```bash
+ch relay add nas \
+  --proxy-url http://nas.local:3211 \
+  --admin-url http://nas.local:4211 \
+  --admin-token-env CODEX_HELPER_NAS_ADMIN_TOKEN \
+  --preset official-relay
+```
+
+`local` 是内置 target，会按当前 `default_service` 解析到普通 loopback 端口，所以 `ch relay local` 保持正常本地前台启动语义。命名 target 默认是远端：`ch relay nas` 会把本机 Codex 配置 patch 到目标 proxy，并用本机 TUI 附着到目标 admin API。`--no-tui` 只切换客户端，`--attach-only` 只观察不改本机 Codex 配置。
+
+`admin_token_env` 保存的是环境变量名，不是 token 值。Docker/NAS target 推荐在 server 侧设置 `advertised-admin-base-url`，让 `relay add` 能发现可访问的 admin URL；否则在添加 target 时显式传 `--admin-url`。
+
 ## Codex 客户端 Patch 预设
 
 默认预设只把 `~/.codex/config.toml` 的 `model_provider` 指到本地 `codex_proxy`。如果要保留 ChatGPT 登录态和移动端/桌面端账号能力，同时让模型请求进入 codex-helper，可启用 ChatGPT bridge：

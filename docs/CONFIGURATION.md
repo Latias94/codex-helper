@@ -41,6 +41,34 @@ Codex-owned files remain owned by Codex:
 
 `switch on/off` and one-command startup only patch the local Codex proxy section. They do not overwrite unrelated Codex config changes.
 
+## Relay Targets
+
+Relay targets are client-side bookmarks for local or remote codex-helper runtimes. They live in `~/.codex-helper/config.toml` and are used by `ch relay ...`; provider/routing config still belongs to the server runtime that receives traffic.
+
+```toml
+[relay_targets.nas]
+service = "codex"
+proxy_url = "http://nas.local:3211"
+admin_url = "http://nas.local:4211"
+admin_token_env = "CODEX_HELPER_NAS_ADMIN_TOKEN"
+client_preset = "official-relay"
+responses_websocket = false
+```
+
+Equivalent CLI:
+
+```bash
+ch relay add nas \
+  --proxy-url http://nas.local:3211 \
+  --admin-url http://nas.local:4211 \
+  --admin-token-env CODEX_HELPER_NAS_ADMIN_TOKEN \
+  --preset official-relay
+```
+
+`local` is built in and resolves to the normal loopback ports for the current `default_service`, so `ch relay local` preserves the normal local foreground flow. Named targets are remote by default: `ch relay nas` patches this machine's Codex config to the target proxy and opens an attached TUI against the target admin API. `--no-tui` switches only; `--attach-only` observes only.
+
+`admin_token_env` stores the environment variable name, not the token value. For Docker/NAS targets, prefer setting `advertised-admin-base-url` on the server so `relay add` can discover a reachable admin URL; otherwise pass `--admin-url` explicitly.
+
 ## Codex Client Preset
 
 The default preset only points `~/.codex/config.toml` `model_provider` at the local `codex_proxy`. To keep ChatGPT account auth and mobile/desktop account features while routing model requests through codex-helper, enable ChatGPT bridge:

@@ -1,7 +1,7 @@
 use crate::basellm_metadata;
 use crate::cli_types::{
     Cli, CliError, CliResult, CodexClientPatchPresetArg, Command, DaemonCommand, NotifyCommand,
-    RemoteControlCommand, SwitchCommand,
+    RelayCommand, RemoteControlCommand, SwitchCommand,
 };
 use crate::codex_integration;
 use crate::codex_models_cache::{
@@ -9,11 +9,13 @@ use crate::codex_models_cache::{
 };
 use crate::commands;
 use crate::config::{
-    LoadedProxyConfig, ServiceKind, claude_settings_backup_path, claude_settings_path,
-    codex_auth_path, codex_client_patch_config_from_config_file, codex_config_path,
-    codex_models_cache_path, codex_switch_state_path, load_config,
-    load_or_bootstrap_for_service_with_v4_source, normalize_config_toml_authoring,
+    LoadedProxyConfig, RelayTargetConfig, ServiceKind, claude_settings_backup_path,
+    claude_settings_path, codex_auth_path, codex_client_patch_config_from_config_file,
+    codex_config_path, codex_models_cache_path, codex_switch_state_path, load_config,
+    load_config_with_v4_source, load_or_bootstrap_for_service_with_v4_source,
+    normalize_config_toml_authoring, save_config, save_config_v4,
 };
+use crate::control_plane_client::{ControlPlaneClient, ControlPlaneEndpoint};
 use crate::notify;
 use crate::proxy::admin_loopback_addr_for_proxy_port;
 use crate::runtime_host::{
@@ -24,6 +26,10 @@ use crate::runtime_manager::{
     read_owner_marker_best_effort, write_owner_marker,
 };
 use crate::tui;
+use codex_helper_core::relay_target::{
+    ResolvedRelayTarget, normalize_relay_target_name, relay_target_config_from_args,
+    relay_target_names, resolve_relay_target,
+};
 
 use clap::Parser;
 use codex_helper_core::local_log_store::{LogRetention, RotatingLogWriter, repair_log};
@@ -74,6 +80,10 @@ pub async fn run_cli() -> CliResult<()> {
             )
             .await
             .map_err(|e| CliError::Other(e.to_string()))?;
+            return Ok(());
+        }
+        Command::Relay { cmd } => {
+            handle_relay_cmd(cmd).await?;
             return Ok(());
         }
         Command::Switch { cmd } => {
@@ -195,6 +205,11 @@ fn init_tracing(cli: &Cli) -> Option<WorkerGuard> {
         }
         Some(Command::Tui { .. }) => {
             atty::is(atty::Stream::Stdin) && atty::is(atty::Stream::Stdout)
+        }
+        Some(Command::Relay { cmd }) => {
+            relay_command_opens_tui(cmd)
+                && atty::is(atty::Stream::Stdin)
+                && atty::is(atty::Stream::Stdout)
         }
         None => atty::is(atty::Stream::Stdin) && atty::is(atty::Stream::Stdout),
         _ => false,
@@ -320,6 +335,355 @@ async fn resolve_cli_service_name(codex: bool, claude: bool) -> CliResult<&'stat
 
 fn default_proxy_port_for_service(service_name: &str) -> u16 {
     if service_name == "claude" { 3210 } else { 3211 }
+}
+
+fn relay_command_opens_tui(cmd: &RelayCommand) -> bool {
+    match cmd {
+        RelayCommand::Use { no_tui, .. } => !*no_tui,
+        RelayCommand::Target(args) => !args.iter().any(|arg| arg == "--no-tui"),
+        _ => false,
+    }
+}
+
+async fn handle_relay_cmd(cmd: RelayCommand) -> CliResult<()> {
+    match cmd {
+        RelayCommand::Add {
+            name,
+            proxy_url,
+            admin_url,
+            admin_token_env,
+            codex,
+            claude,
+            preset,
+            responses_websocket,
+        } => {
+            let service = relay_service_from_flags(codex, claude)?;
+            add_relay_target(
+                name,
+                proxy_url,
+                admin_url,
+                admin_token_env,
+                service,
+                preset,
+                responses_websocket,
+            )
+            .await
+        }
+        RelayCommand::List => list_relay_targets().await,
+        RelayCommand::Status { target, json } => relay_status(target, json).await,
+        RelayCommand::Off { codex, claude } => do_switch_off(codex, claude),
+        RelayCommand::Use {
+            target,
+            no_tui,
+            attach_only,
+        } => use_relay_target(target, no_tui, attach_only).await,
+        RelayCommand::Target(args) => {
+            let (target, no_tui, attach_only) = parse_relay_target_shorthand(args)?;
+            use_relay_target(target, no_tui, attach_only).await
+        }
+    }
+}
+
+fn relay_service_from_flags(codex: bool, claude: bool) -> CliResult<ServiceKind> {
+    if codex && claude {
+        return Err(CliError::Other(
+            "Please specify at most one of --codex / --claude".to_string(),
+        ));
+    }
+    if claude {
+        Ok(ServiceKind::Claude)
+    } else {
+        Ok(ServiceKind::Codex)
+    }
+}
+
+fn parse_relay_target_shorthand(args: Vec<String>) -> CliResult<(String, bool, bool)> {
+    let Some(target) = args.first().cloned() else {
+        return Err(CliError::Other(
+            "relay target name is required; try `ch relay local` or `ch relay use nas`".to_string(),
+        ));
+    };
+    let mut no_tui = false;
+    let mut attach_only = false;
+    for arg in args.iter().skip(1) {
+        match arg.as_str() {
+            "--no-tui" => no_tui = true,
+            "--attach-only" => attach_only = true,
+            other => {
+                return Err(CliError::Other(format!(
+                    "unsupported relay target flag '{other}'; supported flags are --no-tui and --attach-only"
+                )));
+            }
+        }
+    }
+    Ok((target, no_tui, attach_only))
+}
+
+async fn add_relay_target(
+    name: String,
+    proxy_url: String,
+    admin_url: Option<String>,
+    admin_token_env: Option<String>,
+    service: ServiceKind,
+    preset: Option<CodexClientPatchPresetArg>,
+    responses_websocket: bool,
+) -> CliResult<()> {
+    let discovered_admin_url = if admin_url.is_none() {
+        match ControlPlaneClient::discover_admin_base_url(&proxy_url).await {
+            Ok(discovery) => Some(discovery.admin_base_url),
+            Err(err) => {
+                tracing::warn!("failed to discover relay admin URL from {proxy_url}: {err}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let target = relay_target_config_from_args(
+        Some(service),
+        proxy_url,
+        admin_url.or(discovered_admin_url),
+        admin_token_env,
+        preset.map(Into::into),
+        responses_websocket.then_some(true),
+    )
+    .map_err(|err| CliError::Other(err.to_string()))?;
+
+    save_named_relay_target(&name, target).await?;
+    println!("Saved relay target '{name}'.");
+    Ok(())
+}
+
+async fn save_named_relay_target(name: &str, target: RelayTargetConfig) -> CliResult<()> {
+    let name = normalize_relay_target_name(name).map_err(|err| CliError::Other(err.to_string()))?;
+    if name == "local" {
+        return Err(CliError::Other(
+            "relay target name cannot be the built-in 'local' target".to_string(),
+        ));
+    }
+    let mut loaded = load_config_with_v4_source()
+        .await
+        .map_err(|err| CliError::ProxyConfig(err.to_string()))?;
+    if let Some(mut v4) = loaded.v4.take() {
+        v4.relay_targets.insert(name, target);
+        save_config_v4(&v4)
+            .await
+            .map_err(|err| CliError::ProxyConfig(err.to_string()))?;
+    } else {
+        loaded.runtime.relay_targets.insert(name, target);
+        save_config(&loaded.runtime)
+            .await
+            .map_err(|err| CliError::ProxyConfig(err.to_string()))?;
+    }
+    Ok(())
+}
+
+async fn list_relay_targets() -> CliResult<()> {
+    let cfg = load_config()
+        .await
+        .map_err(|err| CliError::ProxyConfig(err.to_string()))?;
+    println!("{}", "codex-helper relay targets".bold());
+    for name in relay_target_names(&cfg) {
+        let target = resolve_relay_target(&cfg, &name)
+            .map_err(|err| CliError::ProxyConfig(err.to_string()))?;
+        let service = service_name_for_kind(target.service);
+        let admin = target.admin_url.as_deref().unwrap_or("<discover>");
+        let marker = if target.is_local() {
+            "built-in"
+        } else {
+            "configured"
+        };
+        println!(
+            "  {name:<16} {service:<6} proxy={} admin={} ({marker})",
+            target.proxy_url, admin
+        );
+    }
+    Ok(())
+}
+
+async fn relay_status(target: Option<String>, json: bool) -> CliResult<()> {
+    let cfg = load_config()
+        .await
+        .map_err(|err| CliError::ProxyConfig(err.to_string()))?;
+    if let Some(target_name) = target {
+        let target = resolve_relay_target(&cfg, &target_name)
+            .map_err(|err| CliError::ProxyConfig(err.to_string()))?;
+        return print_relay_target_status(target, json).await;
+    }
+
+    if json {
+        let status = codex_integration::codex_switch_status()
+            .map_err(|err| CliError::CodexConfig(err.to_string()))?;
+        let targets = relay_target_names(&cfg);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "targets": targets,
+                "codex": {
+                    "enabled": status.enabled,
+                    "base_url": status.base_url,
+                    "model_provider": status.model_provider,
+                }
+            }))
+            .unwrap_or_else(|_| "{}".to_string())
+        );
+        return Ok(());
+    }
+
+    println!("{}", "codex-helper relay status".bold());
+    println!("targets: {}", relay_target_names(&cfg).join(", "));
+    print_codex_switch_status();
+    Ok(())
+}
+
+async fn print_relay_target_status(target: ResolvedRelayTarget, json: bool) -> CliResult<()> {
+    let Some(admin_url) = target.admin_url.clone() else {
+        return Err(CliError::Other(format!(
+            "relay target '{}' has no admin URL",
+            target.name
+        )));
+    };
+    let client = ControlPlaneClient::new(ControlPlaneEndpoint::new(
+        admin_url.clone(),
+        target.admin_token_env.clone(),
+    )?)
+    .map_err(|err| CliError::Other(err.to_string()))?;
+    let runtime_status = client.runtime_status().await;
+    if json {
+        let payload = match runtime_status {
+            Ok(status) => serde_json::json!({
+                "target": target.name,
+                "service": service_name_for_kind(target.service),
+                "proxy_url": target.proxy_url,
+                "admin_url": admin_url,
+                "reachable": true,
+                "runtime": status,
+            }),
+            Err(err) => serde_json::json!({
+                "target": target.name,
+                "service": service_name_for_kind(target.service),
+                "proxy_url": target.proxy_url,
+                "admin_url": admin_url,
+                "reachable": false,
+                "error": err.to_string(),
+            }),
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
+        );
+        return Ok(());
+    }
+
+    println!("{}", format!("relay target '{}'", target.name).bold());
+    println!("  service: {}", service_name_for_kind(target.service));
+    println!("  proxy:   {}", target.proxy_url);
+    println!("  admin:   {}", admin_url);
+    match runtime_status {
+        Ok(status) => {
+            println!("  status:  {}", "[UP]".green());
+            println!("  shutdown API: {}", status.shutdown_available);
+        }
+        Err(err) => {
+            println!("  status:  {}", "[DOWN]".yellow());
+            println!("  error:   {err}");
+        }
+    }
+    Ok(())
+}
+
+async fn use_relay_target(target_name: String, no_tui: bool, attach_only: bool) -> CliResult<()> {
+    if no_tui && attach_only {
+        return Err(CliError::Other(
+            "`--no-tui` and `--attach-only` together have no effect".to_string(),
+        ));
+    }
+    let cfg = load_config()
+        .await
+        .map_err(|err| CliError::ProxyConfig(err.to_string()))?;
+    let target = resolve_relay_target(&cfg, &target_name)
+        .map_err(|err| CliError::ProxyConfig(err.to_string()))?;
+    if target.is_local() && !attach_only {
+        let service_name = service_name_for_kind(target.service);
+        let port = relay_proxy_port(&target)
+            .unwrap_or_else(|| default_proxy_port_for_service(service_name));
+        return run_server(
+            service_name,
+            IpAddr::from([127, 0, 0, 1]),
+            port,
+            !no_tui,
+            false,
+            false,
+            false,
+        )
+        .await
+        .map_err(|err| CliError::Other(err.to_string()));
+    }
+
+    if !attach_only {
+        switch_client_to_relay_target(&target)?;
+        println!(
+            "Switched {} client to relay target '{}' ({})",
+            service_name_for_kind(target.service),
+            target.name,
+            target.proxy_url
+        );
+    }
+    if !no_tui {
+        attach_tui_to_relay_target(&target).await?;
+    }
+    Ok(())
+}
+
+fn switch_client_to_relay_target(target: &ResolvedRelayTarget) -> CliResult<()> {
+    match target.service {
+        ServiceKind::Codex => {
+            codex_integration::guard_codex_config_before_switch_on_interactive()?;
+            codex_integration::switch_on_with_base_url(
+                &target.proxy_url,
+                target.client_preset,
+                target.client_options,
+            )
+            .map_err(|err| CliError::CodexConfig(err.to_string()))?;
+        }
+        ServiceKind::Claude => {
+            codex_integration::claude_switch_on_base_url(&target.proxy_url)
+                .map_err(|err| CliError::CodexConfig(err.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+async fn attach_tui_to_relay_target(target: &ResolvedRelayTarget) -> CliResult<()> {
+    let Some(admin_url) = target.admin_url.clone() else {
+        return Err(CliError::Other(format!(
+            "relay target '{}' has no admin URL",
+            target.name
+        )));
+    };
+    tui::run_attached_dashboard_with_admin_base_url(
+        service_name_for_kind(target.service),
+        relay_proxy_port(target).unwrap_or_else(|| {
+            default_proxy_port_for_service(service_name_for_kind(target.service))
+        }),
+        admin_url,
+        target.admin_token_env.clone(),
+    )
+    .await
+    .map_err(|err| CliError::Other(err.to_string()))
+}
+
+fn service_name_for_kind(service: ServiceKind) -> &'static str {
+    match service {
+        ServiceKind::Codex => "codex",
+        ServiceKind::Claude => "claude",
+    }
+}
+
+fn relay_proxy_port(target: &ResolvedRelayTarget) -> Option<u16> {
+    reqwest::Url::parse(&target.proxy_url)
+        .ok()
+        .and_then(|url| url.port_or_known_default())
 }
 
 fn daemon_admin_base_url_for_proxy_port(port: u16) -> String {

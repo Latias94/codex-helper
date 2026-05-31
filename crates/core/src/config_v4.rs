@@ -637,6 +637,7 @@ pub fn compile_v4_to_v2(v4: &ProxyConfigV4) -> Result<ProxyConfigV2> {
         retry: v4.retry.clone(),
         notify: v4.notify.clone(),
         default_service: v4.default_service,
+        relay_targets: v4.relay_targets.clone(),
         ui: v4.ui.clone(),
     })
 }
@@ -653,6 +654,7 @@ pub fn compile_v4_to_runtime(v4: &ProxyConfigV4) -> Result<ProxyConfig> {
         retry: v4.retry.clone(),
         notify: v4.notify.clone(),
         default_service: v4.default_service,
+        relay_targets: v4.relay_targets.clone(),
         ui: v4.ui.clone(),
     })
 }
@@ -976,6 +978,7 @@ pub fn migrate_v2_to_v4_with_report(v2: &ProxyConfigV2) -> Result<ConfigV4Migrat
         retry: compact.retry,
         notify: compact.notify,
         default_service: compact.default_service,
+        relay_targets: compact.relay_targets,
         ui: compact.ui,
     };
 
@@ -1281,6 +1284,7 @@ pub mod legacy {
             retry: legacy.retry.clone(),
             notify: legacy.notify.clone(),
             default_service: legacy.default_service,
+            relay_targets: BTreeMap::new(),
             ui: legacy.ui.clone(),
         };
         config.normalize_routing_authoring();

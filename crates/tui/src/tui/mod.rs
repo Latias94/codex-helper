@@ -13,7 +13,7 @@ mod terminal;
 mod types;
 mod view;
 
-pub use attached::run_attached_dashboard;
+pub use attached::{run_attached_dashboard, run_attached_dashboard_with_admin_base_url};
 pub use i18n::Language;
 pub use i18n::{detect_system_language, parse_language, resolve_language_preference};
 #[allow(unused_imports)]

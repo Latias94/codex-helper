@@ -1,12 +1,12 @@
 use std::time::{Duration, Instant};
 
-use anyhow::Context;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
 use futures_util::StreamExt;
 
 use crate::config::storage::load_config;
+use crate::control_plane_client::{ControlPlaneClient, ControlPlaneEndpoint};
 use crate::dashboard_core::ApiV1Snapshot;
-use crate::proxy::{ADMIN_TOKEN_ENV_VAR, ADMIN_TOKEN_HEADER, RuntimeStatusResponse};
+use crate::proxy::RuntimeStatusResponse;
 
 use super::i18n;
 use super::model::{
@@ -19,49 +19,32 @@ use super::types::{Focus, Overlay, Page, StatsFocus};
 use super::{RenderInvalidation, enter_dashboard_terminal, input, leave_dashboard_terminal};
 
 struct AttachedDashboardRuntime {
-    admin_port: u16,
-    admin_base_url: String,
-    client: reqwest::Client,
+    client: ControlPlaneClient,
 }
 
 impl AttachedDashboardRuntime {
     fn new(_service_name: &'static str, _port: u16, admin_port: u16) -> anyhow::Result<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(1200))
-            .build()
-            .context("failed to build attached TUI admin client")?;
-        Ok(Self {
-            admin_port,
-            admin_base_url: format!("http://127.0.0.1:{admin_port}"),
-            client,
-        })
+        Self::new_with_admin_base_url(format!("http://127.0.0.1:{admin_port}"), None)
+    }
+
+    fn new_with_admin_base_url(
+        admin_base_url: impl Into<String>,
+        admin_token_env: Option<String>,
+    ) -> anyhow::Result<Self> {
+        let endpoint = ControlPlaneEndpoint::new(admin_base_url, admin_token_env)?;
+        let client = ControlPlaneClient::new(endpoint)?;
+        Ok(Self { client })
+    }
+
+    fn admin_base_url(&self) -> &str {
+        &self.client.endpoint().admin_base_url
     }
 
     async fn fetch_json<T>(&self, path: &str) -> anyhow::Result<T>
     where
         T: serde::de::DeserializeOwned,
     {
-        let url = format!("{}{}", self.admin_base_url, path);
-        let mut request = self.client.get(url);
-        if let Ok(token) = std::env::var(ADMIN_TOKEN_ENV_VAR)
-            && !token.trim().is_empty()
-        {
-            request = request.header(ADMIN_TOKEN_HEADER, token);
-        }
-
-        let response = request
-            .send()
-            .await
-            .with_context(|| format!("admin API not reachable on 127.0.0.1:{}", self.admin_port))?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("admin API returned {status}: {}", body.trim());
-        }
-        response
-            .json::<T>()
-            .await
-            .context("admin API response is not valid JSON")
+        self.client.fetch_json(path).await
     }
 
     async fn runtime_status(&self) -> anyhow::Result<RuntimeStatusResponse> {
@@ -70,12 +53,12 @@ impl AttachedDashboardRuntime {
     }
 
     async fn snapshot(&self, stats_days: usize) -> anyhow::Result<ApiV1Snapshot> {
-        self.fetch_json(&format!(
-            "/__codex_helper/api/v1/snapshot?recent_limit={}&stats_days={}",
-            crate::state::recent_finished_max().min(2_000),
-            stats_days.min(365)
-        ))
-        .await
+        self.client
+            .snapshot(
+                crate::state::recent_finished_max().min(2_000),
+                stats_days.min(365),
+            )
+            .await
     }
 }
 
@@ -85,12 +68,28 @@ pub async fn run_attached_dashboard(
     admin_port: u16,
 ) -> anyhow::Result<()> {
     let runtime = AttachedDashboardRuntime::new(service_name, port, admin_port)?;
-    let cfg = load_config()
-        .await
-        .context("failed to load local codex-helper config for attached TUI")?;
+    run_attached_dashboard_runtime(service_name, port, runtime).await
+}
+
+pub async fn run_attached_dashboard_with_admin_base_url(
+    service_name: &'static str,
+    port: u16,
+    admin_base_url: String,
+    admin_token_env: Option<String>,
+) -> anyhow::Result<()> {
+    let runtime =
+        AttachedDashboardRuntime::new_with_admin_base_url(admin_base_url, admin_token_env)?;
+    run_attached_dashboard_runtime(service_name, port, runtime).await
+}
+
+async fn run_attached_dashboard_runtime(
+    service_name: &'static str,
+    port: u16,
+    runtime: AttachedDashboardRuntime,
+) -> anyhow::Result<()> {
+    let cfg = load_config().await.unwrap_or_default();
     let language = resolve_attached_language(&cfg);
     let timing = DashboardTiming::from_env();
-    let mut providers = build_provider_options(&cfg, service_name);
 
     let status = runtime.runtime_status().await?;
     let api_snapshot = runtime.snapshot(7).await?;
@@ -101,6 +100,7 @@ pub async fn run_attached_dashboard(
         );
     }
 
+    let mut providers = build_provider_options(&cfg, service_name);
     let mut snapshot = snapshot_from_api_v1(api_snapshot).await;
     let mut ui = UiState {
         service_name,
@@ -115,7 +115,10 @@ pub async fn run_attached_dashboard(
         last_runtime_config_source_mtime_ms: status.source_mtime_ms,
         last_runtime_retry: Some(status.retry),
         last_runtime_config_refresh_at: Some(Instant::now()),
-        toast: Some((attached_start_toast(language), Instant::now())),
+        toast: Some((
+            attached_start_toast(language, runtime.admin_base_url()),
+            Instant::now(),
+        )),
         ..Default::default()
     };
     hydrate_attached_profile_state(&mut ui, &runtime).await;
@@ -187,14 +190,15 @@ fn resolve_attached_language(cfg: &crate::config::ProxyConfig) -> super::Languag
     }
 }
 
-fn attached_start_toast(language: super::Language) -> String {
+fn attached_start_toast(language: super::Language, admin_base_url: &str) -> String {
     match language {
         super::Language::Zh => {
-            "已进入附着观察模式；q 只退出控制台，不停止 resident proxy".to_string()
+            format!("已进入附着观察模式：{admin_base_url}；q 只退出控制台，不停止目标 proxy")
         }
         super::Language::En => {
-            "attached observer mode; q exits only this console and keeps the resident proxy running"
-                .to_string()
+            format!(
+                "attached observer mode: {admin_base_url}; q exits only this console and keeps the target proxy running"
+            )
         }
     }
 }
@@ -553,10 +557,10 @@ mod tests {
 
     #[test]
     fn attached_start_toast_names_observer_lifecycle() {
-        let text = attached_start_toast(crate::tui::Language::En);
+        let text = attached_start_toast(crate::tui::Language::En, "http://127.0.0.1:4211");
 
         assert!(text.contains("attached observer mode"), "{text}");
-        assert!(text.contains("keeps the resident proxy running"), "{text}");
+        assert!(text.contains("keeps the target proxy running"), "{text}");
     }
 
     fn empty_snapshot() -> Snapshot {

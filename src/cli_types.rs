@@ -91,6 +91,11 @@ pub(crate) enum Command {
         #[arg(long)]
         port: Option<u16>,
     },
+    /// Select, inspect, and use local or remote relay targets
+    Relay {
+        #[command(subcommand)]
+        cmd: RelayCommand,
+    },
     /// Manage Codex/Claude switch on/off state
     Switch {
         #[command(subcommand)]
@@ -206,6 +211,69 @@ pub(crate) enum DaemonCommand {
         #[arg(long, default_value_t = 10)]
         max_restarts: u32,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum RelayCommand {
+    /// Add or update a named remote relay target
+    Add {
+        /// Target name, for example "nas"
+        name: String,
+        /// Proxy base URL, for example http://nas.local:3211
+        #[arg(long)]
+        proxy_url: String,
+        /// Admin API base URL. If omitted, derived from proxy URL or discovered later.
+        #[arg(long)]
+        admin_url: Option<String>,
+        /// Environment variable that stores the admin token for this target
+        #[arg(long)]
+        admin_token_env: Option<String>,
+        /// Target Codex service
+        #[arg(long)]
+        codex: bool,
+        /// Target Claude service
+        #[arg(long)]
+        claude: bool,
+        /// Codex client preset used when switching to this target
+        #[arg(long = "preset", alias = "mode", value_enum)]
+        preset: Option<CodexClientPatchPresetArg>,
+        /// Enable Responses WebSocket transport advertising for official bridge presets
+        #[arg(long)]
+        responses_websocket: bool,
+    },
+    /// List configured relay targets
+    List,
+    /// Show target reachability and current Codex switch state
+    Status {
+        /// Optional target name. Defaults to the current summary.
+        target: Option<String>,
+        /// Output JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Restore Codex/Claude away from the active relay patch
+    Off {
+        /// Target Codex config (default if neither flag is set)
+        #[arg(long)]
+        codex: bool,
+        /// Target Claude settings (experimental)
+        #[arg(long)]
+        claude: bool,
+    },
+    /// Use a relay target; switches the client and opens TUI unless flags say otherwise
+    Use {
+        /// Target name, for example "local" or "nas"
+        target: String,
+        /// Switch client only; do not open TUI
+        #[arg(long)]
+        no_tui: bool,
+        /// Attach TUI only; do not switch client config
+        #[arg(long)]
+        attach_only: bool,
+    },
+    /// Shorthand for `ch relay <target> [--no-tui] [--attach-only]`
+    #[command(external_subcommand)]
+    Target(Vec<String>),
 }
 
 #[derive(Subcommand, Debug)]
@@ -1391,6 +1459,76 @@ mod tests {
         assert!(!codex);
         assert!(claude);
         assert_eq!(port, Some(3210));
+    }
+
+    #[test]
+    fn relay_cli_parses_target_shorthand() {
+        let cli = Cli::try_parse_from(["ch", "relay", "nas", "--attach-only"])
+            .expect("parse relay target shorthand");
+
+        let Some(Command::Relay {
+            cmd: RelayCommand::Target(args),
+        }) = cli.command
+        else {
+            panic!("expected relay target shorthand");
+        };
+        assert_eq!(args, vec!["nas".to_string(), "--attach-only".to_string()]);
+    }
+
+    #[test]
+    fn relay_cli_parses_use_target() {
+        let cli = Cli::try_parse_from(["ch", "relay", "use", "nas", "--no-tui"])
+            .expect("parse relay use command");
+
+        let Some(Command::Relay {
+            cmd:
+                RelayCommand::Use {
+                    target,
+                    no_tui,
+                    attach_only,
+                },
+        }) = cli.command
+        else {
+            panic!("expected relay use command");
+        };
+        assert_eq!(target, "nas");
+        assert!(no_tui);
+        assert!(!attach_only);
+    }
+
+    #[test]
+    fn relay_cli_parses_add_target() {
+        let cli = Cli::try_parse_from([
+            "ch",
+            "relay",
+            "add",
+            "nas",
+            "--proxy-url",
+            "http://nas.local:3211",
+            "--admin-token-env",
+            "NAS_ADMIN_TOKEN",
+            "--preset",
+            "chatgpt-bridge",
+        ])
+        .expect("parse relay add command");
+
+        let Some(Command::Relay {
+            cmd:
+                RelayCommand::Add {
+                    name,
+                    proxy_url,
+                    admin_token_env,
+                    preset,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected relay add command");
+        };
+        assert_eq!(name, "nas");
+        assert_eq!(proxy_url, "http://nas.local:3211");
+        assert_eq!(admin_token_env.as_deref(), Some("NAS_ADMIN_TOKEN"));
+        assert_eq!(preset, Some(CodexClientPatchPresetArg::ChatgptBridge));
     }
 
     #[test]

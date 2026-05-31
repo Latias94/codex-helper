@@ -1352,6 +1352,7 @@ async fn proxy_api_v1_station_specs_rejects_crud_after_v2_auto_migration() {
         retry: RetryConfig::default(),
         notify: Default::default(),
         default_service: None,
+        relay_targets: std::collections::BTreeMap::new(),
         ui: UiConfig::default(),
     };
     cfg.codex.active_group = Some("alpha".to_string());
@@ -1500,6 +1501,7 @@ async fn proxy_api_v1_provider_specs_crud_persists_endpoints_and_env_refs() {
         retry: RetryConfig::default(),
         notify: Default::default(),
         default_service: None,
+        relay_targets: std::collections::BTreeMap::new(),
         ui: UiConfig::default(),
     };
     cfg.codex.providers.insert(

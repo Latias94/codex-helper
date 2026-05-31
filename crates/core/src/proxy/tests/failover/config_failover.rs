@@ -110,6 +110,7 @@ async fn proxy_falls_back_to_level_2_config_after_retryable_failure() {
         retry,
         notify: Default::default(),
         default_service: None,
+        relay_targets: std::collections::BTreeMap::new(),
         ui: UiConfig::default(),
     };
 
@@ -250,6 +251,7 @@ async fn proxy_failover_can_switch_configs_with_same_level() {
         retry,
         notify: Default::default(),
         default_service: None,
+        relay_targets: std::collections::BTreeMap::new(),
         ui: UiConfig::default(),
     };
 
@@ -386,6 +388,7 @@ async fn proxy_failover_can_switch_configs_with_same_level_on_404() {
         },
         notify: Default::default(),
         default_service: None,
+        relay_targets: std::collections::BTreeMap::new(),
         ui: UiConfig::default(),
     };
 

@@ -437,7 +437,16 @@ fn switch_on_codex_toml_with_options(
     switch_on_codex_toml_with_plan(text, port, plan)
 }
 
+#[cfg(test)]
 fn switch_on_codex_toml_with_plan(text: &str, port: u16, plan: CodexPatchPlan) -> Result<String> {
+    switch_on_codex_toml_with_base_url_and_plan(text, &format!("http://127.0.0.1:{port}"), plan)
+}
+
+fn switch_on_codex_toml_with_base_url_and_plan(
+    text: &str,
+    base_url: &str,
+    plan: CodexPatchPlan,
+) -> Result<String> {
     let mut doc = if text.trim().is_empty() {
         EditableTomlDocument::new()
     } else {
@@ -469,7 +478,7 @@ fn switch_on_codex_toml_with_plan(text: &str, port: u16, plan: CodexPatchPlan) -
 
     let provider = plan.provider();
     set_toml_string(proxy_table, "name", provider.provider_name());
-    set_toml_string(proxy_table, "base_url", format!("http://127.0.0.1:{port}"));
+    set_toml_string(proxy_table, "base_url", base_url);
     set_toml_string(proxy_table, "wire_api", "responses");
     if !proxy_table.contains_key("request_max_retries") {
         proxy_table.insert("request_max_retries", editable_toml_value(0));
@@ -1921,6 +1930,17 @@ pub fn switch_on_with_options(
     mode: CodexPatchMode,
     options: CodexSwitchOptions,
 ) -> Result<()> {
+    switch_on_with_base_url(&format!("http://127.0.0.1:{port}"), mode, options)
+}
+
+/// Switch Codex to use a codex-helper-compatible model provider at an explicit base URL.
+pub fn switch_on_with_base_url(
+    base_url: &str,
+    mode: CodexPatchMode,
+    options: CodexSwitchOptions,
+) -> Result<()> {
+    let base_url = crate::control_plane_client::normalize_base_url(base_url)
+        .ok_or_else(|| anyhow!("Codex proxy base URL must start with http:// or https://"))?;
     let plan = CodexPatchPlan::for_switch_on(mode, options)?;
     if plan.requires_bridge_runtime_ready() {
         ensure_bridge_runtime_ready(plan.mode())?;
@@ -1949,7 +1969,7 @@ pub fn switch_on_with_options(
     state.responses_websocket = plan.options().responses_websocket;
 
     let auth_edit = auth_edit_for_switch_on_plan(plan, &mut state)?;
-    let new_text = switch_on_codex_toml_with_plan(&text, port, plan)?;
+    let new_text = switch_on_codex_toml_with_base_url_and_plan(&text, &base_url, plan)?;
     apply_switch_on_effects(plan, &cfg_path, &new_text, &state, auth_edit)?;
     Ok(())
 }
@@ -2546,6 +2566,12 @@ fn read_settings_text(path: &Path) -> Result<String> {
 }
 
 pub fn claude_switch_on(port: u16) -> Result<()> {
+    claude_switch_on_base_url(&format!("http://127.0.0.1:{port}"))
+}
+
+pub fn claude_switch_on_base_url(base_url: &str) -> Result<()> {
+    let base_url = crate::control_plane_client::normalize_base_url(base_url)
+        .ok_or_else(|| anyhow!("Claude proxy base URL must start with http:// or https://"))?;
     let settings_path = claude_settings_path();
     let backup_path = claude_settings_backup_path(&settings_path);
 
@@ -2584,7 +2610,6 @@ pub fn claude_switch_on(port: u16) -> Result<()> {
         .as_object_mut()
         .ok_or_else(|| anyhow!("Claude settings env must be an object"))?;
 
-    let base_url = format!("http://127.0.0.1:{}", port);
     env_obj.insert(
         "ANTHROPIC_BASE_URL".to_string(),
         serde_json::Value::String(base_url),
@@ -2595,7 +2620,7 @@ pub fn claude_switch_on(port: u16) -> Result<()> {
         .with_context(|| format!("write {:?}", settings_path))?;
 
     eprintln!(
-        "[EXPERIMENTAL] Updated {:?} to use local Claude proxy via codex-helper",
+        "[EXPERIMENTAL] Updated {:?} to use Claude proxy via codex-helper",
         settings_path
     );
     Ok(())
