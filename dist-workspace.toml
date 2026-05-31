@@ -5,11 +5,10 @@ packages = ["codex-helper"]
 # Config for 'dist'
 [dist]
 # The preferred dist version to use in CI (Cargo.toml SemVer syntax)
-cargo-dist-version = "0.31.0"
+cargo-dist-version = "0.32.0"
 # Features to pass to cargo build
 features = ["gui"]
-# Build only packages selected for distribution. This keeps the unpublished
-# Tauri desktop workspace member out of release artifact builds.
+# Build only the required packages, and individually
 precise-builds = true
 # CI backends to support
 ci = "github"
