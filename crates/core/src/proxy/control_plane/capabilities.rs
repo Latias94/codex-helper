@@ -15,7 +15,7 @@ use super::super::control_plane_manifest::{api_v1_endpoint_paths, api_v1_surface
 use super::super::profile_defaults::{
     configured_active_station_name, effective_active_station_name, effective_default_profile_name,
 };
-use super::{SnapshotQuery, host_local_session_history_available};
+use super::SnapshotQuery;
 
 async fn api_v1_surface_capabilities_for_proxy(
     proxy: &ProxyService,
@@ -39,7 +39,7 @@ async fn api_v1_surface_capabilities_for_proxy(
 pub(in crate::proxy) async fn api_capabilities(
     proxy: ProxyService,
 ) -> Result<Json<ApiV1Capabilities>, (StatusCode, String)> {
-    let host_local_history = host_local_session_history_available();
+    let host_local_history = proxy.host_local_session_history_available();
     let surface_capabilities = api_v1_surface_capabilities_for_proxy(&proxy).await;
     Ok(Json(ApiV1Capabilities {
         api_version: 1,
@@ -113,7 +113,7 @@ pub(in crate::proxy) async fn api_operator_summary(
     proxy: ProxyService,
 ) -> Result<Json<ApiV1OperatorSummary>, (StatusCode, String)> {
     let surface_capabilities = api_v1_surface_capabilities_for_proxy(&proxy).await;
-    let host_local_history = host_local_session_history_available();
+    let host_local_history = proxy.host_local_session_history_available();
     let shared_capabilities = SharedControlPlaneCapabilities {
         session_observability: true,
         request_history: true,

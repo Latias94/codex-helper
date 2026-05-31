@@ -4,4 +4,6 @@ host = "0.0.0.0"
 port = 3211
 admin-host = "0.0.0.0"
 admin-port = 4211
+# Set this to a LAN or Tailscale URL if clients should discover the admin API through the proxy.
+# advertised-admin-base-url = "http://NAS_IP_OR_TAILSCALE_IP:4211"
 host-local-session-history = false

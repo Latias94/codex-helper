@@ -75,6 +75,7 @@ mod target_builder;
 mod tests;
 
 use crate::filter::RequestFilter;
+use crate::host_local::HostLocalSessionHistoryMode;
 use crate::lb::LbState;
 use crate::state::{ProviderBalanceSnapshot, ProxyState};
 use crate::usage_providers::UsageProviderRefreshSummary;
@@ -142,6 +143,7 @@ pub struct ProxyService {
     filter: RequestFilter,
     state: Arc<ProxyState>,
     shutdown_tx: Option<watch::Sender<bool>>,
+    host_local_session_history_mode: HostLocalSessionHistoryMode,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

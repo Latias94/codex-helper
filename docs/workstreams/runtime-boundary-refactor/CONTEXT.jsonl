@@ -1,0 +1,6 @@
+{"role":"design","path":"docs/workstreams/runtime-boundary-refactor/DESIGN.md","reason":"Primary refactor boundary and non-goals."}
+{"role":"tasks","path":"docs/workstreams/runtime-boundary-refactor/TODO.md","reason":"Task ledger for bounded execution."}
+{"role":"evidence","path":"docs/workstreams/runtime-boundary-refactor/EVIDENCE_AND_GATES.md","reason":"Fresh validation evidence."}
+{"role":"adr","path":"docs/adr/0001-central-relay-container-runtime.md","reason":"Container runtime semantics must stay true."}
+{"role":"prior_workstream","path":"docs/workstreams/codex-server-container-deployment/DESIGN.md","reason":"Explains why server/container runtime was split from local serve."}
+{"role":"existing_architecture","path":"docs/workstreams/codex-control-plane-refactor/CENTRAL_RELAY.md","reason":"Defines central relay capability truth and host-local limits."}

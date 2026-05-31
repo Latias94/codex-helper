@@ -9,15 +9,15 @@ use crate::codex_models_cache::{
 };
 use crate::commands;
 use crate::config::{
-    ServiceKind, claude_settings_backup_path, claude_settings_path, codex_auth_path,
-    codex_client_patch_config_from_config_file, codex_config_path, codex_models_cache_path,
-    codex_switch_state_path, load_config, load_or_bootstrap_for_service_with_v4_source,
-    normalize_config_toml_authoring,
+    LoadedProxyConfig, ServiceKind, claude_settings_backup_path, claude_settings_path,
+    codex_auth_path, codex_client_patch_config_from_config_file, codex_config_path,
+    codex_models_cache_path, codex_switch_state_path, load_config,
+    load_or_bootstrap_for_service_with_v4_source, normalize_config_toml_authoring,
 };
 use crate::notify;
 use crate::proxy::admin_loopback_addr_for_proxy_port;
 use crate::runtime_host::{
-    build_proxy_runtime_from_bound_listeners, validate_service_has_upstream,
+    ProxyRuntime, build_proxy_runtime_from_bound_listeners, validate_service_has_upstream,
 };
 use crate::runtime_manager::{
     RuntimeOwnerKind, RuntimeOwnerMarker, RuntimeOwnerMarkerGuard, clear_owner_marker,
@@ -666,6 +666,26 @@ fn supervisor_restart_delay_secs(restart_count: u32) -> u64 {
     1u64 << restart_count.saturating_sub(1).min(5)
 }
 
+struct LocalClientStartup {
+    loaded: Option<LoadedProxyConfig>,
+    codex_patch_mode: codex_integration::CodexPatchMode,
+    codex_responses_websocket: bool,
+    codex_client_state_changed: bool,
+    codex_switch_error: Option<String>,
+}
+
+impl Default for LocalClientStartup {
+    fn default() -> Self {
+        Self {
+            loaded: None,
+            codex_patch_mode: codex_integration::CodexPatchMode::Default,
+            codex_responses_websocket: false,
+            codex_client_state_changed: false,
+            codex_switch_error: None,
+        }
+    }
+}
+
 async fn run_server(
     service_name: &'static str,
     host: IpAddr,
@@ -738,108 +758,9 @@ async fn run_server(
             tracing::warn!("failed to write runtime owner marker: {err}");
         }
     }
-    let mut codex_startup_patch_mode = codex_integration::CodexPatchMode::Default;
-    let mut codex_startup_responses_websocket = false;
-    let mut codex_client_state_changed_this_startup = false;
-    let mut codex_switch_error: Option<String> = None;
+    let client_startup = prepare_local_client_for_proxy(service_name, port).await?;
 
-    // In Codex mode, automatically switch Codex to the local proxy; in Claude mode, try updating
-    // settings.json as well (experimental).
-    let loaded_before_switch = if service_name == "codex" {
-        let codex_config_before_switch = read_existing_text(&codex_config_path());
-        let codex_auth_before_switch = read_existing_text(&codex_auth_path());
-        // Guard before switching: if Codex is already pointing to the local proxy with switch
-        // state, ask whether to disable the stale local proxy patch first (interactive only).
-        if let Err(err) = codex_integration::guard_codex_config_before_switch_on_interactive() {
-            tracing::warn!("Failed to guard Codex config before switch on: {}", err);
-        }
-        if let Err(err) = normalize_config_toml_authoring() {
-            tracing::warn!(
-                "Failed to normalize codex-helper config authoring fields before switch on: {}",
-                err
-            );
-        }
-        let configured_client_patch = || match codex_client_patch_config_from_config_file() {
-            Ok(config) => config,
-            Err(err) => {
-                tracing::warn!(
-                    "Failed to read codex.client_patch from codex-helper config, falling back to default: {}",
-                    err
-                );
-                crate::config::CodexClientPatchConfig::default()
-            }
-        };
-        let loaded = load_or_bootstrap_for_service_with_v4_source(ServiceKind::Codex).await?;
-        let client_patch = configured_client_patch();
-        let (patch_mode, switch_options) = match codex_integration::codex_switch_status() {
-            Ok(status) if status.has_switch_state => (
-                status.patch_mode.unwrap_or(client_patch.preset),
-                codex_integration::CodexSwitchOptions {
-                    responses_websocket: status
-                        .supports_websockets
-                        .unwrap_or(client_patch.options.responses_websocket),
-                },
-            ),
-            Ok(status) => {
-                if status.enabled {
-                    tracing::info!(
-                        "Codex local proxy patch has no switch state; applying codex-helper config preset={} instead of inferring from stale ~/.codex/config.toml",
-                        client_patch.preset.as_preset_str()
-                    );
-                }
-                (client_patch.preset, client_patch.options)
-            }
-            Err(err) => {
-                tracing::warn!(
-                    "Failed to read Codex preset from ~/.codex/config.toml, falling back to default: {}",
-                    err
-                );
-                (client_patch.preset, client_patch.options)
-            }
-        };
-        codex_startup_patch_mode = patch_mode;
-        codex_startup_responses_websocket = switch_options.responses_websocket;
-        match codex_integration::switch_on_with_options(port, patch_mode, switch_options) {
-            Ok(()) => {
-                tracing::info!(
-                    "Codex config switched to local proxy on port {} (preset={}, responses_websocket={})",
-                    port,
-                    patch_mode.as_preset_str(),
-                    switch_options.responses_websocket
-                );
-            }
-            Err(err) => {
-                let err = err.to_string();
-                tracing::warn!("Failed to switch Codex config to local proxy: {}", err);
-                codex_switch_error = Some(err);
-            }
-        }
-        codex_client_state_changed_this_startup = codex_config_before_switch
-            != read_existing_text(&codex_config_path())
-            || codex_auth_before_switch != read_existing_text(&codex_auth_path());
-        invalidate_codex_models_cache_if_needed().await;
-        Some(loaded)
-    } else if service_name == "claude" {
-        if let Err(err) = codex_integration::guard_claude_settings_before_switch_on_interactive() {
-            tracing::warn!("Failed to guard Claude settings before switch on: {}", err);
-        }
-        match codex_integration::claude_switch_on(port) {
-            Ok(()) => {
-                tracing::info!(
-                    "Claude settings updated to use local proxy on port {}",
-                    port
-                );
-            }
-            Err(err) => {
-                tracing::warn!("Failed to update Claude settings for local proxy: {}", err);
-            }
-        }
-        None
-    } else {
-        None
-    };
-
-    let loaded = if let Some(loaded) = loaded_before_switch {
+    let loaded = if let Some(loaded) = client_startup.loaded {
         loaded
     } else {
         match service_name {
@@ -867,31 +788,9 @@ async fn run_server(
         }
     };
 
+    let runtime = build_local_proxy_runtime(service_name, host, port, loaded).await?;
     let addr: SocketAddr = SocketAddr::from((host, port));
-    let admin_addr = admin_loopback_addr_for_proxy_port(port);
-    if !host.is_loopback() {
-        tracing::warn!(
-            "Binding to non-loopback address {}. This may expose your proxy to other machines. Consider using 127.0.0.1 + SSH port forwarding instead.",
-            host
-        );
-        tracing::warn!(
-            "The /__codex_helper admin API stays on loopback only at http://{}.",
-            admin_addr
-        );
-    }
-    let listener = bind_local_listener_or_explain(addr, service_name).await?;
-    let admin_listener = bind_local_listener_or_explain(admin_addr, service_name).await?;
-
-    validate_service_has_upstream(service_name, &loaded.runtime)?;
-    let runtime = build_proxy_runtime_from_bound_listeners(
-        service_name,
-        host,
-        port,
-        loaded,
-        listener,
-        admin_listener,
-    )
-    .await?;
+    let admin_addr = runtime.admin_addr;
     let cfg = runtime.config.clone();
     let proxy = runtime.proxy.clone();
     let state = runtime.state.clone();
@@ -929,10 +828,10 @@ async fn run_server(
             codex_integration::codex_tui_startup_readiness(
                 codex_integration::CodexStartupReadinessInput {
                     expected_port: port,
-                    expected_patch_mode: codex_startup_patch_mode,
-                    expected_responses_websocket: codex_startup_responses_websocket,
-                    client_state_changed_this_startup: codex_client_state_changed_this_startup,
-                    switch_error: codex_switch_error.clone(),
+                    expected_patch_mode: client_startup.codex_patch_mode,
+                    expected_responses_websocket: client_startup.codex_responses_websocket,
+                    client_state_changed_this_startup: client_startup.codex_client_state_changed,
+                    switch_error: client_startup.codex_switch_error.clone(),
                 },
             )
         });
@@ -988,6 +887,151 @@ async fn run_server(
     result?;
 
     Ok(())
+}
+
+async fn prepare_local_client_for_proxy(
+    service_name: &'static str,
+    port: u16,
+) -> anyhow::Result<LocalClientStartup> {
+    match service_name {
+        "codex" => prepare_codex_client_for_local_proxy(port).await,
+        "claude" => {
+            prepare_claude_client_for_local_proxy(port);
+            Ok(LocalClientStartup::default())
+        }
+        _ => Ok(LocalClientStartup::default()),
+    }
+}
+
+async fn prepare_codex_client_for_local_proxy(port: u16) -> anyhow::Result<LocalClientStartup> {
+    let codex_config_before_switch = read_existing_text(&codex_config_path());
+    let codex_auth_before_switch = read_existing_text(&codex_auth_path());
+    if let Err(err) = codex_integration::guard_codex_config_before_switch_on_interactive() {
+        tracing::warn!("Failed to guard Codex config before switch on: {}", err);
+    }
+    if let Err(err) = normalize_config_toml_authoring() {
+        tracing::warn!(
+            "Failed to normalize codex-helper config authoring fields before switch on: {}",
+            err
+        );
+    }
+
+    let loaded = load_or_bootstrap_for_service_with_v4_source(ServiceKind::Codex).await?;
+    let client_patch = match codex_client_patch_config_from_config_file() {
+        Ok(config) => config,
+        Err(err) => {
+            tracing::warn!(
+                "Failed to read codex.client_patch from codex-helper config, falling back to default: {}",
+                err
+            );
+            crate::config::CodexClientPatchConfig::default()
+        }
+    };
+    let (patch_mode, switch_options) = match codex_integration::codex_switch_status() {
+        Ok(status) if status.has_switch_state => (
+            status.patch_mode.unwrap_or(client_patch.preset),
+            codex_integration::CodexSwitchOptions {
+                responses_websocket: status
+                    .supports_websockets
+                    .unwrap_or(client_patch.options.responses_websocket),
+            },
+        ),
+        Ok(status) => {
+            if status.enabled {
+                tracing::info!(
+                    "Codex local proxy patch has no switch state; applying codex-helper config preset={} instead of inferring from stale ~/.codex/config.toml",
+                    client_patch.preset.as_preset_str()
+                );
+            }
+            (client_patch.preset, client_patch.options)
+        }
+        Err(err) => {
+            tracing::warn!(
+                "Failed to read Codex preset from ~/.codex/config.toml, falling back to default: {}",
+                err
+            );
+            (client_patch.preset, client_patch.options)
+        }
+    };
+
+    let mut codex_switch_error = None;
+    match codex_integration::switch_on_with_options(port, patch_mode, switch_options) {
+        Ok(()) => {
+            tracing::info!(
+                "Codex config switched to local proxy on port {} (preset={}, responses_websocket={})",
+                port,
+                patch_mode.as_preset_str(),
+                switch_options.responses_websocket
+            );
+        }
+        Err(err) => {
+            let err = err.to_string();
+            tracing::warn!("Failed to switch Codex config to local proxy: {}", err);
+            codex_switch_error = Some(err);
+        }
+    }
+    let codex_client_state_changed = codex_config_before_switch
+        != read_existing_text(&codex_config_path())
+        || codex_auth_before_switch != read_existing_text(&codex_auth_path());
+    invalidate_codex_models_cache_if_needed().await;
+
+    Ok(LocalClientStartup {
+        loaded: Some(loaded),
+        codex_patch_mode: patch_mode,
+        codex_responses_websocket: switch_options.responses_websocket,
+        codex_client_state_changed,
+        codex_switch_error,
+    })
+}
+
+fn prepare_claude_client_for_local_proxy(port: u16) {
+    if let Err(err) = codex_integration::guard_claude_settings_before_switch_on_interactive() {
+        tracing::warn!("Failed to guard Claude settings before switch on: {}", err);
+    }
+    match codex_integration::claude_switch_on(port) {
+        Ok(()) => {
+            tracing::info!(
+                "Claude settings updated to use local proxy on port {}",
+                port
+            );
+        }
+        Err(err) => {
+            tracing::warn!("Failed to update Claude settings for local proxy: {}", err);
+        }
+    }
+}
+
+async fn build_local_proxy_runtime(
+    service_name: &'static str,
+    host: IpAddr,
+    port: u16,
+    loaded: LoadedProxyConfig,
+) -> anyhow::Result<ProxyRuntime> {
+    let addr: SocketAddr = SocketAddr::from((host, port));
+    let admin_addr = admin_loopback_addr_for_proxy_port(port);
+    if !host.is_loopback() {
+        tracing::warn!(
+            "Binding to non-loopback address {}. This may expose your proxy to other machines. Consider using 127.0.0.1 + SSH port forwarding instead.",
+            host
+        );
+        tracing::warn!(
+            "The /__codex_helper admin API stays on loopback only at http://{}.",
+            admin_addr
+        );
+    }
+    let listener = bind_local_listener_or_explain(addr, service_name).await?;
+    let admin_listener = bind_local_listener_or_explain(admin_addr, service_name).await?;
+
+    validate_service_has_upstream(service_name, &loaded.runtime)?;
+    build_proxy_runtime_from_bound_listeners(
+        service_name,
+        host,
+        port,
+        loaded,
+        listener,
+        admin_listener,
+    )
+    .await
 }
 
 async fn await_server_shutdown(

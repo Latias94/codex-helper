@@ -40,6 +40,8 @@ The Compose sample binds the admin API inside the container to `0.0.0.0:4211`, b
 
 Expose the admin port to LAN or Tailscale only when the host firewall and token policy are intentional.
 
+If proxy clients should discover the admin API from `/.well-known/codex-helper-admin`, set `advertised-admin-base-url` in `deploy/container/server.toml` to the LAN or Tailscale URL clients can actually reach.
+
 ## Host-Local Capabilities
 
 `host-local-session-history = false` is the default container policy. The server can still report shared proxy state such as recent requests and session identity observed through traffic, but it should not claim access to each remote client's local Codex transcript files.

@@ -12,6 +12,7 @@ use crate::config::{
     LoadedProxyConfig, ProxyConfig, ServiceKind, load_or_bootstrap_for_service_with_v4_source,
     model_routing_warnings,
 };
+use crate::host_local::HostLocalSessionHistoryMode;
 use crate::lb::LbState;
 use crate::proxy::{
     ProxyService, admin_listener_router, admin_loopback_addr_for_proxy_port,
@@ -57,6 +58,47 @@ pub struct RunningProxyRuntime {
     pub state: Arc<ProxyState>,
     pub shutdown_tx: watch::Sender<bool>,
     pub server_handle: JoinHandle<Result<()>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProxyRuntimeOptions {
+    pub admin_addr: SocketAddr,
+    pub advertised_admin_base_url: Option<String>,
+    pub host_local_session_history_mode: HostLocalSessionHistoryMode,
+}
+
+impl ProxyRuntimeOptions {
+    pub fn for_proxy_port(port: u16) -> Self {
+        let admin_addr = admin_loopback_addr_for_proxy_port(port);
+        Self {
+            admin_addr,
+            advertised_admin_base_url: admin_discovery_base_url(admin_addr, None),
+            host_local_session_history_mode: HostLocalSessionHistoryMode::Auto,
+        }
+    }
+
+    pub fn with_admin_addr(mut self, admin_addr: SocketAddr) -> Self {
+        self.admin_addr = admin_addr;
+        self.advertised_admin_base_url = admin_discovery_base_url(admin_addr, None);
+        self
+    }
+
+    pub fn with_advertised_admin_base_url(
+        mut self,
+        advertised_admin_base_url: Option<String>,
+    ) -> Self {
+        self.advertised_admin_base_url =
+            admin_discovery_base_url(self.admin_addr, advertised_admin_base_url.as_deref());
+        self
+    }
+
+    pub fn with_host_local_session_history_mode(
+        mut self,
+        mode: HostLocalSessionHistoryMode,
+    ) -> Self {
+        self.host_local_session_history_mode = mode;
+        self
+    }
 }
 
 impl ProxyRuntime {
@@ -123,9 +165,14 @@ pub async fn build_proxy_runtime_from_loaded(
     port: u16,
     loaded: LoadedProxyConfig,
 ) -> Result<ProxyRuntime> {
-    let admin_addr = admin_loopback_addr_for_proxy_port(port);
-    build_proxy_runtime_from_loaded_with_admin_addr(service_name, host, port, admin_addr, loaded)
-        .await
+    build_proxy_runtime_from_loaded_with_options(
+        service_name,
+        host,
+        port,
+        ProxyRuntimeOptions::for_proxy_port(port),
+        loaded,
+    )
+    .await
 }
 
 pub async fn build_proxy_runtime_from_loaded_with_admin_addr(
@@ -135,14 +182,31 @@ pub async fn build_proxy_runtime_from_loaded_with_admin_addr(
     admin_addr: SocketAddr,
     loaded: LoadedProxyConfig,
 ) -> Result<ProxyRuntime> {
-    let addr: SocketAddr = SocketAddr::from((host, port));
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    let admin_listener = tokio::net::TcpListener::bind(admin_addr).await?;
-    build_proxy_runtime_from_bound_listeners_with_admin_addr(
+    build_proxy_runtime_from_loaded_with_options(
         service_name,
         host,
         port,
-        admin_addr,
+        ProxyRuntimeOptions::for_proxy_port(port).with_admin_addr(admin_addr),
+        loaded,
+    )
+    .await
+}
+
+pub async fn build_proxy_runtime_from_loaded_with_options(
+    service_name: &'static str,
+    host: IpAddr,
+    port: u16,
+    options: ProxyRuntimeOptions,
+    loaded: LoadedProxyConfig,
+) -> Result<ProxyRuntime> {
+    let addr: SocketAddr = SocketAddr::from((host, port));
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let admin_listener = tokio::net::TcpListener::bind(options.admin_addr).await?;
+    build_proxy_runtime_from_bound_listeners_with_options(
+        service_name,
+        host,
+        port,
+        options,
         loaded,
         listener,
         admin_listener,
@@ -158,12 +222,11 @@ pub async fn build_proxy_runtime_from_bound_listeners(
     listener: tokio::net::TcpListener,
     admin_listener: tokio::net::TcpListener,
 ) -> Result<ProxyRuntime> {
-    let admin_addr = admin_loopback_addr_for_proxy_port(port);
-    build_proxy_runtime_from_bound_listeners_with_admin_addr(
+    build_proxy_runtime_from_bound_listeners_with_options(
         service_name,
         host,
         port,
-        admin_addr,
+        ProxyRuntimeOptions::for_proxy_port(port),
         loaded,
         listener,
         admin_listener,
@@ -176,6 +239,27 @@ pub async fn build_proxy_runtime_from_bound_listeners_with_admin_addr(
     host: IpAddr,
     port: u16,
     admin_addr: SocketAddr,
+    loaded: LoadedProxyConfig,
+    listener: tokio::net::TcpListener,
+    admin_listener: tokio::net::TcpListener,
+) -> Result<ProxyRuntime> {
+    build_proxy_runtime_from_bound_listeners_with_options(
+        service_name,
+        host,
+        port,
+        ProxyRuntimeOptions::for_proxy_port(port).with_admin_addr(admin_addr),
+        loaded,
+        listener,
+        admin_listener,
+    )
+    .await
+}
+
+pub async fn build_proxy_runtime_from_bound_listeners_with_options(
+    service_name: &'static str,
+    host: IpAddr,
+    port: u16,
+    options: ProxyRuntimeOptions,
     loaded: LoadedProxyConfig,
     listener: tokio::net::TcpListener,
     admin_listener: tokio::net::TcpListener,
@@ -210,17 +294,20 @@ pub async fn build_proxy_runtime_from_bound_listeners_with_admin_addr(
         service_name,
         lb_states,
         Some(shutdown_tx.clone()),
-    );
+    )
+    .with_host_local_session_history_mode(options.host_local_session_history_mode);
     let state = proxy.state_handle();
-    let app =
-        proxy_only_router_with_admin_base_url(proxy.clone(), admin_discovery_base_url(admin_addr));
+    let app = proxy_only_router_with_admin_base_url(
+        proxy.clone(),
+        options.advertised_admin_base_url.clone(),
+    );
     let admin_app = admin_listener_router(proxy.clone());
 
     Ok(ProxyRuntime {
         service_name,
         host,
         port,
-        admin_addr,
+        admin_addr: options.admin_addr,
         config: cfg,
         proxy,
         state,
@@ -233,7 +320,16 @@ pub async fn build_proxy_runtime_from_bound_listeners_with_admin_addr(
     })
 }
 
-fn admin_discovery_base_url(admin_addr: SocketAddr) -> Option<String> {
+fn admin_discovery_base_url(
+    admin_addr: SocketAddr,
+    advertised_admin_base_url: Option<&str>,
+) -> Option<String> {
+    if let Some(url) = advertised_admin_base_url
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+    {
+        return Some(url.trim_end_matches('/').to_string());
+    }
     if admin_addr.ip().is_unspecified() {
         None
     } else {
@@ -256,7 +352,7 @@ mod tests {
     fn admin_discovery_url_is_not_advertised_for_unspecified_bind() {
         let admin_addr = SocketAddr::from(([0, 0, 0, 0], 4211));
 
-        assert_eq!(admin_discovery_base_url(admin_addr), None);
+        assert_eq!(admin_discovery_base_url(admin_addr, None), None);
     }
 
     #[test]
@@ -264,8 +360,18 @@ mod tests {
         let admin_addr = SocketAddr::from(([192, 168, 1, 10], 4211));
 
         assert_eq!(
-            admin_discovery_base_url(admin_addr),
+            admin_discovery_base_url(admin_addr, None),
             Some("http://192.168.1.10:4211".to_string())
+        );
+    }
+
+    #[test]
+    fn admin_discovery_url_uses_advertised_url_when_provided() {
+        let admin_addr = SocketAddr::from(([0, 0, 0, 0], 4211));
+
+        assert_eq!(
+            admin_discovery_base_url(admin_addr, Some("http://nas.local:4211/")),
+            Some("http://nas.local:4211".to_string())
         );
     }
 }

@@ -55,7 +55,3 @@ pub(super) fn require_session_id(session_id: &str) -> Result<(), (StatusCode, St
     }
     Ok(())
 }
-
-pub(super) fn host_local_session_history_available() -> bool {
-    crate::host_local::host_local_session_history_available()
-}

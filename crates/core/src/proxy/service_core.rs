@@ -89,7 +89,22 @@ impl ProxyService {
             filter: RequestFilter::new(),
             state,
             shutdown_tx,
+            host_local_session_history_mode: crate::host_local::HostLocalSessionHistoryMode::Auto,
         }
+    }
+
+    pub fn with_host_local_session_history_mode(
+        mut self,
+        mode: crate::host_local::HostLocalSessionHistoryMode,
+    ) -> Self {
+        self.host_local_session_history_mode = mode;
+        self
+    }
+
+    pub(crate) fn host_local_session_history_available(&self) -> bool {
+        crate::host_local::host_local_session_history_available_for_mode(
+            self.host_local_session_history_mode,
+        )
     }
 
     pub(super) fn service_manager<'a>(&self, cfg: &'a ProxyConfig) -> &'a ServiceConfigManager {

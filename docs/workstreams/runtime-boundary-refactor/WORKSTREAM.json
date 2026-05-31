@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "slug": "runtime-boundary-refactor",
+  "title": "Runtime Boundary Refactor",
+  "status": "complete",
+  "updated": "2026-05-31",
+  "scope_kind": "execution",
+  "problem": "Runtime construction, host-local capability policy, and local CLI server orchestration still have accidental coupling after adding the container server runtime.",
+  "authoritative_docs": [
+    {
+      "role": "design",
+      "path": "docs/workstreams/runtime-boundary-refactor/DESIGN.md"
+    },
+    {
+      "role": "tasks",
+      "path": "docs/workstreams/runtime-boundary-refactor/TODO.md"
+    },
+    {
+      "role": "evidence",
+      "path": "docs/workstreams/runtime-boundary-refactor/EVIDENCE_AND_GATES.md"
+    },
+    {
+      "role": "context_manifest",
+      "path": "docs/workstreams/runtime-boundary-refactor/CONTEXT.jsonl"
+    }
+  ],
+  "context_manifest": "docs/workstreams/runtime-boundary-refactor/CONTEXT.jsonl",
+  "capability_tags": [
+    "runtime-host",
+    "server-runtime",
+    "host-local-policy",
+    "local-cli-lifecycle",
+    "docker"
+  ],
+  "continue_policy": {
+    "default_action": "continue",
+    "notes": "Implementation is complete. Optional follow-ons: proxy authentication for public exposure and remote companion transcript upload."
+  }
+}

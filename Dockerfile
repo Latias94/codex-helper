@@ -35,11 +35,11 @@ RUN cargo install cargo-chef --version "${CARGO_CHEF_VERSION}" --locked
 
 FROM chef AS planner
 COPY . .
-RUN cargo chef prepare --recipe-path recipe.json --bin codex-helper-server
+RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
 COPY --from=planner /workspace/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json --bin codex-helper-server
+RUN cargo chef cook --release --recipe-path recipe.json -p codex-helper-server --bin codex-helper-server
 COPY . .
 RUN cargo build --locked --release -p codex-helper-server --bin codex-helper-server
 
@@ -79,5 +79,5 @@ ENV RUST_LOG=info
 EXPOSE 3211 4211
 VOLUME ["/config", "/data"]
 
-ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["codex-helper-server", "--config", "/config/server.toml"]
+ENTRYPOINT ["/usr/bin/tini", "--", "codex-helper-server"]
+CMD ["--config", "/config/server.toml"]

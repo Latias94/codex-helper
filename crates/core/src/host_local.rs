@@ -1,5 +1,4 @@
 use std::path::Path;
-use std::sync::atomic::{AtomicU8, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostLocalSessionHistoryMode {
@@ -8,19 +7,19 @@ pub enum HostLocalSessionHistoryMode {
     Enabled,
 }
 
-const MODE_AUTO: u8 = 0;
-const MODE_DISABLED: u8 = 1;
-const MODE_ENABLED: u8 = 2;
-
-static SESSION_HISTORY_MODE: AtomicU8 = AtomicU8::new(MODE_AUTO);
-
-pub fn set_host_local_session_history_mode(mode: HostLocalSessionHistoryMode) {
-    SESSION_HISTORY_MODE.store(mode_to_u8(mode), Ordering::Relaxed);
+impl Default for HostLocalSessionHistoryMode {
+    fn default() -> Self {
+        Self::Auto
+    }
 }
 
 pub fn host_local_session_history_available() -> bool {
+    host_local_session_history_available_for_mode(HostLocalSessionHistoryMode::Auto)
+}
+
+pub fn host_local_session_history_available_for_mode(mode: HostLocalSessionHistoryMode) -> bool {
     host_local_session_history_available_in_dir(
-        configured_host_local_session_history_mode(),
+        configured_mode(mode),
         &crate::config::codex_sessions_dir(),
     )
 }
@@ -39,8 +38,8 @@ pub fn host_local_session_history_available_in_dir(
     }
 }
 
-fn configured_host_local_session_history_mode() -> HostLocalSessionHistoryMode {
-    match u8_to_mode(SESSION_HISTORY_MODE.load(Ordering::Relaxed)) {
+fn configured_mode(mode: HostLocalSessionHistoryMode) -> HostLocalSessionHistoryMode {
+    match mode {
         HostLocalSessionHistoryMode::Auto => {
             mode_from_env().unwrap_or(HostLocalSessionHistoryMode::Auto)
         }
@@ -58,22 +57,6 @@ fn mode_from_env() -> Option<HostLocalSessionHistoryMode> {
         "1" | "true" | "on" | "enabled" | "enable" => Some(HostLocalSessionHistoryMode::Enabled),
         "" | "auto" => Some(HostLocalSessionHistoryMode::Auto),
         _ => None,
-    }
-}
-
-fn mode_to_u8(mode: HostLocalSessionHistoryMode) -> u8 {
-    match mode {
-        HostLocalSessionHistoryMode::Auto => MODE_AUTO,
-        HostLocalSessionHistoryMode::Disabled => MODE_DISABLED,
-        HostLocalSessionHistoryMode::Enabled => MODE_ENABLED,
-    }
-}
-
-fn u8_to_mode(value: u8) -> HostLocalSessionHistoryMode {
-    match value {
-        MODE_DISABLED => HostLocalSessionHistoryMode::Disabled,
-        MODE_ENABLED => HostLocalSessionHistoryMode::Enabled,
-        _ => HostLocalSessionHistoryMode::Auto,
     }
 }
 
