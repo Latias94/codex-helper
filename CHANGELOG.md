@@ -10,9 +10,13 @@ All notable changes to this project will be documented in this file.
 #### 新增
 
 - 新增仓库内 `codex-session-diagnostics` skill，可按 Codex session key 只读收集 `~/.codex-helper` 日志/状态/配置和 `~/.codex` 会话 JSONL，辅助定位 waiting、resume、stream、routing affinity 和 relay 连续性问题。
+- 新增容器优先的中央 relay runtime：`codex-helper-server`、cargo-chef Dockerfile、Synology-friendly Compose 示例、容器 server 配置和 Docker 部署文档。容器启动 proxy/admin API，不会 patch 宿主机的 `~/.codex/config.toml` 或 `auth.json`。
+- 新增本机保存的 relay target 工作流：`ch relay add/list/status/off/use` 和短入口 `ch relay <target>`。`local` 是内置本机 target；命名 target 可指向 NAS、Tailscale 或 LAN 上的 helper runtime，并支持 `--no-tui` switch-only、`--attach-only` observe-only，以及只保存环境变量名的 `admin_token_env`。
+- 新增 GHCR Docker 发布 workflow：`v*` tag、GitHub Release 发布和手动 dispatch 可构建/发布 `ghcr.io/<owner>/codex-helper-server`，PR 只做 Docker build/smoke，不推送镜像；稳定 tag 会额外发布 `latest`，预发布 tag 不会覆盖 `latest`。
 
 #### 变更
 
+- 本地桌面 CLI 和容器 server 的职责边界进一步拆开：本地 `ch`、`serve`、`switch` 仍负责本机 client patch 和 TUI 生命周期；容器/server runtime 只暴露 proxy/admin control-plane。远端 attached TUI 现在通过 resolved admin URL 和可选 admin token env 观察目标 proxy，不再假设 admin API 一定在本机 loopback。
 - control-plane 的 `station/config` 语义收口到 station-first 口径；GUI/TUI/tray/请求详情不再把默认站点、上次观测站点或旧 route-attempt 投影显示成 `active_station` / `legacy` / `config` 文案，`operator/summary` 回归断言也补强为显式拒绝旧 session-card、link 和 capability key。
 - TUI 第 5 页用户可见名称统一为 `Usage / 用量` 口径；Recent/History 都明确标注为 Codex 全局会话，Recent 页 footer 也补齐 `s/f/h` 跳转提示。Usage / Balance 预测现在会显示样本来源来自当前 runtime 还是本地 request ledger，Requests 页在从 Codex 历史会话跳入且当前 runtime 未观测到请求时会给出明确空态说明，避免启动后把历史数据误认成当前会话请求。
 
@@ -37,6 +41,9 @@ All notable changes to this project will be documented in this file.
 #### Added
 
 - Added the repository `codex-session-diagnostics` skill for read-only collection of `~/.codex-helper` logs/state/config and `~/.codex` session JSONL files from a Codex session key, helping diagnose waiting, resume, stream, routing-affinity, and relay-continuity failures.
+- Added a container-first central relay runtime: `codex-helper-server`, a cargo-chef Dockerfile, Synology-friendly Compose samples, container server config, and Docker deployment docs. The container starts only the proxy/admin APIs and does not patch the host machine's `~/.codex/config.toml` or `auth.json`.
+- Added client-side relay targets: `ch relay add/list/status/off/use` and the shorthand `ch relay <target>`. `local` is the built-in local target; named targets can point at NAS, Tailscale, or LAN helper runtimes with `--no-tui` switch-only, `--attach-only` observe-only, and `admin_token_env` storing only the token environment variable name.
+- Added a GHCR Docker publishing workflow. `v*` tags, published GitHub Releases, and manual dispatches can build/publish `ghcr.io/<owner>/codex-helper-server`; PRs perform Docker build/smoke only. Stable tags also publish `latest`, while prerelease tags do not overwrite `latest`.
 
 #### Fixed
 
@@ -50,6 +57,7 @@ All notable changes to this project will be documented in this file.
 
 #### Changed
 
+- Split the local desktop CLI responsibilities from the container server runtime. Local `ch`, `serve`, and `switch` continue to own local client patching and TUI lifecycle, while the container/server runtime exposes only proxy/admin control-plane APIs. Remote attached TUI now observes a target proxy through a resolved admin URL and optional admin-token environment variable instead of assuming loopback admin access.
 - Closed the control-plane `station/config` semantic tail around station-first wording. GUI/TUI/tray/request-detail surfaces no longer present default stations, last observed stations, or legacy route-attempt projections as `active_station` / `legacy` / `config` labels, and `operator/summary` regressions now explicitly reject old session-card, link, and capability keys.
 - Standardized the TUI page-5 user-facing label around `Usage` / `Usage / Balance`. Recent and History now both identify their Codex-global session scope, the Recent footer advertises the `s/f/h` navigation keys, Usage / Balance spend forecasts show whether their sample comes from the current runtime or the local request ledger, and Requests explains when a focused Codex-history session has no requests observed by the current runtime.
 - Consolidated the route graph and legacy routing compatibility authoring boundary. CLI, GUI, and admin API callers now update entry routes, provider references, and manual targets through semantic `RoutingConfigV4` / `ServiceViewV4` methods instead of mutating fields and synchronizing compatibility state at each call site.
