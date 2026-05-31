@@ -1,0 +1,10 @@
+{"role":"adr","path":"docs/adr/0001-central-relay-container-runtime.md","reason":"Locks server/container runtime semantics and host-local capability policy."}
+{"role":"design","path":"docs/workstreams/codex-server-container-deployment/DESIGN.md","reason":"Primary target-state authority for this lane."}
+{"role":"execution","path":"docs/workstreams/codex-server-container-deployment/TODO.md","reason":"Task ledger and validation scope."}
+{"role":"gates","path":"docs/workstreams/codex-server-container-deployment/EVIDENCE_AND_GATES.md","reason":"Fresh evidence and verification commands."}
+{"role":"existing_architecture","path":"docs/workstreams/codex-control-plane-refactor/CENTRAL_RELAY.md","reason":"Defines LAN/Tailscale central relay semantics and host-local limitations."}
+{"role":"existing_architecture","path":"docs/workstreams/codex-control-plane-refactor/DESIGN.md","reason":"Defines station/profile/session identity language used by the server deployment."}
+{"role":"reference","path":"repo-ref/nako/Dockerfile","reason":"Reference cargo-chef multi-stage server image."}
+{"role":"reference","path":"repo-ref/nako/deploy/compose/nako-sqlite.yml","reason":"Reference Compose shape, healthcheck, and mounted config pattern."}
+{"role":"reference","path":"repo-ref/nako/.github/workflows/docker-publish.yml","reason":"Reference release-tag Docker publishing workflow."}
+{"role":"reference","path":"repo-ref/cargo-chef/docker/Dockerfile","reason":"Reference cargo-chef image build assumptions."}

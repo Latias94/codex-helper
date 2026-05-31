@@ -11,6 +11,7 @@ pub mod doctor;
 mod file_replace;
 pub mod filter;
 pub mod healthcheck;
+pub mod host_local;
 pub mod lb;
 pub mod local_log_store;
 pub mod logging;

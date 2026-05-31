@@ -1,0 +1,21 @@
+[package]
+name = "codex-helper-server"
+version = "0.17.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Container-oriented server runtime for codex-helper central relay deployments."
+repository = "https://github.com/Latias94/codex-helper"
+
+[[bin]]
+name = "codex-helper-server"
+path = "src/main.rs"
+
+[dependencies]
+codex-helper-core = { path = "../core", version = "0.17.0" }
+anyhow = "1.0.102"
+clap = { version = "4.6.1", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "signal"] }
+toml = "0.8"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

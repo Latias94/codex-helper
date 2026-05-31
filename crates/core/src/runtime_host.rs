@@ -14,7 +14,7 @@ use crate::config::{
 };
 use crate::lb::LbState;
 use crate::proxy::{
-    ProxyService, admin_listener_router, admin_loopback_addr_for_proxy_port, local_proxy_base_url,
+    ProxyService, admin_listener_router, admin_loopback_addr_for_proxy_port,
     proxy_only_router_with_admin_base_url,
 };
 use crate::state::ProxyState;
@@ -123,14 +123,26 @@ pub async fn build_proxy_runtime_from_loaded(
     port: u16,
     loaded: LoadedProxyConfig,
 ) -> Result<ProxyRuntime> {
-    let addr: SocketAddr = SocketAddr::from((host, port));
     let admin_addr = admin_loopback_addr_for_proxy_port(port);
+    build_proxy_runtime_from_loaded_with_admin_addr(service_name, host, port, admin_addr, loaded)
+        .await
+}
+
+pub async fn build_proxy_runtime_from_loaded_with_admin_addr(
+    service_name: &'static str,
+    host: IpAddr,
+    port: u16,
+    admin_addr: SocketAddr,
+    loaded: LoadedProxyConfig,
+) -> Result<ProxyRuntime> {
+    let addr: SocketAddr = SocketAddr::from((host, port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let admin_listener = tokio::net::TcpListener::bind(admin_addr).await?;
-    build_proxy_runtime_from_bound_listeners(
+    build_proxy_runtime_from_bound_listeners_with_admin_addr(
         service_name,
         host,
         port,
+        admin_addr,
         loaded,
         listener,
         admin_listener,
@@ -142,6 +154,28 @@ pub async fn build_proxy_runtime_from_bound_listeners(
     service_name: &'static str,
     host: IpAddr,
     port: u16,
+    loaded: LoadedProxyConfig,
+    listener: tokio::net::TcpListener,
+    admin_listener: tokio::net::TcpListener,
+) -> Result<ProxyRuntime> {
+    let admin_addr = admin_loopback_addr_for_proxy_port(port);
+    build_proxy_runtime_from_bound_listeners_with_admin_addr(
+        service_name,
+        host,
+        port,
+        admin_addr,
+        loaded,
+        listener,
+        admin_listener,
+    )
+    .await
+}
+
+pub async fn build_proxy_runtime_from_bound_listeners_with_admin_addr(
+    service_name: &'static str,
+    host: IpAddr,
+    port: u16,
+    admin_addr: SocketAddr,
     loaded: LoadedProxyConfig,
     listener: tokio::net::TcpListener,
     admin_listener: tokio::net::TcpListener,
@@ -166,7 +200,6 @@ pub async fn build_proxy_runtime_from_bound_listeners(
         .build()?;
 
     let lb_states = Arc::new(Mutex::new(HashMap::<String, LbState>::new()));
-    let admin_addr = admin_loopback_addr_for_proxy_port(port);
     let cfg = Arc::new(cfg);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -179,10 +212,8 @@ pub async fn build_proxy_runtime_from_bound_listeners(
         Some(shutdown_tx.clone()),
     );
     let state = proxy.state_handle();
-    let app = proxy_only_router_with_admin_base_url(
-        proxy.clone(),
-        Some(local_proxy_base_url(admin_addr.port())),
-    );
+    let app =
+        proxy_only_router_with_admin_base_url(proxy.clone(), admin_discovery_base_url(admin_addr));
     let admin_app = admin_listener_router(proxy.clone());
 
     Ok(ProxyRuntime {
@@ -202,10 +233,40 @@ pub async fn build_proxy_runtime_from_bound_listeners(
     })
 }
 
+fn admin_discovery_base_url(admin_addr: SocketAddr) -> Option<String> {
+    if admin_addr.ip().is_unspecified() {
+        None
+    } else {
+        Some(format!("http://{admin_addr}"))
+    }
+}
+
 pub fn service_name_for_kind(service_kind: ServiceKind) -> &'static str {
     match service_kind {
         ServiceKind::Codex => "codex",
         ServiceKind::Claude => "claude",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn admin_discovery_url_is_not_advertised_for_unspecified_bind() {
+        let admin_addr = SocketAddr::from(([0, 0, 0, 0], 4211));
+
+        assert_eq!(admin_discovery_base_url(admin_addr), None);
+    }
+
+    #[test]
+    fn admin_discovery_url_uses_explicit_bind_address() {
+        let admin_addr = SocketAddr::from(([192, 168, 1, 10], 4211));
+
+        assert_eq!(
+            admin_discovery_base_url(admin_addr),
+            Some("http://192.168.1.10:4211".to_string())
+        );
     }
 }
 

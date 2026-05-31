@@ -1,0 +1,16 @@
+version = 5
+
+[codex.providers.openai]
+base_url = "https://api.openai.com/v1"
+auth_token_env = "OPENAI_API_KEY"
+tags = { billing = "paygo", deployment = "container" }
+
+[codex.routing]
+entry = "main"
+
+[codex.routing.routes.main]
+strategy = "ordered-failover"
+children = ["openai"]
+
+[retry]
+profile = "balanced"

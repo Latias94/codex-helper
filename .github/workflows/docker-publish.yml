@@ -1,0 +1,143 @@
+name: Docker Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_ref:
+        description: "Git ref or tag to build, for example v0.17.0"
+        required: true
+        type: string
+      publish:
+        description: "Push the image to GHCR after smoke checks pass"
+        required: true
+        type: boolean
+        default: false
+  push:
+    tags:
+      - "v*"
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - ".github/workflows/docker-publish.yml"
+      - "deploy/**"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    name: Build Docker image
+    runs-on: ubuntu-24.04
+    env:
+      DOCKER_PUBLISH: ${{ github.event_name == 'push' || inputs.publish == true }}
+    steps:
+      - name: Resolve release ref
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ref="${{ inputs.release_ref }}"
+          if [[ -z "$ref" ]]; then
+            ref="$GITHUB_REF_NAME"
+          fi
+
+          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
+            tag="${ref#refs/tags/}"
+            if [[ "$tag" != v* ]]; then
+              echo "Docker releases must be built from a v* tag, got: $ref" >&2
+              exit 64
+            fi
+            version="${tag#v}"
+          else
+            tag="$GITHUB_SHA"
+            version="pr-${{ github.event.pull_request.number }}"
+          fi
+
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          image="ghcr.io/${owner}/codex-helper-server"
+
+          {
+            echo "ref=$ref"
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "image=$image"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.sha || steps.release.outputs.ref }}
+          persist-credentials: false
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build smoke image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --target runtime -t codex-helper-server:smoke .
+
+      - name: Smoke test image
+        shell: bash
+        run: docker run --rm codex-helper-server:smoke --help
+
+      - name: Login to GHCR
+        if: env.DOCKER_PUBLISH == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.release.outputs.image }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ steps.release.outputs.tag }},enable=${{ github.event_name != 'pull_request' }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.release.outputs.tag }},enable=${{ github.event_name != 'pull_request' }}
+            type=raw,value=${{ steps.release.outputs.version }},enable=${{ github.event_name == 'pull_request' }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(steps.release.outputs.version, '-') }}
+            type=sha
+          labels: |
+            org.opencontainers.image.title=codex-helper-server
+            org.opencontainers.image.description=Container-oriented codex-helper central relay runtime
+
+      - name: Build and optionally publish
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: runtime
+          platforms: linux/amd64,linux/arm64
+          push: ${{ env.DOCKER_PUBLISH == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Write summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## Docker image"
+            echo
+            echo "- Image: \`${{ steps.release.outputs.image }}:${{ steps.release.outputs.version }}\`"
+            echo "- Published: \`${DOCKER_PUBLISH}\`"
+            echo "- Smoke image: \`codex-helper-server:smoke\`"
+          } >>"$GITHUB_STEP_SUMMARY"

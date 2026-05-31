@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "slug": "codex-server-container-deployment",
+  "title": "Codex Server Container Deployment",
+  "status": "complete",
+  "updated": "2026-05-31",
+  "scope_kind": "execution",
+  "problem": "codex-helper lacks a container-first central relay runtime, Docker Compose deployment assets, and Docker image publishing.",
+  "authoritative_docs": [
+    {
+      "role": "adr",
+      "path": "docs/adr/0001-central-relay-container-runtime.md"
+    },
+    {
+      "role": "design",
+      "path": "docs/workstreams/codex-server-container-deployment/DESIGN.md"
+    },
+    {
+      "role": "execution",
+      "path": "docs/workstreams/codex-server-container-deployment/TODO.md"
+    },
+    {
+      "role": "gates",
+      "path": "docs/workstreams/codex-server-container-deployment/EVIDENCE_AND_GATES.md"
+    },
+    {
+      "role": "context_manifest",
+      "path": "docs/workstreams/codex-server-container-deployment/CONTEXT.jsonl"
+    }
+  ],
+  "context_manifest": "docs/workstreams/codex-server-container-deployment/CONTEXT.jsonl",
+  "gates": [
+    "cargo nextest run --locked -p codex-helper-core server_runtime admin",
+    "cargo nextest run --locked -p codex-helper-core capabilities session",
+    "docker build --target runtime -t codex-helper:local .",
+    "docker compose -f deploy/compose/codex-helper.yml config"
+  ],
+  "evidence": [
+    {
+      "task": "CSC-010",
+      "path": "docs/workstreams/codex-server-container-deployment/EVIDENCE_AND_GATES.md"
+    },
+    {
+      "task": "CSC-020",
+      "path": "docs/workstreams/codex-server-container-deployment/EVIDENCE_AND_GATES.md"
+    },
+    {
+      "task": "CSC-030",
+      "path": "docs/workstreams/codex-server-container-deployment/EVIDENCE_AND_GATES.md"
+    },
+    {
+      "task": "CSC-040",
+      "path": "docs/workstreams/codex-server-container-deployment/EVIDENCE_AND_GATES.md"
+    },
+    {
+      "task": "CSC-050",
+      "path": "docs/workstreams/codex-server-container-deployment/EVIDENCE_AND_GATES.md"
+    },
+    {
+      "task": "CSC-060",
+      "path": "docs/workstreams/codex-server-container-deployment/EVIDENCE_AND_GATES.md"
+    }
+  ],
+  "adr_refs": [
+    "docs/adr/0001-central-relay-container-runtime.md"
+  ],
+  "architecture_refs": [
+    "docs/workstreams/codex-control-plane-refactor/CENTRAL_RELAY.md",
+    "docs/workstreams/codex-control-plane-refactor/DESIGN.md"
+  ],
+  "capability_tags": [
+    "central-relay",
+    "server-runtime",
+    "docker",
+    "ghcr",
+    "host-local-capability"
+  ],
+  "lane_slug": null,
+  "continue_policy": {
+    "default_action": "continue",
+    "notes": "Implementation is complete. Optional follow-ons: proxy authentication for public exposure, remote companion transcript upload, and a CI-only Docker build result review."
+  }
+}

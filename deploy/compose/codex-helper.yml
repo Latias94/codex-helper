@@ -1,0 +1,42 @@
+services:
+  codex-helper:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: ${CODEX_HELPER_IMAGE:-ghcr.io/latias94/codex-helper-server}:${CODEX_HELPER_VERSION:-latest}
+    restart: unless-stopped
+    environment:
+      CODEX_HELPER_HOME: /data
+      CODEX_HELPER_ADMIN_TOKEN: ${CODEX_HELPER_ADMIN_TOKEN:?set CODEX_HELPER_ADMIN_TOKEN}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?set OPENAI_API_KEY or edit deploy/container/config.toml}
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      - "${CODEX_HELPER_PROXY_BIND:-0.0.0.0}:3211:3211"
+      - "${CODEX_HELPER_ADMIN_BIND:-127.0.0.1}:4211:4211"
+    volumes:
+      - type: bind
+        source: ../container/server.toml
+        target: /config/server.toml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ../container/config.toml
+        target: /config/config.toml
+        read_only: true
+        bind:
+          create_host_path: false
+      - codex-helper-data:/data
+    command:
+      - sh
+      - -c
+      - test -f /data/config.toml || cp /config/config.toml /data/config.toml; exec codex-helper-server --config /config/server.toml
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:4211/__codex_helper/api/v1/capabilities >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+volumes:
+  codex-helper-data:

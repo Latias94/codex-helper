@@ -1,0 +1,12 @@
+.git
+.github
+target
+repo-ref
+screenshots
+tmp
+*.log
+*.tmp
+*.bak
+node_modules
+apps/desktop/node_modules
+apps/desktop/src-tauri/target

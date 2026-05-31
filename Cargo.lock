@@ -1202,6 +1202,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-helper-server"
+version = "0.17.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "codex-helper-core",
+ "serde",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "codex-helper-tui"
 version = "0.17.0"
 dependencies = [

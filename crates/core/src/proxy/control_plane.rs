@@ -57,8 +57,5 @@ pub(super) fn require_session_id(session_id: &str) -> Result<(), (StatusCode, St
 }
 
 pub(super) fn host_local_session_history_available() -> bool {
-    let sessions_dir = crate::config::codex_sessions_dir();
-    std::fs::metadata(sessions_dir)
-        .map(|metadata| metadata.is_dir())
-        .unwrap_or(false)
+    crate::host_local::host_local_session_history_available()
 }

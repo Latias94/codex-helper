@@ -1,0 +1,7 @@
+[server]
+service = "codex"
+host = "0.0.0.0"
+port = 3211
+admin-host = "0.0.0.0"
+admin-port = 4211
+host-local-session-history = false

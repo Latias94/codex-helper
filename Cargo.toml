@@ -12,7 +12,13 @@ repository = "https://github.com/Latias94/codex-helper"
 homepage = "https://github.com/Latias94/codex-helper"
 
 [workspace]
-members = ["crates/core", "crates/tui", "crates/gui", "apps/desktop/src-tauri"]
+members = [
+    "crates/core",
+    "crates/tui",
+    "crates/gui",
+    "crates/server",
+    "apps/desktop/src-tauri",
+]
 default-members = ["."]
 
 [[bin]]
