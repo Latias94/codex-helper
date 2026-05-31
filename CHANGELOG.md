@@ -5,6 +5,8 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## [0.18.0] - 2026-05-31
+
 ### 中文
 
 #### 新增
