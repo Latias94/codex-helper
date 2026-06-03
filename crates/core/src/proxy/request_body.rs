@@ -138,6 +138,35 @@ pub(super) fn normalize_codex_compact_request_value(value: &mut serde_json::Valu
     *object = normalized;
 }
 
+pub(super) fn build_codex_remote_compaction_v2_downgrade_body(body: &[u8]) -> Option<Bytes> {
+    let mut value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+    remove_compaction_trigger_items(&mut value);
+    normalize_codex_compact_request_value(&mut value);
+    serde_json::to_vec(&value).ok().map(Bytes::from)
+}
+
+fn remove_compaction_trigger_items(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(items) => {
+            items.retain(|item| {
+                !item
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|item_type| item_type == "compaction_trigger")
+            });
+            for item in items {
+                remove_compaction_trigger_items(item);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            for value in object.values_mut() {
+                remove_compaction_trigger_items(value);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub(super) fn codex_compact_request_requires_affinity(body: &[u8]) -> bool {
     let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
         return false;

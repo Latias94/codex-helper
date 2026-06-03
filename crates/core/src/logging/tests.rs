@@ -110,6 +110,7 @@ fn request_log_serializes_codex_bridge_metadata() {
             patch_mode: "official-imagegen-bridge".to_string(),
             remote_compaction_v1_request: true,
             remote_compaction_v2_request: true,
+            downgraded_to_responses_compact: true,
             responses_websocket_request: false,
             strips_client_auth: true,
         }),
@@ -131,6 +132,10 @@ fn request_log_serializes_codex_bridge_metadata() {
     );
     assert_eq!(
         value["codex_bridge"]["remote_compaction_v2_request"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        value["codex_bridge"]["downgraded_to_responses_compact"].as_bool(),
         Some(true)
     );
     assert_eq!(

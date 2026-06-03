@@ -3,10 +3,12 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use axum::body::{Body, Bytes};
-use axum::http::{HeaderMap, Method, Response, StatusCode, Uri};
+use axum::http::{HeaderMap, HeaderValue, Method, Response, StatusCode, Uri, header};
 
 use crate::lb::{CooldownBackoff, LoadBalancer};
-use crate::logging::{BodyPreview, HeaderEntry, RouteAttemptLog, ServiceTierLog, log_retry_trace};
+use crate::logging::{
+    BodyPreview, CodexBridgeLog, HeaderEntry, RouteAttemptLog, ServiceTierLog, log_retry_trace,
+};
 use crate::state::{SessionBinding, SessionIdentitySource};
 
 use super::ProxyService;
@@ -22,9 +24,14 @@ use super::attempt_transport::{
 use super::concurrency_limits::ConcurrencyPermit;
 use super::headers::filter_response_headers;
 use super::request_body::{
-    is_stale_previous_response_error, remove_previous_response_id_from_body,
+    build_codex_remote_compaction_v2_downgrade_body, is_stale_previous_response_error,
+    remove_previous_response_id_from_body,
 };
 use super::request_preparation::RequestFlavor;
+use super::response_fixer::{
+    classify_remote_compaction_v2_response,
+    synthesize_remote_compaction_v2_sse_from_compact_response,
+};
 use super::retry::{RetryLayerOptions, RetryPlan};
 use super::route_attempts::{
     StartRouteAttemptParams, StatusRouteAttemptParams, record_status_route_attempt,
@@ -282,8 +289,10 @@ pub(super) async fn execute_selected_upstream(
             let success = status.is_success();
             let resp_headers = resp.headers().clone();
             let resp_headers_filtered = filter_response_headers(&resp_headers);
+            let remote_v2_downgrade_enabled = request_flavor.is_remote_compaction_v2_request
+                && codex_remote_v2_downgrade_enabled(proxy).await;
 
-            if request_flavor.is_stream && success {
+            if request_flavor.is_stream && success && !remote_v2_downgrade_enabled {
                 return SelectedUpstreamExecutionOutcome::Return(
                     handle_streaming_attempt_success(StreamingAttemptResponseParams {
                         proxy,
@@ -355,6 +364,389 @@ pub(super) async fn execute_selected_upstream(
                 }
                 AttemptReadBodyOutcome::Continue(bytes) => bytes,
             };
+
+            if remote_v2_downgrade_enabled {
+                let classification =
+                    classify_remote_compaction_v2_response(status, &resp_headers, &bytes);
+                if classification.valid_v2_stream {
+                    let dur = start.elapsed().as_millis() as u64;
+                    match handle_attempt_response(AttemptResponseParams {
+                        proxy,
+                        legacy_lb,
+                        target,
+                        method,
+                        path: uri.path(),
+                        status,
+                        response_headers: resp_headers,
+                        response_headers_filtered: resp_headers_filtered,
+                        response_body: bytes,
+                        request_id,
+                        duration_ms: dur,
+                        started_at_ms,
+                        upstream_headers_ms,
+                        provider_id: provider_id.as_deref(),
+                        session_id,
+                        session_identity_source,
+                        cwd,
+                        effective_effort,
+                        base_service_tier,
+                        codex_bridge: request_flavor.codex_bridge_log.clone(),
+                        upstream_chain,
+                        route_attempts,
+                        route_attempt_index,
+                        model_note: model_note.as_str(),
+                        route_graph_key,
+                        plan,
+                        upstream_opt,
+                        provider_opt,
+                        upstream_attempt,
+                        avoid_set,
+                        avoided_total,
+                        last_err,
+                        cooldown_backoff,
+                        is_user_turn: request_flavor.is_user_turn,
+                        allow_provider_failover,
+                        is_codex_service: request_flavor.is_codex_service,
+                    })
+                    .await
+                    {
+                        AttemptResponseOutcome::RetrySameUpstream => break,
+                        AttemptResponseOutcome::TryNextUpstream => {
+                            return SelectedUpstreamExecutionOutcome::ContinueStation;
+                        }
+                        AttemptResponseOutcome::Return(response) => {
+                            return SelectedUpstreamExecutionOutcome::Return(response);
+                        }
+                    }
+                }
+
+                if !classification.downgrade_recommended {
+                    let dur = start.elapsed().as_millis() as u64;
+                    match handle_attempt_response(AttemptResponseParams {
+                        proxy,
+                        legacy_lb,
+                        target,
+                        method,
+                        path: uri.path(),
+                        status,
+                        response_headers: resp_headers,
+                        response_headers_filtered: resp_headers_filtered,
+                        response_body: bytes,
+                        request_id,
+                        duration_ms: dur,
+                        started_at_ms,
+                        upstream_headers_ms,
+                        provider_id: provider_id.as_deref(),
+                        session_id,
+                        session_identity_source,
+                        cwd,
+                        effective_effort,
+                        base_service_tier,
+                        codex_bridge: request_flavor.codex_bridge_log.clone(),
+                        upstream_chain,
+                        route_attempts,
+                        route_attempt_index,
+                        model_note: model_note.as_str(),
+                        route_graph_key,
+                        plan,
+                        upstream_opt,
+                        provider_opt,
+                        upstream_attempt,
+                        avoid_set,
+                        avoided_total,
+                        last_err,
+                        cooldown_backoff,
+                        is_user_turn: request_flavor.is_user_turn,
+                        allow_provider_failover,
+                        is_codex_service: request_flavor.is_codex_service,
+                    })
+                    .await
+                    {
+                        AttemptResponseOutcome::RetrySameUpstream => break,
+                        AttemptResponseOutcome::TryNextUpstream => {
+                            return SelectedUpstreamExecutionOutcome::ContinueStation;
+                        }
+                        AttemptResponseOutcome::Return(response) => {
+                            return SelectedUpstreamExecutionOutcome::Return(response);
+                        }
+                    }
+                }
+
+                record_status_route_attempt(
+                    upstream_chain,
+                    route_attempts,
+                    StatusRouteAttemptParams {
+                        target,
+                        route_attempt_index,
+                        status_code: status.as_u16(),
+                        error_class: Some(classification.response_shape),
+                        model_note: model_note.as_str(),
+                        upstream_headers_ms,
+                        duration_ms: start.elapsed().as_millis() as u64,
+                        cooldown_secs: None,
+                        cooldown_reason: None,
+                    },
+                );
+
+                if let (Some(compact_body), Some(compact_uri), Some(compact_client_uri)) = (
+                    build_codex_remote_compaction_v2_downgrade_body(current_filtered_body.as_ref()),
+                    compact_uri_for_remote_v2(uri),
+                    compact_client_uri_for_remote_v2(client_uri),
+                ) {
+                    tracing::info!(
+                        request_id,
+                        response_shape = classification.response_shape,
+                        downgraded_to_responses_compact = true,
+                        "downgrading Codex remote_compaction_v2 request to /responses/compact"
+                    );
+                    let compact_previews = super::request_preparation::build_body_previews(
+                        compact_body.as_ref(),
+                        request_flavor.client_content_type.as_deref(),
+                        request_body_previews,
+                        debug_max,
+                        warn_max,
+                    );
+                    *global_attempt = global_attempt.saturating_add(1);
+                    log_attempt_select(AttemptSelectLogParams {
+                        service_name: proxy.service_name,
+                        request_id,
+                        global_attempt: *global_attempt,
+                        provider_attempt,
+                        upstream_attempt,
+                        provider_opt,
+                        upstream_opt,
+                        target,
+                        provider_id: provider_id.as_deref(),
+                        avoid_set,
+                        avoided_total: *avoided_total,
+                        total_upstreams,
+                        model_note: model_note.as_str(),
+                    });
+                    let compact_route_attempt_index = start_selected_route_attempt(
+                        route_attempts,
+                        StartRouteAttemptParams {
+                            target,
+                            provider_id: provider_id.as_deref(),
+                            provider_attempt,
+                            upstream_attempt,
+                            provider_max_attempts: provider_opt.max_attempts,
+                            upstream_max_attempts: upstream_opt.max_attempts,
+                            model_note: model_note.as_str(),
+                            avoid_set,
+                            avoided_total: *avoided_total,
+                            total_upstreams,
+                        },
+                    );
+                    let transport = handle_attempt_transport(AttemptTransportParams {
+                        proxy,
+                        legacy_lb,
+                        target,
+                        method,
+                        uri: &compact_uri,
+                        client_headers,
+                        codex_client_patch_mode: request_flavor.codex_client_patch_mode,
+                        client_headers_entries_cache,
+                        request_body_len,
+                        upstream_request_body_len: compact_body.len(),
+                        debug_max,
+                        warn_max,
+                        client_uri: compact_client_uri.as_str(),
+                        client_body_debug,
+                        upstream_request_body_debug: compact_previews.debug.as_ref(),
+                        client_body_warn,
+                        upstream_request_body_warn: compact_previews.warn.as_ref(),
+                        request_id,
+                        provider_id: provider_id.as_deref(),
+                        route_decision: &route_decision,
+                        filtered_body: &compact_body,
+                        upstream_opt,
+                        upstream_attempt,
+                        transport_cooldown_secs: plan.transport_cooldown_secs,
+                        cooldown_backoff,
+                        avoid_set,
+                        avoided_total,
+                        last_err,
+                        upstream_chain,
+                        route_attempts,
+                        route_attempt_index: compact_route_attempt_index,
+                        model_note: model_note.as_str(),
+                        allow_provider_failover,
+                    })
+                    .await;
+                    let (
+                        compact_resp,
+                        _compact_upstream_start,
+                        compact_upstream_headers_ms,
+                        _debug_base,
+                    ) = match transport {
+                        AttemptTransportOutcome::RetrySameUpstream => break,
+                        AttemptTransportOutcome::TryNextUpstream => {
+                            return SelectedUpstreamExecutionOutcome::ContinueStation;
+                        }
+                        AttemptTransportOutcome::StopProviderChain => {
+                            return SelectedUpstreamExecutionOutcome::StopProviderChain;
+                        }
+                        AttemptTransportOutcome::Continue(success) => (
+                            success.response,
+                            success.upstream_start,
+                            success.upstream_headers_ms,
+                            success.debug_base,
+                        ),
+                    };
+                    let compact_status = compact_resp.status();
+                    let compact_success = compact_status.is_success();
+                    let compact_headers = compact_resp.headers().clone();
+                    let compact_headers_filtered = filter_response_headers(&compact_headers);
+                    let compact_bytes = match read_attempt_response_body(AttemptReadBodyParams {
+                        proxy,
+                        legacy_lb,
+                        target,
+                        response: compact_resp,
+                        upstream_opt,
+                        upstream_attempt,
+                        transport_cooldown_secs: plan.transport_cooldown_secs,
+                        cooldown_backoff,
+                        avoid_set,
+                        avoided_total,
+                        last_err,
+                        upstream_chain,
+                        route_attempts,
+                        route_attempt_index: compact_route_attempt_index,
+                        model_note: model_note.as_str(),
+                        allow_provider_failover,
+                    })
+                    .await
+                    {
+                        AttemptReadBodyOutcome::RetrySameUpstream => break,
+                        AttemptReadBodyOutcome::TryNextUpstream => {
+                            return SelectedUpstreamExecutionOutcome::ContinueStation;
+                        }
+                        AttemptReadBodyOutcome::StopProviderChain => {
+                            return SelectedUpstreamExecutionOutcome::StopProviderChain;
+                        }
+                        AttemptReadBodyOutcome::Continue(bytes) => bytes,
+                    };
+
+                    if compact_success
+                        && let Some(sse_body) =
+                            synthesize_remote_compaction_v2_sse_from_compact_response(
+                                proxy.service_name,
+                                compact_uri.path(),
+                                &compact_headers,
+                                &compact_bytes,
+                            )
+                    {
+                        let mut sse_headers = compact_headers_filtered.clone();
+                        sse_headers.insert(
+                            header::CONTENT_TYPE,
+                            HeaderValue::from_static("text/event-stream"),
+                        );
+                        let dur = start.elapsed().as_millis() as u64;
+                        match handle_attempt_response(AttemptResponseParams {
+                            proxy,
+                            legacy_lb,
+                            target,
+                            method,
+                            path: uri.path(),
+                            status: StatusCode::OK,
+                            response_headers: sse_headers.clone(),
+                            response_headers_filtered: sse_headers,
+                            response_body: sse_body,
+                            request_id,
+                            duration_ms: dur,
+                            started_at_ms,
+                            upstream_headers_ms: compact_upstream_headers_ms,
+                            provider_id: provider_id.as_deref(),
+                            session_id,
+                            session_identity_source,
+                            cwd,
+                            effective_effort,
+                            base_service_tier,
+                            codex_bridge: codex_bridge_with_remote_v2_downgrade(
+                                request_flavor.codex_bridge_log.clone(),
+                            ),
+                            upstream_chain,
+                            route_attempts,
+                            route_attempt_index: compact_route_attempt_index,
+                            model_note: model_note.as_str(),
+                            route_graph_key,
+                            plan,
+                            upstream_opt,
+                            provider_opt,
+                            upstream_attempt,
+                            avoid_set,
+                            avoided_total,
+                            last_err,
+                            cooldown_backoff,
+                            is_user_turn: request_flavor.is_user_turn,
+                            allow_provider_failover,
+                            is_codex_service: request_flavor.is_codex_service,
+                        })
+                        .await
+                        {
+                            AttemptResponseOutcome::RetrySameUpstream => break,
+                            AttemptResponseOutcome::TryNextUpstream => {
+                                return SelectedUpstreamExecutionOutcome::ContinueStation;
+                            }
+                            AttemptResponseOutcome::Return(response) => {
+                                return SelectedUpstreamExecutionOutcome::Return(response);
+                            }
+                        }
+                    }
+
+                    let dur = start.elapsed().as_millis() as u64;
+                    match handle_attempt_response(AttemptResponseParams {
+                        proxy,
+                        legacy_lb,
+                        target,
+                        method,
+                        path: compact_uri.path(),
+                        status: compact_status,
+                        response_headers: compact_headers,
+                        response_headers_filtered: compact_headers_filtered,
+                        response_body: compact_bytes,
+                        request_id,
+                        duration_ms: dur,
+                        started_at_ms,
+                        upstream_headers_ms: compact_upstream_headers_ms,
+                        provider_id: provider_id.as_deref(),
+                        session_id,
+                        session_identity_source,
+                        cwd,
+                        effective_effort,
+                        base_service_tier,
+                        codex_bridge: codex_bridge_with_remote_v2_downgrade(
+                            request_flavor.codex_bridge_log.clone(),
+                        ),
+                        upstream_chain,
+                        route_attempts,
+                        route_attempt_index: compact_route_attempt_index,
+                        model_note: model_note.as_str(),
+                        route_graph_key,
+                        plan,
+                        upstream_opt,
+                        provider_opt,
+                        upstream_attempt,
+                        avoid_set,
+                        avoided_total,
+                        last_err,
+                        cooldown_backoff,
+                        is_user_turn: request_flavor.is_user_turn,
+                        allow_provider_failover,
+                        is_codex_service: request_flavor.is_codex_service,
+                    })
+                    .await
+                    {
+                        AttemptResponseOutcome::RetrySameUpstream => break,
+                        AttemptResponseOutcome::TryNextUpstream => {
+                            return SelectedUpstreamExecutionOutcome::ContinueStation;
+                        }
+                        AttemptResponseOutcome::Return(response) => {
+                            return SelectedUpstreamExecutionOutcome::Return(response);
+                        }
+                    }
+                }
+            }
 
             if request_flavor.is_codex_service
                 && !previous_response_rectified
@@ -451,6 +843,57 @@ pub(super) async fn execute_selected_upstream(
     }
 
     SelectedUpstreamExecutionOutcome::ContinueStation
+}
+
+async fn codex_remote_v2_downgrade_enabled(proxy: &ProxyService) -> bool {
+    if proxy.service_name != "codex" {
+        return false;
+    }
+    proxy
+        .config
+        .v4_snapshot()
+        .await
+        .map(|config| config.codex.compaction.remote_v2_downgrade)
+        .unwrap_or(true)
+}
+
+fn codex_bridge_with_remote_v2_downgrade(
+    codex_bridge: Option<CodexBridgeLog>,
+) -> Option<CodexBridgeLog> {
+    codex_bridge.map(|mut bridge| {
+        bridge.remote_compaction_v1_request = true;
+        bridge.downgraded_to_responses_compact = true;
+        bridge
+    })
+}
+
+fn compact_uri_for_remote_v2(uri: &Uri) -> Option<Uri> {
+    let path = uri.path().trim_end_matches('/');
+    if !path.ends_with("/responses") {
+        return None;
+    }
+    let compact_path = format!("{path}/compact");
+    let path_and_query = match uri.query() {
+        Some(query) => format!("{compact_path}?{query}"),
+        None => compact_path,
+    };
+    path_and_query.parse().ok()
+}
+
+fn compact_client_uri_for_remote_v2(client_uri: &str) -> Option<String> {
+    let (path, query) = client_uri
+        .split_once('?')
+        .map(|(path, query)| (path, Some(query)))
+        .unwrap_or((client_uri, None));
+    let path = path.trim_end_matches('/');
+    if !path.ends_with("/responses") {
+        return None;
+    }
+    let compact_path = format!("{path}/compact");
+    Some(match query {
+        Some(query) => format!("{compact_path}?{query}"),
+        None => compact_path,
+    })
 }
 
 fn log_attempt_select(params: AttemptSelectLogParams<'_>) {

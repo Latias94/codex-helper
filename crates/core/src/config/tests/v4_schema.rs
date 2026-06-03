@@ -67,6 +67,7 @@ fn v4_tag_preferred_stop_excludes_non_matching_fallbacks() {
         version: 4,
         codex: ServiceViewV4 {
             default_profile: None,
+            compaction: CodexCompactionConfig::default(),
             profiles: BTreeMap::new(),
             providers: BTreeMap::from([
                 (
@@ -125,6 +126,7 @@ fn v4_nested_route_graph_expands_monthly_pool_before_paygo() {
         version: 4,
         codex: ServiceViewV4 {
             default_profile: None,
+            compaction: CodexCompactionConfig::default(),
             profiles: BTreeMap::new(),
             providers: BTreeMap::from([
                 (
@@ -222,6 +224,7 @@ fn compile_v4_to_runtime_direct_path_matches_v2_bridge_for_compat_state() {
         version: 4,
         codex: ServiceViewV4 {
             default_profile: Some("daily".to_string()),
+            compaction: CodexCompactionConfig::default(),
             profiles: BTreeMap::from([(
                 "daily".to_string(),
                 ServiceControlProfile {

@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### 中文
+
+#### 修复
+
+- Codex `remote_compaction_v2` 的 `compaction_trigger` `/responses` 请求现在会默认先尝试 v2；如果 relay 返回普通 Responses 成功流、JSON compact 结果或明确不支持 v2 的错误，helper 会自动降级到 `/responses/compact` 并合成为 Codex 期望的 v2 compact SSE，避免触发 Codex 本地 “expected exactly one compaction output item” fatal。可通过 `[codex.compaction].remote_v2_downgrade = false` 关闭该兜底。
+
+### English summary
+
+#### Fixed
+
+- Codex `remote_compaction_v2` `compaction_trigger` `/responses` requests now try v2 first by default. If a relay returns an ordinary Responses success stream, a JSON compact result, or a clear unsupported-v2 error, helper automatically downgrades to `/responses/compact` and synthesizes the v2 compact SSE shape Codex expects, avoiding Codex's local “expected exactly one compaction output item” fatal. Set `[codex.compaction].remote_v2_downgrade = false` to disable the fallback.
+
 ## [0.18.0] - 2026-05-31
 
 ### 中文

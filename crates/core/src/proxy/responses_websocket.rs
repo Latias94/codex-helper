@@ -895,6 +895,7 @@ async fn relay_websocket_streams(
             remote_compaction_v2_request: prepared
                 .request_continuity
                 .is_remote_compaction_v2_request,
+            downgraded_to_responses_compact: false,
             responses_websocket_request: true,
             strips_client_auth: prepared.codex_patch_mode.strips_codex_client_auth(),
         });

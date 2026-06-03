@@ -1308,14 +1308,13 @@ pub fn codex_bridge_diagnostics() -> CodexBridgeDiagnostics {
             }
 
             if status.remote_compaction_v2_enabled {
+                let action = "Keep helper's [codex.compaction].remote_v2_downgrade enabled unless you explicitly want raw v2 relay behavior without /responses/compact fallback.".to_string();
                 push_bridge_check(
                     &mut checks,
                     "codex_bridge.remote_compaction_v2",
                     CodexBridgeDiagnosticStatus::Warn,
-                    "Codex remote_compaction_v2 is enabled; helper will detect compaction_trigger requests, but relay compatibility is still less stable than v1 /responses/compact.".to_string(),
-                    Some(
-                        "Only keep [features].remote_compaction_v2 = true when your relay explicitly supports compaction_trigger requests and compaction response items.".to_string(),
-                    ),
+                    "Codex remote_compaction_v2 is enabled; helper will detect compaction_trigger requests and automatically downgrade to /responses/compact when the relay does not return a valid v2 compact stream.".to_string(),
+                    Some(action),
                 );
             } else {
                 push_bridge_check(

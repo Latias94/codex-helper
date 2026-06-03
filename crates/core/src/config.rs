@@ -652,6 +652,8 @@ impl Default for ProxyConfigV4 {
 pub struct ServiceViewV4 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "is_default_codex_compaction_config")]
+    pub compaction: CodexCompactionConfig,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub profiles: BTreeMap<String, ServiceControlProfile>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -670,6 +672,36 @@ impl ServiceViewV4 {
             routing.normalize_authoring();
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct CodexCompactionConfig {
+    #[serde(
+        default = "default_codex_remote_v2_downgrade",
+        skip_serializing_if = "is_default_codex_remote_v2_downgrade"
+    )]
+    pub remote_v2_downgrade: bool,
+}
+
+impl Default for CodexCompactionConfig {
+    fn default() -> Self {
+        Self {
+            remote_v2_downgrade: default_codex_remote_v2_downgrade(),
+        }
+    }
+}
+
+fn default_codex_remote_v2_downgrade() -> bool {
+    true
+}
+
+fn is_default_codex_remote_v2_downgrade(value: &bool) -> bool {
+    *value == default_codex_remote_v2_downgrade()
+}
+
+fn is_default_codex_compaction_config(value: &CodexCompactionConfig) -> bool {
+    value == &CodexCompactionConfig::default()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

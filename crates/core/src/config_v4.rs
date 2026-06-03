@@ -955,6 +955,7 @@ fn migrate_service_v2_to_v4(view: &ServiceViewV2) -> ServiceViewV4 {
 
     ServiceViewV4 {
         default_profile: view.default_profile.clone(),
+        compaction: CodexCompactionConfig::default(),
         profiles,
         providers,
         routing,
@@ -1267,6 +1268,7 @@ pub mod legacy {
 
         Ok(ServiceViewV4 {
             default_profile: view.default_profile.clone(),
+            compaction: CodexCompactionConfig::default(),
             profiles,
             providers: view.providers.clone(),
             routing,
