@@ -149,10 +149,9 @@ fn remove_compaction_trigger_items(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Array(items) => {
             items.retain(|item| {
-                !item
-                    .get("type")
+                item.get("type")
                     .and_then(serde_json::Value::as_str)
-                    .is_some_and(|item_type| item_type == "compaction_trigger")
+                    .is_none_or(|item_type| item_type != "compaction_trigger")
             });
             for item in items {
                 remove_compaction_trigger_items(item);

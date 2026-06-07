@@ -8,7 +8,7 @@ use crate::codex_capability_profile::{
     CodexCapabilitySupport, CodexModelCatalogProfile, CodexPatchModeRecommendation,
     CodexPatchModeRecommendationInput,
 };
-use crate::codex_integration::CodexPatchMode;
+use crate::codex_integration::{CodexCompactionStrategy, CodexPatchMode, CodexSwitchOptions};
 use crate::config::{ServiceViewV4, effective_v4_routing};
 use crate::routing_ir::compile_v4_route_plan_template_for_compat_runtime;
 use crate::runtime_identity::ContinuityDomainKey;
@@ -39,6 +39,8 @@ pub struct CodexRelayCapabilitiesRequest {
     #[serde(default, alias = "patch_preset")]
     pub patch_mode: Option<CodexPatchMode>,
     #[serde(default)]
+    pub compaction: Option<CodexCompactionStrategy>,
+    #[serde(default)]
     pub responses_websocket: Option<bool>,
 }
 
@@ -56,6 +58,7 @@ pub struct CodexRelayCapabilitiesResponse {
     pub provider_endpoint_key: Option<String>,
     pub upstream_base_url: String,
     pub patch_mode: CodexPatchMode,
+    pub compaction: CodexCompactionStrategy,
     pub responses_websocket: bool,
     pub model: Option<String>,
     pub expected: CodexCapabilityProfile,
@@ -161,6 +164,26 @@ pub(super) async fn codex_relay_capabilities_for_proxy(
                 .map(|cfg| cfg.options.responses_websocket)
         })
         .unwrap_or(false);
+    let compaction = payload
+        .compaction
+        .or_else(current_codex_switch_compaction_strategy)
+        .or_else(|| {
+            crate::config::codex_client_patch_config_from_config_file()
+                .ok()
+                .map(|cfg| cfg.options.compaction)
+        })
+        .unwrap_or_default();
+    if let Err(err) = (CodexSwitchOptions {
+        responses_websocket,
+        compaction,
+    })
+    .validate_for_mode(patch_mode)
+    {
+        return Err(ProxyControlError::new(
+            StatusCode::BAD_REQUEST,
+            err.to_string(),
+        ));
+    }
     let model = payload
         .model
         .as_deref()
@@ -174,6 +197,7 @@ pub(super) async fn codex_relay_capabilities_for_proxy(
 
     let expected = build_expected_profile(
         patch_mode,
+        compaction,
         responses_websocket,
         model.as_deref(),
         models_observation,
@@ -187,6 +211,7 @@ pub(super) async fn codex_relay_capabilities_for_proxy(
         v4_source.as_deref().map(|cfg| &cfg.codex),
         &target,
         patch_mode,
+        compaction,
         responses_websocket,
     );
 
@@ -200,6 +225,7 @@ pub(super) async fn codex_relay_capabilities_for_proxy(
         provider_endpoint_key: target.provider_endpoint_key,
         upstream_base_url: target.upstream.base_url,
         patch_mode,
+        compaction,
         responses_websocket,
         model,
         expected,
@@ -273,8 +299,16 @@ fn current_codex_switch_responses_websocket() -> Option<bool> {
         .and_then(|status| status.supports_websockets)
 }
 
+fn current_codex_switch_compaction_strategy() -> Option<CodexCompactionStrategy> {
+    crate::codex_integration::codex_switch_status()
+        .ok()
+        .filter(|status| status.enabled)
+        .map(|status| status.compaction_strategy)
+}
+
 fn build_expected_profile(
     patch_mode: CodexPatchMode,
+    compaction: CodexCompactionStrategy,
     responses_websocket: bool,
     model: Option<&str>,
     models_observation: &CodexRelayProbeObservation,
@@ -284,8 +318,9 @@ fn build_expected_profile(
     });
     CodexCapabilityProfile::for_input(CodexCapabilityProfileInput::from_patch_config(
         patch_mode,
-        crate::codex_integration::CodexSwitchOptions {
+        CodexSwitchOptions {
             responses_websocket,
+            compaction,
         },
         model_catalog,
     ))
@@ -344,6 +379,7 @@ fn build_continuity_diagnostics(
     view: Option<&ServiceViewV4>,
     target: &SelectedCodexRelayTarget,
     patch_mode: CodexPatchMode,
+    compaction: CodexCompactionStrategy,
     responses_websocket: bool,
 ) -> CodexRelayContinuityDiagnostics {
     let fallback_domain = target
@@ -380,15 +416,18 @@ fn build_continuity_diagnostics(
         }
     }
 
-    let official_relay = patch_mode.enables_official_relay_features();
+    let remote_compaction_identity = compaction
+        .provider_identity_for_mode(patch_mode)
+        .provider_name()
+        == "OpenAI";
     let can_state_bound_failover_within_domain =
         selected_domain.explicit && same_domain_endpoint_count > 1;
     let mut warnings = Vec::new();
     let mut recommendations = Vec::new();
 
-    if official_relay && !selected_domain.explicit && configured_endpoint_count > 1 {
+    if remote_compaction_identity && !selected_domain.explicit && configured_endpoint_count > 1 {
         warnings.push(
-            "official relay preset is active with multiple configured provider endpoints, but the selected endpoint has no explicit continuity_domain".to_string(),
+            "remote compaction identity is active with multiple configured provider endpoints, but the selected endpoint has no explicit continuity_domain".to_string(),
         );
         recommendations.push(
             "Set the same continuity_domain only on provider endpoints that intentionally share encrypted response state; otherwise keep provider-endpoint isolation.".to_string(),
@@ -409,11 +448,11 @@ fn build_continuity_diagnostics(
     if matches!(
         affinity_policy.as_deref(),
         Some("preferred-group") | Some("off")
-    ) && official_relay
+    ) && remote_compaction_identity
         && configured_endpoint_count > 1
     {
         warnings.push(
-            "official relay presets with multiple provider endpoints should use fallback-sticky or hard affinity when encrypted compact state matters".to_string(),
+            "remote compaction with multiple provider endpoints should use fallback-sticky or hard affinity when encrypted compact state matters".to_string(),
         );
     }
 
@@ -533,6 +572,7 @@ mod tests {
     use reqwest::Client;
 
     use super::*;
+    use crate::codex_capability_profile::{CodexCapabilitySupport, CodexProviderIdentity};
     use crate::config::{
         ProviderConfigV4, ProxyConfigV4, RoutingConfigV4, ServiceViewV4, UpstreamAuth,
     };
@@ -705,6 +745,126 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("no explicit continuity_domain"))
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_relay_capabilities_uses_compaction_strategy_for_expected_profile() {
+        let v4 = ProxyConfigV4 {
+            codex: ServiceViewV4 {
+                providers: BTreeMap::from([
+                    (
+                        "relay-a".to_string(),
+                        ProviderConfigV4 {
+                            base_url: Some("http://127.0.0.1:9/v1".to_string()),
+                            inline_auth: UpstreamAuth::default(),
+                            ..ProviderConfigV4::default()
+                        },
+                    ),
+                    (
+                        "relay-b".to_string(),
+                        ProviderConfigV4 {
+                            base_url: Some("http://127.0.0.1:10/v1".to_string()),
+                            inline_auth: UpstreamAuth::default(),
+                            ..ProviderConfigV4::default()
+                        },
+                    ),
+                ]),
+                routing: Some(RoutingConfigV4::ordered_failover(vec![
+                    "relay-a".to_string(),
+                    "relay-b".to_string(),
+                ])),
+                ..ServiceViewV4::default()
+            },
+            ..ProxyConfigV4::default()
+        };
+        let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compile v4 runtime");
+        let proxy = ProxyService::new_with_v4_source(
+            Client::new(),
+            Arc::new(runtime),
+            Some(Arc::new(v4)),
+            "codex",
+            Arc::new(Mutex::new(HashMap::<String, LbState>::new())),
+        );
+
+        let response = codex_relay_capabilities_for_proxy(
+            &proxy,
+            CodexRelayCapabilitiesRequest {
+                provider_id: Some("relay-a".to_string()),
+                patch_mode: Some(CodexPatchMode::OfficialImagegenBridge),
+                compaction: Some(CodexCompactionStrategy::Local),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("capabilities response");
+
+        assert_eq!(response.compaction, CodexCompactionStrategy::Local);
+        assert_eq!(
+            response.expected.provider_identity,
+            CodexProviderIdentity::HelperRelay
+        );
+        assert_eq!(
+            response.expected.remote_compaction_v1.support,
+            CodexCapabilitySupport::Unsupported
+        );
+        assert!(
+            response.continuity.warnings.is_empty(),
+            "local compaction should not warn about remote compact continuity domains"
+        );
+        assert!(
+            !response
+                .mismatches
+                .iter()
+                .any(|mismatch| mismatch.capability == "remote_compaction_v1"),
+            "local compaction should not require /responses/compact support"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_relay_capabilities_rejects_invalid_compaction_combination() {
+        let v4 = ProxyConfigV4 {
+            codex: ServiceViewV4 {
+                providers: BTreeMap::from([(
+                    "relay-a".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some("http://127.0.0.1:9/v1".to_string()),
+                        inline_auth: UpstreamAuth::default(),
+                        ..ProviderConfigV4::default()
+                    },
+                )]),
+                routing: Some(RoutingConfigV4::ordered_failover(vec![
+                    "relay-a".to_string(),
+                ])),
+                ..ServiceViewV4::default()
+            },
+            ..ProxyConfigV4::default()
+        };
+        let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compile v4 runtime");
+        let proxy = ProxyService::new_with_v4_source(
+            Client::new(),
+            Arc::new(runtime),
+            Some(Arc::new(v4)),
+            "codex",
+            Arc::new(Mutex::new(HashMap::<String, LbState>::new())),
+        );
+
+        let err = codex_relay_capabilities_for_proxy(
+            &proxy,
+            CodexRelayCapabilitiesRequest {
+                provider_id: Some("relay-a".to_string()),
+                patch_mode: Some(CodexPatchMode::Default),
+                compaction: Some(CodexCompactionStrategy::RemoteV1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("remote compaction should require official preset");
+
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            err.message()
+                .contains("remote compaction strategies require --preset official-relay")
         );
     }
 

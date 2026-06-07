@@ -30,7 +30,7 @@ It is probably unnecessary if you only use one official account and do not need 
 
 - **Local proxy**: listens on `127.0.0.1:3211` by default.
 - **Safe Codex patching**: only touches the local proxy fields in `~/.codex/config.toml`; unrelated Codex edits are preserved.
-- **Native Codex presets**: `chatgpt-bridge` keeps ChatGPT login shape, `imagegen-bridge` exposes hosted image generation, and `official-relay` / `official-imagegen` let relays that forward official Responses semantics try remote compaction v1; `responses_websocket` is a separate transport switch for Responses WebSocket v2.
+- **Native Codex presets**: `chatgpt-bridge` keeps ChatGPT login shape, `imagegen-bridge` exposes hosted image generation, and `official-relay` / `official-imagegen` make relays that forward official Responses semantics use remote compaction by default; `compaction` and `responses_websocket` are separate switches for the compaction path and Responses WebSocket v2.
 - **OpenAI Images-compatible entrypoint**: the local proxy also exposes `POST /v1/images/generations` and JSON `POST /v1/images/edits`, translates them into Responses hosted `image_generation` requests, and keeps using the same provider routing / fallback chain for local skills and scripts.
 - **Relay capability diagnostics**: TUI, CLI, and admin API checks for `/models`, `/responses`, and `/responses/compact`, then recommends the preset that matches the selected relay.
 - **Provider / routing config**: `version = 5` route graph schema. Define providers once, then use routing entry/routes for order, pinning, grouping, or tag preference.
@@ -152,12 +152,12 @@ Preset choices:
 | `default` | You only need the local proxy, multiple providers, and fallback | Codex sends model requests to the local helper; helper picks the upstream |
 | `chatgpt-bridge` | You are already signed in to ChatGPT in official Codex and want app/mobile account behavior, but model traffic should use a relay | Keeps the ChatGPT auth shape while upstream credentials still come from helper config |
 | `imagegen-bridge` | The relay does not support official provider identity, but you want Codex to expose hosted `image_generation` | Writes the empty `{}` auth facade and does not require official login |
-| `official-relay` | The relay forwards official OpenAI Responses semantics, especially `/responses/compact` | Makes Codex treat the local helper as an OpenAI provider so it can try remote compaction v1 |
-| `official-imagegen` | The relay is backed by an official subscription account and supports both `/responses/compact` and hosted image generation | Combines OpenAI provider identity with the imagegen auth facade |
+| `official-relay` | The relay forwards official OpenAI Responses semantics, especially `/responses/compact` | Makes Codex treat the local helper as an OpenAI provider and use the remote compaction path by default |
+| `official-imagegen` | The relay is backed by an official subscription account and supports both `/responses/compact` and hosted image generation | Combines OpenAI provider identity, the default remote compaction path, and the imagegen auth facade |
 
 `chatgpt-bridge` requires a completed ChatGPT login in official Codex first. If `~/.codex/auth.json` lacks the full token, email, and account metadata, codex-helper refuses the patch instead of leaving Codex in a half-login state.
 
-`official-relay` and `official-imagegen` are experimental. They only change how Codex chooses client-side capabilities; the relay still has to support the underlying endpoints. Real request credentials come from `~/.codex-helper/config.toml`, and the bridge presets do not forward Codex ChatGPT tokens to third-party relays that do not have helper-side credentials. Legacy names `official-relay-bridge` / `official-imagegen-bridge` are still accepted as aliases, but are no longer the recommended spelling.
+`official-relay` and `official-imagegen` are experimental. They only change how Codex chooses client-side capabilities; the relay still has to support the underlying endpoints. By default, `official-*` makes Codex choose the remote compaction path. To keep other official preset behavior while forcing local compaction, set `[codex.client_patch].compaction = "local"` or run `codex-helper switch on --preset official-imagegen --compaction local`. Real request credentials come from `~/.codex-helper/config.toml`, and the bridge presets do not forward Codex ChatGPT tokens to third-party relays that do not have helper-side credentials. Legacy names `official-relay-bridge` / `official-imagegen-bridge` are still accepted as aliases, but are no longer the recommended spelling.
 
 To avoid degrading capable relays, codex-helper normalizes compressed HTTP request bodies before routing by default (`zstd`, `gzip` / `x-gzip`, `br`, and `deflate`). For Codex `/responses`, `/responses/compact`, and Responses WebSocket, helper also completes missing `session_id`, `x-session-id`, official `session-id` / `thread-id`, and `prompt_cache_key` fields from existing request evidence: header session ids, body `session_id`, `prompt_cache_key`, or `metadata.session_id`. `previous_response_id` is only used for stale-response repair, not as a session identity source. It does not invent a synthetic session id and does not overwrite session fields the client already sent.
 
@@ -177,7 +177,7 @@ default
 
 Do not enable the strongest combination blindly: `official-imagegen` requires the relay to support `/responses`, `/responses/compact`, and hosted `image_generation`; `responses_websocket` additionally requires a passing WebSocket live smoke.
 
-If the upstream is known to support Responses WebSocket v2, enable `responses_websocket = true` or `--responses-websocket` separately; it is a transport switch, not a preset.
+If the upstream is known to support Responses WebSocket v2, enable `responses_websocket = true` or `--responses-websocket` separately; it is a transport switch, not a preset. Compaction is also a separate switch: `compaction = "auto"` keeps the preset default, `local` forces Codex client-side local compaction, `remote-v1` forces `/responses/compact`, and `remote-v2` forces `remote_compaction_v2` while keeping helper's v2-to-v1 downgrade fallback available.
 
 The proxy also exposes OpenAI Images-compatible generation and reference-image edit entrypoints for skills or scripts that should not depend on whether the Codex client exposed its hosted tool:
 
@@ -249,6 +249,7 @@ version = 5
 [codex.client_patch]
 preset = "chatgpt-bridge"
 responses_websocket = false
+compaction = "auto"
 
 [codex.providers.relay]
 base_url = "https://relay.example/v1"
@@ -386,7 +387,7 @@ codex-helper pricing sync-basellm --model gpt-5 --dry-run
 # diagnostics
 codex-helper status
 codex-helper doctor
-codex-helper codex relay-capabilities --preset official-imagegen --model gpt-5.5
+codex-helper codex relay-capabilities --preset official-imagegen --compaction local --model gpt-5.5
 codex-helper codex relay-live-smoke --acknowledgement run-live-codex-relay-smoke --model gpt-5.5
 codex-helper codex relay-live-smoke --acknowledgement run-live-codex-relay-smoke --model gpt-5.5 --provider ciii --compact-v2
 codex-helper codex relay-evidence --limit 20

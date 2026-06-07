@@ -80,6 +80,8 @@ version = 5
 preset = "chatgpt-bridge"
 # Optional transport switch. Only valid with official relay presets.
 responses_websocket = false
+# Optional compaction strategy: auto | local | remote-v1 | remote-v2.
+compaction = "auto"
 ```
 
 Legacy `mode = "..."` config is still accepted for existing users, but codex-helper rewrites saved/generated config as `preset = "..."`.
@@ -91,6 +93,7 @@ codex-helper switch on --preset chatgpt-bridge
 codex-helper switch on --preset imagegen-bridge
 codex-helper switch on --preset official-relay
 codex-helper switch on --preset official-relay --responses-websocket
+codex-helper switch on --preset official-imagegen --compaction local
 codex-helper switch on --preset official-imagegen
 codex-helper switch on --preset default
 ```
@@ -105,13 +108,15 @@ Resident runtimes write a best-effort owner marker under `~/.codex-helper/run/` 
 
 `imagegen-bridge` is an explicit experimental hack preset. It writes an empty `{}` `~/.codex/auth.json` facade so Codex's default auth resolution still treats the session as ChatGPT-backed and exposes the hosted `image_generation` tool, while actual upstream credentials still come from codex-helper routing (`auth_token_env`, `auth_token`, `api_key_env`, or `api_key`). It does not require an official ChatGPT login and does not write an explicit `auth_mode`. Before enabling it, codex-helper verifies that the Codex service has at least one enabled upstream and that at least one upstream credential is actually available to the current process. For env-based credentials, setting only the env var name in config is not enough; the env var value must also be present when you run `switch on` or start `serve`. codex-helper stores the previous `auth.json` in its switch state and restores it when switching back to `default` or running `switch off`, but only if the current `auth.json` still matches the helper-written facade. If the user or Codex changed `auth.json` meanwhile, codex-helper leaves it untouched.
 
-`official-relay` is an experimental official-relay preset for relays that forward OpenAI Responses semantics, especially sub2api-style relays that support `/responses/compact`. It writes `name = "OpenAI"` into `~/.codex/config.toml` so Codex can choose official remote compaction v1. By default it keeps `supports_websockets = false`. It does not write `requires_openai_auth` and does not patch `auth.json`; upstream credentials still must come from codex-helper routing. If the relay rejects `/responses/compact` with 404/405/501 or an unsupported-compact error, switch back to `default` or use a relay account that advertises compact support.
+`official-relay` is an experimental official-relay preset for relays that forward OpenAI Responses semantics, especially sub2api-style relays that support `/responses/compact`. It writes `name = "OpenAI"` into `~/.codex/config.toml` so Codex chooses the remote compaction path by default. It keeps `supports_websockets = false` unless the separate WebSocket switch is enabled. It does not write `requires_openai_auth` and does not patch `auth.json`; upstream credentials still must come from codex-helper routing. If the relay rejects `/responses/compact` with 404/405/501 or an unsupported-compact error, explicitly set `compaction = "local"` to make the Codex client return to local compaction, or use a relay account that advertises compact support.
 
 For all presets, codex-helper normalizes HTTP request `Content-Encoding` by default before it inspects or forwards a request. Supported request encodings are `zstd`, `gzip` / `x-gzip`, `br`, and `deflate`; after a successful decode, helper forwards ordinary JSON and removes stale `Content-Encoding` / `Content-Length`. This is a transport compatibility layer, not a compact fallback: the upstream relay must still implement `/responses/compact`, hosted tools, or WebSocket support itself. If you hit a rare relay that requires the exact compressed Codex request body, start helper with `CODEX_HELPER_REQUEST_BODY_ENCODING=passthrough` to preserve the original body and header.
 
 When Codex does not send stronger session headers (`session_id`, `session-id`, `conversation_id`, or `thread-id`), codex-helper also uses decoded JSON `prompt_cache_key` as the session-affinity key. This mirrors sub2api-style stickiness so normal `/responses` traffic and later `/responses/compact` requests stay on the same selected route without asking users to classify the relay implementation.
 
-`official-imagegen` is the hybrid experimental preset for relays backed by official OpenAI subscriptions. It writes the same OpenAI provider identity as `official-relay` so Codex can use remote compaction v1, and writes the same empty `{}` auth facade as `imagegen-bridge` so Codex exposes hosted `image_generation`. By default it keeps `supports_websockets = false`, does not write `requires_openai_auth`, and still strips Codex client auth before forwarding unless the selected upstream has its own helper-side credential. This preset only makes Codex expose and send the official hosted tool; the relay account still has to support both `/responses/compact` and hosted image generation calls.
+`official-imagegen` is the hybrid experimental preset for relays backed by official OpenAI subscriptions. It writes the same OpenAI provider identity as `official-relay` so Codex uses the remote compaction path by default, and writes the same empty `{}` auth facade as `imagegen-bridge` so Codex exposes hosted `image_generation`. By default it keeps `supports_websockets = false`, does not write `requires_openai_auth`, and still strips Codex client auth before forwarding unless the selected upstream has its own helper-side credential. This preset only makes Codex expose and send the official hosted tool; the relay account still has to support both `/responses/compact` and hosted image generation calls.
+
+`compaction` is a separate compaction strategy, not another preset. `auto` keeps the preset default: `default` / `imagegen-bridge` lean toward Codex local compaction, while `official-relay` / `official-imagegen` use the remote compaction path by default. `local` forces the provider identity back to `codex-helper` so the Codex client performs local compaction; `remote-v1` forces OpenAI provider identity and disables `remote_compaction_v2`, making Codex use `/responses/compact`; `remote-v2` writes `[features].remote_compaction_v2 = true`, while helper still uses `[codex.compaction].remote_v2_downgrade = true` to fall back to v1 when the upstream cannot produce a valid v2 stream.
 
 `responses_websocket = true` is a transport switch, not a separate preset. It is only valid with `official-relay` and `official-imagegen`. When enabled, codex-helper writes `supports_websockets = true` into Codex's provider config and handles the WebSocket upgrade itself on `/responses`, `/v1/responses`, and `/backend-api/codex/responses`. The relay path reads the first `response.create` frame, applies the same model override, model mapping, request filter, routing selection, session affinity, concurrency snapshot, and auth injection as normal helper traffic, injects `OpenAI-Beta: responses_websockets=2026-02-06`, then bridges frames bidirectionally to the selected upstream. Keep it disabled unless your upstream relay also supports Responses WebSocket v2.
 
@@ -192,10 +197,10 @@ preset automatically.
 ```bash
 curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-capabilities \
   -H 'content-type: application/json' \
-  -d '{"patch_preset":"official-imagegen","model":"gpt-5.5"}'
+  -d '{"patch_preset":"official-imagegen","compaction":"local","model":"gpt-5.5"}'
 ```
 
-For API compatibility the response JSON field is still named `patch_mode`; requests accept either `patch_mode` or `patch_preset`, and accept both preset names such as `official-imagegen` and legacy mode names such as `official-imagegen-bridge`.
+For API compatibility the response JSON field is still named `patch_mode`; requests accept either `patch_mode` or `patch_preset`, and accept both preset names such as `official-imagegen` and legacy mode names such as `official-imagegen-bridge`. Requests and responses also include `compaction` so diagnostics evaluate the same `auto` / `local` / `remote-v1` / `remote-v2` strategy that `switch on` would apply.
 
 Use the admin port for your Codex proxy port (`proxy_port + 1000`; the default Codex proxy is
 `3211`, so the default admin port is `4211`). The endpoint is `POST` on purpose: it sends one
@@ -208,6 +213,7 @@ a request storm amplifier.
 The response includes:
 
 - `expected`: what Codex should expose for the requested preset and model metadata.
+- `compaction`: the compaction strategy used when computing the expected Codex client profile.
 - `observed`: what the relay actually returned for `/models`, `/responses`, and
   `/responses/compact`, including confidence and whether helper translation is required.
 - `mismatches`: places where Codex will try a capability that the relay did not prove.
@@ -236,10 +242,10 @@ metadata does not prove image input, the recommendation will not assume hosted i
 Hosted `image_generation` is not actively probed by this diagnostic endpoint because that can spend
 quota or create image artifacts. Responses WebSocket support is opt-in through
 `responses_websocket = true` / `--responses-websocket`; bridge presets keep it disabled by default.
-Remote compaction v2 is still not enabled by these presets. If you enable Codex
+Remote compaction v2 is not enabled by default. If you set `compaction = "remote-v2"` or enable Codex
 `[features].remote_compaction_v2 = true` yourself, helper recognizes the
 `compaction_trigger` request shape for logging and route-continuity protection,
-but the upstream relay must still support v2 compaction response items.
+but the upstream relay must still support v2 compaction response items or rely on helper's v2-to-v1 downgrade fallback.
 
 Official relay presets deliberately separate two ideas:
 
@@ -344,6 +350,7 @@ The same diagnostics are available without starting the TUI or admin listener:
 ```bash
 codex-helper codex relay-capabilities \
   --preset official-imagegen \
+  --compaction local \
   --model gpt-5.5 \
   --provider ciii \
   --endpoint default
@@ -401,7 +408,7 @@ codex-helper usage find --path responses/compact --limit 20
 codex-helper usage find --path responses --limit 20
 ```
 
-An official compact hit normally appears as `POST /responses/compact` in codex-helper logs. Ordinary local fallback compaction appears as a normal `POST /responses` request. Remote compaction v2, when Codex enables it, also travels through ordinary `/responses` with a structured `compaction_trigger` input item rather than `/responses/compact`; helper logs it with `codex_bridge.remote_compaction_v2_request = true` and applies state-bound route-continuity rules. This helper preset does not enable v2. When `responses_websocket` is enabled, normal turn streaming uses a WebSocket `GET /responses`-style upgrade rather than an HTTP `POST /responses`.
+An official compact hit normally appears as `POST /responses/compact` in codex-helper logs. Ordinary local fallback compaction appears as a normal `POST /responses` request. Remote compaction v2, when Codex enables it, also travels through ordinary `/responses` with a structured `compaction_trigger` input item rather than `/responses/compact`; helper logs it with `codex_bridge.remote_compaction_v2_request = true` and applies state-bound route-continuity rules. `compaction = "remote-v2"` explicitly enables v2; default `auto` does not write that feature flag. When `responses_websocket` is enabled, normal turn streaming uses a WebSocket `GET /responses`-style upgrade rather than an HTTP `POST /responses`.
 
 Switching back to `default` removes the bridge-only fields from `codex_proxy` and restores helper-managed auth patches when it is safe to do so.
 

@@ -299,6 +299,7 @@ mod tests {
             provider_endpoint_key: None,
             upstream_base_url: "https://relay.example/v1".to_string(),
             patch_mode: CodexPatchMode::OfficialImagegenBridge,
+            compaction: crate::codex_integration::CodexCompactionStrategy::Auto,
             responses_websocket: false,
             model: Some("gpt-5.5".to_string()),
             expected,

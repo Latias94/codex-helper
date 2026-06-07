@@ -24,6 +24,7 @@ pub(crate) async fn handle_codex_cmd(cmd: CodexCommand) -> CliResult<()> {
             upstream_index,
             model,
             preset,
+            compaction,
             json,
         } => {
             let proxy = build_codex_proxy_for_cli().await?;
@@ -35,6 +36,7 @@ pub(crate) async fn handle_codex_cmd(cmd: CodexCommand) -> CliResult<()> {
                     upstream_index,
                     model,
                     patch_mode: preset.map(Into::into),
+                    compaction: compaction.map(Into::into),
                     responses_websocket: None,
                 })
                 .await
@@ -168,8 +170,9 @@ fn print_capabilities_text(response: &CodexRelayCapabilitiesResponse) {
         response.upstream_base_url
     );
     println!(
-        "Preset: {}; Responses WebSocket: {}; model: {}",
+        "Preset: {}; compaction: {}; Responses WebSocket: {}; model: {}",
         response.patch_mode.as_preset_str(),
+        response.compaction,
         response.responses_websocket,
         response.model.as_deref().unwrap_or("<none>")
     );

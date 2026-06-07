@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 
-use crate::codex_integration::{CodexPatchMode, CodexSwitchOptions};
+use crate::codex_integration::{CodexCompactionStrategy, CodexPatchMode, CodexSwitchOptions};
 use crate::config::{ProxyConfig, RelayTargetConfig, ServiceKind};
 use crate::control_plane_client::normalize_base_url;
 use crate::proxy::{
@@ -54,6 +54,7 @@ pub fn resolve_relay_target(cfg: &ProxyConfig, name: &str) -> Result<ResolvedRel
                     .get("local")
                     .and_then(|target| target.responses_websocket)
                     .unwrap_or(false),
+                compaction: CodexCompactionStrategy::Auto,
             },
             built_in_local: true,
         });
@@ -127,6 +128,7 @@ fn resolve_configured_relay_target(
         client_preset: target.client_preset.unwrap_or(CodexPatchMode::Default),
         client_options: CodexSwitchOptions {
             responses_websocket: target.responses_websocket.unwrap_or(false),
+            compaction: CodexCompactionStrategy::Auto,
         },
         built_in_local: false,
     })

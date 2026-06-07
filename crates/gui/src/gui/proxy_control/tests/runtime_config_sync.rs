@@ -23,6 +23,7 @@ fn v4_config(base_url: &str) -> ProxyConfig {
     compile_v4_to_runtime(&ProxyConfigV4 {
         version: 4,
         codex: ServiceViewV4 {
+            compaction: Default::default(),
             default_profile: None,
             profiles: BTreeMap::new(),
             providers: BTreeMap::from([(

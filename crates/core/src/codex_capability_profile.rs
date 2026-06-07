@@ -63,7 +63,13 @@ impl CodexProviderIdentity {
     pub fn from_patch_mode(patch_mode: CodexPatchMode) -> Self {
         let plan = CodexPatchPlan::for_switch_on(patch_mode, Default::default())
             .expect("default Codex switch options must be valid for every patch mode");
-        match plan.provider().identity() {
+        Self::from_patch_provider_identity(plan.provider().identity())
+    }
+
+    fn from_patch_provider_identity(
+        identity: crate::codex_patch_plan::CodexPatchProviderIdentity,
+    ) -> Self {
+        match identity {
             crate::codex_patch_plan::CodexPatchProviderIdentity::HelperRelay => Self::HelperRelay,
             crate::codex_patch_plan::CodexPatchProviderIdentity::OfficialOpenAi => {
                 Self::OfficialOpenAi
@@ -84,7 +90,11 @@ impl CodexAuthShape {
     pub fn from_patch_mode(patch_mode: CodexPatchMode) -> Self {
         let plan = CodexPatchPlan::for_switch_on(patch_mode, Default::default())
             .expect("default Codex switch options must be valid for every patch mode");
-        match plan.auth() {
+        Self::from_auth_patch_plan(plan.auth())
+    }
+
+    fn from_auth_patch_plan(plan: crate::codex_patch_plan::CodexAuthPatchPlan) -> Self {
+        match plan {
             crate::codex_patch_plan::CodexAuthPatchPlan::RestoreOriginalIfHelperPatched => {
                 Self::None
             }
@@ -519,11 +529,15 @@ impl CodexCapabilityProfileInput {
         patch_plan: CodexPatchPlan,
         model_catalog: CodexModelCatalogProfile,
     ) -> Self {
-        Self::from_patch_mode_with_transport(
-            patch_plan.mode(),
-            patch_plan.options().responses_websocket,
+        Self {
+            patch_mode: patch_plan.mode(),
+            provider_identity: CodexProviderIdentity::from_patch_provider_identity(
+                patch_plan.provider().identity(),
+            ),
+            auth_shape: CodexAuthShape::from_auth_patch_plan(patch_plan.auth()),
+            provider_supports_websockets: patch_plan.options().responses_websocket,
             model_catalog,
-        )
+        }
     }
 
     pub fn from_patch_config(

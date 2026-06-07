@@ -362,8 +362,9 @@ fn push_codex_relay_diagnostics_result_lines(
     )]));
     lines.push(Line::from(vec![Span::styled(
         format!(
-            "  preset={}  model={}  catalog_shape={:?}  selected={:?}",
+            "  preset={}  compaction={}  model={}  catalog_shape={:?}  selected={:?}",
             response.patch_mode.as_preset_str(),
+            response.compaction,
             response.model.as_deref().unwrap_or("-"),
             response.expected.model_catalog.shape,
             response.expected.model_catalog.selection
@@ -1439,6 +1440,7 @@ mod tests {
             provider_endpoint_key: None,
             upstream_base_url: "https://relay.example/v1".to_string(),
             patch_mode: crate::codex_integration::CodexPatchMode::OfficialImagegenBridge,
+            compaction: crate::codex_integration::CodexCompactionStrategy::Auto,
             responses_websocket: false,
             model: Some("gpt-5.5".to_string()),
             expected,

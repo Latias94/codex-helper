@@ -1324,6 +1324,7 @@ version = 5
 [codex.client_patch]
 preset = "official-imagegen"
 responses_websocket = true
+compaction = "local"
 "#,
     );
 
@@ -1334,6 +1335,10 @@ responses_websocket = true
         crate::codex_integration::CodexPatchMode::OfficialImagegenBridge
     );
     assert!(cfg.options.responses_websocket);
+    assert_eq!(
+        cfg.options.compaction,
+        crate::codex_integration::CodexCompactionStrategy::Local
+    );
     assert!(!cfg.translate_models);
 }
 
@@ -1360,6 +1365,10 @@ translate_models = true
         crate::codex_integration::CodexPatchMode::Default
     );
     assert!(!cfg.options.responses_websocket);
+    assert_eq!(
+        cfg.options.compaction,
+        crate::codex_integration::CodexCompactionStrategy::Auto
+    );
     assert!(cfg.translate_models);
 }
 

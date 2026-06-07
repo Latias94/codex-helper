@@ -79,19 +79,95 @@ impl std::fmt::Display for CodexPatchMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexCompactionStrategy {
+    /// Keep the preset-derived behavior and do not rewrite Codex's existing
+    /// `remote_compaction_v2` feature flag.
+    #[default]
+    Auto,
+    /// Force Codex to see a helper-shaped provider so the client chooses local compaction.
+    Local,
+    /// Force remote compaction v1 through `/responses/compact`.
+    #[serde(alias = "remote_v1")]
+    RemoteV1,
+    /// Force remote compaction v2 through `/responses` with `compaction_trigger`.
+    #[serde(alias = "remote_v2")]
+    RemoteV2,
+}
+
+impl CodexCompactionStrategy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Local => "local",
+            Self::RemoteV1 => "remote-v1",
+            Self::RemoteV2 => "remote-v2",
+        }
+    }
+
+    pub fn is_auto(&self) -> bool {
+        matches!(self, Self::Auto)
+    }
+
+    pub fn provider_identity_for_mode(self, mode: CodexPatchMode) -> CodexPatchProviderIdentity {
+        match self {
+            Self::Auto => {
+                if mode.enables_official_relay_features() {
+                    CodexPatchProviderIdentity::OfficialOpenAi
+                } else {
+                    CodexPatchProviderIdentity::HelperRelay
+                }
+            }
+            Self::Local => CodexPatchProviderIdentity::HelperRelay,
+            Self::RemoteV1 | Self::RemoteV2 => CodexPatchProviderIdentity::OfficialOpenAi,
+        }
+    }
+
+    pub fn remote_compaction_v2_feature_patch(self) -> CodexFeatureBoolPatch {
+        match self {
+            Self::Auto => CodexFeatureBoolPatch::Preserve,
+            Self::Local | Self::RemoteV1 => CodexFeatureBoolPatch::Set(false),
+            Self::RemoteV2 => CodexFeatureBoolPatch::Set(true),
+        }
+    }
+}
+
+impl std::fmt::Display for CodexCompactionStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 pub struct CodexSwitchOptions {
     /// Advertise `model_providers.codex_proxy.supports_websockets = true` so Codex may choose
     /// Responses WebSocket transport. This is intentionally separate from `CodexPatchMode` to
     /// avoid mode-combination explosion.
     #[serde(default, skip_serializing_if = "bool_is_false")]
     pub responses_websocket: bool,
+    /// Choose Codex's compaction path without adding more client presets.
+    #[serde(default, skip_serializing_if = "CodexCompactionStrategy::is_auto")]
+    pub compaction: CodexCompactionStrategy,
 }
 
 impl CodexSwitchOptions {
     pub fn validate_for_mode(self, mode: CodexPatchMode) -> Result<()> {
-        if self.responses_websocket && !mode.enables_official_relay_features() {
+        if matches!(
+            self.compaction,
+            CodexCompactionStrategy::RemoteV1 | CodexCompactionStrategy::RemoteV2
+        ) && !mode.enables_official_relay_features()
+        {
             return Err(anyhow!(
-                "Responses WebSocket transport currently requires --preset official-relay or --preset official-imagegen"
+                "remote compaction strategies require --preset official-relay or --preset official-imagegen"
+            ));
+        }
+
+        let provider_identity = self.compaction.provider_identity_for_mode(mode);
+        if self.responses_websocket
+            && provider_identity != CodexPatchProviderIdentity::OfficialOpenAi
+        {
+            return Err(anyhow!(
+                "Responses WebSocket transport requires remote compaction identity; use --preset official-relay or --preset official-imagegen without --compaction local"
             ));
         }
         Ok(())
@@ -130,6 +206,12 @@ impl CodexTomlBoolPatch {
             Self::Set(value) => Some(value),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexFeatureBoolPatch {
+    Preserve,
+    Set(bool),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,6 +257,7 @@ pub struct CodexPatchPlan {
     mode: CodexPatchMode,
     options: CodexSwitchOptions,
     provider: CodexProviderPatchPlan,
+    remote_compaction_v2: CodexFeatureBoolPatch,
     auth: CodexAuthPatchPlan,
     effect_order: CodexSwitchOnEffectOrder,
 }
@@ -184,11 +267,7 @@ impl CodexPatchPlan {
         options.validate_for_mode(mode)?;
 
         let provider = CodexProviderPatchPlan {
-            identity: if mode.enables_official_relay_features() {
-                CodexPatchProviderIdentity::OfficialOpenAi
-            } else {
-                CodexPatchProviderIdentity::HelperRelay
-            },
+            identity: options.compaction.provider_identity_for_mode(mode),
             requires_openai_auth: match mode {
                 CodexPatchMode::ChatGptBridge => CodexTomlBoolPatch::Set(true),
                 CodexPatchMode::Default
@@ -230,6 +309,7 @@ impl CodexPatchPlan {
             mode,
             options,
             provider,
+            remote_compaction_v2: options.compaction.remote_compaction_v2_feature_patch(),
             auth,
             effect_order,
         })
@@ -245,6 +325,10 @@ impl CodexPatchPlan {
 
     pub fn provider(self) -> CodexProviderPatchPlan {
         self.provider
+    }
+
+    pub fn remote_compaction_v2_feature(self) -> CodexFeatureBoolPatch {
+        self.remote_compaction_v2
     }
 
     pub fn auth(self) -> CodexAuthPatchPlan {

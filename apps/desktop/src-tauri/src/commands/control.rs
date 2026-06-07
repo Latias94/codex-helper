@@ -345,6 +345,7 @@ pub async fn switch_codex(
                 mode,
                 CodexSwitchOptions {
                     responses_websocket: payload.responses_websocket,
+                    compaction: codex_integration::CodexCompactionStrategy::Auto,
                 },
             ),
             None => {

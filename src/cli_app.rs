@@ -1,7 +1,7 @@
 use crate::basellm_metadata;
 use crate::cli_types::{
-    Cli, CliError, CliResult, CodexClientPatchPresetArg, Command, DaemonCommand, NotifyCommand,
-    RelayCommand, RemoteControlCommand, SwitchCommand,
+    Cli, CliError, CliResult, CodexClientPatchPresetArg, CodexCompactionStrategyArg, Command,
+    DaemonCommand, NotifyCommand, RelayCommand, RemoteControlCommand, SwitchCommand,
 };
 use crate::codex_integration;
 use crate::codex_models_cache::{
@@ -92,9 +92,10 @@ pub async fn run_cli() -> CliResult<()> {
                     port,
                     preset,
                     responses_websocket,
+                    compaction,
                     codex,
                     claude,
-                } => do_switch_on(port, preset, responses_websocket, codex, claude)?,
+                } => do_switch_on(port, preset, responses_websocket, compaction, codex, claude)?,
                 SwitchCommand::Off { codex, claude } => do_switch_off(codex, claude)?,
                 SwitchCommand::Status { codex, claude } => do_switch_status(codex, claude),
                 SwitchCommand::RemoteControl { cmd } => do_remote_control(cmd)?,
@@ -1298,6 +1299,7 @@ async fn prepare_codex_client_for_local_proxy(port: u16) -> anyhow::Result<Local
                 responses_websocket: status
                     .supports_websockets
                     .unwrap_or(client_patch.options.responses_websocket),
+                compaction: status.compaction_strategy,
             },
         ),
         Ok(status) => {
@@ -1322,9 +1324,10 @@ async fn prepare_codex_client_for_local_proxy(port: u16) -> anyhow::Result<Local
     match codex_integration::switch_on_with_options(port, patch_mode, switch_options) {
         Ok(()) => {
             tracing::info!(
-                "Codex config switched to local proxy on port {} (preset={}, responses_websocket={})",
+                "Codex config switched to local proxy on port {} (preset={}, compaction={}, responses_websocket={})",
                 port,
                 patch_mode.as_preset_str(),
+                switch_options.compaction,
                 switch_options.responses_websocket
             );
         }
@@ -1744,6 +1747,7 @@ fn do_switch_on(
     port: u16,
     preset: Option<CodexClientPatchPresetArg>,
     responses_websocket: bool,
+    compaction: Option<CodexCompactionStrategyArg>,
     codex: bool,
     claude: bool,
 ) -> CliResult<()> {
@@ -1763,6 +1767,11 @@ fn do_switch_on(
                 "--responses-websocket is only supported for Codex switch on".to_string(),
             ));
         }
+        if compaction.is_some() {
+            return Err(CliError::Other(
+                "--compaction is only supported for Codex switch on".to_string(),
+            ));
+        }
         if let Err(err) = codex_integration::guard_claude_settings_before_switch_on_interactive() {
             tracing::warn!("Failed to guard Claude settings before switch on: {}", err);
         }
@@ -1775,17 +1784,25 @@ fn do_switch_on(
                 codex_helper_core::codex_integration::CodexPatchMode::from(preset),
                 codex_helper_core::codex_integration::CodexSwitchOptions {
                     responses_websocket,
+                    compaction: compaction.map(Into::into).unwrap_or_default(),
                 },
             ),
             None => {
-                let configured = codex_client_patch_config_from_config_file()
+                let mut configured = codex_client_patch_config_from_config_file()
                     .map_err(|e| CliError::CodexConfig(e.to_string()))?;
+                if responses_websocket {
+                    configured.options.responses_websocket = true;
+                }
+                if let Some(compaction) = compaction {
+                    configured.options.compaction = compaction.into();
+                }
                 (configured.preset, configured.options)
             }
         };
         codex_integration::switch_on_with_options(port, effective_mode, effective_options)
             .map_err(|e| CliError::CodexConfig(e.to_string()))?;
         println!("Codex client preset: {}", effective_mode.as_preset_str());
+        println!("Compaction: {}", effective_options.compaction);
         println!(
             "Responses WebSocket: {}",
             if effective_options.responses_websocket {
@@ -2028,8 +2045,9 @@ fn print_codex_switch_status() {
         let supports_websockets = proxy.get("supports_websockets").and_then(|v| v.as_bool());
         println!("  codex_proxy.name: {}", name);
         println!("  codex_proxy.base_url: {}", base_url);
-        let patch_mode = codex_integration::codex_switch_status()
-            .ok()
+        let status = codex_integration::codex_switch_status().ok();
+        let patch_mode = status
+            .as_ref()
             .and_then(|status| status.patch_mode)
             .unwrap_or_else(|| {
                 if requires_openai_auth == Some(true) {
@@ -2041,13 +2059,16 @@ fn print_codex_switch_status() {
                 }
             });
         println!("  codex_proxy.preset: {}", patch_mode.as_preset_str());
+        if let Some(status) = status.as_ref() {
+            println!("  codex_proxy.compaction: {}", status.compaction_strategy);
+        }
         if let Some(value) = requires_openai_auth {
             println!("  codex_proxy.requires_openai_auth: {}", value);
         }
         if let Some(value) = supports_websockets {
             println!("  codex_proxy.supports_websockets: {}", value);
         }
-        if let Ok(status) = codex_integration::codex_switch_status() {
+        if let Some(status) = status.as_ref() {
             println!(
                 "  features.remote_compaction_v2: {}",
                 status.remote_compaction_v2_enabled

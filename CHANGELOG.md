@@ -10,6 +10,7 @@ All notable changes to this project will be documented in this file.
 #### 新增
 
 - OpenAI Images 兼容入口现在支持 JSON `POST /v1/images/edits` / `/images/edits` 参考图生成；本地 `ch-imagegen` skill 增加 `--image`、`--edits-base-url` 和 `--input-fidelity`，会把本地参考图转成 data URL 后调用 edits 入口。
+- Codex client patch 新增正交压缩策略 `[codex.client_patch].compaction = "auto" | "local" | "remote-v1" | "remote-v2"` 和 `codex-helper switch on --compaction ...`。`official-relay` / `official-imagegen` 默认仍让 Codex 走远程压缩路径；显式 `local` 可保留 official/imagegen 预设的其它行为但强制 Codex 客户端本地压缩，`remote-v1` 强制 `/responses/compact`，`remote-v2` 写入 `remote_compaction_v2` 并继续使用 helper 的 v2 到 v1 降级兜底。`relay-capabilities` 诊断也支持 `compaction` 输入和输出，确保 expected/mismatch 按实际压缩策略计算。
 
 #### 修复
 
@@ -20,6 +21,7 @@ All notable changes to this project will be documented in this file.
 #### Added
 
 - The OpenAI Images-compatible bridge now supports JSON `POST /v1/images/edits` / `/images/edits` reference-image generation. The local `ch-imagegen` skill gained `--image`, `--edits-base-url`, and `--input-fidelity`, encoding local references as data URLs before calling the edits endpoint.
+- Codex client patch now has a separate compaction strategy: `[codex.client_patch].compaction = "auto" | "local" | "remote-v1" | "remote-v2"` and `codex-helper switch on --compaction ...`. `official-relay` / `official-imagegen` still make Codex use the remote compaction path by default; explicit `local` keeps the other official/imagegen preset behavior while forcing Codex client-side local compaction, `remote-v1` forces `/responses/compact`, and `remote-v2` writes `remote_compaction_v2` while retaining helper's v2-to-v1 downgrade fallback. `relay-capabilities` diagnostics also accept and return `compaction`, so expected capability and mismatch reporting follow the actual strategy.
 
 #### Fixed
 

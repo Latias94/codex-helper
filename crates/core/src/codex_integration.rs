@@ -9,9 +9,10 @@ use crate::client_config::{
     codex_switch_state_path,
 };
 use crate::codex_patch_plan::{
-    CodexAuthPatchPlan, CodexPatchPlan, CodexSwitchOnEffectOrder, CodexTomlBoolPatch,
+    CodexAuthPatchPlan, CodexFeatureBoolPatch, CodexPatchPlan, CodexSwitchOnEffectOrder,
+    CodexTomlBoolPatch,
 };
-pub use crate::codex_patch_plan::{CodexPatchMode, CodexSwitchOptions};
+pub use crate::codex_patch_plan::{CodexCompactionStrategy, CodexPatchMode, CodexSwitchOptions};
 use crate::config::{ProxyConfig, ProxyConfigV2, ProxyConfigV4, RoutingAffinityPolicyV5};
 use crate::file_replace::write_text_file;
 use anyhow::{Context, Result, anyhow};
@@ -93,6 +94,8 @@ struct CodexSwitchState {
     patch_mode: Option<CodexPatchMode>,
     #[serde(default, skip_serializing_if = "bool_is_false")]
     responses_websocket: bool,
+    #[serde(default, skip_serializing_if = "CodexCompactionStrategy::is_auto")]
+    compaction: CodexCompactionStrategy,
     original_config_absent: bool,
     original_model_provider: Option<String>,
     original_codex_proxy: Option<Value>,
@@ -121,6 +124,7 @@ impl CodexSwitchState {
             version: 2,
             patch_mode: None,
             responses_websocket: false,
+            compaction: CodexCompactionStrategy::Auto,
             original_config_absent,
             original_model_provider: toml_string(root, "model_provider"),
             original_codex_proxy: original_codex_proxy_value(text)?,
@@ -497,6 +501,22 @@ fn switch_on_codex_toml_with_base_url_and_plan(
         }
         CodexTomlBoolPatch::Set(value) => {
             proxy_table.insert("supports_websockets", editable_toml_value(value));
+        }
+    }
+    match plan.remote_compaction_v2_feature() {
+        CodexFeatureBoolPatch::Preserve => {}
+        CodexFeatureBoolPatch::Set(value) => {
+            if !root.contains_key("features") {
+                root.insert(
+                    "features",
+                    EditableTomlItem::Table(EditableTomlTable::new()),
+                );
+            }
+            let features = root
+                .get_mut("features")
+                .and_then(EditableTomlItem::as_table_mut)
+                .ok_or_else(|| anyhow!("features must be a table"))?;
+            features.insert("remote_compaction_v2", editable_toml_value(value));
         }
     }
 
@@ -1026,6 +1046,9 @@ pub struct CodexSwitchStatus {
     pub supports_websockets: Option<bool>,
     /// Whether `[features].remote_compaction_v2 = true` is present in Codex config.
     pub remote_compaction_v2_enabled: bool,
+    /// Stored compaction strategy when switch state is present; otherwise inferred from the
+    /// current Codex client patch.
+    pub compaction_strategy: CodexCompactionStrategy,
     /// Whether original switch metadata exists for disabling the local proxy patch.
     pub has_switch_state: bool,
 }
@@ -1112,10 +1135,6 @@ fn push_bridge_check(
     });
 }
 
-fn bridge_mode_expects_remote_compaction_v1(mode: Option<CodexPatchMode>) -> bool {
-    mode.is_some_and(CodexPatchMode::enables_official_relay_features)
-}
-
 fn bridge_mode_expects_imagegen_facade(mode: Option<CodexPatchMode>) -> bool {
     mode.is_some_and(CodexPatchMode::enables_imagegen_facade)
 }
@@ -1164,7 +1183,8 @@ pub fn codex_bridge_diagnostics() -> CodexBridgeDiagnostics {
                 );
             }
 
-            if bridge_mode_expects_remote_compaction_v1(patch_mode) {
+            let remote_compaction_identity = status.provider_name.as_deref() == Some("OpenAI");
+            if remote_compaction_identity {
                 let provider_ok = status.provider_name.as_deref() == Some("OpenAI");
                 remote_compaction_v1_ready = status.enabled && provider_ok;
                 let status_label = if remote_compaction_v1_ready {
@@ -1194,13 +1214,11 @@ pub fn codex_bridge_diagnostics() -> CodexBridgeDiagnostics {
                     "codex_bridge.remote_compaction_v1",
                     CodexBridgeDiagnosticStatus::Info,
                     format!(
-                        "Current preset {} does not advertise the local relay as the official OpenAI provider.",
-                        patch_mode
-                            .map(|mode| mode.as_preset_str())
-                            .unwrap_or("<unknown>")
+                        "Current compaction strategy {} does not advertise the local relay as the official OpenAI provider.",
+                        status.compaction_strategy
                     ),
                     Some(
-                        "Use official-relay or official-imagegen preset when you need Codex remote compaction v1 through relay.".to_string(),
+                        "Use `--compaction remote-v1` or `--compaction remote-v2` with an official preset when you need Codex remote compaction through relay.".to_string(),
                     ),
                 );
             }
@@ -1607,10 +1625,7 @@ fn collect_switch_startup_issues(
         );
     }
 
-    if status
-        .patch_mode
-        .is_some_and(CodexPatchMode::enables_official_relay_features)
-    {
+    if status.provider_name.as_deref() == Some("OpenAI") {
         match official_relay_affinity_policy_warning() {
             Ok(Some(detail)) => report.push(
                 CodexStartupReadinessIssueKind::OfficialRelayAffinityPolicy,
@@ -1772,6 +1787,7 @@ pub fn codex_switch_status() -> Result<CodexSwitchStatus> {
             requires_openai_auth: None,
             supports_websockets: None,
             remote_compaction_v2_enabled: false,
+            compaction_strategy: CodexCompactionStrategy::Auto,
             has_switch_state: state_path.exists(),
         });
     }
@@ -1789,6 +1805,7 @@ pub fn codex_switch_status() -> Result<CodexSwitchStatus> {
             requires_openai_auth: None,
             supports_websockets: None,
             remote_compaction_v2_enabled,
+            compaction_strategy: CodexCompactionStrategy::Auto,
             has_switch_state: state_path.exists(),
         });
     }
@@ -1805,6 +1822,7 @@ pub fn codex_switch_status() -> Result<CodexSwitchStatus> {
                 requires_openai_auth: None,
                 supports_websockets: None,
                 remote_compaction_v2_enabled,
+                compaction_strategy: CodexCompactionStrategy::Auto,
                 has_switch_state: state_path.exists(),
             });
         }
@@ -1821,6 +1839,7 @@ pub fn codex_switch_status() -> Result<CodexSwitchStatus> {
                 requires_openai_auth: None,
                 supports_websockets: None,
                 remote_compaction_v2_enabled,
+                compaction_strategy: CodexCompactionStrategy::Auto,
                 has_switch_state: state_path.exists(),
             });
         }
@@ -1841,6 +1860,7 @@ pub fn codex_switch_status() -> Result<CodexSwitchStatus> {
             requires_openai_auth: None,
             supports_websockets: None,
             remote_compaction_v2_enabled,
+            compaction_strategy: CodexCompactionStrategy::Auto,
             has_switch_state: state_path.exists(),
         });
     }
@@ -1878,7 +1898,8 @@ pub fn codex_switch_status() -> Result<CodexSwitchStatus> {
     let is_helper_name = name == "codex-helper";
     let enabled = is_local || is_helper_name;
 
-    let stored_patch_mode = read_codex_switch_state()?.and_then(|state| state.patch_mode);
+    let stored_state = read_codex_switch_state()?;
+    let stored_patch_mode = stored_state.as_ref().and_then(|state| state.patch_mode);
     let inferred_patch_mode = if requires_openai_auth == Some(true) {
         CodexPatchMode::ChatGptBridge
     } else if name == "OpenAI" {
@@ -1890,6 +1911,19 @@ pub fn codex_switch_status() -> Result<CodexSwitchStatus> {
     } else {
         CodexPatchMode::Default
     };
+    let inferred_compaction_strategy = if name == "OpenAI" {
+        if remote_compaction_v2_enabled {
+            CodexCompactionStrategy::RemoteV2
+        } else {
+            CodexCompactionStrategy::RemoteV1
+        }
+    } else {
+        CodexCompactionStrategy::Local
+    };
+    let compaction_strategy = stored_state
+        .as_ref()
+        .map(|state| state.compaction)
+        .unwrap_or(inferred_compaction_strategy);
 
     Ok(CodexSwitchStatus {
         enabled,
@@ -1900,6 +1934,7 @@ pub fn codex_switch_status() -> Result<CodexSwitchStatus> {
         requires_openai_auth,
         supports_websockets,
         remote_compaction_v2_enabled,
+        compaction_strategy,
         has_switch_state: state_path.exists(),
     })
 }
@@ -1966,6 +2001,7 @@ pub fn switch_on_with_base_url(
     };
     state.patch_mode = Some(plan.mode());
     state.responses_websocket = plan.options().responses_websocket;
+    state.compaction = plan.options().compaction;
 
     let auth_edit = auth_edit_for_switch_on_plan(plan, &mut state)?;
     let new_text = switch_on_codex_toml_with_base_url_and_plan(&text, &base_url, plan)?;
@@ -2917,6 +2953,7 @@ request_max_retries = 5
             CodexPatchMode::OfficialRelayBridge,
             CodexSwitchOptions {
                 responses_websocket: true,
+                compaction: CodexCompactionStrategy::Auto,
             },
         )
         .expect("official relay patch plan");
@@ -2955,18 +2992,108 @@ request_max_retries = 5
     }
 
     #[test]
+    fn codex_patch_plan_compaction_local_overrides_official_provider_identity() {
+        let plan = CodexPatchPlan::for_switch_on(
+            CodexPatchMode::OfficialImagegenBridge,
+            CodexSwitchOptions {
+                responses_websocket: false,
+                compaction: CodexCompactionStrategy::Local,
+            },
+        )
+        .expect("official imagegen local compaction patch plan");
+
+        assert_eq!(plan.provider().provider_name(), "codex-helper");
+        assert_eq!(
+            plan.remote_compaction_v2_feature(),
+            CodexFeatureBoolPatch::Set(false)
+        );
+        assert_eq!(plan.auth(), CodexAuthPatchPlan::PatchImagegenFacade);
+    }
+
+    #[test]
+    fn codex_patch_plan_compaction_remote_v1_forces_openai_identity_and_disables_v2() {
+        let plan = CodexPatchPlan::for_switch_on(
+            CodexPatchMode::OfficialRelayBridge,
+            CodexSwitchOptions {
+                responses_websocket: false,
+                compaction: CodexCompactionStrategy::RemoteV1,
+            },
+        )
+        .expect("official relay remote v1 patch plan");
+
+        assert_eq!(plan.provider().provider_name(), "OpenAI");
+        assert_eq!(
+            plan.remote_compaction_v2_feature(),
+            CodexFeatureBoolPatch::Set(false)
+        );
+    }
+
+    #[test]
+    fn codex_patch_plan_compaction_remote_v2_forces_openai_identity_and_enables_v2() {
+        let plan = CodexPatchPlan::for_switch_on(
+            CodexPatchMode::OfficialRelayBridge,
+            CodexSwitchOptions {
+                responses_websocket: false,
+                compaction: CodexCompactionStrategy::RemoteV2,
+            },
+        )
+        .expect("official relay remote v2 patch plan");
+
+        assert_eq!(plan.provider().provider_name(), "OpenAI");
+        assert_eq!(
+            plan.remote_compaction_v2_feature(),
+            CodexFeatureBoolPatch::Set(true)
+        );
+    }
+
+    #[test]
+    fn codex_patch_plan_rejects_remote_compaction_without_official_preset() {
+        let err = CodexPatchPlan::for_switch_on(
+            CodexPatchMode::Default,
+            CodexSwitchOptions {
+                responses_websocket: false,
+                compaction: CodexCompactionStrategy::RemoteV1,
+            },
+        )
+        .expect_err("remote compaction should require an official preset");
+
+        assert!(
+            err.to_string()
+                .contains("remote compaction strategies require --preset official-relay")
+        );
+    }
+
+    #[test]
     fn codex_patch_plan_rejects_websocket_transport_without_official_identity() {
         let err = CodexPatchPlan::for_switch_on(
             CodexPatchMode::ImagegenBridge,
             CodexSwitchOptions {
                 responses_websocket: true,
+                compaction: CodexCompactionStrategy::Auto,
             },
         )
         .expect_err("websocket transport should be official identity only");
 
         assert!(
             err.to_string()
-                .contains("requires --preset official-relay or --preset official-imagegen")
+                .contains("Responses WebSocket transport requires remote compaction identity")
+        );
+    }
+
+    #[test]
+    fn codex_patch_plan_rejects_websocket_transport_with_local_compaction() {
+        let err = CodexPatchPlan::for_switch_on(
+            CodexPatchMode::OfficialRelayBridge,
+            CodexSwitchOptions {
+                responses_websocket: true,
+                compaction: CodexCompactionStrategy::Local,
+            },
+        )
+        .expect_err("websocket transport should require remote identity");
+
+        assert!(
+            err.to_string()
+                .contains("Responses WebSocket transport requires remote compaction identity")
         );
     }
 
@@ -2986,6 +3113,7 @@ supports_websockets = false
             CodexPatchMode::OfficialRelayBridge,
             CodexSwitchOptions {
                 responses_websocket: true,
+                compaction: CodexCompactionStrategy::Auto,
             },
         )
         .expect("official relay patch plan");
@@ -3006,6 +3134,7 @@ supports_websockets = false
             version: 2,
             patch_mode: Some(CodexPatchMode::OfficialImagegenBridge),
             responses_websocket: false,
+            compaction: CodexCompactionStrategy::Auto,
             original_config_absent: false,
             original_model_provider: None,
             original_codex_proxy: None,
@@ -3074,6 +3203,7 @@ supports_websockets = false
             CodexPatchMode::OfficialRelayBridge,
             CodexSwitchOptions {
                 responses_websocket: true,
+                compaction: CodexCompactionStrategy::Auto,
             },
         )
         .expect("switch_on should write official relay preset fields with websocket transport");
@@ -3108,6 +3238,7 @@ supports_websockets = false
             CodexPatchMode::OfficialImagegenBridge,
             CodexSwitchOptions {
                 responses_websocket: true,
+                compaction: CodexCompactionStrategy::Auto,
             },
         )
         .expect("switch_on should write official imagegen preset fields with websocket transport");
@@ -3118,6 +3249,68 @@ supports_websockets = false
         assert!(updated.contains("wire_api = \"responses\""));
         assert!(updated.contains("supports_websockets = true"));
         assert!(!updated.contains("requires_openai_auth"));
+    }
+
+    #[test]
+    fn codex_switch_on_official_imagegen_can_force_local_compaction() {
+        let updated = switch_on_codex_toml_with_options(
+            r#"
+[features]
+remote_compaction_v2 = true
+"#,
+            3333,
+            CodexPatchMode::OfficialImagegenBridge,
+            CodexSwitchOptions {
+                responses_websocket: false,
+                compaction: CodexCompactionStrategy::Local,
+            },
+        )
+        .expect("switch_on should force local compaction");
+
+        assert!(updated.contains("name = \"codex-helper\""));
+        assert!(updated.contains("remote_compaction_v2 = false"));
+        assert!(!updated.contains("supports_websockets = true"));
+        assert!(!updated.contains("requires_openai_auth"));
+    }
+
+    #[test]
+    fn codex_switch_on_official_relay_can_force_remote_compaction_v1() {
+        let updated = switch_on_codex_toml_with_options(
+            r#"
+[features]
+remote_compaction_v2 = true
+"#,
+            3333,
+            CodexPatchMode::OfficialRelayBridge,
+            CodexSwitchOptions {
+                responses_websocket: false,
+                compaction: CodexCompactionStrategy::RemoteV1,
+            },
+        )
+        .expect("switch_on should force remote compaction v1");
+
+        assert!(updated.contains("name = \"OpenAI\""));
+        assert!(updated.contains("remote_compaction_v2 = false"));
+        assert!(updated.contains("supports_websockets = false"));
+    }
+
+    #[test]
+    fn codex_switch_on_official_relay_can_force_remote_compaction_v2() {
+        let updated = switch_on_codex_toml_with_options(
+            "",
+            3333,
+            CodexPatchMode::OfficialRelayBridge,
+            CodexSwitchOptions {
+                responses_websocket: false,
+                compaction: CodexCompactionStrategy::RemoteV2,
+            },
+        )
+        .expect("switch_on should force remote compaction v2");
+
+        assert!(updated.contains("name = \"OpenAI\""));
+        assert!(updated.contains("[features]"));
+        assert!(updated.contains("remote_compaction_v2 = true"));
+        assert!(updated.contains("supports_websockets = false"));
     }
 
     #[test]
@@ -3752,6 +3945,7 @@ children = ["relay"]
             CodexPatchMode::OfficialRelayBridge,
             CodexSwitchOptions {
                 responses_websocket: true,
+                compaction: CodexCompactionStrategy::Auto,
             },
         )
         .expect_err("official relay preset with websocket should require resolved upstream auth");
@@ -3943,6 +4137,7 @@ base_url = "https://api.openai.com/v1"
             CodexPatchMode::OfficialRelayBridge,
             CodexSwitchOptions {
                 responses_websocket: true,
+                compaction: CodexCompactionStrategy::Auto,
             },
         )
         .expect("switch_on official relay preset should patch config with websocket transport");
@@ -4068,6 +4263,7 @@ base_url = "https://api.openai.com/v1"
             CodexPatchMode::OfficialImagegenBridge,
             CodexSwitchOptions {
                 responses_websocket: true,
+                compaction: CodexCompactionStrategy::Auto,
             },
         )
         .expect("switch_on official imagegen preset should patch config and auth with websocket transport");
@@ -4189,6 +4385,73 @@ base_url = "https://api.openai.com/v1"
     }
 
     #[test]
+    fn codex_switch_on_with_configured_compaction_local_overrides_official_provider_identity() {
+        let env = setup_temp_env();
+        write_helper_codex_config(
+            &env,
+            r#"
+version = 5
+
+[codex.client_patch]
+preset = "official-imagegen"
+compaction = "local"
+
+[codex.providers.relay]
+base_url = "https://relay.example/v1"
+auth_token_env = "CODEX_HELPER_IMAGEGEN_TEST_KEY"
+
+[codex.routing]
+entry = "main"
+
+[codex.routing.routes.main]
+strategy = "ordered-failover"
+children = ["relay"]
+"#,
+        );
+        let cfg_path = env.codex_home.join("config.toml");
+        let auth_path = env.codex_home.join("auth.json");
+        let original_auth = chatgpt_auth_json("user@example.com", "acct_1", "plus");
+
+        write_file(
+            &cfg_path,
+            r#"
+[features]
+remote_compaction_v2 = true
+
+[model_providers.openai]
+name = "openai"
+base_url = "https://api.openai.com/v1"
+"#
+            .trim_start(),
+        );
+        write_file(&auth_path, &original_auth);
+
+        switch_on_with_configured_preset(3211)
+            .expect("configured local compaction should patch config and auth");
+
+        let updated_cfg = read_file(&cfg_path);
+        assert!(updated_cfg.contains("model_provider = \"codex_proxy\""));
+        assert!(updated_cfg.contains("name = \"codex-helper\""));
+        assert!(updated_cfg.contains("remote_compaction_v2 = false"));
+
+        let updated_auth: serde_json::Value =
+            serde_json::from_str(&read_file(&auth_path)).expect("valid auth json");
+        assert!(
+            updated_auth
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty)
+        );
+
+        let status = codex_switch_status().expect("status should load");
+        assert_eq!(
+            status.patch_mode,
+            Some(CodexPatchMode::OfficialImagegenBridge)
+        );
+        assert_eq!(status.provider_name.as_deref(), Some("codex-helper"));
+        assert_eq!(status.compaction_strategy, CodexCompactionStrategy::Local);
+    }
+
+    #[test]
     fn codex_switch_status_infers_official_relay_bridge_without_state() {
         let env = setup_temp_env();
         let cfg_path = env.codex_home.join("config.toml");
@@ -4239,6 +4502,38 @@ supports_websockets = true
         assert_eq!(status.patch_mode, Some(CodexPatchMode::OfficialRelayBridge));
         assert_eq!(status.supports_websockets, Some(true));
         assert_eq!(status.requires_openai_auth, None);
+        assert!(!status.has_switch_state);
+    }
+
+    #[test]
+    fn codex_switch_status_infers_remote_v2_compaction_without_state() {
+        let env = setup_temp_env();
+        let cfg_path = env.codex_home.join("config.toml");
+        write_file(
+            &cfg_path,
+            r#"
+[features]
+remote_compaction_v2 = true
+
+model_provider = "codex_proxy"
+
+[model_providers.codex_proxy]
+name = "OpenAI"
+base_url = "http://127.0.0.1:3211"
+wire_api = "responses"
+supports_websockets = false
+"#
+            .trim_start(),
+        );
+
+        let status = codex_switch_status().expect("status should load");
+
+        assert!(status.enabled);
+        assert_eq!(
+            status.compaction_strategy,
+            CodexCompactionStrategy::RemoteV2
+        );
+        assert!(status.remote_compaction_v2_enabled);
         assert!(!status.has_switch_state);
     }
 
@@ -4589,6 +4884,7 @@ base_url = "https://api.openai.com/v1"
             CodexPatchMode::OfficialImagegenBridge,
             CodexSwitchOptions {
                 responses_websocket: true,
+                compaction: CodexCompactionStrategy::Auto,
             },
         )
         .expect("switch_on official imagegen preset should patch auth with websocket transport");

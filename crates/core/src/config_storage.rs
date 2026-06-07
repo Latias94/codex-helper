@@ -65,8 +65,27 @@ fn parse_codex_client_patch_preset(
             Ok(crate::codex_integration::CodexPatchMode::OfficialImagegenBridge)
         }
         other => anyhow::bail!(
-            "unsupported codex.client_patch.{} '{}'; expected 'default', 'chatgpt-bridge', 'imagegen-bridge', 'official-relay', or 'official-imagegen'. Legacy mode values are still accepted for reading. Use codex.client_patch.responses_websocket = true for WebSocket transport instead of adding another preset.",
+            "unsupported codex.client_patch.{} '{}'; expected 'default', 'chatgpt-bridge', 'imagegen-bridge', 'official-relay', or 'official-imagegen'. Legacy mode values are still accepted for reading. Use codex.client_patch.compaction or codex.client_patch.responses_websocket for orthogonal behavior instead of adding another preset.",
             field_name,
+            other,
+        ),
+    }
+}
+
+fn parse_codex_compaction_strategy(
+    value: &str,
+) -> Result<crate::codex_integration::CodexCompactionStrategy> {
+    match value.trim() {
+        "" | "auto" => Ok(crate::codex_integration::CodexCompactionStrategy::Auto),
+        "local" => Ok(crate::codex_integration::CodexCompactionStrategy::Local),
+        "remote-v1" | "remote_v1" => {
+            Ok(crate::codex_integration::CodexCompactionStrategy::RemoteV1)
+        }
+        "remote-v2" | "remote_v2" => {
+            Ok(crate::codex_integration::CodexCompactionStrategy::RemoteV2)
+        }
+        other => anyhow::bail!(
+            "unsupported codex.client_patch.compaction '{}'; expected 'auto', 'local', 'remote-v1', or 'remote-v2'",
             other,
         ),
     }
@@ -116,6 +135,12 @@ fn codex_client_patch_config_from_toml_value(value: &TomlValue) -> Result<CodexC
         .and_then(|patch| patch.get("responses_websocket"))
         .and_then(TomlValue::as_bool)
         .unwrap_or(false);
+    let compaction = patch
+        .and_then(|patch| patch.get("compaction"))
+        .and_then(TomlValue::as_str)
+        .map(parse_codex_compaction_strategy)
+        .transpose()?
+        .unwrap_or_default();
     let translate_models = patch
         .and_then(|patch| patch.get("translate_models"))
         .and_then(TomlValue::as_bool)
@@ -125,6 +150,7 @@ fn codex_client_patch_config_from_toml_value(value: &TomlValue) -> Result<CodexC
         preset,
         options: crate::codex_integration::CodexSwitchOptions {
             responses_websocket,
+            compaction,
         },
         translate_models,
     })
@@ -409,11 +435,11 @@ version = 5
 # imagegen-bridge：实验模式；把 auth.json 临时写成空对象 {}，利用 Codex 默认 ChatGPT
 #                  auth 解析暴露 hosted image_generation；实际上游凭据仍来自 codex-helper routing / env key。
 # official-relay：实验模式；把本地 codex_proxy 声明为 OpenAI Responses provider，
-#                 让 Codex 使用可由中转转发的官方 HTTP 能力，例如 /responses/compact。
+#                 默认让 Codex 使用远程压缩路径，例如 /responses/compact。
 #                 真实上游凭据仍来自 codex-helper routing / env key。
 # official-imagegen：实验模式；同时启用 official-relay 的 OpenAI provider
-#                    标识和 imagegen-bridge 的 {} auth facade，用于同时尝试
-#                    /responses/compact 与 hosted image_generation。
+#                    标识和 imagegen-bridge 的 {} auth facade；默认同时尝试
+#                    远程压缩与 hosted image_generation。
 # 启用 chatgpt-bridge 时，`switch on --preset chatgpt-bridge` 会把 ~/.codex/auth.json 的
 # auth_mode 改为 "chatgpt"，OPENAI_API_KEY 改为 null，其它字段不动。
 # 启用 imagegen-bridge / official-imagegen 时，`switch on --preset ...` 会临时把 ~/.codex/auth.json
@@ -423,6 +449,10 @@ version = 5
 #                      supports_websockets = true，让 Codex 可选择 Responses WebSocket v2。
 #                      只应与 official-relay / official-imagegen 搭配，
 #                      且仅在 helper 与所选中转都支持 WebSocket relay 时开启。
+# compaction：正交压缩策略。auto 保持 preset 默认：default / imagegen-bridge
+#             更偏向本地压缩，official-relay / official-imagegen 默认让 Codex
+#             走远程压缩路径；local 强制本地压缩；remote-v1 强制 /responses/compact；
+#             remote-v2 强制 remote_compaction_v2，并依赖 helper 的 v2->v1 降级兜底。
 # translate_models：默认 false。false 时 helper 只解码 /models 响应压缩体，
 #                   不把 OpenAI data 列表翻译成 Codex models catalog，让 Codex 使用
 #                   自带 models.json / fallback 元数据；true 仅用于确实需要 helper
@@ -440,6 +470,7 @@ version = 5
 # preset = "official-relay"
 # preset = "official-imagegen"
 # responses_websocket = false
+# compaction = "auto"
 # translate_models = false
 
 # --- Relay targets（可选，本机客户端入口） ---

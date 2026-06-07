@@ -299,6 +299,9 @@ pub(crate) enum CodexCommand {
         /// Preset to evaluate; defaults to current switch/config preset
         #[arg(long = "preset", alias = "mode", value_enum)]
         preset: Option<CodexClientPatchPresetArg>,
+        /// Compaction strategy to evaluate; defaults to current switch/config compaction
+        #[arg(long, value_enum)]
+        compaction: Option<CodexCompactionStrategyArg>,
         /// Output JSON instead of text
         #[arg(long)]
         json: bool,
@@ -393,6 +396,9 @@ pub(crate) enum SwitchCommand {
         /// Enable Responses WebSocket transport advertising for official bridge presets
         #[arg(long)]
         responses_websocket: bool,
+        /// Override Codex client compaction strategy without adding another preset
+        #[arg(long, value_enum)]
+        compaction: Option<CodexCompactionStrategyArg>,
         /// Target Codex config (default if neither flag is set)
         #[arg(long)]
         codex: bool,
@@ -459,6 +465,28 @@ impl From<CodexClientPatchPresetArg> for codex_helper_core::codex_integration::C
             CodexClientPatchPresetArg::ImagegenBridge => Self::ImagegenBridge,
             CodexClientPatchPresetArg::OfficialRelayBridge => Self::OfficialRelayBridge,
             CodexClientPatchPresetArg::OfficialImagegenBridge => Self::OfficialImagegenBridge,
+        }
+    }
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+#[value(rename_all = "kebab-case")]
+pub(crate) enum CodexCompactionStrategyArg {
+    Auto,
+    Local,
+    RemoteV1,
+    RemoteV2,
+}
+
+impl From<CodexCompactionStrategyArg>
+    for codex_helper_core::codex_integration::CodexCompactionStrategy
+{
+    fn from(value: CodexCompactionStrategyArg) -> Self {
+        match value {
+            CodexCompactionStrategyArg::Auto => Self::Auto,
+            CodexCompactionStrategyArg::Local => Self::Local,
+            CodexCompactionStrategyArg::RemoteV1 => Self::RemoteV1,
+            CodexCompactionStrategyArg::RemoteV2 => Self::RemoteV2,
         }
     }
 }
@@ -1090,6 +1118,7 @@ mod tests {
                 SwitchCommand::On {
                     preset,
                     responses_websocket,
+                    compaction,
                     ..
                 },
         }) = cli.command
@@ -1098,10 +1127,11 @@ mod tests {
         };
         assert_eq!(preset, None);
         assert!(!responses_websocket);
+        assert_eq!(compaction, None);
     }
 
     #[test]
-    fn switch_on_with_explicit_preset_keeps_requested_preset() {
+    fn switch_on_with_explicit_preset_keeps_requested_preset_and_compaction() {
         let cli = Cli::try_parse_from([
             "codex-helper",
             "switch",
@@ -1109,6 +1139,8 @@ mod tests {
             "--preset",
             "official-imagegen",
             "--responses-websocket",
+            "--compaction",
+            "local",
         ])
         .expect("parse switch on with explicit preset");
 
@@ -1117,6 +1149,7 @@ mod tests {
                 SwitchCommand::On {
                     preset,
                     responses_websocket,
+                    compaction,
                     ..
                 },
         }) = cli.command
@@ -1128,6 +1161,7 @@ mod tests {
             Some(CodexClientPatchPresetArg::OfficialImagegenBridge)
         );
         assert!(responses_websocket);
+        assert_eq!(compaction, Some(CodexCompactionStrategyArg::Local));
     }
 
     #[test]
@@ -1140,6 +1174,8 @@ mod tests {
             "gpt-5.5",
             "--preset",
             "official-imagegen",
+            "--compaction",
+            "local",
             "--provider",
             "ciii",
             "--endpoint",
@@ -1153,6 +1189,7 @@ mod tests {
                 CodexCommand::Capabilities {
                     model,
                     preset,
+                    compaction,
                     provider,
                     endpoint,
                     json,
@@ -1167,6 +1204,7 @@ mod tests {
             preset,
             Some(CodexClientPatchPresetArg::OfficialImagegenBridge)
         );
+        assert_eq!(compaction, Some(CodexCompactionStrategyArg::Local));
         assert_eq!(provider.as_deref(), Some("ciii"));
         assert_eq!(endpoint.as_deref(), Some("default"));
         assert!(json);

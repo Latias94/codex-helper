@@ -41,7 +41,7 @@ English: [README_EN.md](README_EN.md)
 
 - **本地代理**：默认监听 `127.0.0.1:3211`，Codex 继续按原方式使用。
 - **安全 Codex 局部修改**：只改本地代理片段，不影响 Codex 运行中写入的其他配置。
-- **Codex 原生体验预设**：`chatgpt-bridge` 保留 ChatGPT 登录态，`imagegen-bridge` 暴露 hosted image generation，`official-relay` / `official-imagegen` 让支持官方 Responses 语义的中转尝试 remote compaction v1；`responses_websocket` 作为独立开关控制 Responses WebSocket v2。
+- **Codex 原生体验预设**：`chatgpt-bridge` 保留 ChatGPT 登录态，`imagegen-bridge` 暴露 hosted image generation，`official-relay` / `official-imagegen` 默认让支持官方 Responses 语义的中转走远程压缩；`compaction` 和 `responses_websocket` 分别作为独立开关控制压缩策略与 Responses WebSocket v2。
 - **OpenAI Images 兼容入口**：本地代理额外暴露 `POST /v1/images/generations` 和 JSON `POST /v1/images/edits`，会转成 Responses hosted `image_generation` 请求并复用同一套 provider routing / fallback，方便本地 skill 或脚本稳定生图或带参考图生成。
 - **中转能力诊断**：TUI、CLI 和 admin API 都可以检查 `/models`、`/responses`、`/responses/compact`，并给出当前 relay 更适合哪种 preset。
 - **provider / routing 配置**：`version = 5` route graph 格式，新增 provider 后用 routing entry/routes 决定顺序、固定、分组或标签优先。
@@ -164,12 +164,12 @@ ch relay off
 | `default` | 只需要本地代理、多 provider 和 fallback | Codex 把模型请求发到本地 helper，helper 再选上游 |
 | `chatgpt-bridge` | 你已经在官方 Codex 里登录 ChatGPT，希望保留桌面端/手机端账号体验，但模型流量走 relay | 写入 ChatGPT auth 形态，真实上游凭据仍来自 helper 配置 |
 | `imagegen-bridge` | relay 不支持 official provider 身份，但你想让 Codex 暴露 hosted `image_generation` | 写入 `{}` auth facade；不会要求官方登录 |
-| `official-relay` | relay 背后能转发官方 OpenAI Responses 语义，尤其支持 `/responses/compact` | 让 Codex 把本地 helper 当作 OpenAI provider，从而尝试 remote compaction v1 |
-| `official-imagegen` | relay 背后是官方订阅账号，并且同时支持 `/responses/compact` 和 hosted image generation | 同时启用 OpenAI provider 身份和 `{}` imagegen facade |
+| `official-relay` | relay 背后能转发官方 OpenAI Responses 语义，尤其支持 `/responses/compact` | 默认让 Codex 把本地 helper 当作 OpenAI provider，从而走远程压缩路径 |
+| `official-imagegen` | relay 背后是官方订阅账号，并且同时支持 `/responses/compact` 和 hosted image generation | 默认同时启用 OpenAI provider 身份、远程压缩路径和 `{}` imagegen facade |
 
 `chatgpt-bridge` 启用前必须先在官方 Codex 中完成 ChatGPT 登录。如果 `~/.codex/auth.json` 没有完整 token、email 和账号信息，codex-helper 会拒绝 patch，避免 Codex TUI 因半登录状态启动失败。
 
-`official-relay` 和 `official-imagegen` 都是实验预设。它们只负责让 Codex 使用更接近官方的客户端能力选择；中转站本身仍必须真正支持对应接口。真实请求密钥来自 `~/.codex-helper/config.toml` 的 provider 配置，bridge 预设不会把 Codex 的 ChatGPT token 透传给没有 helper 侧密钥的第三方 relay。旧的 `official-relay-bridge` / `official-imagegen-bridge` 仍作为 alias 接受，但不再作为推荐写法。
+`official-relay` 和 `official-imagegen` 都是实验预设。它们只负责让 Codex 使用更接近官方的客户端能力选择；中转站本身仍必须真正支持对应接口。默认情况下，`official-*` 会让 Codex 选择远程压缩路径；如果要保留 official preset 的其它行为但强制本地压缩，可额外设置 `[codex.client_patch].compaction = "local"` 或使用 `codex-helper switch on --preset official-imagegen --compaction local`。真实请求密钥来自 `~/.codex-helper/config.toml` 的 provider 配置，bridge 预设不会把 Codex 的 ChatGPT token 透传给没有 helper 侧密钥的第三方 relay。旧的 `official-relay-bridge` / `official-imagegen-bridge` 仍作为 alias 接受，但不再作为推荐写法。
 
 为了不拖能力较强的中转后腿，codex-helper 默认会在路由前归一化压缩 HTTP 请求体（`zstd`、`gzip` / `x-gzip`、`br`、`deflate`）。对 Codex `/responses`、`/responses/compact` 和 Responses WebSocket，helper 还会从已有请求证据补齐缺失的 `session_id`、`x-session-id`、官方 `session-id` / `thread-id` 和 `prompt_cache_key`，来源包括 header session、body `session_id`、`prompt_cache_key` 和 `metadata.session_id`。`previous_response_id` 只用于 stale-response 修复，不作为 session identity 来源；helper 不会凭空生成 session id，也不会覆盖用户已经带上的 session 字段。
 
@@ -189,7 +189,7 @@ default
 
 不要无脑开最强组合：`official-imagegen` 要求中转同时支持 `/responses`、`/responses/compact` 和 hosted `image_generation`；`responses_websocket` 还要求 WebSocket live smoke 通过。
 
-如果上游已确认支持 Responses WebSocket v2，再额外启用 `responses_websocket = true` 或 `--responses-websocket`；它是独立传输开关，不是新的 preset。
+如果上游已确认支持 Responses WebSocket v2，再额外启用 `responses_websocket = true` 或 `--responses-websocket`；它是独立传输开关，不是新的 preset。压缩路径同样是独立开关：`compaction = "auto"` 保持 preset 默认，`local` 强制 Codex 客户端走本地压缩，`remote-v1` 强制 `/responses/compact`，`remote-v2` 强制 `remote_compaction_v2` 并继续使用 helper 的 v2 到 v1 降级兜底。
 
 本地代理还提供 OpenAI Images 兼容的生图和参考图编辑入口，适合给 Codex skill 或脚本调用，而不是依赖 Codex 客户端是否成功暴露 hosted tool：
 
@@ -261,6 +261,7 @@ version = 5
 [codex.client_patch]
 preset = "chatgpt-bridge"
 responses_websocket = false
+compaction = "auto"
 
 [codex.providers.relay]
 base_url = "https://relay.example/v1"
@@ -395,7 +396,7 @@ codex-helper pricing sync-basellm --model gpt-5 --dry-run
 # 诊断
 codex-helper status
 codex-helper doctor
-codex-helper codex relay-capabilities --preset official-imagegen --model gpt-5.5
+codex-helper codex relay-capabilities --preset official-imagegen --compaction local --model gpt-5.5
 codex-helper codex relay-live-smoke --acknowledgement run-live-codex-relay-smoke --model gpt-5.5
 codex-helper codex relay-live-smoke --acknowledgement run-live-codex-relay-smoke --model gpt-5.5 --provider ciii --compact-v2
 codex-helper codex relay-evidence --limit 20
