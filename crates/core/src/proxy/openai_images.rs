@@ -71,15 +71,15 @@ struct RawOpenAiImagesEditRequest {
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum OneOrManyRawImageReference {
-    One(RawImageReference),
     Many(Vec<RawImageReference>),
+    One(RawImageReference),
 }
 
 impl OneOrManyRawImageReference {
     fn into_vec(self) -> Vec<RawImageReference> {
         match self {
-            Self::One(reference) => vec![reference],
             Self::Many(references) => references,
+            Self::One(reference) => vec![reference],
         }
     }
 }
@@ -656,6 +656,10 @@ mod tests {
         .expect_err("empty images rejected");
 
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert!(err.1.contains("at least one image"));
+        assert!(
+            err.1.contains("at least one image"),
+            "unexpected error: {}",
+            err.1
+        );
     }
 }

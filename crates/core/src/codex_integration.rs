@@ -4512,10 +4512,10 @@ supports_websockets = true
         write_file(
             &cfg_path,
             r#"
+model_provider = "codex_proxy"
+
 [features]
 remote_compaction_v2 = true
-
-model_provider = "codex_proxy"
 
 [model_providers.codex_proxy]
 name = "OpenAI"
