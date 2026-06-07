@@ -27,6 +27,8 @@ use super::request_preparation::{
 use super::request_routing::RequestRouteSelection;
 use super::retry::RetryPlan;
 
+const MAX_PROXY_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+
 pub(super) struct PreparedProxyRequest {
     pub(super) method: Method,
     pub(super) uri: Uri,
@@ -85,7 +87,7 @@ pub(super) async fn prepare_proxy_request(
         uri.path(),
         config.codex_patch_mode,
     );
-    let raw_body = match to_bytes(body, 10 * 1024 * 1024).await {
+    let raw_body = match to_bytes(body, MAX_PROXY_REQUEST_BYTES).await {
         Ok(body) => body,
         Err(error) => {
             let dur = start.elapsed().as_millis() as u64;

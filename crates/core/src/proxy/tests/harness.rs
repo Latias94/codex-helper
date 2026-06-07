@@ -22,6 +22,10 @@ impl TestProxyServer {
     pub(super) fn images_generations_url(&self) -> String {
         self.url("/v1/images/generations")
     }
+
+    pub(super) fn images_edits_url(&self) -> String {
+        self.url("/v1/images/edits")
+    }
 }
 
 impl Drop for TestProxyServer {
@@ -131,6 +135,20 @@ pub(super) async fn post_images_generations_json(
         .send()
         .await
         .expect("send images generations request")
+}
+
+pub(super) async fn post_images_edits_json(
+    client: &reqwest::Client,
+    proxy: &TestProxyServer,
+    body: impl Into<reqwest::Body>,
+) -> reqwest::Response {
+    client
+        .post(proxy.images_edits_url())
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("send images edits request")
 }
 
 pub(super) async fn find_finished_request(

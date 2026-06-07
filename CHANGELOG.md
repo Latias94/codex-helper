@@ -7,11 +7,19 @@ All notable changes to this project will be documented in this file.
 
 ### 中文
 
+#### 新增
+
+- OpenAI Images 兼容入口现在支持 JSON `POST /v1/images/edits` / `/images/edits` 参考图生成；本地 `ch-imagegen` skill 增加 `--image`、`--edits-base-url` 和 `--input-fidelity`，会把本地参考图转成 data URL 后调用 edits 入口。
+
 #### 修复
 
 - Codex `remote_compaction_v2` 的 `compaction_trigger` `/responses` 请求现在会默认先尝试 v2；如果 relay 返回普通 Responses 成功流、JSON compact 结果或明确不支持 v2 的错误，helper 会自动降级到 `/responses/compact` 并合成为 Codex 期望的 v2 compact SSE，避免触发 Codex 本地 “expected exactly one compaction output item” fatal。可通过 `[codex.compaction].remote_v2_downgrade = false` 关闭该兜底。
 
 ### English summary
+
+#### Added
+
+- The OpenAI Images-compatible bridge now supports JSON `POST /v1/images/edits` / `/images/edits` reference-image generation. The local `ch-imagegen` skill gained `--image`, `--edits-base-url`, and `--input-fidelity`, encoding local references as data URLs before calling the edits endpoint.
 
 #### Fixed
 

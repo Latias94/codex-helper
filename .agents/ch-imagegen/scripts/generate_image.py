@@ -17,9 +17,10 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+from mimetypes import guess_type
 from typing import Any
 
-DEFAULT_BASE_URL = "http://127.0.0.1:3211/v1/images/generations"
+DEFAULT_GENERATIONS_URL = "http://127.0.0.1:3211/v1/images/generations"
 DEFAULT_MODEL = "gpt-image-2"
 DEFAULT_RESOLUTION = "4k"
 DEFAULT_ASPECT = "16:9"
@@ -173,6 +174,49 @@ def _image_size(path: Path, data: bytes, output_format: str) -> tuple[int | None
         return image.size
 
 
+def _reference_endpoint(base_url: str, edits_base_url: str | None, has_images: bool) -> str:
+    if not has_images:
+        return base_url
+    if edits_base_url:
+        return edits_base_url
+    if base_url.rstrip("/").endswith("/images/generations"):
+        return re.sub(r"/images/generations/?$", "/images/edits", base_url.rstrip("/"))
+    return base_url
+
+
+def _image_reference(value: str) -> dict[str, str]:
+    value = value.strip()
+    if not value:
+        _die("empty --image value")
+    if value.startswith(("data:image/", "http://", "https://")):
+        return {"image_url": value}
+    if value.startswith(("file-", "file_")):
+        return {"file_id": value}
+
+    path = Path(value).expanduser().resolve()
+    if not path.is_file():
+        _die(f"reference image not found: {path}")
+    mime_type = guess_type(path.name)[0] or "application/octet-stream"
+    if not mime_type.startswith("image/"):
+        _die(f"reference file is not an image type: {path}")
+    image_b64 = base64.b64encode(path.read_bytes()).decode("ascii")
+    return {"image_url": f"data:{mime_type};base64,{image_b64}"}
+
+
+def _redacted_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    redacted = json.loads(json.dumps(payload))
+    images = redacted.get("images")
+    if isinstance(images, list):
+        for image in images:
+            if not isinstance(image, dict):
+                continue
+            image_url = image.get("image_url")
+            if isinstance(image_url, str) and image_url.startswith("data:image/"):
+                prefix = image_url.split(",", 1)[0]
+                image["image_url"] = f"{prefix},<redacted>"
+    return redacted
+
+
 def _request_json(url: str, api_key: str | None, payload: dict[str, Any], timeout: int) -> dict[str, Any]:
     headers = {
         "Content-Type": "application/json",
@@ -244,6 +288,10 @@ def _build_payload(args: argparse.Namespace, size: str) -> dict[str, Any]:
         payload["background"] = args.background
     if args.moderation:
         payload["moderation"] = args.moderation
+    if args.input_fidelity:
+        payload["input_fidelity"] = args.input_fidelity
+    if args.image:
+        payload["images"] = [_image_reference(image) for image in args.image]
     return payload
 
 
@@ -255,12 +303,15 @@ def main() -> int:
     parser.add_argument("--resolution", default=DEFAULT_RESOLUTION, choices=sorted(PIXEL_BUDGETS))
     parser.add_argument("--size")
     parser.add_argument("--out-dir", default="output/imagegen")
-    parser.add_argument("--base-url", default=os.getenv("CH_IMAGEGEN_BASE_URL", DEFAULT_BASE_URL))
+    parser.add_argument("--base-url", default=os.getenv("CH_IMAGEGEN_BASE_URL", DEFAULT_GENERATIONS_URL))
+    parser.add_argument("--edits-base-url", default=os.getenv("CH_IMAGEGEN_EDITS_BASE_URL"))
     parser.add_argument("--api-key", default=os.getenv("CH_IMAGEGEN_API_KEY"))
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--quality", default=DEFAULT_QUALITY)
     parser.add_argument("--background")
     parser.add_argument("--moderation")
+    parser.add_argument("--input-fidelity", choices=("low", "high"))
+    parser.add_argument("--image", action="append", help="Reference image path, data URL, HTTP URL, or file ID; may be repeated")
     parser.add_argument("--output-format", default=DEFAULT_OUTPUT_FORMAT)
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     parser.add_argument("--progress-interval", type=int, default=DEFAULT_PROGRESS_INTERVAL)
@@ -283,6 +334,8 @@ def main() -> int:
     timestamp = _timestamp_ms()
     dry_path = out_dir / f"{title}-{requested_size}-{timestamp}.{args.output_format}"
     payload = _build_payload(args, requested_size)
+    endpoint = _reference_endpoint(args.base_url, args.edits_base_url, bool(args.image))
+    mode = "edits" if args.image else "generations"
 
     if args.dry_run:
         print(
@@ -290,12 +343,14 @@ def main() -> int:
                 {
                     "ok": True,
                     "mode": "dry-run",
-                    "base_url": args.base_url,
+                    "request_mode": mode,
+                    "base_url": endpoint,
                     "model": args.model,
                     "size": requested_size,
+                    "reference_count": len(args.image or []),
                     "title": title,
                     "output": str(dry_path),
-                    "payload": payload,
+                    "payload": _redacted_payload(payload),
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -304,14 +359,15 @@ def main() -> int:
         return 0
 
     _log(
-        f"[ch-imagegen] starting request model={args.model} size={requested_size} "
+        f"[ch-imagegen] starting {mode} request model={args.model} size={requested_size} "
+        f"references={len(args.image or [])} "
         f"timeout={args.timeout}s output={dry_path}"
     )
-    _log(f"[ch-imagegen] endpoint={args.base_url}")
+    _log(f"[ch-imagegen] endpoint={endpoint}")
     heartbeat = _Heartbeat(args.progress_interval, "image response")
     heartbeat.start()
     try:
-        response = _request_json(args.base_url, args.api_key, payload, args.timeout)
+        response = _request_json(endpoint, args.api_key, payload, args.timeout)
     finally:
         heartbeat.stop()
     _log("[ch-imagegen] received API response")
@@ -343,10 +399,12 @@ def main() -> int:
         json.dumps(
             {
                 "ok": True,
-                "base_url": args.base_url,
+                "request_mode": mode,
+                "base_url": endpoint,
                 "model": args.model,
                 "requested_size": requested_size,
                 "actual_size": actual_size,
+                "reference_count": len(args.image or []),
                 "title": title,
                 "output": str(final_path),
                 "revised_prompt": revised_prompt,

@@ -127,12 +127,16 @@ default
 
 `official-imagegen` is the most complete preset, but it is also the most demanding: the relay must support `/responses`, `/responses/compact`, and hosted `image_generation`. Only enable `responses_websocket` after a WebSocket live smoke passes for the selected upstream.
 
-## OpenAI Images-Compatible Generation Endpoint
+## OpenAI Images-Compatible Endpoints
 
-The proxy also exposes `POST /v1/images/generations` and `/images/generations` for local skills
-or scripts that want a simple OpenAI Images-style interface. codex-helper translates the request
-into a non-streaming `/v1/responses` call with a hosted `image_generation` tool, then converts a
-successful `image_generation_call.result` back into `data[0].b64_json`.
+The proxy also exposes OpenAI Images-style endpoints for local skills or scripts:
+
+- `POST /v1/images/generations` and `/images/generations` for text-to-image generation.
+- JSON `POST /v1/images/edits` and `/images/edits` for reference-image generation.
+
+codex-helper translates these requests into a non-streaming `/v1/responses` call with a hosted
+`image_generation` tool, then converts a successful `image_generation_call.result` back into
+`data[0].b64_json`.
 
 Example:
 
@@ -151,8 +155,31 @@ curl 'http://127.0.0.1:3211/v1/images/generations' \
 
 This endpoint intentionally reuses normal provider routing, model mapping, retry/fallback, auth
 injection, and request logging. The selected upstream must still support hosted Responses image
-generation. The first version supports one image per request (`n` absent or `1`) and does not
-implement `/v1/images/edits`.
+generation.
+
+Reference-image edits accept JSON with an `images` array. Each item can be an object with
+`image_url` or `file_id`, or a direct image URL / data URL string. codex-helper turns these into
+Responses `input_image` content:
+
+```bash
+curl 'http://127.0.0.1:3211/v1/images/edits' \
+  -X POST \
+  -H 'Content-Type: application/json' \
+  --data-raw '{
+    "model": "gpt-image-2",
+    "prompt": "draw the reference character as a messy full-page sketchbook sheet",
+    "images": [
+      {"image_url": "data:image/png;base64,..."}
+    ],
+    "size": "2160x2880",
+    "output_format": "png",
+    "quality": "high",
+    "input_fidelity": "high"
+  }'
+```
+
+Both generation and JSON edits support one generated result (`n` absent or `1`). JSON edits do not
+parse masks; JSON requests with `mask` and multipart edits pass through as ordinary proxy requests.
 
 You can actively inspect a relay's Codex capability profile through the local admin API:
 

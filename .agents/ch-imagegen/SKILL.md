@@ -1,19 +1,21 @@
 ---
 name: ch-imagegen
-description: Generate raster images through a running local codex-helper proxy using its OpenAI-compatible `/v1/images/generations` bridge. Use when Codex should create bitmap images via the user's local relay/provider chain, when the built-in imagegen tool is unstable with the relay, or when the user asks for `ch-imagegen`, codex-helper image generation, OpenAI Images API generation, gpt-image-2 images, 2K/4K image outputs, or local proxy image generation.
+description: Generate or reference-edit raster images through a running local codex-helper proxy using its OpenAI-compatible `/v1/images/generations` and JSON `/v1/images/edits` bridges. Use when Codex should create bitmap images via the user's local relay/provider chain, when the built-in imagegen tool is unstable with the relay, or when the user asks for `ch-imagegen`, codex-helper image generation, OpenAI Images API generation, reference image generation, gpt-image-2 images, 2K/4K image outputs, or local proxy image generation.
 ---
 
 # CH Imagegen
 
 Use this skill for local codex-helper image generation. It calls the proxy's
-OpenAI-compatible `/v1/images/generations` endpoint, saves the returned base64 image,
-and validates only the newly written file.
+OpenAI-compatible `/v1/images/generations` endpoint, or `/v1/images/edits` when
+reference images are passed with `--image`, saves the returned base64 image, and
+validates only the newly written file.
 
 ## Rules
 
 - Do not use the system `.system/imagegen` workflow for requests that explicitly ask for
   `ch-imagegen` or local codex-helper image generation.
-- Require a running codex-helper proxy that exposes `/v1/images/generations`.
+- Require a running codex-helper proxy that exposes `/v1/images/generations`; reference-image
+  mode additionally requires `/v1/images/edits`.
 - Do not ask the user to paste provider API keys. Upstream credentials belong in codex-helper
   config or environment variables.
 - Treat `scripts/generate_image.py` exit code and stdout JSON as the source of truth.
@@ -32,9 +34,23 @@ python "${CODEX_HOME:-$HOME/.codex}/skills/ch-imagegen/scripts/generate_image.py
   --resolution "4k"
 ```
 
+Reference image mode:
+
+```bash
+python "${CODEX_HOME:-$HOME/.codex}/skills/ch-imagegen/scripts/generate_image.py" \
+  --prompt "<user prompt>" \
+  --image "/path/to/reference.png" \
+  --aspect "3:4" \
+  --resolution "4k"
+```
+
 Useful overrides:
 
 - `--base-url "http://127.0.0.1:3211/v1/images/generations"`
+- `--edits-base-url "http://127.0.0.1:3211/v1/images/edits"`
+- `--image "reference.png"`; may be repeated; accepts local image paths, `data:image/...`,
+  HTTP(S) URLs, and `file_id` values
+- `--input-fidelity "high"` for reference-image edits
 - `--aspect "4:3"` or `--aspect "9:16"`
 - `--resolution "2k"`
 - `--size "3840x2160"`
@@ -58,6 +74,7 @@ After generation, report:
 
 - endpoint used;
 - requested size and actual local image size;
+- reference image count when present;
 - output path;
 - revised prompt if present.
 

@@ -42,7 +42,7 @@ English: [README_EN.md](README_EN.md)
 - **本地代理**：默认监听 `127.0.0.1:3211`，Codex 继续按原方式使用。
 - **安全 Codex 局部修改**：只改本地代理片段，不影响 Codex 运行中写入的其他配置。
 - **Codex 原生体验预设**：`chatgpt-bridge` 保留 ChatGPT 登录态，`imagegen-bridge` 暴露 hosted image generation，`official-relay` / `official-imagegen` 让支持官方 Responses 语义的中转尝试 remote compaction v1；`responses_websocket` 作为独立开关控制 Responses WebSocket v2。
-- **OpenAI Images 兼容入口**：本地代理额外暴露 `POST /v1/images/generations`，会转成 Responses hosted `image_generation` 请求并复用同一套 provider routing / fallback，方便本地 skill 或脚本稳定生图。
+- **OpenAI Images 兼容入口**：本地代理额外暴露 `POST /v1/images/generations` 和 JSON `POST /v1/images/edits`，会转成 Responses hosted `image_generation` 请求并复用同一套 provider routing / fallback，方便本地 skill 或脚本稳定生图或带参考图生成。
 - **中转能力诊断**：TUI、CLI 和 admin API 都可以检查 `/models`、`/responses`、`/responses/compact`，并给出当前 relay 更适合哪种 preset。
 - **provider / routing 配置**：`version = 5` route graph 格式，新增 provider 后用 routing entry/routes 决定顺序、固定、分组或标签优先。
 - **会话粘性与自动兜底**：同一 Codex 会话会尽量粘住已选 provider，请求失败、上游不可用或可信余额显示耗尽时再按策略切换候选 provider/upstream。
@@ -191,7 +191,7 @@ default
 
 如果上游已确认支持 Responses WebSocket v2，再额外启用 `responses_websocket = true` 或 `--responses-websocket`；它是独立传输开关，不是新的 preset。
 
-本地代理还提供 OpenAI Images 兼容的生图入口，适合给 Codex skill 或脚本调用，而不是依赖 Codex 客户端是否成功暴露 hosted tool：
+本地代理还提供 OpenAI Images 兼容的生图和参考图编辑入口，适合给 Codex skill 或脚本调用，而不是依赖 Codex 客户端是否成功暴露 hosted tool：
 
 ```bash
 curl 'http://127.0.0.1:3211/v1/images/generations' \
@@ -206,7 +206,26 @@ curl 'http://127.0.0.1:3211/v1/images/generations' \
   }'
 ```
 
-这个入口内部仍走 `/v1/responses` + hosted `image_generation`，因此真实上游必须支持该能力；当前只支持 `n=1` 的单图生成，不覆盖 `/v1/images/edits`。返回形态为 OpenAI Images 风格的 `data[0].b64_json`。
+参考图模式使用 JSON `POST /v1/images/edits`，接受 `images` 数组，数组元素可以是 `{"image_url":"..."}`、`{"file_id":"..."}`，也可以直接写图片 URL / data URL 字符串；helper 会把这些引用转成 Responses `input_image` 内容：
+
+```bash
+curl 'http://127.0.0.1:3211/v1/images/edits' \
+  -X POST \
+  -H 'Content-Type: application/json' \
+  --data-raw '{
+    "model": "gpt-image-2",
+    "prompt": "把参考图人物画成一整页凌乱角色速写",
+    "images": [
+      {"image_url": "data:image/png;base64,..."}
+    ],
+    "size": "2160x2880",
+    "output_format": "png",
+    "quality": "high",
+    "input_fidelity": "high"
+  }'
+```
+
+这两个入口内部仍走 `/v1/responses` + hosted `image_generation`，因此真实上游必须支持该能力；当前只支持 `n=1` 的单图结果。JSON edits 不实现 mask 解析，带 `mask` 的 JSON 和 multipart edits 会按普通代理请求直通上游。返回形态为 OpenAI Images 风格的 `data[0].b64_json`。
 
 注意：任何对 `~/.codex/config.toml` 的修改都只会被新启动的 Codex 会话读取；修改后请完整重启 Codex App、TUI 或 `codex exec` 会话。
 

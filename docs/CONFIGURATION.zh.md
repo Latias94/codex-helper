@@ -127,12 +127,15 @@ default
 
 `official-imagegen` 是当前最完整 preset，但也是对中转要求最高的 preset：中转必须支持 `/responses`、`/responses/compact` 和 hosted `image_generation`。只有选中的上游通过 WebSocket live smoke 后，才建议额外开启 `responses_websocket`。
 
-## OpenAI Images 兼容生图入口
+## OpenAI Images 兼容入口
 
-本地代理也暴露 `POST /v1/images/generations` 和 `/images/generations`，方便本地 skill 或脚本使用
-简单的 OpenAI Images 风格接口。codex-helper 会把请求转成非流式 `/v1/responses` + hosted
-`image_generation` tool 调用，再把成功响应里的 `image_generation_call.result` 转回
-`data[0].b64_json`。
+本地代理也暴露 OpenAI Images 风格入口，方便本地 skill 或脚本使用：
+
+- `POST /v1/images/generations` 和 `/images/generations` 用于文本生图。
+- JSON `POST /v1/images/edits` 和 `/images/edits` 用于带参考图生成。
+
+codex-helper 会把这些请求转成非流式 `/v1/responses` + hosted `image_generation` tool 调用，
+再把成功响应里的 `image_generation_call.result` 转回 `data[0].b64_json`。
 
 示例：
 
@@ -150,8 +153,30 @@ curl 'http://127.0.0.1:3211/v1/images/generations' \
 ```
 
 这个入口刻意复用正常 provider routing、model mapping、retry/fallback、auth 注入和请求日志；
-被选中的真实上游仍必须支持 Responses hosted image generation。当前版本只支持单图生成
-（`n` 不传或为 `1`），不实现 `/v1/images/edits`。
+被选中的真实上游仍必须支持 Responses hosted image generation。
+
+参考图 edits 使用 JSON `images` 数组。每个元素可以是带 `image_url` 或 `file_id` 的对象，
+也可以直接写图片 URL / data URL 字符串。helper 会把这些引用转成 Responses `input_image` 内容：
+
+```bash
+curl 'http://127.0.0.1:3211/v1/images/edits' \
+  -X POST \
+  -H 'Content-Type: application/json' \
+  --data-raw '{
+    "model": "gpt-image-2",
+    "prompt": "把参考图人物画成一整页凌乱角色速写",
+    "images": [
+      {"image_url": "data:image/png;base64,..."}
+    ],
+    "size": "2160x2880",
+    "output_format": "png",
+    "quality": "high",
+    "input_fidelity": "high"
+  }'
+```
+
+文本生图和 JSON edits 当前都只支持单张输出结果（`n` 不传或为 `1`）。JSON edits 不解析
+mask；带 `mask` 的 JSON 请求和 multipart edits 会按普通代理请求直通上游。
 
 可以通过本地 admin API 主动检查某个中转的 Codex 能力画像：
 
