@@ -578,13 +578,22 @@ fn openai_images_error(error: (StatusCode, String)) -> (StatusCode, String) {
     if looks_like_json(&message) {
         return (status, message);
     }
+    let failure_hint = openai_images_failure_hint(status, &message);
     let body = json!({
         "error": {
             "message": message,
             "type": "image_generation_route_failed",
+            "failure_hint": failure_hint,
             "retryable": status.is_server_error(),
+            "suggested_action": openai_images_suggested_action(failure_hint, status),
         }
     });
+    let mut body = body;
+    if let Some(request_id) = extract_request_id(&message)
+        && let Some(error) = body.get_mut("error").and_then(Value::as_object_mut)
+    {
+        error.insert("request_id".to_string(), Value::String(request_id));
+    }
     (
         status,
         serde_json::to_string(&body).unwrap_or_else(|_| {
@@ -596,6 +605,47 @@ fn openai_images_error(error: (StatusCode, String)) -> (StatusCode, String) {
 
 fn looks_like_json(value: &str) -> bool {
     value.trim_start().starts_with('{') || value.trim_start().starts_with('[')
+}
+
+fn openai_images_failure_hint(status: StatusCode, message: &str) -> &'static str {
+    let lowered = message.to_ascii_lowercase();
+    if lowered.contains("no upstreams are currently routable")
+        || lowered.contains("route_unavailable")
+    {
+        return "route_unavailable";
+    }
+    if lowered.contains("all upstream attempts failed") {
+        return "all_upstreams_failed";
+    }
+    if status.is_server_error() {
+        return "upstream_failure";
+    }
+    "request_failed"
+}
+
+fn openai_images_suggested_action(failure_hint: &str, status: StatusCode) -> &'static str {
+    match failure_hint {
+        "route_unavailable" => {
+            "wait for route cooldown or configure an image-capable upstream provider for this model"
+        }
+        "all_upstreams_failed" => {
+            "check upstream image-generation support for this model, then retry after cooldown or select an image-capable route"
+        }
+        "upstream_failure" if status.is_server_error() => {
+            "retry after cooldown; inspect codex-helper logs with the request_id if the route keeps failing"
+        }
+        _ => "inspect codex-helper logs with the request_id",
+    }
+}
+
+fn extract_request_id(message: &str) -> Option<String> {
+    let marker = "request_id=";
+    let start = message.find(marker)? + marker.len();
+    let request_id: String = message[start..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':'))
+        .collect();
+    (!request_id.is_empty()).then_some(request_id)
 }
 
 #[cfg(test)]
@@ -707,6 +757,25 @@ mod tests {
             err.1.contains("at least one image"),
             "unexpected error: {}",
             err.1
+        );
+    }
+
+    #[test]
+    fn openai_images_error_enriches_route_failure_diagnostics() {
+        let (status, body) = openai_images_error((
+            StatusCode::BAD_GATEWAY,
+            "all upstream attempts failed (request_id=64, status=502, attempts=18)".to_string(),
+        ));
+        let body: Value = serde_json::from_str(&body).expect("json");
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"]["type"], "image_generation_route_failed");
+        assert_eq!(body["error"]["failure_hint"], "all_upstreams_failed");
+        assert_eq!(body["error"]["request_id"], "64");
+        assert!(
+            body["error"]["suggested_action"]
+                .as_str()
+                .is_some_and(|action| action.contains("image-generation support"))
         );
     }
 }

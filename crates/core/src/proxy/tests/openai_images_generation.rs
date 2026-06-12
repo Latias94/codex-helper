@@ -323,6 +323,20 @@ async fn openai_images_generation_route_failure_returns_openai_error_json() {
         Some("image_generation_route_failed")
     );
     assert_eq!(body["error"]["retryable"].as_bool(), Some(true));
+    assert_eq!(
+        body["error"]["failure_hint"].as_str(),
+        Some("all_upstreams_failed")
+    );
+    assert!(
+        body["error"]["request_id"].as_str().is_some(),
+        "request_id should be a structured field: {body}"
+    );
+    assert!(
+        body["error"]["suggested_action"]
+            .as_str()
+            .is_some_and(|action| action.contains("image-generation support")),
+        "suggested_action should point at image route/provider support: {body}"
+    );
     assert!(
         body["error"]["message"]
             .as_str()

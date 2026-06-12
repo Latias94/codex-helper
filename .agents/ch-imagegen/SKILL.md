@@ -27,7 +27,14 @@ validates only the newly written file.
   longer than the script timeout plus retry buffer; do not use a 120s shell timeout for 4K images.
 - Treat stdout JSON as authoritative for both success and failure. On failure the script prints
   `ok:false` with `error.status`, `error.classification`, `error.request_id`,
-  `error.retryable`, `error.attempts`, and `error.suggested_action`.
+  `error.failure_hint`, `error.retryable`, `error.attempts`, and `error.suggested_action`.
+- If `error.classification` is `image_generation_route_failed` and `error.failure_hint` is
+  `all_upstreams_failed` or `route_unavailable`, report that the configured codex-helper route
+  did not have a currently usable image-capable upstream for the requested model. Do not present
+  that as a prompt, reference image, or resolution problem unless the error says so explicitly.
+- Do not automatically fall back to the system `.system/imagegen` workflow after local proxy
+  failure. It may use a different account/path; ask or use it only when the user explicitly
+  approves that bypass.
 - Save final outputs under `output/imagegen/` unless the user specifies another directory.
 
 ## Command
@@ -89,6 +96,6 @@ After generation, report:
 - revised prompt if present.
 
 If generation fails, report the structured `error` block from stdout, especially
-`classification`, `request_id`, `retryable`, and `suggested_action`.
+`classification`, `failure_hint`, `request_id`, `retryable`, and `suggested_action`.
 
 Never scan old output files to guess that generation succeeded.

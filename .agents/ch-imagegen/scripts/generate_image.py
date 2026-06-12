@@ -78,6 +78,7 @@ class ImagegenRequestError(RuntimeError):
         body: str | None = None,
         retryable: bool | None = None,
         classification: str | None = None,
+        failure_hint: str | None = None,
         request_id: str | None = None,
         attempts: int = 1,
     ) -> None:
@@ -87,6 +88,7 @@ class ImagegenRequestError(RuntimeError):
         self.body = body
         self.retryable = retryable
         self.classification = classification
+        self.failure_hint = failure_hint
         self.request_id = request_id
         self.attempts = attempts
 
@@ -116,6 +118,7 @@ def _emit_failure(
                     "message": error.message,
                     "status": error.status,
                     "classification": error.classification,
+                    "failure_hint": error.failure_hint,
                     "request_id": error.request_id,
                     "retryable": error.retryable,
                     "attempts": attempts,
@@ -131,6 +134,8 @@ def _emit_failure(
 def _suggested_action(error: ImagegenRequestError) -> str:
     if error.classification == "image_generation_missing_result":
         return "retry another route/provider or use --fallback-resolution 2k"
+    if _is_image_route_pool_failure(error):
+        return "configure or select an upstream route that supports image generation for this model; use the built-in imagegen tool only with user approval"
     if error.status in (502, 503, 504, 524):
         return "retry after cooldown or reduce resolution"
     if error.status in (400, 422):
@@ -142,6 +147,7 @@ def _parse_error_payload(status: int, body: str) -> ImagegenRequestError:
     message = body.strip() or f"HTTP {status}"
     retryable: bool | None = status in (408, 429, 500, 502, 503, 504, 524)
     classification: str | None = None
+    failure_hint: str | None = None
     request_id: str | None = None
     try:
         payload = json.loads(body)
@@ -156,6 +162,9 @@ def _parse_error_payload(status: int, body: str) -> ImagegenRequestError:
             raw_type = error.get("type") or error.get("code")
             if isinstance(raw_type, str) and raw_type.strip():
                 classification = raw_type
+            raw_failure_hint = error.get("failure_hint")
+            if isinstance(raw_failure_hint, str) and raw_failure_hint.strip():
+                failure_hint = raw_failure_hint
             raw_retryable = error.get("retryable")
             if isinstance(raw_retryable, bool):
                 retryable = raw_retryable
@@ -180,12 +189,16 @@ def _parse_error_payload(status: int, body: str) -> ImagegenRequestError:
             classification = "route_unavailable"
             retryable = True
 
+    if failure_hint is None:
+        failure_hint = _failure_hint_from_message(message)
+
     return ImagegenRequestError(
         message,
         status=status,
         body=body,
         retryable=retryable,
         classification=classification,
+        failure_hint=failure_hint,
         request_id=request_id,
     )
 
@@ -194,6 +207,23 @@ def _is_retryable(error: ImagegenRequestError) -> bool:
     if error.retryable is not None:
         return error.retryable
     return error.status in (408, 429, 500, 502, 503, 504, 524)
+
+
+def _failure_hint_from_message(message: str) -> str | None:
+    lowered = message.lower()
+    if "no upstreams are currently routable" in lowered or "route_unavailable" in lowered:
+        return "route_unavailable"
+    if "all upstream attempts failed" in lowered:
+        return "all_upstreams_failed"
+    return None
+
+
+def _is_image_route_pool_failure(error: ImagegenRequestError) -> bool:
+    if error.failure_hint in {"route_unavailable", "all_upstreams_failed"}:
+        return True
+    if error.classification in {"route_unavailable", "image_generation_route_failed"}:
+        return _failure_hint_from_message(error.message) is not None
+    return False
 
 
 def _floor_aligned(value: float, align: int = ALIGN) -> int:
@@ -421,6 +451,8 @@ def _request_json_with_retries(
 
 
 def _should_use_fallback_resolution(error: ImagegenRequestError) -> bool:
+    if _is_image_route_pool_failure(error):
+        return False
     return error.status in (502, 503, 504, 524) or error.classification in {
         "image_generation_missing_result",
         "route_unavailable",

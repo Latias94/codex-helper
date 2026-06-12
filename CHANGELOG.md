@@ -15,7 +15,8 @@ All notable changes to this project will be documented in this file.
 
 #### 修复
 
-- TUI crate 现在显式钉住 `ratatui-widgets = 0.3.0`，避免 fresh dependency resolution 选到 `0.3.1` 后在 `time::HourBase` 转换实现上触发 Rust E0119 coherence 编译错误。
+- TUI crate 升级到 `ratatui 0.30.1`，并关闭默认 `all-widgets` / `widget-calendar` feature，避免 `ratatui-widgets` 拉入 `time` 后在 `HourBase` 转换实现上触发 Rust E0119 coherence 编译错误。
+- OpenAI Images 兼容入口的路由失败错误现在会返回 `failure_hint`、`request_id` 和 `suggested_action`；仓库内 `ch-imagegen` skill 会把全上游 502/503 或 route unavailable 识别为 image-capable provider/路由池问题，而不是误导为分辨率问题。
 - 仓库内 `ch-imagegen` skill 默认改为 2K，并新增结构化失败 JSON、可重试错误重试、`--fallback-resolution 2k` 和 4K 超时使用说明，降低慢上游、4K 请求或无图结果导致外层工具超时/误判的概率。
 - Codex `remote_compaction_v2` 的 `compaction_trigger` `/responses` 请求现在会默认先尝试 v2；如果 relay 返回普通 Responses 成功流、JSON compact 结果或明确不支持 v2 的错误，helper 会自动降级到 `/responses/compact` 并合成为 Codex 期望的 v2 compact SSE，避免触发 Codex 本地 “expected exactly one compaction output item” fatal。可通过 `[codex.compaction].remote_v2_downgrade = false` 关闭该兜底。
 
@@ -29,7 +30,8 @@ All notable changes to this project will be documented in this file.
 
 #### Fixed
 
-- The TUI crate now pins `ratatui-widgets = 0.3.0`, preventing fresh dependency resolution from selecting `0.3.1` and hitting Rust E0119 coherence failures around `time::HourBase` conversion impls.
+- The TUI crate now upgrades to `ratatui 0.30.1` with default `all-widgets` / `widget-calendar` features disabled, preventing `ratatui-widgets` from pulling in `time` and hitting Rust E0119 coherence failures around `HourBase` conversion impls.
+- OpenAI Images-compatible route failures now return `failure_hint`, `request_id`, and `suggested_action`; the repository `ch-imagegen` skill recognizes all-upstream 502/503 or route-unavailable failures as image-capable provider/route-pool issues instead of misleadingly treating them as resolution problems.
 - The repository `ch-imagegen` skill now defaults to 2K and emits structured failure JSON with retry metadata, retry handling, `--fallback-resolution 2k`, and 4K timeout guidance to reduce outer tool timeouts and false success/failure handling for slow providers or missing image results.
 - Codex `remote_compaction_v2` `compaction_trigger` `/responses` requests now try v2 first by default. If a relay returns an ordinary Responses success stream, a JSON compact result, or a clear unsupported-v2 error, helper automatically downgrades to `/responses/compact` and synthesizes the v2 compact SSE shape Codex expects, avoiding Codex's local “expected exactly one compaction output item” fatal. Set `[codex.compaction].remote_v2_downgrade = false` to disable the fallback.
 
