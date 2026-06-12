@@ -141,6 +141,7 @@ impl RetryProfileName {
                     on_class: vec![
                         "upstream_transport_error".to_string(),
                         "routing_mismatch_capability".to_string(),
+                        "image_generation_missing_result".to_string(),
                     ],
                     strategy: RetryStrategy::Failover,
                 },

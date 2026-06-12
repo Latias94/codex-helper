@@ -1,6 +1,7 @@
 use super::*;
 use crate::proxy::tests::harness::{
     post_images_edits_json, post_images_generations_json, spawn_test_proxy, spawn_test_upstream,
+    upstream_config,
 };
 use std::sync::{Arc, Mutex};
 
@@ -223,6 +224,110 @@ async fn openai_images_generation_endpoint_reports_missing_image_result() {
 
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert!(text.contains("image_generation_call"));
+}
+
+#[tokio::test]
+async fn openai_images_generation_missing_result_fails_over_to_next_upstream() {
+    let bad_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let bad_hits_for_route = bad_hits.clone();
+    let bad_upstream = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let bad_hits_for_route = bad_hits_for_route.clone();
+            async move {
+                bad_hits_for_route.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "id": "resp_no_image",
+                        "output": [
+                            {"type": "message", "content": []}
+                        ]
+                    })),
+                )
+            }
+        }),
+    );
+    let good_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let good_hits_for_route = good_hits.clone();
+    let good_upstream = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let good_hits_for_route = good_hits_for_route.clone();
+            async move {
+                good_hits_for_route.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "id": "resp_image",
+                        "created": 45,
+                        "output": [
+                            {
+                                "type": "image_generation_call",
+                                "id": "ig_1",
+                                "status": "completed",
+                                "result": "YmF6"
+                            }
+                        ]
+                    })),
+                )
+            }
+        }),
+    );
+    let bad_upstream = spawn_test_upstream(bad_upstream);
+    let good_upstream = spawn_test_upstream(good_upstream);
+    let cfg = make_proxy_config(
+        vec![
+            bad_upstream.upstream_config(),
+            good_upstream.upstream_config(),
+        ],
+        RetryConfig::default(),
+    );
+    let proxy = spawn_test_proxy(cfg);
+    let client = Client::new();
+
+    let response =
+        post_images_generations_json(&client, &proxy, r#"{"model":"gpt-image-2","prompt":"cat"}"#)
+            .await
+            .error_for_status()
+            .expect("images status")
+            .json::<serde_json::Value>()
+            .await
+            .expect("images json");
+
+    assert_eq!(response["created"], 45);
+    assert_eq!(response["data"][0]["b64_json"], "YmF6");
+    assert_eq!(bad_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(good_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn openai_images_generation_route_failure_returns_openai_error_json() {
+    let unused_addr = reserve_unused_local_addr();
+    let cfg = make_proxy_config(
+        vec![upstream_config(format!("http://{unused_addr}/v1"))],
+        RetryConfig::default(),
+    );
+    let proxy = spawn_test_proxy(cfg);
+    let client = Client::new();
+
+    let response =
+        post_images_generations_json(&client, &proxy, r#"{"model":"gpt-image-2","prompt":"cat"}"#)
+            .await;
+    let status = response.status();
+    let body = response.json::<serde_json::Value>().await.expect("json");
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        body["error"]["type"].as_str(),
+        Some("image_generation_route_failed")
+    );
+    assert_eq!(body["error"]["retryable"].as_bool(), Some(true));
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("request_id"))
+    );
 }
 
 #[tokio::test]

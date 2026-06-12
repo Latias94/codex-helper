@@ -55,6 +55,7 @@ pub async fn handle_proxy(
         cwd: prepared.cwd.as_deref(),
         request_flavor: &prepared.request_flavor,
         request_body_previews: prepared.request_body_previews,
+        response_semantic_contract: prepared.response_semantic_contract,
         debug_max: prepared.debug_max,
         warn_max: prepared.warn_max,
         client_body_debug: prepared.client_body_debug.as_ref(),

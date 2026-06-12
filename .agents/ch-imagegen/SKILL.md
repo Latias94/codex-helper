@@ -21,8 +21,13 @@ validates only the newly written file.
 - Treat `scripts/generate_image.py` exit code and stdout JSON as the source of truth.
 - If the script exits non-zero, report the error and stop. Do not infer success from older files.
 - Default model: `gpt-image-2`.
-- Default resolution: `4k`; default aspect ratio: `16:9`; default output format: `png`;
+- Default resolution: `2k`; default aspect ratio: `16:9`; default output format: `png`;
   default quality: `high`.
+- Use `4k` only when the user explicitly needs final-resolution output. Set a tool/shell timeout
+  longer than the script timeout plus retry buffer; do not use a 120s shell timeout for 4K images.
+- Treat stdout JSON as authoritative for both success and failure. On failure the script prints
+  `ok:false` with `error.status`, `error.classification`, `error.request_id`,
+  `error.retryable`, `error.attempts`, and `error.suggested_action`.
 - Save final outputs under `output/imagegen/` unless the user specifies another directory.
 
 ## Command
@@ -31,7 +36,7 @@ validates only the newly written file.
 python "${CODEX_HOME:-$HOME/.codex}/skills/ch-imagegen/scripts/generate_image.py" \
   --prompt "<user prompt>" \
   --aspect "16:9" \
-  --resolution "4k"
+  --resolution "2k"
 ```
 
 Reference image mode:
@@ -41,7 +46,7 @@ python "${CODEX_HOME:-$HOME/.codex}/skills/ch-imagegen/scripts/generate_image.py
   --prompt "<user prompt>" \
   --image "/path/to/reference.png" \
   --aspect "3:4" \
-  --resolution "4k"
+  --resolution "2k"
 ```
 
 Useful overrides:
@@ -52,9 +57,14 @@ Useful overrides:
   HTTP(S) URLs, and `file_id` values
 - `--input-fidelity "high"` for reference-image edits
 - `--aspect "4:3"` or `--aspect "9:16"`
+- `--resolution "4k"` for explicit final output
 - `--resolution "2k"`
+- `--fallback-resolution "2k"` when trying 4K but willing to retry smaller after route/provider
+  failures
 - `--size "3840x2160"`
 - `--quality "medium"`
+- `--retries 2`
+- `--retry-delay 30`
 - `--output-format "webp"`
 - `--title "short-slug"`
 - `--out-dir "output/imagegen"`
@@ -77,5 +87,8 @@ After generation, report:
 - reference image count when present;
 - output path;
 - revised prompt if present.
+
+If generation fails, report the structured `error` block from stdout, especially
+`classification`, `request_id`, `retryable`, and `suggested_action`.
 
 Never scan old output files to guess that generation succeeded.

@@ -32,6 +32,7 @@ use super::response_fixer::{
     classify_remote_compaction_v2_response,
     synthesize_remote_compaction_v2_sse_from_compact_response,
 };
+use super::response_semantics::ResponseSemanticContract;
 use super::retry::{RetryLayerOptions, RetryPlan};
 use super::route_attempts::{
     StartRouteAttemptParams, StatusRouteAttemptParams, record_status_route_attempt,
@@ -92,6 +93,7 @@ pub(super) struct ExecuteSelectedUpstreamParams<'a> {
     pub(super) cwd: Option<&'a str>,
     pub(super) request_flavor: &'a RequestFlavor,
     pub(super) request_body_previews: bool,
+    pub(super) response_semantic_contract: Option<ResponseSemanticContract>,
     pub(super) debug_max: usize,
     pub(super) warn_max: usize,
     pub(super) client_body_debug: Option<&'a BodyPreview>,
@@ -145,6 +147,7 @@ pub(super) async fn execute_selected_upstream(
         cwd,
         request_flavor,
         request_body_previews,
+        response_semantic_contract,
         debug_max,
         warn_max,
         client_body_debug,
@@ -391,6 +394,7 @@ pub(super) async fn execute_selected_upstream(
                         effective_effort,
                         base_service_tier,
                         codex_bridge: request_flavor.codex_bridge_log.clone(),
+                        response_semantic_contract,
                         upstream_chain,
                         route_attempts,
                         route_attempt_index,
@@ -443,6 +447,7 @@ pub(super) async fn execute_selected_upstream(
                         effective_effort,
                         base_service_tier,
                         codex_bridge: request_flavor.codex_bridge_log.clone(),
+                        response_semantic_contract,
                         upstream_chain,
                         route_attempts,
                         route_attempt_index,
@@ -665,6 +670,7 @@ pub(super) async fn execute_selected_upstream(
                             codex_bridge: codex_bridge_with_remote_v2_downgrade(
                                 request_flavor.codex_bridge_log.clone(),
                             ),
+                            response_semantic_contract,
                             upstream_chain,
                             route_attempts,
                             route_attempt_index: compact_route_attempt_index,
@@ -718,6 +724,7 @@ pub(super) async fn execute_selected_upstream(
                         codex_bridge: codex_bridge_with_remote_v2_downgrade(
                             request_flavor.codex_bridge_log.clone(),
                         ),
+                        response_semantic_contract,
                         upstream_chain,
                         route_attempts,
                         route_attempt_index: compact_route_attempt_index,
@@ -812,6 +819,7 @@ pub(super) async fn execute_selected_upstream(
                 effective_effort,
                 base_service_tier,
                 codex_bridge: request_flavor.codex_bridge_log.clone(),
+                response_semantic_contract,
                 upstream_chain,
                 route_attempts,
                 route_attempt_index,

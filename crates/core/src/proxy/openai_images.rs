@@ -5,6 +5,10 @@ use serde_json::{Value, json};
 
 use super::ProxyService;
 use super::handle_proxy;
+use super::response_semantics::{
+    HostedImageGenerationResultState, ResponseSemanticContract,
+    hosted_image_generation_result_state,
+};
 
 const MAX_IMAGES_GENERATION_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_IMAGES_EDITS_REQUEST_BYTES: usize = 64 * 1024 * 1024;
@@ -128,7 +132,9 @@ pub(super) async fn handle_openai_images_generations(
             )
         })?;
 
-    let response = handle_proxy(proxy, upstream_request).await?;
+    let response = handle_proxy(proxy, upstream_request)
+        .await
+        .map_err(openai_images_error)?;
     convert_responses_image_generation_response(response).await
 }
 
@@ -175,7 +181,9 @@ pub(super) async fn handle_openai_images_edits(
             )
         })?;
 
-    let response = handle_proxy(proxy, upstream_request).await?;
+    let response = handle_proxy(proxy, upstream_request)
+        .await
+        .map_err(openai_images_error)?;
     convert_responses_image_generation_response(response).await
 }
 
@@ -407,6 +415,9 @@ fn build_json_proxy_request(
     builder = builder.header(header::CONTENT_TYPE, "application/json");
     let mut request = builder.body(Body::from(Bytes::from(body)))?;
     *request.extensions_mut() = parts.extensions;
+    request
+        .extensions_mut()
+        .insert(ResponseSemanticContract::HostedImageGeneration);
     Ok(request)
 }
 
@@ -498,15 +509,26 @@ async fn convert_responses_image_generation_response(
 fn extract_image_generation_result(
     value: &Value,
 ) -> Result<ImageGenerationResult, (StatusCode, String)> {
+    match hosted_image_generation_result_state(value) {
+        HostedImageGenerationResultState::Completed => {}
+        HostedImageGenerationResultState::NoOutputArray => {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                "upstream response did not contain an output array".to_string(),
+            ));
+        }
+        HostedImageGenerationResultState::MissingResult => {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                "upstream response contained no completed image_generation_call result".to_string(),
+            ));
+        }
+    }
+
     let output = value
         .get("output")
         .and_then(Value::as_array)
-        .ok_or_else(|| {
-            (
-                StatusCode::BAD_GATEWAY,
-                "upstream response did not contain an output array".to_string(),
-            )
-        })?;
+        .expect("validated hosted image output array");
     for item in output {
         if item.get("type").and_then(Value::as_str) != Some("image_generation_call") {
             continue;
@@ -549,6 +571,31 @@ fn build_response(status: StatusCode, content_type: Option<&str>, body: Bytes) -
         builder = builder.header(header::CONTENT_TYPE, content_type);
     }
     builder.body(Body::from(body)).unwrap()
+}
+
+fn openai_images_error(error: (StatusCode, String)) -> (StatusCode, String) {
+    let (status, message) = error;
+    if looks_like_json(&message) {
+        return (status, message);
+    }
+    let body = json!({
+        "error": {
+            "message": message,
+            "type": "image_generation_route_failed",
+            "retryable": status.is_server_error(),
+        }
+    });
+    (
+        status,
+        serde_json::to_string(&body).unwrap_or_else(|_| {
+            r#"{"error":{"message":"image generation route failed","type":"image_generation_route_failed","retryable":true}}"#
+                .to_string()
+        }),
+    )
+}
+
+fn looks_like_json(value: &str) -> bool {
+    value.trim_start().starts_with('{') || value.trim_start().starts_with('[')
 }
 
 #[cfg(test)]

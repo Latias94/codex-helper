@@ -9,22 +9,26 @@ All notable changes to this project will be documented in this file.
 
 #### 新增
 
+- OpenAI Images 兼容入口新增 hosted `image_generation_call` 语义校验：上游即使返回 HTTP 200，只要缺少 completed image generation result，就会按 `image_generation_missing_result` 进入 provider failover/passive health，而不会被记录为成功。
 - OpenAI Images 兼容入口现在支持 JSON `POST /v1/images/edits` / `/images/edits` 参考图生成；本地 `ch-imagegen` skill 增加 `--image`、`--edits-base-url` 和 `--input-fidelity`，会把本地参考图转成 data URL 后调用 edits 入口。
 - Codex client patch 新增正交压缩策略 `[codex.client_patch].compaction = "auto" | "local" | "remote-v1" | "remote-v2"` 和 `codex-helper switch on --compaction ...`。`official-relay` / `official-imagegen` 默认仍让 Codex 走远程压缩路径；显式 `local` 可保留 official/imagegen 预设的其它行为但强制 Codex 客户端本地压缩，`remote-v1` 强制 `/responses/compact`，`remote-v2` 写入 `remote_compaction_v2` 并继续使用 helper 的 v2 到 v1 降级兜底。`relay-capabilities` 诊断也支持 `compaction` 输入和输出，确保 expected/mismatch 按实际压缩策略计算。
 
 #### 修复
 
+- 仓库内 `ch-imagegen` skill 默认改为 2K，并新增结构化失败 JSON、可重试错误重试、`--fallback-resolution 2k` 和 4K 超时使用说明，降低慢上游、4K 请求或无图结果导致外层工具超时/误判的概率。
 - Codex `remote_compaction_v2` 的 `compaction_trigger` `/responses` 请求现在会默认先尝试 v2；如果 relay 返回普通 Responses 成功流、JSON compact 结果或明确不支持 v2 的错误，helper 会自动降级到 `/responses/compact` 并合成为 Codex 期望的 v2 compact SSE，避免触发 Codex 本地 “expected exactly one compaction output item” fatal。可通过 `[codex.compaction].remote_v2_downgrade = false` 关闭该兜底。
 
 ### English summary
 
 #### Added
 
+- The OpenAI Images-compatible bridge now validates hosted `image_generation_call` semantics. Upstream HTTP 200 responses without a completed image generation result are classified as `image_generation_missing_result` and enter provider failover/passive health instead of being recorded as success.
 - The OpenAI Images-compatible bridge now supports JSON `POST /v1/images/edits` / `/images/edits` reference-image generation. The local `ch-imagegen` skill gained `--image`, `--edits-base-url`, and `--input-fidelity`, encoding local references as data URLs before calling the edits endpoint.
 - Codex client patch now has a separate compaction strategy: `[codex.client_patch].compaction = "auto" | "local" | "remote-v1" | "remote-v2"` and `codex-helper switch on --compaction ...`. `official-relay` / `official-imagegen` still make Codex use the remote compaction path by default; explicit `local` keeps the other official/imagegen preset behavior while forcing Codex client-side local compaction, `remote-v1` forces `/responses/compact`, and `remote-v2` writes `remote_compaction_v2` while retaining helper's v2-to-v1 downgrade fallback. `relay-capabilities` diagnostics also accept and return `compaction`, so expected capability and mismatch reporting follow the actual strategy.
 
 #### Fixed
 
+- The repository `ch-imagegen` skill now defaults to 2K and emits structured failure JSON with retry metadata, retry handling, `--fallback-resolution 2k`, and 4K timeout guidance to reduce outer tool timeouts and false success/failure handling for slow providers or missing image results.
 - Codex `remote_compaction_v2` `compaction_trigger` `/responses` requests now try v2 first by default. If a relay returns an ordinary Responses success stream, a JSON compact result, or a clear unsupported-v2 error, helper automatically downgrades to `/responses/compact` and synthesizes the v2 compact SSE shape Codex expects, avoiding Codex's local “expected exactly one compaction output item” fatal. Set `[codex.compaction].remote_v2_downgrade = false` to disable the fallback.
 
 ## [0.18.0] - 2026-05-31

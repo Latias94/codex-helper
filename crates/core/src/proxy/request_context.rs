@@ -25,6 +25,7 @@ use super::request_preparation::{
     session_identity_value,
 };
 use super::request_routing::RequestRouteSelection;
+use super::response_semantics::ResponseSemanticContract;
 use super::retry::RetryPlan;
 
 const MAX_PROXY_REQUEST_BYTES: usize = 64 * 1024 * 1024;
@@ -53,6 +54,7 @@ pub(super) struct PreparedProxyRequest {
     pub(super) request_body_len: usize,
     pub(super) request_flavor: RequestFlavor,
     pub(super) request_body_previews: bool,
+    pub(super) response_semantic_contract: Option<ResponseSemanticContract>,
     pub(super) debug_max: usize,
     pub(super) warn_max: usize,
     pub(super) client_body_debug: Option<BodyPreview>,
@@ -70,6 +72,7 @@ pub(super) async fn prepare_proxy_request(
 ) -> Result<PreparedProxyRequest, (StatusCode, String)> {
     let (parts, body) = req.into_parts();
     let client_addr = extract_client_addr(&parts.extensions);
+    let response_semantic_contract = parts.extensions.get::<ResponseSemanticContract>().copied();
     let uri = parts.uri;
     let client_uri = uri.to_string();
     let method = parts.method;
@@ -151,7 +154,6 @@ pub(super) async fn prepare_proxy_request(
     let request_flavor = request_flavor
         .with_remote_compaction_context_from_body(raw_body.as_ref())
         .with_responses_stream_from_body(raw_body.as_ref());
-
     let request_body_previews = crate::logging::should_log_request_body_preview();
     let prepared = match prepare_common_request(CommonRequestPreparationParams {
         proxy,
@@ -235,6 +237,7 @@ pub(super) async fn prepare_proxy_request(
         request_body_len: prepared.request_body_len,
         request_flavor,
         request_body_previews: prepared.request_body_previews,
+        response_semantic_contract,
         debug_max: prepared.debug_max,
         warn_max: prepared.warn_max,
         client_body_debug: prepared.client_body_debug,

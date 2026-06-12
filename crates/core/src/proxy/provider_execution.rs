@@ -34,6 +34,7 @@ use super::provider_orchestration::{
 use super::request_continuity::{RequestContinuityContract, RouteContinuityDecisionInput};
 use super::request_preparation::RequestFlavor;
 use super::request_routing::RequestRouteSelection;
+use super::response_semantics::ResponseSemanticContract;
 use super::retry::{RetryLayerOptions, RetryPlan, backoff_sleep};
 use super::route_affinity::apply_session_route_affinity_for_template;
 use super::route_attempts::{UnsupportedModelSkipParams, record_unsupported_model_skip};
@@ -157,6 +158,7 @@ pub(super) struct ExecuteProviderChainParams<'a> {
     pub(super) cwd: Option<&'a str>,
     pub(super) request_flavor: &'a RequestFlavor,
     pub(super) request_body_previews: bool,
+    pub(super) response_semantic_contract: Option<ResponseSemanticContract>,
     pub(super) debug_max: usize,
     pub(super) warn_max: usize,
     pub(super) client_body_debug: Option<&'a BodyPreview>,
@@ -204,6 +206,7 @@ struct ProviderExecutionContext<'a> {
     cwd: Option<&'a str>,
     request_flavor: &'a RequestFlavor,
     request_body_previews: bool,
+    response_semantic_contract: Option<ResponseSemanticContract>,
     debug_max: usize,
     warn_max: usize,
     client_body_debug: Option<&'a BodyPreview>,
@@ -257,6 +260,7 @@ impl<'a> ProviderExecutionContext<'a> {
             cwd: params.cwd,
             request_flavor: params.request_flavor,
             request_body_previews: params.request_body_previews,
+            response_semantic_contract: params.response_semantic_contract,
             debug_max: params.debug_max,
             warn_max: params.warn_max,
             client_body_debug: params.client_body_debug,
@@ -310,6 +314,7 @@ impl<'a> ProviderExecutionContext<'a> {
             cwd: self.cwd,
             request_flavor: self.request_flavor,
             request_body_previews: self.request_body_previews,
+            response_semantic_contract: self.response_semantic_contract,
             debug_max: self.debug_max,
             warn_max: self.warn_max,
             client_body_debug: self.client_body_debug,

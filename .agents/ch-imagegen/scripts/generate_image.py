@@ -22,12 +22,14 @@ from typing import Any
 
 DEFAULT_GENERATIONS_URL = "http://127.0.0.1:3211/v1/images/generations"
 DEFAULT_MODEL = "gpt-image-2"
-DEFAULT_RESOLUTION = "4k"
+DEFAULT_RESOLUTION = "2k"
 DEFAULT_ASPECT = "16:9"
 DEFAULT_OUTPUT_FORMAT = "png"
 DEFAULT_QUALITY = "high"
 DEFAULT_TIMEOUT = 900
 DEFAULT_PROGRESS_INTERVAL = 15
+DEFAULT_RETRIES = 2
+DEFAULT_RETRY_DELAY = 30
 
 MIN_PIXELS = 655_360
 MAX_EDGE = 3840
@@ -65,6 +67,133 @@ def _die(message: str, code: int = 1) -> None:
 
 def _log(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
+
+
+class ImagegenRequestError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int | None = None,
+        body: str | None = None,
+        retryable: bool | None = None,
+        classification: str | None = None,
+        request_id: str | None = None,
+        attempts: int = 1,
+    ) -> None:
+        super().__init__(message)
+        self.message = message
+        self.status = status
+        self.body = body
+        self.retryable = retryable
+        self.classification = classification
+        self.request_id = request_id
+        self.attempts = attempts
+
+
+def _emit_failure(
+    error: ImagegenRequestError,
+    *,
+    endpoint: str,
+    mode: str,
+    model: str,
+    requested_size: str,
+    reference_count: int,
+    attempts: int,
+    output: Path,
+) -> None:
+    print(
+        json.dumps(
+            {
+                "ok": False,
+                "request_mode": mode,
+                "base_url": endpoint,
+                "model": model,
+                "requested_size": requested_size,
+                "reference_count": reference_count,
+                "output": str(output),
+                "error": {
+                    "message": error.message,
+                    "status": error.status,
+                    "classification": error.classification,
+                    "request_id": error.request_id,
+                    "retryable": error.retryable,
+                    "attempts": attempts,
+                    "suggested_action": _suggested_action(error),
+                },
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
+def _suggested_action(error: ImagegenRequestError) -> str:
+    if error.classification == "image_generation_missing_result":
+        return "retry another route/provider or use --fallback-resolution 2k"
+    if error.status in (502, 503, 504, 524):
+        return "retry after cooldown or reduce resolution"
+    if error.status in (400, 422):
+        return "fix request parameters; do not retry unchanged"
+    return "inspect codex-helper logs with the request_id"
+
+
+def _parse_error_payload(status: int, body: str) -> ImagegenRequestError:
+    message = body.strip() or f"HTTP {status}"
+    retryable: bool | None = status in (408, 429, 500, 502, 503, 504, 524)
+    classification: str | None = None
+    request_id: str | None = None
+    try:
+        payload = json.loads(body)
+    except Exception:
+        payload = None
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            raw_message = error.get("message")
+            if isinstance(raw_message, str) and raw_message.strip():
+                message = raw_message
+            raw_type = error.get("type") or error.get("code")
+            if isinstance(raw_type, str) and raw_type.strip():
+                classification = raw_type
+            raw_retryable = error.get("retryable")
+            if isinstance(raw_retryable, bool):
+                retryable = raw_retryable
+            raw_request_id = error.get("request_id")
+            if isinstance(raw_request_id, str) and raw_request_id.strip():
+                request_id = raw_request_id
+        raw_request_id = payload.get("request_id")
+        if request_id is None and isinstance(raw_request_id, str) and raw_request_id.strip():
+            request_id = raw_request_id
+
+    if request_id is None:
+        match = re.search(r"\brequest_id=([0-9A-Za-z_.:-]+)", message)
+        if match:
+            request_id = match.group(1)
+
+    if classification is None:
+        lowered = message.lower()
+        if "image_generation_call" in lowered or "completed image" in lowered:
+            classification = "image_generation_missing_result"
+            retryable = True
+        elif "route unavailable" in lowered or "all upstream attempts failed" in lowered:
+            classification = "route_unavailable"
+            retryable = True
+
+    return ImagegenRequestError(
+        message,
+        status=status,
+        body=body,
+        retryable=retryable,
+        classification=classification,
+        request_id=request_id,
+    )
+
+
+def _is_retryable(error: ImagegenRequestError) -> bool:
+    if error.retryable is not None:
+        return error.retryable
+    return error.status in (408, 429, 500, 502, 503, 504, 524)
 
 
 def _floor_aligned(value: float, align: int = ALIGN) -> int:
@@ -235,10 +364,68 @@ def _request_json(url: str, api_key: str | None, payload: dict[str, Any], timeou
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
-        _die(f"HTTP {exc.code}: {body}")
+        raise _parse_error_payload(exc.code, body) from exc
     except urllib.error.URLError as exc:
-        _die(f"request failed: {exc}")
+        raise ImagegenRequestError(
+            f"request failed: {exc}",
+            retryable=True,
+            classification="transport_error",
+        ) from exc
     return {}
+
+
+def _request_json_with_retries(
+    endpoint: str,
+    api_key: str | None,
+    payload: dict[str, Any],
+    *,
+    timeout: int,
+    retries: int,
+    retry_delay: int,
+    fallback_payload: dict[str, Any] | None,
+) -> tuple[dict[str, Any], int, bool]:
+    max_attempts = max(1, retries + 1)
+    last_error: ImagegenRequestError | None = None
+    used_fallback = False
+    for attempt in range(1, max_attempts + 1):
+        current_payload = fallback_payload if used_fallback and fallback_payload is not None else payload
+        try:
+            return _request_json(endpoint, api_key, current_payload, timeout), attempt, used_fallback
+        except ImagegenRequestError as error:
+            error.attempts = attempt
+            last_error = error
+            retryable = _is_retryable(error)
+            if (
+                not used_fallback
+                and fallback_payload is not None
+                and retryable
+                and _should_use_fallback_resolution(error)
+            ):
+                used_fallback = True
+                _log(
+                    "[ch-imagegen] retrying with fallback resolution after "
+                    f"class={error.classification} status={error.status}"
+                )
+            elif not retryable or attempt >= max_attempts:
+                raise
+
+            if retry_delay > 0:
+                _log(
+                    f"[ch-imagegen] retrying image request attempt={attempt + 1}/{max_attempts} "
+                    f"after {retry_delay}s status={error.status} class={error.classification}"
+                )
+                time.sleep(retry_delay)
+
+    assert last_error is not None
+    raise last_error
+
+
+def _should_use_fallback_resolution(error: ImagegenRequestError) -> bool:
+    return error.status in (502, 503, 504, 524) or error.classification in {
+        "image_generation_missing_result",
+        "route_unavailable",
+        "transport_error",
+    }
 
 
 class _Heartbeat:
@@ -265,13 +452,25 @@ class _Heartbeat:
 def _extract_image_result(data: dict[str, Any]) -> tuple[str, str | None]:
     items = data.get("data")
     if not isinstance(items, list) or not items:
-        _die("response contained no data array")
+        raise ImagegenRequestError(
+            "response contained no data array",
+            retryable=True,
+            classification="image_generation_missing_result",
+        )
     first = items[0]
     if not isinstance(first, dict):
-        _die("response data[0] is not an object")
+        raise ImagegenRequestError(
+            "response data[0] is not an object",
+            retryable=True,
+            classification="image_generation_missing_result",
+        )
     image_b64 = first.get("b64_json")
     if not isinstance(image_b64, str) or not image_b64.strip():
-        _die("response data[0] contained no b64_json")
+        raise ImagegenRequestError(
+            "response data[0] contained no b64_json",
+            retryable=True,
+            classification="image_generation_missing_result",
+        )
     revised_prompt = first.get("revised_prompt")
     return image_b64, revised_prompt if isinstance(revised_prompt, str) else None
 
@@ -315,6 +514,9 @@ def main() -> int:
     parser.add_argument("--output-format", default=DEFAULT_OUTPUT_FORMAT)
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     parser.add_argument("--progress-interval", type=int, default=DEFAULT_PROGRESS_INTERVAL)
+    parser.add_argument("--retries", type=int, default=DEFAULT_RETRIES)
+    parser.add_argument("--retry-delay", type=int, default=DEFAULT_RETRY_DELAY)
+    parser.add_argument("--fallback-resolution", choices=sorted(PIXEL_BUDGETS))
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -336,6 +538,15 @@ def main() -> int:
     payload = _build_payload(args, requested_size)
     endpoint = _reference_endpoint(args.base_url, args.edits_base_url, bool(args.image))
     mode = "edits" if args.image else "generations"
+    fallback_payload = None
+    fallback_size = None
+    if args.fallback_resolution and not args.size and args.fallback_resolution != args.resolution:
+        fallback_width, fallback_height = _compute_budgeted_size(
+            _parse_aspect(args.aspect),
+            args.fallback_resolution,
+        )
+        fallback_size = f"{fallback_width}x{fallback_height}"
+        fallback_payload = _build_payload(args, fallback_size)
 
     if args.dry_run:
         print(
@@ -347,6 +558,8 @@ def main() -> int:
                     "base_url": endpoint,
                     "model": args.model,
                     "size": requested_size,
+                    "fallback_size": fallback_size,
+                    "retries": max(0, args.retries),
                     "reference_count": len(args.image or []),
                     "title": title,
                     "output": str(dry_path),
@@ -361,18 +574,55 @@ def main() -> int:
     _log(
         f"[ch-imagegen] starting {mode} request model={args.model} size={requested_size} "
         f"references={len(args.image or [])} "
-        f"timeout={args.timeout}s output={dry_path}"
+        f"timeout={args.timeout}s retries={max(0, args.retries)} output={dry_path}"
     )
+    if fallback_size:
+        _log(f"[ch-imagegen] fallback_size={fallback_size}")
     _log(f"[ch-imagegen] endpoint={endpoint}")
     heartbeat = _Heartbeat(args.progress_interval, "image response")
     heartbeat.start()
     try:
-        response = _request_json(endpoint, args.api_key, payload, args.timeout)
+        try:
+            response, attempts, used_fallback = _request_json_with_retries(
+                endpoint,
+                args.api_key,
+                payload,
+                timeout=args.timeout,
+                retries=max(0, args.retries),
+                retry_delay=max(0, args.retry_delay),
+                fallback_payload=fallback_payload,
+            )
+        except ImagegenRequestError as error:
+            _emit_failure(
+                error,
+                endpoint=endpoint,
+                mode=mode,
+                model=args.model,
+                requested_size=requested_size,
+                reference_count=len(args.image or []),
+                attempts=error.attempts,
+                output=dry_path,
+            )
+            _die(error.message)
     finally:
         heartbeat.stop()
     _log("[ch-imagegen] received API response")
 
-    image_b64, revised_prompt = _extract_image_result(response)
+    try:
+        image_b64, revised_prompt = _extract_image_result(response)
+    except ImagegenRequestError as error:
+        error.attempts = attempts
+        _emit_failure(
+            error,
+            endpoint=endpoint,
+            mode=mode,
+            model=args.model,
+            requested_size=requested_size,
+            reference_count=len(args.image or []),
+            attempts=error.attempts,
+            output=dry_path,
+        )
+        _die(error.message)
     image_bytes = base64.b64decode(image_b64)
     suffix = "." + args.output_format.lower().lstrip(".")
     final_path = out_dir / f"{title}-{requested_size}-{timestamp}{suffix}"
@@ -403,6 +653,9 @@ def main() -> int:
                 "base_url": endpoint,
                 "model": args.model,
                 "requested_size": requested_size,
+                "fallback_size": fallback_size,
+                "used_fallback": used_fallback,
+                "attempts": attempts,
                 "actual_size": actual_size,
                 "reference_count": len(args.image or []),
                 "title": title,

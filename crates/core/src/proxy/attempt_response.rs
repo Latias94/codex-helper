@@ -28,6 +28,10 @@ use super::response_fixer::{
     CodexCompactSseRepair, maybe_repair_codex_compact_sse_response,
     maybe_repair_codex_response_body,
 };
+use super::response_semantics::{
+    IMAGE_GENERATION_MISSING_RESULT_CLASS, ResponseSemanticContract,
+    validate_success_response_semantics,
+};
 use super::retry::{
     RetryLayerOptions, RetryPlan, response_penalty_cooldown_secs, retry_info_for_observed_attempts,
     retry_sleep, should_never_retry, should_retry_class, should_retry_status,
@@ -63,6 +67,7 @@ pub(super) struct AttemptResponseParams<'a> {
     pub(super) effective_effort: Option<&'a str>,
     pub(super) base_service_tier: &'a ServiceTierLog,
     pub(super) codex_bridge: Option<CodexBridgeLog>,
+    pub(super) response_semantic_contract: Option<ResponseSemanticContract>,
     pub(super) route_graph_key: Option<&'a str>,
     pub(super) upstream_chain: &'a mut Vec<String>,
     pub(super) route_attempts: &'a mut Vec<RouteAttemptLog>,
@@ -172,8 +177,11 @@ fn decide_attempt_response(params: AttemptResponseDecisionParams<'_>) -> Attempt
     } = params;
     let status_code = status.as_u16();
     let never_retry = should_never_retry(plan, status_code, class) || compact_protocol_failure;
-    let upstream_retryable =
-        should_retry_status(upstream_opt, status_code) || should_retry_class(upstream_opt, class);
+    let semantic_failure_requires_provider_failover =
+        matches!(class, Some(IMAGE_GENERATION_MISSING_RESULT_CLASS));
+    let upstream_retryable = !semantic_failure_requires_provider_failover
+        && (should_retry_status(upstream_opt, status_code)
+            || should_retry_class(upstream_opt, class));
     let retry_same_upstream =
         upstream_retryable && upstream_attempt + 1 < upstream_opt.max_attempts;
     let provider_retryable =
@@ -343,6 +351,7 @@ pub(super) async fn handle_attempt_response(
         effective_effort,
         base_service_tier,
         codex_bridge,
+        response_semantic_contract,
         route_graph_key,
         upstream_chain,
         route_attempts,
@@ -397,7 +406,7 @@ pub(super) async fn handle_attempt_response(
             }
         }
     }
-    let response_body = if response_status.is_success() {
+    let mut response_body = if response_status.is_success() {
         maybe_decode_models_response_body(
             proxy.service_name,
             path,
@@ -407,9 +416,32 @@ pub(super) async fn handle_attempt_response(
     } else {
         response_body
     };
+
+    let semantic_failure = if response_status.is_success() {
+        validate_success_response_semantics(response_semantic_contract, &response_body).err()
+    } else {
+        None
+    };
+    let mut semantic_error_class = None;
+    if let Some(failure) = semantic_failure {
+        semantic_error_class = Some(failure.error_class);
+        response_status = failure.status;
+        response_headers_filtered = failure.response_headers;
+        response_body = failure.response_body;
+        tracing::warn!(
+            request_id,
+            error_class = failure.error_class,
+            message = failure.message.as_str(),
+            "upstream response failed semantic validation"
+        );
+    }
+
     let status_code = response_status.as_u16();
-    let (cls, _hint, _cf_ray) =
+    let (classified_cls, _hint, _cf_ray) =
         classify_upstream_response(status_code, &response_headers, response_body.as_ref());
+    let cls = semantic_error_class
+        .map(ToOwned::to_owned)
+        .or(classified_cls);
     let observed_service_tier = extract_service_tier_from_response_body(response_body.as_ref());
     let decision = decide_attempt_response(AttemptResponseDecisionParams {
         plan,
