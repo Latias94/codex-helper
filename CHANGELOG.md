@@ -15,6 +15,7 @@ All notable changes to this project will be documented in this file.
 
 #### 修复
 
+- TUI crate 现在显式钉住 `ratatui-widgets = 0.3.0`，避免 fresh dependency resolution 选到 `0.3.1` 后在 `time::HourBase` 转换实现上触发 Rust E0119 coherence 编译错误。
 - 仓库内 `ch-imagegen` skill 默认改为 2K，并新增结构化失败 JSON、可重试错误重试、`--fallback-resolution 2k` 和 4K 超时使用说明，降低慢上游、4K 请求或无图结果导致外层工具超时/误判的概率。
 - Codex `remote_compaction_v2` 的 `compaction_trigger` `/responses` 请求现在会默认先尝试 v2；如果 relay 返回普通 Responses 成功流、JSON compact 结果或明确不支持 v2 的错误，helper 会自动降级到 `/responses/compact` 并合成为 Codex 期望的 v2 compact SSE，避免触发 Codex 本地 “expected exactly one compaction output item” fatal。可通过 `[codex.compaction].remote_v2_downgrade = false` 关闭该兜底。
 
@@ -28,6 +29,7 @@ All notable changes to this project will be documented in this file.
 
 #### Fixed
 
+- The TUI crate now pins `ratatui-widgets = 0.3.0`, preventing fresh dependency resolution from selecting `0.3.1` and hitting Rust E0119 coherence failures around `time::HourBase` conversion impls.
 - The repository `ch-imagegen` skill now defaults to 2K and emits structured failure JSON with retry metadata, retry handling, `--fallback-resolution 2k`, and 4K timeout guidance to reduce outer tool timeouts and false success/failure handling for slow providers or missing image results.
 - Codex `remote_compaction_v2` `compaction_trigger` `/responses` requests now try v2 first by default. If a relay returns an ordinary Responses success stream, a JSON compact result, or a clear unsupported-v2 error, helper automatically downgrades to `/responses/compact` and synthesizes the v2 compact SSE shape Codex expects, avoiding Codex's local “expected exactly one compaction output item” fatal. Set `[codex.compaction].remote_v2_downgrade = false` to disable the fallback.
 
