@@ -20,7 +20,10 @@ validates only the newly written file.
   config or environment variables.
 - Treat `scripts/generate_image.py` exit code and stdout JSON as the source of truth.
 - If the script exits non-zero, report the error and stop. Do not infer success from older files.
-- Default model: `gpt-image-2`.
+- Default Image API model intent: `gpt-image-2`.
+- Default Responses wrapper model: `gpt-5.5`, sent as the helper-only `responses_model`
+  JSON field so the local bridge uses `/v1/responses` hosted `image_generation` through the
+  same kind of mainline model path as Codex's built-in `imagegen` tool.
 - Default resolution: `2k`; default aspect ratio: `16:9`; default output format: `png`;
   default quality: `high`.
 - Use `4k` only when the user explicitly needs final-resolution output. Set a tool/shell timeout
@@ -60,6 +63,8 @@ Useful overrides:
 
 - `--base-url "http://127.0.0.1:3211/v1/images/generations"`
 - `--edits-base-url "http://127.0.0.1:3211/v1/images/edits"`
+- `--responses-model "gpt-5.5"` to choose the hosted `image_generation` wrapper model used
+  by codex-helper's `/v1/responses` bridge
 - `--image "reference.png"`; may be repeated; accepts local image paths, `data:image/...`,
   HTTP(S) URLs, and `file_id` values
 - `--input-fidelity "high"` for reference-image edits
@@ -90,6 +95,7 @@ Useful overrides:
 After generation, report:
 
 - endpoint used;
+- Image API model intent and Responses wrapper model;
 - requested size and actual local image size;
 - reference image count when present;
 - output path;

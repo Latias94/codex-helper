@@ -60,12 +60,69 @@ async fn openai_images_generation_endpoint_translates_request_and_response() {
         .expect("lock")
         .clone()
         .expect("upstream body");
-    assert_eq!(seen["model"], "gpt-image-2");
+    assert_eq!(seen["model"], "gpt-5.5");
     assert_eq!(seen["input"], "一只猫在雨夜的霓虹灯下");
     assert_eq!(seen["tools"][0]["type"], "image_generation");
     assert_eq!(seen["tools"][0]["size"], "3840x2160");
     assert_eq!(seen["tools"][0]["output_format"], "png");
     assert_eq!(seen["tools"][0]["quality"], "high");
+    assert_eq!(seen["tool_choice"]["type"], "image_generation");
+}
+
+#[tokio::test]
+async fn openai_images_generation_endpoint_honors_explicit_responses_model() {
+    let seen_body = Arc::new(Mutex::new(None::<serde_json::Value>));
+    let seen_body_for_route = seen_body.clone();
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        post(move |Json(body): Json<serde_json::Value>| {
+            let seen_body_for_route = seen_body_for_route.clone();
+            async move {
+                *seen_body_for_route.lock().expect("lock") = Some(body);
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "id": "resp_image",
+                        "created": 42,
+                        "output": [
+                            {
+                                "type": "image_generation_call",
+                                "id": "ig_1",
+                                "status": "completed",
+                                "result": "Zm9v"
+                            }
+                        ]
+                    })),
+                )
+            }
+        }),
+    );
+    let upstream = spawn_test_upstream(upstream);
+    let cfg = make_proxy_config(vec![upstream.upstream_config()], RetryConfig::default());
+    let proxy = spawn_test_proxy(cfg);
+    let client = Client::new();
+
+    let response = post_images_generations_json(
+        &client,
+        &proxy,
+        r#"{"model":"gpt-image-2","responses_model":"gpt-5.4","prompt":"cat"}"#,
+    )
+    .await
+    .error_for_status()
+    .expect("images status")
+    .json::<serde_json::Value>()
+    .await
+    .expect("images json");
+
+    assert_eq!(response["data"][0]["b64_json"], "Zm9v");
+    let seen = seen_body
+        .lock()
+        .expect("lock")
+        .clone()
+        .expect("upstream body");
+    assert_eq!(seen["model"], "gpt-5.4");
+    assert_eq!(seen["tools"][0]["type"], "image_generation");
+    assert_eq!(seen["tool_choice"]["type"], "image_generation");
 }
 
 #[tokio::test]
@@ -413,12 +470,13 @@ async fn openai_images_edits_endpoint_translates_json_references_and_response() 
         .expect("lock")
         .clone()
         .expect("upstream body");
-    assert_eq!(seen["model"], "gpt-image-2");
+    assert_eq!(seen["model"], "gpt-5.5");
     assert_eq!(seen["tools"][0]["type"], "image_generation");
     assert_eq!(seen["tools"][0]["size"], "2160x2880");
     assert_eq!(seen["tools"][0]["output_format"], "png");
     assert_eq!(seen["tools"][0]["quality"], "high");
     assert_eq!(seen["tools"][0]["input_fidelity"], "high");
+    assert_eq!(seen["tool_choice"]["type"], "image_generation");
     assert_eq!(seen["input"][0]["content"][0]["type"], "input_text");
     assert_eq!(
         seen["input"][0]["content"][0]["text"],

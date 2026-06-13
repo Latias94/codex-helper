@@ -13,6 +13,7 @@ use super::response_semantics::{
 const MAX_IMAGES_GENERATION_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_IMAGES_EDITS_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 const MAX_IMAGES_RESPONSE_BYTES: usize = 96 * 1024 * 1024;
+const DEFAULT_HOSTED_IMAGE_RESPONSES_MODEL: &str = "gpt-5.5";
 
 #[derive(Debug, Deserialize)]
 struct OpenAiImagesGenerationRequest {
@@ -32,6 +33,8 @@ struct OpenAiImagesGenerationRequest {
     moderation: Option<String>,
     #[serde(default)]
     user: Option<String>,
+    #[serde(default)]
+    responses_model: Option<String>,
 }
 
 #[derive(Debug)]
@@ -46,6 +49,7 @@ struct OpenAiImagesEditRequest {
     moderation: Option<String>,
     input_fidelity: Option<String>,
     user: Option<String>,
+    responses_model: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -70,6 +74,8 @@ struct RawOpenAiImagesEditRequest {
     input_fidelity: Option<String>,
     #[serde(default)]
     user: Option<String>,
+    #[serde(default)]
+    responses_model: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -265,6 +271,7 @@ fn parse_images_edit_request(
         moderation: request.moderation,
         input_fidelity: request.input_fidelity,
         user: request.user,
+        responses_model: request.responses_model,
     })
 }
 
@@ -320,9 +327,10 @@ fn build_responses_image_generation_body(
     copy_optional_string(&mut tool, "moderation", request.moderation.as_deref());
 
     let mut body = json!({
-        "model": request.model,
+        "model": hosted_image_responses_model(&request.model, request.responses_model.as_deref()),
         "input": request.prompt,
         "tools": [tool],
+        "tool_choice": {"type": "image_generation"},
     });
     copy_optional_string(&mut body, "user", request.user.as_deref());
 
@@ -365,7 +373,7 @@ fn build_responses_image_edit_body(
     }
 
     let mut body = json!({
-        "model": request.model,
+        "model": hosted_image_responses_model(&request.model, request.responses_model.as_deref()),
         "input": [
             {
                 "role": "user",
@@ -373,6 +381,7 @@ fn build_responses_image_edit_body(
             }
         ],
         "tools": [tool],
+        "tool_choice": {"type": "image_generation"},
     });
     copy_optional_string(&mut body, "user", request.user.as_deref());
 
@@ -389,6 +398,26 @@ fn copy_optional_string(target: &mut Value, key: &str, value: Option<&str>) {
         return;
     };
     target[key] = Value::String(value.to_string());
+}
+
+fn hosted_image_responses_model(request_model: &str, responses_model: Option<&str>) -> String {
+    if let Some(model) = responses_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    {
+        return model.to_string();
+    }
+    let request_model = request_model.trim();
+    if is_image_api_model(request_model) {
+        DEFAULT_HOSTED_IMAGE_RESPONSES_MODEL.to_string()
+    } else {
+        request_model.to_string()
+    }
+}
+
+fn is_image_api_model(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    model.starts_with("gpt-image-") || model.starts_with("dall-e-")
 }
 
 fn request_content_type_is_json(headers: &HeaderMap) -> bool {
@@ -664,18 +693,65 @@ mod tests {
             output_format: Some("png".to_string()),
             moderation: None,
             user: None,
+            responses_model: None,
         };
 
         let body = build_responses_image_generation_body(&request).expect("body");
         let json: Value = serde_json::from_slice(&body).expect("json");
 
-        assert_eq!(json["model"], "gpt-image-2");
+        assert_eq!(json["model"], "gpt-5.5");
         assert_eq!(json["input"], "一只猫在雨夜的霓虹灯下");
         assert_eq!(json["tools"][0]["type"], "image_generation");
         assert_eq!(json["tools"][0]["size"], "3840x2160");
         assert_eq!(json["tools"][0]["quality"], "high");
         assert_eq!(json["tools"][0]["output_format"], "png");
-        assert!(json.get("tool_choice").is_none());
+        assert_eq!(json["tool_choice"]["type"], "image_generation");
+    }
+
+    #[test]
+    fn openai_images_generation_body_honors_explicit_responses_model() {
+        let request = OpenAiImagesGenerationRequest {
+            model: "gpt-image-2".to_string(),
+            prompt: "cat".to_string(),
+            n: None,
+            size: None,
+            quality: None,
+            background: None,
+            output_format: None,
+            moderation: None,
+            user: None,
+            responses_model: Some("gpt-5.4".to_string()),
+        };
+
+        let body = build_responses_image_generation_body(&request).expect("body");
+        let json: Value = serde_json::from_slice(&body).expect("json");
+
+        assert_eq!(json["model"], "gpt-5.4");
+        assert_eq!(json["tools"][0]["type"], "image_generation");
+        assert_eq!(json["tool_choice"]["type"], "image_generation");
+    }
+
+    #[test]
+    fn openai_images_generation_body_preserves_non_image_responses_model() {
+        let request = OpenAiImagesGenerationRequest {
+            model: "gpt-5.5".to_string(),
+            prompt: "cat".to_string(),
+            n: None,
+            size: None,
+            quality: None,
+            background: None,
+            output_format: None,
+            moderation: None,
+            user: None,
+            responses_model: None,
+        };
+
+        let body = build_responses_image_generation_body(&request).expect("body");
+        let json: Value = serde_json::from_slice(&body).expect("json");
+
+        assert_eq!(json["model"], "gpt-5.5");
+        assert_eq!(json["tools"][0]["type"], "image_generation");
+        assert_eq!(json["tool_choice"]["type"], "image_generation");
     }
 
     #[test]
@@ -726,8 +802,9 @@ mod tests {
         let body = build_responses_image_edit_body(&request).expect("body");
         let json: Value = serde_json::from_slice(&body).expect("json");
 
-        assert_eq!(json["model"], "gpt-image-2");
+        assert_eq!(json["model"], "gpt-5.5");
         assert_eq!(json["tools"][0]["type"], "image_generation");
+        assert_eq!(json["tool_choice"]["type"], "image_generation");
         assert_eq!(json["tools"][0]["size"], "3840x2160");
         assert_eq!(json["input"][0]["content"][0]["type"], "input_text");
         assert_eq!(

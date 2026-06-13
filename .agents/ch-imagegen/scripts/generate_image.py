@@ -22,6 +22,7 @@ from typing import Any
 
 DEFAULT_GENERATIONS_URL = "http://127.0.0.1:3211/v1/images/generations"
 DEFAULT_MODEL = "gpt-image-2"
+DEFAULT_RESPONSES_MODEL = "gpt-5.5"
 DEFAULT_RESOLUTION = "2k"
 DEFAULT_ASPECT = "16:9"
 DEFAULT_OUTPUT_FORMAT = "png"
@@ -99,6 +100,7 @@ def _emit_failure(
     endpoint: str,
     mode: str,
     model: str,
+    responses_model: str | None,
     requested_size: str,
     reference_count: int,
     attempts: int,
@@ -111,6 +113,7 @@ def _emit_failure(
                 "request_mode": mode,
                 "base_url": endpoint,
                 "model": model,
+                "responses_model": responses_model,
                 "requested_size": requested_size,
                 "reference_count": reference_count,
                 "output": str(output),
@@ -521,6 +524,8 @@ def _build_payload(args: argparse.Namespace, size: str) -> dict[str, Any]:
         payload["moderation"] = args.moderation
     if args.input_fidelity:
         payload["input_fidelity"] = args.input_fidelity
+    if args.responses_model:
+        payload["responses_model"] = args.responses_model
     if args.image:
         payload["images"] = [_image_reference(image) for image in args.image]
     return payload
@@ -538,6 +543,7 @@ def main() -> int:
     parser.add_argument("--edits-base-url", default=os.getenv("CH_IMAGEGEN_EDITS_BASE_URL"))
     parser.add_argument("--api-key", default=os.getenv("CH_IMAGEGEN_API_KEY"))
     parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--responses-model", default=os.getenv("CH_IMAGEGEN_RESPONSES_MODEL", DEFAULT_RESPONSES_MODEL))
     parser.add_argument("--quality", default=DEFAULT_QUALITY)
     parser.add_argument("--background")
     parser.add_argument("--moderation")
@@ -589,6 +595,7 @@ def main() -> int:
                     "request_mode": mode,
                     "base_url": endpoint,
                     "model": args.model,
+                    "responses_model": args.responses_model,
                     "size": requested_size,
                     "fallback_size": fallback_size,
                     "retries": max(0, args.retries),
@@ -605,7 +612,7 @@ def main() -> int:
 
     _log(
         f"[ch-imagegen] starting {mode} request model={args.model} size={requested_size} "
-        f"references={len(args.image or [])} "
+        f"responses_model={args.responses_model or '-'} references={len(args.image or [])} "
         f"timeout={args.timeout}s retries={max(0, args.retries)} output={dry_path}"
     )
     if fallback_size:
@@ -630,6 +637,7 @@ def main() -> int:
                 endpoint=endpoint,
                 mode=mode,
                 model=args.model,
+                responses_model=args.responses_model,
                 requested_size=requested_size,
                 reference_count=len(args.image or []),
                 attempts=error.attempts,
@@ -649,6 +657,7 @@ def main() -> int:
             endpoint=endpoint,
             mode=mode,
             model=args.model,
+            responses_model=args.responses_model,
             requested_size=requested_size,
             reference_count=len(args.image or []),
             attempts=error.attempts,
@@ -684,6 +693,7 @@ def main() -> int:
                 "request_mode": mode,
                 "base_url": endpoint,
                 "model": args.model,
+                "responses_model": args.responses_model,
                 "requested_size": requested_size,
                 "fallback_size": fallback_size,
                 "used_fallback": used_fallback,
