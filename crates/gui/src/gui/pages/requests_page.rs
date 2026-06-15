@@ -104,15 +104,18 @@ fn request_list_metrics(request: &FinishedRequest) -> String {
     if let Some(usage) = request.usage.as_ref() {
         parts.push(format!(
             "tok={}/{}/{}",
-            compact_count(usage.input_tokens),
-            compact_count(usage.output_tokens),
-            compact_count(usage.total_tokens)
+            crate::usage_format::tokens_short(usage.input_tokens),
+            crate::usage_format::tokens_short(usage.output_tokens),
+            crate::usage_format::tokens_short(usage.total_tokens)
         ));
         let cache_total = usage
             .cache_read_tokens_total()
             .saturating_add(usage.cache_creation_tokens_total().max(0));
         if cache_total > 0 {
-            parts.push(format!("cache={}", compact_count(cache_total)));
+            parts.push(format!(
+                "cache={}",
+                crate::usage_format::tokens_short(cache_total)
+            ));
         }
         if let Some(hit_rate) = request.cache_hit_rate() {
             parts.push(format!("hit={:.1}%", hit_rate * 100.0));
@@ -120,7 +123,10 @@ fn request_list_metrics(request: &FinishedRequest) -> String {
     }
 
     if let Some(rate) = request.output_tokens_per_second() {
-        parts.push(format!("out/s={rate:.1}"));
+        parts.push(format!(
+            "out/s={}",
+            crate::usage_format::tokens_per_second(Some(rate))
+        ));
     }
     if !request.cost.is_unknown() {
         parts.push(format!(
@@ -150,17 +156,6 @@ fn request_list_metrics(request: &FinishedRequest) -> String {
 
 fn request_list_ttfb(request: &FinishedRequest) -> String {
     format_duration_ms_opt(request.observability_view().ttfb_ms)
-}
-
-fn compact_count(value: i64) -> String {
-    let value = value.max(0) as f64;
-    if value >= 1_000_000.0 {
-        format!("{:.1}m", value / 1_000_000.0)
-    } else if value >= 1_000.0 {
-        format!("{:.1}k", value / 1_000.0)
-    } else {
-        format!("{value:.0}")
-    }
 }
 
 fn render_requests_detail(

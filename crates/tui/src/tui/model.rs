@@ -1489,41 +1489,19 @@ pub(in crate::tui) fn duration_short(ms: u64) -> String {
 }
 
 pub(in crate::tui) fn tokens_short(n: i64) -> String {
-    let n = n.max(0) as f64;
-    if n >= 1_000_000.0 {
-        format!("{:.1}m", n / 1_000_000.0)
-    } else if n >= 1_000.0 {
-        format!("{:.1}k", n / 1_000.0)
-    } else {
-        format!("{:.0}", n)
-    }
+    crate::usage_format::tokens_short(n)
 }
 
 pub(in crate::tui) fn format_tok_per_second(value: Option<f64>) -> String {
-    value
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .map(|value| format!("{value:.1}"))
-        .unwrap_or_else(|| "-".to_string())
+    crate::usage_format::tokens_per_second(value)
 }
 
 pub(in crate::tui) fn usage_line_lang(usage: &UsageMetrics, lang: Language) -> String {
-    let mut line = format!(
-        "{}: {}/{}/{}/{}",
+    crate::usage_format::usage_line_with_labels(
+        usage,
         i18n::label(lang, "tok in/out/rsn/ttl"),
-        tokens_short(usage.input_tokens),
-        tokens_short(usage.output_tokens),
-        tokens_short(usage.reasoning_output_tokens_total()),
-        tokens_short(usage.total_tokens)
-    );
-    if usage.has_cache_tokens() {
-        line.push_str(&format!(
-            " {}: {}/{}",
-            i18n::label(lang, "cache read/create"),
-            tokens_short(usage.cache_read_tokens_total()),
-            tokens_short(usage.cache_creation_tokens_total())
-        ));
-    }
-    line
+        i18n::label(lang, "cache read/create"),
+    )
 }
 
 pub(in crate::tui) fn request_cache_hit_rate_label(request: &FinishedRequest) -> String {

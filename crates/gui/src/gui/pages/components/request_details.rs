@@ -678,7 +678,10 @@ fn request_speed_rows(request: &FinishedRequest) -> Vec<(String, String)> {
         ),
     ];
     if let Some(rate) = observability.output_tokens_per_second {
-        rows.push(("out_tok/s".to_string(), format!("{rate:.1}")));
+        rows.push((
+            "out_tok/s".to_string(),
+            crate::usage_format::tokens_per_second(Some(rate)),
+        ));
     }
     rows
 }

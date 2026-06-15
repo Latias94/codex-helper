@@ -6,9 +6,9 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::tui::i18n;
 use crate::tui::model::{
-    Palette, Snapshot, duration_short, format_age, now_ms, request_cache_hit_rate_label,
-    request_page_focus_is_runtime_observed, request_page_focus_session_id, shorten, shorten_middle,
-    status_style, usage_line_lang,
+    Palette, Snapshot, duration_short, format_age, format_tok_per_second, now_ms,
+    request_cache_hit_rate_label, request_page_focus_is_runtime_observed,
+    request_page_focus_session_id, shorten, shorten_middle, status_style, usage_line_lang,
 };
 use crate::tui::state::UiState;
 
@@ -299,7 +299,10 @@ pub(super) fn render_requests_page(
                         format!("{}: ", l("out_tok/s")),
                         Style::default().fg(p.muted),
                     ),
-                    Span::styled(format!("{rate:.1}"), Style::default().fg(p.text)),
+                    Span::styled(
+                        format_tok_per_second(Some(rate)),
+                        Style::default().fg(p.text),
+                    ),
                 ]));
             }
         }

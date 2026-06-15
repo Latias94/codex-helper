@@ -470,11 +470,21 @@ fn render_summary_rows(ui: &mut egui::Ui, lang: Language, rows: &[RequestUsageSu
                     for row in rows {
                         ui.small(shorten(&row.group_value, 32));
                         ui.small(row.aggregate.requests.to_string());
-                        ui.small(compact_count(row.aggregate.total_tokens));
-                        ui.small(compact_count(row.aggregate.input_tokens));
-                        ui.small(compact_count(row.aggregate.output_tokens));
-                        ui.small(compact_count(row.aggregate.cache_read_input_tokens));
-                        ui.small(compact_count(row.aggregate.cache_creation_input_tokens));
+                        ui.small(crate::usage_format::tokens_short(
+                            row.aggregate.total_tokens,
+                        ));
+                        ui.small(crate::usage_format::tokens_short(
+                            row.aggregate.input_tokens,
+                        ));
+                        ui.small(crate::usage_format::tokens_short(
+                            row.aggregate.output_tokens,
+                        ));
+                        ui.small(crate::usage_format::tokens_short(
+                            row.aggregate.cache_read_input_tokens,
+                        ));
+                        ui.small(crate::usage_format::tokens_short(
+                            row.aggregate.cache_creation_input_tokens,
+                        ));
                         ui.small(format_duration_ms(row.aggregate.average_duration_ms()));
                         ui.end_row();
                     }
@@ -488,17 +498,6 @@ fn summary_group_label(lang: Language, group: RequestUsageSummaryGroup) -> &'sta
         RequestUsageSummaryGroup::Provider => pick(lang, "按提供商", "By provider"),
         RequestUsageSummaryGroup::Model => pick(lang, "按模型", "By model"),
         RequestUsageSummaryGroup::Session => pick(lang, "按会话", "By session"),
-    }
-}
-
-fn compact_count(value: i64) -> String {
-    let value = value.max(0) as f64;
-    if value >= 1_000_000.0 {
-        format!("{:.1}m", value / 1_000_000.0)
-    } else if value >= 1_000.0 {
-        format!("{:.1}k", value / 1_000.0)
-    } else {
-        format!("{value:.0}")
     }
 }
 

@@ -136,40 +136,12 @@ pub(super) fn summarize_upstream_target(raw: &str, max_chars: usize) -> String {
     }
 }
 
-fn tokens_short(n: i64) -> String {
-    let n = n.max(0) as f64;
-    if n >= 1_000_000.0 {
-        format!("{:.1}m", n / 1_000_000.0)
-    } else if n >= 1_000.0 {
-        format!("{:.1}k", n / 1_000.0)
-    } else {
-        format!("{:.0}", n)
-    }
-}
-
 pub(super) fn usage_line(usage: &UsageMetrics) -> String {
-    let mut line = format!(
-        "tok in/out/rsn/ttl: {}/{}/{}/{}",
-        tokens_short(usage.input_tokens),
-        tokens_short(usage.output_tokens),
-        tokens_short(usage.reasoning_output_tokens_total()),
-        tokens_short(usage.total_tokens)
-    );
-    if usage.has_cache_tokens() {
-        line.push_str(&format!(
-            " cache read/create: {}/{}",
-            tokens_short(usage.cache_read_tokens_total()),
-            tokens_short(usage.cache_creation_tokens_total())
-        ));
-    }
-    line
+    crate::usage_format::usage_line_with_labels(usage, "tok in/out/rsn/ttl", "cache read/create")
 }
 
 pub(super) fn format_tok_per_second(value: Option<f64>) -> String {
-    value
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .map(|value| format!("{value:.1}"))
-        .unwrap_or_else(|| "-".to_string())
+    crate::usage_format::tokens_per_second(value)
 }
 
 #[cfg(test)]

@@ -2,11 +2,10 @@ use std::collections::HashMap;
 
 use super::Language;
 use super::i18n;
-use super::model::tokens_short;
+use super::model::{tokens_short, usage_line_lang};
 use super::state::UiState;
 use super::types::StatsFocus;
 use crate::state::UsageBucket;
-use crate::usage::UsageMetrics;
 use crate::usage_balance::UsageBalanceView;
 
 #[derive(Debug, Clone)]
@@ -124,26 +123,6 @@ fn fmt_avg_ms(total_ms: u64, n: u64) -> String {
     format!("{}ms", total_ms / n)
 }
 
-fn fmt_usage_line(u: &UsageMetrics, lang: Language) -> String {
-    let mut line = format!(
-        "{}: {}/{}/{}/{}",
-        i18n::label(lang, "tok in/out/rsn/ttl"),
-        tokens_short(u.input_tokens),
-        tokens_short(u.output_tokens),
-        tokens_short(u.reasoning_output_tokens_total()),
-        tokens_short(u.total_tokens)
-    );
-    if u.has_cache_tokens() {
-        line.push_str(&format!(
-            " {}: {}/{}",
-            i18n::label(lang, "cache read/create"),
-            tokens_short(u.cache_read_tokens_total()),
-            tokens_short(u.cache_creation_tokens_total())
-        ));
-    }
-    line
-}
-
 fn selected_stats_target_from_view(
     ui: &UiState,
     snapshot: &super::model::Snapshot,
@@ -248,7 +227,7 @@ pub(in crate::tui) fn build_stats_report(
     ));
     out.push_str(&format!(
         "{}\n",
-        fmt_usage_line(&window_bucket.usage, ui.language)
+        usage_line_lang(&window_bucket.usage, ui.language)
     ));
     if let StatsTarget::Provider(provider_id) = &target
         && let Some(row) = usage_balance

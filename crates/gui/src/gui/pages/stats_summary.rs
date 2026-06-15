@@ -95,10 +95,10 @@ pub(super) fn render_stats_summary(
             ui.label(pick(ctx.lang, "Tokens(窗口)", "Tokens (window)"));
             ui.label(format!(
                 "in={}  out={}  rsn={}  ttl={}",
-                tokens_short(input_tokens),
-                tokens_short(output_tokens),
-                tokens_short(reasoning_tokens),
-                tokens_short(total_tokens)
+                crate::usage_format::tokens_short(input_tokens),
+                crate::usage_format::tokens_short(output_tokens),
+                crate::usage_format::tokens_short(reasoning_tokens),
+                crate::usage_format::tokens_short(total_tokens)
             ));
             ui.end_row();
 
@@ -106,8 +106,10 @@ pub(super) fn render_stats_summary(
                 ui.label(pick(ctx.lang, "Cache Tokens", "Cache tokens"));
                 ui.label(format!(
                     "read={}  create={}",
-                    tokens_short(cached_input_tokens),
-                    tokens_short(window_bucket.usage.cache_creation_tokens_total())
+                    crate::usage_format::tokens_short(cached_input_tokens),
+                    crate::usage_format::tokens_short(
+                        window_bucket.usage.cache_creation_tokens_total()
+                    )
                 ));
                 ui.end_row();
             }
@@ -204,7 +206,7 @@ pub(super) fn render_stats_summary(
                 ui.label(label);
                 ui.label(format!(
                     "{}  {}",
-                    tokens_short(bucket.usage.total_tokens),
+                    crate::usage_format::tokens_short(bucket.usage.total_tokens),
                     bar
                 ));
                 ui.label(bucket.requests_total.to_string());
@@ -230,7 +232,7 @@ pub(super) fn render_stats_summary(
                     ui.label(format!(
                         "{}  tok={}  n={}  err={}",
                         shorten(name, 28),
-                        tokens_short(bucket.usage.total_tokens),
+                        crate::usage_format::tokens_short(bucket.usage.total_tokens),
                         bucket.requests_total,
                         bucket.requests_error
                     ));
@@ -246,26 +248,13 @@ pub(super) fn render_stats_summary(
                     ui.label(format!(
                         "{}  tok={}  n={}  err={}",
                         shorten(name, 28),
-                        tokens_short(bucket.usage.total_tokens),
+                        crate::usage_format::tokens_short(bucket.usage.total_tokens),
                         bucket.requests_total,
                         bucket.requests_error
                     ));
                 }
             });
     });
-}
-
-fn tokens_short(v: i64) -> String {
-    let v = v.max(0) as u64;
-    if v >= 1_000_000_000 {
-        format!("{:.1}b", (v as f64) / 1_000_000_000.0)
-    } else if v >= 1_000_000 {
-        format!("{:.1}m", (v as f64) / 1_000_000.0)
-    } else if v >= 1_000 {
-        format!("{:.1}k", (v as f64) / 1_000.0)
-    } else {
-        v.to_string()
-    }
 }
 
 fn fmt_pct(ok: usize, total: usize) -> String {

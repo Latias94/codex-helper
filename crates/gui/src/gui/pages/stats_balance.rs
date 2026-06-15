@@ -56,7 +56,7 @@ pub(super) fn render_balance_overview(
                         ui.label(format!(
                             "req={} tok={} cost={}",
                             row.usage.requests_total,
-                            tokens_short(row.usage.usage.total_tokens),
+                            crate::usage_format::tokens_short(row.usage.usage.total_tokens),
                             row.cost_display
                         ));
                         ui.label(shorten(&format_provider_balance(row), 96));
@@ -98,7 +98,7 @@ pub(super) fn render_balance_overview(
                             "req={} err={} tok={}",
                             row.usage.requests_total,
                             row.usage.requests_error,
-                            tokens_short(row.usage.usage.total_tokens)
+                            crate::usage_format::tokens_short(row.usage.usage.total_tokens)
                         ));
                         ui.label(shorten(&format_endpoint_route(ctx.lang, row), 48));
                         ui.end_row();
@@ -254,18 +254,5 @@ fn format_balance_counts(
         "-".to_string()
     } else {
         parts.join("  ")
-    }
-}
-
-fn tokens_short(v: i64) -> String {
-    let v = v.max(0) as u64;
-    if v >= 1_000_000_000 {
-        format!("{:.1}b", (v as f64) / 1_000_000_000.0)
-    } else if v >= 1_000_000 {
-        format!("{:.1}m", (v as f64) / 1_000_000.0)
-    } else if v >= 1_000 {
-        format!("{:.1}k", (v as f64) / 1_000.0)
-    } else {
-        v.to_string()
     }
 }
