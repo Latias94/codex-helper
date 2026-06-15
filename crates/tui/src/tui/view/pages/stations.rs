@@ -337,26 +337,6 @@ fn format_skip_reason_lang(reason: &StationRoutingSkipReason, lang: Language) ->
     }
 }
 
-fn format_runtime_selected_route(
-    explain: &crate::routing_explain::RoutingExplainResponse,
-) -> String {
-    match explain.selected_route.as_ref() {
-        Some(selected) => {
-            let compatibility = crate::routing_explain::format_compatibility_compact(
-                selected.compatibility.as_ref(),
-            );
-            format!(
-                "selected={} endpoint={} {} path={}",
-                selected.provider_id,
-                selected.endpoint_id,
-                compatibility,
-                selected.route_path.join(" > ")
-            )
-        }
-        None => "selected=<none>".to_string(),
-    }
-}
-
 fn format_runtime_candidate(candidate: &crate::routing_explain::RoutingExplainCandidate) -> String {
     candidate.compact_label()
 }
@@ -687,7 +667,7 @@ pub(super) fn render_stations_page(
                     Style::default().fg(p.muted),
                 ),
                 Span::styled(
-                    shorten_middle(&format_runtime_selected_route(explain), 96),
+                    shorten_middle(&explain.selected_route_compact_label(), 96),
                     Style::default().fg(p.text),
                 ),
             ]));

@@ -38,7 +38,7 @@ pub(super) fn render_stations_routing_preview(
         if let Some(explain) = snapshot.routing_explain.as_ref() {
             ui.add_space(4.0);
             ui.label(pick(ctx.lang, "运行态选路", "Runtime route"));
-            ui.small(format_runtime_selected_route(ctx.lang, explain));
+            ui.small(explain.selected_route_compact_label());
             for candidate in &explain.candidates {
                 ui.small(format_runtime_candidate(candidate));
             }
@@ -366,36 +366,6 @@ fn format_skip_reason(lang: Language, reason: &StationRoutingSkipReason) -> Stri
             "breaker_open blocks pinned routing",
         )
         .to_string(),
-    }
-}
-
-fn format_runtime_selected_route(
-    lang: Language,
-    explain: &crate::routing_explain::RoutingExplainResponse,
-) -> String {
-    match explain.selected_route.as_ref() {
-        Some(selected) => {
-            let compatibility = crate::routing_explain::format_compatibility_compact(
-                selected.compatibility.as_ref(),
-            );
-            match lang {
-                Language::Zh => format!(
-                    "selected={} endpoint={} path={} {}",
-                    selected.provider_id,
-                    selected.endpoint_id,
-                    selected.route_path.join(" > "),
-                    compatibility
-                ),
-                Language::En => format!(
-                    "selected={} endpoint={} path={} {}",
-                    selected.provider_id,
-                    selected.endpoint_id,
-                    selected.route_path.join(" > "),
-                    compatibility
-                ),
-            }
-        }
-        None => pick(lang, "selected=<none>", "selected=<none>").to_string(),
     }
 }
 
