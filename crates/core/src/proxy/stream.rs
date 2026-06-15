@@ -401,34 +401,25 @@ impl Drop for StreamFinalize {
             self.method.clone(),
             self.path.clone(),
         );
-        let publication = RequestPublication {
-            request_id,
-            status_code,
-            duration_ms: dur,
-            ended_at_ms: started_at_ms + dur,
-            ttfb_ms,
-            station_name: self.compatibility_station_name.clone(),
-            provider_id: self.provider_id.clone(),
-            endpoint_id: self.endpoint_id.clone(),
-            provider_endpoint_key: self.provider_endpoint_key.clone(),
-            upstream_base_url: self.upstream_base_url.clone(),
-            session_id: self.session_id.clone(),
-            session_identity_source: self.session_identity_source,
-            cwd: self.cwd.clone(),
-            model: self
-                .route_decision
-                .as_ref()
-                .and_then(|decision| decision.effective_model.as_ref())
-                .map(|model| model.value.clone()),
-            reasoning_effort: self.reasoning_effort.clone(),
-            service_tier,
-            codex_bridge: self.codex_bridge.clone(),
-            usage,
-            route_decision: self.route_decision.clone(),
-            retry: self.retry.clone(),
-            http_debug,
-            streaming: true,
-        };
+        let mut publication =
+            RequestPublication::new_terminal(request_id, status_code, dur, started_at_ms, true);
+        publication.ttfb_ms = ttfb_ms;
+        publication.station_name = self.compatibility_station_name.clone();
+        publication.provider_id = self.provider_id.clone();
+        publication.endpoint_id = self.endpoint_id.clone();
+        publication.provider_endpoint_key = self.provider_endpoint_key.clone();
+        publication.upstream_base_url = self.upstream_base_url.clone();
+        publication.session_id = self.session_id.clone();
+        publication.session_identity_source = self.session_identity_source;
+        publication.cwd = self.cwd.clone();
+        publication.reasoning_effort = self.reasoning_effort.clone();
+        publication.service_tier = service_tier;
+        publication.codex_bridge = self.codex_bridge.clone();
+        publication.usage = usage;
+        publication.route_decision = self.route_decision.clone();
+        publication.retry = self.retry.clone();
+        publication.http_debug = http_debug;
+        let publication = publication.with_route_decision_model();
 
         tokio::spawn(async move {
             match health_update {

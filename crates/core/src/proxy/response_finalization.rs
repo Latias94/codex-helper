@@ -63,35 +63,30 @@ pub(super) async fn finish_and_build_forward_response(
     } = params;
 
     let status_code = status.as_u16();
-    let model = route_decision
-        .as_ref()
-        .and_then(|decision| decision.effective_model.as_ref())
-        .map(|model| model.value.clone());
+    let mut publication = RequestPublication::new_terminal(
+        request_id,
+        status_code,
+        duration_ms,
+        started_at_ms,
+        false,
+    );
+    publication.ttfb_ms = Some(upstream_headers_ms);
+    publication.station_name = station_name;
+    publication.provider_id = provider_id;
+    publication.endpoint_id = endpoint_id;
+    publication.provider_endpoint_key = provider_endpoint_key;
+    publication.upstream_base_url = upstream_base_url;
+    publication.session_id = session_id;
+    publication.session_identity_source = session_identity_source;
+    publication.cwd = cwd;
+    publication.reasoning_effort = effective_effort;
+    publication.service_tier = service_tier;
+    publication.codex_bridge = codex_bridge;
+    publication.usage = usage;
+    publication.route_decision = route_decision;
+    publication.retry = retry;
     RequestObserver::new(proxy, method, path)
-        .publish_terminal_once(RequestPublication {
-            request_id,
-            status_code,
-            duration_ms,
-            ended_at_ms: started_at_ms + duration_ms,
-            ttfb_ms: Some(upstream_headers_ms),
-            station_name,
-            provider_id,
-            endpoint_id,
-            provider_endpoint_key,
-            upstream_base_url,
-            session_id,
-            session_identity_source,
-            cwd,
-            model,
-            reasoning_effort: effective_effort,
-            service_tier,
-            codex_bridge,
-            usage,
-            route_decision,
-            retry,
-            http_debug: None,
-            streaming: false,
-        })
+        .publish_terminal_once(publication.with_route_decision_model())
         .await;
 
     build_forward_response(status, &response_headers, response_body)

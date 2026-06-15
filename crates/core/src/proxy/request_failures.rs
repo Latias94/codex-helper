@@ -130,31 +130,22 @@ pub(super) async fn finish_failed_proxy_request(
         &failure_route_attempts,
     );
 
+    let mut publication = RequestPublication::failure_without_upstream(
+        request_id,
+        status.as_u16(),
+        duration_ms,
+        started_at_ms,
+    );
+    publication.upstream_base_url = EMPTY_TARGET_URL.to_string();
+    publication.session_id = session_id;
+    publication.session_identity_source = session_identity_source;
+    publication.cwd = cwd;
+    publication.reasoning_effort = effective_effort;
+    publication.service_tier = service_tier;
+    publication.codex_bridge = codex_bridge;
+    publication.retry = retry;
     RequestObserver::new(proxy, method, path)
-        .publish_terminal_once(RequestPublication {
-            request_id,
-            status_code: status.as_u16(),
-            duration_ms,
-            ended_at_ms: started_at_ms + duration_ms,
-            ttfb_ms: None,
-            station_name: None,
-            provider_id: None,
-            endpoint_id: None,
-            provider_endpoint_key: None,
-            upstream_base_url: EMPTY_TARGET_URL.to_string(),
-            session_id,
-            session_identity_source,
-            cwd,
-            model: None,
-            reasoning_effort: effective_effort,
-            service_tier,
-            codex_bridge,
-            usage: None,
-            route_decision: None,
-            retry,
-            http_debug: None,
-            streaming: false,
-        })
+        .publish_terminal_once(publication)
         .await;
 
     (status, client_message)

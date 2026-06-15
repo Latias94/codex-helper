@@ -157,6 +157,59 @@ pub(super) struct RequestPublication {
     pub(super) streaming: bool,
 }
 
+impl RequestPublication {
+    pub(super) fn new_terminal(
+        request_id: u64,
+        status_code: u16,
+        duration_ms: u64,
+        started_at_ms: u64,
+        streaming: bool,
+    ) -> Self {
+        Self {
+            request_id,
+            status_code,
+            duration_ms,
+            ended_at_ms: started_at_ms + duration_ms,
+            ttfb_ms: None,
+            station_name: None,
+            provider_id: None,
+            endpoint_id: None,
+            provider_endpoint_key: None,
+            upstream_base_url: "-".to_string(),
+            session_id: None,
+            session_identity_source: None,
+            cwd: None,
+            model: None,
+            reasoning_effort: None,
+            service_tier: ServiceTierLog::default(),
+            codex_bridge: None,
+            usage: None,
+            route_decision: None,
+            retry: None,
+            http_debug: None,
+            streaming,
+        }
+    }
+
+    pub(super) fn with_route_decision_model(mut self) -> Self {
+        self.model = self
+            .route_decision
+            .as_ref()
+            .and_then(|decision| decision.effective_model.as_ref())
+            .map(|model| model.value.clone());
+        self
+    }
+
+    pub(super) fn failure_without_upstream(
+        request_id: u64,
+        status_code: u16,
+        duration_ms: u64,
+        started_at_ms: u64,
+    ) -> Self {
+        Self::new_terminal(request_id, status_code, duration_ms, started_at_ms, false)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,30 +341,18 @@ mod tests {
     }
 
     fn test_publication(request_id: u64, streaming: bool, status_code: u16) -> RequestPublication {
-        RequestPublication {
-            request_id,
-            status_code,
-            duration_ms: 25,
-            ended_at_ms: 1_025,
-            ttfb_ms: Some(5),
-            station_name: Some("station-a".to_string()),
-            provider_id: Some("provider-a".to_string()),
-            endpoint_id: Some("endpoint-a".to_string()),
-            provider_endpoint_key: Some("codex:provider-a:endpoint-a".to_string()),
-            upstream_base_url: "http://upstream.test".to_string(),
-            session_id: Some("session-a".to_string()),
-            session_identity_source: None,
-            cwd: None,
-            model: Some("gpt-5".to_string()),
-            reasoning_effort: Some("medium".to_string()),
-            service_tier: ServiceTierLog::default(),
-            codex_bridge: None,
-            usage: None,
-            route_decision: None,
-            retry: None,
-            http_debug: None,
-            streaming,
-        }
+        let mut publication =
+            RequestPublication::new_terminal(request_id, status_code, 25, 1_000, streaming);
+        publication.ttfb_ms = Some(5);
+        publication.station_name = Some("station-a".to_string());
+        publication.provider_id = Some("provider-a".to_string());
+        publication.endpoint_id = Some("endpoint-a".to_string());
+        publication.provider_endpoint_key = Some("codex:provider-a:endpoint-a".to_string());
+        publication.upstream_base_url = "http://upstream.test".to_string();
+        publication.session_id = Some("session-a".to_string());
+        publication.model = Some("gpt-5".to_string());
+        publication.reasoning_effort = Some("medium".to_string());
+        publication
     }
 
     fn temp_proxy_home(test_name: &str) -> PathBuf {

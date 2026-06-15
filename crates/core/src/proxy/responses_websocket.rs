@@ -900,40 +900,34 @@ async fn relay_websocket_streams(
             strips_client_auth: prepared.codex_patch_mode.strips_codex_client_auth(),
         });
 
+    let mut publication = RequestPublication::new_terminal(
+        prepared.request_id,
+        status_code,
+        duration_ms,
+        prepared.started_at_ms,
+        true,
+    );
+    publication.ttfb_ms = Some(upstream_headers_ms);
+    publication.station_name = selected
+        .target
+        .compatibility_station_name()
+        .map(ToOwned::to_owned);
+    publication.provider_id = selected
+        .provider_id
+        .or_else(|| selected.target.provider_id().map(ToOwned::to_owned));
+    publication.endpoint_id = selected.target.endpoint_id();
+    publication.provider_endpoint_key = selected.target.provider_endpoint_key();
+    publication.upstream_base_url = selected.target.upstream().base_url.clone();
+    publication.session_id = prepared.session_id.clone();
+    publication.session_identity_source = prepared.session_identity_source;
+    publication.cwd = prepared.cwd.clone();
+    publication.reasoning_effort = prepared.effective_effort.clone();
+    publication.service_tier = service_tier;
+    publication.codex_bridge = codex_bridge;
+    publication.route_decision = Some(selected.route_decision.clone());
+    publication.retry = retry;
     RequestObserver::new(&proxy, &prepared.method, prepared.uri.path())
-        .publish_terminal_once(RequestPublication {
-            request_id: prepared.request_id,
-            status_code,
-            duration_ms,
-            ended_at_ms: prepared.started_at_ms + duration_ms,
-            ttfb_ms: Some(upstream_headers_ms),
-            station_name: selected
-                .target
-                .compatibility_station_name()
-                .map(ToOwned::to_owned),
-            provider_id: selected
-                .provider_id
-                .or_else(|| selected.target.provider_id().map(ToOwned::to_owned)),
-            endpoint_id: selected.target.endpoint_id(),
-            provider_endpoint_key: selected.target.provider_endpoint_key(),
-            upstream_base_url: selected.target.upstream().base_url.clone(),
-            session_id: prepared.session_id.clone(),
-            session_identity_source: prepared.session_identity_source,
-            cwd: prepared.cwd.clone(),
-            model: selected
-                .route_decision
-                .effective_model
-                .as_ref()
-                .map(|model| model.value.clone()),
-            reasoning_effort: prepared.effective_effort.clone(),
-            service_tier,
-            codex_bridge,
-            usage: None,
-            route_decision: Some(selected.route_decision.clone()),
-            retry,
-            http_debug: None,
-            streaming: true,
-        })
+        .publish_terminal_once(publication.with_route_decision_model())
         .await;
 }
 
