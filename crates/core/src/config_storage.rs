@@ -653,14 +653,14 @@ profile = "balanced"
 # backoff_ms = 200
 # backoff_max_ms = 2000
 # jitter_ms = 100
-# on_status = "429,500-599,524"
-# on_class = ["upstream_transport_error", "cloudflare_timeout", "cloudflare_challenge"]
+# on_status = "429,500-502,504-528,530-599"
+# on_class = ["upstream_transport_error", "cloudflare_timeout", "cloudflare_challenge", "upstream_rate_limited", "upstream_overloaded"]
 #
 # [retry.provider]
 # max_attempts = 2
 # strategy = "failover"
 # on_status = "401,403,404,408,429,500-599,524"
-# on_class = ["upstream_transport_error"]
+# on_class = ["upstream_transport_error", "upstream_rate_limited", "upstream_overloaded"]
 
 # 明确禁止重试/切换的 HTTP 状态码/范围（字符串形式）。
 # 示例："413,415,422"。
@@ -671,6 +671,8 @@ profile = "balanced"
 # never_on_class = ["client_error_non_retryable"]
 
 # 对某些失败类型施加冷却（秒）。
+# upstream_rate_limited / upstream_overloaded 会优先使用 Retry-After 或 Codex usage_limit_reached
+# body 中的 resets_at / resets_in_seconds；没有显式等待窗口时回落到 transport_cooldown_secs。
 # cloudflare_challenge_cooldown_secs = 300
 # cloudflare_timeout_cooldown_secs = 60
 # transport_cooldown_secs = 30

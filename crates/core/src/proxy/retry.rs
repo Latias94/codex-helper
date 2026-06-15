@@ -7,6 +7,8 @@ use crate::config::ResolvedRetryLayerConfig;
 use crate::config::RetryStrategy;
 use crate::logging::{RetryInfo, RouteAttemptLog, parse_route_attempts_from_chain};
 
+use super::classify::{UPSTREAM_OVERLOADED_CLASS, UPSTREAM_RATE_LIMITED_CLASS};
+
 #[derive(Clone)]
 pub(super) struct RetryLayerOptions {
     pub(super) max_attempts: u32,
@@ -195,10 +197,18 @@ pub(super) fn response_penalty_cooldown_secs(
     cloudflare_timeout_cooldown_secs: u64,
     transport_cooldown_secs: u64,
     class: Option<&str>,
+    retry_after_secs: Option<u64>,
 ) -> u64 {
     match class {
         Some("cloudflare_challenge") => cloudflare_challenge_cooldown_secs,
         Some("cloudflare_timeout") => cloudflare_timeout_cooldown_secs,
+        Some(UPSTREAM_RATE_LIMITED_CLASS) => retry_after_secs
+            .filter(|value| *value > 0)
+            .unwrap_or(transport_cooldown_secs),
+        Some(UPSTREAM_OVERLOADED_CLASS) => retry_after_secs
+            .filter(|value| *value > 0)
+            .map(|value| value.max(transport_cooldown_secs))
+            .unwrap_or(transport_cooldown_secs),
         _ => transport_cooldown_secs,
     }
 }
@@ -210,6 +220,15 @@ fn retry_after_ms(headers: &HeaderMap, opt: &RetryLayerOptions) -> Option<u64> {
     }
     let seconds = raw.parse::<u64>().ok()?;
     let ms = seconds.saturating_mul(1000);
+    let cap = opt.max_backoff_ms.max(opt.base_backoff_ms);
+    Some(ms.min(cap))
+}
+
+fn retry_after_ms_from_secs(secs: u64, opt: &RetryLayerOptions) -> Option<u64> {
+    if secs == 0 {
+        return None;
+    }
+    let ms = secs.saturating_mul(1000);
     let cap = opt.max_backoff_ms.max(opt.base_backoff_ms);
     Some(ms.min(cap))
 }
@@ -236,8 +255,12 @@ pub(super) async fn retry_sleep(
     opt: &RetryLayerOptions,
     attempt_index: u32,
     resp_headers: &HeaderMap,
+    retry_after_secs: Option<u64>,
 ) {
-    if let Some(mut ms) = retry_after_ms(resp_headers, opt) {
+    if let Some(mut ms) = retry_after_secs
+        .and_then(|secs| retry_after_ms_from_secs(secs, opt))
+        .or_else(|| retry_after_ms(resp_headers, opt))
+    {
         if opt.jitter_ms > 0 {
             let jitter = rand::rng().random_range(0..=opt.jitter_ms);
             let cap = opt.max_backoff_ms.max(opt.base_backoff_ms);

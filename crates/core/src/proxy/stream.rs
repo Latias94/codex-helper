@@ -22,7 +22,10 @@ use super::attempt_health::{
     penalize_attempt_target, record_attempt_failure, record_attempt_success,
 };
 use super::attempt_target::AttemptTarget;
-use super::classify::classify_upstream_response;
+use super::classify::{
+    UPSTREAM_OVERLOADED_CLASS, UPSTREAM_RATE_LIMITED_CLASS, classify_upstream_response,
+    classify_upstream_throttle_response,
+};
 use super::codex_failure::CodexFailureSse;
 use super::concurrency_limits::ConcurrencyPermit;
 use super::headers::header_map_to_entries;
@@ -120,10 +123,12 @@ struct StreamTerminalDecisionParams<'a> {
     cloudflare_timeout_cooldown_secs: u64,
 }
 
-fn stream_cloudflare_penalty_reason(class: Option<&str>) -> &'static str {
+fn stream_penalty_reason(class: Option<&str>) -> &'static str {
     match class {
         Some("cloudflare_challenge") => "cloudflare_challenge",
         Some("cloudflare_timeout") => "cloudflare_timeout",
+        Some(UPSTREAM_RATE_LIMITED_CLASS) => UPSTREAM_RATE_LIMITED_CLASS,
+        Some(UPSTREAM_OVERLOADED_CLASS) => UPSTREAM_OVERLOADED_CLASS,
         _ => "upstream_response_error",
     }
 }
@@ -164,6 +169,8 @@ fn decide_stream_terminal_response(
         };
     }
 
+    let throttle_signal =
+        classify_upstream_throttle_response(status_code, resp_headers, response_body);
     let (cls, _hint, _cf_ray) =
         classify_upstream_response(status_code, resp_headers, response_body);
     let error_class = cls.clone();
@@ -172,13 +179,19 @@ fn decide_stream_terminal_response(
         cloudflare_timeout_cooldown_secs,
         transport_cooldown_secs,
         cls.as_deref(),
+        throttle_signal
+            .as_ref()
+            .and_then(|signal| signal.retry_after_secs),
     );
     let health_update = if matches!(
         cls.as_deref(),
-        Some("cloudflare_challenge") | Some("cloudflare_timeout")
+        Some("cloudflare_challenge")
+            | Some("cloudflare_timeout")
+            | Some(UPSTREAM_RATE_LIMITED_CLASS)
+            | Some(UPSTREAM_OVERLOADED_CLASS)
     ) {
         Some(StreamHealthUpdate::FailureAndPenalty {
-            error_reason: stream_cloudflare_penalty_reason(cls.as_deref()),
+            error_reason: stream_penalty_reason(cls.as_deref()),
             cooldown_secs: penalty_cooldown_secs,
         })
     } else if status_code >= 500 || cls.is_some() {

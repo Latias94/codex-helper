@@ -9,13 +9,27 @@ fn retry_profile_defaults_to_balanced_when_unset() {
     assert_eq!(resolved.upstream.backoff_ms, 200);
     assert_eq!(resolved.upstream.backoff_max_ms, 2_000);
     assert_eq!(resolved.upstream.jitter_ms, 100);
-    assert_eq!(resolved.upstream.on_status, "429,500-599,524");
+    assert_eq!(resolved.upstream.on_status, "429,500-502,504-528,530-599");
     assert!(
         resolved
             .upstream
             .on_class
             .iter()
             .any(|c| c == "upstream_transport_error")
+    );
+    assert!(
+        resolved
+            .upstream
+            .on_class
+            .iter()
+            .any(|c| c == "upstream_rate_limited")
+    );
+    assert!(
+        resolved
+            .upstream
+            .on_class
+            .iter()
+            .any(|c| c == "upstream_overloaded")
     );
 
     assert_eq!(resolved.route.strategy, RetryStrategy::Failover);
@@ -27,6 +41,20 @@ fn retry_profile_defaults_to_balanced_when_unset() {
             .on_class
             .iter()
             .any(|c| c == "routing_mismatch_capability")
+    );
+    assert!(
+        resolved
+            .route
+            .on_class
+            .iter()
+            .any(|c| c == "upstream_rate_limited")
+    );
+    assert!(
+        resolved
+            .route
+            .on_class
+            .iter()
+            .any(|c| c == "upstream_overloaded")
     );
     assert_eq!(resolved.never_on_status, "413,415,422");
     assert!(
@@ -67,12 +95,20 @@ fn retry_profile_aggressive_failover_enables_broader_failover_with_guardrails() 
     assert_eq!(resolved.route.max_attempts, 3);
     assert_eq!(resolved.route.strategy, RetryStrategy::Failover);
     assert_eq!(resolved.route.on_status, "401,403,404,408,429,500-599,524");
+    assert_eq!(resolved.upstream.on_status, "429,500-502,504-528,530-599");
     assert!(
         resolved
             .route
             .on_class
             .iter()
             .any(|c| c == "routing_mismatch_capability")
+    );
+    assert!(
+        resolved
+            .route
+            .on_class
+            .iter()
+            .any(|c| c == "upstream_overloaded")
     );
     assert_eq!(resolved.never_on_status, "413,415,422");
     assert!(

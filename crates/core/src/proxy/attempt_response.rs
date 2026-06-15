@@ -15,7 +15,9 @@ use super::attempt_health::{
     penalize_attempt_target, record_attempt_failure, record_attempt_success,
 };
 use super::attempt_target::AttemptTarget;
-use super::classify::{class_is_health_neutral, classify_upstream_response};
+use super::classify::{
+    class_is_health_neutral, classify_upstream_response, classify_upstream_throttle_response,
+};
 use super::concurrency_limits::ConcurrencyPermit;
 use super::http_debug::HttpDebugBase;
 use super::models_compat::maybe_decode_models_response_body;
@@ -155,6 +157,7 @@ struct AttemptResponseDecisionParams<'a> {
     provider_opt: &'a RetryLayerOptions,
     status: StatusCode,
     class: Option<&'a str>,
+    retry_after_secs: Option<u64>,
     upstream_attempt: u32,
     allow_provider_failover: bool,
     compact_protocol_failure: bool,
@@ -169,6 +172,7 @@ fn decide_attempt_response(params: AttemptResponseDecisionParams<'_>) -> Attempt
         provider_opt,
         status,
         class,
+        retry_after_secs,
         upstream_attempt,
         allow_provider_failover,
         compact_protocol_failure,
@@ -194,6 +198,7 @@ fn decide_attempt_response(params: AttemptResponseDecisionParams<'_>) -> Attempt
         plan.cloudflare_timeout_cooldown_secs,
         plan.transport_cooldown_secs,
         class,
+        retry_after_secs,
     );
     let should_probe_codex_usage =
         status_code == StatusCode::TOO_MANY_REQUESTS.as_u16() && is_user_turn && is_codex_service;
@@ -437,11 +442,16 @@ pub(super) async fn handle_attempt_response(
     }
 
     let status_code = response_status.as_u16();
+    let throttle_signal =
+        classify_upstream_throttle_response(status_code, &response_headers, response_body.as_ref());
     let (classified_cls, _hint, _cf_ray) =
         classify_upstream_response(status_code, &response_headers, response_body.as_ref());
     let cls = semantic_error_class
         .map(ToOwned::to_owned)
         .or(classified_cls);
+    let retry_after_secs = throttle_signal
+        .as_ref()
+        .and_then(|signal| signal.retry_after_secs);
     let observed_service_tier = extract_service_tier_from_response_body(response_body.as_ref());
     let decision = decide_attempt_response(AttemptResponseDecisionParams {
         plan,
@@ -449,6 +459,7 @@ pub(super) async fn handle_attempt_response(
         provider_opt,
         status: response_status,
         class: cls.as_deref(),
+        retry_after_secs,
         upstream_attempt,
         allow_provider_failover,
         compact_protocol_failure,
@@ -456,7 +467,10 @@ pub(super) async fn handle_attempt_response(
         is_codex_service,
     });
     let penalty_cooldown_secs = decision.penalty_cooldown_secs;
-    let cooldown_reason = format!("status_{status_code}");
+    let cooldown_reason = cls
+        .as_deref()
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("status_{status_code}"));
     record_status_route_attempt(
         upstream_chain,
         route_attempts,
@@ -603,20 +617,25 @@ pub(super) async fn handle_attempt_response(
     }
 
     if decision.retry_same_upstream {
-        retry_sleep(upstream_opt, upstream_attempt, &response_headers).await;
+        retry_sleep(
+            upstream_opt,
+            upstream_attempt,
+            &response_headers,
+            retry_after_secs,
+        )
+        .await;
         return AttemptResponseOutcome::RetrySameUpstream;
     }
 
     if decision.provider_penalty {
         if !class_is_health_neutral(cls.as_deref()) {
-            let penalty_reason = format!("status_{status_code}");
             penalize_attempt_target(
                 proxy.state.as_ref(),
                 proxy.service_name,
                 legacy_lb,
                 target,
                 penalty_cooldown_secs,
-                penalty_reason.as_str(),
+                cooldown_reason.as_str(),
                 cooldown_backoff,
             )
             .await;
