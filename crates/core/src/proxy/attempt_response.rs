@@ -15,9 +15,7 @@ use super::attempt_health::{
     penalize_attempt_target, record_attempt_failure, record_attempt_success,
 };
 use super::attempt_target::AttemptTarget;
-use super::classify::{
-    class_is_health_neutral, classify_upstream_response, classify_upstream_throttle_response,
-};
+use super::classify::{class_is_health_neutral, classify_observed_upstream_response};
 use super::concurrency_limits::ConcurrencyPermit;
 use super::http_debug::HttpDebugBase;
 use super::models_compat::maybe_decode_models_response_body;
@@ -442,16 +440,12 @@ pub(super) async fn handle_attempt_response(
     }
 
     let status_code = response_status.as_u16();
-    let throttle_signal =
-        classify_upstream_throttle_response(status_code, &response_headers, response_body.as_ref());
-    let (classified_cls, _hint, _cf_ray) =
-        classify_upstream_response(status_code, &response_headers, response_body.as_ref());
+    let classified_response =
+        classify_observed_upstream_response(status_code, &response_headers, response_body.as_ref());
+    let retry_after_secs = classified_response.retry_after_secs();
     let cls = semantic_error_class
         .map(ToOwned::to_owned)
-        .or(classified_cls);
-    let retry_after_secs = throttle_signal
-        .as_ref()
-        .and_then(|signal| signal.retry_after_secs);
+        .or(classified_response.class);
     let observed_service_tier = extract_service_tier_from_response_body(response_body.as_ref());
     let decision = decide_attempt_response(AttemptResponseDecisionParams {
         plan,

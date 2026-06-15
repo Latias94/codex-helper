@@ -36,6 +36,7 @@ futures-util = "0.3.31"
 regex = "1.12.3"
 owo-colors = "4.2.3"
 humantime = "2.1.0"
+httpdate = "1.0.3"
 atty = "0.2.14"
 rusqlite = { version = "0.39.0", features = ["bundled"] }
 

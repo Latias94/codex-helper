@@ -29,7 +29,7 @@
 
 ## RSO-030 Upstream Throttle Outcome Integration
 
-- Status: proposed
+- Status: completed
 - Owner: main
 - Scope: response classification, retry policy, cooldown updates, route attempt
   logs.
@@ -37,6 +37,18 @@
   same outcome path for stream and non-stream attempts.
 - Validation: `429`, `503`, `529`, retry-after headers, and quota/capacity
   bodies produce policy-consistent retry/failover behavior.
+- Handoff: `classify_observed_upstream_response` now gives stream and
+  non-stream paths one response classification result with the throttle signal
+  and retry-after hint. The throttle classifier covers OpenAI/new-api style
+  `rate_limit_error`, `usage_limit_reached`, `insufficient_quota`,
+  `insufficient_user_quota`, billing/balance exhaustion, Google
+  `RESOURCE_EXHAUSTED` plus `RetryInfo.retryDelay`/`quotaResetDelay`, flat
+  sub2api `{ "error": "rate limit exceeded" }`, HTTP-date `Retry-After`,
+  and relay capacity/concurrency saturation such as `no capacity`,
+  `MODEL_CAPACITY_EXHAUSTED`, pending queue saturation, and websocket
+  connection limits. Provider failover remains governed by the configured
+  retry policy; the classifier only supplies the class, retry-after, cooldown
+  reason, and health penalty input.
 
 ## RSO-040 Session Metrics Surface
 

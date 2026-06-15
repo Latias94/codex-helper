@@ -23,8 +23,7 @@ use super::attempt_health::{
 };
 use super::attempt_target::AttemptTarget;
 use super::classify::{
-    UPSTREAM_OVERLOADED_CLASS, UPSTREAM_RATE_LIMITED_CLASS, classify_upstream_response,
-    classify_upstream_throttle_response,
+    UPSTREAM_OVERLOADED_CLASS, UPSTREAM_RATE_LIMITED_CLASS, classify_observed_upstream_response,
 };
 use super::codex_failure::CodexFailureSse;
 use super::concurrency_limits::ConcurrencyPermit;
@@ -169,19 +168,17 @@ fn decide_stream_terminal_response(
         };
     }
 
-    let throttle_signal =
-        classify_upstream_throttle_response(status_code, resp_headers, response_body);
-    let (cls, _hint, _cf_ray) =
-        classify_upstream_response(status_code, resp_headers, response_body);
+    let classified_response =
+        classify_observed_upstream_response(status_code, resp_headers, response_body);
+    let retry_after_secs = classified_response.retry_after_secs();
+    let cls = classified_response.class;
     let error_class = cls.clone();
     let penalty_cooldown_secs = response_penalty_cooldown_secs(
         cloudflare_challenge_cooldown_secs,
         cloudflare_timeout_cooldown_secs,
         transport_cooldown_secs,
         cls.as_deref(),
-        throttle_signal
-            .as_ref()
-            .and_then(|signal| signal.retry_after_secs),
+        retry_after_secs,
     );
     let health_update = if matches!(
         cls.as_deref(),
@@ -308,17 +305,17 @@ impl StreamFinalize {
                 b.upstream_request_body_debug.clone(),
             )
         };
-        let (cls, hint, cf_ray) =
-            classify_upstream_response(self.status_code, &self.resp_headers, body);
+        let classified_response =
+            classify_observed_upstream_response(self.status_code, &self.resp_headers, body);
         Some(HttpDebugLog {
             request_body_len: Some(self.request_body_len),
             upstream_request_body_len: Some(self.upstream_request_body_len),
             upstream_headers_ms: Some(self.upstream_headers_ms),
             upstream_first_chunk_ms: first_chunk_ms,
             upstream_body_read_ms: None,
-            upstream_error_class: cls,
-            upstream_error_hint: hint,
-            upstream_cf_ray: cf_ray,
+            upstream_error_class: classified_response.class,
+            upstream_error_hint: classified_response.hint,
+            upstream_cf_ray: classified_response.cf_ray,
             client_uri: b.client_uri.clone(),
             target_url: b.target_url.clone(),
             client_headers: b.client_headers.clone(),
