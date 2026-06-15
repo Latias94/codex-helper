@@ -10,7 +10,7 @@ use crate::tui::ProviderOption;
 use crate::tui::i18n;
 use crate::tui::model::{
     Palette, Snapshot, balance_snapshot_status_style, basename, duration_short, format_age,
-    format_observed_client_identity, now_ms, request_cache_hit_rate_label,
+    format_observed_client_identity, format_tok_per_second, now_ms, request_cache_hit_rate_label,
     session_control_posture_lang, session_observation_scope_label_lang,
     session_observed_provider_balance_brief_lang, session_observed_provider_balance_snapshot,
     session_row_has_any_override, session_transcript_host_status_lang, short_sid, shorten,
@@ -66,6 +66,7 @@ fn render_sessions_panel(
         Cell::from(Span::styled(l("Last"), Style::default().fg(p.muted))),
         Cell::from(Span::styled(l("Age"), Style::default().fg(p.muted))),
         Cell::from(Span::styled(l("ΣTok"), Style::default().fg(p.muted))),
+        Cell::from(Span::styled("tok/s", Style::default().fg(p.muted))),
     ])
     .height(1)
     .style(Style::default().bg(p.panel));
@@ -110,6 +111,10 @@ fn render_sessions_panel(
             } else {
                 Span::styled("-", Style::default().fg(p.muted))
             };
+            let tok_per_second = Span::styled(
+                format_tok_per_second(r.last_output_tokens_per_second),
+                Style::default().fg(p.accent),
+            );
 
             let mut badges = Vec::new();
             if r.active_count > 0 {
@@ -154,6 +159,7 @@ fn render_sessions_panel(
                 Cell::from(Line::from(vec![last])),
                 Cell::from(Span::styled(age, Style::default().fg(p.muted))),
                 Cell::from(Line::from(vec![tok])),
+                Cell::from(Line::from(vec![tok_per_second])),
             ])
             .style(row_style)
         })
@@ -168,6 +174,7 @@ fn render_sessions_panel(
             Constraint::Length(5),
             Constraint::Length(6),
             Constraint::Length(6),
+            Constraint::Length(7),
         ],
     )
     .header(header)

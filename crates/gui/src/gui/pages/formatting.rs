@@ -165,6 +165,13 @@ pub(super) fn usage_line(usage: &UsageMetrics) -> String {
     line
 }
 
+pub(super) fn format_tok_per_second(value: Option<f64>) -> String {
+    value
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .map(|value| format!("{value:.1}"))
+        .unwrap_or_else(|| "-".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

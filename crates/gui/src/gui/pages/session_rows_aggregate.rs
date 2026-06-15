@@ -77,6 +77,9 @@ fn merge_recent_request_row(entry: &mut SessionRow, request: &FinishedRequest) {
             .clone()
             .or(entry.last_upstream_base_url.clone());
         entry.last_usage = request.usage.clone().or(entry.last_usage.clone());
+        entry.last_output_tokens_per_second = request
+            .output_tokens_per_second()
+            .or(entry.last_output_tokens_per_second);
     }
     if entry.cwd.is_none() {
         entry.cwd = request.cwd.clone();
@@ -129,6 +132,12 @@ fn merge_session_stats_row(entry: &mut SessionRow, session_stats: &SessionStats)
     }
     if entry.turns_with_usage.is_none() {
         entry.turns_with_usage = Some(session_stats.turns_with_usage);
+    }
+    if entry.last_output_tokens_per_second.is_none() {
+        entry.last_output_tokens_per_second = session_stats.last_output_tokens_per_second;
+    }
+    if entry.avg_output_tokens_per_second.is_none() {
+        entry.avg_output_tokens_per_second = session_stats.avg_output_tokens_per_second;
     }
     update_session_row_route_decision(
         &mut entry.last_route_decision,

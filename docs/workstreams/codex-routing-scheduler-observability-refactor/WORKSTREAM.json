@@ -2,7 +2,7 @@
   "schema_version": 1,
   "slug": "codex-routing-scheduler-observability-refactor",
   "title": "Codex Routing Scheduler Observability Refactor",
-  "status": "proposed",
+  "status": "in_progress",
   "updated": "2026-06-15",
   "scope_kind": "execution",
   "problem": "Routing, local concurrency gates, upstream throttle cooldowns, retry/failover decisions, and session/TUI metrics are correct in pieces but not yet represented through one first-class scheduler and observability boundary.",

@@ -25,6 +25,8 @@ fn sample_session_row() -> SessionRow {
         total_usage: None,
         turns_total: None,
         turns_with_usage: None,
+        last_output_tokens_per_second: None,
+        avg_output_tokens_per_second: None,
         binding_profile_name: None,
         binding_continuity_mode: None,
         last_route_decision: None,
@@ -386,6 +388,8 @@ fn session_route_decision_status_line_mentions_changed_fields() {
 fn build_session_rows_from_cards_preserves_last_route_decision() {
     let rows = build_session_rows_from_cards(&[SessionIdentityCard {
         session_id: Some("sid-1".to_string()),
+        last_output_tokens_per_second: Some(123.4),
+        avg_output_tokens_per_second: Some(98.7),
         last_route_decision: Some(RouteDecisionProvenance {
             decided_at_ms: 789,
             provider_id: Some("right".to_string()),
@@ -399,6 +403,8 @@ fn build_session_rows_from_cards_preserves_last_route_decision() {
     }]);
 
     assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].last_output_tokens_per_second, Some(123.4));
+    assert_eq!(rows[0].avg_output_tokens_per_second, Some(98.7));
     let decision = rows[0]
         .last_route_decision
         .as_ref()

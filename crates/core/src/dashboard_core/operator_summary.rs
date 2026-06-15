@@ -13,7 +13,7 @@ use super::types::{
     ProviderOption, RemoteAdminAccessCapabilities, SharedControlPlaneCapabilities, StationOption,
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ApiV1OperatorSummary {
     pub api_version: u32,
     pub service_name: String,

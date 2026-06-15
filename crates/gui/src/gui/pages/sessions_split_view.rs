@@ -94,6 +94,14 @@ pub(super) fn render_sessions_split_view(
         if let Some(usage) = row.total_usage.as_ref() {
             cols[1].label(format!("usage(total): {}", usage_line(usage)));
         }
+        if row.last_output_tokens_per_second.is_some() || row.avg_output_tokens_per_second.is_some()
+        {
+            cols[1].label(format!(
+                "out_tok/s: last={} avg={}",
+                format_tok_per_second(row.last_output_tokens_per_second),
+                format_tok_per_second(row.avg_output_tokens_per_second)
+            ));
+        }
 
         cols[1].separator();
 

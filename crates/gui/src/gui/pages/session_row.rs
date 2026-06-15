@@ -71,7 +71,7 @@ pub(super) fn sync_session_order(state: &mut SessionsViewState, rows: &[SessionR
     state.last_active_set = active_set;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(super) struct SessionRow {
     pub(super) session_id: Option<String>,
     pub(super) observation_scope: SessionObservationScope,
@@ -94,6 +94,8 @@ pub(super) struct SessionRow {
     pub(super) total_usage: Option<UsageMetrics>,
     pub(super) turns_total: Option<u64>,
     pub(super) turns_with_usage: Option<u64>,
+    pub(super) last_output_tokens_per_second: Option<f64>,
+    pub(super) avg_output_tokens_per_second: Option<f64>,
     pub(super) binding_profile_name: Option<String>,
     pub(super) binding_continuity_mode: Option<crate::state::SessionContinuityMode>,
     pub(super) last_route_decision: Option<RouteDecisionProvenance>,

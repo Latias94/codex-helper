@@ -217,12 +217,16 @@ fn observed_session_row_from_snapshot_prefers_session_cards() {
             provider_id: Some("right".to_string()),
             ..Default::default()
         }),
+        last_output_tokens_per_second: Some(123.4),
+        avg_output_tokens_per_second: Some(98.7),
         ..SessionIdentityCard::default()
     }];
 
     let row = observed_session_row_from_snapshot(&snapshot, "sid-card").expect("observed row");
 
     assert_eq!(row.session_id.as_deref(), Some("sid-card"));
+    assert_eq!(row.last_output_tokens_per_second, Some(123.4));
+    assert_eq!(row.avg_output_tokens_per_second, Some(98.7));
     assert_eq!(
         row.effective_service_tier
             .as_ref()

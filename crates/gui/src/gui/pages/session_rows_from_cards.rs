@@ -28,6 +28,8 @@ pub(super) fn build_session_rows_from_cards(cards: &[SessionIdentityCard]) -> Ve
                 total_usage: card.total_usage.clone(),
                 turns_total: card.turns_total,
                 turns_with_usage: card.turns_with_usage,
+                last_output_tokens_per_second: card.last_output_tokens_per_second,
+                avg_output_tokens_per_second: card.avg_output_tokens_per_second,
                 binding_profile_name: card.binding_profile_name.clone(),
                 binding_continuity_mode: card.binding_continuity_mode,
                 last_route_decision: card.last_route_decision.clone(),

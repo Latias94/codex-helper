@@ -255,7 +255,7 @@ pub(in crate::tui) fn routing_leaf_provider_names(spec: &RoutingSpecView) -> Vec
     names
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(in crate::tui) struct SessionRow {
     pub(in crate::tui) session_id: Option<String>,
     pub(in crate::tui) observation_scope: SessionObservationScope,
@@ -280,6 +280,8 @@ pub(in crate::tui) struct SessionRow {
     pub(in crate::tui) total_usage: Option<UsageMetrics>,
     pub(in crate::tui) turns_total: Option<u64>,
     pub(in crate::tui) turns_with_usage: Option<u64>,
+    pub(in crate::tui) last_output_tokens_per_second: Option<f64>,
+    pub(in crate::tui) avg_output_tokens_per_second: Option<f64>,
     pub(in crate::tui) binding_profile_name: Option<String>,
     pub(in crate::tui) binding_continuity_mode: Option<crate::state::SessionContinuityMode>,
     pub(in crate::tui) last_route_decision: Option<RouteDecisionProvenance>,
@@ -1497,6 +1499,13 @@ pub(in crate::tui) fn tokens_short(n: i64) -> String {
     }
 }
 
+pub(in crate::tui) fn format_tok_per_second(value: Option<f64>) -> String {
+    value
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .map(|value| format!("{value:.1}"))
+        .unwrap_or_else(|| "-".to_string())
+}
+
 pub(in crate::tui) fn usage_line_lang(usage: &UsageMetrics, lang: Language) -> String {
     let mut line = format!(
         "{}: {}/{}/{}/{}",
@@ -1563,6 +1572,8 @@ fn build_session_rows_from_cards(cards: &[SessionIdentityCard]) -> Vec<SessionRo
                 total_usage: card.total_usage.clone(),
                 turns_total: card.turns_total,
                 turns_with_usage: card.turns_with_usage,
+                last_output_tokens_per_second: card.last_output_tokens_per_second,
+                avg_output_tokens_per_second: card.avg_output_tokens_per_second,
                 binding_profile_name: card.binding_profile_name.clone(),
                 binding_continuity_mode: card.binding_continuity_mode,
                 last_route_decision: card.last_route_decision.clone(),
@@ -2090,6 +2101,8 @@ mod tests {
             total_usage: None,
             turns_total: None,
             turns_with_usage: None,
+            last_output_tokens_per_second: None,
+            avg_output_tokens_per_second: None,
             binding_profile_name: None,
             binding_continuity_mode: None,
             last_route_decision: None,
@@ -2486,6 +2499,8 @@ mod tests {
                 total_usage: None,
                 turns_total: None,
                 turns_with_usage: None,
+                last_output_tokens_per_second: None,
+                avg_output_tokens_per_second: None,
                 binding_profile_name: None,
                 binding_continuity_mode: None,
                 last_route_decision: None,
@@ -2555,6 +2570,8 @@ mod tests {
                 total_usage: None,
                 turns_total: None,
                 turns_with_usage: None,
+                last_output_tokens_per_second: None,
+                avg_output_tokens_per_second: None,
                 binding_profile_name: None,
                 binding_continuity_mode: None,
                 last_route_decision: None,
@@ -2728,6 +2745,8 @@ mod tests {
     fn build_session_rows_from_cards_preserves_route_affinity() {
         let rows = build_session_rows_from_cards(&[SessionIdentityCard {
             session_id: Some("sid-1".to_string()),
+            last_output_tokens_per_second: Some(123.4),
+            avg_output_tokens_per_second: Some(98.7),
             route_affinity: Some(SessionRouteAffinity {
                 route_graph_key: "v4:deadbeef".to_string(),
                 session_identity_source: None,
@@ -2744,6 +2763,8 @@ mod tests {
         }]);
 
         assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].last_output_tokens_per_second, Some(123.4));
+        assert_eq!(rows[0].avg_output_tokens_per_second, Some(98.7));
         assert_eq!(
             rows[0]
                 .route_affinity
@@ -2786,6 +2807,8 @@ mod tests {
             total_usage: None,
             turns_total: None,
             turns_with_usage: None,
+            last_output_tokens_per_second: None,
+            avg_output_tokens_per_second: None,
             binding_profile_name: Some("fast".to_string()),
             binding_continuity_mode: None,
             last_route_decision: None,

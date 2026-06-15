@@ -7,7 +7,7 @@ use crate::state::{ResolvedRouteValue, RouteValueSource};
 use crate::tui::i18n;
 use crate::tui::model::{
     Palette, Snapshot, balance_snapshot_status_style, basename, format_age,
-    format_observed_client_identity, now_ms, session_control_posture_lang,
+    format_observed_client_identity, format_tok_per_second, now_ms, session_control_posture_lang,
     session_observation_scope_label_lang, session_observed_provider_balance_brief_lang,
     session_observed_provider_balance_snapshot, session_row_has_any_override,
     session_transcript_host_status_lang, short_sid, shorten, shorten_middle, status_style,
@@ -71,6 +71,7 @@ pub(super) fn render_sessions_page(
         l("Last"),
         l("turns"),
         "Tok",
+        "tok/s",
         "Pin",
     ])
     .style(Style::default().fg(p.muted))
@@ -103,6 +104,7 @@ pub(super) fn render_sessions_page(
                 .as_ref()
                 .map(|u| tokens_short(u.total_tokens))
                 .unwrap_or_else(|| "-".to_string());
+            let tok_per_second = format_tok_per_second(row.last_output_tokens_per_second);
             let pin = row
                 .override_route_target
                 .as_deref()
@@ -135,6 +137,7 @@ pub(super) fn render_sessions_page(
                 Cell::from(Span::styled(last, Style::default().fg(p.muted))),
                 Cell::from(Span::styled(turns, Style::default().fg(p.muted))),
                 Cell::from(Span::styled(tok, Style::default().fg(p.muted))),
+                Cell::from(Span::styled(tok_per_second, Style::default().fg(p.accent))),
                 Cell::from(Span::styled(
                     pin,
                     Style::default().fg(
@@ -162,6 +165,7 @@ pub(super) fn render_sessions_page(
             Constraint::Length(6),
             Constraint::Length(6),
             Constraint::Length(5),
+            Constraint::Length(7),
             Constraint::Min(8),
         ],
     )
@@ -485,10 +489,14 @@ pub(super) fn render_sessions_page(
             .filter(|u| u.total_tokens > 0)
             .map(|usage| usage_line_lang(usage, lang))
             .unwrap_or_else(|| "tok in/out/rsn/ttl: -".to_string());
+        let last_tok_per_second = format_tok_per_second(row.last_output_tokens_per_second);
+        let avg_tok_per_second = format_tok_per_second(row.avg_output_tokens_per_second);
         lines.push(kv_line(
             p,
             l("usage"),
-            format!("{total_usage} | turns {turns_total}/{turns_with_usage}"),
+            format!(
+                "{total_usage} | turns {turns_total}/{turns_with_usage} | out_tok/s last={last_tok_per_second} avg={avg_tok_per_second}"
+            ),
             Style::default().fg(p.muted),
         ));
 

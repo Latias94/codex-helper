@@ -2732,6 +2732,24 @@ impl ProxyState {
                 entry.total_usage.add_assign(u);
                 entry.turns_with_usage = entry.turns_with_usage.saturating_add(1);
             }
+            if finished
+                .usage
+                .as_ref()
+                .is_some_and(|usage| usage.output_tokens > 0)
+            {
+                entry.last_output_tokens_per_second =
+                    finished.observability.output_tokens_per_second;
+                if let Some(generation_ms) = finished.observability.generation_ms {
+                    entry.output_generation_ms_total = entry
+                        .output_generation_ms_total
+                        .saturating_add(generation_ms);
+                    entry.avg_output_tokens_per_second =
+                        self::session_identity::token_weighted_output_tokens_per_second(
+                            entry.total_usage.output_tokens,
+                            entry.output_generation_ms_total,
+                        );
+                }
+            }
             entry.last_status = Some(finished.status_code);
             entry.last_duration_ms = Some(finished.duration_ms);
             entry.last_ended_at_ms = Some(finished.ended_at_ms);
@@ -3327,6 +3345,75 @@ mod tests {
     }
 
     #[test]
+    fn session_cards_expose_last_and_average_output_token_speed() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+
+            let first_id = state
+                .begin_request_for_test()
+                .session_id("sid-speed")
+                .started_at_ms(100)
+                .begin()
+                .await;
+            state
+                .finish_request(FinishRequestParams {
+                    id: first_id,
+                    status_code: 200,
+                    duration_ms: 1_500,
+                    ended_at_ms: 1_600,
+                    observed_service_tier: None,
+                    usage: Some(UsageMetrics {
+                        output_tokens: 200,
+                        total_tokens: 200,
+                        ..UsageMetrics::default()
+                    }),
+                    retry: None,
+                    ttfb_ms: Some(500),
+                    streaming: true,
+                })
+                .await;
+
+            let second_id = state
+                .begin_request_for_test()
+                .session_id("sid-speed")
+                .started_at_ms(2_000)
+                .begin()
+                .await;
+            state
+                .finish_request(FinishRequestParams {
+                    id: second_id,
+                    status_code: 200,
+                    duration_ms: 2_500,
+                    ended_at_ms: 4_500,
+                    observed_service_tier: None,
+                    usage: Some(UsageMetrics {
+                        output_tokens: 300,
+                        total_tokens: 300,
+                        ..UsageMetrics::default()
+                    }),
+                    retry: None,
+                    ttfb_ms: Some(500),
+                    streaming: true,
+                })
+                .await;
+
+            let stats = state.list_session_stats().await;
+            let stats = stats.get("sid-speed").expect("session stats");
+            assert_eq!(stats.last_output_tokens_per_second, Some(150.0));
+            assert_eq!(stats.avg_output_tokens_per_second, Some(500.0 / 3.0));
+
+            let cards = state.list_session_identity_cards(16).await;
+            let card = cards
+                .iter()
+                .find(|card| card.session_id.as_deref() == Some("sid-speed"))
+                .expect("session card");
+            assert_eq!(card.last_output_tokens_per_second, Some(150.0));
+            assert_eq!(card.avg_output_tokens_per_second, Some(500.0 / 3.0));
+        });
+    }
+
+    #[test]
     fn state_change_subscription_tracks_dashboard_mutations() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         runtime.block_on(async {
@@ -3647,6 +3734,9 @@ mod tests {
                     ..UsageMetrics::default()
                 },
                 turns_with_usage: 2,
+                last_output_tokens_per_second: None,
+                avg_output_tokens_per_second: None,
+                output_generation_ms_total: 0,
                 last_status: Some(429),
                 last_duration_ms: Some(900),
                 last_ended_at_ms: Some(1_000),

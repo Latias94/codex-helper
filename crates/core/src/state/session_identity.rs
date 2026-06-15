@@ -13,6 +13,10 @@ fn bool_is_false(value: &bool) -> bool {
     !*value
 }
 
+fn u64_is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
 const OUTPUT_RATE_SANITY_CEIL: f64 = 5_000.0;
 
 fn service_tier_is_fast(value: Option<&str>) -> bool {
@@ -93,6 +97,17 @@ fn output_tokens_per_second(
     } else {
         rate
     };
+    rate.is_finite().then_some(rate).filter(|rate| *rate > 0.0)
+}
+
+pub(super) fn token_weighted_output_tokens_per_second(
+    output_tokens: i64,
+    generation_ms: u64,
+) -> Option<f64> {
+    if output_tokens <= 0 || generation_ms == 0 {
+        return None;
+    }
+    let rate = output_tokens as f64 / (generation_ms as f64 / 1000.0);
     rate.is_finite().then_some(rate).filter(|rate| *rate > 0.0)
 }
 
@@ -351,7 +366,7 @@ pub struct FinishRequestParams {
     pub streaming: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct SessionStats {
     pub turns_total: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -376,6 +391,12 @@ pub struct SessionStats {
     pub last_usage: Option<UsageMetrics>,
     pub total_usage: UsageMetrics,
     pub turns_with_usage: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_output_tokens_per_second: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avg_output_tokens_per_second: Option<f64>,
+    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    pub output_generation_ms_total: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_status: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -513,7 +534,7 @@ impl SessionRouteAffinityTarget {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct SessionIdentityCard {
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -557,6 +578,10 @@ pub struct SessionIdentityCard {
     pub turns_total: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turns_with_usage: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_output_tokens_per_second: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avg_output_tokens_per_second: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binding_profile_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -684,6 +709,8 @@ fn empty_session_identity_card(session_id: Option<String>) -> SessionIdentityCar
         total_usage: None,
         turns_total: None,
         turns_with_usage: None,
+        last_output_tokens_per_second: None,
+        avg_output_tokens_per_second: None,
         binding_profile_name: None,
         binding_continuity_mode: None,
         last_route_decision: None,
@@ -1033,6 +1060,10 @@ pub fn build_session_identity_cards_from_parts(
                 .clone()
                 .or(entry.last_upstream_base_url.clone());
             entry.last_usage = r.usage.clone().or(entry.last_usage.clone());
+            entry.last_output_tokens_per_second = r
+                .observability_view()
+                .output_tokens_per_second
+                .or(entry.last_output_tokens_per_second);
         }
         if entry.cwd.is_none() {
             entry.cwd = r.cwd.clone();
@@ -1091,6 +1122,12 @@ pub fn build_session_identity_cards_from_parts(
         }
         if entry.turns_with_usage.is_none() {
             entry.turns_with_usage = Some(st.turns_with_usage);
+        }
+        if entry.last_output_tokens_per_second.is_none() {
+            entry.last_output_tokens_per_second = st.last_output_tokens_per_second;
+        }
+        if entry.avg_output_tokens_per_second.is_none() {
+            entry.avg_output_tokens_per_second = st.avg_output_tokens_per_second;
         }
         update_card_route_decision(entry, st.last_route_decision.as_ref());
     }

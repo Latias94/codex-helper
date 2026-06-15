@@ -33,7 +33,7 @@
 
 ## RSO-040 Session Metrics Surface
 
-- Status: proposed
+- Status: completed
 - Owner: main
 - Scope: session identity cards, active/finished request snapshots, TUI/GUI/API
   session views.
@@ -41,6 +41,10 @@
   metrics from core snapshots.
 - Validation: TUI snapshot tests cover session rows and details when metrics
   are present or absent.
+- Handoff: `SessionStats` and `SessionIdentityCard` now expose
+  `last_output_tokens_per_second` and `avg_output_tokens_per_second`; TUI
+  dashboard/session views and GUI session details render those fields from core
+  snapshots instead of recomputing them in UI code.
 
 ## RSO-050 Operator Capacity Surface
 

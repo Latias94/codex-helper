@@ -279,6 +279,8 @@ mod tests {
             total_usage: None,
             turns_total: None,
             turns_with_usage: None,
+            last_output_tokens_per_second: None,
+            avg_output_tokens_per_second: None,
             binding_profile_name: None,
             binding_continuity_mode: None,
             last_route_decision: None,
