@@ -884,6 +884,8 @@ limit_group = "relay-us"
 
 When a candidate is saturated, routing treats it as temporarily unavailable and continues to the next fallback. Saturation does not count as a provider failure, does not open cooldown, and does not poison session affinity. `routing explain` reports `concurrency_saturated` with the active count and limit.
 
+If only one or two candidates remain, failover still follows the configured route order. A saturated candidate is skipped first; if every remaining candidate is saturated or unavailable, the request exits through the normal route-unavailable path instead of inventing a new provider. For shared upstream accounts, put the same `limit_group` on every endpoint that consumes the same quota so the runtime treats them as one concurrency pool.
+
 ## Route Strategies
 
 | Strategy | Best For | UI Mental Model |
@@ -891,6 +893,8 @@ When a candidate is saturated, routing treats it as temporarily unavailable and 
 | `ordered-failover` | Simple fallback chains and named pools | Reorder child routes/providers |
 | `tag-preferred` | Monthly-first, region-first, vendor-class-first setups | Choose preferred tags, then fallback |
 | `manual-sticky` | Debugging or strict manual selection | Pick one target |
+
+`manual-sticky` still respects saturation and availability for the pinned target itself. It does not change the route graph's fallback rules for other requests, and it should not be used as a queueing policy.
 
 `on_exhausted` is currently used by `tag-preferred`:
 

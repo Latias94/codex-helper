@@ -822,6 +822,8 @@ limit_group = "relay-us"
 
 候选饱和时，routing 会把它当作临时不可用并继续走下一个 fallback。饱和不会记为 provider 失败，不会打开 cooldown，也不会污染 session affinity。`routing explain` 会用 `concurrency_saturated` 展示当前活跃数和上限。
 
+如果只剩一两个候选，failover 仍然按照配置的 route 顺序走。饱和的候选会先被跳过；如果剩余候选全部饱和或不可用，请求会走正常的 route-unavailable 路径，而不是凭空造一个新的 provider。对于共用同一上游账号的多个 endpoint，请给它们设置相同的 `limit_group`，让 runtime 把它们当成一个并发池。
+
 ## Route 策略
 
 | Strategy | 最适合 | UI 心智模型 |
@@ -829,6 +831,8 @@ limit_group = "relay-us"
 | `ordered-failover` | 简单 fallback 链和具名池 | 调整 child routes/providers 顺序 |
 | `tag-preferred` | 包月优先、区域优先、厂商类型优先 | 选择 preferred tags，然后 fallback |
 | `manual-sticky` | 调试或严格手动选择 | 选择一个 target |
+
+`manual-sticky` 仍然会检查被 pin 的 target 自己是否饱和或不可用。它不会改变其它请求的 route graph fallback 规则，也不应该拿来当队列策略。
 
 `on_exhausted` 当前由 `tag-preferred` 使用：
 
