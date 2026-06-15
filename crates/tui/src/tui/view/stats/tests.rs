@@ -8,11 +8,68 @@ use ratatui::buffer::Buffer;
 
 use crate::dashboard_core::WindowStats;
 use crate::state::{
-    BalanceSnapshotStatus, FinishedRequest, ProviderBalanceSnapshot, UsageRollupView,
+    BalanceSnapshotStatus, FinishedRequest, ProviderBalanceSnapshot, UsageRollupCoverage,
+    UsageRollupView,
 };
 use crate::usage_providers::UsageProviderRefreshSummary;
 
+fn current_test_day() -> i32 {
+    (crate::tui::model::now_ms() / 86_400_000) as i32
+}
+
 fn sample_snapshot(provider_balances: HashMap<String, Vec<ProviderBalanceSnapshot>>) -> Snapshot {
+    let day = current_test_day();
+    let ok_provider_bucket = UsageBucket {
+        requests_total: 4,
+        duration_ms_total: 12_000,
+        requests_with_usage: 4,
+        duration_ms_with_usage_total: 12_000,
+        generation_ms_total: 8_000,
+        ttfb_ms_total: 600,
+        ttfb_samples: 4,
+        usage: crate::usage::UsageMetrics {
+            input_tokens: 2_000,
+            output_tokens: 800,
+            total_tokens: 3_000,
+            cache_read_input_tokens: 400,
+            cache_creation_input_tokens: 100,
+            ..Default::default()
+        },
+        ..UsageBucket::default()
+    };
+    let stale_provider_bucket = UsageBucket {
+        requests_total: 2,
+        requests_error: 1,
+        duration_ms_total: 6_000,
+        requests_with_usage: 2,
+        duration_ms_with_usage_total: 6_000,
+        generation_ms_total: 4_000,
+        usage: crate::usage::UsageMetrics {
+            input_tokens: 1_000,
+            output_tokens: 500,
+            total_tokens: 1_500,
+            ..Default::default()
+        },
+        ..UsageBucket::default()
+    };
+    let station_bucket = UsageBucket {
+        requests_total: 3,
+        duration_ms_total: 5_000,
+        requests_with_usage: 3,
+        duration_ms_with_usage_total: 5_000,
+        generation_ms_total: 3_000,
+        usage: crate::usage::UsageMetrics {
+            input_tokens: 1_200,
+            output_tokens: 600,
+            total_tokens: 1_800,
+            cache_read_input_tokens: 300,
+            ..Default::default()
+        },
+        ..UsageBucket::default()
+    };
+    let mut today = UsageBucket::default();
+    today.add_assign(&ok_provider_bucket);
+    today.add_assign(&stale_provider_bucket);
     Snapshot {
         rows: Vec::new(),
         recent: Vec::new(),
@@ -27,23 +84,38 @@ fn sample_snapshot(provider_balances: HashMap<String, Vec<ProviderBalanceSnapsho
         global_route_target_override: None,
         station_meta_overrides: HashMap::new(),
         usage_rollup: UsageRollupView {
+            loaded: today.clone(),
+            window: today.clone(),
+            coverage: UsageRollupCoverage {
+                requested_days: 7,
+                all_loaded: false,
+                loaded_first_day: Some(day),
+                loaded_last_day: Some(day),
+                loaded_days_with_data: 1,
+                loaded_requests: today.requests_total,
+                window_first_day: Some(day - 6),
+                window_last_day: Some(day),
+                window_days_with_data: 1,
+                window_requests: today.requests_total,
+                window_exceeds_loaded_start: true,
+            },
+            by_day: vec![(day, today.clone())],
             by_provider: vec![
-                (
-                    "ok-provider".to_string(),
-                    UsageBucket {
-                        requests_total: 1,
-                        ..UsageBucket::default()
-                    },
-                ),
+                ("ok-provider".to_string(), ok_provider_bucket.clone()),
                 (
                     "超级中转套餐年度输入提供商".to_string(),
-                    UsageBucket {
-                        requests_total: 2,
-                        requests_error: 1,
-                        ..UsageBucket::default()
-                    },
+                    stale_provider_bucket.clone(),
                 ),
             ],
+            by_provider_day: HashMap::from([
+                ("ok-provider".to_string(), vec![(day, ok_provider_bucket)]),
+                (
+                    "超级中转套餐年度输入提供商".to_string(),
+                    vec![(day, stale_provider_bucket)],
+                ),
+            ]),
+            by_config: vec![("station".to_string(), station_bucket.clone())],
+            by_config_day: HashMap::from([("station".to_string(), vec![(day, station_bucket)])]),
             ..UsageRollupView::default()
         },
         provider_balances,
@@ -280,6 +352,36 @@ fn stats_narrow_render_keeps_cjk_provider_and_complete_balance_amount() {
 }
 
 #[test]
+fn stats_render_prioritizes_today_usage_signals() {
+    let snapshot = sample_snapshot(HashMap::from([(
+        "ok-provider".to_string(),
+        vec![ProviderBalanceSnapshot {
+            provider_id: "ok-provider".to_string(),
+            status: BalanceSnapshotStatus::Ok,
+            total_balance_usd: Some("12.50".to_string()),
+            ..ProviderBalanceSnapshot::default()
+        }],
+    )]));
+    let mut ui = UiState {
+        page: crate::tui::types::Page::Stats,
+        stats_focus: StatsFocus::Providers,
+        ..UiState::default()
+    };
+
+    let text = render_stats_text(140, 30, &mut ui, &snapshot);
+
+    assert!(text.contains("Today usage"), "{text}");
+    assert!(text.contains("Today requests"), "{text}");
+    assert!(text.contains("Cache / speed"), "{text}");
+    assert!(text.contains("Local data coverage"), "{text}");
+    assert!(text.contains("Live speed / errors"), "{text}");
+    assert!(text.contains("Today providers / stations"), "{text}");
+    assert!(text.contains("ok-provider"), "{text}");
+    assert!(text.contains("station"), "{text}");
+    assert!(text.contains("local history is shorter"), "{text}");
+}
+
+#[test]
 fn stats_kpis_show_spend_forecast_when_priced_requests_exist() {
     let now = crate::tui::model::now_ms();
     let mut snapshot = sample_snapshot(HashMap::from([(
@@ -309,7 +411,7 @@ fn stats_kpis_show_spend_forecast_when_priced_requests_exist() {
     assert!(text.contains("burn"), "{text}");
     assert!(text.contains("rate"), "{text}");
     assert!(text.contains("/h"), "{text}");
-    assert!(text.contains("not project"), "{text}");
+    assert!(text.contains("low sample"), "{text}");
 }
 
 #[test]
@@ -343,7 +445,8 @@ fn stats_kpis_show_spend_projection_only_when_sample_is_confident() {
     let text = render_stats_text(140, 28, &mut ui, &snapshot);
 
     assert!(text.contains("burn"), "{text}");
-    assert!(text.contains("at current rate to reset"), "{text}");
+    assert!(text.contains("at current rate"), "{text}");
+    assert!(text.contains("estimated"), "{text}");
 }
 
 #[test]

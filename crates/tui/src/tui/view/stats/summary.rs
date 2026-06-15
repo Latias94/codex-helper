@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use ratatui::prelude::{Line, Span, Style};
+use ratatui::prelude::Style;
 use unicode_width::UnicodeWidthStr;
 
 use crate::pricing::CostConfidence;
@@ -410,43 +410,6 @@ pub(super) fn day_range_label(first: Option<i32>, last: Option<i32>) -> String {
         (Some(first), Some(last)) => format!("{}..{}", day_to_ymd(first), day_to_ymd(last)),
         _ => "-".to_string(),
     }
-}
-
-pub(super) fn stats_coverage_line(
-    p: Palette,
-    snapshot: &Snapshot,
-    window_label: &str,
-    lang: Language,
-) -> Line<'static> {
-    let c = &snapshot.usage_rollup.coverage;
-    let loaded = day_range_label(c.loaded_first_day, c.loaded_last_day);
-    let window = day_range_label(c.window_first_day, c.window_last_day);
-    let warning = if c.window_exceeds_loaded_start {
-        match lang {
-            Language::Zh => "  部分覆盖：所选窗口早于已加载日志数据",
-            Language::En => "  partial: selected window starts before loaded log data",
-        }
-    } else {
-        ""
-    };
-
-    Line::from(vec![
-        Span::styled(
-            format!("{} {window_label} {window}", i18n::label(lang, "window")),
-            Style::default().fg(p.text),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            format!(
-                "{} {loaded} days={} req={}",
-                i18n::label(lang, "loaded"),
-                c.loaded_days_with_data,
-                c.loaded_requests
-            ),
-            Style::default().fg(p.muted),
-        ),
-        Span::styled(warning.to_string(), Style::default().fg(p.warn)),
-    ])
 }
 
 pub(super) fn usage_spend_forecast(
