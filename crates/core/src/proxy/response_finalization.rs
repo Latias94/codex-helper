@@ -1,11 +1,12 @@
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, Method, Response, StatusCode};
 
-use crate::logging::{CodexBridgeLog, RetryInfo, ServiceTierLog, log_request_with_debug};
-use crate::state::{FinishRequestParams, RouteDecisionProvenance, SessionIdentitySource};
+use crate::logging::{CodexBridgeLog, RetryInfo, ServiceTierLog};
+use crate::state::{RouteDecisionProvenance, SessionIdentitySource};
 use crate::usage::UsageMetrics;
 
 use super::ProxyService;
+use super::request_observer::{RequestObserver, RequestPublication};
 
 pub(super) struct FinalizeForwardResponseParams {
     pub request_id: u64,
@@ -61,49 +62,37 @@ pub(super) async fn finish_and_build_forward_response(
         response_body,
     } = params;
 
-    proxy
-        .state
-        .finish_request(FinishRequestParams {
-            id: request_id,
-            status_code: status.as_u16(),
+    let status_code = status.as_u16();
+    let model = route_decision
+        .as_ref()
+        .and_then(|decision| decision.effective_model.as_ref())
+        .map(|model| model.value.clone());
+    RequestObserver::new(proxy, method, path)
+        .publish_terminal_once(RequestPublication {
+            request_id,
+            status_code,
             duration_ms,
             ended_at_ms: started_at_ms + duration_ms,
-            observed_service_tier: service_tier.actual.clone(),
-            usage: usage.clone(),
-            retry: retry.clone(),
             ttfb_ms: Some(upstream_headers_ms),
+            station_name,
+            provider_id,
+            endpoint_id,
+            provider_endpoint_key,
+            upstream_base_url,
+            session_id,
+            session_identity_source,
+            cwd,
+            model,
+            reasoning_effort: effective_effort,
+            service_tier,
+            codex_bridge,
+            usage,
+            route_decision,
+            retry,
+            http_debug: None,
             streaming: false,
         })
         .await;
-
-    log_request_with_debug(
-        Some(request_id),
-        proxy.service_name,
-        method.as_str(),
-        path,
-        status.as_u16(),
-        duration_ms,
-        Some(upstream_headers_ms),
-        station_name.as_deref(),
-        provider_id,
-        endpoint_id,
-        provider_endpoint_key,
-        upstream_base_url.as_str(),
-        session_id,
-        session_identity_source,
-        cwd,
-        route_decision
-            .as_ref()
-            .and_then(|decision| decision.effective_model.as_ref())
-            .map(|model| model.value.clone()),
-        effective_effort,
-        service_tier,
-        codex_bridge,
-        usage,
-        route_decision,
-        retry,
-        None,
-    );
 
     build_forward_response(status, &response_headers, response_body)
 }

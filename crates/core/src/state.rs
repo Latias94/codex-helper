@@ -2567,10 +2567,10 @@ impl ProxyState {
         self.notify_state_changed();
     }
 
-    pub async fn finish_request(&self, params: FinishRequestParams) {
+    pub async fn finish_request(&self, params: FinishRequestParams) -> bool {
         let mut active = self.active_requests.write().await;
         let Some(req) = active.remove(&params.id) else {
-            return;
+            return false;
         };
         drop(active);
 
@@ -2762,6 +2762,7 @@ impl ProxyState {
             recent.pop_back();
         }
         self.notify_state_changed();
+        true
     }
 
     pub async fn list_active_requests(&self) -> Vec<ActiveRequest> {
@@ -3341,6 +3342,54 @@ mod tests {
             assert_eq!(recent[0].observability.trace_id.as_deref(), Some("codex-1"));
             assert!(recent[0].observability.fast_mode);
             assert_eq!(recent[0].observability.generation_ms, Some(6));
+        });
+    }
+
+    #[test]
+    fn finish_request_reports_exactly_once_publication() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            let request_id = state
+                .begin_request_for_test()
+                .started_at_ms(100)
+                .begin()
+                .await;
+
+            let first = state
+                .finish_request(FinishRequestParams {
+                    id: request_id,
+                    status_code: 200,
+                    duration_ms: 10,
+                    ended_at_ms: 110,
+                    observed_service_tier: None,
+                    usage: None,
+                    retry: None,
+                    ttfb_ms: Some(4),
+                    streaming: false,
+                })
+                .await;
+            let second = state
+                .finish_request(FinishRequestParams {
+                    id: request_id,
+                    status_code: 500,
+                    duration_ms: 20,
+                    ended_at_ms: 120,
+                    observed_service_tier: None,
+                    usage: None,
+                    retry: None,
+                    ttfb_ms: None,
+                    streaming: false,
+                })
+                .await;
+
+            assert!(first);
+            assert!(!second);
+
+            let recent = state.list_recent_finished(10).await;
+            assert_eq!(recent.len(), 1);
+            assert_eq!(recent[0].id, request_id);
+            assert_eq!(recent[0].status_code, 200);
         });
     }
 

@@ -19,8 +19,7 @@ use crate::lb::{COOLDOWN_SECS, LoadBalancer};
 use crate::logging::{CodexBridgeLog, RouteAttemptLog, ServiceTierLog};
 use crate::routing_ir::{RouteCandidate, RoutePlanAttemptState, RoutePlanExecutor};
 use crate::state::{
-    FinishRequestParams, ResolvedRouteValue, RouteDecisionProvenance, RouteValueSource,
-    SessionIdentitySource,
+    ResolvedRouteValue, RouteDecisionProvenance, RouteValueSource, SessionIdentitySource,
 };
 
 use super::attempt_failures::{TerminalUpstreamFailureParams, apply_terminal_upstream_failure};
@@ -38,6 +37,7 @@ use super::request_continuity::{
     classify_request_continuity,
 };
 use super::request_failures::{FailedProxyRequestParams, finish_failed_proxy_request};
+use super::request_observer::{RequestObserver, RequestPublication};
 use super::request_preparation::{
     CommonRequestPreparationError, CommonRequestPreparationParams, load_request_config_context,
     prepare_common_request,
@@ -900,49 +900,38 @@ async fn relay_websocket_streams(
             strips_client_auth: prepared.codex_patch_mode.strips_codex_client_auth(),
         });
 
-    crate::logging::log_request_with_debug(
-        Some(prepared.request_id),
-        proxy.service_name,
-        prepared.method.as_str(),
-        prepared.uri.path(),
-        status_code,
-        duration_ms,
-        Some(upstream_headers_ms),
-        selected.target.compatibility_station_name(),
-        selected
-            .provider_id
-            .or_else(|| selected.target.provider_id().map(ToOwned::to_owned)),
-        selected.target.endpoint_id(),
-        selected.target.provider_endpoint_key(),
-        selected.target.upstream().base_url.as_str(),
-        prepared.session_id.clone(),
-        prepared.session_identity_source,
-        prepared.cwd.clone(),
-        selected
-            .route_decision
-            .effective_model
-            .as_ref()
-            .map(|model| model.value.clone()),
-        prepared.effective_effort.clone(),
-        service_tier.clone(),
-        codex_bridge,
-        None,
-        Some(selected.route_decision.clone()),
-        retry.clone(),
-        None,
-    );
-
-    proxy
-        .state
-        .finish_request(FinishRequestParams {
-            id: prepared.request_id,
+    RequestObserver::new(&proxy, &prepared.method, prepared.uri.path())
+        .publish_terminal_once(RequestPublication {
+            request_id: prepared.request_id,
             status_code,
             duration_ms,
             ended_at_ms: prepared.started_at_ms + duration_ms,
-            observed_service_tier: service_tier.actual,
-            usage: None,
-            retry,
             ttfb_ms: Some(upstream_headers_ms),
+            station_name: selected
+                .target
+                .compatibility_station_name()
+                .map(ToOwned::to_owned),
+            provider_id: selected
+                .provider_id
+                .or_else(|| selected.target.provider_id().map(ToOwned::to_owned)),
+            endpoint_id: selected.target.endpoint_id(),
+            provider_endpoint_key: selected.target.provider_endpoint_key(),
+            upstream_base_url: selected.target.upstream().base_url.clone(),
+            session_id: prepared.session_id.clone(),
+            session_identity_source: prepared.session_identity_source,
+            cwd: prepared.cwd.clone(),
+            model: selected
+                .route_decision
+                .effective_model
+                .as_ref()
+                .map(|model| model.value.clone()),
+            reasoning_effort: prepared.effective_effort.clone(),
+            service_tier,
+            codex_bridge,
+            usage: None,
+            route_decision: Some(selected.route_decision.clone()),
+            retry,
+            http_debug: None,
             streaming: true,
         })
         .await;

@@ -11,8 +11,8 @@ use tracing::{info, warn};
 
 use crate::lb::LoadBalancer;
 use crate::logging::{
-    CodexBridgeLog, HttpDebugLog, RetryInfo, ServiceTierLog, log_request_with_debug,
-    make_body_preview, should_include_http_debug, should_include_http_warn,
+    CodexBridgeLog, HttpDebugLog, RetryInfo, ServiceTierLog, make_body_preview,
+    should_include_http_debug, should_include_http_warn,
 };
 use crate::state::{ProxyState, RouteDecisionProvenance, SessionIdentitySource};
 use crate::usage_providers;
@@ -31,6 +31,7 @@ use super::headers::header_map_to_entries;
 use super::http_debug::{HttpDebugBase, warn_http_debug};
 use super::passive_health::{record_passive_upstream_failure, record_passive_upstream_success};
 use super::request_body::scan_service_tier_from_sse_bytes_incremental;
+use super::request_observer::{RequestObserver, RequestPublication, RequestPublicationGate};
 use super::retry::response_penalty_cooldown_secs;
 
 fn stream_buffer_max_bytes() -> usize {
@@ -80,8 +81,7 @@ struct StreamErrorInfo {
 #[derive(Default)]
 struct StreamUsageState {
     buffer: Vec<u8>,
-    logged: bool,
-    finished: bool,
+    terminal_publication: RequestPublicationGate,
     stream_error: Option<StreamErrorInfo>,
     warned_non_success: bool,
     first_chunk_ms: Option<u64>,
@@ -341,68 +341,32 @@ impl Drop for StreamFinalize {
             Ok(g) => g,
             Err(_) => return,
         };
-        if guard.finished {
+        if !guard.terminal_publication.mark_published() {
             return;
         }
-        guard.finished = true;
-        let already_logged = guard.logged;
-        let usage_for_state = guard.usage.clone();
-        let retry_for_state = self.retry.clone();
-        let ttfb_ms_for_state = guard.first_chunk_ms;
-        let service_tier_for_state = guard.service_tier.clone();
+        let usage = guard.usage.clone();
+        let ttfb_ms = guard.first_chunk_ms;
+        let service_tier = ServiceTierLog {
+            actual: guard.service_tier.clone(),
+            ..self.service_tier.clone()
+        };
         let stream_error = guard.stream_error.clone();
 
         let dur = self.start.elapsed().as_millis() as u64;
 
-        if !already_logged {
-            guard.logged = true;
-            let usage = usage_for_state.clone();
-            let http_debug_warn = self.build_http_debug(&guard.buffer, guard.first_chunk_ms, true);
-            if should_include_http_warn(self.status_code)
-                && !guard.warned_non_success
-                && let Some(h) = http_debug_warn.as_ref()
-            {
-                warn_http_debug(self.status_code, h);
-                guard.warned_non_success = true;
-            }
-            let http_debug = if should_include_http_debug(self.status_code) {
-                self.build_http_debug(&guard.buffer, guard.first_chunk_ms, false)
-            } else {
-                None
-            };
-            let service_tier = ServiceTierLog {
-                actual: guard.service_tier.clone(),
-                ..self.service_tier.clone()
-            };
-            log_request_with_debug(
-                Some(request_id),
-                &self.service_name,
-                &self.method,
-                &self.path,
-                self.status_code,
-                dur,
-                guard.first_chunk_ms,
-                self.compatibility_station_name.as_deref(),
-                self.provider_id.clone(),
-                self.endpoint_id.clone(),
-                self.provider_endpoint_key.clone(),
-                &self.upstream_base_url,
-                self.session_id.clone(),
-                self.session_identity_source,
-                self.cwd.clone(),
-                self.route_decision
-                    .as_ref()
-                    .and_then(|decision| decision.effective_model.as_ref())
-                    .map(|model| model.value.clone()),
-                self.reasoning_effort.clone(),
-                service_tier,
-                self.codex_bridge.clone(),
-                usage,
-                self.route_decision.clone(),
-                self.retry.clone(),
-                http_debug,
-            );
+        let http_debug_warn = self.build_http_debug(&guard.buffer, guard.first_chunk_ms, true);
+        if should_include_http_warn(self.status_code)
+            && !guard.warned_non_success
+            && let Some(h) = http_debug_warn.as_ref()
+        {
+            warn_http_debug(self.status_code, h);
+            guard.warned_non_success = true;
         }
+        let http_debug = if should_include_http_debug(self.status_code) {
+            self.build_http_debug(&guard.buffer, guard.first_chunk_ms, false)
+        } else {
+            None
+        };
 
         let response_body = std::mem::take(&mut guard.buffer);
         drop(guard);
@@ -431,6 +395,40 @@ impl Drop for StreamFinalize {
         let legacy_lb_for_health = self.legacy_lb.clone();
         let target_for_health = self.target.clone();
         let cooldown_backoff = self.cooldown_backoff;
+        let observer = RequestObserver::from_parts(
+            state.clone(),
+            self.service_name.clone(),
+            self.method.clone(),
+            self.path.clone(),
+        );
+        let publication = RequestPublication {
+            request_id,
+            status_code,
+            duration_ms: dur,
+            ended_at_ms: started_at_ms + dur,
+            ttfb_ms,
+            station_name: self.compatibility_station_name.clone(),
+            provider_id: self.provider_id.clone(),
+            endpoint_id: self.endpoint_id.clone(),
+            provider_endpoint_key: self.provider_endpoint_key.clone(),
+            upstream_base_url: self.upstream_base_url.clone(),
+            session_id: self.session_id.clone(),
+            session_identity_source: self.session_identity_source,
+            cwd: self.cwd.clone(),
+            model: self
+                .route_decision
+                .as_ref()
+                .and_then(|decision| decision.effective_model.as_ref())
+                .map(|model| model.value.clone()),
+            reasoning_effort: self.reasoning_effort.clone(),
+            service_tier,
+            codex_bridge: self.codex_bridge.clone(),
+            usage,
+            route_decision: self.route_decision.clone(),
+            retry: self.retry.clone(),
+            http_debug,
+            streaming: true,
+        };
 
         tokio::spawn(async move {
             match health_update {
@@ -505,19 +503,7 @@ impl Drop for StreamFinalize {
                     .await;
                 }
             }
-            state
-                .finish_request(crate::state::FinishRequestParams {
-                    id: request_id,
-                    status_code,
-                    duration_ms: dur,
-                    ended_at_ms: started_at_ms + dur,
-                    observed_service_tier: service_tier_for_state,
-                    usage: usage_for_state,
-                    retry: retry_for_state,
-                    ttfb_ms: ttfb_ms_for_state,
-                    streaming: true,
-                })
-                .await;
+            observer.publish_terminal_once(publication).await;
         });
     }
 }
@@ -596,9 +582,6 @@ impl StreamForwardState {
             }
             guard.warned_non_success = true;
         }
-        if guard.logged {
-            return chunk;
-        }
         {
             let StreamUsageState {
                 buffer,
@@ -617,48 +600,6 @@ impl StreamForwardState {
                 buffer.as_slice(),
                 service_tier_scan_pos,
                 service_tier,
-            );
-        }
-        if let Some(usage) = guard.usage.clone() {
-            guard.logged = true;
-            let dur = finalize.start.elapsed().as_millis() as u64;
-            let http_debug = if should_include_http_debug(finalize.status_code) {
-                finalize.build_http_debug(&guard.buffer, guard.first_chunk_ms, false)
-            } else {
-                None
-            };
-            let service_tier = ServiceTierLog {
-                actual: guard.service_tier.clone(),
-                ..finalize.service_tier.clone()
-            };
-            log_request_with_debug(
-                Some(finalize.request_id),
-                &finalize.service_name,
-                &finalize.method,
-                &finalize.path,
-                finalize.status_code,
-                dur,
-                guard.first_chunk_ms,
-                finalize.compatibility_station_name.as_deref(),
-                finalize.provider_id.clone(),
-                finalize.endpoint_id.clone(),
-                finalize.provider_endpoint_key.clone(),
-                &finalize.upstream_base_url,
-                finalize.session_id.clone(),
-                finalize.session_identity_source,
-                finalize.cwd.clone(),
-                finalize
-                    .route_decision
-                    .as_ref()
-                    .and_then(|decision| decision.effective_model.as_ref())
-                    .map(|model| model.value.clone()),
-                finalize.reasoning_effort.clone(),
-                service_tier,
-                finalize.codex_bridge.clone(),
-                Some(usage),
-                finalize.route_decision.clone(),
-                finalize.retry.clone(),
-                http_debug,
             );
         }
 

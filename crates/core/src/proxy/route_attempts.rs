@@ -50,6 +50,115 @@ pub(super) struct ErrorRouteAttemptParams<'a> {
     pub(super) cooldown_reason: Option<&'a str>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct CandidateSkip {
+    decision: String,
+    reason: Option<String>,
+    model: Option<String>,
+    raw: String,
+}
+
+impl CandidateSkip {
+    fn unsupported_model(target: &AttemptTarget, requested_model: &str) -> Self {
+        Self {
+            decision: "skipped_capability_mismatch".to_string(),
+            reason: Some("unsupported_model".to_string()),
+            model: normalize_model(requested_model),
+            raw: format!(
+                "{} skipped_unsupported_model={}",
+                target.route_attempt_identity(),
+                requested_model
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct AttemptOutcome {
+    decision: String,
+    reason: Option<String>,
+    status_code: Option<u16>,
+    class: Option<String>,
+    model: Option<String>,
+    ttfb_ms: Option<u64>,
+    duration_ms: Option<u64>,
+    cooldown_secs: Option<u64>,
+    cooldown_reason: Option<String>,
+    skipped: bool,
+    raw: String,
+}
+
+impl AttemptOutcome {
+    fn from_skip(skip: CandidateSkip) -> Self {
+        Self {
+            decision: skip.decision,
+            reason: skip.reason,
+            status_code: None,
+            class: None,
+            model: skip.model,
+            ttfb_ms: None,
+            duration_ms: None,
+            cooldown_secs: None,
+            cooldown_reason: None,
+            skipped: true,
+            raw: skip.raw,
+        }
+    }
+
+    fn from_status(params: &StatusRouteAttemptParams<'_>) -> Self {
+        let class_for_chain = params.error_class.unwrap_or("-");
+        let cooldown_secs = normalize_cooldown(params.cooldown_secs);
+        Self {
+            decision: if (200..300).contains(&params.status_code) {
+                "completed".to_string()
+            } else {
+                "failed_status".to_string()
+            },
+            reason: None,
+            status_code: Some(params.status_code),
+            class: params.error_class.map(ToOwned::to_owned),
+            model: normalize_model(params.model_note),
+            ttfb_ms: Some(params.upstream_headers_ms),
+            duration_ms: Some(params.duration_ms),
+            cooldown_secs,
+            cooldown_reason: cooldown_secs
+                .and_then(|_| params.cooldown_reason.map(ToOwned::to_owned)),
+            skipped: false,
+            raw: format!(
+                "{} status={} class={} model={}",
+                params.target.route_attempt_identity(),
+                params.status_code,
+                class_for_chain,
+                params.model_note
+            ),
+        }
+    }
+
+    fn from_error(params: &ErrorRouteAttemptParams<'_>) -> Self {
+        let cooldown_secs = normalize_cooldown(params.cooldown_secs);
+        Self {
+            decision: params.kind.decision().to_string(),
+            reason: Some(params.reason.to_string()),
+            status_code: None,
+            class: Some(params.kind.error_class().to_string()),
+            model: normalize_model(params.model_note),
+            ttfb_ms: None,
+            duration_ms: params.duration_ms,
+            cooldown_secs,
+            cooldown_reason: cooldown_secs
+                .and_then(|_| params.cooldown_reason.map(ToOwned::to_owned)),
+            skipped: false,
+            raw: format!(
+                "{} {}={} model={}",
+                params.target.route_attempt_identity(),
+                params.kind.chain_key(),
+                params.reason,
+                params.model_note
+            ),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum RouteAttemptErrorKind {
     TargetBuild,
@@ -133,38 +242,24 @@ pub(super) fn record_unsupported_model_skip(
     route_attempts: &mut Vec<RouteAttemptLog>,
     params: UnsupportedModelSkipParams<'_>,
 ) {
-    let raw = format!(
-        "{} skipped_unsupported_model={}",
-        params.target.route_attempt_identity(),
-        params.requested_model
-    );
-    upstream_chain.push(raw.clone());
-    route_attempts.push(RouteAttemptLog {
+    let outcome = AttemptOutcome::from_skip(CandidateSkip::unsupported_model(
+        params.target,
+        params.requested_model,
+    ));
+    upstream_chain.push(outcome.raw.clone());
+    let mut attempt = RouteAttemptLog {
         attempt_index: route_attempts.len() as u32,
-        provider_id: params.target.provider_id().map(ToOwned::to_owned),
-        endpoint_id: params.target.endpoint_id(),
-        provider_endpoint_key: params.target.provider_endpoint_key(),
-        preference_group: params.target.preference_group(),
-        route_path: params.target.route_path(),
         provider_attempt: Some(params.provider_attempt + 1),
         provider_max_attempts: Some(params.provider_max_attempts),
-        station_name: params
-            .target
-            .compatibility_station_name()
-            .map(ToOwned::to_owned),
-        upstream_base_url: Some(params.target.upstream().base_url.clone()),
-        upstream_index: params.target.compatibility_upstream_index(),
         avoid_for_station: legacy_avoid_for_station(params.target, params.avoid_set),
         avoided_candidate_indices: avoided_candidate_indices(params.target, params.avoid_set),
         avoided_total: Some(params.avoided_total),
         total_upstreams: Some(params.total_upstreams),
-        decision: "skipped_capability_mismatch".to_string(),
-        reason: Some("unsupported_model".to_string()),
-        model: normalize_model(params.requested_model),
-        skipped: true,
-        raw,
         ..Default::default()
-    });
+    };
+    fill_attempt_identity(&mut attempt, params.target);
+    apply_attempt_outcome(&mut attempt, outcome);
+    route_attempts.push(attempt);
 }
 
 pub(super) fn record_status_route_attempt(
@@ -172,78 +267,22 @@ pub(super) fn record_status_route_attempt(
     route_attempts: &mut Vec<RouteAttemptLog>,
     params: StatusRouteAttemptParams<'_>,
 ) {
-    let class_for_chain = params.error_class.unwrap_or("-");
-    let raw = format!(
-        "{} status={} class={} model={}",
-        params.target.route_attempt_identity(),
-        params.status_code,
-        class_for_chain,
-        params.model_note
-    );
-    upstream_chain.push(raw.clone());
+    let outcome = AttemptOutcome::from_status(&params);
+    upstream_chain.push(outcome.raw.clone());
 
     if let Some(attempt) = route_attempts.get_mut(params.route_attempt_index) {
-        if attempt.provider_id.is_none() {
-            attempt.provider_id = params.target.provider_id().map(ToOwned::to_owned);
-        }
-        if attempt.endpoint_id.is_none() {
-            attempt.endpoint_id = params.target.endpoint_id();
-        }
-        if attempt.provider_endpoint_key.is_none() {
-            attempt.provider_endpoint_key = params.target.provider_endpoint_key();
-        }
-        if attempt.preference_group.is_none() {
-            attempt.preference_group = params.target.preference_group();
-        }
-        if attempt.route_path.is_empty() {
-            attempt.route_path = params.target.route_path();
-        }
-        attempt.decision = if (200..300).contains(&params.status_code) {
-            "completed".to_string()
-        } else {
-            "failed_status".to_string()
-        };
-        attempt.status_code = Some(params.status_code);
-        attempt.error_class = params.error_class.map(ToOwned::to_owned);
-        attempt.model = normalize_model(params.model_note);
-        attempt.upstream_headers_ms = Some(params.upstream_headers_ms);
-        attempt.duration_ms = Some(params.duration_ms);
-        attempt.cooldown_secs = normalize_cooldown(params.cooldown_secs);
-        attempt.cooldown_reason = normalize_cooldown(params.cooldown_secs)
-            .and_then(|_| params.cooldown_reason.map(ToOwned::to_owned));
-        attempt.raw = raw;
+        fill_attempt_identity(attempt, params.target);
+        apply_attempt_outcome(attempt, outcome);
         return;
     }
 
-    route_attempts.push(RouteAttemptLog {
+    let mut attempt = RouteAttemptLog {
         attempt_index: route_attempts.len() as u32,
-        provider_id: params.target.provider_id().map(ToOwned::to_owned),
-        endpoint_id: params.target.endpoint_id(),
-        provider_endpoint_key: params.target.provider_endpoint_key(),
-        preference_group: params.target.preference_group(),
-        route_path: params.target.route_path(),
-        station_name: params
-            .target
-            .compatibility_station_name()
-            .map(ToOwned::to_owned),
-        upstream_base_url: Some(params.target.upstream().base_url.clone()),
-        upstream_index: params.target.compatibility_upstream_index(),
-        decision: if (200..300).contains(&params.status_code) {
-            "completed".to_string()
-        } else {
-            "failed_status".to_string()
-        },
-        status_code: Some(params.status_code),
-        error_class: params.error_class.map(ToOwned::to_owned),
-        model: normalize_model(params.model_note),
-        upstream_headers_ms: Some(params.upstream_headers_ms),
-        duration_ms: Some(params.duration_ms),
-        cooldown_secs: normalize_cooldown(params.cooldown_secs),
-        cooldown_reason: normalize_cooldown(params.cooldown_secs)
-            .and_then(|_| params.cooldown_reason.map(ToOwned::to_owned)),
-        raw,
         ..Default::default()
-    });
+    };
+    fill_attempt_identity(&mut attempt, params.target);
+    apply_attempt_outcome(&mut attempt, outcome);
+    route_attempts.push(attempt);
 }
 
 pub(super) fn record_error_route_attempt(
@@ -251,67 +290,63 @@ pub(super) fn record_error_route_attempt(
     route_attempts: &mut Vec<RouteAttemptLog>,
     params: ErrorRouteAttemptParams<'_>,
 ) {
-    let raw = format!(
-        "{} {}={} model={}",
-        params.target.route_attempt_identity(),
-        params.kind.chain_key(),
-        params.reason,
-        params.model_note
-    );
-    upstream_chain.push(raw.clone());
+    let outcome = AttemptOutcome::from_error(&params);
+    upstream_chain.push(outcome.raw.clone());
 
     if let Some(attempt) = route_attempts.get_mut(params.route_attempt_index) {
-        if attempt.provider_id.is_none() {
-            attempt.provider_id = params.target.provider_id().map(ToOwned::to_owned);
-        }
-        if attempt.endpoint_id.is_none() {
-            attempt.endpoint_id = params.target.endpoint_id();
-        }
-        if attempt.provider_endpoint_key.is_none() {
-            attempt.provider_endpoint_key = params.target.provider_endpoint_key();
-        }
-        if attempt.preference_group.is_none() {
-            attempt.preference_group = params.target.preference_group();
-        }
-        if attempt.route_path.is_empty() {
-            attempt.route_path = params.target.route_path();
-        }
-        attempt.decision = params.kind.decision().to_string();
-        attempt.reason = Some(params.reason.to_string());
-        attempt.error_class = Some(params.kind.error_class().to_string());
-        attempt.model = normalize_model(params.model_note);
-        attempt.duration_ms = params.duration_ms;
-        attempt.cooldown_secs = normalize_cooldown(params.cooldown_secs);
-        attempt.cooldown_reason = normalize_cooldown(params.cooldown_secs)
-            .and_then(|_| params.cooldown_reason.map(ToOwned::to_owned));
-        attempt.raw = raw;
+        fill_attempt_identity(attempt, params.target);
+        apply_attempt_outcome(attempt, outcome);
         return;
     }
 
-    route_attempts.push(RouteAttemptLog {
+    let mut attempt = RouteAttemptLog {
         attempt_index: route_attempts.len() as u32,
-        provider_id: params.target.provider_id().map(ToOwned::to_owned),
-        endpoint_id: params.target.endpoint_id(),
-        provider_endpoint_key: params.target.provider_endpoint_key(),
-        preference_group: params.target.preference_group(),
-        route_path: params.target.route_path(),
-        station_name: params
-            .target
-            .compatibility_station_name()
-            .map(ToOwned::to_owned),
-        upstream_base_url: Some(params.target.upstream().base_url.clone()),
-        upstream_index: params.target.compatibility_upstream_index(),
-        decision: params.kind.decision().to_string(),
-        reason: Some(params.reason.to_string()),
-        error_class: Some(params.kind.error_class().to_string()),
-        model: normalize_model(params.model_note),
-        duration_ms: params.duration_ms,
-        cooldown_secs: normalize_cooldown(params.cooldown_secs),
-        cooldown_reason: normalize_cooldown(params.cooldown_secs)
-            .and_then(|_| params.cooldown_reason.map(ToOwned::to_owned)),
-        raw,
         ..Default::default()
-    });
+    };
+    fill_attempt_identity(&mut attempt, params.target);
+    apply_attempt_outcome(&mut attempt, outcome);
+    route_attempts.push(attempt);
+}
+
+fn fill_attempt_identity(attempt: &mut RouteAttemptLog, target: &AttemptTarget) {
+    if attempt.provider_id.is_none() {
+        attempt.provider_id = target.provider_id().map(ToOwned::to_owned);
+    }
+    if attempt.endpoint_id.is_none() {
+        attempt.endpoint_id = target.endpoint_id();
+    }
+    if attempt.provider_endpoint_key.is_none() {
+        attempt.provider_endpoint_key = target.provider_endpoint_key();
+    }
+    if attempt.preference_group.is_none() {
+        attempt.preference_group = target.preference_group();
+    }
+    if attempt.route_path.is_empty() {
+        attempt.route_path = target.route_path();
+    }
+    if attempt.station_name.is_none() {
+        attempt.station_name = target.compatibility_station_name().map(ToOwned::to_owned);
+    }
+    if attempt.upstream_base_url.is_none() {
+        attempt.upstream_base_url = Some(target.upstream().base_url.clone());
+    }
+    if attempt.upstream_index.is_none() {
+        attempt.upstream_index = target.compatibility_upstream_index();
+    }
+}
+
+fn apply_attempt_outcome(attempt: &mut RouteAttemptLog, outcome: AttemptOutcome) {
+    attempt.decision = outcome.decision;
+    attempt.reason = outcome.reason;
+    attempt.status_code = outcome.status_code;
+    attempt.error_class = outcome.class;
+    attempt.model = outcome.model;
+    attempt.upstream_headers_ms = outcome.ttfb_ms;
+    attempt.duration_ms = outcome.duration_ms;
+    attempt.cooldown_secs = outcome.cooldown_secs;
+    attempt.cooldown_reason = outcome.cooldown_reason;
+    attempt.skipped = outcome.skipped;
+    attempt.raw = outcome.raw;
 }
 
 fn sorted_avoid_set(avoid_set: &HashSet<usize>) -> Vec<usize> {

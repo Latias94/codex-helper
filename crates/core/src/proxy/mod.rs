@@ -47,6 +47,7 @@ mod request_context;
 mod request_continuity;
 mod request_encoding;
 mod request_failures;
+mod request_observer;
 mod request_preparation;
 mod request_routing;
 mod response_finalization;

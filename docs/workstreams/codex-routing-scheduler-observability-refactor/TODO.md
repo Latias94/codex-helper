@@ -2,12 +2,19 @@
 
 ## RSO-010 Contract Baseline
 
-- Status: proposed
+- Status: completed
 - Owner: main
 - Scope: core proxy attempt/result types and request ledger tests.
 - Goal: define `AttemptOutcome`, `CandidateSkip`, and `RequestObserver`
   without changing route graph policy.
 - Validation: non-stream and stream tests prove exactly-once publication.
+- Handoff: `AttemptOutcome` and `CandidateSkip` now normalize route attempt
+  status/error/skip updates before they are applied to legacy
+  `RouteAttemptLog` fields. `RequestObserver` is the terminal request
+  publication facade for non-stream, websocket, and SSE stream completion; it
+  publishes only when `ProxyState::finish_request` wins the active-request
+  transition. SSE usage is cached during chunks and published once at terminal
+  stream finalization instead of writing an early `request_completed` row.
 
 ## RSO-020 Scheduler Runtime Snapshot
 

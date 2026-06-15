@@ -4,10 +4,11 @@ use crate::logging::{
     CodexBridgeLog, HeaderEntry, HttpDebugLog, RetryInfo, RouteAttemptLog, ServiceTierLog,
     log_request_with_debug, should_include_http_warn,
 };
-use crate::state::{FinishRequestParams, SessionIdentitySource};
+use crate::state::SessionIdentitySource;
 
 use super::ProxyService;
 use super::failure_summary::failed_proxy_client_message;
+use super::request_observer::{RequestObserver, RequestPublication};
 
 const EMPTY_TARGET_URL: &str = "-";
 const CLIENT_BODY_READ_ERROR_HINT: &str =
@@ -129,46 +130,32 @@ pub(super) async fn finish_failed_proxy_request(
         &failure_route_attempts,
     );
 
-    proxy
-        .state
-        .finish_request(FinishRequestParams {
-            id: request_id,
+    RequestObserver::new(proxy, method, path)
+        .publish_terminal_once(RequestPublication {
+            request_id,
             status_code: status.as_u16(),
             duration_ms,
             ended_at_ms: started_at_ms + duration_ms,
-            observed_service_tier: None,
-            usage: None,
-            retry: retry.clone(),
             ttfb_ms: None,
+            station_name: None,
+            provider_id: None,
+            endpoint_id: None,
+            provider_endpoint_key: None,
+            upstream_base_url: EMPTY_TARGET_URL.to_string(),
+            session_id,
+            session_identity_source,
+            cwd,
+            model: None,
+            reasoning_effort: effective_effort,
+            service_tier,
+            codex_bridge,
+            usage: None,
+            route_decision: None,
+            retry,
+            http_debug: None,
             streaming: false,
         })
         .await;
-
-    log_request_with_debug(
-        Some(request_id),
-        proxy.service_name,
-        method.as_str(),
-        path,
-        status.as_u16(),
-        duration_ms,
-        None,
-        None,
-        None,
-        None,
-        None,
-        EMPTY_TARGET_URL,
-        session_id,
-        session_identity_source,
-        cwd,
-        None,
-        effective_effort,
-        service_tier,
-        codex_bridge,
-        None,
-        None,
-        retry,
-        None,
-    );
 
     (status, client_message)
 }
