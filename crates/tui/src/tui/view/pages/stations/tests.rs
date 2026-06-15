@@ -174,7 +174,7 @@ fn runtime_candidate_includes_capacity_surface() {
     };
 
     let text = format_runtime_candidate(&candidate);
-    assert!(text.contains("capacity=active=1/2,group=shared"));
+    assert!(text.contains("capacity=active=1/2,group=shared,inherited"));
     assert!(text.contains("availability=available"));
 }
 

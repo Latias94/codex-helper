@@ -365,7 +365,7 @@ fn format_runtime_candidate(candidate: &crate::routing_explain::RoutingExplainCa
         candidate.endpoint_id,
         compatibility,
         candidate.availability.summary(),
-        format_runtime_capacity(&candidate.capacity),
+        candidate.capacity.compact_runtime_label(),
         format_runtime_skip_reasons(&candidate.skip_reasons)
     )
 }
@@ -408,29 +408,6 @@ fn format_runtime_skip_reason(reason: &crate::routing_explain::RoutingExplainSki
             _ => reason.code().to_string(),
         },
         _ => reason.code().to_string(),
-    }
-}
-
-fn format_runtime_capacity(capacity: &crate::dashboard_core::ProviderCapacity) -> String {
-    if capacity.is_empty() {
-        return "capacity=-".to_string();
-    }
-    let mut parts = Vec::new();
-    match (capacity.active, capacity.limit) {
-        (Some(active), Some(limit)) => parts.push(format!("active={active}/{limit}")),
-        (None, Some(limit)) => parts.push(format!("limit={limit}")),
-        _ => {}
-    }
-    if let Some(group) = capacity.effective_limit_group.as_deref() {
-        parts.push(format!("group={group}"));
-    }
-    if capacity.saturated {
-        parts.push("saturated".to_string());
-    }
-    if parts.is_empty() {
-        "capacity=-".to_string()
-    } else {
-        format!("capacity={}", parts.join(","))
     }
 }
 

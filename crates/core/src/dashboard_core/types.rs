@@ -318,11 +318,52 @@ impl ProviderCapacity {
     pub fn is_empty(&self) -> bool {
         self == &Self::default()
     }
+
+    pub fn runtime_label(&self) -> Option<String> {
+        self.capacity_parts(" ", true)
+            .map(|parts| format!("capacity {parts}"))
+    }
+
+    pub fn compact_runtime_label(&self) -> String {
+        self.capacity_parts(",", false)
+            .map(|parts| format!("capacity={parts}"))
+            .unwrap_or_else(|| "capacity=-".to_string())
+    }
+
+    fn capacity_parts(&self, separator: &str, include_configured: bool) -> Option<String> {
+        if self.is_empty() {
+            return None;
+        }
+        let mut parts = Vec::new();
+        match (self.active, self.limit) {
+            (Some(active), Some(limit)) => parts.push(format!("active={active}/{limit}")),
+            (None, Some(limit)) => parts.push(format!("limit={limit}")),
+            _ => {}
+        }
+        if include_configured && let Some(configured) = self.configured_max_concurrent_requests {
+            parts.push(format!("configured={configured}"));
+        }
+        if let Some(group) = self
+            .effective_limit_group
+            .as_deref()
+            .map(str::trim)
+            .filter(|group| !group.is_empty())
+        {
+            parts.push(format!("group={group}"));
+        }
+        if self.inherited_from_provider == Some(true) {
+            parts.push("inherited".to_string());
+        }
+        if self.saturated {
+            parts.push("saturated".to_string());
+        }
+        (!parts.is_empty()).then(|| parts.join(separator))
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ControlPlaneSurfaceCapabilities;
+    use super::{ControlPlaneSurfaceCapabilities, ProviderCapacity};
 
     #[test]
     fn control_plane_surface_capabilities_serializes_station_persisted_settings() {
@@ -333,5 +374,48 @@ mod tests {
 
         let value = serde_json::to_value(caps).expect("serialize capabilities");
         assert_eq!(value["station_persisted_settings"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn provider_capacity_runtime_label_reports_configured_inherited_and_saturated_state() {
+        let capacity = ProviderCapacity {
+            configured_max_concurrent_requests: Some(3),
+            configured_limit_group: Some("relay".to_string()),
+            effective_max_concurrent_requests: Some(3),
+            effective_limit_group: Some("relay".to_string()),
+            active: Some(3),
+            limit: Some(3),
+            limit_key: Some("codex/relay".to_string()),
+            saturated: true,
+            inherited_from_provider: Some(true),
+        };
+
+        assert_eq!(
+            capacity.runtime_label().as_deref(),
+            Some("capacity active=3/3 configured=3 group=relay inherited saturated")
+        );
+    }
+
+    #[test]
+    fn provider_capacity_compact_runtime_label_keeps_route_preview_shape() {
+        let capacity = ProviderCapacity {
+            effective_max_concurrent_requests: Some(2),
+            effective_limit_group: Some("shared".to_string()),
+            active: Some(1),
+            limit: Some(2),
+            limit_key: Some("codex/shared".to_string()),
+            inherited_from_provider: Some(true),
+            ..ProviderCapacity::default()
+        };
+
+        assert_eq!(
+            capacity.compact_runtime_label(),
+            "capacity=active=1/2,group=shared,inherited"
+        );
+        assert_eq!(
+            ProviderCapacity::default().compact_runtime_label(),
+            "capacity=-"
+        );
+        assert_eq!(ProviderCapacity::default().runtime_label(), None);
     }
 }

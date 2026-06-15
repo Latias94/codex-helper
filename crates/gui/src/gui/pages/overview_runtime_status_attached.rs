@@ -161,7 +161,7 @@ fn render_attached_provider_runtime_section(
                 ui.group(|ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(format_provider_display(provider));
-                        if let Some(capacity) = format_provider_capacity(&provider.capacity) {
+                        if let Some(capacity) = provider.capacity.runtime_label() {
                             ui.small(capacity);
                         }
                         ui.small(format!(
@@ -201,7 +201,7 @@ fn render_attached_provider_endpoint_row(
             endpoint.name.as_str(),
         ));
         ui.small(format!("base={}", shorten_middle(&endpoint.base_url, 56)));
-        if let Some(capacity) = format_provider_capacity(&endpoint.capacity) {
+        if let Some(capacity) = endpoint.capacity.runtime_label() {
             ui.small(capacity);
         }
         ui.small(format!(
@@ -367,35 +367,6 @@ fn format_attached_provider_endpoint_identity(provider_name: &str, endpoint_name
         .unwrap_or_else(|| format!("{provider_name}/{endpoint_name}"))
 }
 
-fn format_provider_capacity(capacity: &crate::dashboard_core::ProviderCapacity) -> Option<String> {
-    if capacity.is_empty() {
-        return None;
-    }
-    let mut parts = Vec::new();
-    match (capacity.active, capacity.limit) {
-        (Some(active), Some(limit)) => parts.push(format!("active={active}/{limit}")),
-        (None, Some(limit)) => parts.push(format!("limit={limit}")),
-        _ => {}
-    }
-    if let Some(configured) = capacity.configured_max_concurrent_requests {
-        parts.push(format!("configured={configured}"));
-    }
-    if let Some(group) = capacity
-        .effective_limit_group
-        .as_deref()
-        .filter(|group| !group.trim().is_empty())
-    {
-        parts.push(format!("group={group}"));
-    }
-    if capacity.inherited_from_provider == Some(true) {
-        parts.push("inherited".to_string());
-    }
-    if capacity.saturated {
-        parts.push("saturated".to_string());
-    }
-    (!parts.is_empty()).then(|| format!("capacity {}", parts.join(" ")))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,7 +381,7 @@ mod tests {
 
     #[test]
     fn format_provider_capacity_reports_active_limit_group_and_saturation() {
-        let text = format_provider_capacity(&crate::dashboard_core::ProviderCapacity {
+        let text = crate::dashboard_core::ProviderCapacity {
             configured_max_concurrent_requests: Some(3),
             configured_limit_group: Some("relay".to_string()),
             effective_max_concurrent_requests: Some(3),
@@ -420,7 +391,8 @@ mod tests {
             limit_key: Some("codex/relay".to_string()),
             saturated: true,
             inherited_from_provider: Some(true),
-        })
+        }
+        .runtime_label()
         .expect("capacity text");
 
         assert!(text.contains("active=3/3"));
