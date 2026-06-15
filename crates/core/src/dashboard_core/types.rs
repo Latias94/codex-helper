@@ -271,6 +271,8 @@ pub struct ProviderEndpointOption {
     pub runtime_state: RuntimeConfigState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_state_override: Option<RuntimeConfigState>,
+    #[serde(default, skip_serializing_if = "ProviderCapacity::is_empty")]
+    pub capacity: ProviderCapacity,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -286,6 +288,36 @@ pub struct ProviderOption {
     pub routable_endpoints: usize,
     #[serde(default)]
     pub endpoints: Vec<ProviderEndpointOption>,
+    #[serde(default, skip_serializing_if = "ProviderCapacity::is_empty")]
+    pub capacity: ProviderCapacity,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ProviderCapacity {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_max_concurrent_requests: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_limit_group: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_max_concurrent_requests: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_limit_group: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_key: Option<String>,
+    #[serde(default)]
+    pub saturated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherited_from_provider: Option<bool>,
+}
+
+impl ProviderCapacity {
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 #[cfg(test)]

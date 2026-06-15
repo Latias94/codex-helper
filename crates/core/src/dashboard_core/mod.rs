@@ -23,8 +23,8 @@ pub use station_options::{
 };
 pub use types::{
     ApiV1Capabilities, CapabilitySupport, ControlPlaneSurfaceCapabilities, ControlProfileOption,
-    HostLocalControlPlaneCapabilities, ModelCatalogKind, ProviderEndpointOption, ProviderOption,
-    RemoteAdminAccessCapabilities, RuntimeProviderOption, RuntimeUpstreamOption,
+    HostLocalControlPlaneCapabilities, ModelCatalogKind, ProviderCapacity, ProviderEndpointOption,
+    ProviderOption, RemoteAdminAccessCapabilities, RuntimeProviderOption, RuntimeUpstreamOption,
     SharedControlPlaneCapabilities, StationCapabilitySummary, StationOption,
 };
 pub use window_stats::WindowStats;

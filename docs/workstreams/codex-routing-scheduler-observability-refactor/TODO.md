@@ -48,7 +48,7 @@
 
 ## RSO-050 Operator Capacity Surface
 
-- Status: proposed
+- Status: completed
 - Owner: main
 - Scope: routing explain, admin provider/endpoint summaries, TUI/GUI provider
   views.
@@ -57,6 +57,14 @@
 - Validation: route explain and UI formatting tests render
   `concurrency_saturated(active=N/limit=M)` and configured/effective limit
   fields.
+- Handoff: `ProviderCapacity` now backs `/providers`, operator summary provider
+  payloads, and routing explain candidates. GUI attached provider runtime shows
+  provider/endpoint capacity, while TUI and GUI routing previews show candidate
+  active/limit/group/saturation from routing explain. Provider rows only
+  aggregate active/limit when there is a single endpoint or all endpoints share
+  the same limit group and effective limit; otherwise endpoint rows remain the
+  authoritative view. Cooldown reason and retry-after source stay assigned to
+  RSO-020/RSO-030 so they flow through the unified runtime/outcome model.
 
 ## RSO-060 Cleanup And Documentation
 

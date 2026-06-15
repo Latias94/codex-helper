@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::config::{RoutingAffinityPolicyV5, RoutingConditionV4};
+use crate::dashboard_core::ProviderCapacity;
 use crate::routing_ir::{
     RouteCandidate, RoutePlanAttemptState, RoutePlanExecutor, RoutePlanRuntimeState,
     RoutePlanSkipReason, RoutePlanTemplate, RouteRef, RouteRequestContext,
@@ -115,6 +116,8 @@ pub struct RoutingExplainCandidate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compatibility: Option<RoutingExplainCompatibility>,
     pub upstream_base_url: String,
+    #[serde(default, skip_serializing_if = "ProviderCapacity::is_empty")]
+    pub capacity: ProviderCapacity,
     pub selected: bool,
     pub skip_reasons: Vec<RoutingExplainSkipReason>,
 }
@@ -187,6 +190,7 @@ pub fn build_routing_explain_response_with_request(
     template: &RoutePlanTemplate,
     runtime: &RoutePlanRuntimeState,
 ) -> RoutingExplainResponse {
+    let service_name = service_name.into();
     let executor = RoutePlanExecutor::new(template);
     let mut state = RoutePlanAttemptState::default();
     let selection = executor.select_supported_candidate_with_runtime_state(
@@ -222,6 +226,8 @@ pub fn build_routing_explain_response_with_request(
             routing_explain_candidate(
                 template,
                 candidate,
+                runtime.provider_endpoint(&template.candidate_provider_endpoint_key(candidate)),
+                service_name.as_str(),
                 selected_key.as_deref() == Some(key.as_str()),
                 skip_reasons_by_candidate
                     .get(&key)
@@ -237,7 +243,7 @@ pub fn build_routing_explain_response_with_request(
 
     RoutingExplainResponse {
         api_version: 1,
-        service_name: service_name.into(),
+        service_name,
         runtime_loaded_at_ms,
         request_model: request.model.clone(),
         session_id,
@@ -329,12 +335,13 @@ impl RoutingExplainSkipReason {
 fn routing_explain_candidate(
     template: &RoutePlanTemplate,
     candidate: &RouteCandidate,
+    runtime_state: crate::routing_ir::RoutePlanUpstreamRuntimeState,
+    service_name: &str,
     selected: bool,
     skip_reasons: Vec<RoutingExplainSkipReason>,
 ) -> RoutingExplainCandidate {
-    let provider_endpoint_key = template
-        .candidate_provider_endpoint_key(candidate)
-        .stable_key();
+    let provider_endpoint = template.candidate_provider_endpoint_key(candidate);
+    let provider_endpoint_key = provider_endpoint.stable_key();
     let compatibility = candidate
         .compatibility_station_name
         .as_ref()
@@ -355,8 +362,38 @@ fn routing_explain_candidate(
         preference_group: candidate.preference_group,
         compatibility,
         upstream_base_url: candidate.base_url.clone(),
+        capacity: routing_explain_candidate_capacity(
+            candidate,
+            runtime_state,
+            service_name,
+            &provider_endpoint,
+        ),
         selected,
         skip_reasons,
+    }
+}
+
+fn routing_explain_candidate_capacity(
+    candidate: &RouteCandidate,
+    runtime_state: crate::routing_ir::RoutePlanUpstreamRuntimeState,
+    service_name: &str,
+    provider_endpoint: &crate::runtime_identity::ProviderEndpointKey,
+) -> ProviderCapacity {
+    let limit_key = candidate
+        .concurrency
+        .limit_key(service_name, provider_endpoint);
+    ProviderCapacity {
+        configured_max_concurrent_requests: None,
+        configured_limit_group: None,
+        effective_max_concurrent_requests: candidate.concurrency.max_concurrent_requests,
+        effective_limit_group: candidate.concurrency.limit_group.clone(),
+        active: runtime_state.concurrency_active,
+        limit: runtime_state
+            .concurrency_limit
+            .or(candidate.concurrency.max_concurrent_requests),
+        limit_key,
+        saturated: runtime_state.concurrency_saturated,
+        inherited_from_provider: None,
     }
 }
 

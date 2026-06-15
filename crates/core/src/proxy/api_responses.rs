@@ -4,17 +4,16 @@ use crate::dashboard_core::{
     HostLocalControlPlaneCapabilities, OperatorProfileSummary, OperatorRetrySummary,
     OperatorRuntimeSummary, OperatorSummaryCounts, RemoteAdminAccessCapabilities,
     SharedControlPlaneCapabilities, build_operator_health_summary, build_profile_options_from_mgr,
-    build_provider_options_from_view, build_station_options_from_mgr,
-    summarize_recent_retry_observations,
+    build_station_options_from_mgr, summarize_recent_retry_observations,
 };
 use crate::state::{SessionIdentityCardBuildInputs, build_session_identity_cards_from_parts};
 
 use super::ProxyService;
 use super::control_plane_manifest::api_v1_operator_summary_links;
-use super::control_plane_service::{load_persisted_proxy_settings_v2, service_view_v2};
 use super::profile_defaults::{
     configured_active_station_name, effective_active_station_name, effective_default_profile_name,
 };
+use super::providers_api::build_provider_options_for_proxy;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProfilesResponse {
@@ -77,7 +76,6 @@ pub(super) async fn build_operator_summary(
         default_profile,
         station_meta_overrides,
         station_state_overrides,
-        provider_upstream_overrides,
         station_health,
         health_checks,
         lb_view,
@@ -98,7 +96,6 @@ pub(super) async fn build_operator_summary(
         proxy
             .state
             .get_station_runtime_state_overrides(proxy.service_name),
-        proxy.state.get_upstream_meta_overrides(proxy.service_name),
         proxy.state.get_station_health(proxy.service_name),
         proxy.state.list_health_checks(proxy.service_name),
         proxy.state.get_lb_view(),
@@ -132,16 +129,8 @@ pub(super) async fn build_operator_summary(
     let profiles = build_profile_options_from_mgr(mgr, default_profile.as_deref());
     let health =
         build_operator_health_summary(&stations, &station_health, &health_checks, &lb_view);
-    let providers = load_persisted_proxy_settings_v2()
+    let providers = build_provider_options_for_proxy(proxy)
         .await
-        .ok()
-        .map(|persisted_cfg| {
-            build_provider_options_from_view(
-                proxy.service_name,
-                service_view_v2(&persisted_cfg, proxy.service_name),
-                &provider_upstream_overrides,
-            )
-        })
         .unwrap_or_default();
     let retry_observations = summarize_recent_retry_observations(&recent);
 

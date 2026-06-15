@@ -883,6 +883,10 @@ async fn proxy_api_v1_provider_runtime_override_filters_v4_route_plan_routing() 
             providers: BTreeMap::from([(
                 "alpha".to_string(),
                 ProviderConfigV4 {
+                    limits: ProviderConcurrencyLimits {
+                        max_concurrent_requests: Some(2),
+                        limit_group: Some("shared-alpha".to_string()),
+                    },
                     endpoints: BTreeMap::from([
                         (
                             "default".to_string(),
@@ -907,7 +911,10 @@ async fn proxy_api_v1_provider_runtime_override_filters_v4_route_plan_routing() 
                                 tags: BTreeMap::new(),
                                 supported_models: BTreeMap::new(),
                                 model_mapping: BTreeMap::new(),
-                                limits: ProviderConcurrencyLimits::default(),
+                                limits: ProviderConcurrencyLimits {
+                                    max_concurrent_requests: Some(3),
+                                    limit_group: Some("shared-alpha".to_string()),
+                                },
                             },
                         ),
                     ]),
@@ -977,6 +984,18 @@ async fn proxy_api_v1_provider_runtime_override_filters_v4_route_plan_routing() 
         .and_then(|value| value.as_str())
         .expect("provider name")
         .to_string();
+    assert_eq!(
+        initial_provider_surface[0]["capacity"]["configured_max_concurrent_requests"].as_u64(),
+        Some(2)
+    );
+    assert_eq!(
+        initial_provider_surface[0]["capacity"]["effective_max_concurrent_requests"].as_u64(),
+        Some(2)
+    );
+    assert_eq!(
+        initial_provider_surface[0]["capacity"]["configured_limit_group"].as_str(),
+        Some("shared-alpha")
+    );
     let default_base_url = format!("http://{default_addr}/v1");
     let default_endpoint_name = initial_provider_surface[0]["endpoints"]
         .as_array()
@@ -990,6 +1009,47 @@ async fn proxy_api_v1_provider_runtime_override_filters_v4_route_plan_routing() 
         })
         .expect("default endpoint name")
         .to_string();
+    let default_endpoint = initial_provider_surface[0]["endpoints"]
+        .as_array()
+        .and_then(|endpoints| {
+            endpoints.iter().find(|endpoint| {
+                endpoint.get("base_url").and_then(|value| value.as_str())
+                    == Some(default_base_url.as_str())
+            })
+        })
+        .expect("default endpoint");
+    assert_eq!(
+        default_endpoint["capacity"]["configured_max_concurrent_requests"].as_u64(),
+        None
+    );
+    assert_eq!(
+        default_endpoint["capacity"]["effective_max_concurrent_requests"].as_u64(),
+        Some(2)
+    );
+    assert_eq!(
+        default_endpoint["capacity"]["inherited_from_provider"].as_bool(),
+        Some(true)
+    );
+    let backup_endpoint = initial_provider_surface[0]["endpoints"]
+        .as_array()
+        .and_then(|endpoints| {
+            endpoints.iter().find(|endpoint| {
+                endpoint.get("name").and_then(|value| value.as_str()) == Some("backup")
+            })
+        })
+        .expect("backup endpoint");
+    assert_eq!(
+        backup_endpoint["capacity"]["configured_max_concurrent_requests"].as_u64(),
+        Some(3)
+    );
+    assert_eq!(
+        backup_endpoint["capacity"]["effective_max_concurrent_requests"].as_u64(),
+        Some(3)
+    );
+    assert_eq!(
+        backup_endpoint["capacity"]["inherited_from_provider"].as_bool(),
+        Some(false)
+    );
 
     let update = client
         .post(format!(
@@ -1025,6 +1085,14 @@ async fn proxy_api_v1_provider_runtime_override_filters_v4_route_plan_routing() 
     assert_eq!(
         explain["candidates"][0]["skip_reasons"][0]["code"].as_str(),
         Some("runtime_disabled")
+    );
+    assert_eq!(
+        explain["candidates"][0]["capacity"]["effective_max_concurrent_requests"].as_u64(),
+        Some(2)
+    );
+    assert_eq!(
+        explain["candidates"][0]["capacity"]["limit"].as_u64(),
+        Some(2)
     );
 
     let after = client

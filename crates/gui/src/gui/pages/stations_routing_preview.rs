@@ -401,11 +401,12 @@ fn format_runtime_candidate(candidate: &crate::routing_explain::RoutingExplainCa
     let marker = if candidate.selected { "*" } else { " " };
     let compatibility = format_runtime_compatibility(candidate.compatibility.as_ref());
     format!(
-        "{} {} endpoint={} path={} skip={} {}",
+        "{} {} endpoint={} path={} {} skip={} {}",
         marker,
         candidate.provider_id,
         candidate.endpoint_id,
         candidate.route_path.join(" > "),
+        format_runtime_capacity(&candidate.capacity),
         format_runtime_skip_reasons(&candidate.skip_reasons),
         compatibility
     )
@@ -449,6 +450,29 @@ fn format_runtime_skip_reason(reason: &crate::routing_explain::RoutingExplainSki
             _ => reason.code().to_string(),
         },
         _ => reason.code().to_string(),
+    }
+}
+
+fn format_runtime_capacity(capacity: &crate::dashboard_core::ProviderCapacity) -> String {
+    if capacity.is_empty() {
+        return "capacity=-".to_string();
+    }
+    let mut parts = Vec::new();
+    match (capacity.active, capacity.limit) {
+        (Some(active), Some(limit)) => parts.push(format!("active={active}/{limit}")),
+        (None, Some(limit)) => parts.push(format!("limit={limit}")),
+        _ => {}
+    }
+    if let Some(group) = capacity.effective_limit_group.as_deref() {
+        parts.push(format!("group={group}"));
+    }
+    if capacity.saturated {
+        parts.push("saturated".to_string());
+    }
+    if parts.is_empty() {
+        "capacity=-".to_string()
+    } else {
+        format!("capacity={}", parts.join(","))
     }
 }
 
@@ -501,6 +525,36 @@ mod tests {
         ]);
 
         assert_eq!(text, "concurrency_saturated(active=5/limit=5),missing_auth");
+    }
+
+    #[test]
+    fn runtime_candidate_includes_capacity_surface() {
+        let candidate = crate::routing_explain::RoutingExplainCandidate {
+            provider_id: "alpha".to_string(),
+            provider_alias: None,
+            endpoint_id: "default".to_string(),
+            provider_endpoint_key: "codex/alpha/default".to_string(),
+            route_path: vec!["alpha".to_string()],
+            preference_group: 0,
+            compatibility: None,
+            upstream_base_url: "https://example.invalid/v1".to_string(),
+            capacity: crate::dashboard_core::ProviderCapacity {
+                configured_max_concurrent_requests: None,
+                configured_limit_group: None,
+                effective_max_concurrent_requests: Some(2),
+                effective_limit_group: Some("shared".to_string()),
+                active: Some(1),
+                limit: Some(2),
+                limit_key: Some("codex/shared".to_string()),
+                saturated: false,
+                inherited_from_provider: Some(true),
+            },
+            selected: false,
+            skip_reasons: vec![],
+        };
+
+        let text = format_runtime_candidate(&candidate);
+        assert!(text.contains("capacity=active=1/2,group=shared"));
     }
 
     #[test]

@@ -221,6 +221,7 @@ pub fn build_provider_options_from_view(
                     .filter(|endpoint| endpoint.routable)
                     .count(),
                 endpoints,
+                capacity: Default::default(),
             }
         })
         .collect::<Vec<_>>();
@@ -305,6 +306,7 @@ fn build_provider_endpoint_option(
         runtime_enabled_override,
         runtime_state,
         runtime_state_override,
+        capacity: Default::default(),
     }
 }
 

@@ -138,6 +138,36 @@ fn runtime_skip_reasons_include_concurrency_counts() {
 }
 
 #[test]
+fn runtime_candidate_includes_capacity_surface() {
+    let candidate = crate::routing_explain::RoutingExplainCandidate {
+        provider_id: "alpha".to_string(),
+        provider_alias: None,
+        endpoint_id: "default".to_string(),
+        provider_endpoint_key: "codex/alpha/default".to_string(),
+        route_path: vec!["alpha".to_string()],
+        preference_group: 0,
+        compatibility: None,
+        upstream_base_url: "https://example.invalid/v1".to_string(),
+        capacity: crate::dashboard_core::ProviderCapacity {
+            configured_max_concurrent_requests: None,
+            configured_limit_group: None,
+            effective_max_concurrent_requests: Some(2),
+            effective_limit_group: Some("shared".to_string()),
+            active: Some(1),
+            limit: Some(2),
+            limit_key: Some("codex/shared".to_string()),
+            saturated: false,
+            inherited_from_provider: Some(true),
+        },
+        selected: false,
+        skip_reasons: vec![],
+    };
+
+    let text = format_runtime_candidate(&candidate);
+    assert!(text.contains("capacity=active=1/2,group=shared"));
+}
+
+#[test]
 fn station_routing_preview_sorts_multi_level_and_active_tiebreak() {
     let providers = vec![
         provider("alpha", true, 2, false, 1),
