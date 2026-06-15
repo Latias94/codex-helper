@@ -126,7 +126,7 @@ fn station_routing_preview_uses_single_level_fallback_order() {
 
 #[test]
 fn runtime_skip_reasons_include_concurrency_counts() {
-    let text = format_runtime_skip_reasons(&[
+    let text = crate::routing_explain::format_skip_reasons_compact(&[
         crate::routing_explain::RoutingExplainSkipReason::ConcurrencySaturated {
             active: Some(5),
             limit: Some(5),

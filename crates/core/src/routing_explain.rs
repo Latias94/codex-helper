@@ -401,6 +401,27 @@ impl RoutingExplainSkipReason {
             RoutingExplainSkipReason::ConcurrencySaturated { .. } => "concurrency_saturated",
         }
     }
+
+    pub fn compact_label(&self) -> String {
+        match self {
+            RoutingExplainSkipReason::ConcurrencySaturated {
+                active: Some(active),
+                limit: Some(limit),
+            } => format!("concurrency_saturated(active={active}/limit={limit})"),
+            _ => self.code().to_string(),
+        }
+    }
+}
+
+pub fn format_skip_reasons_compact(reasons: &[RoutingExplainSkipReason]) -> String {
+    if reasons.is_empty() {
+        return "-".to_string();
+    }
+    reasons
+        .iter()
+        .map(RoutingExplainSkipReason::compact_label)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn routing_explain_candidate(
@@ -574,6 +595,35 @@ mod tests {
             inline_auth: UpstreamAuth::default(),
             ..ProviderConfigV4::default()
         }
+    }
+
+    #[test]
+    fn format_skip_reasons_compact_includes_concurrency_counts() {
+        let reasons = [
+            RoutingExplainSkipReason::ConcurrencySaturated {
+                active: Some(5),
+                limit: Some(5),
+            },
+            RoutingExplainSkipReason::MissingAuth,
+        ];
+
+        assert_eq!(
+            format_skip_reasons_compact(&reasons),
+            "concurrency_saturated(active=5/limit=5),missing_auth"
+        );
+    }
+
+    #[test]
+    fn format_skip_reasons_compact_falls_back_to_code() {
+        assert_eq!(format_skip_reasons_compact(&[]), "-");
+        assert_eq!(
+            RoutingExplainSkipReason::ConcurrencySaturated {
+                active: None,
+                limit: Some(5),
+            }
+            .compact_label(),
+            "concurrency_saturated"
+        );
     }
 
     #[test]

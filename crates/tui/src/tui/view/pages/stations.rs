@@ -366,7 +366,7 @@ fn format_runtime_candidate(candidate: &crate::routing_explain::RoutingExplainCa
         compatibility,
         candidate.availability.summary(),
         candidate.capacity.compact_runtime_label(),
-        format_runtime_skip_reasons(&candidate.skip_reasons)
+        crate::routing_explain::format_skip_reasons_compact(&candidate.skip_reasons)
     )
 }
 
@@ -381,34 +381,6 @@ fn format_runtime_compatibility(
             )
         })
         .unwrap_or_else(|| "compatibility=-".to_string())
-}
-
-fn format_runtime_skip_reasons(
-    reasons: &[crate::routing_explain::RoutingExplainSkipReason],
-) -> String {
-    if reasons.is_empty() {
-        return "-".to_string();
-    }
-    reasons
-        .iter()
-        .map(format_runtime_skip_reason)
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-fn format_runtime_skip_reason(reason: &crate::routing_explain::RoutingExplainSkipReason) -> String {
-    match reason {
-        crate::routing_explain::RoutingExplainSkipReason::ConcurrencySaturated {
-            active,
-            limit,
-        } => match (active, limit) {
-            (Some(active), Some(limit)) => {
-                format!("concurrency_saturated(active={active}/limit={limit})")
-            }
-            _ => reason.code().to_string(),
-        },
-        _ => reason.code().to_string(),
-    }
 }
 
 pub(super) fn render_stations_page(
