@@ -342,7 +342,9 @@ fn format_runtime_selected_route(
 ) -> String {
     match explain.selected_route.as_ref() {
         Some(selected) => {
-            let compatibility = format_runtime_compatibility(selected.compatibility.as_ref());
+            let compatibility = crate::routing_explain::format_compatibility_compact(
+                selected.compatibility.as_ref(),
+            );
             format!(
                 "selected={} endpoint={} {} path={}",
                 selected.provider_id,
@@ -356,31 +358,7 @@ fn format_runtime_selected_route(
 }
 
 fn format_runtime_candidate(candidate: &crate::routing_explain::RoutingExplainCandidate) -> String {
-    let marker = if candidate.selected { "*" } else { " " };
-    let compatibility = format_runtime_compatibility(candidate.compatibility.as_ref());
-    format!(
-        "{} {} endpoint={} {} availability={} {} skip={}",
-        marker,
-        candidate.provider_id,
-        candidate.endpoint_id,
-        compatibility,
-        candidate.availability.summary(),
-        candidate.capacity.compact_runtime_label(),
-        crate::routing_explain::format_skip_reasons_compact(&candidate.skip_reasons)
-    )
-}
-
-fn format_runtime_compatibility(
-    compatibility: Option<&crate::routing_explain::RoutingExplainCompatibility>,
-) -> String {
-    compatibility
-        .map(|compatibility| {
-            format!(
-                "compat_station={} upstream#{}",
-                compatibility.station_name, compatibility.upstream_index
-            )
-        })
-        .unwrap_or_else(|| "compatibility=-".to_string())
+    candidate.compact_label()
 }
 
 pub(super) fn render_stations_page(

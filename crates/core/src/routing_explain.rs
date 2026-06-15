@@ -171,6 +171,15 @@ pub struct RoutingExplainCompatibility {
     pub upstream_index: usize,
 }
 
+impl RoutingExplainCompatibility {
+    pub fn compact_label(&self) -> String {
+        format!(
+            "compat_station={} upstream#{}",
+            self.station_name, self.upstream_index
+        )
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(tag = "code", rename_all = "snake_case")]
 pub enum RoutingExplainSkipReason {
@@ -424,6 +433,29 @@ pub fn format_skip_reasons_compact(reasons: &[RoutingExplainSkipReason]) -> Stri
         .join(",")
 }
 
+pub fn format_compatibility_compact(compatibility: Option<&RoutingExplainCompatibility>) -> String {
+    compatibility
+        .map(RoutingExplainCompatibility::compact_label)
+        .unwrap_or_else(|| "compatibility=-".to_string())
+}
+
+impl RoutingExplainCandidate {
+    pub fn compact_label(&self) -> String {
+        let marker = if self.selected { "*" } else { " " };
+        format!(
+            "{} {} endpoint={} path={} availability={} {} skip={} {}",
+            marker,
+            self.provider_id,
+            self.endpoint_id,
+            self.route_path.join(" > "),
+            self.availability.summary(),
+            self.capacity.compact_runtime_label(),
+            format_skip_reasons_compact(&self.skip_reasons),
+            format_compatibility_compact(self.compatibility.as_ref())
+        )
+    }
+}
+
 fn routing_explain_candidate(
     template: &RoutePlanTemplate,
     candidate: &RouteCandidate,
@@ -623,6 +655,49 @@ mod tests {
             }
             .compact_label(),
             "concurrency_saturated"
+        );
+    }
+
+    #[test]
+    fn routing_explain_candidate_compact_label_includes_route_runtime_and_compatibility() {
+        let candidate = RoutingExplainCandidate {
+            provider_id: "alpha".to_string(),
+            provider_alias: None,
+            endpoint_id: "default".to_string(),
+            provider_endpoint_key: "codex/alpha/default".to_string(),
+            route_path: vec!["root".to_string(), "alpha".to_string()],
+            preference_group: 0,
+            compatibility: Some(RoutingExplainCompatibility {
+                station_name: "alpha-station".to_string(),
+                upstream_index: 2,
+            }),
+            upstream_base_url: "https://example.invalid/v1".to_string(),
+            capacity: ProviderCapacity {
+                effective_max_concurrent_requests: Some(2),
+                effective_limit_group: Some("shared".to_string()),
+                active: Some(2),
+                limit: Some(2),
+                saturated: true,
+                ..ProviderCapacity::default()
+            },
+            availability: RoutingExplainAvailability {
+                available: false,
+                dominant_reason: Some(RoutingExplainSkipReason::ConcurrencySaturated {
+                    active: Some(2),
+                    limit: Some(2),
+                }),
+                ..RoutingExplainAvailability::default()
+            },
+            selected: true,
+            skip_reasons: vec![RoutingExplainSkipReason::ConcurrencySaturated {
+                active: Some(2),
+                limit: Some(2),
+            }],
+        };
+
+        assert_eq!(
+            candidate.compact_label(),
+            "* alpha endpoint=default path=root > alpha availability=unavailable(concurrency_saturated) capacity=active=2/2,group=shared,saturated skip=concurrency_saturated(active=2/limit=2) compat_station=alpha-station upstream#2"
         );
     }
 
