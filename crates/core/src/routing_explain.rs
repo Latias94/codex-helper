@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use crate::config::{RoutingAffinityPolicyV5, RoutingConditionV4};
 use crate::dashboard_core::ProviderCapacity;
 use crate::routing_ir::{
-    RouteCandidate, RoutePlanAttemptState, RoutePlanExecutor, RoutePlanRuntimeState,
-    RoutePlanSkipReason, RoutePlanTemplate, RouteRef, RouteRequestContext,
+    RouteCandidate, RoutePlanAttemptState, RoutePlanCandidateRuntimeSnapshot, RoutePlanExecutor,
+    RoutePlanRuntimeState, RoutePlanSkipReason, RoutePlanTemplate, RouteRef, RouteRequestContext,
     request_matches_condition,
 };
 
@@ -118,8 +118,37 @@ pub struct RoutingExplainCandidate {
     pub upstream_base_url: String,
     #[serde(default, skip_serializing_if = "ProviderCapacity::is_empty")]
     pub capacity: ProviderCapacity,
+    #[serde(default)]
+    pub availability: RoutingExplainAvailability,
     pub selected: bool,
     pub skip_reasons: Vec<RoutingExplainSkipReason>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RoutingExplainAvailability {
+    pub available: bool,
+    pub runtime_available: bool,
+    pub routable_except_usage: bool,
+    pub hard_unavailable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dominant_reason: Option<RoutingExplainSkipReason>,
+    pub runtime_disabled: bool,
+    pub cooldown_active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown_remaining_secs: Option<u64>,
+    pub breaker_open: bool,
+    pub failure_count: u32,
+    pub usage_exhausted: bool,
+    pub missing_auth: bool,
+    pub concurrency_saturated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency_active: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency_limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_max_concurrent_requests: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_limit_group: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -226,7 +255,7 @@ pub fn build_routing_explain_response_with_request(
             routing_explain_candidate(
                 template,
                 candidate,
-                runtime.provider_endpoint(&template.candidate_provider_endpoint_key(candidate)),
+                runtime.candidate_runtime_snapshot(template, candidate),
                 service_name.as_str(),
                 selected_key.as_deref() == Some(key.as_str()),
                 skip_reasons_by_candidate
@@ -318,6 +347,48 @@ impl From<&RoutePlanSkipReason> for RoutingExplainSkipReason {
     }
 }
 
+impl RoutingExplainAvailability {
+    fn from_snapshot(
+        snapshot: &RoutePlanCandidateRuntimeSnapshot,
+        skip_reasons: &[RoutingExplainSkipReason],
+    ) -> Self {
+        let unsupported_model = skip_reasons
+            .iter()
+            .any(|reason| matches!(reason, RoutingExplainSkipReason::UnsupportedModel { .. }));
+        Self {
+            available: snapshot.runtime_available && !unsupported_model,
+            runtime_available: snapshot.runtime_available,
+            routable_except_usage: snapshot.routable_except_usage,
+            hard_unavailable: snapshot.hard_unavailable,
+            dominant_reason: skip_reasons.first().cloned(),
+            runtime_disabled: snapshot.runtime_disabled,
+            cooldown_active: snapshot.cooldown_active,
+            cooldown_remaining_secs: snapshot.cooldown_remaining_secs,
+            breaker_open: snapshot.breaker_open,
+            failure_count: snapshot.failure_count,
+            usage_exhausted: snapshot.usage_exhausted,
+            missing_auth: snapshot.missing_auth,
+            concurrency_saturated: snapshot.concurrency_saturated,
+            concurrency_active: snapshot.concurrency_active,
+            concurrency_limit: snapshot.concurrency_limit,
+            effective_max_concurrent_requests: snapshot.effective_max_concurrent_requests,
+            effective_limit_group: snapshot.effective_limit_group.clone(),
+        }
+    }
+
+    pub fn summary(&self) -> String {
+        if self.available {
+            return "available".to_string();
+        }
+        let reason = self
+            .dominant_reason
+            .as_ref()
+            .map(RoutingExplainSkipReason::code)
+            .unwrap_or("unknown");
+        format!("unavailable({reason})")
+    }
+}
+
 impl RoutingExplainSkipReason {
     pub fn code(&self) -> &'static str {
         match self {
@@ -335,7 +406,7 @@ impl RoutingExplainSkipReason {
 fn routing_explain_candidate(
     template: &RoutePlanTemplate,
     candidate: &RouteCandidate,
-    runtime_state: crate::routing_ir::RoutePlanUpstreamRuntimeState,
+    runtime_snapshot: RoutePlanCandidateRuntimeSnapshot,
     service_name: &str,
     selected: bool,
     skip_reasons: Vec<RoutingExplainSkipReason>,
@@ -364,10 +435,11 @@ fn routing_explain_candidate(
         upstream_base_url: candidate.base_url.clone(),
         capacity: routing_explain_candidate_capacity(
             candidate,
-            runtime_state,
+            &runtime_snapshot,
             service_name,
             &provider_endpoint,
         ),
+        availability: RoutingExplainAvailability::from_snapshot(&runtime_snapshot, &skip_reasons),
         selected,
         skip_reasons,
     }
@@ -375,7 +447,7 @@ fn routing_explain_candidate(
 
 fn routing_explain_candidate_capacity(
     candidate: &RouteCandidate,
-    runtime_state: crate::routing_ir::RoutePlanUpstreamRuntimeState,
+    runtime_snapshot: &RoutePlanCandidateRuntimeSnapshot,
     service_name: &str,
     provider_endpoint: &crate::runtime_identity::ProviderEndpointKey,
 ) -> ProviderCapacity {
@@ -385,14 +457,14 @@ fn routing_explain_candidate_capacity(
     ProviderCapacity {
         configured_max_concurrent_requests: None,
         configured_limit_group: None,
-        effective_max_concurrent_requests: candidate.concurrency.max_concurrent_requests,
-        effective_limit_group: candidate.concurrency.limit_group.clone(),
-        active: runtime_state.concurrency_active,
-        limit: runtime_state
+        effective_max_concurrent_requests: runtime_snapshot.effective_max_concurrent_requests,
+        effective_limit_group: runtime_snapshot.effective_limit_group.clone(),
+        active: runtime_snapshot.concurrency_active,
+        limit: runtime_snapshot
             .concurrency_limit
-            .or(candidate.concurrency.max_concurrent_requests),
+            .or(runtime_snapshot.effective_max_concurrent_requests),
         limit_key,
-        saturated: runtime_state.concurrency_saturated,
+        saturated: runtime_snapshot.concurrency_saturated,
         inherited_from_provider: None,
     }
 }

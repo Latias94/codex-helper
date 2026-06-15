@@ -359,11 +359,12 @@ fn format_runtime_candidate(candidate: &crate::routing_explain::RoutingExplainCa
     let marker = if candidate.selected { "*" } else { " " };
     let compatibility = format_runtime_compatibility(candidate.compatibility.as_ref());
     format!(
-        "{} {} endpoint={} {} {} skip={}",
+        "{} {} endpoint={} {} availability={} {} skip={}",
         marker,
         candidate.provider_id,
         candidate.endpoint_id,
         compatibility,
+        candidate.availability.summary(),
         format_runtime_capacity(&candidate.capacity),
         format_runtime_skip_reasons(&candidate.skip_reasons)
     )

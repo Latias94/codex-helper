@@ -168,6 +168,12 @@ mod tests {
                 }),
                 upstream_base_url: "https://alpha.example/v1".to_string(),
                 capacity: Default::default(),
+                availability: crate::routing_explain::RoutingExplainAvailability {
+                    available: true,
+                    runtime_available: true,
+                    routable_except_usage: true,
+                    ..Default::default()
+                },
                 selected: true,
                 skip_reasons: Vec::new(),
             }),
@@ -203,6 +209,12 @@ mod tests {
                 compatibility: None,
                 upstream_base_url: "https://alpha.example/v1".to_string(),
                 capacity: Default::default(),
+                availability: crate::routing_explain::RoutingExplainAvailability {
+                    available: true,
+                    runtime_available: true,
+                    routable_except_usage: true,
+                    ..Default::default()
+                },
                 selected: true,
                 skip_reasons: Vec::new(),
             }),

@@ -407,6 +407,26 @@ async fn proxy_api_v1_routing_explain_uses_provider_endpoint_runtime_health_for_
                 .collect::<Vec<_>>()),
         Some(vec!["usage_exhausted"])
     );
+    assert_eq!(
+        explain["candidates"][0]["availability"]["available"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        explain["candidates"][0]["availability"]["runtime_available"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        explain["candidates"][0]["availability"]["routable_except_usage"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        explain["candidates"][0]["availability"]["usage_exhausted"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        explain["candidates"][0]["availability"]["dominant_reason"]["code"].as_str(),
+        Some("usage_exhausted")
+    );
 
     proxy_handle.abort();
 }

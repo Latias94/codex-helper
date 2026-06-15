@@ -842,6 +842,30 @@ async fn proxy_v4_route_graph_skips_provider_when_local_concurrency_limit_is_sat
         explain["candidates"][0]["capacity"]["saturated"].as_bool(),
         Some(true)
     );
+    assert_eq!(
+        explain["candidates"][0]["availability"]["available"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        explain["candidates"][0]["availability"]["runtime_available"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        explain["candidates"][0]["availability"]["routable_except_usage"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        explain["candidates"][0]["availability"]["dominant_reason"]["code"].as_str(),
+        Some("concurrency_saturated")
+    );
+    assert_eq!(
+        explain["candidates"][0]["availability"]["concurrency_active"].as_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        explain["candidates"][0]["availability"]["concurrency_limit"].as_u64(),
+        Some(1)
+    );
 
     let second = match tokio::time::timeout(
         Duration::from_secs(2),

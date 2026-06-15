@@ -530,6 +530,17 @@ impl RoutePlanRuntimeState {
     ) -> RoutePlanUpstreamRuntimeState {
         self.provider_endpoint(&candidate_provider_endpoint_key(template, candidate))
     }
+
+    pub fn candidate_runtime_snapshot(
+        &self,
+        template: &RoutePlanTemplate,
+        candidate: &RouteCandidate,
+    ) -> RoutePlanCandidateRuntimeSnapshot {
+        RoutePlanCandidateRuntimeSnapshot::from_candidate_runtime(
+            candidate,
+            self.runtime_state_for_candidate(template, candidate),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -552,6 +563,103 @@ impl RoutePlanUpstreamRuntimeState {
 
     fn hard_unavailable(self) -> bool {
         self.runtime_disabled || self.missing_auth || self.breaker_open()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RoutePlanCandidateRuntimeSnapshot {
+    pub runtime_available: bool,
+    pub routable_except_usage: bool,
+    pub hard_unavailable: bool,
+    pub runtime_disabled: bool,
+    pub cooldown_active: bool,
+    pub cooldown_remaining_secs: Option<u64>,
+    pub breaker_open: bool,
+    pub failure_count: u32,
+    pub usage_exhausted: bool,
+    pub missing_auth: bool,
+    pub concurrency_saturated: bool,
+    pub concurrency_active: Option<u32>,
+    pub concurrency_limit: Option<u32>,
+    pub effective_max_concurrent_requests: Option<u32>,
+    pub effective_limit_group: Option<String>,
+}
+
+impl RoutePlanCandidateRuntimeSnapshot {
+    fn from_candidate_runtime(
+        candidate: &RouteCandidate,
+        runtime_state: RoutePlanUpstreamRuntimeState,
+    ) -> Self {
+        let breaker_open = runtime_state.breaker_open();
+        let hard_unavailable = runtime_state.hard_unavailable();
+        let routable_except_usage = !hard_unavailable && !runtime_state.concurrency_saturated;
+        let runtime_available = routable_except_usage && !runtime_state.usage_exhausted;
+
+        Self {
+            runtime_available,
+            routable_except_usage,
+            hard_unavailable,
+            runtime_disabled: runtime_state.runtime_disabled,
+            cooldown_active: runtime_state.cooldown_active,
+            cooldown_remaining_secs: runtime_state.cooldown_remaining_secs,
+            breaker_open,
+            failure_count: runtime_state.failure_count,
+            usage_exhausted: runtime_state.usage_exhausted,
+            missing_auth: runtime_state.missing_auth,
+            concurrency_saturated: runtime_state.concurrency_saturated,
+            concurrency_active: runtime_state.concurrency_active,
+            concurrency_limit: runtime_state.concurrency_limit,
+            effective_max_concurrent_requests: candidate.concurrency.max_concurrent_requests,
+            effective_limit_group: candidate.concurrency.limit_group.clone(),
+        }
+    }
+
+    pub fn skip_reasons_for_candidate(
+        &self,
+        candidate: &RouteCandidate,
+        request_model: Option<&str>,
+    ) -> Vec<RoutePlanSkipReason> {
+        let mut reasons = Vec::new();
+        if let Some(requested_model) = request_model
+            && !candidate_supports_model(candidate, requested_model)
+        {
+            reasons.push(RoutePlanSkipReason::UnsupportedModel {
+                requested_model: requested_model.to_string(),
+            });
+        }
+        reasons.extend(self.runtime_skip_reasons());
+        reasons
+    }
+
+    pub fn runtime_skip_reasons(&self) -> Vec<RoutePlanSkipReason> {
+        let mut reasons = Vec::new();
+        if self.runtime_disabled {
+            reasons.push(RoutePlanSkipReason::RuntimeDisabled);
+        }
+        if self.cooldown_active {
+            reasons.push(RoutePlanSkipReason::Cooldown);
+        } else if self.failure_count >= FAILURE_THRESHOLD {
+            reasons.push(RoutePlanSkipReason::BreakerOpen {
+                failure_count: self.failure_count,
+            });
+        }
+        if self.usage_exhausted {
+            reasons.push(RoutePlanSkipReason::UsageExhausted);
+        }
+        if self.missing_auth {
+            reasons.push(RoutePlanSkipReason::MissingAuth);
+        }
+        if self.concurrency_saturated {
+            reasons.push(RoutePlanSkipReason::ConcurrencySaturated {
+                active: self.concurrency_active,
+                limit: self.concurrency_limit,
+            });
+        }
+        reasons
+    }
+
+    pub fn dominant_runtime_skip_reason(&self) -> Option<RoutePlanSkipReason> {
+        self.runtime_skip_reasons().into_iter().next()
     }
 }
 
@@ -680,8 +788,8 @@ impl<'a> RoutePlanExecutor<'a> {
             .iter()
             .filter_map(|candidate| {
                 let provider_endpoint = candidate_provider_endpoint_key(self.template, candidate);
-                let runtime_state = runtime.runtime_state_for_candidate(self.template, candidate);
-                let reasons = self.candidate_skip_reasons(candidate, runtime_state, request_model);
+                let snapshot = runtime.candidate_runtime_snapshot(self.template, candidate);
+                let reasons = snapshot.skip_reasons_for_candidate(candidate, request_model);
                 (!reasons.is_empty()).then_some(RouteCandidateSkipExplanation {
                     candidate,
                     provider_endpoint,
@@ -1016,45 +1124,6 @@ impl<'a> RoutePlanExecutor<'a> {
         state.route_candidates_exhausted(self.template)
     }
 
-    fn candidate_skip_reasons(
-        &self,
-        candidate: &RouteCandidate,
-        runtime_state: RoutePlanUpstreamRuntimeState,
-        request_model: Option<&str>,
-    ) -> Vec<RoutePlanSkipReason> {
-        let mut reasons = Vec::new();
-        if let Some(requested_model) = request_model
-            && !candidate_supports_model(candidate, requested_model)
-        {
-            reasons.push(RoutePlanSkipReason::UnsupportedModel {
-                requested_model: requested_model.to_string(),
-            });
-        }
-        if runtime_state.runtime_disabled {
-            reasons.push(RoutePlanSkipReason::RuntimeDisabled);
-        }
-        if runtime_state.cooldown_active {
-            reasons.push(RoutePlanSkipReason::Cooldown);
-        } else if runtime_state.failure_count >= FAILURE_THRESHOLD {
-            reasons.push(RoutePlanSkipReason::BreakerOpen {
-                failure_count: runtime_state.failure_count,
-            });
-        }
-        if runtime_state.usage_exhausted {
-            reasons.push(RoutePlanSkipReason::UsageExhausted);
-        }
-        if runtime_state.missing_auth {
-            reasons.push(RoutePlanSkipReason::MissingAuth);
-        }
-        if runtime_state.concurrency_saturated {
-            reasons.push(RoutePlanSkipReason::ConcurrencySaturated {
-                active: runtime_state.concurrency_active,
-                limit: runtime_state.concurrency_limit,
-            });
-        }
-        reasons
-    }
-
     fn station_candidate_count(&self, station_name: &str) -> usize {
         self.template
             .candidates
@@ -1276,8 +1345,9 @@ fn candidate_available_in_runtime(
     runtime: &RoutePlanRuntimeState,
     candidate: &RouteCandidate,
 ) -> bool {
-    let upstream = runtime.runtime_state_for_candidate(template, candidate);
-    candidate_routable_except_usage(template, runtime, candidate) && !upstream.usage_exhausted
+    runtime
+        .candidate_runtime_snapshot(template, candidate)
+        .runtime_available
 }
 
 fn candidate_routable_except_usage(
@@ -1285,8 +1355,9 @@ fn candidate_routable_except_usage(
     runtime: &RoutePlanRuntimeState,
     candidate: &RouteCandidate,
 ) -> bool {
-    let upstream = runtime.runtime_state_for_candidate(template, candidate);
-    !upstream.hard_unavailable() && !upstream.concurrency_saturated
+    runtime
+        .candidate_runtime_snapshot(template, candidate)
+        .routable_except_usage
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -4422,6 +4493,81 @@ mod tests {
 
         assert_eq!(selected.candidate.provider_id, "backup");
         assert_eq!(selection.avoided_candidate_indices, Vec::<usize>::new());
+    }
+
+    #[test]
+    fn route_plan_candidate_runtime_snapshot_reports_structured_availability() {
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([(
+                "primary".to_string(),
+                ProviderConfigV4 {
+                    base_url: Some("https://primary.example/v1".to_string()),
+                    supported_models: BTreeMap::from([("gpt-4.1".to_string(), true)]),
+                    limits: ProviderConcurrencyLimits {
+                        max_concurrent_requests: Some(2),
+                        limit_group: Some("shared".to_string()),
+                    },
+                    ..ProviderConfigV4::default()
+                },
+            )]),
+            routing: Some(RoutingConfigV4::ordered_failover(vec![
+                "primary".to_string(),
+            ])),
+            ..ServiceViewV4::default()
+        };
+        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let candidate = &template.candidates[0];
+        let mut runtime = RoutePlanRuntimeState::default();
+        runtime.set_provider_endpoint(
+            endpoint_key("codex", "primary", "default"),
+            RoutePlanUpstreamRuntimeState {
+                cooldown_active: true,
+                cooldown_remaining_secs: Some(30),
+                usage_exhausted: true,
+                missing_auth: true,
+                concurrency_saturated: true,
+                concurrency_active: Some(2),
+                concurrency_limit: Some(2),
+                ..RoutePlanUpstreamRuntimeState::default()
+            },
+        );
+
+        let snapshot = runtime.candidate_runtime_snapshot(&template, candidate);
+
+        assert!(!snapshot.runtime_available);
+        assert!(!snapshot.routable_except_usage);
+        assert!(snapshot.hard_unavailable);
+        assert!(snapshot.cooldown_active);
+        assert!(snapshot.breaker_open);
+        assert_eq!(snapshot.cooldown_remaining_secs, Some(30));
+        assert!(snapshot.usage_exhausted);
+        assert!(snapshot.missing_auth);
+        assert!(snapshot.concurrency_saturated);
+        assert_eq!(snapshot.concurrency_active, Some(2));
+        assert_eq!(snapshot.concurrency_limit, Some(2));
+        assert_eq!(snapshot.effective_max_concurrent_requests, Some(2));
+        assert_eq!(snapshot.effective_limit_group.as_deref(), Some("shared"));
+        assert_eq!(
+            snapshot
+                .skip_reasons_for_candidate(candidate, Some("gpt-5"))
+                .iter()
+                .map(RoutePlanSkipReason::code)
+                .collect::<Vec<_>>(),
+            vec![
+                "unsupported_model",
+                "cooldown",
+                "usage_exhausted",
+                "missing_auth",
+                "concurrency_saturated"
+            ]
+        );
+        assert_eq!(
+            snapshot
+                .dominant_runtime_skip_reason()
+                .as_ref()
+                .map(RoutePlanSkipReason::code),
+            Some("cooldown")
+        );
     }
 
     #[test]

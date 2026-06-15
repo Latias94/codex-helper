@@ -11,7 +11,7 @@
 
 ## RSO-020 Scheduler Runtime Snapshot
 
-- Status: proposed
+- Status: completed
 - Owner: main
 - Scope: route candidate selection and runtime availability state.
 - Goal: expose one availability snapshot containing cooldown, usage
@@ -19,6 +19,13 @@
   active count, and saturation.
 - Validation: saturated candidates skip without failure penalty and all
   unavailable paths report structured dominant reasons.
+- Handoff: `RoutePlanCandidateRuntimeSnapshot` is now the single runtime
+  availability source for selection helpers, structured skip reasons, routing
+  explain candidate capacity, and routing explain candidate availability.
+  `/routing/explain` candidates expose `availability` with available/runtime
+  available, hard-unavailable, usage, breaker/cooldown, missing-auth, and
+  concurrency active/limit fields plus `dominant_reason`. TUI and GUI routing
+  previews render `availability=...` next to capacity and skip reasons.
 
 ## RSO-030 Upstream Throttle Outcome Integration
 

@@ -1057,6 +1057,12 @@ mod tests {
                 compatibility: None,
                 upstream_base_url: "https://selected.example/v1".to_string(),
                 capacity: Default::default(),
+                availability: crate::routing_explain::RoutingExplainAvailability {
+                    available: true,
+                    runtime_available: true,
+                    routable_except_usage: true,
+                    ..Default::default()
+                },
                 selected: true,
                 skip_reasons: Vec::new(),
             }],
@@ -1139,6 +1145,14 @@ mod tests {
                 }),
                 upstream_base_url: "https://right.example/v1".to_string(),
                 capacity: Default::default(),
+                availability: crate::routing_explain::RoutingExplainAvailability {
+                    available: false,
+                    runtime_available: false,
+                    routable_except_usage: true,
+                    usage_exhausted: true,
+                    dominant_reason: Some(RoutingExplainSkipReason::UsageExhausted),
+                    ..Default::default()
+                },
                 selected: false,
                 skip_reasons: vec![RoutingExplainSkipReason::UsageExhausted],
             }],
