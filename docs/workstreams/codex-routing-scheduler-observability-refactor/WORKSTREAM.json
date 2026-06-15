@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "slug": "codex-routing-scheduler-observability-refactor",
+  "title": "Codex Routing Scheduler Observability Refactor",
+  "status": "proposed",
+  "updated": "2026-06-15",
+  "scope_kind": "execution",
+  "problem": "Routing, local concurrency gates, upstream throttle cooldowns, retry/failover decisions, and session/TUI metrics are correct in pieces but not yet represented through one first-class scheduler and observability boundary.",
+  "authoritative_docs": [
+    {
+      "role": "design",
+      "path": "docs/workstreams/codex-routing-scheduler-observability-refactor/DESIGN.md"
+    },
+    {
+      "role": "execution",
+      "path": "docs/workstreams/codex-routing-scheduler-observability-refactor/TODO.md"
+    },
+    {
+      "role": "gates",
+      "path": "docs/workstreams/codex-routing-scheduler-observability-refactor/EVIDENCE_AND_GATES.md"
+    }
+  ],
+  "gates": [
+    "cargo fmt --check",
+    "cargo nextest run -p codex-helper-core scheduler_observability",
+    "cargo nextest run -p codex-helper-tui session_metrics"
+  ],
+  "evidence": [
+    "docs/workstreams/codex-routing-scheduler-observability-refactor/EVIDENCE_AND_GATES.md"
+  ],
+  "adr_refs": [],
+  "continue_policy": {
+    "default_action": "continue",
+    "notes": "Continue while the work is limited to scheduler runtime state, attempt outcome classification, and operator/session observability. Split route graph semantics changes into a separate workstream."
+  }
+}
