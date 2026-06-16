@@ -69,6 +69,30 @@ ch relay add nas \
 
 `admin_token_env` 保存的是环境变量名，不是 token 值。Docker/NAS target 推荐在 server 侧设置 `advertised-admin-base-url`，让 `relay add` 能发现可访问的 admin URL；否则在添加 target 时显式传 `--admin-url`。
 
+## Fleet 观测注册表
+
+Fleet 页是只读的。它可以观测本地和远端 runtime，但不会对远端节点发送 interrupt、message、approval 或 TTY attach。
+
+Fleet target 配在 `[fleet.nodes.*]` 下，与 `relay_targets` 是两套不同的配置：
+
+```toml
+[fleet.nodes.workstation]
+label = "Workstation"
+admin_url = "https://workstation.example.com:4211"
+admin_token_env = "CODEX_HELPER_WORKSTATION_ADMIN_TOKEN"
+enabled = true
+
+[fleet.nodes.mini]
+label = "Mac mini"
+admin_url = "http://mac-mini.tailnet.example.ts.net:4211"
+admin_token_env = "CODEX_HELPER_MAC_MINI_ADMIN_TOKEN"
+enabled = true
+```
+
+`admin_token_env` 只填写环境变量名，不要直接写 token 字符串。非 loopback 节点建议使用 HTTPS，或者使用可信的加密隧道并配置 `admin_token_env`。
+
+`ch tui` 会在 `9` 打开 Fleet 页，`r` 负责刷新，`Tab` 在节点和工作单元之间切换焦点，`t` 在 tree / flat 两种 work unit 视图间切换。
+
 ## Codex 客户端 Patch 预设
 
 默认预设只把 `~/.codex/config.toml` 的 `model_provider` 指到本地 `codex_proxy`。如果要保留 ChatGPT 登录态和移动端/桌面端账号能力，同时让模型请求进入 codex-helper，可启用 ChatGPT bridge：

@@ -69,6 +69,30 @@ ch relay add nas \
 
 `admin_token_env` stores the environment variable name, not the token value. For Docker/NAS targets, prefer setting `advertised-admin-base-url` on the server so `relay add` can discover a reachable admin URL; otherwise pass `--admin-url` explicitly.
 
+## Fleet Observer Registry
+
+The Fleet page is read-only. It can observe local and remote runtimes, but it does not send interrupts, messages, approvals, or TTY attaches to remote nodes.
+
+Fleet targets live under `[fleet.nodes.*]` and are separate from `relay_targets`:
+
+```toml
+[fleet.nodes.workstation]
+label = "Workstation"
+admin_url = "https://workstation.example.com:4211"
+admin_token_env = "CODEX_HELPER_WORKSTATION_ADMIN_TOKEN"
+enabled = true
+
+[fleet.nodes.mini]
+label = "Mac mini"
+admin_url = "http://mac-mini.tailnet.example.ts.net:4211"
+admin_token_env = "CODEX_HELPER_MAC_MINI_ADMIN_TOKEN"
+enabled = true
+```
+
+`admin_token_env` names the environment variable that holds the admin token. Do not put a raw token string there. For non-loopback nodes, use HTTPS or a trusted encrypted tunnel plus `admin_token_env`.
+
+`ch tui` renders the Fleet page at `9`, with `r` for refresh, `Tab` to switch between nodes and work units, and `t` to switch between tree and flat work-unit views.
+
 ## Codex Client Preset
 
 The default preset only points `~/.codex/config.toml` `model_provider` at the local `codex_proxy`. To keep ChatGPT account auth and mobile/desktop account features while routing model requests through codex-helper, enable ChatGPT bridge:
