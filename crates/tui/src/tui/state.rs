@@ -2,7 +2,8 @@ use ratatui::widgets::{ListState, TableState};
 
 use crate::codex_integration::CodexStartupReadiness;
 use crate::config::{
-    ResolvedRetryConfig, UsageForecastConfig, is_supported_route_graph_config_version,
+    FleetRegistryConfig, ResolvedRetryConfig, UsageForecastConfig,
+    is_supported_route_graph_config_version,
 };
 use crate::dashboard_core::ControlProfileOption;
 use crate::routing_explain::RoutingExplainResponse;
@@ -14,6 +15,7 @@ use crate::usage_balance::{
     UsageBalanceRefreshInput, UsageBalanceView,
 };
 use crate::usage_providers::UsageProviderRefreshSummary;
+use codex_helper_core::fleet::FleetSnapshot;
 use std::collections::{BTreeMap, HashMap};
 
 use super::Language;
@@ -50,6 +52,18 @@ pub(in crate::tui) struct RecentCodexRow {
     pub(in crate::tui) session_id: String,
     pub(in crate::tui) cwd: Option<String>,
     pub(in crate::tui) mtime_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::tui) enum FleetViewMode {
+    Tree,
+    Flat,
+}
+
+impl Default for FleetViewMode {
+    fn default() -> Self {
+        Self::Tree
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,6 +160,19 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) routing_spec: Option<RoutingSpecView>,
     pub(in crate::tui) routing_explain: Option<RoutingExplainResponse>,
     pub(in crate::tui) last_routing_control_refresh_at: Option<std::time::Instant>,
+    pub(in crate::tui) fleet_registry: FleetRegistryConfig,
+    pub(in crate::tui) fleet_snapshot: Option<FleetSnapshot>,
+    pub(in crate::tui) fleet_loading: bool,
+    pub(in crate::tui) fleet_refresh_generation: u64,
+    pub(in crate::tui) fleet_last_refresh_at: Option<std::time::Instant>,
+    pub(in crate::tui) fleet_last_loaded_at_ms: Option<u64>,
+    pub(in crate::tui) fleet_last_error: Option<String>,
+    pub(in crate::tui) needs_fleet_refresh: bool,
+    pub(in crate::tui) selected_fleet_node_idx: usize,
+    pub(in crate::tui) selected_fleet_unit_idx: usize,
+    pub(in crate::tui) selected_fleet_node_id: Option<String>,
+    pub(in crate::tui) selected_fleet_unit_id: Option<String>,
+    pub(in crate::tui) fleet_view_mode: FleetViewMode,
     pub(in crate::tui) session_model_options: Vec<String>,
     pub(in crate::tui) session_model_input: String,
     pub(in crate::tui) session_model_input_hint: Option<String>,
@@ -213,6 +240,8 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) sessions_page_table: TableState,
     pub(in crate::tui) codex_history_table: TableState,
     pub(in crate::tui) codex_recent_table: TableState,
+    pub(in crate::tui) fleet_nodes_table: TableState,
+    pub(in crate::tui) fleet_units_table: TableState,
     pub(in crate::tui) stats_stations_table: TableState,
     pub(in crate::tui) stats_providers_table: TableState,
     pub(in crate::tui) menu_list: ListState,
@@ -256,6 +285,19 @@ impl Default for UiState {
             routing_spec: None,
             routing_explain: None,
             last_routing_control_refresh_at: None,
+            fleet_registry: FleetRegistryConfig::default(),
+            fleet_snapshot: None,
+            fleet_loading: false,
+            fleet_refresh_generation: 0,
+            fleet_last_refresh_at: None,
+            fleet_last_loaded_at_ms: None,
+            fleet_last_error: None,
+            needs_fleet_refresh: false,
+            selected_fleet_node_idx: 0,
+            selected_fleet_unit_idx: 0,
+            selected_fleet_node_id: None,
+            selected_fleet_unit_id: None,
+            fleet_view_mode: FleetViewMode::default(),
             session_model_options: Vec::new(),
             session_model_input: String::new(),
             session_model_input_hint: None,
@@ -323,6 +365,8 @@ impl Default for UiState {
             sessions_page_table: TableState::default(),
             codex_history_table: TableState::default(),
             codex_recent_table: TableState::default(),
+            fleet_nodes_table: TableState::default(),
+            fleet_units_table: TableState::default(),
             stats_stations_table: TableState::default(),
             stats_providers_table: TableState::default(),
             menu_list: ListState::default(),
@@ -418,6 +462,8 @@ impl UiState {
             &mut self.sessions_page_table,
             &mut self.codex_history_table,
             &mut self.codex_recent_table,
+            &mut self.fleet_nodes_table,
+            &mut self.fleet_units_table,
             &mut self.stats_stations_table,
             &mut self.stats_providers_table,
         ] {
@@ -548,8 +594,74 @@ impl UiState {
             Page::Requests => self.sync_request_page_selection(snapshot),
             Page::History => self.sync_codex_history_selection(),
             Page::Recent => self.sync_codex_recent_selection(now_ms()),
+            Page::Fleet => self.sync_fleet_selection(),
             _ => {}
         }
+    }
+
+    pub(in crate::tui) fn sync_fleet_selection(&mut self) {
+        let Some(snapshot) = self.fleet_snapshot.as_ref() else {
+            self.selected_fleet_node_idx = 0;
+            self.selected_fleet_unit_idx = 0;
+            self.selected_fleet_node_id = None;
+            self.selected_fleet_unit_id = None;
+            clamp_table_selection(&mut self.fleet_nodes_table, None, 0);
+            clamp_table_selection(&mut self.fleet_units_table, None, 0);
+            return;
+        };
+
+        let node_len = snapshot.nodes.len();
+        let selected_node_idx = self
+            .selected_fleet_node_id
+            .as_deref()
+            .and_then(|node_id| {
+                snapshot
+                    .nodes
+                    .iter()
+                    .position(|node| node.node_id == node_id)
+            })
+            .unwrap_or(self.selected_fleet_node_idx.min(node_len.saturating_sub(1)));
+
+        self.selected_fleet_node_idx = clamp_table_selection(
+            &mut self.fleet_nodes_table,
+            Some(selected_node_idx),
+            node_len,
+        )
+        .unwrap_or(0);
+        self.selected_fleet_node_id = snapshot
+            .nodes
+            .get(self.selected_fleet_node_idx)
+            .map(|node| node.node_id.clone());
+
+        let unit_len = snapshot
+            .nodes
+            .get(self.selected_fleet_node_idx)
+            .map(|node| node.work_units.len())
+            .unwrap_or(0);
+        let selected_unit_idx = self
+            .selected_fleet_unit_id
+            .as_deref()
+            .and_then(|unit_id| {
+                snapshot
+                    .nodes
+                    .get(self.selected_fleet_node_idx)?
+                    .work_units
+                    .iter()
+                    .position(|unit| unit.id == unit_id)
+            })
+            .unwrap_or(self.selected_fleet_unit_idx.min(unit_len.saturating_sub(1)));
+
+        self.selected_fleet_unit_idx = clamp_table_selection(
+            &mut self.fleet_units_table,
+            Some(selected_unit_idx),
+            unit_len,
+        )
+        .unwrap_or(0);
+        self.selected_fleet_unit_id = snapshot
+            .nodes
+            .get(self.selected_fleet_node_idx)
+            .and_then(|node| node.work_units.get(self.selected_fleet_unit_idx))
+            .map(|unit| unit.id.clone());
     }
 
     pub(in crate::tui) fn filtered_sessions_page_indices(&self, snapshot: &Snapshot) -> Vec<usize> {

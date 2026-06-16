@@ -253,6 +253,7 @@ pub(super) async fn apply_pending_refresh_requests(
                 *cfg = Arc::new(new_cfg);
                 ui.config_version = cfg.version;
                 ui.usage_forecast = cfg.ui.usage_forecast.clone();
+                ui.fleet_registry = cfg.fleet.clone();
                 snapshot_refresh.invalidate();
                 *providers = build_provider_options(cfg.as_ref(), service_name);
                 snapshot_refresh.request(state.clone(), cfg.clone(), service_name, ui.stats_days);

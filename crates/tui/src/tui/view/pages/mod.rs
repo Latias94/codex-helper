@@ -7,6 +7,7 @@ use crate::tui::state::UiState;
 use crate::tui::types::Page;
 
 mod dashboard;
+mod fleet;
 mod history;
 mod recent;
 mod requests;
@@ -38,5 +39,6 @@ pub(super) fn render_body(
         Page::Settings => settings::render_settings_page(f, p, ui, snapshot, area),
         Page::History => history::render_history_page(f, p, ui, area),
         Page::Recent => recent::render_recent_page(f, p, ui, area),
+        Page::Fleet => fleet::render_fleet_page(f, p, ui, area),
     }
 }

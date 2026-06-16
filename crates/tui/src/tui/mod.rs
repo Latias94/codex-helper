@@ -1,6 +1,7 @@
 mod attached;
 mod codex_relay_diagnostics;
 mod codex_relay_live_smoke;
+mod fleet_refresh;
 mod i18n;
 mod input;
 mod model;
@@ -41,6 +42,9 @@ use self::codex_relay_diagnostics::{
 };
 use self::codex_relay_live_smoke::{
     CodexRelayLiveSmokeResult, apply_codex_relay_live_smoke_result,
+};
+use self::fleet_refresh::{
+    FleetRefreshResult, FleetRefreshSource, apply_fleet_refresh_result, start_fleet_refresh,
 };
 use self::model::{Palette, Snapshot, refresh_snapshot};
 use self::runtime_refresh::{
@@ -87,6 +91,11 @@ struct RenderSurfaceKey {
     selected_sessions_page_idx: usize,
     selected_codex_history_idx: usize,
     codex_recent_selected_idx: usize,
+    selected_fleet_node_idx: usize,
+    selected_fleet_unit_idx: usize,
+    fleet_loading: bool,
+    fleet_refresh_generation: u64,
+    fleet_view_mode: state::FleetViewMode,
     selected_stats_station_idx: usize,
     selected_stats_provider_idx: usize,
     stats_provider_detail_scroll: u16,
@@ -117,6 +126,11 @@ impl RenderSurfaceKey {
             selected_sessions_page_idx: ui.selected_sessions_page_idx,
             selected_codex_history_idx: ui.selected_codex_history_idx,
             codex_recent_selected_idx: ui.codex_recent_selected_idx,
+            selected_fleet_node_idx: ui.selected_fleet_node_idx,
+            selected_fleet_unit_idx: ui.selected_fleet_unit_idx,
+            fleet_loading: ui.fleet_loading,
+            fleet_refresh_generation: ui.fleet_refresh_generation,
+            fleet_view_mode: ui.fleet_view_mode,
             selected_stats_station_idx: ui.selected_stats_station_idx,
             selected_stats_provider_idx: ui.selected_stats_provider_idx,
             stats_provider_detail_scroll: ui.stats_provider_detail_scroll,
@@ -221,6 +235,7 @@ pub async fn run_dashboard(
         proxy_port: port,
         language,
         usage_forecast: cfg.ui.usage_forecast.clone(),
+        fleet_registry: cfg.fleet.clone(),
         refresh_ms: timing.refresh_ms,
         config_version: cfg.version,
         overlay: if show_startup_alert {
@@ -253,6 +268,7 @@ pub async fn run_dashboard(
         mpsc::unbounded_channel::<CodexHistoryRefreshResult>();
     let (recent_refresh_tx, mut recent_refresh_rx) =
         mpsc::unbounded_channel::<CodexRecentRefreshResult>();
+    let (fleet_refresh_tx, mut fleet_refresh_rx) = mpsc::unbounded_channel::<FleetRefreshResult>();
     let (codex_relay_diagnostics_tx, mut codex_relay_diagnostics_rx) =
         mpsc::unbounded_channel::<CodexRelayDiagnosticsResult>();
     let (codex_relay_live_smoke_tx, mut codex_relay_live_smoke_rx) =
@@ -295,6 +311,26 @@ pub async fn run_dashboard(
                     timing.snapshot_fallback_interval,
                     &mut snapshot_refresh,
                 ).await;
+                if ui.page == types::Page::Fleet
+                    && !ui.fleet_loading
+                    && ui
+                        .fleet_last_refresh_at
+                        .is_none_or(|last| last.elapsed() >= Duration::from_secs(5))
+                {
+                    ui.needs_fleet_refresh = true;
+                }
+                if ui.needs_fleet_refresh && !ui.fleet_loading {
+                    start_fleet_refresh(
+                        &mut ui,
+                        FleetRefreshSource::Integrated {
+                            state: state.clone(),
+                            cfg: cfg.clone(),
+                            service_name,
+                        },
+                        fleet_refresh_tx.clone(),
+                    );
+                    ui.needs_fleet_refresh = false;
+                }
                 request_redraw(&mut render_invalidation);
             }
             changed = state_changes.changed() => {
@@ -350,6 +386,13 @@ pub async fn run_dashboard(
             maybe_recent_refresh = recent_refresh_rx.recv() => {
                 if let Some(result) = maybe_recent_refresh
                     && apply_codex_recent_refresh_result(&mut ui, result)
+                {
+                    request_redraw(&mut render_invalidation);
+                }
+            }
+            maybe_fleet_refresh = fleet_refresh_rx.recv() => {
+                if let Some(result) = maybe_fleet_refresh
+                    && apply_fleet_refresh_result(&mut ui, result)
                 {
                     request_redraw(&mut render_invalidation);
                 }
@@ -410,6 +453,18 @@ pub async fn run_dashboard(
                                 history_refresh_tx.clone(),
                                 recent_refresh_tx.clone(),
                             ).await;
+                            if ui.needs_fleet_refresh && !ui.fleet_loading {
+                                start_fleet_refresh(
+                                    &mut ui,
+                                    FleetRefreshSource::Integrated {
+                                        state: state.clone(),
+                                        cfg: cfg.clone(),
+                                        service_name,
+                                    },
+                                    fleet_refresh_tx.clone(),
+                                );
+                                ui.needs_fleet_refresh = false;
+                            }
                             let after_surface = RenderSurfaceKey::capture(&ui);
                             if before_surface != after_surface {
                                 request_full_clear(&mut render_invalidation);

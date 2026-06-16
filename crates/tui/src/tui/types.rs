@@ -24,6 +24,7 @@ pub(in crate::tui) enum Page {
     Settings,
     History,
     Recent,
+    Fleet,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,7 +117,7 @@ impl ServiceTierChoice {
 pub(in crate::tui) fn page_titles(
     lang: Language,
     uses_route_graph_routing: bool,
-) -> [&'static str; 8] {
+) -> [&'static str; 9] {
     [
         i18n::text(lang, msg::PAGE_DASHBOARD),
         if uses_route_graph_routing {
@@ -130,6 +131,7 @@ pub(in crate::tui) fn page_titles(
         i18n::text(lang, msg::PAGE_SETTINGS),
         i18n::text(lang, msg::PAGE_HISTORY),
         i18n::text(lang, msg::PAGE_RECENT),
+        i18n::text(lang, msg::PAGE_FLEET),
     ]
 }
 
@@ -143,5 +145,6 @@ pub(in crate::tui) fn page_index(page: Page) -> usize {
         Page::Settings => 5,
         Page::History => 6,
         Page::Recent => 7,
+        Page::Fleet => 8,
     }
 }

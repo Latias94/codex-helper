@@ -24,7 +24,9 @@ use crate::tui::model::{
     session_row_has_any_override, short_sid,
 };
 use crate::tui::report::build_stats_report;
-use crate::tui::state::{CodexHistoryExternalFocusOrigin, UiState, adjust_table_selection};
+use crate::tui::state::{
+    CodexHistoryExternalFocusOrigin, FleetViewMode, UiState, adjust_table_selection,
+};
 use crate::tui::types::{Focus, Overlay, Page, StatsFocus};
 
 use super::KeyEventContext;
@@ -63,6 +65,7 @@ pub(super) fn apply_page_shortcuts(ui: &mut UiState, code: KeyCode) -> bool {
         KeyCode::Char('6') => Some(Page::Settings),
         KeyCode::Char('7') => Some(Page::History),
         KeyCode::Char('8') => Some(Page::Recent),
+        KeyCode::Char('9') => Some(Page::Fleet),
         _ => None,
     };
     if let Some(p) = page {
@@ -87,6 +90,10 @@ pub(super) fn apply_page_shortcuts(ui: &mut UiState, code: KeyCode) -> bool {
             ui.codex_recent_selected_idx = 0;
             ui.codex_recent_selected_id = None;
             ui.codex_recent_table.select(None);
+        }
+        if ui.page == Page::Fleet {
+            ui.needs_fleet_refresh = true;
+            ui.sync_fleet_selection();
         }
         return true;
     }
@@ -139,6 +146,53 @@ fn prepare_select_requests_for_session(ui: &mut UiState, sid: String) {
 fn clear_request_page_focus(ui: &mut UiState) {
     ui.focused_request_session_id = None;
     ui.selected_request_page_idx = 0;
+}
+
+fn move_fleet_selection(ui: &mut UiState, delta: i32) -> bool {
+    let Some(snapshot) = ui.fleet_snapshot.as_ref() else {
+        return false;
+    };
+
+    if ui.focus == Focus::Stations {
+        if let Some(next) =
+            adjust_table_selection(&mut ui.fleet_nodes_table, delta, snapshot.nodes.len())
+        {
+            ui.selected_fleet_node_idx = next;
+            ui.selected_fleet_node_id = snapshot.nodes.get(next).map(|node| node.node_id.clone());
+            ui.selected_fleet_unit_idx = 0;
+            ui.selected_fleet_unit_id = snapshot
+                .nodes
+                .get(next)
+                .and_then(|node| node.work_units.first())
+                .map(|unit| unit.id.clone());
+            let unit_len = snapshot
+                .nodes
+                .get(next)
+                .map(|node| node.work_units.len())
+                .unwrap_or(0);
+            ui.fleet_units_table
+                .select((unit_len > 0).then_some(ui.selected_fleet_unit_idx));
+            *ui.fleet_units_table.offset_mut() = 0;
+            return true;
+        }
+        return false;
+    }
+
+    let unit_len = snapshot
+        .nodes
+        .get(ui.selected_fleet_node_idx)
+        .map(|node| node.work_units.len())
+        .unwrap_or(0);
+    if let Some(next) = adjust_table_selection(&mut ui.fleet_units_table, delta, unit_len) {
+        ui.selected_fleet_unit_idx = next;
+        ui.selected_fleet_unit_id = snapshot
+            .nodes
+            .get(ui.selected_fleet_node_idx)
+            .and_then(|node| node.work_units.get(next))
+            .map(|unit| unit.id.clone());
+        return true;
+    }
+    false
 }
 
 async fn apply_session_provider_override(state: &ProxyState, sid: String, cfg: Option<String>) {
@@ -630,9 +684,54 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                     ),
                     Instant::now(),
                 ));
+            } else if ui.page == Page::Fleet {
+                ui.focus = match ui.focus {
+                    Focus::Stations => Focus::Sessions,
+                    Focus::Sessions | Focus::Requests => Focus::Stations,
+                };
+                ui.toast = Some((
+                    format!(
+                        "{}: {}",
+                        i18n::label(ui.language, "focus"),
+                        if ui.focus == Focus::Stations {
+                            i18n::label(ui.language, "nodes")
+                        } else {
+                            i18n::label(ui.language, "work units")
+                        }
+                    ),
+                    Instant::now(),
+                ));
             }
             true
         }
+        KeyCode::Char('r') if ui.page == Page::Fleet => {
+            ui.needs_fleet_refresh = true;
+            ui.toast = Some((
+                i18n::label(ui.language, "fleet: refreshing").to_string(),
+                Instant::now(),
+            ));
+            true
+        }
+        KeyCode::Char('t') if ui.page == Page::Fleet => {
+            ui.fleet_view_mode = match ui.fleet_view_mode {
+                FleetViewMode::Tree => FleetViewMode::Flat,
+                FleetViewMode::Flat => FleetViewMode::Tree,
+            };
+            ui.toast = Some((
+                format!(
+                    "{}: {}",
+                    i18n::label(ui.language, "fleet view"),
+                    match ui.fleet_view_mode {
+                        FleetViewMode::Tree => i18n::label(ui.language, "tree"),
+                        FleetViewMode::Flat => i18n::label(ui.language, "flat"),
+                    }
+                ),
+                Instant::now(),
+            ));
+            true
+        }
+        KeyCode::Up | KeyCode::Char('k') if ui.page == Page::Fleet => move_fleet_selection(ui, -1),
+        KeyCode::Down | KeyCode::Char('j') if ui.page == Page::Fleet => move_fleet_selection(ui, 1),
         KeyCode::Up | KeyCode::Char('k') if ui.page == Page::Stations => {
             let len = ui.station_page_rows_len(providers.len());
             if let Some(next) = adjust_table_selection(&mut ui.stations_table, -1, len) {

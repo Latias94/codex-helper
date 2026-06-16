@@ -552,6 +552,38 @@ async fn startup_alert_enter_dismisses_report() {
     assert!(ui.startup_readiness.is_none());
 }
 
+#[tokio::test]
+async fn page_shortcut_nine_opens_fleet_and_requests_refresh() {
+    let (proxy, cfg) = proxy_with_single_station_without_upstreams();
+    let state = proxy.state_handle();
+    let snapshot = empty_snapshot(state.as_ref(), cfg).await;
+    let mut providers = Vec::new();
+    let mut ui = UiState::default();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let (diagnostics_tx, _diagnostics_rx) = mpsc::unbounded_channel();
+    let (live_smoke_tx, _live_smoke_rx) = mpsc::unbounded_channel();
+
+    let handled = super::handle_key_event(
+        TestKeyEventContext {
+            state: &state,
+            providers: &mut providers,
+            ui: &mut ui,
+            snapshot: &snapshot,
+            proxy: &proxy,
+            balance_refresh_tx: &tx,
+            codex_relay_diagnostics_tx: &diagnostics_tx,
+            codex_relay_live_smoke_tx: &live_smoke_tx,
+        }
+        .into(),
+        KeyEvent::new(KeyCode::Char('9'), KeyModifiers::NONE),
+    )
+    .await;
+
+    assert!(handled);
+    assert_eq!(ui.page, Page::Fleet);
+    assert!(ui.needs_fleet_refresh);
+}
+
 struct TestKeyEventContext<'a> {
     state: &'a Arc<ProxyState>,
     providers: &'a mut Vec<ProviderOption>,

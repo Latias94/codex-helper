@@ -93,6 +93,11 @@ mod tests {
     use crate::tui::model::SessionRow;
     use crate::tui::model::{RoutingProviderRef, RoutingSpecView, Snapshot};
     use crate::tui::types::{Overlay, Page, StatsFocus};
+    use codex_helper_core::fleet::{
+        FleetConfidence, FleetEvidence, FleetEvidenceSource, FleetNodeHealth, FleetNodeKind,
+        FleetNodeSnapshot, FleetProcessSummary, FleetSnapshot, FleetTopology, FleetUsageSummary,
+        FleetWorkUnit, FleetWorkUnitKind, FleetWorkUnitState,
+    };
 
     fn buffer_text(buffer: &Buffer) -> String {
         let mut out = String::new();
@@ -242,6 +247,105 @@ mod tests {
         }
     }
 
+    fn sample_fleet_snapshot() -> FleetSnapshot {
+        FleetSnapshot {
+            api_version: 1,
+            service_name: "codex".to_string(),
+            refreshed_at_ms: 1_000,
+            nodes: vec![FleetNodeSnapshot {
+                node_id: "local".to_string(),
+                label: "local workstation".to_string(),
+                kind: FleetNodeKind::Local,
+                health: FleetNodeHealth::Fresh,
+                refreshed_at_ms: 1_000,
+                stale_since_ms: None,
+                snapshot_age_ms: Some(0),
+                active_endpoint: Some("http://127.0.0.1:4211".to_string()),
+                last_error: None,
+                processes: FleetProcessSummary {
+                    scan_available: true,
+                    codex_like_processes: 2,
+                    error: None,
+                },
+                topology: FleetTopology::default(),
+                work_units: vec![
+                    FleetWorkUnit {
+                        node_id: "local".to_string(),
+                        id: "session:sid-1234567890".to_string(),
+                        parent_id: None,
+                        kind: FleetWorkUnitKind::Root,
+                        state: FleetWorkUnitState::Running,
+                        evidence: FleetEvidence {
+                            source: FleetEvidenceSource::RuntimeStatus,
+                            confidence: FleetConfidence::High,
+                            detail: Some("runtime active request".to_string()),
+                        },
+                        session_id: Some("sid-1234567890".to_string()),
+                        local_thread_id: Some("sid-1234567890".to_string()),
+                        task_name: Some("implement fleet tui".to_string()),
+                        cwd: Some("F:/SourceCodes/Rust/codex-helper".to_string()),
+                        model: Some("gpt-5".to_string()),
+                        station_name: Some("input".to_string()),
+                        provider_id: Some("input".to_string()),
+                        last_status: Some(200),
+                        active_started_at_ms: Some(900),
+                        last_activity_ms: Some(950),
+                        last_error: None,
+                        usage: FleetUsageSummary::default(),
+                    },
+                    FleetWorkUnit {
+                        node_id: "local".to_string(),
+                        id: "subagent:research".to_string(),
+                        parent_id: Some("session:sid-1234567890".to_string()),
+                        kind: FleetWorkUnitKind::Subagent,
+                        state: FleetWorkUnitState::WaitingApproval,
+                        evidence: FleetEvidence {
+                            source: FleetEvidenceSource::SessionLog,
+                            confidence: FleetConfidence::Medium,
+                            detail: Some("session log child task".to_string()),
+                        },
+                        session_id: Some("sid-1234567890".to_string()),
+                        local_thread_id: Some("subagent-thread".to_string()),
+                        task_name: Some("research fleet behavior".to_string()),
+                        cwd: Some("F:/SourceCodes/Rust/codex-helper".to_string()),
+                        model: Some("gpt-5".to_string()),
+                        station_name: Some("input".to_string()),
+                        provider_id: Some("input".to_string()),
+                        last_status: Some(202),
+                        active_started_at_ms: Some(960),
+                        last_activity_ms: Some(980),
+                        last_error: None,
+                        usage: FleetUsageSummary::default(),
+                    },
+                    FleetWorkUnit {
+                        node_id: "local".to_string(),
+                        id: "process:scan".to_string(),
+                        parent_id: Some("subagent:research".to_string()),
+                        kind: FleetWorkUnitKind::Process,
+                        state: FleetWorkUnitState::Idle,
+                        evidence: FleetEvidence {
+                            source: FleetEvidenceSource::ProcessScan,
+                            confidence: FleetConfidence::Low,
+                            detail: Some("process scan child".to_string()),
+                        },
+                        session_id: Some("sid-1234567890".to_string()),
+                        local_thread_id: Some("subagent-thread".to_string()),
+                        task_name: Some("child process".to_string()),
+                        cwd: Some("F:/SourceCodes/Rust/codex-helper".to_string()),
+                        model: Some("gpt-5".to_string()),
+                        station_name: Some("input".to_string()),
+                        provider_id: Some("input".to_string()),
+                        last_status: None,
+                        active_started_at_ms: None,
+                        last_activity_ms: Some(990),
+                        last_error: None,
+                        usage: FleetUsageSummary::default(),
+                    },
+                ],
+            }],
+        }
+    }
+
     fn remote_control_log_unconfirmed_startup_readiness() -> CodexStartupReadiness {
         CodexStartupReadiness {
             issues: vec![CodexStartupReadinessIssue {
@@ -338,12 +442,18 @@ mod tests {
             assert!(text.contains("?") || text.contains("帮助"), "{text}");
             match page {
                 Page::Stats => {
-                    assert!(text.contains("Balance") || text.contains("余额"), "{text}");
+                    let compact_text = text_without_whitespace(&text);
                     assert!(
-                        text.contains("input-light")
-                            || (text.contains("超") && text.contains("级")),
+                        text.contains("Balance") || compact_text.contains("余额"),
                         "{text}"
                     );
+                    if width >= 100 {
+                        assert!(
+                            text.contains("input-light")
+                                || (text.contains("超") && text.contains("级")),
+                            "{text}"
+                        );
+                    }
                 }
                 Page::Stations => {
                     assert!(text.contains("entry route main"), "{text}");
@@ -433,5 +543,27 @@ mod tests {
 
         assert!(compact_text.contains("未知"), "{text}");
         assert!(text.contains("RUN"), "{text}");
+    }
+
+    #[test]
+    fn fleet_page_renders_nodes_work_units_and_details() {
+        let snapshot = sample_snapshot();
+        let mut ui = UiState {
+            page: Page::Fleet,
+            language: Language::En,
+            fleet_snapshot: Some(sample_fleet_snapshot()),
+            selected_fleet_unit_idx: 1,
+            ..UiState::default()
+        };
+
+        let text = render_app_text(120, 30, &mut ui, &snapshot);
+
+        assert!(text.contains("9 Fleet"), "{text}");
+        assert!(text.contains("local workstation"), "{text}");
+        assert!(text.contains("runtime/high"), "{text}");
+        assert!(text.contains("session_log/med"), "{text}");
+        assert!(text.contains("process/low"), "{text}");
+        assert!(text.contains("research fleet behavior"), "{text}");
+        assert!(text.contains("waiting_approval"), "{text}");
     }
 }

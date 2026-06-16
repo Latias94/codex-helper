@@ -177,10 +177,10 @@ fn footer_help_text(ui: &UiState) -> &'static str {
     if ui.runtime_connection.is_attached() && ui.overlay == Overlay::None {
         return match ui.language {
             crate::tui::Language::Zh => {
-                "1-8 页面  q 只退出控制台  L 语言  Tab 焦点  ↑/↓ 移动  ? 帮助"
+                "1-9 页面  q 只退出控制台  L 语言  Tab 焦点  ↑/↓ 移动  ? 帮助"
             }
             crate::tui::Language::En => {
-                "1-8 pages  q exit console only  L language  Tab focus  ↑/↓ move  ? help"
+                "1-9 pages  q exit console only  L language  Tab focus  ↑/↓ move  ? help"
             }
         };
     }
@@ -204,6 +204,7 @@ fn footer_help_text(ui: &UiState) -> &'static str {
             Page::Settings => i18n::text(ui.language, msg::FOOTER_SETTINGS_OTHER),
             Page::History => i18n::text(ui.language, msg::FOOTER_HISTORY),
             Page::Recent => i18n::text(ui.language, msg::FOOTER_RECENT),
+            Page::Fleet => i18n::text(ui.language, msg::FOOTER_FLEET),
         },
         Overlay::Help => i18n::text(ui.language, msg::FOOTER_HELP),
         Overlay::EffortMenu => i18n::text(ui.language, msg::FOOTER_SELECT_APPLY),
@@ -362,13 +363,17 @@ pub(super) fn render_header(
     } else {
         global_station
     };
-    let focus = match ui.focus {
-        Focus::Sessions => i18n::text(ui.language, msg::FOCUS_SESSIONS),
-        Focus::Requests => i18n::text(ui.language, msg::FOCUS_REQUESTS),
-        Focus::Stations if ui.uses_route_graph_routing() => {
-            i18n::text(ui.language, msg::FOCUS_ROUTING)
+    let focus = if ui.page == Page::Fleet {
+        i18n::label(ui.language, "fleet view")
+    } else {
+        match ui.focus {
+            Focus::Sessions => i18n::text(ui.language, msg::FOCUS_SESSIONS),
+            Focus::Requests => i18n::text(ui.language, msg::FOCUS_REQUESTS),
+            Focus::Stations if ui.uses_route_graph_routing() => {
+                i18n::text(ui.language, msg::FOCUS_ROUTING)
+            }
+            Focus::Stations => i18n::text(ui.language, msg::FOCUS_STATIONS),
         }
-        Focus::Stations => i18n::text(ui.language, msg::FOCUS_STATIONS),
     };
     let connection = ui.runtime_connection.label(ui.language);
     let title = if inner.width >= 72 {
@@ -817,7 +822,7 @@ mod tests {
     #[test]
     fn split_footer_help_uses_second_line_for_overflow() {
         let (first, second) =
-            split_footer_help("1-8 pages  q quit  L language  Tab focus  P global pin", 26);
+            split_footer_help("1-9 pages  q quit  L language  Tab focus  P global pin", 26);
 
         assert!(UnicodeWidthStr::width(first.as_str()) <= 26);
         assert!(!second.is_empty());
@@ -912,5 +917,19 @@ mod tests {
 
         assert!(line_width(&line) <= 8);
         assert!(line_text(&line).starts_with("8"));
+    }
+
+    #[test]
+    fn footer_help_text_mentions_fleet_page() {
+        let ui = UiState {
+            page: Page::Fleet,
+            language: crate::tui::Language::En,
+            ..Default::default()
+        };
+
+        let text = footer_help_text(&ui);
+
+        assert!(text.contains("1-9 pages"), "{text}");
+        assert!(text.contains("? help"), "{text}");
     }
 }

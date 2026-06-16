@@ -2,19 +2,23 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
 use futures_util::StreamExt;
+use tokio::sync::mpsc;
 
 use crate::config::storage::load_config;
 use crate::control_plane_client::{ControlPlaneClient, ControlPlaneEndpoint};
 use crate::dashboard_core::ApiV1Snapshot;
 use crate::proxy::RuntimeStatusResponse;
 
+use super::fleet_refresh::{
+    FleetRefreshResult, FleetRefreshSource, apply_fleet_refresh_result, start_fleet_refresh,
+};
 use super::i18n;
 use super::model::{
     Palette, ProviderOption, Snapshot, build_provider_options, filtered_request_page_len,
     filtered_requests_len, snapshot_from_api_v1,
 };
 use super::runtime_refresh::DashboardTiming;
-use super::state::{RuntimeConnectionKind, UiState, adjust_table_selection};
+use super::state::{FleetViewMode, RuntimeConnectionKind, UiState, adjust_table_selection};
 use super::types::{Focus, Overlay, Page, StatsFocus};
 use super::{RenderInvalidation, enter_dashboard_terminal, input, leave_dashboard_terminal};
 
@@ -107,6 +111,7 @@ async fn run_attached_dashboard_runtime(
         proxy_port: port,
         language,
         usage_forecast: cfg.ui.usage_forecast.clone(),
+        fleet_registry: cfg.fleet.clone(),
         refresh_ms: timing.refresh_ms,
         config_version: cfg.version,
         runtime_connection: RuntimeConnectionKind::Attached,
@@ -130,6 +135,7 @@ async fn run_attached_dashboard_runtime(
     let mut ticker = tokio::time::interval(Duration::from_millis(timing.refresh_ms));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
+    let (fleet_refresh_tx, mut fleet_refresh_rx) = mpsc::unbounded_channel::<FleetRefreshResult>();
     let palette = Palette::default();
     let mut render_invalidation = RenderInvalidation::FullClear;
 
@@ -152,7 +158,25 @@ async fn run_attached_dashboard_runtime(
         tokio::select! {
             _ = ticker.tick() => {
                 refresh_attached_snapshot(&runtime, &mut ui, &mut snapshot, providers.len()).await;
+                if ui.page == Page::Fleet
+                    && !ui.fleet_loading
+                    && ui
+                        .fleet_last_refresh_at
+                        .is_none_or(|last| last.elapsed() >= Duration::from_secs(5))
+                {
+                    ui.needs_fleet_refresh = true;
+                }
+                if ui.needs_fleet_refresh && !ui.fleet_loading {
+                    start_attached_fleet_refresh(&mut ui, &runtime, fleet_refresh_tx.clone());
+                }
                 render_invalidation = RenderInvalidation::Redraw;
+            }
+            maybe_fleet_refresh = fleet_refresh_rx.recv() => {
+                if let Some(result) = maybe_fleet_refresh
+                    && apply_fleet_refresh_result(&mut ui, result)
+                {
+                    render_invalidation = RenderInvalidation::Redraw;
+                }
             }
             _ = &mut ctrl_c => {
                 ui.should_exit = true;
@@ -165,6 +189,9 @@ async fn run_attached_dashboard_runtime(
                         if input::should_accept_key_event(&key)
                             && handle_attached_key(&mut ui, &snapshot, &mut providers, key) =>
                     {
+                        if ui.needs_fleet_refresh && !ui.fleet_loading {
+                            start_attached_fleet_refresh(&mut ui, &runtime, fleet_refresh_tx.clone());
+                        }
                         render_invalidation = RenderInvalidation::FullClear;
                     }
                     Event::Resize(_, _) => {
@@ -178,6 +205,21 @@ async fn run_attached_dashboard_runtime(
     }
 
     leave_dashboard_terminal(term_guard, &mut terminal)
+}
+
+fn start_attached_fleet_refresh(
+    ui: &mut UiState,
+    runtime: &AttachedDashboardRuntime,
+    tx: mpsc::UnboundedSender<FleetRefreshResult>,
+) {
+    start_fleet_refresh(
+        ui,
+        FleetRefreshSource::Attached {
+            client: runtime.client.clone(),
+        },
+        tx,
+    );
+    ui.needs_fleet_refresh = false;
 }
 
 fn resolve_attached_language(cfg: &crate::config::ProxyConfig) -> super::Language {
@@ -343,6 +385,7 @@ fn handle_attached_key(
         KeyCode::Char('6') => switch_attached_page(ui, Page::Settings),
         KeyCode::Char('7') => switch_attached_page(ui, Page::History),
         KeyCode::Char('8') => switch_attached_page(ui, Page::Recent),
+        KeyCode::Char('9') => switch_attached_page(ui, Page::Fleet),
         KeyCode::Tab => {
             cycle_attached_focus(ui);
             true
@@ -371,6 +414,17 @@ fn handle_attached_key(
             ui.stats_provider_detail_scroll = 0;
             true
         }
+        KeyCode::Char('r') if ui.page == Page::Fleet => {
+            ui.needs_fleet_refresh = true;
+            true
+        }
+        KeyCode::Char('t') if ui.page == Page::Fleet => {
+            ui.fleet_view_mode = match ui.fleet_view_mode {
+                FleetViewMode::Tree => FleetViewMode::Flat,
+                FleetViewMode::Flat => FleetViewMode::Tree,
+            };
+            true
+        }
         _ => false,
     }
 }
@@ -381,6 +435,11 @@ fn switch_attached_page(ui: &mut UiState, page: Page) -> bool {
         Page::Stations => ui.focus = Focus::Stations,
         Page::Requests => ui.focus = Focus::Requests,
         Page::Sessions | Page::History | Page::Recent => ui.focus = Focus::Sessions,
+        Page::Fleet => {
+            ui.focus = Focus::Stations;
+            ui.needs_fleet_refresh = true;
+            ui.sync_fleet_selection();
+        }
         Page::Dashboard if ui.focus == Focus::Stations => ui.focus = Focus::Sessions,
         _ => {}
     }
@@ -402,6 +461,12 @@ fn cycle_attached_focus(ui: &mut UiState) {
                 StatsFocus::Providers => StatsFocus::Stations,
             };
             ui.stats_provider_detail_scroll = 0;
+        }
+        Page::Fleet => {
+            ui.focus = match ui.focus {
+                Focus::Stations => Focus::Sessions,
+                Focus::Sessions | Focus::Requests => Focus::Stations,
+            };
         }
         _ => {}
     }
@@ -469,6 +534,7 @@ fn move_attached_selection(
             }
             false
         }
+        Page::Fleet => move_attached_fleet_selection(ui, delta),
         _ => match ui.focus {
             Focus::Sessions => {
                 if let Some(next) =
@@ -500,6 +566,53 @@ fn move_attached_selection(
             Focus::Stations => false,
         },
     }
+}
+
+fn move_attached_fleet_selection(ui: &mut UiState, delta: i32) -> bool {
+    let Some(snapshot) = ui.fleet_snapshot.as_ref() else {
+        return false;
+    };
+
+    if ui.focus == Focus::Stations {
+        if let Some(next) =
+            adjust_table_selection(&mut ui.fleet_nodes_table, delta, snapshot.nodes.len())
+        {
+            ui.selected_fleet_node_idx = next;
+            ui.selected_fleet_node_id = snapshot.nodes.get(next).map(|node| node.node_id.clone());
+            ui.selected_fleet_unit_idx = 0;
+            ui.selected_fleet_unit_id = snapshot
+                .nodes
+                .get(next)
+                .and_then(|node| node.work_units.first())
+                .map(|unit| unit.id.clone());
+            let unit_len = snapshot
+                .nodes
+                .get(next)
+                .map(|node| node.work_units.len())
+                .unwrap_or(0);
+            ui.fleet_units_table
+                .select((unit_len > 0).then_some(ui.selected_fleet_unit_idx));
+            *ui.fleet_units_table.offset_mut() = 0;
+            return true;
+        }
+        return false;
+    }
+
+    let unit_len = snapshot
+        .nodes
+        .get(ui.selected_fleet_node_idx)
+        .map(|node| node.work_units.len())
+        .unwrap_or(0);
+    if let Some(next) = adjust_table_selection(&mut ui.fleet_units_table, delta, unit_len) {
+        ui.selected_fleet_unit_idx = next;
+        ui.selected_fleet_unit_id = snapshot
+            .nodes
+            .get(ui.selected_fleet_node_idx)
+            .and_then(|node| node.work_units.get(next))
+            .map(|unit| unit.id.clone());
+        return true;
+    }
+    false
 }
 
 fn toggle_attached_language(ui: &mut UiState) {
@@ -553,6 +666,26 @@ mod tests {
 
         assert_eq!(ui.page, Page::Requests);
         assert_eq!(ui.focus, Focus::Requests);
+    }
+
+    #[test]
+    fn attached_navigation_supports_fleet_page() {
+        let mut ui = UiState {
+            runtime_connection: RuntimeConnectionKind::Attached,
+            ..Default::default()
+        };
+        let snapshot = empty_snapshot();
+
+        assert!(handle_attached_key(
+            &mut ui,
+            &snapshot,
+            &mut [],
+            KeyEvent::from(KeyCode::Char('9')),
+        ));
+
+        assert_eq!(ui.page, Page::Fleet);
+        assert_eq!(ui.focus, Focus::Stations);
+        assert!(ui.needs_fleet_refresh);
     }
 
     #[test]

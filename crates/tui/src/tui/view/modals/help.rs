@@ -26,6 +26,7 @@ fn help_current_page_title(lang: Language, page: Page, is_route_graph: bool) -> 
         (Language::Zh, Page::Settings, _) => "当前页面：设置",
         (Language::Zh, Page::History, _) => "当前页面：历史",
         (Language::Zh, Page::Recent, _) => "当前页面：最近",
+        (Language::Zh, Page::Fleet, _) => "当前页面：Fleet",
         (Language::En, Page::Dashboard, _) => "Current page: Dashboard",
         (Language::En, Page::Stations, true) => "Current page: Routing",
         (Language::En, Page::Stations, false) => "Current page: Stations",
@@ -35,6 +36,7 @@ fn help_current_page_title(lang: Language, page: Page, is_route_graph: bool) -> 
         (Language::En, Page::Settings, _) => "Current page: Settings",
         (Language::En, Page::History, _) => "Current page: History",
         (Language::En, Page::Recent, _) => "Current page: Recent",
+        (Language::En, Page::Fleet, _) => "Current page: Fleet",
     }
 }
 
@@ -120,6 +122,12 @@ pub(super) fn current_page_help_lines(
             "  t          打开全屏对话记录",
             "  s/f/h      跳到 Sessions / Requests / History",
         ],
+        (Language::Zh, Page::Fleet, _, _) => vec![
+            "  Tab        切换节点列表 / 工作单元视图",
+            "  ↑/↓        移动当前列表选择",
+            "  r          立即刷新 Fleet 快照",
+            "  t          切换 Tree / Flat 展示",
+        ],
         (Language::En, Page::Dashboard, true, _) => vec![
             "  Tab        switch Sessions / Requests focus",
             "  b/M/f      session profile, model, fast/service tier overrides",
@@ -189,6 +197,12 @@ pub(super) fn current_page_help_lines(
             "  t          open full-screen transcript",
             "  s/f/h      jump to Sessions / Requests / History",
         ],
+        (Language::En, Page::Fleet, _, _) => vec![
+            "  Tab        switch nodes / work units focus",
+            "  ↑/↓        move the current list selection",
+            "  r          refresh the Fleet snapshot now",
+            "  t          toggle Tree / Flat layout",
+        ],
     };
 
     lines.extend(entries.into_iter().map(Line::from));
@@ -249,9 +263,9 @@ pub(in crate::tui::view) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui:
                 Style::default().fg(p.text).add_modifier(Modifier::BOLD),
             )]),
             Line::from("  ↑/↓, j/k   移动选中项"),
-            Line::from("  1-8        切换页面"),
+            Line::from("  1-9        切换页面"),
             Line::from(
-                "            1 总览  2 站点/路由  3 会话  4 请求  5 用量  6 设置  7 历史  8 最近",
+                "            1 总览  2 站点/路由  3 会话  4 请求  5 用量  6 设置  7 历史  8 最近  9 Fleet",
             ),
             Line::from("  L          切换语言（中/英，自动落盘）"),
             Line::from("  6 设置     查看运行态与关键配置入口"),
@@ -386,6 +400,14 @@ pub(in crate::tui::view) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui:
             Line::from("  s/f/h      打开到 Sessions / Requests / History"),
             Line::from(""),
             Line::from(vec![Span::styled(
+                "Fleet 页",
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+            )]),
+            Line::from("  r          刷新 Fleet 快照"),
+            Line::from("  Tab        切换节点 / 工作单元焦点"),
+            Line::from("  t          切换 Tree / Flat 展示"),
+            Line::from(""),
+            Line::from(vec![Span::styled(
                 "用量页（Usage / Balance）",
                 Style::default().fg(p.text).add_modifier(Modifier::BOLD),
             )]),
@@ -415,9 +437,9 @@ pub(in crate::tui::view) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui:
             )]),
             Line::from("  Tab        switch focus (Dashboard)"),
             Line::from("  ↑/↓, j/k   move selection"),
-            Line::from("  1-8        switch page"),
+            Line::from("  1-9        switch page"),
             Line::from(
-                "            1 Dashboard  2 Stations/Routing  3 Sessions  4 Requests  5 Usage  6 Settings  7 History  8 Recent",
+                "            1 Dashboard  2 Stations/Routing  3 Sessions  4 Requests  5 Usage  6 Settings  7 History  8 Recent  9 Fleet",
             ),
             Line::from("  L          toggle language (zh/en, persisted)"),
             Line::from("  6 Settings show runtime + station overview"),
@@ -551,6 +573,14 @@ pub(in crate::tui::view) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui:
             Line::from("  Enter / y  copy selected / copy visible list"),
             Line::from("  t          open transcript (full-screen)"),
             Line::from("  s/f/h      open in Sessions / Requests / History"),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "Fleet page",
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+            )]),
+            Line::from("  r          refresh Fleet snapshot"),
+            Line::from("  Tab        switch nodes / work units focus"),
+            Line::from("  t          toggle Tree / Flat layout"),
             Line::from(""),
             Line::from(vec![Span::styled(
                 "Usage / Balance page",
