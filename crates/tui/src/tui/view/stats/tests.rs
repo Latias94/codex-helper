@@ -116,7 +116,6 @@ fn sample_snapshot(provider_balances: HashMap<String, Vec<ProviderBalanceSnapsho
             ]),
             by_config: vec![("station".to_string(), station_bucket.clone())],
             by_config_day: HashMap::from([("station".to_string(), vec![(day, station_bucket)])]),
-            ..UsageRollupView::default()
         },
         provider_balances,
         station_health: HashMap::new(),

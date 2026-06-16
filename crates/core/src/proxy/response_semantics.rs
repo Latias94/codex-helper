@@ -21,7 +21,7 @@ pub(super) struct SemanticResponseFailure {
 pub(super) fn validate_success_response_semantics(
     contract: Option<ResponseSemanticContract>,
     response_body: &Bytes,
-) -> Result<(), SemanticResponseFailure> {
+) -> Result<(), Box<SemanticResponseFailure>> {
     match contract {
         Some(ResponseSemanticContract::HostedImageGeneration) => {
             validate_hosted_image_generation_response(response_body.as_ref())
@@ -30,20 +30,22 @@ pub(super) fn validate_success_response_semantics(
     }
 }
 
-fn validate_hosted_image_generation_response(body: &[u8]) -> Result<(), SemanticResponseFailure> {
+fn validate_hosted_image_generation_response(
+    body: &[u8],
+) -> Result<(), Box<SemanticResponseFailure>> {
     match serde_json::from_slice::<Value>(body) {
         Ok(value) => match hosted_image_generation_result_state(&value) {
             HostedImageGenerationResultState::Completed => Ok(()),
-            HostedImageGenerationResultState::NoOutputArray => Err(hosted_image_failure(
+            HostedImageGenerationResultState::NoOutputArray => Err(Box::new(hosted_image_failure(
                 "upstream image generation response did not contain an output array",
-            )),
-            HostedImageGenerationResultState::MissingResult => Err(hosted_image_failure(
+            ))),
+            HostedImageGenerationResultState::MissingResult => Err(Box::new(hosted_image_failure(
                 "upstream response contained no completed image_generation_call result",
-            )),
+            ))),
         },
-        Err(error) => Err(hosted_image_failure(format!(
+        Err(error) => Err(Box::new(hosted_image_failure(format!(
             "upstream image generation response was not valid JSON: {error}"
-        ))),
+        )))),
     }
 }
 

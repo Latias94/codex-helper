@@ -20,16 +20,15 @@ pub async fn build_local_fleet_snapshot(
     let refreshed_at_ms = now_ms();
     let dashboard = build_dashboard_snapshot(state, service_name, 2_000, 7).await;
     let process_scan = scan_codex_processes();
-    let node = build_local_fleet_node_from_parts(
-        node_id.into(),
-        label.into(),
-        service_name,
+    let node = build_local_fleet_node_from_parts(LocalFleetNodeParts {
+        node_id: node_id.into(),
+        label: label.into(),
         refreshed_at_ms,
-        process_scan.summary(),
-        &dashboard.session_cards,
-        &dashboard.active,
-        &dashboard.recent,
-    );
+        processes: process_scan.summary(),
+        session_cards: &dashboard.session_cards,
+        active: &dashboard.active,
+        recent: &dashboard.recent,
+    });
 
     FleetSnapshot {
         api_version: 1,
@@ -48,16 +47,15 @@ pub fn build_local_fleet_snapshot_from_parts(
     active: &[ActiveRequest],
     recent: &[FinishedRequest],
 ) -> FleetSnapshot {
-    let node = build_local_fleet_node_from_parts(
-        node_id.into(),
-        label.into(),
-        service_name,
+    let node = build_local_fleet_node_from_parts(LocalFleetNodeParts {
+        node_id: node_id.into(),
+        label: label.into(),
         refreshed_at_ms,
-        FleetProcessSummary::default(),
+        processes: FleetProcessSummary::default(),
         session_cards,
         active,
         recent,
-    );
+    });
 
     FleetSnapshot {
         api_version: 1,
@@ -73,16 +71,15 @@ pub fn build_local_fleet_snapshot_from_dashboard(
     label: impl Into<String>,
     dashboard: &DashboardSnapshot,
 ) -> FleetSnapshot {
-    let node = build_local_fleet_node_from_parts(
-        node_id.into(),
-        label.into(),
-        service_name,
-        dashboard.refreshed_at_ms,
-        scan_codex_processes().summary(),
-        &dashboard.session_cards,
-        &dashboard.active,
-        &dashboard.recent,
-    );
+    let node = build_local_fleet_node_from_parts(LocalFleetNodeParts {
+        node_id: node_id.into(),
+        label: label.into(),
+        refreshed_at_ms: dashboard.refreshed_at_ms,
+        processes: scan_codex_processes().summary(),
+        session_cards: &dashboard.session_cards,
+        active: &dashboard.active,
+        recent: &dashboard.recent,
+    });
 
     FleetSnapshot {
         api_version: 1,
@@ -92,16 +89,27 @@ pub fn build_local_fleet_snapshot_from_dashboard(
     }
 }
 
-fn build_local_fleet_node_from_parts(
+struct LocalFleetNodeParts<'a> {
     node_id: String,
     label: String,
-    _service_name: &str,
     refreshed_at_ms: u64,
     processes: FleetProcessSummary,
-    session_cards: &[SessionIdentityCard],
-    active: &[ActiveRequest],
-    recent: &[FinishedRequest],
-) -> FleetNodeSnapshot {
+    session_cards: &'a [SessionIdentityCard],
+    active: &'a [ActiveRequest],
+    recent: &'a [FinishedRequest],
+}
+
+fn build_local_fleet_node_from_parts(parts: LocalFleetNodeParts<'_>) -> FleetNodeSnapshot {
+    let LocalFleetNodeParts {
+        node_id,
+        label,
+        refreshed_at_ms,
+        processes,
+        session_cards,
+        active,
+        recent,
+    } = parts;
+
     let active_by_session = active
         .iter()
         .filter_map(|request| request.session_id.as_deref().map(|sid| (sid, request)))
@@ -178,7 +186,7 @@ fn work_unit_from_session_card(
         .map(|sid| format!("session:{sid}"))
         .unwrap_or_else(|| format!("unknown-session:{idx}"));
     let active_started_at_ms = active
-        .and_then(|requests| requests.iter().filter_map(|r| Some(r.started_at_ms)).min())
+        .and_then(|requests| requests.iter().map(|r| r.started_at_ms).min())
         .or(card.active_started_at_ms_min);
     let last_recent = recent.and_then(|requests| {
         requests
@@ -261,6 +269,9 @@ fn infer_work_unit_evidence(
     active: Option<&[&ActiveRequest]>,
     recent: Option<&[&FinishedRequest]>,
 ) -> FleetEvidence {
+    if card.active_count > 0 || card.active_started_at_ms_min.is_some() {
+        return FleetEvidence::high(FleetEvidenceSource::RuntimeStatus);
+    }
     if active.is_some_and(|requests| !requests.is_empty()) {
         return FleetEvidence::high(FleetEvidenceSource::RuntimeStatus);
     }

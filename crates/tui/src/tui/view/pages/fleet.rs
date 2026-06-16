@@ -633,7 +633,7 @@ fn topology_summary(node: &FleetNodeSnapshot) -> String {
     };
     let mut summary = format!("{status} edges={}", node.topology.edges.len());
     if let Some(note) = node.topology.note.as_deref() {
-        summary.push_str(" ");
+        summary.push(' ');
         summary.push_str(&shorten_middle(note, 48));
     }
     summary

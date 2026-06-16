@@ -54,16 +54,11 @@ pub(in crate::tui) struct RecentCodexRow {
     pub(in crate::tui) mtime_ms: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(in crate::tui) enum FleetViewMode {
+    #[default]
     Tree,
     Flat,
-}
-
-impl Default for FleetViewMode {
-    fn default() -> Self {
-        Self::Tree
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

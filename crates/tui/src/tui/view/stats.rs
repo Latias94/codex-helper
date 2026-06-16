@@ -25,6 +25,15 @@ struct StatsKpiContext<'a> {
     usage_forecast: &'a crate::config::UsageForecastConfig,
 }
 
+#[derive(Clone, Copy)]
+struct UsageSignalsContext<'a> {
+    snapshot: &'a Snapshot,
+    today: &'a UsageBucket,
+    today_day: i32,
+    window_label: &'a str,
+    lang: Language,
+}
+
 const DAY_MS: u64 = 86_400_000;
 
 #[derive(Clone)]
@@ -71,12 +80,14 @@ pub(super) fn render_stats_page(
     render_usage_signals(
         f,
         p,
-        snapshot,
-        &today,
-        today_day,
-        &window_label,
+        UsageSignalsContext {
+            snapshot,
+            today: &today,
+            today_day,
+            window_label: &window_label,
+            lang,
+        },
         rows[1],
-        lang,
     );
     render_tables(
         f,
@@ -298,16 +309,7 @@ fn render_today_kpis(
     );
 }
 
-fn render_usage_signals(
-    f: &mut Frame<'_>,
-    p: Palette,
-    snapshot: &Snapshot,
-    today: &UsageBucket,
-    today_day: i32,
-    window_label: &str,
-    area: Rect,
-    lang: Language,
-) {
+fn render_usage_signals(f: &mut Frame<'_>, p: Palette, ctx: UsageSignalsContext<'_>, area: Rect) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -317,30 +319,17 @@ fn render_usage_signals(
         ])
         .split(area);
 
-    render_coverage_block(
-        f,
-        p,
-        snapshot,
-        today,
-        today_day,
-        window_label,
-        cols[0],
-        lang,
-    );
-    render_runtime_health_block(f, p, snapshot, cols[1], lang);
-    render_recent_days_sparkline(f, p, snapshot, cols[2], lang);
+    render_coverage_block(f, p, ctx, cols[0]);
+    render_runtime_health_block(f, p, ctx.snapshot, cols[1], ctx.lang);
+    render_recent_days_sparkline(f, p, ctx.snapshot, cols[2], ctx.lang);
 }
 
-fn render_coverage_block(
-    f: &mut Frame<'_>,
-    p: Palette,
-    snapshot: &Snapshot,
-    today: &UsageBucket,
-    today_day: i32,
-    window_label: &str,
-    area: Rect,
-    lang: Language,
-) {
+fn render_coverage_block(f: &mut Frame<'_>, p: Palette, ctx: UsageSignalsContext<'_>, area: Rect) {
+    let snapshot = ctx.snapshot;
+    let today = ctx.today;
+    let today_day = ctx.today_day;
+    let window_label = ctx.window_label;
+    let lang = ctx.lang;
     let c = &snapshot.usage_rollup.coverage;
     let loaded = day_range_label(c.loaded_first_day, c.loaded_last_day);
     let note = if c.window_exceeds_loaded_start {

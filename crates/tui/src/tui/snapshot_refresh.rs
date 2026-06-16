@@ -16,20 +16,19 @@ pub(super) struct SnapshotRefreshResult {
     pub(super) snapshot: Snapshot,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SnapshotRefreshKey {
+    generation: u64,
+    config_version: Option<u32>,
+    stats_days: usize,
+    forecast_mode: ForecastRecentMode,
+}
+
 fn snapshot_refresh_result_is_current(
-    result_generation: u64,
-    result_config_version: Option<u32>,
-    result_stats_days: usize,
-    result_forecast_mode: ForecastRecentMode,
-    current_generation: u64,
-    current_config_version: Option<u32>,
-    current_stats_days: usize,
-    current_forecast_mode: ForecastRecentMode,
+    result: SnapshotRefreshKey,
+    current: SnapshotRefreshKey,
 ) -> bool {
-    result_generation == current_generation
-        && result_config_version == current_config_version
-        && result_stats_days == current_stats_days
-        && result_forecast_mode == current_forecast_mode
+    result == current
 }
 
 #[derive(Debug)]
@@ -86,14 +85,18 @@ impl SnapshotRefreshController {
         current_forecast_mode: ForecastRecentMode,
     ) -> bool {
         snapshot_refresh_result_is_current(
-            result.generation,
-            result.config_version,
-            result.stats_days,
-            result.forecast_mode,
-            self.generation,
-            current_config_version,
-            current_stats_days,
-            current_forecast_mode,
+            SnapshotRefreshKey {
+                generation: result.generation,
+                config_version: result.config_version,
+                stats_days: result.stats_days,
+                forecast_mode: result.forecast_mode,
+            },
+            SnapshotRefreshKey {
+                generation: self.generation,
+                config_version: current_config_version,
+                stats_days: current_stats_days,
+                forecast_mode: current_forecast_mode,
+            },
         )
     }
 
@@ -144,62 +147,52 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        ForecastRecentMode, SnapshotRefreshController, snapshot_refresh_result_is_current,
+        ForecastRecentMode, SnapshotRefreshController, SnapshotRefreshKey,
+        snapshot_refresh_result_is_current,
     };
     use crate::config::ProxyConfig;
     use crate::state::ProxyState;
 
     #[test]
     fn snapshot_refresh_result_guard_rejects_stale_results() {
+        let current = SnapshotRefreshKey {
+            generation: 3,
+            config_version: Some(5),
+            stats_days: 7,
+            forecast_mode: ForecastRecentMode::RuntimeOnly,
+        };
+
         assert!(snapshot_refresh_result_is_current(
-            3,
-            Some(5),
-            7,
-            ForecastRecentMode::RuntimeOnly,
-            3,
-            Some(5),
-            7,
-            ForecastRecentMode::RuntimeOnly
+            SnapshotRefreshKey { ..current },
+            current
         ));
         assert!(!snapshot_refresh_result_is_current(
-            2,
-            Some(5),
-            7,
-            ForecastRecentMode::RuntimeOnly,
-            3,
-            Some(5),
-            7,
-            ForecastRecentMode::RuntimeOnly
+            SnapshotRefreshKey {
+                generation: 2,
+                ..current
+            },
+            current
         ));
         assert!(!snapshot_refresh_result_is_current(
-            3,
-            Some(4),
-            7,
-            ForecastRecentMode::RuntimeOnly,
-            3,
-            Some(5),
-            7,
-            ForecastRecentMode::RuntimeOnly
+            SnapshotRefreshKey {
+                config_version: Some(4),
+                ..current
+            },
+            current
         ));
         assert!(!snapshot_refresh_result_is_current(
-            3,
-            Some(5),
-            30,
-            ForecastRecentMode::RuntimeOnly,
-            3,
-            Some(5),
-            7,
-            ForecastRecentMode::RuntimeOnly
+            SnapshotRefreshKey {
+                stats_days: 30,
+                ..current
+            },
+            current
         ));
         assert!(!snapshot_refresh_result_is_current(
-            3,
-            Some(5),
-            7,
-            ForecastRecentMode::IncludeRequestLedger,
-            3,
-            Some(5),
-            7,
-            ForecastRecentMode::RuntimeOnly
+            SnapshotRefreshKey {
+                forecast_mode: ForecastRecentMode::IncludeRequestLedger,
+                ..current
+            },
+            current
         ));
     }
 

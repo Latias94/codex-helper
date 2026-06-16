@@ -427,6 +427,7 @@ pub(super) async fn handle_attempt_response(
     };
     let mut semantic_error_class = None;
     if let Some(failure) = semantic_failure {
+        let failure = *failure;
         semantic_error_class = Some(failure.error_class);
         response_status = failure.status;
         response_headers_filtered = failure.response_headers;
