@@ -89,7 +89,14 @@ fn stale_routing_explain() -> crate::routing_explain::RoutingExplainResponse {
 }
 
 async fn empty_snapshot(state: &ProxyState, cfg: Arc<ProxyConfig>) -> Snapshot {
-    crate::tui::model::refresh_snapshot(state, cfg, "codex", 7).await
+    crate::tui::model::refresh_snapshot(
+        state,
+        cfg,
+        "codex",
+        7,
+        crate::tui::model::ForecastRecentMode::RuntimeOnly,
+    )
+    .await
 }
 
 fn proxy_with_single_station_without_upstreams() -> (ProxyService, Arc<ProxyConfig>) {

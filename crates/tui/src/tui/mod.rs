@@ -257,7 +257,14 @@ pub async fn run_dashboard(
     let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
 
     let mut cfg = cfg;
-    let mut snapshot = refresh_snapshot(&state, cfg.clone(), service_name, ui.stats_days).await;
+    let mut snapshot = refresh_snapshot(
+        &state,
+        cfg.clone(),
+        service_name,
+        ui.stats_days,
+        ui.forecast_recent_mode(),
+    )
+    .await;
     let mut providers = providers;
     ui.clamp_selection(&snapshot, ui.station_page_rows_len(providers.len()));
     let (balance_refresh_tx, mut balance_refresh_rx) =
@@ -340,13 +347,19 @@ pub async fn run_dashboard(
                         cfg.clone(),
                         service_name,
                         ui.stats_days,
+                        ui.forecast_recent_mode(),
                     );
                 }
             }
             maybe_snapshot_refresh = snapshot_refresh_rx.recv() => {
                 if let Some(result) = maybe_snapshot_refresh {
                     snapshot_refresh.finish(result.generation);
-                    if snapshot_refresh.result_is_current(&result, cfg.version, ui.stats_days) {
+                    if snapshot_refresh.result_is_current(
+                        &result,
+                        cfg.version,
+                        ui.stats_days,
+                        ui.forecast_recent_mode(),
+                    ) {
                         snapshot = result.snapshot;
                         ui.clamp_selection(&snapshot, ui.station_page_rows_len(providers.len()));
                         request_redraw(&mut render_invalidation);
@@ -356,6 +369,7 @@ pub async fn run_dashboard(
                         cfg.clone(),
                         service_name,
                         ui.stats_days,
+                        ui.forecast_recent_mode(),
                     );
                 }
             }

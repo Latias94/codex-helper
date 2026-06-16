@@ -105,7 +105,6 @@ async fn run_attached_dashboard_runtime(
     }
 
     let mut providers = build_provider_options(&cfg, service_name);
-    let mut snapshot = snapshot_from_api_v1(api_snapshot).await;
     let mut ui = UiState {
         service_name,
         proxy_port: port,
@@ -126,6 +125,7 @@ async fn run_attached_dashboard_runtime(
         )),
         ..Default::default()
     };
+    let mut snapshot = snapshot_from_api_v1(api_snapshot, ui.forecast_recent_mode()).await;
     hydrate_attached_profile_state(&mut ui, &runtime).await;
     hydrate_attached_routing_state(&mut ui, &runtime).await;
     ui.clamp_selection(&snapshot, ui.station_page_rows_len(providers.len()));
@@ -191,6 +191,10 @@ async fn run_attached_dashboard_runtime(
                     {
                         if ui.needs_fleet_refresh && !ui.fleet_loading {
                             start_attached_fleet_refresh(&mut ui, &runtime, fleet_refresh_tx.clone());
+                        }
+                        if ui.needs_snapshot_refresh {
+                            refresh_attached_snapshot(&runtime, &mut ui, &mut snapshot, providers.len()).await;
+                            ui.needs_snapshot_refresh = false;
                         }
                         render_invalidation = RenderInvalidation::FullClear;
                     }
@@ -292,7 +296,7 @@ async fn refresh_attached_snapshot(
 
     match runtime.snapshot(ui.stats_days).await {
         Ok(api_snapshot) => {
-            *snapshot = snapshot_from_api_v1(api_snapshot).await;
+            *snapshot = snapshot_from_api_v1(api_snapshot, ui.forecast_recent_mode()).await;
             ui.clamp_selection(snapshot, ui.station_page_rows_len(providers_len));
         }
         Err(err) => {
@@ -412,6 +416,7 @@ fn handle_attached_key(
                 .unwrap_or(1);
             ui.stats_days = options[(idx + 1) % options.len()];
             ui.stats_provider_detail_scroll = 0;
+            ui.needs_snapshot_refresh = true;
             true
         }
         KeyCode::Char('r') if ui.page == Page::Fleet => {
@@ -430,7 +435,11 @@ fn handle_attached_key(
 }
 
 fn switch_attached_page(ui: &mut UiState, page: Page) -> bool {
+    let previous_page = ui.page;
     ui.page = page;
+    if previous_page == Page::Stats || ui.page == Page::Stats {
+        ui.needs_snapshot_refresh = true;
+    }
     match ui.page {
         Page::Stations => ui.focus = Focus::Stations,
         Page::Requests => ui.focus = Focus::Requests,

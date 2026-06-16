@@ -381,6 +381,14 @@ impl UiState {
             .is_some_and(|version| version == 3 || is_supported_route_graph_config_version(version))
     }
 
+    pub(in crate::tui) fn forecast_recent_mode(&self) -> super::model::ForecastRecentMode {
+        if self.page == Page::Stats && self.usage_forecast.enabled {
+            super::model::ForecastRecentMode::IncludeRequestLedger
+        } else {
+            super::model::ForecastRecentMode::RuntimeOnly
+        }
+    }
+
     pub(in crate::tui) fn station_page_rows_len(&self, legacy_len: usize) -> usize {
         if self.uses_route_graph_routing() {
             return self.routing_provider_count().unwrap_or(legacy_len);
@@ -1011,6 +1019,7 @@ mod tests {
         BalanceSnapshotStatus, FinishedRequest, ProviderBalanceSnapshot, SessionObservationScope,
         UsageBucket, UsageRollupView,
     };
+    use crate::tui::model::ForecastRecentMode;
     use crate::tui::model::RoutingProviderRef;
     use crate::tui::model::{SessionRow, UsageForecastSampleSource};
     use crate::tui::types::StatsFocus;
@@ -1074,6 +1083,22 @@ mod tests {
             pricing_catalog: crate::pricing::ModelPriceCatalogSnapshot::default(),
             refreshed_at: std::time::Instant::now(),
         }
+    }
+
+    #[test]
+    fn forecast_recent_mode_only_includes_ledger_on_enabled_stats_page() {
+        let mut ui = UiState::default();
+
+        assert_eq!(ui.forecast_recent_mode(), ForecastRecentMode::RuntimeOnly);
+
+        ui.page = Page::Stats;
+        assert_eq!(
+            ui.forecast_recent_mode(),
+            ForecastRecentMode::IncludeRequestLedger
+        );
+
+        ui.usage_forecast.enabled = false;
+        assert_eq!(ui.forecast_recent_mode(), ForecastRecentMode::RuntimeOnly);
     }
 
     fn empty_session_row(id: &str) -> SessionRow {

@@ -1233,12 +1233,12 @@ async fn run_server(
                     Ok(Err(err)) => {
                         // If the dashboard fails (e.g. terminal issues), keep running without it.
                         tracing::warn!("TUI dashboard failed; continuing without TUI: {}", err);
-                        await_server_shutdown_with_timeout(server_handle).await?;
+                        await_server_shutdown(server_handle).await?;
                         Ok::<(), anyhow::Error>(())
                     }
                     Err(join_err) => {
                         tracing::warn!("TUI task join error; continuing without TUI: {}", join_err);
-                        await_server_shutdown_with_timeout(server_handle).await?;
+                        await_server_shutdown(server_handle).await?;
                         Ok::<(), anyhow::Error>(())
                     }
                 }

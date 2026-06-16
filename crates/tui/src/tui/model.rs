@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use ratatui::prelude::{Color, Style};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -302,6 +303,12 @@ pub(in crate::tui) struct SessionRow {
 pub(in crate::tui) enum UsageForecastSampleSource {
     RuntimeOnly,
     RuntimeAndRequestLedger,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::tui) enum ForecastRecentMode {
+    RuntimeOnly,
+    IncludeRequestLedger,
 }
 
 #[derive(Debug, Clone)]
@@ -1782,6 +1789,7 @@ pub(in crate::tui) async fn refresh_snapshot(
     cfg: Arc<ProxyConfig>,
     service_name: &str,
     stats_days: usize,
+    forecast_mode: ForecastRecentMode,
 ) -> Snapshot {
     let (mut snap, config_meta) = tokio::join!(
         crate::dashboard_core::build_dashboard_snapshot(
@@ -1811,7 +1819,7 @@ pub(in crate::tui) async fn refresh_snapshot(
         }
     }
     let (forecast_recent, forecast_recent_source) =
-        load_forecast_recent_requests(snap.recent.clone()).await;
+        load_forecast_recent_requests(&snap.recent, forecast_mode).await;
     Snapshot {
         rows,
         recent: snap.recent,
@@ -1837,7 +1845,10 @@ pub(in crate::tui) async fn refresh_snapshot(
     }
 }
 
-pub(in crate::tui) async fn snapshot_from_api_v1(api: ApiV1Snapshot) -> Snapshot {
+pub(in crate::tui) async fn snapshot_from_api_v1(
+    api: ApiV1Snapshot,
+    forecast_mode: ForecastRecentMode,
+) -> Snapshot {
     let snap = api.snapshot;
     let global_station_override = snap.effective_global_station_override().map(str::to_owned);
     let global_route_target_override = snap
@@ -1852,7 +1863,7 @@ pub(in crate::tui) async fn snapshot_from_api_v1(api: ApiV1Snapshot) -> Snapshot
         }
     }
     let (forecast_recent, forecast_recent_source) =
-        load_forecast_recent_requests(snap.recent.clone()).await;
+        load_forecast_recent_requests(&snap.recent, forecast_mode).await;
     Snapshot {
         rows,
         recent: snap.recent,
@@ -1885,15 +1896,64 @@ fn usage_forecast_log_tail_limit() -> usize {
             .ok()
             .and_then(|s| s.trim().parse::<usize>().ok())
             .filter(|&n| n > 0)
-            .unwrap_or(20_000)
+            .unwrap_or(5_000)
             .clamp(crate::state::recent_finished_max(), 200_000)
     })
 }
 
+fn usage_forecast_ledger_cache_ttl() -> Duration {
+    Duration::from_secs(30)
+}
+
 async fn load_forecast_recent_requests(
-    memory_recent: Vec<FinishedRequest>,
+    memory_recent: &[FinishedRequest],
+    forecast_mode: ForecastRecentMode,
 ) -> (Vec<FinishedRequest>, UsageForecastSampleSource) {
+    if forecast_mode == ForecastRecentMode::RuntimeOnly {
+        clear_forecast_ledger_cache();
+        return (Vec::new(), UsageForecastSampleSource::RuntimeOnly);
+    }
+
     let limit = usage_forecast_log_tail_limit();
+    let ledger_recent = load_cached_forecast_ledger_recent(limit).await;
+    let source = forecast_recent_sample_source(&ledger_recent);
+
+    (
+        merge_forecast_recent_requests(memory_recent.to_vec(), ledger_recent, limit),
+        source,
+    )
+}
+
+#[derive(Debug, Clone)]
+struct ForecastLedgerCacheEntry {
+    limit: usize,
+    loaded_at: Instant,
+    recent: Vec<FinishedRequest>,
+}
+
+fn forecast_ledger_cache() -> &'static Mutex<Option<ForecastLedgerCacheEntry>> {
+    static CACHE: std::sync::OnceLock<Mutex<Option<ForecastLedgerCacheEntry>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn clear_forecast_ledger_cache() {
+    if let Ok(mut cache) = forecast_ledger_cache().lock() {
+        *cache = None;
+    }
+}
+
+async fn load_cached_forecast_ledger_recent(limit: usize) -> Vec<FinishedRequest> {
+    if let Ok(cache) = forecast_ledger_cache().lock()
+        && let Some(entry) = cache.as_ref()
+        && entry.limit == limit
+        && entry.loaded_at.elapsed() <= usage_forecast_ledger_cache_ttl()
+    {
+        return entry.recent.clone();
+    }
+
+    clear_forecast_ledger_cache();
+
     let ledger_recent = tokio::task::spawn_blocking(move || {
         crate::request_ledger::RequestLedgerStore::default().tail_finished_requests(limit)
     })
@@ -1901,12 +1961,16 @@ async fn load_forecast_recent_requests(
     .ok()
     .and_then(Result::ok)
     .unwrap_or_default();
-    let source = forecast_recent_sample_source(&ledger_recent);
 
-    (
-        merge_forecast_recent_requests(memory_recent, ledger_recent, limit),
-        source,
-    )
+    if let Ok(mut cache) = forecast_ledger_cache().lock() {
+        *cache = Some(ForecastLedgerCacheEntry {
+            limit,
+            loaded_at: Instant::now(),
+            recent: ledger_recent.clone(),
+        });
+    }
+
+    ledger_recent
 }
 
 fn forecast_recent_sample_source(recent: &[FinishedRequest]) -> UsageForecastSampleSource {

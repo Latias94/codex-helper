@@ -56,6 +56,7 @@ use super::session_overrides::{
 };
 use super::transcript::open_session_transcript_from_path;
 pub(super) fn apply_page_shortcuts(ui: &mut UiState, code: KeyCode) -> bool {
+    let previous_page = ui.page;
     let page = match code {
         KeyCode::Char('1') => Some(Page::Dashboard),
         KeyCode::Char('2') => Some(Page::Stations),
@@ -70,6 +71,9 @@ pub(super) fn apply_page_shortcuts(ui: &mut UiState, code: KeyCode) -> bool {
     };
     if let Some(p) = page {
         ui.page = p;
+        if previous_page == Page::Stats || ui.page == Page::Stats {
+            ui.needs_snapshot_refresh = true;
+        }
         if ui.page == Page::Stations {
             ui.focus = Focus::Stations;
         } else if ui.page == Page::Requests {

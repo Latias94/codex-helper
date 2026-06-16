@@ -5,13 +5,14 @@ use tokio::sync::mpsc;
 use crate::config::ProxyConfig;
 use crate::state::ProxyState;
 
-use super::model::{Snapshot, refresh_snapshot};
+use super::model::{ForecastRecentMode, Snapshot, refresh_snapshot};
 
 #[derive(Debug)]
 pub(super) struct SnapshotRefreshResult {
     pub(super) generation: u64,
     pub(super) config_version: Option<u32>,
     pub(super) stats_days: usize,
+    pub(super) forecast_mode: ForecastRecentMode,
     pub(super) snapshot: Snapshot,
 }
 
@@ -19,13 +20,16 @@ fn snapshot_refresh_result_is_current(
     result_generation: u64,
     result_config_version: Option<u32>,
     result_stats_days: usize,
+    result_forecast_mode: ForecastRecentMode,
     current_generation: u64,
     current_config_version: Option<u32>,
     current_stats_days: usize,
+    current_forecast_mode: ForecastRecentMode,
 ) -> bool {
     result_generation == current_generation
         && result_config_version == current_config_version
         && result_stats_days == current_stats_days
+        && result_forecast_mode == current_forecast_mode
 }
 
 #[derive(Debug)]
@@ -58,13 +62,14 @@ impl SnapshotRefreshController {
         cfg: Arc<ProxyConfig>,
         service_name: &'static str,
         stats_days: usize,
+        forecast_mode: ForecastRecentMode,
     ) {
         if self.in_flight.is_some() {
             self.pending = true;
             return;
         }
 
-        self.start(state, cfg, service_name, stats_days);
+        self.start(state, cfg, service_name, stats_days, forecast_mode);
     }
 
     pub(super) fn finish(&mut self, generation: u64) {
@@ -78,14 +83,17 @@ impl SnapshotRefreshController {
         result: &SnapshotRefreshResult,
         current_config_version: Option<u32>,
         current_stats_days: usize,
+        current_forecast_mode: ForecastRecentMode,
     ) -> bool {
         snapshot_refresh_result_is_current(
             result.generation,
             result.config_version,
             result.stats_days,
+            result.forecast_mode,
             self.generation,
             current_config_version,
             current_stats_days,
+            current_forecast_mode,
         )
     }
 
@@ -95,9 +103,10 @@ impl SnapshotRefreshController {
         cfg: Arc<ProxyConfig>,
         service_name: &'static str,
         stats_days: usize,
+        forecast_mode: ForecastRecentMode,
     ) {
         if self.pending && self.in_flight.is_none() {
-            self.request(state, cfg, service_name, stats_days);
+            self.request(state, cfg, service_name, stats_days, forecast_mode);
         }
     }
 
@@ -107,6 +116,7 @@ impl SnapshotRefreshController {
         cfg: Arc<ProxyConfig>,
         service_name: &'static str,
         stats_days: usize,
+        forecast_mode: ForecastRecentMode,
     ) {
         debug_assert!(self.in_flight.is_none());
         self.pending = false;
@@ -116,11 +126,13 @@ impl SnapshotRefreshController {
         let config_version = cfg.version;
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let snapshot = refresh_snapshot(&state, cfg, service_name, stats_days).await;
+            let snapshot =
+                refresh_snapshot(&state, cfg, service_name, stats_days, forecast_mode).await;
             let _ = tx.send(SnapshotRefreshResult {
                 generation,
                 config_version,
                 stats_days,
+                forecast_mode,
                 snapshot,
             });
         });
@@ -131,7 +143,9 @@ impl SnapshotRefreshController {
 mod tests {
     use std::sync::Arc;
 
-    use super::{SnapshotRefreshController, snapshot_refresh_result_is_current};
+    use super::{
+        ForecastRecentMode, SnapshotRefreshController, snapshot_refresh_result_is_current,
+    };
     use crate::config::ProxyConfig;
     use crate::state::ProxyState;
 
@@ -141,33 +155,51 @@ mod tests {
             3,
             Some(5),
             7,
+            ForecastRecentMode::RuntimeOnly,
             3,
             Some(5),
-            7
+            7,
+            ForecastRecentMode::RuntimeOnly
         ));
         assert!(!snapshot_refresh_result_is_current(
             2,
             Some(5),
             7,
+            ForecastRecentMode::RuntimeOnly,
             3,
             Some(5),
-            7
+            7,
+            ForecastRecentMode::RuntimeOnly
         ));
         assert!(!snapshot_refresh_result_is_current(
             3,
             Some(4),
             7,
+            ForecastRecentMode::RuntimeOnly,
             3,
             Some(5),
-            7
+            7,
+            ForecastRecentMode::RuntimeOnly
         ));
         assert!(!snapshot_refresh_result_is_current(
             3,
             Some(5),
             30,
+            ForecastRecentMode::RuntimeOnly,
             3,
             Some(5),
-            7
+            7,
+            ForecastRecentMode::RuntimeOnly
+        ));
+        assert!(!snapshot_refresh_result_is_current(
+            3,
+            Some(5),
+            7,
+            ForecastRecentMode::IncludeRequestLedger,
+            3,
+            Some(5),
+            7,
+            ForecastRecentMode::RuntimeOnly
         ));
     }
 
@@ -198,6 +230,7 @@ mod tests {
             Arc::new(ProxyConfig::default()),
             "codex",
             7,
+            ForecastRecentMode::RuntimeOnly,
         );
 
         assert_eq!(controller.generation, 7);
@@ -219,6 +252,7 @@ mod tests {
             Arc::new(ProxyConfig::default()),
             "codex",
             7,
+            ForecastRecentMode::RuntimeOnly,
         );
 
         assert_eq!(controller.generation, 8);
