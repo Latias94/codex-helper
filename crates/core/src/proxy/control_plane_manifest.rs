@@ -2,6 +2,7 @@ use crate::dashboard_core::{ControlPlaneSurfaceCapabilities, OperatorSummaryLink
 
 pub(super) const API_V1_CAPABILITIES: &str = "/__codex_helper/api/v1/capabilities";
 pub(super) const API_V1_SNAPSHOT: &str = "/__codex_helper/api/v1/snapshot";
+pub(super) const API_V1_FLEET_SNAPSHOT: &str = "/__codex_helper/api/v1/fleet/snapshot";
 pub(super) const API_V1_OPERATOR_SUMMARY: &str = "/__codex_helper/api/v1/operator/summary";
 pub(super) const API_V1_SESSIONS: &str = "/__codex_helper/api/v1/sessions";
 pub(super) const API_V1_SESSION_BY_ID: &str = "/__codex_helper/api/v1/sessions/{session_id}";
@@ -71,6 +72,7 @@ pub(super) const API_V1_HEALTHCHECK_CANCEL: &str = "/__codex_helper/api/v1/healt
 const API_V1_ENDPOINT_PATHS: &[&str] = &[
     API_V1_CAPABILITIES,
     API_V1_SNAPSHOT,
+    API_V1_FLEET_SNAPSHOT,
     API_V1_OPERATOR_SUMMARY,
     API_V1_SESSIONS,
     API_V1_SESSION_BY_ID,
@@ -133,6 +135,7 @@ pub(super) fn api_v1_surface_capabilities() -> ControlPlaneSurfaceCapabilities {
     ControlPlaneSurfaceCapabilities {
         snapshot: true,
         operator_summary: true,
+        fleet_snapshot: true,
         status_active: true,
         status_recent: true,
         status_session_stats: true,
@@ -181,6 +184,7 @@ pub(super) fn api_v1_surface_capabilities() -> ControlPlaneSurfaceCapabilities {
 pub(super) fn api_v1_operator_summary_links() -> OperatorSummaryLinks {
     OperatorSummaryLinks {
         snapshot: API_V1_SNAPSHOT.to_string(),
+        fleet_snapshot: API_V1_FLEET_SNAPSHOT.to_string(),
         status_active: API_V1_STATUS_ACTIVE.to_string(),
         runtime_status: API_V1_RUNTIME_STATUS.to_string(),
         runtime_reload: API_V1_RUNTIME_RELOAD.to_string(),

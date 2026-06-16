@@ -11,6 +11,7 @@ pub mod dashboard_core;
 pub mod doctor;
 mod file_replace;
 pub mod filter;
+pub mod fleet;
 pub mod healthcheck;
 pub mod host_local;
 pub mod lb;

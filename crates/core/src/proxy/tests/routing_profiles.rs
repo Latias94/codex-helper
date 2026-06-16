@@ -163,6 +163,7 @@ async fn proxy_capability_mismatch_fails_over_without_poisoning_health() {
         notify: Default::default(),
         default_service: None,
         relay_targets: std::collections::BTreeMap::new(),
+        fleet: Default::default(),
         ui: UiConfig::default(),
     };
 
@@ -766,6 +767,7 @@ async fn proxy_runtime_config_meta_override_controls_routing() {
         notify: Default::default(),
         default_service: None,
         relay_targets: std::collections::BTreeMap::new(),
+        fleet: Default::default(),
         ui: UiConfig::default(),
     };
 
@@ -990,6 +992,7 @@ async fn proxy_runtime_config_state_override_controls_routing() {
         notify: Default::default(),
         default_service: None,
         relay_targets: std::collections::BTreeMap::new(),
+        fleet: Default::default(),
         ui: UiConfig::default(),
     };
 

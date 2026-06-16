@@ -41,6 +41,8 @@ pub struct ControlPlaneSurfaceCapabilities {
     #[serde(default)]
     pub operator_summary: bool,
     #[serde(default)]
+    pub fleet_snapshot: bool,
+    #[serde(default)]
     pub status_active: bool,
     #[serde(default)]
     pub status_recent: bool,

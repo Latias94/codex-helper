@@ -3,10 +3,12 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use reqwest::{Client, Url};
 use serde::Deserialize;
+use thiserror::Error;
 
 use crate::dashboard_core::{
     ApiV1Capabilities, ApiV1OperatorSummary, ApiV1Snapshot, ProviderOption,
 };
+use crate::fleet::FleetSnapshot;
 use crate::proxy::{ADMIN_TOKEN_ENV_VAR, ADMIN_TOKEN_HEADER, RuntimeStatusResponse};
 
 const ADMIN_DISCOVERY_PATH: &str = "/.well-known/codex-helper-admin";
@@ -21,6 +23,23 @@ pub struct ControlPlaneEndpoint {
 pub struct ControlPlaneClient {
     endpoint: ControlPlaneEndpoint,
     client: Client,
+}
+
+#[derive(Debug, Error)]
+pub enum ControlPlaneError {
+    #[error("admin API not reachable at {base_url}: {source}")]
+    Transport {
+        base_url: String,
+        #[source]
+        source: reqwest::Error,
+    },
+    #[error("admin API returned {status}: {body}")]
+    HttpStatus { status: u16, body: String },
+    #[error("admin API response is not valid JSON: {source}")]
+    Decode {
+        #[source]
+        source: reqwest::Error,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -84,27 +103,38 @@ impl ControlPlaneClient {
     where
         T: serde::de::DeserializeOwned,
     {
+        self.fetch_json_classified(path).await.map_err(Into::into)
+    }
+
+    pub async fn fetch_json_classified<T>(&self, path: &str) -> Result<T, ControlPlaneError>
+    where
+        T: serde::de::DeserializeOwned,
+    {
         let url = format!("{}{}", self.endpoint.admin_base_url, path);
         let mut request = self.client.get(url);
         if let Some(token) = self.admin_token() {
             request = request.header(ADMIN_TOKEN_HEADER, token);
         }
 
-        let response = request.send().await.with_context(|| {
-            format!(
-                "admin API not reachable at {}",
-                self.endpoint.admin_base_url
-            )
-        })?;
+        let response = request
+            .send()
+            .await
+            .map_err(|source| ControlPlaneError::Transport {
+                base_url: self.endpoint.admin_base_url.clone(),
+                source,
+            })?;
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("admin API returned {status}: {}", body.trim());
+            return Err(ControlPlaneError::HttpStatus {
+                status: status.as_u16(),
+                body: body.trim().to_string(),
+            });
         }
         response
             .json::<T>()
             .await
-            .context("admin API response is not valid JSON")
+            .map_err(|source| ControlPlaneError::Decode { source })
     }
 
     pub async fn runtime_status(&self) -> Result<RuntimeStatusResponse> {
@@ -126,6 +156,11 @@ impl ControlPlaneClient {
             "/__codex_helper/api/v1/snapshot?recent_limit={recent_limit}&stats_days={stats_days}"
         ))
         .await
+    }
+
+    pub async fn fleet_snapshot(&self) -> Result<FleetSnapshot, ControlPlaneError> {
+        self.fetch_json_classified("/__codex_helper/api/v1/fleet/snapshot")
+            .await
     }
 
     pub async fn providers(&self) -> Result<Vec<ProviderOption>> {

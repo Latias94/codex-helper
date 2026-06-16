@@ -128,6 +128,7 @@ fn make_proxy_config(upstreams: Vec<UpstreamConfig>, retry: RetryConfig) -> Prox
         notify: Default::default(),
         default_service: None,
         relay_targets: std::collections::BTreeMap::new(),
+        fleet: Default::default(),
         ui: UiConfig::default(),
     }
 }

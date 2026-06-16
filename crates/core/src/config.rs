@@ -15,6 +15,7 @@ pub use crate::client_config::{
     claude_settings_backup_path, claude_settings_path, codex_auth_path, codex_config_path,
     codex_models_cache_path, codex_switch_state_path,
 };
+pub use crate::fleet::registry::{FleetNodeConfig, FleetRegistryConfig};
 
 #[path = "config_storage.rs"]
 mod storage_impl;
@@ -555,6 +556,9 @@ pub struct ProxyConfig {
     /// Named local or remote relay targets used by daily CLI/TUI workflows.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub relay_targets: BTreeMap<String, RelayTargetConfig>,
+    /// Optional fleet observer targets used by the read-only Codex Fleet panel.
+    #[serde(default, skip_serializing_if = "FleetRegistryConfig::is_empty")]
+    pub fleet: FleetRegistryConfig,
     /// UI settings (mainly for the built-in TUI).
     #[serde(default)]
     pub ui: UiConfig,
@@ -594,6 +598,8 @@ pub struct ProxyConfigV2 {
     pub default_service: Option<ServiceKind>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub relay_targets: BTreeMap<String, RelayTargetConfig>,
+    #[serde(default, skip_serializing_if = "FleetRegistryConfig::is_empty")]
+    pub fleet: FleetRegistryConfig,
     #[serde(default)]
     pub ui: UiConfig,
 }
@@ -608,6 +614,7 @@ impl Default for ProxyConfigV2 {
             notify: NotifyConfig::default(),
             default_service: None,
             relay_targets: BTreeMap::new(),
+            fleet: FleetRegistryConfig::default(),
             ui: UiConfig::default(),
         }
     }
@@ -629,6 +636,8 @@ pub struct ProxyConfigV4 {
     pub default_service: Option<ServiceKind>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub relay_targets: BTreeMap<String, RelayTargetConfig>,
+    #[serde(default, skip_serializing_if = "FleetRegistryConfig::is_empty")]
+    pub fleet: FleetRegistryConfig,
     #[serde(default)]
     pub ui: UiConfig,
 }
@@ -643,6 +652,7 @@ impl Default for ProxyConfigV4 {
             notify: NotifyConfig::default(),
             default_service: None,
             relay_targets: BTreeMap::new(),
+            fleet: FleetRegistryConfig::default(),
             ui: UiConfig::default(),
         }
     }

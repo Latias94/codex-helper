@@ -62,6 +62,105 @@ on_exhausted = "continue"
 }
 
 #[test]
+fn load_config_supports_v4_fleet_registry_and_validates_remote_admin_tokens() {
+    let _env = setup_temp_codex_home();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    rt.block_on(async move {
+        let dir = super::proxy_home_dir();
+        let toml_path = dir.join("config.toml");
+        write_file(
+            &toml_path,
+            r#"
+version = 5
+
+[fleet.nodes.local]
+label = "Local"
+admin_url = "http://127.0.0.1:4211"
+enabled = true
+
+[fleet.nodes.workstation]
+label = "Workstation"
+admin_url = "https://workstation.example.com:4211"
+admin_token_env = "CODEX_HELPER_WORKSTATION_ADMIN_TOKEN"
+enabled = true
+"#,
+        );
+
+        let cfg = super::load_config().await.expect("load fleet config");
+        assert_eq!(cfg.fleet.nodes.len(), 2);
+        assert_eq!(
+            cfg.fleet.nodes["workstation"].admin_token_env.as_deref(),
+            Some("CODEX_HELPER_WORKSTATION_ADMIN_TOKEN")
+        );
+    });
+}
+
+#[test]
+fn load_config_rejects_remote_fleet_http_without_admin_token_env() {
+    let _env = setup_temp_codex_home();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    rt.block_on(async move {
+        let dir = super::proxy_home_dir();
+        let toml_path = dir.join("config.toml");
+        write_file(
+            &toml_path,
+            r#"
+version = 5
+
+[fleet.nodes.remote]
+label = "Remote"
+admin_url = "http://nas.example.com:4211"
+enabled = true
+"#,
+        );
+
+        let err = super::load_config()
+            .await
+            .expect_err("remote fleet node without token should fail");
+        assert!(err.to_string().contains("admin_token_env"));
+    });
+}
+
+#[test]
+fn load_config_rejects_invalid_fleet_token_env_name() {
+    let _env = setup_temp_codex_home();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    rt.block_on(async move {
+        let dir = super::proxy_home_dir();
+        let toml_path = dir.join("config.toml");
+        write_file(
+            &toml_path,
+            r#"
+version = 5
+
+[fleet.nodes.remote]
+label = "Remote"
+admin_url = "https://nas.example.com:4211"
+admin_token_env = "Bearer abc"
+enabled = true
+"#,
+        );
+
+        let err = super::load_config()
+            .await
+            .expect_err("invalid env name should fail");
+        assert!(err.to_string().contains("environment variable name"));
+    });
+}
+
+#[test]
 fn v4_tag_preferred_stop_excludes_non_matching_fallbacks() {
     let v4 = ProxyConfigV4 {
         version: 4,
@@ -105,6 +204,7 @@ fn v4_tag_preferred_stop_excludes_non_matching_fallbacks() {
         notify: NotifyConfig::default(),
         default_service: Some(ServiceKind::Codex),
         relay_targets: std::collections::BTreeMap::new(),
+        fleet: Default::default(),
         ui: UiConfig::default(),
     };
 
@@ -194,6 +294,7 @@ fn v4_nested_route_graph_expands_monthly_pool_before_paygo() {
         notify: NotifyConfig::default(),
         default_service: Some(ServiceKind::Codex),
         relay_targets: std::collections::BTreeMap::new(),
+        fleet: Default::default(),
         ui: UiConfig::default(),
     };
 
@@ -310,6 +411,7 @@ fn compile_v4_to_runtime_direct_path_matches_v2_bridge_for_compat_state() {
         notify: NotifyConfig::default(),
         default_service: Some(ServiceKind::Codex),
         relay_targets: std::collections::BTreeMap::new(),
+        fleet: Default::default(),
         ui: UiConfig::default(),
     };
 
@@ -601,6 +703,7 @@ fn migrate_v2_to_v4_emits_route_graph_and_inline_simple_providers() {
         notify: NotifyConfig::default(),
         default_service: Some(ServiceKind::Codex),
         relay_targets: std::collections::BTreeMap::new(),
+        fleet: Default::default(),
         ui: UiConfig::default(),
     };
 
@@ -733,6 +836,7 @@ fn migrate_v2_to_v4_report_warns_when_flattening_endpoint_scoped_groups() {
         notify: NotifyConfig::default(),
         default_service: Some(ServiceKind::Codex),
         relay_targets: std::collections::BTreeMap::new(),
+        fleet: Default::default(),
         ui: UiConfig::default(),
     };
 
@@ -932,6 +1036,7 @@ fn migrate_v2_to_v4_omits_disabled_inactive_groups_from_route_graph() {
         notify: NotifyConfig::default(),
         default_service: Some(ServiceKind::Codex),
         relay_targets: std::collections::BTreeMap::new(),
+        fleet: Default::default(),
         ui: UiConfig::default(),
     };
 
@@ -1713,6 +1818,7 @@ fn station_shaped_v2_config_migrates_to_route_graph_without_profile_station_bind
         notify: NotifyConfig::default(),
         default_service: Some(ServiceKind::Codex),
         relay_targets: std::collections::BTreeMap::new(),
+        fleet: Default::default(),
         ui: UiConfig::default(),
     };
 

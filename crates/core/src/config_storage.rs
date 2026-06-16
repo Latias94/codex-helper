@@ -1025,6 +1025,7 @@ async fn save_existing_v4_if_only_runtime_metadata_changed(
     existing.notify = requested.notify;
     existing.default_service = requested.default_service;
     existing.relay_targets = requested.relay_targets;
+    existing.fleet = requested.fleet;
     existing.ui = requested.ui;
     save_config_v4(&existing).await.map(Some)
 }
@@ -1190,5 +1191,6 @@ fn normalize_proxy_config(cfg: &mut ProxyConfig) {
 fn validate_proxy_config(cfg: &ProxyConfig) -> Result<()> {
     validate_service_profiles("codex", &cfg.codex)?;
     validate_service_profiles("claude", &cfg.claude)?;
+    cfg.fleet.validate()?;
     Ok(())
 }

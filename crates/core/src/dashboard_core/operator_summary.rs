@@ -170,6 +170,8 @@ pub struct OperatorHealthSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct OperatorSummaryLinks {
     pub snapshot: String,
+    #[serde(default)]
+    pub fleet_snapshot: String,
     pub status_active: String,
     pub runtime_status: String,
     pub runtime_reload: String,

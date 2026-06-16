@@ -205,6 +205,11 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
             .iter()
             .any(|item| item.as_str() == Some("/__codex_helper/api/v1/request-ledger/summary"))
     }));
+    assert!(caps["endpoints"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item.as_str() == Some("/__codex_helper/api/v1/fleet/snapshot"))
+    }));
     assert_eq!(
         caps["surface_capabilities"]["snapshot"].as_bool(),
         Some(true)
@@ -261,6 +266,26 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
         caps["surface_capabilities"]["runtime_shutdown"].as_bool(),
         Some(true)
     );
+    assert_eq!(
+        caps["surface_capabilities"]["fleet_snapshot"].as_bool(),
+        Some(true)
+    );
+    let fleet_snapshot = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/fleet/snapshot",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("fleet snapshot send")
+        .error_for_status()
+        .expect("fleet snapshot status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("fleet snapshot json");
+    assert_eq!(fleet_snapshot["api_version"].as_u64(), Some(1));
+    assert_eq!(fleet_snapshot["service_name"].as_str(), Some("codex"));
+    assert!(fleet_snapshot["nodes"].as_array().is_some());
     let host_local_history = crate::config::codex_sessions_dir().is_dir();
     assert_eq!(
         caps["shared_capabilities"]["session_observability"].as_bool(),

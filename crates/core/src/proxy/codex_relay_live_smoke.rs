@@ -1431,6 +1431,7 @@ mod tests {
             notify: Default::default(),
             default_service: None,
             relay_targets: std::collections::BTreeMap::new(),
+            fleet: Default::default(),
             ui: UiConfig::default(),
         };
         ProxyService::new(

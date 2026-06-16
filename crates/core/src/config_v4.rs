@@ -629,6 +629,7 @@ pub fn compile_v4_to_v2(v4: &ProxyConfigV4) -> Result<ProxyConfigV2> {
     if !is_supported_route_graph_config_version(v4.version) {
         anyhow::bail!("unsupported route graph config version: {}", v4.version);
     }
+    v4.fleet.validate()?;
 
     Ok(ProxyConfigV2 {
         version: 2,
@@ -638,6 +639,7 @@ pub fn compile_v4_to_v2(v4: &ProxyConfigV4) -> Result<ProxyConfigV2> {
         notify: v4.notify.clone(),
         default_service: v4.default_service,
         relay_targets: v4.relay_targets.clone(),
+        fleet: v4.fleet.clone(),
         ui: v4.ui.clone(),
     })
 }
@@ -646,6 +648,7 @@ pub fn compile_v4_to_runtime(v4: &ProxyConfigV4) -> Result<ProxyConfig> {
     if !is_supported_route_graph_config_version(v4.version) {
         anyhow::bail!("unsupported route graph config version: {}", v4.version);
     }
+    v4.fleet.validate()?;
 
     Ok(ProxyConfig {
         version: Some(v4.version),
@@ -655,6 +658,7 @@ pub fn compile_v4_to_runtime(v4: &ProxyConfigV4) -> Result<ProxyConfig> {
         notify: v4.notify.clone(),
         default_service: v4.default_service,
         relay_targets: v4.relay_targets.clone(),
+        fleet: v4.fleet.clone(),
         ui: v4.ui.clone(),
     })
 }
@@ -980,6 +984,7 @@ pub fn migrate_v2_to_v4_with_report(v2: &ProxyConfigV2) -> Result<ConfigV4Migrat
         notify: compact.notify,
         default_service: compact.default_service,
         relay_targets: compact.relay_targets,
+        fleet: compact.fleet,
         ui: compact.ui,
     };
 
@@ -1287,6 +1292,7 @@ pub mod legacy {
             notify: legacy.notify.clone(),
             default_service: legacy.default_service,
             relay_targets: BTreeMap::new(),
+            fleet: FleetRegistryConfig::default(),
             ui: legacy.ui.clone(),
         };
         config.normalize_routing_authoring();

@@ -230,6 +230,7 @@ pub fn compile_v2_to_runtime(v2: &ProxyConfigV2) -> Result<ProxyConfig> {
     if v2.version != 2 {
         anyhow::bail!("unsupported v2 config version: {}", v2.version);
     }
+    v2.fleet.validate()?;
 
     Ok(ProxyConfig {
         version: Some(v2.version),
@@ -239,6 +240,7 @@ pub fn compile_v2_to_runtime(v2: &ProxyConfigV2) -> Result<ProxyConfig> {
         notify: v2.notify.clone(),
         default_service: v2.default_service,
         relay_targets: v2.relay_targets.clone(),
+        fleet: v2.fleet.clone(),
         ui: v2.ui.clone(),
     })
 }
@@ -334,6 +336,7 @@ pub fn migrate_legacy_to_v2(old: &ProxyConfig) -> ProxyConfigV2 {
         notify: old.notify.clone(),
         default_service: old.default_service,
         relay_targets: old.relay_targets.clone(),
+        fleet: old.fleet.clone(),
         ui: old.ui.clone(),
     }
 }
@@ -939,6 +942,7 @@ pub fn compact_v2_config(v2: &ProxyConfigV2) -> Result<ProxyConfigV2> {
         notify: v2.notify.clone(),
         default_service: v2.default_service,
         relay_targets: v2.relay_targets.clone(),
+        fleet: v2.fleet.clone(),
         ui: v2.ui.clone(),
     })
 }

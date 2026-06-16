@@ -39,6 +39,7 @@ humantime = "2.1.0"
 httpdate = "1.0.3"
 atty = "0.2.14"
 rusqlite = { version = "0.39.0", features = ["bundled"] }
+sysinfo = "0.39.3"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Security"] }
