@@ -94,6 +94,7 @@ fn routing_provider_balance_line_falls_back_for_legacy_snapshot_keys() {
                 ..crate::state::ProviderBalanceSnapshot::default()
             }],
         )]),
+        provider_balance_history: std::collections::HashMap::new(),
         station_health: std::collections::HashMap::new(),
         health_checks: std::collections::HashMap::new(),
         lb_view: std::collections::HashMap::new(),
@@ -155,6 +156,7 @@ fn routing_provider_balance_line_prefers_routing_context() {
                 }],
             ),
         ]),
+        provider_balance_history: std::collections::HashMap::new(),
         station_health: std::collections::HashMap::new(),
         health_checks: std::collections::HashMap::new(),
         lb_view: std::collections::HashMap::new(),

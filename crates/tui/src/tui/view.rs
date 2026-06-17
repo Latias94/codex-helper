@@ -181,6 +181,7 @@ mod tests {
                     }],
                 ),
             ]),
+            provider_balance_history: HashMap::new(),
             station_health: HashMap::new(),
             health_checks: HashMap::new(),
             lb_view: HashMap::new(),

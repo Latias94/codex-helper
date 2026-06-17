@@ -52,6 +52,7 @@ fn empty_snapshot(
         station_meta_overrides: HashMap::new(),
         usage_rollup: crate::state::UsageRollupView::default(),
         provider_balances,
+        provider_balance_history: HashMap::new(),
         station_health: HashMap::new(),
         health_checks: HashMap::new(),
         lb_view: HashMap::new(),
@@ -469,6 +470,7 @@ fn routing_provider_balance_brief_preserves_subscription_amount_in_narrow_table(
                 ..crate::state::ProviderBalanceSnapshot::default()
             }],
         )]),
+        provider_balance_history: HashMap::new(),
         station_health: HashMap::new(),
         health_checks: HashMap::new(),
         lb_view: HashMap::new(),
@@ -518,6 +520,7 @@ fn routing_provider_balance_brief_fits_lazy_quota_in_zh_table_cell() {
                 ..crate::state::ProviderBalanceSnapshot::default()
             }],
         )]),
+        provider_balance_history: HashMap::new(),
         station_health: HashMap::new(),
         health_checks: HashMap::new(),
         lb_view: HashMap::new(),

@@ -19,7 +19,7 @@ use crate::usage_balance::{
 };
 use crate::usage_forecast::{
     QuotaPacingForecast, QuotaPacingStatus, UsageForecastConfidence, UsageSpendForecast,
-    build_quota_pacing_forecast, build_usage_spend_forecast,
+    build_quota_pacing_forecast, build_usage_spend_forecast_with_balance_history,
 };
 
 pub(super) const STATS_BALANCE_COLUMN_WIDTH: u16 = 14;
@@ -424,11 +424,23 @@ pub(super) fn usage_spend_forecast(
         .flatten()
         .cloned()
         .collect::<Vec<_>>();
+    let balance_history = snapshot
+        .provider_balance_history
+        .values()
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
     let recent = match snapshot.forecast_recent_source {
         UsageForecastSampleSource::RuntimeOnly => &snapshot.recent,
         UsageForecastSampleSource::RuntimeAndRequestLedger => &snapshot.forecast_recent,
     };
-    build_usage_spend_forecast(config, recent, &balances, now_ms)
+    build_usage_spend_forecast_with_balance_history(
+        config,
+        recent,
+        &balances,
+        &balance_history,
+        now_ms,
+    )
 }
 
 pub(super) fn quota_pacing_forecast(
@@ -465,6 +477,7 @@ pub(super) fn spend_forecast_rate_line(forecast: &UsageSpendForecast, lang: Lang
         .map(duration_short)
         .unwrap_or_else(|| "-".to_string());
     let confidence = spend_forecast_confidence_label(forecast.confidence, lang);
+    let calibration = spend_forecast_calibration_label(forecast, lang);
 
     if forecast.confidence == UsageForecastConfidence::LowSample {
         return match lang {
@@ -476,10 +489,10 @@ pub(super) fn spend_forecast_rate_line(forecast: &UsageSpendForecast, lang: Lang
     let projected = fmt_usd_compact(forecast.projected_until_reset_usd.as_deref());
     match lang {
         Language::Zh => {
-            format!("速率 {rate}/h  按当前速率到0点≈{projected} ({reset}, {confidence})")
+            format!("速率 {rate}/h  到0点≈{projected} ({reset}, {confidence}{calibration})")
         }
         Language::En => {
-            format!("rate {rate}/h  at current rate to reset≈{projected} ({reset}, {confidence})")
+            format!("rate {rate}/h  to reset≈{projected} ({reset}, {confidence}{calibration})")
         }
     }
 }
@@ -493,7 +506,11 @@ pub(super) fn spend_forecast_balance_line(forecast: &UsageSpendForecast, lang: L
         Language::En => "sample",
     };
     let confidence = spend_forecast_confidence_label(forecast.confidence, lang);
-    let sample_prefix = format!("{sample} {} req {confidence}", forecast.priced_requests);
+    let calibration = spend_forecast_calibration_label(forecast, lang);
+    let sample_prefix = format!(
+        "{sample} {} req {confidence}{calibration}",
+        forecast.priced_requests
+    );
 
     match (
         forecast.primary_balance_remaining_usd.as_deref(),
@@ -619,6 +636,19 @@ fn fmt_usd_compact(value: Option<&str>) -> String {
         format!("${parsed:.2}")
     } else {
         format!("${parsed:.0}")
+    }
+}
+
+fn spend_forecast_calibration_label(forecast: &UsageSpendForecast, lang: Language) -> String {
+    if !forecast.balance_calibrated {
+        return String::new();
+    }
+    let Some(multiplier_pct) = forecast.balance_calibration_multiplier_pct else {
+        return String::new();
+    };
+    match lang {
+        Language::Zh => format!(" 余额校准 {multiplier_pct}%"),
+        Language::En => format!(" balance-cal {multiplier_pct}%"),
     }
 }
 

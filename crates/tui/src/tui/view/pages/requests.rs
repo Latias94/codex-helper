@@ -629,6 +629,7 @@ mod tests {
             station_meta_overrides: HashMap::new(),
             usage_rollup: UsageRollupView::default(),
             provider_balances: HashMap::new(),
+            provider_balance_history: HashMap::new(),
             station_health: HashMap::new(),
             health_checks: HashMap::new(),
             lb_view: HashMap::new(),

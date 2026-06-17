@@ -18,6 +18,13 @@ fn current_test_day() -> i32 {
 }
 
 fn sample_snapshot(provider_balances: HashMap<String, Vec<ProviderBalanceSnapshot>>) -> Snapshot {
+    sample_snapshot_with_history(provider_balances, HashMap::new())
+}
+
+fn sample_snapshot_with_history(
+    provider_balances: HashMap<String, Vec<ProviderBalanceSnapshot>>,
+    provider_balance_history: HashMap<String, Vec<ProviderBalanceSnapshot>>,
+) -> Snapshot {
     let day = current_test_day();
     let ok_provider_bucket = UsageBucket {
         requests_total: 4,
@@ -118,6 +125,7 @@ fn sample_snapshot(provider_balances: HashMap<String, Vec<ProviderBalanceSnapsho
             by_config_day: HashMap::from([("station".to_string(), vec![(day, station_bucket)])]),
         },
         provider_balances,
+        provider_balance_history,
         station_health: HashMap::new(),
         health_checks: HashMap::new(),
         lb_view: HashMap::new(),
@@ -444,7 +452,7 @@ fn stats_kpis_show_spend_projection_only_when_sample_is_confident() {
     let text = render_stats_text(140, 28, &mut ui, &snapshot);
 
     assert!(text.contains("burn"), "{text}");
-    assert!(text.contains("at current rate"), "{text}");
+    assert!(text.contains("to reset"), "{text}");
     assert!(text.contains("estimated"), "{text}");
 }
 
@@ -484,6 +492,46 @@ fn stats_kpis_show_package_pacing_for_quota_balances() {
     assert!(text.contains("daily package left"), "{text}");
     assert!(text.contains("$6.00/$20.00"), "{text}");
     assert!(text.contains("target"), "{text}");
+}
+
+#[test]
+fn stats_kpis_marks_balance_calibrated_spend_rate() {
+    let now = crate::tui::model::now_ms();
+    let current_balance = ProviderBalanceSnapshot {
+        provider_id: "provider".to_string(),
+        station_name: Some("station".to_string()),
+        upstream_index: Some(0),
+        status: BalanceSnapshotStatus::Ok,
+        quota_period: Some("daily".to_string()),
+        quota_remaining_usd: Some("8".to_string()),
+        fetched_at_ms: now,
+        ..ProviderBalanceSnapshot::default()
+    };
+    let mut previous_balance = current_balance.clone();
+    previous_balance.quota_remaining_usd = Some("10".to_string());
+    previous_balance.fetched_at_ms = now.saturating_sub(60 * 60_000);
+    let mut snapshot = sample_snapshot_with_history(
+        HashMap::from([("station".to_string(), vec![current_balance.clone()])]),
+        HashMap::from([(
+            "station".to_string(),
+            vec![previous_balance, current_balance],
+        )]),
+    );
+    snapshot.recent = vec![sample_priced_request(now.saturating_sub(30 * 60_000), "1")];
+    let mut ui = UiState {
+        page: crate::tui::types::Page::Stats,
+        usage_forecast: crate::config::UsageForecastConfig {
+            rate_window_minutes: 60,
+            min_priced_requests: 1,
+            reset_utc_offset: "+08:00".to_string(),
+            ..Default::default()
+        },
+        ..UiState::default()
+    };
+
+    let text = render_stats_text(150, 28, &mut ui, &snapshot);
+
+    assert!(text.contains("balance-cal 200%"), "{text}");
 }
 
 #[test]

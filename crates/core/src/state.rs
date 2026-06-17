@@ -54,6 +54,10 @@ type PassiveStationHealthMap =
     HashMap<String, HashMap<String, HashMap<String, PassiveUpstreamHealth>>>;
 type ProviderBalanceMap =
     HashMap<String, HashMap<String, HashMap<usize, HashMap<String, ProviderBalanceSnapshot>>>>;
+type ProviderBalanceHistoryMap = HashMap<
+    String,
+    HashMap<String, HashMap<usize, HashMap<String, VecDeque<ProviderBalanceSnapshot>>>>,
+>;
 type ProviderBalanceSummaryMap = HashMap<String, HashMap<String, StationRoutingBalanceSummary>>;
 type ServiceLayoutSignature = Vec<(String, Vec<String>)>;
 
@@ -106,6 +110,18 @@ pub fn recent_finished_max() -> usize {
             .filter(|&n| n > 0)
             .unwrap_or(2_000)
             .clamp(200, 20_000)
+    })
+}
+
+fn provider_balance_history_max() -> usize {
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("CODEX_HELPER_PROVIDER_BALANCE_HISTORY_MAX")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&n| n > 1)
+            .unwrap_or(64)
+            .clamp(2, 512)
     })
 }
 
@@ -254,6 +270,7 @@ pub struct ProxyState {
     station_health: RwLock<HashMap<String, HashMap<String, StationHealth>>>,
     passive_station_health: RwLock<PassiveStationHealthMap>,
     provider_balances: RwLock<ProviderBalanceMap>,
+    provider_balance_history: RwLock<ProviderBalanceHistoryMap>,
     provider_balance_summaries: RwLock<ProviderBalanceSummaryMap>,
     provider_endpoint_runtime_health:
         RwLock<HashMap<String, HashMap<ProviderEndpointKey, ProviderEndpointRuntimeHealth>>>,
@@ -385,6 +402,7 @@ impl ProxyState {
             station_health: RwLock::new(HashMap::new()),
             passive_station_health: RwLock::new(HashMap::new()),
             provider_balances: RwLock::new(HashMap::new()),
+            provider_balance_history: RwLock::new(HashMap::new()),
             provider_balance_summaries: RwLock::new(HashMap::new()),
             provider_endpoint_runtime_health: RwLock::new(HashMap::new()),
             station_health_checks: RwLock::new(HashMap::new()),
@@ -1528,6 +1546,16 @@ impl ProxyState {
                         provider_balances.remove(service_name);
                     }
                 }
+                let mut provider_balance_history = self.provider_balance_history.write().await;
+                if let Some(per_service) = provider_balance_history.get_mut(service_name) {
+                    let before = per_service.len();
+                    per_service
+                        .retain(|station_name, _| !changed_layout_stations.contains(station_name));
+                    changed |= per_service.len() != before;
+                    if per_service.is_empty() {
+                        provider_balance_history.remove(service_name);
+                    }
+                }
                 let mut provider_balance_summaries = self.provider_balance_summaries.write().await;
                 if let Some(per_service) = provider_balance_summaries.get_mut(service_name) {
                     let before = per_service.len();
@@ -1542,6 +1570,8 @@ impl ProxyState {
             None => {
                 let mut provider_balances = self.provider_balances.write().await;
                 changed |= provider_balances.remove(service_name).is_some();
+                let mut provider_balance_history = self.provider_balance_history.write().await;
+                changed |= provider_balance_history.remove(service_name).is_some();
                 let mut provider_balance_summaries = self.provider_balance_summaries.write().await;
                 changed |= provider_balance_summaries.remove(service_name).is_some();
             }
@@ -1773,7 +1803,7 @@ impl ProxyState {
             station_balances
                 .entry(upstream_index)
                 .or_default()
-                .insert(snapshot.provider_id.clone(), snapshot);
+                .insert(snapshot.provider_id.clone(), snapshot.clone());
             StationRoutingBalanceSummary::from_snapshot_iter_at(
                 station_balances
                     .values()
@@ -1782,12 +1812,53 @@ impl ProxyState {
             )
         };
 
-        let mut summaries = self.provider_balance_summaries.write().await;
-        summaries
+        {
+            let mut summaries = self.provider_balance_summaries.write().await;
+            summaries
+                .entry(service_name.to_string())
+                .or_default()
+                .insert(station_name, station_summary);
+        }
+
+        let history_station_name = snapshot.station_name.clone().unwrap_or_default();
+        self.record_provider_balance_history_snapshot(
+            service_name,
+            &history_station_name,
+            upstream_index,
+            snapshot,
+        )
+        .await;
+        self.notify_state_changed();
+    }
+
+    async fn record_provider_balance_history_snapshot(
+        &self,
+        service_name: &str,
+        station_name: &str,
+        upstream_index: usize,
+        snapshot: ProviderBalanceSnapshot,
+    ) {
+        let mut guard = self.provider_balance_history.write().await;
+        let history = guard
             .entry(service_name.to_string())
             .or_default()
-            .insert(station_name, station_summary);
-        self.notify_state_changed();
+            .entry(station_name.to_string())
+            .or_default()
+            .entry(upstream_index)
+            .or_default()
+            .entry(snapshot.provider_id.clone())
+            .or_default();
+        if history
+            .back()
+            .is_some_and(|previous| previous.fetched_at_ms == snapshot.fetched_at_ms)
+        {
+            history.pop_back();
+        }
+        history.push_back(snapshot);
+        let max = provider_balance_history_max();
+        while history.len() > max {
+            history.pop_front();
+        }
     }
 
     pub async fn get_provider_balance_view(
@@ -1813,6 +1884,38 @@ impl ProxyState {
                 snapshots.sort_by(|a, b| {
                     a.upstream_index
                         .cmp(&b.upstream_index)
+                        .then_with(|| a.provider_id.cmp(&b.provider_id))
+                });
+                (station_name.clone(), snapshots)
+            })
+            .collect()
+    }
+
+    pub async fn get_provider_balance_history_view(
+        &self,
+        service_name: &str,
+    ) -> HashMap<String, Vec<ProviderBalanceSnapshot>> {
+        let now_ms = unix_now_ms();
+        let guard = self.provider_balance_history.read().await;
+        let Some(per_service) = guard.get(service_name) else {
+            return HashMap::new();
+        };
+
+        per_service
+            .iter()
+            .map(|(station_name, upstreams)| {
+                let mut snapshots = upstreams
+                    .values()
+                    .flat_map(|providers| providers.values())
+                    .flat_map(|history| history.iter().cloned())
+                    .collect::<Vec<_>>();
+                for snapshot in &mut snapshots {
+                    snapshot.refresh_status(now_ms);
+                }
+                snapshots.sort_by(|a, b| {
+                    a.fetched_at_ms
+                        .cmp(&b.fetched_at_ms)
+                        .then_with(|| a.upstream_index.cmp(&b.upstream_index))
                         .then_with(|| a.provider_id.cmp(&b.provider_id))
                 });
                 (station_name.clone(), snapshots)
@@ -4322,6 +4425,40 @@ mod tests {
             assert_eq!(summary.snapshots, 1);
             assert_eq!(summary.stale, 1);
             assert_eq!(summary.routing_snapshots, 1);
+        });
+    }
+
+    #[test]
+    fn provider_balance_history_keeps_recent_refreshes() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            for (fetched_at_ms, remaining) in [(10, "10"), (20, "8")] {
+                state
+                    .record_provider_balance_snapshot(
+                        "codex",
+                        ProviderBalanceSnapshot {
+                            provider_id: "packycode".to_string(),
+                            station_name: Some("right".to_string()),
+                            upstream_index: Some(2),
+                            source: "usage_provider:test".to_string(),
+                            fetched_at_ms,
+                            quota_period: Some("daily".to_string()),
+                            quota_remaining_usd: Some(remaining.to_string()),
+                            quota_limit_usd: Some("20".to_string()),
+                            exhausted: Some(false),
+                            ..ProviderBalanceSnapshot::default()
+                        },
+                    )
+                    .await;
+            }
+
+            let history = state.get_provider_balance_history_view("codex").await;
+            let balances = history.get("right").expect("station history");
+
+            assert_eq!(balances.len(), 2);
+            assert_eq!(balances[0].quota_remaining_usd.as_deref(), Some("10"));
+            assert_eq!(balances[1].quota_remaining_usd.as_deref(), Some("8"));
         });
     }
 

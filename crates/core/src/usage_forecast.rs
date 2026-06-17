@@ -25,8 +25,43 @@ pub struct UsageSpendForecast {
     pub primary_balance_remaining_usd: Option<String>,
     pub projected_balance_after_reset_usd: Option<String>,
     pub projected_exhaustion: bool,
+    #[serde(default)]
+    pub balance_calibrated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance_calibration_multiplier_pct: Option<u32>,
+    #[serde(default)]
+    pub balance_calibration_requests: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance_calibration_window_ms: Option<u64>,
     pub confidence: UsageForecastConfidence,
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct UsageBalanceCalibration {
+    pub available: bool,
+    pub provider_id: String,
+    pub station_name: Option<String>,
+    pub upstream_index: Option<usize>,
+    pub window_start_ms: Option<u64>,
+    pub window_end_ms: Option<u64>,
+    pub window_ms: Option<u64>,
+    pub matched_requests: u64,
+    pub actual_delta_usd: Option<String>,
+    pub estimated_delta_usd: Option<String>,
+    pub multiplier_pct: Option<u32>,
+    pub status: UsageBalanceCalibrationStatus,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageBalanceCalibrationStatus {
+    #[default]
+    Unavailable,
+    Calibrated,
+    LowSample,
+    OutOfRange,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -78,6 +113,280 @@ pub enum UsageForecastConfidence {
 }
 
 pub fn build_usage_spend_forecast(
+    config: &UsageForecastConfig,
+    recent: &[FinishedRequest],
+    provider_balances: &[ProviderBalanceSnapshot],
+    now_ms: u64,
+) -> UsageSpendForecast {
+    build_usage_spend_forecast_with_balance_history(config, recent, provider_balances, &[], now_ms)
+}
+
+pub fn build_usage_spend_forecast_with_balance_history(
+    config: &UsageForecastConfig,
+    recent: &[FinishedRequest],
+    provider_balances: &[ProviderBalanceSnapshot],
+    provider_balance_history: &[ProviderBalanceSnapshot],
+    now_ms: u64,
+) -> UsageSpendForecast {
+    let calibration =
+        build_usage_balance_calibration(recent, provider_balance_history, config, now_ms);
+    let mut forecast = build_usage_spend_forecast_inner(config, recent, provider_balances, now_ms);
+    apply_balance_calibration(&mut forecast, calibration);
+    forecast
+}
+
+pub fn build_usage_balance_calibration(
+    recent: &[FinishedRequest],
+    provider_balance_history: &[ProviderBalanceSnapshot],
+    config: &UsageForecastConfig,
+    now_ms: u64,
+) -> UsageBalanceCalibration {
+    let sample_window_ms = config.rate_window_minutes.max(1).saturating_mul(MINUTE_MS);
+    let cutoff_ms = now_ms.saturating_sub(sample_window_ms.saturating_mul(2));
+    let Some((previous, current, actual_delta)) =
+        best_balance_delta_pair(provider_balance_history, cutoff_ms, now_ms)
+    else {
+        return UsageBalanceCalibration {
+            reason: Some("no usable balance delta".to_string()),
+            ..UsageBalanceCalibration::default()
+        };
+    };
+
+    let mut estimated_delta = UsdAmount::ZERO;
+    let mut matched_requests = 0_u64;
+    for request in recent {
+        if request.ended_at_ms <= previous.fetched_at_ms
+            || request.ended_at_ms > current.fetched_at_ms
+        {
+            continue;
+        }
+        if !request_matches_balance_snapshot(request, current) {
+            continue;
+        }
+        let Some(cost) = request
+            .cost
+            .total_cost_usd
+            .as_deref()
+            .and_then(UsdAmount::from_decimal_str)
+        else {
+            continue;
+        };
+        if cost.is_zero() {
+            continue;
+        }
+        estimated_delta = estimated_delta.saturating_add(cost);
+        matched_requests = matched_requests.saturating_add(1);
+    }
+
+    let window_ms = current.fetched_at_ms.saturating_sub(previous.fetched_at_ms);
+    let mut out = UsageBalanceCalibration {
+        available: true,
+        provider_id: current.provider_id.clone(),
+        station_name: current.station_name.clone(),
+        upstream_index: current.upstream_index,
+        window_start_ms: Some(previous.fetched_at_ms),
+        window_end_ms: Some(current.fetched_at_ms),
+        window_ms: Some(window_ms),
+        matched_requests,
+        actual_delta_usd: Some(actual_delta.format_usd()),
+        estimated_delta_usd: Some(estimated_delta.format_usd()),
+        ..UsageBalanceCalibration::default()
+    };
+
+    if matched_requests < config.min_priced_requests.max(1) || estimated_delta.is_zero() {
+        out.status = UsageBalanceCalibrationStatus::LowSample;
+        out.reason = Some("not enough matched priced requests".to_string());
+        return out;
+    }
+
+    let multiplier_pct = amount_ratio_pct(actual_delta, estimated_delta);
+    out.multiplier_pct = Some(multiplier_pct);
+    if !(25..=400).contains(&multiplier_pct) {
+        out.status = UsageBalanceCalibrationStatus::OutOfRange;
+        out.reason = Some("balance delta multiplier outside guardrails".to_string());
+        return out;
+    }
+
+    out.status = UsageBalanceCalibrationStatus::Calibrated;
+    out
+}
+
+fn apply_balance_calibration(
+    forecast: &mut UsageSpendForecast,
+    calibration: UsageBalanceCalibration,
+) {
+    if calibration.status != UsageBalanceCalibrationStatus::Calibrated {
+        return;
+    }
+    let Some(multiplier_pct) = calibration.multiplier_pct else {
+        return;
+    };
+
+    forecast.balance_calibrated = true;
+    forecast.balance_calibration_multiplier_pct = Some(multiplier_pct);
+    forecast.balance_calibration_requests = calibration.matched_requests;
+    forecast.balance_calibration_window_ms = calibration.window_ms;
+
+    if let Some(value) = forecast
+        .sample_cost_usd
+        .as_deref()
+        .and_then(UsdAmount::from_decimal_str)
+    {
+        forecast.sample_cost_usd =
+            Some(scale_usd_by_ratio(value, u64::from(multiplier_pct), 100).format_usd());
+    }
+    if let Some(value) = forecast
+        .rate_per_hour_usd
+        .as_deref()
+        .and_then(UsdAmount::from_decimal_str)
+    {
+        forecast.rate_per_hour_usd =
+            Some(scale_usd_by_ratio(value, u64::from(multiplier_pct), 100).format_usd());
+    }
+    if let Some(value) = forecast
+        .projected_until_reset_usd
+        .as_deref()
+        .and_then(UsdAmount::from_decimal_str)
+    {
+        forecast.projected_until_reset_usd =
+            Some(scale_usd_by_ratio(value, u64::from(multiplier_pct), 100).format_usd());
+    }
+
+    let balance = forecast
+        .primary_balance_remaining_usd
+        .as_deref()
+        .and_then(UsdAmount::from_decimal_str);
+    let projected = forecast
+        .projected_until_reset_usd
+        .as_deref()
+        .and_then(UsdAmount::from_decimal_str);
+    forecast.projected_balance_after_reset_usd = match (balance, projected) {
+        (Some(balance), Some(projected)) => Some(balance.saturating_sub(projected).format_usd()),
+        _ => None,
+    };
+    forecast.projected_exhaustion =
+        matches!((balance, projected), (Some(balance), Some(projected)) if projected > balance);
+}
+
+fn best_balance_delta_pair(
+    provider_balance_history: &[ProviderBalanceSnapshot],
+    cutoff_ms: u64,
+    now_ms: u64,
+) -> Option<(
+    &ProviderBalanceSnapshot,
+    &ProviderBalanceSnapshot,
+    UsdAmount,
+)> {
+    let mut best: Option<(
+        &ProviderBalanceSnapshot,
+        &ProviderBalanceSnapshot,
+        UsdAmount,
+    )> = None;
+    let mut histories = std::collections::BTreeMap::<String, Vec<&ProviderBalanceSnapshot>>::new();
+    for snapshot in provider_balance_history {
+        if snapshot.fetched_at_ms < cutoff_ms || snapshot.fetched_at_ms > now_ms {
+            continue;
+        }
+        if snapshot
+            .error
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            continue;
+        }
+        if snapshot.unlimited_quota == Some(true) {
+            continue;
+        }
+        if balance_delta_amount(snapshot).is_none() {
+            continue;
+        }
+        histories
+            .entry(balance_history_key(snapshot))
+            .or_default()
+            .push(snapshot);
+    }
+
+    for history in histories.values_mut() {
+        history.sort_by_key(|snapshot| snapshot.fetched_at_ms);
+        for pair in history.windows(2) {
+            let [previous, current] = pair else {
+                continue;
+            };
+            let Some(previous_amount) = balance_delta_amount(previous) else {
+                continue;
+            };
+            let Some(current_amount) = balance_delta_amount(current) else {
+                continue;
+            };
+            if current.fetched_at_ms <= previous.fetched_at_ms || current_amount >= previous_amount
+            {
+                continue;
+            }
+            let delta = previous_amount.saturating_sub(current_amount);
+            if delta.is_zero() {
+                continue;
+            }
+            let replace = best.as_ref().is_none_or(|(_, best_current, _)| {
+                current.fetched_at_ms > best_current.fetched_at_ms
+            });
+            if replace {
+                best = Some((previous, current, delta));
+            }
+        }
+    }
+
+    best
+}
+
+fn balance_history_key(snapshot: &ProviderBalanceSnapshot) -> String {
+    format!(
+        "{}|{}|{}",
+        snapshot.station_name.as_deref().unwrap_or_default(),
+        snapshot
+            .upstream_index
+            .map(|idx| idx.to_string())
+            .unwrap_or_default(),
+        snapshot.provider_id
+    )
+}
+
+fn balance_delta_amount(snapshot: &ProviderBalanceSnapshot) -> Option<UsdAmount> {
+    if let Some(amount) = snapshot
+        .quota_remaining_usd
+        .as_deref()
+        .and_then(UsdAmount::from_decimal_str)
+    {
+        return Some(amount);
+    }
+    if let Some(amount) = snapshot
+        .subscription_balance_usd
+        .as_deref()
+        .and_then(UsdAmount::from_decimal_str)
+    {
+        return Some(amount);
+    }
+    snapshot
+        .total_balance_usd
+        .as_deref()
+        .and_then(UsdAmount::from_decimal_str)
+}
+
+fn request_matches_balance_snapshot(
+    request: &FinishedRequest,
+    snapshot: &ProviderBalanceSnapshot,
+) -> bool {
+    let provider_matches = match snapshot.provider_id.trim() {
+        "" => true,
+        provider_id => request.provider_id.as_deref() == Some(provider_id),
+    };
+    let station_matches = snapshot
+        .station_name
+        .as_deref()
+        .is_none_or(|station_name| request.station_name.as_deref() == Some(station_name));
+    provider_matches && station_matches
+}
+
+fn build_usage_spend_forecast_inner(
     config: &UsageForecastConfig,
     recent: &[FinishedRequest],
     provider_balances: &[ProviderBalanceSnapshot],
@@ -200,6 +509,7 @@ pub fn build_usage_spend_forecast(
         projected_exhaustion,
         confidence,
         reason: None,
+        ..UsageSpendForecast::default()
     }
 }
 
@@ -704,6 +1014,54 @@ mod tests {
         assert_eq!(pacing.target_rate_per_hour_usd.as_deref(), Some("1"));
         assert_eq!(pacing.pace_ratio_pct, Some(200));
         assert_eq!(pacing.status, QuotaPacingStatus::Fast);
+    }
+
+    #[test]
+    fn spend_forecast_applies_balance_delta_calibration() {
+        let now_ms = 10 * HOUR_MS;
+        let config = UsageForecastConfig {
+            rate_window_minutes: 60,
+            min_priced_requests: 1,
+            ..UsageForecastConfig::default()
+        };
+        let recent = vec![priced_request(now_ms - 30 * MINUTE_MS, "1")];
+        let balances = vec![ProviderBalanceSnapshot {
+            provider_id: "provider".to_string(),
+            station_name: Some("station".to_string()),
+            quota_period: Some("daily".to_string()),
+            quota_remaining_usd: Some("8".to_string()),
+            fetched_at_ms: now_ms,
+            ..ProviderBalanceSnapshot::default()
+        }];
+        let history = vec![
+            ProviderBalanceSnapshot {
+                provider_id: "provider".to_string(),
+                station_name: Some("station".to_string()),
+                upstream_index: Some(0),
+                quota_period: Some("daily".to_string()),
+                quota_remaining_usd: Some("10".to_string()),
+                fetched_at_ms: now_ms - 60 * MINUTE_MS,
+                ..ProviderBalanceSnapshot::default()
+            },
+            ProviderBalanceSnapshot {
+                provider_id: "provider".to_string(),
+                station_name: Some("station".to_string()),
+                upstream_index: Some(0),
+                quota_period: Some("daily".to_string()),
+                quota_remaining_usd: Some("8".to_string()),
+                fetched_at_ms: now_ms,
+                ..ProviderBalanceSnapshot::default()
+            },
+        ];
+
+        let forecast = build_usage_spend_forecast_with_balance_history(
+            &config, &recent, &balances, &history, now_ms,
+        );
+
+        assert!(forecast.balance_calibrated);
+        assert_eq!(forecast.balance_calibration_multiplier_pct, Some(200));
+        assert_eq!(forecast.rate_per_hour_usd.as_deref(), Some("4"));
+        assert_eq!(forecast.sample_cost_usd.as_deref(), Some("2"));
     }
 
     #[test]

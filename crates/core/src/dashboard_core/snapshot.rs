@@ -37,6 +37,8 @@ pub struct DashboardSnapshot {
     pub station_health: HashMap<String, StationHealth>,
     #[serde(default)]
     pub provider_balances: HashMap<String, Vec<ProviderBalanceSnapshot>>,
+    #[serde(default)]
+    pub provider_balance_history: HashMap<String, Vec<ProviderBalanceSnapshot>>,
     pub health_checks: HashMap<String, HealthCheckStatus>,
     pub lb_view: HashMap<String, LbConfigView>,
     pub usage_rollup: UsageRollupView,
@@ -109,6 +111,7 @@ pub async fn build_dashboard_snapshot(
         usage_rollup,
         station_health,
         provider_balances,
+        provider_balance_history,
         health_checks,
         lb_view,
     ) = tokio::join!(
@@ -127,6 +130,7 @@ pub async fn build_dashboard_snapshot(
         state.get_usage_rollup_view(service_name, 12, stats_days),
         state.get_station_health(service_name),
         state.get_provider_balance_view(service_name),
+        state.get_provider_balance_history_view(service_name),
         state.list_health_checks(service_name),
         state.get_lb_view(),
     );
@@ -169,6 +173,7 @@ pub async fn build_dashboard_snapshot(
         session_stats,
         station_health,
         provider_balances,
+        provider_balance_history,
         health_checks,
         lb_view,
         usage_rollup,

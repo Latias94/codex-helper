@@ -721,6 +721,7 @@ mod tests {
             station_meta_overrides: std::collections::HashMap::new(),
             usage_rollup: crate::state::UsageRollupView::default(),
             provider_balances: std::collections::HashMap::new(),
+            provider_balance_history: std::collections::HashMap::new(),
             station_health: std::collections::HashMap::new(),
             health_checks: std::collections::HashMap::new(),
             lb_view: std::collections::HashMap::new(),
