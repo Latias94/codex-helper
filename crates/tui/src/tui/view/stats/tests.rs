@@ -449,6 +449,44 @@ fn stats_kpis_show_spend_projection_only_when_sample_is_confident() {
 }
 
 #[test]
+fn stats_kpis_show_package_pacing_for_quota_balances() {
+    let now = crate::tui::model::now_ms();
+    let mut snapshot = sample_snapshot(HashMap::from([(
+        "provider".to_string(),
+        vec![ProviderBalanceSnapshot {
+            provider_id: "provider".to_string(),
+            status: BalanceSnapshotStatus::Ok,
+            quota_period: Some("daily".to_string()),
+            quota_remaining_usd: Some("6".to_string()),
+            quota_limit_usd: Some("20".to_string()),
+            fetched_at_ms: now,
+            ..ProviderBalanceSnapshot::default()
+        }],
+    )]));
+    snapshot.recent = vec![
+        sample_priced_request(now.saturating_sub(59 * 60_000), "1"),
+        sample_priced_request(now.saturating_sub(30 * 60_000), "1"),
+    ];
+    let mut ui = UiState {
+        page: crate::tui::types::Page::Stats,
+        usage_forecast: crate::config::UsageForecastConfig {
+            rate_window_minutes: 60,
+            min_priced_requests: 2,
+            reset_utc_offset: "+08:00".to_string(),
+            ..Default::default()
+        },
+        ..UiState::default()
+    };
+
+    let text = render_stats_text(150, 28, &mut ui, &snapshot);
+
+    assert!(text.contains("pace"), "{text}");
+    assert!(text.contains("daily package left"), "{text}");
+    assert!(text.contains("$6.00/$20.00"), "{text}");
+    assert!(text.contains("target"), "{text}");
+}
+
+#[test]
 fn stats_kpis_label_forecast_sample_sources() {
     let now = crate::tui::model::now_ms();
     let mut snapshot = sample_snapshot(HashMap::new());

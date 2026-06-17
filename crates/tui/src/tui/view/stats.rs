@@ -16,6 +16,7 @@ use crate::tui::model::{
 use crate::tui::state::UiState;
 use crate::tui::types::StatsFocus;
 use crate::usage_balance::{UsageBalanceEndpointRow, UsageBalanceProviderRow, UsageBalanceView};
+use crate::usage_forecast::QuotaPacingStatus;
 
 mod summary;
 use summary::*;
@@ -114,12 +115,23 @@ fn render_today_kpis(
     let cols = kpi_cells(area);
     let tokens = &today.usage;
     let ok = today.requests_total.saturating_sub(today.requests_error);
-    let forecast = usage_spend_forecast(snapshot, ctx.usage_forecast, crate::tui::model::now_ms());
+    let now_ms = crate::tui::model::now_ms();
+    let forecast = usage_spend_forecast(snapshot, ctx.usage_forecast, now_ms);
+    let quota_pacing = quota_pacing_forecast(snapshot, &forecast, now_ms);
     let forecast_source = usage_forecast_source_line(snapshot, lang);
     let forecast_style = if forecast.projected_exhaustion {
         Style::default().fg(p.warn)
     } else {
         Style::default().fg(p.muted)
+    };
+    let quota_style = match quota_pacing.status {
+        QuotaPacingStatus::Fast | QuotaPacingStatus::Exhausted => Style::default().fg(p.warn),
+        QuotaPacingStatus::OnTrack | QuotaPacingStatus::Slow | QuotaPacingStatus::Unlimited => {
+            Style::default().fg(p.text)
+        }
+        QuotaPacingStatus::NoSpendRate
+        | QuotaPacingStatus::UnknownReset
+        | QuotaPacingStatus::Unavailable => Style::default().fg(p.muted),
     };
     let live_value_width = usize::from(cols[3].width.saturating_sub(8)).clamp(12, 72);
 
@@ -265,26 +277,33 @@ fn render_today_kpis(
                 ),
             ]),
             Line::from(vec![
+                Span::styled("pace ", Style::default().fg(p.muted)),
+                Span::styled(
+                    shorten(
+                        &quota_pacing_plan_line(&quota_pacing, lang),
+                        live_value_width,
+                    ),
+                    quota_style,
+                ),
+            ]),
+            Line::from(vec![
                 Span::styled("left ", Style::default().fg(p.muted)),
                 Span::styled(
                     shorten(
-                        &spend_forecast_balance_line(&forecast, lang),
+                        &quota_pacing_status_line(&quota_pacing, lang),
                         live_value_width,
                     ),
-                    forecast_style,
+                    quota_style,
                 ),
             ]),
             Line::from(vec![
                 Span::styled("bal ", Style::default().fg(p.muted)),
                 Span::styled(
                     shorten(
-                        &usage_balance_counts_line(
-                            &ctx.usage_balance.totals.balance_status_counts,
-                            lang,
-                        ),
+                        &spend_forecast_balance_line(&forecast, lang),
                         live_value_width,
                     ),
-                    Style::default().fg(p.text),
+                    forecast_style,
                 ),
             ]),
             Line::from(vec![

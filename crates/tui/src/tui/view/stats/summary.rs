@@ -18,7 +18,8 @@ use crate::usage_balance::{
     UsageBalanceView,
 };
 use crate::usage_forecast::{
-    UsageForecastConfidence, UsageSpendForecast, build_usage_spend_forecast,
+    QuotaPacingForecast, QuotaPacingStatus, UsageForecastConfidence, UsageSpendForecast,
+    build_quota_pacing_forecast, build_usage_spend_forecast,
 };
 
 pub(super) const STATS_BALANCE_COLUMN_WIDTH: u16 = 14;
@@ -430,6 +431,20 @@ pub(super) fn usage_spend_forecast(
     build_usage_spend_forecast(config, recent, &balances, now_ms)
 }
 
+pub(super) fn quota_pacing_forecast(
+    snapshot: &Snapshot,
+    spend: &UsageSpendForecast,
+    now_ms: u64,
+) -> QuotaPacingForecast {
+    let balances = snapshot
+        .provider_balances
+        .values()
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
+    build_quota_pacing_forecast(spend, &balances, now_ms)
+}
+
 pub(super) fn spend_forecast_rate_line(forecast: &UsageSpendForecast, lang: Language) -> String {
     if !forecast.enabled {
         return match lang {
@@ -512,6 +527,83 @@ pub(super) fn spend_forecast_balance_line(forecast: &UsageSpendForecast, lang: L
     }
 }
 
+pub(super) fn quota_pacing_plan_line(pacing: &QuotaPacingForecast, lang: Language) -> String {
+    if !pacing.available {
+        return match lang {
+            Language::Zh => "未识别到套餐额度".to_string(),
+            Language::En => "no package quota detected".to_string(),
+        };
+    }
+    if pacing.unlimited {
+        return match lang {
+            Language::Zh => "套餐 unlimited，仅显示当前速度".to_string(),
+            Language::En => "unlimited package, showing burn only".to_string(),
+        };
+    }
+
+    let period = quota_period_label(pacing.period.as_deref(), lang);
+    let remaining = fmt_usd_compact(pacing.remaining_usd.as_deref());
+    let amount = match pacing.limit_usd.as_deref() {
+        Some(limit) => format!("{remaining}/{}", fmt_usd_compact(Some(limit))),
+        None => remaining,
+    };
+    match lang {
+        Language::Zh => format!("{period} 套餐 剩余 {amount}"),
+        Language::En => format!("{period} package left {amount}"),
+    }
+}
+
+pub(super) fn quota_pacing_status_line(pacing: &QuotaPacingForecast, lang: Language) -> String {
+    if !pacing.available {
+        return pacing.reason.clone().unwrap_or_else(|| match lang {
+            Language::Zh => "暂无套餐节奏数据".to_string(),
+            Language::En => "no package pacing data".to_string(),
+        });
+    }
+
+    let rate = fmt_usd_compact(pacing.rate_per_hour_usd.as_deref());
+    match pacing.status {
+        QuotaPacingStatus::Unlimited => match lang {
+            Language::Zh => format!("当前 {rate}/h，无耗尽预估"),
+            Language::En => format!("current {rate}/h, no exhaustion ETA"),
+        },
+        QuotaPacingStatus::Exhausted => match lang {
+            Language::Zh => "套餐已耗尽".to_string(),
+            Language::En => "package exhausted".to_string(),
+        },
+        QuotaPacingStatus::NoSpendRate => match lang {
+            Language::Zh => "暂无可计价样本，无法估算节奏".to_string(),
+            Language::En => "no priced sample, pacing unknown".to_string(),
+        },
+        QuotaPacingStatus::UnknownReset => {
+            let eta = pacing
+                .estimated_exhaustion_in_ms
+                .map(duration_short)
+                .unwrap_or_else(|| "-".to_string());
+            match lang {
+                Language::Zh => format!("当前 {rate}/h，预计还能 {eta}"),
+                Language::En => format!("current {rate}/h, ETA {eta}"),
+            }
+        }
+        QuotaPacingStatus::OnTrack | QuotaPacingStatus::Fast | QuotaPacingStatus::Slow => {
+            let target = fmt_usd_compact(pacing.target_rate_per_hour_usd.as_deref());
+            let reset = pacing
+                .reset_in_ms
+                .map(duration_short)
+                .unwrap_or_else(|| "-".to_string());
+            let status = quota_pacing_status_label(pacing.status, pacing.pace_ratio_pct, lang);
+            match lang {
+                Language::Zh => format!("当前 {rate}/h 目标 {target}/h {status} ({reset})"),
+                Language::En => format!("current {rate}/h target {target}/h {status} ({reset})"),
+            }
+        }
+        QuotaPacingStatus::Unavailable => pacing.reason.clone().unwrap_or_else(|| match lang {
+            Language::Zh => "套餐额度不可用".to_string(),
+            Language::En => "package quota unavailable".to_string(),
+        }),
+    }
+}
+
 fn fmt_usd_compact(value: Option<&str>) -> String {
     let Some(value) = value else {
         return "-".to_string();
@@ -527,6 +619,45 @@ fn fmt_usd_compact(value: Option<&str>) -> String {
         format!("${parsed:.2}")
     } else {
         format!("${parsed:.0}")
+    }
+}
+
+fn quota_period_label(period: Option<&str>, lang: Language) -> String {
+    let Some(period) = period.map(str::trim).filter(|value| !value.is_empty()) else {
+        return match lang {
+            Language::Zh => "quota".to_string(),
+            Language::En => "quota".to_string(),
+        };
+    };
+    match (period, lang) {
+        ("daily", Language::Zh) => "每日".to_string(),
+        ("daily", Language::En) => "daily".to_string(),
+        ("weekly", Language::Zh) => "每周".to_string(),
+        ("weekly", Language::En) => "weekly".to_string(),
+        ("monthly", Language::Zh) => "每月".to_string(),
+        ("monthly", Language::En) => "monthly".to_string(),
+        ("quota", _) => "quota".to_string(),
+        (period, _) => period.to_string(),
+    }
+}
+
+fn quota_pacing_status_label(
+    status: QuotaPacingStatus,
+    pace_ratio_pct: Option<u32>,
+    lang: Language,
+) -> String {
+    let ratio = pace_ratio_pct
+        .map(|value| format!("{value}%"))
+        .unwrap_or_else(|| "-".to_string());
+    match (status, lang) {
+        (QuotaPacingStatus::Fast, Language::Zh) => format!("偏快 {ratio}"),
+        (QuotaPacingStatus::Fast, Language::En) => format!("fast {ratio}"),
+        (QuotaPacingStatus::Slow, Language::Zh) => format!("偏慢 {ratio}"),
+        (QuotaPacingStatus::Slow, Language::En) => format!("slow {ratio}"),
+        (QuotaPacingStatus::OnTrack, Language::Zh) => format!("正常 {ratio}"),
+        (QuotaPacingStatus::OnTrack, Language::En) => format!("on-track {ratio}"),
+        (_, Language::Zh) => "未知".to_string(),
+        (_, Language::En) => "unknown".to_string(),
     }
 }
 
