@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use super::components::request_details;
 use super::requests_filters::{
     ensure_request_ledger_loaded, filtered_recent_requests, render_requests_filters,
@@ -203,12 +205,12 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     ui.add_space(6.0);
 
     ensure_request_ledger_loaded(ctx);
-    let recent = if ctx.view.requests.include_request_ledger {
-        ctx.view.requests.request_ledger_records.clone()
+    let recent: Cow<'_, [FinishedRequest]> = if ctx.view.requests.include_request_ledger {
+        Cow::Owned(ctx.view.requests.request_ledger_records.clone())
     } else {
-        snapshot.recent.clone()
+        Cow::Borrowed(snapshot.recent.as_ref())
     };
-    let filtered = filtered_recent_requests(&recent, ctx, selected_sid_ref);
+    let filtered = filtered_recent_requests(recent.as_ref(), ctx, selected_sid_ref);
 
     if filtered.is_empty() {
         ctx.view.requests.selected_idx = 0;

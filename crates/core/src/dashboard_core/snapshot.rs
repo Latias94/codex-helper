@@ -92,8 +92,8 @@ pub async fn build_dashboard_snapshot(
     stats_days: usize,
 ) -> DashboardSnapshot {
     let now = now_ms();
-    let recent_limit = recent_limit.clamp(1, crate::state::recent_finished_max());
-    let recent_for_stats = recent_limit.max(2_000);
+    let recent_limit = clamp_recent_limit(recent_limit);
+    let recent_for_stats = recent_limit;
 
     let (
         active,
@@ -179,5 +179,22 @@ pub async fn build_dashboard_snapshot(
         usage_rollup,
         stats_5m,
         stats_1h,
+    }
+}
+
+fn clamp_recent_limit(recent_limit: usize) -> usize {
+    recent_limit.clamp(1, crate::state::recent_finished_max())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dashboard_recent_limit_clamps_to_retention() {
+        let retention = crate::state::recent_finished_max();
+
+        assert_eq!(clamp_recent_limit(retention.saturating_mul(2)), retention);
+        assert_eq!(clamp_recent_limit(0), 1);
     }
 }

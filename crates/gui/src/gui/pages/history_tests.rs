@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use super::super::i18n::Language;
 use super::history::{HistoryScope, HistoryViewState};
@@ -47,7 +48,7 @@ fn empty_snapshot() -> GuiRuntimeSnapshot {
         service_name: Some("codex".to_string()),
         last_error: None,
         active: Vec::new(),
-        recent: Vec::new(),
+        recent: Arc::default(),
         session_cards: Vec::new(),
         global_station_override: None,
         global_route_target_override: None,
@@ -252,7 +253,7 @@ fn history_service_tier_display_marks_priority_as_fast_mode() {
 #[test]
 fn observed_history_summaries_fall_back_to_recent_requests() {
     let mut snapshot = empty_snapshot();
-    snapshot.recent = vec![FinishedRequest {
+    snapshot.recent = Arc::from(vec![FinishedRequest {
         id: 1,
         trace_id: Some("codex-1".to_string()),
         session_id: Some("sid-recent".to_string()),
@@ -279,7 +280,7 @@ fn observed_history_summaries_fall_back_to_recent_requests() {
         ttfb_ms: None,
         streaming: false,
         ended_at_ms: 9_000,
-    }];
+    }]);
 
     let summaries = build_observed_history_summaries(&snapshot, Language::En);
 

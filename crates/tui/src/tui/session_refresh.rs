@@ -95,7 +95,7 @@ pub(super) fn start_codex_recent_refresh(
     ui.codex_recent_refresh_generation = ui.codex_recent_refresh_generation.wrapping_add(1);
     let generation = ui.codex_recent_refresh_generation;
     let raw_cwd = ui.codex_recent_raw_cwd;
-    let branch_cache = ui.codex_recent_branch_cache.clone();
+    let branch_cache = ui.codex_recent_branch_cache.clone_entries();
     ui.codex_recent_loading = true;
     ui.codex_recent_error = None;
     ui.toast = Some((
@@ -124,7 +124,7 @@ pub(super) fn apply_codex_recent_refresh_result(
     match result.result {
         Ok(payload) => {
             ui.codex_recent_rows = payload.rows;
-            ui.codex_recent_branch_cache = payload.branch_cache;
+            ui.codex_recent_branch_cache.replace(payload.branch_cache);
             ui.codex_recent_error = None;
             ui.codex_recent_selected_idx = 0;
             ui.codex_recent_selected_id =

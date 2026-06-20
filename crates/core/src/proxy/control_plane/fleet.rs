@@ -10,9 +10,13 @@ pub(in crate::proxy) async fn api_fleet_snapshot(
 ) -> Result<Json<FleetSnapshot>, (StatusCode, String)> {
     let cfg = proxy.config.snapshot().await;
     let mgr = proxy.service_manager(cfg.as_ref());
-    let mut dashboard =
-        crate::dashboard_core::build_dashboard_snapshot(&proxy.state, proxy.service_name, 2_000, 7)
-            .await;
+    let mut dashboard = crate::dashboard_core::build_dashboard_snapshot(
+        &proxy.state,
+        proxy.service_name,
+        crate::state::recent_finished_max(),
+        7,
+    )
+    .await;
     crate::state::enrich_session_identity_cards_with_runtime(&mut dashboard.session_cards, mgr);
 
     Ok(Json(build_local_fleet_snapshot_from_dashboard(

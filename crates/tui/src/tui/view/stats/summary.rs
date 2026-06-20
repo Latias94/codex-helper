@@ -428,19 +428,24 @@ pub(super) fn usage_spend_forecast(
         .provider_balance_history
         .values()
         .flatten()
-        .cloned()
         .collect::<Vec<_>>();
-    let recent = match snapshot.forecast_recent_source {
-        UsageForecastSampleSource::RuntimeOnly => &snapshot.recent,
-        UsageForecastSampleSource::RuntimeAndRequestLedger => &snapshot.forecast_recent,
-    };
-    build_usage_spend_forecast_with_balance_history(
-        config,
-        recent,
-        &balances,
-        &balance_history,
-        now_ms,
-    )
+    if snapshot.forecast_recent_source == UsageForecastSampleSource::RuntimeOnly {
+        build_usage_spend_forecast_with_balance_history(
+            config,
+            &snapshot.recent,
+            &balances,
+            &balance_history,
+            now_ms,
+        )
+    } else {
+        build_usage_spend_forecast_with_balance_history(
+            config,
+            &snapshot.forecast_recent,
+            &balances,
+            &balance_history,
+            now_ms,
+        )
+    }
 }
 
 pub(super) fn quota_pacing_forecast(

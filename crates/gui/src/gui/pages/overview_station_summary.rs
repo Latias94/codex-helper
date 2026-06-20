@@ -99,8 +99,8 @@ pub(super) fn render_overview_station_summary(ui: &mut egui::Ui, ctx: &mut PageC
         .count();
     let health_count = runtime_maps.station_health.len();
     let active_station = current_runtime_active_station(ctx.proxy);
-    let provider_hits = recent_provider_hit_summaries(&snapshot.recent);
-    let retry_rollup = recent_retry_rollup(&snapshot.recent);
+    let provider_hits = recent_provider_hit_summaries(snapshot.recent.as_ref());
+    let retry_rollup = recent_retry_rollup(snapshot.recent.as_ref());
     let same_station_retries = retry_rollup
         .retried_requests
         .saturating_sub(retry_rollup.cross_station_failovers);

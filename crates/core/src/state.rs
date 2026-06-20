@@ -104,13 +104,16 @@ pub struct PassiveUpstreamFailureRecord {
 pub fn recent_finished_max() -> usize {
     static MAX: OnceLock<usize> = OnceLock::new();
     *MAX.get_or_init(|| {
-        std::env::var("CODEX_HELPER_RECENT_FINISHED_MAX")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(2_000)
-            .clamp(200, 20_000)
+        recent_finished_max_from_env(std::env::var("CODEX_HELPER_RECENT_FINISHED_MAX").ok())
     })
+}
+
+fn recent_finished_max_from_env(raw: Option<String>) -> usize {
+    raw.as_deref()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(1_000)
+        .clamp(200, 10_000)
 }
 
 fn provider_balance_history_max() -> usize {
@@ -3446,6 +3449,11 @@ mod tests {
             assert!(recent[0].observability.fast_mode);
             assert_eq!(recent[0].observability.generation_ms, Some(6));
         });
+    }
+
+    #[test]
+    fn recent_finished_max_defaults_to_one_thousand() {
+        assert_eq!(recent_finished_max_from_env(None), 1_000);
     }
 
     #[test]

@@ -112,22 +112,194 @@ pub enum UsageForecastConfidence {
     Estimated,
 }
 
-pub fn build_usage_spend_forecast(
-    config: &UsageForecastConfig,
-    recent: &[FinishedRequest],
-    provider_balances: &[ProviderBalanceSnapshot],
-    now_ms: u64,
-) -> UsageSpendForecast {
-    build_usage_spend_forecast_with_balance_history(config, recent, provider_balances, &[], now_ms)
+pub trait UsageForecastRequestLike {
+    fn id(&self) -> u64;
+    fn trace_id(&self) -> Option<&str>;
+    fn ended_at_ms(&self) -> u64;
+    fn provider_id(&self) -> Option<&str>;
+    fn station_name(&self) -> Option<&str>;
+    fn total_cost_usd(&self) -> Option<&str>;
+    fn has_usage(&self) -> bool;
 }
 
-pub fn build_usage_spend_forecast_with_balance_history(
+pub trait UsageForecastBalanceHistoryLike {
+    fn fetched_at_ms(&self) -> u64;
+    fn provider_id(&self) -> &str;
+    fn station_name(&self) -> Option<&str>;
+    fn upstream_index(&self) -> Option<usize>;
+    fn quota_remaining_usd(&self) -> Option<&str>;
+    fn subscription_balance_usd(&self) -> Option<&str>;
+    fn total_balance_usd(&self) -> Option<&str>;
+    fn error(&self) -> Option<&str>;
+    fn unlimited_quota(&self) -> bool;
+}
+
+impl<T: UsageForecastRequestLike + ?Sized> UsageForecastRequestLike for &T {
+    fn id(&self) -> u64 {
+        (**self).id()
+    }
+
+    fn trace_id(&self) -> Option<&str> {
+        (**self).trace_id()
+    }
+
+    fn ended_at_ms(&self) -> u64 {
+        (**self).ended_at_ms()
+    }
+
+    fn provider_id(&self) -> Option<&str> {
+        (**self).provider_id()
+    }
+
+    fn station_name(&self) -> Option<&str> {
+        (**self).station_name()
+    }
+
+    fn total_cost_usd(&self) -> Option<&str> {
+        (**self).total_cost_usd()
+    }
+
+    fn has_usage(&self) -> bool {
+        (**self).has_usage()
+    }
+}
+
+impl<T: UsageForecastBalanceHistoryLike + ?Sized> UsageForecastBalanceHistoryLike for &T {
+    fn fetched_at_ms(&self) -> u64 {
+        (**self).fetched_at_ms()
+    }
+
+    fn provider_id(&self) -> &str {
+        (**self).provider_id()
+    }
+
+    fn station_name(&self) -> Option<&str> {
+        (**self).station_name()
+    }
+
+    fn upstream_index(&self) -> Option<usize> {
+        (**self).upstream_index()
+    }
+
+    fn quota_remaining_usd(&self) -> Option<&str> {
+        (**self).quota_remaining_usd()
+    }
+
+    fn subscription_balance_usd(&self) -> Option<&str> {
+        (**self).subscription_balance_usd()
+    }
+
+    fn total_balance_usd(&self) -> Option<&str> {
+        (**self).total_balance_usd()
+    }
+
+    fn error(&self) -> Option<&str> {
+        (**self).error()
+    }
+
+    fn unlimited_quota(&self) -> bool {
+        (**self).unlimited_quota()
+    }
+}
+
+impl UsageForecastRequestLike for FinishedRequest {
+    fn id(&self) -> u64 {
+        self.id
+    }
+
+    fn trace_id(&self) -> Option<&str> {
+        self.trace_id.as_deref()
+    }
+
+    fn ended_at_ms(&self) -> u64 {
+        self.ended_at_ms
+    }
+
+    fn provider_id(&self) -> Option<&str> {
+        self.provider_id.as_deref()
+    }
+
+    fn station_name(&self) -> Option<&str> {
+        self.station_name.as_deref()
+    }
+
+    fn total_cost_usd(&self) -> Option<&str> {
+        self.cost.total_cost_usd.as_deref()
+    }
+
+    fn has_usage(&self) -> bool {
+        self.usage.is_some()
+    }
+}
+
+impl UsageForecastBalanceHistoryLike for ProviderBalanceSnapshot {
+    fn fetched_at_ms(&self) -> u64 {
+        self.fetched_at_ms
+    }
+
+    fn provider_id(&self) -> &str {
+        self.provider_id.as_str()
+    }
+
+    fn station_name(&self) -> Option<&str> {
+        self.station_name.as_deref()
+    }
+
+    fn upstream_index(&self) -> Option<usize> {
+        self.upstream_index
+    }
+
+    fn quota_remaining_usd(&self) -> Option<&str> {
+        self.quota_remaining_usd.as_deref()
+    }
+
+    fn subscription_balance_usd(&self) -> Option<&str> {
+        self.subscription_balance_usd.as_deref()
+    }
+
+    fn total_balance_usd(&self) -> Option<&str> {
+        self.total_balance_usd.as_deref()
+    }
+
+    fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    fn unlimited_quota(&self) -> bool {
+        self.unlimited_quota == Some(true)
+    }
+}
+
+pub fn build_usage_spend_forecast<T>(
     config: &UsageForecastConfig,
-    recent: &[FinishedRequest],
+    recent: &[T],
     provider_balances: &[ProviderBalanceSnapshot],
-    provider_balance_history: &[ProviderBalanceSnapshot],
     now_ms: u64,
-) -> UsageSpendForecast {
+) -> UsageSpendForecast
+where
+    T: UsageForecastRequestLike,
+{
+    let empty_history: &[ProviderBalanceSnapshot] = &[];
+    build_usage_spend_forecast_with_balance_history(
+        config,
+        recent,
+        provider_balances,
+        empty_history,
+        now_ms,
+    )
+}
+
+pub fn build_usage_spend_forecast_with_balance_history<T, H>(
+    config: &UsageForecastConfig,
+    recent: &[T],
+    provider_balances: &[ProviderBalanceSnapshot],
+    provider_balance_history: &[H],
+    now_ms: u64,
+) -> UsageSpendForecast
+where
+    T: UsageForecastRequestLike,
+    H: UsageForecastBalanceHistoryLike,
+{
     let calibration =
         build_usage_balance_calibration(recent, provider_balance_history, config, now_ms);
     let mut forecast = build_usage_spend_forecast_inner(config, recent, provider_balances, now_ms);
@@ -135,12 +307,16 @@ pub fn build_usage_spend_forecast_with_balance_history(
     forecast
 }
 
-pub fn build_usage_balance_calibration(
-    recent: &[FinishedRequest],
-    provider_balance_history: &[ProviderBalanceSnapshot],
+pub fn build_usage_balance_calibration<T, H>(
+    recent: &[T],
+    provider_balance_history: &[H],
     config: &UsageForecastConfig,
     now_ms: u64,
-) -> UsageBalanceCalibration {
+) -> UsageBalanceCalibration
+where
+    T: UsageForecastRequestLike,
+    H: UsageForecastBalanceHistoryLike,
+{
     let sample_window_ms = config.rate_window_minutes.max(1).saturating_mul(MINUTE_MS);
     let cutoff_ms = now_ms.saturating_sub(sample_window_ms.saturating_mul(2));
     let Some((previous, current, actual_delta)) =
@@ -155,8 +331,8 @@ pub fn build_usage_balance_calibration(
     let mut estimated_delta = UsdAmount::ZERO;
     let mut matched_requests = 0_u64;
     for request in recent {
-        if request.ended_at_ms <= previous.fetched_at_ms
-            || request.ended_at_ms > current.fetched_at_ms
+        if request.ended_at_ms() <= previous.fetched_at_ms()
+            || request.ended_at_ms() > current.fetched_at_ms()
         {
             continue;
         }
@@ -164,9 +340,7 @@ pub fn build_usage_balance_calibration(
             continue;
         }
         let Some(cost) = request
-            .cost
-            .total_cost_usd
-            .as_deref()
+            .total_cost_usd()
             .and_then(UsdAmount::from_decimal_str)
         else {
             continue;
@@ -178,14 +352,16 @@ pub fn build_usage_balance_calibration(
         matched_requests = matched_requests.saturating_add(1);
     }
 
-    let window_ms = current.fetched_at_ms.saturating_sub(previous.fetched_at_ms);
+    let window_ms = current
+        .fetched_at_ms()
+        .saturating_sub(previous.fetched_at_ms());
     let mut out = UsageBalanceCalibration {
         available: true,
-        provider_id: current.provider_id.clone(),
-        station_name: current.station_name.clone(),
-        upstream_index: current.upstream_index,
-        window_start_ms: Some(previous.fetched_at_ms),
-        window_end_ms: Some(current.fetched_at_ms),
+        provider_id: current.provider_id().to_string(),
+        station_name: current.station_name().map(ToOwned::to_owned),
+        upstream_index: current.upstream_index(),
+        window_start_ms: Some(previous.fetched_at_ms()),
+        window_end_ms: Some(current.fetched_at_ms()),
         window_ms: Some(window_ms),
         matched_requests,
         actual_delta_usd: Some(actual_delta.format_usd()),
@@ -268,33 +444,28 @@ fn apply_balance_calibration(
         matches!((balance, projected), (Some(balance), Some(projected)) if projected > balance);
 }
 
-fn best_balance_delta_pair(
-    provider_balance_history: &[ProviderBalanceSnapshot],
+fn best_balance_delta_pair<H>(
+    provider_balance_history: &[H],
     cutoff_ms: u64,
     now_ms: u64,
-) -> Option<(
-    &ProviderBalanceSnapshot,
-    &ProviderBalanceSnapshot,
-    UsdAmount,
-)> {
-    let mut best: Option<(
-        &ProviderBalanceSnapshot,
-        &ProviderBalanceSnapshot,
-        UsdAmount,
-    )> = None;
-    let mut histories = std::collections::BTreeMap::<String, Vec<&ProviderBalanceSnapshot>>::new();
+) -> Option<(&H, &H, UsdAmount)>
+where
+    H: UsageForecastBalanceHistoryLike,
+{
+    let mut best: Option<(&H, &H, UsdAmount)> = None;
+    let mut histories = std::collections::BTreeMap::<String, Vec<&H>>::new();
     for snapshot in provider_balance_history {
-        if snapshot.fetched_at_ms < cutoff_ms || snapshot.fetched_at_ms > now_ms {
+        if snapshot.fetched_at_ms() < cutoff_ms || snapshot.fetched_at_ms() > now_ms {
             continue;
         }
         if snapshot
-            .error
+            .error()
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty())
         {
             continue;
         }
-        if snapshot.unlimited_quota == Some(true) {
+        if snapshot.unlimited_quota() {
             continue;
         }
         if balance_delta_amount(snapshot).is_none() {
@@ -307,7 +478,7 @@ fn best_balance_delta_pair(
     }
 
     for history in histories.values_mut() {
-        history.sort_by_key(|snapshot| snapshot.fetched_at_ms);
+        history.sort_by_key(|snapshot| snapshot.fetched_at_ms());
         for pair in history.windows(2) {
             let [previous, current] = pair else {
                 continue;
@@ -318,7 +489,8 @@ fn best_balance_delta_pair(
             let Some(current_amount) = balance_delta_amount(current) else {
                 continue;
             };
-            if current.fetched_at_ms <= previous.fetched_at_ms || current_amount >= previous_amount
+            if current.fetched_at_ms() <= previous.fetched_at_ms()
+                || current_amount >= previous_amount
             {
                 continue;
             }
@@ -327,7 +499,7 @@ fn best_balance_delta_pair(
                 continue;
             }
             let replace = best.as_ref().is_none_or(|(_, best_current, _)| {
-                current.fetched_at_ms > best_current.fetched_at_ms
+                current.fetched_at_ms() > best_current.fetched_at_ms()
             });
             if replace {
                 best = Some((previous, current, delta));
@@ -338,60 +510,60 @@ fn best_balance_delta_pair(
     best
 }
 
-fn balance_history_key(snapshot: &ProviderBalanceSnapshot) -> String {
+fn balance_history_key<H: UsageForecastBalanceHistoryLike>(snapshot: &H) -> String {
     format!(
         "{}|{}|{}",
-        snapshot.station_name.as_deref().unwrap_or_default(),
+        snapshot.station_name().unwrap_or_default(),
         snapshot
-            .upstream_index
+            .upstream_index()
             .map(|idx| idx.to_string())
             .unwrap_or_default(),
-        snapshot.provider_id
+        snapshot.provider_id()
     )
 }
 
-fn balance_delta_amount(snapshot: &ProviderBalanceSnapshot) -> Option<UsdAmount> {
+fn balance_delta_amount<H: UsageForecastBalanceHistoryLike>(snapshot: &H) -> Option<UsdAmount> {
     if let Some(amount) = snapshot
-        .quota_remaining_usd
-        .as_deref()
+        .quota_remaining_usd()
         .and_then(UsdAmount::from_decimal_str)
     {
         return Some(amount);
     }
     if let Some(amount) = snapshot
-        .subscription_balance_usd
-        .as_deref()
+        .subscription_balance_usd()
         .and_then(UsdAmount::from_decimal_str)
     {
         return Some(amount);
     }
     snapshot
-        .total_balance_usd
-        .as_deref()
+        .total_balance_usd()
         .and_then(UsdAmount::from_decimal_str)
 }
 
-fn request_matches_balance_snapshot(
-    request: &FinishedRequest,
-    snapshot: &ProviderBalanceSnapshot,
-) -> bool {
-    let provider_matches = match snapshot.provider_id.trim() {
+fn request_matches_balance_snapshot<T, H>(request: &T, snapshot: &H) -> bool
+where
+    T: UsageForecastRequestLike,
+    H: UsageForecastBalanceHistoryLike,
+{
+    let provider_matches = match snapshot.provider_id().trim() {
         "" => true,
-        provider_id => request.provider_id.as_deref() == Some(provider_id),
+        provider_id => request.provider_id() == Some(provider_id),
     };
     let station_matches = snapshot
-        .station_name
-        .as_deref()
-        .is_none_or(|station_name| request.station_name.as_deref() == Some(station_name));
+        .station_name()
+        .is_none_or(|station_name| request.station_name() == Some(station_name));
     provider_matches && station_matches
 }
 
-fn build_usage_spend_forecast_inner(
+fn build_usage_spend_forecast_inner<T>(
     config: &UsageForecastConfig,
-    recent: &[FinishedRequest],
+    recent: &[T],
     provider_balances: &[ProviderBalanceSnapshot],
     now_ms: u64,
-) -> UsageSpendForecast {
+) -> UsageSpendForecast
+where
+    T: UsageForecastRequestLike,
+{
     if !config.enabled {
         return UsageSpendForecast {
             enabled: false,
@@ -415,27 +587,25 @@ fn build_usage_spend_forecast_inner(
     let mut oldest_sample_ms: Option<u64> = None;
 
     for request in recent {
-        if request.ended_at_ms < cutoff_ms || request.ended_at_ms > now_ms {
+        if request.ended_at_ms() < cutoff_ms || request.ended_at_ms() > now_ms {
             continue;
         }
-        if request.cost.total_cost_usd.is_some() {
+        if request.total_cost_usd().is_some() {
             if let Some(cost) = request
-                .cost
-                .total_cost_usd
-                .as_deref()
+                .total_cost_usd()
                 .and_then(UsdAmount::from_decimal_str)
             {
                 sample_cost = sample_cost.saturating_add(cost);
                 priced_requests = priced_requests.saturating_add(1);
                 oldest_sample_ms = Some(
                     oldest_sample_ms
-                        .map(|oldest| oldest.min(request.ended_at_ms))
-                        .unwrap_or(request.ended_at_ms),
+                        .map(|oldest| oldest.min(request.ended_at_ms()))
+                        .unwrap_or(request.ended_at_ms()),
                 );
             } else {
                 unpriced_requests = unpriced_requests.saturating_add(1);
             }
-        } else if request.usage.is_some() {
+        } else if request.has_usage() {
             unpriced_requests = unpriced_requests.saturating_add(1);
         }
     }

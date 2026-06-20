@@ -58,10 +58,7 @@ impl AttachedDashboardRuntime {
 
     async fn snapshot(&self, stats_days: usize) -> anyhow::Result<ApiV1Snapshot> {
         self.client
-            .snapshot(
-                crate::state::recent_finished_max().min(2_000),
-                stats_days.min(365),
-            )
+            .snapshot(crate::state::recent_finished_max(), stats_days.min(365))
             .await
     }
 }

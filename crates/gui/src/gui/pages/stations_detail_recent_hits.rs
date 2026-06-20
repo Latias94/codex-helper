@@ -215,7 +215,8 @@ pub(super) fn render_station_recent_hits_section(
         "This section links recent requests with retry/failover chains: it shows both requests that finally hit this station and requests that touched it before failing over elsewhere.",
     ));
 
-    let related_requests = station_related_recent_requests(&snapshot.recent, cfg.name.as_str());
+    let related_requests =
+        station_related_recent_requests(snapshot.recent.as_ref(), cfg.name.as_str());
     if related_requests.is_empty() {
         ui.small(pick(
             ctx.lang,

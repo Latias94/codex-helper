@@ -64,7 +64,7 @@ fn running_controller(cfg: ProxyConfig) -> ProxyController {
         last_refresh: None,
         last_error: None,
         active: Vec::new(),
-        recent: Vec::new(),
+        recent: Arc::default(),
         session_cards: Vec::new(),
         global_station_override: None,
         global_route_target_override: None,

@@ -18,7 +18,8 @@ pub async fn build_local_fleet_snapshot(
     label: impl Into<String>,
 ) -> FleetSnapshot {
     let refreshed_at_ms = now_ms();
-    let dashboard = build_dashboard_snapshot(state, service_name, 2_000, 7).await;
+    let dashboard =
+        build_dashboard_snapshot(state, service_name, crate::state::recent_finished_max(), 7).await;
     let process_scan = scan_codex_processes();
     let node = build_local_fleet_node_from_parts(LocalFleetNodeParts {
         node_id: node_id.into(),

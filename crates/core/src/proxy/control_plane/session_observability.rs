@@ -14,7 +14,7 @@ async fn load_session_identity_cards(
 ) -> Vec<crate::state::SessionIdentityCard> {
     let mut cards = proxy
         .state
-        .list_session_identity_cards_with_host_transcripts(2_000)
+        .list_session_identity_cards_with_host_transcripts(crate::state::recent_finished_max())
         .await;
     let cfg = proxy.config.snapshot().await;
     let mgr = proxy.service_manager(cfg.as_ref());

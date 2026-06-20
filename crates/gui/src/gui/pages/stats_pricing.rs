@@ -97,7 +97,7 @@ fn render_operator_pricing_catalog(
 
 fn recent_model_order(snapshot: &GuiRuntimeSnapshot) -> Vec<String> {
     let mut counts: HashMap<String, usize> = HashMap::new();
-    for request in &snapshot.recent {
+    for request in snapshot.recent.iter() {
         if let Some(model) = request
             .model
             .as_deref()

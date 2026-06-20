@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::config::ProxyConfig;
@@ -178,7 +179,7 @@ pub(super) fn apply_running_refresh_result(r: &mut RunningProxy, result: Running
     r.profiles = result.profiles;
     r.stations = result.stations;
     r.active = snap.active;
-    r.recent = snap.recent;
+    r.recent = Arc::from(snap.recent);
     r.session_cards = snap.session_cards;
     r.global_station_override = global_station_override;
     r.global_route_target_override = global_route_target_override;

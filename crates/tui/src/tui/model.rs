@@ -19,6 +19,7 @@ use crate::state::{
 use crate::tui::Language;
 use crate::tui::i18n;
 use crate::usage::UsageMetrics;
+use crate::usage_forecast::{UsageForecastBalanceHistoryLike, UsageForecastRequestLike};
 
 pub type UpstreamSummary = crate::dashboard_core::RuntimeUpstreamOption;
 pub type ProviderOption = crate::dashboard_core::RuntimeProviderOption;
@@ -305,6 +306,128 @@ pub(in crate::tui) enum UsageForecastSampleSource {
     RuntimeAndRequestLedger,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::tui) struct ForecastRecentRequest {
+    pub(in crate::tui) id: u64,
+    pub(in crate::tui) trace_id: Option<String>,
+    pub(in crate::tui) ended_at_ms: u64,
+    pub(in crate::tui) provider_id: Option<String>,
+    pub(in crate::tui) station_name: Option<String>,
+    pub(in crate::tui) total_cost_usd: Option<String>,
+    pub(in crate::tui) has_usage: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::tui) struct ForecastBalanceSample {
+    pub(in crate::tui) fetched_at_ms: u64,
+    pub(in crate::tui) provider_id: String,
+    pub(in crate::tui) station_name: Option<String>,
+    pub(in crate::tui) upstream_index: Option<usize>,
+    pub(in crate::tui) quota_remaining_usd: Option<String>,
+    pub(in crate::tui) subscription_balance_usd: Option<String>,
+    pub(in crate::tui) total_balance_usd: Option<String>,
+    pub(in crate::tui) error: Option<String>,
+    pub(in crate::tui) unlimited_quota: bool,
+}
+
+impl ForecastRecentRequest {
+    pub(in crate::tui) fn from_finished_request(request: &FinishedRequest) -> Self {
+        Self {
+            id: request.id,
+            trace_id: request.trace_id.clone(),
+            ended_at_ms: request.ended_at_ms,
+            provider_id: request.provider_id.clone(),
+            station_name: request.station_name.clone(),
+            total_cost_usd: request.cost.total_cost_usd.clone(),
+            has_usage: request.usage.is_some(),
+        }
+    }
+}
+
+impl ForecastBalanceSample {
+    pub(in crate::tui) fn from_snapshot(snapshot: &ProviderBalanceSnapshot) -> Self {
+        Self {
+            fetched_at_ms: snapshot.fetched_at_ms,
+            provider_id: snapshot.provider_id.clone(),
+            station_name: snapshot.station_name.clone(),
+            upstream_index: snapshot.upstream_index,
+            quota_remaining_usd: snapshot.quota_remaining_usd.clone(),
+            subscription_balance_usd: snapshot.subscription_balance_usd.clone(),
+            total_balance_usd: snapshot.total_balance_usd.clone(),
+            error: snapshot.error.clone(),
+            unlimited_quota: snapshot.unlimited_quota == Some(true),
+        }
+    }
+}
+
+impl UsageForecastRequestLike for ForecastRecentRequest {
+    fn id(&self) -> u64 {
+        self.id
+    }
+
+    fn trace_id(&self) -> Option<&str> {
+        self.trace_id.as_deref()
+    }
+
+    fn ended_at_ms(&self) -> u64 {
+        self.ended_at_ms
+    }
+
+    fn provider_id(&self) -> Option<&str> {
+        self.provider_id.as_deref()
+    }
+
+    fn station_name(&self) -> Option<&str> {
+        self.station_name.as_deref()
+    }
+
+    fn total_cost_usd(&self) -> Option<&str> {
+        self.total_cost_usd.as_deref()
+    }
+
+    fn has_usage(&self) -> bool {
+        self.has_usage
+    }
+}
+
+impl UsageForecastBalanceHistoryLike for ForecastBalanceSample {
+    fn fetched_at_ms(&self) -> u64 {
+        self.fetched_at_ms
+    }
+
+    fn provider_id(&self) -> &str {
+        self.provider_id.as_str()
+    }
+
+    fn station_name(&self) -> Option<&str> {
+        self.station_name.as_deref()
+    }
+
+    fn upstream_index(&self) -> Option<usize> {
+        self.upstream_index
+    }
+
+    fn quota_remaining_usd(&self) -> Option<&str> {
+        self.quota_remaining_usd.as_deref()
+    }
+
+    fn subscription_balance_usd(&self) -> Option<&str> {
+        self.subscription_balance_usd.as_deref()
+    }
+
+    fn total_balance_usd(&self) -> Option<&str> {
+        self.total_balance_usd.as_deref()
+    }
+
+    fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    fn unlimited_quota(&self) -> bool {
+        self.unlimited_quota
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::tui) enum ForecastRecentMode {
     RuntimeOnly,
@@ -315,7 +438,7 @@ pub(in crate::tui) enum ForecastRecentMode {
 pub(in crate::tui) struct Snapshot {
     pub(in crate::tui) rows: Vec<SessionRow>,
     pub(in crate::tui) recent: Vec<FinishedRequest>,
-    pub(in crate::tui) forecast_recent: Vec<FinishedRequest>,
+    pub(in crate::tui) forecast_recent: Vec<ForecastRecentRequest>,
     pub(in crate::tui) forecast_recent_source: UsageForecastSampleSource,
     pub(in crate::tui) model_overrides: HashMap<String, String>,
     pub(in crate::tui) overrides: HashMap<String, String>,
@@ -327,7 +450,7 @@ pub(in crate::tui) struct Snapshot {
     pub(in crate::tui) station_meta_overrides: HashMap<String, (Option<bool>, Option<u8>)>,
     pub(in crate::tui) usage_rollup: UsageRollupView,
     pub(in crate::tui) provider_balances: HashMap<String, Vec<ProviderBalanceSnapshot>>,
-    pub(in crate::tui) provider_balance_history: HashMap<String, Vec<ProviderBalanceSnapshot>>,
+    pub(in crate::tui) provider_balance_history: HashMap<String, Vec<ForecastBalanceSample>>,
     pub(in crate::tui) station_health: HashMap<String, StationHealth>,
     pub(in crate::tui) health_checks: HashMap<String, HealthCheckStatus>,
     pub(in crate::tui) lb_view: HashMap<String, LbConfigView>,
@@ -1836,7 +1959,19 @@ pub(in crate::tui) async fn refresh_snapshot(
         station_meta_overrides: config_meta,
         usage_rollup: snap.usage_rollup,
         provider_balances: snap.provider_balances,
-        provider_balance_history: snap.provider_balance_history,
+        provider_balance_history: snap
+            .provider_balance_history
+            .into_iter()
+            .map(|(station, snapshots)| {
+                (
+                    station,
+                    snapshots
+                        .into_iter()
+                        .map(|snapshot| ForecastBalanceSample::from_snapshot(&snapshot))
+                        .collect(),
+                )
+            })
+            .collect(),
         station_health,
         health_checks: snap.health_checks,
         lb_view: snap.lb_view,
@@ -1881,7 +2016,19 @@ pub(in crate::tui) async fn snapshot_from_api_v1(
         station_meta_overrides: HashMap::new(),
         usage_rollup: snap.usage_rollup,
         provider_balances: snap.provider_balances,
-        provider_balance_history: snap.provider_balance_history,
+        provider_balance_history: snap
+            .provider_balance_history
+            .into_iter()
+            .map(|(station, snapshots)| {
+                (
+                    station,
+                    snapshots
+                        .into_iter()
+                        .map(|snapshot| ForecastBalanceSample::from_snapshot(&snapshot))
+                        .collect(),
+                )
+            })
+            .collect(),
         station_health,
         health_checks: snap.health_checks,
         lb_view: snap.lb_view,
@@ -1895,13 +2042,18 @@ pub(in crate::tui) async fn snapshot_from_api_v1(
 fn usage_forecast_log_tail_limit() -> usize {
     static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| {
-        std::env::var("CODEX_HELPER_USAGE_FORECAST_LOG_TAIL_LINES")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(5_000)
-            .clamp(crate::state::recent_finished_max(), 200_000)
+        usage_forecast_log_tail_limit_from_env(
+            std::env::var("CODEX_HELPER_USAGE_FORECAST_LOG_TAIL_LINES").ok(),
+        )
     })
+}
+
+fn usage_forecast_log_tail_limit_from_env(raw: Option<String>) -> usize {
+    raw.as_deref()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(1_000)
+        .clamp(200, 10_000)
 }
 
 fn usage_forecast_ledger_cache_ttl() -> Duration {
@@ -1911,7 +2063,7 @@ fn usage_forecast_ledger_cache_ttl() -> Duration {
 async fn load_forecast_recent_requests(
     memory_recent: &[FinishedRequest],
     forecast_mode: ForecastRecentMode,
-) -> (Vec<FinishedRequest>, UsageForecastSampleSource) {
+) -> (Vec<ForecastRecentRequest>, UsageForecastSampleSource) {
     if forecast_mode == ForecastRecentMode::RuntimeOnly {
         clear_forecast_ledger_cache();
         return (Vec::new(), UsageForecastSampleSource::RuntimeOnly);
@@ -1919,10 +2071,10 @@ async fn load_forecast_recent_requests(
 
     let limit = usage_forecast_log_tail_limit();
     let ledger_recent = load_cached_forecast_ledger_recent(limit).await;
-    let source = forecast_recent_sample_source(&ledger_recent);
+    let source = forecast_recent_sample_source(ledger_recent.as_ref());
 
     (
-        merge_forecast_recent_requests(memory_recent.to_vec(), ledger_recent, limit),
+        merge_forecast_recent_requests(memory_recent, ledger_recent.as_ref(), limit),
         source,
     )
 }
@@ -1931,7 +2083,7 @@ async fn load_forecast_recent_requests(
 struct ForecastLedgerCacheEntry {
     limit: usize,
     loaded_at: Instant,
-    recent: Vec<FinishedRequest>,
+    recent: Arc<[ForecastRecentRequest]>,
 }
 
 fn forecast_ledger_cache() -> &'static Mutex<Option<ForecastLedgerCacheEntry>> {
@@ -1946,7 +2098,7 @@ fn clear_forecast_ledger_cache() {
     }
 }
 
-async fn load_cached_forecast_ledger_recent(limit: usize) -> Vec<FinishedRequest> {
+async fn load_cached_forecast_ledger_recent(limit: usize) -> Arc<[ForecastRecentRequest]> {
     if let Ok(cache) = forecast_ledger_cache().lock()
         && let Some(entry) = cache.as_ref()
         && entry.limit == limit
@@ -1963,7 +2115,11 @@ async fn load_cached_forecast_ledger_recent(limit: usize) -> Vec<FinishedRequest
     .await
     .ok()
     .and_then(Result::ok)
-    .unwrap_or_default();
+    .unwrap_or_default()
+    .into_iter()
+    .map(|request| ForecastRecentRequest::from_finished_request(&request))
+    .collect::<Vec<_>>();
+    let ledger_recent: Arc<[ForecastRecentRequest]> = Arc::from(ledger_recent.into_boxed_slice());
 
     if let Ok(mut cache) = forecast_ledger_cache().lock() {
         *cache = Some(ForecastLedgerCacheEntry {
@@ -1976,7 +2132,7 @@ async fn load_cached_forecast_ledger_recent(limit: usize) -> Vec<FinishedRequest
     ledger_recent
 }
 
-fn forecast_recent_sample_source(recent: &[FinishedRequest]) -> UsageForecastSampleSource {
+fn forecast_recent_sample_source(recent: &[ForecastRecentRequest]) -> UsageForecastSampleSource {
     if recent.is_empty() {
         UsageForecastSampleSource::RuntimeOnly
     } else {
@@ -1985,13 +2141,17 @@ fn forecast_recent_sample_source(recent: &[FinishedRequest]) -> UsageForecastSam
 }
 
 fn merge_forecast_recent_requests(
-    memory_recent: Vec<FinishedRequest>,
-    ledger_recent: Vec<FinishedRequest>,
+    memory_recent: &[FinishedRequest],
+    ledger_recent: &[ForecastRecentRequest],
     limit: usize,
-) -> Vec<FinishedRequest> {
+) -> Vec<ForecastRecentRequest> {
     let mut seen = HashSet::new();
     let mut out = Vec::with_capacity(memory_recent.len().saturating_add(ledger_recent.len()));
-    for request in memory_recent.into_iter().chain(ledger_recent) {
+    for request in memory_recent
+        .iter()
+        .map(ForecastRecentRequest::from_finished_request)
+        .chain(ledger_recent.iter().cloned())
+    {
         if seen.insert(forecast_request_key(&request)) {
             out.push(request);
         }
@@ -2003,18 +2163,15 @@ fn merge_forecast_recent_requests(
             .then_with(|| right.id.cmp(&left.id))
             .then_with(|| right.trace_id.cmp(&left.trace_id))
     });
-    out.truncate(limit.max(crate::state::recent_finished_max()));
+    out.truncate(limit);
     out
 }
 
-fn forecast_request_key(request: &FinishedRequest) -> String {
+fn forecast_request_key(request: &ForecastRecentRequest) -> String {
     if let Some(trace_id) = request.trace_id.as_deref() {
-        return format!("{}|trace|{trace_id}", request.service);
+        return format!("trace|{trace_id}");
     }
-    format!(
-        "{}|{}|{}|{}|{}",
-        request.service, request.ended_at_ms, request.id, request.method, request.path
-    )
+    format!("{}|{}", request.ended_at_ms, request.id)
 }
 
 pub(in crate::tui) fn filtered_requests_len(
@@ -2709,14 +2866,16 @@ mod tests {
         older.trace_id = Some("codex-5".to_string());
 
         let merged = merge_forecast_recent_requests(
-            vec![memory.clone()],
-            vec![duplicate_from_ledger, older.clone()],
+            &[memory.clone()],
+            &[
+                ForecastRecentRequest::from_finished_request(&duplicate_from_ledger),
+                ForecastRecentRequest::from_finished_request(&older),
+            ],
             10,
         );
 
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].trace_id.as_deref(), Some("codex-20"));
-        assert_eq!(merged[0].session_id.as_deref(), Some("sid-memory"));
         assert_eq!(merged[1].trace_id.as_deref(), Some("codex-5"));
     }
 
@@ -2727,8 +2886,23 @@ mod tests {
             UsageForecastSampleSource::RuntimeOnly
         );
         assert_eq!(
-            forecast_recent_sample_source(&[finished_request(1, Some("sid"))]),
+            forecast_recent_sample_source(&[ForecastRecentRequest::from_finished_request(
+                &finished_request(1, Some("sid"))
+            )]),
             UsageForecastSampleSource::RuntimeAndRequestLedger
+        );
+    }
+
+    #[test]
+    fn usage_forecast_log_tail_limit_defaults_to_one_thousand() {
+        assert_eq!(usage_forecast_log_tail_limit_from_env(None), 1_000);
+        assert_eq!(
+            usage_forecast_log_tail_limit_from_env(Some("50".to_string())),
+            200
+        );
+        assert_eq!(
+            usage_forecast_log_tail_limit_from_env(Some("20000".to_string())),
+            10_000
         );
     }
 

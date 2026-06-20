@@ -23,7 +23,7 @@ pub(super) fn render_running_proxy_summary(ui: &mut egui::Ui, ctx: &mut PageCtx<
     ));
     ui.label(format!(
         "{}: {}",
-        pick(ctx.lang, "最近请求(<=200)", "Recent (<=200)"),
+        pick(ctx.lang, "最近请求", "Recent"),
         running.recent.len()
     ));
     let route_graph_routing = running

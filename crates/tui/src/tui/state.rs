@@ -206,7 +206,7 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) codex_recent_selected_idx: usize,
     pub(in crate::tui) codex_recent_selected_id: Option<String>,
     pub(in crate::tui) codex_recent_raw_cwd: bool,
-    pub(in crate::tui) codex_recent_branch_cache: HashMap<String, Option<String>>,
+    pub(in crate::tui) codex_recent_branch_cache: CodexRecentBranchCache,
     pub(in crate::tui) session_transcript_meta: Option<SessionMeta>,
     pub(in crate::tui) session_transcript_sid: Option<String>,
     pub(in crate::tui) session_transcript_file: Option<String>,
@@ -241,6 +241,38 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) stats_providers_table: TableState,
     pub(in crate::tui) menu_list: ListState,
     pub(in crate::tui) station_info_scroll: u16,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(in crate::tui) struct CodexRecentBranchCache {
+    entries: HashMap<String, Option<String>>,
+    loaded_at_ms: Option<u64>,
+}
+
+impl CodexRecentBranchCache {
+    const MAX_ENTRIES: usize = 1_000;
+
+    pub(in crate::tui) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(in crate::tui) fn clone_entries(&self) -> HashMap<String, Option<String>> {
+        self.entries.clone()
+    }
+
+    pub(in crate::tui) fn replace(&mut self, entries: HashMap<String, Option<String>>) {
+        let mut entries = entries;
+        if entries.len() > Self::MAX_ENTRIES {
+            let mut keys = entries.keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+            let remove = keys.len().saturating_sub(Self::MAX_ENTRIES);
+            for key in keys.into_iter().take(remove) {
+                entries.remove(&key);
+            }
+        }
+        self.entries = entries;
+        self.loaded_at_ms = Some(crate::tui::model::now_ms());
+    }
 }
 
 impl Default for UiState {
@@ -331,7 +363,7 @@ impl Default for UiState {
             codex_recent_selected_idx: 0,
             codex_recent_selected_id: None,
             codex_recent_raw_cwd: false,
-            codex_recent_branch_cache: HashMap::new(),
+            codex_recent_branch_cache: CodexRecentBranchCache::new(),
             session_transcript_meta: None,
             session_transcript_sid: None,
             session_transcript_file: None,

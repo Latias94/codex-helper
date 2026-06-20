@@ -11,6 +11,7 @@ use crate::state::{
     BalanceSnapshotStatus, FinishedRequest, ProviderBalanceSnapshot, UsageRollupCoverage,
     UsageRollupView,
 };
+use crate::tui::model::{ForecastBalanceSample, ForecastRecentRequest};
 use crate::usage_providers::UsageProviderRefreshSummary;
 
 fn current_test_day() -> i32 {
@@ -125,7 +126,18 @@ fn sample_snapshot_with_history(
             by_config_day: HashMap::from([("station".to_string(), vec![(day, station_bucket)])]),
         },
         provider_balances,
-        provider_balance_history,
+        provider_balance_history: provider_balance_history
+            .into_iter()
+            .map(|(station, snapshots)| {
+                (
+                    station,
+                    snapshots
+                        .into_iter()
+                        .map(|snapshot| ForecastBalanceSample::from_snapshot(&snapshot))
+                        .collect(),
+                )
+            })
+            .collect(),
         station_health: HashMap::new(),
         health_checks: HashMap::new(),
         lb_view: HashMap::new(),
@@ -543,7 +555,11 @@ fn stats_kpis_label_forecast_sample_sources() {
         sample_priced_request(now.saturating_sub(30 * 60_000), "1"),
         sample_priced_request(now.saturating_sub(10 * 60_000), "1"),
     ];
-    snapshot.forecast_recent = snapshot.recent.clone();
+    snapshot.forecast_recent = snapshot
+        .recent
+        .iter()
+        .map(ForecastRecentRequest::from_finished_request)
+        .collect();
     snapshot.forecast_recent_source =
         crate::tui::model::UsageForecastSampleSource::RuntimeAndRequestLedger;
     let mut ui = UiState {
@@ -570,7 +586,11 @@ fn stats_kpis_use_explicit_forecast_sample_source_not_sample_length() {
         sample_priced_request(now.saturating_sub(59 * 60_000), "1"),
         sample_priced_request(now.saturating_sub(30 * 60_000), "1"),
     ];
-    snapshot.forecast_recent = snapshot.recent.clone();
+    snapshot.forecast_recent = snapshot
+        .recent
+        .iter()
+        .map(ForecastRecentRequest::from_finished_request)
+        .collect();
     snapshot.forecast_recent_source =
         crate::tui::model::UsageForecastSampleSource::RuntimeAndRequestLedger;
     let mut ui = UiState {
@@ -595,9 +615,18 @@ fn spend_forecast_prefers_ledger_backed_sample_over_display_recent() {
     let mut snapshot = sample_snapshot(HashMap::new());
     snapshot.recent = vec![sample_priced_request(now.saturating_sub(30 * 60_000), "1")];
     snapshot.forecast_recent = vec![
-        sample_priced_request(now.saturating_sub(59 * 60_000), "1"),
-        sample_priced_request(now.saturating_sub(30 * 60_000), "1"),
-        sample_priced_request(now.saturating_sub(10 * 60_000), "1"),
+        ForecastRecentRequest::from_finished_request(&sample_priced_request(
+            now.saturating_sub(59 * 60_000),
+            "1",
+        )),
+        ForecastRecentRequest::from_finished_request(&sample_priced_request(
+            now.saturating_sub(30 * 60_000),
+            "1",
+        )),
+        ForecastRecentRequest::from_finished_request(&sample_priced_request(
+            now.saturating_sub(10 * 60_000),
+            "1",
+        )),
     ];
     snapshot.forecast_recent_source =
         crate::tui::model::UsageForecastSampleSource::RuntimeAndRequestLedger;

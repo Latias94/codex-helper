@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use super::*;
 
 #[derive(Debug, serde::Deserialize)]
@@ -415,7 +417,7 @@ pub(super) async fn refresh_from_base(
             api_version: Some(api_version),
             service_name: Some(service_name),
             active: snapshot.active,
-            recent: snapshot.recent,
+            recent: Arc::from(snapshot.recent),
             session_cards: snapshot.session_cards,
             global_station_override,
             global_route_target_override,
@@ -792,7 +794,7 @@ pub(super) async fn refresh_from_base(
         api_version: Some(api_version),
         service_name: Some(service_name),
         active,
-        recent,
+        recent: recent.into(),
         session_cards: operator_session_cards.unwrap_or_default(),
         global_station_override,
         global_route_target_override,
