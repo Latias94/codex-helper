@@ -16,6 +16,15 @@ use std::io::Cursor;
 use std::io::Write;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
+fn reasoning_guard_retry_config(max_attempts: u32) -> RetryConfig {
+    let mut retry = retry_config(max_attempts, "502", Vec::new(), RetryStrategy::SameUpstream);
+    retry.reasoning_guard = Some(crate::config::ReasoningGuardConfig {
+        enabled: Some(true),
+        ..crate::config::ReasoningGuardConfig::default()
+    });
+    retry
+}
+
 #[tokio::test]
 async fn proxy_decodes_unlabeled_gzip_models_response_before_forwarding() {
     let _env_guard = env_lock().await;
@@ -1312,6 +1321,145 @@ async fn proxy_429_usage_limit_body_sets_retry_after_cooldown() {
     );
 
     proxy.handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_reasoning_guard_retries_non_streaming_516_response() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = hits.clone();
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let counter = counter.clone();
+            async move {
+                let attempt = counter.fetch_add(1, Ordering::SeqCst);
+                let reasoning_tokens = if attempt == 0 { 516 } else { 32 };
+                let output_text = if attempt == 0 {
+                    "bad-direct-final"
+                } else {
+                    "good-retry"
+                };
+                Json(serde_json::json!({
+                    "id": format!("resp_{attempt}"),
+                    "object": "response",
+                    "output_text": output_text,
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 20,
+                        "total_tokens": 30,
+                        "reasoning_tokens": reasoning_tokens
+                    }
+                }))
+            }
+        }),
+    );
+    let upstream = spawn_test_upstream(upstream);
+    let cfg = make_proxy_config(
+        vec![upstream.upstream_config()],
+        reasoning_guard_retry_config(2),
+    );
+    let proxy = proxy_service(cfg);
+    let state = proxy.state.clone();
+    let proxy = spawn_proxy_service(proxy);
+
+    let client = reqwest::Client::new();
+    let body = post_responses_json(&client, &proxy, r#"{"model":"gpt-5","input":"hi"}"#)
+        .await
+        .error_for_status()
+        .expect("response status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("json response");
+
+    assert_eq!(body["output_text"].as_str(), Some("good-retry"));
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+    let finished = find_finished_request(&state, 10, |request| {
+        request.path == "/v1/responses" && request.status_code == StatusCode::OK.as_u16()
+    })
+    .await
+    .expect("finished request");
+    let retry = finished.retry.expect("retry info");
+    assert_eq!(retry.attempts, 2);
+    let first = retry.route_attempts.first().expect("first attempt");
+    assert_eq!(first.decision, "failed_reasoning_guard");
+    assert_eq!(
+        first.error_class.as_deref(),
+        Some("reasoning_guard_triggered")
+    );
+    assert_eq!(first.reason.as_deref(), Some("reasoning_tokens=516"));
+}
+
+#[tokio::test]
+async fn proxy_reasoning_guard_strict_buffers_streaming_516_response_before_retry() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = hits.clone();
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let counter = counter.clone();
+            async move {
+                let attempt = counter.fetch_add(1, Ordering::SeqCst);
+                let (text, reasoning_tokens) = if attempt == 0 {
+                    ("bad-direct-final", 516)
+                } else {
+                    ("good-retry", 32)
+                };
+                let body = format!(
+                    "event: response.output_text.delta\n\
+data: {{\"delta\":\"{text}\"}}\n\n\
+event: response.completed\n\
+data: {{\"response\":{{\"usage\":{{\"input_tokens\":10,\"output_tokens\":20,\"total_tokens\":30,\"reasoning_tokens\":{reasoning_tokens}}}}}}}\n\n"
+                );
+                let mut resp = Response::new(Body::from(body));
+                *resp.status_mut() = StatusCode::OK;
+                resp.headers_mut().insert(
+                    axum::http::header::CONTENT_TYPE,
+                    HeaderValue::from_static("text/event-stream"),
+                );
+                resp
+            }
+        }),
+    );
+    let upstream = spawn_test_upstream(upstream);
+    let cfg = make_proxy_config(
+        vec![upstream.upstream_config()],
+        reasoning_guard_retry_config(2),
+    );
+    let proxy = proxy_service(cfg);
+    let state = proxy.state.clone();
+    let proxy = spawn_proxy_service(proxy);
+
+    let client = reqwest::Client::new();
+    let body = client
+        .post(proxy.responses_url())
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .body(r#"{"model":"gpt-5","input":"hi","stream":true}"#)
+        .send()
+        .await
+        .expect("send")
+        .error_for_status()
+        .expect("response status")
+        .text()
+        .await
+        .expect("sse body");
+
+    assert!(body.contains("good-retry"), "{body}");
+    assert!(!body.contains("bad-direct-final"), "{body}");
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+    let finished = find_finished_request(&state, 10, |request| {
+        request.path == "/v1/responses" && request.status_code == StatusCode::OK.as_u16()
+    })
+    .await
+    .expect("finished request");
+    assert!(finished.streaming);
+    let retry = finished.retry.expect("retry info");
+    assert_eq!(retry.attempts, 2);
+    let first = retry.route_attempts.first().expect("first attempt");
+    assert_eq!(first.decision, "failed_reasoning_guard");
+    assert_eq!(first.reason.as_deref(), Some("reasoning_tokens=516"));
 }
 
 #[tokio::test]

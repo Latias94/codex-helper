@@ -512,7 +512,16 @@ fn parse_route_attempt_from_chain_entry(raw: &str, attempt_index: u32) -> RouteA
     if let Some(error_class) =
         route_chain_value(metadata, "class").filter(|value| !value.eq_ignore_ascii_case("-"))
     {
+        if matches!(
+            error_class.as_str(),
+            "reasoning_guard_triggered" | "reasoning_guard_blocked"
+        ) {
+            attempt.decision = "failed_reasoning_guard".to_string();
+        }
         attempt.error_class = Some(error_class);
+    }
+    if let Some(reason) = route_chain_value(metadata, "reason") {
+        attempt.reason = Some(reason);
     }
     if let Some(model) = route_chain_value(metadata, "model") {
         attempt.model = Some(model);

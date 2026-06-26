@@ -70,6 +70,7 @@ pub(super) fn render_requests_page(
         "St",
         l("Dur"),
         "Att",
+        "RG",
         l("Hit%"),
         l("Route"),
         l("Path"),
@@ -90,6 +91,7 @@ pub(super) fn render_requests_page(
             let dur = duration_short(r.duration_ms);
             let attempts_n = r.attempt_count();
             let attempts = attempts_n.to_string();
+            let reasoning_guard = request_reasoning_guard_table_label(r);
             let cache_hit = request_cache_hit_rate_label(r);
             let cache_hit_style =
                 Style::default().fg(if cache_hit != "-" { p.accent } else { p.muted });
@@ -103,6 +105,14 @@ pub(super) fn render_requests_page(
                 Cell::from(Span::styled(
                     attempts,
                     Style::default().fg(if attempts_n > 1 { p.warn } else { p.muted }),
+                )),
+                Cell::from(Span::styled(
+                    reasoning_guard.clone(),
+                    Style::default().fg(if reasoning_guard != "-" {
+                        p.warn
+                    } else {
+                        p.muted
+                    }),
                 )),
                 Cell::from(Span::styled(cache_hit, cache_hit_style)),
                 Cell::from(route),
@@ -118,6 +128,7 @@ pub(super) fn render_requests_page(
             Constraint::Length(6),
             Constraint::Length(4),
             Constraint::Length(8),
+            Constraint::Length(4),
             Constraint::Length(4),
             Constraint::Length(6),
             Constraint::Length(28),
@@ -226,6 +237,15 @@ pub(super) fn render_requests_page(
             lines.push(Line::from(vec![
                 Span::styled(format!("{}: ", l("upstream")), Style::default().fg(p.muted)),
                 Span::styled(shorten_middle(u, 80), Style::default().fg(p.text)),
+            ]));
+        }
+        if let Some(reasoning_guard) = request_reasoning_guard_detail_line(r, lang) {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{}: ", l("reasoning guard")),
+                    Style::default().fg(p.muted),
+                ),
+                Span::styled(reasoning_guard, Style::default().fg(p.warn)),
             ]));
         }
 
@@ -455,6 +475,108 @@ fn request_cost_parts_line(request: &crate::state::FinishedRequest) -> Option<St
         parts.push(format!("create=${value}"));
     }
     (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+fn request_reasoning_guard_table_label(request: &crate::state::FinishedRequest) -> String {
+    let attempts = request_reasoning_guard_attempts(request);
+    if attempts.is_empty() {
+        return "-".to_string();
+    }
+
+    let token = attempts
+        .iter()
+        .filter_map(|attempt| attempt.reason.as_deref())
+        .find_map(reasoning_guard_token_from_reason)
+        .map(|token| token.to_string())
+        .unwrap_or_else(|| "hit".to_string());
+    if attempts
+        .iter()
+        .any(|attempt| attempt.error_class.as_deref() == Some("reasoning_guard_blocked"))
+    {
+        format!("{token}!")
+    } else if request.attempt_count() > 1 {
+        format!("{token}r")
+    } else {
+        token
+    }
+}
+
+fn request_reasoning_guard_detail_line(
+    request: &crate::state::FinishedRequest,
+    lang: crate::tui::Language,
+) -> Option<String> {
+    let attempts = request_reasoning_guard_attempts(request);
+    if attempts.is_empty() {
+        return None;
+    }
+
+    let token = attempts
+        .iter()
+        .filter_map(|attempt| attempt.reason.as_deref())
+        .find_map(reasoning_guard_token_from_reason)
+        .map(|token| format!("reasoning_tokens={token}"))
+        .unwrap_or_else(|| "reasoning_tokens matched".to_string());
+    let blocked = attempts
+        .iter()
+        .any(|attempt| attempt.error_class.as_deref() == Some("reasoning_guard_blocked"));
+    let retried = attempts
+        .iter()
+        .any(|attempt| attempt.error_class.as_deref() == Some("reasoning_guard_triggered"))
+        && request.attempt_count() > 1;
+    let action = match lang {
+        crate::tui::Language::Zh => {
+            if blocked {
+                "已阻断/预算耗尽"
+            } else if retried {
+                "已重试"
+            } else {
+                "已命中"
+            }
+        }
+        crate::tui::Language::En => {
+            if blocked {
+                "blocked/budget exhausted"
+            } else if retried {
+                "retried"
+            } else {
+                "matched"
+            }
+        }
+    };
+
+    Some(format!(
+        "{token}, {action}, guard_attempts={}",
+        attempts.len()
+    ))
+}
+
+fn request_reasoning_guard_attempts(
+    request: &crate::state::FinishedRequest,
+) -> Vec<crate::logging::RouteAttemptLog> {
+    request
+        .retry
+        .as_ref()
+        .map(|retry| {
+            retry
+                .route_attempts_or_derived()
+                .into_iter()
+                .filter(is_reasoning_guard_attempt)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn is_reasoning_guard_attempt(attempt: &crate::logging::RouteAttemptLog) -> bool {
+    matches!(
+        attempt.error_class.as_deref(),
+        Some("reasoning_guard_triggered" | "reasoning_guard_blocked")
+    ) || attempt.decision == "failed_reasoning_guard"
+}
+
+fn reasoning_guard_token_from_reason(reason: &str) -> Option<i64> {
+    reason
+        .strip_prefix("reasoning_tokens=")
+        .and_then(|value| value.parse::<i64>().ok())
 }
 
 fn clean_route_part(value: Option<&str>) -> Option<&str> {

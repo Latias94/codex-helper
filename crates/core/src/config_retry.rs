@@ -24,6 +24,7 @@ pub struct ResolvedRetryLayerConfig {
 pub struct ResolvedRetryConfig {
     pub upstream: ResolvedRetryLayerConfig,
     pub route: ResolvedRetryLayerConfig,
+    pub reasoning_guard: ResolvedReasoningGuardConfig,
     /// Guarded cross-station failover before any upstream output is committed to the client.
     pub allow_cross_station_before_first_output: bool,
     pub never_on_status: String,
@@ -65,6 +66,8 @@ pub struct RetryConfig {
     pub upstream: Option<RetryLayerConfig>,
     #[serde(default)]
     pub provider: Option<RetryLayerConfig>,
+    #[serde(default)]
+    pub reasoning_guard: Option<ReasoningGuardConfig>,
     /// Allow automatic failover to another station, but only before any output has been
     /// committed to the client. Session-pinned routes remain sticky regardless of this setting.
     #[serde(default)]
@@ -88,6 +91,60 @@ pub struct RetryConfig {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReasoningGuardAction {
+    /// Forward the matching response and only emit diagnostics.
+    Observe,
+    /// Convert the matching response to a local 502 without attempting a retry.
+    Block,
+    /// Convert the matching response to a retryable local 502 until the guard retry budget is used.
+    #[default]
+    Retry,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReasoningGuardStreamMode {
+    /// Do not inspect streaming responses.
+    Off,
+    /// Inspect buffered streaming responses when another path already buffered them.
+    Observe,
+    /// Buffer the full stream before forwarding so the terminal usage block can be inspected.
+    #[default]
+    StrictBuffer,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReasoningGuardConfig {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub reasoning_equals: Option<Vec<i64>>,
+    #[serde(default)]
+    pub paths: Option<Vec<String>>,
+    #[serde(default)]
+    pub action: Option<ReasoningGuardAction>,
+    #[serde(default)]
+    pub stream_mode: Option<ReasoningGuardStreamMode>,
+    #[serde(default)]
+    pub max_guard_retries: Option<u32>,
+    #[serde(default)]
+    pub log_matches: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolvedReasoningGuardConfig {
+    pub enabled: bool,
+    pub reasoning_equals: Vec<i64>,
+    pub paths: Vec<String>,
+    pub action: ReasoningGuardAction,
+    pub stream_mode: ReasoningGuardStreamMode,
+    pub max_guard_retries: u32,
+    pub log_matches: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RetryStrategy {
     /// Prefer switching to another upstream on retry (default).
@@ -103,6 +160,7 @@ impl Default for RetryConfig {
             profile: Some(RetryProfileName::Balanced),
             upstream: None,
             provider: None,
+            reasoning_guard: None,
             allow_cross_station_before_first_output: None,
             never_on_status: None,
             never_on_class: None,
@@ -149,6 +207,7 @@ impl RetryProfileName {
                     ],
                     strategy: RetryStrategy::Failover,
                 },
+                reasoning_guard: ReasoningGuardConfig::default_resolved(),
                 allow_cross_station_before_first_output: false,
                 never_on_status: "413,415,422".to_string(),
                 never_on_class: vec!["client_error_non_retryable".to_string()],
@@ -217,6 +276,71 @@ impl RetryProfileName {
     }
 }
 
+impl ReasoningGuardConfig {
+    pub fn default_resolved() -> ResolvedReasoningGuardConfig {
+        ResolvedReasoningGuardConfig {
+            enabled: false,
+            reasoning_equals: vec![516],
+            paths: vec![
+                "/responses".to_string(),
+                "/v1/responses".to_string(),
+                "/chat/completions".to_string(),
+                "/v1/chat/completions".to_string(),
+            ],
+            action: ReasoningGuardAction::Retry,
+            stream_mode: ReasoningGuardStreamMode::StrictBuffer,
+            max_guard_retries: 1,
+            log_matches: true,
+        }
+    }
+
+    pub fn resolve(&self) -> ResolvedReasoningGuardConfig {
+        let mut out = Self::default_resolved();
+        if let Some(v) = self.enabled {
+            out.enabled = v;
+        }
+        if let Some(v) = self.reasoning_equals.as_ref() {
+            out.reasoning_equals = v.clone();
+        }
+        if let Some(v) = self.paths.as_ref() {
+            out.paths = v
+                .iter()
+                .map(|path| normalize_reasoning_guard_path(path))
+                .filter(|path| !path.is_empty())
+                .collect();
+        }
+        if let Some(v) = self.action {
+            out.action = v;
+        }
+        if let Some(v) = self.stream_mode {
+            out.stream_mode = v;
+        }
+        if let Some(v) = self.max_guard_retries {
+            out.max_guard_retries = v.min(8);
+        }
+        if let Some(v) = self.log_matches {
+            out.log_matches = v;
+        }
+        out
+    }
+}
+
+fn normalize_reasoning_guard_path(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let mut normalized = if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    };
+    while normalized.len() > 1 && normalized.ends_with('/') {
+        normalized.pop();
+    }
+    normalized
+}
+
 impl RetryConfig {
     pub fn resolve(&self) -> ResolvedRetryConfig {
         let mut out = self
@@ -279,6 +403,9 @@ impl RetryConfig {
         if let Some(v) = self.never_on_class.as_ref() {
             out.never_on_class = v.clone();
         }
+        if let Some(v) = self.reasoning_guard.as_ref() {
+            out.reasoning_guard = v.resolve();
+        }
         if let Some(v) = self.cloudflare_challenge_cooldown_secs {
             out.cloudflare_challenge_cooldown_secs = v;
         }
@@ -296,5 +423,58 @@ impl RetryConfig {
         }
 
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reasoning_guard_defaults_are_disabled() {
+        let resolved = RetryConfig::default().resolve();
+
+        assert!(!resolved.reasoning_guard.enabled);
+        assert_eq!(resolved.reasoning_guard.reasoning_equals, vec![516]);
+        assert_eq!(
+            resolved.reasoning_guard.stream_mode,
+            ReasoningGuardStreamMode::StrictBuffer
+        );
+        assert_eq!(resolved.reasoning_guard.action, ReasoningGuardAction::Retry);
+        assert_eq!(resolved.reasoning_guard.max_guard_retries, 1);
+    }
+
+    #[test]
+    fn reasoning_guard_toml_overrides_resolve() {
+        let cfg: RetryConfig = toml::from_str(
+            r#"
+profile = "balanced"
+
+[reasoning_guard]
+enabled = true
+reasoning_equals = [516, 777]
+paths = ["responses", "/v1/chat/completions/"]
+action = "block"
+stream_mode = "off"
+max_guard_retries = 3
+log_matches = false
+"#,
+        )
+        .expect("parse retry config");
+
+        let resolved = cfg.resolve();
+        assert!(resolved.reasoning_guard.enabled);
+        assert_eq!(resolved.reasoning_guard.reasoning_equals, vec![516, 777]);
+        assert_eq!(
+            resolved.reasoning_guard.paths,
+            vec!["/responses".to_string(), "/v1/chat/completions".to_string()]
+        );
+        assert_eq!(resolved.reasoning_guard.action, ReasoningGuardAction::Block);
+        assert_eq!(
+            resolved.reasoning_guard.stream_mode,
+            ReasoningGuardStreamMode::Off
+        );
+        assert_eq!(resolved.reasoning_guard.max_guard_retries, 3);
+        assert!(!resolved.reasoning_guard.log_matches);
     }
 }

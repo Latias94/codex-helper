@@ -5,7 +5,9 @@ use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, HeaderValue, Method, Response, StatusCode, header};
 
 use crate::lb::{CooldownBackoff, LoadBalancer};
-use crate::logging::{CodexBridgeLog, RouteAttemptLog, ServiceTierLog, make_body_preview};
+use crate::logging::{
+    CodexBridgeLog, RouteAttemptLog, ServiceTierLog, log_retry_trace, make_body_preview,
+};
 use crate::state::SessionIdentitySource;
 use crate::usage::{UsageMetrics, extract_usage_from_bytes};
 use crate::usage_providers;
@@ -20,6 +22,10 @@ use super::concurrency_limits::ConcurrencyPermit;
 use super::http_debug::HttpDebugBase;
 use super::models_compat::maybe_decode_models_response_body;
 use super::passive_health::{record_passive_upstream_failure, record_passive_upstream_success};
+use super::reasoning_guard::{
+    REASONING_GUARD_BLOCKED_CLASS, evaluate_reasoning_guard, reasoning_guard_error_body,
+    reasoning_guard_retry_count,
+};
 use super::request_body::extract_service_tier_from_response_body;
 use super::response_finalization::{
     FinalizeForwardResponseParams, finish_and_build_forward_response,
@@ -178,16 +184,21 @@ fn decide_attempt_response(params: AttemptResponseDecisionParams<'_>) -> Attempt
         is_codex_service,
     } = params;
     let status_code = status.as_u16();
-    let never_retry = should_never_retry(plan, status_code, class) || compact_protocol_failure;
+    let reasoning_guard_blocked = matches!(class, Some(REASONING_GUARD_BLOCKED_CLASS));
+    let never_retry = should_never_retry(plan, status_code, class)
+        || compact_protocol_failure
+        || reasoning_guard_blocked;
     let semantic_failure_requires_provider_failover =
         matches!(class, Some(IMAGE_GENERATION_MISSING_RESULT_CLASS));
-    let upstream_retryable = !semantic_failure_requires_provider_failover
+    let upstream_retryable = !never_retry
+        && !semantic_failure_requires_provider_failover
         && (should_retry_status(upstream_opt, status_code)
             || should_retry_class(upstream_opt, class));
     let retry_same_upstream =
         upstream_retryable && upstream_attempt + 1 < upstream_opt.max_attempts;
-    let provider_retryable =
-        should_retry_status(provider_opt, status_code) || should_retry_class(provider_opt, class);
+    let provider_retryable = !never_retry
+        && (should_retry_status(provider_opt, status_code)
+            || should_retry_class(provider_opt, class));
     let provider_penalty =
         !status.is_success() && !never_retry && !retry_same_upstream && provider_retryable;
     let provider_failover = provider_penalty && allow_provider_failover;
@@ -270,6 +281,7 @@ pub(super) async fn handle_streaming_attempt_success(
             route_attempt_index,
             status_code: status.as_u16(),
             error_class: None,
+            reason: None,
             model_note,
             upstream_headers_ms,
             duration_ms,
@@ -440,6 +452,56 @@ pub(super) async fn handle_attempt_response(
         );
     }
 
+    let success_usage = if response_status.is_success() {
+        extract_usage_from_bytes(&response_body)
+    } else {
+        None
+    };
+    let mut route_attempt_reason = None;
+    if response_status.is_success() {
+        let guard_decision = evaluate_reasoning_guard(
+            &plan.reasoning_guard,
+            proxy.service_name,
+            path,
+            success_usage.as_ref(),
+            reasoning_guard_retry_count(route_attempts),
+        );
+        if let Some(matched) = guard_decision.matched()
+            && plan.reasoning_guard.log_matches
+        {
+            log_retry_trace(serde_json::json!({
+                "event": "reasoning_guard_match",
+                "service": proxy.service_name,
+                "request_id": request_id,
+                "path": path,
+                "reasoning_tokens": matched.reasoning_tokens,
+                "rule": matched.rule,
+                "action": guard_decision.action_label(),
+                "retryable": guard_decision.retryable(),
+            }));
+        }
+        if let (Some(class), Some(matched)) =
+            (guard_decision.failure_class(), guard_decision.matched())
+        {
+            semantic_error_class = Some(class);
+            response_status = StatusCode::BAD_GATEWAY;
+            response_headers_filtered.remove(header::CONTENT_LENGTH);
+            response_headers_filtered.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            response_body = reasoning_guard_error_body(matched, class, guard_decision.retryable());
+            route_attempt_reason = Some(matched.rule.clone());
+            tracing::warn!(
+                request_id,
+                error_class = class,
+                reason = matched.rule.as_str(),
+                action = guard_decision.action_label(),
+                "upstream response failed reasoning guard"
+            );
+        }
+    }
+
     let status_code = response_status.as_u16();
     let classified_response =
         classify_observed_upstream_response(status_code, &response_headers, response_body.as_ref());
@@ -474,6 +536,7 @@ pub(super) async fn handle_attempt_response(
             route_attempt_index,
             status_code,
             error_class: cls.as_deref(),
+            reason: route_attempt_reason.as_deref(),
             model_note,
             upstream_headers_ms,
             duration_ms,
@@ -515,7 +578,7 @@ pub(super) async fn handle_attempt_response(
         )
         .await;
 
-        let usage = extract_usage_from_bytes(&response_body);
+        let usage = success_usage;
         let retry = retry_info_for_observed_attempts(upstream_chain, route_attempts);
         return AttemptResponseOutcome::Return(
             finish_attempt_forward_response(

@@ -42,6 +42,7 @@ mod profile_defaults;
 mod provider_execution;
 mod provider_orchestration;
 mod providers_api;
+mod reasoning_guard;
 mod request_body;
 mod request_context;
 mod request_continuity;

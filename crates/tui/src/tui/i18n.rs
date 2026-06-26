@@ -284,6 +284,7 @@ fn zh_label(en: &'static str) -> Option<&'static str> {
         "Provider" => "提供商",
         "Provider routing" => "Provider 路由",
         "Recent sample" => "最近样本",
+        "reasoning guard" => "推理保护",
         "Requests" => "请求",
         "Requests page" => "请求页",
         "Retry / route chain" => "重试 / 路由链",

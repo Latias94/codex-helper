@@ -2,6 +2,8 @@ use axum::http::HeaderMap;
 use serde_json::Value;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use super::reasoning_guard::{REASONING_GUARD_BLOCKED_CLASS, REASONING_GUARD_TRIGGERED_CLASS};
+
 pub(super) const ROUTING_MISMATCH_CAPABILITY_CLASS: &str = "routing_mismatch_capability";
 pub(super) const UPSTREAM_RATE_LIMITED_CLASS: &str = "upstream_rate_limited";
 pub(super) const UPSTREAM_OVERLOADED_CLASS: &str = "upstream_overloaded";
@@ -525,7 +527,14 @@ pub(super) fn classify_upstream_throttle_response(
 }
 
 pub(super) fn class_is_health_neutral(class: Option<&str>) -> bool {
-    matches!(class, Some(ROUTING_MISMATCH_CAPABILITY_CLASS))
+    matches!(
+        class,
+        Some(
+            ROUTING_MISMATCH_CAPABILITY_CLASS
+                | REASONING_GUARD_TRIGGERED_CLASS
+                | REASONING_GUARD_BLOCKED_CLASS
+        )
+    )
 }
 
 fn capability_message_indicates_mismatch(message: &str) -> bool {

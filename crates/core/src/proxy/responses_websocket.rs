@@ -865,6 +865,7 @@ async fn relay_websocket_streams(
             route_attempt_index: selected.route_attempt_index,
             status_code,
             error_class,
+            reason: None,
             model_note: selected.model_note.as_str(),
             upstream_headers_ms,
             duration_ms,

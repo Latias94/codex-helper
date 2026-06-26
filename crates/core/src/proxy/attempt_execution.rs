@@ -23,6 +23,7 @@ use super::attempt_transport::{
 };
 use super::concurrency_limits::ConcurrencyPermit;
 use super::headers::filter_response_headers;
+use super::reasoning_guard::should_strict_buffer_reasoning_guard;
 use super::request_body::{
     build_codex_remote_compaction_v2_downgrade_body, is_stale_previous_response_error,
     remove_previous_response_id_from_body,
@@ -294,8 +295,19 @@ pub(super) async fn execute_selected_upstream(
             let resp_headers_filtered = filter_response_headers(&resp_headers);
             let remote_v2_downgrade_enabled = request_flavor.is_remote_compaction_v2_request
                 && codex_remote_v2_downgrade_enabled(proxy).await;
+            let strict_buffer_reasoning_guard = request_flavor.is_stream
+                && success
+                && should_strict_buffer_reasoning_guard(
+                    &plan.reasoning_guard,
+                    proxy.service_name,
+                    uri.path(),
+                );
 
-            if request_flavor.is_stream && success && !remote_v2_downgrade_enabled {
+            if request_flavor.is_stream
+                && success
+                && !remote_v2_downgrade_enabled
+                && !strict_buffer_reasoning_guard
+            {
                 return SelectedUpstreamExecutionOutcome::Return(
                     handle_streaming_attempt_success(StreamingAttemptResponseParams {
                         proxy,
@@ -485,6 +497,7 @@ pub(super) async fn execute_selected_upstream(
                         route_attempt_index,
                         status_code: status.as_u16(),
                         error_class: Some(classification.response_shape),
+                        reason: None,
                         model_note: model_note.as_str(),
                         upstream_headers_ms,
                         duration_ms: start.elapsed().as_millis() as u64,
@@ -769,6 +782,7 @@ pub(super) async fn execute_selected_upstream(
                         route_attempt_index,
                         status_code: status.as_u16(),
                         error_class: Some("codex_stale_previous_response_id"),
+                        reason: None,
                         model_note: model_note.as_str(),
                         upstream_headers_ms,
                         duration_ms: start.elapsed().as_millis() as u64,

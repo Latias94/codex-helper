@@ -32,6 +32,7 @@ pub(super) struct StatusRouteAttemptParams<'a> {
     pub(super) route_attempt_index: usize,
     pub(super) status_code: u16,
     pub(super) error_class: Option<&'a str>,
+    pub(super) reason: Option<&'a str>,
     pub(super) model_note: &'a str,
     pub(super) upstream_headers_ms: u64,
     pub(super) duration_ms: u64,
@@ -108,13 +109,14 @@ impl AttemptOutcome {
     fn from_status(params: &StatusRouteAttemptParams<'_>) -> Self {
         let class_for_chain = params.error_class.unwrap_or("-");
         let cooldown_secs = normalize_cooldown(params.cooldown_secs);
+        let decision = status_decision(params.status_code, params.error_class);
+        let reason_for_chain = params
+            .reason
+            .map(|reason| format!(" reason={reason}"))
+            .unwrap_or_default();
         Self {
-            decision: if (200..300).contains(&params.status_code) {
-                "completed".to_string()
-            } else {
-                "failed_status".to_string()
-            },
-            reason: None,
+            decision: decision.to_string(),
+            reason: params.reason.map(ToOwned::to_owned),
             status_code: Some(params.status_code),
             class: params.error_class.map(ToOwned::to_owned),
             model: normalize_model(params.model_note),
@@ -125,10 +127,11 @@ impl AttemptOutcome {
                 .and_then(|_| params.cooldown_reason.map(ToOwned::to_owned)),
             skipped: false,
             raw: format!(
-                "{} status={} class={} model={}",
+                "{} status={} class={}{} model={}",
                 params.target.route_attempt_identity(),
                 params.status_code,
                 class_for_chain,
+                reason_for_chain,
                 params.model_note
             ),
         }
@@ -383,4 +386,18 @@ fn normalize_model(value: &str) -> Option<String> {
 
 fn normalize_cooldown(value: Option<u64>) -> Option<u64> {
     value.filter(|secs| *secs > 0)
+}
+
+fn status_decision(status_code: u16, error_class: Option<&str>) -> &'static str {
+    if matches!(
+        error_class,
+        Some("reasoning_guard_triggered" | "reasoning_guard_blocked")
+    ) {
+        return "failed_reasoning_guard";
+    }
+    if (200..300).contains(&status_code) {
+        "completed"
+    } else {
+        "failed_status"
+    }
 }

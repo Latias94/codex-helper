@@ -485,6 +485,35 @@ children = ["input", "openai"]
 profile = "balanced"
 ```
 
+### Reasoning Guard: Catch 516 Reasoning Token Anomalies
+
+If a Codex relay occasionally returns a successful response with `reasoning_tokens = 516`, goes
+straight to a final answer, and produces visibly degraded answers, enable the retry reasoning guard.
+The guard only uses upstream usage metadata as a high-confidence signal; it does not try to judge
+whether the answer text is correct.
+
+```toml
+[retry.reasoning_guard]
+enabled = true
+reasoning_equals = [516]
+action = "retry"              # retry | block | observe
+stream_mode = "strict-buffer" # strict-buffer | observe | off
+max_guard_retries = 1
+paths = ["/v1/responses", "/responses", "/v1/chat/completions", "/chat/completions"]
+log_matches = true
+```
+
+- The guard is disabled by default, so existing configs keep their current behavior.
+- `action = "retry"` rewrites a matching successful response into a local 502 and lets the normal
+  `[retry]` upstream/provider policy handle it. `max_guard_retries = 1` means one extra upstream
+  request per client request due to this guard.
+- `stream_mode = "strict-buffer"` buffers matching SSE responses until the terminal usage block is
+  available. This prevents anomalous output from being sent before the guard can inspect
+  `reasoning_tokens`, at the cost of losing live streaming for those guarded requests.
+- The TUI Requests page shows hits in the `RG` column. The details pane's `Retry / route chain`
+  shows `decision=failed_reasoning_guard`, `class=reasoning_guard_triggered`, and
+  `reason=reasoning_tokens=516`.
+
 ## Route Graph Shape
 
 Every service can have its own route graph:

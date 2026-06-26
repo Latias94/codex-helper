@@ -662,6 +662,18 @@ profile = "balanced"
 # on_status = "401,403,404,408,429,500-599,524"
 # on_class = ["upstream_transport_error", "upstream_rate_limited", "upstream_overloaded"]
 
+# 可选：Reasoning Guard，用于拦截 Codex 上游偶发的 reasoning_tokens=516 直接 final 异常。
+# 默认关闭；开启后只基于上游 usage 元数据判断，不会判断答案文本是否正确。
+#
+# [retry.reasoning_guard]
+# enabled = true
+# reasoning_equals = [516]
+# action = "retry"              # retry | block | observe
+# stream_mode = "strict-buffer" # strict-buffer | observe | off
+# max_guard_retries = 1
+# paths = ["/v1/responses", "/responses", "/v1/chat/completions", "/chat/completions"]
+# log_matches = true
+
 # 明确禁止重试/切换的 HTTP 状态码/范围（字符串形式）。
 # 示例："413,415,422"。
 # never_on_status = "413,415,422"

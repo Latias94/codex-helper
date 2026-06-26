@@ -2,12 +2,15 @@ use axum::http::HeaderMap;
 use rand::Rng;
 use tokio::time::sleep;
 
+use crate::config::ReasoningGuardAction;
+use crate::config::ResolvedReasoningGuardConfig;
 use crate::config::ResolvedRetryConfig;
 use crate::config::ResolvedRetryLayerConfig;
 use crate::config::RetryStrategy;
 use crate::logging::{RetryInfo, RouteAttemptLog, parse_route_attempts_from_chain};
 
 use super::classify::{UPSTREAM_OVERLOADED_CLASS, UPSTREAM_RATE_LIMITED_CLASS};
+use super::reasoning_guard::REASONING_GUARD_TRIGGERED_CLASS;
 
 #[derive(Clone)]
 pub(super) struct RetryLayerOptions {
@@ -24,6 +27,7 @@ pub(super) struct RetryLayerOptions {
 pub(super) struct RetryPlan {
     pub(super) upstream: RetryLayerOptions,
     pub(super) route: RetryLayerOptions,
+    pub(super) reasoning_guard: ResolvedReasoningGuardConfig,
     pub(super) allow_cross_station_before_first_output: bool,
     pub(super) never_status_ranges: Vec<(u16, u16)>,
     pub(super) never_error_classes: Vec<String>,
@@ -70,8 +74,21 @@ fn layer_options(cfg: &ResolvedRetryLayerConfig) -> RetryLayerOptions {
 }
 
 pub(super) fn retry_plan(cfg: &ResolvedRetryConfig) -> RetryPlan {
-    let upstream = layer_options(&cfg.upstream);
-    let route = layer_options(&cfg.route);
+    let mut upstream = layer_options(&cfg.upstream);
+    let mut route = layer_options(&cfg.route);
+    if cfg.reasoning_guard.enabled
+        && cfg.reasoning_guard.action == ReasoningGuardAction::Retry
+        && cfg.reasoning_guard.max_guard_retries > 0
+    {
+        push_retry_class_once(
+            &mut upstream.retry_error_classes,
+            REASONING_GUARD_TRIGGERED_CLASS,
+        );
+        push_retry_class_once(
+            &mut route.retry_error_classes,
+            REASONING_GUARD_TRIGGERED_CLASS,
+        );
+    }
     let never_status_ranges = parse_status_ranges(cfg.never_on_status.as_str());
     let never_error_classes = cfg.never_on_class.clone();
     let cloudflare_challenge_cooldown_secs = cfg.cloudflare_challenge_cooldown_secs;
@@ -83,6 +100,7 @@ pub(super) fn retry_plan(cfg: &ResolvedRetryConfig) -> RetryPlan {
     RetryPlan {
         upstream,
         route,
+        reasoning_guard: cfg.reasoning_guard.clone(),
         allow_cross_station_before_first_output: cfg.allow_cross_station_before_first_output,
         never_status_ranges,
         never_error_classes,
@@ -91,6 +109,12 @@ pub(super) fn retry_plan(cfg: &ResolvedRetryConfig) -> RetryPlan {
         transport_cooldown_secs,
         cooldown_backoff_factor,
         cooldown_backoff_max_secs,
+    }
+}
+
+fn push_retry_class_once(classes: &mut Vec<String>, class: &str) {
+    if !classes.iter().any(|existing| existing == class) {
+        classes.push(class.to_string());
     }
 }
 
@@ -278,7 +302,7 @@ pub(super) async fn retry_sleep(
 mod tests {
     use super::*;
 
-    use crate::config::RetryProfileName;
+    use crate::config::{ReasoningGuardConfig, RetryProfileName};
     use axum::http::HeaderValue;
     use pretty_assertions::assert_eq;
 
@@ -442,5 +466,30 @@ mod tests {
             400,
             Some("client_error_non_retryable")
         ));
+    }
+
+    #[test]
+    fn retry_plan_adds_reasoning_guard_class_only_when_retry_enabled() {
+        let mut resolved = RetryProfileName::Balanced.defaults();
+        resolved.reasoning_guard = ReasoningGuardConfig {
+            enabled: Some(true),
+            ..ReasoningGuardConfig::default()
+        }
+        .resolve();
+
+        let plan = retry_plan(&resolved);
+
+        assert!(
+            plan.upstream
+                .retry_error_classes
+                .iter()
+                .any(|class| class == REASONING_GUARD_TRIGGERED_CLASS)
+        );
+        assert!(
+            plan.route
+                .retry_error_classes
+                .iter()
+                .any(|class| class == REASONING_GUARD_TRIGGERED_CLASS)
+        );
     }
 }

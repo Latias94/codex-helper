@@ -1546,6 +1546,7 @@ mod tests {
         let retry = ResolvedRetryConfig {
             upstream: retry_layer(RetryStrategy::SameUpstream, 2),
             route: retry_layer(RetryStrategy::Failover, 3),
+            reasoning_guard: crate::config::ReasoningGuardConfig::default_resolved(),
             allow_cross_station_before_first_output: true,
             never_on_status: "400,401,403".to_string(),
             never_on_class: vec!["client_error_non_retryable".to_string()],

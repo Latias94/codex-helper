@@ -1,5 +1,5 @@
 use axum::body::{Body, Bytes};
-use axum::http::{HeaderMap, Method, Response, StatusCode};
+use axum::http::{HeaderMap, Method, Response, StatusCode, header};
 
 use crate::logging::{CodexBridgeLog, RetryInfo, ServiceTierLog};
 use crate::state::{RouteDecisionProvenance, SessionIdentitySource};
@@ -63,12 +63,16 @@ pub(super) async fn finish_and_build_forward_response(
     } = params;
 
     let status_code = status.as_u16();
+    let streaming = response_headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"));
     let mut publication = RequestPublication::new_terminal(
         request_id,
         status_code,
         duration_ms,
         started_at_ms,
-        false,
+        streaming,
     );
     publication.ttfb_ms = Some(upstream_headers_ms);
     publication.station_name = station_name;

@@ -1234,6 +1234,7 @@ mod tests {
         let plan = RetryPlan {
             upstream: provider_opt.clone(),
             route: provider_opt.clone(),
+            reasoning_guard: crate::config::ReasoningGuardConfig::default_resolved(),
             allow_cross_station_before_first_output: true,
             never_status_ranges: Vec::new(),
             never_error_classes: Vec::new(),
@@ -1253,6 +1254,7 @@ mod tests {
         let blocked_policy = ProviderChainAttemptPolicy::legacy(
             &request_flavor,
             &RetryPlan {
+                reasoning_guard: crate::config::ReasoningGuardConfig::default_resolved(),
                 allow_cross_station_before_first_output: false,
                 ..plan
             },
