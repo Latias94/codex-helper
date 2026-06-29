@@ -8,7 +8,10 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use crate::codex_capability_profile::{
     CodexCapabilityDecision, CodexCapabilitySupport, CodexPatchModeRecommendationConfidence,
 };
-use crate::config::{ResolvedRetryConfig, ResolvedRetryLayerConfig, RetryStrategy};
+use crate::config::{
+    ReasoningGuardAction, ReasoningGuardStreamMode, ResolvedReasoningGuardConfig,
+    ResolvedRetryConfig, ResolvedRetryLayerConfig, RetryStrategy,
+};
 use crate::healthcheck::{
     HEALTHCHECK_MAX_INFLIGHT_ENV, HEALTHCHECK_TIMEOUT_MS_ENV, HEALTHCHECK_UPSTREAM_CONCURRENCY_ENV,
 };
@@ -45,6 +48,62 @@ fn retry_trigger_summary(layer: &ResolvedRetryLayerConfig) -> String {
         layer.on_class.join(",")
     };
     format!("status=[{statuses}] class=[{classes}]")
+}
+
+fn reasoning_guard_action_name(action: ReasoningGuardAction) -> &'static str {
+    match action {
+        ReasoningGuardAction::Observe => "observe",
+        ReasoningGuardAction::Block => "block",
+        ReasoningGuardAction::Retry => "retry",
+    }
+}
+
+fn reasoning_guard_stream_mode_name(stream_mode: ReasoningGuardStreamMode) -> &'static str {
+    match stream_mode {
+        ReasoningGuardStreamMode::Off => "off",
+        ReasoningGuardStreamMode::Observe => "observe",
+        ReasoningGuardStreamMode::StrictBuffer => "strict-buffer",
+    }
+}
+
+fn reasoning_guard_preview_lang(guard: &ResolvedReasoningGuardConfig, lang: Language) -> String {
+    let enabled = if guard.enabled { "on" } else { "off" };
+    let equals = if guard.reasoning_equals.is_empty() {
+        "-".to_string()
+    } else {
+        guard
+            .reasoning_equals
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let paths = if guard.paths.is_empty() {
+        "-".to_string()
+    } else {
+        guard.paths.join(",")
+    };
+
+    match lang {
+        Language::Zh => format!(
+            "reasoning_guard: {} tokens=[{}] action={} stream={} max_guard_retries={} paths=[{}]",
+            enabled,
+            equals,
+            reasoning_guard_action_name(guard.action),
+            reasoning_guard_stream_mode_name(guard.stream_mode),
+            guard.max_guard_retries,
+            paths
+        ),
+        Language::En => format!(
+            "reasoning_guard: {} tokens=[{}] action={} stream={} max_guard_retries={} paths=[{}]",
+            enabled,
+            equals,
+            reasoning_guard_action_name(guard.action),
+            reasoning_guard_stream_mode_name(guard.stream_mode),
+            guard.max_guard_retries,
+            paths
+        ),
+    }
 }
 
 fn capability_support_label(support: CodexCapabilitySupport) -> &'static str {
@@ -559,6 +618,7 @@ fn retry_policy_preview_lines_lang(retry: &ResolvedRetryConfig, lang: Language) 
             retry.cooldown_backoff_max_secs
         ),
     });
+    lines.push(reasoning_guard_preview_lang(&retry.reasoning_guard, lang));
     lines
 }
 

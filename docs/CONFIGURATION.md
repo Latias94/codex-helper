@@ -485,17 +485,17 @@ children = ["input", "openai"]
 profile = "balanced"
 ```
 
-### Reasoning Guard: Catch 516 Reasoning Token Anomalies
+### Reasoning Guard: Catch Reasoning Token Anomaly Buckets
 
-If a Codex relay occasionally returns a successful response with `reasoning_tokens = 516`, goes
-straight to a final answer, and produces visibly degraded answers, enable the retry reasoning guard.
-The guard only uses upstream usage metadata as a high-confidence signal; it does not try to judge
-whether the answer text is correct.
+If a Codex relay occasionally returns a successful response with `reasoning_tokens = 516`, `1034`,
+or `1552`, goes straight to a final answer, and produces visibly degraded answers, enable the retry
+reasoning guard. The guard only uses upstream usage metadata as a high-confidence signal; it does
+not try to judge whether the answer text is correct.
 
 ```toml
 [retry.reasoning_guard]
 enabled = true
-reasoning_equals = [516]
+reasoning_equals = [516, 1034, 1552]
 action = "retry"              # retry | block | observe
 stream_mode = "strict-buffer" # strict-buffer | observe | off
 max_guard_retries = 1
@@ -503,16 +503,20 @@ paths = ["/v1/responses", "/responses", "/v1/chat/completions", "/chat/completio
 log_matches = true
 ```
 
-- The guard is disabled by default, so existing configs keep their current behavior.
+- The guard is disabled by default, so existing configs keep their current behavior. When enabled,
+  the default match list is `[516, 1034, 1552]`; override `reasoning_equals` for a custom list.
 - `action = "retry"` rewrites a matching successful response into a local 502 and lets the normal
   `[retry]` upstream/provider policy handle it. `max_guard_retries = 1` means one extra upstream
   request per client request due to this guard.
 - `stream_mode = "strict-buffer"` buffers matching SSE responses until the terminal usage block is
   available. This prevents anomalous output from being sent before the guard can inspect
   `reasoning_tokens`, at the cost of losing live streaming for those guarded requests.
+- Runtime config reload applies to this guard: every new request checks for config file changes
+  before building its retry plan; in-flight requests keep the config snapshot they started with.
+  Press `R` on the TUI Settings page to force an immediate reload.
 - The TUI Requests page shows hits in the `RG` column. The details pane's `Retry / route chain`
   shows `decision=failed_reasoning_guard`, `class=reasoning_guard_triggered`, and
-  `reason=reasoning_tokens=516`.
+  `reason=reasoning_tokens=<matched value>`.
 
 ## Route Graph Shape
 

@@ -179,6 +179,24 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_guard_matches_default_anomaly_token_buckets() {
+        let mut cfg = ReasoningGuardConfig::default_resolved();
+        cfg.enabled = true;
+
+        for reasoning_output_tokens in [516, 1034, 1552] {
+            let usage = UsageMetrics {
+                reasoning_output_tokens,
+                ..UsageMetrics::default()
+            };
+
+            assert!(matches!(
+                evaluate_reasoning_guard(&cfg, "codex", "/v1/responses", Some(&usage), 0),
+                ReasoningGuardDecision::Retry(_)
+            ));
+        }
+    }
+
+    #[test]
     fn reasoning_guard_exhausts_retry_budget() {
         let mut cfg = ReasoningGuardConfig::default_resolved();
         cfg.enabled = true;

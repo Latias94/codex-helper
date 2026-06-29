@@ -662,12 +662,13 @@ profile = "balanced"
 # on_status = "401,403,404,408,429,500-599,524"
 # on_class = ["upstream_transport_error", "upstream_rate_limited", "upstream_overloaded"]
 
-# 可选：Reasoning Guard，用于拦截 Codex 上游偶发的 reasoning_tokens=516 直接 final 异常。
+# 可选：Reasoning Guard，用于拦截 Codex 上游偶发的 reasoning_tokens 异常桶。
 # 默认关闭；开启后只基于上游 usage 元数据判断，不会判断答案文本是否正确。
+# 运行中修改本段配置会被新请求自动加载；已在途请求继续使用它启动时的配置快照。
 #
 # [retry.reasoning_guard]
 # enabled = true
-# reasoning_equals = [516]
+# reasoning_equals = [516, 1034, 1552]
 # action = "retry"              # retry | block | observe
 # stream_mode = "strict-buffer" # strict-buffer | observe | off
 # max_guard_retries = 1

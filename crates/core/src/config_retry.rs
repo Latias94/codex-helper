@@ -280,7 +280,7 @@ impl ReasoningGuardConfig {
     pub fn default_resolved() -> ResolvedReasoningGuardConfig {
         ResolvedReasoningGuardConfig {
             enabled: false,
-            reasoning_equals: vec![516],
+            reasoning_equals: vec![516, 1034, 1552],
             paths: vec![
                 "/responses".to_string(),
                 "/v1/responses".to_string(),
@@ -435,7 +435,10 @@ mod tests {
         let resolved = RetryConfig::default().resolve();
 
         assert!(!resolved.reasoning_guard.enabled);
-        assert_eq!(resolved.reasoning_guard.reasoning_equals, vec![516]);
+        assert_eq!(
+            resolved.reasoning_guard.reasoning_equals,
+            vec![516, 1034, 1552]
+        );
         assert_eq!(
             resolved.reasoning_guard.stream_mode,
             ReasoningGuardStreamMode::StrictBuffer

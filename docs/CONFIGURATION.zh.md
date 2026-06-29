@@ -425,14 +425,14 @@ children = ["input", "openai"]
 profile = "balanced"
 ```
 
-### Reasoning Guard：拦截 516 推理 token 异常
+### Reasoning Guard：拦截推理 token 异常桶
 
-如果某些 Codex 中转偶发出现 `reasoning_tokens = 516` 后直接 final、且答案质量明显异常，可以开启 retry reasoning guard。它只基于上游响应里的 usage 元数据做高置信拦截，不会尝试理解或判定答案本身是否正确。
+如果某些 Codex 中转偶发出现 `reasoning_tokens = 516`、`1034` 或 `1552` 后直接 final、且答案质量明显异常，可以开启 retry reasoning guard。它只基于上游响应里的 usage 元数据做高置信拦截，不会尝试理解或判定答案本身是否正确。
 
 ```toml
 [retry.reasoning_guard]
 enabled = true
-reasoning_equals = [516]
+reasoning_equals = [516, 1034, 1552]
 action = "retry"          # retry | block | observe
 stream_mode = "strict-buffer" # strict-buffer | observe | off
 max_guard_retries = 1
@@ -440,10 +440,11 @@ paths = ["/v1/responses", "/responses", "/v1/chat/completions", "/chat/completio
 log_matches = true
 ```
 
-- 默认关闭；不配置时不会改变现有行为。
+- 默认关闭；不配置时不会改变现有行为。开启后默认匹配 `[516, 1034, 1552]`，也可以用 `reasoning_equals` 覆盖成自己的列表。
 - `action = "retry"` 会把命中的成功响应改判为本地 502，并交给 `[retry]` 的 upstream/provider 重试规则处理。`max_guard_retries = 1` 表示同一个客户端请求最多因为该 guard 多打一轮上游请求。
-- `stream_mode = "strict-buffer"` 会在命中路径的流式请求中先完整缓冲 SSE，再检查末尾 usage。这样可以避免异常答案已经写给客户端后才发现 `516`，代价是这类流式请求不再实时透传。
-- TUI Requests 页会在列表的 `RG` 列显示命中标记；详情里的 `Retry / route chain` 会显示 `decision=failed_reasoning_guard`、`class=reasoning_guard_triggered` 和 `reason=reasoning_tokens=516`。
+- `stream_mode = "strict-buffer"` 会在命中路径的流式请求中先完整缓冲 SSE，再检查末尾 usage。这样可以避免异常答案已经写给客户端后才发现异常 token，代价是这类流式请求不再实时透传。
+- 配置支持运行时热加载：每个新请求准备阶段都会检查配置文件变更；已在途请求继续使用它开始时的配置快照。TUI Settings 页按 `R` 可以立即强制重载。
+- TUI Requests 页会在列表的 `RG` 列显示命中标记；详情里的 `Retry / route chain` 会显示 `decision=failed_reasoning_guard`、`class=reasoning_guard_triggered` 和 `reason=reasoning_tokens=<命中值>`。
 
 ## Route Graph 形状
 
