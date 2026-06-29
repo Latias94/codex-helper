@@ -120,7 +120,7 @@ describe("admin API mappers", () => {
         },
       ],
       adminBaseUrl: "http://127.0.0.1:4211",
-      appVersion: "0.18.0",
+      appVersion: "0.19.0",
     });
 
     expect(data.runtime.port).toBe(3211);

@@ -9,33 +9,56 @@ All notable changes to this project will be documented in this file.
 
 #### 新增
 
-- OpenAI Images 兼容入口新增 hosted `image_generation_call` 语义校验：上游即使返回 HTTP 200，只要缺少 completed image generation result，就会按 `image_generation_missing_result` 进入 provider failover/passive health，而不会被记录为成功。
-- OpenAI Images 兼容入口现在支持 JSON `POST /v1/images/edits` / `/images/edits` 参考图生成；本地 `ch-imagegen` skill 增加 `--image`、`--edits-base-url` 和 `--input-fidelity`，会把本地参考图转成 data URL 后调用 edits 入口。
-- Codex client patch 新增正交压缩策略 `[codex.client_patch].compaction = "auto" | "local" | "remote-v1" | "remote-v2"` 和 `codex-helper switch on --compaction ...`。`official-relay` / `official-imagegen` 默认仍让 Codex 走远程压缩路径；显式 `local` 可保留 official/imagegen 预设的其它行为但强制 Codex 客户端本地压缩，`remote-v1` 强制 `/responses/compact`，`remote-v2` 写入 `remote_compaction_v2` 并继续使用 helper 的 v2 到 v1 降级兜底。`relay-capabilities` 诊断也支持 `compaction` 输入和输出，确保 expected/mismatch 按实际压缩策略计算。
+- 暂无。
 
 #### 修复
 
-- TUI crate 升级到 `ratatui 0.30.1`，并关闭默认 `all-widgets` / `widget-calendar` feature，避免 `ratatui-widgets` 拉入 `time` 后在 `HourBase` 转换实现上触发 Rust E0119 coherence 编译错误。
-- OpenAI Images 兼容入口现在会把 `gpt-image-*` / `dall-e-*` 这类 Image API 模型意图映射到 hosted `image_generation` 的 Responses wrapper model（默认 `gpt-5.5`，可用 helper-only `responses_model` 覆盖），并用 `tool_choice` 强制调用 `image_generation`，避免把 `gpt-image-2` 误放进 `/v1/responses` 顶层 `model` 后被 Codex 路由池当作不可用上游重试。仓库内 `ch-imagegen` 默认随请求发送 `responses_model=gpt-5.5`。
-- OpenAI Images 兼容入口的路由失败错误现在会返回 `failure_hint`、`request_id` 和 `suggested_action`；仓库内 `ch-imagegen` skill 会把全上游 502/503 或 route unavailable 识别为 image-capable provider/路由池问题，而不是误导为分辨率问题。
-- 仓库内 `ch-imagegen` skill 默认改为 2K，并新增结构化失败 JSON、可重试错误重试、`--fallback-resolution 2k` 和 4K 超时使用说明，降低慢上游、4K 请求或无图结果导致外层工具超时/误判的概率。
-- Codex `remote_compaction_v2` 的 `compaction_trigger` `/responses` 请求现在会默认先尝试 v2；如果 relay 返回普通 Responses 成功流、JSON compact 结果或明确不支持 v2 的错误，helper 会自动降级到 `/responses/compact` 并合成为 Codex 期望的 v2 compact SSE，避免触发 Codex 本地 “expected exactly one compaction output item” fatal。可通过 `[codex.compaction].remote_v2_downgrade = false` 关闭该兜底。
+- 暂无。
 
 ### English summary
 
 #### Added
 
-- The OpenAI Images-compatible bridge now validates hosted `image_generation_call` semantics. Upstream HTTP 200 responses without a completed image generation result are classified as `image_generation_missing_result` and enter provider failover/passive health instead of being recorded as success.
-- The OpenAI Images-compatible bridge now supports JSON `POST /v1/images/edits` / `/images/edits` reference-image generation. The local `ch-imagegen` skill gained `--image`, `--edits-base-url`, and `--input-fidelity`, encoding local references as data URLs before calling the edits endpoint.
-- Codex client patch now has a separate compaction strategy: `[codex.client_patch].compaction = "auto" | "local" | "remote-v1" | "remote-v2"` and `codex-helper switch on --compaction ...`. `official-relay` / `official-imagegen` still make Codex use the remote compaction path by default; explicit `local` keeps the other official/imagegen preset behavior while forcing Codex client-side local compaction, `remote-v1` forces `/responses/compact`, and `remote-v2` writes `remote_compaction_v2` while retaining helper's v2-to-v1 downgrade fallback. `relay-capabilities` diagnostics also accept and return `compaction`, so expected capability and mismatch reporting follow the actual strategy.
+- None.
 
 #### Fixed
 
-- The TUI crate now upgrades to `ratatui 0.30.1` with default `all-widgets` / `widget-calendar` features disabled, preventing `ratatui-widgets` from pulling in `time` and hitting Rust E0119 coherence failures around `HourBase` conversion impls.
-- The OpenAI Images-compatible bridge now maps Image API model intents such as `gpt-image-*` / `dall-e-*` to the hosted `image_generation` Responses wrapper model (default `gpt-5.5`, overrideable with helper-only `responses_model`) and forces `image_generation` with `tool_choice` instead of putting `gpt-image-2` in the top-level `/v1/responses` `model`. The repository `ch-imagegen` skill sends `responses_model=gpt-5.5` by default.
-- OpenAI Images-compatible route failures now return `failure_hint`, `request_id`, and `suggested_action`; the repository `ch-imagegen` skill recognizes all-upstream 502/503 or route-unavailable failures as image-capable provider/route-pool issues instead of misleadingly treating them as resolution problems.
-- The repository `ch-imagegen` skill now defaults to 2K and emits structured failure JSON with retry metadata, retry handling, `--fallback-resolution 2k`, and 4K timeout guidance to reduce outer tool timeouts and false success/failure handling for slow providers or missing image results.
-- Codex `remote_compaction_v2` `compaction_trigger` `/responses` requests now try v2 first by default. If a relay returns an ordinary Responses success stream, a JSON compact result, or a clear unsupported-v2 error, helper automatically downgrades to `/responses/compact` and synthesizes the v2 compact SSE shape Codex expects, avoiding Codex's local “expected exactly one compaction output item” fatal. Set `[codex.compaction].remote_v2_downgrade = false` to disable the fallback.
+- None.
+
+## [0.19.0] - 2026-06-29
+
+### 中文
+
+#### 新增
+
+- 新增可配置的 Reasoning Guard，用于拦截 Codex 中转偶发的异常短推理路径。核心配置在 `[retry.reasoning_guard]`：
+  `enabled`、`reasoning_equals`、`action`、`stream_mode`、`max_guard_retries`、`paths`、`log_matches`。默认异常桶为 `[516, 1034, 1552]`，配置支持运行时热加载，新请求会自动使用最新设置。
+- 新增 Codex 客户端压缩策略配置 `[codex.client_patch].compaction = "auto" | "local" | "remote-v1" | "remote-v2"`，并支持 `codex-helper switch on --compaction ...`。这让 official relay / imagegen 预设可以按中转能力选择本地压缩、remote compact v1 或 remote compact v2。
+- OpenAI Images 兼容入口增强：支持 JSON `POST /v1/images/edits` / `/images/edits` 参考图生成，并对 hosted `image_generation_call` 结果做语义校验，避免上游返回 HTTP 200 但没有图片结果时被误判为成功。
+- TUI Settings 页现在会显示当前 reasoning guard 规则；Relay 能力诊断也会按实际 compaction 策略计算 expected / mismatch。
+
+#### 修复
+
+- 修复 Image API 模型被直接放进 `/v1/responses` 顶层 `model` 后导致路由池误判的问题；现在会映射到可配置的 Responses wrapper model，并强制调用 hosted `image_generation`。
+- 图像入口的路由失败现在会返回更明确的 `failure_hint`、`request_id` 和 `suggested_action`，`ch-imagegen` 也会把失败归因到 provider / 路由池，而不是误导为分辨率问题。
+- Codex `remote_compaction_v2` 请求会在中转不支持 v2 时自动降级到 `/responses/compact` 并合成 Codex 期望的 v2 compact SSE；可用 `[codex.compaction].remote_v2_downgrade = false` 关闭。
+- 修复 TUI 依赖组合在新版 Rust 上可能触发的 `ratatui-widgets` / `time` 编译冲突。
+
+### English summary
+
+#### Added
+
+- Added configurable Reasoning Guard protection for anomalous Codex relay short-reasoning paths. The new `[retry.reasoning_guard]` options are `enabled`, `reasoning_equals`, `action`, `stream_mode`, `max_guard_retries`, `paths`, and `log_matches`. The default anomaly buckets are `[516, 1034, 1552]`, and runtime config reload applies to new requests.
+- Added `[codex.client_patch].compaction = "auto" | "local" | "remote-v1" | "remote-v2"` plus `codex-helper switch on --compaction ...`, so official relay / imagegen presets can match the relay's real local/remote compaction support.
+- Improved OpenAI Images-compatible endpoints with JSON image edits support and hosted `image_generation_call` result validation, preventing HTTP 200 responses without image results from being recorded as successful generations.
+- The TUI Settings page now shows the active reasoning guard rule, and relay diagnostics evaluate expected capability / mismatch output with the selected compaction strategy.
+
+#### Fixed
+
+- Fixed Image API model intents being routed as top-level `/v1/responses` models. They are now mapped to a configurable Responses wrapper model and forced through hosted `image_generation`.
+- Image route failures now include clearer `failure_hint`, `request_id`, and `suggested_action` fields; `ch-imagegen` reports provider / route-pool problems instead of mislabeling them as resolution failures.
+- Codex `remote_compaction_v2` requests now downgrade to `/responses/compact` when the relay cannot produce valid v2 compact output. Set `[codex.compaction].remote_v2_downgrade = false` to disable this fallback.
+- Fixed a TUI dependency combination that could fail to compile on newer Rust due to `ratatui-widgets` / `time` coherence conflicts.
 
 ## [0.18.0] - 2026-05-31
 

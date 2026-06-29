@@ -352,7 +352,7 @@ export function SettingsPage() {
         </SettingsCard>
 
         <SettingsCard title="关于与路径" description="版本、本机路径和更新信息。">
-          <PathRow label="Version" value="v0.18.0" />
+          <PathRow label="Version" value="v0.19.0" />
           <PathRow label="Config" value={paths?.config ?? "~/.codex-helper/config.toml"} onOpen={() => runPathAction("config")} />
           <PathRow label="Logs" value={paths?.logs ?? "~/.codex-helper/logs"} onOpen={() => runPathAction("logs")} />
           <PathRow label="Cache" value={paths?.cache ?? "~/.codex-helper/cache"} onOpen={() => runPathAction("cache")} />

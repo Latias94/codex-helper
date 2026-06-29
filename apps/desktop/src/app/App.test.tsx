@@ -55,7 +55,7 @@ describe("desktop app routes", () => {
   it("renders an admin-token-required state when the local admin API rejects credentials", async () => {
     mockedInvoke.mockImplementation(async (command) => {
       if (command === "get_app_metadata") {
-        return { name: "codex-helper", version: "0.18.0", tauri: "2" };
+        return { name: "codex-helper", version: "0.19.0", tauri: "2" };
       }
       if (command === "get_admin_read_model") {
         throw new Error("HTTP 403 forbidden: missing x-codex-helper-admin-token");
@@ -73,7 +73,7 @@ describe("desktop app routes", () => {
     window.location.hash = "#/usage";
     mockedInvoke.mockImplementation(async (command) => {
       if (command === "get_app_metadata") {
-        return { name: "codex-helper", version: "0.18.0", tauri: "2" };
+        return { name: "codex-helper", version: "0.19.0", tauri: "2" };
       }
       if (command === "get_admin_read_model") {
         return liveReadModel({
@@ -94,7 +94,7 @@ describe("desktop app routes", () => {
   it("renders live admin data when the Tauri read model command succeeds", async () => {
     mockedInvoke.mockImplementation(async (command) => {
       if (command === "get_app_metadata") {
-        return { name: "codex-helper", version: "0.18.0", tauri: "2" };
+        return { name: "codex-helper", version: "0.19.0", tauri: "2" };
       }
       if (command === "get_admin_read_model") {
         return liveReadModel();
@@ -113,7 +113,7 @@ describe("desktop app routes", () => {
     window.location.hash = "#/providers";
     mockedInvoke.mockImplementation(async (command, args) => {
       if (command === "get_app_metadata") {
-        return { name: "codex-helper", version: "0.18.0", tauri: "2" };
+        return { name: "codex-helper", version: "0.19.0", tauri: "2" };
       }
       if (command === "get_admin_read_model") {
         return liveReadModel({
@@ -205,7 +205,7 @@ describe("desktop app routes", () => {
     window.location.hash = "#/providers";
     mockedInvoke.mockImplementation(async (command) => {
       if (command === "get_app_metadata") {
-        return { name: "codex-helper", version: "0.18.0", tauri: "2" };
+        return { name: "codex-helper", version: "0.19.0", tauri: "2" };
       }
       if (command === "get_admin_read_model") {
         return liveReadModel({
@@ -266,7 +266,7 @@ describe("desktop app routes", () => {
     window.location.hash = "#/settings";
     mockedInvoke.mockImplementation(async (command) => {
       if (command === "get_app_metadata") {
-        return { name: "codex-helper", version: "0.18.0", tauri: "2" };
+        return { name: "codex-helper", version: "0.19.0", tauri: "2" };
       }
       if (command === "get_admin_read_model") {
         return liveReadModel();
@@ -309,7 +309,7 @@ describe("desktop app routes", () => {
     window.location.hash = "#/settings";
     mockedInvoke.mockImplementation(async (command, args) => {
       if (command === "get_app_metadata") {
-        return { name: "codex-helper", version: "0.18.0", tauri: "2" };
+        return { name: "codex-helper", version: "0.19.0", tauri: "2" };
       }
       if (command === "get_admin_read_model") {
         return liveReadModel();
@@ -381,7 +381,7 @@ describe("desktop app routes", () => {
     window.location.hash = "#/settings";
     mockedInvoke.mockImplementation(async (command) => {
       if (command === "get_app_metadata") {
-        return { name: "codex-helper", version: "0.18.0", tauri: "2" };
+        return { name: "codex-helper", version: "0.19.0", tauri: "2" };
       }
       if (command === "get_admin_read_model") {
         return liveReadModel();
@@ -416,7 +416,7 @@ describe("desktop app routes", () => {
     window.location.hash = "#/settings";
     mockedInvoke.mockImplementation(async (command) => {
       if (command === "get_app_metadata") {
-        return { name: "codex-helper", version: "0.18.0", tauri: "2" };
+        return { name: "codex-helper", version: "0.19.0", tauri: "2" };
       }
       if (command === "get_admin_read_model") {
         return liveReadModel();

@@ -17,7 +17,7 @@ export const runtimeSummary = {
   codex: "已连接",
   provider: "CodeX Air",
   balance: "$12.48",
-  version: "v0.18.0",
+  version: "v0.19.0",
   endpoint: "http://127.0.0.1:3211",
 };
 
