@@ -460,7 +460,6 @@ where
         }
         if snapshot
             .error()
-            .as_deref()
             .is_some_and(|value| !value.trim().is_empty())
         {
             continue;

@@ -81,11 +81,7 @@ pub(super) fn evaluate_reasoning_guard(
     let Some(reasoning_tokens) = usage.map(UsageMetrics::reasoning_output_tokens_total) else {
         return ReasoningGuardDecision::Pass;
     };
-    if !cfg
-        .reasoning_equals
-        .iter()
-        .any(|expected| *expected == reasoning_tokens)
-    {
+    if !cfg.reasoning_equals.contains(&reasoning_tokens) {
         return ReasoningGuardDecision::Pass;
     }
 
