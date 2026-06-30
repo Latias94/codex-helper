@@ -177,10 +177,10 @@ fn footer_help_text(ui: &UiState) -> &'static str {
     if ui.runtime_connection.is_attached() && ui.overlay == Overlay::None {
         return match ui.language {
             crate::tui::Language::Zh => {
-                "1-9 页面  q 只退出控制台  L 语言  Tab 焦点  ↑/↓ 移动  ? 帮助"
+                "1-9/0 页面  q 只退出控制台  L 语言  Tab 焦点  ↑/↓ 移动  ? 帮助"
             }
             crate::tui::Language::En => {
-                "1-9 pages  q exit console only  L language  Tab focus  ↑/↓ move  ? help"
+                "1-9/0 pages  q exit console only  L language  Tab focus  ↑/↓ move  ? help"
             }
         };
     }
@@ -205,6 +205,7 @@ fn footer_help_text(ui: &UiState) -> &'static str {
             Page::History => i18n::text(ui.language, msg::FOOTER_HISTORY),
             Page::Recent => i18n::text(ui.language, msg::FOOTER_RECENT),
             Page::Fleet => i18n::text(ui.language, msg::FOOTER_FLEET),
+            Page::ServiceStatus => i18n::text(ui.language, msg::FOOTER_SERVICE_STATUS),
         },
         Overlay::Help => i18n::text(ui.language, msg::FOOTER_HELP),
         Overlay::EffortMenu => i18n::text(ui.language, msg::FOOTER_SELECT_APPLY),
@@ -246,6 +247,14 @@ fn tab_style(p: Palette, selected: bool) -> Style {
     }
 }
 
+fn compact_page_key(idx: usize) -> String {
+    if idx == 9 {
+        "0".to_string()
+    } else {
+        (idx + 1).to_string()
+    }
+}
+
 fn header_tabs_line(p: Palette, ui: &UiState, max_width: u16) -> Line<'static> {
     let selected = page_index(ui.page);
     let titles = page_titles(ui.language, ui.uses_route_graph_routing());
@@ -272,7 +281,7 @@ fn header_tabs_line(p: Palette, ui: &UiState, max_width: u16) -> Line<'static> {
         let label = if idx == selected {
             (*title).to_string()
         } else {
-            (idx + 1).to_string()
+            compact_page_key(idx)
         };
         compact.push(Span::styled(label, tab_style(p, idx == selected)));
     }
@@ -363,17 +372,17 @@ pub(super) fn render_header(
     } else {
         global_station
     };
-    let focus = if ui.page == Page::Fleet {
-        i18n::label(ui.language, "fleet view")
-    } else {
-        match ui.focus {
+    let focus = match ui.page {
+        Page::Fleet => i18n::label(ui.language, "fleet view"),
+        Page::ServiceStatus => i18n::label(ui.language, "service status"),
+        _ => match ui.focus {
             Focus::Sessions => i18n::text(ui.language, msg::FOCUS_SESSIONS),
             Focus::Requests => i18n::text(ui.language, msg::FOCUS_REQUESTS),
             Focus::Stations if ui.uses_route_graph_routing() => {
                 i18n::text(ui.language, msg::FOCUS_ROUTING)
             }
             Focus::Stations => i18n::text(ui.language, msg::FOCUS_STATIONS),
-        }
+        },
     };
     let connection = ui.runtime_connection.label(ui.language);
     let title = if inner.width >= 72 {
@@ -888,7 +897,7 @@ mod tests {
         let line = header_tabs_line(Palette::default(), &ui, 24);
 
         assert!(line_width(&line) <= 24);
-        assert!(line_text(&line).contains("6 Settings"));
+        assert!(line_text(&line).contains("7 Settings"));
     }
 
     #[test]
@@ -916,7 +925,7 @@ mod tests {
         let line = header_tabs_line(Palette::default(), &ui, 8);
 
         assert!(line_width(&line) <= 8);
-        assert!(line_text(&line).starts_with("8"));
+        assert!(line_text(&line).starts_with("9"));
     }
 
     #[test]
@@ -929,7 +938,7 @@ mod tests {
 
         let text = footer_help_text(&ui);
 
-        assert!(text.contains("1-9 pages"), "{text}");
+        assert!(text.contains("1-9/0 pages"), "{text}");
         assert!(text.contains("? help"), "{text}");
     }
 }

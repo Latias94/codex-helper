@@ -11,6 +11,7 @@ mod fleet;
 mod history;
 mod recent;
 mod requests;
+mod service_status;
 mod sessions;
 mod settings;
 mod stations;
@@ -40,5 +41,6 @@ pub(super) fn render_body(
         Page::History => history::render_history_page(f, p, ui, area),
         Page::Recent => recent::render_recent_page(f, p, ui, area),
         Page::Fleet => fleet::render_fleet_page(f, p, ui, area),
+        Page::ServiceStatus => service_status::render_service_status_page(f, p, ui, snapshot, area),
     }
 }

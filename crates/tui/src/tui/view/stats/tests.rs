@@ -143,6 +143,7 @@ fn sample_snapshot_with_history(
         lb_view: HashMap::new(),
         stats_5m: WindowStats::default(),
         stats_1h: WindowStats::default(),
+        service_status: None,
         pricing_catalog: crate::pricing::bundled_model_price_catalog_snapshot(),
         refreshed_at: Instant::now(),
     }

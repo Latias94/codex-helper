@@ -1108,6 +1108,7 @@ mod tests {
             lb_view: HashMap::new(),
             stats_5m: crate::dashboard_core::WindowStats::default(),
             stats_1h: crate::dashboard_core::WindowStats::default(),
+            service_status: None,
             pricing_catalog: crate::pricing::ModelPriceCatalogSnapshot::default(),
             refreshed_at: std::time::Instant::now(),
         }

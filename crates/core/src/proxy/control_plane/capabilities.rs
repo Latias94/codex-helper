@@ -91,6 +91,8 @@ pub(in crate::proxy) async fn api_v1_snapshot(
         proxy.service_name,
         recent_limit,
         stats_days,
+        Some(&cfg.ui.service_status),
+        Some(cfg.as_ref()),
     )
     .await;
     crate::state::enrich_session_identity_cards_with_runtime(&mut snapshot.session_cards, mgr);

@@ -9,7 +9,7 @@ All notable changes to this project will be documented in this file.
 
 #### 新增
 
-- 暂无。
+- TUI 新增可选服务状态页，位于 `4 请求` 之后的 `5 状态`。`[ui.service_status]` 默认关闭；显式启用后可按 provider / endpoint 发起 `max_tokens=1`、`stream=false` 的轻量 `chat/completions` 探针，验证真实上游链路，同时保留只读 status JSON URL 兼容模式。
 
 #### 修复
 
@@ -19,7 +19,7 @@ All notable changes to this project will be documented in this file.
 
 #### Added
 
-- None.
+- Added an optional TUI service status page after `4 Requests` as `5 Status`. `[ui.service_status]` is disabled by default; when explicitly enabled it can probe provider / endpoint targets with lightweight `chat/completions` requests using `max_tokens=1` and `stream=false`, while retaining read-only status JSON URL compatibility.
 
 #### Fixed
 

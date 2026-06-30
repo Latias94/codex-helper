@@ -100,6 +100,7 @@ fn routing_provider_balance_line_falls_back_for_legacy_snapshot_keys() {
         lb_view: std::collections::HashMap::new(),
         stats_5m: crate::dashboard_core::WindowStats::default(),
         stats_1h: crate::dashboard_core::WindowStats::default(),
+        service_status: None,
         pricing_catalog: crate::pricing::ModelPriceCatalogSnapshot::default(),
         refreshed_at: std::time::Instant::now(),
     };
@@ -162,6 +163,7 @@ fn routing_provider_balance_line_prefers_routing_context() {
         lb_view: std::collections::HashMap::new(),
         stats_5m: crate::dashboard_core::WindowStats::default(),
         stats_1h: crate::dashboard_core::WindowStats::default(),
+        service_status: None,
         pricing_catalog: crate::pricing::ModelPriceCatalogSnapshot::default(),
         refreshed_at: std::time::Instant::now(),
     };

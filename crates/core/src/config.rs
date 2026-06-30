@@ -518,6 +518,128 @@ fn is_default_usage_forecast_config(value: &UsageForecastConfig) -> bool {
     value == &UsageForecastConfig::default()
 }
 
+fn default_service_status_refresh_interval_secs() -> u64 {
+    60
+}
+
+fn default_service_status_timeout_ms() -> u64 {
+    3_000
+}
+
+fn default_service_status_high_latency_ms() -> u64 {
+    3_000
+}
+
+fn default_service_status_history_cells() -> usize {
+    60
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ServiceStatusConfig {
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    pub enabled: bool,
+    #[serde(
+        default = "default_service_status_refresh_interval_secs",
+        skip_serializing_if = "is_default_service_status_refresh_interval_secs"
+    )]
+    pub refresh_interval_secs: u64,
+    #[serde(
+        default = "default_service_status_timeout_ms",
+        skip_serializing_if = "is_default_service_status_timeout_ms"
+    )]
+    pub timeout_ms: u64,
+    #[serde(
+        default = "default_service_status_high_latency_ms",
+        skip_serializing_if = "is_default_service_status_high_latency_ms"
+    )]
+    pub high_latency_ms: u64,
+    #[serde(
+        default = "default_service_status_history_cells",
+        skip_serializing_if = "is_default_service_status_history_cells"
+    )]
+    pub history_cells: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub probes: Vec<ServiceStatusProbeConfig>,
+}
+
+impl Default for ServiceStatusConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            refresh_interval_secs: default_service_status_refresh_interval_secs(),
+            timeout_ms: default_service_status_timeout_ms(),
+            high_latency_ms: default_service_status_high_latency_ms(),
+            history_cells: default_service_status_history_cells(),
+            probes: Vec::new(),
+        }
+    }
+}
+
+impl ServiceStatusConfig {
+    pub fn has_probes(&self) -> bool {
+        self.probes.iter().any(|probe| {
+            probe
+                .provider
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+                || probe
+                    .url
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+        })
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.enabled && self.has_probes()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct ServiceStatusProbeConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub high_latency_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+}
+
+fn is_default_service_status_config(value: &ServiceStatusConfig) -> bool {
+    value == &ServiceStatusConfig::default()
+}
+
+fn bool_is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn is_default_service_status_refresh_interval_secs(value: &u64) -> bool {
+    *value == default_service_status_refresh_interval_secs()
+}
+
+fn is_default_service_status_timeout_ms(value: &u64) -> bool {
+    *value == default_service_status_timeout_ms()
+}
+
+fn is_default_service_status_high_latency_ms(value: &u64) -> bool {
+    *value == default_service_status_high_latency_ms()
+}
+
+fn is_default_service_status_history_cells(value: &usize) -> bool {
+    *value == default_service_status_history_cells()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(default)]
 pub struct RelayTargetConfig {
@@ -1559,6 +1681,9 @@ pub struct UiConfig {
     /// Spend-rate projection shown in operator UIs.
     #[serde(default, skip_serializing_if = "is_default_usage_forecast_config")]
     pub usage_forecast: UsageForecastConfig,
+    /// Optional remote service status probes shown by operator UIs.
+    #[serde(default, skip_serializing_if = "is_default_service_status_config")]
+    pub service_status: ServiceStatusConfig,
 }
 
 /// 获取 codex-helper 的主目录（用于配置、日志等）

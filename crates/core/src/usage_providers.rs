@@ -8,7 +8,10 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::balance::{BalanceSnapshotStatus, ProviderBalanceSnapshot};
+use crate::balance::{
+    BalanceSnapshotStatus, ProviderBalanceSnapshot, ProviderUsageAlert, ProviderUsageAlertKind,
+    ProviderUsageModelStat, ProviderUsageRateSnapshot, ProviderUsageWindow,
+};
 use crate::config::{ProxyConfig, ServiceConfigManager, proxy_home_dir};
 use crate::lb::LbState;
 use crate::pricing::UsdAmount;
@@ -240,6 +243,8 @@ const MIN_POLL_INTERVAL_SECS: u64 = 20;
 pub const REQUEST_BALANCE_REFRESH_DELAY: Duration = Duration::from_secs(8);
 const BALANCE_REFRESH_CONCURRENCY: usize = 6;
 const BALANCE_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
+const LOW_BALANCE_ALERT_THRESHOLD_USD: &str = "10";
+const EXPIRING_SOON_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
 const AUTO_PROVIDER_ID_PREFIX: &str = "auto:balance:";
 const AUTO_PROBE_KINDS: [ProviderKind; 5] = [
     ProviderKind::RightCodeAccountSummary,
@@ -1129,6 +1134,21 @@ fn amount_from_json(value: &serde_json::Value) -> Option<UsdAmount> {
     UsdAmount::from_decimal_str(raw.as_str())
 }
 
+fn decimal_string_from_json(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        serde_json::Value::String(text) => {
+            let text = text.trim();
+            if text.is_empty() {
+                None
+            } else {
+                Some(text.to_string())
+            }
+        }
+        _ => None,
+    }
+}
+
 fn amount_from_json_with_divisor(
     value: &serde_json::Value,
     divisor: Option<u64>,
@@ -1202,6 +1222,16 @@ fn first_bool_from_paths(
         .find_map(|path| json_value_at_path(value, path).and_then(bool_from_json))
 }
 
+fn first_decimal_string_from_paths(
+    value: &serde_json::Value,
+    default_paths: &[&str],
+) -> Option<String> {
+    default_paths
+        .iter()
+        .copied()
+        .find_map(|path| json_value_at_path(value, path).and_then(decimal_string_from_json))
+}
+
 fn string_from_json(value: &serde_json::Value) -> Option<String> {
     match value {
         serde_json::Value::String(text) => {
@@ -1236,6 +1266,115 @@ fn u64_from_json(value: &serde_json::Value) -> Option<u64> {
         }
         _ => None,
     }
+}
+
+fn seconds_from_json(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::Number(number) => number.as_f64().map(|value| value.max(0.0) as u64),
+        serde_json::Value::String(text) => {
+            let text = text.trim();
+            if text.is_empty() {
+                None
+            } else if let Ok(value) = text.parse::<f64>() {
+                Some(value.max(0.0) as u64)
+            } else {
+                parse_timestamp_secs(text)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn first_secs_from_paths(value: &serde_json::Value, default_paths: &[&str]) -> Option<u64> {
+    default_paths
+        .iter()
+        .copied()
+        .find_map(|path| json_value_at_path(value, path).and_then(seconds_from_json))
+}
+
+fn parse_timestamp_secs(value: &str) -> Option<u64> {
+    parse_rfc3339_like_secs(value).or_else(|| {
+        httpdate::parse_http_date(value).ok().and_then(|time| {
+            time.duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|duration| duration.as_secs())
+        })
+    })
+}
+
+fn parse_rfc3339_like_secs(value: &str) -> Option<u64> {
+    let value = value.trim();
+    let datetime_sep = value.find('T').or_else(|| value.find(' '))?;
+    let (datetime, offset_secs) = if let Some(datetime) = value.strip_suffix('Z') {
+        (datetime, 0_i64)
+    } else {
+        let offset_pos = value[datetime_sep + 1..]
+            .rfind(['+', '-'])
+            .map(|pos| datetime_sep + 1 + pos)?;
+        let (datetime, offset) = value.split_at(offset_pos);
+        (datetime, parse_rfc3339_offset_secs(offset)?)
+    };
+
+    let (date, time) = datetime.split_at(datetime_sep);
+    let time = time.get(1..)?;
+    let mut date_parts = date.split('-');
+    let year = date_parts.next()?.parse::<i32>().ok()?;
+    let month = date_parts.next()?.parse::<u32>().ok()?;
+    let day = date_parts.next()?.parse::<u32>().ok()?;
+    if date_parts.next().is_some() {
+        return None;
+    }
+
+    let mut time_parts = time.split(':');
+    let hour = time_parts.next()?.parse::<u32>().ok()?;
+    let minute = time_parts.next()?.parse::<u32>().ok()?;
+    let second_raw = time_parts.next().unwrap_or("0");
+    if time_parts.next().is_some() {
+        return None;
+    }
+    let second = second_raw
+        .split('.')
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())?;
+    if !(1..=12).contains(&month) || day == 0 || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+
+    let local_secs = days_from_civil(year, month, day)
+        .checked_mul(86_400)?
+        .checked_add(i64::from(hour) * 3_600 + i64::from(minute) * 60 + i64::from(second))?;
+    local_secs
+        .checked_sub(offset_secs)
+        .and_then(|utc_secs| u64::try_from(utc_secs).ok())
+}
+
+fn parse_rfc3339_offset_secs(offset: &str) -> Option<i64> {
+    let sign = match offset.as_bytes().first().copied()? {
+        b'+' => 1_i64,
+        b'-' => -1_i64,
+        _ => return None,
+    };
+    let raw = offset.get(1..)?;
+    let (hours, minutes) = raw
+        .split_once(':')
+        .map(|(hours, minutes)| (hours, minutes))
+        .unwrap_or_else(|| raw.split_at(raw.len().min(2)));
+    let hours = hours.parse::<i64>().ok()?;
+    let minutes = minutes.parse::<i64>().ok()?;
+    if hours > 23 || minutes > 59 {
+        return None;
+    }
+    Some(sign * (hours * 3_600 + minutes * 60))
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let year = i64::from(year) - if month <= 2 { 1 } else { 0 };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let month = i64::from(month);
+    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + i64::from(day) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 fn first_u64_from_paths(value: &serde_json::Value, default_paths: &[&str]) -> Option<u64> {
@@ -1532,34 +1671,72 @@ fn populate_sub2api_usage_fields(
     snapshot: &mut ProviderBalanceSnapshot,
     value: &serde_json::Value,
 ) {
-    snapshot.plan_name = first_string_from_paths(value, &["planName", "data.planName"]);
+    snapshot.plan_name = first_string_from_paths(
+        value,
+        &["planName", "plan_name", "data.planName", "data.plan_name"],
+    );
+    let remaining_balance = sub2api_remaining_balance(value);
+    snapshot.total_balance_usd = snapshot
+        .total_balance_usd
+        .take()
+        .or_else(|| remaining_balance.map(amount_to_string));
     snapshot.total_used_usd = first_amount_from_paths(
         value,
         &[],
-        &["usage.total.cost", "data.usage.total.cost"],
+        &[
+            "usage.total.total_cost_usd",
+            "usage.total.total_cost",
+            "usage.total.cost",
+            "data.usage.total.total_cost_usd",
+            "data.usage.total.total_cost",
+            "data.usage.total.cost",
+        ],
         None,
     )
     .map(amount_to_string);
     snapshot.today_used_usd = first_amount_from_paths(
         value,
         &[],
-        &["usage.today.cost", "data.usage.today.cost"],
+        &[
+            "usage.today.total_cost_usd",
+            "usage.today.total_cost",
+            "usage.today.cost",
+            "data.usage.today.total_cost_usd",
+            "data.usage.today.total_cost",
+            "data.usage.today.cost",
+        ],
         None,
     )
     .map(amount_to_string);
     snapshot.total_requests = first_u64_from_paths(
         value,
-        &["usage.total.requests", "data.usage.total.requests"],
+        &[
+            "usage.total.request_count",
+            "usage.total.requests",
+            "usage.total.count",
+            "data.usage.total.request_count",
+            "data.usage.total.requests",
+            "data.usage.total.count",
+        ],
     );
     snapshot.today_requests = first_u64_from_paths(
         value,
-        &["usage.today.requests", "data.usage.today.requests"],
+        &[
+            "usage.today.request_count",
+            "usage.today.requests",
+            "usage.today.count",
+            "data.usage.today.request_count",
+            "data.usage.today.requests",
+            "data.usage.today.count",
+        ],
     );
     snapshot.total_tokens = first_u64_from_paths(
         value,
         &[
             "usage.total.total_tokens",
             "usage.total.tokens",
+            "usage.total.input_tokens",
+            "usage.total.prompt_tokens",
             "data.usage.total.total_tokens",
             "data.usage.total.tokens",
         ],
@@ -1569,10 +1746,271 @@ fn populate_sub2api_usage_fields(
         &[
             "usage.today.total_tokens",
             "usage.today.tokens",
+            "usage.today.input_tokens",
+            "usage.today.prompt_tokens",
             "data.usage.today.total_tokens",
             "data.usage.today.tokens",
         ],
     );
+    snapshot.usage_rate = sub2api_usage_rate(value);
+    snapshot.usage_windows = sub2api_usage_windows(value);
+    snapshot.usage_model_stats = sub2api_model_stats(value);
+    snapshot.subscription_expires_at = first_string_from_paths(
+        value,
+        &[
+            "subscription.expires_at",
+            "data.subscription.expires_at",
+            "subscription.expiresAt",
+            "data.subscription.expiresAt",
+        ],
+    );
+    snapshot.usage_alerts = sub2api_usage_alerts(value);
+}
+
+fn sub2api_remaining_balance(value: &serde_json::Value) -> Option<UsdAmount> {
+    let remaining = first_amount_from_paths(value, &[], &["remaining", "data.remaining"], None)?;
+    if sub2api_has_subscription_windows(value)
+        && sub2api_window_remaining_amounts(value)
+            .iter()
+            .any(|window_remaining| *window_remaining == remaining)
+    {
+        return None;
+    }
+    Some(remaining)
+}
+
+fn sub2api_has_subscription_windows(value: &serde_json::Value) -> bool {
+    has_any_json_path(
+        value,
+        &[
+            "subscription.daily_usage_usd",
+            "subscription.daily_limit_usd",
+            "subscription.weekly_usage_usd",
+            "subscription.weekly_limit_usd",
+            "subscription.monthly_usage_usd",
+            "subscription.monthly_limit_usd",
+            "data.subscription.daily_usage_usd",
+            "data.subscription.daily_limit_usd",
+            "data.subscription.weekly_usage_usd",
+            "data.subscription.weekly_limit_usd",
+            "data.subscription.monthly_usage_usd",
+            "data.subscription.monthly_limit_usd",
+        ],
+    )
+}
+
+fn sub2api_window_remaining_amounts(value: &serde_json::Value) -> Vec<UsdAmount> {
+    ["daily", "weekly", "monthly"]
+        .into_iter()
+        .filter_map(|period| {
+            let used = first_amount_from_paths(
+                value,
+                &[],
+                &[
+                    &format!("subscription.{period}_usage_usd"),
+                    &format!("data.subscription.{period}_usage_usd"),
+                ],
+                None,
+            );
+            let limit = first_amount_from_paths(
+                value,
+                &[],
+                &[
+                    &format!("subscription.{period}_limit_usd"),
+                    &format!("data.subscription.{period}_limit_usd"),
+                ],
+                None,
+            );
+            match (limit, used) {
+                (Some(limit), Some(used)) if !limit.is_zero() => Some(limit.saturating_sub(used)),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+fn sub2api_usage_rate(value: &serde_json::Value) -> Option<ProviderUsageRateSnapshot> {
+    let rate = ProviderUsageRateSnapshot {
+        average_duration_ms: first_decimal_string_from_paths(
+            value,
+            &[
+                "usage.average_duration_ms",
+                "data.usage.average_duration_ms",
+                "average_duration_ms",
+                "data.average_duration_ms",
+            ],
+        ),
+        rpm: first_decimal_string_from_paths(value, &["usage.rpm", "data.usage.rpm", "rpm"]),
+        tpm: first_decimal_string_from_paths(value, &["usage.tpm", "data.usage.tpm", "tpm"]),
+    };
+    (!rate.is_empty()).then_some(rate)
+}
+
+fn sub2api_usage_windows(value: &serde_json::Value) -> Vec<ProviderUsageWindow> {
+    ["daily", "weekly", "monthly"]
+        .into_iter()
+        .filter_map(|period| {
+            let used = first_amount_from_paths(
+                value,
+                &[],
+                &[
+                    &format!("subscription.{period}_usage_usd"),
+                    &format!("data.subscription.{period}_usage_usd"),
+                ],
+                None,
+            );
+            let limit = first_amount_from_paths(
+                value,
+                &[],
+                &[
+                    &format!("subscription.{period}_limit_usd"),
+                    &format!("data.subscription.{period}_limit_usd"),
+                ],
+                None,
+            );
+            if used.is_none() && limit.is_none() {
+                return None;
+            }
+            let unlimited = limit.map(|limit| limit.is_zero());
+            let remaining = match (limit, used) {
+                (Some(limit), Some(used)) if !limit.is_zero() => Some(limit.saturating_sub(used)),
+                _ => None,
+            };
+            Some(ProviderUsageWindow {
+                period: period.to_string(),
+                used_usd: used.map(amount_to_string),
+                limit_usd: limit.map(amount_to_string),
+                remaining_usd: remaining.map(amount_to_string),
+                unlimited,
+            })
+        })
+        .collect()
+}
+
+fn sub2api_model_stats(value: &serde_json::Value) -> Vec<ProviderUsageModelStat> {
+    [
+        "model_stats",
+        "data.model_stats",
+        "modelStats",
+        "data.modelStats",
+    ]
+    .into_iter()
+    .find_map(|path| array_from_json_path(value, path))
+    .map(|items| {
+        items
+            .iter()
+            .filter_map(sub2api_model_stat_from_json)
+            .collect::<Vec<_>>()
+    })
+    .unwrap_or_default()
+}
+
+fn sub2api_model_stat_from_json(value: &serde_json::Value) -> Option<ProviderUsageModelStat> {
+    let model = first_string_from_paths(value, &["model", "model_name", "name"])?;
+    let input_cost = first_amount_from_paths(value, &[], &["input_cost_usd", "input_cost"], None);
+    let output_cost =
+        first_amount_from_paths(value, &[], &["output_cost_usd", "output_cost"], None);
+    let total_cost =
+        first_amount_from_paths(value, &[], &["total_cost_usd", "total_cost", "cost"], None)
+            .or_else(|| match (input_cost, output_cost) {
+                (Some(input), Some(output)) => Some(input.saturating_add(output)),
+                _ => None,
+            });
+    let input_tokens = first_u64_from_paths(value, &["input_tokens", "prompt_tokens"]);
+    let output_tokens = first_u64_from_paths(value, &["output_tokens", "completion_tokens"]);
+    let total_tokens =
+        first_u64_from_paths(value, &["total_tokens", "tokens"]).or_else(|| {
+            match (input_tokens, output_tokens) {
+                (Some(input), Some(output)) => input.checked_add(output),
+                _ => None,
+            }
+        });
+    Some(ProviderUsageModelStat {
+        model,
+        request_count: first_u64_from_paths(value, &["request_count", "requests", "count"]),
+        input_tokens,
+        output_tokens,
+        total_tokens,
+        input_cost_usd: input_cost.map(amount_to_string),
+        output_cost_usd: output_cost.map(amount_to_string),
+        total_cost_usd: total_cost.map(amount_to_string),
+    })
+}
+
+fn sub2api_usage_alerts(value: &serde_json::Value) -> Vec<ProviderUsageAlert> {
+    let mut alerts = Vec::new();
+    if let (Some(used), Some(limit)) = (
+        first_amount_from_paths(
+            value,
+            &[],
+            &[
+                "subscription.daily_usage_usd",
+                "data.subscription.daily_usage_usd",
+            ],
+            None,
+        ),
+        first_amount_from_paths(
+            value,
+            &[],
+            &[
+                "subscription.daily_limit_usd",
+                "data.subscription.daily_limit_usd",
+            ],
+            None,
+        ),
+    ) && !limit.is_zero()
+    {
+        let used_femto = used.femto_usd();
+        let limit_femto = limit.femto_usd();
+        if used_femto.saturating_mul(100) >= limit_femto.saturating_mul(95) {
+            alerts.push(ProviderUsageAlert {
+                kind: ProviderUsageAlertKind::DailyUsage95,
+                message: "daily usage is at or above 95%".to_string(),
+            });
+        } else if used_femto.saturating_mul(100) >= limit_femto.saturating_mul(80) {
+            alerts.push(ProviderUsageAlert {
+                kind: ProviderUsageAlertKind::DailyUsage80,
+                message: "daily usage is at or above 80%".to_string(),
+            });
+        }
+    }
+
+    if let Some(remaining) = sub2api_remaining_balance(value)
+        && let Some(threshold) = UsdAmount::from_decimal_str(LOW_BALANCE_ALERT_THRESHOLD_USD)
+        && remaining <= threshold
+    {
+        alerts.push(ProviderUsageAlert {
+            kind: ProviderUsageAlertKind::LowBalance,
+            message: "remaining balance is low".to_string(),
+        });
+    }
+
+    if let Some(expires_at_secs) = first_secs_from_paths(
+        value,
+        &[
+            "subscription.expires_at",
+            "data.subscription.expires_at",
+            "subscription.expiresAt",
+            "data.subscription.expiresAt",
+        ],
+    ) {
+        let now = unix_now_secs();
+        if expires_at_secs <= now {
+            alerts.push(ProviderUsageAlert {
+                kind: ProviderUsageAlertKind::SubscriptionExpired,
+                message: "subscription has expired".to_string(),
+            });
+        } else if expires_at_secs <= now.saturating_add(EXPIRING_SOON_WINDOW_SECS) {
+            alerts.push(ProviderUsageAlert {
+                kind: ProviderUsageAlertKind::SubscriptionExpiringSoon,
+                message: "subscription expires within 7 days".to_string(),
+            });
+        }
+    }
+
+    alerts.sort_by_key(|alert| alert.kind);
+    alerts.dedup_by_key(|alert| alert.kind);
+    alerts
 }
 
 fn sub2api_subscription_limit_snapshot(
@@ -3706,6 +4144,98 @@ mod tests {
         assert_eq!(snapshot.today_requests, Some(0));
         assert_eq!(snapshot.total_tokens, Some(384084697));
         assert_eq!(snapshot.today_tokens, Some(0));
+    }
+
+    #[test]
+    fn sub2api_usage_snapshot_reads_rates_model_stats_windows_and_alerts() {
+        let snapshot = sub2api_usage_snapshot_from_json(
+            &provider("sub2api", ProviderKind::Sub2ApiUsage),
+            &upstream(),
+            &serde_json::json!({
+                "isValid": true,
+                "mode": "unrestricted",
+                "plan_name": "CodeX Pro",
+                "remaining": 9,
+                "subscription": {
+                    "daily_usage_usd": 95,
+                    "daily_limit_usd": 100,
+                    "weekly_usage_usd": "120.5",
+                    "weekly_limit_usd": 0,
+                    "monthly_usage_usd": 300.25,
+                    "monthly_limit_usd": 1000,
+                    "expires_at": "2026-05-09T12:00:00.000Z"
+                },
+                "usage": {
+                    "today": {
+                        "request_count": "7",
+                        "input_tokens": 100,
+                        "output_tokens": 25,
+                        "total_cost_usd": "1.5"
+                    },
+                    "total": {
+                        "requests": 42,
+                        "tokens": 1234,
+                        "cost": 9.25
+                    },
+                    "average_duration_ms": "842.7",
+                    "rpm": "0.7",
+                    "tpm": 85.3
+                },
+                "model_stats": [
+                    {
+                        "model": "gpt-4o-mini",
+                        "request_count": "7",
+                        "prompt_tokens": 100,
+                        "completion_tokens": 25,
+                        "input_cost": "0.12",
+                        "output_cost": "0.34"
+                    }
+                ]
+            }),
+            100,
+            Some(1_000),
+        );
+
+        assert_eq!(snapshot.status, BalanceSnapshotStatus::Ok);
+        assert_eq!(snapshot.plan_name.as_deref(), Some("CodeX Pro"));
+        assert_eq!(snapshot.total_balance_usd.as_deref(), Some("9"));
+        assert_eq!(snapshot.today_requests, Some(7));
+        assert_eq!(snapshot.today_tokens, Some(100));
+        assert_eq!(snapshot.today_used_usd.as_deref(), Some("1.5"));
+        assert_eq!(snapshot.total_requests, Some(42));
+        assert_eq!(snapshot.total_tokens, Some(1234));
+        assert_eq!(snapshot.total_used_usd.as_deref(), Some("9.25"));
+        let rate = snapshot.usage_rate.expect("rate");
+        assert_eq!(rate.average_duration_ms.as_deref(), Some("842.7"));
+        assert_eq!(rate.rpm.as_deref(), Some("0.7"));
+        assert_eq!(rate.tpm.as_deref(), Some("85.3"));
+        assert_eq!(snapshot.usage_windows.len(), 3);
+        assert_eq!(snapshot.usage_windows[0].period, "daily");
+        assert_eq!(
+            snapshot.usage_windows[0].remaining_usd.as_deref(),
+            Some("5")
+        );
+        assert_eq!(snapshot.usage_windows[1].unlimited, Some(true));
+        assert_eq!(snapshot.usage_model_stats.len(), 1);
+        assert_eq!(snapshot.usage_model_stats[0].model, "gpt-4o-mini");
+        assert_eq!(snapshot.usage_model_stats[0].request_count, Some(7));
+        assert_eq!(snapshot.usage_model_stats[0].total_tokens, Some(125));
+        assert_eq!(
+            snapshot.usage_model_stats[0].total_cost_usd.as_deref(),
+            Some("0.46")
+        );
+        assert_eq!(
+            snapshot
+                .usage_alerts
+                .iter()
+                .map(|alert| alert.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                ProviderUsageAlertKind::DailyUsage95,
+                ProviderUsageAlertKind::LowBalance,
+                ProviderUsageAlertKind::SubscriptionExpired,
+            ]
+        );
     }
 
     #[test]

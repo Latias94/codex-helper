@@ -509,6 +509,38 @@ version = 5
 # reset_time = "00:00"
 # reset_utc_offset = "+08:00"
 
+# --- TUI 服务状态探针（可选，默认关闭） ---
+#
+# TUI 的 5 状态页可以对指定 provider 发起轻量模型请求，验证真实上游链路。
+# 注意：provider 探针会产生极少 token 消耗；只有 enabled=true 且显式配置 probes 时才会运行。
+#
+# [ui.service_status]
+# enabled = true
+# refresh_interval_secs = 300
+# timeout_ms = 3000
+# high_latency_ms = 3000
+# history_cells = 60
+#
+# [[ui.service_status.probes]]
+# id = "primary-relay"
+# provider = "openai"        # 对应 [codex.providers.openai] 或 [claude.providers.openai]
+# endpoint = "default"       # 可省略；多 endpoint provider 可指定
+# models = ["gpt-5.5"]       # 必填更稳妥；请求使用 max_tokens=1, stream=false
+# # timeout_ms = 3000
+# # high_latency_ms = 2500
+#
+# 兼容模式：也可以读取 UsageMonitor 风格只读 status JSON（不会消耗 token）。
+# { "all_ok": true, "generated_at": 1778762578, "services": [
+#   { "model": "gpt-5.5", "uptime_pct": "99.5", "last": { "ok": true, "latency_ms": 1200 },
+#     "history": [{ "ts": 1778762500, "ok": true, "latency_ms": 1200 }] }
+# ] }
+#
+# [[ui.service_status.probes]]
+# id = "relay-status-json"
+# url = "https://relay.example.com/api/status"
+# models = ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"]
+# # headers = { "x-status-token" = "use-an-env-rendered-static-token-only-if-needed" }
+
 # --- 自动导入（可选） ---
 #
 # 如果你的机器上已配置 Codex CLI（存在 `~/.codex/config.toml`），`codex-helper config init`

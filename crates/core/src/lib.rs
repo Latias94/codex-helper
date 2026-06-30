@@ -29,6 +29,7 @@ pub mod runtime_candidate_state;
 pub mod runtime_host;
 pub mod runtime_identity;
 pub mod runtime_manager;
+pub mod service_status;
 pub mod sessions;
 pub mod state;
 pub mod usage;

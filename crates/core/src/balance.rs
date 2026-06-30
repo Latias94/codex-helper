@@ -82,7 +82,93 @@ pub struct ProviderBalanceSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub today_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_expires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub usage_windows: Vec<ProviderUsageWindow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_rate: Option<ProviderUsageRateSnapshot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub usage_model_stats: Vec<ProviderUsageModelStat>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub usage_alerts: Vec<ProviderUsageAlert>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ProviderUsageRateSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub average_duration_ms: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpm: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tpm: Option<String>,
+}
+
+impl ProviderUsageRateSnapshot {
+    pub fn is_empty(&self) -> bool {
+        self.average_duration_ms.is_none() && self.rpm.is_none() && self.tpm.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ProviderUsageWindow {
+    pub period: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_usd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_usd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_usd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unlimited: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ProviderUsageModelStat {
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_cost_usd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_cost_usd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_cost_usd: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderUsageAlertKind {
+    DailyUsage80,
+    DailyUsage95,
+    LowBalance,
+    SubscriptionExpiringSoon,
+    SubscriptionExpired,
+}
+
+impl ProviderUsageAlertKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProviderUsageAlertKind::DailyUsage80 => "daily_usage_80",
+            ProviderUsageAlertKind::DailyUsage95 => "daily_usage_95",
+            ProviderUsageAlertKind::LowBalance => "low_balance",
+            ProviderUsageAlertKind::SubscriptionExpiringSoon => "subscription_expiring_soon",
+            ProviderUsageAlertKind::SubscriptionExpired => "subscription_expired",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderUsageAlert {
+    pub kind: ProviderUsageAlertKind,
+    pub message: String,
 }
 
 impl Default for ProviderBalanceSnapshot {
@@ -115,6 +201,11 @@ impl Default for ProviderBalanceSnapshot {
             today_requests: None,
             total_tokens: None,
             today_tokens: None,
+            subscription_expires_at: None,
+            usage_windows: Vec::new(),
+            usage_rate: None,
+            usage_model_stats: Vec::new(),
+            usage_alerts: Vec::new(),
             error: None,
         }
     }
@@ -222,6 +313,11 @@ impl ProviderBalanceSnapshot {
         self.today_requests = previous.today_requests;
         self.total_tokens = previous.total_tokens;
         self.today_tokens = previous.today_tokens;
+        self.subscription_expires_at = previous.subscription_expires_at.clone();
+        self.usage_windows = previous.usage_windows.clone();
+        self.usage_rate = previous.usage_rate.clone();
+        self.usage_model_stats = previous.usage_model_stats.clone();
+        self.usage_alerts = previous.usage_alerts.clone();
     }
 
     pub fn amount_summary(&self) -> String {
@@ -273,6 +369,15 @@ impl ProviderBalanceSnapshot {
         }
         if let Some(tokens) = self.total_tokens {
             parts.push(format!("tok={tokens}"));
+        }
+        if !self.usage_alerts.is_empty() {
+            let alerts = self
+                .usage_alerts
+                .iter()
+                .map(|alert| alert.kind.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            parts.push(format!("alerts={alerts}"));
         }
         if parts.is_empty() {
             "-".to_string()
@@ -495,5 +600,18 @@ mod tests {
         assert_eq!(snapshot.status, BalanceSnapshotStatus::Exhausted);
         assert!(!snapshot.routing_exhausted());
         assert!(snapshot.routing_ignored_exhaustion());
+    }
+
+    #[test]
+    fn provider_balance_amount_summary_includes_usage_alerts() {
+        let snapshot = ProviderBalanceSnapshot {
+            usage_alerts: vec![ProviderUsageAlert {
+                kind: ProviderUsageAlertKind::LowBalance,
+                message: "remaining balance is low".to_string(),
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(snapshot.amount_summary(), "alerts=low_balance");
     }
 }

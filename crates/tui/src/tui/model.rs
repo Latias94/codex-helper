@@ -456,6 +456,7 @@ pub(in crate::tui) struct Snapshot {
     pub(in crate::tui) lb_view: HashMap<String, LbConfigView>,
     pub(in crate::tui) stats_5m: WindowStats,
     pub(in crate::tui) stats_1h: WindowStats,
+    pub(in crate::tui) service_status: Option<crate::service_status::ServiceStatusSnapshot>,
     pub(in crate::tui) pricing_catalog: ModelPriceCatalogSnapshot,
     pub(in crate::tui) refreshed_at: Instant,
 }
@@ -1921,6 +1922,8 @@ pub(in crate::tui) async fn refresh_snapshot(
             service_name,
             crate::state::recent_finished_max(),
             stats_days,
+            Some(&cfg.ui.service_status),
+            Some(cfg.as_ref()),
         ),
         state.get_station_meta_overrides(service_name),
     );
@@ -1977,6 +1980,7 @@ pub(in crate::tui) async fn refresh_snapshot(
         lb_view: snap.lb_view,
         stats_5m: snap.stats_5m,
         stats_1h: snap.stats_1h,
+        service_status: snap.service_status,
         pricing_catalog: crate::pricing::operator_model_price_catalog_snapshot(),
         refreshed_at: Instant::now(),
     }
@@ -2034,6 +2038,7 @@ pub(in crate::tui) async fn snapshot_from_api_v1(
         lb_view: snap.lb_view,
         stats_5m: snap.stats_5m,
         stats_1h: snap.stats_1h,
+        service_status: snap.service_status,
         pricing_catalog: crate::pricing::operator_model_price_catalog_snapshot(),
         refreshed_at: Instant::now(),
     }
@@ -2737,6 +2742,7 @@ mod tests {
             lb_view: HashMap::new(),
             stats_5m: WindowStats::default(),
             stats_1h: WindowStats::default(),
+            service_status: None,
             pricing_catalog: crate::pricing::bundled_model_price_catalog_snapshot(),
             refreshed_at: Instant::now(),
         };
@@ -2812,6 +2818,7 @@ mod tests {
             lb_view: HashMap::new(),
             stats_5m: WindowStats::default(),
             stats_1h: WindowStats::default(),
+            service_status: None,
             pricing_catalog: crate::pricing::bundled_model_price_catalog_snapshot(),
             refreshed_at: Instant::now(),
         };
@@ -2849,6 +2856,7 @@ mod tests {
             lb_view: HashMap::new(),
             stats_5m: WindowStats::default(),
             stats_1h: WindowStats::default(),
+            service_status: None,
             pricing_catalog: crate::pricing::bundled_model_price_catalog_snapshot(),
             refreshed_at: Instant::now(),
         };
@@ -2929,6 +2937,7 @@ mod tests {
             lb_view: HashMap::new(),
             stats_5m: WindowStats::default(),
             stats_1h: WindowStats::default(),
+            service_status: None,
             pricing_catalog: crate::pricing::bundled_model_price_catalog_snapshot(),
             refreshed_at: Instant::now(),
         };

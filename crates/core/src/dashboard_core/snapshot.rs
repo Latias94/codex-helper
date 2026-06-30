@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::dashboard_core::WindowStats;
 use crate::dashboard_core::types::{ControlProfileOption, StationOption};
 use crate::dashboard_core::window_stats::compute_window_stats;
+use crate::service_status::ServiceStatusSnapshot;
 use crate::state::{
     ActiveRequest, FinishedRequest, HealthCheckStatus, LbConfigView, ProviderBalanceSnapshot,
     ProxyState, SessionIdentityCard, SessionIdentityCardBuildInputs, SessionStats, StationHealth,
@@ -44,6 +45,8 @@ pub struct DashboardSnapshot {
     pub usage_rollup: UsageRollupView,
     pub stats_5m: WindowStats,
     pub stats_1h: WindowStats,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_status: Option<ServiceStatusSnapshot>,
 }
 
 impl DashboardSnapshot {
@@ -90,6 +93,8 @@ pub async fn build_dashboard_snapshot(
     service_name: &str,
     recent_limit: usize,
     stats_days: usize,
+    service_status_config: Option<&crate::config::ServiceStatusConfig>,
+    runtime_config: Option<&crate::config::ProxyConfig>,
 ) -> DashboardSnapshot {
     let now = now_ms();
     let recent_limit = clamp_recent_limit(recent_limit);
@@ -157,6 +162,17 @@ pub async fn build_dashboard_snapshot(
     if recent_all.len() > recent_limit {
         recent_all.truncate(recent_limit);
     }
+    let service_status = match service_status_config {
+        Some(config) => Some(
+            crate::service_status::refresh_service_status_snapshot(
+                config,
+                runtime_config,
+                service_name,
+            )
+            .await,
+        ),
+        None => None,
+    };
 
     DashboardSnapshot {
         refreshed_at_ms: now,
@@ -179,6 +195,7 @@ pub async fn build_dashboard_snapshot(
         usage_rollup,
         stats_5m,
         stats_1h,
+        service_status,
     }
 }
 

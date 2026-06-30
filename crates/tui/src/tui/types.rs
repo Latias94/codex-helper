@@ -20,6 +20,7 @@ pub(in crate::tui) enum Page {
     Stations,
     Sessions,
     Requests,
+    ServiceStatus,
     Stats,
     Settings,
     History,
@@ -117,7 +118,7 @@ impl ServiceTierChoice {
 pub(in crate::tui) fn page_titles(
     lang: Language,
     uses_route_graph_routing: bool,
-) -> [&'static str; 9] {
+) -> [&'static str; 10] {
     [
         i18n::text(lang, msg::PAGE_DASHBOARD),
         if uses_route_graph_routing {
@@ -127,6 +128,7 @@ pub(in crate::tui) fn page_titles(
         },
         i18n::text(lang, msg::PAGE_SESSIONS),
         i18n::text(lang, msg::PAGE_REQUESTS),
+        i18n::text(lang, msg::PAGE_SERVICE_STATUS),
         i18n::text(lang, msg::PAGE_STATS),
         i18n::text(lang, msg::PAGE_SETTINGS),
         i18n::text(lang, msg::PAGE_HISTORY),
@@ -141,10 +143,11 @@ pub(in crate::tui) fn page_index(page: Page) -> usize {
         Page::Stations => 1,
         Page::Sessions => 2,
         Page::Requests => 3,
-        Page::Stats => 4,
-        Page::Settings => 5,
-        Page::History => 6,
-        Page::Recent => 7,
-        Page::Fleet => 8,
+        Page::ServiceStatus => 4,
+        Page::Stats => 5,
+        Page::Settings => 6,
+        Page::History => 7,
+        Page::Recent => 8,
+        Page::Fleet => 9,
     }
 }

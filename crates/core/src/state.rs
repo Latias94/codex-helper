@@ -4413,6 +4413,7 @@ mod tests {
                         total_tokens: None,
                         today_tokens: None,
                         error: None,
+                        ..ProviderBalanceSnapshot::default()
                     },
                 )
                 .await;
@@ -4523,6 +4524,7 @@ mod tests {
                             } else {
                                 None
                             },
+                            ..ProviderBalanceSnapshot::default()
                         },
                     )
                     .await;
@@ -4796,6 +4798,7 @@ mod tests {
                         total_tokens: None,
                         today_tokens: None,
                         error: None,
+                        ..ProviderBalanceSnapshot::default()
                     },
                 )
                 .await;

@@ -15,6 +15,8 @@ pub(in crate::proxy) async fn api_fleet_snapshot(
         proxy.service_name,
         crate::state::recent_finished_max(),
         7,
+        None,
+        None,
     )
     .await;
     crate::state::enrich_session_identity_cards_with_runtime(&mut dashboard.session_cards, mgr);

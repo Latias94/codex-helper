@@ -58,6 +58,7 @@ fn empty_snapshot(
         lb_view: HashMap::new(),
         stats_5m: crate::dashboard_core::WindowStats::default(),
         stats_1h: crate::dashboard_core::WindowStats::default(),
+        service_status: None,
         pricing_catalog: crate::pricing::bundled_model_price_catalog_snapshot(),
         refreshed_at: Instant::now(),
     }
@@ -476,6 +477,7 @@ fn routing_provider_balance_brief_preserves_subscription_amount_in_narrow_table(
         lb_view: HashMap::new(),
         stats_5m: crate::dashboard_core::WindowStats::default(),
         stats_1h: crate::dashboard_core::WindowStats::default(),
+        service_status: None,
         pricing_catalog: crate::pricing::bundled_model_price_catalog_snapshot(),
         refreshed_at: std::time::Instant::now(),
     };
@@ -526,6 +528,7 @@ fn routing_provider_balance_brief_fits_lazy_quota_in_zh_table_cell() {
         lb_view: HashMap::new(),
         stats_5m: crate::dashboard_core::WindowStats::default(),
         stats_1h: crate::dashboard_core::WindowStats::default(),
+        service_status: None,
         pricing_catalog: crate::pricing::bundled_model_price_catalog_snapshot(),
         refreshed_at: std::time::Instant::now(),
     };

@@ -27,6 +27,7 @@ fn help_current_page_title(lang: Language, page: Page, is_route_graph: bool) -> 
         (Language::Zh, Page::History, _) => "当前页面：历史",
         (Language::Zh, Page::Recent, _) => "当前页面：最近",
         (Language::Zh, Page::Fleet, _) => "当前页面：Fleet",
+        (Language::Zh, Page::ServiceStatus, _) => "当前页面：服务状态",
         (Language::En, Page::Dashboard, _) => "Current page: Dashboard",
         (Language::En, Page::Stations, true) => "Current page: Routing",
         (Language::En, Page::Stations, false) => "Current page: Stations",
@@ -37,6 +38,7 @@ fn help_current_page_title(lang: Language, page: Page, is_route_graph: bool) -> 
         (Language::En, Page::History, _) => "Current page: History",
         (Language::En, Page::Recent, _) => "Current page: Recent",
         (Language::En, Page::Fleet, _) => "Current page: Fleet",
+        (Language::En, Page::ServiceStatus, _) => "Current page: Service Status",
     }
 }
 
@@ -128,6 +130,11 @@ pub(super) fn current_page_help_lines(
             "  r          立即刷新 Fleet 快照",
             "  t          切换 Tree / Flat 展示",
         ],
+        (Language::Zh, Page::ServiceStatus, _, _) => vec![
+            "  r          刷新服务状态快照",
+            "  5          返回本页",
+            "  表格       展示每个探针、模型、最新状态、延迟和历史格子",
+        ],
         (Language::En, Page::Dashboard, true, _) => vec![
             "  Tab        switch Sessions / Requests focus",
             "  b/M/f      session profile, model, fast/service tier overrides",
@@ -203,6 +210,11 @@ pub(super) fn current_page_help_lines(
             "  r          refresh the Fleet snapshot now",
             "  t          toggle Tree / Flat layout",
         ],
+        (Language::En, Page::ServiceStatus, _, _) => vec![
+            "  r          refresh the service status snapshot",
+            "  5          return to this page",
+            "  table      shows each probe, model, latest state, latency, and history cells",
+        ],
     };
 
     lines.extend(entries.into_iter().map(Line::from));
@@ -263,12 +275,12 @@ pub(in crate::tui::view) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui:
                 Style::default().fg(p.text).add_modifier(Modifier::BOLD),
             )]),
             Line::from("  ↑/↓, j/k   移动选中项"),
-            Line::from("  1-9        切换页面"),
+            Line::from("  1-9/0      切换页面"),
             Line::from(
-                "            1 总览  2 站点/路由  3 会话  4 请求  5 用量  6 设置  7 历史  8 最近  9 Fleet",
+                "            1 总览  2 站点/路由  3 会话  4 请求  5 状态  6 用量  7 设置  8 历史  9 最近  0 Fleet",
             ),
             Line::from("  L          切换语言（中/英，自动落盘）"),
-            Line::from("  6 设置     查看运行态与关键配置入口"),
+            Line::from("  7 设置     查看运行态与关键配置入口"),
             Line::from(
                 "  设置页      p 管理配置默认 profile；P 管理运行时默认 profile；R 重载配置；O 覆盖导入 ~/.codex（仅 codex）",
             ),
@@ -408,6 +420,13 @@ pub(in crate::tui::view) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui:
             Line::from("  t          切换 Tree / Flat 展示"),
             Line::from(""),
             Line::from(vec![Span::styled(
+                "服务状态页",
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+            )]),
+            Line::from("  r          刷新服务状态快照"),
+            Line::from("  配置入口    [ui.service_status]"),
+            Line::from(""),
+            Line::from(vec![Span::styled(
                 "用量页（Usage / Balance）",
                 Style::default().fg(p.text).add_modifier(Modifier::BOLD),
             )]),
@@ -437,12 +456,12 @@ pub(in crate::tui::view) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui:
             )]),
             Line::from("  Tab        switch focus (Dashboard)"),
             Line::from("  ↑/↓, j/k   move selection"),
-            Line::from("  1-9        switch page"),
+            Line::from("  1-9/0      switch page"),
             Line::from(
-                "            1 Dashboard  2 Stations/Routing  3 Sessions  4 Requests  5 Usage  6 Settings  7 History  8 Recent  9 Fleet",
+                "            1 Dashboard  2 Stations/Routing  3 Sessions  4 Requests  5 Status  6 Usage  7 Settings  8 History  9 Recent  0 Fleet",
             ),
             Line::from("  L          toggle language (zh/en, persisted)"),
-            Line::from("  6 Settings show runtime + station overview"),
+            Line::from("  7 Settings show runtime + station overview"),
             Line::from(
                 "  Settings   p manage configured default profile; P manage runtime default profile; R reload settings; O overwrite-import ~/.codex (codex only)",
             ),
@@ -581,6 +600,13 @@ pub(in crate::tui::view) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui:
             Line::from("  r          refresh Fleet snapshot"),
             Line::from("  Tab        switch nodes / work units focus"),
             Line::from("  t          toggle Tree / Flat layout"),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "Service Status page",
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+            )]),
+            Line::from("  r          refresh service status snapshot"),
+            Line::from("  config     [ui.service_status]"),
             Line::from(""),
             Line::from(vec![Span::styled(
                 "Usage / Balance page",

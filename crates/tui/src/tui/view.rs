@@ -187,6 +187,7 @@ mod tests {
             lb_view: HashMap::new(),
             stats_5m: crate::dashboard_core::WindowStats::default(),
             stats_1h: crate::dashboard_core::WindowStats::default(),
+            service_status: None,
             pricing_catalog: crate::pricing::bundled_model_price_catalog_snapshot(),
             refreshed_at: Instant::now(),
         }
@@ -559,7 +560,7 @@ mod tests {
 
         let text = render_app_text(120, 30, &mut ui, &snapshot);
 
-        assert!(text.contains("9 Fleet"), "{text}");
+        assert!(text.contains("0 Fleet"), "{text}");
         assert!(text.contains("local workstation"), "{text}");
         assert!(text.contains("runtime/high"), "{text}");
         assert!(text.contains("session_log/med"), "{text}");

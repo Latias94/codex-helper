@@ -429,6 +429,7 @@ mod tests {
                 total_tokens: None,
                 today_tokens: None,
                 error: None,
+                ..ProviderBalanceSnapshot::default()
             })
             .collect::<Vec<_>>();
         StationRoutingBalanceSummary::from_snapshots(Some(&snapshots))

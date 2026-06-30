@@ -62,16 +62,18 @@ pub(super) fn apply_page_shortcuts(ui: &mut UiState, code: KeyCode) -> bool {
         KeyCode::Char('2') => Some(Page::Stations),
         KeyCode::Char('3') => Some(Page::Sessions),
         KeyCode::Char('4') => Some(Page::Requests),
-        KeyCode::Char('5') => Some(Page::Stats),
-        KeyCode::Char('6') => Some(Page::Settings),
-        KeyCode::Char('7') => Some(Page::History),
-        KeyCode::Char('8') => Some(Page::Recent),
-        KeyCode::Char('9') => Some(Page::Fleet),
+        KeyCode::Char('5') => Some(Page::ServiceStatus),
+        KeyCode::Char('6') => Some(Page::Stats),
+        KeyCode::Char('7') => Some(Page::Settings),
+        KeyCode::Char('8') => Some(Page::History),
+        KeyCode::Char('9') => Some(Page::Recent),
+        KeyCode::Char('0') => Some(Page::Fleet),
         _ => None,
     };
     if let Some(p) = page {
         ui.page = p;
-        if previous_page == Page::Stats || ui.page == Page::Stats {
+        if previous_page == Page::Stats || ui.page == Page::Stats || ui.page == Page::ServiceStatus
+        {
             ui.needs_snapshot_refresh = true;
         }
         if ui.page == Page::Stations {
@@ -712,6 +714,14 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
             ui.needs_fleet_refresh = true;
             ui.toast = Some((
                 i18n::label(ui.language, "fleet: refreshing").to_string(),
+                Instant::now(),
+            ));
+            true
+        }
+        KeyCode::Char('r') if ui.page == Page::ServiceStatus => {
+            ui.needs_snapshot_refresh = true;
+            ui.toast = Some((
+                i18n::label(ui.language, "service status: refreshing").to_string(),
                 Instant::now(),
             ));
             true

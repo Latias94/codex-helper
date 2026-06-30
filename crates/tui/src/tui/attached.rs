@@ -382,11 +382,12 @@ fn handle_attached_key(
         KeyCode::Char('2') => switch_attached_page(ui, Page::Stations),
         KeyCode::Char('3') => switch_attached_page(ui, Page::Sessions),
         KeyCode::Char('4') => switch_attached_page(ui, Page::Requests),
-        KeyCode::Char('5') => switch_attached_page(ui, Page::Stats),
-        KeyCode::Char('6') => switch_attached_page(ui, Page::Settings),
-        KeyCode::Char('7') => switch_attached_page(ui, Page::History),
-        KeyCode::Char('8') => switch_attached_page(ui, Page::Recent),
-        KeyCode::Char('9') => switch_attached_page(ui, Page::Fleet),
+        KeyCode::Char('5') => switch_attached_page(ui, Page::ServiceStatus),
+        KeyCode::Char('6') => switch_attached_page(ui, Page::Stats),
+        KeyCode::Char('7') => switch_attached_page(ui, Page::Settings),
+        KeyCode::Char('8') => switch_attached_page(ui, Page::History),
+        KeyCode::Char('9') => switch_attached_page(ui, Page::Recent),
+        KeyCode::Char('0') => switch_attached_page(ui, Page::Fleet),
         KeyCode::Tab => {
             cycle_attached_focus(ui);
             true
@@ -420,6 +421,10 @@ fn handle_attached_key(
             ui.needs_fleet_refresh = true;
             true
         }
+        KeyCode::Char('r') if ui.page == Page::ServiceStatus => {
+            ui.needs_snapshot_refresh = true;
+            true
+        }
         KeyCode::Char('t') if ui.page == Page::Fleet => {
             ui.fleet_view_mode = match ui.fleet_view_mode {
                 FleetViewMode::Tree => FleetViewMode::Flat,
@@ -434,13 +439,14 @@ fn handle_attached_key(
 fn switch_attached_page(ui: &mut UiState, page: Page) -> bool {
     let previous_page = ui.page;
     ui.page = page;
-    if previous_page == Page::Stats || ui.page == Page::Stats {
+    if previous_page == Page::Stats || ui.page == Page::Stats || ui.page == Page::ServiceStatus {
         ui.needs_snapshot_refresh = true;
     }
     match ui.page {
         Page::Stations => ui.focus = Focus::Stations,
         Page::Requests => ui.focus = Focus::Requests,
         Page::Sessions | Page::History | Page::Recent => ui.focus = Focus::Sessions,
+        Page::ServiceStatus => {}
         Page::Fleet => {
             ui.focus = Focus::Stations;
             ui.needs_fleet_refresh = true;
@@ -474,6 +480,7 @@ fn cycle_attached_focus(ui: &mut UiState) {
                 Focus::Sessions | Focus::Requests => Focus::Stations,
             };
         }
+        Page::ServiceStatus => {}
         _ => {}
     }
 }
@@ -541,6 +548,7 @@ fn move_attached_selection(
             false
         }
         Page::Fleet => move_attached_fleet_selection(ui, delta),
+        Page::ServiceStatus => false,
         _ => match ui.focus {
             Focus::Sessions => {
                 if let Some(next) =
@@ -686,7 +694,7 @@ mod tests {
             &mut ui,
             &snapshot,
             &mut [],
-            KeyEvent::from(KeyCode::Char('9')),
+            KeyEvent::from(KeyCode::Char('0')),
         ));
 
         assert_eq!(ui.page, Page::Fleet);
@@ -724,6 +732,7 @@ mod tests {
             lb_view: std::collections::HashMap::new(),
             stats_5m: crate::dashboard_core::WindowStats::default(),
             stats_1h: crate::dashboard_core::WindowStats::default(),
+            service_status: None,
             pricing_catalog: crate::pricing::ModelPriceCatalogSnapshot::default(),
             refreshed_at: Instant::now(),
         }

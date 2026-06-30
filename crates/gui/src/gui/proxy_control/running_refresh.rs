@@ -109,7 +109,8 @@ pub(super) async fn build_running_refresh_result(
     client: reqwest::Client,
     admin_port: u16,
 ) -> anyhow::Result<RunningRefreshResult> {
-    let mut snapshot = build_dashboard_snapshot(&state, service_name.as_str(), 600, 21).await;
+    let mut snapshot =
+        build_dashboard_snapshot(&state, service_name.as_str(), 600, 21, None, None).await;
     let mgr = match service_name.as_str() {
         "claude" => &cfg.claude,
         _ => &cfg.codex,
