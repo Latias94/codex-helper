@@ -24,6 +24,7 @@ pub struct ResolvedRetryLayerConfig {
 pub struct ResolvedRetryConfig {
     pub upstream: ResolvedRetryLayerConfig,
     pub route: ResolvedRetryLayerConfig,
+    #[serde(default = "ReasoningGuardConfig::default_resolved")]
     pub reasoning_guard: ResolvedReasoningGuardConfig,
     /// Guarded cross-station failover before any upstream output is committed to the client.
     pub allow_cross_station_before_first_output: bool,
@@ -445,6 +446,44 @@ mod tests {
         );
         assert_eq!(resolved.reasoning_guard.action, ReasoningGuardAction::Retry);
         assert_eq!(resolved.reasoning_guard.max_guard_retries, 1);
+    }
+
+    #[test]
+    fn resolved_retry_deserializes_legacy_payload_without_reasoning_guard() {
+        let resolved: ResolvedRetryConfig = serde_json::from_value(serde_json::json!({
+            "upstream": {
+                "max_attempts": 2,
+                "backoff_ms": 200,
+                "backoff_max_ms": 2000,
+                "jitter_ms": 100,
+                "on_status": "429,500-599,524",
+                "on_class": ["upstream_transport_error"],
+                "strategy": "same_upstream"
+            },
+            "route": {
+                "max_attempts": 2,
+                "backoff_ms": 0,
+                "backoff_max_ms": 0,
+                "jitter_ms": 0,
+                "on_status": "401,403,404,408,429,500-599,524",
+                "on_class": ["upstream_transport_error"],
+                "strategy": "failover"
+            },
+            "allow_cross_station_before_first_output": true,
+            "never_on_status": "413,415,422",
+            "never_on_class": ["client_error_non_retryable"],
+            "cloudflare_challenge_cooldown_secs": 300,
+            "cloudflare_timeout_cooldown_secs": 12,
+            "transport_cooldown_secs": 45,
+            "cooldown_backoff_factor": 3,
+            "cooldown_backoff_max_secs": 180
+        }))
+        .expect("legacy resolved retry payload should deserialize");
+
+        assert_eq!(
+            resolved.reasoning_guard,
+            ReasoningGuardConfig::default_resolved()
+        );
     }
 
     #[test]
