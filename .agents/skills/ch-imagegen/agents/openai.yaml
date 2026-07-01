@@ -1,0 +1,4 @@
+interface:
+  display_name: "CH Imagegen"
+  short_description: "Local proxy image generation and editing"
+  default_prompt: "Use $ch-imagegen to generate or edit an image through the local codex-helper proxy."
