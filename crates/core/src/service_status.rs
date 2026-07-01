@@ -254,43 +254,43 @@ fn service_status_cache_key(
         probe.high_latency_ms.hash(&mut hasher);
         probe.headers.hash(&mut hasher);
     }
-    if let Some(runtime_config) = runtime_config {
-        if let Some(mgr) = service_manager(runtime_config, service_name) {
-            let mut providers = mgr
-                .stations()
-                .values()
-                .flat_map(|station| station.upstreams.iter())
-                .filter_map(|upstream| {
-                    let provider_id = upstream.tags.get("provider_id")?;
-                    let endpoint_id = upstream
-                        .tags
-                        .get("endpoint_id")
-                        .map(String::as_str)
-                        .unwrap_or("default");
-                    Some((provider_id, endpoint_id, upstream))
-                })
-                .collect::<Vec<_>>();
-            providers.sort_by(|left, right| {
-                left.0
-                    .cmp(right.0)
-                    .then_with(|| left.1.cmp(right.1))
-                    .then_with(|| left.2.base_url.cmp(&right.2.base_url))
-            });
-            for (provider_id, endpoint_id, upstream) in providers {
-                provider_id.hash(&mut hasher);
-                endpoint_id.hash(&mut hasher);
-                upstream.base_url.hash(&mut hasher);
-                let mut supported_models = upstream.supported_models.iter().collect::<Vec<_>>();
-                supported_models.sort_by(|left, right| left.0.cmp(right.0));
-                supported_models.hash(&mut hasher);
-                let mut model_mapping = upstream.model_mapping.iter().collect::<Vec<_>>();
-                model_mapping.sort_by(|left, right| left.0.cmp(right.0));
-                model_mapping.hash(&mut hasher);
-                upstream.auth.auth_token.hash(&mut hasher);
-                upstream.auth.auth_token_env.hash(&mut hasher);
-                upstream.auth.api_key.hash(&mut hasher);
-                upstream.auth.api_key_env.hash(&mut hasher);
-            }
+    if let Some(runtime_config) = runtime_config
+        && let Some(mgr) = service_manager(runtime_config, service_name)
+    {
+        let mut providers = mgr
+            .stations()
+            .values()
+            .flat_map(|station| station.upstreams.iter())
+            .filter_map(|upstream| {
+                let provider_id = upstream.tags.get("provider_id")?;
+                let endpoint_id = upstream
+                    .tags
+                    .get("endpoint_id")
+                    .map(String::as_str)
+                    .unwrap_or("default");
+                Some((provider_id, endpoint_id, upstream))
+            })
+            .collect::<Vec<_>>();
+        providers.sort_by(|left, right| {
+            left.0
+                .cmp(right.0)
+                .then_with(|| left.1.cmp(right.1))
+                .then_with(|| left.2.base_url.cmp(&right.2.base_url))
+        });
+        for (provider_id, endpoint_id, upstream) in providers {
+            provider_id.hash(&mut hasher);
+            endpoint_id.hash(&mut hasher);
+            upstream.base_url.hash(&mut hasher);
+            let mut supported_models = upstream.supported_models.iter().collect::<Vec<_>>();
+            supported_models.sort_by(|left, right| left.0.cmp(right.0));
+            supported_models.hash(&mut hasher);
+            let mut model_mapping = upstream.model_mapping.iter().collect::<Vec<_>>();
+            model_mapping.sort_by(|left, right| left.0.cmp(right.0));
+            model_mapping.hash(&mut hasher);
+            upstream.auth.auth_token.hash(&mut hasher);
+            upstream.auth.auth_token_env.hash(&mut hasher);
+            upstream.auth.api_key.hash(&mut hasher);
+            upstream.auth.api_key_env.hash(&mut hasher);
         }
     }
     hasher.finish()
@@ -646,9 +646,8 @@ fn provider_probe_models(
         target
             .supported_models
             .iter()
-            .filter_map(|(model, supported)| {
-                (*supported && !model.contains('*')).then(|| model.clone())
-            })
+            .filter(|(model, supported)| **supported && !model.contains('*'))
+            .map(|(model, _)| model.clone())
             .collect::<Vec<_>>()
     } else {
         probe.models.clone()

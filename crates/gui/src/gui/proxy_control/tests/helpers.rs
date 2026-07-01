@@ -93,6 +93,7 @@ pub(super) fn sample_snapshot(stations: Vec<StationOption>) -> ApiV1Snapshot {
             usage_rollup: UsageRollupView::default(),
             stats_5m: WindowStats::default(),
             stats_1h: WindowStats::default(),
+            service_status: None,
         },
     }
 }

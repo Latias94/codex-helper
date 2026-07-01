@@ -1357,7 +1357,6 @@ fn parse_rfc3339_offset_secs(offset: &str) -> Option<i64> {
     let raw = offset.get(1..)?;
     let (hours, minutes) = raw
         .split_once(':')
-        .map(|(hours, minutes)| (hours, minutes))
         .unwrap_or_else(|| raw.split_at(raw.len().min(2)));
     let hours = hours.parse::<i64>().ok()?;
     let minutes = minutes.parse::<i64>().ok()?;
@@ -1770,9 +1769,7 @@ fn populate_sub2api_usage_fields(
 fn sub2api_remaining_balance(value: &serde_json::Value) -> Option<UsdAmount> {
     let remaining = first_amount_from_paths(value, &[], &["remaining", "data.remaining"], None)?;
     if sub2api_has_subscription_windows(value)
-        && sub2api_window_remaining_amounts(value)
-            .iter()
-            .any(|window_remaining| *window_remaining == remaining)
+        && sub2api_window_remaining_amounts(value).contains(&remaining)
     {
         return None;
     }
