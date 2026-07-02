@@ -10,6 +10,7 @@ All notable changes to this project will be documented in this file.
 #### 新增
 
 - TUI 新增可选服务状态页，位于 `4 请求` 之后的 `5 状态`。`[ui.service_status]` 默认关闭；显式启用后可按 provider / endpoint 发起 `max_tokens=1`、`stream=false` 的轻量 `chat/completions` 探针，验证真实上游链路，同时保留只读 status JSON URL 兼容模式。
+- 新增 `[codex.client_patch].hosted_image_generation = "auto" | "enabled" | "disabled"`。`disabled` 会在 `switch on` 时写入 Codex `[features].image_generation = false`，并在 helper 转发 Codex `/responses` / WebSocket 请求时移除会话中已有的 hosted `image_generation` 工具声明，避免不支持生图工具的上游仅因 tools 声明失败；显式 OpenAI Images 兼容入口仍保留生图工具。
 
 #### 修复
 
@@ -20,6 +21,7 @@ All notable changes to this project will be documented in this file.
 #### Added
 
 - Added an optional TUI service status page after `4 Requests` as `5 Status`. `[ui.service_status]` is disabled by default; when explicitly enabled it can probe provider / endpoint targets with lightweight `chat/completions` requests using `max_tokens=1` and `stream=false`, while retaining read-only status JSON URL compatibility.
+- Added `[codex.client_patch].hosted_image_generation = "auto" | "enabled" | "disabled"`. `disabled` writes Codex `[features].image_generation = false` during `switch on` and strips existing hosted `image_generation` tool declarations from proxied Codex `/responses` / WebSocket requests, while preserving explicit OpenAI Images-compatible requests.
 
 #### Fixed
 

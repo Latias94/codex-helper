@@ -1478,6 +1478,35 @@ translate_models = true
 }
 
 #[test]
+fn codex_client_patch_config_parses_hosted_image_generation_option() {
+    let _env = setup_temp_codex_home();
+    let dir = super::proxy_home_dir();
+    let toml_path = dir.join("config.toml");
+    write_file(
+        &toml_path,
+        r#"
+version = 5
+
+[codex.client_patch]
+preset = "official-imagegen"
+hosted_image_generation = "disabled"
+"#,
+    );
+
+    let cfg =
+        super::codex_client_patch_config_from_config_file().expect("read client patch config");
+    assert_eq!(
+        cfg.preset,
+        crate::codex_integration::CodexPatchMode::OfficialImagegenBridge
+    );
+    assert_eq!(
+        cfg.hosted_image_generation,
+        crate::codex_integration::CodexHostedImageGenerationMode::Disabled
+    );
+    assert!(cfg.hosted_image_generation.filters_request_tools());
+}
+
+#[test]
 fn load_config_auto_compacts_legacy_v3_import_metadata_to_v4() {
     let _env = setup_temp_codex_home();
     let rt = tokio::runtime::Builder::new_current_thread()

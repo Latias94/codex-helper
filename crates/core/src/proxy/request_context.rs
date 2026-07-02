@@ -169,6 +169,7 @@ pub(super) async fn prepare_proxy_request(
         started_at_ms,
         client_content_type: request_flavor.client_content_type.as_deref(),
         request_body_previews,
+        preserve_hosted_image_generation_tools: response_semantic_contract.is_some(),
     })
     .await
     {

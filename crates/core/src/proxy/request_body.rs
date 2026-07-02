@@ -138,6 +138,52 @@ pub(super) fn normalize_codex_compact_request_value(value: &mut serde_json::Valu
     *object = normalized;
 }
 
+pub(super) fn remove_hosted_image_generation_tools_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            if let Some(tools) = object
+                .get_mut("tools")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                tools.retain(|tool| !tool_is_hosted_image_generation(tool));
+            }
+
+            let forces_hosted_image_generation = object
+                .get("tool_choice")
+                .is_some_and(tool_choice_forces_hosted_image_generation);
+            if forces_hosted_image_generation {
+                object.insert(
+                    "tool_choice".to_string(),
+                    serde_json::Value::String("auto".to_string()),
+                );
+            }
+
+            for value in object.values_mut() {
+                remove_hosted_image_generation_tools_value(value);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                remove_hosted_image_generation_tools_value(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn tool_is_hosted_image_generation(tool: &serde_json::Value) -> bool {
+    tool.get("type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|tool_type| tool_type == "image_generation")
+}
+
+fn tool_choice_forces_hosted_image_generation(tool_choice: &serde_json::Value) -> bool {
+    tool_choice
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|tool_type| tool_type == "image_generation")
+}
+
 pub(super) fn build_codex_remote_compaction_v2_downgrade_body(body: &[u8]) -> Option<Bytes> {
     let mut value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
     remove_compaction_trigger_items(&mut value);

@@ -139,6 +139,50 @@ impl std::fmt::Display for CodexCompactionStrategy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexHostedImageGenerationMode {
+    /// Keep Codex's own feature flag and request tools unchanged.
+    #[default]
+    Auto,
+    /// Explicitly enable Codex hosted image generation in the client config.
+    Enabled,
+    /// Hide Codex hosted image generation from the client config and outgoing Responses requests.
+    Disabled,
+}
+
+impl CodexHostedImageGenerationMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    pub fn is_auto(&self) -> bool {
+        matches!(self, Self::Auto)
+    }
+
+    pub fn feature_patch(self) -> CodexFeatureBoolPatch {
+        match self {
+            Self::Auto => CodexFeatureBoolPatch::Preserve,
+            Self::Enabled => CodexFeatureBoolPatch::Set(true),
+            Self::Disabled => CodexFeatureBoolPatch::Set(false),
+        }
+    }
+
+    pub fn filters_request_tools(self) -> bool {
+        matches!(self, Self::Disabled)
+    }
+}
+
+impl std::fmt::Display for CodexHostedImageGenerationMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 pub struct CodexSwitchOptions {
     /// Advertise `model_providers.codex_proxy.supports_websockets = true` so Codex may choose
     /// Responses WebSocket transport. This is intentionally separate from `CodexPatchMode` to

@@ -374,6 +374,7 @@ async fn prepare_responses_websocket(
             .get("content-type")
             .and_then(|value| value.to_str().ok()),
         request_body_previews: false,
+        preserve_hosted_image_generation_tools: false,
     })
     .await
     {

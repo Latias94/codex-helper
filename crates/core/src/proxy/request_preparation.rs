@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::body::Bytes;
 use axum::http::{HeaderMap, Method, Uri};
 
-use crate::codex_integration::CodexPatchMode;
+use crate::codex_integration::{CodexHostedImageGenerationMode, CodexPatchMode};
 use crate::config::{ProxyConfig, ProxyConfigV4};
 use crate::lb::CooldownBackoff;
 use crate::logging::{BodyPreview, CodexBridgeLog, ServiceTierLog, make_body_preview};
@@ -16,7 +16,7 @@ use super::request_body::{
     apply_model_override_value, apply_reasoning_effort_override_value,
     apply_service_tier_override_value, extract_model_from_value,
     extract_reasoning_effort_from_value, extract_service_tier_from_value,
-    normalize_codex_compact_request_value,
+    normalize_codex_compact_request_value, remove_hosted_image_generation_tools_value,
 };
 use super::request_continuity::{
     RequestContinuityClassificationInput, RequestTransport, classify_request_continuity,
@@ -101,6 +101,7 @@ pub(super) struct RequestConfigContext {
     pub(super) v4_snapshot: Option<Arc<ProxyConfigV4>>,
     pub(super) route_graph_config: bool,
     pub(super) codex_patch_mode: CodexPatchMode,
+    pub(super) hosted_image_generation: CodexHostedImageGenerationMode,
 }
 
 pub(super) struct CommonPreparedRequest {
@@ -156,6 +157,7 @@ pub(super) struct CommonRequestPreparationParams<'a> {
     pub(super) started_at_ms: u64,
     pub(super) client_content_type: Option<&'a str>,
     pub(super) request_body_previews: bool,
+    pub(super) preserve_hosted_image_generation_tools: bool,
 }
 
 fn codex_patch_mode_for_proxy(proxy: &ProxyService) -> CodexPatchMode {
@@ -186,6 +188,9 @@ pub(super) async fn load_request_config_context(proxy: &ProxyService) -> Request
         v4_snapshot,
         route_graph_config,
         codex_patch_mode: codex_patch_mode_for_proxy(proxy),
+        hosted_image_generation: crate::config::codex_client_patch_config_from_config_file()
+            .map(|config| config.hosted_image_generation)
+            .unwrap_or_default(),
     }
 }
 
@@ -206,6 +211,7 @@ pub(super) async fn prepare_common_request(
         started_at_ms,
         client_content_type,
         request_body_previews,
+        preserve_hosted_image_generation_tools,
     } = params;
     let mgr = proxy.service_manager(config.cfg_snapshot.as_ref());
     let _ = client_headers;
@@ -251,6 +257,10 @@ pub(super) async fn prepare_common_request(
     let binding_effort = binding_reasoning_effort_for_request(session_binding.as_ref());
     let binding_model = binding_model_for_request(session_binding.as_ref());
     let binding_service_tier = binding_service_tier_for_request(session_binding.as_ref());
+    let filter_hosted_image_generation_tools = proxy.service_name == "codex"
+        && config.hosted_image_generation.filters_request_tools()
+        && codex_path_is_responses_or_compact(uri.path())
+        && !preserve_hosted_image_generation_tools;
 
     let prepared_request = prepare_request_body(PrepareRequestBodyParams {
         raw_body,
@@ -261,6 +271,7 @@ pub(super) async fn prepare_common_request(
         binding_model,
         override_service_tier: override_service_tier.as_deref(),
         binding_service_tier,
+        filter_hosted_image_generation_tools,
     });
     let body_for_upstream = prepared_request.body_for_upstream.clone();
     let request_model = prepared_request.request_model.clone();
@@ -541,6 +552,7 @@ pub(super) struct PrepareRequestBodyParams<'a> {
     binding_model: Option<&'a str>,
     override_service_tier: Option<&'a str>,
     binding_service_tier: Option<&'a str>,
+    filter_hosted_image_generation_tools: bool,
 }
 
 pub(super) fn prepare_request_body(params: PrepareRequestBodyParams<'_>) -> PreparedRequestBody {
@@ -553,6 +565,7 @@ pub(super) fn prepare_request_body(params: PrepareRequestBodyParams<'_>) -> Prep
         binding_model,
         override_service_tier,
         binding_service_tier,
+        filter_hosted_image_generation_tools,
     } = params;
     let mut request_json = serde_json::from_slice::<serde_json::Value>(raw_body).ok();
     let original_effort = request_json
@@ -577,6 +590,9 @@ pub(super) fn prepare_request_body(params: PrepareRequestBodyParams<'_>) -> Prep
         }
         if compact_request {
             normalize_codex_compact_request_value(value);
+        }
+        if filter_hosted_image_generation_tools {
+            remove_hosted_image_generation_tools_value(value);
         }
     }
 
@@ -774,6 +790,7 @@ mod tests {
             binding_model: Some("gpt-5-mini"),
             override_service_tier: Some("flex"),
             binding_service_tier: Some("default"),
+            filter_hosted_image_generation_tools: false,
         });
 
         assert_eq!(prepared.request_model.as_deref(), Some("gpt-5.4"));
@@ -787,6 +804,94 @@ mod tests {
             Some("flex")
         );
         assert_eq!(prepared.request_body_len, raw_body.len());
+    }
+
+    #[test]
+    fn prepare_request_body_filters_hosted_image_generation_tools_when_enabled() {
+        let raw_body = Bytes::from_static(
+            br#"{"model":"gpt-5","input":[{"type":"additional_tools","tools":[{"type":"image_generation","output_format":"png"},{"type":"function","name":"nested"}]}],"tools":[{"type":"image_generation","output_format":"png"},{"type":"function","name":"shell"}],"tool_choice":{"type":"image_generation"}}"#,
+        );
+
+        let prepared = prepare_request_body(PrepareRequestBodyParams {
+            raw_body: &raw_body,
+            compact_request: false,
+            override_effort: None,
+            binding_effort: None,
+            override_model: None,
+            binding_model: None,
+            override_service_tier: None,
+            binding_service_tier: None,
+            filter_hosted_image_generation_tools: true,
+        });
+
+        let value: serde_json::Value =
+            serde_json::from_slice(prepared.body_for_upstream.as_ref()).expect("json body");
+        let tools = value
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+            .expect("top-level tools");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(
+            tools[0].get("type").and_then(serde_json::Value::as_str),
+            Some("function")
+        );
+        assert_eq!(
+            value.get("tool_choice").and_then(serde_json::Value::as_str),
+            Some("auto")
+        );
+
+        let nested_tools = value
+            .get("input")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|input| input.first())
+            .and_then(|item| item.get("tools"))
+            .and_then(serde_json::Value::as_array)
+            .expect("nested tools");
+        assert_eq!(nested_tools.len(), 1);
+        assert_eq!(
+            nested_tools[0]
+                .get("type")
+                .and_then(serde_json::Value::as_str),
+            Some("function")
+        );
+    }
+
+    #[test]
+    fn prepare_request_body_preserves_hosted_image_generation_tools_by_default() {
+        let raw_body = Bytes::from_static(
+            br#"{"model":"gpt-5","tools":[{"type":"image_generation","output_format":"png"}],"tool_choice":{"type":"image_generation"}}"#,
+        );
+
+        let prepared = prepare_request_body(PrepareRequestBodyParams {
+            raw_body: &raw_body,
+            compact_request: false,
+            override_effort: None,
+            binding_effort: None,
+            override_model: None,
+            binding_model: None,
+            override_service_tier: None,
+            binding_service_tier: None,
+            filter_hosted_image_generation_tools: false,
+        });
+
+        let value: serde_json::Value =
+            serde_json::from_slice(prepared.body_for_upstream.as_ref()).expect("json body");
+        let tools = value
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+            .expect("top-level tools");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(
+            tools[0].get("type").and_then(serde_json::Value::as_str),
+            Some("image_generation")
+        );
+        assert_eq!(
+            value
+                .get("tool_choice")
+                .and_then(|choice| choice.get("type"))
+                .and_then(serde_json::Value::as_str),
+            Some("image_generation")
+        );
     }
 
     #[test]
@@ -922,6 +1027,7 @@ mod tests {
             started_at_ms: 2,
             client_content_type: Some("application/json"),
             request_body_previews: false,
+            preserve_hosted_image_generation_tools: false,
         })
         .await
         .expect("prepared");
@@ -959,6 +1065,62 @@ mod tests {
         assert_eq!(
             active[0].session_identity_source,
             Some(SessionIdentitySource::PromptCacheKey)
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_common_request_preserves_hosted_image_generation_for_explicit_contract() {
+        let proxy = test_proxy_with_active_station();
+        let mut config = load_request_config_context(&proxy).await;
+        config.hosted_image_generation = CodexHostedImageGenerationMode::Disabled;
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        let method = Method::POST;
+        let uri = "/v1/responses".parse::<Uri>().expect("uri");
+        let raw_body = Bytes::from_static(
+            br#"{"model":"gpt-5","prompt_cache_key":"image-contract","tools":[{"type":"image_generation","output_format":"png"}],"tool_choice":{"type":"image_generation"}}"#,
+        );
+
+        let prepared = prepare_common_request(CommonRequestPreparationParams {
+            proxy: &proxy,
+            config: &config,
+            method: &method,
+            uri: &uri,
+            client_headers: &headers,
+            raw_body: &raw_body,
+            compact_request: false,
+            session_identity_hint:
+                super::super::client_identity::extract_session_identity_with_body_fallback(
+                    &headers,
+                    raw_body.as_ref(),
+                ),
+            client_name: Some("test-client".to_string()),
+            client_addr: None,
+            started_at_ms: 3,
+            client_content_type: Some("application/json"),
+            request_body_previews: false,
+            preserve_hosted_image_generation_tools: true,
+        })
+        .await
+        .expect("prepared");
+
+        let value: serde_json::Value =
+            serde_json::from_slice(prepared.body_for_upstream.as_ref()).expect("json body");
+        let tools = value
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+            .expect("tools");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(
+            tools[0].get("type").and_then(serde_json::Value::as_str),
+            Some("image_generation")
+        );
+        assert_eq!(
+            value
+                .get("tool_choice")
+                .and_then(|choice| choice.get("type"))
+                .and_then(serde_json::Value::as_str),
+            Some("image_generation")
         );
     }
 }

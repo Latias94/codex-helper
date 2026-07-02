@@ -31,6 +31,7 @@ pub struct CodexClientPatchConfig {
     pub preset: crate::codex_integration::CodexPatchMode,
     pub options: crate::codex_integration::CodexSwitchOptions,
     pub translate_models: bool,
+    pub hosted_image_generation: crate::codex_integration::CodexHostedImageGenerationMode,
 }
 
 impl Default for CodexClientPatchConfig {
@@ -39,6 +40,7 @@ impl Default for CodexClientPatchConfig {
             preset: crate::codex_integration::CodexPatchMode::Default,
             options: crate::codex_integration::CodexSwitchOptions::default(),
             translate_models: false,
+            hosted_image_generation: crate::codex_integration::CodexHostedImageGenerationMode::Auto,
         }
     }
 }
@@ -86,6 +88,24 @@ fn parse_codex_compaction_strategy(
         }
         other => anyhow::bail!(
             "unsupported codex.client_patch.compaction '{}'; expected 'auto', 'local', 'remote-v1', or 'remote-v2'",
+            other,
+        ),
+    }
+}
+
+fn parse_codex_hosted_image_generation_mode(
+    value: &str,
+) -> Result<crate::codex_integration::CodexHostedImageGenerationMode> {
+    match value.trim() {
+        "" | "auto" => Ok(crate::codex_integration::CodexHostedImageGenerationMode::Auto),
+        "enabled" | "enable" | "on" | "true" => {
+            Ok(crate::codex_integration::CodexHostedImageGenerationMode::Enabled)
+        }
+        "disabled" | "disable" | "off" | "false" => {
+            Ok(crate::codex_integration::CodexHostedImageGenerationMode::Disabled)
+        }
+        other => anyhow::bail!(
+            "unsupported codex.client_patch.hosted_image_generation '{}'; expected 'auto', 'enabled', or 'disabled'",
             other,
         ),
     }
@@ -145,6 +165,12 @@ fn codex_client_patch_config_from_toml_value(value: &TomlValue) -> Result<CodexC
         .and_then(|patch| patch.get("translate_models"))
         .and_then(TomlValue::as_bool)
         .unwrap_or(false);
+    let hosted_image_generation = patch
+        .and_then(|patch| patch.get("hosted_image_generation"))
+        .and_then(TomlValue::as_str)
+        .map(parse_codex_hosted_image_generation_mode)
+        .transpose()?
+        .unwrap_or_default();
 
     Ok(CodexClientPatchConfig {
         preset,
@@ -153,6 +179,7 @@ fn codex_client_patch_config_from_toml_value(value: &TomlValue) -> Result<CodexC
             compaction,
         },
         translate_models,
+        hosted_image_generation,
     })
 }
 
@@ -457,6 +484,11 @@ version = 5
 #                   不把 OpenAI data 列表翻译成 Codex models catalog，让 Codex 使用
 #                   自带 models.json / fallback 元数据；true 仅用于确实需要 helper
 #                   合成模型目录的中转，因为 Codex 会把合成后的字段当成权威。
+# hosted_image_generation：默认 auto。disabled 会在 switch on 时写入
+#                          [features].image_generation = false，并在 helper
+#                          转发 Codex /responses 请求时移除 image_generation
+#                          工具，避免不支持生图的上游仅因 tools 声明失败；
+#                          enabled 会显式写入 true；auto 保持旧行为。
 # 请求体 Content-Encoding 默认自动归一化（zstd / gzip / br / deflate），并会把
 # body.prompt_cache_key 作为缺省 session affinity 信号。极少数中转若必须接收
 # 原始 Codex 压缩体，请在启动 helper 的环境里设置：
@@ -472,6 +504,7 @@ version = 5
 # responses_websocket = false
 # compaction = "auto"
 # translate_models = false
+# hosted_image_generation = "auto"
 
 # --- Relay targets（可选，本机客户端入口） ---
 #

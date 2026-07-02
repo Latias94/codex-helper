@@ -12,7 +12,9 @@ use crate::codex_patch_plan::{
     CodexAuthPatchPlan, CodexFeatureBoolPatch, CodexPatchPlan, CodexSwitchOnEffectOrder,
     CodexTomlBoolPatch,
 };
-pub use crate::codex_patch_plan::{CodexCompactionStrategy, CodexPatchMode, CodexSwitchOptions};
+pub use crate::codex_patch_plan::{
+    CodexCompactionStrategy, CodexHostedImageGenerationMode, CodexPatchMode, CodexSwitchOptions,
+};
 use crate::config::{ProxyConfig, ProxyConfigV2, ProxyConfigV4, RoutingAffinityPolicyV5};
 use crate::file_replace::write_text_file;
 use anyhow::{Context, Result, anyhow};
@@ -443,13 +445,57 @@ fn switch_on_codex_toml_with_options(
 
 #[cfg(test)]
 fn switch_on_codex_toml_with_plan(text: &str, port: u16, plan: CodexPatchPlan) -> Result<String> {
-    switch_on_codex_toml_with_base_url_and_plan(text, &format!("http://127.0.0.1:{port}"), plan)
+    switch_on_codex_toml_with_base_url_and_plan(
+        text,
+        &format!("http://127.0.0.1:{port}"),
+        plan,
+        CodexHostedImageGenerationMode::Auto,
+    )
+}
+
+#[cfg(test)]
+fn switch_on_codex_toml_with_plan_and_hosted_image_generation(
+    text: &str,
+    port: u16,
+    plan: CodexPatchPlan,
+    hosted_image_generation: CodexHostedImageGenerationMode,
+) -> Result<String> {
+    switch_on_codex_toml_with_base_url_and_plan(
+        text,
+        &format!("http://127.0.0.1:{port}"),
+        plan,
+        hosted_image_generation,
+    )
+}
+
+fn apply_feature_bool_patch(
+    root: &mut EditableTomlTable,
+    key: &'static str,
+    patch: CodexFeatureBoolPatch,
+) -> Result<()> {
+    let CodexFeatureBoolPatch::Set(value) = patch else {
+        return Ok(());
+    };
+
+    if !root.contains_key("features") {
+        root.insert(
+            "features",
+            EditableTomlItem::Table(EditableTomlTable::new()),
+        );
+    }
+    let features = root
+        .get_mut("features")
+        .and_then(EditableTomlItem::as_table_mut)
+        .ok_or_else(|| anyhow!("features must be a table"))?;
+    features.insert(key, editable_toml_value(value));
+    Ok(())
 }
 
 fn switch_on_codex_toml_with_base_url_and_plan(
     text: &str,
     base_url: &str,
     plan: CodexPatchPlan,
+    hosted_image_generation: CodexHostedImageGenerationMode,
 ) -> Result<String> {
     let mut doc = if text.trim().is_empty() {
         EditableTomlDocument::new()
@@ -503,22 +549,16 @@ fn switch_on_codex_toml_with_base_url_and_plan(
             proxy_table.insert("supports_websockets", editable_toml_value(value));
         }
     }
-    match plan.remote_compaction_v2_feature() {
-        CodexFeatureBoolPatch::Preserve => {}
-        CodexFeatureBoolPatch::Set(value) => {
-            if !root.contains_key("features") {
-                root.insert(
-                    "features",
-                    EditableTomlItem::Table(EditableTomlTable::new()),
-                );
-            }
-            let features = root
-                .get_mut("features")
-                .and_then(EditableTomlItem::as_table_mut)
-                .ok_or_else(|| anyhow!("features must be a table"))?;
-            features.insert("remote_compaction_v2", editable_toml_value(value));
-        }
-    }
+    apply_feature_bool_patch(
+        root,
+        "remote_compaction_v2",
+        plan.remote_compaction_v2_feature(),
+    )?;
+    apply_feature_bool_patch(
+        root,
+        "image_generation",
+        hosted_image_generation.feature_patch(),
+    )?;
 
     set_toml_string(root, "model_provider", "codex_proxy");
     Ok(doc.to_string())
@@ -1949,7 +1989,12 @@ pub fn switch_on(port: u16) -> Result<()> {
 pub fn switch_on_with_configured_preset(port: u16) -> Result<()> {
     let client_patch = crate::config::codex_client_patch_config_from_config_file()
         .context("read codex.client_patch from codex-helper config before switch on")?;
-    switch_on_with_options(port, client_patch.preset, client_patch.options)
+    switch_on_with_base_url_and_hosted_image_generation(
+        &format!("http://127.0.0.1:{port}"),
+        client_patch.preset,
+        client_patch.options,
+        client_patch.hosted_image_generation,
+    )
 }
 
 /// Switch Codex to use the local codex-helper model provider with an explicit client preset.
@@ -1972,6 +2017,20 @@ pub fn switch_on_with_base_url(
     base_url: &str,
     mode: CodexPatchMode,
     options: CodexSwitchOptions,
+) -> Result<()> {
+    switch_on_with_base_url_and_hosted_image_generation(
+        base_url,
+        mode,
+        options,
+        CodexHostedImageGenerationMode::Auto,
+    )
+}
+
+fn switch_on_with_base_url_and_hosted_image_generation(
+    base_url: &str,
+    mode: CodexPatchMode,
+    options: CodexSwitchOptions,
+    hosted_image_generation: CodexHostedImageGenerationMode,
 ) -> Result<()> {
     let base_url = crate::control_plane_client::normalize_base_url(base_url)
         .ok_or_else(|| anyhow!("Codex proxy base URL must start with http:// or https://"))?;
@@ -2004,7 +2063,12 @@ pub fn switch_on_with_base_url(
     state.compaction = plan.options().compaction;
 
     let auth_edit = auth_edit_for_switch_on_plan(plan, &mut state)?;
-    let new_text = switch_on_codex_toml_with_base_url_and_plan(&text, &base_url, plan)?;
+    let new_text = switch_on_codex_toml_with_base_url_and_plan(
+        &text,
+        &base_url,
+        plan,
+        hosted_image_generation,
+    )?;
     apply_switch_on_effects(plan, &cfg_path, &new_text, &state, auth_edit)?;
     Ok(())
 }
@@ -3252,6 +3316,25 @@ supports_websockets = false
     }
 
     #[test]
+    fn codex_switch_on_can_disable_hosted_image_generation_feature() {
+        let plan = CodexPatchPlan::for_switch_on(
+            CodexPatchMode::OfficialImagegenBridge,
+            CodexSwitchOptions::default(),
+        )
+        .expect("plan");
+        let updated = switch_on_codex_toml_with_plan_and_hosted_image_generation(
+            "",
+            3333,
+            plan,
+            CodexHostedImageGenerationMode::Disabled,
+        )
+        .expect("switch_on should write image generation feature flag");
+
+        assert!(updated.contains("[features]"));
+        assert!(updated.contains("image_generation = false"));
+    }
+
+    #[test]
     fn codex_switch_on_official_imagegen_can_force_local_compaction() {
         let updated = switch_on_codex_toml_with_options(
             r#"
@@ -4327,6 +4410,7 @@ version = 5
 [codex.client_patch]
 preset = "official-imagegen"
 responses_websocket = true
+hosted_image_generation = "disabled"
 
 [codex.providers.relay]
 base_url = "https://relay.example/v1"
@@ -4365,6 +4449,7 @@ base_url = "https://api.openai.com/v1"
         assert!(updated_cfg.contains("name = \"OpenAI\""));
         assert!(updated_cfg.contains("base_url = \"http://127.0.0.1:3211\""));
         assert!(updated_cfg.contains("supports_websockets = true"));
+        assert!(updated_cfg.contains("image_generation = false"));
         assert!(!updated_cfg.contains("requires_openai_auth"));
 
         let updated_auth: serde_json::Value =
