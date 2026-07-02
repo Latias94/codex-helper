@@ -110,6 +110,24 @@ fn write_test_session_file(
     cwd: &std::path::Path,
     first_user_message: &str,
 ) -> std::path::PathBuf {
+    write_test_session_file_with_meta_extra(
+        day_dir,
+        file_ts,
+        id,
+        cwd,
+        first_user_message,
+        serde_json::json!({}),
+    )
+}
+
+fn write_test_session_file_with_meta_extra(
+    day_dir: &std::path::Path,
+    file_ts: &str,
+    id: &str,
+    cwd: &std::path::Path,
+    first_user_message: &str,
+    meta_extra: serde_json::Value,
+) -> std::path::PathBuf {
     std::fs::create_dir_all(day_dir).expect("create sessions day dir");
     let path = day_dir.join(format!("rollout-{file_ts}-{id}.jsonl"));
     let created_at = format!(
@@ -118,14 +136,20 @@ fn write_test_session_file(
         &file_ts[14..16],
         &file_ts[17..19]
     );
+    let mut payload = serde_json::json!({
+        "id": id,
+        "cwd": cwd.to_str().expect("cwd utf8"),
+        "timestamp": created_at.clone()
+    });
+    if let (Some(payload), Some(extra)) = (payload.as_object_mut(), meta_extra.as_object()) {
+        for (key, value) in extra {
+            payload.insert(key.clone(), value.clone());
+        }
+    }
     let meta_line = serde_json::json!({
         "timestamp": created_at.clone(),
         "type": "session_meta",
-        "payload": {
-            "id": id,
-            "cwd": cwd.to_str().expect("cwd utf8"),
-            "timestamp": created_at.clone()
-        }
+        "payload": payload
     })
     .to_string();
     let lines = [
@@ -153,6 +177,31 @@ fn write_test_session_file(
     .join("\n");
     std::fs::write(&path, lines).expect("write session file");
     path
+}
+
+#[test]
+fn parse_session_meta_marks_subagent_from_structured_source() {
+    let meta = serde_json::json!({
+        "timestamp": "2026-05-18T00:00:00.000Z",
+        "type": "session_meta",
+        "payload": {
+            "id": "sid-subagent",
+            "cwd": "G:/code/project",
+            "timestamp": "2026-05-18T00:00:00.000Z",
+            "thread_source": "subagent",
+            "source": {
+                "subagent": {
+                    "thread_spawn": {
+                        "agent_path": "/root/review_correctness"
+                    }
+                }
+            }
+        }
+    });
+
+    let parsed = parse_session_meta(&meta).expect("session meta should parse");
+
+    assert!(parsed.is_subagent, "subagent metadata should be detected");
 }
 
 #[tokio::test]
@@ -192,6 +241,87 @@ async fn find_codex_sessions_in_dir_keeps_other_projects_when_current_matches() 
             "11111111-1111-1111-1111-111111111111"
         ],
         "global history must not drop unrelated projects when current-project matches exist"
+    );
+}
+
+#[tokio::test]
+async fn find_codex_sessions_for_dir_filters_subagents_without_global_fallback() {
+    let tmp = std::env::temp_dir().join(format!("codex-helper-test-{}", uuid::Uuid::new_v4()));
+    let sessions = tmp.join("sessions").join("2026").join("05").join("18");
+    let current = tmp.join("current-project");
+    let other = tmp.join("other-project");
+    std::fs::create_dir_all(&current).expect("create current project");
+    std::fs::create_dir_all(&other).expect("create other project");
+
+    write_test_session_file(
+        &sessions,
+        "2026-05-18T00-00-00",
+        "11111111-1111-1111-1111-111111111111",
+        &current,
+        "current project user session",
+    );
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    write_test_session_file_with_meta_extra(
+        &sessions,
+        "2026-05-18T00-00-01",
+        "22222222-2222-2222-2222-222222222222",
+        &current,
+        "current project spawned agent",
+        serde_json::json!({
+            "thread_source": "subagent",
+            "agent_path": "/root/review_correctness"
+        }),
+    );
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    write_test_session_file(
+        &sessions,
+        "2026-05-18T00-00-02",
+        "33333333-3333-3333-3333-333333333333",
+        &other,
+        "other project user session",
+    );
+
+    let current_only =
+        find_codex_sessions_for_dir_in_sessions_dir(&tmp.join("sessions"), &current, 10)
+            .await
+            .expect("current project history scan ok");
+
+    let ids = current_only
+        .iter()
+        .map(|s| s.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ids,
+        vec!["11111111-1111-1111-1111-111111111111"],
+        "current project history should hide subagents and not fall back to other projects"
+    );
+}
+
+#[tokio::test]
+async fn find_codex_sessions_for_dir_does_not_fallback_when_project_has_no_user_sessions() {
+    let tmp = std::env::temp_dir().join(format!("codex-helper-test-{}", uuid::Uuid::new_v4()));
+    let sessions = tmp.join("sessions").join("2026").join("05").join("18");
+    let current = tmp.join("current-project");
+    let other = tmp.join("other-project");
+    std::fs::create_dir_all(&current).expect("create current project");
+    std::fs::create_dir_all(&other).expect("create other project");
+
+    write_test_session_file(
+        &sessions,
+        "2026-05-18T00-00-00",
+        "11111111-1111-1111-1111-111111111111",
+        &other,
+        "other project user session",
+    );
+
+    let current_only =
+        find_codex_sessions_for_dir_in_sessions_dir(&tmp.join("sessions"), &current, 10)
+            .await
+            .expect("current project history scan ok");
+
+    assert!(
+        current_only.is_empty(),
+        "current project history should not fall back to global history"
     );
 }
 
@@ -306,6 +436,45 @@ async fn recent_sessions_filters_by_mtime_and_prefers_meta_id() {
         .await
         .expect("recent ok");
     assert_eq!(none.len(), 0, "since=0 should filter everything out");
+}
+
+#[tokio::test]
+async fn recent_sessions_filter_subagent_threads() {
+    let tmp = std::env::temp_dir().join(format!("codex-helper-test-{}", uuid::Uuid::new_v4()));
+    let sessions = tmp.join("sessions").join("2026").join("02").join("01");
+    let project = tmp.join("project");
+    std::fs::create_dir_all(&project).expect("create project dir");
+
+    write_test_session_file(
+        &sessions,
+        "2026-02-01T00-00-00",
+        "11111111-1111-1111-1111-111111111111",
+        &project,
+        "user session",
+    );
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    write_test_session_file_with_meta_extra(
+        &sessions,
+        "2026-02-01T00-00-01",
+        "22222222-2222-2222-2222-222222222222",
+        &project,
+        "spawned agent session",
+        serde_json::json!({
+            "thread_source": "subagent",
+            "agent_path": "/root/review_testing"
+        }),
+    );
+
+    let recent = find_recent_codex_sessions_in_dir(
+        &tmp.join("sessions"),
+        Duration::from_secs(24 * 3600),
+        10,
+    )
+    .await
+    .expect("recent ok");
+
+    assert_eq!(recent.len(), 1);
+    assert_eq!(recent[0].id, "11111111-1111-1111-1111-111111111111");
 }
 
 #[tokio::test]

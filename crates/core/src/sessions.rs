@@ -55,6 +55,8 @@ pub struct SessionMeta {
     pub id: String,
     pub cwd: Option<String>,
     pub created_at: Option<String>,
+    #[serde(default)]
+    pub is_subagent: bool,
 }
 
 /// A single transcript message extracted from a Codex session JSONL.
@@ -119,7 +121,7 @@ const SESSION_IO_CONCURRENCY: usize = 8;
 
 const MAX_SCAN_FILES_RECENT: usize = 200_000;
 
-/// Find recent Codex sessions across all projects. Results are ordered newest-first by updated_at.
+/// Find recent user-facing Codex sessions across all projects. Results are ordered newest-first by updated_at.
 pub async fn find_codex_sessions(limit: usize) -> Result<Vec<SessionSummary>> {
     let root = codex_sessions_dir();
     find_codex_sessions_in_dir(&root, limit).await
@@ -156,6 +158,9 @@ async fn find_codex_sessions_in_dir(
 
                     let header_opt = read_session_header(&path, &cwd).await?;
                     if let Some(header) = header_opt {
+                        if header.is_subagent {
+                            continue;
+                        }
                         headers.push(header);
                     }
                 }
@@ -166,22 +171,29 @@ async fn find_codex_sessions_in_dir(
     select_and_expand_headers(Vec::new(), headers, limit).await
 }
 
-/// Find recent Codex sessions for a given directory, preferring sessions whose cwd matches that directory
+/// Find recent user-facing Codex sessions whose cwd matches a given directory
 /// (or one of its ancestors/descendants). Results are ordered newest-first by updated_at.
 pub async fn find_codex_sessions_for_dir(
     root_dir: &Path,
     limit: usize,
 ) -> Result<Vec<SessionSummary>> {
-    let root = codex_sessions_dir();
-    if !root.exists() {
+    let sessions_dir = codex_sessions_dir();
+    find_codex_sessions_for_dir_in_sessions_dir(&sessions_dir, root_dir, limit).await
+}
+
+async fn find_codex_sessions_for_dir_in_sessions_dir(
+    sessions_dir: &Path,
+    root_dir: &Path,
+    limit: usize,
+) -> Result<Vec<SessionSummary>> {
+    if !sessions_dir.exists() {
         return Ok(Vec::new());
     }
 
     let mut matched: Vec<SessionHeader> = Vec::new();
-    let mut others: Vec<SessionHeader> = Vec::new();
     let mut scanned_files: usize = 0;
 
-    let year_dirs = collect_dirs_desc(&root, |s| s.parse::<u32>().ok()).await?;
+    let year_dirs = collect_dirs_desc(sessions_dir, |s| s.parse::<u32>().ok()).await?;
 
     'outer: for (_year, year_path) in year_dirs {
         let month_dirs = collect_dirs_desc(&year_path, |s| s.parse::<u8>().ok()).await?;
@@ -200,17 +212,18 @@ pub async fn find_codex_sessions_for_dir(
                         continue;
                     };
 
+                    if header.is_subagent {
+                        continue;
+                    }
                     if header.is_cwd_match {
                         matched.push(header);
-                    } else {
-                        others.push(header);
                     }
                 }
             }
         }
     }
 
-    select_and_expand_headers(matched, others, limit).await
+    select_and_expand_headers(matched, Vec::new(), limit).await
 }
 
 /// Search Codex sessions for user messages containing the given substring.
@@ -228,7 +241,6 @@ pub async fn search_codex_sessions_for_dir(
     }
 
     let mut matched: Vec<SessionHeader> = Vec::new();
-    let mut others: Vec<SessionHeader> = Vec::new();
     let mut scanned_files: usize = 0;
 
     let year_dirs = collect_dirs_desc(&root, |s| s.parse::<u32>().ok()).await?;
@@ -249,6 +261,9 @@ pub async fn search_codex_sessions_for_dir(
                     let Some(header) = header_opt else {
                         continue;
                     };
+                    if header.is_subagent {
+                        continue;
+                    }
                     if !header
                         .first_user_message
                         .to_lowercase()
@@ -259,15 +274,13 @@ pub async fn search_codex_sessions_for_dir(
 
                     if header.is_cwd_match {
                         matched.push(header);
-                    } else {
-                        others.push(header);
                     }
                 }
             }
         }
     }
 
-    select_and_expand_headers(matched, others, limit).await
+    select_and_expand_headers(matched, Vec::new(), limit).await
 }
 
 /// Convenience wrapper that uses the current working directory as the root for session matching.
@@ -285,7 +298,7 @@ pub async fn search_codex_sessions_for_current_dir(
     search_codex_sessions_for_dir(&cwd, query, limit).await
 }
 
-/// List recent Codex sessions across all projects, filtered by session file mtime.
+/// List recent user-facing Codex sessions across all projects, filtered by session file mtime.
 ///
 /// This is optimized for "resume" workflows: it avoids counting turns/timestamps and only reads the
 /// `session_meta` header for sessions that pass the recency filter.
@@ -354,6 +367,9 @@ pub async fn find_recent_codex_session_summaries(
                     let Some(header) = header_opt else {
                         continue;
                     };
+                    if header.is_subagent {
+                        continue;
+                    }
                     headers.push(header);
                 }
             }
@@ -438,6 +454,9 @@ async fn read_session_index_item(path: PathBuf, cwd: PathBuf) -> Result<Option<S
     let Some(mut header) = header_opt else {
         return Ok(None);
     };
+    if header.is_subagent {
+        return Ok(None);
+    }
     header.updated_hint = read_last_timestamp_from_tail(&header.path)
         .await?
         .or_else(|| header.created_at.clone());
@@ -512,6 +531,9 @@ async fn find_recent_codex_sessions_in_dir(
                         .map(|(_, uuid)| uuid);
 
                     let meta = read_codex_session_meta(&path).await?;
+                    if meta.as_ref().is_some_and(|meta| meta.is_subagent) {
+                        continue;
+                    }
                     let (id, cwd) = if let Some(meta) = meta {
                         (meta.id, meta.cwd)
                     } else if let Some(id) = file_id {
@@ -692,6 +714,7 @@ pub async fn read_codex_session_meta(path: &Path) -> Result<Option<SessionMeta>>
                 id: meta.id,
                 cwd: meta.cwd,
                 created_at: meta.created_at,
+                is_subagent: meta.is_subagent,
             }));
         }
     }
@@ -715,6 +738,7 @@ struct SessionMetaInfo {
     id: String,
     cwd: Option<String>,
     created_at: Option<String>,
+    is_subagent: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -729,6 +753,7 @@ struct SessionHeader {
     updated_hint: Option<String>,
     first_user_message: String,
     is_cwd_match: bool,
+    is_subagent: bool,
 }
 
 fn parse_session_meta(value: &Value) -> Option<SessionMetaInfo> {
@@ -758,7 +783,49 @@ fn parse_session_meta(value: &Value) -> Option<SessionMetaInfo> {
         id,
         cwd,
         created_at,
+        is_subagent: session_meta_payload_is_subagent(payload),
     })
+}
+
+fn session_meta_payload_is_subagent(payload: &serde_json::Map<String, Value>) -> bool {
+    payload
+        .get("thread_source")
+        .and_then(|v| v.as_str())
+        .is_some_and(is_subagent_source_name)
+        || payload.get("source").is_some_and(value_is_subagent_source)
+        || payload
+            .get("agent_path")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty())
+}
+
+fn value_is_subagent_source(value: &Value) -> bool {
+    match value {
+        Value::String(source) => is_subagent_source_name(source),
+        Value::Object(map) => {
+            map.keys().any(|key| is_subagent_source_name(key))
+                || map
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(is_subagent_source_name)
+                || map
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(is_subagent_source_name)
+        }
+        Value::Array(items) => items.iter().any(value_is_subagent_source),
+        _ => false,
+    }
+}
+
+fn is_subagent_source_name(source: &str) -> bool {
+    let normalized = source
+        .trim()
+        .chars()
+        .filter(|ch| *ch != '-' && *ch != '_')
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    normalized.starts_with("subagent")
 }
 
 fn user_message_text(value: &Value) -> Option<&str> {
@@ -805,6 +872,7 @@ async fn read_session_header(path: &Path, cwd: &Path) -> Result<Option<SessionHe
     let mut session_id: Option<String> = None;
     let mut cwd_str: Option<String> = None;
     let mut created_at: Option<String> = None;
+    let mut is_subagent = false;
     let mut first_user_message: Option<String> = None;
 
     let mut lines_scanned = 0usize;
@@ -825,6 +893,7 @@ async fn read_session_header(path: &Path, cwd: &Path) -> Result<Option<SessionHe
         if session_id.is_none()
             && let Some(meta) = parse_session_meta(&value)
         {
+            is_subagent = meta.is_subagent;
             session_id = Some(meta.id);
             cwd_str = meta.cwd;
             created_at = meta.created_at;
@@ -863,6 +932,7 @@ async fn read_session_header(path: &Path, cwd: &Path) -> Result<Option<SessionHe
         updated_hint: None,
         first_user_message,
         is_cwd_match,
+        is_subagent,
     }))
 }
 
