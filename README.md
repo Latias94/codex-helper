@@ -22,8 +22,8 @@ English: [README_EN.md](README_EN.md)
 
 可用折扣码：
 
-- Air 套餐八折：`NEWAIR`
-- Max 套餐七折：`HELLOMAX`
+- Lite 订阅套餐 9 折优惠码：`Lite9`
+- Air 订阅套餐 8 折优惠码：`Air8`
 
 ## 适合谁
 
