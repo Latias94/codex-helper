@@ -138,7 +138,6 @@ async fn find_codex_sessions_in_dir(
         return Ok(Vec::new());
     }
 
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let mut headers: Vec<SessionHeader> = Vec::new();
     let mut scanned_files: usize = 0;
 
@@ -156,11 +155,8 @@ async fn find_codex_sessions_in_dir(
                     }
                     scanned_files += 1;
 
-                    let header_opt = read_session_header(&path, &cwd).await?;
+                    let header_opt = read_session_header_without_cwd_match(&path).await?;
                     if let Some(header) = header_opt {
-                        if header.is_subagent {
-                            continue;
-                        }
                         headers.push(header);
                     }
                 }
@@ -192,6 +188,7 @@ async fn find_codex_sessions_for_dir_in_sessions_dir(
 
     let mut matched: Vec<SessionHeader> = Vec::new();
     let mut scanned_files: usize = 0;
+    let mut cwd_matcher = SessionCwdMatcher::new(root_dir);
 
     let year_dirs = collect_dirs_desc(sessions_dir, |s| s.parse::<u32>().ok()).await?;
 
@@ -207,14 +204,12 @@ async fn find_codex_sessions_for_dir_in_sessions_dir(
                     }
                     scanned_files += 1;
 
-                    let header_opt = read_session_header(&path, root_dir).await?;
+                    let header_opt =
+                        read_session_header_with_cwd_matcher(&path, Some(&mut cwd_matcher)).await?;
                     let Some(header) = header_opt else {
                         continue;
                     };
 
-                    if header.is_subagent {
-                        continue;
-                    }
                     if header.is_cwd_match {
                         matched.push(header);
                     }
@@ -242,6 +237,7 @@ pub async fn search_codex_sessions_for_dir(
 
     let mut matched: Vec<SessionHeader> = Vec::new();
     let mut scanned_files: usize = 0;
+    let mut cwd_matcher = SessionCwdMatcher::new(root_dir);
 
     let year_dirs = collect_dirs_desc(&root, |s| s.parse::<u32>().ok()).await?;
 
@@ -257,13 +253,11 @@ pub async fn search_codex_sessions_for_dir(
                     }
                     scanned_files += 1;
 
-                    let header_opt = read_session_header(&path, root_dir).await?;
+                    let header_opt =
+                        read_session_header_with_cwd_matcher(&path, Some(&mut cwd_matcher)).await?;
                     let Some(header) = header_opt else {
                         continue;
                     };
-                    if header.is_subagent {
-                        continue;
-                    }
                     if !header
                         .first_user_message
                         .to_lowercase()
@@ -323,8 +317,6 @@ pub async fn find_recent_codex_session_summaries(
         return Ok(Vec::new());
     }
 
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -363,13 +355,10 @@ pub async fn find_recent_codex_session_summaries(
                         continue;
                     }
 
-                    let header_opt = read_session_header(&path, &cwd).await?;
+                    let header_opt = read_session_header_without_cwd_match(&path).await?;
                     let Some(header) = header_opt else {
                         continue;
                     };
-                    if header.is_subagent {
-                        continue;
-                    }
                     headers.push(header);
                 }
             }
@@ -421,16 +410,11 @@ pub async fn list_codex_sessions_in_day_dir(
         return Ok(Vec::new());
     }
 
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let day_files = collect_rollout_files_sorted(day_dir).await?;
     let mut out: Vec<SessionIndexItem> = Vec::new();
     for chunk in day_files.chunks(SESSION_IO_CONCURRENCY) {
-        let cwd = cwd.clone();
         let mut stream = stream::iter(chunk.iter().cloned())
-            .map(move |path| {
-                let cwd = cwd.clone();
-                async move { read_session_index_item(path, cwd).await }
-            })
+            .map(|path| async move { read_session_index_item(path).await })
             .buffer_unordered(SESSION_IO_CONCURRENCY);
 
         while let Some(item) = stream.next().await {
@@ -449,14 +433,11 @@ pub async fn list_codex_sessions_in_day_dir(
 }
 
 #[cfg(feature = "gui")]
-async fn read_session_index_item(path: PathBuf, cwd: PathBuf) -> Result<Option<SessionIndexItem>> {
-    let header_opt = read_session_header(&path, &cwd).await?;
+async fn read_session_index_item(path: PathBuf) -> Result<Option<SessionIndexItem>> {
+    let header_opt = read_session_header_without_cwd_match(&path).await?;
     let Some(mut header) = header_opt else {
         return Ok(None);
     };
-    if header.is_subagent {
-        return Ok(None);
-    }
     header.updated_hint = read_last_timestamp_from_tail(&header.path)
         .await?
         .or_else(|| header.created_at.clone());
@@ -747,13 +728,14 @@ struct SessionHeader {
     path: PathBuf,
     cwd: Option<String>,
     created_at: Option<String>,
+    /// File size in bytes at header-read time.
+    file_size: u64,
     /// File modified time in milliseconds since epoch (used for cheap recency sorting).
     mtime_ms: u64,
     /// Best-effort: timestamp of the most recent JSONL record (from the file tail; only computed for displayed rows).
     updated_hint: Option<String>,
     first_user_message: String,
     is_cwd_match: bool,
-    is_subagent: bool,
 }
 
 fn parse_session_meta(value: &Value) -> Option<SessionMetaInfo> {
@@ -852,10 +834,24 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
+#[cfg(test)]
 async fn read_session_header(path: &Path, cwd: &Path) -> Result<Option<SessionHeader>> {
+    let mut cwd_matcher = SessionCwdMatcher::new(cwd);
+    read_session_header_with_cwd_matcher(path, Some(&mut cwd_matcher)).await
+}
+
+async fn read_session_header_without_cwd_match(path: &Path) -> Result<Option<SessionHeader>> {
+    read_session_header_with_cwd_matcher(path, None).await
+}
+
+async fn read_session_header_with_cwd_matcher(
+    path: &Path,
+    mut cwd_matcher: Option<&mut SessionCwdMatcher>,
+) -> Result<Option<SessionHeader>> {
     let meta = fs::metadata(path)
         .await
         .with_context(|| format!("failed to stat session file {:?}", path))?;
+    let file_size = meta.len();
     let mtime_ms = meta
         .modified()
         .ok()
@@ -872,7 +868,6 @@ async fn read_session_header(path: &Path, cwd: &Path) -> Result<Option<SessionHe
     let mut session_id: Option<String> = None;
     let mut cwd_str: Option<String> = None;
     let mut created_at: Option<String> = None;
-    let mut is_subagent = false;
     let mut first_user_message: Option<String> = None;
 
     let mut lines_scanned = 0usize;
@@ -893,7 +888,9 @@ async fn read_session_header(path: &Path, cwd: &Path) -> Result<Option<SessionHe
         if session_id.is_none()
             && let Some(meta) = parse_session_meta(&value)
         {
-            is_subagent = meta.is_subagent;
+            if meta.is_subagent {
+                return Ok(None);
+            }
             session_id = Some(meta.id);
             cwd_str = meta.cwd;
             created_at = meta.created_at;
@@ -918,21 +915,24 @@ async fn read_session_header(path: &Path, cwd: &Path) -> Result<Option<SessionHe
     };
 
     let cwd_value = cwd_str.clone();
-    let is_cwd_match = cwd_value
-        .as_deref()
-        .map(|s| path_matches_current_dir(s, cwd))
-        .unwrap_or(false);
+    let is_cwd_match = if let (Some(session_cwd), Some(matcher)) =
+        (cwd_value.as_deref(), cwd_matcher.as_deref_mut())
+    {
+        matcher.matches(session_cwd)
+    } else {
+        false
+    };
 
     Ok(Some(SessionHeader {
         id,
         path: path.to_path_buf(),
         cwd: cwd_value,
         created_at,
+        file_size,
         mtime_ms,
         updated_hint: None,
         first_user_message,
         is_cwd_match,
-        is_subagent,
     }))
 }
 
@@ -1012,16 +1012,8 @@ async fn expand_header_to_summary_cached(
 ) -> Result<SessionSummary> {
     let path = header.path.clone();
     let key = path.to_string_lossy().to_string();
-    let meta = fs::metadata(&path)
-        .await
-        .with_context(|| format!("failed to stat session file {:?}", path))?;
-    let size = meta.len();
-    let mtime_ms = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    let size = header.file_size;
+    let mtime_ms = header.mtime_ms;
 
     let cached = {
         let cache = cache
@@ -1248,16 +1240,42 @@ async fn read_tail_timestamps(path: &Path, include_assistant: bool) -> Result<Ta
     Ok(found)
 }
 
-fn path_matches_current_dir(session_cwd: &str, current_dir: &Path) -> bool {
-    let session_path = PathBuf::from(session_cwd);
-    if !session_path.is_absolute() {
-        return false;
+struct SessionCwdMatcher {
+    current: PathBuf,
+    cache: HashMap<String, bool>,
+}
+
+impl SessionCwdMatcher {
+    fn new(current_dir: &Path) -> Self {
+        Self {
+            current: std::fs::canonicalize(current_dir)
+                .unwrap_or_else(|_| current_dir.to_path_buf()),
+            cache: HashMap::new(),
+        }
     }
 
-    let current = std::fs::canonicalize(current_dir).unwrap_or_else(|_| current_dir.to_path_buf());
-    let cwd = std::fs::canonicalize(&session_path).unwrap_or(session_path);
+    fn matches(&mut self, session_cwd: &str) -> bool {
+        if let Some(matched) = self.cache.get(session_cwd) {
+            return *matched;
+        }
 
-    current == cwd || current.starts_with(&cwd) || cwd.starts_with(&current)
+        let session_path = PathBuf::from(session_cwd);
+        let matched = if session_path.is_absolute() {
+            let cwd = std::fs::canonicalize(&session_path).unwrap_or(session_path);
+            self.current == cwd || self.current.starts_with(&cwd) || cwd.starts_with(&self.current)
+        } else {
+            false
+        };
+
+        self.cache.insert(session_cwd.to_string(), matched);
+        matched
+    }
+}
+
+#[cfg(test)]
+fn path_matches_current_dir(session_cwd: &str, current_dir: &Path) -> bool {
+    let mut matcher = SessionCwdMatcher::new(current_dir);
+    matcher.matches(session_cwd)
 }
 
 async fn collect_dirs_desc<T, F>(parent: &Path, parse: F) -> std::io::Result<Vec<(T, PathBuf)>>
