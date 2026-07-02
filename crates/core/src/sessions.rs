@@ -846,7 +846,7 @@ async fn read_session_header_without_cwd_match(path: &Path) -> Result<Option<Ses
 
 async fn read_session_header_with_cwd_matcher(
     path: &Path,
-    mut cwd_matcher: Option<&mut SessionCwdMatcher>,
+    cwd_matcher: Option<&mut SessionCwdMatcher>,
 ) -> Result<Option<SessionHeader>> {
     let meta = fs::metadata(path)
         .await
@@ -915,13 +915,12 @@ async fn read_session_header_with_cwd_matcher(
     };
 
     let cwd_value = cwd_str.clone();
-    let is_cwd_match = if let (Some(session_cwd), Some(matcher)) =
-        (cwd_value.as_deref(), cwd_matcher.as_deref_mut())
-    {
-        matcher.matches(session_cwd)
-    } else {
-        false
-    };
+    let is_cwd_match =
+        if let (Some(session_cwd), Some(matcher)) = (cwd_value.as_deref(), cwd_matcher) {
+            matcher.matches(session_cwd)
+        } else {
+            false
+        };
 
     Ok(Some(SessionHeader {
         id,
