@@ -662,10 +662,10 @@ pub(in crate::tui) fn balance_amount_brief_lang(
     {
         if let Some(quota) = quota_amount_brief(snapshot, lang) {
             return Some(format!(
-                "{} {} | {}",
+                "{} | {} {}",
+                quota,
                 i18n::label(lang, "left"),
-                usd_brief(total),
-                quota
+                usd_brief(total)
             ));
         }
         return Some(format!(
@@ -881,12 +881,13 @@ fn balance_amount_terse_lang(snapshot: &ProviderBalanceSnapshot, lang: Language)
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    if let Some(total) = total {
-        return Some(usd_brief(total));
-    }
 
     if let Some(amount) = quota_amount_terse(snapshot, lang) {
         return Some(amount);
+    }
+
+    if let Some(total) = total {
+        return Some(usd_brief(total));
     }
 
     match (subscription, paygo) {
@@ -917,12 +918,13 @@ fn balance_amount_tiny(snapshot: &ProviderBalanceSnapshot) -> Option<String> {
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    if let Some(total) = total {
-        return Some(usd_brief(total));
-    }
 
     if let Some(amount) = quota_amount_tiny(snapshot) {
         return Some(amount);
+    }
+
+    if let Some(total) = total {
+        return Some(usd_brief(total));
     }
 
     let subscription = snapshot
@@ -2396,7 +2398,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_balance_compact_prefers_wallet_when_quota_is_also_present() {
+    fn provider_balance_compact_prefers_quota_when_wallet_is_also_present() {
         let snapshot = ProviderBalanceSnapshot {
             status: BalanceSnapshotStatus::Ok,
             plan_name: Some("RightCode Daily".to_string()),
@@ -2409,9 +2411,12 @@ mod tests {
 
         assert_eq!(
             provider_balance_compact(&snapshot, 120),
-            "RightCode Daily left $3.25 | daily left $7.50 / $20.00"
+            "RightCode Daily daily left $7.50 / $20.00 | left $3.25"
         );
-        assert_eq!(provider_balance_compact(&snapshot, 18), "$3.25");
+        assert_eq!(
+            provider_balance_compact(&snapshot, 18),
+            "daily $7.50/$20.00"
+        );
     }
 
     #[test]
