@@ -11,10 +11,19 @@ All notable changes to this project will be documented in this file.
 
 - TUI 新增可选服务状态页，位于 `4 请求` 之后的 `5 状态`。`[ui.service_status]` 默认关闭；显式启用后可按 provider / endpoint 发起 `max_tokens=1`、`stream=false` 的轻量 `chat/completions` 探针，验证真实上游链路，同时保留只读 status JSON URL 兼容模式。
 - 新增 `[codex.client_patch].hosted_image_generation = "auto" | "enabled" | "disabled"`。`disabled` 会在 `switch on` 时写入 Codex `[features].image_generation = false`，并在 helper 转发 Codex `/responses` / WebSocket 请求时移除会话中已有的 hosted `image_generation` 工具声明，避免不支持生图工具的上游仅因 tools 声明失败；显式 OpenAI Images 兼容入口仍保留生图工具。
+- 新增 provider signal control loop：上游响应、route attempt、传输错误和可信余额快照会先规范化为 provider signal，再生成归 codex-helper 所有、可审计、可过期的 policy action，并投影回 route graph。手动禁用和手动 override 仍高于自动 action，自动 action 不会修改 Codex auth 或第三方账号文件。
+- 请求 ledger、admin API、GUI 和 TUI 现在会展示 provider signal / policy action 证据；Stations / route graph 视图会显示 active automatic policy actions、canonical provider endpoint key、route skip 原因和 provider control 摘要。
+
+#### 变更
+
+- 可信余额耗尽现在通过 owned balance policy action 影响路由，而不是直接散落在多个 runtime 读模型里；新的非耗尽余额快照只会清理 codex-helper 自己拥有的 balance action，不会清理手动 override 或其它响应型 cooldown。
+- 自动余额探针会记住成功的中转适配器类型，并在短时间内跳过刚失败的适配器；当 degraded route selection 只能选择低优先级 provider 时，会对被 cooldown 或 trusted usage exhaustion 跳过的高优先级 endpoint 排队受节流的余额复查。
 
 #### 修复
 
-- 暂无。
+- 修复 provider surface / request ledger 中 endpoint key 兼容性和 CLI 过滤构造问题，旧记录和旧 dashboard DTO 仍能被读取。
+- 修复 policy action 证据一致性问题，route attempt、request detail、provider surface 和 runtime projection 对同一 provider endpoint 使用一致的 action / signal 归属。
+- 400 请求侧非瞬态错误现在归类为 `client_error_non_retryable`，不会计入 provider health 失败，并在 route attempt 中记录为 `failed_client_request`；流式 read error / idle timeout 日志也补充 `stream_error_kind`、首包耗时、已缓存字节数和 provider endpoint 信息，方便区分真实上游故障与请求侧错误。
 
 ### English summary
 
@@ -22,10 +31,19 @@ All notable changes to this project will be documented in this file.
 
 - Added an optional TUI service status page after `4 Requests` as `5 Status`. `[ui.service_status]` is disabled by default; when explicitly enabled it can probe provider / endpoint targets with lightweight `chat/completions` requests using `max_tokens=1` and `stream=false`, while retaining read-only status JSON URL compatibility.
 - Added `[codex.client_patch].hosted_image_generation = "auto" | "enabled" | "disabled"`. `disabled` writes Codex `[features].image_generation = false` during `switch on` and strips existing hosted `image_generation` tool declarations from proxied Codex `/responses` / WebSocket requests, while preserving explicit OpenAI Images-compatible requests.
+- Added the provider signal control loop: upstream responses, route attempts, transport failures, and trusted balance snapshots are normalized into provider signals, converted into codex-helper-owned auditable policy actions, and projected back into the route graph. Manual disables and overrides still take precedence, and automatic actions never mutate Codex auth or third-party account files.
+- Request ledger, admin API, GUI, and TUI surfaces now expose provider signal / policy action evidence. The Stations / route graph views show active automatic policy actions, canonical provider endpoint keys, route skip reasons, and provider control summaries.
+
+#### Changed
+
+- Trusted balance exhaustion now affects routing through owned balance policy actions instead of being interpreted independently by multiple runtime read models. Fresh non-exhausted balance snapshots clear only codex-helper-owned balance actions, not manual overrides or unrelated response-based cooldowns.
+- Automatic balance probing now remembers successful relay adapter kinds and temporarily skips recently failed kinds. When degraded route selection falls back to a lower-priority provider, codex-helper queues throttled balance reprobes for higher-priority endpoints skipped by cooldown or trusted usage exhaustion.
 
 #### Fixed
 
-- None.
+- Fixed provider surface / request ledger endpoint-key compatibility and CLI filter construction so old records and old dashboard DTOs remain readable.
+- Fixed policy action evidence consistency so route attempts, request details, provider surfaces, and runtime projections agree on action / signal ownership for the same provider endpoint.
+- Non-transient client-side 400 responses are now classified as `client_error_non_retryable`, kept health-neutral, and recorded as `failed_client_request` route attempts. Stream read errors and idle timeouts now include `stream_error_kind`, first-byte timing, buffered byte counts, and provider endpoint context for diagnostics.
 
 ## [0.19.0] - 2026-06-29
 
