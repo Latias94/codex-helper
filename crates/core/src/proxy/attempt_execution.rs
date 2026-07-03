@@ -503,6 +503,8 @@ pub(super) async fn execute_selected_upstream(
                         duration_ms: start.elapsed().as_millis() as u64,
                         cooldown_secs: None,
                         cooldown_reason: None,
+                        provider_signals: Vec::new(),
+                        policy_actions: Vec::new(),
                     },
                 );
 
@@ -788,6 +790,8 @@ pub(super) async fn execute_selected_upstream(
                         duration_ms: start.elapsed().as_millis() as u64,
                         cooldown_secs: None,
                         cooldown_reason: None,
+                        provider_signals: Vec::new(),
+                        policy_actions: Vec::new(),
                     },
                 );
                 tracing::info!(

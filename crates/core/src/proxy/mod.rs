@@ -39,6 +39,7 @@ mod openai_images;
 mod passive_health;
 mod persisted_registry_api;
 mod profile_defaults;
+mod provider_evidence;
 mod provider_execution;
 mod provider_orchestration;
 mod providers_api;

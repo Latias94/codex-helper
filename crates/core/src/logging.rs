@@ -370,6 +370,22 @@ fn policy_actions_is_empty(value: &[PolicyAction]) -> bool {
     value.is_empty()
 }
 
+fn provider_signals_from_retry(retry: Option<&RetryInfo>) -> Vec<ProviderSignal> {
+    retry
+        .into_iter()
+        .flat_map(|retry| retry.route_attempts.iter())
+        .flat_map(|attempt| attempt.provider_signals.iter().cloned())
+        .collect()
+}
+
+fn policy_actions_from_retry(retry: Option<&RetryInfo>) -> Vec<PolicyAction> {
+    retry
+        .into_iter()
+        .flat_map(|retry| retry.route_attempts.iter())
+        .flat_map(|attempt| attempt.policy_actions.iter().cloned())
+        .collect()
+}
+
 fn bool_is_false(value: &bool) -> bool {
     !*value
 }
@@ -920,6 +936,9 @@ pub fn log_request_with_debug(
         }
     }
 
+    let provider_signals = provider_signals_from_retry(retry.as_ref());
+    let policy_actions = policy_actions_from_retry(retry.as_ref());
+
     let entry = RequestLog {
         timestamp_ms: ts,
         request_id,
@@ -947,8 +966,8 @@ pub fn log_request_with_debug(
         http_debug_ref,
         route_decision,
         retry,
-        provider_signals: Vec::new(),
-        policy_actions: Vec::new(),
+        provider_signals,
+        policy_actions,
     };
 
     if let Ok(line) = serde_json::to_string(&entry) {

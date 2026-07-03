@@ -30,6 +30,7 @@ use super::concurrency_limits::ConcurrencyPermit;
 use super::headers::header_map_to_entries;
 use super::http_debug::{HttpDebugBase, warn_http_debug};
 use super::passive_health::{record_passive_upstream_failure, record_passive_upstream_success};
+use super::provider_evidence::{ResponseEvidenceParams, response_evidence_from_classification};
 use super::request_body::scan_service_tier_from_sse_bytes_incremental;
 use super::request_observer::{RequestObserver, RequestPublication, RequestPublicationGate};
 use super::retry::response_penalty_cooldown_secs;
@@ -387,6 +388,26 @@ impl Drop for StreamFinalize {
         });
         let health_update = terminal_decision.health_update;
         let passive_failure = terminal_decision.passive_failure;
+        let classified_response =
+            classify_observed_upstream_response(status_code, &self.resp_headers, &response_body);
+        let evidence_route_facing = matches!(
+            &health_update,
+            Some(StreamHealthUpdate::FailureAndPenalty { .. })
+        );
+        let provider_evidence = response_evidence_from_classification(ResponseEvidenceParams {
+            target: &self.target,
+            classified_response: &classified_response,
+            status_code,
+            error_class: stream_error
+                .as_ref()
+                .map(|error| error.class)
+                .or(classified_response.class.as_deref()),
+            route_facing: evidence_route_facing,
+            default_cooldown_secs: match &health_update {
+                Some(StreamHealthUpdate::FailureAndPenalty { cooldown_secs, .. }) => *cooldown_secs,
+                _ => transport_cooldown_secs,
+            },
+        });
 
         let state_for_passive = state.clone();
         let service_name_for_passive = self.service_name.clone();
@@ -418,6 +439,14 @@ impl Drop for StreamFinalize {
         publication.usage = usage;
         publication.route_decision = self.route_decision.clone();
         publication.retry = self.retry.clone();
+        if let Some(retry) = publication.retry.as_mut()
+            && let Some(last_attempt) = retry.route_attempts.last_mut()
+            && last_attempt.provider_endpoint_key.as_deref()
+                == self.provider_endpoint_key.as_deref()
+        {
+            last_attempt.provider_signals = provider_evidence.signals.clone();
+            last_attempt.policy_actions = provider_evidence.actions.clone();
+        }
         publication.http_debug = http_debug;
         let publication = publication.with_route_decision_model();
 
@@ -449,6 +478,9 @@ impl Drop for StreamFinalize {
                     error_reason,
                     cooldown_secs,
                 }) => {
+                    provider_evidence
+                        .apply_to_state(service_name_for_passive.as_str(), state.as_ref())
+                        .await;
                     record_attempt_failure(
                         state.as_ref(),
                         service_name_for_passive.as_str(),

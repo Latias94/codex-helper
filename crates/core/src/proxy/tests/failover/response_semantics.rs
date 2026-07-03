@@ -1319,8 +1319,189 @@ async fn proxy_429_usage_limit_body_sets_retry_after_cooldown() {
         first.cooldown_reason.as_deref(),
         Some("upstream_rate_limited")
     );
+    assert!(first.provider_signals.is_empty());
+    assert!(first.policy_actions.is_empty());
 
     proxy.handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_v4_429_usage_limit_records_provider_signal_and_policy_action() {
+    let _env_guard = env_lock().await;
+    let temp_dir = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
+    }
+
+    let primary_hits = Arc::new(AtomicUsize::new(0));
+    let backup_hits = Arc::new(AtomicUsize::new(0));
+
+    let primary_counter = primary_hits.clone();
+    let primary = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let primary_counter = primary_counter.clone();
+            async move {
+                primary_counter.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(serde_json::json!({
+                        "error": {
+                            "type": "usage_limit_reached",
+                            "message": "usage limit reached",
+                            "resets_in_seconds": 12
+                        }
+                    })),
+                )
+            }
+        }),
+    );
+    let (primary_addr, primary_handle) = spawn_axum_server(primary);
+
+    let backup_counter = backup_hits.clone();
+    let backup = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let backup_counter = backup_counter.clone();
+            async move {
+                backup_counter.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "provider": "backup" })),
+                )
+            }
+        }),
+    );
+    let (backup_addr, backup_handle) = spawn_axum_server(backup);
+
+    let retry = RetryConfig {
+        upstream: Some(retry_layer_config(
+            1,
+            "",
+            Vec::new(),
+            RetryStrategy::SameUpstream,
+        )),
+        provider: Some(retry_layer_config(
+            2,
+            "",
+            vec!["upstream_rate_limited".to_string()],
+            RetryStrategy::Failover,
+        )),
+        transport_cooldown_secs: Some(30),
+        cooldown_backoff_factor: Some(1),
+        cooldown_backoff_max_secs: Some(0),
+        ..RetryConfig::default()
+    };
+    let v4 = ProxyConfigV4 {
+        retry,
+        codex: ServiceViewV4 {
+            providers: std::collections::BTreeMap::from([
+                (
+                    "primary".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some(format!("http://{primary_addr}/v1")),
+                        inline_auth: UpstreamAuth::default(),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+                (
+                    "backup".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some(format!("http://{backup_addr}/v1")),
+                        inline_auth: UpstreamAuth::default(),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+            ]),
+            routing: Some(RoutingConfigV4::ordered_failover(vec![
+                "primary".to_string(),
+                "backup".to_string(),
+            ])),
+            ..ServiceViewV4::default()
+        },
+        ..ProxyConfigV4::default()
+    };
+    let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compile v4");
+    let proxy = ProxyService::new_with_v4_source(
+        Client::new(),
+        Arc::new(runtime),
+        Some(Arc::new(v4)),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let state = proxy.state.clone();
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let resp = Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt-5","input":"hi"}"#)
+        .send()
+        .await
+        .expect("send")
+        .error_for_status()
+        .expect("status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("json response");
+
+    assert_eq!(resp["provider"].as_str(), Some("backup"));
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 1);
+
+    let finished = find_finished_request(&state, 10, |request| {
+        request.status_code == StatusCode::OK.as_u16()
+    })
+    .await
+    .expect("finished request");
+    let retry = finished.retry.expect("retry trace");
+    let first = retry.route_attempts.first().expect("first route attempt");
+    assert_eq!(
+        first.provider_endpoint_key.as_deref(),
+        Some("codex/primary/default")
+    );
+    assert_eq!(first.provider_signals.len(), 1);
+    assert!(matches!(
+        first.provider_signals[0].kind,
+        crate::provider_signals::ProviderSignalKind::RateLimit
+    ));
+    assert!(first.provider_signals[0].route_facing);
+    assert_eq!(first.provider_signals[0].reset_after_secs, Some(12));
+    assert_eq!(first.policy_actions.len(), 1);
+    assert!(matches!(
+        first.policy_actions[0].kind,
+        crate::policy_actions::PolicyActionKind::Cooldown
+    ));
+    assert_eq!(first.policy_actions[0].reason, "upstream_rate_limited");
+
+    let active_actions = state.list_policy_actions("codex").await;
+    assert_eq!(active_actions.len(), 1);
+    assert_eq!(
+        active_actions[0].provider_endpoint_key.stable_key(),
+        "codex/primary/default"
+    );
+
+    let log_text =
+        std::fs::read_to_string(crate::logging::request_log_path()).expect("read request log");
+    let record = log_text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|record| record["status_code"].as_u64() == Some(StatusCode::OK.as_u16() as u64))
+        .expect("logged successful request");
+    assert_eq!(
+        record["provider_signals"][0]["kind"].as_str(),
+        Some("rate_limit")
+    );
+    assert_eq!(
+        record["policy_actions"][0]["provider_endpoint_key"]["provider_id"].as_str(),
+        Some("primary")
+    );
+
+    proxy_handle.abort();
+    primary_handle.abort();
+    backup_handle.abort();
 }
 
 #[tokio::test]

@@ -22,6 +22,7 @@ use super::concurrency_limits::ConcurrencyPermit;
 use super::http_debug::HttpDebugBase;
 use super::models_compat::maybe_decode_models_response_body;
 use super::passive_health::{record_passive_upstream_failure, record_passive_upstream_success};
+use super::provider_evidence::{ResponseEvidenceParams, response_evidence_from_classification};
 use super::reasoning_guard::{
     REASONING_GUARD_BLOCKED_CLASS, evaluate_reasoning_guard, reasoning_guard_error_body,
     reasoning_guard_retry_count,
@@ -287,6 +288,8 @@ pub(super) async fn handle_streaming_attempt_success(
             duration_ms,
             cooldown_secs: None,
             cooldown_reason: None,
+            provider_signals: Vec::new(),
+            policy_actions: Vec::new(),
         },
     );
     record_session_route_affinity_success(
@@ -508,7 +511,7 @@ pub(super) async fn handle_attempt_response(
     let retry_after_secs = classified_response.retry_after_secs();
     let cls = semantic_error_class
         .map(ToOwned::to_owned)
-        .or(classified_response.class);
+        .or_else(|| classified_response.class.clone());
     let observed_service_tier = extract_service_tier_from_response_body(response_body.as_ref());
     let decision = decide_attempt_response(AttemptResponseDecisionParams {
         plan,
@@ -528,6 +531,16 @@ pub(super) async fn handle_attempt_response(
         .as_deref()
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| format!("status_{status_code}"));
+    let route_facing_evidence =
+        decision.provider_penalty && !class_is_health_neutral(cls.as_deref());
+    let provider_evidence = response_evidence_from_classification(ResponseEvidenceParams {
+        target,
+        classified_response: &classified_response,
+        status_code,
+        error_class: cls.as_deref(),
+        route_facing: route_facing_evidence,
+        default_cooldown_secs: penalty_cooldown_secs,
+    });
     record_status_route_attempt(
         upstream_chain,
         route_attempts,
@@ -544,6 +557,8 @@ pub(super) async fn handle_attempt_response(
             cooldown_reason: decision
                 .provider_penalty
                 .then_some(cooldown_reason.as_str()),
+            provider_signals: provider_evidence.signals.clone(),
+            policy_actions: provider_evidence.actions.clone(),
         },
     );
 
@@ -687,6 +702,9 @@ pub(super) async fn handle_attempt_response(
 
     if decision.provider_penalty {
         if !class_is_health_neutral(cls.as_deref()) {
+            provider_evidence
+                .apply_to_state(proxy.service_name, proxy.state.as_ref())
+                .await;
             penalize_attempt_target(
                 proxy.state.as_ref(),
                 proxy.service_name,

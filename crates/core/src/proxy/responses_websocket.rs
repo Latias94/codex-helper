@@ -872,6 +872,8 @@ async fn relay_websocket_streams(
             duration_ms,
             cooldown_secs: None,
             cooldown_reason: None,
+            provider_signals: Vec::new(),
+            policy_actions: Vec::new(),
         },
     );
     record_session_route_affinity_success(

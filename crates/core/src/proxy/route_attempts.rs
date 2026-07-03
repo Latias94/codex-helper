@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 
 use crate::logging::RouteAttemptLog;
+use crate::policy_actions::PolicyAction;
+use crate::provider_signals::ProviderSignal;
 
 use super::attempt_target::AttemptTarget;
 
@@ -38,6 +40,8 @@ pub(super) struct StatusRouteAttemptParams<'a> {
     pub(super) duration_ms: u64,
     pub(super) cooldown_secs: Option<u64>,
     pub(super) cooldown_reason: Option<&'a str>,
+    pub(super) provider_signals: Vec<ProviderSignal>,
+    pub(super) policy_actions: Vec<PolicyAction>,
 }
 
 pub(super) struct ErrorRouteAttemptParams<'a> {
@@ -85,6 +89,8 @@ pub(super) struct AttemptOutcome {
     duration_ms: Option<u64>,
     cooldown_secs: Option<u64>,
     cooldown_reason: Option<String>,
+    provider_signals: Vec<ProviderSignal>,
+    policy_actions: Vec<PolicyAction>,
     skipped: bool,
     raw: String,
 }
@@ -101,6 +107,8 @@ impl AttemptOutcome {
             duration_ms: None,
             cooldown_secs: None,
             cooldown_reason: None,
+            provider_signals: Vec::new(),
+            policy_actions: Vec::new(),
             skipped: true,
             raw: skip.raw,
         }
@@ -125,6 +133,8 @@ impl AttemptOutcome {
             cooldown_secs,
             cooldown_reason: cooldown_secs
                 .and_then(|_| params.cooldown_reason.map(ToOwned::to_owned)),
+            provider_signals: params.provider_signals.clone(),
+            policy_actions: params.policy_actions.clone(),
             skipped: false,
             raw: format!(
                 "{} status={} class={}{} model={}",
@@ -150,6 +160,8 @@ impl AttemptOutcome {
             cooldown_secs,
             cooldown_reason: cooldown_secs
                 .and_then(|_| params.cooldown_reason.map(ToOwned::to_owned)),
+            provider_signals: Vec::new(),
+            policy_actions: Vec::new(),
             skipped: false,
             raw: format!(
                 "{} {}={} model={}",
@@ -348,6 +360,8 @@ fn apply_attempt_outcome(attempt: &mut RouteAttemptLog, outcome: AttemptOutcome)
     attempt.duration_ms = outcome.duration_ms;
     attempt.cooldown_secs = outcome.cooldown_secs;
     attempt.cooldown_reason = outcome.cooldown_reason;
+    attempt.provider_signals = outcome.provider_signals;
+    attempt.policy_actions = outcome.policy_actions;
     attempt.skipped = outcome.skipped;
     attempt.raw = outcome.raw;
 }
