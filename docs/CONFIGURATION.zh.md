@@ -1245,13 +1245,21 @@ codex-helper routing explain --model <MODEL> --json
 
 `routing show` 回答“配置里保存了什么”。`routing explain` 回答“运行时现在会尝试什么”，包括 candidate order、route paths，以及 disabled provider、unsupported model、cooldown 或 trusted balance exhaustion 等 skip reasons。
 
+Provider 运行时事实会先进入 provider signal，再变成有归属的 policy action：
+
+- 上游响应、route attempt 和可信 balance snapshot 会被规范化成 provider signal。
+- 只有高置信、影响路由的 quota、rate-limit、capacity、transport 或 balance 证据可以创建自动 policy action。
+- 自动 action 归 codex-helper 所有，持久化在 `~/.codex-helper/state/policy-actions.json`，并投影到 routing runtime state 和 `/__codex_helper/api/v1/providers`。
+- 手动 runtime override 的优先级始终高于自动 action 恢复。
+- codex-helper 不会因为自动额度处理去修改 Codex auth 文件、ChatGPT 登录状态、中转账号文件或 provider dashboard。
+
 每个完成的请求都会写入：
 
 ```text
 ~/.codex-helper/logs/requests.jsonl
 ```
 
-当请求重试或切换 provider 时，请求日志会保存 `retry.route_attempts[]`。最有用的字段是 `provider_id`、`endpoint_id`、`route_path`、`decision`、`status_code` 和 `error_class`。
+当请求重试或切换 provider 时，请求日志会保存 `retry.route_attempts[]`。最有用的字段是 `provider_id`、`endpoint_id`、`route_path`、`decision`、`status_code` 和 `error_class`。较新的记录还可能在 route attempt 和顶层包含 `provider_signals[]` 与 `policy_actions[]`，所以 request-ledger API 可以按 `signal_kind` 或 `policy_action_kind` 过滤；旧 JSONL 记录仍会以空 evidence 读取。
 
 排查 compact 时，按请求路径过滤：
 
@@ -1301,7 +1309,7 @@ codex-helper routing explain --model <MODEL> --json
 - 可信 balance data 把 endpoint 标记为 `usage_exhausted`；
 - 配置使用 `affinity_policy = "fallback-sticky"` 或 `hard`。
 
-可信余额耗尽是 provider-endpoint 运行时信号。它可以在当前请求/刷新窗口内降级 monthly endpoint，但不是永久 session preference。如果所有 candidate 当前都被可信耗尽或 cooldown 阻断，Codex streaming turn 会收到带有限延迟的可重试 `response.failed` SSE，而不是反复打已耗尽 upstream；helper 也会排队一个受节流的 balance refresh，让恢复后的中转重新进入路由。如果某个 provider 对可用订阅返回误导性的零余额，请为该 usage provider 设置 `trust_exhaustion_for_routing = false`，或修复 balance extractor。
+可信余额耗尽是 provider-endpoint 运行时信号。它会为 canonical provider endpoint 创建一个归 codex-helper 所有的 balance policy action，并可以在当前请求/刷新窗口内降级 monthly endpoint，但不是永久 session preference。新的非耗尽 balance snapshot 只会清除 codex-helper 自己拥有的 balance action，不会清手动 override，也不会清其它基于响应的 cooldown。如果所有 candidate 当前都被可信耗尽或 cooldown 阻断，Codex streaming turn 会收到带有限延迟的可重试 `response.failed` SSE，而不是反复打已耗尽 upstream；helper 也会排队一个受节流的 balance refresh，让恢复后的中转重新进入路由。如果某个 provider 对可用订阅返回误导性的零余额，请为该 usage provider 设置 `trust_exhaustion_for_routing = false`，或修复 balance extractor。
 
 当选中低优先级组时，使用 control trace：
 
@@ -1325,7 +1333,7 @@ codex-helper routing explain --model <MODEL> --json
 
 TUI 和 GUI 应该和配置文件保持相同心智模型：
 
-- Provider list：names、aliases、enabled state、tags、balance 和 expanded fallback order。
+- Provider list：names、aliases、enabled state、tags、balance、expanded fallback order、canonical provider endpoint keys 和 active automatic policy actions。
 - Routing editor：entry strategy、target、children/order、preferred tags、exhaustion behavior 和 route graph tree preview。
 - GUI route node editor：常见 graph 编辑所需的 create、rename、delete 和 save nested route nodes。
 - Requests and sessions：provider choice、route affinity、retry chain、token/cache token usage、cache hit rate 和 estimated cost。

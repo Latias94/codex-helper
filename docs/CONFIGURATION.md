@@ -1322,13 +1322,21 @@ codex-helper routing explain --model <MODEL> --json
 
 `routing show` answers "what is saved in config". `routing explain` answers "what the runtime would try now", including candidate order, route paths, and skip reasons such as disabled provider, unsupported model, cooldown, or trusted balance exhaustion.
 
+Provider runtime facts flow through provider signals and owned policy actions:
+
+- Upstream responses, route attempts, and trusted balance snapshots are normalized into provider signals.
+- Only high-confidence route-facing quota, rate-limit, capacity, transport, or balance evidence can create an automatic policy action.
+- Automatic actions are owned by codex-helper, persisted under `~/.codex-helper/state/policy-actions.json`, and projected into routing runtime state and `/__codex_helper/api/v1/providers`.
+- Manual runtime overrides remain higher priority than automatic action recovery.
+- codex-helper does not mutate Codex auth files, ChatGPT login state, relay account files, or provider dashboards as an automatic quota response.
+
 Every completed request is written to:
 
 ```text
 ~/.codex-helper/logs/requests.jsonl
 ```
 
-When a request retries or switches provider, the request log stores `retry.route_attempts[]`. The most useful fields are `provider_id`, `endpoint_id`, `route_path`, `decision`, `status_code`, and `error_class`.
+When a request retries or switches provider, the request log stores `retry.route_attempts[]`. The most useful fields are `provider_id`, `endpoint_id`, `route_path`, `decision`, `status_code`, and `error_class`. Newer records may also include `provider_signals[]` and `policy_actions[]` at the route-attempt and top levels, so request-ledger APIs can filter by `signal_kind` or `policy_action_kind` while old JSONL records still read with empty evidence.
 
 For compact diagnostics, filter by request path:
 
@@ -1388,7 +1396,7 @@ For a monthly-first setup, the generated default is `affinity_policy = "fallback
 - trusted balance data marks the endpoint `usage_exhausted`;
 - the config uses `affinity_policy = "fallback-sticky"` or `hard`.
 
-Trusted balance exhaustion is a provider-endpoint runtime signal. It can demote a monthly endpoint for the current request/refresh window, but it is not a permanent session preference. If every candidate is currently blocked by trusted exhaustion or cooldown, Codex streaming turns receive a retryable `response.failed` SSE with a bounded delay instead of repeatedly hitting depleted upstreams; the helper also queues a throttled balance refresh so recovered relays can re-enter routing. If a provider reports misleading zero balances for an active subscription, set `trust_exhaustion_for_routing = false` for that usage provider or fix the balance extractor.
+Trusted balance exhaustion is a provider-endpoint runtime signal. It creates an owned balance policy action for the canonical provider endpoint and can demote a monthly endpoint for the current request/refresh window, but it is not a permanent session preference. A fresh non-exhausted balance snapshot clears only the balance action owned by codex-helper; it does not clear manual overrides or unrelated response-based cooldowns. If every candidate is currently blocked by trusted exhaustion or cooldown, Codex streaming turns receive a retryable `response.failed` SSE with a bounded delay instead of repeatedly hitting depleted upstreams; the helper also queues a throttled balance refresh so recovered relays can re-enter routing. If a provider reports misleading zero balances for an active subscription, set `trust_exhaustion_for_routing = false` for that usage provider or fix the balance extractor.
 
 Use the control trace when a lower-priority group is selected:
 
@@ -1402,7 +1410,7 @@ Look for `route_graph_selection_explain`. It records the selected provider endpo
 
 TUI and GUI should keep the same mental model as the config file:
 
-- Provider list: names, aliases, enabled state, tags, balance, and expanded fallback order.
+- Provider list: names, aliases, enabled state, tags, balance, expanded fallback order, canonical provider endpoint keys, and active automatic policy actions.
 - Routing editor: entry strategy, target, children/order, preferred tags, exhaustion behavior, and route graph tree preview.
 - GUI route node editor: create, rename, delete, and save nested route nodes for common graph edits.
 - Requests and sessions: provider choice, route affinity, retry chain, token/cache token usage, cache hit rate, and estimated cost.
