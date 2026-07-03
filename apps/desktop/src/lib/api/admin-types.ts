@@ -211,10 +211,21 @@ export type ApiProviderEndpointKey = {
   endpoint_id?: string;
 };
 
+export type ApiProviderSignalTarget =
+  | { provider_endpoint: { provider_endpoint_key?: string | ApiProviderEndpointKey } }
+  | { provider: { service?: string; provider_id?: string } }
+  | { service: { service?: string } };
+
+export type ApiProviderSignalTrace = {
+  trace_id?: string;
+  cf_ray?: string;
+  upstream_request_id?: string;
+};
+
 export type ApiProviderSignal = {
   kind?: string;
   source?: string;
-  target?: unknown;
+  target?: ApiProviderSignalTarget;
   confidence?: string;
   observed_at_ms?: number;
   route_facing?: boolean;
@@ -222,7 +233,7 @@ export type ApiProviderSignal = {
   reset_after_secs?: number;
   reason?: string;
   error_class?: string;
-  trace?: unknown;
+  trace?: ApiProviderSignalTrace;
 };
 
 export type ApiPolicyAction = {

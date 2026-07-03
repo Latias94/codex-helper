@@ -9,6 +9,7 @@ use crate::local_log_store::{LogRetention, repair_log};
 pub use crate::logging::request_log_path;
 use crate::logging::request_log_retention;
 use crate::pricing::{CostAdjustments, estimate_request_cost_from_operator_catalog_for_service};
+use crate::runtime_identity::ProviderEndpointKey;
 use crate::state::{
     FinishedRequest, RequestObservability, RouteDecisionProvenance, SessionIdentitySource,
 };
@@ -104,16 +105,12 @@ impl RequestLogFilters {
             return false;
         }
         if let Some(expected) = self.signal_kind.as_deref()
-            && !record_provider_signal_kinds(record)
-                .iter()
-                .any(|kind| field_contains(Some(kind), expected))
+            && !record_has_provider_signal_kind(record, expected)
         {
             return false;
         }
         if let Some(expected) = self.policy_action_kind.as_deref()
-            && !record_policy_action_kinds(record)
-                .iter()
-                .any(|kind| field_contains(Some(kind), expected))
+            && !record_has_policy_action_kind(record, expected)
         {
             return false;
         }
@@ -691,13 +688,40 @@ fn record_provider_signal_kinds(record: &JsonValue) -> Vec<String> {
     dedup_preserving_order(kinds)
 }
 
-fn record_policy_action_kinds(record: &JsonValue) -> Vec<String> {
-    let mut kinds = Vec::new();
-    collect_array_string_field(record.get("policy_actions"), "kind", &mut kinds);
-    for attempt in record_route_attempts(record) {
-        collect_array_string_field(attempt.get("policy_actions"), "kind", &mut kinds);
-    }
-    dedup_preserving_order(kinds)
+fn record_has_provider_signal_kind(record: &JsonValue, expected: &str) -> bool {
+    let expected = expected.trim().to_ascii_lowercase();
+    array_string_field_contains(record.get("provider_signals"), "kind", &expected)
+        || record_route_attempts(record).iter().any(|attempt| {
+            array_string_field_contains(attempt.get("provider_signals"), "kind", &expected)
+        })
+}
+
+fn record_has_policy_action_kind(record: &JsonValue, expected: &str) -> bool {
+    let expected = expected.trim().to_ascii_lowercase();
+    array_string_field_contains(record.get("policy_actions"), "kind", &expected)
+        || record_route_attempts(record).iter().any(|attempt| {
+            array_string_field_contains(attempt.get("policy_actions"), "kind", &expected)
+        })
+}
+
+fn array_string_field_contains(
+    value: Option<&JsonValue>,
+    field: &str,
+    expected_lower: &str,
+) -> bool {
+    let Some(items) = value.and_then(|value| value.as_array()) else {
+        return false;
+    };
+    items
+        .iter()
+        .filter_map(|item| str_field(item, field))
+        .any(|value| {
+            if expected_lower.is_empty() {
+                true
+            } else {
+                value.to_ascii_lowercase().contains(expected_lower)
+            }
+        })
 }
 
 fn record_policy_action_summaries(record: &JsonValue) -> Vec<String> {
@@ -709,12 +733,12 @@ fn record_policy_action_summaries(record: &JsonValue) -> Vec<String> {
     dedup_preserving_order(summaries)
 }
 
-fn record_route_attempts(record: &JsonValue) -> Vec<&JsonValue> {
+fn record_route_attempts(record: &JsonValue) -> &[JsonValue] {
     record
         .get("retry")
         .and_then(|retry| retry.get("route_attempts"))
         .and_then(|attempts| attempts.as_array())
-        .map(|attempts| attempts.iter().collect())
+        .map(Vec::as_slice)
         .unwrap_or_default()
 }
 
@@ -753,7 +777,7 @@ fn provider_endpoint_key_value(value: &JsonValue) -> Option<String> {
             let service = str_field(value, "service")?;
             let provider = str_field(value, "provider_id")?;
             let endpoint = str_field(value, "endpoint_id")?;
-            Some(format!("{service}/{provider}/{endpoint}"))
+            Some(ProviderEndpointKey::new(service, provider, endpoint).stable_key())
         })
 }
 

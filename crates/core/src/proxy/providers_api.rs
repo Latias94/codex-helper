@@ -706,16 +706,20 @@ async fn apply_provider_policy_action_surface(
     if projections.is_empty() {
         return;
     }
+    let mut projections_by_endpoint: HashMap<String, Vec<_>> = HashMap::new();
+    for projection in projections {
+        projections_by_endpoint
+            .entry(projection.provider_endpoint_key.stable_key())
+            .or_default()
+            .push(projection);
+    }
 
     for provider in providers {
         for endpoint in &mut provider.endpoints {
-            endpoint.policy_actions = projections
-                .iter()
-                .filter(|projection| {
-                    projection.provider_endpoint_key.stable_key() == endpoint.provider_endpoint_key
-                })
+            endpoint.policy_actions = projections_by_endpoint
+                .get(&endpoint.provider_endpoint_key)
                 .cloned()
-                .collect();
+                .unwrap_or_default();
         }
     }
 }

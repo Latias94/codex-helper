@@ -17,8 +17,7 @@ use crate::lb::LbState;
 use crate::policy_actions::{PolicyAction, PolicyActionKind};
 use crate::pricing::UsdAmount;
 use crate::provider_signals::{
-    ProviderSignal, ProviderSignalConfidence, ProviderSignalKind, ProviderSignalSource,
-    ProviderSignalTarget,
+    ProviderSignal, ProviderSignalKind, ProviderSignalSource, ProviderSignalTarget,
 };
 use crate::runtime_identity::ProviderEndpointKey;
 use crate::state::ProxyState;
@@ -2542,21 +2541,16 @@ fn balance_exhaustion_policy_action(
     observed_at_ms: u64,
 ) -> Option<PolicyAction> {
     const BALANCE_EXHAUSTION_COOLDOWN_SECS: u64 = 24 * 60 * 60;
-    let signal = ProviderSignal {
-        kind: ProviderSignalKind::Balance,
-        source: ProviderSignalSource::BalanceSnapshot,
-        target: ProviderSignalTarget::ProviderEndpoint {
+    let mut signal = ProviderSignal::high_confidence_route_facing(
+        ProviderSignalKind::Balance,
+        ProviderSignalSource::BalanceSnapshot,
+        ProviderSignalTarget::ProviderEndpoint {
             provider_endpoint_key: endpoint_key,
         },
-        confidence: ProviderSignalConfidence::High,
         observed_at_ms,
-        route_facing: true,
-        retry_after_secs: None,
-        reset_after_secs: Some(BALANCE_EXHAUSTION_COOLDOWN_SECS),
-        reason: Some("balance_exhausted".to_string()),
-        error_class: None,
-        trace: Default::default(),
-    };
+    );
+    signal.reset_after_secs = Some(BALANCE_EXHAUSTION_COOLDOWN_SECS);
+    signal.reason = Some("balance_exhausted".to_string());
     PolicyAction::cooldown_from_signal(signal, observed_at_ms, 0, observed_at_ms)
 }
 
