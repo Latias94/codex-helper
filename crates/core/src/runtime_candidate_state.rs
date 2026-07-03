@@ -121,7 +121,7 @@ fn candidate_balance_summary(
             .collect::<Vec<_>>()
     };
 
-    StationRoutingBalanceSummary::from_snapshot_iter_at(snapshots.into_iter(), now_ms)
+    StationRoutingBalanceSummary::from_snapshot_iter_at(snapshots, now_ms)
 }
 
 fn balance_snapshot_matches_candidate(
