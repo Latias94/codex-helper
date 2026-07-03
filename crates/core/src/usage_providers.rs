@@ -14,7 +14,12 @@ use crate::balance::{
 };
 use crate::config::{ProxyConfig, ServiceConfigManager, proxy_home_dir};
 use crate::lb::LbState;
+use crate::policy_actions::{PolicyAction, PolicyActionKind};
 use crate::pricing::UsdAmount;
+use crate::provider_signals::{
+    ProviderSignal, ProviderSignalConfidence, ProviderSignalKind, ProviderSignalSource,
+    ProviderSignalTarget,
+};
 use crate::runtime_identity::ProviderEndpointKey;
 use crate::state::ProxyState;
 
@@ -2532,6 +2537,54 @@ fn openai_organization_costs_snapshot_from_json(
     snapshot
 }
 
+fn balance_exhaustion_policy_action(
+    endpoint_key: ProviderEndpointKey,
+    observed_at_ms: u64,
+) -> Option<PolicyAction> {
+    const BALANCE_EXHAUSTION_COOLDOWN_SECS: u64 = 24 * 60 * 60;
+    let signal = ProviderSignal {
+        kind: ProviderSignalKind::Balance,
+        source: ProviderSignalSource::BalanceSnapshot,
+        target: ProviderSignalTarget::ProviderEndpoint {
+            provider_endpoint_key: endpoint_key,
+        },
+        confidence: ProviderSignalConfidence::High,
+        observed_at_ms,
+        route_facing: true,
+        retry_after_secs: None,
+        reset_after_secs: Some(BALANCE_EXHAUSTION_COOLDOWN_SECS),
+        reason: Some("balance_exhausted".to_string()),
+        error_class: None,
+        trace: Default::default(),
+    };
+    PolicyAction::cooldown_from_signal(signal, observed_at_ms, 0, observed_at_ms)
+}
+
+async fn sync_balance_policy_action_for_endpoint(
+    state: &Arc<ProxyState>,
+    service_name: &str,
+    endpoint_key: ProviderEndpointKey,
+    exhausted: bool,
+) {
+    if exhausted {
+        if let Some(action) =
+            balance_exhaustion_policy_action(endpoint_key, crate::logging::now_ms())
+        {
+            state.upsert_owned_policy_action(service_name, action).await;
+        }
+    } else {
+        state
+            .clear_owned_policy_action(
+                service_name,
+                &endpoint_key,
+                PolicyActionKind::Cooldown,
+                ProviderSignalKind::Balance,
+                ProviderSignalSource::BalanceSnapshot,
+            )
+            .await;
+    }
+}
+
 async fn update_usage_exhausted(
     lb_states: &Arc<Mutex<HashMap<String, LbState>>>,
     state: &Arc<ProxyState>,
@@ -2559,6 +2612,13 @@ async fn update_usage_exhausted(
 
     for uref in upstreams {
         if let Some(endpoint_key) = uref.provider_endpoint.clone() {
+            sync_balance_policy_action_for_endpoint(
+                state,
+                service_name,
+                endpoint_key.clone(),
+                exhausted,
+            )
+            .await;
             state
                 .set_provider_endpoint_usage_exhausted(service_name, endpoint_key, exhausted)
                 .await;
@@ -3446,6 +3506,14 @@ mod tests {
             station_name: "right".to_string(),
             index: 1,
             provider_endpoint: None,
+        }
+    }
+
+    fn endpoint_upstream() -> UpstreamRef {
+        UpstreamRef {
+            station_name: "right".to_string(),
+            index: 1,
+            provider_endpoint: Some(ProviderEndpointKey::new("codex", "right", "default")),
         }
     }
 
@@ -4577,6 +4645,29 @@ mod tests {
                 .copied()
                 .unwrap_or(true)
         );
+    }
+
+    #[tokio::test]
+    async fn usage_exhaustion_syncs_owned_balance_policy_action() {
+        let cfg = proxy_config(vec![service_config(
+            "right",
+            vec![
+                upstream_config("https://primary.example/v1"),
+                upstream_config("https://backup.example/v1"),
+            ],
+        )]);
+        let lb_states = Arc::new(Mutex::new(HashMap::new()));
+        let upstreams = vec![endpoint_upstream()];
+        let state = ProxyState::new();
+
+        update_usage_exhausted(&lb_states, &state, &cfg, "codex", &upstreams, true).await;
+        let actions = state.list_policy_actions("codex").await;
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].source_signal.kind, ProviderSignalKind::Balance);
+        assert_eq!(actions[0].reason, "balance_exhausted");
+
+        update_usage_exhausted(&lb_states, &state, &cfg, "codex", &upstreams, false).await;
+        assert!(state.list_policy_actions("codex").await.is_empty());
     }
 
     #[test]

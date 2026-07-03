@@ -61,6 +61,7 @@ impl PolicyAction {
                 | ProviderSignalKind::RateLimit
                 | ProviderSignalKind::Capacity
                 | ProviderSignalKind::Transport
+                | ProviderSignalKind::Balance
         ) {
             return None;
         }

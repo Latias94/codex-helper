@@ -1419,15 +1419,50 @@ impl ProxyState {
         let actions = per_service
             .entry(action.provider_endpoint_key.clone())
             .or_default();
-        if let Some(existing) = actions
-            .iter_mut()
-            .find(|existing| existing.kind == action.kind && existing.owner == action.owner)
-        {
+        if let Some(existing) = actions.iter_mut().find(|existing| {
+            existing.kind == action.kind
+                && existing.owner == action.owner
+                && existing.source_signal.kind == action.source_signal.kind
+                && existing.source_signal.source == action.source_signal.source
+        }) {
             *existing = action;
         } else {
             actions.push(action);
         }
         self.notify_state_changed();
+    }
+
+    pub async fn clear_owned_policy_action(
+        &self,
+        service_name: &str,
+        endpoint_key: &ProviderEndpointKey,
+        kind: PolicyActionKind,
+        source_kind: crate::provider_signals::ProviderSignalKind,
+        source: crate::provider_signals::ProviderSignalSource,
+    ) {
+        let mut changed = false;
+        let mut guard = self.policy_actions.write().await;
+        if let Some(per_service) = guard.get_mut(service_name) {
+            if let Some(actions) = per_service.get_mut(endpoint_key) {
+                let before = actions.len();
+                actions.retain(|action| {
+                    !(action.kind == kind
+                        && action.owner == crate::policy_actions::PolicyActionOwner::CodexHelper)
+                        || action.source_signal.kind != source_kind
+                        || action.source_signal.source != source
+                });
+                changed |= actions.len() != before;
+                if actions.is_empty() {
+                    per_service.remove(endpoint_key);
+                }
+            }
+            if per_service.is_empty() {
+                guard.remove(service_name);
+            }
+        }
+        if changed {
+            self.notify_state_changed();
+        }
     }
 
     pub async fn list_policy_actions(&self, service_name: &str) -> Vec<PolicyAction> {
@@ -5135,7 +5170,7 @@ mod tests {
     }
 
     #[test]
-    fn owned_policy_action_upsert_replaces_existing_action_for_same_owner_and_kind() {
+    fn owned_policy_action_upsert_replaces_existing_action_for_same_source() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         runtime.block_on(async {
             let state = ProxyState::new();
@@ -5166,6 +5201,79 @@ mod tests {
             assert_eq!(actions.len(), 1);
             assert_eq!(actions[0].generation, 2);
             assert_eq!(actions[0].expires_at_ms, 22_000);
+        });
+    }
+
+    #[test]
+    fn owned_policy_action_clear_is_source_aware() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            let endpoint = ProviderEndpointKey::new("codex", "monthly", "default");
+            let mut response_signal =
+                crate::provider_signals::ProviderSignal::high_confidence_route_facing(
+                    crate::provider_signals::ProviderSignalKind::RateLimit,
+                    crate::provider_signals::ProviderSignalSource::UpstreamResponse,
+                    crate::provider_signals::ProviderSignalTarget::ProviderEndpoint {
+                        provider_endpoint_key: endpoint.clone(),
+                    },
+                    1_000,
+                );
+            response_signal.reset_after_secs = Some(30);
+            let balance_signal = crate::provider_signals::ProviderSignal {
+                kind: crate::provider_signals::ProviderSignalKind::Balance,
+                source: crate::provider_signals::ProviderSignalSource::BalanceSnapshot,
+                target: crate::provider_signals::ProviderSignalTarget::ProviderEndpoint {
+                    provider_endpoint_key: endpoint.clone(),
+                },
+                confidence: crate::provider_signals::ProviderSignalConfidence::High,
+                observed_at_ms: 1_000,
+                route_facing: true,
+                retry_after_secs: None,
+                reset_after_secs: Some(60),
+                reason: Some("balance_exhausted".to_string()),
+                error_class: None,
+                trace: Default::default(),
+            };
+            let response_action = crate::policy_actions::PolicyAction::cooldown_from_signal(
+                response_signal,
+                1_000,
+                30,
+                1,
+            )
+            .expect("response cooldown");
+            let balance_action = crate::policy_actions::PolicyAction::cooldown_from_signal(
+                balance_signal,
+                1_100,
+                0,
+                2,
+            )
+            .expect("balance cooldown");
+
+            state
+                .upsert_owned_policy_action("codex", response_action)
+                .await;
+            state
+                .upsert_owned_policy_action("codex", balance_action)
+                .await;
+            assert_eq!(state.list_policy_actions("codex").await.len(), 2);
+
+            state
+                .clear_owned_policy_action(
+                    "codex",
+                    &endpoint,
+                    crate::policy_actions::PolicyActionKind::Cooldown,
+                    crate::provider_signals::ProviderSignalKind::Balance,
+                    crate::provider_signals::ProviderSignalSource::BalanceSnapshot,
+                )
+                .await;
+
+            let actions = state.list_policy_actions("codex").await;
+            assert_eq!(actions.len(), 1);
+            assert_eq!(
+                actions[0].source_signal.kind,
+                crate::provider_signals::ProviderSignalKind::RateLimit
+            );
         });
     }
 
