@@ -175,6 +175,8 @@ mod tests {
             usage: None,
             cost: crate::pricing::CostBreakdown::default(),
             retry: None,
+            provider_signals: Vec::new(),
+            policy_actions: Vec::new(),
             observability: RequestObservability::default(),
             service: "codex".to_string(),
             method: "POST".to_string(),

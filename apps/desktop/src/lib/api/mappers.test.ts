@@ -195,6 +195,28 @@ describe("admin API mappers", () => {
     expect(data.rows[0].tokens.cache).toBe("20%");
   });
 
+  it("maps provider control evidence from top-level request evidence", () => {
+    const data = mapAdminDashboardData({
+      summary: operatorSummary,
+      recentRequests: [
+        {
+          ...finishedRequest,
+          status_code: 429,
+          provider_signals: [{ kind: "rate_limit" }],
+          policy_actions: [{ kind: "cooldown" }],
+        },
+      ],
+      usageSummary: [],
+      adminBaseUrl: "http://127.0.0.1:4211",
+      appVersion: "0.19.0",
+    });
+
+    expect(data.recentRequests[0]).toMatchObject({
+      status: "warn",
+      providerControl: "signal rate_limit · action cooldown",
+    });
+  });
+
   it("maps provider control evidence from retry attempts", () => {
     const data = mapAdminDashboardData({
       summary: operatorSummary,

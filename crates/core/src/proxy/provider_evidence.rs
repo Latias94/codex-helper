@@ -4,6 +4,7 @@ use crate::provider_signals::{
     ProviderSignal, ProviderSignalConfidence, ProviderSignalKind, ProviderSignalSource,
     ProviderSignalTarget, ProviderSignalTrace,
 };
+use crate::runtime_identity::ProviderEndpointKey;
 use crate::state::ProxyState;
 
 use super::attempt_target::AttemptTarget;
@@ -49,7 +50,7 @@ pub(super) fn response_evidence_from_classification(
         route_facing,
         default_cooldown_secs,
     } = params;
-    let Some(provider_endpoint_key) = target.provider_endpoint_ref().cloned() else {
+    let Some(provider_endpoint_key) = target_provider_endpoint_key(target) else {
         return ProviderResponseEvidence::default();
     };
 
@@ -62,7 +63,7 @@ pub(super) fn response_evidence_from_classification(
 
     let now_ms = now_ms();
     let retry_after_secs = classified_response.retry_after_secs();
-    let confidence = signal_confidence(classified_response, &kind, status_code);
+    let confidence = signal_confidence(class, classified_response, &kind, status_code);
     let mut signal = ProviderSignal {
         kind,
         source: ProviderSignalSource::UpstreamResponse,
@@ -100,14 +101,42 @@ pub(super) fn response_evidence_from_classification(
     }
 }
 
+fn target_provider_endpoint_key(target: &AttemptTarget) -> Option<ProviderEndpointKey> {
+    target.provider_endpoint_ref().cloned().or_else(|| {
+        target
+            .provider_endpoint_key()
+            .and_then(parse_provider_endpoint_key)
+    })
+}
+
+fn parse_provider_endpoint_key(value: String) -> Option<ProviderEndpointKey> {
+    let mut parts = value.split('/');
+    let service_name = parts.next()?.trim();
+    let provider_id = parts.next()?.trim();
+    let endpoint_id = parts.next()?.trim();
+    if parts.next().is_some()
+        || service_name.is_empty()
+        || provider_id.is_empty()
+        || endpoint_id.is_empty()
+    {
+        return None;
+    }
+    Some(ProviderEndpointKey::new(
+        service_name,
+        provider_id,
+        endpoint_id,
+    ))
+}
+
 fn signal_kind_for_class(class: &str, status_code: u16) -> Option<ProviderSignalKind> {
     match class {
         UPSTREAM_RATE_LIMITED_CLASS => Some(ProviderSignalKind::RateLimit),
         UPSTREAM_OVERLOADED_CLASS => Some(ProviderSignalKind::Capacity),
         "cloudflare_challenge" | "cloudflare_timeout" => Some(ProviderSignalKind::Transport),
-        "upstream_transport_error" | "upstream_body_read_error" => {
-            Some(ProviderSignalKind::Transport)
-        }
+        "upstream_transport_error"
+        | "upstream_body_read_error"
+        | "upstream_stream_error"
+        | "upstream_stream_idle_timeout" => Some(ProviderSignalKind::Transport),
         "routing_mismatch_capability" => Some(ProviderSignalKind::Capability),
         _ if status_code == 429 => Some(ProviderSignalKind::RateLimit),
         _ if matches!(status_code, 503 | 529) => Some(ProviderSignalKind::Capacity),
@@ -116,10 +145,14 @@ fn signal_kind_for_class(class: &str, status_code: u16) -> Option<ProviderSignal
 }
 
 fn signal_confidence(
+    class: &str,
     classified_response: &ClassifiedUpstreamResponse,
     kind: &ProviderSignalKind,
     status_code: u16,
 ) -> ProviderSignalConfidence {
+    if matches!(kind, ProviderSignalKind::Transport) && is_transport_error_class(class) {
+        return ProviderSignalConfidence::High;
+    }
     if classified_response
         .throttle_signal
         .as_ref()
@@ -142,6 +175,18 @@ fn signal_confidence(
     } else {
         ProviderSignalConfidence::Medium
     }
+}
+
+fn is_transport_error_class(class: &str) -> bool {
+    matches!(
+        class,
+        "cloudflare_challenge"
+            | "cloudflare_timeout"
+            | "upstream_transport_error"
+            | "upstream_body_read_error"
+            | "upstream_stream_error"
+            | "upstream_stream_idle_timeout"
+    )
 }
 
 #[cfg(test)]
@@ -226,6 +271,28 @@ mod tests {
 
         assert_eq!(evidence.signals.len(), 1);
         assert_eq!(evidence.signals[0].kind, ProviderSignalKind::Capability);
+        assert!(evidence.actions.is_empty());
+    }
+
+    #[test]
+    fn rate_limit_without_reset_horizon_is_recorded_only() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        let body = br#"{"error":{"type":"rate_limit_error","message":"too many requests"}}"#;
+        let classified = classify_observed_upstream_response(429, &headers, body);
+
+        let evidence = response_evidence_from_classification(ResponseEvidenceParams {
+            target: &provider_target(),
+            classified_response: &classified,
+            status_code: 429,
+            error_class: classified.class.as_deref(),
+            route_facing: true,
+            default_cooldown_secs: 30,
+        });
+
+        assert_eq!(evidence.signals.len(), 1);
+        assert_eq!(evidence.signals[0].kind, ProviderSignalKind::RateLimit);
+        assert_eq!(evidence.signals[0].reset_after_secs, None);
         assert!(evidence.actions.is_empty());
     }
 }

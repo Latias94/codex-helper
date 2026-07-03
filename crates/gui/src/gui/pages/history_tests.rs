@@ -271,6 +271,8 @@ fn observed_history_summaries_fall_back_to_recent_requests() {
         usage: None,
         cost: crate::pricing::CostBreakdown::default(),
         retry: None,
+        provider_signals: Vec::new(),
+        policy_actions: Vec::new(),
         observability: crate::state::RequestObservability::default(),
         service: "codex".to_string(),
         method: "POST".to_string(),

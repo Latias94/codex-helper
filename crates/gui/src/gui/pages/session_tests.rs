@@ -63,6 +63,8 @@ fn sample_finished_request(session_id: Option<&str>, ended_at_ms: u64) -> Finish
         usage: None,
         cost: crate::pricing::CostBreakdown::default(),
         retry: None,
+        provider_signals: Vec::new(),
+        policy_actions: Vec::new(),
         observability: crate::state::RequestObservability::default(),
         service: "codex".to_string(),
         method: "POST".to_string(),

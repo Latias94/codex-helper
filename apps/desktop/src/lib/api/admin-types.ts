@@ -206,6 +206,7 @@ export type ApiRequestObservability = {
 };
 
 export type ApiProviderEndpointKey = {
+  service_name?: string;
   service?: string;
   provider_id?: string;
   endpoint_id?: string;

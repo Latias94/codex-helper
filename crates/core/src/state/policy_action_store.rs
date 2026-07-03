@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -68,23 +68,25 @@ impl PolicyActionStore {
         }
     }
 
-    pub(super) fn load(&self) -> PolicyActionMap {
+    pub(super) fn load(&self, now_ms: u64) -> (PolicyActionMap, bool) {
         let Some(path) = self.path.as_ref() else {
-            return HashMap::new();
+            return (HashMap::new(), false);
         };
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return (HashMap::new(), false);
+            }
             Err(err) => {
                 warn!(path = %path.display(), error = %err, "failed to read policy action ledger");
-                return HashMap::new();
+                return (HashMap::new(), false);
             }
         };
         let ledger = match serde_json::from_str::<PersistedPolicyActionLedger>(&text) {
             Ok(ledger) => ledger,
             Err(err) => {
                 warn!(path = %path.display(), error = %err, "failed to parse policy action ledger");
-                return HashMap::new();
+                return (HashMap::new(), false);
             }
         };
         if ledger.schema_version != POLICY_ACTION_LEDGER_SCHEMA_VERSION {
@@ -94,10 +96,15 @@ impl PolicyActionStore {
                 supported_schema_version = POLICY_ACTION_LEDGER_SCHEMA_VERSION,
                 "ignoring unsupported policy action ledger schema"
             );
-            return HashMap::new();
+            return (HashMap::new(), false);
         }
         let mut entries = PolicyActionMap::new();
+        let mut pruned = false;
         for entry in ledger.entries {
+            if !entry.action.is_active_at(now_ms) {
+                pruned = true;
+                continue;
+            }
             entries
                 .entry(entry.service_name)
                 .or_default()
@@ -105,7 +112,41 @@ impl PolicyActionStore {
                 .or_default()
                 .push(entry.action);
         }
-        entries
+        (entries, pruned)
+    }
+
+    pub(super) fn save_blocking(
+        &self,
+        entries: &PolicyActionMap,
+        updated_at_ms: u64,
+    ) -> std::io::Result<()> {
+        let Some(path) = self.path.as_ref() else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let ledger = persisted_ledger(entries, updated_at_ms);
+        let text = serde_json::to_string_pretty(&ledger).map_err(std::io::Error::other)?;
+        let tmp_path = tmp_path_for(path, updated_at_ms);
+        std::fs::write(&tmp_path, text)?;
+        match std::fs::rename(&tmp_path, path) {
+            Ok(()) => Ok(()),
+            Err(err) if should_retry_ledger_rename_after_remove(err.kind()) => {
+                let _ = std::fs::remove_file(path);
+                match std::fs::rename(&tmp_path, path) {
+                    Ok(()) => Ok(()),
+                    Err(err) => {
+                        let _ = std::fs::remove_file(&tmp_path);
+                        Err(err)
+                    }
+                }
+            }
+            Err(err) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                Err(err)
+            }
+        }
     }
 
     pub(super) async fn save(
@@ -119,31 +160,9 @@ impl PolicyActionStore {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let ledger = PersistedPolicyActionLedger {
-            schema_version: POLICY_ACTION_LEDGER_SCHEMA_VERSION,
-            updated_at_ms,
-            entries: entries
-                .iter()
-                .flat_map(|(service_name, per_service)| {
-                    per_service.values().flat_map(|actions| {
-                        actions
-                            .iter()
-                            .cloned()
-                            .map(|action| PersistedPolicyActionEntry {
-                                service_name: service_name.clone(),
-                                action,
-                            })
-                    })
-                })
-                .collect(),
-        };
+        let ledger = persisted_ledger(entries, updated_at_ms);
         let text = serde_json::to_string_pretty(&ledger).map_err(std::io::Error::other)?;
-        let tmp_path = path.with_extension(format!(
-            "json.tmp-{}-{}-{}",
-            std::process::id(),
-            updated_at_ms,
-            uuid::Uuid::new_v4()
-        ));
+        let tmp_path = tmp_path_for(path, updated_at_ms);
         tokio::fs::write(&tmp_path, text).await?;
         match tokio::fs::rename(&tmp_path, path).await {
             Ok(()) => Ok(()),
@@ -163,6 +182,36 @@ impl PolicyActionStore {
             }
         }
     }
+}
+
+fn persisted_ledger(entries: &PolicyActionMap, updated_at_ms: u64) -> PersistedPolicyActionLedger {
+    PersistedPolicyActionLedger {
+        schema_version: POLICY_ACTION_LEDGER_SCHEMA_VERSION,
+        updated_at_ms,
+        entries: entries
+            .iter()
+            .flat_map(|(service_name, per_service)| {
+                per_service.values().flat_map(|actions| {
+                    actions
+                        .iter()
+                        .cloned()
+                        .map(|action| PersistedPolicyActionEntry {
+                            service_name: service_name.clone(),
+                            action,
+                        })
+                })
+            })
+            .collect(),
+    }
+}
+
+fn tmp_path_for(path: &Path, updated_at_ms: u64) -> PathBuf {
+    path.with_extension(format!(
+        "json.tmp-{}-{}-{}",
+        std::process::id(),
+        updated_at_ms,
+        uuid::Uuid::new_v4()
+    ))
 }
 
 fn should_retry_ledger_rename_after_remove(kind: std::io::ErrorKind) -> bool {

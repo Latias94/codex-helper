@@ -9,7 +9,6 @@ use crate::runtime_identity::ProviderEndpointKey;
 #[serde(rename_all = "snake_case")]
 pub enum PolicyActionKind {
     Cooldown,
-    Disable,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -23,9 +22,6 @@ pub enum PolicyActionOwner {
 pub enum PolicyActionRecoveryState {
     #[default]
     Active,
-    Expired,
-    SupersededByManual,
-    ClearedByFreshEvidence,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

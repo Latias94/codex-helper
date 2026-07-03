@@ -1102,6 +1102,8 @@ mod tests {
             }),
             cost: CostBreakdown::unknown(),
             retry: None,
+            provider_signals: Vec::new(),
+            policy_actions: Vec::new(),
             observability: Default::default(),
             service: "codex".to_string(),
             method: "POST".to_string(),

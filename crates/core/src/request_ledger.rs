@@ -8,7 +8,9 @@ use serde_json::Value as JsonValue;
 use crate::local_log_store::{LogRetention, repair_log};
 pub use crate::logging::request_log_path;
 use crate::logging::request_log_retention;
+use crate::policy_actions::PolicyAction;
 use crate::pricing::{CostAdjustments, estimate_request_cost_from_operator_catalog_for_service};
+use crate::provider_signals::ProviderSignal;
 use crate::runtime_identity::ProviderEndpointKey;
 use crate::state::{
     FinishedRequest, RequestObservability, RouteDecisionProvenance, SessionIdentitySource,
@@ -578,6 +580,14 @@ pub fn finished_request_from_request_log_record(record: &JsonValue) -> Option<Fi
     let retry = record
         .get("retry")
         .and_then(|retry| serde_json::from_value(retry.clone()).ok());
+    let provider_signals = record
+        .get("provider_signals")
+        .and_then(|signals| serde_json::from_value::<Vec<ProviderSignal>>(signals.clone()).ok())
+        .unwrap_or_default();
+    let policy_actions = record
+        .get("policy_actions")
+        .and_then(|actions| serde_json::from_value::<Vec<PolicyAction>>(actions.clone()).ok())
+        .unwrap_or_default();
     let route_decision = record.get("route_decision").and_then(|route_decision| {
         serde_json::from_value::<RouteDecisionProvenance>(route_decision.clone()).ok()
     });
@@ -603,6 +613,8 @@ pub fn finished_request_from_request_log_record(record: &JsonValue) -> Option<Fi
         usage,
         cost,
         retry,
+        provider_signals,
+        policy_actions,
         observability: RequestObservability::default(),
         service: service.to_string(),
         method: str_field(record, "method").unwrap_or("-").to_string(),
@@ -774,7 +786,8 @@ fn provider_endpoint_key_value(value: &JsonValue) -> Option<String> {
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .or_else(|| {
-            let service = str_field(value, "service")?;
+            let service =
+                str_field(value, "service_name").or_else(|| str_field(value, "service"))?;
             let provider = str_field(value, "provider_id")?;
             let endpoint = str_field(value, "endpoint_id")?;
             Some(ProviderEndpointKey::new(service, provider, endpoint).stable_key())
@@ -1212,7 +1225,7 @@ mod tests {
                             {
                                 "kind": "cooldown",
                                 "provider_endpoint_key": {
-                                    "service": "codex",
+                                    "service_name": "codex",
                                     "provider_id": "primary",
                                     "endpoint_id": "default"
                                 }
@@ -1248,6 +1261,70 @@ mod tests {
                 ..RequestLogFilters::default()
             }
             .matches(&record)
+        );
+    }
+
+    #[test]
+    fn provider_endpoint_key_value_accepts_current_and_legacy_shapes() {
+        let current = json!({
+            "service_name": "codex",
+            "provider_id": "primary",
+            "endpoint_id": "default"
+        });
+        let legacy = json!({
+            "service": "codex",
+            "provider_id": "primary",
+            "endpoint_id": "default"
+        });
+
+        assert_eq!(
+            provider_endpoint_key_value(&current).as_deref(),
+            Some("codex/primary/default")
+        );
+        assert_eq!(
+            provider_endpoint_key_value(&legacy).as_deref(),
+            Some("codex/primary/default")
+        );
+    }
+
+    #[test]
+    fn finished_request_round_trips_top_level_provider_control_evidence() {
+        let endpoint = ProviderEndpointKey::new("codex", "primary", "default");
+        let mut signal = crate::provider_signals::ProviderSignal::high_confidence_route_facing(
+            crate::provider_signals::ProviderSignalKind::RateLimit,
+            crate::provider_signals::ProviderSignalSource::UpstreamResponse,
+            crate::provider_signals::ProviderSignalTarget::ProviderEndpoint {
+                provider_endpoint_key: endpoint,
+            },
+            1_000,
+        );
+        signal.reset_after_secs = Some(30);
+        let action =
+            crate::policy_actions::PolicyAction::cooldown_from_signal(signal.clone(), 1_000, 30, 1)
+                .expect("cooldown action");
+        let record = json!({
+            "timestamp_ms": 1_234,
+            "request_id": 7,
+            "service": "codex",
+            "method": "POST",
+            "path": "/v1/responses",
+            "status_code": 429,
+            "duration_ms": 55,
+            "provider_signals": [signal],
+            "policy_actions": [action]
+        });
+
+        let request = finished_request_from_request_log_record(&record).expect("finished request");
+
+        assert_eq!(request.provider_signals.len(), 1);
+        assert_eq!(
+            request.provider_signals[0].kind,
+            crate::provider_signals::ProviderSignalKind::RateLimit
+        );
+        assert_eq!(request.policy_actions.len(), 1);
+        assert_eq!(
+            request.policy_actions[0].provider_endpoint_key.stable_key(),
+            "codex/primary/default"
         );
     }
 

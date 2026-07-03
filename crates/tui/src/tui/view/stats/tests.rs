@@ -190,6 +190,8 @@ fn sample_priced_request(ended_at_ms: u64, usd: &str) -> FinishedRequest {
         usage: Some(usage),
         cost,
         retry: None,
+        provider_signals: Vec::new(),
+        policy_actions: Vec::new(),
         observability: crate::state::RequestObservability::default(),
         service: "codex".to_string(),
         method: "POST".to_string(),

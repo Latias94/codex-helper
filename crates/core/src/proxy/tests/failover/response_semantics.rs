@@ -591,28 +591,31 @@ async fn proxy_codex_stream_upstream_read_error_emits_response_failed_terminal_e
         socket.flush().await.expect("flush partial chunk");
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     });
-    let retry = retry_config(1, "502", Vec::new(), RetryStrategy::Failover);
+    let mut retry = retry_config(1, "502", Vec::new(), RetryStrategy::Failover);
+    retry.transport_cooldown_secs = Some(30);
     let cfg = make_proxy_config(
         vec![UpstreamConfig {
             base_url: format!("http://{upstream_addr}/v1"),
             auth: UpstreamAuth::default(),
-            tags: HashMap::new(),
+            tags: HashMap::from([
+                ("provider_id".to_string(), "primary".to_string()),
+                ("endpoint_id".to_string(), "default".to_string()),
+                (
+                    "provider_endpoint_key".to_string(),
+                    "codex/primary/default".to_string(),
+                ),
+            ]),
             supported_models: HashMap::new(),
             model_mapping: HashMap::new(),
         }],
         retry,
     );
-    let proxy = ProxyService::new(
-        Client::new(),
-        Arc::new(cfg),
-        "codex",
-        Arc::new(std::sync::Mutex::new(HashMap::new())),
-    );
-    let app = crate::proxy::router(proxy);
-    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let proxy_service = proxy_service(cfg);
+    let state = proxy_service.state_handle();
+    let proxy = spawn_proxy_service(proxy_service);
 
     let resp = Client::new()
-        .post(format!("http://{proxy_addr}/v1/responses"))
+        .post(proxy.responses_url())
         .header("content-type", "application/json")
         .header("accept", "text/event-stream")
         .body(r#"{"model":"gpt-5","input":"hi","stream":true}"#)
@@ -630,7 +633,27 @@ async fn proxy_codex_stream_upstream_read_error_emits_response_failed_terminal_e
     );
     assert!(body.contains("Upstream stream failed:"), "{body}");
 
-    proxy_handle.abort();
+    let finished = find_finished_request(&state, 10, |request| request.path == "/v1/responses")
+        .await
+        .expect("finished request");
+    let route_attempt = finished
+        .retry
+        .as_ref()
+        .and_then(|retry| retry.route_attempts.first())
+        .expect("route attempt");
+    assert_eq!(route_attempt.provider_signals.len(), 1);
+    assert_eq!(
+        route_attempt.provider_signals[0].kind,
+        crate::provider_signals::ProviderSignalKind::Transport
+    );
+    assert_eq!(route_attempt.policy_actions.len(), 1);
+    assert_eq!(
+        route_attempt.policy_actions[0].kind,
+        crate::policy_actions::PolicyActionKind::Cooldown
+    );
+    assert_eq!(state.list_policy_actions("codex").await.len(), 1);
+
+    proxy.handle.abort();
     upstream_handle.abort();
 }
 
@@ -662,8 +685,22 @@ async fn proxy_codex_stream_idle_timeout_emits_response_failed_terminal_event() 
         }),
     );
     let upstream = spawn_test_upstream(upstream);
-    let retry = retry_config(1, "502", Vec::new(), RetryStrategy::Failover);
-    let cfg = make_proxy_config(vec![upstream.upstream_config()], retry);
+    let mut retry = retry_config(1, "502", Vec::new(), RetryStrategy::Failover);
+    retry.transport_cooldown_secs = Some(30);
+    let cfg = make_proxy_config(
+        vec![UpstreamConfig {
+            tags: HashMap::from([
+                ("provider_id".to_string(), "primary".to_string()),
+                ("endpoint_id".to_string(), "default".to_string()),
+                (
+                    "provider_endpoint_key".to_string(),
+                    "codex/primary/default".to_string(),
+                ),
+            ]),
+            ..upstream.upstream_config()
+        }],
+        retry,
+    );
     let proxy_service = proxy_service(cfg);
     let state = proxy_service.state_handle();
     let proxy = spawn_proxy_service(proxy_service);
@@ -701,6 +738,22 @@ async fn proxy_codex_stream_idle_timeout_emits_response_failed_terminal_event() 
         finished.duration_ms < 3_000,
         "duration should be bounded by idle watchdog: {finished:?}"
     );
+    let route_attempt = finished
+        .retry
+        .as_ref()
+        .and_then(|retry| retry.route_attempts.first())
+        .expect("route attempt");
+    assert_eq!(route_attempt.provider_signals.len(), 1);
+    assert_eq!(
+        route_attempt.provider_signals[0].kind,
+        crate::provider_signals::ProviderSignalKind::Transport
+    );
+    assert_eq!(route_attempt.policy_actions.len(), 1);
+    assert_eq!(
+        route_attempt.policy_actions[0].kind,
+        crate::policy_actions::PolicyActionKind::Cooldown
+    );
+    assert_eq!(state.list_policy_actions("codex").await.len(), 1);
 }
 
 #[tokio::test]
@@ -1319,8 +1372,18 @@ async fn proxy_429_usage_limit_body_sets_retry_after_cooldown() {
         first.cooldown_reason.as_deref(),
         Some("upstream_rate_limited")
     );
-    assert!(first.provider_signals.is_empty());
-    assert!(first.policy_actions.is_empty());
+    assert_eq!(first.provider_signals.len(), 1);
+    assert_eq!(
+        first.provider_signals[0].kind,
+        crate::provider_signals::ProviderSignalKind::RateLimit
+    );
+    assert_eq!(first.provider_signals[0].reset_after_secs, Some(12));
+    assert_eq!(first.policy_actions.len(), 1);
+    assert_eq!(
+        first.policy_actions[0].kind,
+        crate::policy_actions::PolicyActionKind::Cooldown
+    );
+    assert_eq!(first.policy_actions[0].reason, "upstream_rate_limited");
 
     proxy.handle.abort();
 }

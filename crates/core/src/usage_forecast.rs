@@ -1068,6 +1068,8 @@ mod tests {
             usage: Some(usage),
             cost,
             retry: None,
+            provider_signals: Vec::new(),
+            policy_actions: Vec::new(),
             observability: RequestObservability::default(),
             service: "codex".to_string(),
             method: "POST".to_string(),

@@ -375,7 +375,13 @@ impl ProxyState {
             unix_now_ms(),
         );
         let policy_action_store = PolicyActionStore::from_env();
-        let restored_policy_actions = policy_action_store.load();
+        let now_ms = unix_now_ms();
+        let (restored_policy_actions, pruned_policy_actions) = policy_action_store.load(now_ms);
+        if pruned_policy_actions
+            && let Err(err) = policy_action_store.save_blocking(&restored_policy_actions, now_ms)
+        {
+            tracing::warn!(error = %err, "failed to compact expired policy action ledger");
+        }
 
         Arc::new(Self {
             next_request_id: AtomicU64::new(1),
@@ -1419,9 +1425,10 @@ impl ProxyState {
     }
 
     pub async fn upsert_owned_policy_action(&self, service_name: &str, action: PolicyAction) {
-        let snapshot = {
-            let mut guard = self.policy_actions.write().await;
-            let per_service = guard.entry(service_name.to_string()).or_default();
+        let mut guard = self.policy_actions.write().await;
+        let mut snapshot = guard.clone();
+        {
+            let per_service = snapshot.entry(service_name.to_string()).or_default();
             let actions = per_service
                 .entry(action.provider_endpoint_key.clone())
                 .or_default();
@@ -1435,9 +1442,11 @@ impl ProxyState {
             } else {
                 actions.push(action);
             }
-            guard.clone()
-        };
-        self.persist_policy_actions(snapshot).await;
+        }
+        if !self.persist_policy_actions(&snapshot).await {
+            return;
+        }
+        *guard = snapshot;
         self.notify_state_changed();
     }
 
@@ -1449,10 +1458,11 @@ impl ProxyState {
         source_kind: crate::provider_signals::ProviderSignalKind,
         source: crate::provider_signals::ProviderSignalSource,
     ) {
-        let (changed, snapshot) = {
+        let mut guard = self.policy_actions.write().await;
+        let mut snapshot = guard.clone();
+        let changed = {
             let mut changed = false;
-            let mut guard = self.policy_actions.write().await;
-            if let Some(per_service) = guard.get_mut(service_name) {
+            if let Some(per_service) = snapshot.get_mut(service_name) {
                 if let Some(actions) = per_service.get_mut(endpoint_key) {
                     let before = actions.len();
                     actions.retain(|action| {
@@ -1468,27 +1478,27 @@ impl ProxyState {
                     }
                 }
                 if per_service.is_empty() {
-                    guard.remove(service_name);
+                    snapshot.remove(service_name);
                 }
             }
-            let snapshot = changed.then(|| guard.clone());
-            (changed, snapshot)
+            changed
         };
         if changed {
-            if let Some(snapshot) = snapshot {
-                self.persist_policy_actions(snapshot).await;
+            if !self.persist_policy_actions(&snapshot).await {
+                return;
             }
+            *guard = snapshot;
             self.notify_state_changed();
         }
     }
 
-    async fn persist_policy_actions(&self, snapshot: PolicyActionMap) {
-        if let Err(err) = self
-            .policy_action_store
-            .save(&snapshot, unix_now_ms())
-            .await
-        {
-            tracing::warn!(error = %err, "failed to persist policy action ledger");
+    async fn persist_policy_actions(&self, snapshot: &PolicyActionMap) -> bool {
+        match self.policy_action_store.save(snapshot, unix_now_ms()).await {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to persist policy action ledger");
+                false
+            }
         }
     }
 
@@ -1770,14 +1780,20 @@ impl ProxyState {
 
         {
             let mut guard = self.policy_actions.write().await;
-            if let Some(per_service) = guard.get_mut(service_name) {
+            let mut snapshot = guard.clone();
+            let mut policy_actions_changed = false;
+            if let Some(per_service) = snapshot.get_mut(service_name) {
                 let before = per_service.len();
                 per_service
                     .retain(|endpoint_key, _| active_provider_endpoint_keys.contains(endpoint_key));
-                changed |= per_service.len() != before;
+                policy_actions_changed |= per_service.len() != before;
                 if per_service.is_empty() {
-                    guard.remove(service_name);
+                    snapshot.remove(service_name);
                 }
+            }
+            if policy_actions_changed && self.persist_policy_actions(&snapshot).await {
+                *guard = snapshot;
+                changed = true;
             }
         }
 
@@ -2863,6 +2879,8 @@ impl ProxyState {
             usage: params.usage.clone(),
             cost,
             retry: params.retry,
+            provider_signals: Vec::new(),
+            policy_actions: Vec::new(),
             observability: RequestObservability::default(),
             service: req.service,
             method: req.method,
@@ -3979,6 +3997,8 @@ mod tests {
                 }),
                 cost: CostBreakdown::default(),
                 retry: None,
+                provider_signals: Vec::new(),
+                policy_actions: Vec::new(),
                 observability: RequestObservability::default(),
                 service: "codex".to_string(),
                 method: "POST".to_string(),
@@ -4007,6 +4027,8 @@ mod tests {
                 usage: None,
                 cost: CostBreakdown::default(),
                 retry: None,
+                provider_signals: Vec::new(),
+                policy_actions: Vec::new(),
                 observability: RequestObservability::default(),
                 service: "codex".to_string(),
                 method: "POST".to_string(),
@@ -5709,6 +5731,182 @@ mod tests {
                 actions[0].provider_endpoint_key.stable_key(),
                 "codex/monthly/default"
             );
+        });
+    }
+
+    #[test]
+    fn policy_action_upsert_does_not_publish_when_ledger_save_fails() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let _home = env_lock().await;
+            let temp_dir = std::env::temp_dir().join(format!(
+                "codex-helper-policy-action-save-failure-test-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&temp_dir).expect("create temp dir");
+            let mut scoped = ScopedEnv::default();
+            unsafe {
+                scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
+                scoped.set_path("CODEX_HELPER_POLICY_ACTION_LEDGER", temp_dir.as_path());
+            }
+
+            let state = ProxyState::new_with_runtime_policy(None, test_runtime_policy(0, 0, 2_000));
+            let endpoint = ProviderEndpointKey::new("codex", "monthly", "default");
+            let mut signal = crate::provider_signals::ProviderSignal::high_confidence_route_facing(
+                crate::provider_signals::ProviderSignalKind::RateLimit,
+                crate::provider_signals::ProviderSignalSource::UpstreamResponse,
+                crate::provider_signals::ProviderSignalTarget::ProviderEndpoint {
+                    provider_endpoint_key: endpoint.clone(),
+                },
+                unix_now_ms(),
+            );
+            signal.reset_after_secs = Some(60);
+            let action = crate::policy_actions::PolicyAction::cooldown_from_signal(
+                signal,
+                unix_now_ms(),
+                0,
+                1,
+            )
+            .expect("cooldown action");
+
+            state.upsert_owned_policy_action("codex", action).await;
+
+            assert!(state.list_policy_actions("codex").await.is_empty());
+            let runtime_state = state
+                .route_plan_runtime_state_for_provider_endpoints("codex")
+                .await;
+            assert!(!runtime_state.provider_endpoint(&endpoint).cooldown_active);
+        });
+    }
+
+    #[test]
+    fn policy_action_ledger_drops_expired_actions_on_restore() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let _home = env_lock().await;
+            let temp_dir = std::env::temp_dir().join(format!(
+                "codex-helper-policy-action-expired-ledger-test-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&temp_dir).expect("create temp dir");
+            let ledger_path = temp_dir.join("policy-actions.json");
+            let mut scoped = ScopedEnv::default();
+            unsafe {
+                scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
+                scoped.set_path("CODEX_HELPER_POLICY_ACTION_LEDGER", ledger_path.as_path());
+            }
+
+            let endpoint = ProviderEndpointKey::new("codex", "monthly", "default");
+            let signal = crate::provider_signals::ProviderSignal::high_confidence_route_facing(
+                crate::provider_signals::ProviderSignalKind::Transport,
+                crate::provider_signals::ProviderSignalSource::UpstreamResponse,
+                crate::provider_signals::ProviderSignalTarget::ProviderEndpoint {
+                    provider_endpoint_key: endpoint,
+                },
+                1_000,
+            );
+            let action =
+                crate::policy_actions::PolicyAction::cooldown_from_signal(signal, 1_000, 1, 1)
+                    .expect("transport cooldown");
+            let ledger = serde_json::json!({
+                "schema_version": 1,
+                "updated_at_ms": 2_000,
+                "entries": [
+                    {
+                        "service_name": "codex",
+                        "action": action
+                    }
+                ]
+            });
+            std::fs::write(
+                &ledger_path,
+                serde_json::to_string_pretty(&ledger).expect("ledger json"),
+            )
+            .expect("write ledger");
+
+            let state = ProxyState::new_with_runtime_policy(None, test_runtime_policy(0, 0, 2_000));
+
+            assert!(state.list_policy_actions("codex").await.is_empty());
+            let compacted: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(&ledger_path).expect("compacted ledger"),
+            )
+            .expect("parse compacted ledger");
+            assert_eq!(
+                compacted
+                    .get("entries")
+                    .and_then(|entries| entries.as_array())
+                    .map(Vec::len),
+                Some(0)
+            );
+        });
+    }
+
+    #[test]
+    fn policy_action_prune_persists_removed_endpoint_actions() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let _home = env_lock().await;
+            let temp_dir = std::env::temp_dir().join(format!(
+                "codex-helper-policy-action-prune-ledger-test-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&temp_dir).expect("create temp dir");
+            let ledger_path = temp_dir.join("policy-actions.json");
+            let mut scoped = ScopedEnv::default();
+            unsafe {
+                scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
+                scoped.set_path("CODEX_HELPER_POLICY_ACTION_LEDGER", ledger_path.as_path());
+            }
+
+            let state = ProxyState::new_with_runtime_policy(None, test_runtime_policy(0, 0, 2_000));
+            let endpoint = ProviderEndpointKey::new("codex", "monthly", "default");
+            let mut signal = crate::provider_signals::ProviderSignal::high_confidence_route_facing(
+                crate::provider_signals::ProviderSignalKind::RateLimit,
+                crate::provider_signals::ProviderSignalSource::UpstreamResponse,
+                crate::provider_signals::ProviderSignalTarget::ProviderEndpoint {
+                    provider_endpoint_key: endpoint,
+                },
+                unix_now_ms(),
+            );
+            signal.reset_after_secs = Some(60);
+            let action = crate::policy_actions::PolicyAction::cooldown_from_signal(
+                signal,
+                unix_now_ms(),
+                0,
+                1,
+            )
+            .expect("cooldown action");
+            state.upsert_owned_policy_action("codex", action).await;
+            assert_eq!(state.list_policy_actions("codex").await.len(), 1);
+
+            let mut mgr = ServiceConfigManager::default();
+            mgr.configs.insert(
+                "routing".to_string(),
+                ServiceConfig {
+                    name: "routing".to_string(),
+                    alias: None,
+                    enabled: true,
+                    level: 1,
+                    upstreams: vec![UpstreamConfig {
+                        base_url: "https://backup.example/v1".to_string(),
+                        auth: UpstreamAuth::default(),
+                        tags: HashMap::from([
+                            ("provider_id".to_string(), "backup".to_string()),
+                            ("endpoint_id".to_string(), "default".to_string()),
+                        ]),
+                        supported_models: HashMap::new(),
+                        model_mapping: HashMap::new(),
+                    }],
+                },
+            );
+            state
+                .prune_runtime_observability_for_service("codex", &mgr)
+                .await;
+            assert!(state.list_policy_actions("codex").await.is_empty());
+
+            let restored =
+                ProxyState::new_with_runtime_policy(None, test_runtime_policy(0, 0, 2_000));
+            assert!(restored.list_policy_actions("codex").await.is_empty());
         });
     }
 

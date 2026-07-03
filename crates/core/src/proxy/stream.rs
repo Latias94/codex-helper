@@ -441,8 +441,10 @@ impl Drop for StreamFinalize {
         publication.retry = self.retry.clone();
         if let Some(retry) = publication.retry.as_mut()
             && let Some(last_attempt) = retry.route_attempts.last_mut()
-            && last_attempt.provider_endpoint_key.as_deref()
+            && (last_attempt.provider_endpoint_key.as_deref()
                 == self.provider_endpoint_key.as_deref()
+                || (last_attempt.provider_signals.is_empty()
+                    && last_attempt.policy_actions.is_empty()))
         {
             last_attempt.provider_signals = provider_evidence.signals.clone();
             last_attempt.policy_actions = provider_evidence.actions.clone();

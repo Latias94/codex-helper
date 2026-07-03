@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::ServiceConfigManager;
 use crate::logging::RetryInfo;
+use crate::policy_actions::PolicyAction;
 use crate::pricing::CostBreakdown;
+use crate::provider_signals::ProviderSignal;
 use crate::runtime_identity::ProviderEndpointKey;
 use crate::sessions;
 use crate::usage::{CacheInputAccounting, UsageMetrics};
@@ -232,6 +234,10 @@ pub struct FinishedRequest {
     pub cost: CostBreakdown,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry: Option<crate::logging::RetryInfo>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_signals: Vec<ProviderSignal>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policy_actions: Vec<PolicyAction>,
     #[serde(default)]
     pub observability: RequestObservability,
     pub service: String,
@@ -1302,6 +1308,8 @@ mod tests {
                 ],
                 route_attempts: Vec::new(),
             }),
+            provider_signals: Vec::new(),
+            policy_actions: Vec::new(),
             observability: RequestObservability::default(),
             service: "codex".to_string(),
             method: "POST".to_string(),
