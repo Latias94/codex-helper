@@ -90,6 +90,7 @@ pub(super) fn sample_snapshot(stations: Vec<StationOption>) -> ApiV1Snapshot {
             provider_balance_history: HashMap::new(),
             health_checks: HashMap::new(),
             lb_view: HashMap::new(),
+            policy_actions: Vec::new(),
             usage_rollup: UsageRollupView::default(),
             stats_5m: WindowStats::default(),
             stats_1h: WindowStats::default(),

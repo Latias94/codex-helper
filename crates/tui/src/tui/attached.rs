@@ -538,6 +538,7 @@ fn move_attached_selection(
                 ui.selected_session_idx,
                 ui.request_page_errors_only,
                 ui.request_page_scope_session,
+                ui.request_page_control_filter,
             );
             if let Some(next) =
                 adjust_table_selection(&mut ui.request_page_table, delta, filtered_len)
@@ -730,6 +731,7 @@ mod tests {
             station_health: std::collections::HashMap::new(),
             health_checks: std::collections::HashMap::new(),
             lb_view: std::collections::HashMap::new(),
+            provider_endpoint_policy_actions: std::collections::HashMap::new(),
             stats_5m: crate::dashboard_core::WindowStats::default(),
             stats_1h: crate::dashboard_core::WindowStats::default(),
             service_status: None,

@@ -119,6 +119,38 @@ impl RuntimeConnectionKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(in crate::tui) enum RequestControlFilter {
+    #[default]
+    All,
+    AnyEvidence,
+    Signals,
+    Actions,
+}
+
+impl RequestControlFilter {
+    pub(in crate::tui) fn next(self) -> Self {
+        match self {
+            Self::All => Self::AnyEvidence,
+            Self::AnyEvidence => Self::Signals,
+            Self::Signals => Self::Actions,
+            Self::Actions => Self::All,
+        }
+    }
+
+    pub(in crate::tui) fn label(self, lang: Language) -> &'static str {
+        match (lang, self) {
+            (_, Self::All) => "all",
+            (Language::Zh, Self::AnyEvidence) => "证据",
+            (Language::En, Self::AnyEvidence) => "evidence",
+            (Language::Zh, Self::Signals) => "信号",
+            (Language::En, Self::Signals) => "signals",
+            (Language::Zh, Self::Actions) => "动作",
+            (Language::En, Self::Actions) => "actions",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(in crate::tui) struct UiState {
     pub(in crate::tui) service_name: &'static str,
@@ -142,6 +174,7 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) focused_request_session_id: Option<String>,
     pub(in crate::tui) request_page_errors_only: bool,
     pub(in crate::tui) request_page_scope_session: bool,
+    pub(in crate::tui) request_page_control_filter: RequestControlFilter,
     pub(in crate::tui) selected_sessions_page_idx: usize,
     pub(in crate::tui) sessions_page_active_only: bool,
     pub(in crate::tui) sessions_page_errors_only: bool,
@@ -299,6 +332,7 @@ impl Default for UiState {
             focused_request_session_id: None,
             request_page_errors_only: false,
             request_page_scope_session: false,
+            request_page_control_filter: RequestControlFilter::All,
             selected_sessions_page_idx: 0,
             sessions_page_active_only: false,
             sessions_page_errors_only: false,
@@ -772,6 +806,7 @@ impl UiState {
                     self.request_page_errors_only,
                     self.request_page_scope_session,
                     focused_sid.as_deref(),
+                    self.request_page_control_filter,
                 )
             })
             .map(|(idx, _)| idx)
@@ -1106,6 +1141,7 @@ mod tests {
             station_health: HashMap::new(),
             health_checks: HashMap::new(),
             lb_view: HashMap::new(),
+            provider_endpoint_policy_actions: HashMap::new(),
             stats_5m: crate::dashboard_core::WindowStats::default(),
             stats_1h: crate::dashboard_core::WindowStats::default(),
             service_status: None,

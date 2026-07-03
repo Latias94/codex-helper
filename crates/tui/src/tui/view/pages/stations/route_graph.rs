@@ -13,6 +13,7 @@ use crate::tui::model::{
     provider_balance_compact_lang, routing_context_balance_rank, shorten, shorten_middle,
 };
 use crate::tui::state::UiState;
+use crate::tui::view::provider_control::routing_policy_action_control_details;
 
 pub(super) const ROUTING_BALANCE_COLUMN_WIDTH: u16 = 24;
 pub(super) const ROUTING_BALANCE_SUMMARY_WIDTH: usize = 32;
@@ -392,6 +393,34 @@ pub(super) fn routing_provider_balance_cell_lang(
     }
 }
 
+pub(super) fn routing_provider_policy_actions<'a>(
+    snapshot: &'a Snapshot,
+    provider_name: &str,
+) -> Vec<&'a crate::policy_actions::PolicyActionProjection> {
+    let mut actions = snapshot
+        .provider_endpoint_policy_actions
+        .values()
+        .flat_map(|actions| actions.iter())
+        .filter(|action| action.provider_endpoint_key.provider_id == provider_name)
+        .collect::<Vec<_>>();
+    actions.sort_by(|left, right| {
+        left.provider_endpoint_key
+            .endpoint_id
+            .cmp(&right.provider_endpoint_key.endpoint_id)
+            .then_with(|| left.action_id.cmp(&right.action_id))
+    });
+    actions
+}
+
+fn routing_provider_control_cell(snapshot: &Snapshot, provider_name: &str) -> (String, Style) {
+    let count = routing_provider_policy_actions(snapshot, provider_name).len();
+    if count == 0 {
+        ("-".to_string(), Style::default())
+    } else {
+        (format!("control={count}"), Style::default())
+    }
+}
+
 pub(super) fn routing_provider_display_label(
     provider: Option<&crate::tui::state::RoutingProviderRow>,
     provider_name: &str,
@@ -719,10 +748,10 @@ pub(super) fn render_route_graph_routing_page(
         .style(Style::default().bg(p.panel));
 
     let left_inner_width = left_block.inner(columns[0]).width;
-    let compact_provider_table = left_inner_width < 52;
+    let compact_provider_table = left_inner_width < 60;
     let balance_column_width = if compact_provider_table {
         left_inner_width
-            .saturating_sub(19)
+            .saturating_sub(29)
             .clamp(10, ROUTING_BALANCE_COLUMN_WIDTH)
     } else {
         ROUTING_BALANCE_COLUMN_WIDTH
@@ -732,6 +761,7 @@ pub(super) fn render_route_graph_routing_page(
             "#".to_string(),
             l("Provider").to_string(),
             l("On").to_string(),
+            l("control").to_string(),
             l("Balance/Quota").to_string(),
         ])
     } else {
@@ -740,6 +770,7 @@ pub(super) fn render_route_graph_routing_page(
             l("Provider").to_string(),
             l("On").to_string(),
             l("Route").to_string(),
+            l("control").to_string(),
             l("Balance/Quota").to_string(),
         ])
     }
@@ -759,6 +790,8 @@ pub(super) fn render_route_graph_routing_page(
                 usize::from(balance_column_width),
                 lang,
             );
+            let (control, control_style) = routing_provider_control_cell(snapshot, name);
+            let control_style = control_style.fg(if control == "-" { p.muted } else { p.warn });
             let provider_style = if !row.enabled {
                 Style::default().fg(p.muted)
             } else if session_route_target == Some(name) {
@@ -787,6 +820,7 @@ pub(super) fn render_route_graph_routing_page(
                         if row.enabled { l("on") } else { l("off") }.to_string(),
                         on_style,
                     )),
+                    Cell::from(Span::styled(control, control_style)),
                     Cell::from(Span::styled(balance, balance_style)),
                 ]
             } else {
@@ -801,6 +835,7 @@ pub(super) fn render_route_graph_routing_page(
                         on_style,
                     )),
                     Cell::from(Span::styled(marker.to_string(), route_style)),
+                    Cell::from(Span::styled(control, control_style)),
                     Cell::from(Span::styled(balance, balance_style)),
                 ]
             };
@@ -815,6 +850,7 @@ pub(super) fn render_route_graph_routing_page(
             Constraint::Length(4),
             Constraint::Min(10),
             Constraint::Length(3),
+            Constraint::Length(10),
             Constraint::Length(balance_column_width),
         ]
     } else {
@@ -823,6 +859,7 @@ pub(super) fn render_route_graph_routing_page(
             Constraint::Min(10),
             Constraint::Length(3),
             Constraint::Length(5),
+            Constraint::Length(10),
             Constraint::Length(balance_column_width),
         ]
     };
@@ -1023,6 +1060,37 @@ pub(super) fn render_route_graph_routing_page(
                 l("provider is referenced by the route graph but missing from catalog"),
                 Style::default().fg(p.warn),
             )));
+        }
+
+        let policy_actions = routing_provider_policy_actions(snapshot, name);
+        if !policy_actions.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![Span::styled(
+                l("Provider control"),
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+            )]));
+            for action in policy_actions.iter().take(8) {
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        shorten_middle(
+                            &format!(
+                                "{} {}",
+                                action.provider_endpoint_key.stable_key(),
+                                routing_policy_action_control_details(action, 34)
+                            ),
+                            right_detail_width,
+                        ),
+                        Style::default().fg(p.warn),
+                    ),
+                ]));
+            }
+            if policy_actions.len() > 8 {
+                lines.push(Line::from(Span::styled(
+                    format!("… +{} more", policy_actions.len() - 8),
+                    Style::default().fg(p.muted),
+                )));
+            }
         }
 
         lines.push(Line::from(""));

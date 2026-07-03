@@ -13,10 +13,14 @@ use crate::dashboard_core::{
 use crate::tui::i18n::{self, msg};
 use crate::tui::model::{
     Palette, Snapshot, balance_amount_brief_lang, balance_snapshot_status_label_lang,
-    balance_snapshot_status_style, format_age, now_ms, shorten, shorten_middle,
-    station_balance_brief_lang,
+    balance_snapshot_status_style, format_age, now_ms, runtime_provider_policy_action_count,
+    runtime_upstream_policy_actions, runtime_upstream_provider_endpoint_key, shorten,
+    shorten_middle, station_balance_brief_lang,
 };
 use crate::tui::state::UiState;
+use crate::tui::view::provider_control::{
+    policy_action_control_details, policy_action_control_summary,
+};
 use crate::tui::{Language, ProviderOption};
 
 mod route_graph;
@@ -387,6 +391,7 @@ pub(super) fn render_stations_page(
         l("Name"),
         l("On"),
         l("Up"),
+        l("control"),
         l("Balance/Quota"),
         l("Health"),
     ])
@@ -411,6 +416,13 @@ pub(super) fn render_stations_page(
 
             let on = if enabled { l("on") } else { l("off") };
             let up = cfg.upstreams.len().to_string();
+            let policy_action_count =
+                runtime_provider_policy_action_count(snapshot, ui.service_name, cfg);
+            let control = if policy_action_count == 0 {
+                "-".to_string()
+            } else {
+                format!("control={policy_action_count}")
+            };
             let balance = station_balance_brief_lang(
                 &snapshot.provider_balances,
                 cfg.name.as_str(),
@@ -474,6 +486,7 @@ pub(super) fn render_stations_page(
                 name,
                 on.to_string(),
                 up,
+                control,
                 balance,
                 health,
             ])
@@ -492,6 +505,7 @@ pub(super) fn render_stations_page(
             Constraint::Min(8),
             Constraint::Length(3),
             Constraint::Length(3),
+            Constraint::Length(10),
             Constraint::Length(18),
             Constraint::Length(8),
         ],
@@ -609,6 +623,40 @@ pub(super) fn render_stations_page(
                 Style::default().fg(p.muted),
             ),
         ]));
+        let provider_control_lines = cfg
+            .upstreams
+            .iter()
+            .enumerate()
+            .flat_map(|(idx, upstream)| {
+                runtime_upstream_policy_actions(snapshot, ui.service_name, &cfg.name, idx, upstream)
+                    .iter()
+                    .map(move |action| {
+                        format!(
+                            "{idx:>2}. {}",
+                            policy_action_control_summary(action, 40, 34)
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        if !provider_control_lines.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![Span::styled(
+                l("Provider control"),
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+            )]));
+            for line in provider_control_lines.iter().take(8) {
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(shorten_middle(line, 96), Style::default().fg(p.warn)),
+                ]));
+            }
+            if provider_control_lines.len() > 8 {
+                lines.push(Line::from(Span::styled(
+                    format!("… +{} more", provider_control_lines.len() - 8),
+                    Style::default().fg(p.muted),
+                )));
+            }
+        }
         let observations = summarize_recent_retry_observations(&snapshot.recent);
         lines.push(Line::from(vec![
             Span::styled(
@@ -860,12 +908,37 @@ pub(super) fn render_stations_page(
         } else {
             for (idx, u) in cfg.upstreams.iter().enumerate() {
                 let pid = u.provider_id.as_deref().unwrap_or("-");
+                let endpoint_key =
+                    runtime_upstream_provider_endpoint_key(ui.service_name, &cfg.name, idx, u);
                 lines.push(Line::from(vec![
                     Span::styled(format!("{idx:>2}. "), Style::default().fg(p.muted)),
                     Span::styled(pid.to_string(), Style::default().fg(p.muted)),
                     Span::raw("  "),
                     Span::styled(u.base_url.clone(), Style::default().fg(p.text)),
                 ]));
+                let actions =
+                    runtime_upstream_policy_actions(snapshot, ui.service_name, &cfg.name, idx, u);
+                if !actions.is_empty() {
+                    let action_text = actions
+                        .iter()
+                        .map(|action| policy_action_control_details(action, 34))
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    lines.push(Line::from(vec![
+                        Span::raw("     "),
+                        Span::styled(
+                            format!(
+                                "{}: {}",
+                                l("control"),
+                                shorten_middle(
+                                    &format!("{} {}", endpoint_key.stable_key(), action_text),
+                                    96
+                                )
+                            ),
+                            Style::default().fg(p.warn),
+                        ),
+                    ]));
+                }
             }
         }
 

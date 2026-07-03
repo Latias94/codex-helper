@@ -9,6 +9,7 @@ use crate::tui::i18n::{self, msg};
 mod chrome;
 mod modals;
 mod pages;
+mod provider_control;
 mod stats;
 mod widgets;
 
@@ -185,6 +186,7 @@ mod tests {
             station_health: HashMap::new(),
             health_checks: HashMap::new(),
             lb_view: HashMap::new(),
+            provider_endpoint_policy_actions: HashMap::new(),
             stats_5m: crate::dashboard_core::WindowStats::default(),
             stats_1h: crate::dashboard_core::WindowStats::default(),
             service_status: None,

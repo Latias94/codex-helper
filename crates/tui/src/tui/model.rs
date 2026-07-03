@@ -9,7 +9,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::config::ProxyConfig;
 pub(in crate::tui) use crate::dashboard_core::window_stats::compute_window_stats;
 use crate::dashboard_core::{ApiV1Snapshot, WindowStats};
+use crate::policy_actions::PolicyActionProjection;
 use crate::pricing::{ModelPriceCatalogSnapshot, UsdAmount};
+use crate::runtime_identity::ProviderEndpointKey;
 use crate::state::{
     BalanceSnapshotStatus, FinishedRequest, HealthCheckStatus, LbConfigView,
     ProviderBalanceSnapshot, ProxyState, ResolvedRouteValue, RouteDecisionProvenance,
@@ -18,6 +20,7 @@ use crate::state::{
 };
 use crate::tui::Language;
 use crate::tui::i18n;
+use crate::tui::state::RequestControlFilter;
 use crate::usage::UsageMetrics;
 use crate::usage_forecast::{UsageForecastBalanceHistoryLike, UsageForecastRequestLike};
 
@@ -454,6 +457,8 @@ pub(in crate::tui) struct Snapshot {
     pub(in crate::tui) station_health: HashMap<String, StationHealth>,
     pub(in crate::tui) health_checks: HashMap<String, HealthCheckStatus>,
     pub(in crate::tui) lb_view: HashMap<String, LbConfigView>,
+    pub(in crate::tui) provider_endpoint_policy_actions:
+        HashMap<String, Vec<PolicyActionProjection>>,
     pub(in crate::tui) stats_5m: WindowStats,
     pub(in crate::tui) stats_1h: WindowStats,
     pub(in crate::tui) service_status: Option<crate::service_status::ServiceStatusSnapshot>,
@@ -623,6 +628,77 @@ pub fn build_provider_options(
         _ => &cfg.codex,
     };
     crate::dashboard_core::build_runtime_provider_options_from_mgr(mgr)
+}
+
+fn indexed_policy_actions(
+    actions: Vec<PolicyActionProjection>,
+) -> HashMap<String, Vec<PolicyActionProjection>> {
+    let mut indexed: HashMap<String, Vec<PolicyActionProjection>> = HashMap::new();
+    for action in actions {
+        indexed
+            .entry(action.provider_endpoint_key.stable_key())
+            .or_default()
+            .push(action);
+    }
+    indexed
+}
+
+pub(in crate::tui) fn runtime_upstream_provider_endpoint_key(
+    service_name: &str,
+    station_name: &str,
+    upstream_index: usize,
+    upstream: &UpstreamSummary,
+) -> ProviderEndpointKey {
+    let tag = |name: &str| {
+        upstream
+            .tags
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let provider_id =
+        tag("provider_id").unwrap_or_else(|| format!("{station_name}#{upstream_index}"));
+    let endpoint_id = tag("endpoint_id").unwrap_or_else(|| upstream_index.to_string());
+
+    ProviderEndpointKey::new(service_name, provider_id, endpoint_id)
+}
+
+pub(in crate::tui) fn runtime_upstream_policy_actions<'a>(
+    snapshot: &'a Snapshot,
+    service_name: &str,
+    station_name: &str,
+    upstream_index: usize,
+    upstream: &UpstreamSummary,
+) -> &'a [PolicyActionProjection] {
+    let endpoint_key = runtime_upstream_provider_endpoint_key(
+        service_name,
+        station_name,
+        upstream_index,
+        upstream,
+    );
+    snapshot
+        .provider_endpoint_policy_actions
+        .get(endpoint_key.stable_key().as_str())
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+pub(in crate::tui) fn runtime_provider_policy_action_count(
+    snapshot: &Snapshot,
+    service_name: &str,
+    provider: &ProviderOption,
+) -> usize {
+    provider
+        .upstreams
+        .iter()
+        .enumerate()
+        .map(|(idx, upstream)| {
+            runtime_upstream_policy_actions(snapshot, service_name, &provider.name, idx, upstream)
+                .len()
+        })
+        .sum()
 }
 
 pub(in crate::tui) fn balance_status_style(p: Palette, status: BalanceSnapshotStatus) -> Style {
@@ -1980,6 +2056,7 @@ pub(in crate::tui) async fn refresh_snapshot(
         station_health,
         health_checks: snap.health_checks,
         lb_view: snap.lb_view,
+        provider_endpoint_policy_actions: indexed_policy_actions(snap.policy_actions),
         stats_5m: snap.stats_5m,
         stats_1h: snap.stats_1h,
         service_status: snap.service_status,
@@ -2038,6 +2115,7 @@ pub(in crate::tui) async fn snapshot_from_api_v1(
         station_health,
         health_checks: snap.health_checks,
         lb_view: snap.lb_view,
+        provider_endpoint_policy_actions: indexed_policy_actions(snap.policy_actions),
         stats_5m: snap.stats_5m,
         stats_1h: snap.stats_1h,
         service_status: snap.service_status,
@@ -2241,8 +2319,12 @@ pub(in crate::tui) fn request_matches_page_filters(
     errors_only: bool,
     scope_session: bool,
     focused_sid: Option<&str>,
+    control_filter: RequestControlFilter,
 ) -> bool {
     if errors_only && request.status_code < 400 {
+        return false;
+    }
+    if !request_matches_control_filter(request, control_filter) {
         return false;
     }
     if !scope_session {
@@ -2256,12 +2338,47 @@ pub(in crate::tui) fn request_matches_page_filters(
     }
 }
 
+pub(in crate::tui) fn request_has_provider_signals(request: &FinishedRequest) -> bool {
+    !request.provider_signals.is_empty()
+        || request.retry.as_ref().is_some_and(|retry| {
+            retry
+                .route_attempts
+                .iter()
+                .any(|attempt| !attempt.provider_signals.is_empty())
+        })
+}
+
+pub(in crate::tui) fn request_has_policy_actions(request: &FinishedRequest) -> bool {
+    !request.policy_actions.is_empty()
+        || request.retry.as_ref().is_some_and(|retry| {
+            retry
+                .route_attempts
+                .iter()
+                .any(|attempt| !attempt.policy_actions.is_empty())
+        })
+}
+
+pub(in crate::tui) fn request_matches_control_filter(
+    request: &FinishedRequest,
+    control_filter: RequestControlFilter,
+) -> bool {
+    match control_filter {
+        RequestControlFilter::All => true,
+        RequestControlFilter::AnyEvidence => {
+            request_has_provider_signals(request) || request_has_policy_actions(request)
+        }
+        RequestControlFilter::Signals => request_has_provider_signals(request),
+        RequestControlFilter::Actions => request_has_policy_actions(request),
+    }
+}
+
 pub(in crate::tui) fn filtered_request_page_len(
     snapshot: &Snapshot,
     explicit_focus: Option<&str>,
     selected_session_idx: usize,
     errors_only: bool,
     scope_session: bool,
+    control_filter: RequestControlFilter,
 ) -> usize {
     let focused_sid = request_page_focus_session_id(snapshot, explicit_focus, selected_session_idx);
     snapshot
@@ -2273,6 +2390,7 @@ pub(in crate::tui) fn filtered_request_page_len(
                 errors_only,
                 scope_session,
                 focused_sid.as_deref(),
+                control_filter,
             )
         })
         .count()
@@ -2359,6 +2477,43 @@ mod tests {
             ttfb_ms: None,
             streaming: false,
             ended_at_ms: id,
+        }
+    }
+
+    fn provider_signal(
+        provider_id: &str,
+        endpoint_id: &str,
+    ) -> crate::provider_signals::ProviderSignal {
+        let mut signal = crate::provider_signals::ProviderSignal::high_confidence_route_facing(
+            crate::provider_signals::ProviderSignalKind::RateLimit,
+            crate::provider_signals::ProviderSignalSource::UpstreamResponse,
+            crate::provider_signals::ProviderSignalTarget::ProviderEndpoint {
+                provider_endpoint_key: ProviderEndpointKey::new("codex", provider_id, endpoint_id),
+            },
+            1_000,
+        );
+        signal.reset_after_secs = Some(60);
+        signal.reason = Some("upstream_rate_limited".to_string());
+        signal
+    }
+
+    fn policy_action(provider_id: &str, endpoint_id: &str) -> crate::policy_actions::PolicyAction {
+        crate::policy_actions::PolicyAction::cooldown_from_signal(
+            provider_signal(provider_id, endpoint_id),
+            1_000,
+            30,
+            1,
+        )
+        .expect("cooldown policy action")
+    }
+
+    fn policy_action_projection(provider_id: &str, endpoint_id: &str) -> PolicyActionProjection {
+        PolicyActionProjection {
+            provider_endpoint_key: ProviderEndpointKey::new("codex", provider_id, endpoint_id),
+            active_cooldown: true,
+            cooldown_remaining_secs: Some(42),
+            reason: Some("upstream_rate_limited".to_string()),
+            action_id: Some(format!("codex-helper:codex/{provider_id}/{endpoint_id}:1")),
         }
     }
 
@@ -2686,6 +2841,148 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn snapshot_from_api_v1_indexes_policy_actions_by_stable_key() {
+        let projection = policy_action_projection("alpha", "default");
+        let api = ApiV1Snapshot {
+            api_version: 1,
+            service_name: "codex".to_string(),
+            runtime_loaded_at_ms: None,
+            runtime_source_mtime_ms: None,
+            stations: Vec::new(),
+            configured_active_station: None,
+            effective_active_station: None,
+            default_profile: None,
+            profiles: Vec::new(),
+            snapshot: crate::dashboard_core::snapshot::DashboardSnapshot {
+                refreshed_at_ms: 1,
+                active: Vec::new(),
+                recent: Vec::new(),
+                session_cards: Vec::new(),
+                global_station_override: None,
+                global_route_target_override: None,
+                session_model_overrides: HashMap::new(),
+                session_station_overrides: HashMap::new(),
+                session_route_target_overrides: HashMap::new(),
+                session_effort_overrides: HashMap::new(),
+                session_service_tier_overrides: HashMap::new(),
+                session_stats: HashMap::new(),
+                station_health: HashMap::new(),
+                provider_balances: HashMap::new(),
+                provider_balance_history: HashMap::new(),
+                health_checks: HashMap::new(),
+                lb_view: HashMap::new(),
+                policy_actions: vec![projection.clone()],
+                usage_rollup: UsageRollupView::default(),
+                stats_5m: WindowStats::default(),
+                stats_1h: WindowStats::default(),
+                service_status: None,
+            },
+        };
+
+        let snapshot = snapshot_from_api_v1(api, ForecastRecentMode::RuntimeOnly).await;
+
+        assert_eq!(
+            snapshot
+                .provider_endpoint_policy_actions
+                .get("codex/alpha/default")
+                .map(Vec::as_slice),
+            Some(std::slice::from_ref(&projection))
+        );
+    }
+
+    #[test]
+    fn request_control_filter_matches_top_level_and_retry_evidence() {
+        let plain = finished_request(1, Some("plain"));
+        let mut top_signal = finished_request(2, Some("top-signal"));
+        top_signal
+            .provider_signals
+            .push(provider_signal("signal-provider", "default"));
+        let mut top_action = finished_request(3, Some("top-action"));
+        top_action
+            .policy_actions
+            .push(policy_action("action-provider", "default"));
+        let mut retry_signal = finished_request(4, Some("retry-signal"));
+        retry_signal.retry = Some(crate::logging::RetryInfo {
+            attempts: 1,
+            upstream_chain: Vec::new(),
+            route_attempts: vec![crate::logging::RouteAttemptLog {
+                attempt_index: 0,
+                decision: "failed".to_string(),
+                provider_signals: vec![provider_signal("retry-signal-provider", "default")],
+                raw: "retry-signal".to_string(),
+                ..crate::logging::RouteAttemptLog::default()
+            }],
+        });
+        let mut retry_action = finished_request(5, Some("retry-action"));
+        retry_action.retry = Some(crate::logging::RetryInfo {
+            attempts: 1,
+            upstream_chain: Vec::new(),
+            route_attempts: vec![crate::logging::RouteAttemptLog {
+                attempt_index: 0,
+                decision: "failed".to_string(),
+                policy_actions: vec![policy_action("retry-action-provider", "default")],
+                raw: "retry-action".to_string(),
+                ..crate::logging::RouteAttemptLog::default()
+            }],
+        });
+
+        for request in [
+            &plain,
+            &top_signal,
+            &top_action,
+            &retry_signal,
+            &retry_action,
+        ] {
+            assert!(request_matches_control_filter(
+                request,
+                RequestControlFilter::All
+            ));
+        }
+        assert!(!request_matches_control_filter(
+            &plain,
+            RequestControlFilter::AnyEvidence
+        ));
+        for request in [&top_signal, &top_action, &retry_signal, &retry_action] {
+            assert!(request_matches_control_filter(
+                request,
+                RequestControlFilter::AnyEvidence
+            ));
+        }
+        assert!(request_matches_control_filter(
+            &top_signal,
+            RequestControlFilter::Signals
+        ));
+        assert!(request_matches_control_filter(
+            &retry_signal,
+            RequestControlFilter::Signals
+        ));
+        assert!(!request_matches_control_filter(
+            &top_action,
+            RequestControlFilter::Signals
+        ));
+        assert!(!request_matches_control_filter(
+            &retry_action,
+            RequestControlFilter::Signals
+        ));
+        assert!(request_matches_control_filter(
+            &top_action,
+            RequestControlFilter::Actions
+        ));
+        assert!(request_matches_control_filter(
+            &retry_action,
+            RequestControlFilter::Actions
+        ));
+        assert!(!request_matches_control_filter(
+            &top_signal,
+            RequestControlFilter::Actions
+        ));
+        assert!(!request_matches_control_filter(
+            &retry_signal,
+            RequestControlFilter::Actions
+        ));
+    }
+
     #[test]
     fn request_page_focus_session_prefers_explicit_focus() {
         let snapshot = Snapshot {
@@ -2747,6 +3044,7 @@ mod tests {
             station_health: HashMap::new(),
             health_checks: HashMap::new(),
             lb_view: HashMap::new(),
+            provider_endpoint_policy_actions: HashMap::new(),
             stats_5m: WindowStats::default(),
             stats_1h: WindowStats::default(),
             service_status: None,
@@ -2823,6 +3121,7 @@ mod tests {
             station_health: HashMap::new(),
             health_checks: HashMap::new(),
             lb_view: HashMap::new(),
+            provider_endpoint_policy_actions: HashMap::new(),
             stats_5m: WindowStats::default(),
             stats_1h: WindowStats::default(),
             service_status: None,
@@ -2830,7 +3129,14 @@ mod tests {
             refreshed_at: Instant::now(),
         };
 
-        let count = filtered_request_page_len(&snapshot, Some("sid-explicit"), 0, false, true);
+        let count = filtered_request_page_len(
+            &snapshot,
+            Some("sid-explicit"),
+            0,
+            false,
+            true,
+            RequestControlFilter::All,
+        );
 
         assert_eq!(count, 1);
     }
@@ -2861,6 +3167,7 @@ mod tests {
             station_health: HashMap::new(),
             health_checks: HashMap::new(),
             lb_view: HashMap::new(),
+            provider_endpoint_policy_actions: HashMap::new(),
             stats_5m: WindowStats::default(),
             stats_1h: WindowStats::default(),
             service_status: None,
@@ -2942,6 +3249,7 @@ mod tests {
             station_health: HashMap::new(),
             health_checks: HashMap::new(),
             lb_view: HashMap::new(),
+            provider_endpoint_policy_actions: HashMap::new(),
             stats_5m: WindowStats::default(),
             stats_1h: WindowStats::default(),
             service_status: None,

@@ -141,6 +141,7 @@ fn sample_snapshot_with_history(
         station_health: HashMap::new(),
         health_checks: HashMap::new(),
         lb_view: HashMap::new(),
+        provider_endpoint_policy_actions: HashMap::new(),
         stats_5m: WindowStats::default(),
         stats_1h: WindowStats::default(),
         service_status: None,

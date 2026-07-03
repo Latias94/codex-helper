@@ -92,6 +92,7 @@ pub(super) fn current_page_help_lines(
         ],
         (Language::Zh, Page::Requests, _, _) => vec![
             "  e          仅看错误",
+            "  c          循环控制证据过滤",
             "  s          切换当前会话 / 全部请求",
             "  x          清除显式 session 聚焦",
             "  o/h        跳到 Sessions / History",
@@ -172,6 +173,7 @@ pub(super) fn current_page_help_lines(
         ],
         (Language::En, Page::Requests, _, _) => vec![
             "  e          toggle errors-only",
+            "  c          cycle provider-control filter",
             "  s          switch current session / all requests",
             "  x          clear explicit session focus",
             "  o/h        jump to Sessions / History",

@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::dashboard_core::WindowStats;
 use crate::dashboard_core::types::{ControlProfileOption, StationOption};
 use crate::dashboard_core::window_stats::compute_window_stats;
+use crate::policy_actions::PolicyActionProjection;
 use crate::service_status::ServiceStatusSnapshot;
 use crate::state::{
     ActiveRequest, FinishedRequest, HealthCheckStatus, LbConfigView, ProviderBalanceSnapshot,
@@ -42,6 +43,8 @@ pub struct DashboardSnapshot {
     pub provider_balance_history: HashMap<String, Vec<ProviderBalanceSnapshot>>,
     pub health_checks: HashMap<String, HealthCheckStatus>,
     pub lb_view: HashMap<String, LbConfigView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policy_actions: Vec<PolicyActionProjection>,
     pub usage_rollup: UsageRollupView,
     pub stats_5m: WindowStats,
     pub stats_1h: WindowStats,
@@ -119,6 +122,7 @@ pub async fn build_dashboard_snapshot(
         provider_balance_history,
         health_checks,
         lb_view,
+        policy_actions,
     ) = tokio::join!(
         state.list_active_requests(),
         state.list_recent_finished(recent_for_stats),
@@ -138,6 +142,7 @@ pub async fn build_dashboard_snapshot(
         state.get_provider_balance_history_view(service_name),
         state.list_health_checks(service_name),
         state.get_lb_view(),
+        state.active_policy_action_projections(service_name, now),
     );
 
     let stats_5m = compute_window_stats(&recent_all, now, 5 * 60_000, |_| true);
@@ -192,6 +197,7 @@ pub async fn build_dashboard_snapshot(
         provider_balance_history,
         health_checks,
         lb_view,
+        policy_actions,
         usage_rollup,
         stats_5m,
         stats_1h,

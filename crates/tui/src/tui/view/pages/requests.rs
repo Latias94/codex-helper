@@ -45,7 +45,7 @@ pub(super) fn render_requests_page(
         l("all").to_string()
     };
     let left_title = format!(
-        "{}  ({}: {}, {}: {})",
+        "{}  ({}: {}, {}: {}, {}: {})",
         l("Requests"),
         l("scope"),
         scope_label,
@@ -54,7 +54,9 @@ pub(super) fn render_requests_page(
             l("on")
         } else {
             l("off")
-        }
+        },
+        l("control"),
+        ui.request_page_control_filter.label(lang)
     );
     let left_block = Block::default()
         .title(Span::styled(
@@ -387,6 +389,10 @@ pub(super) fn render_requests_page(
         lines.push(Line::from(match ui.language {
             crate::tui::Language::Zh => "  e 切换仅错误",
             crate::tui::Language::En => "  e toggle errors-only",
+        }));
+        lines.push(Line::from(match ui.language {
+            crate::tui::Language::Zh => "  c 切换控制证据过滤",
+            crate::tui::Language::En => "  c cycle provider-control filter",
         }));
         lines.push(Line::from(match ui.language {
             crate::tui::Language::Zh => "  s 切换会话范围",
@@ -797,11 +803,45 @@ mod tests {
             station_health: HashMap::new(),
             health_checks: HashMap::new(),
             lb_view: HashMap::new(),
+            provider_endpoint_policy_actions: HashMap::new(),
             stats_5m: WindowStats::default(),
             stats_1h: WindowStats::default(),
             service_status: None,
             pricing_catalog: crate::pricing::bundled_model_price_catalog_snapshot(),
             refreshed_at: Instant::now(),
+        }
+    }
+
+    fn request_fixture(session_id: &str, status_code: u16) -> crate::state::FinishedRequest {
+        crate::state::FinishedRequest {
+            id: u64::from(status_code),
+            trace_id: None,
+            session_id: Some(session_id.to_string()),
+            session_identity_source: None,
+            client_name: None,
+            client_addr: None,
+            cwd: None,
+            model: None,
+            reasoning_effort: None,
+            service_tier: None,
+            upstream_base_url: None,
+            route_decision: None,
+            usage: None,
+            cost: crate::pricing::CostBreakdown::default(),
+            retry: None,
+            provider_signals: Vec::new(),
+            policy_actions: Vec::new(),
+            observability: crate::state::RequestObservability::default(),
+            service: "codex".to_string(),
+            method: "POST".to_string(),
+            path: format!("/v1/responses/{session_id}"),
+            status_code,
+            duration_ms: 120,
+            ttfb_ms: None,
+            streaming: false,
+            ended_at_ms: 1,
+            provider_id: None,
+            station_name: None,
         }
     }
 
@@ -847,6 +887,41 @@ mod tests {
 
         assert!(text.contains("came from Codex history"), "{text}");
         assert!(text.contains("current proxy runtime"), "{text}");
+    }
+
+    #[test]
+    fn requests_page_can_filter_to_provider_control_evidence() {
+        let mut snapshot = empty_snapshot();
+        let mut ordinary_error = request_fixture("ordinary", 500);
+        ordinary_error.provider_id = Some("plain".to_string());
+        let mut controlled = request_fixture("controlled", 429);
+        controlled.provider_id = Some("limited".to_string());
+        controlled.provider_signals.push(
+            codex_helper_core::provider_signals::ProviderSignal::high_confidence_route_facing(
+                codex_helper_core::provider_signals::ProviderSignalKind::RateLimit,
+                codex_helper_core::provider_signals::ProviderSignalSource::UpstreamResponse,
+                codex_helper_core::provider_signals::ProviderSignalTarget::ProviderEndpoint {
+                    provider_endpoint_key:
+                        codex_helper_core::runtime_identity::ProviderEndpointKey::new(
+                            "codex", "limited", "default",
+                        ),
+                },
+                1_000,
+            ),
+        );
+        snapshot.recent = vec![ordinary_error, controlled];
+        let mut ui = UiState {
+            page: crate::tui::types::Page::Requests,
+            language: crate::tui::Language::En,
+            request_page_control_filter: crate::tui::state::RequestControlFilter::AnyEvidence,
+            ..UiState::default()
+        };
+
+        let text = render_requests_text(140, 24, &mut ui, &snapshot);
+
+        assert!(text.contains("limited"), "{text}");
+        assert!(!text.contains("plain"), "{text}");
+        assert!(text.contains("control: evidence"), "{text}");
     }
 
     #[test]

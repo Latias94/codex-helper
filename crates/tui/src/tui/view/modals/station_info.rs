@@ -5,9 +5,14 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use crate::tui::Language;
 use crate::tui::ProviderOption;
 use crate::tui::i18n::{self, msg};
-use crate::tui::model::{Palette, Snapshot, compute_window_stats, now_ms, shorten, shorten_middle};
+use crate::tui::model::{
+    Palette, Snapshot, compute_window_stats, now_ms, runtime_upstream_policy_actions,
+    runtime_upstream_provider_endpoint_key, shorten, shorten_middle,
+};
 use crate::tui::state::UiState;
+use crate::tui::view::provider_control::policy_action_control_details;
 use crate::tui::view::widgets::centered_rect;
+
 pub(in crate::tui::view) fn render_station_info_modal(
     f: &mut Frame<'_>,
     p: Palette,
@@ -487,6 +492,31 @@ pub(in crate::tui::view) fn render_station_info_modal(
                     ),
                     Span::styled(lb_text, Style::default().fg(p.muted)),
                 ]));
+                let control_actions =
+                    runtime_upstream_policy_actions(snapshot, ui.service_name, &cfg.name, idx, up);
+                if !control_actions.is_empty() {
+                    let endpoint_key =
+                        runtime_upstream_provider_endpoint_key(ui.service_name, &cfg.name, idx, up);
+                    let action_text = control_actions
+                        .iter()
+                        .map(|action| policy_action_control_details(action, 34))
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    lines.push(Line::from(vec![
+                        Span::raw("     "),
+                        Span::styled(
+                            format!("{}: ", i18n::label(ui.language, "control")),
+                            Style::default().fg(p.muted),
+                        ),
+                        Span::styled(
+                            shorten_middle(
+                                &format!("{} {}", endpoint_key.stable_key(), action_text),
+                                112,
+                            ),
+                            Style::default().fg(p.warn),
+                        ),
+                    ]));
+                }
 
                 let runtime_line = {
                     fn pct(ok: usize, total: usize) -> String {

@@ -2329,6 +2329,20 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
             ));
             true
         }
+        KeyCode::Char('c') if ui.page == Page::Requests => {
+            ui.request_page_control_filter = ui.request_page_control_filter.next();
+            ui.selected_request_page_idx = 0;
+            ui.toast = Some((
+                format!(
+                    "{}: {}={}",
+                    i18n::label(ui.language, "requests filter"),
+                    i18n::label(ui.language, "control"),
+                    ui.request_page_control_filter.label(ui.language)
+                ),
+                Instant::now(),
+            ));
+            true
+        }
         KeyCode::Char('s') if ui.page == Page::Requests => {
             ui.request_page_scope_session = !ui.request_page_scope_session;
             if ui.request_page_scope_session && ui.focused_request_session_id.is_none() {

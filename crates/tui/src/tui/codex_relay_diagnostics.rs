@@ -253,6 +253,7 @@ mod tests {
             station_health: HashMap::new(),
             health_checks: HashMap::new(),
             lb_view: HashMap::new(),
+            provider_endpoint_policy_actions: HashMap::new(),
             stats_5m: crate::dashboard_core::WindowStats::default(),
             stats_1h: crate::dashboard_core::WindowStats::default(),
             service_status: None,

@@ -56,12 +56,58 @@ fn empty_snapshot(
         station_health: HashMap::new(),
         health_checks: HashMap::new(),
         lb_view: HashMap::new(),
+        provider_endpoint_policy_actions: HashMap::new(),
         stats_5m: crate::dashboard_core::WindowStats::default(),
         stats_1h: crate::dashboard_core::WindowStats::default(),
         service_status: None,
         pricing_catalog: crate::pricing::bundled_model_price_catalog_snapshot(),
         refreshed_at: Instant::now(),
     }
+}
+
+fn policy_action_projection(
+    provider_id: &str,
+    endpoint_id: &str,
+    cooldown_remaining_secs: u64,
+) -> codex_helper_core::policy_actions::PolicyActionProjection {
+    codex_helper_core::policy_actions::PolicyActionProjection {
+        provider_endpoint_key: codex_helper_core::runtime_identity::ProviderEndpointKey::new(
+            "codex",
+            provider_id,
+            endpoint_id,
+        ),
+        active_cooldown: true,
+        cooldown_remaining_secs: Some(cooldown_remaining_secs),
+        reason: Some("upstream_rate_limited".to_string()),
+        action_id: Some(format!("codex-helper:codex/{provider_id}/{endpoint_id}:1")),
+    }
+}
+
+#[test]
+fn station_row_surfaces_owned_policy_action_cooldowns() {
+    let mut snapshot = empty_snapshot(HashMap::new(), None);
+    snapshot.provider_endpoint_policy_actions.insert(
+        "codex/alpha/default".to_string(),
+        vec![policy_action_projection("alpha", "default", 42)],
+    );
+    let mut providers = vec![provider("alpha", true, 1, true, 1)];
+    providers[0].upstreams[0]
+        .tags
+        .push(("provider_id".to_string(), "alpha".to_string()));
+    providers[0].upstreams[0]
+        .tags
+        .push(("endpoint_id".to_string(), "default".to_string()));
+    let mut ui = UiState {
+        page: Page::Stations,
+        language: crate::tui::Language::En,
+        ..UiState::default()
+    };
+
+    let text = render_stations_text_with_providers(120, 28, &mut ui, &snapshot, &providers);
+
+    assert!(text.contains("control=1"), "{text}");
+    assert!(text.contains("cooldown=42s"), "{text}");
+    assert!(text.contains("upstream_rate_limited"), "{text}");
 }
 
 fn routing_provider(name: &str) -> crate::tui::model::RoutingProviderRef {
@@ -85,11 +131,28 @@ fn buffer_text(buffer: &Buffer) -> String {
 }
 
 fn render_stations_text(width: u16, height: u16, ui: &mut UiState, snapshot: &Snapshot) -> String {
+    render_stations_text_with_providers(width, height, ui, snapshot, &[])
+}
+
+fn render_stations_text_with_providers(
+    width: u16,
+    height: u16,
+    ui: &mut UiState,
+    snapshot: &Snapshot,
+    providers: &[ProviderOption],
+) -> String {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("terminal");
     let frame = terminal
         .draw(|frame| {
-            render_stations_page(frame, Palette::default(), ui, snapshot, &[], frame.area());
+            render_stations_page(
+                frame,
+                Palette::default(),
+                ui,
+                snapshot,
+                providers,
+                frame.area(),
+            );
         })
         .expect("draw");
     buffer_text(frame.buffer)
@@ -475,6 +538,7 @@ fn routing_provider_balance_brief_preserves_subscription_amount_in_narrow_table(
         station_health: HashMap::new(),
         health_checks: HashMap::new(),
         lb_view: HashMap::new(),
+        provider_endpoint_policy_actions: HashMap::new(),
         stats_5m: crate::dashboard_core::WindowStats::default(),
         stats_1h: crate::dashboard_core::WindowStats::default(),
         service_status: None,
@@ -526,6 +590,7 @@ fn routing_provider_balance_brief_fits_lazy_quota_in_zh_table_cell() {
         station_health: HashMap::new(),
         health_checks: HashMap::new(),
         lb_view: HashMap::new(),
+        provider_endpoint_policy_actions: HashMap::new(),
         stats_5m: crate::dashboard_core::WindowStats::default(),
         stats_1h: crate::dashboard_core::WindowStats::default(),
         service_status: None,
@@ -726,6 +791,59 @@ fn route_graph_routing_render_folds_long_order_and_keeps_target_balance_visible(
     assert!(text.contains("超") && text.contains("级"), "{text}");
     assert!(!text.contains("inp…ght"), "{text}");
     assert!(!text.contains("$0/$│"), "{text}");
+}
+
+#[test]
+fn route_graph_provider_surfaces_owned_policy_action_cooldowns() {
+    let order = ["alpha", "beta"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let spec = crate::tui::model::RoutingSpecView {
+        entry: "main".to_string(),
+        routes: BTreeMap::from([(
+            "main".to_string(),
+            crate::config::RoutingNodeV4 {
+                strategy: crate::config::RoutingPolicyV4::OrderedFailover,
+                children: order.clone(),
+                ..crate::config::RoutingNodeV4::default()
+            },
+        )]),
+        policy: crate::config::RoutingPolicyV4::OrderedFailover,
+        order: Vec::new(),
+        target: None,
+        prefer_tags: Vec::new(),
+        chain: Vec::new(),
+        pools: BTreeMap::new(),
+        on_exhausted: crate::config::RoutingExhaustedActionV4::Continue,
+        entry_strategy: crate::config::RoutingPolicyV4::OrderedFailover,
+        expanded_order: order.clone(),
+        entry_target: None,
+        providers: order.iter().map(|name| routing_provider(name)).collect(),
+    };
+    let mut snapshot = empty_snapshot(HashMap::new(), None);
+    snapshot.provider_endpoint_policy_actions.insert(
+        "codex/alpha/default".to_string(),
+        vec![policy_action_projection("alpha", "default", 42)],
+    );
+    let mut ui = UiState {
+        page: Page::Stations,
+        config_version: Some(5),
+        routing_spec: Some(spec),
+        selected_station_idx: 0,
+        language: Language::En,
+        ..UiState::default()
+    };
+
+    let text = render_stations_text(160, 32, &mut ui, &snapshot);
+
+    assert!(text.contains("control=1"), "{text}");
+    assert!(text.contains("Provider control"), "{text}");
+    assert!(text.contains("codex/alpha/default"), "{text}");
+    assert!(text.contains("endpoint=default"), "{text}");
+    assert!(text.contains("cooldown=42s"), "{text}");
+    assert!(text.contains("upstream_rate_limited"), "{text}");
+    assert!(!text.contains("codex/beta/default"), "{text}");
 }
 
 #[test]
