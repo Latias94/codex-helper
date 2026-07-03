@@ -24,10 +24,12 @@ use crate::runtime_identity::ProviderEndpointKey;
 use crate::sessions;
 use crate::usage::UsageMetrics;
 
+mod policy_action_store;
 mod runtime_types;
 mod session_identity;
 mod session_route_ledger;
 
+use self::policy_action_store::{PolicyActionMap, PolicyActionStore};
 use self::runtime_types::{
     ConfigMetaOverride, RuntimeDefaultProfileOverride, UsageRollup, merge_station_health,
 };
@@ -61,7 +63,6 @@ type ProviderBalanceHistoryMap = HashMap<
 >;
 type ProviderBalanceSummaryMap = HashMap<String, HashMap<String, StationRoutingBalanceSummary>>;
 type ServiceLayoutSignature = Vec<(String, Vec<String>)>;
-type PolicyActionMap = HashMap<String, HashMap<ProviderEndpointKey, Vec<PolicyAction>>>;
 
 #[derive(Debug, Clone, Default)]
 struct ProviderEndpointRuntimeHealth {
@@ -279,6 +280,7 @@ pub struct ProxyState {
     provider_balance_summaries: RwLock<ProviderBalanceSummaryMap>,
     provider_endpoint_runtime_health:
         RwLock<HashMap<String, HashMap<ProviderEndpointKey, ProviderEndpointRuntimeHealth>>>,
+    policy_action_store: PolicyActionStore,
     policy_actions: RwLock<PolicyActionMap>,
     station_health_checks: RwLock<HashMap<String, HashMap<String, HealthCheckStatus>>>,
     service_layout_signatures: RwLock<HashMap<String, ServiceLayoutSignature>>,
@@ -372,6 +374,8 @@ impl ProxyState {
             policy.session_route_affinity_max_entries,
             unix_now_ms(),
         );
+        let policy_action_store = PolicyActionStore::from_env();
+        let restored_policy_actions = policy_action_store.load();
 
         Arc::new(Self {
             next_request_id: AtomicU64::new(1),
@@ -411,7 +415,8 @@ impl ProxyState {
             provider_balance_history: RwLock::new(HashMap::new()),
             provider_balance_summaries: RwLock::new(HashMap::new()),
             provider_endpoint_runtime_health: RwLock::new(HashMap::new()),
-            policy_actions: RwLock::new(HashMap::new()),
+            policy_action_store,
+            policy_actions: RwLock::new(restored_policy_actions),
             station_health_checks: RwLock::new(HashMap::new()),
             service_layout_signatures: RwLock::new(HashMap::new()),
             state_version_tx: watch::channel(0).0,
@@ -1414,21 +1419,25 @@ impl ProxyState {
     }
 
     pub async fn upsert_owned_policy_action(&self, service_name: &str, action: PolicyAction) {
-        let mut guard = self.policy_actions.write().await;
-        let per_service = guard.entry(service_name.to_string()).or_default();
-        let actions = per_service
-            .entry(action.provider_endpoint_key.clone())
-            .or_default();
-        if let Some(existing) = actions.iter_mut().find(|existing| {
-            existing.kind == action.kind
-                && existing.owner == action.owner
-                && existing.source_signal.kind == action.source_signal.kind
-                && existing.source_signal.source == action.source_signal.source
-        }) {
-            *existing = action;
-        } else {
-            actions.push(action);
-        }
+        let snapshot = {
+            let mut guard = self.policy_actions.write().await;
+            let per_service = guard.entry(service_name.to_string()).or_default();
+            let actions = per_service
+                .entry(action.provider_endpoint_key.clone())
+                .or_default();
+            if let Some(existing) = actions.iter_mut().find(|existing| {
+                existing.kind == action.kind
+                    && existing.owner == action.owner
+                    && existing.source_signal.kind == action.source_signal.kind
+                    && existing.source_signal.source == action.source_signal.source
+            }) {
+                *existing = action;
+            } else {
+                actions.push(action);
+            }
+            guard.clone()
+        };
+        self.persist_policy_actions(snapshot).await;
         self.notify_state_changed();
     }
 
@@ -1440,28 +1449,46 @@ impl ProxyState {
         source_kind: crate::provider_signals::ProviderSignalKind,
         source: crate::provider_signals::ProviderSignalSource,
     ) {
-        let mut changed = false;
-        let mut guard = self.policy_actions.write().await;
-        if let Some(per_service) = guard.get_mut(service_name) {
-            if let Some(actions) = per_service.get_mut(endpoint_key) {
-                let before = actions.len();
-                actions.retain(|action| {
-                    !(action.kind == kind
-                        && action.owner == crate::policy_actions::PolicyActionOwner::CodexHelper)
-                        || action.source_signal.kind != source_kind
-                        || action.source_signal.source != source
-                });
-                changed |= actions.len() != before;
-                if actions.is_empty() {
-                    per_service.remove(endpoint_key);
+        let (changed, snapshot) = {
+            let mut changed = false;
+            let mut guard = self.policy_actions.write().await;
+            if let Some(per_service) = guard.get_mut(service_name) {
+                if let Some(actions) = per_service.get_mut(endpoint_key) {
+                    let before = actions.len();
+                    actions.retain(|action| {
+                        !(action.kind == kind
+                            && action.owner
+                                == crate::policy_actions::PolicyActionOwner::CodexHelper)
+                            || action.source_signal.kind != source_kind
+                            || action.source_signal.source != source
+                    });
+                    changed |= actions.len() != before;
+                    if actions.is_empty() {
+                        per_service.remove(endpoint_key);
+                    }
+                }
+                if per_service.is_empty() {
+                    guard.remove(service_name);
                 }
             }
-            if per_service.is_empty() {
-                guard.remove(service_name);
-            }
-        }
+            let snapshot = changed.then(|| guard.clone());
+            (changed, snapshot)
+        };
         if changed {
+            if let Some(snapshot) = snapshot {
+                self.persist_policy_actions(snapshot).await;
+            }
             self.notify_state_changed();
+        }
+    }
+
+    async fn persist_policy_actions(&self, snapshot: PolicyActionMap) {
+        if let Err(err) = self
+            .policy_action_store
+            .save(&snapshot, unix_now_ms())
+            .await
+        {
+            tracing::warn!(error = %err, "failed to persist policy action ledger");
         }
     }
 
@@ -5629,6 +5656,58 @@ mod tests {
                     .get_session_route_affinity("sid-expired-ledger")
                     .await
                     .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn policy_action_ledger_restores_owned_actions() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let _home = env_lock().await;
+            let temp_dir = std::env::temp_dir().join(format!(
+                "codex-helper-policy-action-ledger-test-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&temp_dir).expect("create temp dir");
+            let mut scoped = ScopedEnv::default();
+            unsafe {
+                scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
+                scoped.set_path(
+                    "CODEX_HELPER_POLICY_ACTION_LEDGER",
+                    temp_dir.join("policy-actions.json").as_path(),
+                );
+            }
+
+            let first_state =
+                ProxyState::new_with_runtime_policy(None, test_runtime_policy(0, 0, 2_000));
+            let mut signal = crate::provider_signals::ProviderSignal::high_confidence_route_facing(
+                crate::provider_signals::ProviderSignalKind::RateLimit,
+                crate::provider_signals::ProviderSignalSource::UpstreamResponse,
+                crate::provider_signals::ProviderSignalTarget::ProviderEndpoint {
+                    provider_endpoint_key: ProviderEndpointKey::new("codex", "monthly", "default"),
+                },
+                unix_now_ms(),
+            );
+            signal.reset_after_secs = Some(60);
+            let action = crate::policy_actions::PolicyAction::cooldown_from_signal(
+                signal,
+                unix_now_ms(),
+                0,
+                1,
+            )
+            .expect("cooldown action");
+            first_state
+                .upsert_owned_policy_action("codex", action)
+                .await;
+
+            let second_state =
+                ProxyState::new_with_runtime_policy(None, test_runtime_policy(0, 0, 2_000));
+            let actions = second_state.list_policy_actions("codex").await;
+            assert_eq!(actions.len(), 1);
+            assert_eq!(
+                actions[0].provider_endpoint_key.stable_key(),
+                "codex/monthly/default"
             );
         });
     }
