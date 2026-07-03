@@ -35,9 +35,10 @@ It is probably unnecessary if you only use one official account and do not need 
 - **Relay capability diagnostics**: TUI, CLI, and admin API checks for `/models`, `/responses`, and `/responses/compact`, then recommends the preset that matches the selected relay.
 - **Provider / routing config**: `version = 5` route graph schema. Define providers once, then use routing entry/routes for order, pinning, grouping, or tag preference.
 - **Session affinity and failover**: each Codex session tries to keep using the selected provider, then falls through to other route candidates when requests fail, upstreams are unavailable, or trusted balance snapshots are exhausted.
+- **Provider signal control loop**: rate limits, quota responses, transport failures, and exhausted balances are first recorded as provider signals, then converted into helper-owned temporary policy actions projected into routing. Manual disables have higher precedence, and automatic actions never mutate Codex auth or third-party account files.
 - **Balance and plan visibility**: probes common Sub2API, New API, and `/user/balance` endpoints; lookup failures are not treated as exhausted.
 - **Outbound proxy compatibility**: the local proxy and outbound network proxy are separate layers; outbound requests currently follow system/environment proxy variables, with no first-class `config.toml` proxy section yet.
-- **Request observability**: provider, model, tokens, cache tokens, cache hit rate, TTFB, duration, output rate, retry chain, and estimated cost.
+- **Request observability**: provider, model, tokens, cache tokens, cache hit rate, TTFB, duration, output rate, retry chain, provider signal / policy action evidence, and estimated cost.
 - **TUI and GUI**: built-in TUI for terminal use; `codex-helper-gui`/egui remains available as an optional legacy GUI entrypoint. The Tauri desktop source lives under `apps/desktop` and has passed Windows packaged smoke, but v0.19.0 does not ship a public desktop installer yet; that release path is deferred until signing, release-channel, and rollback operations are ready.
 
 ## Quick Start

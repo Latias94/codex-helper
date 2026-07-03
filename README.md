@@ -46,10 +46,11 @@ English: [README_EN.md](README_EN.md)
 - **中转能力诊断**：TUI、CLI 和 admin API 都可以检查 `/models`、`/responses`、`/responses/compact`，并给出当前 relay 更适合哪种 preset。
 - **provider / routing 配置**：`version = 5` route graph 格式，新增 provider 后用 routing entry/routes 决定顺序、固定、分组或标签优先。
 - **会话粘性与自动兜底**：同一 Codex 会话会尽量粘住已选 provider，请求失败、上游不可用或可信余额显示耗尽时再按策略切换候选 provider/upstream。
+- **provider 信号控制循环**：限流、配额、传输错误和余额耗尽会先记录为 provider signal，再生成 helper 拥有的临时 policy action 投影到路由；手动禁用优先级更高，自动 action 不会修改 Codex auth 或第三方账号文件。
 - **本地并发上限**：可为 provider 或 endpoint 配置本进程并发上限，relay 账号饱和时自动跳过并走 fallback。
 - **余额/套餐**：支持 Sub2API、New API 和常见 `/user/balance` 探测；失败不计为耗尽。
 - **出站代理兼容**：本地代理和出站网络代理是两层概念；当前出站请求受系统/环境代理变量影响，还没有 `config.toml` 专用代理段。
-- **请求可观测**：记录 provider、model、token、cache token、缓存命中率、TTFB、总耗时、输出速度、重试链和估算成本。
+- **请求可观测**：记录 provider、model、token、cache token、缓存命中率、TTFB、总耗时、输出速度、重试链、provider signal / policy action 证据和估算成本。
 - **TUI/GUI**：TUI 内置在命令行里；`codex-helper-gui`/egui 仍作为可选 legacy GUI 入口保留。Tauri 桌面端代码位于 `apps/desktop`，已完成 Windows packaged smoke，但 v0.19.0 仍不随公开 release 发布桌面安装包，等签名、发布通道和回滚流程就绪后再进入正式桌面发布。
 
 ## 快速开始
