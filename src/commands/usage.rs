@@ -77,6 +77,8 @@ pub async fn handle_usage_cmd(cmd: UsageCommand) -> CliResult<()> {
                 status_max,
                 fast,
                 retried,
+                signal_kind: None,
+                policy_action_kind: None,
             };
             let lines = store.find_lines(&filters, limit).map_err(|err| {
                 CliError::Usage(format!("无法打开请求日志 {:?}: {}", store.path(), err))
