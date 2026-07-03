@@ -271,6 +271,7 @@ export function mapRecentRequests(requests: ApiFinishedRequest[]): RecentRequest
     cost: formatCost(request.cost),
     duration: formatMs(request.duration_ms),
     time: formatClock(request.ended_at_ms),
+    providerControl: providerControlSummary(request),
   }));
 }
 
@@ -415,6 +416,34 @@ function requestTokensLabel(usage?: ApiUsageMetrics) {
     return "—";
   }
   return `${compactInteger(positive(usage.input_tokens))} / ${compactInteger(positive(usage.output_tokens))}`;
+}
+
+function providerControlSummary(request: ApiFinishedRequest): string | undefined {
+  const signals = [
+    ...(request.provider_signals ?? []),
+    ...(request.retry?.route_attempts ?? []).flatMap((attempt) => attempt.provider_signals ?? []),
+  ]
+    .map((signal) => signal.kind)
+    .filter((kind): kind is string => Boolean(kind));
+  const actions = [
+    ...(request.policy_actions ?? []),
+    ...(request.retry?.route_attempts ?? []).flatMap((attempt) => attempt.policy_actions ?? []),
+  ]
+    .map((action) => action.kind)
+    .filter((kind): kind is string => Boolean(kind));
+
+  const signal = firstUnique(signals)[0];
+  const action = firstUnique(actions)[0];
+  if (!signal && !action) {
+    return undefined;
+  }
+  return [signal ? `signal ${signal}` : undefined, action ? `action ${action}` : undefined]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+function firstUnique(items: string[]): string[] {
+  return items.filter((item, index) => items.indexOf(item) === index);
 }
 
 function usageChartBars(summaryRows: ApiRequestUsageSummaryRow[], recentRequests: ApiFinishedRequest[]) {

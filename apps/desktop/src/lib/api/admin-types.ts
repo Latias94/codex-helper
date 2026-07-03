@@ -203,6 +203,61 @@ export type ApiRequestObservability = {
   streaming?: boolean;
 };
 
+export type ApiProviderEndpointKey = {
+  service?: string;
+  provider_id?: string;
+  endpoint_id?: string;
+};
+
+export type ApiProviderSignal = {
+  kind?: string;
+  source?: string;
+  target?: unknown;
+  confidence?: string;
+  observed_at_ms?: number;
+  route_facing?: boolean;
+  retry_after_secs?: number;
+  reset_after_secs?: number;
+  reason?: string;
+  error_class?: string;
+  trace?: unknown;
+};
+
+export type ApiPolicyAction = {
+  id?: string;
+  kind?: string;
+  owner?: string;
+  provider_endpoint_key?: string | ApiProviderEndpointKey;
+  source_signal?: ApiProviderSignal;
+  reason?: string;
+  confidence?: string;
+  created_at_ms?: number;
+  expires_at_ms?: number;
+  recovery_state?: string;
+  generation?: number;
+};
+
+export type ApiRouteAttempt = {
+  provider_endpoint_key?: string;
+  station_name?: string;
+  provider_id?: string;
+  endpoint_id?: string;
+  upstream_base_url?: string;
+  decision?: string;
+  reason?: string;
+  status_code?: number;
+  error_class?: string;
+  provider_signals?: ApiProviderSignal[];
+  policy_actions?: ApiPolicyAction[];
+  [key: string]: unknown;
+};
+
+export type ApiRetryInfo = {
+  attempts?: number;
+  upstream_chain?: string[];
+  route_attempts?: ApiRouteAttempt[];
+};
+
 export type ApiFinishedRequest = {
   id: number;
   trace_id?: string;
@@ -215,6 +270,9 @@ export type ApiFinishedRequest = {
   upstream_base_url?: string;
   usage?: ApiUsageMetrics;
   cost?: ApiCostBreakdown;
+  retry?: ApiRetryInfo;
+  provider_signals?: ApiProviderSignal[];
+  policy_actions?: ApiPolicyAction[];
   observability?: ApiRequestObservability;
   service: string;
   method: string;

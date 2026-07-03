@@ -115,6 +115,7 @@ export type RecentRequestView = {
   cost: string;
   duration: string;
   time: string;
+  providerControl?: string;
 };
 
 export type ProviderCardView = {

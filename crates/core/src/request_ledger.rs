@@ -54,6 +54,8 @@ pub struct RequestLogFilters {
     pub station: Option<String>,
     pub provider: Option<String>,
     pub path: Option<String>,
+    pub signal_kind: Option<String>,
+    pub policy_action_kind: Option<String>,
     pub status_min: Option<u64>,
     pub status_max: Option<u64>,
     pub fast: bool,
@@ -67,6 +69,8 @@ impl RequestLogFilters {
             && self.station.is_none()
             && self.provider.is_none()
             && self.path.is_none()
+            && self.signal_kind.is_none()
+            && self.policy_action_kind.is_none()
             && self.status_min.is_none()
             && self.status_max.is_none()
             && !self.fast
@@ -96,6 +100,20 @@ impl RequestLogFilters {
         }
         if let Some(expected) = self.path.as_deref()
             && !field_contains(str_field(record, "path"), expected)
+        {
+            return false;
+        }
+        if let Some(expected) = self.signal_kind.as_deref()
+            && !record_provider_signal_kinds(record)
+                .iter()
+                .any(|kind| field_contains(Some(kind), expected))
+        {
+            return false;
+        }
+        if let Some(expected) = self.policy_action_kind.as_deref()
+            && !record_policy_action_kinds(record)
+                .iter()
+                .any(|kind| field_contains(Some(kind), expected))
         {
             return false;
         }
@@ -515,6 +533,16 @@ pub fn format_request_log_record_lines(record: &JsonValue) -> Vec<String> {
         lines.push("    tokens -".to_string());
     }
 
+    let signal_kinds = record_provider_signal_kinds(record);
+    let action_summaries = record_policy_action_summaries(record);
+    if !signal_kinds.is_empty() || !action_summaries.is_empty() {
+        lines.push(format!(
+            "    provider_control signals={} actions={}",
+            comma_or_dash(&signal_kinds),
+            comma_or_dash(&action_summaries)
+        ));
+    }
+
     lines
 }
 
@@ -652,6 +680,99 @@ fn request_was_retried(record: &JsonValue) -> bool {
         .and_then(|retry| retry.get("upstream_chain"))
         .and_then(|attempts| attempts.as_array())
         .is_some_and(|attempts| attempts.len() > 1)
+}
+
+fn record_provider_signal_kinds(record: &JsonValue) -> Vec<String> {
+    let mut kinds = Vec::new();
+    collect_array_string_field(record.get("provider_signals"), "kind", &mut kinds);
+    for attempt in record_route_attempts(record) {
+        collect_array_string_field(attempt.get("provider_signals"), "kind", &mut kinds);
+    }
+    dedup_preserving_order(kinds)
+}
+
+fn record_policy_action_kinds(record: &JsonValue) -> Vec<String> {
+    let mut kinds = Vec::new();
+    collect_array_string_field(record.get("policy_actions"), "kind", &mut kinds);
+    for attempt in record_route_attempts(record) {
+        collect_array_string_field(attempt.get("policy_actions"), "kind", &mut kinds);
+    }
+    dedup_preserving_order(kinds)
+}
+
+fn record_policy_action_summaries(record: &JsonValue) -> Vec<String> {
+    let mut summaries = Vec::new();
+    collect_policy_action_summaries(record.get("policy_actions"), &mut summaries);
+    for attempt in record_route_attempts(record) {
+        collect_policy_action_summaries(attempt.get("policy_actions"), &mut summaries);
+    }
+    dedup_preserving_order(summaries)
+}
+
+fn record_route_attempts(record: &JsonValue) -> Vec<&JsonValue> {
+    record
+        .get("retry")
+        .and_then(|retry| retry.get("route_attempts"))
+        .and_then(|attempts| attempts.as_array())
+        .map(|attempts| attempts.iter().collect())
+        .unwrap_or_default()
+}
+
+fn collect_array_string_field(value: Option<&JsonValue>, field: &str, out: &mut Vec<String>) {
+    let Some(items) = value.and_then(|value| value.as_array()) else {
+        return;
+    };
+    out.extend(
+        items
+            .iter()
+            .filter_map(|item| str_field(item, field).map(ToOwned::to_owned)),
+    );
+}
+
+fn collect_policy_action_summaries(value: Option<&JsonValue>, out: &mut Vec<String>) {
+    let Some(items) = value.and_then(|value| value.as_array()) else {
+        return;
+    };
+    out.extend(items.iter().filter_map(|item| {
+        let kind = str_field(item, "kind")?;
+        let endpoint = item
+            .get("provider_endpoint_key")
+            .and_then(provider_endpoint_key_value)
+            .unwrap_or_else(|| "-".to_string());
+        Some(format!("{kind}:{endpoint}"))
+    }));
+}
+
+fn provider_endpoint_key_value(value: &JsonValue) -> Option<String> {
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            let service = str_field(value, "service")?;
+            let provider = str_field(value, "provider_id")?;
+            let endpoint = str_field(value, "endpoint_id")?;
+            Some(format!("{service}/{provider}/{endpoint}"))
+        })
+}
+
+fn dedup_preserving_order(items: Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for item in items {
+        if !out.iter().any(|existing| existing == &item) {
+            out.push(item);
+        }
+    }
+    out
+}
+
+fn comma_or_dash(items: &[String]) -> String {
+    if items.is_empty() {
+        "-".to_string()
+    } else {
+        items.join(",")
+    }
 }
 
 fn usage_metrics(record: &JsonValue) -> Option<UsageMetrics> {
@@ -1036,6 +1157,8 @@ mod tests {
             station: Some("main".to_string()),
             provider: Some("relay".to_string()),
             path: Some("responses".to_string()),
+            signal_kind: None,
+            policy_action_kind: None,
             status_min: Some(400),
             status_max: Some(499),
             fast: true,
@@ -1043,6 +1166,65 @@ mod tests {
         };
 
         assert!(filters.matches(&record));
+    }
+
+    #[test]
+    fn display_lines_and_filters_include_provider_control_evidence() {
+        let record = json!({
+            "timestamp_ms": 123,
+            "service": "codex",
+            "method": "POST",
+            "path": "/v1/responses",
+            "status_code": 429,
+            "provider_id": "primary",
+            "retry": {
+                "route_attempts": [
+                    {
+                        "decision": "failed_status",
+                        "provider_signals": [
+                            { "kind": "rate_limit" }
+                        ],
+                        "policy_actions": [
+                            {
+                                "kind": "cooldown",
+                                "provider_endpoint_key": {
+                                    "service": "codex",
+                                    "provider_id": "primary",
+                                    "endpoint_id": "default"
+                                }
+                            }
+                        ]
+                    }
+                ]
+            }
+        });
+
+        let lines = format_request_log_record_lines(&record);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("provider_control signals=rate_limit"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("actions=cooldown:codex/primary/default"))
+        );
+
+        assert!(
+            RequestLogFilters {
+                signal_kind: Some("rate".to_string()),
+                ..RequestLogFilters::default()
+            }
+            .matches(&record)
+        );
+        assert!(
+            RequestLogFilters {
+                policy_action_kind: Some("cool".to_string()),
+                ..RequestLogFilters::default()
+            }
+            .matches(&record)
+        );
     }
 
     #[test]

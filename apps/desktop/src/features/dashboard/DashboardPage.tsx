@@ -131,6 +131,9 @@ export function DashboardPage() {
                   <div className="mt-1 text-xs text-slate-500">
                     {request.provider} · {request.tokens}
                   </div>
+                  {request.providerControl ? (
+                    <div className="mt-1 text-xs text-amber-700">{request.providerControl}</div>
+                  ) : null}
                 </div>
                 <div className="text-right text-sm">
                   <div className="font-medium text-slate-900">{request.cost}</div>

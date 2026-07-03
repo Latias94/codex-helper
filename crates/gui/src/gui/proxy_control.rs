@@ -666,6 +666,15 @@ fn request_ledger_summary_query_pairs(
     if let Some(path) = filters.path.as_deref() {
         query.push(("path".to_string(), path.to_string()));
     }
+    if let Some(signal_kind) = filters.signal_kind.as_deref() {
+        query.push(("signal_kind".to_string(), signal_kind.to_string()));
+    }
+    if let Some(policy_action_kind) = filters.policy_action_kind.as_deref() {
+        query.push((
+            "policy_action_kind".to_string(),
+            policy_action_kind.to_string(),
+        ));
+    }
     if let Some(status_min) = filters.status_min {
         query.push(("status_min".to_string(), status_min.to_string()));
     }

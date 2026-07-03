@@ -212,6 +212,8 @@ fn read_request_ledger_summary_prefers_attached_api_when_supported() {
         station: Some("backup".to_string()),
         provider: Some("relay".to_string()),
         path: Some("responses/compact".to_string()),
+        signal_kind: Some("rate_limit".to_string()),
+        policy_action_kind: Some("cooldown".to_string()),
         status_min: Some(400),
         status_max: Some(499),
         fast: true,
@@ -286,6 +288,20 @@ fn read_request_ledger_summary_prefers_attached_api_when_supported() {
             .and_then(|query| query.get("path"))
             .map(String::as_str),
         Some("responses/compact")
+    );
+    assert_eq!(
+        captured
+            .as_ref()
+            .and_then(|query| query.get("signal_kind"))
+            .map(String::as_str),
+        Some("rate_limit")
+    );
+    assert_eq!(
+        captured
+            .as_ref()
+            .and_then(|query| query.get("policy_action_kind"))
+            .map(String::as_str),
+        Some("cooldown")
     );
     assert_eq!(
         captured

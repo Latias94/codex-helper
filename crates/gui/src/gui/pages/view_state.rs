@@ -83,6 +83,8 @@ impl RequestLedgerSummaryFilterState {
             station: normalize_text_filter(&self.station),
             provider: normalize_text_filter(&self.provider),
             path: None,
+            signal_kind: None,
+            policy_action_kind: None,
             status_min: parse_status_bound(
                 &self.status_min,
                 RequestLedgerSummaryFilterParseError::StatusMin,

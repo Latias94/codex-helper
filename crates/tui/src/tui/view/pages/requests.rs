@@ -718,7 +718,49 @@ fn request_route_attempt_line(attempt: &crate::logging::RouteAttemptLog) -> Stri
     if let Some(reason) = attempt.reason.as_deref() {
         parts.push(format!("reason={}", shorten_middle(reason, 42)));
     }
+    if let Some(provider_control) = request_route_attempt_provider_control_line(attempt, 34) {
+        parts.push(provider_control);
+    }
     format!("{target}  {}", parts.join(" "))
+}
+
+fn request_route_attempt_provider_control_line(
+    attempt: &crate::logging::RouteAttemptLog,
+    endpoint_width: usize,
+) -> Option<String> {
+    let signals = attempt
+        .provider_signals
+        .iter()
+        .map(|signal| format!("{:?}", signal.kind).to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let actions = attempt
+        .policy_actions
+        .iter()
+        .map(|action| {
+            format!(
+                "{:?}:{}",
+                action.kind,
+                shorten_middle(&action.provider_endpoint_key.stable_key(), endpoint_width)
+            )
+            .to_ascii_lowercase()
+        })
+        .collect::<Vec<_>>();
+    if signals.is_empty() && actions.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "control signals={} actions={}",
+        dash_join(&signals),
+        dash_join(&actions)
+    ))
+}
+
+fn dash_join(items: &[String]) -> String {
+    if items.is_empty() {
+        "-".to_string()
+    } else {
+        items.join(",")
+    }
 }
 
 #[cfg(test)]
