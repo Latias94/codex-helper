@@ -153,6 +153,31 @@ describe("admin API mappers", () => {
     expect(data.routeOrder[0].active).toBe(true);
   });
 
+  it("maps active policy action projections into provider health", () => {
+    const data = mapProvidersData({
+      ...operatorSummary,
+      providers: [
+        {
+          ...operatorSummary.providers![0],
+          endpoints: [
+            {
+              ...operatorSummary.providers![0].endpoints![0],
+              policy_actions: [
+                {
+                  active_cooldown: true,
+                  reason: "upstream_rate_limited",
+                  cooldown_remaining_secs: 30,
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(data.providers[0].health).toBe("Warning");
+  });
+
   it("maps request-ledger rows into usage table rows and summary cards", () => {
     const data = mapUsageData({
       recentRequests: [finishedRequest],

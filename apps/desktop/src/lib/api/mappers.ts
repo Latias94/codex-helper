@@ -226,6 +226,7 @@ export function mapProviders(
     const active = provider.name === activeProvider || (!activeProvider && index === 0);
     const endpointCount = endpoints.length;
     const editable = endpointCount === 1 && Boolean(primaryEndpoint?.base_url);
+    const policyAction = firstActivePolicyAction(provider);
 
     return {
       id: provider.name,
@@ -245,7 +246,7 @@ export function mapProviders(
       latency: provider.routable_endpoints ? "可路由" : "—",
       capabilities: providerCapabilities(provider),
       usage: `${provider.routable_endpoints ?? 0}/${endpoints.length} endpoints`,
-      lastUsed: active ? "当前路由" : "等待请求",
+      lastUsed: policyAction?.reason ? `policy ${policyAction.reason}` : active ? "当前路由" : "等待请求",
       active,
     };
   });
@@ -273,6 +274,12 @@ export function mapRecentRequests(requests: ApiFinishedRequest[]): RecentRequest
     time: formatClock(request.ended_at_ms),
     providerControl: providerControlSummary(request),
   }));
+}
+
+function firstActivePolicyAction(provider: ApiProviderOption) {
+  return (provider.endpoints ?? [])
+    .flatMap((endpoint) => endpoint.policy_actions ?? [])
+    .find((action) => action.active_cooldown);
 }
 
 export function mapUsageRows(requests: ApiFinishedRequest[]): UsageRowView[] {
@@ -355,6 +362,9 @@ function providerHealth(provider: ApiProviderOption): ProviderCardView["health"]
   }
   if (endpoints.some((endpoint) => endpoint.runtime_state === "breaker_open")) {
     return "Error";
+  }
+  if (endpoints.some((endpoint) => (endpoint.policy_actions ?? []).some((action) => action.active_cooldown))) {
+    return "Warning";
   }
   if (endpoints.some((endpoint) => endpoint.runtime_state === "draining" || endpoint.runtime_state === "half_open")) {
     return "Warning";

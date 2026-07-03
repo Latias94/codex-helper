@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::policy_actions::PolicyActionProjection;
 use crate::state::RuntimeConfigState;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -254,6 +255,7 @@ pub struct ControlProfileOption {
 pub struct ProviderEndpointOption {
     pub provider_name: String,
     pub name: String,
+    pub provider_endpoint_key: String,
     pub base_url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub continuity_domain: Option<String>,
@@ -275,6 +277,8 @@ pub struct ProviderEndpointOption {
     pub runtime_state_override: Option<RuntimeConfigState>,
     #[serde(default, skip_serializing_if = "ProviderCapacity::is_empty")]
     pub capacity: ProviderCapacity,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policy_actions: Vec<PolicyActionProjection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

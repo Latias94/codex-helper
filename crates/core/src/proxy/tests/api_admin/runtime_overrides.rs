@@ -1118,3 +1118,95 @@ async fn proxy_api_v1_provider_runtime_override_filters_v4_route_plan_routing() 
     default_handle.abort();
     backup_handle.abort();
 }
+
+#[tokio::test]
+async fn provider_surface_includes_owned_policy_action_projection() {
+    let _env_lock = env_lock().await;
+    let temp_dir = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
+    }
+
+    let cfg = ProxyConfigV4 {
+        version: 4,
+        codex: ServiceViewV4 {
+            providers: BTreeMap::from([(
+                "primary".to_string(),
+                ProviderConfigV4 {
+                    endpoints: BTreeMap::from([(
+                        "default".to_string(),
+                        ProviderEndpointV4 {
+                            base_url: "http://127.0.0.1:9/v1".to_string(),
+                            continuity_domain: None,
+                            enabled: true,
+                            priority: 0,
+                            tags: BTreeMap::new(),
+                            supported_models: BTreeMap::new(),
+                            model_mapping: BTreeMap::new(),
+                            limits: ProviderConcurrencyLimits::default(),
+                        },
+                    )]),
+                    ..ProviderConfigV4::default()
+                },
+            )]),
+            routing: Some(RoutingConfigV4::ordered_failover(vec![
+                "primary".to_string(),
+            ])),
+            ..ServiceViewV4::default()
+        },
+        claude: ServiceViewV4::default(),
+        retry: RetryConfig::default(),
+        notify: Default::default(),
+        default_service: None,
+        relay_targets: std::collections::BTreeMap::new(),
+        fleet: Default::default(),
+        ui: UiConfig::default(),
+    };
+    crate::config::save_config_v4(&cfg)
+        .await
+        .expect("write provider policy action surface config");
+    let loaded = crate::config::load_config_with_v4_source()
+        .await
+        .expect("load provider policy action surface config");
+    let proxy = ProxyService::new_with_v4_source(
+        Client::new(),
+        Arc::new(loaded.runtime),
+        loaded.v4.map(Arc::new),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+
+    let now = crate::logging::now_ms();
+    let mut signal = crate::provider_signals::ProviderSignal::high_confidence_route_facing(
+        crate::provider_signals::ProviderSignalKind::RateLimit,
+        crate::provider_signals::ProviderSignalSource::UpstreamResponse,
+        crate::provider_signals::ProviderSignalTarget::ProviderEndpoint {
+            provider_endpoint_key: crate::runtime_identity::ProviderEndpointKey::new(
+                "codex", "primary", "default",
+            ),
+        },
+        now,
+    );
+    signal.reset_after_secs = Some(30);
+    signal.reason = Some("upstream_rate_limited".to_string());
+    let action = crate::policy_actions::PolicyAction::cooldown_from_signal(signal, now, 0, 1)
+        .expect("cooldown action");
+    proxy
+        .state
+        .upsert_owned_policy_action("codex", action)
+        .await;
+
+    let providers = crate::proxy::providers_api::build_provider_options_for_proxy(&proxy)
+        .await
+        .expect("provider options");
+
+    let endpoint = providers[0].endpoints.first().expect("provider endpoint");
+    assert_eq!(endpoint.provider_endpoint_key, "codex/primary/default");
+    assert_eq!(endpoint.policy_actions.len(), 1);
+    assert!(endpoint.policy_actions[0].active_cooldown);
+    assert_eq!(
+        endpoint.policy_actions[0].reason.as_deref(),
+        Some("upstream_rate_limited")
+    );
+}

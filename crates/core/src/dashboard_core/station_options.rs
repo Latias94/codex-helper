@@ -292,10 +292,19 @@ fn build_provider_endpoint_option(
     let effective_continuity_domain = continuity_domain
         .clone()
         .or_else(|| normalized_tag_value(endpoint.tags.get("provider_continuity_domain")));
+    let provider_endpoint_key = ProviderEndpointKey::new(
+        service_name,
+        normalized_tag_value(endpoint.tags.get("provider_id"))
+            .unwrap_or_else(|| provider_name.to_string()),
+        normalized_tag_value(endpoint.tags.get("endpoint_id"))
+            .unwrap_or_else(|| endpoint_name.to_string()),
+    )
+    .stable_key();
 
     ProviderEndpointOption {
         provider_name: provider_name.to_string(),
         name: endpoint_name.to_string(),
+        provider_endpoint_key,
         base_url: endpoint.base_url.clone(),
         continuity_domain,
         effective_continuity_domain,
@@ -307,6 +316,7 @@ fn build_provider_endpoint_option(
         runtime_state,
         runtime_state_override,
         capacity: Default::default(),
+        policy_actions: Vec::new(),
     }
 }
 

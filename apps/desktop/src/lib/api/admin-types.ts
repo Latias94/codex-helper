@@ -30,6 +30,7 @@ export type ApiCostBreakdown = {
 export type ApiProviderEndpointOption = {
   provider_name: string;
   name: string;
+  provider_endpoint_key?: string;
   base_url: string;
   continuity_domain?: string | null;
   effective_continuity_domain?: string | null;
@@ -40,6 +41,7 @@ export type ApiProviderEndpointOption = {
   runtime_enabled_override?: boolean | null;
   runtime_state?: ApiRuntimeConfigState;
   runtime_state_override?: ApiRuntimeConfigState | null;
+  policy_actions?: ApiPolicyActionProjection[];
 };
 
 export type ApiProviderOption = {
@@ -235,6 +237,14 @@ export type ApiPolicyAction = {
   expires_at_ms?: number;
   recovery_state?: string;
   generation?: number;
+};
+
+export type ApiPolicyActionProjection = {
+  provider_endpoint_key?: string | ApiProviderEndpointKey;
+  active_cooldown?: boolean;
+  cooldown_remaining_secs?: number;
+  reason?: string;
+  action_id?: string;
 };
 
 export type ApiRouteAttempt = {
