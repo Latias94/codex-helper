@@ -10,6 +10,8 @@ use serde_json::Value as JsonValue;
 
 use crate::config::proxy_home_dir;
 use crate::local_log_store::{LogRetention, append_line};
+use crate::policy_actions::PolicyAction;
+use crate::provider_signals::ProviderSignal;
 use crate::state::{RouteDecisionProvenance, SessionIdentitySource};
 use crate::usage::UsageMetrics;
 
@@ -332,6 +334,10 @@ pub struct RequestLog<'a> {
     pub route_decision: Option<RouteDecisionProvenance>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry: Option<RetryInfo>,
+    #[serde(default, skip_serializing_if = "provider_signals_is_empty")]
+    pub provider_signals: Vec<ProviderSignal>,
+    #[serde(default, skip_serializing_if = "policy_actions_is_empty")]
+    pub policy_actions: Vec<PolicyAction>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -353,6 +359,14 @@ fn route_attempt_avoided_candidate_indices_is_empty(value: &[usize]) -> bool {
 }
 
 fn route_attempt_route_path_is_empty(value: &[String]) -> bool {
+    value.is_empty()
+}
+
+fn provider_signals_is_empty(value: &[ProviderSignal]) -> bool {
+    value.is_empty()
+}
+
+fn policy_actions_is_empty(value: &[PolicyAction]) -> bool {
     value.is_empty()
 }
 
@@ -418,6 +432,10 @@ pub struct RouteAttemptLog {
     pub cooldown_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cooldown_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "provider_signals_is_empty")]
+    pub provider_signals: Vec<ProviderSignal>,
+    #[serde(default, skip_serializing_if = "policy_actions_is_empty")]
+    pub policy_actions: Vec<PolicyAction>,
     #[serde(default, skip_serializing_if = "bool_is_false")]
     pub skipped: bool,
     pub raw: String,
@@ -929,6 +947,8 @@ pub fn log_request_with_debug(
         http_debug_ref,
         route_decision,
         retry,
+        provider_signals: Vec::new(),
+        policy_actions: Vec::new(),
     };
 
     if let Ok(line) = serde_json::to_string(&entry) {

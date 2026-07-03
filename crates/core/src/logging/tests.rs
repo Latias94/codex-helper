@@ -33,6 +33,8 @@ fn request_log_serializes_request_id_when_present() {
         http_debug_ref: None,
         route_decision: None,
         retry: None,
+        provider_signals: Vec::new(),
+        policy_actions: Vec::new(),
     })
     .expect("serialize request log");
 
@@ -71,6 +73,8 @@ fn request_log_can_serialize_provider_endpoint_without_station_identity() {
         http_debug_ref: None,
         route_decision: None,
         retry: None,
+        provider_signals: Vec::new(),
+        policy_actions: Vec::new(),
     })
     .expect("serialize request log");
 
@@ -119,6 +123,8 @@ fn request_log_serializes_codex_bridge_metadata() {
         http_debug_ref: None,
         route_decision: None,
         retry: None,
+        provider_signals: Vec::new(),
+        policy_actions: Vec::new(),
     })
     .expect("serialize request log");
 

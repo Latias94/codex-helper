@@ -15,6 +15,7 @@ pub use crate::balance::{
 };
 use crate::config::ServiceConfigManager;
 use crate::lb::{COOLDOWN_SECS, CooldownBackoff, FAILURE_THRESHOLD, LbState};
+use crate::policy_actions::{PolicyAction, PolicyActionKind, PolicyActionProjection};
 #[cfg(test)]
 use crate::pricing::CostBreakdown;
 use crate::pricing::{CostAdjustments, estimate_request_cost_from_operator_catalog_for_service};
@@ -60,6 +61,7 @@ type ProviderBalanceHistoryMap = HashMap<
 >;
 type ProviderBalanceSummaryMap = HashMap<String, HashMap<String, StationRoutingBalanceSummary>>;
 type ServiceLayoutSignature = Vec<(String, Vec<String>)>;
+type PolicyActionMap = HashMap<String, HashMap<ProviderEndpointKey, Vec<PolicyAction>>>;
 
 #[derive(Debug, Clone, Default)]
 struct ProviderEndpointRuntimeHealth {
@@ -277,6 +279,7 @@ pub struct ProxyState {
     provider_balance_summaries: RwLock<ProviderBalanceSummaryMap>,
     provider_endpoint_runtime_health:
         RwLock<HashMap<String, HashMap<ProviderEndpointKey, ProviderEndpointRuntimeHealth>>>,
+    policy_actions: RwLock<PolicyActionMap>,
     station_health_checks: RwLock<HashMap<String, HashMap<String, HealthCheckStatus>>>,
     service_layout_signatures: RwLock<HashMap<String, ServiceLayoutSignature>>,
     state_version_tx: watch::Sender<u64>,
@@ -408,6 +411,7 @@ impl ProxyState {
             provider_balance_history: RwLock::new(HashMap::new()),
             provider_balance_summaries: RwLock::new(HashMap::new()),
             provider_endpoint_runtime_health: RwLock::new(HashMap::new()),
+            policy_actions: RwLock::new(HashMap::new()),
             station_health_checks: RwLock::new(HashMap::new()),
             service_layout_signatures: RwLock::new(HashMap::new()),
             state_version_tx: watch::channel(0).0,
@@ -1313,6 +1317,7 @@ impl ProxyState {
     ) -> RoutePlanRuntimeState {
         let mut runtime = RoutePlanRuntimeState::default();
         let now = std::time::Instant::now();
+        let now_ms = unix_now_ms();
         {
             let mut guard = self.provider_endpoint_runtime_health.write().await;
             if let Some(per_service) = guard.get_mut(service_name) {
@@ -1359,6 +1364,36 @@ impl ProxyState {
         }
 
         {
+            let guard = self.policy_actions.read().await;
+            if let Some(per_service) = guard.get(service_name) {
+                for (endpoint_key, actions) in per_service {
+                    for action in actions {
+                        let Some(projection) = PolicyActionProjection::from_action(action, now_ms)
+                        else {
+                            continue;
+                        };
+                        let mut upstream_state = runtime.provider_endpoint(endpoint_key);
+                        if projection.active_cooldown {
+                            upstream_state.cooldown_active = true;
+                            upstream_state.cooldown_remaining_secs =
+                                projection.cooldown_remaining_secs;
+                            if matches!(action.kind, PolicyActionKind::Cooldown)
+                                && matches!(
+                                    action.source_signal.kind,
+                                    crate::provider_signals::ProviderSignalKind::Quota
+                                        | crate::provider_signals::ProviderSignalKind::RateLimit
+                                )
+                            {
+                                upstream_state.usage_exhausted = true;
+                            }
+                        }
+                        runtime.set_provider_endpoint(endpoint_key.clone(), upstream_state);
+                    }
+                }
+            }
+        }
+
+        {
             let guard = self.provider_endpoint_meta_overrides.read().await;
             if let Some(per_service) = guard.get(service_name) {
                 for (endpoint_key, meta) in per_service {
@@ -1376,6 +1411,48 @@ impl ProxyState {
         }
 
         runtime
+    }
+
+    pub async fn upsert_owned_policy_action(&self, service_name: &str, action: PolicyAction) {
+        let mut guard = self.policy_actions.write().await;
+        let per_service = guard.entry(service_name.to_string()).or_default();
+        let actions = per_service
+            .entry(action.provider_endpoint_key.clone())
+            .or_default();
+        if let Some(existing) = actions
+            .iter_mut()
+            .find(|existing| existing.kind == action.kind && existing.owner == action.owner)
+        {
+            *existing = action;
+        } else {
+            actions.push(action);
+        }
+        self.notify_state_changed();
+    }
+
+    pub async fn list_policy_actions(&self, service_name: &str) -> Vec<PolicyAction> {
+        let guard = self.policy_actions.read().await;
+        guard
+            .get(service_name)
+            .into_iter()
+            .flat_map(|per_service| per_service.values())
+            .flat_map(|actions| actions.iter().cloned())
+            .collect()
+    }
+
+    pub async fn active_policy_action_projections(
+        &self,
+        service_name: &str,
+        now_ms: u64,
+    ) -> Vec<PolicyActionProjection> {
+        let guard = self.policy_actions.read().await;
+        guard
+            .get(service_name)
+            .into_iter()
+            .flat_map(|per_service| per_service.values())
+            .flat_map(|actions| actions.iter())
+            .filter_map(|action| PolicyActionProjection::from_action(action, now_ms))
+            .collect()
     }
 
     pub async fn record_provider_endpoint_attempt_success(
@@ -1623,6 +1700,19 @@ impl ProxyState {
             if let Some(per_service) = guard.get_mut(service_name) {
                 per_service
                     .retain(|endpoint_key, _| active_provider_endpoint_keys.contains(endpoint_key));
+                if per_service.is_empty() {
+                    guard.remove(service_name);
+                }
+            }
+        }
+
+        {
+            let mut guard = self.policy_actions.write().await;
+            if let Some(per_service) = guard.get_mut(service_name) {
+                let before = per_service.len();
+                per_service
+                    .retain(|endpoint_key, _| active_provider_endpoint_keys.contains(endpoint_key));
+                changed |= per_service.len() != before;
                 if per_service.is_empty() {
                     guard.remove(service_name);
                 }
@@ -4990,6 +5080,127 @@ mod tests {
                 .route_plan_runtime_state_for_provider_endpoints("codex")
                 .await;
             assert!(runtime.provider_endpoint(&fallback).runtime_disabled);
+        });
+    }
+
+    #[test]
+    fn owned_policy_action_projects_to_runtime_state_below_manual_overrides() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            let endpoint = ProviderEndpointKey::new("codex", "monthly", "default");
+            let now_ms = unix_now_ms();
+            let mut signal = crate::provider_signals::ProviderSignal::high_confidence_route_facing(
+                crate::provider_signals::ProviderSignalKind::Quota,
+                crate::provider_signals::ProviderSignalSource::UpstreamResponse,
+                crate::provider_signals::ProviderSignalTarget::ProviderEndpoint {
+                    provider_endpoint_key: endpoint.clone(),
+                },
+                now_ms,
+            );
+            signal.reset_after_secs = Some(60);
+            signal.reason = Some("usage_limit_reached".to_string());
+            let action =
+                crate::policy_actions::PolicyAction::cooldown_from_signal(signal, now_ms, 0, 1)
+                    .expect("owned cooldown action");
+
+            state.upsert_owned_policy_action("codex", action).await;
+            let runtime = state
+                .route_plan_runtime_state_for_provider_endpoints("codex")
+                .await;
+            let projected = runtime.provider_endpoint(&endpoint);
+            assert!(projected.cooldown_active);
+            assert!(projected.usage_exhausted);
+            assert!(!projected.runtime_disabled);
+
+            state
+                .set_provider_endpoint_runtime_state_override(
+                    "codex",
+                    endpoint.clone(),
+                    RuntimeConfigState::BreakerOpen,
+                    now_ms.saturating_add(1_000),
+                )
+                .await;
+            let runtime = state
+                .route_plan_runtime_state_for_provider_endpoints("codex")
+                .await;
+            let projected = runtime.provider_endpoint(&endpoint);
+            assert!(projected.cooldown_active);
+            assert!(projected.usage_exhausted);
+            assert!(
+                projected.runtime_disabled,
+                "manual runtime override must outrank automatic action projection"
+            );
+        });
+    }
+
+    #[test]
+    fn owned_policy_action_upsert_replaces_existing_action_for_same_owner_and_kind() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            let endpoint = ProviderEndpointKey::new("codex", "monthly", "default");
+            let signal = crate::provider_signals::ProviderSignal::high_confidence_route_facing(
+                crate::provider_signals::ProviderSignalKind::Capacity,
+                crate::provider_signals::ProviderSignalSource::UpstreamResponse,
+                crate::provider_signals::ProviderSignalTarget::ProviderEndpoint {
+                    provider_endpoint_key: endpoint,
+                },
+                1_000,
+            );
+            let first = crate::policy_actions::PolicyAction::cooldown_from_signal(
+                signal.clone(),
+                1_000,
+                10,
+                1,
+            )
+            .expect("first cooldown");
+            let second =
+                crate::policy_actions::PolicyAction::cooldown_from_signal(signal, 2_000, 20, 2)
+                    .expect("second cooldown");
+
+            state.upsert_owned_policy_action("codex", first).await;
+            state.upsert_owned_policy_action("codex", second).await;
+
+            let actions = state.list_policy_actions("codex").await;
+            assert_eq!(actions.len(), 1);
+            assert_eq!(actions[0].generation, 2);
+            assert_eq!(actions[0].expires_at_ms, 22_000);
+        });
+    }
+
+    #[test]
+    fn expired_owned_policy_action_is_not_projected() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            let endpoint = ProviderEndpointKey::new("codex", "monthly", "default");
+            let signal = crate::provider_signals::ProviderSignal::high_confidence_route_facing(
+                crate::provider_signals::ProviderSignalKind::Transport,
+                crate::provider_signals::ProviderSignalSource::UpstreamResponse,
+                crate::provider_signals::ProviderSignalTarget::ProviderEndpoint {
+                    provider_endpoint_key: endpoint.clone(),
+                },
+                1_000,
+            );
+            let action =
+                crate::policy_actions::PolicyAction::cooldown_from_signal(signal, 1_000, 1, 1)
+                    .expect("transport cooldown");
+
+            state.upsert_owned_policy_action("codex", action).await;
+
+            assert!(
+                state
+                    .active_policy_action_projections("codex", 2_001)
+                    .await
+                    .is_empty()
+            );
+            let runtime = state
+                .route_plan_runtime_state_for_provider_endpoints("codex")
+                .await;
+            let projected = runtime.provider_endpoint(&endpoint);
+            assert!(!projected.cooldown_active);
+            assert!(!projected.usage_exhausted);
         });
     }
 
