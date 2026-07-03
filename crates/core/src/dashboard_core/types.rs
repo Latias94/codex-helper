@@ -255,6 +255,7 @@ pub struct ControlProfileOption {
 pub struct ProviderEndpointOption {
     pub provider_name: String,
     pub name: String,
+    #[serde(default)]
     pub provider_endpoint_key: String,
     pub base_url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
