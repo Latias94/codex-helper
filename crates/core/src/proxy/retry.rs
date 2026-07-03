@@ -300,6 +300,7 @@ pub(super) async fn retry_sleep(
 
 #[cfg(test)]
 mod tests {
+    use super::super::classify::CLIENT_ERROR_NON_RETRYABLE_CLASS;
     use super::*;
 
     use crate::config::{ReasoningGuardConfig, RetryProfileName};
@@ -464,7 +465,7 @@ mod tests {
         assert!(should_never_retry(
             &plan,
             400,
-            Some("client_error_non_retryable")
+            Some(CLIENT_ERROR_NON_RETRYABLE_CLASS)
         ));
     }
 

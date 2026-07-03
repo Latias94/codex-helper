@@ -7,6 +7,7 @@ use super::reasoning_guard::{REASONING_GUARD_BLOCKED_CLASS, REASONING_GUARD_TRIG
 pub(super) const ROUTING_MISMATCH_CAPABILITY_CLASS: &str = "routing_mismatch_capability";
 pub(super) const UPSTREAM_RATE_LIMITED_CLASS: &str = "upstream_rate_limited";
 pub(super) const UPSTREAM_OVERLOADED_CLASS: &str = "upstream_overloaded";
+pub(super) const CLIENT_ERROR_NON_RETRYABLE_CLASS: &str = "client_error_non_retryable";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct UpstreamThrottleSignal {
@@ -531,6 +532,7 @@ pub(super) fn class_is_health_neutral(class: Option<&str>) -> bool {
         class,
         Some(
             ROUTING_MISMATCH_CAPABILITY_CLASS
+                | CLIENT_ERROR_NON_RETRYABLE_CLASS
                 | REASONING_GUARD_TRIGGERED_CLASS
                 | REASONING_GUARD_BLOCKED_CLASS
         )
@@ -677,7 +679,7 @@ pub(super) fn classify_upstream_response(
                 || t == "content_filter";
             if non_retryable_type {
                 return (
-                    Some("client_error_non_retryable".to_string()),
+                    Some(CLIENT_ERROR_NON_RETRYABLE_CLASS.to_string()),
                     Some(
                         "检测到更可能是请求参数/限制类错误（非瞬态）；建议直接修正请求，而不是重试或切换 provider。"
                             .to_string(),
@@ -698,7 +700,7 @@ pub(super) fn classify_upstream_response(
 
             if non_retryable {
                 return (
-                    Some("client_error_non_retryable".to_string()),
+                    Some(CLIENT_ERROR_NON_RETRYABLE_CLASS.to_string()),
                     Some(
                         "检测到更可能是请求格式/参数错误（非瞬态）；建议直接修正请求，而不是重试或切换 provider。"
                             .to_string(),
@@ -772,6 +774,22 @@ mod tests {
         assert!(
             hint.as_deref()
                 .is_some_and(|value| value.contains("容量耗尽"))
+        );
+    }
+
+    #[test]
+    fn non_retryable_client_errors_are_health_neutral() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        let body = br#"{"error":{"type":"invalid_request_error","message":"`tool_use` ids must be unique"}}"#;
+
+        let (class, hint, _) = classify_upstream_response(400, &headers, body);
+
+        assert_eq!(class.as_deref(), Some(CLIENT_ERROR_NON_RETRYABLE_CLASS));
+        assert!(class_is_health_neutral(class.as_deref()));
+        assert!(
+            hint.as_deref()
+                .is_some_and(|value| value.contains("非瞬态"))
         );
     }
 

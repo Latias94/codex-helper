@@ -96,21 +96,32 @@ fn candidate_balance_summary(
     provider_balances: Option<&HashMap<String, Vec<ProviderBalanceSnapshot>>>,
     now_ms: u64,
 ) -> StationRoutingBalanceSummary {
-    let Some(compatibility) = identity.compatibility.as_ref() else {
-        return StationRoutingBalanceSummary::default();
-    };
-    let Some(snapshots) =
-        provider_balances.and_then(|balances| balances.get(compatibility.station_name.as_str()))
-    else {
+    let Some(provider_balances) = provider_balances else {
         return StationRoutingBalanceSummary::default();
     };
 
-    StationRoutingBalanceSummary::from_snapshot_iter_at(
-        snapshots
-            .iter()
-            .filter(|snapshot| balance_snapshot_matches_candidate(snapshot, identity)),
-        now_ms,
-    )
+    let snapshots = if let Some(compatibility) = identity.compatibility.as_ref() {
+        provider_balances
+            .get(compatibility.station_name.as_str())
+            .into_iter()
+            .flat_map(|snapshots| snapshots.iter())
+            .filter(|snapshot| balance_snapshot_matches_candidate(snapshot, identity))
+            .collect::<Vec<_>>()
+    } else {
+        let provider_endpoint_key = identity.provider_endpoint.stable_key();
+        provider_balances
+            .values()
+            .flat_map(|snapshots| snapshots.iter())
+            .filter(|snapshot| {
+                snapshot
+                    .provider_endpoint_key
+                    .as_deref()
+                    .is_some_and(|key| key == provider_endpoint_key)
+            })
+            .collect::<Vec<_>>()
+    };
+
+    StationRoutingBalanceSummary::from_snapshot_iter_at(snapshots.into_iter(), now_ms)
 }
 
 fn balance_snapshot_matches_candidate(
@@ -236,7 +247,7 @@ mod tests {
     }
 
     #[test]
-    fn route_candidate_runtime_signals_disambiguate_multi_endpoint_provider_by_legacy_index() {
+    fn route_candidate_runtime_signals_disambiguate_multi_endpoint_provider_by_endpoint_key() {
         let mut endpoints = BTreeMap::new();
         endpoints.insert(
             "slow".to_string(),
@@ -279,8 +290,10 @@ mod tests {
         let provider_balances = HashMap::from([(
             "routing".to_string(),
             vec![
-                balance_snapshot("input", "routing", 0, false),
-                balance_snapshot("input", "routing", 1, true),
+                balance_snapshot("input", "routing", 0, false)
+                    .with_provider_endpoint_key("codex/input/fast"),
+                balance_snapshot("input", "routing", 1, true)
+                    .with_provider_endpoint_key("codex/input/slow"),
             ],
         )]);
         let load_balancers = HashMap::from([(
@@ -319,8 +332,10 @@ mod tests {
         );
         assert!(signals[0].identity.compatibility.is_none());
         assert!(signals[1].identity.compatibility.is_none());
-        assert!(signals[0].balance.is_empty());
-        assert!(signals[1].balance.is_empty());
+        assert_eq!(signals[0].balance.ok, 1);
+        assert_eq!(signals[0].balance.routing_snapshots, 1);
+        assert_eq!(signals[1].balance.exhausted, 1);
+        assert_eq!(signals[1].balance.routing_exhausted, 1);
         assert!(signals[0].load_balancer.is_none());
         assert!(signals[1].load_balancer.is_none());
     }

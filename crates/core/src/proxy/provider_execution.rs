@@ -47,6 +47,7 @@ use super::route_target_selection::{
 use super::route_unavailability::route_unavailable_report;
 
 const COMPACT_ROUTE_UNAVAILABLE_WAIT_MAX_SECS: u64 = 10;
+const DEGRADED_SELECTION_BALANCE_REPROBE_LIMIT: usize = 16;
 
 #[derive(Clone, Copy)]
 struct ProviderChainAttemptPolicy {
@@ -733,6 +734,25 @@ impl<'a, 'route> RouteGraphAttemptLoop<'a, 'route> {
                 selected: &selected,
                 policy,
             });
+            let balance_probe_targets = degraded_selection_balance_probe_targets(
+                executor,
+                &*runtime,
+                ctx.request_model,
+                &selected,
+            );
+            if !balance_probe_targets.is_empty() {
+                log_degraded_selection_balance_reprobe(
+                    ctx.proxy.service_name,
+                    ctx.request_id,
+                    &selected,
+                    &balance_probe_targets,
+                );
+                enqueue_usage_probes_for_provider_endpoints(
+                    ctx.proxy,
+                    balance_probe_targets.iter(),
+                )
+                .await;
+            }
             let selected_candidate = selected.candidate;
             let mut avoid_set = hash_set_from_indices(&avoided_candidate_indices);
 
@@ -1053,6 +1073,98 @@ fn routing_affinity_policy_trace_label(policy: RoutingAffinityPolicyV5) -> &'sta
     }
 }
 
+fn degraded_selection_balance_probe_targets(
+    executor: &RoutePlanExecutor<'_>,
+    runtime: &RoutePlanRuntimeState,
+    request_model: Option<&str>,
+    selected: &SelectedRouteCandidate<'_>,
+) -> Vec<ProviderEndpointKey> {
+    let selected_group = selected.candidate.preference_group;
+    if selected_group == 0 {
+        return Vec::new();
+    }
+
+    let template = executor.template();
+    let runtime_reason_map = executor
+        .explain_candidate_skip_reasons_with_runtime_state(runtime, request_model)
+        .into_iter()
+        .map(|skip| (skip.provider_endpoint, skip.reasons))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut seen = BTreeSet::new();
+    let mut targets = Vec::new();
+    for candidate in executor.iter_candidates() {
+        if candidate.preference_group >= selected_group {
+            continue;
+        }
+
+        let provider_endpoint = template.candidate_provider_endpoint_key(candidate);
+        if provider_endpoint == selected.provider_endpoint {
+            continue;
+        }
+
+        let Some(reasons) = runtime_reason_map.get(&provider_endpoint) else {
+            continue;
+        };
+        if !runtime_skip_reasons_warrant_balance_reprobe(reasons) {
+            continue;
+        }
+
+        if seen.insert(provider_endpoint.clone()) {
+            targets.push(provider_endpoint);
+            if targets.len() >= DEGRADED_SELECTION_BALANCE_REPROBE_LIMIT {
+                break;
+            }
+        }
+    }
+
+    targets
+}
+
+fn runtime_skip_reasons_warrant_balance_reprobe(reasons: &[RoutePlanSkipReason]) -> bool {
+    let has_balance_recoverable_reason = reasons.iter().any(|reason| {
+        matches!(
+            reason,
+            RoutePlanSkipReason::Cooldown | RoutePlanSkipReason::UsageExhausted
+        )
+    });
+    let has_non_balance_blocker = reasons.iter().any(|reason| {
+        matches!(
+            reason,
+            RoutePlanSkipReason::UnsupportedModel { .. }
+                | RoutePlanSkipReason::RuntimeDisabled
+                | RoutePlanSkipReason::MissingAuth
+                | RoutePlanSkipReason::ConcurrencySaturated { .. }
+        )
+    });
+
+    has_balance_recoverable_reason && !has_non_balance_blocker
+}
+
+fn log_degraded_selection_balance_reprobe(
+    service_name: &str,
+    request_id: u64,
+    selected: &SelectedRouteCandidate<'_>,
+    provider_endpoints: &[ProviderEndpointKey],
+) {
+    log_retry_trace(serde_json::json!({
+        "event": "route_graph_degraded_balance_reprobe_queued",
+        "service": service_name,
+        "request_id": request_id,
+        "selected": {
+            "provider_id": selected.candidate.provider_id.as_str(),
+            "endpoint_id": selected.candidate.endpoint_id.as_str(),
+            "provider_endpoint_key": selected.provider_endpoint.stable_key(),
+            "preference_group": selected.candidate.preference_group,
+            "route_path": &selected.candidate.route_path,
+        },
+        "probe_provider_endpoints": provider_endpoints
+            .iter()
+            .map(ProviderEndpointKey::stable_key)
+            .collect::<Vec<_>>(),
+    }));
+}
+
 async fn enqueue_usage_probes_for_provider_endpoints<'a>(
     proxy: &ProxyService,
     provider_endpoints: impl IntoIterator<Item = &'a ProviderEndpointKey>,
@@ -1161,7 +1273,13 @@ fn retry_strategy_name(strategy: RetryStrategy) -> &'static str {
 mod tests {
     use super::*;
 
+    use std::collections::BTreeMap;
+
     use crate::codex_integration::CodexPatchMode;
+    use crate::config::UpstreamAuth;
+    use crate::routing_ir::{
+        RouteCandidate, RouteCandidateConcurrency, RoutePlanTemplate, RoutePlanUpstreamRuntimeState,
+    };
 
     fn test_request_flavor(
         is_remote_compaction_v1_request: bool,
@@ -1178,6 +1296,59 @@ mod tests {
             codex_client_patch_mode: CodexPatchMode::Default,
             codex_bridge_log: None,
         }
+    }
+
+    fn test_route_candidate(provider_id: &str, preference_group: u32) -> RouteCandidate {
+        RouteCandidate {
+            provider_id: provider_id.to_string(),
+            provider_alias: None,
+            endpoint_id: "default".to_string(),
+            base_url: format!("https://{provider_id}.example/v1"),
+            continuity_domain: None,
+            auth: UpstreamAuth::default(),
+            tags: BTreeMap::new(),
+            supported_models: BTreeMap::new(),
+            model_mapping: BTreeMap::new(),
+            route_path: vec!["monthly_first".to_string(), provider_id.to_string()],
+            preference_group,
+            stable_index: preference_group as usize,
+            concurrency: RouteCandidateConcurrency::default(),
+            compatibility_station_name: Some("routing".to_string()),
+            compatibility_upstream_index: Some(preference_group as usize),
+        }
+    }
+
+    fn test_route_template(groups: &[&str]) -> RoutePlanTemplate {
+        RoutePlanTemplate {
+            service_name: "codex".to_string(),
+            entry: "monthly_first".to_string(),
+            affinity_policy: RoutingAffinityPolicyV5::PreferredGroup,
+            fallback_ttl_ms: None,
+            reprobe_preferred_after_ms: None,
+            nodes: BTreeMap::new(),
+            expanded_provider_order: groups.iter().map(|provider| provider.to_string()).collect(),
+            candidates: groups
+                .iter()
+                .enumerate()
+                .map(|(idx, provider)| test_route_candidate(provider, idx as u32))
+                .collect(),
+            compatibility_station_name: Some("routing".to_string()),
+        }
+    }
+
+    fn selected_route_candidate<'a>(
+        template: &'a RoutePlanTemplate,
+        index: usize,
+    ) -> SelectedRouteCandidate<'a> {
+        let candidate = &template.candidates[index];
+        SelectedRouteCandidate {
+            candidate,
+            provider_endpoint: template.candidate_provider_endpoint_key(candidate),
+        }
+    }
+
+    fn stable_keys(keys: Vec<ProviderEndpointKey>) -> Vec<String> {
+        keys.into_iter().map(|key| key.stable_key()).collect()
     }
 
     #[test]
@@ -1263,5 +1434,73 @@ mod tests {
         );
         assert!(!blocked_policy.cross_station_failover_enabled);
         assert_eq!(blocked_policy.provider_attempt_limit, 1);
+    }
+
+    #[test]
+    fn degraded_selection_balance_reprobe_targets_runtime_recoverable_skips() {
+        let template = test_route_template(&["input", "input1", "input2", "input3"]);
+        let executor = RoutePlanExecutor::new(&template);
+        let mut runtime = RoutePlanRuntimeState::default();
+        runtime.set_provider_endpoint(
+            template.candidate_provider_endpoint_key(&template.candidates[0]),
+            RoutePlanUpstreamRuntimeState {
+                cooldown_active: true,
+                cooldown_remaining_secs: Some(30),
+                ..Default::default()
+            },
+        );
+        runtime.set_provider_endpoint(
+            template.candidate_provider_endpoint_key(&template.candidates[1]),
+            RoutePlanUpstreamRuntimeState {
+                usage_exhausted: true,
+                ..Default::default()
+            },
+        );
+        runtime.set_provider_endpoint(
+            template.candidate_provider_endpoint_key(&template.candidates[2]),
+            RoutePlanUpstreamRuntimeState {
+                missing_auth: true,
+                ..Default::default()
+            },
+        );
+
+        let targets = degraded_selection_balance_probe_targets(
+            &executor,
+            &runtime,
+            None,
+            &selected_route_candidate(&template, 3),
+        );
+
+        assert_eq!(
+            stable_keys(targets),
+            vec![
+                "codex/input/default".to_string(),
+                "codex/input1/default".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn degraded_selection_balance_reprobe_ignores_best_group_selection() {
+        let template = test_route_template(&["input", "input1"]);
+        let executor = RoutePlanExecutor::new(&template);
+        let mut runtime = RoutePlanRuntimeState::default();
+        runtime.set_provider_endpoint(
+            template.candidate_provider_endpoint_key(&template.candidates[1]),
+            RoutePlanUpstreamRuntimeState {
+                cooldown_active: true,
+                cooldown_remaining_secs: Some(30),
+                ..Default::default()
+            },
+        );
+
+        let targets = degraded_selection_balance_probe_targets(
+            &executor,
+            &runtime,
+            None,
+            &selected_route_candidate(&template, 0),
+        );
+
+        assert!(targets.is_empty());
     }
 }

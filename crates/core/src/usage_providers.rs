@@ -22,7 +22,7 @@ use crate::provider_signals::{
 use crate::runtime_identity::ProviderEndpointKey;
 use crate::state::ProxyState;
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 enum ProviderKind {
     /// 简单预算接口，返回 total/used，判断是否用尽
@@ -240,6 +240,9 @@ struct RefreshProviderTargetParams<'a> {
 static LAST_USAGE_POLL: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
 static REQUEST_BALANCE_QUEUE: OnceLock<Mutex<HashMap<RequestBalanceQueueKey, Instant>>> =
     OnceLock::new();
+static AUTO_PROBE_KIND_HINTS: OnceLock<Mutex<HashMap<String, ProviderKind>>> = OnceLock::new();
+static AUTO_PROBE_KIND_FAILURES: OnceLock<Mutex<HashMap<AutoProbeKindFailureKey, Instant>>> =
+    OnceLock::new();
 
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 60;
 // Minimal poll interval per provider to avoid hammering usage APIs.
@@ -247,6 +250,7 @@ const MIN_POLL_INTERVAL_SECS: u64 = 20;
 pub const REQUEST_BALANCE_REFRESH_DELAY: Duration = Duration::from_secs(8);
 const BALANCE_REFRESH_CONCURRENCY: usize = 6;
 const BALANCE_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
+const AUTO_PROBE_KIND_FAILURE_TTL: Duration = Duration::from_secs(10 * 60);
 const LOW_BALANCE_ALERT_THRESHOLD_USD: &str = "10";
 const EXPIRING_SOON_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
 const AUTO_PROVIDER_ID_PREFIX: &str = "auto:balance:";
@@ -257,6 +261,12 @@ const AUTO_PROBE_KINDS: [ProviderKind; 5] = [
     ProviderKind::NewApiUserSelf,
     ProviderKind::OpenAiBalanceHttpJson,
 ];
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AutoProbeKindFailureKey {
+    provider_id: String,
+    kind: ProviderKind,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum RequestBalanceQueueKey {
@@ -492,6 +502,92 @@ fn first_auto_probe_kind(target: &UsageProviderTarget) -> ProviderKind {
         ProviderKind::RightCodeAccountSummary
     } else {
         ProviderKind::Sub2ApiUsage
+    }
+}
+
+fn auto_probe_kind_order(provider_id: &str, target: &UsageProviderTarget) -> Vec<ProviderKind> {
+    let now = Instant::now();
+    let mut ordered = Vec::new();
+    if let Some(kind) = remembered_auto_probe_kind(provider_id) {
+        ordered.push(kind);
+    }
+    ordered.push(first_auto_probe_kind(target));
+    ordered.extend(AUTO_PROBE_KINDS);
+
+    let mut seen = HashSet::new();
+    ordered
+        .into_iter()
+        .filter(|kind| {
+            if *kind == ProviderKind::RightCodeAccountSummary
+                && !is_rightcode_base_url(&target.base_url)
+            {
+                return false;
+            }
+            seen.insert(*kind) && !auto_probe_kind_failure_active(provider_id, *kind, now)
+        })
+        .collect()
+}
+
+fn remembered_auto_probe_kind(provider_id: &str) -> Option<ProviderKind> {
+    AUTO_PROBE_KIND_HINTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()
+        .and_then(|map| map.get(provider_id).copied())
+}
+
+fn remember_auto_probe_kind_success(provider_id: &str, kind: ProviderKind) {
+    if let Ok(mut hints) = AUTO_PROBE_KIND_HINTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        hints.insert(provider_id.to_string(), kind);
+    }
+    if let Ok(mut failures) = AUTO_PROBE_KIND_FAILURES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        failures.remove(&AutoProbeKindFailureKey {
+            provider_id: provider_id.to_string(),
+            kind,
+        });
+    }
+}
+
+fn remember_auto_probe_kind_failure(provider_id: &str, kind: ProviderKind, now: Instant) {
+    if let Ok(mut failures) = AUTO_PROBE_KIND_FAILURES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        failures.insert(
+            AutoProbeKindFailureKey {
+                provider_id: provider_id.to_string(),
+                kind,
+            },
+            now,
+        );
+    }
+}
+
+fn auto_probe_kind_failure_active(provider_id: &str, kind: ProviderKind, now: Instant) -> bool {
+    let key = AutoProbeKindFailureKey {
+        provider_id: provider_id.to_string(),
+        kind,
+    };
+    let Ok(mut failures) = AUTO_PROBE_KIND_FAILURES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    else {
+        return false;
+    };
+    let Some(failed_at) = failures.get(&key).copied() else {
+        return false;
+    };
+    if now.duration_since(failed_at) < AUTO_PROBE_KIND_FAILURE_TTL {
+        true
+    } else {
+        failures.remove(&key);
+        false
     }
 }
 
@@ -1420,6 +1516,9 @@ fn base_snapshot(
         fetched_at_ms,
         stale_after_ms,
     );
+    if let Some(provider_endpoint) = &upstream.provider_endpoint {
+        snapshot.provider_endpoint_key = Some(provider_endpoint.stable_key());
+    }
     snapshot.exhaustion_affects_routing = provider.trust_exhaustion_for_routing;
     snapshot
 }
@@ -3022,6 +3121,7 @@ async fn auto_probe_provider_target(
     }
 
     let first_provider = auto_usage_provider(target, first_auto_probe_kind(target));
+    let provider_id = first_provider.id.clone();
 
     let Some(token) = resolve_token(&first_provider, &upstreams, cfg, service_name) else {
         state
@@ -3040,12 +3140,17 @@ async fn auto_probe_provider_target(
         return UsageProviderRefreshOutcome::MissingToken;
     };
 
+    let probe_order = auto_probe_kind_order(&provider_id, target);
+    if probe_order.is_empty() {
+        warn!(
+            "auto usage provider '{}' skipped {}[{}]: all balance probe kinds are temporarily suppressed",
+            first_provider.id, target.upstream.station_name, target.upstream.index
+        );
+        return UsageProviderRefreshOutcome::Failed;
+    }
+
     let mut last_error: Option<String> = None;
-    for kind in AUTO_PROBE_KINDS {
-        if kind == ProviderKind::RightCodeAccountSummary && !is_rightcode_base_url(&target.base_url)
-        {
-            continue;
-        }
+    for kind in probe_order {
         let provider = auto_usage_provider(target, kind);
         match poll_provider_http_json(client, &provider, &target.base_url, &token).await {
             Ok(value) => {
@@ -3058,6 +3163,7 @@ async fn auto_probe_provider_target(
                     stale_after_ms,
                 );
                 if auto_snapshot_is_usable(&snapshot) {
+                    remember_auto_probe_kind_success(&provider_id, kind);
                     let exhausted_for_lb = snapshot.routing_exhausted();
                     update_usage_exhausted(
                         lb_states,
@@ -3081,6 +3187,7 @@ async fn auto_probe_provider_target(
                     );
                     return UsageProviderRefreshOutcome::Refreshed;
                 }
+                remember_auto_probe_kind_failure(&provider_id, kind, Instant::now());
                 last_error = snapshot.error.or_else(|| {
                     Some(format!(
                         "auto probe {:?} returned no usable balance fields",
@@ -3089,6 +3196,7 @@ async fn auto_probe_provider_target(
                 });
             }
             Err(err) => {
+                remember_auto_probe_kind_failure(&provider_id, kind, Instant::now());
                 last_error = Some(err.to_string());
             }
         }
@@ -3553,6 +3661,31 @@ mod tests {
             .map(|station| (station.name.clone(), station))
             .collect();
         cfg
+    }
+
+    fn usage_provider_target(base_url: &str, provider_id: &str) -> UsageProviderTarget {
+        UsageProviderTarget {
+            upstream: UpstreamRef {
+                station_name: "routing".to_string(),
+                index: 0,
+                provider_endpoint: Some(ProviderEndpointKey::new("codex", provider_id, "default")),
+            },
+            base_url: base_url.to_string(),
+            provider_id: Some(provider_id.to_string()),
+        }
+    }
+
+    fn clear_auto_probe_kind_state(provider_id: &str) {
+        if let Some(hints) = AUTO_PROBE_KIND_HINTS.get()
+            && let Ok(mut hints) = hints.lock()
+        {
+            hints.remove(provider_id);
+        }
+        if let Some(failures) = AUTO_PROBE_KIND_FAILURES.get()
+            && let Ok(mut failures) = failures.lock()
+        {
+            failures.retain(|key, _| key.provider_id != provider_id);
+        }
     }
 
     #[test]
@@ -4048,6 +4181,76 @@ mod tests {
 
         assert!(auto_snapshot_is_usable(&usable));
         assert!(!auto_snapshot_is_usable(&unusable));
+    }
+
+    #[test]
+    fn auto_probe_kind_order_prioritizes_remembered_success() {
+        let provider_id = "input-order-success";
+        clear_auto_probe_kind_state(provider_id);
+        let target = usage_provider_target("https://relay.example.com/v1", provider_id);
+
+        remember_auto_probe_kind_success(provider_id, ProviderKind::NewApiUserSelf);
+
+        let order = auto_probe_kind_order(provider_id, &target);
+
+        assert_eq!(order.first(), Some(&ProviderKind::NewApiUserSelf));
+        assert_eq!(
+            order
+                .iter()
+                .filter(|kind| **kind == ProviderKind::Sub2ApiUsage)
+                .count(),
+            1
+        );
+        clear_auto_probe_kind_state(provider_id);
+    }
+
+    #[test]
+    fn auto_probe_kind_order_temporarily_skips_recent_failures() {
+        let provider_id = "input-order-failure";
+        clear_auto_probe_kind_state(provider_id);
+        let target = usage_provider_target("https://relay.example.com/v1", provider_id);
+        let now = Instant::now();
+
+        remember_auto_probe_kind_failure(provider_id, ProviderKind::Sub2ApiUsage, now);
+
+        let order = auto_probe_kind_order(provider_id, &target);
+
+        assert!(!order.contains(&ProviderKind::Sub2ApiUsage));
+        assert!(order.contains(&ProviderKind::NewApiTokenUsage));
+
+        if let Some(failures) = AUTO_PROBE_KIND_FAILURES.get()
+            && let Ok(mut failures) = failures.lock()
+        {
+            failures.insert(
+                AutoProbeKindFailureKey {
+                    provider_id: provider_id.to_string(),
+                    kind: ProviderKind::Sub2ApiUsage,
+                },
+                now - AUTO_PROBE_KIND_FAILURE_TTL - Duration::from_secs(1),
+            );
+        }
+
+        let order = auto_probe_kind_order(provider_id, &target);
+        assert!(order.contains(&ProviderKind::Sub2ApiUsage));
+        clear_auto_probe_kind_state(provider_id);
+    }
+
+    #[test]
+    fn auto_probe_kind_order_can_be_empty_when_all_kinds_are_suppressed() {
+        let provider_id = "input-order-all-suppressed";
+        clear_auto_probe_kind_state(provider_id);
+        let target = usage_provider_target("https://relay.example.com/v1", provider_id);
+        let now = Instant::now();
+
+        for kind in AUTO_PROBE_KINDS {
+            if kind == ProviderKind::RightCodeAccountSummary {
+                continue;
+            }
+            remember_auto_probe_kind_failure(provider_id, kind, now);
+        }
+
+        assert!(auto_probe_kind_order(provider_id, &target).is_empty());
+        clear_auto_probe_kind_state(provider_id);
     }
 
     #[test]

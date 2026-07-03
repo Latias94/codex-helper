@@ -32,6 +32,8 @@ pub struct ProviderBalanceSnapshot {
     pub station_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_index: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_endpoint_key: Option<String>,
     pub source: String,
     pub fetched_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -177,6 +179,7 @@ impl Default for ProviderBalanceSnapshot {
             provider_id: String::new(),
             station_name: None,
             upstream_index: None,
+            provider_endpoint_key: None,
             source: String::new(),
             fetched_at_ms: 0,
             stale_after_ms: None,
@@ -237,6 +240,14 @@ impl ProviderBalanceSnapshot {
         self.error = Some(error.into());
         self.exhausted = None;
         self.refresh_status(self.fetched_at_ms);
+        self
+    }
+
+    pub fn with_provider_endpoint_key(mut self, key: impl Into<String>) -> Self {
+        let key = key.into();
+        if !key.trim().is_empty() {
+            self.provider_endpoint_key = Some(key);
+        }
         self
     }
 

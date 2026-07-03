@@ -5,6 +5,7 @@ use crate::policy_actions::PolicyAction;
 use crate::provider_signals::ProviderSignal;
 
 use super::attempt_target::AttemptTarget;
+use super::classify::CLIENT_ERROR_NON_RETRYABLE_CLASS;
 
 pub(super) struct StartRouteAttemptParams<'a> {
     pub(super) target: &'a AttemptTarget,
@@ -411,7 +412,24 @@ fn status_decision(status_code: u16, error_class: Option<&str>) -> &'static str 
     }
     if (200..300).contains(&status_code) {
         "completed"
+    } else if error_class == Some(CLIENT_ERROR_NON_RETRYABLE_CLASS) {
+        "failed_client_request"
     } else {
         "failed_status"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_decision_separates_non_retryable_client_errors() {
+        assert_eq!(
+            status_decision(400, Some(CLIENT_ERROR_NON_RETRYABLE_CLASS)),
+            "failed_client_request"
+        );
+        assert_eq!(status_decision(400, None), "failed_status");
+        assert_eq!(status_decision(200, None), "completed");
     }
 }

@@ -1619,6 +1619,7 @@ impl ProxyState {
             return;
         }
         entry.usage_exhausted = exhausted;
+        self.notify_state_changed();
     }
 
     pub async fn prune_runtime_observability_for_service(
@@ -3769,6 +3770,17 @@ mod tests {
             let balance_version = *changes.borrow();
             assert!(balance_version > 0);
 
+            state
+                .set_provider_endpoint_usage_exhausted(
+                    "codex",
+                    ProviderEndpointKey::new("codex", "input6", "default"),
+                    true,
+                )
+                .await;
+            changes.changed().await.expect("usage exhausted change");
+            let usage_version = *changes.borrow();
+            assert!(usage_version > balance_version);
+
             let request_id = state
                 .begin_request_for_test()
                 .session_id("sid-1")
@@ -3778,7 +3790,7 @@ mod tests {
                 .await;
             changes.changed().await.expect("begin request change");
             let active_version = *changes.borrow();
-            assert!(active_version > balance_version);
+            assert!(active_version > usage_version);
 
             state
                 .finish_request(FinishRequestParams {

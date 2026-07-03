@@ -11,7 +11,7 @@ use tracing::{info, warn};
 
 use crate::lb::LoadBalancer;
 use crate::logging::{
-    CodexBridgeLog, HttpDebugLog, RetryInfo, ServiceTierLog, make_body_preview,
+    CodexBridgeLog, HttpDebugLog, RetryInfo, ServiceTierLog, log_retry_trace, make_body_preview,
     should_include_http_debug, should_include_http_warn,
 };
 use crate::state::{ProxyState, RouteDecisionProvenance, SessionIdentitySource};
@@ -76,6 +76,7 @@ fn is_codex_responses_sse_path(path: &str) -> bool {
 #[derive(Clone, Debug)]
 struct StreamErrorInfo {
     class: &'static str,
+    kind: &'static str,
     message: String,
 }
 
@@ -133,6 +134,22 @@ fn stream_penalty_reason(class: Option<&str>) -> &'static str {
     }
 }
 
+fn classify_stream_read_error_kind(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_decode() {
+        "decode"
+    } else if error.is_body() {
+        "body"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_request() {
+        "request"
+    } else {
+        "other"
+    }
+}
+
 fn decide_stream_terminal_response(
     params: StreamTerminalDecisionParams<'_>,
 ) -> StreamTerminalDecision {
@@ -156,8 +173,7 @@ fn decide_stream_terminal_response(
             passive_failure: Some(StreamPassiveFailure {
                 status_code: Some(status_code),
                 error_class: Some(stream_error.class.to_string()),
-                error: Some(stream_error.message.clone())
-                    .or_else(|| summarize_error_body(response_body, resp_content_type)),
+                error: Some(format!("{}: {}", stream_error.kind, stream_error.message)),
             }),
         };
     }
@@ -632,8 +648,9 @@ impl StreamForwardState {
     }
 
     fn handle_read_error(&mut self, error: reqwest::Error) -> Result<Bytes, io::Error> {
+        let kind = classify_stream_read_error_kind(&error);
         let message = format!("Upstream stream failed: {error}");
-        self.handle_stream_failure("upstream_stream_error", message, io::ErrorKind::Other)
+        self.handle_stream_failure("upstream_stream_error", kind, message, io::ErrorKind::Other)
     }
 
     fn handle_idle_timeout(&mut self, timeout: Duration) -> Result<Bytes, io::Error> {
@@ -643,6 +660,7 @@ impl StreamForwardState {
         );
         self.handle_stream_failure(
             "upstream_stream_idle_timeout",
+            "idle_timeout",
             message,
             io::ErrorKind::TimedOut,
         )
@@ -651,28 +669,59 @@ impl StreamForwardState {
     fn handle_stream_failure(
         &mut self,
         class: &'static str,
+        kind: &'static str,
         message: String,
         io_kind: io::ErrorKind,
     ) -> Result<Bytes, io::Error> {
-        if let Ok(mut guard) = self.finalize.usage_state.lock() {
-            guard.stream_error = Some(StreamErrorInfo {
-                class,
-                message: message.clone(),
-            });
-        }
+        let (first_chunk_ms, buffered_bytes) =
+            if let Ok(mut guard) = self.finalize.usage_state.lock() {
+                let first_chunk_ms = guard.first_chunk_ms;
+                let buffered_bytes = guard.buffer.len();
+                guard.stream_error = Some(StreamErrorInfo {
+                    class,
+                    kind,
+                    message: message.clone(),
+                });
+                (first_chunk_ms, buffered_bytes)
+            } else {
+                (None, 0)
+            };
+
+        let trace_id = format!("codex-{}", self.finalize.request_id);
+        log_retry_trace(serde_json::json!({
+            "event": "upstream_stream_error",
+            "service": self.finalize.service_name,
+            "request_id": self.finalize.request_id,
+            "trace_id": trace_id,
+            "session_id": self.finalize.session_id,
+            "method": self.finalize.method,
+            "path": self.finalize.path,
+            "status": self.finalize.status_code,
+            "target": self.finalize.target.log_target_label(),
+            "provider_endpoint_key": self.finalize.provider_endpoint_key,
+            "base_url": self.finalize.upstream_base_url,
+            "class": class,
+            "stream_error_kind": kind,
+            "first_chunk_ms": first_chunk_ms,
+            "buffered_bytes": buffered_bytes,
+            "error": message,
+        }));
 
         warn!(
-            "upstream stream error: request_id={} trace_id=codex-{} session_id={} {} {} status={} target={} base_url={} class={} err={}",
-            self.finalize.request_id,
-            self.finalize.request_id,
-            self.finalize.session_id.as_deref().unwrap_or("-"),
-            self.finalize.method,
-            self.finalize.path,
-            self.finalize.status_code,
-            self.finalize.target.log_target_label(),
-            self.finalize.upstream_base_url,
-            class,
-            message
+            request_id = self.finalize.request_id,
+            trace_id = %trace_id,
+            session_id = self.finalize.session_id.as_deref().unwrap_or("-"),
+            method = %self.finalize.method,
+            path = %self.finalize.path,
+            status = self.finalize.status_code,
+            target = %self.finalize.target.log_target_label(),
+            base_url = %self.finalize.upstream_base_url,
+            error_class = class,
+            stream_error_kind = kind,
+            first_chunk_ms = ?first_chunk_ms,
+            buffered_bytes,
+            error = %message,
+            "upstream stream error"
         );
 
         self.terminal_after_current_item = true;
@@ -905,4 +954,37 @@ pub(super) struct SseSuccessMeta {
     pub(super) method: Method,
     pub(super) path: String,
     pub(super) concurrency_permit: Option<ConcurrencyPermit>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_terminal_failure_keeps_stream_error_kind_in_passive_error() {
+        let headers = HeaderMap::new();
+        let stream_error = StreamErrorInfo {
+            class: "upstream_stream_error",
+            kind: "decode",
+            message: "bad sse".to_string(),
+        };
+
+        let decision = decide_stream_terminal_response(StreamTerminalDecisionParams {
+            status_code: 200,
+            stream_error: Some(&stream_error),
+            resp_headers: &headers,
+            resp_content_type: None,
+            response_body: b"",
+            transport_cooldown_secs: 30,
+            cloudflare_challenge_cooldown_secs: 0,
+            cloudflare_timeout_cooldown_secs: 0,
+        });
+
+        let passive_failure = decision.passive_failure.expect("passive failure");
+        assert_eq!(
+            passive_failure.error_class.as_deref(),
+            Some("upstream_stream_error")
+        );
+        assert_eq!(passive_failure.error.as_deref(), Some("decode: bad sse"));
+    }
 }
