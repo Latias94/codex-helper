@@ -205,15 +205,6 @@ pub(super) async fn prepare_proxy_request(
         }
     };
 
-    if let Some(lbs) = prepared.route_selection.legacy_lbs() {
-        super::route_executor_shadow::maybe_log_route_executor_shadow_diff(
-            proxy.service_name,
-            prepared.request_id,
-            lbs,
-            prepared.request_model.as_deref(),
-        );
-    }
-
     Ok(PreparedProxyRequest {
         method,
         uri,

@@ -2783,7 +2783,7 @@ mod tests {
         selected
     }
 
-    fn legacy_shadow_attempt_order_signatures(
+    fn legacy_attempt_order_signatures(
         view: ServiceViewV4,
         request_model: Option<&str>,
     ) -> Vec<AttemptOrderEvent> {
@@ -2837,7 +2837,7 @@ mod tests {
         events
     }
 
-    fn executor_shadow_attempt_order_signatures(
+    fn executor_attempt_order_signatures(
         view: &ServiceViewV4,
         request_model: Option<&str>,
     ) -> Vec<AttemptOrderEvent> {
@@ -4164,7 +4164,7 @@ mod tests {
     }
 
     #[test]
-    fn route_plan_executor_shadow_attempt_order_matches_legacy_failover_avoidance() {
+    fn route_plan_executor_attempt_order_matches_legacy_failover_avoidance() {
         let view = ServiceViewV4 {
             providers: BTreeMap::from([
                 (
@@ -4182,8 +4182,8 @@ mod tests {
             ..ServiceViewV4::default()
         };
 
-        let executor_events = executor_shadow_attempt_order_signatures(&view, None);
-        let legacy_events = legacy_shadow_attempt_order_signatures(view, None);
+        let executor_events = executor_attempt_order_signatures(&view, None);
+        let legacy_events = legacy_attempt_order_signatures(view, None);
 
         assert_eq!(executor_events, legacy_events);
         assert_eq!(
@@ -4196,7 +4196,7 @@ mod tests {
     }
 
     #[test]
-    fn route_plan_executor_shadow_attempt_order_matches_legacy_unsupported_model_skip() {
+    fn route_plan_executor_attempt_order_matches_legacy_unsupported_model_skip() {
         let view = ServiceViewV4 {
             providers: BTreeMap::from([
                 (
@@ -4231,8 +4231,8 @@ mod tests {
             ..ServiceViewV4::default()
         };
 
-        let executor_events = executor_shadow_attempt_order_signatures(&view, Some("gpt-5"));
-        let legacy_events = legacy_shadow_attempt_order_signatures(view, Some("gpt-5"));
+        let executor_events = executor_attempt_order_signatures(&view, Some("gpt-5"));
+        let legacy_events = legacy_attempt_order_signatures(view, Some("gpt-5"));
 
         assert_eq!(executor_events, legacy_events);
         assert_eq!(
@@ -4253,7 +4253,7 @@ mod tests {
     }
 
     #[test]
-    fn route_plan_executor_shadow_attempt_order_matches_legacy_all_unsupported_exhaustion() {
+    fn route_plan_executor_attempt_order_matches_legacy_all_unsupported_exhaustion() {
         let view = ServiceViewV4 {
             providers: BTreeMap::from([
                 (
@@ -4280,8 +4280,8 @@ mod tests {
             ..ServiceViewV4::default()
         };
 
-        let executor_events = executor_shadow_attempt_order_signatures(&view, Some("gpt-5"));
-        let legacy_events = legacy_shadow_attempt_order_signatures(view.clone(), Some("gpt-5"));
+        let executor_events = executor_attempt_order_signatures(&view, Some("gpt-5"));
+        let legacy_events = legacy_attempt_order_signatures(view.clone(), Some("gpt-5"));
 
         assert_eq!(executor_events, legacy_events);
         assert_eq!(
@@ -5239,7 +5239,7 @@ mod tests {
     }
 
     #[test]
-    fn route_plan_executor_shadow_keeps_same_candidate_until_caller_marks_avoidance() {
+    fn route_plan_executor_keeps_same_candidate_until_caller_marks_avoidance() {
         let view = ServiceViewV4 {
             providers: BTreeMap::from([
                 ("first".to_string(), provider("https://first.example/v1")),

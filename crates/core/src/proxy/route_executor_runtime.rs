@@ -5,13 +5,6 @@ use crate::routing_ir::{RoutePlanRuntimeState, RoutePlanUpstreamRuntimeState};
 use crate::runtime_identity::ProviderEndpointKey;
 use crate::state::RuntimeConfigState;
 
-pub(super) fn route_plan_runtime_state_from_lbs(
-    service_name: &str,
-    lbs: &[LoadBalancer],
-) -> RoutePlanRuntimeState {
-    route_plan_runtime_state_from_lbs_with_overrides(service_name, lbs, &HashMap::new())
-}
-
 pub(super) fn route_plan_runtime_state_from_lbs_with_overrides(
     service_name: &str,
     lbs: &[LoadBalancer],
@@ -184,7 +177,11 @@ mod tests {
             states,
         );
 
-        let runtime = route_plan_runtime_state_from_lbs("codex", &[reordered]);
+        let runtime = route_plan_runtime_state_from_lbs_with_overrides(
+            "codex",
+            &[reordered],
+            &HashMap::new(),
+        );
 
         let primary =
             runtime.provider_endpoint(&ProviderEndpointKey::new("codex", "primary", "default"));

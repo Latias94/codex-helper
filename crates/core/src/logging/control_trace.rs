@@ -46,18 +46,6 @@ pub enum ControlTraceDetail {
         runtime_state: Option<String>,
         clear_runtime_state: bool,
     },
-    RouteExecutorShadowMismatch {
-        request_model: Option<String>,
-        legacy_attempt_count: usize,
-        executor_attempt_count: usize,
-        first_mismatch_index: Option<usize>,
-        legacy_station_name: Option<String>,
-        legacy_upstream_index: Option<u64>,
-        legacy_provider_id: Option<String>,
-        executor_station_name: Option<String>,
-        executor_upstream_index: Option<u64>,
-        executor_provider_id: Option<String>,
-    },
     RouteGraphSelectionExplain {
         request_model: Option<String>,
         continuity_class: Option<String>,
@@ -410,7 +398,6 @@ fn infer_retry_control_trace_detail(
             runtime_state: json_string_field(payload, "runtime_state"),
             clear_runtime_state: json_bool_field(payload, "clear_runtime_state").unwrap_or(false),
         }),
-        "route_executor_shadow_mismatch" => Some(route_executor_shadow_mismatch_detail(payload)),
         "route_graph_selection_explain" => Some(route_graph_selection_explain_detail(payload)),
         _ => Some(ControlTraceDetail::RetryEvent {
             event_name,
@@ -475,43 +462,6 @@ fn route_graph_selection_explain_detail(payload: &JsonValue) -> ControlTraceDeta
         })
         .collect(),
     }
-}
-
-fn route_executor_shadow_mismatch_detail(payload: &JsonValue) -> ControlTraceDetail {
-    let legacy_attempts = json_array_field(payload, "legacy_attempts");
-    let executor_attempts = json_array_field(payload, "executor_attempts");
-    let first_mismatch_index = first_mismatch_index(legacy_attempts, executor_attempts);
-    let legacy_attempt = first_mismatch_index.and_then(|idx| legacy_attempts.get(idx));
-    let executor_attempt = first_mismatch_index.and_then(|idx| executor_attempts.get(idx));
-
-    ControlTraceDetail::RouteExecutorShadowMismatch {
-        request_model: json_string_field(payload, "request_model"),
-        legacy_attempt_count: legacy_attempts.len(),
-        executor_attempt_count: executor_attempts.len(),
-        first_mismatch_index,
-        legacy_station_name: legacy_attempt
-            .and_then(|attempt| json_string_field(attempt, "station_name")),
-        legacy_upstream_index: legacy_attempt
-            .and_then(|attempt| json_u64_field(attempt, "upstream_index")),
-        legacy_provider_id: legacy_attempt
-            .and_then(|attempt| json_string_field(attempt, "provider_id")),
-        executor_station_name: executor_attempt
-            .and_then(|attempt| json_string_field(attempt, "station_name")),
-        executor_upstream_index: executor_attempt
-            .and_then(|attempt| json_u64_field(attempt, "upstream_index")),
-        executor_provider_id: executor_attempt
-            .and_then(|attempt| json_string_field(attempt, "provider_id")),
-    }
-}
-
-fn first_mismatch_index(left: &[JsonValue], right: &[JsonValue]) -> Option<usize> {
-    let shared_len = left.len().min(right.len());
-    for idx in 0..shared_len {
-        if left[idx] != right[idx] {
-            return Some(idx);
-        }
-    }
-    (left.len() != right.len()).then_some(shared_len)
 }
 
 pub(super) fn append_control_trace_payload(
@@ -886,83 +836,5 @@ mod tests {
                 }],
             })
         );
-    }
-
-    #[test]
-    fn control_trace_entry_resolved_detail_infers_route_executor_shadow_mismatch() {
-        let entry: ControlTraceLogEntry = serde_json::from_value(serde_json::json!({
-            "ts_ms": 1,
-            "kind": "retry_trace",
-            "service": "codex",
-            "request_id": 19,
-            "event": "route_executor_shadow_mismatch",
-            "payload": {
-                "event": "route_executor_shadow_mismatch",
-                "service": "codex",
-                "request_id": 19,
-                "request_model": "gpt-5",
-                "legacy_attempts": [
-                    {
-                        "decision": "selected",
-                        "station_name": "routing",
-                        "upstream_index": 1,
-                        "upstream_base_url": "https://legacy.example/v1",
-                        "provider_id": "legacy"
-                    }
-                ],
-                "executor_attempts": [
-                    {
-                        "decision": "selected",
-                        "station_name": "routing",
-                        "upstream_index": 0,
-                        "upstream_base_url": "https://executor.example/v1",
-                        "provider_id": "executor"
-                    },
-                    {
-                        "decision": "selected",
-                        "station_name": "routing",
-                        "upstream_index": 1,
-                        "upstream_base_url": "https://legacy.example/v1",
-                        "provider_id": "legacy"
-                    }
-                ]
-            }
-        }))
-        .expect("deserialize shadow mismatch trace");
-
-        let entry = hydrate_control_trace_entry(entry);
-        assert_eq!(
-            entry.resolved_detail(),
-            Some(ControlTraceDetail::RouteExecutorShadowMismatch {
-                request_model: Some("gpt-5".to_string()),
-                legacy_attempt_count: 1,
-                executor_attempt_count: 2,
-                first_mismatch_index: Some(0),
-                legacy_station_name: Some("routing".to_string()),
-                legacy_upstream_index: Some(1),
-                legacy_provider_id: Some("legacy".to_string()),
-                executor_station_name: Some("routing".to_string()),
-                executor_upstream_index: Some(0),
-                executor_provider_id: Some("executor".to_string()),
-            })
-        );
-
-        let value = serde_json::to_value(entry).expect("serialize shadow mismatch trace");
-        assert_eq!(
-            value["detail"]["type"].as_str(),
-            Some("route_executor_shadow_mismatch")
-        );
-    }
-
-    #[test]
-    fn first_mismatch_index_reports_length_mismatch_after_shared_prefix() {
-        let left = vec![serde_json::json!({"provider_id": "a"})];
-        let right = vec![
-            serde_json::json!({"provider_id": "a"}),
-            serde_json::json!({"provider_id": "b"}),
-        ];
-
-        assert_eq!(first_mismatch_index(&left, &right), Some(1));
-        assert_eq!(first_mismatch_index(&left, &left), None);
     }
 }

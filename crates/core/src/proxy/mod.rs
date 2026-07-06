@@ -60,7 +60,6 @@ mod retry;
 mod route_affinity;
 mod route_attempts;
 mod route_executor_runtime;
-mod route_executor_shadow;
 mod route_metadata;
 mod route_provenance;
 mod route_target_selection;

@@ -458,13 +458,6 @@ impl RequestRouteSelection {
             Self::RouteGraph { template } => template.candidates.is_empty(),
         }
     }
-
-    pub(super) fn legacy_lbs(&self) -> Option<&[LoadBalancer]> {
-        match self {
-            Self::Legacy { lbs } => Some(lbs),
-            Self::RouteGraph { .. } => None,
-        }
-    }
 }
 
 impl From<Vec<LoadBalancer>> for RequestRouteSelection {
