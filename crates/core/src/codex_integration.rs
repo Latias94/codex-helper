@@ -729,7 +729,7 @@ fn ensure_chatgpt_bridge_auth_ready(value: &serde_json::Value) -> Result<()> {
     }
 
     Err(anyhow!(
-        "Codex auth.json does not contain a complete ChatGPT login state required for chatgpt-bridge (missing: {}). Open Codex and sign in with ChatGPT first, then run `codex-helper switch on --mode chatgpt-bridge` again.",
+        "Codex auth.json does not contain a complete ChatGPT login state required for chatgpt-bridge (missing: {}). Open Codex and sign in with ChatGPT first, then run `codex-helper switch on --preset chatgpt-bridge` again.",
         missing.join(", ")
     ))
 }
@@ -4183,7 +4183,7 @@ base_url = "https://api.openai.com/v1"
         let state: serde_json::Value = serde_json::from_str(&state_text).expect("valid state");
         assert_eq!(
             state.get("patch_mode").and_then(|value| value.as_str()),
-            Some("official-relay-bridge")
+            Some("official-relay")
         );
         assert!(state.get("patched_auth_json").is_none());
 
@@ -4236,7 +4236,7 @@ base_url = "https://api.openai.com/v1"
         let state: serde_json::Value = serde_json::from_str(&state_text).expect("valid state");
         assert_eq!(
             state.get("patch_mode").and_then(|value| value.as_str()),
-            Some("official-relay-bridge")
+            Some("official-relay")
         );
         assert_eq!(
             state
@@ -4295,7 +4295,7 @@ base_url = "https://api.openai.com/v1"
         let state: serde_json::Value = serde_json::from_str(&state_text).expect("valid state");
         assert_eq!(
             state.get("patch_mode").and_then(|value| value.as_str()),
-            Some("official-imagegen-bridge")
+            Some("official-imagegen")
         );
         assert_eq!(
             state
@@ -4369,7 +4369,7 @@ base_url = "https://api.openai.com/v1"
         let state: serde_json::Value = serde_json::from_str(&state_text).expect("valid state");
         assert_eq!(
             state.get("patch_mode").and_then(|value| value.as_str()),
-            Some("official-imagegen-bridge")
+            Some("official-imagegen")
         );
         assert_eq!(
             state

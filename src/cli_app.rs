@@ -2,6 +2,7 @@ use crate::basellm_metadata;
 use crate::cli_types::{
     Cli, CliError, CliResult, CodexClientPatchPresetArg, CodexCompactionStrategyArg, Command,
     DaemonCommand, NotifyCommand, RelayCommand, RemoteControlCommand, SwitchCommand,
+    reject_legacy_mode,
 };
 use crate::codex_integration;
 use crate::codex_models_cache::{
@@ -91,11 +92,15 @@ pub async fn run_cli() -> CliResult<()> {
                 SwitchCommand::On {
                     port,
                     preset,
+                    legacy_mode,
                     responses_websocket,
                     compaction,
                     codex,
                     claude,
-                } => do_switch_on(port, preset, responses_websocket, compaction, codex, claude)?,
+                } => {
+                    reject_legacy_mode(legacy_mode)?;
+                    do_switch_on(port, preset, responses_websocket, compaction, codex, claude)?
+                }
                 SwitchCommand::Off { codex, claude } => do_switch_off(codex, claude)?,
                 SwitchCommand::Status { codex, claude } => do_switch_status(codex, claude),
                 SwitchCommand::RemoteControl { cmd } => do_remote_control(cmd)?,
@@ -356,8 +361,10 @@ async fn handle_relay_cmd(cmd: RelayCommand) -> CliResult<()> {
             codex,
             claude,
             preset,
+            legacy_mode,
             responses_websocket,
         } => {
+            reject_legacy_mode(legacy_mode)?;
             let service = relay_service_from_flags(codex, claude)?;
             add_relay_target(
                 name,

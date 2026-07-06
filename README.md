@@ -170,7 +170,7 @@ ch relay off
 
 `chatgpt-bridge` 启用前必须先在官方 Codex 中完成 ChatGPT 登录。如果 `~/.codex/auth.json` 没有完整 token、email 和账号信息，codex-helper 会拒绝 patch，避免 Codex TUI 因半登录状态启动失败。
 
-`official-relay` 和 `official-imagegen` 都是实验预设。它们只负责让 Codex 使用更接近官方的客户端能力选择；中转站本身仍必须真正支持对应接口。默认情况下，`official-*` 会让 Codex 选择远程压缩路径；如果要保留 official preset 的其它行为但强制本地压缩，可额外设置 `[codex.client_patch].compaction = "local"` 或使用 `codex-helper switch on --preset official-imagegen --compaction local`。真实请求密钥来自 `~/.codex-helper/config.toml` 的 provider 配置，bridge 预设不会把 Codex 的 ChatGPT token 透传给没有 helper 侧密钥的第三方 relay。旧的 `official-relay-bridge` / `official-imagegen-bridge` 仍作为 alias 接受，但不再作为推荐写法。
+`official-relay` 和 `official-imagegen` 都是实验预设。它们只负责让 Codex 使用更接近官方的客户端能力选择；中转站本身仍必须真正支持对应接口。默认情况下，`official-*` 会让 Codex 选择远程压缩路径；如果要保留 official preset 的其它行为但强制本地压缩，可额外设置 `[codex.client_patch].compaction = "local"` 或使用 `codex-helper switch on --preset official-imagegen --compaction local`。真实请求密钥来自 `~/.codex-helper/config.toml` 的 provider 配置，bridge 预设不会把 Codex 的 ChatGPT token 透传给没有 helper 侧密钥的第三方 relay。旧的 `official-relay-bridge` / `official-imagegen-bridge` 输入名已移除；新命令请使用 `official-relay` / `official-imagegen`。
 
 为了不拖能力较强的中转后腿，codex-helper 默认会在路由前归一化压缩 HTTP 请求体（`zstd`、`gzip` / `x-gzip`、`br`、`deflate`）。对 Codex `/responses`、`/responses/compact` 和 Responses WebSocket，helper 还会从已有请求证据补齐缺失的 `session_id`、`x-session-id`、官方 `session-id` / `thread-id` 和 `prompt_cache_key`，来源包括 header session、body `session_id`、`prompt_cache_key` 和 `metadata.session_id`。`previous_response_id` 只用于 stale-response 修复，不作为 session identity 来源；helper 不会凭空生成 session id，也不会覆盖用户已经带上的 session 字段。
 

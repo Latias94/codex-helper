@@ -19,6 +19,7 @@ All notable changes to this project will be documented in this file.
 - 可信余额耗尽现在通过 owned balance policy action 影响路由，而不是直接散落在多个 runtime 读模型里；新的非耗尽余额快照只会清理 codex-helper 自己拥有的 balance action，不会清理手动 override 或其它响应型 cooldown。
 - 自动余额探针会记住成功的中转适配器类型，并在短时间内跳过刚失败的适配器；当 degraded route selection 只能选择低优先级 provider 时，会对被 cooldown 或 trusted usage exhaustion 跳过的高优先级 endpoint 排队受节流的余额复查。
 - Breaking cleanup：移除旧 `codex-helper-gui` egui crate、二进制入口和 `gui` Cargo feature；桌面方向收口到 `apps/desktop` Tauri 预览，公开安装命令只保留 `codex-helper` 和 `ch`。
+- Breaking cleanup：移除 `switch on --mode ...` / relay diagnostics `--mode ...` 旧 CLI 写法，以及 `official-relay-bridge` / `official-imagegen-bridge` 新输入别名；新命令和 API 请求使用 `--preset official-relay`、`--preset official-imagegen` 或 `patch_preset`。
 
 #### 修复
 
@@ -40,6 +41,7 @@ All notable changes to this project will be documented in this file.
 - Trusted balance exhaustion now affects routing through owned balance policy actions instead of being interpreted independently by multiple runtime read models. Fresh non-exhausted balance snapshots clear only codex-helper-owned balance actions, not manual overrides or unrelated response-based cooldowns.
 - Automatic balance probing now remembers successful relay adapter kinds and temporarily skips recently failed kinds. When degraded route selection falls back to a lower-priority provider, codex-helper queues throttled balance reprobes for higher-priority endpoints skipped by cooldown or trusted usage exhaustion.
 - Breaking cleanup: removed the old `codex-helper-gui` egui crate, binary entrypoint, and `gui` Cargo feature. Desktop development is now concentrated in the `apps/desktop` Tauri preview, while public installs expose only `codex-helper` and `ch`.
+- Breaking cleanup: removed the old `--mode ...` CLI spelling for `switch on` / relay diagnostics and removed `official-relay-bridge` / `official-imagegen-bridge` as accepted new input aliases. New commands and API requests should use `--preset official-relay`, `--preset official-imagegen`, or `patch_preset`.
 
 #### Fixed
 

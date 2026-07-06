@@ -16,12 +16,22 @@ pub enum CodexPatchMode {
     /// Advertise the local relay as the official OpenAI Responses provider so Codex can use
     /// first-party HTTP features that helper can safely forward, starting with remote compaction
     /// v1. Request credentials still come from codex-helper routing/upstream configuration.
-    #[serde(alias = "official-relay", alias = "official_relay")]
+    #[serde(
+        rename = "official-relay",
+        alias = "official_relay",
+        alias = "official-relay-bridge",
+        alias = "official_relay_bridge"
+    )]
     OfficialRelayBridge,
     /// Combine official relay provider identity for remote compaction with the image generation
     /// ChatGPT auth facade. Request credentials still come from codex-helper routing/upstream
     /// configuration.
-    #[serde(alias = "official-imagegen", alias = "official_imagegen")]
+    #[serde(
+        rename = "official-imagegen",
+        alias = "official_imagegen",
+        alias = "official-imagegen-bridge",
+        alias = "official_imagegen_bridge"
+    )]
     OfficialImagegenBridge,
 }
 
@@ -31,8 +41,8 @@ impl CodexPatchMode {
             Self::Default => "default",
             Self::ChatGptBridge => "chatgpt-bridge",
             Self::ImagegenBridge => "imagegen-bridge",
-            Self::OfficialRelayBridge => "official-relay-bridge",
-            Self::OfficialImagegenBridge => "official-imagegen-bridge",
+            Self::OfficialRelayBridge => "official-relay",
+            Self::OfficialImagegenBridge => "official-imagegen",
         }
     }
 
@@ -385,5 +395,34 @@ impl CodexPatchPlan {
 
     pub fn requires_bridge_runtime_ready(self) -> bool {
         self.mode.strips_codex_client_auth() && self.mode != CodexPatchMode::ChatGptBridge
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_patch_mode_serializes_current_official_preset_names() {
+        assert_eq!(
+            serde_json::to_string(&CodexPatchMode::OfficialRelayBridge).unwrap(),
+            "\"official-relay\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CodexPatchMode::OfficialImagegenBridge).unwrap(),
+            "\"official-imagegen\""
+        );
+    }
+
+    #[test]
+    fn codex_patch_mode_reads_legacy_official_bridge_state() {
+        assert_eq!(
+            serde_json::from_str::<CodexPatchMode>("\"official-relay-bridge\"").unwrap(),
+            CodexPatchMode::OfficialRelayBridge
+        );
+        assert_eq!(
+            serde_json::from_str::<CodexPatchMode>("\"official-imagegen-bridge\"").unwrap(),
+            CodexPatchMode::OfficialImagegenBridge
+        );
     }
 }

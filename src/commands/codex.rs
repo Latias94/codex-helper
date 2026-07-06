@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use owo_colors::OwoColorize;
 use reqwest::Client;
 
-use crate::cli_types::CodexCommand;
+use crate::cli_types::{CodexCommand, reject_legacy_mode};
 use crate::config::{ServiceKind, load_or_bootstrap_for_service_with_v4_source};
 use crate::proxy::{
     CODEX_RELAY_LIVE_SMOKE_ACK, CodexRelayCapabilitiesRequest, CodexRelayCapabilitiesResponse,
@@ -24,9 +24,11 @@ pub(crate) async fn handle_codex_cmd(cmd: CodexCommand) -> CliResult<()> {
             upstream_index,
             model,
             preset,
+            legacy_mode,
             compaction,
             json,
         } => {
+            reject_legacy_mode(legacy_mode)?;
             let proxy = build_codex_proxy_for_cli().await?;
             let response = proxy
                 .codex_relay_capabilities(CodexRelayCapabilitiesRequest {

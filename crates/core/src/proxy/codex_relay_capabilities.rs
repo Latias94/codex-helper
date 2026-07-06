@@ -36,12 +36,51 @@ pub struct CodexRelayCapabilitiesRequest {
     pub upstream_index: Option<usize>,
     #[serde(default)]
     pub model: Option<String>,
-    #[serde(default, alias = "patch_preset")]
+    #[serde(
+        default,
+        alias = "patch_preset",
+        deserialize_with = "deserialize_patch_preset_input"
+    )]
     pub patch_mode: Option<CodexPatchMode>,
     #[serde(default)]
     pub compaction: Option<CodexCompactionStrategy>,
     #[serde(default)]
     pub responses_websocket: Option<bool>,
+}
+
+fn deserialize_patch_preset_input<'de, D>(
+    deserializer: D,
+) -> Result<Option<CodexPatchMode>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    value
+        .as_deref()
+        .map(parse_patch_preset_input)
+        .transpose()
+        .map_err(serde::de::Error::custom)
+}
+
+fn parse_patch_preset_input(value: &str) -> Result<CodexPatchMode, String> {
+    match value.trim() {
+        "default" => Ok(CodexPatchMode::Default),
+        "chatgpt-bridge" => Ok(CodexPatchMode::ChatGptBridge),
+        "imagegen-bridge" => Ok(CodexPatchMode::ImagegenBridge),
+        "official-relay" => Ok(CodexPatchMode::OfficialRelayBridge),
+        "official-imagegen" => Ok(CodexPatchMode::OfficialImagegenBridge),
+        "official-relay-bridge" | "official_relay_bridge" => Err(
+            "legacy patch preset 'official-relay-bridge' has been removed; use 'official-relay'"
+                .to_string(),
+        ),
+        "official-imagegen-bridge" | "official_imagegen_bridge" => Err(
+            "legacy patch preset 'official-imagegen-bridge' has been removed; use 'official-imagegen'"
+                .to_string(),
+        ),
+        other => Err(format!(
+            "unsupported patch_preset '{other}'; expected 'default', 'chatgpt-bridge', 'imagegen-bridge', 'official-relay', or 'official-imagegen'"
+        )),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -601,6 +640,29 @@ mod tests {
             headers: axum::http::HeaderMap::new(),
             body: axum::body::Bytes::new(),
         }
+    }
+
+    #[test]
+    fn codex_relay_capabilities_request_accepts_patch_preset_names() {
+        let request = serde_json::from_value::<CodexRelayCapabilitiesRequest>(
+            serde_json::json!({ "patch_preset": "official-imagegen" }),
+        )
+        .expect("current patch preset should deserialize");
+
+        assert_eq!(
+            request.patch_mode,
+            Some(CodexPatchMode::OfficialImagegenBridge)
+        );
+    }
+
+    #[test]
+    fn codex_relay_capabilities_request_rejects_legacy_bridge_preset_names() {
+        let error = serde_json::from_value::<CodexRelayCapabilitiesRequest>(
+            serde_json::json!({ "patch_preset": "official-imagegen-bridge" }),
+        )
+        .expect_err("legacy bridge preset should be rejected for new API requests");
+
+        assert!(error.to_string().contains("use 'official-imagegen'"));
     }
 
     #[test]

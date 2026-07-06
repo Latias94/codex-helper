@@ -111,7 +111,7 @@ fn request_log_serializes_codex_bridge_metadata() {
         reasoning_effort: Some("medium".to_string()),
         service_tier: ServiceTierLog::default(),
         codex_bridge: Some(CodexBridgeLog {
-            patch_mode: "official-imagegen-bridge".to_string(),
+            patch_mode: "official-imagegen".to_string(),
             remote_compaction_v1_request: true,
             remote_compaction_v2_request: true,
             downgraded_to_responses_compact: true,
@@ -130,7 +130,7 @@ fn request_log_serializes_codex_bridge_metadata() {
 
     assert_eq!(
         value["codex_bridge"]["patch_mode"].as_str(),
-        Some("official-imagegen-bridge")
+        Some("official-imagegen")
     );
     assert_eq!(
         value["codex_bridge"]["remote_compaction_v1_request"].as_bool(),

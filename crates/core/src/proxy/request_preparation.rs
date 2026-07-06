@@ -703,7 +703,7 @@ mod tests {
         assert!(!flavor.is_user_turn);
         assert!(flavor.is_remote_compaction_v1_request);
         let bridge = flavor.codex_bridge_log.expect("bridge log");
-        assert_eq!(bridge.patch_mode, "official-imagegen-bridge");
+        assert_eq!(bridge.patch_mode, "official-imagegen");
         assert!(bridge.remote_compaction_v1_request);
         assert!(!bridge.remote_compaction_v2_request);
         assert!(bridge.strips_client_auth);

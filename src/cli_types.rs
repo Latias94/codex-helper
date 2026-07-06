@@ -235,8 +235,11 @@ pub(crate) enum RelayCommand {
         #[arg(long)]
         claude: bool,
         /// Codex client preset used when switching to this target
-        #[arg(long = "preset", alias = "mode", value_enum)]
+        #[arg(long = "preset", value_enum)]
         preset: Option<CodexClientPatchPresetArg>,
+        /// Removed legacy spelling; use --preset instead.
+        #[arg(long = "mode", hide = true)]
+        legacy_mode: Option<String>,
         /// Enable Responses WebSocket transport advertising for official bridge presets
         #[arg(long)]
         responses_websocket: bool,
@@ -297,8 +300,11 @@ pub(crate) enum CodexCommand {
         #[arg(long)]
         model: Option<String>,
         /// Preset to evaluate; defaults to current switch/config preset
-        #[arg(long = "preset", alias = "mode", value_enum)]
+        #[arg(long = "preset", value_enum)]
         preset: Option<CodexClientPatchPresetArg>,
+        /// Removed legacy spelling; use --preset instead.
+        #[arg(long = "mode", hide = true)]
+        legacy_mode: Option<String>,
         /// Compaction strategy to evaluate; defaults to current switch/config compaction
         #[arg(long, value_enum)]
         compaction: Option<CodexCompactionStrategyArg>,
@@ -391,8 +397,11 @@ pub(crate) enum SwitchCommand {
         #[arg(long, default_value_t = 3211)]
         port: u16,
         /// Codex client preset; if omitted, use the preset from ~/.codex-helper/config.toml
-        #[arg(long = "preset", alias = "mode", value_enum)]
+        #[arg(long = "preset", value_enum)]
         preset: Option<CodexClientPatchPresetArg>,
+        /// Removed legacy spelling; use --preset instead.
+        #[arg(long = "mode", hide = true)]
+        legacy_mode: Option<String>,
         /// Enable Responses WebSocket transport advertising for official bridge presets
         #[arg(long)]
         responses_websocket: bool,
@@ -450,11 +459,29 @@ pub(crate) enum CodexClientPatchPresetArg {
     /// Experimental image generation bridge using a minimal ChatGPT auth facade
     ImagegenBridge,
     /// Experimental official relay preset for HTTP OpenAI Responses features
-    #[value(name = "official-relay", alias = "official-relay-bridge")]
+    #[value(name = "official-relay")]
     OfficialRelayBridge,
     /// Experimental official imagegen preset plus minimal image generation auth facade
-    #[value(name = "official-imagegen", alias = "official-imagegen-bridge")]
+    #[value(name = "official-imagegen")]
     OfficialImagegenBridge,
+}
+
+pub(crate) fn legacy_mode_replacement_hint(value: &str) -> String {
+    let trimmed = value.trim();
+    let replacement = match trimmed {
+        "official-relay-bridge" | "official_relay_bridge" => "official-relay",
+        "official-imagegen-bridge" | "official_imagegen_bridge" => "official-imagegen",
+        "" => "<preset>",
+        other => other,
+    };
+    format!("`--mode {trimmed}` has been removed; use `--preset {replacement}` instead")
+}
+
+pub(crate) fn reject_legacy_mode(value: Option<String>) -> CliResult<()> {
+    if let Some(value) = value {
+        return Err(CliError::Other(legacy_mode_replacement_hint(&value)));
+    }
+    Ok(())
 }
 
 impl From<CodexClientPatchPresetArg> for codex_helper_core::codex_integration::CodexPatchMode {
@@ -1211,7 +1238,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_relay_cli_accepts_legacy_mode_alias() {
+    fn codex_relay_cli_captures_removed_mode_for_replacement_hint() {
         let cli = Cli::try_parse_from([
             "codex-helper",
             "codex",
@@ -1219,18 +1246,41 @@ mod tests {
             "--mode",
             "official-imagegen-bridge",
         ])
-        .expect("parse legacy codex relay capabilities mode alias");
+        .expect("capture removed codex relay capabilities mode option");
 
         let Some(Command::Codex {
-            cmd: CodexCommand::Capabilities { preset, .. },
+            cmd:
+                CodexCommand::Capabilities {
+                    preset,
+                    legacy_mode,
+                    ..
+                },
         }) = cli.command
         else {
             panic!("expected codex relay capabilities command");
         };
+        assert_eq!(preset, None);
+        assert_eq!(legacy_mode.as_deref(), Some("official-imagegen-bridge"));
         assert_eq!(
-            preset,
-            Some(CodexClientPatchPresetArg::OfficialImagegenBridge)
+            legacy_mode_replacement_hint(legacy_mode.as_deref().unwrap()),
+            "`--mode official-imagegen-bridge` has been removed; use `--preset official-imagegen` instead"
         );
+    }
+
+    #[test]
+    fn codex_relay_cli_rejects_legacy_bridge_preset_value() {
+        let error = Cli::try_parse_from([
+            "codex-helper",
+            "codex",
+            "relay-capabilities",
+            "--preset",
+            "official-imagegen-bridge",
+        ])
+        .expect_err("legacy bridge preset value should fail clap parse");
+
+        let message = error.to_string();
+        assert!(message.contains("invalid value"));
+        assert!(message.contains("official-imagegen"));
     }
 
     #[test]

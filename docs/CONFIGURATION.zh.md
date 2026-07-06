@@ -122,7 +122,7 @@ codex-helper switch on --preset official-imagegen
 codex-helper switch on --preset default
 ```
 
-旧 CLI 写法 `--mode ...` 仍作为 alias 保留。启动时，`codex-helper serve` 会在 Codex 尚未切到 codex-helper 时读取 `[codex.client_patch]`；如果 Codex 已经切到 helper，则保留当前客户端 patch 预设。要显式切换，可使用 `switch on --preset ...` 或 TUI Settings 页的 `B`/`I`/`F`/`D`。
+旧 CLI 写法 `--mode ...` 已移除；新命令请使用 `--preset ...`。启动时，`codex-helper serve` 会在 Codex 尚未切到 codex-helper 时读取 `[codex.client_patch]`；如果 Codex 已经切到 helper，则保留当前客户端 patch 预设。要显式切换，可使用 `switch on --preset ...` 或 TUI Settings 页的 `B`/`I`/`F`/`D`。
 
 默认情况下，控制台拥有代理生命周期：`codex-helper serve` 会在内置 TUI 退出时停止代理并恢复本地客户端 patch。如果希望本地代理长期运行，可以显式使用 `codex-helper serve --resident`。resident 模式在控制台退出时保留客户端 patch，暴露 `/__codex_helper/api/v1/runtime/shutdown`，并可用 `codex-helper daemon status` 查看、`codex-helper daemon stop` 停止。`codex-helper tui --codex` 或 `codex-helper tui --claude` 可以只读附着到已有 resident proxy，退出这个 TUI 只会关闭控制台，不会停止代理。需要前台 watchdog 时，可以运行 `codex-helper daemon supervise --codex`；它会用有界退避重启崩溃的 resident 子进程，并把轻量 crash marker 写到 `~/.codex-helper/run/` 便于排查。
 
@@ -220,7 +220,7 @@ curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-capabilities \
   -d '{"patch_preset":"official-imagegen","compaction":"local","model":"gpt-5.5"}'
 ```
 
-为了 API 兼容，响应 JSON 字段仍叫 `patch_mode`；请求同时接受 `patch_mode` 或 `patch_preset`，并且同时接受 `official-imagegen` 这类 preset 名称和 `official-imagegen-bridge` 这类旧 mode 名称。请求和响应也会包含 `compaction`，这样诊断会按 `switch on` 实际使用的 `auto` / `local` / `remote-v1` / `remote-v2` 策略计算预期能力。
+为了 API 兼容，响应 JSON 字段仍叫 `patch_mode`；新请求应发送 `patch_preset`，临时保留的 `patch_mode` 请求字段也只接受 `official-imagegen` 这类当前 preset 名称。`official-imagegen-bridge` 这类旧 bridge-mode 值会被拒绝并返回替代提示。请求和响应也会包含 `compaction`，这样诊断会按 `switch on` 实际使用的 `auto` / `local` / `remote-v1` / `remote-v2` 策略计算预期能力。
 
 这里要使用 Codex proxy port 对应的 admin port（`proxy_port + 1000`；默认 Codex proxy 是
 `3211`，所以默认 admin port 是 `4211`）。这个端点故意设计成 `POST`：它会对选中的上游各发一次有界主动探测，分别访问 `/models`、`/responses` 和 `/responses/compact`。其中 `/models` 是只读探测；两个 Responses 探测发送 `{}`，并把“缺少 model/input”这类校验错误判断为端点存在。它不会走正常 routing、retry、request ledger、session affinity、passive health 或 runtime health 状态，所以这是显式诊断动作，不会放大成每请求重试风暴。

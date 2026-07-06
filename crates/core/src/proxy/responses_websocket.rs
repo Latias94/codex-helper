@@ -138,7 +138,7 @@ pub(super) async fn handle_responses_websocket(
     if !codex_provider_supports_websocket() {
         return (
             StatusCode::UPGRADE_REQUIRED,
-            "Responses WebSocket is not enabled; run codex-helper switch on --mode official-relay-bridge --responses-websocket",
+            "Responses WebSocket is not enabled; run codex-helper switch on --preset official-relay --responses-websocket",
         )
             .into_response();
     }

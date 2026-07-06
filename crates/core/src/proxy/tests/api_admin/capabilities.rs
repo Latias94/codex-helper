@@ -1129,7 +1129,7 @@ async fn codex_capabilities_api_reports_expected_observed_and_mismatches() {
     );
     assert_eq!(
         diagnostics.get("patch_mode").and_then(|v| v.as_str()),
-        Some("official-imagegen-bridge")
+        Some("official-imagegen")
     );
     assert_eq!(
         diagnostics
@@ -1163,7 +1163,7 @@ async fn codex_capabilities_api_reports_expected_observed_and_mismatches() {
     );
     assert_eq!(
         diagnostics["recommendation"]["current_patch_mode"].as_str(),
-        Some("official-imagegen-bridge")
+        Some("official-imagegen")
     );
     assert_eq!(
         diagnostics["recommendation"]["recommended_patch_mode"].as_str(),
@@ -1311,7 +1311,7 @@ request_max_retries = 0
 
     assert_eq!(
         diagnostics.get("patch_mode").and_then(|v| v.as_str()),
-        Some("official-imagegen-bridge")
+        Some("official-imagegen")
     );
     assert_eq!(
         diagnostics
@@ -1329,7 +1329,7 @@ request_max_retries = 0
     );
     assert_eq!(
         diagnostics["recommendation"]["current_patch_mode"].as_str(),
-        Some("official-imagegen-bridge")
+        Some("official-imagegen")
     );
     assert_eq!(
         diagnostics["recommendation"]["recommended_patch_mode"].as_str(),

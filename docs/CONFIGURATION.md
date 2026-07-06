@@ -122,7 +122,7 @@ codex-helper switch on --preset official-imagegen
 codex-helper switch on --preset default
 ```
 
-The legacy CLI spelling `--mode ...` is also accepted as an alias. On startup, `codex-helper serve` uses `[codex.client_patch]` when Codex is not already switched to codex-helper. If Codex is already switched, the existing client preset is preserved; use `switch on --preset ...` or the TUI Settings `B`/`I`/`F`/`D` keys to change it explicitly.
+The legacy CLI spelling `--mode ...` has been removed. Use `--preset ...` for new commands. On startup, `codex-helper serve` uses `[codex.client_patch]` when Codex is not already switched to codex-helper. If Codex is already switched, the existing client preset is preserved; use `switch on --preset ...` or the TUI Settings `B`/`I`/`F`/`D` keys to change it explicitly.
 
 By default, the console owns the proxy lifecycle: `codex-helper serve` stops its proxy and restores the local client patch when the built-in TUI exits. For long-running local proxy use, start `codex-helper serve --resident`. Resident mode keeps the client patch active when the console exits, exposes `/__codex_helper/api/v1/runtime/shutdown`, and can be inspected with `codex-helper daemon status` or stopped with `codex-helper daemon stop`. Use `codex-helper tui --codex` or `codex-helper tui --claude` to attach a read-only terminal dashboard to an existing resident proxy; quitting that dashboard exits only the console. If you want a foreground watchdog, `codex-helper daemon supervise --codex` starts a resident child, restarts it with bounded backoff after crashes, and records crash markers in `~/.codex-helper/run/`.
 
@@ -224,7 +224,7 @@ curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-capabilities \
   -d '{"patch_preset":"official-imagegen","compaction":"local","model":"gpt-5.5"}'
 ```
 
-For API compatibility the response JSON field is still named `patch_mode`; requests accept either `patch_mode` or `patch_preset`, and accept both preset names such as `official-imagegen` and legacy mode names such as `official-imagegen-bridge`. Requests and responses also include `compaction` so diagnostics evaluate the same `auto` / `local` / `remote-v1` / `remote-v2` strategy that `switch on` would apply.
+For API compatibility the response JSON field is still named `patch_mode`; new requests should send `patch_preset`, and the temporary `patch_mode` request field only accepts current preset names such as `official-imagegen`. Legacy bridge-mode values such as `official-imagegen-bridge` are rejected with a replacement hint. Requests and responses also include `compaction` so diagnostics evaluate the same `auto` / `local` / `remote-v1` / `remote-v2` strategy that `switch on` would apply.
 
 Use the admin port for your Codex proxy port (`proxy_port + 1000`; the default Codex proxy is
 `3211`, so the default admin port is `4211`). The endpoint is `POST` on purpose: it sends one
