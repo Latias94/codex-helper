@@ -31,7 +31,7 @@ English: [README_EN.md](README_EN.md)
 - 你希望“包月中转优先，用完或失败后再兜底到备用线路”。
 - 你想让 Codex 保留 ChatGPT 登录态、桌面端/手机端账号能力判定，但模型请求实际走自有 relay 或包月额度。
 - 你的 sub2api 或其它中转普通对话能跑，但 `/models`、`/responses/compact`、hosted `image_generation`、模型名映射这类 Codex 细节不稳定。
-- 你想在 TUI/GUI 里看到当前 provider、余额/套餐、请求 token、cache token、耗时、重试和成本估算。
+- 你想在 TUI 或桌面端里看到当前 provider、余额/套餐、请求 token、cache token、耗时、重试和成本估算。
 - 你需要长期运行的本地代理，并希望日志、状态、session 绑定和 dashboard 刷新保持可控。
 - 你想快速查看和恢复本机 Codex 会话。
 
@@ -51,7 +51,7 @@ English: [README_EN.md](README_EN.md)
 - **余额/套餐**：支持 Sub2API、New API 和常见 `/user/balance` 探测；失败不计为耗尽。
 - **出站代理兼容**：本地代理和出站网络代理是两层概念；当前出站请求受系统/环境代理变量影响，还没有 `config.toml` 专用代理段。
 - **请求可观测**：记录 provider、model、token、cache token、缓存命中率、TTFB、总耗时、输出速度、重试链、provider signal / policy action 证据和估算成本。
-- **TUI/GUI**：TUI 内置在命令行里；`codex-helper-gui`/egui 仍作为可选 legacy GUI 入口保留。Tauri 桌面端代码位于 `apps/desktop`，已完成 Windows packaged smoke，但 v0.19.0 仍不随公开 release 发布桌面安装包，等签名、发布通道和回滚流程就绪后再进入正式桌面发布。
+- **TUI / Desktop**：TUI 内置在命令行里；旧 `codex-helper-gui`/egui 入口已移除。Tauri 桌面端代码位于 `apps/desktop`，已完成 Windows packaged smoke，但 v0.19.0 仍不随公开 release 发布桌面安装包，等签名、发布通道和回滚流程就绪后再进入正式桌面发布。
 
 ## 快速开始
 
@@ -71,7 +71,7 @@ Windows PowerShell:
 powershell -ExecutionPolicy Bypass -c "irm https://github.com/Latias94/codex-helper/releases/download/v0.19.0/codex-helper-installer.ps1 | iex"
 ```
 
-安装后会得到三个命令：`codex-helper`、短别名 `ch`，以及可选 legacy GUI 入口 `codex-helper-gui`（egui，已弃用但保留）。Tauri 桌面端当前仍是源码内预览路径，v0.19.0 release 不发布桌面安装包；需要本地验证时可从 `apps/desktop` 运行 `pnpm tauri:build`。
+安装后会得到两个命令：`codex-helper` 和短别名 `ch`。旧 egui GUI 入口 `codex-helper-gui` 已移除；Tauri 桌面端当前仍是源码内预览路径，v0.19.0 release 不发布桌面安装包；需要本地验证时可从 `apps/desktop` 运行 `pnpm tauri:build`。
 
 如果不想 pipe shell，可以到 [GitHub Releases](https://github.com/Latias94/codex-helper/releases) 下载对应平台压缩包，并使用同名 `.sha256` 文件校验。
 
@@ -119,7 +119,7 @@ codex-helper daemon stop
 codex-helper tui --codex
 ```
 
-默认 `codex-helper serve` 的 TUI 和 GUI 都遵循“界面拥有代理”：退出界面会停止它自己启动的代理，并撤销本地客户端 patch。`daemon status/stop` 只用于查询或停止你显式启动的 resident proxy；`tui` 子命令只读附着到已有 resident proxy，退出这个 attached TUI 不会停止代理。需要自动拉起/崩溃重启时可用 `codex-helper daemon supervise --codex`，supervisor 会写入轻量 crash marker 到 `~/.codex-helper/run/` 便于排查。
+默认 `codex-helper serve` 的内置 TUI 遵循“界面拥有代理”：退出界面会停止它自己启动的代理，并撤销本地客户端 patch。`daemon status/stop` 只用于查询或停止你显式启动的 resident proxy；`tui` 子命令只读附着到已有 resident proxy，退出这个 attached TUI 不会停止代理。需要自动拉起/崩溃重启时可用 `codex-helper daemon supervise --codex`，supervisor 会写入轻量 crash marker 到 `~/.codex-helper/run/` 便于排查。
 
 `daemon status` 会尽量显示当前 resident proxy 的 owner marker（manual CLI、supervisor 或未来桌面/托盘 owner）；marker 只用于可观测性，读取或清理失败不会阻断代理启动/退出。面向未来桌面端的 sidecar 语义已经预留为隐藏的 managed 启动模式，普通用户无需手动判断或使用。
 
@@ -420,17 +420,7 @@ codex-helper --version
 常用快捷键会显示在底部。TUI 的持久化 provider/routing 编辑优先使用 routing 页面，手动改配置后可用 `R` 重新加载运行态配置。
 在 `Usage` 页面按 `g` 可以刷新余额；单个 provider 查询失败只会显示为错误/未知状态，不会打断页面刷新或其他 provider 的刷新。
 
-### GUI
-
-如果构建启用了 GUI feature，可以运行：
-
-```bash
-codex-helper-gui
-# 或源码运行：
-cargo run --release --features gui --bin codex-helper-gui
-```
-
-这个 egui GUI 已弃用并保留为 legacy fallback。它仍可以启动/附着本地代理，编辑常见单 endpoint provider、route node 和 routing，查看请求、余额、价格目录、session、health、breaker 和控制面板状态。默认行为是 GUI 启动的代理跟随 GUI 退出而停止；附着已有代理必须在界面中显式选择，关闭 GUI 只会取消附着，不会偷偷停止别的进程。复杂多 endpoint provider、模型映射和高级字段仍建议用 CLI 或 raw TOML。
+### Desktop Preview
 
 新的 Tauri 桌面端位于 `apps/desktop`，技术栈是 React 19、Tailwind CSS 4、shadcn/ui 风格组件和 TanStack Router/Query/Table。它已经实现 Dashboard、Providers、Usage、Settings、只读 admin 数据、安全控制动作、关闭隐藏到托盘语义、单实例、开机启动设置、轻量单配置导入导出、打开配置/日志/缓存路径、Provider 常用编辑表单和 Windows NSIS packaged sidecar 构建。Windows packaged smoke 已覆盖安装包启动、托盘 Show/Hide/Quit、显式 Stop Proxy、Detach、第二次启动聚焦、开机启动注册、配置导入导出和 Provider 编辑；但 v0.19.0 不发布桌面安装包，正式桌面 release 会等签名密钥、HTTPS 发布端点、artifact hosting 和回滚流程就绪后再启用。桌面端打包策略见 [docs/DESKTOP_RELEASE.md](docs/DESKTOP_RELEASE.md)。
 
@@ -442,7 +432,6 @@ cargo run --release --features gui --bin codex-helper-gui
 - 请求过滤：`~/.codex-helper/filter.json`
 - 请求日志：`~/.codex-helper/logs/requests.jsonl`
 - Codex relay 诊断证据：`~/.codex-helper/logs/codex_relay_evidence.jsonl`
-- GUI 配置：`~/.codex-helper/gui.toml`
 
 Codex 自己的文件仍由 Codex 维护：
 
@@ -469,7 +458,6 @@ codex-helper 刻意避免这些做法：
 - [docs/DESKTOP_RELEASE.md](docs/DESKTOP_RELEASE.md)：Tauri 桌面端打包、sidecar 和 release gate 说明。
 - [docs/workstreams/codex-routing-scheduler-observability-refactor/README.md](docs/workstreams/codex-routing-scheduler-observability-refactor/README.md)：路由调度状态、限流/过载结果、并发上限和 TUI 指标的无畏重构设计。
 - [docs/workstreams/codex-tui-operator-polish/README.md](docs/workstreams/codex-tui-operator-polish/README.md)：TUI 用量、路由、窄终端和快捷键操作体验优化计划。
-- [docs/workstreams/tauri-desktop-client/REPLACEMENT_READINESS.md](docs/workstreams/tauri-desktop-client/REPLACEMENT_READINESS.md)：Tauri 桌面端替代 egui 前的 readiness、parity gaps 和后续任务拆分。
 - [docs/workstreams/codex-operator-experience-refactor/GAP_MATRIX.md](docs/workstreams/codex-operator-experience-refactor/GAP_MATRIX.md)：与 cc-switch、aio-coding-hub、all-api-hub 的差距分析。
 - [docs/workstreams/codex-control-plane-refactor/README.md](docs/workstreams/codex-control-plane-refactor/README.md)：控制平面设计记录。
 

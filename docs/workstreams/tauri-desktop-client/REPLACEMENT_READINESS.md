@@ -1,7 +1,12 @@
 # Tauri Desktop Client — Replacement Readiness
 
-Status: Internal dogfood ready, not ready for egui removal
-Last updated: 2026-05-22
+Status: Superseded by the 2026-07-07 fearless legacy cleanup
+Last updated: 2026-07-07
+
+Supersession note: this readiness report captured the conservative 2026-05-22
+gate posture. The 2026-07-07 cleanup intentionally breaks that fallback policy:
+the legacy `codex-helper-gui` egui crate and binary entrypoint have been removed,
+and current desktop work now continues through `apps/desktop`.
 
 ## Decision
 

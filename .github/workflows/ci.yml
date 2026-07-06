@@ -25,7 +25,7 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Install Linux GUI dependencies
+      - name: Install Linux desktop dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -55,7 +55,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --locked --workspace --all-targets --features gui -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
   test-build:
     name: test-build (${{ matrix.os }})
@@ -80,7 +80,7 @@ jobs:
         with:
           cache-bin: false
 
-      - name: Install Linux GUI dependencies
+      - name: Install Linux desktop dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
@@ -111,7 +111,7 @@ jobs:
           cargo nextest --version
 
       - name: Test (nextest)
-        run: cargo nextest run --locked --workspace --features gui --no-fail-fast
+        run: cargo nextest run --locked --workspace --no-fail-fast
 
       - name: Build (release)
-        run: cargo build --release --locked --workspace --features gui
+        run: cargo build --release --locked --workspace

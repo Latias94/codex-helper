@@ -6,10 +6,6 @@ license = "MIT OR Apache-2.0"
 description = "Core library for codex-helper."
 repository = "https://github.com/Latias94/codex-helper"
 
-[features]
-# UI-specific helper APIs (used by the GUI crate).
-gui = []
-
 [dependencies]
 anyhow = "1.0.102"
 base64 = "0.22.1"

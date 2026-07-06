@@ -120,10 +120,11 @@ Current policy:
 
 ## Replacement posture
 
-The Windows NSIS packaged Tauri app is the intended desktop GUI replacement
-path, but it is not part of the v0.19.0 public release. The legacy
-`codex-helper-gui` egui binary remains available as a deprecated fallback for
-rollback and for platforms where packaged Tauri parity has not yet been smoked.
+The Windows NSIS packaged Tauri app is the desktop GUI replacement path, but it
+is not part of the v0.19.0 public release. The legacy `codex-helper-gui` egui
+binary has been removed; public release artifacts remain CLI/TUI focused until
+the Tauri desktop installer, signing, release-channel, and rollback operations
+are ready.
 
 Do not claim cross-platform replacement until macOS/Linux packaged smoke has
 covered the same lifecycle behavior. Do not enable or advertise automatic
@@ -161,4 +162,4 @@ Still required before broader release claims:
   automatic updates.
 - macOS/Linux packaged lifecycle smoke before claiming cross-platform GUI
   replacement.
-- A release rollback checklist before removing the legacy egui fallback entirely.
+- A release rollback checklist before publishing Tauri desktop installers.

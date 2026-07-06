@@ -124,9 +124,9 @@ codex-helper switch on --preset default
 
 The legacy CLI spelling `--mode ...` is also accepted as an alias. On startup, `codex-helper serve` uses `[codex.client_patch]` when Codex is not already switched to codex-helper. If Codex is already switched, the existing client preset is preserved; use `switch on --preset ...` or the TUI Settings `B`/`I`/`F`/`D` keys to change it explicitly.
 
-By default, the console owns the proxy lifecycle: `codex-helper serve` stops its proxy and restores the local client patch when the built-in TUI exits, and the GUI stops any proxy it started when the GUI exits. For long-running local proxy use, start `codex-helper serve --resident`. Resident mode keeps the client patch active when the console exits, exposes `/__codex_helper/api/v1/runtime/shutdown`, and can be inspected with `codex-helper daemon status` or stopped with `codex-helper daemon stop`. Use `codex-helper tui --codex` or `codex-helper tui --claude` to attach a read-only terminal dashboard to an existing resident proxy; quitting that dashboard exits only the console. The GUI can also attach explicitly from its setup/overview pages, but it no longer silently adopts the helper port from Codex/Claude on startup. If you want a foreground watchdog, `codex-helper daemon supervise --codex` starts a resident child, restarts it with bounded backoff after crashes, and records crash markers in `~/.codex-helper/run/`.
+By default, the console owns the proxy lifecycle: `codex-helper serve` stops its proxy and restores the local client patch when the built-in TUI exits. For long-running local proxy use, start `codex-helper serve --resident`. Resident mode keeps the client patch active when the console exits, exposes `/__codex_helper/api/v1/runtime/shutdown`, and can be inspected with `codex-helper daemon status` or stopped with `codex-helper daemon stop`. Use `codex-helper tui --codex` or `codex-helper tui --claude` to attach a read-only terminal dashboard to an existing resident proxy; quitting that dashboard exits only the console. If you want a foreground watchdog, `codex-helper daemon supervise --codex` starts a resident child, restarts it with bounded backoff after crashes, and records crash markers in `~/.codex-helper/run/`.
 
-Resident runtimes write a best-effort owner marker under `~/.codex-helper/run/` so `daemon status` can distinguish manual CLI, supervisor, and future desktop/tray-owned sidecars. These marker files are advisory metadata only: stale, corrupt, or missing markers should not stop a proxy from starting, exiting, or being stopped explicitly. The desktop-managed sidecar mode is intentionally hidden until a visible desktop/tray shell exists; normal `serve` and GUI startup remain non-resident by default.
+Resident runtimes write a best-effort owner marker under `~/.codex-helper/run/` so `daemon status` can distinguish manual CLI, supervisor, and future desktop/tray-owned sidecars. These marker files are advisory metadata only: stale, corrupt, or missing markers should not stop a proxy from starting, exiting, or being stopped explicitly. The desktop-managed sidecar mode is intentionally hidden until a visible desktop/tray shell exists; normal `serve` startup remains non-resident by default.
 
 `chatgpt-bridge` writes `requires_openai_auth = true` and `supports_websockets = false` into `~/.codex/config.toml`, and changes only two `~/.codex/auth.json` fields: `auth_mode` becomes `"chatgpt"` and `OPENAI_API_KEY` becomes `null`. It requires an existing official Codex ChatGPT login state; if `auth.json` has no complete token/email/account metadata, codex-helper refuses the patch before writing `config.toml` or `auth.json`. Existing Codex apps usually need a restart before they read the changed client config.
 
@@ -1188,7 +1188,7 @@ Important balance behavior:
 
 ## Usage / Balance Page
 
-TUI page 5 is now labeled `Usage`, and the GUI stats page is titled `Usage / Balance`. Both consume the same core `UsageBalanceView`, so provider, endpoint, balance state, and route-impact semantics should match.
+TUI page 5 is now labeled `Usage`, and the Tauri desktop Usage page consumes the same core `UsageBalanceView`, so provider, endpoint, balance state, and route-impact semantics should match.
 
 How to read it:
 
@@ -1198,7 +1198,7 @@ How to read it:
 - `unknown` means there is no trusted balance data or the lookup failed. Do not treat it as healthy balance.
 - `stale` means the snapshot expired; it is distinct from `exhausted`, `error`, and `unlimited`.
 - `unlimited` is a known unlimited quota state, not unknown.
-- Press `g` on the TUI `Usage` page to refresh balances; use the `Refresh balances` button on the GUI stats page.
+- Press `g` on the TUI `Usage` page to refresh balances; use the `Refresh balances` button on the Tauri desktop Usage page.
 - A single provider balance refresh failure only updates that provider's error/unknown state. It does not interrupt other provider refreshes, TUI redraw, or snapshot refresh.
 - The `Routing` page keeps compact balance context only. Use `Usage / Balance` to answer which provider is used most, which one is running out, or which endpoint is failing.
 
@@ -1260,7 +1260,7 @@ Useful adapter fields:
 Pricing is separate from relay config:
 
 - Local overrides: `~/.codex-helper/pricing_overrides.toml`
-- Built-in and synced catalog: rendered by TUI/GUI and used for estimated cost
+- Built-in and synced catalog: rendered by TUI/desktop surfaces and used for estimated cost
 - Sync commands:
 
 ```bash
@@ -1362,7 +1362,6 @@ Request/debug logs, `control_trace.jsonl`, and the optional `retry_trace.jsonl` 
 Other local helper logs use the same bounded storage primitive with separate knobs:
 
 - `runtime.log`: `CODEX_HELPER_RUNTIME_LOG_MAX_BYTES` / `CODEX_HELPER_RUNTIME_LOG_MAX_FILES` (defaults: 20 MiB, 10 files).
-- `gui.log`: `CODEX_HELPER_GUI_LOG_MAX_BYTES` / `CODEX_HELPER_GUI_LOG_MAX_FILES` (defaults: 20 MiB, 10 files).
 - `codex_relay_evidence.jsonl`: `CODEX_HELPER_RELAY_EVIDENCE_LOG_MAX_BYTES` / `CODEX_HELPER_RELAY_EVIDENCE_LOG_MAX_FILES` (defaults: 20 MiB, 10 files).
 
 For route-continuity diagnosis, control trace fields are intentionally provider-opaque:
@@ -1411,11 +1410,11 @@ Look for `route_graph_selection_explain`. It records the selected provider endpo
 
 ## UI Editing
 
-TUI and GUI should keep the same mental model as the config file:
+TUI and desktop surfaces should keep the same mental model as the config file:
 
 - Provider list: names, aliases, enabled state, tags, balance, expanded fallback order, canonical provider endpoint keys, and active automatic policy actions.
 - Routing editor: entry strategy, target, children/order, preferred tags, exhaustion behavior, and route graph tree preview.
-- GUI route node editor: create, rename, delete, and save nested route nodes for common graph edits.
+- Desktop provider and routing forms: expose common edits while preserving advanced route graph fields for CLI or raw TOML.
 - Requests and sessions: provider choice, route affinity, retry chain, token/cache token usage, cache hit rate, and estimated cost.
 - Runtime steering: useful for temporary choices, but durable provider intent belongs in `[service.providers]` and `[service.routing]`.
 
@@ -1468,5 +1467,5 @@ codex-helper intentionally avoids:
 - pretending speed-first or cost-first routing is reliable before real measurements exist;
 - keeping `level` as the main user-facing priority control;
 - treating balance lookup failure as provider exhaustion;
-- silently writing legacy station schema from GUI or TUI;
+- silently writing legacy station schema from TUI or desktop forms;
 - using a special `pool-fallback` syntax when nested route nodes express the same intent more cleanly.

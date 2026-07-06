@@ -20,7 +20,7 @@ Use codex-helper if:
 - you want monthly relays first, then pay-as-you-go or official providers as fallback;
 - you want Codex to keep ChatGPT login/account behavior for the app or mobile flow, while model traffic uses your own relay or monthly quota;
 - your sub2api-style or other relay works for ordinary chat but is shaky around `/models`, `/responses/compact`, hosted `image_generation`, or provider-specific model names;
-- you want TUI/GUI visibility into provider choice, balance/plan, tokens, cache tokens, latency, retries, and estimated cost;
+- you want TUI or desktop visibility into provider choice, balance/plan, tokens, cache tokens, latency, retries, and estimated cost;
 - you run a local proxy for long periods and need bounded runtime state plus rotated logs;
 - you want quick helpers for local Codex session discovery and resume.
 
@@ -39,7 +39,7 @@ It is probably unnecessary if you only use one official account and do not need 
 - **Balance and plan visibility**: probes common Sub2API, New API, and `/user/balance` endpoints; lookup failures are not treated as exhausted.
 - **Outbound proxy compatibility**: the local proxy and outbound network proxy are separate layers; outbound requests currently follow system/environment proxy variables, with no first-class `config.toml` proxy section yet.
 - **Request observability**: provider, model, tokens, cache tokens, cache hit rate, TTFB, duration, output rate, retry chain, provider signal / policy action evidence, and estimated cost.
-- **TUI and GUI**: built-in TUI for terminal use; `codex-helper-gui`/egui remains available as an optional legacy GUI entrypoint. The Tauri desktop source lives under `apps/desktop` and has passed Windows packaged smoke, but v0.19.0 does not ship a public desktop installer yet; that release path is deferred until signing, release-channel, and rollback operations are ready.
+- **TUI and Desktop**: built-in TUI for terminal use; the old `codex-helper-gui`/egui entrypoint has been removed. The Tauri desktop source lives under `apps/desktop` and has passed Windows packaged smoke, but v0.19.0 does not ship a public desktop installer yet; that release path is deferred until signing, release-channel, and rollback operations are ready.
 
 ## Quick Start
 
@@ -59,7 +59,7 @@ Windows PowerShell:
 powershell -ExecutionPolicy Bypass -c "irm https://github.com/Latias94/codex-helper/releases/download/v0.19.0/codex-helper-installer.ps1 | iex"
 ```
 
-This installs `codex-helper`, the short alias `ch`, and the optional legacy GUI entrypoint `codex-helper-gui` (egui, deprecated but retained). The Tauri desktop client remains a source-tree preview in v0.19.0 and is not uploaded as a public release artifact; local validation can still build it from `apps/desktop` with `pnpm tauri:build`.
+This installs `codex-helper` and the short alias `ch`. The old egui GUI entrypoint `codex-helper-gui` has been removed. The Tauri desktop client remains a source-tree preview in v0.19.0 and is not uploaded as a public release artifact; local validation can still build it from `apps/desktop` with `pnpm tauri:build`.
 
 If you do not want to pipe a shell script, download the archive for your platform from [GitHub Releases](https://github.com/Latias94/codex-helper/releases) and verify it with the matching `.sha256` file.
 
@@ -107,7 +107,7 @@ codex-helper daemon stop
 codex-helper tui --codex
 ```
 
-By default, `codex-helper serve` and the GUI follow “the console owns the proxy”: exiting the UI stops the proxy it started and restores the local client patch. `daemon status/stop` is only for resident proxies you explicitly started. The `tui` subcommand attaches read-only to an existing resident proxy, so exiting that attached TUI does not stop the proxy. For automatic restart after child crashes, run `codex-helper daemon supervise --codex`; the supervisor records lightweight crash markers under `~/.codex-helper/run/`.
+By default, the built-in `codex-helper serve` TUI follows “the console owns the proxy”: exiting the UI stops the proxy it started and restores the local client patch. `daemon status/stop` is only for resident proxies you explicitly started. The `tui` subcommand attaches read-only to an existing resident proxy, so exiting that attached TUI does not stop the proxy. For automatic restart after child crashes, run `codex-helper daemon supervise --codex`; the supervisor records lightweight crash markers under `~/.codex-helper/run/`.
 
 `daemon status` best-effort shows the resident proxy owner marker (manual CLI, supervisor, or a future desktop/tray owner). The marker is only observability metadata: read or cleanup failures never block proxy startup or shutdown. A hidden managed sidecar mode is reserved for the future desktop shell, so ordinary users do not need to choose it manually.
 
@@ -345,7 +345,7 @@ max_concurrent_requests = 5
 limit_group = "input-account"
 ```
 
-For complete config, migration, balance adapters, pricing, and GUI/TUI editing notes, see [docs/CONFIGURATION.md](docs/CONFIGURATION.md). The equivalent Chinese reference is [docs/CONFIGURATION.zh.md](docs/CONFIGURATION.zh.md).
+For complete config, migration, balance adapters, pricing, and TUI/desktop editing notes, see [docs/CONFIGURATION.md](docs/CONFIGURATION.md). The equivalent Chinese reference is [docs/CONFIGURATION.zh.md](docs/CONFIGURATION.zh.md).
 
 ## Proxy Notes
 
@@ -410,17 +410,7 @@ Useful pages:
 
 Shortcut hints are shown at the bottom. Under v5 config, durable provider/routing edits should go through the routing page, provider/routing CLI commands, or raw TOML. Press `R` after manual config edits to reload runtime config.
 
-### GUI
-
-When built with the GUI feature:
-
-```bash
-codex-helper-gui
-# or from source:
-cargo run --release --features gui --bin codex-helper-gui
-```
-
-The egui GUI is deprecated and kept as a legacy fallback. It can still start or explicitly attach to a proxy, edit common single-endpoint providers, route nodes, and routing, and inspect requests, balances, pricing, sessions, health, breaker state, and control-plane status. By default, a GUI-started proxy stops when the GUI exits; attaching to an existing proxy must be selected explicitly, and closing the GUI only detaches instead of stopping someone else’s process. Complex multi-endpoint providers, model mappings, and advanced fields should still be edited through CLI or raw TOML.
+### Desktop Preview
 
 The new Tauri desktop client lives under `apps/desktop` and uses React 19, Tailwind CSS 4, shadcn/ui-style components, and TanStack Router/Query/Table. It already implements Dashboard, Providers, Usage, Settings, read-only admin data, safe control actions, close-to-tray semantics, single instance, launch-at-login settings, lightweight single-config import/export, config/log/cache path openers, common provider edit forms, and a Windows NSIS packaged sidecar build. Windows packaged smoke now covers tray Show/Hide/Quit, Detach, Stop Proxy, second-launch focus, launch-at-login registration, config import/export, and provider editing. v0.19.0 does not publish the desktop installer; the public desktop release remains gated on signing keys, HTTPS release endpoints, artifact hosting, and rollback operations. See [docs/DESKTOP_RELEASE.md](docs/DESKTOP_RELEASE.md) for the desktop packaging contract.
 
@@ -432,7 +422,6 @@ The new Tauri desktop client lives under `apps/desktop` and uses React 19, Tailw
 - Request filter: `~/.codex-helper/filter.json`
 - Request log: `~/.codex-helper/logs/requests.jsonl`
 - Codex relay diagnostic evidence: `~/.codex-helper/logs/codex_relay_evidence.jsonl`
-- GUI config: `~/.codex-helper/gui.toml`
 
 Codex-owned files remain owned by Codex:
 
@@ -458,7 +447,6 @@ codex-helper intentionally avoids:
 - [CHANGELOG.md](CHANGELOG.md): release notes and upgrade notes.
 - [docs/DESKTOP_RELEASE.md](docs/DESKTOP_RELEASE.md): Tauri desktop packaging, sidecar, and release-gate notes.
 - [docs/workstreams/codex-routing-scheduler-observability-refactor/README.md](docs/workstreams/codex-routing-scheduler-observability-refactor/README.md): fearless refactor design for routing scheduler state, throttle/overload outcomes, concurrency limits, and TUI metrics.
-- [docs/workstreams/tauri-desktop-client/REPLACEMENT_READINESS.md](docs/workstreams/tauri-desktop-client/REPLACEMENT_READINESS.md): Tauri desktop readiness, parity gaps, and follow-on split before egui removal.
 - [docs/workstreams/codex-operator-experience-refactor/GAP_MATRIX.md](docs/workstreams/codex-operator-experience-refactor/GAP_MATRIX.md): comparison against cc-switch, aio-coding-hub, and all-api-hub.
 - [docs/workstreams/codex-control-plane-refactor/README.md](docs/workstreams/codex-control-plane-refactor/README.md): control-plane design notes.
 
