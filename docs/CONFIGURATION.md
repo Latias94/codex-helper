@@ -1085,7 +1085,7 @@ RightCode hosts (`www.right.codes` / `right.codes`) are special-cased before the
 
 Explicit adapters are still useful when a relay needs dashboard credentials, custom headers, a custom endpoint, or safer exhaustion handling.
 
-Request-driven balance refreshes are coalesced with a 30-second delay by default, and the same provider is auto-polled at most once every 600 seconds. Explicit `poll_interval_secs` values below 120 seconds are raised to 120 seconds. Manual refresh can still query proactively, but it respects confirmed terminal errors and current-period exhaustion safeguards.
+Request-driven balance refreshes are coalesced with a 60-second delay by default, and the same provider is auto-polled at most once every 600 seconds. Explicit `poll_interval_secs` values below 120 seconds are raised to 120 seconds. Manual refresh can still query proactively, but it respects confirmed terminal errors and current-period exhaustion safeguards.
 
 For `api.openai.com`, codex-helper skips relay-style `/user/balance` probing. If `OPENAI_ADMIN_KEY` is set, it can auto-read `openai_organization_costs`; otherwise the official OpenAI provider remains unknown instead of being treated as exhausted.
 

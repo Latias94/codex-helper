@@ -250,7 +250,7 @@ static USAGE_PROVIDER_TARGET_SUPPRESSIONS: OnceLock<
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 10 * 60;
 // Minimal request-driven poll interval per provider to avoid hammering usage APIs.
 const MIN_POLL_INTERVAL_SECS: u64 = 2 * 60;
-pub const REQUEST_BALANCE_REFRESH_DELAY: Duration = Duration::from_secs(30);
+pub const REQUEST_BALANCE_REFRESH_DELAY: Duration = Duration::from_secs(60);
 const BALANCE_REFRESH_CONCURRENCY: usize = 6;
 const BALANCE_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
 const BALANCE_HTTP_ERROR_BODY_LIMIT: usize = 2_048;
@@ -723,9 +723,7 @@ fn usage_provider_target_suppression_active(
     else {
         return None;
     };
-    let Some(suppression) = suppressions.get(&key).cloned() else {
-        return None;
-    };
+    let suppression = suppressions.get(&key).cloned()?;
     if now < suppression.until {
         Some(suppression)
     } else {
