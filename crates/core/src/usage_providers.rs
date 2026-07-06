@@ -243,14 +243,20 @@ static REQUEST_BALANCE_QUEUE: OnceLock<Mutex<HashMap<RequestBalanceQueueKey, Ins
 static AUTO_PROBE_KIND_HINTS: OnceLock<Mutex<HashMap<String, ProviderKind>>> = OnceLock::new();
 static AUTO_PROBE_KIND_FAILURES: OnceLock<Mutex<HashMap<AutoProbeKindFailureKey, Instant>>> =
     OnceLock::new();
+static USAGE_PROVIDER_TARGET_SUPPRESSIONS: OnceLock<
+    Mutex<HashMap<ProviderTargetSuppressionKey, ProviderTargetSuppression>>,
+> = OnceLock::new();
 
-const DEFAULT_POLL_INTERVAL_SECS: u64 = 60;
-// Minimal poll interval per provider to avoid hammering usage APIs.
-const MIN_POLL_INTERVAL_SECS: u64 = 20;
-pub const REQUEST_BALANCE_REFRESH_DELAY: Duration = Duration::from_secs(8);
+const DEFAULT_POLL_INTERVAL_SECS: u64 = 10 * 60;
+// Minimal request-driven poll interval per provider to avoid hammering usage APIs.
+const MIN_POLL_INTERVAL_SECS: u64 = 2 * 60;
+pub const REQUEST_BALANCE_REFRESH_DELAY: Duration = Duration::from_secs(30);
 const BALANCE_REFRESH_CONCURRENCY: usize = 6;
 const BALANCE_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
+const BALANCE_HTTP_ERROR_BODY_LIMIT: usize = 2_048;
 const AUTO_PROBE_KIND_FAILURE_TTL: Duration = Duration::from_secs(10 * 60);
+const USAGE_PROVIDER_TERMINAL_FAILURE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+const USAGE_PROVIDER_EXHAUSTED_SUPPRESSION_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const LOW_BALANCE_ALERT_THRESHOLD_USD: &str = "10";
 const EXPIRING_SOON_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
 const AUTO_PROVIDER_ID_PREFIX: &str = "auto:balance:";
@@ -267,6 +273,26 @@ struct AutoProbeKindFailureKey {
     provider_id: String,
     target: AutoProbeTargetKey,
     kind: ProviderKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ProviderTargetSuppressionKey {
+    provider_id: String,
+    target: AutoProbeTargetKey,
+}
+
+#[derive(Debug, Clone)]
+struct ProviderTargetSuppression {
+    until: Instant,
+    reason: String,
+    routing_exhausted: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ProviderTargetSuppressionDecision {
+    reason: String,
+    routing_exhausted: bool,
+    ttl: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -395,7 +421,7 @@ fn default_provider_config(
         endpoint: endpoint.to_string(),
         token_env: None,
         require_token_env: false,
-        poll_interval_secs: Some(60),
+        poll_interval_secs: Some(DEFAULT_POLL_INTERVAL_SECS),
         refresh_on_request: true,
         trust_exhaustion_for_routing: true,
         headers: BTreeMap::new(),
@@ -582,6 +608,7 @@ fn remember_auto_probe_kind_success(
             kind,
         });
     }
+    clear_usage_provider_target_suppression(provider_id, target);
 }
 
 fn remember_auto_probe_kind_failure(
@@ -630,6 +657,80 @@ fn auto_probe_kind_failure_active(
     } else {
         failures.remove(&key);
         false
+    }
+}
+
+fn usage_provider_target_suppression_key(
+    provider_id: &str,
+    target: &UsageProviderTarget,
+) -> ProviderTargetSuppressionKey {
+    ProviderTargetSuppressionKey {
+        provider_id: provider_id.to_string(),
+        target: auto_probe_target_key(target),
+    }
+}
+
+fn remember_usage_provider_target_suppression(
+    provider_id: &str,
+    target: &UsageProviderTarget,
+    ttl: Duration,
+    reason: impl Into<String>,
+    routing_exhausted: bool,
+    now: Instant,
+) {
+    if let Ok(mut suppressions) = USAGE_PROVIDER_TARGET_SUPPRESSIONS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        suppressions.insert(
+            usage_provider_target_suppression_key(provider_id, target),
+            ProviderTargetSuppression {
+                until: now + ttl,
+                reason: reason.into(),
+                routing_exhausted,
+            },
+        );
+    }
+}
+
+fn clear_usage_provider_target_suppression(provider_id: &str, target: &UsageProviderTarget) {
+    if let Ok(mut suppressions) = USAGE_PROVIDER_TARGET_SUPPRESSIONS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        suppressions.remove(&usage_provider_target_suppression_key(provider_id, target));
+    }
+}
+
+#[cfg(test)]
+fn clear_usage_provider_target_suppressions_for_provider(provider_id: &str) {
+    if let Some(suppressions) = USAGE_PROVIDER_TARGET_SUPPRESSIONS.get()
+        && let Ok(mut suppressions) = suppressions.lock()
+    {
+        suppressions.retain(|key, _| key.provider_id != provider_id);
+    }
+}
+
+fn usage_provider_target_suppression_active(
+    provider_id: &str,
+    target: &UsageProviderTarget,
+    now: Instant,
+) -> Option<ProviderTargetSuppression> {
+    let key = usage_provider_target_suppression_key(provider_id, target);
+    let Ok(mut suppressions) = USAGE_PROVIDER_TARGET_SUPPRESSIONS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    else {
+        return None;
+    };
+    let Some(suppression) = suppressions.get(&key).cloned() else {
+        return None;
+    };
+    if now < suppression.until {
+        Some(suppression)
+    } else {
+        suppressions.remove(&key);
+        None
     }
 }
 
@@ -1236,20 +1337,31 @@ async fn poll_provider_http_json(
         )
     })?;
 
-    if !resp.status().is_success() {
-        anyhow::bail!(
-            "usage provider HTTP {} from {} via {:?}",
-            resp.status(),
-            origin,
-            provider.kind
-        );
-    }
+    let status = resp.status();
     let content_type = resp
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string)
         .unwrap_or_else(|| "unknown".to_string());
+    if !status.is_success() {
+        let text = resp.text().await.with_context(|| {
+            format!(
+                "usage provider error response read failed from {} via {:?}",
+                origin, provider.kind
+            )
+        })?;
+        let detail = usage_provider_http_error_detail(&text)
+            .map(|detail| format!(": {detail}"))
+            .unwrap_or_default();
+        anyhow::bail!(
+            "usage provider HTTP {} from {} via {:?}{}",
+            status,
+            origin,
+            provider.kind,
+            detail
+        );
+    }
     let text = resp.text().await.with_context(|| {
         format!(
             "usage provider response read failed from {} via {:?}",
@@ -1265,6 +1377,81 @@ async fn poll_provider_http_json(
             text.len()
         )
     })
+}
+
+fn truncate_error_detail(value: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (idx, ch) in value.chars().enumerate() {
+        if idx >= max_chars {
+            out.push_str("...");
+            return out;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn compact_error_detail(value: &str) -> Option<String> {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        None
+    } else {
+        Some(truncate_error_detail(
+            &compact,
+            BALANCE_HTTP_ERROR_BODY_LIMIT,
+        ))
+    }
+}
+
+fn json_error_detail(value: &serde_json::Value) -> Option<String> {
+    let code = first_string_from_paths(
+        value,
+        &[
+            "code",
+            "error.code",
+            "error.type",
+            "type",
+            "data.code",
+            "data.error.code",
+        ],
+    );
+    let message = first_string_from_paths(
+        value,
+        &[
+            "message",
+            "msg",
+            "detail",
+            "error.message",
+            "error_description",
+            "error",
+            "data.message",
+            "data.error.message",
+        ],
+    );
+
+    match (code, message) {
+        (Some(code), Some(message)) if !message.eq_ignore_ascii_case(&code) => {
+            Some(format!("{code}: {message}"))
+        }
+        (Some(code), _) => Some(code),
+        (_, Some(message)) => Some(message),
+        _ => None,
+    }
+}
+
+fn usage_provider_http_error_detail(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed)
+        && let Some(detail) = json_error_detail(&value)
+    {
+        return compact_error_detail(&detail);
+    }
+
+    compact_error_detail(trimmed)
 }
 
 fn amount_from_json(value: &serde_json::Value) -> Option<UsdAmount> {
@@ -2878,6 +3065,55 @@ async fn refresh_provider_target(
     let upstreams = vec![target.upstream.clone()];
     let fetched_at_ms = unix_now_ms();
     let stale_after_ms = stale_after_ms(fetched_at_ms, interval_secs);
+    if let Some(suppression) =
+        usage_provider_target_suppression_active(&provider.id, target, Instant::now())
+    {
+        update_usage_exhausted(
+            lb_states,
+            state,
+            cfg,
+            service_name,
+            &upstreams,
+            suppression.routing_exhausted,
+        )
+        .await;
+        warn!(
+            "usage provider '{}' skipped {}[{}]: balance refresh suppressed: {}",
+            provider.id, target.upstream.station_name, target.upstream.index, suppression.reason
+        );
+        return UsageProviderRefreshOutcome::Failed;
+    }
+    if let Some(decision) = existing_usage_provider_target_suppression_decision(
+        state,
+        service_name,
+        &provider.id,
+        target,
+    )
+    .await
+    {
+        remember_usage_provider_target_suppression(
+            &provider.id,
+            target,
+            decision.ttl,
+            decision.reason.clone(),
+            decision.routing_exhausted,
+            Instant::now(),
+        );
+        update_usage_exhausted(
+            lb_states,
+            state,
+            cfg,
+            service_name,
+            &upstreams,
+            decision.routing_exhausted,
+        )
+        .await;
+        warn!(
+            "usage provider '{}' skipped {}[{}]: existing balance snapshot suppresses refresh: {}",
+            provider.id, target.upstream.station_name, target.upstream.index, decision.reason
+        );
+        return UsageProviderRefreshOutcome::Failed;
+    }
 
     let Some(token) = resolve_token(provider, &upstreams, cfg, service_name) else {
         let snapshot = if provider.kind == ProviderKind::OpenAiOrganizationCosts {
@@ -2915,7 +3151,33 @@ async fn refresh_provider_target(
                 fetched_at_ms,
                 stale_after_ms,
             );
-            let exhausted_for_lb = snapshot.routing_exhausted();
+            let snapshot_error = usage_provider_snapshot_error(&snapshot).map(str::to_string);
+            let terminal_error =
+                usage_provider_snapshot_terminal_error(&snapshot).map(str::to_string);
+            let suppression_reason = usage_provider_snapshot_suppression_reason(&snapshot);
+            let exhausted_for_lb =
+                terminal_error.is_some() || usage_provider_snapshot_blocks_further_usage(&snapshot);
+            if let Some(error) = terminal_error.as_deref() {
+                remember_usage_provider_target_suppression(
+                    &provider.id,
+                    target,
+                    USAGE_PROVIDER_TERMINAL_FAILURE_TTL,
+                    error,
+                    true,
+                    Instant::now(),
+                );
+            } else if let Some(reason) = suppression_reason.as_deref() {
+                remember_usage_provider_target_suppression(
+                    &provider.id,
+                    target,
+                    USAGE_PROVIDER_EXHAUSTED_SUPPRESSION_TTL,
+                    reason,
+                    true,
+                    Instant::now(),
+                );
+            } else {
+                clear_usage_provider_target_suppression(&provider.id, target);
+            }
             update_usage_exhausted(
                 lb_states,
                 state,
@@ -2928,6 +3190,13 @@ async fn refresh_provider_target(
             state
                 .record_provider_balance_snapshot(service_name, snapshot)
                 .await;
+            if let Some(error) = snapshot_error {
+                warn!(
+                    "usage provider '{}' returned error snapshot for {}[{}]: {}",
+                    provider.id, target.upstream.station_name, target.upstream.index, error
+                );
+                return UsageProviderRefreshOutcome::Failed;
+            }
             info!(
                 "usage provider '{}' refreshed {}[{}], exhausted = {}, routing_trusted = {}",
                 provider.id,
@@ -2939,17 +3208,37 @@ async fn refresh_provider_target(
             UsageProviderRefreshOutcome::Refreshed
         }
         Err(err) => {
+            let error = err.to_string();
+            let terminal_failure = usage_provider_error_is_terminal(&error);
+            if terminal_failure {
+                remember_usage_provider_target_suppression(
+                    &provider.id,
+                    target,
+                    USAGE_PROVIDER_TERMINAL_FAILURE_TTL,
+                    error.clone(),
+                    true,
+                    Instant::now(),
+                );
+            }
             state
                 .record_provider_balance_snapshot(
                     service_name,
                     base_snapshot(provider, &upstreams[0], fetched_at_ms, stale_after_ms)
-                        .with_error(err.to_string()),
+                        .with_error(error.clone()),
                 )
                 .await;
-            update_usage_exhausted(lb_states, state, cfg, service_name, &upstreams, false).await;
+            update_usage_exhausted(
+                lb_states,
+                state,
+                cfg,
+                service_name,
+                &upstreams,
+                terminal_failure,
+            )
+            .await;
             warn!(
                 "usage provider '{}' poll failed for {}[{}]: {}",
-                provider.id, target.upstream.station_name, target.upstream.index, err
+                provider.id, target.upstream.station_name, target.upstream.index, error
             );
             UsageProviderRefreshOutcome::Failed
         }
@@ -3096,6 +3385,179 @@ fn auto_snapshot_is_usable(snapshot: &ProviderBalanceSnapshot) -> bool {
         )
 }
 
+fn normalized_error_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| match ch {
+            '_' | '-' | '.' | '/' | ':' | '[' | ']' | '(' | ')' | ',' | ';' => ' ',
+            _ => ch.to_ascii_lowercase(),
+        })
+        .collect::<String>()
+}
+
+fn usage_provider_error_is_terminal(error: &str) -> bool {
+    let normalized = normalized_error_text(error);
+    let terminal_markers = [
+        "user inactive",
+        "user account is not active",
+        "account is not active",
+        "account inactive",
+        "account disabled",
+        "user disabled",
+        "api key disabled",
+        "api key is disabled",
+        "api key inactive",
+        "api key is not active",
+        "key inactive",
+        "key disabled",
+        "invalid api key",
+        "invalid token",
+        "invalid bearer token",
+        "token invalid",
+        "unauthorized api key",
+        "insufficient balance",
+        "balance insufficient",
+        "insufficient quota",
+        "quota exhausted",
+        "quota exceeded",
+        "no balance",
+        "余额不足",
+        "额度不足",
+        "配额不足",
+        "账户未激活",
+        "账号未激活",
+        "用户未激活",
+        "账户已禁用",
+        "账号已禁用",
+        "用户已禁用",
+        "密钥无效",
+        "令牌无效",
+    ];
+    terminal_markers
+        .iter()
+        .any(|marker| normalized.contains(marker))
+}
+
+fn quota_period_is_current_day(period: &str) -> bool {
+    let normalized = period.trim().to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "daily" | "day" | "today" | "current_day" | "current-day" | "1d" | "24h" | "今日" | "今天"
+    )
+}
+
+fn snapshot_has_current_day_quota_exhaustion(snapshot: &ProviderBalanceSnapshot) -> bool {
+    snapshot.exhausted == Some(true)
+        && snapshot
+            .quota_period
+            .as_deref()
+            .is_some_and(quota_period_is_current_day)
+}
+
+fn usage_provider_snapshot_suppression_reason(
+    snapshot: &ProviderBalanceSnapshot,
+) -> Option<String> {
+    if snapshot.status_at(snapshot.fetched_at_ms) != BalanceSnapshotStatus::Exhausted {
+        return None;
+    }
+
+    if snapshot_has_current_day_quota_exhaustion(snapshot) {
+        let period = snapshot.quota_period.as_deref().unwrap_or("daily");
+        return Some(format!(
+            "{period} package quota exhausted for current period"
+        ));
+    }
+
+    if snapshot.routing_exhausted() {
+        return Some("balance exhausted".to_string());
+    }
+
+    None
+}
+
+fn usage_provider_snapshot_blocks_further_usage(snapshot: &ProviderBalanceSnapshot) -> bool {
+    usage_provider_snapshot_suppression_reason(snapshot).is_some()
+}
+
+fn usage_provider_snapshot_error(snapshot: &ProviderBalanceSnapshot) -> Option<&str> {
+    snapshot
+        .error
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn usage_provider_snapshot_terminal_error(snapshot: &ProviderBalanceSnapshot) -> Option<&str> {
+    usage_provider_snapshot_error(snapshot).filter(|error| usage_provider_error_is_terminal(error))
+}
+
+fn usage_provider_suppression_decision_from_snapshot(
+    snapshot: &ProviderBalanceSnapshot,
+) -> Option<ProviderTargetSuppressionDecision> {
+    if let Some(error) = usage_provider_snapshot_terminal_error(snapshot) {
+        return Some(ProviderTargetSuppressionDecision {
+            reason: error.to_string(),
+            routing_exhausted: true,
+            ttl: USAGE_PROVIDER_TERMINAL_FAILURE_TTL,
+        });
+    }
+
+    usage_provider_snapshot_suppression_reason(snapshot).map(|reason| {
+        ProviderTargetSuppressionDecision {
+            reason,
+            routing_exhausted: true,
+            ttl: USAGE_PROVIDER_EXHAUSTED_SUPPRESSION_TTL,
+        }
+    })
+}
+
+fn provider_balance_snapshot_matches_target(
+    snapshot: &ProviderBalanceSnapshot,
+    provider_id: &str,
+    target: &UsageProviderTarget,
+) -> bool {
+    if snapshot.provider_id != provider_id {
+        return false;
+    }
+    if snapshot.station_name.as_deref() != Some(target.upstream.station_name.as_str()) {
+        return false;
+    }
+    if snapshot.upstream_index != Some(target.upstream.index) {
+        return false;
+    }
+
+    match (
+        snapshot.provider_endpoint_key.as_deref(),
+        target
+            .upstream
+            .provider_endpoint
+            .as_ref()
+            .map(ProviderEndpointKey::stable_key),
+    ) {
+        (Some(snapshot_key), Some(target_key)) => snapshot_key == target_key,
+        _ => true,
+    }
+}
+
+async fn existing_usage_provider_target_suppression_decision(
+    state: &Arc<ProxyState>,
+    service_name: &str,
+    provider_id: &str,
+    target: &UsageProviderTarget,
+) -> Option<ProviderTargetSuppressionDecision> {
+    let view = state.get_provider_balance_view(service_name).await;
+    view.get(&target.upstream.station_name)
+        .and_then(|snapshots| {
+            snapshots
+                .iter()
+                .filter(|snapshot| {
+                    provider_balance_snapshot_matches_target(snapshot, provider_id, target)
+                })
+                .max_by_key(|snapshot| snapshot.fetched_at_ms)
+                .and_then(usage_provider_suppression_decision_from_snapshot)
+        })
+}
+
 fn auto_probe_error_summary(probe_errors: &[String]) -> Option<String> {
     (!probe_errors.is_empty()).then(|| format!("attempts failed: {}", probe_errors.join("; ")))
 }
@@ -3168,6 +3630,58 @@ async fn auto_probe_provider_target(
 
     let first_provider = auto_usage_provider(target, first_auto_probe_kind(target));
     let provider_id = first_provider.id.clone();
+    if let Some(suppression) =
+        usage_provider_target_suppression_active(&provider_id, target, Instant::now())
+    {
+        update_usage_exhausted(
+            lb_states,
+            state,
+            cfg,
+            service_name,
+            &upstreams,
+            suppression.routing_exhausted,
+        )
+        .await;
+        warn!(
+            "auto usage provider '{}' skipped {}[{}]: balance refresh suppressed: {}",
+            first_provider.id,
+            target.upstream.station_name,
+            target.upstream.index,
+            suppression.reason
+        );
+        return UsageProviderRefreshOutcome::Failed;
+    }
+    if let Some(decision) = existing_usage_provider_target_suppression_decision(
+        state,
+        service_name,
+        &provider_id,
+        target,
+    )
+    .await
+    {
+        remember_usage_provider_target_suppression(
+            &provider_id,
+            target,
+            decision.ttl,
+            decision.reason.clone(),
+            decision.routing_exhausted,
+            Instant::now(),
+        );
+        update_usage_exhausted(
+            lb_states,
+            state,
+            cfg,
+            service_name,
+            &upstreams,
+            decision.routing_exhausted,
+        )
+        .await;
+        warn!(
+            "auto usage provider '{}' skipped {}[{}]: existing balance snapshot suppresses refresh: {}",
+            first_provider.id, target.upstream.station_name, target.upstream.index, decision.reason
+        );
+        return UsageProviderRefreshOutcome::Failed;
+    }
 
     let Some(token) = resolve_token(&first_provider, &upstreams, cfg, service_name) else {
         state
@@ -3224,7 +3738,20 @@ async fn auto_probe_provider_target(
                 );
                 if auto_snapshot_is_usable(&snapshot) {
                     remember_auto_probe_kind_success(&provider_id, target, kind);
-                    let exhausted_for_lb = snapshot.routing_exhausted();
+                    let suppression_reason = usage_provider_snapshot_suppression_reason(&snapshot);
+                    let exhausted_for_lb = usage_provider_snapshot_blocks_further_usage(&snapshot);
+                    if let Some(reason) = suppression_reason.as_deref() {
+                        remember_usage_provider_target_suppression(
+                            &provider_id,
+                            target,
+                            USAGE_PROVIDER_EXHAUSTED_SUPPRESSION_TTL,
+                            reason,
+                            true,
+                            Instant::now(),
+                        );
+                    } else {
+                        clear_usage_provider_target_suppression(&provider_id, target);
+                    }
                     update_usage_exhausted(
                         lb_states,
                         state,
@@ -3274,10 +3801,29 @@ async fn auto_probe_provider_target(
                     fetched_at_ms,
                     stale_after_ms,
                 )
-                .with_error(error),
+                .with_error(error.clone()),
             )
             .await;
-        update_usage_exhausted(lb_states, state, cfg, service_name, &upstreams, false).await;
+        let terminal_failure = usage_provider_error_is_terminal(error.as_str());
+        if terminal_failure {
+            remember_usage_provider_target_suppression(
+                &provider_id,
+                target,
+                USAGE_PROVIDER_TERMINAL_FAILURE_TTL,
+                error.clone(),
+                true,
+                Instant::now(),
+            );
+        }
+        update_usage_exhausted(
+            lb_states,
+            state,
+            cfg,
+            service_name,
+            &upstreams,
+            terminal_failure,
+        )
+        .await;
     }
     UsageProviderRefreshOutcome::Failed
 }
@@ -3643,6 +4189,19 @@ mod tests {
 
     use crate::balance::BalanceSnapshotStatus;
     use crate::config::{ServiceConfig, UpstreamAuth, UpstreamConfig};
+    use axum::routing::get;
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::net::TcpListener;
+
+    async fn spawn_axum_server(app: axum::Router) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        (addr, handle)
+    }
 
     fn provider(id: &str, kind: ProviderKind) -> UsageProviderConfig {
         UsageProviderConfig {
@@ -3761,6 +4320,7 @@ mod tests {
         {
             failures.retain(|key, _| key.provider_id != provider_id);
         }
+        clear_usage_provider_target_suppressions_for_provider(provider_id);
     }
 
     #[test]
@@ -3946,6 +4506,37 @@ mod tests {
 
         provider.refresh_on_request = false;
         assert_eq!(effective_poll_interval_secs(&provider), None);
+    }
+
+    #[test]
+    fn usage_provider_http_error_detail_extracts_json_code_and_message() {
+        let detail = usage_provider_http_error_detail(
+            r#"{"code":"USER_INACTIVE","message":"User account is not active"}"#,
+        )
+        .expect("error detail");
+
+        assert_eq!(detail, "USER_INACTIVE: User account is not active");
+        assert!(usage_provider_error_is_terminal(&detail));
+    }
+
+    #[test]
+    fn current_day_quota_exhaustion_blocks_followup_usage_even_when_display_only() {
+        let mut snapshot = ProviderBalanceSnapshot {
+            status: BalanceSnapshotStatus::Exhausted,
+            exhausted: Some(true),
+            exhaustion_affects_routing: false,
+            quota_period: Some("daily".to_string()),
+            quota_remaining_usd: Some("0".to_string()),
+            ..ProviderBalanceSnapshot::default()
+        };
+        snapshot.refresh_status(0);
+
+        assert!(!snapshot.routing_exhausted());
+        assert!(usage_provider_snapshot_blocks_further_usage(&snapshot));
+        assert_eq!(
+            usage_provider_snapshot_suppression_reason(&snapshot).as_deref(),
+            Some("daily package quota exhausted for current period")
+        );
     }
 
     #[test]
@@ -4418,6 +5009,170 @@ mod tests {
                 .unwrap_or(true)
         );
         clear_auto_probe_kind_state(provider_id);
+    }
+
+    #[tokio::test]
+    async fn auto_probe_terminal_auth_failure_keeps_route_exhausted_during_suppression() {
+        let provider_id = "input-terminal-auth";
+        clear_auto_probe_kind_state(provider_id);
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let counter = request_count.clone();
+        let app = axum::Router::new().fallback(get(move || {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                (
+                    axum::http::StatusCode::UNAUTHORIZED,
+                    axum::Json(serde_json::json!({
+                        "code": "USER_INACTIVE",
+                        "message": "User account is not active"
+                    })),
+                )
+            }
+        }));
+        let (addr, handle) = spawn_axum_server(app).await;
+        let base_url = format!("http://{addr}/v1");
+        let mut upstream = endpoint_upstream_config(&base_url, provider_id, "default");
+        upstream.auth.auth_token = Some("model-key".to_string());
+        let cfg = proxy_config(vec![service_config("routing", vec![upstream])]);
+        let lb_states = Arc::new(Mutex::new(HashMap::new()));
+        let state = ProxyState::new();
+        let target = usage_provider_target(&base_url, provider_id);
+
+        let outcome =
+            auto_probe_provider_target(&Client::new(), &target, &cfg, &lb_states, &state, "codex")
+                .await;
+
+        assert_eq!(outcome, UsageProviderRefreshOutcome::Failed);
+        assert!(request_count.load(Ordering::SeqCst) > 0);
+        {
+            let guard = lb_states.lock().expect("lb states");
+            assert!(
+                guard
+                    .get("routing")
+                    .and_then(|entry| entry.usage_exhausted.first())
+                    .copied()
+                    .unwrap_or(false)
+            );
+        }
+        let view = state.get_provider_balance_view("codex").await;
+        let snapshot = view
+            .get("routing")
+            .and_then(|snapshots| {
+                snapshots
+                    .iter()
+                    .find(|snapshot| snapshot.provider_id == provider_id)
+            })
+            .expect("terminal auth failure snapshot");
+        assert!(
+            snapshot
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("User account is not active")
+        );
+
+        let requests_after_first_probe = request_count.load(Ordering::SeqCst);
+        let suppressed_outcome =
+            auto_probe_provider_target(&Client::new(), &target, &cfg, &lb_states, &state, "codex")
+                .await;
+
+        assert_eq!(suppressed_outcome, UsageProviderRefreshOutcome::Failed);
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            requests_after_first_probe
+        );
+        let guard = lb_states.lock().expect("lb states");
+        assert!(
+            guard
+                .get("routing")
+                .and_then(|entry| entry.usage_exhausted.first())
+                .copied()
+                .unwrap_or(false)
+        );
+        clear_auto_probe_kind_state(provider_id);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn auto_probe_daily_package_exhaustion_suppresses_followup_refresh() {
+        let provider_id = "input-daily-exhausted";
+        clear_auto_probe_kind_state(provider_id);
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let counter = request_count.clone();
+        let app = axum::Router::new().fallback(get(move || {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                axum::Json(serde_json::json!({
+                    "isValid": true,
+                    "mode": "unrestricted",
+                    "planName": "CodeX Lite",
+                    "subscription": {
+                        "daily_usage_usd": 100,
+                        "daily_limit_usd": 100,
+                        "weekly_usage_usd": 100,
+                        "weekly_limit_usd": 0,
+                        "monthly_usage_usd": 100,
+                        "monthly_limit_usd": 0
+                    }
+                }))
+            }
+        }));
+        let (addr, handle) = spawn_axum_server(app).await;
+        let base_url = format!("http://{addr}/v1");
+        let mut upstream = endpoint_upstream_config(&base_url, provider_id, "default");
+        upstream.auth.auth_token = Some("model-key".to_string());
+        let cfg = proxy_config(vec![service_config("routing", vec![upstream])]);
+        let lb_states = Arc::new(Mutex::new(HashMap::new()));
+        let state = ProxyState::new();
+        let target = usage_provider_target(&base_url, provider_id);
+
+        let outcome =
+            auto_probe_provider_target(&Client::new(), &target, &cfg, &lb_states, &state, "codex")
+                .await;
+
+        assert_eq!(outcome, UsageProviderRefreshOutcome::Refreshed);
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        {
+            let guard = lb_states.lock().expect("lb states");
+            assert!(
+                guard
+                    .get("routing")
+                    .and_then(|entry| entry.usage_exhausted.first())
+                    .copied()
+                    .unwrap_or(false)
+            );
+        }
+        let view = state.get_provider_balance_view("codex").await;
+        let snapshot = view
+            .get("routing")
+            .and_then(|snapshots| {
+                snapshots
+                    .iter()
+                    .find(|snapshot| snapshot.provider_id == provider_id)
+            })
+            .expect("daily exhausted snapshot");
+        assert_eq!(snapshot.status, BalanceSnapshotStatus::Exhausted);
+        assert_eq!(snapshot.quota_period.as_deref(), Some("daily"));
+        assert!(snapshot.routing_ignored_exhaustion());
+
+        let suppressed_outcome =
+            auto_probe_provider_target(&Client::new(), &target, &cfg, &lb_states, &state, "codex")
+                .await;
+
+        assert_eq!(suppressed_outcome, UsageProviderRefreshOutcome::Failed);
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        let guard = lb_states.lock().expect("lb states");
+        assert!(
+            guard
+                .get("routing")
+                .and_then(|entry| entry.usage_exhausted.first())
+                .copied()
+                .unwrap_or(false)
+        );
+        clear_auto_probe_kind_state(provider_id);
+        handle.abort();
     }
 
     #[test]

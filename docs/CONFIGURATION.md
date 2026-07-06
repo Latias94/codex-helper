@@ -1085,6 +1085,8 @@ RightCode hosts (`www.right.codes` / `right.codes`) are special-cased before the
 
 Explicit adapters are still useful when a relay needs dashboard credentials, custom headers, a custom endpoint, or safer exhaustion handling.
 
+Request-driven balance refreshes are coalesced with a 30-second delay by default, and the same provider is auto-polled at most once every 600 seconds. Explicit `poll_interval_secs` values below 120 seconds are raised to 120 seconds. Manual refresh can still query proactively, but it respects confirmed terminal errors and current-period exhaustion safeguards.
+
 For `api.openai.com`, codex-helper skips relay-style `/user/balance` probing. If `OPENAI_ADMIN_KEY` is set, it can auto-read `openai_organization_costs`; otherwise the official OpenAI provider remains unknown instead of being treated as exhausted.
 
 OpenAI's public platform surface is not a wallet-balance API. It exposes organization-level costs/usage views, which are suitable for showing current spend but not for routing off a wallet balance or subscription remainder. To connect the official OpenAI billing view, use:
@@ -1099,7 +1101,7 @@ OpenAI's public platform surface is not a wallet-balance API. It exposes organiz
       "token_env": "OPENAI_ADMIN_KEY",
       "require_token_env": true,
       "endpoint": "https://api.openai.com/v1/organization/costs?start_time={{unix_days_ago:30}}&limit=30",
-      "poll_interval_secs": 60,
+      "poll_interval_secs": 600,
       "refresh_on_request": false,
       "trust_exhaustion_for_routing": false
     }
@@ -1120,7 +1122,7 @@ Sub2API API-key telemetry:
       "id": "input-monthly",
       "kind": "sub2api_usage",
       "domains": ["ai.input.im"],
-      "poll_interval_secs": 60,
+      "poll_interval_secs": 600,
       "refresh_on_request": true,
       "trust_exhaustion_for_routing": true
     }
@@ -1139,7 +1141,7 @@ RightCode account summary:
       "domains": ["www.right.codes", "right.codes"],
       "endpoint": "https://www.right.codes/account/summary",
       "token_env": "RIGHTCODE_API_KEY",
-      "poll_interval_secs": 60,
+      "poll_interval_secs": 600,
       "refresh_on_request": true,
       "trust_exhaustion_for_routing": false
     }
@@ -1163,7 +1165,7 @@ New API dashboard-style quota:
       "headers": {
         "New-Api-User": "{{env:RIGHTCODE_NEWAPI_USER_ID}}"
       },
-      "poll_interval_secs": 60,
+      "poll_interval_secs": 600,
       "refresh_on_request": true,
       "trust_exhaustion_for_routing": true
     }
@@ -1175,12 +1177,13 @@ Important balance behavior:
 
 - Lookup failure is displayed as `unknown`, not exhausted, and does not change route graph config.
 - Known exhausted snapshots can demote automatic routing only when `trust_exhaustion_for_routing = true`.
+- Terminal errors such as inactive accounts, invalid keys, insufficient balance, or exhausted quota temporarily disable that provider target and suppress follow-up balance requests for 6 hours to avoid repeatedly hitting unusable accounts.
 - Sub2API lazy subscription-window zeros are displayed as lazy reset state before a real request refreshes the period; they should not be confused with a durable package design choice.
-- Sub2API subscription-mode `remaining` is a period-limit capacity signal, not a wallet balance. A zero `remaining` means at least one configured subscription window is currently exhausted and may demote routing once trusted.
+- Sub2API subscription-mode `remaining` is a period-limit capacity signal, not a wallet balance. A zero `remaining` means at least one configured subscription window is currently exhausted; when the current daily/today window is exhausted, codex-helper suppresses follow-up balance requests and temporarily skips that target even if the package signal is display-only.
 - New API quota values are quota units converted with `QuotaPerUnit = 500000`; token usage snapshots with `unlimited_quota = true` are never treated as exhausted.
 - RightCode `balance` is shown as wallet balance. Matched `subscriptions[*].total_quota` and `remaining_quota` are shown as daily quota; `reset_today = false` means codex-helper includes today's fresh daily quota before displaying remaining quota.
 - If a provider reports misleading zero balances for active subscriptions, set `trust_exhaustion_for_routing = false`.
-- UI surfaces cached balance snapshots; manual refresh uses `POST /__codex_helper/api/v1/providers/balances/refresh`.
+- UI surfaces cached balance snapshots; manual refresh uses `POST /__codex_helper/api/v1/providers/balances/refresh` and also avoids targets with confirmed terminal errors or current-period exhaustion.
 - Balance HTTP calls are bounded and reuse the same outbound client as proxy runtime calls. A failed lookup should surface the probed origin and adapter kind in logs, for example whether `sub2api_usage` or `openai_balance_http_json` returned non-JSON.
 
 ## Usage / Balance Page
