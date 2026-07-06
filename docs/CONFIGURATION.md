@@ -1274,7 +1274,7 @@ Use pricing overrides for local corrections or relay-specific multipliers. Do no
 
 Initialize or inspect migration:
 
-Normal startup, including the default TUI path, performs config migration automatically. Use the migration commands only when you want to preview or diagnose the migration explicitly.
+Normal startup, including the default TUI path, requires a current `version = 5` `config.toml`. If an older TOML or `config.json` is present, startup stops with a migration-required error; use the migration commands below to preview and then explicitly write the new file.
 
 ```bash
 codex-helper config init
@@ -1432,18 +1432,18 @@ Advanced multi-endpoint providers, model mappings, custom balance extraction rul
 
 ## Migration
 
-The current route graph schema writes `version = 5`. Existing `version = 4` route graph configs still load as migration input.
+The current route graph schema writes `version = 5`. Normal startup only accepts a current `config.toml` with `version = 5`.
 
-Normal users usually do not need to run migration commands by hand. Starting codex-helper, including the default TUI startup path, loads legacy `version = 4`, `version = 3`, `version = 2`, unversioned TOML, and legacy `config.json`, then migrates them to `config.toml` with `version = 5`. The previous file is copied to `config.toml.bak` or `config.json.bak` before writing the new file.
-
-During migration, codex-helper writes missing route-graph affinity as `affinity_policy = "fallback-sticky"` so the on-disk config is explicit. Existing configs can still set either policy depending on whether official relay continuity or fastest return to the preferred group matters more; configs that explicitly keep `preferred-group` may be called out in migration previews so operators notice the trade-off.
-
-Manual migration commands are mainly for previewing or diagnosing a migration without going through the normal TUI/proxy startup path:
+Legacy `version = 4`, `version = 3`, `version = 2`, unversioned TOML, and legacy `config.json` files are migration input only. Starting codex-helper, including the default TUI startup path, now stops with a migration-required error instead of rewriting old files implicitly. Preview the generated v5 TOML first, then opt in to writing it:
 
 ```bash
 codex-helper config migrate --dry-run
 codex-helper config migrate --write --yes
 ```
+
+When `--write --yes` writes the new file, the previous file is copied to `config.toml.bak` or `config.json.bak` first.
+
+During migration, codex-helper writes missing route-graph affinity as `affinity_policy = "fallback-sticky"` so the on-disk config is explicit. Existing configs can still set either policy depending on whether official relay continuity or fastest return to the preferred group matters more; configs that explicitly keep `preferred-group` may be called out in migration previews so operators notice the trade-off. The command is intentionally explicit so automated restarts and foreground TUI sessions cannot silently change persistent config.
 
 Migration rules:
 

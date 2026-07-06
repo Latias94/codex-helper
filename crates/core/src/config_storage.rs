@@ -422,7 +422,9 @@ fn ensure_config_version(cfg: &mut ProxyConfig) {
 
 const CONFIG_TOML_DOC_HEADER: &str = r#"# codex-helper config.toml
 #
-# 本文件可选；如果存在，codex-helper 会优先使用它（而不是 config.json）。
+# 启动路径只接受当前 `version = 5` TOML。旧版 TOML 或 config.json
+# 需要先用 `codex-helper config migrate --dry-run` 预览，再用
+# `codex-helper config migrate --write --yes` 显式写入。
 #
 # 常用命令：
 # - 生成带注释的模板：`codex-helper config init`
@@ -435,9 +437,10 @@ const CONFIG_TOML_DOC_HEADER: &str = r#"# codex-helper config.toml
 
 const CONFIG_TOML_TEMPLATE: &str = r#"# codex-helper config.toml
 #
-# codex-helper 同时支持 config.json 与 config.toml：
-# - 如果 `config.toml` 存在，则优先使用它；
-# - 否则使用 `config.json`（兼容旧版本）。
+# codex-helper 启动路径只读取当前 `version = 5` 的 config.toml。
+# 如果你还有旧版 TOML 或 config.json，请先运行：
+# - 预览：`codex-helper config migrate --dry-run`
+# - 写入：`codex-helper config migrate --write --yes`
 #
 # 本模板以“可发现性”为主：包含可直接抄的示例，以及每个字段的说明。
 #
@@ -493,7 +496,7 @@ version = 5
 # body.prompt_cache_key 作为缺省 session affinity 信号。极少数中转若必须接收
 # 原始 Codex 压缩体，请在启动 helper 的环境里设置：
 # CODEX_HELPER_REQUEST_BODY_ENCODING=passthrough
-# 兼容性：旧配置键 mode 仍会被读取；保存/生成配置时统一写 preset。
+# 兼容性：显式迁移旧配置时仍会读取旧键 mode；保存/生成配置时统一写 preset。
 #
 # [codex.client_patch]
 # preset = "default"
@@ -874,59 +877,28 @@ pub async fn load_config_with_v4_source() -> Result<LoadedProxyConfig> {
         let text = fs::read_to_string(&toml_path).await?;
         let version = toml_schema_version_or_shape(&text);
 
-        let mut loaded_v4 = None;
-        let mut cfg = if version.is_some_and(is_supported_route_graph_config_version) {
-            let cfg_v4 = toml::from_str::<ProxyConfigV4>(&text)?;
-            let runtime = compile_v4_to_runtime(&cfg_v4)?;
-            loaded_v4 = Some(cfg_v4);
-            runtime
-        } else if version == Some(3) {
-            let cfg_legacy = toml::from_str::<crate::config::legacy::ProxyConfigV3Legacy>(&text)?;
-            let migrated = crate::config::legacy::migrate_v3_legacy_to_v4(&cfg_legacy)?;
-            let runtime = compile_v4_to_runtime(&migrated.config)?;
-            loaded_v4 = Some(migrated.config);
-            runtime
-        } else if version == Some(2) {
-            let cfg_v2 = toml::from_str::<ProxyConfigV2>(&text)?;
-            compile_v2_to_runtime(&cfg_v2)?
-        } else {
-            let mut cfg = toml::from_str::<ProxyConfig>(&text)?;
-            ensure_config_version(&mut cfg);
-            cfg
-        };
+        if version != Some(CURRENT_ROUTE_GRAPH_CONFIG_VERSION) {
+            return Err(migration_required_error("config.toml", version));
+        }
+
+        let cfg_v4 = toml::from_str::<ProxyConfigV4>(&text)?;
+        let mut cfg = compile_v4_to_runtime(&cfg_v4)?;
         normalize_proxy_config(&mut cfg);
         validate_proxy_config(&cfg)?;
-        if version != Some(CURRENT_ROUTE_GRAPH_CONFIG_VERSION) {
-            if let Some(cfg_v4) = loaded_v4.as_mut() {
-                auto_migrate_loaded_v4_config(cfg_v4, "config.toml", version).await;
-                cfg_v4.version = CURRENT_ROUTE_GRAPH_CONFIG_VERSION;
-                cfg.version = Some(CURRENT_ROUTE_GRAPH_CONFIG_VERSION);
-            } else {
-                auto_migrate_loaded_config(&mut cfg, "config.toml", version).await;
-            }
-        } else if let Some(cfg_v4) = loaded_v4.as_ref() {
-            auto_compact_loaded_v4_config(cfg_v4, "config.toml").await;
-        }
-        auto_normalize_loaded_config_toml_authoring("config.toml").await;
         return Ok(LoadedProxyConfig {
             runtime: cfg,
-            v4: loaded_v4,
+            v4: Some(cfg_v4),
         });
     }
 
     let json_path = config_path();
     if json_path.exists() {
-        let bytes = fs::read(json_path).await?;
-        let mut cfg = serde_json::from_slice::<ProxyConfig>(&bytes)?;
-        let version = cfg.version;
-        ensure_config_version(&mut cfg);
-        normalize_proxy_config(&mut cfg);
-        validate_proxy_config(&cfg)?;
-        auto_migrate_loaded_config(&mut cfg, "config.json", version).await;
-        return Ok(LoadedProxyConfig {
-            runtime: cfg,
-            v4: None,
-        });
+        let bytes = fs::read(&json_path).await?;
+        let version = serde_json::from_slice::<JsonValue>(&bytes)
+            .ok()
+            .and_then(|value| value.get("version").and_then(JsonValue::as_u64))
+            .map(|value| value as u32);
+        return Err(migration_required_error("config.json", version));
     }
 
     let mut cfg = ProxyConfig::default();
@@ -939,135 +911,20 @@ pub async fn load_config_with_v4_source() -> Result<LoadedProxyConfig> {
     })
 }
 
-async fn auto_migrate_loaded_config(
-    cfg: &mut ProxyConfig,
-    source: &str,
-    source_version: Option<u32>,
-) {
-    match save_config(cfg).await {
-        Ok(()) => {
-            cfg.version = Some(CURRENT_ROUTE_GRAPH_CONFIG_VERSION);
-            info!(
-                "auto-migrated {} from version {:?} to version {}",
-                source, source_version, CURRENT_ROUTE_GRAPH_CONFIG_VERSION
-            );
-        }
-        Err(err) => {
-            warn!(
-                "failed to auto-migrate {} from version {:?} to version {}: {}",
-                source, source_version, CURRENT_ROUTE_GRAPH_CONFIG_VERSION, err
-            );
-        }
-    }
-}
-
-async fn auto_migrate_loaded_v4_config(
-    cfg: &ProxyConfigV4,
-    source: &str,
-    source_version: Option<u32>,
-) {
-    match save_config_v4(cfg).await {
-        Ok(_) => {
-            info!(
-                "auto-migrated {} from version {:?} to version {}",
-                source, source_version, CURRENT_ROUTE_GRAPH_CONFIG_VERSION
-            );
-        }
-        Err(err) => {
-            warn!(
-                "failed to auto-migrate {} from version {:?} to version {}: {}",
-                source, source_version, CURRENT_ROUTE_GRAPH_CONFIG_VERSION, err
-            );
-        }
-    }
+fn migration_required_error(source: &str, source_version: Option<u32>) -> anyhow::Error {
+    let version_label = source_version
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "legacy/unversioned".to_string());
+    anyhow::anyhow!(
+        "{} uses config schema {}; normal startup only accepts version = {}. Run `codex-helper config migrate --write --yes` to migrate explicitly, or `codex-helper config migrate --dry-run` to preview.",
+        source,
+        version_label,
+        CURRENT_ROUTE_GRAPH_CONFIG_VERSION
+    )
 }
 
 fn runtime_service_manager_value(mgr: &ServiceConfigManager) -> Result<JsonValue> {
     serde_json::to_value(mgr).context("serialize runtime service manager")
-}
-
-fn v4_service_has_import_metadata(view: &ServiceViewV4) -> bool {
-    view.providers.values().any(|provider| {
-        provider.tags.contains_key("provider_id")
-            || provider.tags.contains_key("requires_openai_auth")
-            || provider
-                .tags
-                .get("source")
-                .is_some_and(|value| value == "codex-config")
-            || provider.endpoints.values().any(|endpoint| {
-                endpoint.tags.contains_key("provider_id")
-                    || endpoint.tags.contains_key("requires_openai_auth")
-                    || endpoint
-                        .tags
-                        .get("source")
-                        .is_some_and(|value| value == "codex-config")
-            })
-    })
-}
-
-async fn auto_compact_loaded_v4_config(cfg: &ProxyConfigV4, source: &str) {
-    if !v4_service_has_import_metadata(&cfg.codex) && !v4_service_has_import_metadata(&cfg.claude) {
-        return;
-    }
-
-    match save_config_v4(cfg).await {
-        Ok(_) => {
-            info!(
-                "auto-compacted {} v4 provider config metadata for authoring format",
-                source
-            );
-        }
-        Err(err) => {
-            warn!(
-                "failed to auto-compact {} v4 provider config metadata: {}",
-                source, err
-            );
-        }
-    }
-}
-
-async fn auto_normalize_loaded_config_toml_authoring(source: &str) {
-    let path = config_toml_path();
-    let text = match fs::read_to_string(&path).await {
-        Ok(text) => text,
-        Err(err) => {
-            warn!(
-                "failed to read {} while normalizing config authoring fields: {}",
-                source, err
-            );
-            return;
-        }
-    };
-    let normalized = match normalize_config_toml_authoring_text(&text) {
-        Ok(Some(normalized)) => normalized,
-        Ok(None) => return,
-        Err(err) => {
-            warn!(
-                "failed to normalize {} config authoring fields: {}",
-                source, err
-            );
-            return;
-        }
-    };
-
-    let backup_path = config_toml_backup_path();
-    if path.exists()
-        && let Err(err) = fs::copy(&path, &backup_path).await
-    {
-        warn!("failed to backup {:?} to {:?}: {}", path, backup_path, err);
-    }
-
-    match write_bytes_file_async(&path, normalized.as_bytes()).await {
-        Ok(()) => {
-            info!("auto-normalized {} config authoring fields", source);
-        }
-        Err(err) => {
-            warn!(
-                "failed to auto-normalize {} config authoring fields: {}",
-                source, err
-            );
-        }
-    }
 }
 
 async fn save_existing_v4_if_only_runtime_metadata_changed(

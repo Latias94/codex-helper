@@ -16,11 +16,11 @@ fn load_config_prefers_toml_over_json() {
         // JSON sets notify.enabled=false
         write_file(&json_path, r#"{"version":1,"notify":{"enabled":false}}"#);
 
-        // TOML overrides notify.enabled=true
+        // TOML v5 overrides notify.enabled=true; legacy JSON still loses precedence.
         write_file(
             &toml_path,
             r#"
-version = 1
+version = 5
 
 [notify]
 enabled = true
@@ -37,9 +37,8 @@ enabled = true
 }
 
 #[test]
-fn load_config_toml_allows_missing_service_name_and_infers_from_key() {
-    let env = setup_temp_codex_home();
-    let home = env.home.clone();
+fn load_config_legacy_toml_requires_explicit_migration() {
+    let _env = setup_temp_codex_home();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -65,22 +64,15 @@ auth_token_env = "RIGHTCODE_API_KEY"
 "#,
         );
 
-        let cfg = super::load_config().await.expect("load_config");
-        let svc = cfg
-            .codex
-            .configs
-            .get("right")
-            .expect("codex config 'right'");
-        assert_eq!(
-            svc.name, "right",
-            "expected ServiceConfig.name to default to the map key (home={:?})",
-            home
-        );
+        let err = super::load_config()
+            .await
+            .expect_err("legacy TOML should require explicit migration");
+        assert_migration_required(&err, "schema 1");
     });
 }
 
 #[test]
-fn load_config_auto_migrates_unversioned_legacy_toml_to_v4() {
+fn load_config_unversioned_legacy_toml_requires_explicit_migration() {
     let _env = setup_temp_codex_home();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -104,20 +96,14 @@ auth_token_env = "RIGHTCODE_API_KEY"
 "#,
         );
 
-        let cfg = super::load_config()
+        let err = super::load_config()
             .await
-            .expect("load unversioned legacy config");
-        assert_eq!(cfg.version, Some(CURRENT_ROUTE_GRAPH_CONFIG_VERSION));
-        assert_eq!(
-            cfg.codex.active_station().map(|svc| svc.name.as_str()),
-            Some("right")
-        );
+            .expect_err("unversioned legacy config should require explicit migration");
+        assert_migration_required(&err, "legacy/unversioned");
 
-        let saved = std::fs::read_to_string(&toml_path).expect("read migrated config.toml");
-        assert!(saved.contains("version = 5"));
-        assert!(saved.contains("[codex.providers.rightcode]"));
-        assert!(saved.contains("[codex.routing]"));
-        assert!(!saved.contains("[codex.configs.right]"));
+        let original = std::fs::read_to_string(&toml_path).expect("read unchanged config.toml");
+        assert!(original.contains("[codex.configs.right]"));
+        assert!(!original.contains("version = 5"));
     });
 }
 

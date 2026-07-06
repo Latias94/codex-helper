@@ -412,7 +412,7 @@ fn compact_v2_config_preserves_explicit_provider_alias() {
 }
 
 #[test]
-fn load_config_supports_v2_schema() {
+fn load_config_v2_schema_requires_explicit_migration() {
     let _env = setup_temp_codex_home();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -458,42 +458,14 @@ preferred = true
 "#,
         );
 
-        let cfg = super::load_config().await.expect("load v2 config");
-        assert_eq!(cfg.version, Some(CURRENT_ROUTE_GRAPH_CONFIG_VERSION));
-        assert_eq!(cfg.codex.active.as_deref(), Some("primary"));
-        assert_eq!(cfg.codex.default_profile.as_deref(), Some("daily"));
-        assert_eq!(
-            cfg.codex
-                .profiles
-                .get("daily")
-                .and_then(|profile| profile.station.as_deref()),
-            Some("primary")
-        );
+        let err = super::load_config()
+            .await
+            .expect_err("v2 config should require explicit migration");
+        assert_migration_required(&err, "schema 2");
 
-        let svc = cfg
-            .codex
-            .configs
-            .get("primary")
-            .expect("primary config should exist");
-        assert_eq!(svc.level, 2);
-        assert_eq!(svc.upstreams.len(), 1);
-        assert_eq!(svc.upstreams[0].base_url, "https://us.example.com/v1");
-        assert_eq!(
-            svc.upstreams[0].auth.auth_token_env.as_deref(),
-            Some("OPENAI_API_KEY")
-        );
-        assert_eq!(
-            svc.upstreams[0].tags.get("provider_id").map(|s| s.as_str()),
-            Some("openai")
-        );
-
-        let saved = std::fs::read_to_string(&toml_path).expect("read migrated config.toml");
-        assert!(saved.contains("version = 5"));
-        assert!(saved.contains("[codex.routing]"));
-
-        let backup = std::fs::read_to_string(dir.join("config.toml.bak"))
-            .expect("read migrated backup config.toml.bak");
-        assert!(backup.contains("version = 2"));
+        let saved = std::fs::read_to_string(&toml_path).expect("read unchanged config.toml");
+        assert!(saved.contains("version = 2"));
+        assert!(!dir.join("config.toml.bak").exists());
     });
 }
 
@@ -540,7 +512,9 @@ endpoint_names = ["default"]
 "#,
         );
 
-        let cfg = super::load_config().await.expect("load inherited profiles");
+        let text = std::fs::read_to_string(&toml_path).expect("read v2 config");
+        let v2 = toml::from_str::<ProxyConfigV2>(&text).expect("parse v2 config");
+        let cfg = super::compile_v2_to_runtime(&v2).expect("compile inherited profiles");
         let fast = cfg.codex.profiles.get("fast").expect("fast profile");
         assert_eq!(fast.extends.as_deref(), Some("base"));
         assert_eq!(fast.reasoning_effort.as_deref(), Some("low"));
@@ -578,14 +552,16 @@ extends = "alpha"
 "#,
         );
 
-        let err = super::load_config().await.expect_err("load should fail");
+        let text = std::fs::read_to_string(&toml_path).expect("read v2 config");
+        let v2 = toml::from_str::<ProxyConfigV2>(&text).expect("parse v2 config");
+        let err = super::compile_v2_to_runtime(&v2).expect_err("compile should fail");
         assert!(err.to_string().contains("profile inheritance cycle"));
         assert!(err.to_string().contains("alpha -> beta -> alpha"));
     });
 }
 
 #[test]
-fn save_config_after_loading_v2_upgrades_to_v4_schema_and_backup() {
+fn load_config_v2_save_flow_requires_explicit_migration_first() {
     let _env = setup_temp_codex_home();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -623,18 +599,14 @@ endpoint_names = ["default"]
 "#,
         );
 
-        let cfg = super::load_config().await.expect("load v2 config");
-        assert_eq!(cfg.version, Some(CURRENT_ROUTE_GRAPH_CONFIG_VERSION));
+        let err = super::load_config()
+            .await
+            .expect_err("v2 save flow should require explicit migration first");
+        assert_migration_required(&err, "schema 2");
 
-        super::save_config(&cfg).await.expect("save v2 config");
-        let saved = std::fs::read_to_string(&toml_path).expect("read saved config.toml");
-        assert!(saved.contains("version = 5"));
-        assert!(saved.contains("[codex.routing]"));
-        assert!(saved.contains("[codex.providers.openai]"));
-        assert!(saved.contains("default_profile = \"daily\""));
-        assert!(saved.contains("[codex.profiles.daily]"));
-        assert!(saved.contains("service_tier = \"priority\""));
-        assert!(saved.contains("[codex.routing]"));
+        let saved = std::fs::read_to_string(&toml_path).expect("read unchanged config.toml");
+        assert!(saved.contains("version = 2"));
+        assert!(saved.contains("[codex.stations.primary]"));
     });
 }
 
@@ -671,10 +643,10 @@ provider = "openai"
 "#,
         );
 
-        let cfg = super::load_config()
-            .await
-            .expect("load legacy-named v2 config");
-        assert_eq!(cfg.version, Some(CURRENT_ROUTE_GRAPH_CONFIG_VERSION));
+        let text = std::fs::read_to_string(&toml_path).expect("read v2 config");
+        let v2 = toml::from_str::<ProxyConfigV2>(&text).expect("parse v2 config");
+        let cfg = super::compile_v2_to_runtime(&v2).expect("compile legacy-named v2 config");
+        assert_eq!(cfg.version, Some(2));
         assert_eq!(cfg.codex.active.as_deref(), Some("legacy"));
         assert!(cfg.codex.configs.contains_key("legacy"));
     });
@@ -717,10 +689,10 @@ base_url = "https://vibe.example.com/v1"
 "#,
         );
 
-        let cfg = super::load_config()
+        let err = super::load_config()
             .await
-            .expect("load boolish active config");
-        assert_eq!(cfg.codex.active.as_deref(), Some("right"));
+            .expect_err("legacy boolish active config should require explicit migration");
+        assert_migration_required(&err, "schema 1");
     });
 }
 
@@ -753,10 +725,10 @@ base_url = "https://right.example.com/v1"
 "#,
         );
 
-        let cfg = super::load_config()
+        let err = super::load_config()
             .await
-            .expect("load boolish inactive config");
-        assert_eq!(cfg.codex.active, None);
+            .expect_err("legacy boolish inactive config should require explicit migration");
+        assert_migration_required(&err, "schema 1");
     });
 }
 
@@ -789,10 +761,7 @@ base_url = "https://api.example.com/v1"
         );
 
         let err = super::load_config().await.expect_err("load should fail");
-        assert!(
-            err.to_string().contains("default_profile"),
-            "unexpected error: {err}"
-        );
+        assert_migration_required(&err, "schema 1");
     });
 }
 
@@ -830,15 +799,12 @@ supported_models = { "gpt-5.4" = true }
         );
 
         let err = super::load_config().await.expect_err("load should fail");
-        assert!(
-            err.to_string().contains("not supported"),
-            "unexpected error: {err}"
-        );
+        assert_migration_required(&err, "schema 1");
     });
 }
 
 #[test]
-fn save_config_after_loading_legacy_upgrades_to_v4_schema_and_backup() {
+fn load_config_legacy_save_flow_requires_explicit_migration_first() {
     let _env = setup_temp_codex_home();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -848,7 +814,6 @@ fn save_config_after_loading_legacy_upgrades_to_v4_schema_and_backup() {
     rt.block_on(async move {
         let dir = super::proxy_home_dir();
         let toml_path = dir.join("config.toml");
-        let backup_path = dir.join("config.toml.bak");
         write_file(
             &toml_path,
             r#"
@@ -866,20 +831,13 @@ base_url = "https://legacy.example.com/v1"
 "#,
         );
 
-        let cfg = super::load_config().await.expect("load legacy config");
-        assert_eq!(cfg.version, Some(CURRENT_ROUTE_GRAPH_CONFIG_VERSION));
-
-        super::save_config(&cfg)
+        let err = super::load_config()
             .await
-            .expect("save_config should succeed");
-        let saved = std::fs::read_to_string(&toml_path).expect("read v4 config.toml");
-        assert!(saved.contains("version = 5"));
-        assert!(saved.contains("[codex.routing]"));
-        assert!(saved.contains("[codex.providers.example]"));
-        assert!(saved.contains("base_url = \"https://legacy.example.com/v1\""));
+            .expect_err("legacy save flow should require explicit migration first");
+        assert_migration_required(&err, "schema 1");
 
-        let backup = std::fs::read_to_string(&backup_path).expect("read config.toml.bak");
-        assert!(backup.contains("version = 5"));
-        assert!(backup.contains("[codex.routing]"));
+        let saved = std::fs::read_to_string(&toml_path).expect("read unchanged config.toml");
+        assert!(saved.contains("version = 1"));
+        assert!(saved.contains("[codex.configs.legacy]"));
     });
 }

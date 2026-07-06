@@ -1197,7 +1197,7 @@ codex-helper pricing sync-basellm --model gpt-5 --dry-run
 
 初始化或检查迁移：
 
-正常启动，包括默认打开 TUI 的路径，会自动完成配置迁移。只有在你想显式预览或诊断迁移时，才需要使用迁移命令。
+正常启动，包括默认打开 TUI 的路径，都要求当前 `version = 5` 的 `config.toml`。如果存在旧版 TOML 或 `config.json`，启动会停下并提示 migration-required；请用下面的迁移命令先预览，再显式写入新文件。
 
 ```bash
 codex-helper config init
@@ -1355,18 +1355,18 @@ TUI routing editor 快捷键：
 
 ## 迁移
 
-当前 route graph schema 写出 `version = 5`。现有 `version = 4` route graph 配置仍会作为迁移输入加载。
+当前 route graph schema 写出 `version = 5`。正常启动路径只接受当前 `version = 5` 的 `config.toml`。
 
-正常用户通常不需要手动运行迁移命令。启动 codex-helper，包括默认打开 TUI 的启动路径，会加载 legacy `version = 4`、`version = 3`、`version = 2`、未标版本 TOML 和 legacy `config.json`，然后迁移到带 `version = 5` 的 `config.toml`。写入新文件前，旧文件会复制为 `config.toml.bak` 或 `config.json.bak`。
-
-迁移期间，codex-helper 会把缺失的 route-graph affinity 补成 `affinity_policy = "fallback-sticky"`，让落盘配置更显式。已有配置仍可按需求选择：更重视 official relay 连续性就用 `fallback-sticky`，更重视尽快回到优先组就用 `preferred-group`；如果配置显式保留 `preferred-group`，迁移预览可能会提示你注意这个取舍。
-
-手动迁移命令主要用于在不走正常 TUI/proxy 启动路径的情况下预览或诊断迁移：
+Legacy `version = 4`、`version = 3`、`version = 2`、未标版本 TOML 和 legacy `config.json` 只作为迁移输入。启动 codex-helper，包括默认打开 TUI 的启动路径，现在会直接报 migration-required 错误，不再隐式重写旧文件。请先预览生成的 v5 TOML，再显式同意写入：
 
 ```bash
 codex-helper config migrate --dry-run
 codex-helper config migrate --write --yes
 ```
+
+`--write --yes` 写入新文件前，旧文件会复制为 `config.toml.bak` 或 `config.json.bak`。
+
+迁移期间，codex-helper 会把缺失的 route-graph affinity 补成 `affinity_policy = "fallback-sticky"`，让落盘配置更显式。已有配置仍可按需求选择：更重视 official relay 连续性就用 `fallback-sticky`，更重视尽快回到优先组就用 `preferred-group`；如果配置显式保留 `preferred-group`，迁移预览可能会提示你注意这个取舍。迁移命令必须显式执行，这样自动重启和前台 TUI 会话都不会静默改写持久配置。
 
 迁移规则：
 

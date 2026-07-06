@@ -90,3 +90,19 @@ fn write_file(path: &Path, content: &str) {
     }
     std::fs::write(path, content).expect("write test file");
 }
+
+fn assert_migration_required(error: &anyhow::Error, schema_label: &str) {
+    let message = error.to_string();
+    assert!(
+        message.contains(schema_label),
+        "expected migration error to mention {schema_label:?}, got: {message}"
+    );
+    assert!(
+        message.contains("normal startup only accepts version = 5"),
+        "expected normal-startup v5 boundary, got: {message}"
+    );
+    assert!(
+        message.contains("config migrate"),
+        "expected explicit migrate guidance, got: {message}"
+    );
+}

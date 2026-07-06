@@ -93,7 +93,10 @@ pub(super) async fn load_config_document() -> anyhow::Result<ConfigDocument> {
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"));
     if !is_toml {
-        return Ok(ConfigDocument::Legacy(Box::new(load_config().await?)));
+        let bytes = fs::read(&path).await?;
+        return Ok(ConfigDocument::Legacy(Box::new(serde_json::from_slice(
+            &bytes,
+        )?)));
     }
 
     let text = fs::read_to_string(&path).await?;
@@ -142,7 +145,9 @@ pub(super) async fn load_config_document() -> anyhow::Result<ConfigDocument> {
         compile_v2_to_runtime(&cfg)?;
         Ok(ConfigDocument::V2(Box::new(cfg)))
     } else {
-        Ok(ConfigDocument::Legacy(Box::new(load_config().await?)))
+        Ok(ConfigDocument::Legacy(Box::new(toml::from_str::<
+            ProxyConfig,
+        >(&text)?)))
     }
 }
 

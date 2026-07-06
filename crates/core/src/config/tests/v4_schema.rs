@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn load_config_supports_v4_route_graph_schema() {
+fn load_config_supports_v5_route_graph_schema() {
     let _env = setup_temp_codex_home();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -14,7 +14,7 @@ fn load_config_supports_v4_route_graph_schema() {
         write_file(
             &toml_path,
             r#"
-version = 4
+version = 5
 
 [codex.providers.monthly]
 base_url = "https://monthly.example.com/v1"
@@ -37,7 +37,7 @@ on_exhausted = "continue"
 "#,
         );
 
-        let cfg = super::load_config().await.expect("load v4 config");
+        let cfg = super::load_config().await.expect("load v5 config");
         assert_eq!(cfg.version, Some(CURRENT_ROUTE_GRAPH_CONFIG_VERSION));
         assert_eq!(cfg.codex.active.as_deref(), Some("routing"));
 
@@ -1204,7 +1204,7 @@ responses_websocket = true
 }
 
 #[test]
-fn load_config_auto_normalizes_legacy_codex_client_patch_mode() {
+fn load_config_does_not_auto_normalize_legacy_codex_client_patch_mode() {
     let _env = setup_temp_codex_home();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1245,22 +1245,17 @@ target = "main"
             Some(CURRENT_ROUTE_GRAPH_CONFIG_VERSION)
         );
 
-        let saved = std::fs::read_to_string(&toml_path).expect("read normalized config");
+        let saved = std::fs::read_to_string(&toml_path).expect("read unchanged config");
         assert!(saved.contains("[codex.client_patch]"));
-        assert!(saved.contains("preset = \"official-imagegen\""));
-        assert!(!saved.contains("mode = \"official-imagegen-bridge\""));
-        assert!(saved.contains("affinity_policy = \"fallback-sticky\""));
-
-        let backup_path = dir.join("config.toml.bak");
-        let backup = std::fs::read_to_string(backup_path).expect("read normalization backup");
-        assert!(backup.contains("# mode = \"imagegen-bridge\""));
-        assert!(backup.contains("# mode = \"official-relay-bridge\""));
-        assert!(backup.contains("mode = \"official-imagegen-bridge\""));
+        assert!(saved.contains("mode = \"official-imagegen-bridge\""));
+        assert!(!saved.contains("preset = \"official-imagegen\""));
+        assert!(!saved.contains("affinity_policy = \"fallback-sticky\""));
+        assert!(!dir.join("config.toml.bak").exists());
     });
 }
 
 #[test]
-fn load_config_auto_adds_default_route_graph_affinity_policy() {
+fn load_config_does_not_auto_add_default_route_graph_affinity_policy() {
     let _env = setup_temp_codex_home();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1296,14 +1291,10 @@ target = "main"
             Some(CURRENT_ROUTE_GRAPH_CONFIG_VERSION)
         );
 
-        let saved = std::fs::read_to_string(&toml_path).expect("read normalized config");
+        let saved = std::fs::read_to_string(&toml_path).expect("read unchanged config");
         assert!(saved.contains("[codex.routing]"));
-        assert!(saved.contains("affinity_policy = \"fallback-sticky\""));
-
-        let backup_path = dir.join("config.toml.bak");
-        let backup = std::fs::read_to_string(backup_path).expect("read normalization backup");
-        assert!(backup.contains("[codex.routing]"));
-        assert!(!backup.contains("affinity_policy"));
+        assert!(!saved.contains("affinity_policy = \"fallback-sticky\""));
+        assert!(!dir.join("config.toml.bak").exists());
     });
 }
 
@@ -1507,7 +1498,7 @@ hosted_image_generation = "disabled"
 }
 
 #[test]
-fn load_config_auto_compacts_legacy_v3_import_metadata_to_v4() {
+fn load_config_legacy_v3_import_metadata_requires_explicit_migration() {
     let _env = setup_temp_codex_home();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1538,19 +1529,17 @@ target = "input"
 "#,
         );
 
-        let cfg = super::load_config().await.expect("load legacy v3 config");
-        assert_eq!(cfg.version, Some(CURRENT_ROUTE_GRAPH_CONFIG_VERSION));
-        let saved = std::fs::read_to_string(&toml_path).expect("read compacted config");
-        assert!(saved.contains("version = 5"));
-        assert!(saved.contains("[codex.routing.routes.main]"));
-        assert!(saved.contains("strategy = \"manual-sticky\""));
-        assert!(saved.contains("[codex.providers.input]"));
-        assert!(saved.contains("auth_token_env = \"INPUT_API_KEY\""));
-        assert!(!saved.contains("enabled = true"));
-        assert!(!saved.contains("[codex.providers.input.tags]"));
-        assert!(!saved.contains("provider_id"));
-        assert!(!saved.contains("requires_openai_auth"));
-        assert!(!saved.contains("source = \"codex-config\""));
+        let err = super::load_config()
+            .await
+            .expect_err("legacy v3 config should require explicit migration");
+        assert_migration_required(&err, "schema 3");
+
+        let saved = std::fs::read_to_string(&toml_path).expect("read unchanged config");
+        assert!(saved.contains("version = 3"));
+        assert!(saved.contains("[codex.providers.input.tags]"));
+        assert!(saved.contains("provider_id"));
+        assert!(saved.contains("requires_openai_auth"));
+        assert!(saved.contains("source = \"codex-config\""));
     });
 }
 
@@ -1623,7 +1612,7 @@ fn save_config_preserves_v4_route_graph_when_only_runtime_metadata_changes() {
 }
 
 #[test]
-fn old_v4_route_graph_auto_migrates_to_v5_and_preserves_endpoint_identity() {
+fn old_v4_route_graph_requires_explicit_migration() {
     let _env = setup_temp_codex_home();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1633,7 +1622,6 @@ fn old_v4_route_graph_auto_migrates_to_v5_and_preserves_endpoint_identity() {
     rt.block_on(async move {
         let dir = super::proxy_home_dir();
         let toml_path = dir.join("config.toml");
-        let backup_path = dir.join("config.toml.bak");
         write_file(
             &toml_path,
             r#"
@@ -1668,76 +1656,19 @@ children = ["monthly", "paygo"]
 "#,
         );
 
-        let loaded = super::load_config_with_v4_source()
+        let err = super::load_config_with_v4_source()
             .await
-            .expect("load old v4 route graph");
-        assert_eq!(
-            loaded.runtime.version,
-            Some(CURRENT_ROUTE_GRAPH_CONFIG_VERSION)
-        );
-        assert_eq!(
-            loaded.v4.as_ref().map(|cfg| cfg.version),
-            Some(CURRENT_ROUTE_GRAPH_CONFIG_VERSION)
-        );
+            .expect_err("old v4 route graph should require explicit migration");
+        assert_migration_required(&err, "schema 4");
 
-        let saved = std::fs::read_to_string(&toml_path).expect("read migrated v5 config");
-        assert!(saved.contains("version = 5"));
+        let saved = std::fs::read_to_string(&toml_path).expect("read unchanged v4 config");
+        assert!(saved.contains("version = 4"));
         assert!(saved.contains("fallback_ttl_ms = 120000"));
         assert!(saved.contains("reprobe_preferred_after_ms = 30000"));
         assert!(saved.contains("[codex.routing.routes.main]"));
         assert!(saved.contains("[codex.providers.monthly.endpoints.fast]"));
         assert!(saved.contains("auth_token_env = \"MONTHLY_API_KEY\""));
-
-        let backup = std::fs::read_to_string(&backup_path).expect("read old v4 backup");
-        assert!(backup.contains("version = 4"));
-        assert!(backup.contains("[codex.providers.monthly.endpoints.fast]"));
-
-        let reparsed = toml::from_str::<ProxyConfigV4>(&saved).expect("parse migrated v5 config");
-        let reparsed_routing = reparsed
-            .codex
-            .routing
-            .as_ref()
-            .expect("migrated routing should remain");
-        assert_eq!(reparsed_routing.fallback_ttl_ms, Some(120_000));
-        assert_eq!(reparsed_routing.reprobe_preferred_after_ms, Some(30_000));
-        let runtime = compile_v4_to_runtime(&reparsed).expect("compile migrated v5 config");
-        let routing = runtime
-            .codex
-            .station("routing")
-            .expect("compat routing projection should exist");
-        assert_eq!(
-            routing
-                .upstreams
-                .iter()
-                .map(|upstream| upstream.base_url.as_str())
-                .collect::<Vec<_>>(),
-            vec![
-                "https://monthly-fast.example.com/v1",
-                "https://monthly-slow.example.com/v1",
-                "https://paygo.example.com/v1",
-            ]
-        );
-        assert_eq!(
-            routing.upstreams[0]
-                .tags
-                .get("provider_id")
-                .map(String::as_str),
-            Some("monthly")
-        );
-        assert_eq!(
-            routing.upstreams[0]
-                .tags
-                .get("endpoint_id")
-                .map(String::as_str),
-            Some("fast")
-        );
-        assert_eq!(
-            routing.upstreams[2]
-                .tags
-                .get("endpoint_id")
-                .map(String::as_str),
-            Some("default")
-        );
+        assert!(!dir.join("config.toml.bak").exists());
     });
 }
 
