@@ -3096,6 +3096,10 @@ fn auto_snapshot_is_usable(snapshot: &ProviderBalanceSnapshot) -> bool {
         )
 }
 
+fn auto_probe_error_summary(probe_errors: &[String]) -> Option<String> {
+    (!probe_errors.is_empty()).then(|| format!("attempts failed: {}", probe_errors.join("; ")))
+}
+
 async fn auto_probe_provider_target(
     client: &Client,
     target: &UsageProviderTarget,
@@ -3184,14 +3188,28 @@ async fn auto_probe_provider_target(
 
     let probe_order = auto_probe_kind_order(&provider_id, target);
     if probe_order.is_empty() {
+        let error = "all balance probe kinds are temporarily suppressed";
         warn!(
-            "auto usage provider '{}' skipped {}[{}]: all balance probe kinds are temporarily suppressed",
-            first_provider.id, target.upstream.station_name, target.upstream.index
+            "auto usage provider '{}' skipped {}[{}]: {}",
+            first_provider.id, target.upstream.station_name, target.upstream.index, error
         );
+        state
+            .record_provider_balance_snapshot(
+                service_name,
+                base_snapshot(
+                    &first_provider,
+                    &target.upstream,
+                    fetched_at_ms,
+                    stale_after_ms,
+                )
+                .with_error(error),
+            )
+            .await;
+        update_usage_exhausted(lb_states, state, cfg, service_name, &upstreams, false).await;
         return UsageProviderRefreshOutcome::Failed;
     }
 
-    let mut last_error: Option<String> = None;
+    let mut probe_errors = Vec::new();
     for kind in probe_order {
         let provider = auto_usage_provider(target, kind);
         match poll_provider_http_json(client, &provider, &target.base_url, &token).await {
@@ -3230,21 +3248,19 @@ async fn auto_probe_provider_target(
                     return UsageProviderRefreshOutcome::Refreshed;
                 }
                 remember_auto_probe_kind_failure(&provider_id, target, kind, Instant::now());
-                last_error = snapshot.error.or_else(|| {
-                    Some(format!(
-                        "auto probe {:?} returned no usable balance fields",
-                        kind
-                    ))
+                let error = snapshot.error.unwrap_or_else(|| {
+                    format!("auto probe {:?} returned no usable balance fields", kind)
                 });
+                probe_errors.push(format!("{:?}: {}", kind, error));
             }
             Err(err) => {
                 remember_auto_probe_kind_failure(&provider_id, target, kind, Instant::now());
-                last_error = Some(err.to_string());
+                probe_errors.push(format!("{:?}: {}", kind, err));
             }
         }
     }
 
-    if let Some(error) = last_error {
+    if let Some(error) = auto_probe_error_summary(&probe_errors) {
         warn!(
             "auto usage provider '{}' found no usable balance endpoint for {}[{}]: {}",
             first_provider.id, target.upstream.station_name, target.upstream.index, error
@@ -4243,6 +4259,21 @@ mod tests {
     }
 
     #[test]
+    fn auto_probe_error_summary_keeps_all_attempt_failures() {
+        let errors = vec![
+            "Sub2ApiUsage: HTTP 404".to_string(),
+            "NewApiTokenUsage: missing quota fields".to_string(),
+            "OpenAiBalanceHttpJson: non-JSON response".to_string(),
+        ];
+
+        let summary = auto_probe_error_summary(&errors).expect("summary");
+
+        assert!(summary.contains("Sub2ApiUsage: HTTP 404"));
+        assert!(summary.contains("NewApiTokenUsage: missing quota fields"));
+        assert!(summary.contains("OpenAiBalanceHttpJson: non-JSON response"));
+    }
+
+    #[test]
     fn auto_probe_kind_order_prioritizes_remembered_success() {
         let provider_id = "input-order-success";
         clear_auto_probe_kind_state(provider_id);
@@ -4334,6 +4365,57 @@ mod tests {
         assert!(
             !auto_probe_kind_order(provider_id, &catalog_target).is_empty(),
             "a routing target's temporary failures must not hide catalog balance probes for the same provider"
+        );
+        clear_auto_probe_kind_state(provider_id);
+    }
+
+    #[tokio::test]
+    async fn auto_probe_suppressed_order_records_error_snapshot() {
+        let provider_id = "input-suppressed-snapshot";
+        clear_auto_probe_kind_state(provider_id);
+        let mut upstream =
+            endpoint_upstream_config("https://relay.example.com/v1", provider_id, "default");
+        upstream.auth.auth_token = Some("model-key".to_string());
+        let cfg = proxy_config(vec![service_config("routing", vec![upstream])]);
+        let lb_states = Arc::new(Mutex::new(HashMap::new()));
+        let state = ProxyState::new();
+        let target = usage_provider_target("https://relay.example.com/v1", provider_id);
+        let now = Instant::now();
+
+        for kind in AUTO_PROBE_KINDS {
+            if kind == ProviderKind::RightCodeAccountSummary {
+                continue;
+            }
+            remember_auto_probe_kind_failure(provider_id, &target, kind, now);
+        }
+
+        let outcome =
+            auto_probe_provider_target(&Client::new(), &target, &cfg, &lb_states, &state, "codex")
+                .await;
+
+        assert_eq!(outcome, UsageProviderRefreshOutcome::Failed);
+        let view = state.get_provider_balance_view("codex").await;
+        let snapshot = view
+            .get("routing")
+            .and_then(|snapshots| {
+                snapshots
+                    .iter()
+                    .find(|snapshot| snapshot.provider_id == provider_id)
+            })
+            .expect("suppressed auto probe snapshot");
+        assert_eq!(snapshot.status, BalanceSnapshotStatus::Error);
+        assert_eq!(
+            snapshot.error.as_deref(),
+            Some("all balance probe kinds are temporarily suppressed")
+        );
+        assert_eq!(snapshot.upstream_index, Some(0));
+        let guard = lb_states.lock().expect("lb states");
+        assert!(
+            !guard
+                .get("routing")
+                .and_then(|entry| entry.usage_exhausted.first())
+                .copied()
+                .unwrap_or(true)
         );
         clear_auto_probe_kind_state(provider_id);
     }
