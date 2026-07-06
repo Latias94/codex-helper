@@ -886,19 +886,6 @@ pub(super) async fn build_sse_success_response(
                 service_name.as_str(),
                 provider_endpoint,
             );
-        } else if let (Some(station_name), Some(upstream_index)) = (
-            target.compatibility_station_name().map(ToOwned::to_owned),
-            target.compatibility_upstream_index(),
-        ) {
-            usage_providers::enqueue_poll_for_codex_upstream(
-                client,
-                cfg_snapshot,
-                lb_states,
-                state,
-                service_name.as_str(),
-                &station_name,
-                upstream_index,
-            );
         }
     }
 

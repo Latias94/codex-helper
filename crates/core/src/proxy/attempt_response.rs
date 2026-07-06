@@ -827,19 +827,6 @@ async fn enqueue_usage_probe_for_target(proxy: &ProxyService, target: &AttemptTa
             proxy.service_name,
             provider_endpoint,
         );
-    } else if let (Some(station_name), Some(upstream_index)) = (
-        target.compatibility_station_name().map(ToOwned::to_owned),
-        target.compatibility_upstream_index(),
-    ) {
-        usage_providers::enqueue_poll_for_codex_upstream(
-            proxy.client.clone(),
-            cfg_snapshot,
-            proxy.lb_states.clone(),
-            proxy.state.clone(),
-            proxy.service_name,
-            &station_name,
-            upstream_index,
-        );
     }
 }
 
