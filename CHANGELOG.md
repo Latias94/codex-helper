@@ -17,6 +17,7 @@ All notable changes to this project will be documented in this file.
 
 - 可信余额耗尽现在通过 codex-helper owned balance policy action 影响路由。新的非耗尽余额只会清理 helper 自己创建的 balance action，不会清理手动 override 或其它 cooldown。
 - 自动余额探针会记住可用 adapter，并暂时跳过刚失败的 adapter。降级到低优先级 provider 时，会节流复查被 cooldown 或 trusted usage exhaustion 跳过的高优先级 endpoint。
+- Reasoning Guard 在开启后除了固定 `reasoning_equals` 列表，也会默认匹配 `518*n-2` 且 `n <= 4` 的推理 token 边界；可用 `boundary_sequence_max_n = 0` 关闭序列匹配。
 
 #### 破坏性变更
 
@@ -43,6 +44,7 @@ All notable changes to this project will be documented in this file.
 
 - Trusted balance exhaustion now affects routing through codex-helper-owned balance policy actions. Fresh non-exhausted balances clear only helper-owned balance actions, not manual overrides or unrelated cooldowns.
 - Automatic balance probing remembers working adapters and temporarily skips recently failed adapters. When routing falls back to a lower-priority provider, codex-helper throttles reprobes for higher-priority endpoints skipped by cooldown or trusted usage exhaustion.
+- When enabled, Reasoning Guard now matches the `518*n-2` reasoning-token boundary sequence up to `n <= 4` in addition to the fixed `reasoning_equals` list; set `boundary_sequence_max_n = 0` to disable sequence matching.
 
 #### Breaking changes
 

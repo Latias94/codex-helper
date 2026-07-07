@@ -427,12 +427,13 @@ profile = "balanced"
 
 ### Reasoning Guard：拦截推理 token 异常桶
 
-如果某些 Codex 中转偶发出现 `reasoning_tokens = 516`、`1034` 或 `1552` 后直接 final、且答案质量明显异常，可以开启 retry reasoning guard。它只基于上游响应里的 usage 元数据做高置信拦截，不会尝试理解或判定答案本身是否正确。
+如果某些 Codex 中转偶发出现 `reasoning_tokens = 516`、`1034`、`1552` 或同类 `518*n-2` 边界后直接 final、且答案质量明显异常，可以开启 retry reasoning guard。它只基于上游响应里的 usage 元数据做高置信拦截，不会尝试理解或判定答案本身是否正确。
 
 ```toml
 [retry.reasoning_guard]
 enabled = true
 reasoning_equals = [516, 1034, 1552]
+boundary_sequence_max_n = 4
 action = "retry"          # retry | block | observe
 stream_mode = "strict-buffer" # strict-buffer | observe | off
 max_guard_retries = 1
@@ -440,7 +441,7 @@ paths = ["/v1/responses", "/responses", "/v1/chat/completions", "/chat/completio
 log_matches = true
 ```
 
-- 默认关闭；不配置时不会改变现有行为。开启后默认匹配 `[516, 1034, 1552]`，也可以用 `reasoning_equals` 覆盖成自己的列表。
+- 默认关闭；不配置时不会改变现有行为。开启后默认匹配 `reasoning_equals = [516, 1034, 1552]`，并额外匹配 `518*n-2` 且 `n <= 4` 的边界序列。可以用 `reasoning_equals` 覆盖固定列表，用 `boundary_sequence_max_n = 0` 关闭序列匹配。
 - `action = "retry"` 会把命中的成功响应改判为本地 502，并交给 `[retry]` 的 upstream/provider 重试规则处理。`max_guard_retries = 1` 表示同一个客户端请求最多因为该 guard 多打一轮上游请求。
 - `stream_mode = "strict-buffer"` 会在命中路径的流式请求中先完整缓冲 SSE，再检查末尾 usage。这样可以避免异常答案已经写给客户端后才发现异常 token，代价是这类流式请求不再实时透传。
 - 配置支持运行时热加载：每个新请求准备阶段都会检查配置文件变更；已在途请求继续使用它开始时的配置快照。TUI Settings 页按 `R` 可以立即强制重载。

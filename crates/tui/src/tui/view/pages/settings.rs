@@ -83,21 +83,28 @@ fn reasoning_guard_preview_lang(guard: &ResolvedReasoningGuardConfig, lang: Lang
     } else {
         guard.paths.join(",")
     };
+    let boundary = if guard.boundary_sequence_max_n == 0 {
+        "off".to_string()
+    } else {
+        format!("518*n-2,n<={}", guard.boundary_sequence_max_n)
+    };
 
     match lang {
         Language::Zh => format!(
-            "reasoning_guard: {} tokens=[{}] action={} stream={} max_guard_retries={} paths=[{}]",
+            "reasoning_guard: {} tokens=[{}] boundary={} action={} stream={} max_guard_retries={} paths=[{}]",
             enabled,
             equals,
+            boundary,
             reasoning_guard_action_name(guard.action),
             reasoning_guard_stream_mode_name(guard.stream_mode),
             guard.max_guard_retries,
             paths
         ),
         Language::En => format!(
-            "reasoning_guard: {} tokens=[{}] action={} stream={} max_guard_retries={} paths=[{}]",
+            "reasoning_guard: {} tokens=[{}] boundary={} action={} stream={} max_guard_retries={} paths=[{}]",
             enabled,
             equals,
+            boundary,
             reasoning_guard_action_name(guard.action),
             reasoning_guard_stream_mode_name(guard.stream_mode),
             guard.max_guard_retries,

@@ -123,6 +123,8 @@ pub struct ReasoningGuardConfig {
     #[serde(default)]
     pub reasoning_equals: Option<Vec<i64>>,
     #[serde(default)]
+    pub boundary_sequence_max_n: Option<u32>,
+    #[serde(default)]
     pub paths: Option<Vec<String>>,
     #[serde(default)]
     pub action: Option<ReasoningGuardAction>,
@@ -138,11 +140,17 @@ pub struct ReasoningGuardConfig {
 pub struct ResolvedReasoningGuardConfig {
     pub enabled: bool,
     pub reasoning_equals: Vec<i64>,
+    #[serde(default = "default_reasoning_guard_boundary_sequence_max_n")]
+    pub boundary_sequence_max_n: u32,
     pub paths: Vec<String>,
     pub action: ReasoningGuardAction,
     pub stream_mode: ReasoningGuardStreamMode,
     pub max_guard_retries: u32,
     pub log_matches: bool,
+}
+
+fn default_reasoning_guard_boundary_sequence_max_n() -> u32 {
+    4
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -282,6 +290,7 @@ impl ReasoningGuardConfig {
         ResolvedReasoningGuardConfig {
             enabled: false,
             reasoning_equals: vec![516, 1034, 1552],
+            boundary_sequence_max_n: 4,
             paths: vec![
                 "/responses".to_string(),
                 "/v1/responses".to_string(),
@@ -302,6 +311,9 @@ impl ReasoningGuardConfig {
         }
         if let Some(v) = self.reasoning_equals.as_ref() {
             out.reasoning_equals = v.clone();
+        }
+        if let Some(v) = self.boundary_sequence_max_n {
+            out.boundary_sequence_max_n = v.min(16);
         }
         if let Some(v) = self.paths.as_ref() {
             out.paths = v
@@ -440,6 +452,7 @@ mod tests {
             resolved.reasoning_guard.reasoning_equals,
             vec![516, 1034, 1552]
         );
+        assert_eq!(resolved.reasoning_guard.boundary_sequence_max_n, 4);
         assert_eq!(
             resolved.reasoning_guard.stream_mode,
             ReasoningGuardStreamMode::StrictBuffer
@@ -487,6 +500,51 @@ mod tests {
     }
 
     #[test]
+    fn resolved_retry_deserializes_legacy_reasoning_guard_without_boundary_sequence() {
+        let resolved: ResolvedRetryConfig = serde_json::from_value(serde_json::json!({
+            "upstream": {
+                "max_attempts": 2,
+                "backoff_ms": 200,
+                "backoff_max_ms": 2000,
+                "jitter_ms": 100,
+                "on_status": "429,500-599,524",
+                "on_class": ["upstream_transport_error"],
+                "strategy": "same_upstream"
+            },
+            "route": {
+                "max_attempts": 2,
+                "backoff_ms": 0,
+                "backoff_max_ms": 0,
+                "jitter_ms": 0,
+                "on_status": "401,403,404,408,429,500-599,524",
+                "on_class": ["upstream_transport_error"],
+                "strategy": "failover"
+            },
+            "reasoning_guard": {
+                "enabled": true,
+                "reasoning_equals": [516, 1034, 1552],
+                "paths": ["/responses", "/v1/responses"],
+                "action": "retry",
+                "stream_mode": "strict-buffer",
+                "max_guard_retries": 1,
+                "log_matches": true
+            },
+            "allow_cross_station_before_first_output": true,
+            "never_on_status": "413,415,422",
+            "never_on_class": ["client_error_non_retryable"],
+            "cloudflare_challenge_cooldown_secs": 300,
+            "cloudflare_timeout_cooldown_secs": 12,
+            "transport_cooldown_secs": 45,
+            "cooldown_backoff_factor": 3,
+            "cooldown_backoff_max_secs": 180
+        }))
+        .expect("legacy resolved retry reasoning guard should deserialize");
+
+        assert!(resolved.reasoning_guard.enabled);
+        assert_eq!(resolved.reasoning_guard.boundary_sequence_max_n, 4);
+    }
+
+    #[test]
     fn reasoning_guard_toml_overrides_resolve() {
         let cfg: RetryConfig = toml::from_str(
             r#"
@@ -495,6 +553,7 @@ profile = "balanced"
 [reasoning_guard]
 enabled = true
 reasoning_equals = [516, 777]
+boundary_sequence_max_n = 0
 paths = ["responses", "/v1/chat/completions/"]
 action = "block"
 stream_mode = "off"
@@ -507,6 +566,7 @@ log_matches = false
         let resolved = cfg.resolve();
         assert!(resolved.reasoning_guard.enabled);
         assert_eq!(resolved.reasoning_guard.reasoning_equals, vec![516, 777]);
+        assert_eq!(resolved.reasoning_guard.boundary_sequence_max_n, 0);
         assert_eq!(
             resolved.reasoning_guard.paths,
             vec!["/responses".to_string(), "/v1/chat/completions".to_string()]

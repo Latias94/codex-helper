@@ -81,13 +81,13 @@ pub(super) fn evaluate_reasoning_guard(
     let Some(reasoning_tokens) = usage.map(UsageMetrics::reasoning_output_tokens_total) else {
         return ReasoningGuardDecision::Pass;
     };
-    if !cfg.reasoning_equals.contains(&reasoning_tokens) {
+    let Some(rule) = reasoning_guard_match_rule(cfg, reasoning_tokens) else {
         return ReasoningGuardDecision::Pass;
-    }
+    };
 
     let matched = ReasoningGuardMatch {
         reasoning_tokens,
-        rule: format!("reasoning_tokens={reasoning_tokens}"),
+        rule,
     };
     match cfg.action {
         ReasoningGuardAction::Observe => ReasoningGuardDecision::Observe(matched),
@@ -97,6 +97,37 @@ pub(super) fn evaluate_reasoning_guard(
         }
         ReasoningGuardAction::Retry => ReasoningGuardDecision::Exhausted(matched),
     }
+}
+
+fn reasoning_guard_match_rule(
+    cfg: &ResolvedReasoningGuardConfig,
+    reasoning_tokens: i64,
+) -> Option<String> {
+    if cfg.reasoning_equals.contains(&reasoning_tokens) {
+        return Some(format!("reasoning_tokens={reasoning_tokens}"));
+    }
+
+    if let Some(n) = reasoning_boundary_sequence_n(reasoning_tokens)
+        && n <= cfg.boundary_sequence_max_n
+    {
+        return Some(format!(
+            "reasoning_tokens={reasoning_tokens} boundary=518*n-2 n={n}"
+        ));
+    }
+
+    None
+}
+
+fn reasoning_boundary_sequence_n(reasoning_tokens: i64) -> Option<u32> {
+    if reasoning_tokens <= 0 {
+        return None;
+    }
+    let shifted = reasoning_tokens.checked_add(2)?;
+    if shifted % 518 != 0 {
+        return None;
+    }
+    let n = shifted / 518;
+    u32::try_from(n).ok().filter(|value| *value > 0)
 }
 
 pub(super) fn reasoning_guard_retry_count(route_attempts: &[RouteAttemptLog]) -> u32 {
@@ -190,6 +221,40 @@ mod tests {
                 ReasoningGuardDecision::Retry(_)
             ));
         }
+    }
+
+    #[test]
+    fn reasoning_guard_matches_default_boundary_sequence() {
+        let mut cfg = ReasoningGuardConfig::default_resolved();
+        cfg.enabled = true;
+        let usage = UsageMetrics {
+            reasoning_output_tokens: 2070,
+            ..UsageMetrics::default()
+        };
+
+        assert_eq!(
+            evaluate_reasoning_guard(&cfg, "codex", "/v1/responses", Some(&usage), 0),
+            ReasoningGuardDecision::Retry(ReasoningGuardMatch {
+                reasoning_tokens: 2070,
+                rule: "reasoning_tokens=2070 boundary=518*n-2 n=4".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn reasoning_guard_can_disable_boundary_sequence() {
+        let mut cfg = ReasoningGuardConfig::default_resolved();
+        cfg.enabled = true;
+        cfg.boundary_sequence_max_n = 0;
+        let usage = UsageMetrics {
+            reasoning_output_tokens: 2070,
+            ..UsageMetrics::default()
+        };
+
+        assert_eq!(
+            evaluate_reasoning_guard(&cfg, "codex", "/v1/responses", Some(&usage), 0),
+            ReasoningGuardDecision::Pass
+        );
     }
 
     #[test]

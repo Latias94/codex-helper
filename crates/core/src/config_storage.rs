@@ -737,6 +737,7 @@ profile = "balanced"
 # [retry.reasoning_guard]
 # enabled = true
 # reasoning_equals = [516, 1034, 1552]
+# boundary_sequence_max_n = 4 # 匹配 reasoning_tokens = 518*n-2，设为 0 可关闭序列匹配。
 # action = "retry"              # retry | block | observe
 # stream_mode = "strict-buffer" # strict-buffer | observe | off
 # max_guard_retries = 1

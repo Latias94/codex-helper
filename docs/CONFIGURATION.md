@@ -488,14 +488,15 @@ profile = "balanced"
 ### Reasoning Guard: Catch Reasoning Token Anomaly Buckets
 
 If a Codex relay occasionally returns a successful response with `reasoning_tokens = 516`, `1034`,
-or `1552`, goes straight to a final answer, and produces visibly degraded answers, enable the retry
-reasoning guard. The guard only uses upstream usage metadata as a high-confidence signal; it does
-not try to judge whether the answer text is correct.
+`1552`, or another `518*n-2` boundary, goes straight to a final answer, and produces visibly
+degraded answers, enable the retry reasoning guard. The guard only uses upstream usage metadata as a
+high-confidence signal; it does not try to judge whether the answer text is correct.
 
 ```toml
 [retry.reasoning_guard]
 enabled = true
 reasoning_equals = [516, 1034, 1552]
+boundary_sequence_max_n = 4
 action = "retry"              # retry | block | observe
 stream_mode = "strict-buffer" # strict-buffer | observe | off
 max_guard_retries = 1
@@ -504,7 +505,9 @@ log_matches = true
 ```
 
 - The guard is disabled by default, so existing configs keep their current behavior. When enabled,
-  the default match list is `[516, 1034, 1552]`; override `reasoning_equals` for a custom list.
+  the default fixed match list is `reasoning_equals = [516, 1034, 1552]`, and the guard also matches
+  `518*n-2` boundaries where `n <= 4`. Override `reasoning_equals` for a custom fixed list, or set
+  `boundary_sequence_max_n = 0` to disable sequence matching.
 - `action = "retry"` rewrites a matching successful response into a local 502 and lets the normal
   `[retry]` upstream/provider policy handle it. `max_guard_retries = 1` means one extra upstream
   request per client request due to this guard.
