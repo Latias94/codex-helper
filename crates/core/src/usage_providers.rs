@@ -21,6 +21,7 @@ use crate::provider_signals::{
 };
 use crate::runtime_identity::ProviderEndpointKey;
 use crate::state::ProxyState;
+use crate::usage_forecast::next_reset_at_ms;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -257,6 +258,7 @@ const BALANCE_HTTP_ERROR_BODY_LIMIT: usize = 2_048;
 const AUTO_PROBE_KIND_FAILURE_TTL: Duration = Duration::from_secs(10 * 60);
 const USAGE_PROVIDER_TERMINAL_FAILURE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const USAGE_PROVIDER_EXHAUSTED_SUPPRESSION_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+const USAGE_PROVIDER_DAILY_RESET_SUPPRESSION_GRACE: Duration = Duration::from_secs(5 * 60);
 const LOW_BALANCE_ALERT_THRESHOLD_USD: &str = "10";
 const EXPIRING_SOON_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
 const AUTO_PROVIDER_ID_PREFIX: &str = "auto:balance:";
@@ -3048,9 +3050,11 @@ async fn refresh_provider_target(
     }
     if let Some(decision) = existing_usage_provider_target_suppression_decision(
         state,
+        cfg,
         service_name,
         &provider.id,
         target,
+        fetched_at_ms,
     )
     .await
     {
@@ -3115,27 +3119,18 @@ async fn refresh_provider_target(
                 stale_after_ms,
             );
             let snapshot_error = usage_provider_snapshot_error(&snapshot).map(str::to_string);
-            let terminal_error =
-                usage_provider_snapshot_terminal_error(&snapshot).map(str::to_string);
-            let suppression_reason = usage_provider_snapshot_suppression_reason(&snapshot);
-            let exhausted_for_lb =
-                terminal_error.is_some() || usage_provider_snapshot_blocks_further_usage(&snapshot);
-            if let Some(error) = terminal_error.as_deref() {
+            let suppression_decision =
+                usage_provider_suppression_decision_from_snapshot(&snapshot, cfg, fetched_at_ms);
+            let exhausted_for_lb = suppression_decision
+                .as_ref()
+                .is_some_and(|decision| decision.routing_exhausted);
+            if let Some(decision) = suppression_decision.as_ref() {
                 remember_usage_provider_target_suppression(
                     &provider.id,
                     target,
-                    USAGE_PROVIDER_TERMINAL_FAILURE_TTL,
-                    error,
-                    true,
-                    Instant::now(),
-                );
-            } else if let Some(reason) = suppression_reason.as_deref() {
-                remember_usage_provider_target_suppression(
-                    &provider.id,
-                    target,
-                    USAGE_PROVIDER_EXHAUSTED_SUPPRESSION_TTL,
-                    reason,
-                    true,
+                    decision.ttl,
+                    decision.reason.as_str(),
+                    decision.routing_exhausted,
                     Instant::now(),
                 );
             } else {
@@ -3417,6 +3412,56 @@ fn snapshot_has_current_day_quota_exhaustion(snapshot: &ProviderBalanceSnapshot)
             .is_some_and(quota_period_is_current_day)
 }
 
+fn duration_millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn duration_until_ms(deadline_ms: u64, now_ms: u64) -> Option<Duration> {
+    deadline_ms
+        .checked_sub(now_ms)
+        .filter(|remaining_ms| *remaining_ms > 0)
+        .map(Duration::from_millis)
+}
+
+fn snapshot_freshness_ttl(snapshot: &ProviderBalanceSnapshot, now_ms: u64) -> Option<Duration> {
+    snapshot
+        .stale_after_ms
+        .and_then(|stale_after_ms| duration_until_ms(stale_after_ms, now_ms))
+}
+
+fn current_day_quota_suppression_ttl(
+    snapshot: &ProviderBalanceSnapshot,
+    cfg: &ProxyConfig,
+    now_ms: u64,
+) -> Option<Duration> {
+    let reset_at_ms = next_reset_at_ms(
+        snapshot.fetched_at_ms,
+        cfg.ui.usage_forecast.reset_utc_offset.as_str(),
+        cfg.ui.usage_forecast.reset_time.as_str(),
+    )?;
+    let suppress_until_ms = reset_at_ms.saturating_add(duration_millis_u64(
+        USAGE_PROVIDER_DAILY_RESET_SUPPRESSION_GRACE,
+    ));
+    duration_until_ms(suppress_until_ms, now_ms)
+}
+
+fn usage_provider_snapshot_suppression_ttl(
+    snapshot: &ProviderBalanceSnapshot,
+    cfg: &ProxyConfig,
+    now_ms: u64,
+) -> Option<Duration> {
+    if snapshot_has_current_day_quota_exhaustion(snapshot) {
+        return current_day_quota_suppression_ttl(snapshot, cfg, now_ms)
+            .or_else(|| snapshot_freshness_ttl(snapshot, now_ms));
+    }
+
+    if snapshot.stale_at(now_ms) {
+        None
+    } else {
+        Some(USAGE_PROVIDER_EXHAUSTED_SUPPRESSION_TTL)
+    }
+}
+
 fn usage_provider_snapshot_suppression_reason(
     snapshot: &ProviderBalanceSnapshot,
 ) -> Option<String> {
@@ -3438,10 +3483,6 @@ fn usage_provider_snapshot_suppression_reason(
     None
 }
 
-fn usage_provider_snapshot_blocks_further_usage(snapshot: &ProviderBalanceSnapshot) -> bool {
-    usage_provider_snapshot_suppression_reason(snapshot).is_some()
-}
-
 fn usage_provider_snapshot_error(snapshot: &ProviderBalanceSnapshot) -> Option<&str> {
     snapshot
         .error
@@ -3456,8 +3497,13 @@ fn usage_provider_snapshot_terminal_error(snapshot: &ProviderBalanceSnapshot) ->
 
 fn usage_provider_suppression_decision_from_snapshot(
     snapshot: &ProviderBalanceSnapshot,
+    cfg: &ProxyConfig,
+    now_ms: u64,
 ) -> Option<ProviderTargetSuppressionDecision> {
     if let Some(error) = usage_provider_snapshot_terminal_error(snapshot) {
+        if snapshot.stale_at(now_ms) {
+            return None;
+        }
         return Some(ProviderTargetSuppressionDecision {
             reason: error.to_string(),
             routing_exhausted: true,
@@ -3465,11 +3511,12 @@ fn usage_provider_suppression_decision_from_snapshot(
         });
     }
 
-    usage_provider_snapshot_suppression_reason(snapshot).map(|reason| {
+    let reason = usage_provider_snapshot_suppression_reason(snapshot)?;
+    usage_provider_snapshot_suppression_ttl(snapshot, cfg, now_ms).map(|ttl| {
         ProviderTargetSuppressionDecision {
             reason,
             routing_exhausted: true,
-            ttl: USAGE_PROVIDER_EXHAUSTED_SUPPRESSION_TTL,
+            ttl,
         }
     })
 }
@@ -3504,9 +3551,11 @@ fn provider_balance_snapshot_matches_target(
 
 async fn existing_usage_provider_target_suppression_decision(
     state: &Arc<ProxyState>,
+    cfg: &ProxyConfig,
     service_name: &str,
     provider_id: &str,
     target: &UsageProviderTarget,
+    now_ms: u64,
 ) -> Option<ProviderTargetSuppressionDecision> {
     let view = state.get_provider_balance_view(service_name).await;
     view.get(&target.upstream.station_name)
@@ -3517,7 +3566,9 @@ async fn existing_usage_provider_target_suppression_decision(
                     provider_balance_snapshot_matches_target(snapshot, provider_id, target)
                 })
                 .max_by_key(|snapshot| snapshot.fetched_at_ms)
-                .and_then(usage_provider_suppression_decision_from_snapshot)
+                .and_then(|snapshot| {
+                    usage_provider_suppression_decision_from_snapshot(snapshot, cfg, now_ms)
+                })
         })
 }
 
@@ -3616,9 +3667,11 @@ async fn auto_probe_provider_target(
     }
     if let Some(decision) = existing_usage_provider_target_suppression_decision(
         state,
+        cfg,
         service_name,
         &provider_id,
         target,
+        fetched_at_ms,
     )
     .await
     {
@@ -3701,15 +3754,21 @@ async fn auto_probe_provider_target(
                 );
                 if auto_snapshot_is_usable(&snapshot) {
                     remember_auto_probe_kind_success(&provider_id, target, kind);
-                    let suppression_reason = usage_provider_snapshot_suppression_reason(&snapshot);
-                    let exhausted_for_lb = usage_provider_snapshot_blocks_further_usage(&snapshot);
-                    if let Some(reason) = suppression_reason.as_deref() {
+                    let suppression_decision = usage_provider_suppression_decision_from_snapshot(
+                        &snapshot,
+                        cfg,
+                        fetched_at_ms,
+                    );
+                    let exhausted_for_lb = suppression_decision
+                        .as_ref()
+                        .is_some_and(|decision| decision.routing_exhausted);
+                    if let Some(decision) = suppression_decision.as_ref() {
                         remember_usage_provider_target_suppression(
                             &provider_id,
                             target,
-                            USAGE_PROVIDER_EXHAUSTED_SUPPRESSION_TTL,
-                            reason,
-                            true,
+                            decision.ttl,
+                            decision.reason.as_str(),
+                            decision.routing_exhausted,
                             Instant::now(),
                         );
                     } else {
@@ -4432,10 +4491,83 @@ mod tests {
         snapshot.refresh_status(0);
 
         assert!(!snapshot.routing_exhausted());
-        assert!(usage_provider_snapshot_blocks_further_usage(&snapshot));
+        assert!(
+            usage_provider_suppression_decision_from_snapshot(
+                &snapshot,
+                &ProxyConfig::default(),
+                snapshot.fetched_at_ms,
+            )
+            .is_some()
+        );
         assert_eq!(
             usage_provider_snapshot_suppression_reason(&snapshot).as_deref(),
             Some("daily package quota exhausted for current period")
+        );
+    }
+
+    #[test]
+    fn current_day_quota_suppression_expires_after_configured_reset() {
+        let cfg = ProxyConfig::default();
+        let fetched_at_ms = 1_700_000_000_000;
+        let reset_at_ms = next_reset_at_ms(
+            fetched_at_ms,
+            cfg.ui.usage_forecast.reset_utc_offset.as_str(),
+            cfg.ui.usage_forecast.reset_time.as_str(),
+        )
+        .expect("default reset config is valid");
+        let grace_ms = duration_millis_u64(USAGE_PROVIDER_DAILY_RESET_SUPPRESSION_GRACE);
+        let suppress_until_ms = reset_at_ms + grace_ms;
+
+        let mut snapshot = ProviderBalanceSnapshot {
+            fetched_at_ms,
+            stale_after_ms: Some(fetched_at_ms + 60_000),
+            status: BalanceSnapshotStatus::Exhausted,
+            exhausted: Some(true),
+            exhaustion_affects_routing: false,
+            quota_period: Some("daily".to_string()),
+            quota_remaining_usd: Some("0".to_string()),
+            ..ProviderBalanceSnapshot::default()
+        };
+        snapshot.refresh_status(fetched_at_ms);
+
+        let decision = usage_provider_suppression_decision_from_snapshot(
+            &snapshot,
+            &cfg,
+            suppress_until_ms - 1,
+        )
+        .expect("daily exhaustion should suppress until reset grace expires");
+        assert_eq!(decision.ttl, Duration::from_millis(1));
+        assert!(decision.routing_exhausted);
+
+        assert!(
+            usage_provider_suppression_decision_from_snapshot(&snapshot, &cfg, suppress_until_ms)
+                .is_none(),
+            "a stale daily exhaustion snapshot must not suppress refresh after the reset boundary"
+        );
+    }
+
+    #[test]
+    fn stale_non_daily_exhaustion_snapshot_does_not_renew_suppression() {
+        let cfg = ProxyConfig::default();
+        let mut snapshot = ProviderBalanceSnapshot {
+            fetched_at_ms: 1_000,
+            stale_after_ms: Some(2_000),
+            status: BalanceSnapshotStatus::Exhausted,
+            exhausted: Some(true),
+            quota_period: Some("quota".to_string()),
+            quota_remaining_usd: Some("0".to_string()),
+            ..ProviderBalanceSnapshot::default()
+        };
+        snapshot.refresh_status(1_000);
+
+        let fresh_decision =
+            usage_provider_suppression_decision_from_snapshot(&snapshot, &cfg, 1_500)
+                .expect("fresh exhausted quota should suppress follow-up polling");
+        assert_eq!(fresh_decision.ttl, USAGE_PROVIDER_EXHAUSTED_SUPPRESSION_TTL);
+
+        assert!(
+            usage_provider_suppression_decision_from_snapshot(&snapshot, &cfg, 2_001).is_none(),
+            "stale exhausted quota snapshots must not be used to renew suppression forever"
         );
     }
 
