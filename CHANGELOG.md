@@ -12,12 +12,12 @@ All notable changes to this project will be documented in this file.
 - TUI 新增可选 `5 状态` 页。`[ui.service_status]` 默认关闭；启用后可按 provider / endpoint 发起轻量 `chat/completions` 探针，也保留只读 status JSON URL 模式。
 - 新增 `[codex.client_patch].hosted_image_generation = "auto" | "enabled" | "disabled"`。设为 `disabled` 时，`switch on` 会关闭 Codex hosted image generation，并在转发 `/responses` / WebSocket 时移除已有工具声明；OpenAI Images 兼容入口不受影响。
 - 新增 provider signal / policy action 控制链路。上游响应、route attempt、传输错误和可信余额快照会统一生成 provider 证据，并在 request ledger、admin API、TUI 和 Tauri desktop 中展示。
+- 新增 `[retry.reasoning_guard].boundary_sequence_max_n`，用于在 Reasoning Guard 开启后匹配 `518*n-2` 推理 token 边界（默认 `n <= 4`）。设为 `0` 可关闭序列匹配，仅保留 `reasoning_equals` 固定列表。
 
 #### 变更
 
 - 可信余额耗尽现在通过 codex-helper owned balance policy action 影响路由。新的非耗尽余额只会清理 helper 自己创建的 balance action，不会清理手动 override 或其它 cooldown。
 - 自动余额探针会记住可用 adapter，并暂时跳过刚失败的 adapter。降级到低优先级 provider 时，会节流复查被 cooldown 或 trusted usage exhaustion 跳过的高优先级 endpoint。
-- Reasoning Guard 在开启后除了固定 `reasoning_equals` 列表，也会默认匹配 `518*n-2` 且 `n <= 4` 的推理 token 边界；可用 `boundary_sequence_max_n = 0` 关闭序列匹配。
 
 #### 破坏性变更
 
@@ -39,12 +39,12 @@ All notable changes to this project will be documented in this file.
 - Added an optional `5 Status` page in the TUI. `[ui.service_status]` is off by default; when enabled it can run lightweight `chat/completions` probes per provider / endpoint, while still supporting read-only status JSON URLs.
 - Added `[codex.client_patch].hosted_image_generation = "auto" | "enabled" | "disabled"`. `disabled` turns off Codex hosted image generation during `switch on` and strips existing hosted image tools from proxied `/responses` / WebSocket requests; OpenAI Images-compatible requests still work.
 - Added the provider signal / policy action control loop. Upstream responses, route attempts, transport failures, and trusted balance snapshots now produce provider evidence shown in the request ledger, admin API, TUI, and Tauri desktop.
+- Added `[retry.reasoning_guard].boundary_sequence_max_n`, which lets Reasoning Guard match the `518*n-2` reasoning-token boundary sequence when enabled (default `n <= 4`). Set it to `0` to disable sequence matching and keep only the fixed `reasoning_equals` list.
 
 #### Changed
 
 - Trusted balance exhaustion now affects routing through codex-helper-owned balance policy actions. Fresh non-exhausted balances clear only helper-owned balance actions, not manual overrides or unrelated cooldowns.
 - Automatic balance probing remembers working adapters and temporarily skips recently failed adapters. When routing falls back to a lower-priority provider, codex-helper throttles reprobes for higher-priority endpoints skipped by cooldown or trusted usage exhaustion.
-- When enabled, Reasoning Guard now matches the `518*n-2` reasoning-token boundary sequence up to `n <= 4` in addition to the fixed `reasoning_equals` list; set `boundary_sequence_max_n = 0` to disable sequence matching.
 
 #### Breaking changes
 

@@ -431,17 +431,26 @@ profile = "balanced"
 
 ```toml
 [retry.reasoning_guard]
+# 总开关。默认 false；只有显式开启才会拦截或重试。
 enabled = true
+# 固定异常桶：精确命中这些 reasoning token 数时触发 guard。
 reasoning_equals = [516, 1034, 1552]
+# 序列异常桶：额外匹配 reasoning_tokens = 518*n-2。默认 n<=4，设为 0 可关闭。
 boundary_sequence_max_n = 4
-action = "retry"          # retry | block | observe
-stream_mode = "strict-buffer" # strict-buffer | observe | off
+# 命中后的动作：retry 改判为本地 502 并交给重试策略；block 直接拦截；observe 只记录。
+action = "retry"
+# 流式响应检查方式：strict-buffer 会先完整缓冲 SSE，避免异常内容先写给客户端。
+stream_mode = "strict-buffer"
+# 同一个客户端请求最多因 reasoning guard 增加多少轮上游请求。
 max_guard_retries = 1
+# 只在这些路径上启用，避免影响非 Codex / 非 Responses 请求。
 paths = ["/v1/responses", "/responses", "/v1/chat/completions", "/chat/completions"]
+# 是否把命中记录到 retry trace，便于 TUI Requests 和日志排查。
 log_matches = true
 ```
 
 - 默认关闭；不配置时不会改变现有行为。开启后默认匹配 `reasoning_equals = [516, 1034, 1552]`，并额外匹配 `518*n-2` 且 `n <= 4` 的边界序列。可以用 `reasoning_equals` 覆盖固定列表，用 `boundary_sequence_max_n = 0` 关闭序列匹配。
+- 推荐先从上面的示例开始：`action = "retry"` + `stream_mode = "strict-buffer"` 可以在内容写给 Codex 前拦截异常响应；如果只想观察命中频率，把 `action` 改成 `"observe"`。
 - `action = "retry"` 会把命中的成功响应改判为本地 502，并交给 `[retry]` 的 upstream/provider 重试规则处理。`max_guard_retries = 1` 表示同一个客户端请求最多因为该 guard 多打一轮上游请求。
 - `stream_mode = "strict-buffer"` 会在命中路径的流式请求中先完整缓冲 SSE，再检查末尾 usage。这样可以避免异常答案已经写给客户端后才发现异常 token，代价是这类流式请求不再实时透传。
 - 配置支持运行时热加载：每个新请求准备阶段都会检查配置文件变更；已在途请求继续使用它开始时的配置快照。TUI Settings 页按 `R` 可以立即强制重载。

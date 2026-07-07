@@ -736,12 +736,19 @@ profile = "balanced"
 #
 # [retry.reasoning_guard]
 # enabled = true
+# 固定异常桶：精确命中这些 reasoning token 数时触发 guard。
 # reasoning_equals = [516, 1034, 1552]
-# boundary_sequence_max_n = 4 # 匹配 reasoning_tokens = 518*n-2，设为 0 可关闭序列匹配。
-# action = "retry"              # retry | block | observe
-# stream_mode = "strict-buffer" # strict-buffer | observe | off
+# 序列异常桶：额外匹配 reasoning_tokens = 518*n-2；默认 n<=4，设为 0 可关闭。
+# boundary_sequence_max_n = 4
+# 命中后的动作：retry 改判为本地 502 并交给重试策略；block 直接拦截；observe 只记录。
+# action = "retry"
+# 流式响应检查方式：strict-buffer 会先完整缓冲 SSE，避免异常内容先写给客户端。
+# stream_mode = "strict-buffer"
+# 同一个客户端请求最多因 reasoning guard 增加多少轮上游请求。
 # max_guard_retries = 1
+# 只在这些路径上启用，避免影响非 Codex / 非 Responses 请求。
 # paths = ["/v1/responses", "/responses", "/v1/chat/completions", "/chat/completions"]
+# 是否把命中记录到 retry trace，便于 TUI Requests 和日志排查。
 # log_matches = true
 
 # 明确禁止重试/切换的 HTTP 状态码/范围（字符串形式）。

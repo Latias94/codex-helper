@@ -494,13 +494,21 @@ high-confidence signal; it does not try to judge whether the answer text is corr
 
 ```toml
 [retry.reasoning_guard]
+# Master switch. Defaults to false; the guard only acts when explicitly enabled.
 enabled = true
+# Fixed anomaly buckets: trigger when reasoning tokens exactly match one of these values.
 reasoning_equals = [516, 1034, 1552]
+# Sequence anomaly bucket: also match reasoning_tokens = 518*n-2. Defaults to n<=4; set 0 to disable.
 boundary_sequence_max_n = 4
-action = "retry"              # retry | block | observe
-stream_mode = "strict-buffer" # strict-buffer | observe | off
+# Match action: retry rewrites the response to a local 502; block rejects; observe only logs.
+action = "retry"
+# Streaming inspection mode: strict-buffer holds SSE until terminal usage is available.
+stream_mode = "strict-buffer"
+# Maximum extra upstream rounds per client request caused by this guard.
 max_guard_retries = 1
+# Limit the guard to Codex/Responses-compatible paths.
 paths = ["/v1/responses", "/responses", "/v1/chat/completions", "/chat/completions"]
+# Emit retry trace entries for matches so TUI Requests and logs can explain the decision.
 log_matches = true
 ```
 
@@ -508,6 +516,9 @@ log_matches = true
   the default fixed match list is `reasoning_equals = [516, 1034, 1552]`, and the guard also matches
   `518*n-2` boundaries where `n <= 4`. Override `reasoning_equals` for a custom fixed list, or set
   `boundary_sequence_max_n = 0` to disable sequence matching.
+- The recommended starting point is the example above: `action = "retry"` plus
+  `stream_mode = "strict-buffer"` lets codex-helper catch the anomalous response before it reaches
+  Codex. Use `action = "observe"` first if you only want to measure match frequency.
 - `action = "retry"` rewrites a matching successful response into a local 502 and lets the normal
   `[retry]` upstream/provider policy handle it. `max_guard_retries = 1` means one extra upstream
   request per client request due to this guard.
