@@ -9,49 +9,53 @@ All notable changes to this project will be documented in this file.
 
 #### 新增
 
-- TUI 新增可选服务状态页，位于 `4 请求` 之后的 `5 状态`。`[ui.service_status]` 默认关闭；显式启用后可按 provider / endpoint 发起 `max_tokens=1`、`stream=false` 的轻量 `chat/completions` 探针，验证真实上游链路，同时保留只读 status JSON URL 兼容模式。
-- 新增 `[codex.client_patch].hosted_image_generation = "auto" | "enabled" | "disabled"`。`disabled` 会在 `switch on` 时写入 Codex `[features].image_generation = false`，并在 helper 转发 Codex `/responses` / WebSocket 请求时移除会话中已有的 hosted `image_generation` 工具声明，避免不支持生图工具的上游仅因 tools 声明失败；显式 OpenAI Images 兼容入口仍保留生图工具。
-- 新增 provider signal control loop：上游响应、route attempt、传输错误和可信余额快照会先规范化为 provider signal，再生成归 codex-helper 所有、可审计、可过期的 policy action，并投影回 route graph。手动禁用和手动 override 仍高于自动 action，自动 action 不会修改 Codex auth 或第三方账号文件。
-- 请求 ledger、admin API、Tauri desktop 和 TUI 现在会展示 provider signal / policy action 证据；Stations / route graph 视图会显示 active automatic policy actions、canonical provider endpoint key、route skip 原因和 provider control 摘要。
+- TUI 新增可选 `5 状态` 页。`[ui.service_status]` 默认关闭；启用后可按 provider / endpoint 发起轻量 `chat/completions` 探针，也保留只读 status JSON URL 模式。
+- 新增 `[codex.client_patch].hosted_image_generation = "auto" | "enabled" | "disabled"`。设为 `disabled` 时，`switch on` 会关闭 Codex hosted image generation，并在转发 `/responses` / WebSocket 时移除已有工具声明；OpenAI Images 兼容入口不受影响。
+- 新增 provider signal / policy action 控制链路。上游响应、route attempt、传输错误和可信余额快照会统一生成 provider 证据，并在 request ledger、admin API、TUI 和 Tauri desktop 中展示。
 
 #### 变更
 
-- 可信余额耗尽现在通过 owned balance policy action 影响路由，而不是直接散落在多个 runtime 读模型里；新的非耗尽余额快照只会清理 codex-helper 自己拥有的 balance action，不会清理手动 override 或其它响应型 cooldown。
-- 自动余额探针会记住成功的中转适配器类型，并在短时间内跳过刚失败的适配器；当 degraded route selection 只能选择低优先级 provider 时，会对被 cooldown 或 trusted usage exhaustion 跳过的高优先级 endpoint 排队受节流的余额复查。
-- Breaking cleanup：移除旧 `codex-helper-gui` egui crate、二进制入口和 `gui` Cargo feature；桌面方向收口到 `apps/desktop` Tauri 预览，公开安装命令只保留 `codex-helper` 和 `ch`。
-- Breaking cleanup：移除 `switch on --mode ...` / relay diagnostics `--mode ...` 旧 CLI 写法，以及 `official-relay-bridge` / `official-imagegen-bridge` 新输入别名；新命令和 API 请求使用 `--preset official-relay`、`--preset official-imagegen` 或 `patch_preset`。
-- Breaking cleanup：正常启动路径不再隐式迁移旧配置；legacy v2/v3/v4、未标版本 TOML 和 `config.json` 会提示先运行 `codex-helper config migrate --dry-run` / `--write --yes`。
-- Breaking cleanup：新的 routing explain、usage/balance 和 route attempt DTO 不再输出 legacy station/upstream 兼容身份；调用方应使用 `provider_endpoint_key`、`provider_id` 和 `endpoint_id`，旧日志和旧快照仍保留读取兼容。
+- 可信余额耗尽现在通过 codex-helper owned balance policy action 影响路由。新的非耗尽余额只会清理 helper 自己创建的 balance action，不会清理手动 override 或其它 cooldown。
+- 自动余额探针会记住可用 adapter，并暂时跳过刚失败的 adapter。降级到低优先级 provider 时，会节流复查被 cooldown 或 trusted usage exhaustion 跳过的高优先级 endpoint。
+
+#### 破坏性变更
+
+- 移除旧 `codex-helper-gui` egui crate、二进制入口和 `gui` feature。GUI 方向收口到 `apps/desktop` Tauri，公开安装命令只保留 `codex-helper` 和 `ch`。
+- 不再接受 `switch on --mode ...` / relay diagnostics `--mode ...` 旧写法，也不再接受 `official-relay-bridge` / `official-imagegen-bridge` 作为新输入。请改用 `--preset official-relay`、`--preset official-imagegen` 或 API 字段 `patch_preset`。
+- 正常启动不再隐式迁移旧配置。legacy v2/v3/v4、未标版本 TOML 和 `config.json` 需要先运行 `codex-helper config migrate --dry-run` 或 `--write --yes`。
+- 新的 routing explain、usage/balance 和 route attempt DTO 不再输出 legacy station/upstream identity。调用方应使用 `provider_endpoint_key`、`provider_id` 和 `endpoint_id`；旧日志和旧快照仍可读取。
 
 #### 修复
 
-- 修复 provider surface / request ledger 中 endpoint key 兼容性和 CLI 过滤构造问题，旧记录和旧 dashboard DTO 仍能被读取。
-- 修复 policy action 证据一致性问题，route attempt、request detail、provider surface 和 runtime projection 对同一 provider endpoint 使用一致的 action / signal 归属。
-- 400 请求侧非瞬态错误现在归类为 `client_error_non_retryable`，不会计入 provider health 失败，并在 route attempt 中记录为 `failed_client_request`；流式 read error / idle timeout 日志也补充 `stream_error_kind`、首包耗时、已缓存字节数和 provider endpoint 信息，方便区分真实上游故障与请求侧错误。
+- 修复 provider surface、request ledger 和 CLI 过滤中的 endpoint key 兼容问题，旧记录和旧 dashboard DTO 仍可读取。
+- 修复 provider control 证据不一致的问题；route attempt、request detail、provider surface 和 runtime projection 现在对同一 provider endpoint 使用一致的 signal / action 归属。
+- 400 请求侧非瞬态错误现在归类为 `client_error_non_retryable`，不再计入 provider health 失败；流式 read error / idle timeout 日志也补充了更完整的 provider endpoint 信息。
 
 ### English summary
 
 #### Added
 
-- Added an optional TUI service status page after `4 Requests` as `5 Status`. `[ui.service_status]` is disabled by default; when explicitly enabled it can probe provider / endpoint targets with lightweight `chat/completions` requests using `max_tokens=1` and `stream=false`, while retaining read-only status JSON URL compatibility.
-- Added `[codex.client_patch].hosted_image_generation = "auto" | "enabled" | "disabled"`. `disabled` writes Codex `[features].image_generation = false` during `switch on` and strips existing hosted `image_generation` tool declarations from proxied Codex `/responses` / WebSocket requests, while preserving explicit OpenAI Images-compatible requests.
-- Added the provider signal control loop: upstream responses, route attempts, transport failures, and trusted balance snapshots are normalized into provider signals, converted into codex-helper-owned auditable policy actions, and projected back into the route graph. Manual disables and overrides still take precedence, and automatic actions never mutate Codex auth or third-party account files.
-- Request ledger, admin API, Tauri desktop, and TUI surfaces now expose provider signal / policy action evidence. The Stations / route graph views show active automatic policy actions, canonical provider endpoint keys, route skip reasons, and provider control summaries.
+- Added an optional `5 Status` page in the TUI. `[ui.service_status]` is off by default; when enabled it can run lightweight `chat/completions` probes per provider / endpoint, while still supporting read-only status JSON URLs.
+- Added `[codex.client_patch].hosted_image_generation = "auto" | "enabled" | "disabled"`. `disabled` turns off Codex hosted image generation during `switch on` and strips existing hosted image tools from proxied `/responses` / WebSocket requests; OpenAI Images-compatible requests still work.
+- Added the provider signal / policy action control loop. Upstream responses, route attempts, transport failures, and trusted balance snapshots now produce provider evidence shown in the request ledger, admin API, TUI, and Tauri desktop.
 
 #### Changed
 
-- Trusted balance exhaustion now affects routing through owned balance policy actions instead of being interpreted independently by multiple runtime read models. Fresh non-exhausted balance snapshots clear only codex-helper-owned balance actions, not manual overrides or unrelated response-based cooldowns.
-- Automatic balance probing now remembers successful relay adapter kinds and temporarily skips recently failed kinds. When degraded route selection falls back to a lower-priority provider, codex-helper queues throttled balance reprobes for higher-priority endpoints skipped by cooldown or trusted usage exhaustion.
-- Breaking cleanup: removed the old `codex-helper-gui` egui crate, binary entrypoint, and `gui` Cargo feature. Desktop development is now concentrated in the `apps/desktop` Tauri preview, while public installs expose only `codex-helper` and `ch`.
-- Breaking cleanup: removed the old `--mode ...` CLI spelling for `switch on` / relay diagnostics and removed `official-relay-bridge` / `official-imagegen-bridge` as accepted new input aliases. New commands and API requests should use `--preset official-relay`, `--preset official-imagegen`, or `patch_preset`.
-- Breaking cleanup: normal startup no longer migrates legacy config implicitly. Legacy v2/v3/v4, unversioned TOML, and `config.json` now ask operators to run `codex-helper config migrate --dry-run` / `--write --yes` first.
-- Breaking cleanup: new routing explain, usage/balance, and route attempt DTOs no longer emit legacy station/upstream compatibility identity. Callers should use `provider_endpoint_key`, `provider_id`, and `endpoint_id`; old logs and snapshots remain readable.
+- Trusted balance exhaustion now affects routing through codex-helper-owned balance policy actions. Fresh non-exhausted balances clear only helper-owned balance actions, not manual overrides or unrelated cooldowns.
+- Automatic balance probing remembers working adapters and temporarily skips recently failed adapters. When routing falls back to a lower-priority provider, codex-helper throttles reprobes for higher-priority endpoints skipped by cooldown or trusted usage exhaustion.
+
+#### Breaking changes
+
+- Removed the old `codex-helper-gui` egui crate, binary entrypoint, and `gui` feature. GUI work is now in `apps/desktop` Tauri; public installs expose only `codex-helper` and `ch`.
+- Removed `switch on --mode ...` / relay diagnostics `--mode ...` and the `official-relay-bridge` / `official-imagegen-bridge` input aliases. Use `--preset official-relay`, `--preset official-imagegen`, or the API field `patch_preset`.
+- Normal startup no longer migrates old config files implicitly. Legacy v2/v3/v4, unversioned TOML, and `config.json` must be migrated with `codex-helper config migrate --dry-run` or `--write --yes`.
+- New routing explain, usage/balance, and route attempt DTOs no longer emit legacy station/upstream identity. Use `provider_endpoint_key`, `provider_id`, and `endpoint_id`; old logs and snapshots remain readable.
 
 #### Fixed
 
-- Fixed provider surface / request ledger endpoint-key compatibility and CLI filter construction so old records and old dashboard DTOs remain readable.
-- Fixed policy action evidence consistency so route attempts, request details, provider surfaces, and runtime projections agree on action / signal ownership for the same provider endpoint.
-- Non-transient client-side 400 responses are now classified as `client_error_non_retryable`, kept health-neutral, and recorded as `failed_client_request` route attempts. Stream read errors and idle timeouts now include `stream_error_kind`, first-byte timing, buffered byte counts, and provider endpoint context for diagnostics.
+- Fixed endpoint-key compatibility in provider surfaces, request ledger reads, and CLI filters so old records and old dashboard DTOs remain readable.
+- Fixed provider control evidence consistency: route attempts, request details, provider surfaces, and runtime projections now agree on signal / action ownership for the same provider endpoint.
+- Non-transient client-side 400 responses are now `client_error_non_retryable` and stay health-neutral. Stream read errors and idle timeouts now include clearer provider endpoint diagnostics.
 
 ## [0.19.0] - 2026-06-29
 
