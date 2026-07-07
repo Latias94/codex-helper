@@ -6,8 +6,6 @@ packages = ["codex-helper"]
 [dist]
 # The preferred dist version to use in CI (Cargo.toml SemVer syntax)
 cargo-dist-version = "0.32.0"
-# Features to pass to cargo build
-features = ["gui"]
 # Build only the required packages, and individually
 precise-builds = true
 # CI backends to support
