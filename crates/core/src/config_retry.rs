@@ -115,6 +115,16 @@ pub enum ReasoningGuardStreamMode {
     StrictBuffer,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReasoningGuardRetryExhaustedAction {
+    /// Forward the final matching upstream response after the guard retry budget is used.
+    #[default]
+    Pass,
+    /// Convert the final matching upstream response to a local guard error.
+    Block,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ReasoningGuardConfig {
@@ -133,6 +143,8 @@ pub struct ReasoningGuardConfig {
     #[serde(default)]
     pub max_guard_retries: Option<u32>,
     #[serde(default)]
+    pub on_retry_exhausted: Option<ReasoningGuardRetryExhaustedAction>,
+    #[serde(default)]
     pub log_matches: Option<bool>,
 }
 
@@ -146,6 +158,8 @@ pub struct ResolvedReasoningGuardConfig {
     pub action: ReasoningGuardAction,
     pub stream_mode: ReasoningGuardStreamMode,
     pub max_guard_retries: u32,
+    #[serde(default)]
+    pub on_retry_exhausted: ReasoningGuardRetryExhaustedAction,
     pub log_matches: bool,
 }
 
@@ -300,6 +314,7 @@ impl ReasoningGuardConfig {
             action: ReasoningGuardAction::Retry,
             stream_mode: ReasoningGuardStreamMode::StrictBuffer,
             max_guard_retries: 1,
+            on_retry_exhausted: ReasoningGuardRetryExhaustedAction::Pass,
             log_matches: true,
         }
     }
@@ -330,6 +345,9 @@ impl ReasoningGuardConfig {
         }
         if let Some(v) = self.max_guard_retries {
             out.max_guard_retries = v.min(8);
+        }
+        if let Some(v) = self.on_retry_exhausted {
+            out.on_retry_exhausted = v;
         }
         if let Some(v) = self.log_matches {
             out.log_matches = v;
@@ -459,6 +477,10 @@ mod tests {
         );
         assert_eq!(resolved.reasoning_guard.action, ReasoningGuardAction::Retry);
         assert_eq!(resolved.reasoning_guard.max_guard_retries, 1);
+        assert_eq!(
+            resolved.reasoning_guard.on_retry_exhausted,
+            ReasoningGuardRetryExhaustedAction::Pass
+        );
     }
 
     #[test]

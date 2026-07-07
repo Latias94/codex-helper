@@ -189,7 +189,7 @@ pub async fn run_doctor(lang: DoctorLang) -> DoctorReport {
 
         match std::fs::read_to_string(&codex_cfg_path)
             .ok()
-            .and_then(|s| s.parse::<toml::Value>().ok())
+            .and_then(|s| toml::from_str::<toml::Value>(&s).ok())
         {
             Some(value) => {
                 let provider = value

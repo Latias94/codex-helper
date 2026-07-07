@@ -1635,6 +1635,66 @@ async fn proxy_reasoning_guard_retries_non_streaming_516_response() {
 }
 
 #[tokio::test]
+async fn proxy_reasoning_guard_passes_final_516_response_after_retry_budget() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = hits.clone();
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let counter = counter.clone();
+            async move {
+                let attempt = counter.fetch_add(1, Ordering::SeqCst);
+                Json(serde_json::json!({
+                    "id": format!("resp_{attempt}"),
+                    "object": "response",
+                    "output_text": format!("still-516-attempt-{attempt}"),
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 20,
+                        "total_tokens": 30,
+                        "reasoning_tokens": 516
+                    }
+                }))
+            }
+        }),
+    );
+    let upstream = spawn_test_upstream(upstream);
+    let cfg = make_proxy_config(
+        vec![upstream.upstream_config()],
+        reasoning_guard_retry_config(2),
+    );
+    let proxy = proxy_service(cfg);
+    let state = proxy.state.clone();
+    let proxy = spawn_proxy_service(proxy);
+
+    let client = reqwest::Client::new();
+    let body = post_responses_json(&client, &proxy, r#"{"model":"gpt-5","input":"hi"}"#)
+        .await
+        .error_for_status()
+        .expect("response status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("json response");
+
+    assert_eq!(body["output_text"].as_str(), Some("still-516-attempt-1"));
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+    let finished = find_finished_request(&state, 10, |request| {
+        request.path == "/v1/responses" && request.status_code == StatusCode::OK.as_u16()
+    })
+    .await
+    .expect("finished request");
+    let retry = finished.retry.expect("retry info");
+    assert_eq!(retry.attempts, 2);
+    let first = retry.route_attempts.first().expect("first attempt");
+    assert_eq!(first.decision, "failed_reasoning_guard");
+    assert_eq!(first.reason.as_deref(), Some("reasoning_tokens=516"));
+    let final_attempt = retry.route_attempts.last().expect("final attempt");
+    assert_eq!(final_attempt.decision, "completed");
+    assert_eq!(final_attempt.status_code, Some(StatusCode::OK.as_u16()));
+}
+
+#[tokio::test]
 async fn proxy_reasoning_guard_strict_buffers_streaming_516_response_before_retry() {
     let hits = Arc::new(AtomicUsize::new(0));
     let counter = hits.clone();

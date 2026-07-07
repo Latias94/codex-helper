@@ -2,7 +2,7 @@ use super::bootstrap_impl::bootstrap_from_codex;
 use super::*;
 use crate::file_replace::{write_bytes_file_async, write_text_file};
 use toml_edit::{
-    Document as EditableTomlDocument, Item as EditableTomlItem, Table as EditableTomlTable,
+    DocumentMut as EditableTomlDocument, Item as EditableTomlItem, Table as EditableTomlTable,
     value as editable_toml_value,
 };
 
@@ -746,6 +746,8 @@ profile = "balanced"
 # stream_mode = "strict-buffer"
 # 同一个客户端请求最多因 reasoning guard 增加多少轮上游请求。
 # max_guard_retries = 1
+# guard 重试预算耗尽后如何处理仍命中的响应：pass 原样放行；block 继续拦截。
+# on_retry_exhausted = "pass"
 # 只在这些路径上启用，避免影响非 Codex / 非 Responses 请求。
 # paths = ["/v1/responses", "/responses", "/v1/chat/completions", "/chat/completions"]
 # 是否把命中记录到 retry trace，便于 TUI Requests 和日志排查。

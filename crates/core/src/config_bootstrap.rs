@@ -15,7 +15,7 @@ pub(crate) fn bootstrap_from_codex(cfg: &mut ProxyConfig) -> Result<()> {
         }
     };
 
-    let value: TomlValue = cfg_text.parse()?;
+    let value: TomlValue = toml::from_str(&cfg_text)?;
     let table = value
         .as_table()
         .cloned()

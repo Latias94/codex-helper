@@ -36,7 +36,7 @@ export function useDashboardData(): QueryBackedData<typeof mockDashboardData> {
     canUseLiveActions: state.canUseLiveActions && (control.data?.reachable ?? true),
   };
 
-  const appVersion = metadata.data?.version ?? "0.19.0";
+  const appVersion = metadata.data?.version ?? "0.20.0";
   const data = readModel.data
     ? mapAdminDashboardData({
         summary: readModel.data.operatorSummary,

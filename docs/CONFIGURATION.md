@@ -506,6 +506,8 @@ action = "retry"
 stream_mode = "strict-buffer"
 # Maximum extra upstream rounds per client request caused by this guard.
 max_guard_retries = 1
+# What to do if the response still matches after the retry budget: pass it through or block it.
+on_retry_exhausted = "pass"
 # Limit the guard to Codex/Responses-compatible paths.
 paths = ["/v1/responses", "/responses", "/v1/chat/completions", "/chat/completions"]
 # Emit retry trace entries for matches so TUI Requests and logs can explain the decision.
@@ -521,7 +523,9 @@ log_matches = true
   Codex. Use `action = "observe"` first if you only want to measure match frequency.
 - `action = "retry"` rewrites a matching successful response into a local 502 and lets the normal
   `[retry]` upstream/provider policy handle it. `max_guard_retries = 1` means one extra upstream
-  request per client request due to this guard.
+  request per client request due to this guard. If the response still matches after that budget,
+  the default `on_retry_exhausted = "pass"` forwards the final upstream response to Codex so the
+  helper does not interrupt the task. Set it to `"block"` only when you prefer hard rejection.
 - `stream_mode = "strict-buffer"` buffers matching SSE responses until the terminal usage block is
   available. This prevents anomalous output from being sent before the guard can inspect
   `reasoning_tokens`, at the cost of losing live streaming for those guarded requests.
@@ -530,7 +534,8 @@ log_matches = true
   Press `R` on the TUI Settings page to force an immediate reload.
 - The TUI Requests page shows hits in the `RG` column. The details pane's `Retry / route chain`
   shows `decision=failed_reasoning_guard`, `class=reasoning_guard_triggered`, and
-  `reason=reasoning_tokens=<matched value>`.
+  `reason=reasoning_tokens=<matched value>`. A final response passed after retry exhaustion is
+  recorded as a normal completion, with retry trace `action=exhausted-pass`.
 
 ## Route Graph Shape
 

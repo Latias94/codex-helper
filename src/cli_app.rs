@@ -2020,7 +2020,7 @@ fn print_codex_switch_status() {
         }
     };
 
-    let value: toml::Value = match text.parse() {
+    let value: toml::Value = match toml::from_str(&text) {
         Ok(v) => v,
         Err(err) => {
             println!("  无法解析配置为 TOML：{}", err.to_string().red());

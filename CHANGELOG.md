@@ -3,21 +3,24 @@ All notable changes to this project will be documented in this file.
 
 > Recent entries use **Chinese first, then an English summary**. Older entries keep the previous inline bilingual style.
 
-## Unreleased
+## [0.20.0] - 2026-07-07
 
 ### 中文
 
 #### 新增
 
-- TUI 新增可选 `5 状态` 页。`[ui.service_status]` 默认关闭；启用后可按 provider / endpoint 发起轻量 `chat/completions` 探针，也保留只读 status JSON URL 模式。
-- 新增 `[codex.client_patch].hosted_image_generation = "auto" | "enabled" | "disabled"`。设为 `disabled` 时，`switch on` 会关闭 Codex hosted image generation，并在转发 `/responses` / WebSocket 时移除已有工具声明；OpenAI Images 兼容入口不受影响。
-- 新增 provider signal / policy action 控制链路。上游响应、route attempt、传输错误和可信余额快照会统一生成 provider 证据，并在 request ledger、admin API、TUI 和 Tauri desktop 中展示。
-- 新增 `[retry.reasoning_guard].boundary_sequence_max_n`，用于在 Reasoning Guard 开启后匹配 `518*n-2` 推理 token 边界（默认 `n <= 4`）。设为 `0` 可关闭序列匹配，仅保留 `reasoning_equals` 固定列表。
+- 新增可选的 TUI `5 状态` 页。启用 `[ui.service_status]` 后，可以按 provider / endpoint 发起轻量探针，或读取只读 status JSON，方便判断线路是否真的可用。
+- 新增 Codex hosted image generation 开关：`[codex.client_patch].hosted_image_generation = "auto" | "enabled" | "disabled"`。关闭后会在 Codex patch 和代理转发时移除 hosted image tool；OpenAI Images 兼容入口仍可继续使用。
+- 新增 provider signal / policy action 控制链路。限流、传输错误和可信余额耗尽会形成可解释的路由证据，并显示在 request ledger、admin API、TUI 和桌面端里。
+- Reasoning Guard 支持更完整的 `518*n-2` 推理 token 边界识别（如 `516/1034/1552/2070`）。开启 guard 后默认匹配到 `n <= 4`，可用 `boundary_sequence_max_n = 0` 关闭序列匹配。
+- Reasoning Guard 新增 `on_retry_exhausted = "pass" | "block"`。默认 `pass`：多次命中仍修不掉时放行最后一次上游响应，避免 helper 中断 Codex 任务。
 
 #### 变更
 
-- 可信余额耗尽现在通过 codex-helper owned balance policy action 影响路由。新的非耗尽余额只会清理 helper 自己创建的 balance action，不会清理手动 override 或其它 cooldown。
-- 自动余额探针会记住可用 adapter，并暂时跳过刚失败的 adapter。降级到低优先级 provider 时，会节流复查被 cooldown 或 trusted usage exhaustion 跳过的高优先级 endpoint。
+- 可信余额耗尽现在会通过 codex-helper 自己管理的 balance policy action 影响路由；新的可用余额只会清理 helper 自动创建的 action，不会覆盖手动禁用或其它 cooldown。
+- 自动余额探针会记住成功的 adapter，暂时跳过刚失败或今日套餐已耗尽的 adapter；路由降级后也会节流复查高优先级线路，减少余额接口滥用。
+- Tauri 桌面端仍只作为源码内预览和内部打包验证路径；v0.20.0 公开 release 不发布桌面安装包。
+- 依赖栈升级到当前可用版本，并适配 `toml` / `toml_edit` / `rand` / `rusqlite` / `tauri` 等跨版本 API 变化。
 
 #### 破坏性变更
 
@@ -36,15 +39,18 @@ All notable changes to this project will be documented in this file.
 
 #### Added
 
-- Added an optional `5 Status` page in the TUI. `[ui.service_status]` is off by default; when enabled it can run lightweight `chat/completions` probes per provider / endpoint, while still supporting read-only status JSON URLs.
-- Added `[codex.client_patch].hosted_image_generation = "auto" | "enabled" | "disabled"`. `disabled` turns off Codex hosted image generation during `switch on` and strips existing hosted image tools from proxied `/responses` / WebSocket requests; OpenAI Images-compatible requests still work.
-- Added the provider signal / policy action control loop. Upstream responses, route attempts, transport failures, and trusted balance snapshots now produce provider evidence shown in the request ledger, admin API, TUI, and Tauri desktop.
-- Added `[retry.reasoning_guard].boundary_sequence_max_n`, which lets Reasoning Guard match the `518*n-2` reasoning-token boundary sequence when enabled (default `n <= 4`). Set it to `0` to disable sequence matching and keep only the fixed `reasoning_equals` list.
+- Added an optional TUI `5 Status` page. When `[ui.service_status]` is enabled, it can run lightweight probes per provider / endpoint or read status JSON URLs to make route availability easier to inspect.
+- Added `[codex.client_patch].hosted_image_generation = "auto" | "enabled" | "disabled"`. `disabled` removes hosted image tools during Codex patching and proxied `/responses` / WebSocket forwarding, while the OpenAI Images-compatible endpoints remain available.
+- Added the provider signal / policy action control loop. Rate limits, transport failures, and trusted balance exhaustion now produce route-facing evidence visible in the request ledger, admin API, TUI, and desktop client.
+- Reasoning Guard now recognizes the broader `518*n-2` reasoning-token boundary pattern, such as `516/1034/1552/2070`. When enabled, it matches up to `n <= 4` by default; set `boundary_sequence_max_n = 0` to disable sequence matching.
+- Reasoning Guard added `on_retry_exhausted = "pass" | "block"`. The default `pass` forwards the final upstream response after the guard retry budget is used, so helper does not interrupt the Codex task.
 
 #### Changed
 
 - Trusted balance exhaustion now affects routing through codex-helper-owned balance policy actions. Fresh non-exhausted balances clear only helper-owned balance actions, not manual overrides or unrelated cooldowns.
-- Automatic balance probing remembers working adapters and temporarily skips recently failed adapters. When routing falls back to a lower-priority provider, codex-helper throttles reprobes for higher-priority endpoints skipped by cooldown or trusted usage exhaustion.
+- Automatic balance probing remembers working adapters and temporarily skips recently failed or daily-exhausted adapters. After fallback, codex-helper throttles reprobes for higher-priority endpoints to avoid balance API abuse.
+- The Tauri desktop client remains a source-tree preview and internal packaging validation target; v0.20.0 does not publish desktop installers.
+- Dependencies were upgraded to current available releases, including cross-version compatibility work for `toml`, `toml_edit`, `rand`, `rusqlite`, and `tauri`.
 
 #### Breaking changes
 

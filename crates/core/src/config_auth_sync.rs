@@ -79,7 +79,7 @@ pub fn sync_codex_auth_from_codex_cli(
         _ => anyhow::bail!("未找到 ~/.codex/config.toml 或文件为空，无法同步 Codex 账号信息"),
     };
 
-    let value: TomlValue = cfg_text.parse()?;
+    let value: TomlValue = toml::from_str(&cfg_text)?;
     let table = value
         .as_table()
         .cloned()

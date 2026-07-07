@@ -20,7 +20,7 @@ use crate::file_replace::write_text_file;
 use anyhow::{Context, Result, anyhow};
 use toml::Value;
 use toml_edit::{
-    Document as EditableTomlDocument, Item as EditableTomlItem, Table as EditableTomlTable,
+    DocumentMut as EditableTomlDocument, Item as EditableTomlItem, Table as EditableTomlTable,
     Value as EditableTomlValue, value as editable_toml_value,
 };
 
@@ -154,7 +154,7 @@ fn original_codex_proxy_value(text: &str) -> Result<Option<Value>> {
     if text.trim().is_empty() {
         return Ok(None);
     }
-    let value = text.parse::<Value>()?;
+    let value = toml::from_str::<Value>(text)?;
     Ok(value
         .as_table()
         .and_then(|root| root.get("model_providers"))
@@ -592,7 +592,7 @@ fn codex_remote_connections_feature_enabled_from_toml(text: &str) -> Result<bool
     if text.trim().is_empty() {
         return Ok(false);
     }
-    let value = text.parse::<Value>()?;
+    let value = toml::from_str::<Value>(text)?;
     Ok(value
         .as_table()
         .and_then(|root| root.get("features"))
@@ -606,7 +606,7 @@ fn codex_remote_control_feature_present_in_toml(text: &str) -> Result<bool> {
     if text.trim().is_empty() {
         return Ok(false);
     }
-    let value = text.parse::<Value>()?;
+    let value = toml::from_str::<Value>(text)?;
     Ok(value
         .as_table()
         .and_then(|root| root.get("features"))
@@ -618,7 +618,7 @@ fn codex_remote_compaction_v2_feature_enabled_from_toml(text: &str) -> Result<bo
     if text.trim().is_empty() {
         return Ok(false);
     }
-    let value = text.parse::<Value>()?;
+    let value = toml::from_str::<Value>(text)?;
     Ok(value
         .as_table()
         .and_then(|root| root.get("features"))
@@ -1850,7 +1850,7 @@ pub fn codex_switch_status() -> Result<CodexSwitchStatus> {
         });
     }
 
-    let value: Value = match text.parse() {
+    let value: Value = match toml::from_str(&text) {
         Ok(v) => v,
         Err(_) => {
             return Ok(CodexSwitchStatus {
@@ -2564,7 +2564,7 @@ pub fn guard_codex_config_before_switch_on_interactive() -> Result<()> {
         return Ok(());
     }
 
-    let value: Value = match text.parse() {
+    let value: Value = match toml::from_str(&text) {
         Ok(value) => value,
         Err(_) => return Ok(()),
     };

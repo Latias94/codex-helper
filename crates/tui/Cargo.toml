@@ -1,21 +1,21 @@
 [package]
 name = "codex-helper-tui"
-version = "0.19.0"
+version = "0.20.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Terminal UI crate for codex-helper."
 repository = "https://github.com/Latias94/codex-helper"
 
 [dependencies]
-codex-helper-core = { path = "../core", version = "0.19.0" }
-anyhow = "1.0.102"
+codex-helper-core = { path = "../core", version = "0.20.0" }
+anyhow = "1.0.103"
 # Keep default all-widgets disabled: the calendar widget pulls time into
 # ratatui-widgets, whose broad conversion impls fail rustc 1.96 coherence checks.
-ratatui = { version = "0.30.1", default-features = false, features = ["crossterm", "layout-cache", "macros", "underline-color"] }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache", "macros", "underline-color"] }
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 unicode-width = "0.2"
 tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "signal", "fs"] }
-futures-util = "0.3.31"
-reqwest = { version = "0.13.3", features = ["json", "stream", "gzip", "brotli", "zstd", "deflate"] }
+futures-util = "0.3.32"
+reqwest = { version = "0.13.4", features = ["json", "stream", "gzip", "brotli", "zstd", "deflate"] }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
+serde_json = "1.0.150"

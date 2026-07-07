@@ -1,7 +1,10 @@
 use axum::body::Bytes;
 use serde_json::json;
 
-use crate::config::{ReasoningGuardAction, ReasoningGuardStreamMode, ResolvedReasoningGuardConfig};
+use crate::config::{
+    ReasoningGuardAction, ReasoningGuardRetryExhaustedAction, ReasoningGuardStreamMode,
+    ResolvedReasoningGuardConfig,
+};
 use crate::logging::RouteAttemptLog;
 use crate::usage::UsageMetrics;
 
@@ -20,7 +23,8 @@ pub(super) enum ReasoningGuardDecision {
     Observe(ReasoningGuardMatch),
     Retry(ReasoningGuardMatch),
     Block(ReasoningGuardMatch),
-    Exhausted(ReasoningGuardMatch),
+    ExhaustedPass(ReasoningGuardMatch),
+    ExhaustedBlock(ReasoningGuardMatch),
 }
 
 impl ReasoningGuardDecision {
@@ -30,15 +34,16 @@ impl ReasoningGuardDecision {
             Self::Observe(matched)
             | Self::Retry(matched)
             | Self::Block(matched)
-            | Self::Exhausted(matched) => Some(matched),
+            | Self::ExhaustedPass(matched)
+            | Self::ExhaustedBlock(matched) => Some(matched),
         }
     }
 
     pub(super) fn failure_class(&self) -> Option<&'static str> {
         match self {
             Self::Retry(_) => Some(REASONING_GUARD_TRIGGERED_CLASS),
-            Self::Block(_) | Self::Exhausted(_) => Some(REASONING_GUARD_BLOCKED_CLASS),
-            Self::Pass | Self::Observe(_) => None,
+            Self::Block(_) | Self::ExhaustedBlock(_) => Some(REASONING_GUARD_BLOCKED_CLASS),
+            Self::Pass | Self::Observe(_) | Self::ExhaustedPass(_) => None,
         }
     }
 
@@ -52,7 +57,8 @@ impl ReasoningGuardDecision {
             Self::Observe(_) => "observe",
             Self::Retry(_) => "retry",
             Self::Block(_) => "block",
-            Self::Exhausted(_) => "exhausted",
+            Self::ExhaustedPass(_) => "exhausted-pass",
+            Self::ExhaustedBlock(_) => "exhausted-block",
         }
     }
 }
@@ -95,7 +101,14 @@ pub(super) fn evaluate_reasoning_guard(
         ReasoningGuardAction::Retry if prior_retry_matches < cfg.max_guard_retries => {
             ReasoningGuardDecision::Retry(matched)
         }
-        ReasoningGuardAction::Retry => ReasoningGuardDecision::Exhausted(matched),
+        ReasoningGuardAction::Retry => match cfg.on_retry_exhausted {
+            ReasoningGuardRetryExhaustedAction::Pass => {
+                ReasoningGuardDecision::ExhaustedPass(matched)
+            }
+            ReasoningGuardRetryExhaustedAction::Block => {
+                ReasoningGuardDecision::ExhaustedBlock(matched)
+            }
+        },
     }
 }
 
@@ -258,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_guard_exhausts_retry_budget() {
+    fn reasoning_guard_passes_after_exhausting_retry_budget_by_default() {
         let mut cfg = ReasoningGuardConfig::default_resolved();
         cfg.enabled = true;
         cfg.max_guard_retries = 1;
@@ -269,7 +282,24 @@ mod tests {
 
         assert!(matches!(
             evaluate_reasoning_guard(&cfg, "codex", "/v1/responses", Some(&usage), 1),
-            ReasoningGuardDecision::Exhausted(_)
+            ReasoningGuardDecision::ExhaustedPass(_)
+        ));
+    }
+
+    #[test]
+    fn reasoning_guard_can_block_after_exhausting_retry_budget() {
+        let mut cfg = ReasoningGuardConfig::default_resolved();
+        cfg.enabled = true;
+        cfg.max_guard_retries = 1;
+        cfg.on_retry_exhausted = ReasoningGuardRetryExhaustedAction::Block;
+        let usage = UsageMetrics {
+            reasoning_output_tokens: 516,
+            ..UsageMetrics::default()
+        };
+
+        assert!(matches!(
+            evaluate_reasoning_guard(&cfg, "codex", "/v1/responses", Some(&usage), 1),
+            ReasoningGuardDecision::ExhaustedBlock(_)
         ));
     }
 

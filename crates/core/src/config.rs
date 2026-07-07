@@ -57,9 +57,9 @@ pub use profiles_impl::{
     validate_profile_station_compatibility,
 };
 pub use retry_impl::{
-    ReasoningGuardAction, ReasoningGuardConfig, ReasoningGuardStreamMode,
-    ResolvedReasoningGuardConfig, ResolvedRetryConfig, ResolvedRetryLayerConfig, RetryConfig,
-    RetryLayerConfig, RetryProfileName, RetryStrategy,
+    ReasoningGuardAction, ReasoningGuardConfig, ReasoningGuardRetryExhaustedAction,
+    ReasoningGuardStreamMode, ResolvedReasoningGuardConfig, ResolvedRetryConfig,
+    ResolvedRetryLayerConfig, RetryConfig, RetryLayerConfig, RetryProfileName, RetryStrategy,
 };
 pub use routing_impl::{RoutingCandidate, ServiceRoutingExplanation, explain_service_routing};
 pub use storage_impl::{

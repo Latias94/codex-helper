@@ -120,7 +120,7 @@ fn notify_lock_path() -> PathBuf {
 }
 
 fn codex_proxy_base_url_from_codex_config_text(text: &str) -> Option<String> {
-    let value: toml::Value = text.parse().ok()?;
+    let value: toml::Value = toml::from_str(text).ok()?;
     let table = value.as_table()?;
     let providers = table.get("model_providers")?.as_table()?;
     let proxy = providers.get("codex_proxy")?.as_table()?;
