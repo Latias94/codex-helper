@@ -6,6 +6,14 @@ license = "MIT OR Apache-2.0"
 authors = ["Mingzhen Zhuang <superfrankie621@gmail.com>"]
 description = "A Rust-based local helper / proxy for Codex CLI traffic with multi-provider routing, usage-aware switching, filtering, and session helpers."
 readme = "README_EN.md"
+include = [
+    "/Cargo.lock",
+    "/Cargo.toml",
+    "/CHANGELOG.md",
+    "/README.md",
+    "/README_EN.md",
+    "/src/**",
+]
 keywords = ["codex", "proxy", "cli", "ai"]
 categories = ["command-line-utilities", "development-tools", "asynchronous"]
 repository = "https://github.com/Latias94/codex-helper"
