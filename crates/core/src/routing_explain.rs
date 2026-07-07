@@ -119,8 +119,6 @@ pub struct RoutingExplainCandidate {
     pub provider_endpoint_key: String,
     pub route_path: Vec<String>,
     pub preference_group: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub compatibility: Option<RoutingExplainCompatibility>,
     pub upstream_base_url: String,
     #[serde(default, skip_serializing_if = "ProviderCapacity::is_empty")]
     pub capacity: ProviderCapacity,
@@ -169,21 +167,6 @@ pub struct RoutingExplainAffinity {
     pub fallback_ttl_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reprobe_preferred_after_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct RoutingExplainCompatibility {
-    pub station_name: String,
-    pub upstream_index: usize,
-}
-
-impl RoutingExplainCompatibility {
-    pub fn compact_label(&self) -> String {
-        format!(
-            "compat_station={} upstream#{}",
-            self.station_name, self.upstream_index
-        )
-    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -439,35 +422,29 @@ pub fn format_skip_reasons_compact(reasons: &[RoutingExplainSkipReason]) -> Stri
         .join(",")
 }
 
-pub fn format_compatibility_compact(compatibility: Option<&RoutingExplainCompatibility>) -> String {
-    compatibility
-        .map(RoutingExplainCompatibility::compact_label)
-        .unwrap_or_else(|| "compatibility=-".to_string())
-}
-
 impl RoutingExplainCandidate {
     pub fn selected_route_label(&self) -> String {
         format!(
-            "selected={} endpoint={} path={} {}",
+            "selected={} endpoint={} key={} path={}",
             self.provider_id,
             self.endpoint_id,
-            self.route_path.join(" > "),
-            format_compatibility_compact(self.compatibility.as_ref())
+            self.provider_endpoint_key,
+            self.route_path.join(" > ")
         )
     }
 
     pub fn compact_label(&self) -> String {
         let marker = if self.selected { "*" } else { " " };
         format!(
-            "{} {} endpoint={} path={} availability={} {} skip={} {}",
+            "{} {} endpoint={} key={} path={} availability={} {} skip={}",
             marker,
             self.provider_id,
             self.endpoint_id,
+            self.provider_endpoint_key,
             self.route_path.join(" > "),
             self.availability.summary(),
             self.capacity.compact_runtime_label(),
-            format_skip_reasons_compact(&self.skip_reasons),
-            format_compatibility_compact(self.compatibility.as_ref())
+            format_skip_reasons_compact(&self.skip_reasons)
         )
     }
 }
@@ -488,17 +465,6 @@ fn routing_explain_candidate(
 ) -> RoutingExplainCandidate {
     let provider_endpoint = template.candidate_provider_endpoint_key(candidate);
     let provider_endpoint_key = provider_endpoint.stable_key();
-    let compatibility = candidate
-        .compatibility_station_name
-        .as_ref()
-        .and_then(|station_name| {
-            candidate
-                .compatibility_upstream_index
-                .map(|upstream_index| RoutingExplainCompatibility {
-                    station_name: station_name.clone(),
-                    upstream_index,
-                })
-        });
     RoutingExplainCandidate {
         provider_id: candidate.provider_id.clone(),
         provider_alias: candidate.provider_alias.clone(),
@@ -506,7 +472,6 @@ fn routing_explain_candidate(
         provider_endpoint_key,
         route_path: candidate.route_path.clone(),
         preference_group: candidate.preference_group,
-        compatibility,
         upstream_base_url: candidate.base_url.clone(),
         capacity: routing_explain_candidate_capacity(
             candidate,
@@ -681,7 +646,7 @@ mod tests {
     }
 
     #[test]
-    fn routing_explain_candidate_compact_label_includes_route_runtime_and_compatibility() {
+    fn routing_explain_candidate_compact_label_includes_route_runtime_and_provider_endpoint_key() {
         let candidate = RoutingExplainCandidate {
             provider_id: "alpha".to_string(),
             provider_alias: None,
@@ -689,10 +654,6 @@ mod tests {
             provider_endpoint_key: "codex/alpha/default".to_string(),
             route_path: vec!["root".to_string(), "alpha".to_string()],
             preference_group: 0,
-            compatibility: Some(RoutingExplainCompatibility {
-                station_name: "alpha-station".to_string(),
-                upstream_index: 2,
-            }),
             upstream_base_url: "https://example.invalid/v1".to_string(),
             capacity: ProviderCapacity {
                 effective_max_concurrent_requests: Some(2),
@@ -719,12 +680,12 @@ mod tests {
 
         assert_eq!(
             candidate.compact_label(),
-            "* alpha endpoint=default path=root > alpha availability=unavailable(concurrency_saturated) capacity=active=2/2,group=shared,saturated skip=concurrency_saturated(active=2/limit=2) compat_station=alpha-station upstream#2"
+            "* alpha endpoint=default key=codex/alpha/default path=root > alpha availability=unavailable(concurrency_saturated) capacity=active=2/2,group=shared,saturated skip=concurrency_saturated(active=2/limit=2)"
         );
     }
 
     #[test]
-    fn selected_route_compact_label_includes_path_and_compatibility() {
+    fn selected_route_compact_label_includes_path_and_provider_endpoint_key() {
         let candidate = RoutingExplainCandidate {
             provider_id: "alpha".to_string(),
             provider_alias: None,
@@ -732,10 +693,6 @@ mod tests {
             provider_endpoint_key: "codex/alpha/default".to_string(),
             route_path: vec!["root".to_string(), "alpha".to_string()],
             preference_group: 0,
-            compatibility: Some(RoutingExplainCompatibility {
-                station_name: "alpha-station".to_string(),
-                upstream_index: 1,
-            }),
             upstream_base_url: "https://example.invalid/v1".to_string(),
             capacity: ProviderCapacity::default(),
             availability: RoutingExplainAvailability::default(),
@@ -745,7 +702,7 @@ mod tests {
 
         assert_eq!(
             format_selected_route_compact(Some(&candidate)),
-            "selected=alpha endpoint=default path=root > alpha compat_station=alpha-station upstream#1"
+            "selected=alpha endpoint=default key=codex/alpha/default path=root > alpha"
         );
         assert_eq!(format_selected_route_compact(None), "selected=<none>");
     }

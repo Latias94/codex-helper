@@ -49,18 +49,8 @@ async fn proxy_api_v1_operator_summary_reports_runtime_target_and_retry() {
         },
     );
     let v2 = crate::config::migrate_legacy_to_v2(&cfg);
-    crate::config::save_config_v2(&v2)
-        .await
-        .expect("write operator summary v2 config");
-    let loaded = crate::config::load_config()
-        .await
-        .expect("load operator summary runtime config");
-
-    let proxy = ProxyService::new(
-        Client::new(),
-        Arc::new(loaded),
-        "codex",
-        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    let proxy = proxy_with_loaded_route_graph_config(
+        save_v2_as_route_graph_config_and_load(&v2, "load operator summary runtime config").await,
     );
     proxy
         .state
@@ -70,7 +60,7 @@ async fn proxy_api_v1_operator_summary_reports_runtime_target_and_retry() {
         .state
         .set_station_runtime_state_override(
             "codex",
-            "test".to_string(),
+            "routing".to_string(),
             RuntimeConfigState::Draining,
             2,
         )
@@ -79,7 +69,7 @@ async fn proxy_api_v1_operator_summary_reports_runtime_target_and_retry() {
         .state
         .record_station_health(
             "codex",
-            "test".to_string(),
+            "routing".to_string(),
             crate::state::StationHealth {
                 checked_at_ms: 20,
                 upstreams: vec![crate::state::UpstreamHealth {
@@ -97,7 +87,7 @@ async fn proxy_api_v1_operator_summary_reports_runtime_target_and_retry() {
         .state
         .record_passive_upstream_failure(crate::state::PassiveUpstreamFailureRecord {
             service_name: "codex".to_string(),
-            station_name: "test".to_string(),
+            station_name: "routing".to_string(),
             base_url: "http://127.0.0.1:9/v1".to_string(),
             status_code: Some(503),
             error_class: Some("upstream_transport_error".to_string()),
@@ -109,7 +99,7 @@ async fn proxy_api_v1_operator_summary_reports_runtime_target_and_retry() {
         .state
         .record_passive_upstream_failure(crate::state::PassiveUpstreamFailureRecord {
             service_name: "codex".to_string(),
-            station_name: "test".to_string(),
+            station_name: "routing".to_string(),
             base_url: "http://127.0.0.1:9/v1".to_string(),
             status_code: Some(503),
             error_class: Some("upstream_transport_error".to_string()),
@@ -120,13 +110,13 @@ async fn proxy_api_v1_operator_summary_reports_runtime_target_and_retry() {
     assert!(
         proxy
             .state
-            .try_begin_station_health_check("codex", "test", 1, 23)
+            .try_begin_station_health_check("codex", "routing", 1, 23)
             .await
     );
     {
         let mut guard = proxy.lb_states.lock().expect("lb state lock");
         guard.insert(
-            "test".to_string(),
+            "routing".to_string(),
             crate::lb::LbState {
                 failure_counts: vec![2],
                 cooldown_until: vec![Some(
@@ -280,11 +270,11 @@ async fn proxy_api_v1_operator_summary_reports_runtime_target_and_retry() {
     assert_eq!(summary["service_name"].as_str(), Some("codex"));
     assert_eq!(
         summary["runtime"]["configured_active_station"].as_str(),
-        Some("test")
+        Some("routing")
     );
     assert_eq!(
         summary["runtime"]["effective_active_station"].as_str(),
-        Some("test")
+        Some("routing")
     );
     assert_eq!(
         summary["runtime"]["global_station_override"].as_str(),
@@ -321,7 +311,7 @@ async fn proxy_api_v1_operator_summary_reports_runtime_target_and_retry() {
             .map(|stations| stations.len()),
         Some(1)
     );
-    assert_eq!(summary["stations"][0]["name"].as_str(), Some("test"));
+    assert_eq!(summary["stations"][0]["name"].as_str(), Some("routing"));
     assert_eq!(
         summary["providers"]
             .as_array()
@@ -688,18 +678,8 @@ async fn proxy_api_v1_provider_runtime_override_filters_real_routing() {
         },
     );
 
-    crate::config::save_config_v2(&cfg)
-        .await
-        .expect("write provider runtime v2 config");
-    let loaded = crate::config::load_config()
-        .await
-        .expect("load provider runtime config");
-
-    let proxy = ProxyService::new(
-        Client::new(),
-        Arc::new(loaded),
-        "codex",
-        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    let proxy = proxy_with_loaded_route_graph_config(
+        save_v2_as_route_graph_config_and_load(&cfg, "load provider runtime config").await,
     );
     let app = crate::proxy::router(proxy);
     let (proxy_addr, proxy_handle) = spawn_axum_server(app);

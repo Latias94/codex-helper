@@ -133,6 +133,35 @@ fn make_proxy_config(upstreams: Vec<UpstreamConfig>, retry: RetryConfig) -> Prox
     }
 }
 
+async fn save_v2_as_route_graph_config_and_load(
+    cfg: &ProxyConfigV2,
+    context: &str,
+) -> crate::config::LoadedProxyConfig {
+    let migrated = crate::config::migrate_v2_to_v4_with_report(cfg)
+        .expect("explicitly migrate v2 test config to route graph")
+        .config;
+    crate::config::save_config_v4(&migrated)
+        .await
+        .expect("write migrated route graph test config");
+    crate::config::load_config_with_v4_source()
+        .await
+        .expect(context)
+}
+
+fn proxy_with_loaded_route_graph_config(loaded: crate::config::LoadedProxyConfig) -> ProxyService {
+    let v4_source = loaded
+        .v4
+        .clone()
+        .expect("route graph test config source should be available");
+    ProxyService::new_with_v4_source(
+        Client::new(),
+        Arc::new(loaded.runtime),
+        Some(Arc::new(v4_source)),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    )
+}
+
 fn reserve_unused_local_addr() -> std::net::SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     listener.local_addr().expect("local_addr")

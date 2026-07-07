@@ -602,7 +602,7 @@ Pick one recipe first. You can refine fields later. For Claude, replace `codex` 
 | I need to force one provider temporarily | [Manual Pin](#manual-pin) | Explicit and easy to undo |
 | One provider account has multiple upstream endpoints | [Multiple Endpoints For One Provider](#multiple-endpoints-for-one-provider) | Keeps one provider identity with endpoint-level routing |
 
-Routing decisions use runtime provider endpoints. `compatibility` station/upstream fields in diagnostics are migration context, not the new identity.
+Routing decisions use runtime provider endpoints. New diagnostics and balance DTOs expose `provider_endpoint_key`, `provider_id`, and `endpoint_id`; station/upstream fields are only read from legacy logs and snapshots.
 
 ### One Provider
 
@@ -1311,7 +1311,7 @@ Use `--claude` on provider/routing commands when editing the Claude service inst
 
 `routing show` reads persisted config. `routing list` and `routing explain` read the compiled runtime candidate view.
 Use `routing explain --model <MODEL> --json` to inspect the same selected route, candidate order, route paths, and structured skip reasons exposed by the runtime admin explain API.
-In that response, `provider_endpoint_key`, `provider_id`, `endpoint_id`, `route_path`, and `preference_group` are the primary v5 routing identity. Legacy station/upstream identity is reported under each candidate's `compatibility` object for migration diagnostics.
+In that response, `provider_endpoint_key`, `provider_id`, `endpoint_id`, `route_path`, and `preference_group` are the primary v5 routing identity. New routing explain responses no longer emit legacy station/upstream compatibility objects; old logs and balance snapshots can still be read for migration.
 
 ## Inspect Routing And Logs
 
@@ -1387,7 +1387,7 @@ Check these fields first:
 - `selected_route.provider_endpoint_key` and `selected_route.preference_group` show what the runtime would try now. Group `0` is the most preferred group.
 - `candidates[].skip_reasons` explains why a preferred candidate was skipped, for example `unsupported_model`, `cooldown`, `usage_exhausted`, `runtime_disabled`, or `attempt_avoided`.
 - `affinity.policy` / `affinity_policy` tells whether automatic affinity is `preferred-group`, `off`, `fallback-sticky`, or `hard`.
-- `compatibility` is legacy station/upstream context only. For route graph decisions, prefer `provider_endpoint_key`, `provider_id`, `endpoint_id`, and `route_path`.
+- Route graph decisions use `provider_endpoint_key`, `provider_id`, `endpoint_id`, and `route_path`; legacy station/upstream context is not emitted by new routing explain responses.
 
 For a monthly-first setup, the generated default is `affinity_policy = "fallback-sticky"`, because relay providers often bind cache and encrypted response state to an upstream account. If you prefer automatic return to the best monthly group after an outage, explicitly set `affinity_policy = "preferred-group"`. If the route keeps using paygo unexpectedly, look for one of these causes:
 

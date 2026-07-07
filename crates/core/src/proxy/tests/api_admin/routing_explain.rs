@@ -129,14 +129,7 @@ async fn proxy_api_v1_routing_explain_returns_selected_route_and_structured_skip
                 .collect::<Vec<_>>()),
         Some(vec!["legacy", "test", "new"])
     );
-    assert_eq!(
-        explain["selected_route"]["compatibility"]["station_name"].as_str(),
-        Some("test")
-    );
-    assert_eq!(
-        explain["selected_route"]["compatibility"]["upstream_index"].as_u64(),
-        Some(1)
-    );
+    assert!(explain["selected_route"]["compatibility"].is_null());
     assert!(explain["selected_route"]["station_name"].is_null());
     assert!(explain["selected_route"]["upstream_index"].is_null());
 
@@ -148,10 +141,7 @@ async fn proxy_api_v1_routing_explain_returns_selected_route_and_structured_skip
     );
     assert_eq!(first["preference_group"].as_u64(), Some(0));
     assert_eq!(first["selected"].as_bool(), Some(false));
-    assert_eq!(
-        first["compatibility"]["station_name"].as_str(),
-        Some("test")
-    );
+    assert!(first["compatibility"].is_null());
     assert_eq!(
         first["skip_reasons"].as_array().map(|reasons| reasons
             .iter()

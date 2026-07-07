@@ -21,6 +21,7 @@ All notable changes to this project will be documented in this file.
 - Breaking cleanup：移除旧 `codex-helper-gui` egui crate、二进制入口和 `gui` Cargo feature；桌面方向收口到 `apps/desktop` Tauri 预览，公开安装命令只保留 `codex-helper` 和 `ch`。
 - Breaking cleanup：移除 `switch on --mode ...` / relay diagnostics `--mode ...` 旧 CLI 写法，以及 `official-relay-bridge` / `official-imagegen-bridge` 新输入别名；新命令和 API 请求使用 `--preset official-relay`、`--preset official-imagegen` 或 `patch_preset`。
 - Breaking cleanup：正常启动路径不再隐式迁移旧配置；legacy v2/v3/v4、未标版本 TOML 和 `config.json` 会提示先运行 `codex-helper config migrate --dry-run` / `--write --yes`。
+- Breaking cleanup：新的 routing explain、usage/balance 和 route attempt DTO 不再输出 legacy station/upstream 兼容身份；调用方应使用 `provider_endpoint_key`、`provider_id` 和 `endpoint_id`，旧日志和旧快照仍保留读取兼容。
 
 #### 修复
 
@@ -44,6 +45,7 @@ All notable changes to this project will be documented in this file.
 - Breaking cleanup: removed the old `codex-helper-gui` egui crate, binary entrypoint, and `gui` Cargo feature. Desktop development is now concentrated in the `apps/desktop` Tauri preview, while public installs expose only `codex-helper` and `ch`.
 - Breaking cleanup: removed the old `--mode ...` CLI spelling for `switch on` / relay diagnostics and removed `official-relay-bridge` / `official-imagegen-bridge` as accepted new input aliases. New commands and API requests should use `--preset official-relay`, `--preset official-imagegen`, or `patch_preset`.
 - Breaking cleanup: normal startup no longer migrates legacy config implicitly. Legacy v2/v3/v4, unversioned TOML, and `config.json` now ask operators to run `codex-helper config migrate --dry-run` / `--write --yes` first.
+- Breaking cleanup: new routing explain, usage/balance, and route attempt DTOs no longer emit legacy station/upstream compatibility identity. Callers should use `provider_endpoint_key`, `provider_id`, and `endpoint_id`; old logs and snapshots remain readable.
 
 #### Fixed
 

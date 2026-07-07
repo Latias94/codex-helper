@@ -250,14 +250,38 @@ fn retry_info_serializes_structured_route_attempts() {
         value["route_attempts"][0]["decision"].as_str(),
         Some("failed_transport")
     );
-    assert_eq!(
-        value["route_attempts"][0]["station_name"].as_str(),
-        Some("right")
-    );
+    assert!(value["route_attempts"][0]["station_name"].is_null());
+    assert!(value["route_attempts"][0]["upstream_index"].is_null());
     assert_eq!(
         value["route_attempts"][1]["decision"].as_str(),
         Some("completed")
     );
+}
+
+#[test]
+fn retry_info_reads_legacy_route_attempt_station_identity() {
+    let retry: RetryInfo = serde_json::from_value(serde_json::json!({
+        "attempts": 1,
+        "upstream_chain": [],
+        "route_attempts": [
+            {
+                "attempt_index": 0,
+                "decision": "completed",
+                "station_name": "legacy",
+                "upstream_index": 2,
+                "upstream_base_url": "https://legacy.example/v1",
+                "raw": "legacy:https://legacy.example/v1 (idx=2) status=200"
+            }
+        ]
+    }))
+    .expect("deserialize legacy retry info");
+
+    assert_eq!(retry.route_attempts.len(), 1);
+    assert_eq!(
+        retry.route_attempts[0].station_name.as_deref(),
+        Some("legacy")
+    );
+    assert_eq!(retry.route_attempts[0].upstream_index, Some(2));
 }
 
 #[test]

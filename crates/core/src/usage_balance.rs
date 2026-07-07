@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::pricing::{CostConfidence, UsdAmount};
 use crate::routing_explain::{RoutingExplainCandidate, RoutingExplainResponse};
+use crate::runtime_identity::ProviderEndpointKey;
 use crate::state::{
     BalanceSnapshotStatus, FinishedRequest, ProviderBalanceSnapshot, UsageBucket, UsageRollupView,
 };
@@ -161,8 +162,7 @@ impl UsageBalanceProviderRow {
 pub struct UsageBalanceEndpointRow {
     pub provider_id: String,
     pub endpoint_id: String,
-    pub station_name: Option<String>,
-    pub upstream_index: Option<usize>,
+    pub provider_endpoint_key: String,
     pub base_url: Option<String>,
     pub usage: UsageBucket,
     pub balance_status: UsageBalanceStatus,
@@ -174,8 +174,7 @@ pub struct UsageBalanceEndpointRow {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UsageBalanceSnapshotSummary {
     pub provider_id: String,
-    pub station_name: Option<String>,
-    pub upstream_index: Option<usize>,
+    pub provider_endpoint_key: Option<String>,
     pub source: String,
     pub status: UsageBalanceStatus,
     pub amount_summary: String,
@@ -237,6 +236,7 @@ impl UsageBalanceView {
     pub fn build(input: UsageBalanceBuildInput<'_>) -> Self {
         let route_index = RouteIndex::from_explain(input.routing_explain);
         let mut endpoint_rows = build_endpoint_rows(
+            input.service_name,
             input.recent,
             input.provider_balances,
             &route_index,
@@ -453,6 +453,7 @@ fn build_refresh_status(
 }
 
 fn build_endpoint_rows(
+    service_name: &str,
     recent: &[FinishedRequest],
     provider_balances: &HashMap<String, Vec<ProviderBalanceSnapshot>>,
     route_index: &RouteIndex,
@@ -467,15 +468,12 @@ fn build_endpoint_rows(
         };
         let row = acc
             .entry(key.clone())
-            .or_insert_with(|| EndpointAccum::new(key));
+            .or_insert_with(|| EndpointAccum::new(service_name, key));
+        row.provider_endpoint_key = candidate.provider_endpoint_key.clone();
         row.base_url = non_empty(candidate.base_url.clone()).or(row.base_url.take());
         row.route_selected |= candidate.selected;
         row.route_skip_reasons
             .extend(candidate.skip_reasons.iter().cloned());
-        if let Some((station_name, upstream_index)) = candidate.compatibility.as_ref() {
-            row.station_name = Some(station_name.clone());
-            row.upstream_index = Some(*upstream_index);
-        }
     }
 
     for request in recent {
@@ -510,7 +508,7 @@ fn build_endpoint_rows(
         };
         let row = acc
             .entry(key.clone())
-            .or_insert_with(|| EndpointAccum::new(key));
+            .or_insert_with(|| EndpointAccum::new(service_name, key));
         if row.base_url.is_none() {
             row.base_url = base_url.map(ToOwned::to_owned);
         }
@@ -520,34 +518,22 @@ fn build_endpoint_rows(
     for (station_name, snapshots) in provider_balances {
         for snapshot in snapshots {
             let provider_id = balance_provider_id(station_name, snapshot);
-            let endpoint_id = snapshot
-                .upstream_index
-                .and_then(|idx| {
-                    route_index
-                        .endpoint_by_provider_station_upstream
-                        .get(&(provider_id.clone(), station_name.clone(), idx))
-                        .cloned()
-                })
-                .unwrap_or_else(|| {
-                    snapshot
-                        .upstream_index
-                        .map(|idx| format!("upstream#{idx}"))
-                        .or_else(|| non_empty(snapshot.source.clone()))
-                        .unwrap_or_else(|| "balance".to_string())
-                });
+            let endpoint_id = snapshot_endpoint_id(snapshot, &provider_id, route_index)
+                .or_else(|| snapshot.upstream_index.map(|idx| format!("upstream#{idx}")))
+                .or_else(|| non_empty(snapshot.source.clone()))
+                .unwrap_or_else(|| "balance".to_string());
             let key = EndpointKey {
                 provider_id: provider_id.clone(),
                 endpoint_id,
             };
             let row = acc
                 .entry(key.clone())
-                .or_insert_with(|| EndpointAccum::new(key));
-            row.station_name = snapshot
-                .station_name
-                .clone()
-                .or_else(|| Some(station_name.clone()))
-                .or(row.station_name.take());
-            row.upstream_index = snapshot.upstream_index.or(row.upstream_index);
+                .or_insert_with(|| EndpointAccum::new(service_name, key));
+            if let Some(provider_endpoint_key) =
+                non_empty(snapshot.provider_endpoint_key.clone().unwrap_or_default())
+            {
+                row.provider_endpoint_key = provider_endpoint_key;
+            }
             let summary = summarize_snapshot(snapshot, now_ms);
             let replace = row.balance.as_ref().is_none_or(|existing| {
                 snapshot_display_rank(summary.status) < snapshot_display_rank(existing.status)
@@ -559,6 +545,31 @@ fn build_endpoint_rows(
     }
 
     acc.into_values().map(EndpointAccum::finish).collect()
+}
+
+fn snapshot_endpoint_id(
+    snapshot: &ProviderBalanceSnapshot,
+    provider_id: &str,
+    route_index: &RouteIndex,
+) -> Option<String> {
+    let provider_endpoint_key = snapshot
+        .provider_endpoint_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    route_index
+        .endpoint_by_provider_endpoint_key
+        .get(provider_endpoint_key)
+        .cloned()
+        .or_else(|| endpoint_id_from_provider_endpoint_key(provider_endpoint_key, provider_id))
+}
+
+fn endpoint_id_from_provider_endpoint_key(key: &str, provider_id: &str) -> Option<String> {
+    let mut parts = key.splitn(3, '/');
+    let _service_name = parts.next()?;
+    let provider = parts.next()?;
+    let endpoint = parts.next()?.trim();
+    (provider == provider_id && !endpoint.is_empty()).then(|| endpoint.to_string())
 }
 
 fn record_finished_into_bucket(bucket: &mut UsageBucket, request: &FinishedRequest) {
@@ -639,8 +650,7 @@ fn summarize_snapshot(
 ) -> UsageBalanceSnapshotSummary {
     UsageBalanceSnapshotSummary {
         provider_id: snapshot.provider_id.clone(),
-        station_name: snapshot.station_name.clone(),
-        upstream_index: snapshot.upstream_index,
+        provider_endpoint_key: snapshot.provider_endpoint_key.clone(),
         source: snapshot.source.clone(),
         status: classify_snapshot(snapshot, now_ms),
         amount_summary: snapshot.amount_summary(),
@@ -764,8 +774,7 @@ struct EndpointKey {
 #[derive(Debug, Clone)]
 struct EndpointAccum {
     key: EndpointKey,
-    station_name: Option<String>,
-    upstream_index: Option<usize>,
+    provider_endpoint_key: String,
     base_url: Option<String>,
     usage: UsageBucket,
     balance: Option<UsageBalanceSnapshotSummary>,
@@ -774,11 +783,12 @@ struct EndpointAccum {
 }
 
 impl EndpointAccum {
-    fn new(key: EndpointKey) -> Self {
+    fn new(service_name: &str, key: EndpointKey) -> Self {
+        let provider_endpoint_key =
+            stable_provider_endpoint_key(service_name, &key.provider_id, &key.endpoint_id);
         Self {
             key,
-            station_name: None,
-            upstream_index: None,
+            provider_endpoint_key,
             base_url: None,
             usage: UsageBucket::default(),
             balance: None,
@@ -796,8 +806,7 @@ impl EndpointAccum {
         UsageBalanceEndpointRow {
             provider_id: self.key.provider_id,
             endpoint_id: self.key.endpoint_id,
-            station_name: self.station_name,
-            upstream_index: self.upstream_index,
+            provider_endpoint_key: self.provider_endpoint_key,
             base_url: self.base_url,
             usage: self.usage,
             balance_status,
@@ -812,10 +821,10 @@ impl EndpointAccum {
 struct RouteCandidateView {
     provider_id: String,
     endpoint_id: String,
+    provider_endpoint_key: String,
     base_url: String,
     selected: bool,
     skip_reasons: Vec<String>,
-    compatibility: Option<(String, usize)>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -823,7 +832,7 @@ struct RouteIndex {
     candidates: BTreeMap<String, RouteCandidateView>,
     provider_impacts: BTreeMap<String, UsageBalanceRouteImpact>,
     endpoint_by_provider_base_url: BTreeMap<(String, String), String>,
-    endpoint_by_provider_station_upstream: BTreeMap<(String, String, usize), String>,
+    endpoint_by_provider_endpoint_key: BTreeMap<String, String>,
 }
 
 impl RouteIndex {
@@ -851,19 +860,13 @@ impl RouteIndex {
             .iter()
             .map(|reason| reason.code().to_string())
             .collect::<Vec<_>>();
-        let compatibility = candidate.compatibility.as_ref().map(|compatibility| {
-            (
-                compatibility.station_name.clone(),
-                compatibility.upstream_index,
-            )
-        });
         let view = RouteCandidateView {
             provider_id: candidate.provider_id.clone(),
             endpoint_id: candidate.endpoint_id.clone(),
+            provider_endpoint_key: candidate.provider_endpoint_key.clone(),
             base_url: candidate.upstream_base_url.clone(),
             selected: candidate.selected,
             skip_reasons: skip_reasons.clone(),
-            compatibility: compatibility.clone(),
         };
 
         self.endpoint_by_provider_base_url.insert(
@@ -873,12 +876,10 @@ impl RouteIndex {
             ),
             candidate.endpoint_id.clone(),
         );
-        if let Some((station_name, upstream_index)) = compatibility {
-            self.endpoint_by_provider_station_upstream.insert(
-                (candidate.provider_id.clone(), station_name, upstream_index),
-                candidate.endpoint_id.clone(),
-            );
-        }
+        self.endpoint_by_provider_endpoint_key.insert(
+            candidate.provider_endpoint_key.clone(),
+            candidate.endpoint_id.clone(),
+        );
 
         let impact = self
             .provider_impacts
@@ -899,6 +900,14 @@ impl RouteIndex {
         self.candidates
             .insert(candidate.provider_endpoint_key.clone(), view);
     }
+}
+
+fn stable_provider_endpoint_key(
+    service_name: &str,
+    provider_id: &str,
+    endpoint_id: &str,
+) -> String {
+    ProviderEndpointKey::new(service_name, provider_id, endpoint_id).stable_key()
 }
 
 fn endpoint_id_from_base_url(base_url: &str) -> String {
@@ -1051,10 +1060,9 @@ mod tests {
                 provider_id: "selected".to_string(),
                 provider_alias: None,
                 endpoint_id: "default".to_string(),
-                provider_endpoint_key: "codex:selected:default".to_string(),
+                provider_endpoint_key: "codex/selected/default".to_string(),
                 route_path: vec!["main".to_string(), "selected".to_string()],
                 preference_group: 0,
-                compatibility: None,
                 upstream_base_url: "https://selected.example/v1".to_string(),
                 capacity: Default::default(),
                 availability: crate::routing_explain::RoutingExplainAvailability {
@@ -1117,14 +1125,17 @@ mod tests {
         let mut balances = HashMap::new();
         balances.insert(
             "station-a".to_string(),
-            vec![ProviderBalanceSnapshot {
-                provider_id: "right".to_string(),
-                station_name: Some("station-a".to_string()),
-                upstream_index: Some(0),
-                exhausted: Some(true),
-                fetched_at_ms: 940,
-                ..ProviderBalanceSnapshot::default()
-            }],
+            vec![
+                ProviderBalanceSnapshot {
+                    provider_id: "right".to_string(),
+                    station_name: Some("station-a".to_string()),
+                    upstream_index: Some(0),
+                    exhausted: Some(true),
+                    fetched_at_ms: 940,
+                    ..ProviderBalanceSnapshot::default()
+                }
+                .with_provider_endpoint_key("codex/right/default"),
+            ],
         );
         let explain = RoutingExplainResponse {
             api_version: 1,
@@ -1138,13 +1149,9 @@ mod tests {
                 provider_id: "right".to_string(),
                 provider_alias: None,
                 endpoint_id: "default".to_string(),
-                provider_endpoint_key: "codex:right:default".to_string(),
+                provider_endpoint_key: "codex/right/default".to_string(),
                 route_path: vec!["main".to_string(), "right".to_string()],
                 preference_group: 0,
-                compatibility: Some(crate::routing_explain::RoutingExplainCompatibility {
-                    station_name: "station-a".to_string(),
-                    upstream_index: 0,
-                }),
                 upstream_base_url: "https://right.example/v1".to_string(),
                 capacity: Default::default(),
                 availability: crate::routing_explain::RoutingExplainAvailability {
@@ -1176,9 +1183,17 @@ mod tests {
             .expect("right endpoint");
 
         assert_eq!(endpoint.endpoint_id, "default");
+        assert_eq!(endpoint.provider_endpoint_key, "codex/right/default");
         assert_eq!(endpoint.usage.requests_total, 1);
         assert_eq!(endpoint.usage.requests_error, 1);
         assert_eq!(endpoint.balance_status, UsageBalanceStatus::Exhausted);
+        assert_eq!(
+            endpoint
+                .balance
+                .as_ref()
+                .and_then(|balance| balance.provider_endpoint_key.as_deref()),
+            Some("codex/right/default")
+        );
         assert_eq!(endpoint.route_skip_reasons, vec!["usage_exhausted"]);
     }
 }

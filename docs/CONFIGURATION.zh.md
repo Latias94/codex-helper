@@ -530,7 +530,7 @@ Affinity 不是硬 pin：
 | 需要临时强制某个 provider | [手动固定](#手动固定) | 明确且容易撤销 |
 | 一个 provider 账号有多个 upstream endpoints | [单 Provider 多 Endpoints](#单-provider-多-endpoints) | 保留一个 provider identity，同时做 endpoint 级路由 |
 
-路由决策使用运行时 provider endpoints。诊断里的 `compatibility` station/upstream 字段只是迁移上下文，不是新的 identity。
+路由决策使用运行时 provider endpoints。新的诊断和余额 DTO 会暴露 `provider_endpoint_key`、`provider_id` 和 `endpoint_id`；station/upstream 字段只在读取旧日志和旧快照时兼容。
 
 ### 单 Provider
 
@@ -1234,7 +1234,7 @@ codex-helper routing explain
 
 `routing show` 读取持久化配置。`routing list` 和 `routing explain` 读取编译后的运行时候选视图。
 使用 `routing explain --model <MODEL> --json` 可以检查和运行时 admin explain API 相同的 selected route、candidate order、route paths 和结构化 skip reasons。
-在该响应里，`provider_endpoint_key`、`provider_id`、`endpoint_id`、`route_path` 和 `preference_group` 是 v5 routing identity。Legacy station/upstream identity 会在每个 candidate 的 `compatibility` 对象下报告，用于迁移诊断。
+在该响应里，`provider_endpoint_key`、`provider_id`、`endpoint_id`、`route_path` 和 `preference_group` 是 v5 routing identity。新的 routing explain 响应不再输出 legacy station/upstream compatibility 对象；旧日志和旧余额快照仍可读取用于迁移。
 
 ## 检查 Routing 和日志
 
@@ -1300,7 +1300,7 @@ codex-helper routing explain --model <MODEL> --json
 - `selected_route.provider_endpoint_key` 和 `selected_route.preference_group` 显示运行时现在会尝试什么。Group `0` 是最高优先级组。
 - `candidates[].skip_reasons` 解释 preferred candidate 为什么被跳过，例如 `unsupported_model`、`cooldown`、`usage_exhausted`、`runtime_disabled` 或 `attempt_avoided`。
 - `affinity.policy` / `affinity_policy` 显示自动 affinity 是 `preferred-group`、`off`、`fallback-sticky` 还是 `hard`。
-- `compatibility` 只是 legacy station/upstream 上下文。route graph 决策优先看 `provider_endpoint_key`、`provider_id`、`endpoint_id` 和 `route_path`。
+- route graph 决策使用 `provider_endpoint_key`、`provider_id`、`endpoint_id` 和 `route_path`；新的 routing explain 响应不再输出 legacy station/upstream 上下文。
 
 对于 monthly-first setup，生成配置默认使用 `affinity_policy = "fallback-sticky"`，因为中转 provider 往往会把缓存和 encrypted response state 绑定到上游账号。如果你更希望故障恢复后自动回到最佳 monthly group，可以显式设置 `affinity_policy = "preferred-group"`。如果 route 意外一直使用 paygo，请检查这些原因：
 

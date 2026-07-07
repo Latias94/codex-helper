@@ -411,11 +411,11 @@ pub struct RouteAttemptLog {
     pub provider_max_attempts: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_max_attempts: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing)]
     pub station_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_base_url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing)]
     pub upstream_index: Option<usize>,
     #[serde(
         default,

@@ -211,7 +211,6 @@ fn runtime_candidate_includes_capacity_surface() {
         provider_endpoint_key: "codex/alpha/default".to_string(),
         route_path: vec!["alpha".to_string()],
         preference_group: 0,
-        compatibility: None,
         upstream_base_url: "https://example.invalid/v1".to_string(),
         capacity: crate::dashboard_core::ProviderCapacity {
             configured_max_concurrent_requests: None,
@@ -242,7 +241,7 @@ fn runtime_candidate_includes_capacity_surface() {
     assert!(text.contains("path=alpha"));
     assert!(text.contains("capacity=active=1/2,group=shared,inherited"));
     assert!(text.contains("availability=available"));
-    assert!(text.contains("compatibility=-"));
+    assert!(text.contains("key=codex/alpha/default"));
 }
 
 #[test]

@@ -36,19 +36,9 @@ async fn proxy_api_v1_profile_config_crud_persists_and_clears_stale_runtime_over
     );
 
     let v2 = crate::config::migrate_legacy_to_v2(&cfg);
-    crate::config::save_config_v2(&v2)
-        .await
-        .expect("write initial v2 config");
-    let loaded = crate::config::load_config()
-        .await
-        .expect("load initial runtime config");
+    let loaded = save_v2_as_route_graph_config_and_load(&v2, "load initial runtime config").await;
 
-    let proxy = ProxyService::new(
-        Client::new(),
-        Arc::new(loaded),
-        "codex",
-        Arc::new(std::sync::Mutex::new(HashMap::new())),
-    );
+    let proxy = proxy_with_loaded_route_graph_config(loaded);
     let app = crate::proxy::router(proxy);
     let (proxy_addr, proxy_handle) = spawn_axum_server(app);
     let client = reqwest::Client::new();
@@ -177,7 +167,7 @@ async fn proxy_api_v1_profile_config_crud_persists_and_clears_stale_runtime_over
 }
 
 #[tokio::test]
-async fn proxy_api_v1_station_settings_rejects_persisted_writes_after_v2_auto_migration() {
+async fn proxy_api_v1_station_settings_rejects_persisted_writes_after_explicit_v2_migration() {
     let _env_lock = env_lock().await;
     let temp_dir = make_temp_test_dir();
     let mut scoped = ScopedEnv::default();
@@ -214,19 +204,9 @@ async fn proxy_api_v1_station_settings_rejects_persisted_writes_after_v2_auto_mi
     );
 
     let v2 = crate::config::migrate_legacy_to_v2(&cfg);
-    crate::config::save_config_v2(&v2)
-        .await
-        .expect("write initial v2 config");
-    let loaded = crate::config::load_config()
-        .await
-        .expect("load initial runtime config");
+    let loaded = save_v2_as_route_graph_config_and_load(&v2, "load initial runtime config").await;
 
-    let proxy = ProxyService::new(
-        Client::new(),
-        Arc::new(loaded),
-        "codex",
-        Arc::new(std::sync::Mutex::new(HashMap::new())),
-    );
+    let proxy = proxy_with_loaded_route_graph_config(loaded);
     let app = crate::proxy::router(proxy);
     let (proxy_addr, proxy_handle) = spawn_axum_server(app);
     let client = reqwest::Client::new();
@@ -1224,19 +1204,9 @@ async fn proxy_api_v1_retry_config_crud_persists_profile_and_cooldowns() {
     cfg.version = Some(2);
 
     let v2 = crate::config::migrate_legacy_to_v2(&cfg);
-    crate::config::save_config_v2(&v2)
-        .await
-        .expect("write initial v2 config");
-    let loaded = crate::config::load_config()
-        .await
-        .expect("load initial runtime config");
+    let loaded = save_v2_as_route_graph_config_and_load(&v2, "load initial runtime config").await;
 
-    let proxy = ProxyService::new(
-        Client::new(),
-        Arc::new(loaded),
-        "codex",
-        Arc::new(std::sync::Mutex::new(HashMap::new())),
-    );
+    let proxy = proxy_with_loaded_route_graph_config(loaded);
     let app = crate::proxy::router(proxy);
     let (proxy_addr, proxy_handle) = spawn_axum_server(app);
     let client = reqwest::Client::new();
@@ -1337,7 +1307,7 @@ async fn proxy_api_v1_retry_config_crud_persists_profile_and_cooldowns() {
 }
 
 #[tokio::test]
-async fn proxy_api_v1_station_specs_rejects_crud_after_v2_auto_migration() {
+async fn proxy_api_v1_station_specs_rejects_crud_after_explicit_v2_migration() {
     let _env_lock = env_lock().await;
     let temp_dir = make_temp_test_dir();
     let mut scoped = ScopedEnv::default();
@@ -1413,19 +1383,9 @@ async fn proxy_api_v1_station_specs_rejects_crud_after_v2_auto_migration() {
         },
     );
 
-    crate::config::save_config_v2(&cfg)
-        .await
-        .expect("write initial v2 config");
-    let loaded = crate::config::load_config()
-        .await
-        .expect("load initial runtime config");
+    let loaded = save_v2_as_route_graph_config_and_load(&cfg, "load initial runtime config").await;
 
-    let proxy = ProxyService::new(
-        Client::new(),
-        Arc::new(loaded),
-        "codex",
-        Arc::new(std::sync::Mutex::new(HashMap::new())),
-    );
+    let proxy = proxy_with_loaded_route_graph_config(loaded);
     let app = crate::proxy::router(proxy);
     let (proxy_addr, proxy_handle) = spawn_axum_server(app);
     let client = reqwest::Client::new();
@@ -1625,15 +1585,8 @@ async fn proxy_api_v1_provider_specs_crud_persists_endpoints_and_env_refs() {
     );
     v2_proxy_handle.abort();
 
-    let loaded = crate::config::load_config()
-        .await
-        .expect("load migrated runtime config");
-    let proxy = ProxyService::new(
-        Client::new(),
-        Arc::new(loaded),
-        "codex",
-        Arc::new(std::sync::Mutex::new(HashMap::new())),
-    );
+    let loaded = save_v2_as_route_graph_config_and_load(&cfg, "load migrated runtime config").await;
+    let proxy = proxy_with_loaded_route_graph_config(loaded);
     let app = crate::proxy::router(proxy);
     let (proxy_addr, proxy_handle) = spawn_axum_server(app);
 

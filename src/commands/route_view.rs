@@ -8,10 +8,9 @@ use crate::config::{
     ServiceRoutingExplanation, ServiceViewV4, explain_service_routing, storage::config_file_path,
 };
 use crate::routing_explain::{
-    RoutingExplainCompatibility, RoutingExplainCondition, RoutingExplainConditionalBranch,
-    RoutingExplainResponse, RoutingExplainRouteRef, RoutingExplainRouteRefKind,
-    RoutingExplainSkipReason, build_routing_explain_response_with_request,
-    parse_routing_explain_headers,
+    RoutingExplainCondition, RoutingExplainConditionalBranch, RoutingExplainResponse,
+    RoutingExplainRouteRef, RoutingExplainRouteRefKind, RoutingExplainSkipReason,
+    build_routing_explain_response_with_request, parse_routing_explain_headers,
 };
 use crate::routing_ir::{
     RoutePlanRuntimeState, RouteRequestContext, compile_legacy_route_plan_template,
@@ -324,14 +323,12 @@ fn runtime_explain_text_lines(explain: &RoutingExplainResponse) -> Vec<String> {
         ));
     }
     if let Some(selected) = &explain.selected_route {
-        let compatibility = format_explain_compatibility(selected.compatibility.as_ref());
         lines.push(format!(
-            "Selected route: endpoint={} group={} provider={} path=[{}] {}",
+            "Selected route: endpoint={} group={} provider={} path=[{}]",
             selected.provider_endpoint_key,
             selected.preference_group,
             selected.provider_id,
-            selected.route_path.join(" > "),
-            compatibility
+            selected.route_path.join(" > ")
         ));
     } else {
         lines.push("Selected route: <none>".to_string());
@@ -346,17 +343,15 @@ fn runtime_explain_text_lines(explain: &RoutingExplainResponse) -> Vec<String> {
     for (idx, candidate) in explain.candidates.iter().enumerate() {
         let marker = if candidate.selected { "*" } else { " " };
         let skips = format_skip_reasons(&candidate.skip_reasons);
-        let compatibility = format_explain_compatibility(candidate.compatibility.as_ref());
         lines.push(format!(
-            "  {} {}. endpoint={} group={} provider={} path=[{}] skip={} {}",
+            "  {} {}. endpoint={} group={} provider={} path=[{}] skip={}",
             marker,
             idx + 1,
             candidate.provider_endpoint_key,
             candidate.preference_group,
             candidate.provider_id,
             candidate.route_path.join(" > "),
-            skips,
-            compatibility
+            skips
         ));
     }
 
@@ -380,17 +375,6 @@ fn runtime_explain_text_lines(explain: &RoutingExplainResponse) -> Vec<String> {
     }
 
     lines
-}
-
-fn format_explain_compatibility(compatibility: Option<&RoutingExplainCompatibility>) -> String {
-    compatibility
-        .map(|compatibility| {
-            format!(
-                "compat_station={} upstream_index={}",
-                compatibility.station_name, compatibility.upstream_index
-            )
-        })
-        .unwrap_or_else(|| "compatibility=-".to_string())
 }
 
 fn print_runtime_explain_text(explain: &RoutingExplainResponse) {
@@ -713,9 +697,7 @@ pub async fn handle_route_view_cmd(cmd: RoutingCommand) -> CliResult<()> {
 mod tests {
     use super::*;
     use crate::config::{ProviderConfigV4, RoutingConfigV4, UpstreamAuth};
-    use crate::routing_explain::{
-        RoutingExplainCandidate, RoutingExplainCompatibility, RoutingExplainResponse,
-    };
+    use crate::routing_explain::{RoutingExplainCandidate, RoutingExplainResponse};
 
     fn provider(base_url: &str, supported_models: &[&str]) -> ProviderConfigV4 {
         ProviderConfigV4 {
@@ -800,10 +782,6 @@ mod tests {
                 provider_endpoint_key: "codex/input/default".to_string(),
                 route_path: vec!["main".to_string(), "input".to_string()],
                 preference_group: 0,
-                compatibility: Some(RoutingExplainCompatibility {
-                    station_name: "legacy".to_string(),
-                    upstream_index: 1,
-                }),
                 upstream_base_url: "https://input.example/v1".to_string(),
                 capacity: Default::default(),
                 availability: Default::default(),
@@ -817,10 +795,6 @@ mod tests {
                 provider_endpoint_key: "codex/input/default".to_string(),
                 route_path: vec!["main".to_string(), "input".to_string()],
                 preference_group: 0,
-                compatibility: Some(RoutingExplainCompatibility {
-                    station_name: "legacy".to_string(),
-                    upstream_index: 1,
-                }),
                 upstream_base_url: "https://input.example/v1".to_string(),
                 capacity: Default::default(),
                 availability: Default::default(),
@@ -836,7 +810,7 @@ mod tests {
 
         assert_eq!(
             lines[0],
-            "Selected route: endpoint=codex/input/default group=0 provider=input path=[main > input] compat_station=legacy upstream_index=1"
+            "Selected route: endpoint=codex/input/default group=0 provider=input path=[main > input]"
         );
         assert_eq!(lines[1], "Runtime candidates:");
         assert!(lines[2].starts_with(
