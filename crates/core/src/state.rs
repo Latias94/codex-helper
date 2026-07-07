@@ -23,6 +23,7 @@ use crate::routing_ir::{RoutePlanRuntimeState, RoutePlanUpstreamRuntimeState};
 use crate::runtime_identity::ProviderEndpointKey;
 use crate::sessions;
 use crate::usage::UsageMetrics;
+use crate::usage_day;
 
 mod policy_action_store;
 mod runtime_types;
@@ -2359,13 +2360,6 @@ impl ProxyState {
             return UsageRollupView::default();
         };
 
-        fn now_day() -> i32 {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| (d.as_millis() / 86_400_000) as i32)
-                .unwrap_or(0)
-        }
-
         fn sorted_day_series(map: &HashMap<i32, UsageBucket>) -> Vec<(i32, UsageBucket)> {
             let mut out = map.iter().map(|(k, v)| (*k, v.clone())).collect::<Vec<_>>();
             out.sort_by_key(|(k, _)| *k);
@@ -2439,7 +2433,7 @@ impl ProxyState {
         let (start_day, end_day) = if all_loaded {
             (loaded_first_day, loaded_last_day)
         } else {
-            let end = now_day();
+            let end = usage_day::current_local_day();
             let offset = i32::try_from(days.saturating_sub(1)).unwrap_or(i32::MAX);
             (Some(end.saturating_sub(offset)), Some(end))
         };
@@ -2686,7 +2680,7 @@ impl ProxyState {
         for (ended_at_ms, status_code, duration_ms, cfg_key, provider_key, usage, ttfb_ms) in
             events.iter()
         {
-            let day = (*ended_at_ms / 86_400_000) as i32;
+            let day = usage_day::local_day_from_ms(*ended_at_ms);
             rollup
                 .loaded
                 .record(*status_code, *duration_ms, usage.as_ref(), None, *ttfb_ms);
@@ -2896,7 +2890,7 @@ impl ProxyState {
 
         {
             let effective_ttfb_ms = finished.observability.ttfb_ms;
-            let day = (finished.ended_at_ms / 86_400_000) as i32;
+            let day = usage_day::local_day_from_ms(finished.ended_at_ms);
             let cfg_key = finished
                 .station_name
                 .clone()
@@ -3348,7 +3342,7 @@ impl ProxyState {
             .and_then(|s| s.trim().parse::<i32>().ok())
             .filter(|&n| n > 0)
             .unwrap_or(60);
-        let now_day = (now_ms / 86_400_000) as i32;
+        let now_day = usage_day::local_day_from_ms(now_ms);
         let cutoff_day = now_day.saturating_sub(keep_days);
         let mut rollups = self.usage_rollups.write().await;
         for rollup in rollups.values_mut() {

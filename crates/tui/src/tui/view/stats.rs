@@ -35,8 +35,6 @@ struct UsageSignalsContext<'a> {
     lang: Language,
 }
 
-const DAY_MS: u64 = 86_400_000;
-
 #[derive(Clone)]
 struct TodayEntityRow {
     scope: &'static str,
@@ -529,7 +527,7 @@ fn kpi_cells(area: Rect) -> Vec<Rect> {
 }
 
 fn current_day() -> i32 {
-    (crate::tui::model::now_ms() / DAY_MS) as i32
+    crate::usage_day::current_local_day()
 }
 
 fn bucket_for_day(series: &[(i32, UsageBucket)], day: i32) -> UsageBucket {

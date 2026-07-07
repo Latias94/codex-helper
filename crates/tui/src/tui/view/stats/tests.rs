@@ -15,7 +15,7 @@ use crate::tui::model::{ForecastBalanceSample, ForecastRecentRequest};
 use crate::usage_providers::UsageProviderRefreshSummary;
 
 fn current_test_day() -> i32 {
-    (crate::tui::model::now_ms() / 86_400_000) as i32
+    crate::usage_day::current_local_day()
 }
 
 fn sample_snapshot(provider_balances: HashMap<String, Vec<ProviderBalanceSnapshot>>) -> Snapshot {
