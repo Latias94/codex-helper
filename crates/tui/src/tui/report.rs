@@ -1,112 +1,14 @@
-use std::collections::HashMap;
-
 use super::Language;
 use super::i18n;
-use super::model::{tokens_short, usage_line_lang};
+use super::model::tokens_short;
 use super::state::UiState;
 use super::types::StatsFocus;
-use crate::state::UsageBucket;
-use crate::usage_balance::UsageBalanceView;
+use crate::state::{UsageBucket, UsageDayDimensionRow, UsageDayView};
 
 #[derive(Debug, Clone)]
 pub(in crate::tui) enum StatsTarget {
-    Station(String),
-    Provider(String),
-}
-
-fn sum_buckets(buckets: &[(i32, UsageBucket)]) -> UsageBucket {
-    let mut out = UsageBucket::default();
-    for (_, b) in buckets {
-        out.add_assign(b);
-    }
-    out
-}
-
-#[derive(Debug, Clone, Default)]
-struct RecentBreakdown {
-    total: u64,
-    err: u64,
-    class_2xx: u64,
-    class_3xx: u64,
-    class_4xx: u64,
-    class_5xx: u64,
-    top_status: Vec<(u16, u64)>,
-    top_models_by_tokens: Vec<(String, (u64, i64))>,
-    top_paths_by_tokens: Vec<(String, (u64, u64, i64))>,
-}
-
-fn compute_recent_breakdown(
-    ui: &UiState,
-    snapshot: &super::model::Snapshot,
-    target: &StatsTarget,
-) -> RecentBreakdown {
-    let mut by_model: HashMap<String, (u64, i64)> = HashMap::new();
-    let mut by_path: HashMap<String, (u64, u64, i64)> = HashMap::new();
-    let mut by_status: HashMap<u16, u64> = HashMap::new();
-    let mut out = RecentBreakdown::default();
-
-    for r in &snapshot.recent {
-        let matches = match target {
-            StatsTarget::Station(name) => r.station_name.as_deref() == Some(name.as_str()),
-            StatsTarget::Provider(name) => r.provider_id.as_deref() == Some(name.as_str()),
-        };
-        if !matches {
-            continue;
-        }
-        if ui.stats_errors_only && r.status_code < 400 {
-            continue;
-        }
-
-        out.total += 1;
-        if r.status_code >= 400 {
-            out.err += 1;
-        }
-        match r.status_code {
-            200..=299 => out.class_2xx += 1,
-            300..=399 => out.class_3xx += 1,
-            400..=499 => out.class_4xx += 1,
-            _ => out.class_5xx += 1,
-        }
-        *by_status.entry(r.status_code).or_insert(0) += 1;
-
-        let model = r.model.as_deref().unwrap_or("-");
-        let tokens = r.usage.as_ref().map(|u| u.total_tokens).unwrap_or(0);
-        by_model
-            .entry(model.to_string())
-            .and_modify(|(c, t)| {
-                *c = c.saturating_add(1);
-                *t = t.saturating_add(tokens);
-            })
-            .or_insert((1, tokens));
-
-        by_path
-            .entry(r.path.clone())
-            .and_modify(|(c, e, t)| {
-                *c = c.saturating_add(1);
-                if r.status_code >= 400 {
-                    *e = e.saturating_add(1);
-                }
-                *t = t.saturating_add(tokens);
-            })
-            .or_insert((1, if r.status_code >= 400 { 1 } else { 0 }, tokens));
-    }
-
-    let mut status_items = by_status.into_iter().collect::<Vec<_>>();
-    status_items.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
-    status_items.truncate(10);
-    out.top_status = status_items;
-
-    let mut model_items = by_model.into_iter().collect::<Vec<_>>();
-    model_items.sort_by_key(|(_, (_, tok))| std::cmp::Reverse(*tok));
-    model_items.truncate(10);
-    out.top_models_by_tokens = model_items;
-
-    let mut path_items = by_path.into_iter().collect::<Vec<_>>();
-    path_items.sort_by_key(|(_, (_, _, tok))| std::cmp::Reverse(*tok));
-    path_items.truncate(10);
-    out.top_paths_by_tokens = path_items;
-
-    out
+    Station(String, UsageBucket),
+    Provider(String, UsageBucket),
 }
 
 fn fmt_pct(num: u64, den: u64) -> String {
@@ -117,26 +19,22 @@ fn fmt_pct(num: u64, den: u64) -> String {
 }
 
 fn fmt_avg_ms(total_ms: u64, n: u64) -> String {
-    if n == 0 {
-        return "-".to_string();
-    }
-    format!("{}ms", total_ms / n)
+    total_ms
+        .checked_div(n)
+        .map(|avg| format!("{avg}ms"))
+        .unwrap_or_else(|| "-".to_string())
 }
 
-fn selected_stats_target_from_view(
-    ui: &UiState,
-    snapshot: &super::model::Snapshot,
-    usage_balance: &UsageBalanceView,
-) -> Option<StatsTarget> {
+fn selected_stats_target_from_view(ui: &UiState, usage: &UsageDayView) -> Option<StatsTarget> {
     match ui.stats_focus {
-        StatsFocus::Stations => snapshot
-            .usage_rollup
-            .by_config
+        StatsFocus::Stations => usage
+            .station_rows
             .get(ui.selected_stats_station_idx)
-            .map(|(k, _)| StatsTarget::Station(k.clone())),
-        StatsFocus::Providers => ui
-            .selected_usage_balance_provider_row(usage_balance)
-            .map(|row| StatsTarget::Provider(row.provider_id.clone())),
+            .map(|row| StatsTarget::Station(row.name.clone(), row.bucket.clone())),
+        StatsFocus::Providers => usage
+            .provider_rows
+            .get(ui.selected_stats_provider_idx)
+            .map(|row| StatsTarget::Provider(row.name.clone(), row.bucket.clone())),
     }
 }
 
@@ -145,228 +43,151 @@ pub(in crate::tui) fn build_stats_report(
     snapshot: &super::model::Snapshot,
     now_ms: u64,
 ) -> Option<String> {
-    let usage_balance = ui.usage_balance_view_for_report(snapshot, now_ms);
-    let target = selected_stats_target_from_view(ui, snapshot, &usage_balance)?;
-
-    let window_series = match &target {
-        StatsTarget::Station(name) => snapshot
-            .usage_rollup
-            .by_config_day
-            .get(name)
-            .cloned()
-            .unwrap_or_default(),
-        StatsTarget::Provider(name) => snapshot
-            .usage_rollup
-            .by_provider_day
-            .get(name)
-            .cloned()
-            .unwrap_or_default(),
-    };
-
-    let window_bucket = sum_buckets(&window_series);
-    let recent = compute_recent_breakdown(ui, snapshot, &target);
-
-    let (kind, name) = match &target {
-        StatsTarget::Station(n) => (i18n::label(ui.language, "station"), n.as_str()),
-        StatsTarget::Provider(n) => (i18n::label(ui.language, "provider"), n.as_str()),
+    let usage = &snapshot.usage_day;
+    let target = selected_stats_target_from_view(ui, usage)?;
+    let (kind, name, target_bucket) = match &target {
+        StatsTarget::Station(name, bucket) => (i18n::label(ui.language, "station"), name, bucket),
+        StatsTarget::Provider(name, bucket) => (i18n::label(ui.language, "provider"), name, bucket),
     };
     let l = |text| i18n::label(ui.language, text);
 
     let mut out = String::new();
     out.push_str(match ui.language {
-        Language::Zh => "codex-helper TUI 统计报告\n",
-        Language::En => "codex-helper TUI Stats report\n",
+        Language::Zh => "codex-helper TUI 今日用量报告\n",
+        Language::En => "codex-helper TUI Daily Usage report\n",
     });
     out.push_str(&format!("generated_at_ms: {now_ms}\n"));
     out.push_str(&format!("service: {}\n", ui.service_name));
+    out.push_str(&format!("day: {} ({})\n", usage.label, usage.day));
     out.push_str(&format!("{}: {kind} {name}\n", l("target")));
-    let window_label = match ui.stats_days {
-        0 => l("loaded").to_string(),
-        1 => l("today").to_string(),
-        n => format!("{n}d"),
-    };
-    out.push_str(&format!("{}: {window_label}\n", l("window")));
-    out.push_str(&format!(
-        "{}: {}  {}: {}\n",
-        l("loaded total req"),
-        snapshot.usage_rollup.coverage.loaded_requests,
-        l("loaded days with data"),
-        snapshot.usage_rollup.coverage.loaded_days_with_data
-    ));
-    if snapshot.usage_rollup.coverage.window_exceeds_loaded_start {
-        out.push_str(&format!(
-            "{}: {}\n",
-            l("coverage warning"),
-            l("selected window starts before loaded log data")
-        ));
-    }
-    out.push_str(&format!(
-        "{}: {}={}\n",
-        l("recent filter"),
-        l("errors_only"),
-        ui.stats_errors_only
-    ));
     out.push('\n');
 
     out.push_str(match ui.language {
-        Language::Zh => "[窗口汇总]\n",
-        Language::En => "[window rollup]\n",
+        Language::Zh => "[今日汇总]\n",
+        Language::En => "[day summary]\n",
+    });
+    append_bucket(&mut out, ui.language, &usage.summary, "total");
+    append_bucket(&mut out, ui.language, target_bucket, name);
+    out.push('\n');
+
+    out.push_str(match ui.language {
+        Language::Zh => "[覆盖范围]\n",
+        Language::En => "[coverage]\n",
     });
     out.push_str(&format!(
-        "{}: {} ({} {} / {})  {} {}\n",
-        l("requests"),
-        window_bucket.requests_total,
-        l("errors"),
-        window_bucket.requests_error,
-        fmt_pct(window_bucket.requests_error, window_bucket.requests_total),
-        l("avg"),
-        fmt_avg_ms(
-            window_bucket.duration_ms_total,
-            window_bucket.requests_total
-        ),
+        "source={} loaded_requests={} first_ms={} last_ms={}\n",
+        usage.coverage.source,
+        usage.coverage.loaded_requests,
+        usage
+            .coverage
+            .loaded_first_ms
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        usage
+            .coverage
+            .loaded_last_ms
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string())
     ));
     out.push_str(&format!(
-        "{}\n",
-        usage_line_lang(&window_bucket.usage, ui.language)
+        "partial={} reason={}\n",
+        usage.coverage.day_may_be_partial,
+        usage.coverage.partial_reason.as_deref().unwrap_or("-")
     ));
-    if let StatsTarget::Provider(provider_id) = &target
-        && let Some(row) = usage_balance
-            .provider_rows
-            .iter()
-            .find(|row| row.provider_id == *provider_id)
-    {
+    if usage.coverage.scanned_lines > 0 {
         out.push_str(&format!(
-            "{}: {}  balance_status={}  route={}  endpoints={}  latest_error={}\n",
-            i18n::label(ui.language, "Usage / Balance"),
-            row.provider_id,
-            row.balance_status.as_str(),
-            if row.routing.selected {
-                row.routing
-                    .selected_endpoint_id
-                    .as_deref()
-                    .unwrap_or("selected")
-                    .to_string()
-            } else if row.routing.skip_reasons.is_empty() {
-                "-".to_string()
-            } else {
-                row.routing.skip_reasons.join(",")
-            },
-            row.endpoint_count,
-            row.latest_balance_error.as_deref().unwrap_or("-")
+            "scan_lines={} max_lines={} max_bytes={} bytes_truncated={} lines_truncated={}\n",
+            usage.coverage.scanned_lines,
+            usage.coverage.max_lines,
+            usage.coverage.max_bytes,
+            usage.coverage.bytes_truncated,
+            usage.coverage.lines_truncated
         ));
     }
     out.push('\n');
 
     out.push_str(match ui.language {
-        Language::Zh => "[Usage / Balance providers]\n",
-        Language::En => "[Usage / Balance providers]\n",
+        Language::Zh => "[Retry Gate]\n",
+        Language::En => "[retry gate]\n",
     });
-    for row in usage_balance.provider_rows.iter().take(30) {
-        let route = if row.routing.selected {
-            row.routing
-                .selected_endpoint_id
-                .as_deref()
-                .unwrap_or("selected")
-                .to_string()
-        } else if row.routing.skip_reasons.is_empty() {
-            "-".to_string()
-        } else {
-            row.routing.skip_reasons.join(",")
-        };
-        out.push_str(&format!(
-            "  - {}: req={} err={} tok={} cost={} balance={} endpoints={} route={} latest_error={}\n",
-            row.provider_id,
-            row.usage.requests_total,
-            row.usage.requests_error,
-            tokens_short(row.usage.usage.total_tokens),
-            row.cost_display,
-            row.balance_status.as_str(),
-            row.endpoint_count,
-            route,
-            row.latest_balance_error.as_deref().unwrap_or("-")
-        ));
-    }
-    if let StatsTarget::Provider(provider_id) = &target {
-        let endpoint_rows = usage_balance
-            .endpoint_rows
-            .iter()
-            .filter(|row| row.provider_id == *provider_id)
-            .take(30)
-            .collect::<Vec<_>>();
-        if !endpoint_rows.is_empty() {
-            out.push_str(match ui.language {
-                Language::Zh => "[Usage / Balance endpoints]\n",
-                Language::En => "[Usage / Balance endpoints]\n",
-            });
-            for row in endpoint_rows {
-                let route = if row.route_selected {
-                    "selected".to_string()
-                } else if row.route_skip_reasons.is_empty() {
-                    "-".to_string()
-                } else {
-                    row.route_skip_reasons.join(",")
-                };
-                out.push_str(&format!(
-                    "  - {}: req={} err={} tok={} balance={} route={}\n",
-                    row.endpoint_id,
-                    row.usage.requests_total,
-                    row.usage.requests_error,
-                    tokens_short(row.usage.usage.total_tokens),
-                    row.balance_status.as_str(),
-                    route
-                ));
-            }
-        }
+    out.push_str(&format!(
+        "active={} cooldown={} max_remaining_secs={}\n",
+        usage.retry_gate.active,
+        usage.retry_gate.active_cooldowns,
+        usage
+            .retry_gate
+            .max_remaining_secs
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string())
+    ));
+    for row in &usage.retry_gate.reasons {
+        out.push_str(&format!("  - {}: {}\n", row.reason, row.active));
     }
     out.push('\n');
 
-    out.push_str(match ui.language {
-        Language::Zh => "[最近样本]\n",
-        Language::En => "[recent sample]\n",
-    });
-    out.push_str(&format!(
-        "{}: {}  {}: {}  2xx/3xx/4xx/5xx: {}/{}/{}/{}\n",
-        l("requests"),
-        recent.total,
-        l("errors"),
-        recent.err,
-        recent.class_2xx,
-        recent.class_3xx,
-        recent.class_4xx,
-        recent.class_5xx
-    ));
-    if !recent.top_status.is_empty() {
-        out.push_str(&format!("{}:\n", l("top status")));
-        for (s, c) in &recent.top_status {
-            out.push_str(&format!("  - {s}: {c}\n"));
-        }
-    }
-    if !recent.top_models_by_tokens.is_empty() {
-        out.push_str(&format!("{}:\n", l("top models by tokens")));
-        for (m, (c, tok)) in &recent.top_models_by_tokens {
-            out.push_str(&format!(
-                "  - {}: {} {} / {}\n",
-                m,
-                c,
-                l("req"),
-                tokens_short(*tok)
-            ));
-        }
-    }
-    if !recent.top_paths_by_tokens.is_empty() {
-        out.push_str(&format!("{}:\n", l("top paths by tokens")));
-        for (path, (c, e, tok)) in &recent.top_paths_by_tokens {
-            out.push_str(&format!(
-                "  - {}: {} {} ({} {}) / {}\n",
-                path,
-                c,
-                l("req"),
-                l("err"),
-                e,
-                tokens_short(*tok)
-            ));
-        }
-    }
+    append_dimension(&mut out, ui.language, "providers", &usage.provider_rows);
+    append_dimension(&mut out, ui.language, "stations", &usage.station_rows);
+    append_dimension(&mut out, ui.language, "models", &usage.model_rows);
+    append_dimension(&mut out, ui.language, "sessions", &usage.session_rows);
+    append_dimension(&mut out, ui.language, "projects", &usage.project_rows);
 
     Some(out)
+}
+
+fn append_bucket(out: &mut String, lang: Language, bucket: &UsageBucket, label: &str) {
+    let l = |text| i18n::label(lang, text);
+    out.push_str(&format!(
+        "{label}: {}={} {}={} {}={} {}={} {}={} {}\n",
+        l("requests"),
+        bucket.requests_total,
+        l("errors"),
+        bucket.requests_error,
+        l("error rate"),
+        fmt_pct(bucket.requests_error, bucket.requests_total),
+        l("avg"),
+        fmt_avg_ms(bucket.duration_ms_total, bucket.requests_total),
+        l("tokens"),
+        tokens_short(bucket.usage.total_tokens),
+        cost_text(bucket)
+    ));
+}
+
+fn cost_text(bucket: &UsageBucket) -> String {
+    format!(
+        "cost={} priced={} unpriced={}",
+        bucket.cost.display_total(),
+        bucket.cost.priced_requests,
+        bucket.cost.unpriced_requests
+    )
+}
+
+fn append_dimension(
+    out: &mut String,
+    lang: Language,
+    title: &'static str,
+    rows: &[UsageDayDimensionRow],
+) {
+    let display_title = match (lang, title) {
+        (Language::Zh, "providers") => "providers",
+        (Language::Zh, "stations") => "stations",
+        (Language::Zh, "models") => "models",
+        (Language::Zh, "sessions") => "sessions",
+        (Language::Zh, "projects") => "projects",
+        _ => title,
+    };
+    out.push_str(&format!("[{display_title}]\n"));
+    if rows.is_empty() {
+        out.push_str("  -\n");
+        return;
+    }
+    for row in rows.iter().take(30) {
+        out.push_str(&format!(
+            "  - {}: req={} err={} tok={} {}\n",
+            row.name,
+            row.bucket.requests_total,
+            row.bucket.requests_error,
+            tokens_short(row.bucket.usage.total_tokens),
+            cost_text(&row.bucket)
+        ));
+    }
 }

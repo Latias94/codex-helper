@@ -62,8 +62,8 @@ pub(super) fn apply_page_shortcuts(ui: &mut UiState, code: KeyCode) -> bool {
         KeyCode::Char('2') => Some(Page::Stations),
         KeyCode::Char('3') => Some(Page::Sessions),
         KeyCode::Char('4') => Some(Page::Requests),
-        KeyCode::Char('5') => Some(Page::ServiceStatus),
-        KeyCode::Char('6') => Some(Page::Stats),
+        KeyCode::Char('5') => Some(Page::Stats),
+        KeyCode::Char('6') => Some(Page::ServiceStatus),
         KeyCode::Char('7') => Some(Page::Settings),
         KeyCode::Char('8') => Some(Page::History),
         KeyCode::Char('9') => Some(Page::Recent),
@@ -765,7 +765,7 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
         KeyCode::Up | KeyCode::Char('k') if ui.page == Page::Stats => {
             match ui.stats_focus {
                 StatsFocus::Stations => {
-                    let len = snapshot.usage_rollup.by_config.len();
+                    let len = snapshot.usage_day.station_rows.len();
                     if let Some(next) =
                         adjust_table_selection(&mut ui.stats_stations_table, -1, len)
                     {
@@ -774,7 +774,7 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                     }
                 }
                 StatsFocus::Providers => {
-                    let len = ui.usage_balance_provider_rows_len(snapshot);
+                    let len = snapshot.usage_day.provider_rows.len();
                     if let Some(next) =
                         adjust_table_selection(&mut ui.stats_providers_table, -1, len)
                     {
@@ -789,7 +789,7 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
         KeyCode::Down | KeyCode::Char('j') if ui.page == Page::Stats => {
             match ui.stats_focus {
                 StatsFocus::Stations => {
-                    let len = snapshot.usage_rollup.by_config.len();
+                    let len = snapshot.usage_day.station_rows.len();
                     if let Some(next) = adjust_table_selection(&mut ui.stats_stations_table, 1, len)
                     {
                         ui.selected_stats_station_idx = next;
@@ -797,7 +797,7 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                     }
                 }
                 StatsFocus::Providers => {
-                    let len = ui.usage_balance_provider_rows_len(snapshot);
+                    let len = snapshot.usage_day.provider_rows.len();
                     if let Some(next) =
                         adjust_table_selection(&mut ui.stats_providers_table, 1, len)
                     {
@@ -808,91 +808,6 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                 }
             }
             false
-        }
-        KeyCode::PageUp if ui.page == Page::Stats && ui.stats_focus == StatsFocus::Providers => {
-            ui.stats_provider_detail_scroll = ui.stats_provider_detail_scroll.saturating_sub(5);
-            true
-        }
-        KeyCode::PageDown if ui.page == Page::Stats && ui.stats_focus == StatsFocus::Providers => {
-            ui.stats_provider_detail_scroll = ui.stats_provider_detail_scroll.saturating_add(5);
-            true
-        }
-        KeyCode::Char('d') if ui.page == Page::Stats => {
-            let options = [1usize, 7usize, 30usize, 0usize];
-            let idx = options
-                .iter()
-                .position(|&n| n == ui.stats_days)
-                .unwrap_or(1);
-            let next = options[(idx + 1) % options.len()];
-            ui.stats_days = next;
-            ui.stats_provider_detail_scroll = 0;
-            ui.needs_snapshot_refresh = true;
-            let label = if next == 0 {
-                i18n::label(ui.language, "loaded").to_string()
-            } else if next == 1 {
-                i18n::label(ui.language, "today").to_string()
-            } else {
-                format!("{next}d")
-            };
-            ui.toast = Some((
-                format!("{}: {label}", i18n::label(ui.language, "window")),
-                Instant::now(),
-            ));
-            true
-        }
-        KeyCode::Char('a') if ui.page == Page::Stats => {
-            ui.stats_attention_only = !ui.stats_attention_only;
-            ui.selected_stats_provider_idx = 0;
-            ui.stats_provider_detail_scroll = 0;
-            let len = ui.usage_balance_provider_rows_len(snapshot);
-            ui.stats_providers_table
-                .select((len > 0).then_some(ui.selected_stats_provider_idx));
-            *ui.stats_providers_table.offset_mut() = 0;
-            ui.toast = Some((
-                format!(
-                    "{}: {}={}",
-                    i18n::label(ui.language, "Usage page"),
-                    i18n::label(ui.language, "attention only"),
-                    ui.stats_attention_only
-                ),
-                Instant::now(),
-            ));
-            true
-        }
-        KeyCode::Char('e') if ui.page == Page::Stats => {
-            ui.stats_errors_only = !ui.stats_errors_only;
-            ui.toast = Some((
-                format!(
-                    "{}: {}={}",
-                    i18n::label(ui.language, "Usage page"),
-                    i18n::label(ui.language, "errors_only"),
-                    ui.stats_errors_only
-                ),
-                Instant::now(),
-            ));
-            true
-        }
-        KeyCode::Char('g') if ui.page == Page::Stats => {
-            let balance_started = request_provider_balance_refresh(
-                ui,
-                snapshot,
-                proxy,
-                BalanceRefreshMode::Force,
-                balance_refresh_tx,
-            );
-            ui.toast = Some((
-                if balance_started {
-                    match ui.language {
-                        Language::Zh => "usage/balance: 余额刷新已开始",
-                        Language::En => "usage/balance: balance refresh started",
-                    }
-                } else {
-                    i18n::label(ui.language, "balance refresh already requested")
-                }
-                .to_string(),
-                Instant::now(),
-            ));
-            true
         }
         KeyCode::Char('y') if ui.page == Page::Stats => {
             let now = now_ms();

@@ -178,13 +178,7 @@ pub(super) async fn handle_ticker_refreshes(
     snapshot_refresh: &mut SnapshotRefreshController,
 ) {
     if snapshot.refreshed_at.elapsed() >= snapshot_fallback_interval {
-        snapshot_refresh.request(
-            state,
-            cfg,
-            service_name,
-            ui.stats_days,
-            ui.forecast_recent_mode(),
-        );
+        snapshot_refresh.request(state, cfg, service_name, ui.stats_days);
     }
     refresh_runtime_config_if_due(ui, proxy, io_timeout).await;
     refresh_route_graph_control_if_needed(
@@ -228,13 +222,7 @@ pub(super) async fn handle_balance_refresh_result(
             ui.toast = Some((format!("balance refresh failed: {err}"), Instant::now()));
         }
     }
-    snapshot_refresh.request(
-        state,
-        cfg,
-        service_name,
-        ui.stats_days,
-        ui.forecast_recent_mode(),
-    );
+    snapshot_refresh.request(state, cfg, service_name, ui.stats_days);
     refresh_route_graph_control_if_needed(
         ui,
         proxy,
@@ -268,13 +256,7 @@ pub(super) async fn apply_pending_refresh_requests(
                 ui.fleet_registry = cfg.fleet.clone();
                 snapshot_refresh.invalidate();
                 *providers = build_provider_options(cfg.as_ref(), service_name);
-                snapshot_refresh.request(
-                    state.clone(),
-                    cfg.clone(),
-                    service_name,
-                    ui.stats_days,
-                    ui.forecast_recent_mode(),
-                );
+                snapshot_refresh.request(state.clone(), cfg.clone(), service_name, ui.stats_days);
                 ui.clamp_selection(snapshot, ui.station_page_rows_len(providers.len()));
             }
             Err(err) => {
@@ -285,13 +267,7 @@ pub(super) async fn apply_pending_refresh_requests(
     }
     if ui.needs_snapshot_refresh {
         snapshot_refresh.invalidate();
-        snapshot_refresh.request(
-            state.clone(),
-            cfg.clone(),
-            service_name,
-            ui.stats_days,
-            ui.forecast_recent_mode(),
-        );
+        snapshot_refresh.request(state.clone(), cfg.clone(), service_name, ui.stats_days);
         ui.needs_snapshot_refresh = false;
     }
     if ui.needs_codex_history_refresh {

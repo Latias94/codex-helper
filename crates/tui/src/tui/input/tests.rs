@@ -89,14 +89,7 @@ fn stale_routing_explain() -> crate::routing_explain::RoutingExplainResponse {
 }
 
 async fn empty_snapshot(state: &ProxyState, cfg: Arc<ProxyConfig>) -> Snapshot {
-    crate::tui::model::refresh_snapshot(
-        state,
-        cfg,
-        "codex",
-        7,
-        crate::tui::model::ForecastRecentMode::RuntimeOnly,
-    )
-    .await
+    crate::tui::model::refresh_snapshot(state, cfg, "codex", 7).await
 }
 
 fn proxy_with_single_station_without_upstreams() -> (ProxyService, Arc<ProxyConfig>) {
@@ -619,7 +612,7 @@ async fn page_shortcut_five_opens_service_status_and_requests_refresh() {
     .await;
 
     assert!(handled);
-    assert_eq!(ui.page, Page::ServiceStatus);
+    assert_eq!(ui.page, Page::Stats);
     assert!(ui.needs_snapshot_refresh);
 }
 

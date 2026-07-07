@@ -40,8 +40,6 @@ fn empty_snapshot(
     Snapshot {
         rows: Vec::new(),
         recent: Vec::new(),
-        forecast_recent: Vec::new(),
-        forecast_recent_source: crate::tui::model::UsageForecastSampleSource::RuntimeOnly,
         model_overrides: HashMap::new(),
         overrides: HashMap::new(),
         station_overrides: HashMap::new(),
@@ -50,6 +48,7 @@ fn empty_snapshot(
         global_station_override: None,
         global_route_target_override,
         station_meta_overrides: HashMap::new(),
+        usage_day: crate::state::UsageDayView::default(),
         usage_rollup: crate::state::UsageRollupView::default(),
         provider_balances,
         provider_balance_history: HashMap::new(),
@@ -512,8 +511,6 @@ fn routing_provider_balance_brief_preserves_subscription_amount_in_narrow_table(
     let snapshot = Snapshot {
         rows: Vec::new(),
         recent: Vec::new(),
-        forecast_recent: Vec::new(),
-        forecast_recent_source: crate::tui::model::UsageForecastSampleSource::RuntimeOnly,
         model_overrides: HashMap::new(),
         overrides: HashMap::new(),
         station_overrides: HashMap::new(),
@@ -522,6 +519,7 @@ fn routing_provider_balance_brief_preserves_subscription_amount_in_narrow_table(
         global_station_override: None,
         global_route_target_override: None,
         station_meta_overrides: HashMap::new(),
+        usage_day: crate::state::UsageDayView::default(),
         usage_rollup: crate::state::UsageRollupView::default(),
         provider_balances: HashMap::from([(
             "input".to_string(),
@@ -561,8 +559,6 @@ fn routing_provider_balance_brief_fits_lazy_quota_in_zh_table_cell() {
     let snapshot = Snapshot {
         rows: Vec::new(),
         recent: Vec::new(),
-        forecast_recent: Vec::new(),
-        forecast_recent_source: crate::tui::model::UsageForecastSampleSource::RuntimeOnly,
         model_overrides: HashMap::new(),
         overrides: HashMap::new(),
         station_overrides: HashMap::new(),
@@ -571,6 +567,7 @@ fn routing_provider_balance_brief_fits_lazy_quota_in_zh_table_cell() {
         global_station_override: None,
         global_route_target_override: None,
         station_meta_overrides: HashMap::new(),
+        usage_day: crate::state::UsageDayView::default(),
         usage_rollup: crate::state::UsageRollupView::default(),
         provider_balances: HashMap::from([(
             "input".to_string(),

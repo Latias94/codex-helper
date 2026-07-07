@@ -10,7 +10,7 @@ use crate::service_status::ServiceStatusSnapshot;
 use crate::state::{
     ActiveRequest, FinishedRequest, HealthCheckStatus, LbConfigView, ProviderBalanceSnapshot,
     ProxyState, SessionIdentityCard, SessionIdentityCardBuildInputs, SessionStats, StationHealth,
-    UsageRollupView, build_session_identity_cards_from_parts,
+    UsageDayView, UsageRollupView, build_session_identity_cards_from_parts,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +45,8 @@ pub struct DashboardSnapshot {
     pub lb_view: HashMap<String, LbConfigView>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub policy_actions: Vec<PolicyActionProjection>,
+    #[serde(default)]
+    pub usage_day: UsageDayView,
     pub usage_rollup: UsageRollupView,
     pub stats_5m: WindowStats,
     pub stats_1h: WindowStats,
@@ -116,6 +118,7 @@ pub async fn build_dashboard_snapshot(
         session_bindings,
         session_route_affinities,
         session_stats,
+        mut usage_day,
         usage_rollup,
         station_health,
         provider_balances,
@@ -136,6 +139,7 @@ pub async fn build_dashboard_snapshot(
         state.list_session_bindings(),
         state.list_session_route_affinities(),
         state.list_session_stats(),
+        state.get_usage_day_view(service_name, 12, now),
         state.get_usage_rollup_view(service_name, 12, stats_days),
         state.get_station_health(service_name),
         state.get_provider_balance_view(service_name),
@@ -144,6 +148,8 @@ pub async fn build_dashboard_snapshot(
         state.get_lb_view(),
         state.active_policy_action_projections(service_name, now),
     );
+    usage_day.retry_gate =
+        crate::state::UsageRetryGateSummary::from_policy_actions(&policy_actions);
 
     let stats_5m = compute_window_stats(&recent_all, now, 5 * 60_000, |_| true);
     let stats_1h = compute_window_stats(&recent_all, now, 60 * 60_000, |_| true);
@@ -198,6 +204,7 @@ pub async fn build_dashboard_snapshot(
         health_checks,
         lb_view,
         policy_actions,
+        usage_day,
         usage_rollup,
         stats_5m,
         stats_1h,

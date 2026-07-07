@@ -121,8 +121,6 @@ mod tests {
         Snapshot {
             rows: Vec::new(),
             recent: Vec::new(),
-            forecast_recent: Vec::new(),
-            forecast_recent_source: crate::tui::model::UsageForecastSampleSource::RuntimeOnly,
             model_overrides: HashMap::new(),
             overrides: HashMap::new(),
             station_overrides: HashMap::new(),
@@ -131,6 +129,7 @@ mod tests {
             global_station_override: None,
             global_route_target_override: Some("input-light".to_string()),
             station_meta_overrides: HashMap::new(),
+            usage_day: crate::state::UsageDayView::default(),
             usage_rollup: crate::state::UsageRollupView {
                 by_config: vec![(
                     "超级路由入口".to_string(),
@@ -448,16 +447,11 @@ mod tests {
                 Page::Stats => {
                     let compact_text = text_without_whitespace(&text);
                     assert!(
-                        text.contains("Balance") || compact_text.contains("余额"),
+                        text.contains("Usage") || compact_text.contains("今日用量"),
                         "{text}"
                     );
-                    if width >= 100 {
-                        assert!(
-                            text.contains("input-light")
-                                || (text.contains("超") && text.contains("级")),
-                            "{text}"
-                        );
-                    }
+                    assert!(text.contains("Retry Gate"), "{text}");
+                    assert!(compact_text.contains("覆盖范围"), "{text}");
                 }
                 Page::Stations => {
                     assert!(text.contains("entry route main"), "{text}");

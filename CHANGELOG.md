@@ -9,11 +9,12 @@ All notable changes to this project will be documented in this file.
 
 #### 新增
 
-- 新增可选的 TUI `5 状态` 页。启用 `[ui.service_status]` 后，可以按 provider / endpoint 发起轻量探针，或读取只读 status JSON，方便判断线路是否真的可用。
+- TUI `5 用量` 页重做为今日数据面板：按本地日统计请求、token、估算成本、24 小时活跃度、provider / station / model / session / project 排行，并显示本地日志覆盖是否可能不完整。
+- 新增可选的 TUI `6 状态` 页。启用 `[ui.service_status]` 后，可以按 provider / endpoint 发起轻量探针，或读取只读 status JSON，方便判断线路是否真的可用。
 - 新增 Codex hosted image generation 开关：`[codex.client_patch].hosted_image_generation = "auto" | "enabled" | "disabled"`。关闭后会在 Codex patch 和代理转发时移除 hosted image tool；OpenAI Images 兼容入口仍可继续使用。
 - 新增 provider signal / policy action 控制链路。限流、传输错误和可信余额耗尽会形成可解释的路由证据，并显示在 request ledger、admin API、TUI 和桌面端里。
 - Reasoning Guard 支持更完整的 `518*n-2` 推理 token 边界识别（如 `516/1034/1552/2070`）。开启 guard 后默认匹配到 `n <= 4`，可用 `boundary_sequence_max_n = 0` 关闭序列匹配。
-- Reasoning Guard 新增 `on_retry_exhausted = "pass" | "block"`。默认 `pass`：多次命中仍修不掉时放行最后一次上游响应，避免 helper 中断 Codex 任务。
+- Reasoning Guard 新增 `on_retry_exhausted = "pass" | "block"`。默认 `pass`：多次命中仍修不掉时放行最后一次上游响应，避免 helper 中断 Codex 任务。TUI 用量页会显示全局 retry gate 数量，帮助判断是否有大面积 gate 生效。
 
 #### 变更
 
@@ -39,11 +40,12 @@ All notable changes to this project will be documented in this file.
 
 #### Added
 
-- Added an optional TUI `5 Status` page. When `[ui.service_status]` is enabled, it can run lightweight probes per provider / endpoint or read status JSON URLs to make route availability easier to inspect.
+- Reworked the TUI `5 Usage` page into a daily panel: local-day requests, tokens, estimated cost, 24h activity, provider / station / model / session / project rankings, and local-log coverage warnings.
+- Added an optional TUI `6 Status` page. When `[ui.service_status]` is enabled, it can run lightweight probes per provider / endpoint or read status JSON URLs to make route availability easier to inspect.
 - Added `[codex.client_patch].hosted_image_generation = "auto" | "enabled" | "disabled"`. `disabled` removes hosted image tools during Codex patching and proxied `/responses` / WebSocket forwarding, while the OpenAI Images-compatible endpoints remain available.
 - Added the provider signal / policy action control loop. Rate limits, transport failures, and trusted balance exhaustion now produce route-facing evidence visible in the request ledger, admin API, TUI, and desktop client.
 - Reasoning Guard now recognizes the broader `518*n-2` reasoning-token boundary pattern, such as `516/1034/1552/2070`. When enabled, it matches up to `n <= 4` by default; set `boundary_sequence_max_n = 0` to disable sequence matching.
-- Reasoning Guard added `on_retry_exhausted = "pass" | "block"`. The default `pass` forwards the final upstream response after the guard retry budget is used, so helper does not interrupt the Codex task.
+- Reasoning Guard added `on_retry_exhausted = "pass" | "block"`. The default `pass` forwards the final upstream response after the guard retry budget is used, so helper does not interrupt the Codex task. The TUI usage page now shows the global retry gate count.
 
 #### Changed
 

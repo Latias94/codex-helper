@@ -1121,21 +1121,23 @@ New API dashboard-style quota：
 - UI 展示的是 cached balance snapshots；手动刷新使用 `POST /__codex_helper/api/v1/providers/balances/refresh`，并同样避开已确认终态错误或当前周期已耗尽的 target。
 - Balance HTTP 调用有边界，并且复用和 proxy runtime calls 相同的 outbound client。查询失败时，日志应该显示被探测的 origin 和 adapter kind，例如 `sub2api_usage` 或 `openai_balance_http_json` 返回了非 JSON。
 
-## Usage / Balance 页面
+## Usage 页面
 
-TUI 第 5 页现在显示为 `Usage`，Tauri 桌面端 Usage 页读取同一个 core `UsageBalanceView`，所以 provider、endpoint、余额状态和路由影响的口径应该一致。
+TUI 第 5 页显示为 `Usage`。它是本地日用量面板，不是持久多日分析仓库。
 
 如何阅读：
 
-- 顶部汇总显示当前窗口的请求数、token、估算成本、余额状态计数和最近刷新状态。
-- Provider 行显示该 provider 的请求量、成功率、token、成本、主余额/配额摘要、余额状态和 routing 影响。
-- Endpoint 行显示最近样本里的 provider endpoint、请求数、错误数、token、绑定的 balance snapshot 和 route skip reason。
+- 顶部汇总显示今日请求数、token、估算成本、成功率、token 结构和全局 retry gate 数量。
+- 24 小时活跃度展示本地日请求分布，并说明已加载 request log 是否可能不完整。
+- Provider 和 station 行展示今日请求量、错误数、token、估算成本和平均耗时。
+- Model、session、project 面板展示今日主要用量来源。
+- 覆盖范围 warning 表示 codex-helper 只加载了有边界的本地 request log 窗口；它不是“更早没有用量”的保证。
 - `unknown` 表示没有可信余额数据或查询失败，不能当作健康余额。
 - `stale` 表示 snapshot 已过期；它和 `exhausted`、`error`、`unlimited` 是不同状态。
 - `unlimited` 是已知不限量/无限 quota，不是 unknown。
-- TUI `Usage` 页面按 `g` 刷新余额；Tauri 桌面端 Usage 页使用“刷新余额”按钮。
+- 余额刷新保留在 routing/provider 诊断界面；TUI 在 Routing/Stations 相关页面按 `g`，Tauri 桌面端 Usage 页使用“刷新余额”按钮。
 - 单个 provider 的余额刷新失败只更新该 provider 的错误/unknown 状态，不会打断其他 provider 刷新、TUI redraw 或 snapshot 刷新。
-- `Routing` 页面只保留紧凑余额上下文；如果要判断谁用得最多、谁快耗尽、哪个 endpoint 报错，应看 `Usage / Balance`。
+- `Routing` 页面保留紧凑余额上下文和刷新控制。判断“今天用了什么”看 TUI `Usage`；判断余额和路由可用性看 Routing/Stations。
 
 ## 运行时保护
 

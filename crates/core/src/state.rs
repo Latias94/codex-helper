@@ -16,12 +16,13 @@ pub use crate::balance::{
 use crate::config::ServiceConfigManager;
 use crate::lb::{COOLDOWN_SECS, CooldownBackoff, FAILURE_THRESHOLD, LbState};
 use crate::policy_actions::{PolicyAction, PolicyActionKind, PolicyActionProjection};
-#[cfg(test)]
-use crate::pricing::CostBreakdown;
-use crate::pricing::{CostAdjustments, estimate_request_cost_from_operator_catalog_for_service};
+use crate::pricing::{
+    CostAdjustments, CostBreakdown, estimate_request_cost_from_operator_catalog_for_service,
+};
 use crate::routing_ir::{RoutePlanRuntimeState, RoutePlanUpstreamRuntimeState};
 use crate::runtime_identity::ProviderEndpointKey;
 use crate::sessions;
+#[cfg(test)]
 use crate::usage::UsageMetrics;
 use crate::usage_day;
 
@@ -36,8 +37,9 @@ use self::runtime_types::{
 };
 pub use self::runtime_types::{
     HealthCheckStatus, LbConfigView, LbUpstreamView, PassiveHealthState, PassiveUpstreamHealth,
-    RuntimeConfigState, StationHealth, UpstreamHealth, UsageBucket, UsageRollupCoverage,
-    UsageRollupView,
+    RuntimeConfigState, StationHealth, UpstreamHealth, UsageBucket, UsageDayCoverage,
+    UsageDayDimensionRow, UsageDayHourRow, UsageDayView, UsageRetryGateReasonRow,
+    UsageRetryGateSummary, UsageRollupCoverage, UsageRollupView,
 };
 pub use self::session_identity::{
     ActiveRequest, FinishRequestParams, FinishedRequest, RequestObservability, ResolvedRouteValue,
@@ -137,6 +139,276 @@ fn unix_now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn usage_rollup_unknown_key(value: Option<&str>) -> String {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("-")
+        .to_string()
+}
+
+fn usage_rollup_project_key(cwd: Option<&str>) -> String {
+    usage_rollup_unknown_key(cwd)
+}
+
+fn usage_rollup_request_key(request: &FinishedRequest) -> String {
+    request
+        .trace_id
+        .as_deref()
+        .map(|trace_id| format!("trace|{trace_id}"))
+        .unwrap_or_else(|| format!("{}|{}", request.ended_at_ms, request.id))
+}
+
+fn usage_rollup_record_bucket(
+    bucket: &mut UsageBucket,
+    request: &FinishedRequest,
+    cost: Option<&CostBreakdown>,
+) {
+    bucket.record(
+        request.status_code,
+        request.duration_ms,
+        request.usage.as_ref(),
+        cost,
+        request.observability.ttfb_ms,
+    );
+}
+
+fn usage_rollup_hourly_buckets(
+    by_hour: &mut HashMap<i32, Vec<UsageBucket>>,
+    day: i32,
+) -> &mut Vec<UsageBucket> {
+    let buckets = by_hour
+        .entry(day)
+        .or_insert_with(|| vec![UsageBucket::default(); 24]);
+    if buckets.len() < 24 {
+        buckets.resize_with(24, UsageBucket::default);
+    } else if buckets.len() > 24 {
+        buckets.truncate(24);
+    }
+    buckets
+}
+
+fn usage_rollup_mark_loaded_timestamp(rollup: &mut UsageRollup, timestamp_ms: u64) {
+    rollup.loaded_first_ms = Some(
+        rollup
+            .loaded_first_ms
+            .map(|current| current.min(timestamp_ms))
+            .unwrap_or(timestamp_ms),
+    );
+    rollup.loaded_last_ms = Some(
+        rollup
+            .loaded_last_ms
+            .map(|current| current.max(timestamp_ms))
+            .unwrap_or(timestamp_ms),
+    );
+    if rollup.coverage_source.is_empty() {
+        rollup.coverage_source = "live".to_string();
+    }
+}
+
+fn usage_bucket_cost_sort_key(bucket: &UsageBucket) -> Option<f64> {
+    bucket
+        .cost
+        .total_cost_usd
+        .as_deref()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+}
+
+fn compare_usage_day_rows(
+    left: &UsageDayDimensionRow,
+    right: &UsageDayDimensionRow,
+) -> std::cmp::Ordering {
+    match (
+        usage_bucket_cost_sort_key(&left.bucket),
+        usage_bucket_cost_sort_key(&right.bucket),
+    ) {
+        (Some(left_cost), Some(right_cost)) => right_cost
+            .partial_cmp(&left_cost)
+            .unwrap_or(std::cmp::Ordering::Equal),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+    .then_with(|| {
+        right
+            .bucket
+            .usage
+            .total_tokens
+            .cmp(&left.bucket.usage.total_tokens)
+    })
+    .then_with(|| right.bucket.requests_total.cmp(&left.bucket.requests_total))
+    .then_with(|| left.name.cmp(&right.name))
+}
+
+fn usage_day_dimension_rows(
+    source: &HashMap<String, HashMap<i32, UsageBucket>>,
+    day: i32,
+    top_n: usize,
+) -> Vec<UsageDayDimensionRow> {
+    let mut rows = source
+        .iter()
+        .filter_map(|(name, days)| {
+            let bucket = days.get(&day)?;
+            (bucket.requests_total > 0).then(|| UsageDayDimensionRow {
+                name: name.clone(),
+                bucket: bucket.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(compare_usage_day_rows);
+    rows.truncate(top_n);
+    rows
+}
+
+fn usage_day_hour_rows(rollup: &UsageRollup, day: i32) -> Vec<UsageDayHourRow> {
+    let mut buckets = rollup
+        .by_hour
+        .get(&day)
+        .cloned()
+        .unwrap_or_else(|| vec![UsageBucket::default(); 24]);
+    if buckets.len() < 24 {
+        buckets.resize_with(24, UsageBucket::default);
+    } else if buckets.len() > 24 {
+        buckets.truncate(24);
+    }
+    buckets
+        .into_iter()
+        .enumerate()
+        .map(|(hour, bucket)| UsageDayHourRow {
+            hour: u8::try_from(hour).unwrap_or(0),
+            bucket,
+        })
+        .collect()
+}
+
+fn usage_day_coverage(rollup: &UsageRollup, window: usage_day::UsageDayWindow) -> UsageDayCoverage {
+    let mut reasons = Vec::new();
+    if rollup.replay_bytes_truncated {
+        reasons.push("request log byte limit truncated older data");
+    }
+    if rollup.replay_lines_truncated {
+        reasons.push("request log line limit truncated older data");
+    }
+    if rollup
+        .loaded_first_ms
+        .is_some_and(|loaded_first_ms| loaded_first_ms > window.start_ms)
+    {
+        reasons.push("loaded data starts after local day start");
+    }
+
+    UsageDayCoverage {
+        source: if rollup.coverage_source.is_empty() {
+            "none".to_string()
+        } else {
+            rollup.coverage_source.clone()
+        },
+        loaded_first_ms: rollup.loaded_first_ms,
+        loaded_last_ms: rollup.loaded_last_ms,
+        loaded_requests: rollup.loaded.requests_total,
+        scanned_lines: rollup.replay_scanned_lines,
+        max_lines: rollup.replay_max_lines,
+        max_bytes: rollup.replay_max_bytes,
+        bytes_truncated: rollup.replay_bytes_truncated,
+        lines_truncated: rollup.replay_lines_truncated,
+        day_may_be_partial: !reasons.is_empty(),
+        partial_reason: (!reasons.is_empty()).then(|| reasons.join("; ")),
+    }
+}
+
+fn record_usage_entity(
+    totals: &mut HashMap<String, UsageBucket>,
+    by_day: &mut HashMap<String, HashMap<i32, UsageBucket>>,
+    key: String,
+    day: i32,
+    request: &FinishedRequest,
+    cost: Option<&CostBreakdown>,
+) {
+    usage_rollup_record_bucket(totals.entry(key.clone()).or_default(), request, cost);
+    usage_rollup_record_bucket(
+        by_day.entry(key).or_default().entry(day).or_default(),
+        request,
+        cost,
+    );
+}
+
+fn record_finished_request_into_usage_rollup(
+    rollup: &mut UsageRollup,
+    request: &FinishedRequest,
+) -> bool {
+    let request_key = usage_rollup_request_key(request);
+    if rollup.recorded_requests.contains_key(&request_key) {
+        return false;
+    }
+
+    let day = usage_day::local_day_from_ms(request.ended_at_ms);
+    let hour = usize::from(usage_day::local_hour_from_ms(request.ended_at_ms).min(23));
+    rollup.recorded_requests.insert(request_key, day);
+    usage_rollup_mark_loaded_timestamp(rollup, request.ended_at_ms);
+
+    let cost = Some(&request.cost);
+    usage_rollup_record_bucket(&mut rollup.loaded, request, cost);
+    usage_rollup_record_bucket(rollup.by_day.entry(day).or_default(), request, cost);
+    usage_rollup_record_bucket(
+        &mut usage_rollup_hourly_buckets(&mut rollup.by_hour, day)[hour],
+        request,
+        cost,
+    );
+
+    record_usage_entity(
+        &mut rollup.by_config,
+        &mut rollup.by_config_day,
+        usage_rollup_unknown_key(request.station_name.as_deref()),
+        day,
+        request,
+        cost,
+    );
+    record_usage_entity(
+        &mut rollup.by_provider,
+        &mut rollup.by_provider_day,
+        usage_rollup_unknown_key(request.provider_id.as_deref()),
+        day,
+        request,
+        cost,
+    );
+    record_usage_entity(
+        &mut rollup.by_model,
+        &mut rollup.by_model_day,
+        usage_rollup_unknown_key(request.model.as_deref()),
+        day,
+        request,
+        cost,
+    );
+    record_usage_entity(
+        &mut rollup.by_session,
+        &mut rollup.by_session_day,
+        usage_rollup_unknown_key(request.session_id.as_deref()),
+        day,
+        request,
+        cost,
+    );
+    record_usage_entity(
+        &mut rollup.by_project,
+        &mut rollup.by_project_day,
+        usage_rollup_project_key(request.cwd.as_deref()),
+        day,
+        request,
+        cost,
+    );
+
+    true
+}
+
+fn prune_usage_entity_days(
+    by_day: &mut HashMap<String, HashMap<i32, UsageBucket>>,
+    cutoff_day: i32,
+) {
+    by_day.retain(|_, days| {
+        days.retain(|day, _| *day >= cutoff_day);
+        !days.is_empty()
+    });
 }
 
 fn prune_lru_cache<T>(
@@ -2548,6 +2820,59 @@ impl ProxyState {
         }
     }
 
+    pub async fn get_usage_day_view(
+        &self,
+        service_name: &str,
+        top_n: usize,
+        generated_at_ms: u64,
+    ) -> UsageDayView {
+        let day = usage_day::current_local_day();
+        let window = usage_day::local_day_window(day).unwrap_or(usage_day::UsageDayWindow {
+            day,
+            start_ms: 0,
+            end_ms: 0,
+        });
+
+        let guard = self.usage_rollups.read().await;
+        let Some(rollup) = guard.get(service_name) else {
+            return UsageDayView {
+                day,
+                label: usage_day::format_day(day),
+                start_ms: window.start_ms,
+                end_ms: window.end_ms,
+                generated_at_ms,
+                hourly: (0..24)
+                    .map(|hour| UsageDayHourRow {
+                        hour,
+                        bucket: UsageBucket::default(),
+                    })
+                    .collect(),
+                coverage: UsageDayCoverage {
+                    source: "none".to_string(),
+                    ..UsageDayCoverage::default()
+                },
+                ..UsageDayView::default()
+            };
+        };
+
+        UsageDayView {
+            day,
+            label: usage_day::format_day(day),
+            start_ms: window.start_ms,
+            end_ms: window.end_ms,
+            generated_at_ms,
+            summary: rollup.by_day.get(&day).cloned().unwrap_or_default(),
+            hourly: usage_day_hour_rows(rollup, day),
+            provider_rows: usage_day_dimension_rows(&rollup.by_provider_day, day, top_n),
+            station_rows: usage_day_dimension_rows(&rollup.by_config_day, day, top_n),
+            model_rows: usage_day_dimension_rows(&rollup.by_model_day, day, top_n),
+            session_rows: usage_day_dimension_rows(&rollup.by_session_day, day, top_n),
+            project_rows: usage_day_dimension_rows(&rollup.by_project_day, day, top_n),
+            coverage: usage_day_coverage(rollup, window),
+            ..UsageDayView::default()
+        }
+    }
+
     pub async fn replay_usage_from_requests_log(
         &self,
         service_name: &str,
@@ -2598,6 +2923,7 @@ impl ProxyState {
         };
         let len: u64 = file.metadata().map(|m| m.len()).unwrap_or_default();
         let start = len.saturating_sub(max_bytes as u64);
+        let bytes_truncated = start > 0;
         if file.seek(SeekFrom::Start(start)).is_err() {
             return 0;
         }
@@ -2623,8 +2949,10 @@ impl ProxyState {
             .filter(|l| !l.is_empty())
             .collect::<Vec<_>>();
         let start_idx = lines.len().saturating_sub(max_lines);
+        let scanned_lines = lines.len().saturating_sub(start_idx);
+        let lines_truncated = start_idx > 0;
 
-        let mut events = Vec::new();
+        let mut requests = Vec::new();
         for line in &lines[start_idx..] {
             let Ok(v) = serde_json::from_str::<JsonValue>(line) else {
                 continue;
@@ -2636,90 +2964,46 @@ impl ProxyState {
                 continue;
             }
 
-            let ended_at_ms = v.get("timestamp_ms").and_then(|x| x.as_u64()).unwrap_or(0);
-            let status_code = v.get("status_code").and_then(|x| x.as_u64()).unwrap_or(0) as u16;
-            let duration_ms = v.get("duration_ms").and_then(|x| x.as_u64()).unwrap_or(0);
-            let station_name = v
-                .get("station_name")
-                .and_then(|x| x.as_str())
-                .unwrap_or("-")
-                .to_string();
-            let upstream_base_url = v
-                .get("upstream_base_url")
-                .and_then(|x| x.as_str())
-                .unwrap_or("-")
-                .to_string();
-            let provider_id = v
-                .get("provider_id")
-                .and_then(|x| x.as_str())
-                .map(|s| s.to_string())
-                .or_else(|| base_url_to_provider_id.get(&upstream_base_url).cloned())
-                .unwrap_or_else(|| "-".to_string());
-            let usage = v
-                .get("usage")
-                .and_then(|u| serde_json::from_value::<UsageMetrics>(u.clone()).ok());
-            let ttfb_ms = v.get("ttfb_ms").and_then(|x| x.as_u64());
-
-            events.push((
-                ended_at_ms,
-                status_code,
-                duration_ms,
-                station_name,
-                provider_id,
-                usage,
-                ttfb_ms,
-            ));
+            let Some(mut request) =
+                crate::request_ledger::finished_request_from_request_log_record(&v)
+            else {
+                continue;
+            };
+            if request
+                .provider_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|provider_id| !provider_id.is_empty())
+                .is_none()
+                && let Some(provider_id) = request
+                    .upstream_base_url
+                    .as_deref()
+                    .and_then(|base_url| base_url_to_provider_id.get(base_url))
+            {
+                request.provider_id = Some(provider_id.clone());
+            }
+            requests.push(request);
         }
 
-        if events.is_empty() {
+        if requests.is_empty() {
             return 0;
         }
 
         let mut guard = self.usage_rollups.write().await;
         let rollup = guard.entry(service_name.to_string()).or_default();
-        for (ended_at_ms, status_code, duration_ms, cfg_key, provider_key, usage, ttfb_ms) in
-            events.iter()
-        {
-            let day = usage_day::local_day_from_ms(*ended_at_ms);
-            rollup
-                .loaded
-                .record(*status_code, *duration_ms, usage.as_ref(), None, *ttfb_ms);
-            rollup.by_day.entry(day).or_default().record(
-                *status_code,
-                *duration_ms,
-                usage.as_ref(),
-                None,
-                *ttfb_ms,
-            );
-            rollup.by_config.entry(cfg_key.clone()).or_default().record(
-                *status_code,
-                *duration_ms,
-                usage.as_ref(),
-                None,
-                *ttfb_ms,
-            );
-            rollup
-                .by_config_day
-                .entry(cfg_key.clone())
-                .or_default()
-                .entry(day)
-                .or_default()
-                .record(*status_code, *duration_ms, usage.as_ref(), None, *ttfb_ms);
-            rollup
-                .by_provider
-                .entry(provider_key.clone())
-                .or_default()
-                .record(*status_code, *duration_ms, usage.as_ref(), None, *ttfb_ms);
-            rollup
-                .by_provider_day
-                .entry(provider_key.clone())
-                .or_default()
-                .entry(day)
-                .or_default()
-                .record(*status_code, *duration_ms, usage.as_ref(), None, *ttfb_ms);
+        rollup.coverage_source = "request_log".to_string();
+        rollup.replay_scanned_lines = scanned_lines;
+        rollup.replay_max_lines = max_lines;
+        rollup.replay_max_bytes = max_bytes;
+        rollup.replay_bytes_truncated = bytes_truncated;
+        rollup.replay_lines_truncated = lines_truncated;
+        let mut replayed = 0;
+        for request in &requests {
+            if record_finished_request_into_usage_rollup(rollup, request) {
+                replayed += 1;
+            }
         }
 
-        let replayed = events.len();
         self.notify_state_changed();
         replayed
     }
@@ -2889,78 +3173,9 @@ impl ProxyState {
         finished.refresh_observability();
 
         {
-            let effective_ttfb_ms = finished.observability.ttfb_ms;
-            let day = usage_day::local_day_from_ms(finished.ended_at_ms);
-            let cfg_key = finished
-                .station_name
-                .clone()
-                .unwrap_or_else(|| "-".to_string());
-            let provider_key = finished
-                .provider_id
-                .clone()
-                .unwrap_or_else(|| "-".to_string());
-
             let mut rollups = self.usage_rollups.write().await;
             let rollup = rollups.entry(finished.service.clone()).or_default();
-            rollup.loaded.record(
-                finished.status_code,
-                finished.duration_ms,
-                finished.usage.as_ref(),
-                Some(&finished.cost),
-                effective_ttfb_ms,
-            );
-            rollup.by_day.entry(day).or_default().record(
-                finished.status_code,
-                finished.duration_ms,
-                finished.usage.as_ref(),
-                Some(&finished.cost),
-                effective_ttfb_ms,
-            );
-            rollup.by_config.entry(cfg_key.clone()).or_default().record(
-                finished.status_code,
-                finished.duration_ms,
-                finished.usage.as_ref(),
-                Some(&finished.cost),
-                effective_ttfb_ms,
-            );
-            rollup
-                .by_config_day
-                .entry(cfg_key)
-                .or_default()
-                .entry(day)
-                .or_default()
-                .record(
-                    finished.status_code,
-                    finished.duration_ms,
-                    finished.usage.as_ref(),
-                    Some(&finished.cost),
-                    effective_ttfb_ms,
-                );
-
-            rollup
-                .by_provider
-                .entry(provider_key.clone())
-                .or_default()
-                .record(
-                    finished.status_code,
-                    finished.duration_ms,
-                    finished.usage.as_ref(),
-                    Some(&finished.cost),
-                    effective_ttfb_ms,
-                );
-            rollup
-                .by_provider_day
-                .entry(provider_key)
-                .or_default()
-                .entry(day)
-                .or_default()
-                .record(
-                    finished.status_code,
-                    finished.duration_ms,
-                    finished.usage.as_ref(),
-                    Some(&finished.cost),
-                    effective_ttfb_ms,
-                );
+            record_finished_request_into_usage_rollup(rollup, &finished);
         }
 
         if let Some(sid) = finished.session_id.as_deref() {
@@ -3346,15 +3561,14 @@ impl ProxyState {
         let cutoff_day = now_day.saturating_sub(keep_days);
         let mut rollups = self.usage_rollups.write().await;
         for rollup in rollups.values_mut() {
+            rollup.recorded_requests.retain(|_, day| *day >= cutoff_day);
             rollup.by_day.retain(|day, _| *day >= cutoff_day);
-            rollup.by_config_day.retain(|_, m| {
-                m.retain(|day, _| *day >= cutoff_day);
-                !m.is_empty()
-            });
-            rollup.by_provider_day.retain(|_, m| {
-                m.retain(|day, _| *day >= cutoff_day);
-                !m.is_empty()
-            });
+            rollup.by_hour.retain(|day, _| *day >= cutoff_day);
+            prune_usage_entity_days(&mut rollup.by_config_day, cutoff_day);
+            prune_usage_entity_days(&mut rollup.by_provider_day, cutoff_day);
+            prune_usage_entity_days(&mut rollup.by_model_day, cutoff_day);
+            prune_usage_entity_days(&mut rollup.by_session_day, cutoff_day);
+            prune_usage_entity_days(&mut rollup.by_project_day, cutoff_day);
         }
 
         let cutoff_cwd =
@@ -3476,6 +3690,11 @@ impl<'a> BeginRequestTestBuilder<'a> {
         self
     }
 
+    pub(crate) fn cwd(mut self, value: impl Into<String>) -> Self {
+        self.cwd = Some(value.into());
+        self
+    }
+
     pub(crate) fn service_tier(mut self, value: impl Into<String>) -> Self {
         self.service_tier = Some(value.into());
         self
@@ -3576,6 +3795,14 @@ mod tests {
             session_transcript_path_cache_ttl_ms: 30_000,
             session_transcript_path_cache_max_entries: 5_000,
         }
+    }
+
+    fn temp_state_log_path(test_name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "codex-helper-state-{test_name}-{}-{}.jsonl",
+            std::process::id(),
+            unix_now_ms()
+        ))
     }
 
     #[test]
@@ -3864,6 +4091,244 @@ mod tests {
             );
             assert_eq!(rollup.loaded.cost.priced_requests, 1);
             assert_eq!(rollup.loaded.cost.unpriced_requests, 0);
+        });
+    }
+
+    #[test]
+    fn usage_rollup_records_hour_dimensions_and_dedupes_trace() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            let ended_at_ms = 1_704_038_400_000_u64;
+            let request_id = state
+                .begin_request_for_test()
+                .session_id("sid-day")
+                .cwd("F:/SourceCodes/Rust/codex-helper")
+                .model("gpt-5")
+                .started_at_ms(ended_at_ms.saturating_sub(1_000))
+                .begin()
+                .await;
+            state
+                .update_request_route(
+                    request_id,
+                    Some("station-day".to_string()),
+                    Some("provider-day".to_string()),
+                    "https://provider.example/v1".to_string(),
+                    None,
+                )
+                .await;
+            state
+                .finish_request(FinishRequestParams {
+                    id: request_id,
+                    status_code: 200,
+                    duration_ms: 10,
+                    ended_at_ms,
+                    observed_service_tier: None,
+                    usage: Some(UsageMetrics {
+                        total_tokens: 42,
+                        ..UsageMetrics::default()
+                    }),
+                    retry: None,
+                    ttfb_ms: Some(3),
+                    streaming: false,
+                })
+                .await;
+
+            let recent = state.list_recent_finished(1).await;
+            let day = usage_day::local_day_from_ms(ended_at_ms);
+            let hour = usize::from(usage_day::local_hour_from_ms(ended_at_ms));
+            let mut rollups = state.usage_rollups.write().await;
+            let rollup = rollups.get_mut("codex").expect("codex rollup");
+
+            assert_eq!(rollup.by_hour[&day][hour].requests_total, 1);
+            assert_eq!(rollup.by_model["gpt-5"].requests_total, 1);
+            assert_eq!(rollup.by_model_day["gpt-5"][&day].usage.total_tokens, 42);
+            assert_eq!(rollup.by_session["sid-day"].requests_total, 1);
+            assert_eq!(
+                rollup.by_project["F:/SourceCodes/Rust/codex-helper"].requests_total,
+                1
+            );
+
+            let before = rollup.loaded.requests_total;
+            assert!(!record_finished_request_into_usage_rollup(
+                rollup, &recent[0]
+            ));
+            assert_eq!(rollup.loaded.requests_total, before);
+        });
+    }
+
+    #[test]
+    fn usage_replay_projects_finished_requests_and_keeps_provider_fallback() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let log_path = temp_state_log_path("usage-replay-projection");
+            let window =
+                usage_day::local_day_window(usage_day::current_local_day()).expect("window");
+            let ended_at_ms = window.start_ms.saturating_add(3_600_000);
+            let record = serde_json::json!({
+                "timestamp_ms": ended_at_ms,
+                "request_id": 77,
+                "trace_id": "codex-replay-77",
+                "service": "codex",
+                "method": "POST",
+                "path": "/v1/responses",
+                "status_code": 200,
+                "duration_ms": 100,
+                "ttfb_ms": 25,
+                "station_name": "station-replay",
+                "upstream_base_url": "https://legacy.example/v1",
+                "session_id": "sid-replay",
+                "cwd": "F:/SourceCodes/Rust/codex-helper",
+                "model": "gpt-5",
+                "usage": {
+                    "input_tokens": 1,
+                    "output_tokens": 2,
+                    "total_tokens": 3
+                }
+            });
+            std::fs::write(&log_path, format!("{record}\n")).expect("write request log");
+
+            let state = ProxyState::new();
+            let replayed = state
+                .replay_usage_from_requests_log(
+                    "codex",
+                    log_path.clone(),
+                    HashMap::from([(
+                        "https://legacy.example/v1".to_string(),
+                        "provider-fallback".to_string(),
+                    )]),
+                )
+                .await;
+
+            assert_eq!(replayed, 1);
+            let day = usage_day::local_day_from_ms(ended_at_ms);
+            let rollups = state.usage_rollups.read().await;
+            let rollup = rollups.get("codex").expect("codex rollup");
+            assert_eq!(rollup.by_provider["provider-fallback"].requests_total, 1);
+            assert_eq!(
+                rollup.by_provider_day["provider-fallback"][&day]
+                    .usage
+                    .total_tokens,
+                3
+            );
+            assert_eq!(rollup.by_model["gpt-5"].requests_total, 1);
+            assert_eq!(rollup.by_session["sid-replay"].requests_total, 1);
+            assert_eq!(
+                rollup.by_project["F:/SourceCodes/Rust/codex-helper"].requests_total,
+                1
+            );
+
+            let day_view = state.get_usage_day_view("codex", 12, ended_at_ms).await;
+            assert_eq!(day_view.coverage.source, "request_log");
+            assert_eq!(day_view.coverage.loaded_first_ms, Some(ended_at_ms));
+            assert!(day_view.coverage.day_may_be_partial);
+            assert!(
+                day_view
+                    .coverage
+                    .partial_reason
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("loaded data starts after local day start")
+            );
+
+            let _ = std::fs::remove_file(log_path);
+        });
+    }
+
+    #[test]
+    fn usage_day_view_includes_hour_rows_dimensions_and_cost_sorting() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            let window =
+                usage_day::local_day_window(usage_day::current_local_day()).expect("window");
+            let small_ended_at_ms = window.start_ms.saturating_add(3_600_000);
+            let large_ended_at_ms = window.start_ms.saturating_add(7_200_000);
+
+            let small_id = state
+                .begin_request_for_test()
+                .session_id("sid-small")
+                .cwd("F:/small")
+                .model("gpt-5")
+                .started_at_ms(small_ended_at_ms.saturating_sub(500))
+                .begin()
+                .await;
+            state
+                .update_request_route(
+                    small_id,
+                    Some("station-small".to_string()),
+                    Some("provider-small".to_string()),
+                    "https://small.example/v1".to_string(),
+                    None,
+                )
+                .await;
+            state
+                .finish_request(FinishRequestParams {
+                    id: small_id,
+                    status_code: 200,
+                    duration_ms: 50,
+                    ended_at_ms: small_ended_at_ms,
+                    observed_service_tier: None,
+                    usage: Some(UsageMetrics {
+                        input_tokens: 100,
+                        output_tokens: 10,
+                        total_tokens: 110,
+                        ..UsageMetrics::default()
+                    }),
+                    retry: None,
+                    ttfb_ms: Some(10),
+                    streaming: false,
+                })
+                .await;
+
+            let large_id = state
+                .begin_request_for_test()
+                .session_id("sid-large")
+                .cwd("F:/large")
+                .model("gpt-5")
+                .started_at_ms(large_ended_at_ms.saturating_sub(500))
+                .begin()
+                .await;
+            state
+                .update_request_route(
+                    large_id,
+                    Some("station-large".to_string()),
+                    Some("provider-large".to_string()),
+                    "https://large.example/v1".to_string(),
+                    None,
+                )
+                .await;
+            state
+                .finish_request(FinishRequestParams {
+                    id: large_id,
+                    status_code: 200,
+                    duration_ms: 100,
+                    ended_at_ms: large_ended_at_ms,
+                    observed_service_tier: None,
+                    usage: Some(UsageMetrics {
+                        input_tokens: 1_000,
+                        output_tokens: 500,
+                        total_tokens: 1_500,
+                        ..UsageMetrics::default()
+                    }),
+                    retry: None,
+                    ttfb_ms: Some(20),
+                    streaming: false,
+                })
+                .await;
+
+            let view = state
+                .get_usage_day_view("codex", 12, large_ended_at_ms)
+                .await;
+
+            assert_eq!(view.hourly.len(), 24);
+            assert_eq!(view.summary.requests_total, 2);
+            assert_eq!(view.provider_rows[0].name, "provider-large");
+            assert_eq!(view.station_rows[0].name, "station-large");
+            assert_eq!(view.session_rows[0].name, "sid-large");
+            assert_eq!(view.project_rows[0].name, "F:/large");
+            assert_eq!(view.model_rows[0].name, "gpt-5");
+            assert_eq!(view.retry_gate.active, 0);
         });
     }
 

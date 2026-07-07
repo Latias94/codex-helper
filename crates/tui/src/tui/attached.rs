@@ -122,7 +122,7 @@ async fn run_attached_dashboard_runtime(
         )),
         ..Default::default()
     };
-    let mut snapshot = snapshot_from_api_v1(api_snapshot, ui.forecast_recent_mode()).await;
+    let mut snapshot = snapshot_from_api_v1(api_snapshot).await;
     hydrate_attached_profile_state(&mut ui, &runtime).await;
     hydrate_attached_routing_state(&mut ui, &runtime).await;
     ui.clamp_selection(&snapshot, ui.station_page_rows_len(providers.len()));
@@ -293,7 +293,7 @@ async fn refresh_attached_snapshot(
 
     match runtime.snapshot(ui.stats_days).await {
         Ok(api_snapshot) => {
-            *snapshot = snapshot_from_api_v1(api_snapshot, ui.forecast_recent_mode()).await;
+            *snapshot = snapshot_from_api_v1(api_snapshot).await;
             ui.clamp_selection(snapshot, ui.station_page_rows_len(providers_len));
         }
         Err(err) => {
@@ -382,8 +382,8 @@ fn handle_attached_key(
         KeyCode::Char('2') => switch_attached_page(ui, Page::Stations),
         KeyCode::Char('3') => switch_attached_page(ui, Page::Sessions),
         KeyCode::Char('4') => switch_attached_page(ui, Page::Requests),
-        KeyCode::Char('5') => switch_attached_page(ui, Page::ServiceStatus),
-        KeyCode::Char('6') => switch_attached_page(ui, Page::Stats),
+        KeyCode::Char('5') => switch_attached_page(ui, Page::Stats),
+        KeyCode::Char('6') => switch_attached_page(ui, Page::ServiceStatus),
         KeyCode::Char('7') => switch_attached_page(ui, Page::Settings),
         KeyCode::Char('8') => switch_attached_page(ui, Page::History),
         KeyCode::Char('9') => switch_attached_page(ui, Page::Recent),
@@ -397,25 +397,6 @@ fn handle_attached_key(
         }
         KeyCode::Down | KeyCode::Char('j') => {
             move_attached_selection(ui, snapshot, providers.len(), 1)
-        }
-        KeyCode::PageUp if ui.page == Page::Stats && ui.stats_focus == StatsFocus::Providers => {
-            ui.stats_provider_detail_scroll = ui.stats_provider_detail_scroll.saturating_sub(5);
-            true
-        }
-        KeyCode::PageDown if ui.page == Page::Stats && ui.stats_focus == StatsFocus::Providers => {
-            ui.stats_provider_detail_scroll = ui.stats_provider_detail_scroll.saturating_add(5);
-            true
-        }
-        KeyCode::Char('d') if ui.page == Page::Stats => {
-            let options = [1usize, 7usize, 30usize, 0usize];
-            let idx = options
-                .iter()
-                .position(|&n| n == ui.stats_days)
-                .unwrap_or(1);
-            ui.stats_days = options[(idx + 1) % options.len()];
-            ui.stats_provider_detail_scroll = 0;
-            ui.needs_snapshot_refresh = true;
-            true
         }
         KeyCode::Char('r') if ui.page == Page::Fleet => {
             ui.needs_fleet_refresh = true;
@@ -502,7 +483,7 @@ fn move_attached_selection(
         }
         Page::Stats => match ui.stats_focus {
             StatsFocus::Stations => {
-                let len = snapshot.usage_rollup.by_config.len();
+                let len = snapshot.usage_day.station_rows.len();
                 if let Some(next) = adjust_table_selection(&mut ui.stats_stations_table, delta, len)
                 {
                     ui.selected_stats_station_idx = next;
@@ -511,7 +492,7 @@ fn move_attached_selection(
                 false
             }
             StatsFocus::Providers => {
-                let len = ui.usage_balance_provider_rows_len(snapshot);
+                let len = snapshot.usage_day.provider_rows.len();
                 if let Some(next) =
                     adjust_table_selection(&mut ui.stats_providers_table, delta, len)
                 {
@@ -715,8 +696,6 @@ mod tests {
         Snapshot {
             rows: Vec::new(),
             recent: Vec::new(),
-            forecast_recent: Vec::new(),
-            forecast_recent_source: crate::tui::model::UsageForecastSampleSource::RuntimeOnly,
             model_overrides: std::collections::HashMap::new(),
             overrides: std::collections::HashMap::new(),
             station_overrides: std::collections::HashMap::new(),
@@ -725,6 +704,7 @@ mod tests {
             global_station_override: None,
             global_route_target_override: None,
             station_meta_overrides: std::collections::HashMap::new(),
+            usage_day: crate::state::UsageDayView::default(),
             usage_rollup: crate::state::UsageRollupView::default(),
             provider_balances: std::collections::HashMap::new(),
             provider_balance_history: std::collections::HashMap::new(),

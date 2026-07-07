@@ -1205,21 +1205,23 @@ Important balance behavior:
 - UI surfaces cached balance snapshots; manual refresh uses `POST /__codex_helper/api/v1/providers/balances/refresh` and also avoids targets with confirmed terminal errors or current-period exhaustion.
 - Balance HTTP calls are bounded and reuse the same outbound client as proxy runtime calls. A failed lookup should surface the probed origin and adapter kind in logs, for example whether `sub2api_usage` or `openai_balance_http_json` returned non-JSON.
 
-## Usage / Balance Page
+## Usage Page
 
-TUI page 5 is now labeled `Usage`, and the Tauri desktop Usage page consumes the same core `UsageBalanceView`, so provider, endpoint, balance state, and route-impact semantics should match.
+TUI page 5 is labeled `Usage`. It is a local-day usage panel, not a durable multi-day analytics warehouse.
 
 How to read it:
 
-- The summary band shows request count, tokens, estimated cost, balance state counts, and the latest refresh state for the selected window.
-- Provider rows show request volume, success rate, tokens, cost, primary balance/quota summary, balance state, and routing impact.
-- Endpoint rows show recent provider endpoint samples, request count, error count, tokens, attached balance snapshot, and route skip reason.
+- The summary band shows today's request count, tokens, estimated cost, success rate, token mix, and the global retry gate count.
+- The 24h activity band shows local-day request distribution and whether the loaded request log may be partial.
+- Provider and station rows show today's request volume, error count, tokens, estimated cost, and average latency.
+- Model, session, and project panels highlight the main local-day usage drivers.
+- Coverage warnings mean codex-helper only loaded the bounded local request log window. They are not a claim that no earlier usage exists.
 - `unknown` means there is no trusted balance data or the lookup failed. Do not treat it as healthy balance.
 - `stale` means the snapshot expired; it is distinct from `exhausted`, `error`, and `unlimited`.
 - `unlimited` is a known unlimited quota state, not unknown.
-- Press `g` on the TUI `Usage` page to refresh balances; use the `Refresh balances` button on the Tauri desktop Usage page.
+- Balance refresh remains on the routing/provider diagnostics surfaces; use Routing/Stations `g` in TUI or the `Refresh balances` button on the Tauri desktop Usage page.
 - A single provider balance refresh failure only updates that provider's error/unknown state. It does not interrupt other provider refreshes, TUI redraw, or snapshot refresh.
-- The `Routing` page keeps compact balance context only. Use `Usage / Balance` to answer which provider is used most, which one is running out, or which endpoint is failing.
+- The `Routing` page keeps compact balance context and refresh controls. Use TUI `Usage` to answer what was used today; use Routing/Stations to answer balance and route eligibility questions.
 
 ## Runtime Safeguards
 

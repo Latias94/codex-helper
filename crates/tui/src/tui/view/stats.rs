@@ -1,46 +1,18 @@
-use std::collections::HashMap;
-
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::prelude::{Line, Modifier, Span, Style, Text};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, Table, Wrap};
+use ratatui::prelude::{Color, Line, Modifier, Span, Style, Text};
+use ratatui::widgets::{
+    Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Sparkline, Table, Wrap,
+};
 
-use crate::state::UsageBucket;
+use crate::state::{UsageBucket, UsageDayDimensionRow, UsageDayView};
 use crate::tui::Language;
 use crate::tui::ProviderOption;
-use crate::tui::i18n;
 use crate::tui::model::{
-    Palette, Snapshot, UsageForecastSampleSource, duration_short, shorten, shorten_middle,
-    tokens_short,
+    Palette, Snapshot, duration_short, format_age, now_ms, shorten, tokens_short,
 };
 use crate::tui::state::UiState;
 use crate::tui::types::StatsFocus;
-use crate::usage_balance::{UsageBalanceEndpointRow, UsageBalanceProviderRow, UsageBalanceView};
-use crate::usage_forecast::QuotaPacingStatus;
-
-mod summary;
-use summary::*;
-
-struct StatsKpiContext<'a> {
-    usage_balance: &'a UsageBalanceView,
-    usage_forecast: &'a crate::config::UsageForecastConfig,
-}
-
-#[derive(Clone, Copy)]
-struct UsageSignalsContext<'a> {
-    snapshot: &'a Snapshot,
-    today: &'a UsageBucket,
-    today_day: i32,
-    window_label: &'a str,
-    lang: Language,
-}
-
-#[derive(Clone)]
-struct TodayEntityRow {
-    scope: &'static str,
-    name: String,
-    bucket: UsageBucket,
-}
 
 pub(super) fn render_stats_page(
     f: &mut Frame<'_>,
@@ -50,128 +22,51 @@ pub(super) fn render_stats_page(
     _providers: &[ProviderOption],
     area: Rect,
 ) {
-    let usage_balance = ui.usage_balance_view_for_selection(snapshot);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(8),
-            Constraint::Length(6),
+            Constraint::Length(7),
+            Constraint::Length(7),
             Constraint::Min(0),
         ])
         .split(area);
 
-    let lang = ui.language;
-    let window_label = stats_window_label(ui.stats_days, lang);
-    let today_day = current_day();
-    let today = bucket_for_day(&snapshot.usage_rollup.by_day, today_day);
-    render_today_kpis(
-        f,
-        p,
-        snapshot,
-        StatsKpiContext {
-            usage_balance: &usage_balance,
-            usage_forecast: &ui.usage_forecast,
-        },
-        &today,
-        rows[0],
-        lang,
-    );
-    render_usage_signals(
-        f,
-        p,
-        UsageSignalsContext {
-            snapshot,
-            today: &today,
-            today_day,
-            window_label: &window_label,
-            lang,
-        },
-        rows[1],
-    );
-    render_tables(
-        f,
-        p,
-        ui,
-        snapshot,
-        &usage_balance,
-        &window_label,
-        rows[2],
-        lang,
-    );
+    render_kpi_row(f, p, ui.language, &snapshot.usage_day, rows[0]);
+    render_activity_row(f, p, ui.language, &snapshot.usage_day, rows[1]);
+    render_dimension_area(f, p, ui, &snapshot.usage_day, rows[2]);
 }
 
-fn render_today_kpis(
-    f: &mut Frame<'_>,
-    p: Palette,
-    snapshot: &Snapshot,
-    ctx: StatsKpiContext<'_>,
-    today: &UsageBucket,
-    area: Rect,
-    lang: Language,
-) {
-    let l = |text| i18n::label(lang, text);
-    let cols = kpi_cells(area);
-    let tokens = &today.usage;
-    let ok = today.requests_total.saturating_sub(today.requests_error);
-    let now_ms = crate::tui::model::now_ms();
-    let forecast = usage_spend_forecast(snapshot, ctx.usage_forecast, now_ms);
-    let quota_pacing = quota_pacing_forecast(snapshot, &forecast, now_ms);
-    let forecast_source = usage_forecast_source_line(snapshot, lang);
-    let forecast_style = if forecast.projected_exhaustion {
-        Style::default().fg(p.warn)
-    } else {
-        Style::default().fg(p.muted)
-    };
-    let quota_style = match quota_pacing.status {
-        QuotaPacingStatus::Fast | QuotaPacingStatus::Exhausted => Style::default().fg(p.warn),
-        QuotaPacingStatus::OnTrack | QuotaPacingStatus::Slow | QuotaPacingStatus::Unlimited => {
-            Style::default().fg(p.text)
-        }
-        QuotaPacingStatus::NoSpendRate
-        | QuotaPacingStatus::UnknownReset
-        | QuotaPacingStatus::Unavailable => Style::default().fg(p.muted),
-    };
-    let live_value_width = usize::from(cols[3].width.saturating_sub(8)).clamp(12, 72);
+fn render_kpi_row(f: &mut Frame<'_>, p: Palette, lang: Language, usage: &UsageDayView, area: Rect) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(28),
+            Constraint::Percentage(24),
+            Constraint::Percentage(24),
+            Constraint::Percentage(24),
+        ])
+        .split(area);
 
+    let summary = &usage.summary;
+    let ok = summary
+        .requests_total
+        .saturating_sub(summary.requests_error);
     render_info_block(
         f,
         p,
-        today_usage_title(lang),
+        match lang {
+            Language::Zh => format!("今日用量 {}", usage.label),
+            Language::En => format!("Today {}", usage.label),
+        },
         vec![
-            Line::from(vec![
-                Span::styled(format!("{} ", l("tok")), Style::default().fg(p.muted)),
-                Span::styled(
-                    tokens_short(tokens.total_tokens),
-                    Style::default().fg(p.accent),
-                ),
-                Span::raw("  "),
-                Span::styled(format!("{} ", l("cost")), Style::default().fg(p.muted)),
-                Span::styled(today.cost.display_total(), Style::default().fg(p.text)),
-            ]),
-            Line::from(vec![
-                Span::styled(format!("{} ", l("in/out")), Style::default().fg(p.muted)),
-                Span::styled(
-                    format!(
-                        "{}/{}",
-                        tokens_short(tokens.input_tokens),
-                        tokens_short(tokens.output_tokens)
-                    ),
-                    Style::default().fg(p.text),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled(format!("{} ", l("reasoning")), Style::default().fg(p.muted)),
-                Span::styled(
-                    tokens_short(tokens.reasoning_output_tokens_total()),
-                    Style::default().fg(p.muted),
-                ),
-                Span::raw("  "),
-                Span::styled(format!("{} ", l("coverage")), Style::default().fg(p.muted)),
-                Span::styled(
-                    cost_coverage_label(today, lang),
-                    Style::default().fg(p.muted),
-                ),
-            ]),
+            kv_line(
+                p,
+                "tokens",
+                &tokens_short(summary.usage.total_tokens),
+                p.accent,
+            ),
+            kv_line(p, "cost", &summary.cost.display_total(), p.text),
+            kv_line(p, "coverage", &cost_coverage_label(summary, lang), p.muted),
         ],
         cols[0],
     );
@@ -179,44 +74,29 @@ fn render_today_kpis(
     render_info_block(
         f,
         p,
-        today_requests_title(lang),
+        match lang {
+            Language::Zh => "请求",
+            Language::En => "Requests",
+        },
         vec![
             Line::from(vec![
-                Span::styled(format!("{} ", l("total")), Style::default().fg(p.muted)),
+                muted(p, "total "),
                 Span::styled(
-                    today.requests_total.to_string(),
+                    summary.requests_total.to_string(),
                     Style::default().fg(p.text),
                 ),
                 Span::raw("  "),
-                Span::styled(format!("{} ", l("ok")), Style::default().fg(p.muted)),
+                muted(p, "ok "),
                 Span::styled(ok.to_string(), Style::default().fg(p.good)),
                 Span::raw("  "),
-                Span::styled(format!("{} ", l("err")), Style::default().fg(p.muted)),
+                muted(p, "err "),
                 Span::styled(
-                    today.requests_error.to_string(),
+                    summary.requests_error.to_string(),
                     Style::default().fg(p.warn),
                 ),
             ]),
-            Line::from(vec![
-                Span::styled(format!("{} ", l("success")), Style::default().fg(p.muted)),
-                Span::styled(fmt_success_pct(today), Style::default().fg(p.good)),
-                Span::raw("  "),
-                Span::styled(format!("{} ", l("avg")), Style::default().fg(p.muted)),
-                Span::styled(
-                    fmt_avg_ms(today.duration_ms_total, today.requests_total),
-                    Style::default().fg(p.text),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled(format!("{} ", l("ttfb")), Style::default().fg(p.muted)),
-                Span::styled(fmt_avg_ttfb_ms(today), Style::default().fg(p.text)),
-                Span::raw("  "),
-                Span::styled(
-                    format!("{} ", l("generation")),
-                    Style::default().fg(p.muted),
-                ),
-                Span::styled(fmt_avg_generation_ms(today), Style::default().fg(p.text)),
-            ]),
+            kv_line(p, "success", &success_pct(summary), p.good),
+            kv_line(p, "avg latency", &avg_duration(summary), p.text),
         ],
         cols[1],
     );
@@ -224,258 +104,371 @@ fn render_today_kpis(
     render_info_block(
         f,
         p,
-        cache_speed_title(lang),
+        match lang {
+            Language::Zh => "Token 结构",
+            Language::En => "Token Mix",
+        },
         vec![
             Line::from(vec![
-                Span::styled(format!("{} ", l("cache hit")), Style::default().fg(p.muted)),
-                Span::styled(fmt_cache_hit(tokens), Style::default().fg(p.text)),
+                muted(p, "in "),
+                Span::styled(
+                    tokens_short(summary.usage.input_tokens),
+                    Style::default().fg(p.text),
+                ),
                 Span::raw("  "),
-                Span::styled(format!("{} ", l("tok/s")), Style::default().fg(p.muted)),
+                muted(p, "out "),
                 Span::styled(
-                    fmt_tok_s_0(calc_output_rate_tok_s(today)),
+                    tokens_short(summary.usage.output_tokens),
                     Style::default().fg(p.text),
                 ),
             ]),
-            Line::from(vec![
-                Span::styled(
-                    format!("{} ", l("read/create")),
-                    Style::default().fg(p.muted),
-                ),
-                Span::styled(
-                    format!(
-                        "{}/{}",
-                        tokens_short(tokens.cache_read_tokens_total()),
-                        tokens_short(tokens.cache_creation_tokens_total()),
-                    ),
-                    Style::default().fg(p.text),
-                ),
-            ]),
-            Line::from(vec![Span::styled(
-                today_data_hint(today, lang),
-                Style::default().fg(if today.requests_total == 0 {
-                    p.warn
-                } else {
-                    p.muted
-                }),
-            )]),
+            kv_line(
+                p,
+                "cache read",
+                &tokens_short(summary.usage.cache_read_tokens_total()),
+                p.muted,
+            ),
+            kv_line(
+                p,
+                "reasoning",
+                &tokens_short(summary.usage.reasoning_output_tokens_total()),
+                p.muted,
+            ),
         ],
         cols[2],
     );
 
+    let gate = &usage.retry_gate;
+    let reasons = if gate.reasons.is_empty() {
+        "-".to_string()
+    } else {
+        gate.reasons
+            .iter()
+            .map(|row| format!("{}:{}", shorten(&row.reason, 18), row.active))
+            .collect::<Vec<_>>()
+            .join("  ")
+    };
     render_info_block(
         f,
         p,
-        spend_forecast_title(lang),
+        match lang {
+            Language::Zh => "Retry Gate",
+            Language::En => "Retry Gate",
+        },
         vec![
-            Line::from(vec![
-                Span::styled("burn ", Style::default().fg(p.muted)),
-                Span::styled(
-                    shorten(&spend_forecast_rate_line(&forecast, lang), live_value_width),
-                    forecast_style,
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("pace ", Style::default().fg(p.muted)),
-                Span::styled(
-                    shorten(
-                        &quota_pacing_plan_line(&quota_pacing, lang),
-                        live_value_width,
-                    ),
-                    quota_style,
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("left ", Style::default().fg(p.muted)),
-                Span::styled(
-                    shorten(
-                        &quota_pacing_status_line(&quota_pacing, lang),
-                        live_value_width,
-                    ),
-                    quota_style,
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("bal ", Style::default().fg(p.muted)),
-                Span::styled(
-                    shorten(
-                        &spend_forecast_balance_line(&forecast, lang),
-                        live_value_width,
-                    ),
-                    forecast_style,
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("ref ", Style::default().fg(p.muted)),
-                Span::styled(
-                    shorten(
-                        &usage_refresh_brief_line(ctx.usage_balance, lang),
-                        live_value_width,
-                    ),
-                    Style::default().fg(p.muted),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("src ", Style::default().fg(p.muted)),
-                Span::styled(
-                    shorten(&forecast_source, live_value_width),
-                    Style::default().fg(p.muted),
-                ),
-            ]),
+            kv_line(
+                p,
+                "active",
+                &gate.active.to_string(),
+                gate_style(p, gate.active),
+            ),
+            kv_line(
+                p,
+                "cooldown",
+                &gate.active_cooldowns.to_string(),
+                gate_style(p, gate.active_cooldowns),
+            ),
+            kv_line(
+                p,
+                "max left",
+                &gate
+                    .max_remaining_secs
+                    .map(|secs| duration_short(secs.saturating_mul(1000)))
+                    .unwrap_or_else(|| "-".to_string()),
+                p.muted,
+            ),
+            kv_line(p, "reason", &shorten(&reasons, 56), p.muted),
         ],
         cols[3],
     );
 }
 
-fn render_usage_signals(f: &mut Frame<'_>, p: Palette, ctx: UsageSignalsContext<'_>, area: Rect) {
+fn render_activity_row(
+    f: &mut Frame<'_>,
+    p: Palette,
+    lang: Language,
+    usage: &UsageDayView,
+    area: Rect,
+) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .split(area);
+
+    let data = usage
+        .hourly
+        .iter()
+        .map(|row| row.bucket.requests_total)
+        .collect::<Vec<_>>();
+    let title = match lang {
+        Language::Zh => "24 小时请求量",
+        Language::En => "24h Requests",
+    };
+    f.render_widget(
+        Sparkline::default()
+            .block(panel_block(p, title))
+            .data(&data)
+            .style(Style::default().fg(p.accent)),
+        cols[0],
+    );
+
+    let coverage = &usage.coverage;
+    let coverage_style = if coverage.day_may_be_partial {
+        Style::default().fg(p.warn)
+    } else {
+        Style::default().fg(p.good)
+    };
+    let status = if coverage.day_may_be_partial {
+        match lang {
+            Language::Zh => "可能不完整",
+            Language::En => "partial",
+        }
+    } else {
+        match lang {
+            Language::Zh => "已加载窗口",
+            Language::En => "loaded window",
+        }
+    };
+    let first = format_age(now_ms(), coverage.loaded_first_ms);
+    let last = format_age(now_ms(), coverage.loaded_last_ms);
+    let mut lines = vec![
+        Line::from(vec![
+            muted(p, "status "),
+            Span::styled(status, coverage_style),
+        ]),
+        Line::from(vec![
+            muted(p, "source "),
+            Span::styled(shorten(&coverage.source, 20), Style::default().fg(p.text)),
+            Span::raw("  "),
+            muted(p, "loaded "),
+            Span::styled(
+                coverage.loaded_requests.to_string(),
+                Style::default().fg(p.text),
+            ),
+        ]),
+        Line::from(vec![
+            muted(p, "first "),
+            Span::styled(first, Style::default().fg(p.muted)),
+            Span::raw("  "),
+            muted(p, "last "),
+            Span::styled(last, Style::default().fg(p.muted)),
+        ]),
+    ];
+    if coverage.scanned_lines > 0 {
+        lines.push(Line::from(vec![
+            muted(p, "scan "),
+            Span::styled(
+                format!(
+                    "{} lines / {} MiB cap",
+                    coverage.scanned_lines,
+                    coverage.max_bytes / 1024 / 1024
+                ),
+                Style::default().fg(p.muted),
+            ),
+        ]));
+    }
+    if let Some(reason) = coverage.partial_reason.as_deref() {
+        lines.push(Line::from(vec![
+            muted(p, "note "),
+            Span::styled(shorten(reason, 72), Style::default().fg(p.warn)),
+        ]));
+    }
+
+    f.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(panel_block(
+                p,
+                match lang {
+                    Language::Zh => "覆盖范围",
+                    Language::En => "Coverage",
+                },
+            ))
+            .wrap(Wrap { trim: true }),
+        cols[1],
+    );
+}
+
+fn render_dimension_area(
+    f: &mut Frame<'_>,
+    p: Palette,
+    ui: &mut UiState,
+    usage: &UsageDayView,
+    area: Rect,
+) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .split(area);
+    render_focus_table(f, p, ui, usage, cols[0]);
+    render_side_lists(f, p, ui.language, usage, cols[1]);
+}
+
+fn render_focus_table(
+    f: &mut Frame<'_>,
+    p: Palette,
+    ui: &mut UiState,
+    usage: &UsageDayView,
+    area: Rect,
+) {
+    let (title, rows, table_state) = match ui.stats_focus {
+        StatsFocus::Providers => (
+            match ui.language {
+                Language::Zh => "提供商排行",
+                Language::En => "Providers",
+            },
+            &usage.provider_rows,
+            &mut ui.stats_providers_table,
+        ),
+        StatsFocus::Stations => (
+            match ui.language {
+                Language::Zh => "站点排行",
+                Language::En => "Stations",
+            },
+            &usage.station_rows,
+            &mut ui.stats_stations_table,
+        ),
+    };
+
+    let table_rows = rows
+        .iter()
+        .map(|row| dimension_table_row(p, row))
+        .collect::<Vec<_>>();
+    let table = Table::new(
+        table_rows,
+        [
+            Constraint::Min(18),
+            Constraint::Length(8),
+            Constraint::Length(10),
+            Constraint::Length(8),
+            Constraint::Length(8),
+            Constraint::Length(8),
+        ],
+    )
+    .header(Row::new(vec![
+        Cell::from(muted(p, "name")),
+        Cell::from(muted(p, "req")),
+        Cell::from(muted(p, "tokens")),
+        Cell::from(muted(p, "cost")),
+        Cell::from(muted(p, "err")),
+        Cell::from(muted(p, "avg")),
+    ]))
+    .block(panel_block(p, title))
+    .row_highlight_style(Style::default().bg(Color::Rgb(32, 39, 48)))
+    .highlight_symbol("  ")
+    .highlight_spacing(HighlightSpacing::Always);
+    f.render_stateful_widget(table, area, table_state);
+}
+
+fn render_side_lists(
+    f: &mut Frame<'_>,
+    p: Palette,
+    lang: Language,
+    usage: &UsageDayView,
+    area: Rect,
+) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
         .constraints([
             Constraint::Percentage(34),
             Constraint::Percentage(33),
             Constraint::Percentage(33),
         ])
         .split(area);
-
-    render_coverage_block(f, p, ctx, cols[0]);
-    render_runtime_health_block(f, p, ctx.snapshot, cols[1], ctx.lang);
-    render_recent_days_sparkline(f, p, ctx.snapshot, cols[2], ctx.lang);
-}
-
-fn render_coverage_block(f: &mut Frame<'_>, p: Palette, ctx: UsageSignalsContext<'_>, area: Rect) {
-    let snapshot = ctx.snapshot;
-    let today = ctx.today;
-    let today_day = ctx.today_day;
-    let window_label = ctx.window_label;
-    let lang = ctx.lang;
-    let c = &snapshot.usage_rollup.coverage;
-    let loaded = day_range_label(c.loaded_first_day, c.loaded_last_day);
-    let note = if c.window_exceeds_loaded_start {
-        match lang {
-            Language::Zh => "本地历史不足，长窗口仅部分覆盖",
-            Language::En => "local history is shorter than the selected window",
-        }
-    } else {
-        match lang {
-            Language::Zh => "窗口仅作辅助；首页优先看今天",
-            Language::En => "window is auxiliary; this page prioritizes today",
-        }
-    };
-    let today_line = if today.requests_total == 0 {
-        match lang {
-            Language::Zh => format!("今天 {} 暂无请求", day_to_ymd(today_day)),
-            Language::En => format!("today {} no requests yet", day_to_ymd(today_day)),
-        }
-    } else {
-        match lang {
-            Language::Zh => format!(
-                "今天 {} req={} tok={}",
-                day_to_ymd(today_day),
-                today.requests_total,
-                tokens_short(today.usage.total_tokens)
-            ),
-            Language::En => format!(
-                "today {} req={} tok={}",
-                day_to_ymd(today_day),
-                today.requests_total,
-                tokens_short(today.usage.total_tokens)
-            ),
-        }
-    };
-
-    render_info_block(
+    render_compact_rows(
         f,
         p,
-        data_coverage_title(lang),
-        vec![
-            Line::from(vec![Span::styled(today_line, Style::default().fg(p.text))]),
-            Line::from(vec![Span::styled(
-                format!(
-                    "{} {loaded} days={} req={}",
-                    i18n::label(lang, "loaded"),
-                    c.loaded_days_with_data,
-                    c.loaded_requests
-                ),
-                Style::default().fg(p.muted),
-            )]),
-            Line::from(vec![Span::styled(
-                format!(
-                    "{} {window_label} req={}",
-                    i18n::label(lang, "window"),
-                    c.window_requests
-                ),
-                Style::default().fg(p.muted),
-            )]),
-            Line::from(vec![Span::styled(
-                note.to_string(),
-                Style::default().fg(if c.window_exceeds_loaded_start {
-                    p.warn
-                } else {
-                    p.muted
-                }),
-            )]),
-        ],
+        match lang {
+            Language::Zh => "模型",
+            Language::En => "Models",
+        },
+        &usage.model_rows,
+        rows[0],
+    );
+    render_compact_rows(
+        f,
+        p,
+        match lang {
+            Language::Zh => "会话",
+            Language::En => "Sessions",
+        },
+        &usage.session_rows,
+        rows[1],
+    );
+    render_compact_rows(
+        f,
+        p,
+        match lang {
+            Language::Zh => "项目",
+            Language::En => "Projects",
+        },
+        &usage.project_rows,
+        rows[2],
+    );
+}
+
+fn render_compact_rows(
+    f: &mut Frame<'_>,
+    p: Palette,
+    title: &'static str,
+    rows: &[UsageDayDimensionRow],
+    area: Rect,
+) {
+    let lines = if rows.is_empty() {
+        vec![Line::from(Span::styled("-", Style::default().fg(p.muted)))]
+    } else {
+        rows.iter()
+            .take(6)
+            .map(|row| {
+                Line::from(vec![
+                    Span::styled(shorten(&row.name, 28), Style::default().fg(p.text)),
+                    Span::raw("  "),
+                    muted(p, &tokens_short(row.bucket.usage.total_tokens)),
+                    Span::raw("  "),
+                    muted(p, &format!("n={}", row.bucket.requests_total)),
+                ])
+            })
+            .collect::<Vec<_>>()
+    };
+    f.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(panel_block(p, title))
+            .wrap(Wrap { trim: true }),
         area,
     );
 }
 
-fn render_runtime_health_block(
-    f: &mut Frame<'_>,
-    p: Palette,
-    snapshot: &Snapshot,
-    area: Rect,
-    lang: Language,
-) {
-    let lines = vec![
-        Line::from(vec![
-            Span::styled("5m ", Style::default().fg(p.muted)),
-            Span::styled(
-                window_stats_brief(&snapshot.stats_5m),
-                Style::default().fg(p.text),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("1h ", Style::default().fg(p.muted)),
-            Span::styled(
-                window_stats_brief(&snapshot.stats_1h),
-                Style::default().fg(p.text),
-            ),
-        ]),
-        Line::from(vec![Span::styled(
-            window_stats_top_line(&snapshot.stats_1h, lang),
+fn dimension_table_row(p: Palette, row: &UsageDayDimensionRow) -> Row<'static> {
+    Row::new(vec![
+        Cell::from(Span::styled(
+            shorten(&row.name, 48),
+            Style::default().fg(p.text),
+        )),
+        Cell::from(Span::styled(
+            row.bucket.requests_total.to_string(),
+            Style::default().fg(p.text),
+        )),
+        Cell::from(Span::styled(
+            tokens_short(row.bucket.usage.total_tokens),
+            Style::default().fg(p.accent),
+        )),
+        Cell::from(Span::styled(
+            row.bucket.cost.display_total(),
+            Style::default().fg(p.text),
+        )),
+        Cell::from(Span::styled(
+            row.bucket.requests_error.to_string(),
+            Style::default().fg(if row.bucket.requests_error > 0 {
+                p.warn
+            } else {
+                p.muted
+            }),
+        )),
+        Cell::from(Span::styled(
+            avg_duration(&row.bucket),
             Style::default().fg(p.muted),
-        )]),
-    ];
-    render_info_block(f, p, runtime_health_title(lang), lines, area);
-}
-
-fn render_recent_days_sparkline(
-    f: &mut Frame<'_>,
-    p: Palette,
-    snapshot: &Snapshot,
-    area: Rect,
-    lang: Language,
-) {
-    let mut values = snapshot
-        .usage_rollup
-        .by_day
-        .iter()
-        .rev()
-        .take(14)
-        .map(|(_, b)| b.usage.total_tokens.max(0) as u64)
-        .collect::<Vec<_>>();
-    values.reverse();
-    if values.is_empty() {
-        values.push(0);
-    }
-    let block = Block::default()
-        .title(recent_days_title(lang))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(p.border));
-    let widget = Sparkline::default()
-        .block(block)
-        .style(Style::default().fg(p.accent))
-        .data(&values);
-    f.render_widget(widget, area);
+        )),
+    ])
+    .style(Style::default().bg(p.panel).fg(p.text))
 }
 
 fn render_info_block(
@@ -485,1400 +478,228 @@ fn render_info_block(
     lines: Vec<Line<'static>>,
     area: Rect,
 ) {
-    let block = Block::default()
-        .title(title.into())
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(p.border));
     f.render_widget(
         Paragraph::new(Text::from(lines))
-            .block(block)
+            .block(panel_block(p, title))
             .wrap(Wrap { trim: true }),
         area,
     );
 }
 
-fn kpi_cells(area: Rect) -> Vec<Rect> {
-    if area.width >= 112 || area.height < 8 {
-        return Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(24),
-                Constraint::Percentage(22),
-                Constraint::Percentage(22),
-                Constraint::Percentage(32),
-            ])
-            .split(area)
-            .to_vec();
-    }
-
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(area);
-    let top = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(rows[0]);
-    let bottom = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(rows[1]);
-    vec![top[0], top[1], bottom[0], bottom[1]]
-}
-
-fn current_day() -> i32 {
-    crate::usage_day::current_local_day()
-}
-
-fn bucket_for_day(series: &[(i32, UsageBucket)], day: i32) -> UsageBucket {
-    series
-        .iter()
-        .find_map(|(bucket_day, bucket)| (*bucket_day == day).then(|| bucket.clone()))
-        .unwrap_or_default()
-}
-
-fn bucket_for_entity_day(
-    map: &HashMap<String, Vec<(i32, UsageBucket)>>,
-    name: &str,
-    day: i32,
-) -> UsageBucket {
-    map.get(name)
-        .map(|series| bucket_for_day(series, day))
-        .unwrap_or_default()
-}
-
-fn usage_bucket_has_activity(bucket: &UsageBucket) -> bool {
-    bucket.requests_total > 0 || bucket.usage.total_tokens > 0
-}
-
-fn today_data_hint(today: &UsageBucket, lang: Language) -> String {
-    if today.requests_total == 0 {
-        return match lang {
-            Language::Zh => "今日暂无请求数据".to_string(),
-            Language::En => "no requests today yet".to_string(),
-        };
-    }
-    match lang {
-        Language::Zh => "按今日已完成请求统计".to_string(),
-        Language::En => "completed requests today".to_string(),
-    }
-}
-
-fn window_stats_brief(stats: &crate::dashboard_core::WindowStats) -> String {
-    let ok = fmt_pct(stats.ok_2xx as u64, stats.total as u64);
-    let p95 = stats
-        .p95_ms
-        .map(duration_short)
-        .unwrap_or_else(|| "-".to_string());
-    format!(
-        "req={} ok={} 429={} 5xx={} p95={}",
-        stats.total, ok, stats.err_429, stats.err_5xx, p95
-    )
-}
-
-fn window_stats_top_line(stats: &crate::dashboard_core::WindowStats, lang: Language) -> String {
-    let retry = stats
-        .retry_rate
-        .map(|value| format!("{:.1}%", value * 100.0))
-        .unwrap_or_else(|| "-".to_string());
-    let provider = stats
-        .top_provider
-        .as_ref()
-        .map(|(name, count)| format!("{}({count})", shorten(name, 18)))
-        .unwrap_or_else(|| "-".to_string());
-    let station = stats
-        .top_config
-        .as_ref()
-        .map(|(name, count)| format!("{}({count})", shorten(name, 18)))
-        .unwrap_or_else(|| "-".to_string());
-    match lang {
-        Language::Zh => format!("retry={retry}  provider={provider}  station={station}"),
-        Language::En => format!("retry={retry}  provider={provider}  station={station}"),
-    }
-}
-
-fn today_usage_title(lang: Language) -> &'static str {
-    match lang {
-        Language::Zh => "今日用量",
-        Language::En => "Today usage",
-    }
-}
-
-fn today_requests_title(lang: Language) -> &'static str {
-    match lang {
-        Language::Zh => "今日请求",
-        Language::En => "Today requests",
-    }
-}
-
-fn cache_speed_title(lang: Language) -> &'static str {
-    match lang {
-        Language::Zh => "缓存 / 速度",
-        Language::En => "Cache / speed",
-    }
-}
-
-fn spend_forecast_title(lang: Language) -> &'static str {
-    match lang {
-        Language::Zh => "花费预测 / 余额",
-        Language::En => "Spend forecast / balance",
-    }
-}
-
-fn data_coverage_title(lang: Language) -> &'static str {
-    match lang {
-        Language::Zh => "本地数据覆盖",
-        Language::En => "Local data coverage",
-    }
-}
-
-fn runtime_health_title(lang: Language) -> &'static str {
-    match lang {
-        Language::Zh => "实时速度 / 错误",
-        Language::En => "Live speed / errors",
-    }
-}
-
-fn recent_days_title(lang: Language) -> &'static str {
-    match lang {
-        Language::Zh => "最近每日 Token",
-        Language::En => "Recent daily tokens",
-    }
-}
-
-fn today_breakdown_title(lang: Language) -> &'static str {
-    match lang {
-        Language::Zh => "今日供应商 / 站点排行",
-        Language::En => "Today providers / stations",
-    }
-}
-
-fn balance_routing_title(attention_only: bool, lang: Language) -> String {
-    let suffix = filter_suffix(attention_only, lang);
-    match lang {
-        Language::Zh => format!("余额 / 路由{suffix}"),
-        Language::En => format!("Balance / routing{suffix}"),
-    }
-}
-
-fn selected_window_title(base: &str, window_label: &str, lang: Language) -> String {
-    match lang {
-        Language::Zh => format!("{base} · 辅助窗口 {window_label}"),
-        Language::En => format!("{base} · auxiliary window {window_label}"),
-    }
-}
-
-fn no_today_breakdown(lang: Language) -> &'static str {
-    match lang {
-        Language::Zh => "今日暂无供应商或站点用量数据。",
-        Language::En => "No provider or station usage today yet.",
-    }
-}
-
-fn usage_forecast_source_line(snapshot: &Snapshot, lang: Language) -> String {
-    let runtime = snapshot.recent.len();
-    match (snapshot.forecast_recent_source, lang) {
-        (UsageForecastSampleSource::RuntimeOnly, Language::Zh) => {
-            format!("当前 runtime {runtime} 条")
-        }
-        (UsageForecastSampleSource::RuntimeOnly, Language::En) => {
-            format!("runtime {runtime}")
-        }
-        (UsageForecastSampleSource::RuntimeAndRequestLedger, Language::Zh) => {
-            format!("当前 runtime {runtime} + 本地 request ledger")
-        }
-        (UsageForecastSampleSource::RuntimeAndRequestLedger, Language::En) => {
-            format!("runtime {runtime} + local request ledger")
-        }
-    }
-}
-
-fn today_entity_rows(snapshot: &Snapshot, day: i32, lang: Language) -> Vec<TodayEntityRow> {
-    let provider_scope = match lang {
-        Language::Zh => "提供商",
-        Language::En => "provider",
-    };
-    let station_scope = match lang {
-        Language::Zh => "站点",
-        Language::En => "station",
-    };
-    let mut rows = Vec::new();
-    for (name, _) in &snapshot.usage_rollup.by_provider {
-        let bucket = bucket_for_entity_day(&snapshot.usage_rollup.by_provider_day, name, day);
-        if usage_bucket_has_activity(&bucket) {
-            rows.push(TodayEntityRow {
-                scope: provider_scope,
-                name: name.clone(),
-                bucket,
-            });
-        }
-    }
-    for (name, _) in &snapshot.usage_rollup.by_config {
-        let bucket = bucket_for_entity_day(&snapshot.usage_rollup.by_config_day, name, day);
-        if usage_bucket_has_activity(&bucket) {
-            rows.push(TodayEntityRow {
-                scope: station_scope,
-                name: name.clone(),
-                bucket,
-            });
-        }
-    }
-    rows.sort_by(|left, right| {
-        right
-            .bucket
-            .usage
-            .total_tokens
-            .cmp(&left.bucket.usage.total_tokens)
-            .then_with(|| right.bucket.requests_total.cmp(&left.bucket.requests_total))
-            .then_with(|| left.scope.cmp(right.scope))
-            .then_with(|| left.name.cmp(&right.name))
-    });
-    rows.truncate(8);
-    rows
-}
-
-fn render_today_breakdown_table(
-    f: &mut Frame<'_>,
-    p: Palette,
-    snapshot: &Snapshot,
-    today_day: i32,
-    area: Rect,
-    lang: Language,
-) {
-    let rows = today_entity_rows(snapshot, today_day, lang);
-    let block = Block::default()
-        .title(today_breakdown_title(lang))
+fn panel_block(p: Palette, title: impl Into<String>) -> Block<'static> {
+    Block::default()
+        .title(Span::styled(
+            title.into(),
+            Style::default().fg(p.muted).add_modifier(Modifier::BOLD),
+        ))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(p.border));
-    if rows.is_empty() {
-        f.render_widget(
-            Paragraph::new(Text::from(Line::from(Span::styled(
-                no_today_breakdown(lang),
-                Style::default().fg(p.muted),
-            ))))
-            .block(block)
-            .wrap(Wrap { trim: true }),
-            area,
-        );
-        return;
-    }
-
-    let compact = area.width < 86;
-    let header_cells = if compact {
-        vec![
-            Cell::from(Span::styled(
-                i18n::label(lang, "scope"),
-                Style::default().fg(p.muted),
-            )),
-            Cell::from(Span::styled(
-                i18n::label(lang, "name"),
-                Style::default().fg(p.muted),
-            )),
-            Cell::from(Span::styled(
-                i18n::label(lang, "req"),
-                Style::default().fg(p.muted),
-            )),
-            Cell::from(Span::styled(
-                i18n::label(lang, "tok"),
-                Style::default().fg(p.muted),
-            )),
-            Cell::from(Span::styled("Hit%", Style::default().fg(p.muted))),
-        ]
-    } else {
-        vec![
-            Cell::from(Span::styled(
-                i18n::label(lang, "scope"),
-                Style::default().fg(p.muted),
-            )),
-            Cell::from(Span::styled(
-                i18n::label(lang, "name"),
-                Style::default().fg(p.muted),
-            )),
-            Cell::from(Span::styled(
-                i18n::label(lang, "req"),
-                Style::default().fg(p.muted),
-            )),
-            Cell::from(Span::styled("ok%", Style::default().fg(p.muted))),
-            Cell::from(Span::styled("Hit%", Style::default().fg(p.muted))),
-            Cell::from(Span::styled(
-                i18n::label(lang, "tok/s"),
-                Style::default().fg(p.muted),
-            )),
-            Cell::from(Span::styled(
-                i18n::label(lang, "tok"),
-                Style::default().fg(p.muted),
-            )),
-            Cell::from(Span::styled(
-                i18n::label(lang, "usd"),
-                Style::default().fg(p.muted),
-            )),
-        ]
-    };
-    let header = Row::new(header_cells).style(Style::default().add_modifier(Modifier::BOLD));
-    let table_rows = rows
-        .iter()
-        .map(|row| {
-            if compact {
-                Row::new(vec![
-                    Cell::from(row.scope),
-                    Cell::from(shorten_middle(&row.name, 22)),
-                    Cell::from(row.bucket.requests_total.to_string()),
-                    Cell::from(tokens_short(row.bucket.usage.total_tokens)),
-                    Cell::from(fmt_cache_hit(&row.bucket.usage)),
-                ])
-            } else {
-                Row::new(vec![
-                    Cell::from(row.scope),
-                    Cell::from(shorten_middle(&row.name, 26)),
-                    Cell::from(row.bucket.requests_total.to_string()),
-                    Cell::from(fmt_success_pct(&row.bucket)),
-                    Cell::from(fmt_cache_hit(&row.bucket.usage)),
-                    Cell::from(fmt_tok_s_0(calc_output_rate_tok_s(&row.bucket))),
-                    Cell::from(tokens_short(row.bucket.usage.total_tokens)),
-                    Cell::from(shorten(&row.bucket.cost.display_total(), 8)),
-                ])
-            }
-        })
-        .collect::<Vec<_>>();
-    let widths = if compact {
-        vec![
-            Constraint::Length(8),
-            Constraint::Min(12),
-            Constraint::Length(5),
-            Constraint::Length(7),
-            Constraint::Length(7),
-        ]
-    } else {
-        vec![
-            Constraint::Length(8),
-            Constraint::Min(16),
-            Constraint::Length(6),
-            Constraint::Length(6),
-            Constraint::Length(7),
-            Constraint::Length(7),
-            Constraint::Length(7),
-            Constraint::Length(8),
-        ]
-    };
-    let table = Table::new(table_rows, widths).header(header).block(block);
-    f.render_widget(table, area);
+        .border_style(Style::default().fg(p.border))
+        .style(Style::default().bg(p.panel))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn render_window_aux_table(
-    f: &mut Frame<'_>,
-    p: Palette,
-    ui: &mut UiState,
-    snapshot: &Snapshot,
-    provider_rows: &[&UsageBalanceProviderRow],
-    window_label: &str,
-    area: Rect,
-    lang: Language,
-) {
-    if ui.stats_focus == StatsFocus::Providers {
-        render_provider_usage_balance_table_stateful(
-            f,
-            p,
-            true,
-            &balance_routing_title(ui.stats_attention_only, lang),
-            provider_rows,
-            snapshot,
-            area,
-            &mut ui.stats_providers_table,
-            lang,
-        );
-    } else {
-        let station_title = selected_window_title(
-            &format!("{} scorecard", i18n::label(lang, "Stations")),
-            window_label,
-            lang,
-        );
-        render_bucket_table_stateful(
-            f,
-            p,
-            true,
-            &station_title,
-            &snapshot.usage_rollup.by_config,
-            snapshot,
-            StatsFocus::Stations,
-            area,
-            &mut ui.stats_stations_table,
-            lang,
-        );
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn render_tables(
-    f: &mut Frame<'_>,
-    p: Palette,
-    ui: &mut UiState,
-    snapshot: &Snapshot,
-    usage_balance: &UsageBalanceView,
-    window_label: &str,
-    area: Rect,
-    lang: Language,
-) {
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
-        .split(area);
-
-    let provider_rows = ui.filtered_usage_balance_provider_rows(usage_balance);
-    let left = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
-        .split(cols[0]);
-
-    render_today_breakdown_table(f, p, snapshot, current_day(), left[0], lang);
-    render_window_aux_table(
-        f,
-        p,
-        ui,
-        snapshot,
-        &provider_rows,
-        window_label,
-        left[1],
-        lang,
-    );
-
-    render_detail_panel(
-        f,
-        p,
-        ui,
-        snapshot,
-        usage_balance,
-        &provider_rows,
-        window_label,
-        cols[1],
-        lang,
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-fn render_bucket_table_stateful(
-    f: &mut Frame<'_>,
-    p: Palette,
-    focused: bool,
-    title: &str,
-    items: &[(String, UsageBucket)],
-    snapshot: &Snapshot,
-    focus: StatsFocus,
-    area: Rect,
-    state: &mut ratatui::widgets::TableState,
-    lang: Language,
-) {
-    let l = |text| i18n::label(lang, text);
-    let header = Row::new(vec![
-        Cell::from(Span::styled(l("name"), Style::default().fg(p.muted))),
-        Cell::from(Span::styled(
-            l("balance/quota"),
-            Style::default().fg(p.muted),
-        )),
-        Cell::from(Span::styled(l("req"), Style::default().fg(p.muted))),
-        Cell::from(Span::styled("ok%", Style::default().fg(p.muted))),
-        Cell::from(Span::styled(l("ttfb"), Style::default().fg(p.muted))),
-        Cell::from(Span::styled(l("tok/s"), Style::default().fg(p.muted))),
-        Cell::from(Span::styled(l("tok"), Style::default().fg(p.muted))),
-        Cell::from(Span::styled(l("usd"), Style::default().fg(p.muted))),
+fn kv_line(p: Palette, key: &'static str, value: &str, color: Color) -> Line<'static> {
+    Line::from(vec![
+        muted(p, key),
+        Span::raw(" "),
+        Span::styled(value.to_string(), Style::default().fg(color)),
     ])
-    .style(Style::default().add_modifier(Modifier::BOLD));
-
-    let rows = items
-        .iter()
-        .map(|(name, b)| {
-            let cost = b
-                .cost
-                .total_cost_usd
-                .clone()
-                .unwrap_or_else(|| "-".to_string());
-            let rate = fmt_tok_s_0(calc_output_rate_tok_s(b));
-            Row::new(vec![
-                Cell::from(shorten_middle(name, 24)),
-                Cell::from(table_balance_brief(snapshot, focus, name, lang)),
-                Cell::from(b.requests_total.to_string()),
-                Cell::from(fmt_success_pct(b)),
-                Cell::from(fmt_avg_ttfb_ms(b)),
-                Cell::from(rate),
-                Cell::from(tokens_short(b.usage.total_tokens)),
-                Cell::from(cost),
-            ])
-        })
-        .collect::<Vec<_>>();
-
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Min(14),
-            Constraint::Length(STATS_BALANCE_COLUMN_WIDTH),
-            Constraint::Length(6),
-            Constraint::Length(6),
-            Constraint::Length(7),
-            Constraint::Length(7),
-            Constraint::Length(7),
-            Constraint::Length(8),
-        ],
-    )
-    .header(header)
-    .block(
-        Block::default()
-            .title(title)
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(if focused { p.focus } else { p.border })),
-    )
-    .row_highlight_style(Style::default().bg(p.panel).fg(p.text))
-    .highlight_symbol("  ");
-
-    f.render_stateful_widget(table, area, state);
 }
 
-#[allow(clippy::too_many_arguments)]
-fn render_provider_usage_balance_table_stateful(
-    f: &mut Frame<'_>,
-    p: Palette,
-    focused: bool,
-    title: &str,
-    rows: &[&UsageBalanceProviderRow],
-    snapshot: &Snapshot,
-    area: Rect,
-    state: &mut ratatui::widgets::TableState,
-    lang: Language,
-) {
-    let l = |text| i18n::label(lang, text);
-    let compact = area.width < 72;
-    let header_cells = if compact {
-        vec![
-            Cell::from(Span::styled(l("provider"), Style::default().fg(p.muted))),
-            Cell::from(Span::styled(l("status"), Style::default().fg(p.muted))),
-            Cell::from(Span::styled(
-                l("balance/quota"),
-                Style::default().fg(p.muted),
-            )),
-            Cell::from(Span::styled(l("route"), Style::default().fg(p.muted))),
-        ]
-    } else {
-        vec![
-            Cell::from(Span::styled(l("provider"), Style::default().fg(p.muted))),
-            Cell::from(Span::styled(l("status"), Style::default().fg(p.muted))),
-            Cell::from(Span::styled(
-                l("balance/quota"),
-                Style::default().fg(p.muted),
-            )),
-            Cell::from(Span::styled(l("req"), Style::default().fg(p.muted))),
-            Cell::from(Span::styled("ok%", Style::default().fg(p.muted))),
-            Cell::from(Span::styled(l("tok"), Style::default().fg(p.muted))),
-            Cell::from(Span::styled(l("usd"), Style::default().fg(p.muted))),
-            Cell::from(Span::styled(l("route"), Style::default().fg(p.muted))),
-        ]
-    };
-    let header = Row::new(header_cells).style(Style::default().add_modifier(Modifier::BOLD));
-
-    let table_rows = rows
-        .iter()
-        .map(|row| {
-            let balance = provider_balance_brief(
-                snapshot,
-                &row.provider_id,
-                usize::from(STATS_BALANCE_COLUMN_WIDTH),
-                lang,
-            );
-            let status_style = provider_balance_status_style(p, row);
-            let route = shorten(
-                &provider_route_brief(row, lang),
-                if compact { 10 } else { 18 },
-            );
-            let cells = if compact {
-                vec![
-                    Cell::from(shorten_middle(&row.provider_id, 18)),
-                    Cell::from(Span::styled(
-                        provider_usage_balance_status_label(row, true, lang),
-                        status_style,
-                    )),
-                    Cell::from(Span::styled(balance, status_style)),
-                    Cell::from(Span::styled(route, Style::default().fg(p.muted))),
-                ]
-            } else {
-                vec![
-                    Cell::from(shorten_middle(&row.provider_id, 22)),
-                    Cell::from(Span::styled(
-                        provider_usage_balance_status_label(row, false, lang),
-                        status_style,
-                    )),
-                    Cell::from(Span::styled(balance, status_style)),
-                    Cell::from(row.usage.requests_total.to_string()),
-                    Cell::from(fmt_per_mille(row.success_per_mille)),
-                    Cell::from(tokens_short(row.usage.usage.total_tokens)),
-                    Cell::from(row.cost_display.clone()),
-                    Cell::from(Span::styled(route, Style::default().fg(p.muted))),
-                ]
-            };
-            Row::new(cells)
-        })
-        .collect::<Vec<_>>();
-    let widths = if compact {
-        vec![
-            Constraint::Min(10),
-            Constraint::Length(8),
-            Constraint::Length(STATS_BALANCE_COLUMN_WIDTH),
-            Constraint::Length(8),
-        ]
-    } else {
-        vec![
-            Constraint::Min(12),
-            Constraint::Length(10),
-            Constraint::Length(STATS_BALANCE_COLUMN_WIDTH),
-            Constraint::Length(6),
-            Constraint::Length(6),
-            Constraint::Length(7),
-            Constraint::Length(8),
-            Constraint::Length(10),
-        ]
-    };
-
-    let table = Table::new(table_rows, widths)
-        .header(header)
-        .block(
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(if focused { p.focus } else { p.border })),
-        )
-        .row_highlight_style(Style::default().bg(p.panel).fg(p.text))
-        .highlight_symbol("  ");
-
-    f.render_stateful_widget(table, area, state);
+fn muted(p: Palette, value: &str) -> Span<'static> {
+    Span::styled(value.to_string(), Style::default().fg(p.muted))
 }
 
-fn provider_route_brief(row: &UsageBalanceProviderRow, lang: Language) -> String {
-    if row.routing.selected {
-        return row
-            .routing
-            .selected_endpoint_id
-            .as_deref()
-            .map(|endpoint| format!("{} {endpoint}", i18n::label(lang, "selected")))
-            .unwrap_or_else(|| i18n::label(lang, "selected").to_string());
-    }
-    if !row.routing.skip_reasons.is_empty() {
-        return row.routing.skip_reasons.join(",");
-    }
-    if row.routing.candidate_count > 0 {
-        return i18n::label(lang, "candidate").to_string();
-    }
-    "-".to_string()
+fn gate_style(p: Palette, value: u64) -> Color {
+    if value > 0 { p.warn } else { p.good }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn render_provider_usage_detail(
-    f: &mut Frame<'_>,
-    p: Palette,
-    ui: &mut UiState,
-    usage_balance: &UsageBalanceView,
-    row: Option<&UsageBalanceProviderRow>,
-    window_label: &str,
-    area: Rect,
-    lang: Language,
-) {
-    let l = |text| i18n::label(lang, text);
-    let block = Block::default()
-        .title(Span::styled(
-            format!("{} / {} {window_label}", l("Usage"), l("Balance")),
-            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-        ))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(p.border));
+fn success_pct(bucket: &UsageBucket) -> String {
+    if bucket.requests_total == 0 {
+        return "-".to_string();
+    }
+    let ok = bucket.requests_total.saturating_sub(bucket.requests_error);
+    format!("{:.0}%", (ok as f64 / bucket.requests_total as f64) * 100.0)
+}
 
-    let Some(row) = row else {
-        f.render_widget(
-            Paragraph::new(Text::from(Line::from(Span::styled(
-                l("No data in this window."),
-                Style::default().fg(p.muted),
-            ))))
-            .block(block)
-            .wrap(Wrap { trim: true }),
-            area,
-        );
-        return;
-    };
+fn avg_duration(bucket: &UsageBucket) -> String {
+    bucket
+        .duration_ms_total
+        .checked_div(bucket.requests_total)
+        .map(duration_short)
+        .unwrap_or_else(|| "-".to_string())
+}
 
-    let inner = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(9), Constraint::Min(0)])
-        .split(area);
-
-    let balance_summary = row
-        .primary_balance
-        .as_ref()
-        .map(|balance| balance.amount_summary.as_str())
-        .unwrap_or("-");
-    let route = provider_route_brief(row, lang);
-    let latest_error = row.latest_balance_error.as_deref().unwrap_or("-");
-    let status_style = provider_balance_status_style(p, row);
-    let lines = vec![
-        Line::from(vec![
-            Span::styled(format!("{}: ", l("provider")), Style::default().fg(p.muted)),
-            Span::styled(row.provider_id.clone(), Style::default().fg(p.text)),
-        ]),
-        Line::from(vec![
-            Span::styled(format!("{} ", l("requests")), Style::default().fg(p.muted)),
-            Span::styled(
-                row.usage.requests_total.to_string(),
-                Style::default().fg(p.text),
-            ),
-            Span::raw("  "),
-            Span::styled(format!("{} ", l("success")), Style::default().fg(p.muted)),
-            Span::styled(
-                fmt_per_mille(row.success_per_mille),
-                Style::default().fg(p.good),
-            ),
-            Span::raw("  "),
-            Span::styled(format!("{} ", l("errors")), Style::default().fg(p.muted)),
-            Span::styled(
-                row.usage.requests_error.to_string(),
-                Style::default().fg(p.warn),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(format!("{} ", l("tokens")), Style::default().fg(p.muted)),
-            Span::styled(
-                tokens_short(row.usage.usage.total_tokens),
-                Style::default().fg(p.accent),
-            ),
-            Span::raw("  "),
-            Span::styled(format!("{} ", l("cost")), Style::default().fg(p.muted)),
-            Span::styled(row.cost_display.clone(), Style::default().fg(p.text)),
-            Span::raw("  "),
-            Span::styled(format!("{} ", l("coverage")), Style::default().fg(p.muted)),
-            Span::styled(
-                cost_coverage_label(&row.usage, lang),
-                Style::default().fg(p.muted),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(format!("{} ", l("balance")), Style::default().fg(p.muted)),
-            Span::styled(
-                provider_usage_balance_status_label(row, false, lang),
-                status_style,
-            ),
-            Span::raw("  "),
-            Span::styled(balance_summary.to_string(), status_style),
-        ]),
-        Line::from(vec![
-            Span::styled(format!("{} ", l("counts")), Style::default().fg(p.muted)),
-            Span::styled(
-                usage_balance_counts_line(&row.balance_counts, lang),
-                Style::default().fg(p.muted),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(format!("{} ", l("route")), Style::default().fg(p.muted)),
-            Span::styled(shorten(&route, 72), Style::default().fg(p.text)),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                format!("{} ", l("latest error")),
-                Style::default().fg(p.muted),
-            ),
-            Span::styled(latest_error.to_string(), Style::default().fg(p.warn)),
-        ]),
-    ];
-
-    f.render_widget(
-        Paragraph::new(Text::from(lines))
-            .block(block)
-            .wrap(Wrap { trim: true }),
-        inner[0],
-    );
-
-    let endpoints = ui.selected_usage_balance_provider_endpoints(usage_balance);
-    let visible_rows = endpoint_visible_rows(inner[1]);
-    let max_scroll = endpoints.len().saturating_sub(visible_rows) as u16;
-    ui.stats_provider_detail_scroll = ui.stats_provider_detail_scroll.min(max_scroll);
-    render_endpoint_rows(
-        f,
-        p,
-        &endpoints,
-        ui.stats_provider_detail_scroll,
-        visible_rows,
-        inner[1],
+fn cost_coverage_label(bucket: &UsageBucket, lang: Language) -> String {
+    match (
+        bucket.cost.priced_requests,
+        bucket.cost.unpriced_requests,
         lang,
-    );
-}
-
-fn render_endpoint_rows(
-    f: &mut Frame<'_>,
-    p: Palette,
-    endpoints: &[&UsageBalanceEndpointRow],
-    scroll: u16,
-    visible_rows: usize,
-    area: Rect,
-    lang: Language,
-) {
-    let l = |text| i18n::label(lang, text);
-    let compact = area.width < 70;
-    let header_cells = if compact {
-        vec![
-            Cell::from(Span::styled(l("endpoint"), Style::default().fg(p.muted))),
-            Cell::from(Span::styled(l("balance"), Style::default().fg(p.muted))),
-            Cell::from(Span::styled(l("req"), Style::default().fg(p.muted))),
-        ]
-    } else {
-        vec![
-            Cell::from(Span::styled(l("endpoint"), Style::default().fg(p.muted))),
-            Cell::from(Span::styled(l("balance"), Style::default().fg(p.muted))),
-            Cell::from(Span::styled(l("req"), Style::default().fg(p.muted))),
-            Cell::from(Span::styled(l("err"), Style::default().fg(p.muted))),
-            Cell::from(Span::styled(l("tok"), Style::default().fg(p.muted))),
-            Cell::from(Span::styled(l("route"), Style::default().fg(p.muted))),
-        ]
-    };
-    let header = Row::new(header_cells).style(Style::default().add_modifier(Modifier::BOLD));
-
-    let scroll = usize::from(scroll).min(endpoints.len().saturating_sub(visible_rows));
-    let balance_width = if compact {
-        STATS_BALANCE_COLUMN_WIDTH
-    } else {
-        STATS_ENDPOINT_BALANCE_COLUMN_WIDTH
-    };
-    let rows = endpoints
-        .iter()
-        .skip(scroll)
-        .take(visible_rows)
-        .map(|endpoint| {
-            let endpoint = *endpoint;
-            let endpoint_label = endpoint
-                .base_url
-                .as_deref()
-                .unwrap_or(endpoint.endpoint_id.as_str());
-            let balance = endpoint
-                .balance
-                .as_ref()
-                .map(|balance| {
-                    atomic_summary_or_status(
-                        &balance.amount_summary,
-                        endpoint.balance_status,
-                        usize::from(balance_width),
-                        lang,
-                    )
-                })
-                .unwrap_or_else(|| {
-                    usage_balance_status_label(endpoint.balance_status, lang).to_string()
-                });
-            let route = if endpoint.route_selected {
-                i18n::label(lang, "selected").to_string()
-            } else if endpoint.route_skip_reasons.is_empty() {
-                "-".to_string()
-            } else {
-                endpoint.route_skip_reasons.join(",")
-            };
-            let balance_style = endpoint_balance_status_style(p, endpoint);
-            let cells = if compact {
-                vec![
-                    Cell::from(shorten_middle(endpoint_label, 14)),
-                    Cell::from(Span::styled(balance, balance_style)),
-                    Cell::from(endpoint.usage.requests_total.to_string()),
-                ]
-            } else {
-                vec![
-                    Cell::from(shorten_middle(endpoint_label, 30)),
-                    Cell::from(Span::styled(balance, balance_style)),
-                    Cell::from(endpoint.usage.requests_total.to_string()),
-                    Cell::from(endpoint.usage.requests_error.to_string()),
-                    Cell::from(tokens_short(endpoint.usage.usage.total_tokens)),
-                    Cell::from(shorten(&route, 24)),
-                ]
-            };
-            Row::new(cells)
-        })
-        .collect::<Vec<_>>();
-    let widths = if compact {
-        vec![
-            Constraint::Min(10),
-            Constraint::Length(STATS_BALANCE_COLUMN_WIDTH),
-            Constraint::Length(4),
-        ]
-    } else {
-        vec![
-            Constraint::Min(16),
-            Constraint::Length(STATS_ENDPOINT_BALANCE_COLUMN_WIDTH),
-            Constraint::Length(6),
-            Constraint::Length(5),
-            Constraint::Length(7),
-            Constraint::Length(12),
-        ]
-    };
-
-    let table = Table::new(rows, widths).header(header).block(
-        Block::default()
-            .title(endpoint_table_title(
-                endpoints.len(),
-                scroll,
-                visible_rows,
-                lang,
-            ))
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(p.border)),
-    );
-    f.render_widget(table, area);
-}
-
-fn endpoint_visible_rows(area: Rect) -> usize {
-    usize::from(area.height.saturating_sub(3))
-}
-
-fn endpoint_table_title(
-    total: usize,
-    scroll: usize,
-    visible_rows: usize,
-    lang: Language,
-) -> String {
-    let base = i18n::label(lang, "Endpoints / recent sample");
-    if total > visible_rows && visible_rows > 0 {
-        format!(
-            "{base}  PgUp/PgDn {}-{} / {total}",
-            scroll.saturating_add(1),
-            scroll.saturating_add(visible_rows).min(total)
-        )
-    } else {
-        base.to_string()
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn render_detail_panel(
-    f: &mut Frame<'_>,
-    p: Palette,
-    ui: &mut UiState,
-    snapshot: &Snapshot,
-    usage_balance: &UsageBalanceView,
-    _provider_rows: &[&UsageBalanceProviderRow],
-    window_label: &str,
-    area: Rect,
-    lang: Language,
-) {
-    let l = |text| i18n::label(lang, text);
-    if ui.stats_focus == StatsFocus::Providers {
-        render_provider_usage_detail(
-            f,
-            p,
-            ui,
-            usage_balance,
-            ui.selected_usage_balance_provider_row(usage_balance),
-            window_label,
-            area,
-            lang,
-        );
-        return;
-    }
-
-    let selected = match ui.stats_focus {
-        StatsFocus::Stations => snapshot
-            .usage_rollup
-            .by_config
-            .get(ui.selected_stats_station_idx)
-            .map(|(k, v)| ("station", k.as_str(), v)),
-        StatsFocus::Providers => None,
-    };
-
-    let block = Block::default()
-        .title(Span::styled(
-            format!("{}  {}: {window_label}", l("Details"), l("window")),
-            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-        ))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(p.border));
-
-    let Some((kind, name, bucket)) = selected else {
-        f.render_widget(
-            Paragraph::new(Text::from(Line::from(Span::styled(
-                l("No data in this window."),
-                Style::default().fg(p.muted),
-            ))))
-            .block(block)
-            .wrap(Wrap { trim: true }),
-            area,
-        );
-        return;
-    };
-
-    let series = match kind {
-        "station" => snapshot
-            .usage_rollup
-            .by_config_day
-            .get(name)
-            .map(|v| {
-                v.iter()
-                    .map(|(_, b)| b.usage.total_tokens.max(0) as u64)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default(),
-        _ => snapshot
-            .usage_rollup
-            .by_provider_day
-            .get(name)
-            .map(|v| {
-                v.iter()
-                    .map(|(_, b)| b.usage.total_tokens.max(0) as u64)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default(),
-    };
-
-    let inner = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(8),
-            Constraint::Length(5),
-            Constraint::Min(0),
-        ])
-        .split(area);
-
-    let cost = bucket.cost.display_total();
-    let lines = vec![
-        Line::from(vec![
-            Span::styled(
-                format!("{}: ", i18n::label(lang, kind)),
-                Style::default().fg(p.muted),
-            ),
-            Span::styled(name.to_string(), Style::default().fg(p.text)),
-        ]),
-        Line::from(vec![
-            Span::styled(format!("{} ", l("requests")), Style::default().fg(p.muted)),
-            Span::styled(
-                bucket.requests_total.to_string(),
-                Style::default().fg(p.text),
-            ),
-            Span::raw("  "),
-            Span::styled(format!("{} ", l("success")), Style::default().fg(p.muted)),
-            Span::styled(fmt_success_pct(bucket), Style::default().fg(p.good)),
-            Span::raw("  "),
-            Span::styled(format!("{} ", l("errors")), Style::default().fg(p.muted)),
-            Span::styled(
-                bucket.requests_error.to_string(),
-                Style::default().fg(p.warn),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(format!("{} ", l("tokens")), Style::default().fg(p.muted)),
-            Span::styled(
-                tokens_short(bucket.usage.total_tokens),
-                Style::default().fg(p.accent),
-            ),
-            Span::raw("  "),
-            Span::styled(format!("{} ", l("cost")), Style::default().fg(p.muted)),
-            Span::styled(cost, Style::default().fg(p.text)),
-            Span::raw("  "),
-            Span::styled(format!("{} ", l("coverage")), Style::default().fg(p.muted)),
-            Span::styled(
-                cost_coverage_label(bucket, lang),
-                Style::default().fg(p.muted),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(format!("{} ", l("ttfb")), Style::default().fg(p.muted)),
-            Span::styled(fmt_avg_ttfb_ms(bucket), Style::default().fg(p.text)),
-            Span::raw("  "),
-            Span::styled(format!("{} ", l("avg")), Style::default().fg(p.muted)),
-            Span::styled(
-                fmt_avg_ms(bucket.duration_ms_total, bucket.requests_total),
-                Style::default().fg(p.text),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                format!("{} ", l("generation")),
-                Style::default().fg(p.muted),
-            ),
-            Span::styled(fmt_avg_generation_ms(bucket), Style::default().fg(p.text)),
-            Span::raw("  "),
-            Span::styled(format!("{} ", l("tok/s")), Style::default().fg(p.muted)),
-            Span::styled(
-                fmt_tok_s_0(calc_output_rate_tok_s(bucket)),
-                Style::default().fg(p.text),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(format!("{} ", l("cache hit")), Style::default().fg(p.muted)),
-            Span::styled(fmt_cache_hit(&bucket.usage), Style::default().fg(p.text)),
-            Span::raw("  "),
-            Span::styled(
-                format!("{} ", l("read/create")),
-                Style::default().fg(p.muted),
-            ),
-            Span::styled(
-                format!(
-                    "{}/{}",
-                    tokens_short(bucket.usage.cache_read_tokens_total()),
-                    tokens_short(bucket.usage.cache_creation_tokens_total()),
-                ),
-                Style::default().fg(p.muted),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                format!("{} ", l("tok in/out/rsn")),
-                Style::default().fg(p.muted),
-            ),
-            Span::styled(
-                format!(
-                    "{}/{}/{}",
-                    tokens_short(bucket.usage.input_tokens),
-                    tokens_short(bucket.usage.output_tokens),
-                    tokens_short(bucket.usage.reasoning_output_tokens_total()),
-                ),
-                Style::default().fg(p.muted),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                format!("{} ", l("loaded total req")),
-                Style::default().fg(p.muted),
-            ),
-            Span::styled(
-                snapshot.usage_rollup.loaded.requests_total.to_string(),
-                Style::default().fg(p.muted),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                if snapshot.usage_rollup.coverage.window_exceeds_loaded_start {
-                    match lang {
-                        Language::Zh => "所选窗口只加载了部分覆盖数据",
-                        Language::En => "selected window has partial loaded coverage",
-                    }
-                } else {
-                    ""
-                },
-                Style::default().fg(p.warn),
-            ),
-        ]),
-    ];
-
-    f.render_widget(
-        Paragraph::new(Text::from(lines))
-            .block(block)
-            .wrap(Wrap { trim: true }),
-        inner[0],
-    );
-
-    let sl_block = Block::default()
-        .title(Span::styled(
-            l("Tokens / day"),
-            Style::default().fg(p.muted).add_modifier(Modifier::DIM),
-        ))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(p.border));
-    let sl = Sparkline::default()
-        .block(sl_block)
-        .style(Style::default().fg(p.accent))
-        .data(&series);
-    f.render_widget(sl, inner[1]);
-
-    render_recent_breakdown(f, p, ui, snapshot, kind, name, inner[2]);
-}
-
-fn render_recent_breakdown(
-    f: &mut Frame<'_>,
-    p: Palette,
-    ui: &UiState,
-    snapshot: &Snapshot,
-    kind: &str,
-    name: &str,
-    area: Rect,
-) {
-    let lang = ui.language;
-    let l = |text| i18n::label(lang, text);
-    let tips = Text::from(vec![
-        Line::from(vec![
-            Span::styled("Tab", Style::default().fg(p.text)),
-            Span::styled(format!(" {}  ", l("focus")), Style::default().fg(p.muted)),
-            Span::styled("d", Style::default().fg(p.text)),
-            Span::styled(format!(" {}  ", l("window")), Style::default().fg(p.muted)),
-            Span::styled("e", Style::default().fg(p.text)),
-            Span::styled(
-                format!(" {}(recent)", l("errors_only")),
-                Style::default().fg(p.muted),
-            ),
-            Span::raw("  "),
-            Span::styled("a", Style::default().fg(p.text)),
-            Span::styled(
-                format!(" {}", l("attention only")),
-                Style::default().fg(p.muted),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("↑/↓", Style::default().fg(p.text)),
-            Span::styled(
-                match lang {
-                    Language::Zh => " 选择  ",
-                    Language::En => " select  ",
-                },
-                Style::default().fg(p.muted),
-            ),
-            Span::styled("y", Style::default().fg(p.text)),
-            Span::styled(
-                match lang {
-                    Language::Zh => " 导出报告",
-                    Language::En => " export report",
-                },
-                Style::default().fg(p.muted),
-            ),
-            Span::raw("  "),
-            Span::styled("PgUp/PgDn", Style::default().fg(p.text)),
-            Span::styled(
-                match lang {
-                    Language::Zh => " 详情滚动",
-                    Language::En => " detail scroll",
-                },
-                Style::default().fg(p.muted),
-            ),
-        ]),
-    ]);
-
-    let errors_only = ui.stats_errors_only;
-    let mut recent_total = 0u64;
-    let mut recent_err = 0u64;
-    let mut class_2xx = 0u64;
-    let mut class_3xx = 0u64;
-    let mut class_4xx = 0u64;
-    let mut class_5xx = 0u64;
-    let mut by_model: HashMap<String, (u64, i64)> = HashMap::new();
-    let mut by_status: HashMap<u16, u64> = HashMap::new();
-
-    for r in &snapshot.recent {
-        let matches = match kind {
-            "station" => r.station_name.as_deref() == Some(name),
-            _ => r.provider_id.as_deref() == Some(name),
-        };
-        if !matches {
-            continue;
-        }
-        if errors_only && r.status_code < 400 {
-            continue;
-        }
-        recent_total += 1;
-        if r.status_code >= 400 {
-            recent_err += 1;
-        }
-        match r.status_code {
-            200..=299 => class_2xx += 1,
-            300..=399 => class_3xx += 1,
-            400..=499 => class_4xx += 1,
-            500..=599 => class_5xx += 1,
-            _ => {}
-        }
-        *by_status.entry(r.status_code).or_insert(0) += 1;
-        let model = r.model.as_deref().unwrap_or("-");
-        let tokens = r.usage.as_ref().map(|u| u.total_tokens).unwrap_or(0);
-        by_model
-            .entry(model.to_string())
-            .and_modify(|(c, t)| {
-                *c = c.saturating_add(1);
-                *t = t.saturating_add(tokens);
-            })
-            .or_insert((1, tokens));
-    }
-
-    let mut lines = Vec::new();
-    lines.push(Line::from(vec![
-        Span::styled(
-            format!("{} ", l("Recent sample")),
-            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            if errors_only {
-                match lang {
-                    Language::Zh => "（仅错误）",
-                    Language::En => "(errors only)",
-                }
-            } else {
-                match lang {
-                    Language::Zh => "（全部）",
-                    Language::En => "(all)",
-                }
-            },
-            Style::default().fg(p.muted).add_modifier(Modifier::DIM),
-        ),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled(format!("{} ", l("req")), Style::default().fg(p.muted)),
-        Span::styled(recent_total.to_string(), Style::default().fg(p.text)),
-        Span::raw("  "),
-        Span::styled(format!("{} ", l("err")), Style::default().fg(p.muted)),
-        Span::styled(recent_err.to_string(), Style::default().fg(p.warn)),
-        Span::raw("  "),
-        Span::styled("2xx/3xx/4xx/5xx ", Style::default().fg(p.muted)),
-        Span::styled(
-            format!("{class_2xx}/{class_3xx}/{class_4xx}/{class_5xx}"),
-            Style::default().fg(p.muted),
-        ),
-    ]));
-
-    let mut status_items = by_status.into_iter().collect::<Vec<_>>();
-    status_items.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
-    let top_status = status_items
-        .into_iter()
-        .take(6)
-        .map(|(s, c)| format!("{s}:{c}"))
-        .collect::<Vec<_>>()
-        .join("  ");
-    if !top_status.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled(format!("{} ", l("status")), Style::default().fg(p.muted)),
-            Span::styled(shorten(&top_status, 56), Style::default().fg(p.muted)),
-        ]));
-    }
-
-    let mut models = by_model.into_iter().collect::<Vec<_>>();
-    models.sort_by_key(|(_, (_, tok))| std::cmp::Reverse(*tok));
-    let top_models = models
-        .into_iter()
-        .take(5)
-        .map(|(m, (c, tok))| format!("{}({} / {})", shorten(&m, 18), c, tokens_short(tok)))
-        .collect::<Vec<_>>()
-        .join("  ");
-    if !top_models.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled(format!("{} ", l("models")), Style::default().fg(p.muted)),
-            Span::styled(shorten(&top_models, 56), Style::default().fg(p.muted)),
-        ]));
-    }
-
-    lines.push(Line::from(""));
-    for l in tips.lines {
-        lines.push(l);
-    }
-
-    f.render_widget(
-        Paragraph::new(Text::from(lines))
-            .block(
-                Block::default()
-                    .title(Span::styled(
-                        recent_sample_title(snapshot, lang),
-                        Style::default().fg(p.muted).add_modifier(Modifier::DIM),
-                    ))
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(p.border)),
-            )
-            .wrap(Wrap { trim: true }),
-        area,
-    );
-}
-
-fn recent_sample_title(snapshot: &Snapshot, lang: Language) -> String {
-    let runtime = snapshot.recent.len();
-    match (snapshot.forecast_recent_source, lang) {
-        (UsageForecastSampleSource::RuntimeOnly, Language::Zh) => {
-            format!("最近样本 (runtime {runtime}) + 提示")
-        }
-        (UsageForecastSampleSource::RuntimeOnly, Language::En) => {
-            format!("Recent sample (runtime {runtime}) + Tips")
-        }
-        (UsageForecastSampleSource::RuntimeAndRequestLedger, Language::Zh) => {
-            format!("最近样本 (runtime {runtime}, 本地 request ledger) + 提示")
-        }
-        (UsageForecastSampleSource::RuntimeAndRequestLedger, Language::En) => {
-            format!("Recent sample (runtime {runtime}, local request ledger) + Tips")
-        }
+    ) {
+        (0, 0, _) => "-".to_string(),
+        (priced, 0, Language::Zh) => format!("估算 {priced}"),
+        (priced, 0, Language::En) => format!("estimated {priced}"),
+        (priced, unpriced, Language::Zh) => format!("估算 {priced} / 未知 {unpriced}"),
+        (priced, unpriced, Language::En) => format!("estimated {priced} / unknown {unpriced}"),
     }
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+
+    use super::*;
+    use crate::state::{
+        UsageDayCoverage, UsageDayDimensionRow, UsageDayHourRow, UsageDayView,
+        UsageRetryGateReasonRow, UsageRetryGateSummary,
+    };
+    use crate::tui::model::Snapshot;
+    use crate::tui::state::UiState;
+
+    fn bucket(requests: u64, tokens: i64) -> UsageBucket {
+        let mut bucket = UsageBucket {
+            requests_total: requests,
+            duration_ms_total: requests.saturating_mul(100),
+            ..UsageBucket::default()
+        };
+        bucket.usage.total_tokens = tokens;
+        bucket.usage.input_tokens = tokens / 2;
+        bucket.usage.output_tokens = tokens / 2;
+        bucket
+    }
+
+    fn row(name: &str, requests: u64, tokens: i64) -> UsageDayDimensionRow {
+        UsageDayDimensionRow {
+            name: name.to_string(),
+            bucket: bucket(requests, tokens),
+        }
+    }
+
+    fn sample_snapshot() -> Snapshot {
+        let hourly = (0..24)
+            .map(|hour| UsageDayHourRow {
+                hour,
+                bucket: bucket(u64::from(hour % 4), i64::from(hour) * 10),
+            })
+            .collect::<Vec<_>>();
+        Snapshot {
+            rows: Vec::new(),
+            recent: Vec::new(),
+            model_overrides: HashMap::new(),
+            overrides: HashMap::new(),
+            station_overrides: HashMap::new(),
+            route_target_overrides: HashMap::new(),
+            service_tier_overrides: HashMap::new(),
+            global_station_override: None,
+            global_route_target_override: None,
+            station_meta_overrides: HashMap::new(),
+            usage_day: UsageDayView {
+                day: crate::usage_day::current_local_day(),
+                label: "2026-07-07".to_string(),
+                start_ms: 1,
+                end_ms: 2,
+                generated_at_ms: 2,
+                summary: bucket(12, 4096),
+                hourly,
+                provider_rows: vec![row("input", 7, 3000), row("input1", 5, 1096)],
+                station_rows: vec![row("routing", 12, 4096)],
+                model_rows: vec![row("gpt-5", 12, 4096)],
+                session_rows: vec![row("sid-main", 8, 3000)],
+                project_rows: vec![row("F:/SourceCodes/Rust/codex-helper", 12, 4096)],
+                retry_gate: UsageRetryGateSummary {
+                    active: 2,
+                    active_cooldowns: 2,
+                    max_remaining_secs: Some(60),
+                    reasons: vec![UsageRetryGateReasonRow {
+                        reason: "reasoning_tokens=516".to_string(),
+                        active: 2,
+                    }],
+                },
+                coverage: UsageDayCoverage {
+                    source: "request_log".to_string(),
+                    loaded_first_ms: Some(1),
+                    loaded_last_ms: Some(2),
+                    loaded_requests: 12,
+                    scanned_lines: 12,
+                    max_lines: 20_000,
+                    max_bytes: 8 * 1024 * 1024,
+                    day_may_be_partial: true,
+                    partial_reason: Some("loaded data starts after local day start".to_string()),
+                    ..UsageDayCoverage::default()
+                },
+            },
+            usage_rollup: crate::state::UsageRollupView::default(),
+            provider_balances: HashMap::new(),
+            provider_balance_history: HashMap::new(),
+            station_health: HashMap::new(),
+            health_checks: HashMap::new(),
+            lb_view: HashMap::new(),
+            provider_endpoint_policy_actions: HashMap::new(),
+            stats_5m: crate::dashboard_core::WindowStats::default(),
+            stats_1h: crate::dashboard_core::WindowStats::default(),
+            service_status: None,
+            pricing_catalog: crate::pricing::ModelPriceCatalogSnapshot::default(),
+            refreshed_at: Instant::now(),
+        }
+    }
+
+    fn render_text(width: u16, height: u16, ui: &mut UiState, snapshot: &Snapshot) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let frame = terminal
+            .draw(|frame| {
+                render_stats_page(frame, Palette::default(), ui, snapshot, &[], frame.area());
+            })
+            .expect("draw");
+        buffer_text(frame.buffer)
+    }
+
+    fn buffer_text(buffer: &Buffer) -> String {
+        let mut out = String::new();
+        for y in buffer.area.y..buffer.area.y.saturating_add(buffer.area.height) {
+            for x in buffer.area.x..buffer.area.x.saturating_add(buffer.area.width) {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn stats_render_uses_usage_day_and_global_retry_gate() {
+        let snapshot = sample_snapshot();
+        let mut ui = UiState {
+            page: crate::tui::types::Page::Stats,
+            stats_focus: StatsFocus::Providers,
+            ..UiState::default()
+        };
+
+        let text = render_text(128, 26, &mut ui, &snapshot);
+
+        assert!(text.contains("Today"));
+        assert!(text.contains("Retry Gate"));
+        assert!(text.contains("active"));
+        assert!(text.contains("reasoning_tokens"));
+        assert!(text.contains("input"));
+        assert!(text.contains("Coverage"));
+    }
+
+    #[test]
+    fn stats_render_keeps_narrow_layout_bounded() {
+        let snapshot = sample_snapshot();
+        let mut ui = UiState {
+            page: crate::tui::types::Page::Stats,
+            stats_focus: StatsFocus::Stations,
+            ..UiState::default()
+        };
+
+        let text = render_text(76, 22, &mut ui, &snapshot);
+
+        assert!(text.contains("Stations") || text.contains("站点"));
+        assert!(!text.contains("15d"));
+    }
+}

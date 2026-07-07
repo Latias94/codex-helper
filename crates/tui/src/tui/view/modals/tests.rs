@@ -74,8 +74,6 @@ fn routing_provider_balance_line_falls_back_for_legacy_snapshot_keys() {
     let snapshot = crate::tui::model::Snapshot {
         rows: Vec::new(),
         recent: Vec::new(),
-        forecast_recent: Vec::new(),
-        forecast_recent_source: crate::tui::model::UsageForecastSampleSource::RuntimeOnly,
         model_overrides: std::collections::HashMap::new(),
         overrides: std::collections::HashMap::new(),
         station_overrides: std::collections::HashMap::new(),
@@ -84,6 +82,7 @@ fn routing_provider_balance_line_falls_back_for_legacy_snapshot_keys() {
         global_station_override: None,
         global_route_target_override: None,
         station_meta_overrides: std::collections::HashMap::new(),
+        usage_day: crate::state::UsageDayView::default(),
         usage_rollup: crate::state::UsageRollupView::default(),
         provider_balances: std::collections::HashMap::from([(
             "input".to_string(),
@@ -117,8 +116,6 @@ fn routing_provider_balance_line_prefers_routing_context() {
     let snapshot = crate::tui::model::Snapshot {
         rows: Vec::new(),
         recent: Vec::new(),
-        forecast_recent: Vec::new(),
-        forecast_recent_source: crate::tui::model::UsageForecastSampleSource::RuntimeOnly,
         model_overrides: std::collections::HashMap::new(),
         overrides: std::collections::HashMap::new(),
         station_overrides: std::collections::HashMap::new(),
@@ -127,6 +124,7 @@ fn routing_provider_balance_line_prefers_routing_context() {
         global_station_override: None,
         global_route_target_override: None,
         station_meta_overrides: std::collections::HashMap::new(),
+        usage_day: crate::state::UsageDayView::default(),
         usage_rollup: crate::state::UsageRollupView::default(),
         provider_balances: std::collections::HashMap::from([
             (
@@ -196,8 +194,12 @@ fn current_page_help_includes_usage_detail_actions() {
     let text = help_text_for_tests(&lines);
 
     assert!(text.contains("Current page: Usage"), "{text}");
-    assert!(text.contains("PgUp/PgDn"), "{text}");
-    assert!(text.contains("refresh provider balances"), "{text}");
+    assert!(
+        text.contains("switch station / provider day ranking"),
+        "{text}"
+    );
+    assert!(text.contains("move the active ranking selection"), "{text}");
+    assert!(text.contains("global retry gate count"), "{text}");
 }
 
 #[test]
