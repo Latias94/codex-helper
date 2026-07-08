@@ -19,6 +19,7 @@ pub fn run() {
         .on_window_event(lifecycle::handle_window_event)
         .invoke_handler(tauri::generate_handler![
             commands::admin_api::get_admin_read_model,
+            commands::admin_api::get_request_chain,
             commands::app::get_app_metadata,
             commands::app::hide_main_window,
             commands::app::minimize_main_window,

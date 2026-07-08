@@ -4,8 +4,8 @@ use codex_helper_core::proxy::{
     ADMIN_PORT_OFFSET, ADMIN_TOKEN_ENV_VAR, ADMIN_TOKEN_HEADER, RuntimeStatusResponse,
     admin_port_for_proxy_port, local_admin_base_url_for_proxy_port, local_proxy_base_url,
 };
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::CommandError;
@@ -76,6 +76,15 @@ impl AdminReadModelSectionStatus {
             error: Some(error.message),
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestChainPayload {
+    pub trace_id: Option<String>,
+    pub request_id: Option<u64>,
+    pub session: Option<String>,
+    pub limit: Option<usize>,
 }
 
 #[tauri::command]
@@ -206,6 +215,21 @@ pub async fn get_admin_read_model() -> Result<AdminReadModel, CommandError> {
         usage_day,
         section_statuses,
     })
+}
+
+#[tauri::command]
+pub async fn get_request_chain(payload: RequestChainPayload) -> Result<Value, CommandError> {
+    if !request_chain_payload_has_selector(&payload) {
+        return Err(CommandError::new(
+            "desktop_request_chain_selector_required",
+            "traceId, requestId, or session is required",
+            false,
+        ));
+    }
+    let endpoint = admin_endpoint_config();
+    let client = admin_client()?;
+    let path = request_chain_path(&payload);
+    get_json::<Value>(&client, &endpoint.admin_base_url, &path).await
 }
 
 fn record_optional_section<T>(
@@ -426,6 +450,51 @@ fn append_query(path: &str, query: &str) -> String {
     format!("{path}{separator}{query}")
 }
 
+fn request_chain_payload_has_selector(payload: &RequestChainPayload) -> bool {
+    payload
+        .trace_id
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        || payload.request_id.is_some()
+        || payload
+            .session
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn request_chain_path(payload: &RequestChainPayload) -> String {
+    let mut url =
+        reqwest::Url::parse("http://localhost/__codex_helper/api/v1/request-ledger/chain")
+            .expect("request chain URL literal should be valid");
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("limit", &payload.limit.unwrap_or(20).to_string());
+        if let Some(trace_id) = payload
+            .trace_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            query.append_pair("trace_id", trace_id);
+        }
+        if let Some(request_id) = payload.request_id {
+            query.append_pair("request_id", &request_id.to_string());
+        }
+        if let Some(session) = payload
+            .session
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            query.append_pair("session", session);
+        }
+    }
+    match url.query() {
+        Some(query) => format!("{}?{query}", url.path()),
+        None => url.path().to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,6 +509,34 @@ mod tests {
             append_query("/snapshot?recent_limit=40", "stats_days=1"),
             "/snapshot?recent_limit=40&stats_days=1"
         );
+    }
+
+    #[test]
+    fn request_chain_path_encodes_selector() {
+        let payload = RequestChainPayload {
+            trace_id: Some(" trace/with space ".to_string()),
+            request_id: Some(42),
+            session: Some("session a".to_string()),
+            limit: Some(10),
+        };
+
+        assert!(request_chain_payload_has_selector(&payload));
+        assert_eq!(
+            request_chain_path(&payload),
+            "/__codex_helper/api/v1/request-ledger/chain?limit=10&trace_id=trace%2Fwith+space&request_id=42&session=session+a"
+        );
+    }
+
+    #[test]
+    fn request_chain_payload_requires_selector() {
+        let payload = RequestChainPayload {
+            trace_id: Some(" ".to_string()),
+            request_id: None,
+            session: None,
+            limit: None,
+        };
+
+        assert!(!request_chain_payload_has_selector(&payload));
     }
 
     #[test]

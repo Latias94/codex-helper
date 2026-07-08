@@ -1,14 +1,18 @@
 import { createColumnHelper, flexRender, getCoreRowModel, useReactTable } from "@tanstack/react-table";
-import { Info, Search } from "lucide-react";
+import { useState } from "react";
+import { GitBranch, Info, Search } from "lucide-react";
 
 import { Badge, Button, Card, Input, SelectBox, TooltipHint } from "@/components/ui";
+import { errorToMessage } from "@/lib/api/data-state";
 import type { UsageRowView } from "@/lib/api/types";
+import { getRequestChain } from "@/lib/tauri/commands";
+import type { ApiRequestChainExport, ApiRequestChainRequest } from "@/lib/api/admin-types";
 
 type UsageRow = UsageRowView;
 
 const columnHelper = createColumnHelper<UsageRow>();
 
-const columns = [
+const baseColumns = [
   columnHelper.accessor("key", {
     header: "API Key",
     cell: (info) => <span className="font-mono text-xs">{info.getValue()}</span>,
@@ -63,6 +67,12 @@ const columns = [
   columnHelper.accessor("time", { header: "Time" }),
 ];
 
+type ChainState =
+  | { status: "idle" }
+  | { status: "loading"; rowId: string }
+  | { status: "success"; rowId: string; export: ApiRequestChainExport }
+  | { status: "error"; rowId: string; message: string };
+
 export function UsageTable({
   rows,
   totalRows,
@@ -72,11 +82,55 @@ export function UsageTable({
   totalRows: number;
   onRefresh?: () => void;
 }) {
+  const [chainState, setChainState] = useState<ChainState>({ status: "idle" });
+  const tableColumns = [
+    ...baseColumns,
+    columnHelper.display({
+      id: "chain",
+      header: "Chain",
+      cell: (info) => {
+        const row = info.row.original;
+        const loading = chainState.status === "loading" && chainState.rowId === row.id;
+        return (
+          <Button
+            className="h-8 px-2.5"
+            variant="outline"
+            disabled={loading}
+            onClick={() => void loadRequestChain(row)}
+            title="查看请求链路"
+          >
+            <GitBranch className="h-3.5 w-3.5" />
+            {loading ? "Loading" : "Chain"}
+          </Button>
+        );
+      },
+    }),
+  ];
+
   const table = useReactTable({
     data: rows,
-    columns,
+    columns: tableColumns,
     getCoreRowModel: getCoreRowModel(),
   });
+
+  async function loadRequestChain(row: UsageRow) {
+    setChainState({ status: "loading", rowId: row.id });
+    try {
+      const requestChain = await getRequestChain({
+        traceId: row.traceId,
+        requestId: row.traceId ? undefined : row.requestId,
+        session: row.traceId || row.requestId ? undefined : row.sessionId,
+        limit: 20,
+      });
+      setChainState({ status: "success", rowId: row.id, export: requestChain });
+    } catch (error) {
+      setChainState({
+        status: "error",
+        rowId: row.id,
+        message: errorToMessage(error) ?? "无法读取请求链路",
+      });
+    }
+  }
 
   return (
     <Card className="flex min-h-0 flex-1 flex-col overflow-hidden">
@@ -104,6 +158,7 @@ export function UsageTable({
           <Button onClick={onRefresh}>Refresh</Button>
         </div>
       </div>
+      <RequestChainPanel state={chainState} />
       <div className="app-scroll min-h-0 flex-1 overflow-auto">
         <table className="w-full min-w-[1120px] border-collapse text-left text-sm">
           <thead className="sticky top-0 z-10 bg-slate-50 text-xs uppercase tracking-wide text-slate-500 shadow-[0_1px_0_rgba(226,232,240,1)]">
@@ -120,7 +175,7 @@ export function UsageTable({
           <tbody>
             {table.getRowModel().rows.length === 0 ? (
               <tr>
-                <td className="px-3 py-12 text-center text-sm text-slate-500" colSpan={columns.length}>
+                <td className="px-3 py-12 text-center text-sm text-slate-500" colSpan={tableColumns.length}>
                   暂无请求历史。Codex 请求通过本地代理后，这里会显示 request-ledger 记录。
                 </td>
               </tr>
@@ -154,5 +209,103 @@ export function UsageTable({
         </div>
       </div>
     </Card>
+  );
+}
+
+function RequestChainPanel({ state }: { state: ChainState }) {
+  if (state.status === "idle") {
+    return null;
+  }
+
+  if (state.status === "loading") {
+    return (
+      <div className="border-b border-slate-100 bg-slate-50 px-4 py-3 text-sm text-slate-500">
+        正在读取请求链路…
+      </div>
+    );
+  }
+
+  if (state.status === "error") {
+    return (
+      <div className="border-b border-red-100 bg-red-50 px-4 py-3 text-sm text-red-700">
+        {state.message}
+      </div>
+    );
+  }
+
+  const request = state.export.requests[0];
+  if (!request) {
+    return (
+      <div className="border-b border-amber-100 bg-amber-50 px-4 py-3 text-sm text-amber-700">
+        没有找到匹配的请求链路。
+      </div>
+    );
+  }
+
+  return (
+    <div className="border-b border-slate-100 bg-slate-50 px-4 py-3">
+      <div className="flex flex-wrap items-center gap-2 text-sm">
+        <span className="font-medium text-slate-900">Request {request.request_id}</span>
+        <Badge variant={request.status_code >= 400 ? "warning" : "success"}>{request.status_code}</Badge>
+        <span className="font-mono text-xs text-slate-500">{request.trace_id ?? request.session_id ?? "-"}</span>
+        {state.export.truncated ? <Badge variant="warning">Truncated</Badge> : null}
+      </div>
+      <div className="mt-3 grid gap-3 lg:grid-cols-[1fr_1fr]">
+        <ChainAttemptList request={request} />
+        <ChainTimeline request={request} />
+      </div>
+    </div>
+  );
+}
+
+function ChainAttemptList({ request }: { request: ApiRequestChainRequest }) {
+  return (
+    <div className="rounded-md border border-slate-200 bg-white">
+      <div className="border-b border-slate-100 px-3 py-2 text-xs font-semibold uppercase text-slate-500">
+        Route Attempts
+      </div>
+      <div className="max-h-44 overflow-auto">
+        {request.route_attempts.length === 0 ? (
+          <div className="px-3 py-4 text-sm text-slate-500">没有 route attempt 记录</div>
+        ) : request.route_attempts.map((attempt) => (
+          <div key={`${attempt.attempt_index}-${attempt.code}`} className="border-b border-slate-50 px-3 py-2 last:border-0">
+            <div className="flex flex-wrap items-center gap-2 text-sm">
+              <Badge variant={attempt.status_code && attempt.status_code >= 400 ? "warning" : "muted"}>
+                #{attempt.attempt_index}
+              </Badge>
+              <span className="font-medium text-slate-800">{attempt.code}</span>
+              <span className="font-mono text-xs text-slate-500">{attempt.provider_endpoint_key ?? attempt.provider_id ?? "-"}</span>
+            </div>
+            <div className="mt-1 text-xs text-slate-500">
+              status {attempt.status_code ?? "-"} · decision {attempt.decision} · model {attempt.model ?? request.model ?? "-"}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ChainTimeline({ request }: { request: ApiRequestChainRequest }) {
+  return (
+    <div className="rounded-md border border-slate-200 bg-white">
+      <div className="border-b border-slate-100 px-3 py-2 text-xs font-semibold uppercase text-slate-500">
+        Timeline
+      </div>
+      <div className="max-h-44 overflow-auto">
+        {request.timeline.map((event) => (
+          <div key={`${event.order}-${event.kind}-${event.code}`} className="border-b border-slate-50 px-3 py-2 last:border-0">
+            <div className="flex flex-wrap items-center gap-2 text-sm">
+              <Badge variant={event.kind === "request" ? "blue" : "muted"}>{event.kind}</Badge>
+              <span className="font-medium text-slate-800">{event.code}</span>
+              {event.status_code ? <span className="text-xs text-slate-500">status {event.status_code}</span> : null}
+            </div>
+            <div className="mt-1 font-mono text-xs text-slate-500">
+              {event.provider_endpoint_key ?? event.provider_id ?? request.provider_id ?? "-"}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }

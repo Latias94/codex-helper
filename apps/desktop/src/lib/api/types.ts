@@ -143,6 +143,9 @@ export type ProviderCardView = {
 
 export type UsageRowView = {
   id: string;
+  requestId: number;
+  traceId?: string;
+  sessionId?: string;
   provider: string;
   key: string;
   model: string;

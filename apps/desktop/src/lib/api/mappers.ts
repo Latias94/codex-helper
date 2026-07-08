@@ -315,6 +315,9 @@ export function mapUsageRows(requests: ApiFinishedRequest[]): UsageRowView[] {
     const usage = request.usage;
     return {
       id: String(request.trace_id ?? request.id),
+      requestId: request.id,
+      traceId: request.trace_id,
+      sessionId: request.session_id,
       provider: request.provider_id ?? request.station_name ?? "-",
       key: request.provider_id ? `provider ${request.provider_id}` : "local config",
       model: request.model ?? "unknown",

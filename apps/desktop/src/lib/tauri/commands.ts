@@ -6,6 +6,7 @@ import {
 } from "@tauri-apps/plugin-autostart";
 
 import type { DesktopActionResult, DesktopControlState } from "@/lib/api/types";
+import type { ApiRequestChainExport } from "@/lib/api/admin-types";
 
 export type AppMetadata = {
   name: string;
@@ -62,6 +63,13 @@ export type DesktopCommandError = {
   message: string;
   retryable: boolean;
   hint?: string | null;
+};
+
+export type RequestChainPayload = {
+  traceId?: string;
+  requestId?: number;
+  session?: string;
+  limit?: number;
 };
 
 export type StopProxyScope = "owned" | "attached";
@@ -150,6 +158,10 @@ export async function setLaunchAtLoginEnabled(enabled: boolean) {
 
 export async function getAdminReadModel() {
   return invoke<AdminReadModel>("get_admin_read_model");
+}
+
+export async function getRequestChain(payload: RequestChainPayload) {
+  return invoke<ApiRequestChainExport>("get_request_chain", { payload });
 }
 
 export async function getDesktopControlState() {

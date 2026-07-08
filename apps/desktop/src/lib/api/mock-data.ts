@@ -58,8 +58,10 @@ export const mockDashboardMetrics: DashboardMetric[] = mockMetrics.map(({ label,
   tone,
 }));
 
-export const mockUsageRowViews: UsageRowView[] = mockUsageRows.map((row) => ({
+export const mockUsageRowViews: UsageRowView[] = mockUsageRows.map((row, index) => ({
   ...row,
+  requestId: index + 1,
+  traceId: `mock-trace-${index + 1}`,
   costBreakdown: {
     input: "$0.006",
     output: "$0.018",
