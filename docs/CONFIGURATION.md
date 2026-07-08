@@ -1208,6 +1208,7 @@ Important balance behavior:
 ## Usage Page
 
 TUI page 5 is labeled `Usage`. It is a local-day usage panel, not a durable multi-day analytics warehouse.
+The Tauri desktop `Usage` page consumes the same local-day read model; its recent request rows are drilldown samples, not the source of truth for today's totals.
 
 How to read it:
 
@@ -1219,8 +1220,9 @@ How to read it:
 - `unknown` means there is no trusted balance data or the lookup failed. Do not treat it as healthy balance.
 - `stale` means the snapshot expired; it is distinct from `exhausted`, `error`, and `unlimited`.
 - `unlimited` is a known unlimited quota state, not unknown.
-- Balance refresh remains on the routing/provider diagnostics surfaces; use Routing/Stations `g` in TUI or the `Refresh balances` button on the Tauri desktop Usage page.
+- Balance refresh remains on the routing/provider diagnostics surfaces; use Routing/Stations `g` in TUI or the `Refresh balances` button on the Tauri desktop Providers page.
 - A single provider balance refresh failure only updates that provider's error/unknown state. It does not interrupt other provider refreshes, TUI redraw, or snapshot refresh.
+- In the desktop Usage table, the per-row `Chain` action loads the sanitized request chain only on demand. Use it for single-request diagnosis after the totals show an unusual pattern.
 - The `Routing` page keeps compact balance context and refresh controls. Use TUI `Usage` to answer what was used today; use Routing/Stations to answer balance and route eligibility questions.
 
 ## Runtime Safeguards
@@ -1369,6 +1371,24 @@ codex-helper usage find --path responses/compact --limit 20
 ```
 
 The same filter is available through the local admin API as `GET /__codex_helper/api/v1/request-ledger/recent?path=responses/compact`.
+
+To inspect one request or session as a route-control timeline, use the request-chain export:
+
+```bash
+codex-helper usage chain --trace-id <TRACE_ID> --json
+codex-helper usage chain --request-id <REQUEST_ID>
+codex-helper usage chain --session <SESSION_ID> --limit 20 --json
+```
+
+The same read model is available through the local admin API:
+
+```text
+GET /__codex_helper/api/v1/request-ledger/chain?trace_id=<TRACE_ID>
+GET /__codex_helper/api/v1/request-ledger/chain?request_id=<REQUEST_ID>
+GET /__codex_helper/api/v1/request-ledger/chain?session=<SESSION_ID>&limit=20
+```
+
+The request-chain export is an allowlisted diagnostic view. It includes request identity, status, sanitized route attempts, stable provider signal / policy action codes, and timeline events. It intentionally omits sensitive raw fields such as client address, cwd, upstream base URL, provider trace internals, and raw upstream payload details. Large session exports are capped and marked `truncated` instead of streaming the whole local log.
 
 The control trace is enabled by default and is written to:
 

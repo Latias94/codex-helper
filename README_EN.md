@@ -380,6 +380,7 @@ codex-helper session transcript <SESSION_ID> --tail 40
 codex-helper usage summary
 codex-helper usage tail --limit 20
 codex-helper usage find --errors --limit 10
+codex-helper usage chain --trace-id <TRACE_ID> --json
 
 # pricing
 codex-helper pricing list
@@ -406,7 +407,8 @@ Useful pages:
 - `Overview`: proxy status, current sessions, and recent requests.
 - `Routing` / `Stations`: route graph, provider order, balance/plan, tags, health, and routing preview.
 - `Sessions`: session identity, effective route, route affinity, and per-session overrides.
-- `Usage` / `Requests`: provider usage, recent endpoint samples, balance/quota state, tokens, cache tokens, latency, retries, cost, and request logs.
+- `Usage`: local-day requests, tokens, estimated cost, 24h activity, provider/station/model/session/project rankings, coverage warnings, and the global retry-gate count.
+- `Requests`: request logs, recent endpoint samples, tokens, cache tokens, latency, retries, request chains, and cost.
 
 Shortcut hints are shown at the bottom. Under v5 config, durable provider/routing edits should go through the routing page, provider/routing CLI commands, or raw TOML. Press `R` after manual config edits to reload runtime config.
 

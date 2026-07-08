@@ -389,6 +389,7 @@ codex-helper session transcript <SESSION_ID> --tail 40
 codex-helper usage summary
 codex-helper usage tail --limit 20
 codex-helper usage find --errors --limit 10
+codex-helper usage chain --trace-id <TRACE_ID> --json
 
 # 价格
 codex-helper pricing list
@@ -416,7 +417,7 @@ codex-helper --version
 - `Routing` / `Stations`：route graph、provider 顺序、余额/套餐、tags、健康状态和 routing 预览。
 - `Sessions`：session identity、effective route、route affinity、单会话覆盖。
 - `Usage`：今日请求、token、估算成本、24 小时活跃度、provider/station/model/session/project 排行、日志覆盖提示和全局 retry gate 数量。
-- `Requests`：请求日志、endpoint 最近样本、token、cache token、耗时、重试和成本。
+- `Requests`：请求日志、endpoint 最近样本、token、cache token、耗时、重试、request chain 和成本。
 
 常用快捷键会显示在底部。TUI 的持久化 provider/routing 编辑优先使用 routing 页面，手动改配置后可用 `R` 重新加载运行态配置。
 余额刷新和余额诊断保留在 `Routing` / `Stations` 相关页面；单个 provider 查询失败只会显示为错误/未知状态，不会打断页面刷新或其他 provider 的刷新。
