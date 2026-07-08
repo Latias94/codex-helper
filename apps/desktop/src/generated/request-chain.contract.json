@@ -4,6 +4,15 @@
   "rust": [
     {
       "file": "../../crates/core/src/request_chain.rs",
+      "struct": "RequestChainSelector",
+      "fields": [
+        "trace_id",
+        "request_id",
+        "session_id"
+      ]
+    },
+    {
+      "file": "../../crates/core/src/request_chain.rs",
       "struct": "RequestChainExport",
       "fields": [
         "api_version",
@@ -20,7 +29,27 @@
         "request_id",
         "trace_id",
         "session_id",
+        "session_identity_source",
+        "client_name",
+        "model",
+        "reasoning_effort",
+        "service_tier",
+        "station_name",
+        "provider_id",
+        "usage",
+        "cost",
+        "observability",
+        "service",
+        "method",
+        "path",
         "status_code",
+        "duration_ms",
+        "ttfb_ms",
+        "streaming",
+        "ended_at_ms",
+        "attempts_truncated",
+        "provider_signals_truncated",
+        "policy_actions_truncated",
         "route_attempts",
         "provider_signals",
         "policy_actions",
@@ -32,14 +61,102 @@
       "struct": "RequestChainRouteAttempt",
       "fields": [
         "attempt_index",
+        "provider_id",
+        "endpoint_id",
         "provider_endpoint_key",
+        "station_name",
+        "preference_group",
+        "route_path",
+        "provider_attempt",
+        "upstream_attempt",
+        "provider_max_attempts",
+        "upstream_max_attempts",
+        "avoided_total",
+        "total_upstreams",
         "decision",
         "code",
-        "status_code"
+        "status_code",
+        "error_class",
+        "model",
+        "upstream_headers_ms",
+        "duration_ms",
+        "cooldown_secs",
+        "skipped",
+        "provider_signals",
+        "policy_actions"
+      ]
+    },
+    {
+      "file": "../../crates/core/src/request_chain.rs",
+      "struct": "RequestChainProviderSignal",
+      "fields": [
+        "kind",
+        "code",
+        "source",
+        "target",
+        "confidence",
+        "observed_at_ms",
+        "route_facing",
+        "retry_after_secs",
+        "reset_after_secs",
+        "error_class",
+        "trace_id"
+      ]
+    },
+    {
+      "file": "../../crates/core/src/request_chain.rs",
+      "struct": "RequestChainPolicyAction",
+      "fields": [
+        "id",
+        "kind",
+        "code",
+        "owner",
+        "provider_endpoint_key",
+        "source_signal",
+        "confidence",
+        "created_at_ms",
+        "expires_at_ms",
+        "recovery_state",
+        "generation"
+      ]
+    },
+    {
+      "file": "../../crates/core/src/request_chain.rs",
+      "struct": "RequestChainTimelineEvent",
+      "fields": [
+        "order",
+        "at_ms",
+        "kind",
+        "code",
+        "attempt_index",
+        "provider_id",
+        "endpoint_id",
+        "provider_endpoint_key",
+        "status_code",
+        "model"
+      ]
+    },
+    {
+      "file": "src-tauri/src/commands/admin_api.rs",
+      "struct": "RequestChainPayload",
+      "fields": [
+        "trace_id",
+        "request_id",
+        "session",
+        "limit"
       ]
     }
   ],
   "typescript": [
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiRequestChainSelector",
+      "fields": [
+        "trace_id",
+        "request_id",
+        "session_id"
+      ]
+    },
     {
       "file": "src/lib/api/admin-types.ts",
       "type": "ApiRequestChainExport",
@@ -58,11 +175,111 @@
         "request_id",
         "trace_id",
         "session_id",
+        "session_identity_source",
+        "client_name",
+        "model",
+        "reasoning_effort",
+        "service_tier",
+        "station_name",
+        "provider_id",
+        "usage",
+        "cost",
+        "observability",
+        "service",
+        "method",
+        "path",
         "status_code",
+        "duration_ms",
+        "ttfb_ms",
+        "streaming",
+        "ended_at_ms",
+        "attempts_truncated",
+        "provider_signals_truncated",
+        "policy_actions_truncated",
         "route_attempts",
         "provider_signals",
         "policy_actions",
         "timeline"
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiRequestChainRouteAttempt",
+      "fields": [
+        "attempt_index",
+        "provider_id",
+        "endpoint_id",
+        "provider_endpoint_key",
+        "station_name",
+        "preference_group",
+        "route_path",
+        "provider_attempt",
+        "upstream_attempt",
+        "provider_max_attempts",
+        "upstream_max_attempts",
+        "avoided_total",
+        "total_upstreams",
+        "decision",
+        "code",
+        "status_code",
+        "error_class",
+        "model",
+        "upstream_headers_ms",
+        "duration_ms",
+        "cooldown_secs",
+        "skipped",
+        "provider_signals",
+        "policy_actions"
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiRequestChainProviderSignal",
+      "fields": [
+        "kind",
+        "code",
+        "source",
+        "target",
+        "confidence",
+        "observed_at_ms",
+        "route_facing",
+        "retry_after_secs",
+        "reset_after_secs",
+        "error_class",
+        "trace_id"
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiRequestChainPolicyAction",
+      "fields": [
+        "id",
+        "kind",
+        "code",
+        "owner",
+        "provider_endpoint_key",
+        "source_signal",
+        "confidence",
+        "created_at_ms",
+        "expires_at_ms",
+        "recovery_state",
+        "generation"
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiRequestChainTimelineEvent",
+      "fields": [
+        "order",
+        "at_ms",
+        "kind",
+        "code",
+        "attempt_index",
+        "provider_id",
+        "endpoint_id",
+        "provider_endpoint_key",
+        "status_code",
+        "model"
       ]
     },
     {
@@ -94,6 +311,7 @@
     }
   ],
   "notes": [
+    "Generated by apps/desktop/scripts/generate-desktop-contracts.mjs from Rust DTO field declarations.",
     "Request-chain export is an allowlisted diagnostic DTO. It must not be replaced by raw FinishedRequest or raw request-log JSON.",
     "The desktop bridge fetches this DTO on demand; the read model does not batch-load request chains."
   ]

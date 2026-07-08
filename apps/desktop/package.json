@@ -10,6 +10,7 @@
     "preview": "vite preview --host 127.0.0.1",
     "test": "vitest run",
     "check:contracts": "node ./scripts/check-admin-read-model-contract.mjs",
+    "generate:contracts": "node ./scripts/generate-desktop-contracts.mjs",
     "check:versions": "node ./scripts/check-version-sync.mjs",
     "prepare:sidecar": "node ./scripts/prepare-sidecar.mjs",
     "tauri:build:assets": "pnpm build && pnpm prepare:sidecar",
