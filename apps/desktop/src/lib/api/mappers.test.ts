@@ -242,10 +242,13 @@ describe("admin API mappers", () => {
               policy_actions: [
                 {
                   active_cooldown: true,
+                  code: "cooldown",
                   reason: "upstream_rate_limited",
                   cooldown_remaining_secs: 30,
+                  action_id: "a1",
                 },
               ],
+              runtime_state_override: "breaker_open",
             },
           ],
         },
@@ -253,6 +256,20 @@ describe("admin API mappers", () => {
     });
 
     expect(data.providers[0].health).toBe("Warning");
+    expect(data.providers[0].controlSummary).toBe("2 active control events");
+    expect(data.providers[0].controlBadges).toEqual([
+      expect.objectContaining({
+        key: expect.stringContaining("runtime_state"),
+        label: "state breaker_open",
+        tone: "warning",
+      }),
+      expect.objectContaining({
+        key: expect.stringContaining("policy:a1"),
+        label: "cooldown",
+        detail: expect.stringContaining("remaining 30s"),
+        tone: "warning",
+      }),
+    ]);
   });
 
   it("maps request-ledger rows into usage table rows and summary cards", () => {

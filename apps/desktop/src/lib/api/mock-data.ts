@@ -43,6 +43,8 @@ export const mockProviderCardViews: ProviderCardView[] = mockProviders.map((prov
   endpointName: "default",
   editable: true,
   health: provider.health as ProviderCardView["health"],
+  controlSummary: "无 active retry gate 或 runtime override",
+  controlBadges: [],
 }));
 
 export const mockRecentRequestViews: RecentRequestView[] = mockRecentRequests.map((request, index) => ({

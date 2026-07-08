@@ -13,6 +13,7 @@ export function ProvidersPage() {
   const providersState = useProvidersData();
   const actions = useRuntimeActions();
   const { providers, routeOrder } = providersState.data;
+  const activeControlEvents = providers.reduce((total, provider) => total + provider.controlBadges.length, 0);
 
   return (
     <div className="flex min-h-[calc(100vh-5rem)] flex-col">
@@ -48,6 +49,9 @@ export function ProvidersPage() {
           <Badge variant="teal">responses</Badge>
           <Badge variant="teal">compact</Badge>
           <Badge variant="teal">imagegen</Badge>
+          <Badge variant={activeControlEvents > 0 ? "warning" : "muted"}>
+            control {activeControlEvents}
+          </Badge>
         </div>
         <div className="flex gap-2">
           <Button

@@ -66,6 +66,21 @@ export function ProviderCard({
           ))}
           {provider.endpointCount > 1 && <Badge variant="warning">raw TOML</Badge>}
         </div>
+        {provider.controlBadges.length > 0 && (
+          <div className="rounded-md border border-amber-200 bg-amber-50/70 px-3 py-2">
+            <div className="mb-2 flex items-center justify-between gap-3">
+              <span className="text-xs font-semibold uppercase text-amber-700">Provider Control</span>
+              <span className="text-xs text-amber-700">{provider.controlSummary}</span>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {provider.controlBadges.map((badge) => (
+                <Badge key={badge.key} variant={badge.tone === "warning" ? "warning" : badge.tone === "teal" ? "teal" : "muted"} title={badge.detail}>
+                  {badge.label}
+                </Badge>
+              ))}
+            </div>
+          </div>
+        )}
         {editing && (
           <ProviderEditForm
             provider={provider}

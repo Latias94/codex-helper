@@ -138,7 +138,16 @@ export type ProviderCardView = {
   capabilities: string[];
   usage: string;
   lastUsed: string;
+  controlSummary: string;
+  controlBadges: ProviderControlBadgeView[];
   active: boolean;
+};
+
+export type ProviderControlBadgeView = {
+  key: string;
+  label: string;
+  detail: string;
+  tone: "warning" | "teal" | "muted";
 };
 
 export type UsageRowView = {

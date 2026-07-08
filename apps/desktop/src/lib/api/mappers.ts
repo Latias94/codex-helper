@@ -31,6 +31,7 @@ import type {
   DashboardMetric,
   DashboardMetricTone,
   ProviderCardView,
+  ProviderControlBadgeView,
   RecentRequestView,
   RuntimeSummary,
   UsageData,
@@ -254,6 +255,7 @@ export function mapProviders(
     const active = provider.name === activeProvider || (!activeProvider && index === 0);
     const endpointCount = endpoints.length;
     const editable = endpointCount === 1 && Boolean(primaryEndpoint?.base_url);
+    const controlBadges = providerControlBadges(provider);
     const policyAction = firstActivePolicyAction(provider);
 
     return {
@@ -275,6 +277,11 @@ export function mapProviders(
       capabilities: providerCapabilities(provider),
       usage: `${provider.routable_endpoints ?? 0}/${endpoints.length} endpoints`,
       lastUsed: policyAction?.reason ? `policy ${policyAction.reason}` : active ? "当前路由" : "等待请求",
+      controlSummary:
+        controlBadges.length > 0
+          ? `${controlBadges.length} active control event${controlBadges.length === 1 ? "" : "s"}`
+          : "无 active retry gate 或 runtime override",
+      controlBadges,
       active,
     };
   });
@@ -308,6 +315,46 @@ function firstActivePolicyAction(provider: ApiProviderOption) {
   return (provider.endpoints ?? [])
     .flatMap((endpoint) => endpoint.policy_actions ?? [])
     .find((action) => action.active_cooldown);
+}
+
+function providerControlBadges(provider: ApiProviderOption): ProviderControlBadgeView[] {
+  return (provider.endpoints ?? []).flatMap((endpoint) => {
+    const endpointLabel = endpoint.name || endpoint.provider_endpoint_key || provider.name;
+    const badges: ProviderControlBadgeView[] = [];
+    if (endpoint.runtime_enabled_override !== null && endpoint.runtime_enabled_override !== undefined) {
+      badges.push({
+        key: `${endpointLabel}:runtime_enabled`,
+        label: endpoint.runtime_enabled_override ? "enabled override" : "disabled override",
+        detail: `${endpointLabel} runtime enabled=${endpoint.runtime_enabled_override}`,
+        tone: endpoint.runtime_enabled_override ? "teal" : "warning",
+      });
+    }
+    if (endpoint.runtime_state_override) {
+      badges.push({
+        key: `${endpointLabel}:runtime_state`,
+        label: `state ${endpoint.runtime_state_override}`,
+        detail: `${endpointLabel} runtime state override`,
+        tone: endpoint.runtime_state_override === "normal" ? "muted" : "warning",
+      });
+    }
+    for (const action of endpoint.policy_actions ?? []) {
+      if (!action.active_cooldown) {
+        continue;
+      }
+      const code = action.code ?? "cooldown";
+      badges.push({
+        key: `${endpointLabel}:policy:${action.action_id ?? code}`,
+        label: code,
+        detail: [
+          endpointLabel,
+          action.cooldown_remaining_secs ? `remaining ${formatSeconds(action.cooldown_remaining_secs)}` : undefined,
+          action.reason,
+        ].filter(Boolean).join(" · "),
+        tone: "warning",
+      });
+    }
+    return badges;
+  });
 }
 
 export function mapUsageRows(requests: ApiFinishedRequest[]): UsageRowView[] {
