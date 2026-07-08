@@ -3,8 +3,13 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const desktopRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const contractPath = path.join(desktopRoot, "src", "generated", "admin-read-model.contract.json");
-const contract = JSON.parse(fs.readFileSync(contractPath, "utf8"));
+const contractPaths = [
+  path.join(desktopRoot, "src", "generated", "admin-read-model.contract.json"),
+  path.join(desktopRoot, "src", "generated", "request-chain.contract.json"),
+];
+const contracts = contractPaths.map((contractPath) =>
+  JSON.parse(fs.readFileSync(contractPath, "utf8")),
+);
 
 const failures = [];
 
@@ -19,22 +24,39 @@ function requireText(file, text, reason) {
   }
 }
 
-for (const field of contract.rust.fields) {
-  requireText(contract.rust.file, `pub ${field}:`, `${contract.rust.struct}.${field}`);
+function checkRustTarget(target) {
+  for (const field of target.fields ?? []) {
+    requireText(target.file, `pub ${field}:`, `${target.struct}.${field}`);
+  }
 }
 
-for (const target of contract.typescript) {
+function checkTypescriptTarget(target) {
   for (const field of target.fields) {
     requireText(target.file, `${field}`, `${target.type}.${field}`);
   }
 }
 
+for (const contract of contracts) {
+  const rustTargets = Array.isArray(contract.rust) ? contract.rust : [contract.rust].filter(Boolean);
+  for (const target of rustTargets) {
+    checkRustTarget(target);
+  }
+
+  for (const target of contract.typescript ?? []) {
+    checkTypescriptTarget(target);
+  }
+
+  for (const requirement of contract.requiredText ?? []) {
+    requireText(requirement.file, requirement.text, requirement.reason ?? contract.contract);
+  }
+}
+
 if (failures.length > 0) {
-  console.error("Admin read-model contract drift detected:");
+  console.error("Admin contract drift detected:");
   for (const failure of failures) {
     console.error(`- ${failure}`);
   }
   process.exit(1);
 }
 
-console.log(`Admin read-model contract ${contract.contract} is in sync.`);
+console.log(`Admin contracts in sync: ${contracts.map((contract) => contract.contract).join(", ")}.`);

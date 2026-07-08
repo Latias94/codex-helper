@@ -1,0 +1,100 @@
+{
+  "contract": "codex-helper-request-chain/v1",
+  "version": 1,
+  "rust": [
+    {
+      "file": "../../crates/core/src/request_chain.rs",
+      "struct": "RequestChainExport",
+      "fields": [
+        "api_version",
+        "selector",
+        "limit",
+        "truncated",
+        "requests"
+      ]
+    },
+    {
+      "file": "../../crates/core/src/request_chain.rs",
+      "struct": "RequestChainRequest",
+      "fields": [
+        "request_id",
+        "trace_id",
+        "session_id",
+        "status_code",
+        "route_attempts",
+        "provider_signals",
+        "policy_actions",
+        "timeline"
+      ]
+    },
+    {
+      "file": "../../crates/core/src/request_chain.rs",
+      "struct": "RequestChainRouteAttempt",
+      "fields": [
+        "attempt_index",
+        "provider_endpoint_key",
+        "decision",
+        "code",
+        "status_code"
+      ]
+    }
+  ],
+  "typescript": [
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiRequestChainExport",
+      "fields": [
+        "api_version",
+        "selector",
+        "limit",
+        "truncated",
+        "requests"
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiRequestChainRequest",
+      "fields": [
+        "request_id",
+        "trace_id",
+        "session_id",
+        "status_code",
+        "route_attempts",
+        "provider_signals",
+        "policy_actions",
+        "timeline"
+      ]
+    },
+    {
+      "file": "src/lib/tauri/commands.ts",
+      "type": "RequestChainPayload",
+      "fields": [
+        "traceId",
+        "requestId",
+        "session",
+        "limit"
+      ]
+    }
+  ],
+  "requiredText": [
+    {
+      "file": "../../crates/core/src/proxy/control_plane_manifest.rs",
+      "text": "API_V1_REQUEST_LEDGER_CHAIN",
+      "reason": "request-chain endpoint is discoverable"
+    },
+    {
+      "file": "../../crates/core/src/proxy/control_plane_manifest.rs",
+      "text": "request_ledger_chain",
+      "reason": "request-chain capability and operator link are discoverable"
+    },
+    {
+      "file": "src-tauri/src/lib.rs",
+      "text": "commands::admin_api::get_request_chain",
+      "reason": "desktop command is registered"
+    }
+  ],
+  "notes": [
+    "Request-chain export is an allowlisted diagnostic DTO. It must not be replaced by raw FinishedRequest or raw request-log JSON.",
+    "The desktop bridge fetches this DTO on demand; the read model does not batch-load request chains."
+  ]
+}

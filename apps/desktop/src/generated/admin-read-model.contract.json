@@ -48,6 +48,6 @@
   "notes": [
     "usageDay is sourced from operatorSummary.links.snapshot -> snapshot.usage_day.",
     "sectionStatuses distinguishes empty sections from failed section loads.",
-    "This lightweight contract is intentionally narrow; broader generated bindings are handled by the later contract unit."
+    "This lightweight contract is intentionally narrow; request-chain diagnostics have a separate contract file."
   ]
 }
