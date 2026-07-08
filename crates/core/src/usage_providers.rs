@@ -2129,6 +2129,91 @@ fn sub2api_window_remaining_amounts(value: &serde_json::Value) -> Vec<UsdAmount>
         .collect()
 }
 
+fn optional_amount_is_zero(value: Option<UsdAmount>) -> bool {
+    value.map(UsdAmount::is_zero).unwrap_or(true)
+}
+
+fn optional_u64_is_zero(value: Option<u64>) -> bool {
+    value.unwrap_or(0) == 0
+}
+
+fn sub2api_today_usage_is_zero(value: &serde_json::Value) -> bool {
+    let today_cost = first_amount_from_paths(
+        value,
+        &[],
+        &[
+            "usage.today.actual_cost",
+            "usage.today.total_cost_usd",
+            "usage.today.total_cost",
+            "usage.today.cost",
+            "data.usage.today.actual_cost",
+            "data.usage.today.total_cost_usd",
+            "data.usage.today.total_cost",
+            "data.usage.today.cost",
+        ],
+        None,
+    );
+    let today_requests = first_u64_from_paths(
+        value,
+        &[
+            "usage.today.request_count",
+            "usage.today.requests",
+            "usage.today.count",
+            "data.usage.today.request_count",
+            "data.usage.today.requests",
+            "data.usage.today.count",
+        ],
+    );
+    let today_tokens = first_u64_from_paths(
+        value,
+        &[
+            "usage.today.total_tokens",
+            "usage.today.tokens",
+            "usage.today.input_tokens",
+            "usage.today.prompt_tokens",
+            "data.usage.today.total_tokens",
+            "data.usage.today.tokens",
+        ],
+    );
+    let has_today_usage_data =
+        today_cost.is_some() || today_requests.is_some() || today_tokens.is_some();
+    has_today_usage_data
+        && optional_amount_is_zero(today_cost)
+        && optional_u64_is_zero(today_requests)
+        && optional_u64_is_zero(today_tokens)
+}
+
+fn sub2api_daily_subscription_usage_is_lazy_stale(value: &serde_json::Value) -> bool {
+    if first_string_from_paths(value, &["mode", "data.mode"]).as_deref() != Some("unrestricted") {
+        return false;
+    }
+
+    let used = first_amount_from_paths(
+        value,
+        &[],
+        &[
+            "subscription.daily_usage_usd",
+            "data.subscription.daily_usage_usd",
+        ],
+        None,
+    );
+    let limit = first_amount_from_paths(
+        value,
+        &[],
+        &[
+            "subscription.daily_limit_usd",
+            "data.subscription.daily_limit_usd",
+        ],
+        None,
+    );
+
+    matches!(
+        (used, limit),
+        (Some(used), Some(limit))
+            if !limit.is_zero() && used >= limit && sub2api_today_usage_is_zero(value)
+    )
+}
+
 fn sub2api_usage_rate(value: &serde_json::Value) -> Option<ProviderUsageRateSnapshot> {
     let rate = ProviderUsageRateSnapshot {
         average_duration_ms: first_decimal_string_from_paths(
@@ -2150,15 +2235,20 @@ fn sub2api_usage_windows(value: &serde_json::Value) -> Vec<ProviderUsageWindow> 
     ["daily", "weekly", "monthly"]
         .into_iter()
         .filter_map(|period| {
-            let used = first_amount_from_paths(
-                value,
-                &[],
-                &[
-                    &format!("subscription.{period}_usage_usd"),
-                    &format!("data.subscription.{period}_usage_usd"),
-                ],
-                None,
-            );
+            let used = if period == "daily" && sub2api_daily_subscription_usage_is_lazy_stale(value)
+            {
+                Some(UsdAmount::ZERO)
+            } else {
+                first_amount_from_paths(
+                    value,
+                    &[],
+                    &[
+                        &format!("subscription.{period}_usage_usd"),
+                        &format!("data.subscription.{period}_usage_usd"),
+                    ],
+                    None,
+                )
+            };
             let limit = first_amount_from_paths(
                 value,
                 &[],
@@ -2294,6 +2384,11 @@ fn sub2api_usage_alerts(value: &serde_json::Value) -> Vec<ProviderUsageAlert> {
         ),
     ) && !limit.is_zero()
     {
+        let used = if sub2api_daily_subscription_usage_is_lazy_stale(value) {
+            UsdAmount::ZERO
+        } else {
+            used
+        };
         let used_femto = used.femto_usd();
         let limit_femto = limit.femto_usd();
         if used_femto.saturating_mul(100) >= limit_femto.saturating_mul(95) {
@@ -2357,7 +2452,11 @@ fn sub2api_subscription_limit_snapshot(
     if budget.is_zero() {
         return None;
     }
-    let spent = first_amount_from_paths(value, &[], usage_paths, None).unwrap_or(UsdAmount::ZERO);
+    let spent = if period == "daily" && sub2api_daily_subscription_usage_is_lazy_stale(value) {
+        UsdAmount::ZERO
+    } else {
+        first_amount_from_paths(value, &[], usage_paths, None).unwrap_or(UsdAmount::ZERO)
+    };
     let remaining = budget.saturating_sub(spent);
     Some(QuotaWindowSnapshot {
         period,
@@ -5572,7 +5671,7 @@ mod tests {
     }
 
     #[test]
-    fn sub2api_subscription_zero_remaining_is_display_only_period_capacity_exhaustion() {
+    fn sub2api_subscription_lazy_daily_reset_projects_today_capacity() {
         let snapshot = sub2api_usage_snapshot_from_json(
             &provider("sub2api", ProviderKind::Sub2ApiUsage),
             &upstream(),
@@ -5598,22 +5697,72 @@ mod tests {
             Some(1_000),
         );
 
-        assert_eq!(snapshot.status, BalanceSnapshotStatus::Exhausted);
-        assert_eq!(snapshot.exhausted, Some(true));
+        assert_eq!(snapshot.status, BalanceSnapshotStatus::Ok);
+        assert_eq!(snapshot.exhausted, Some(false));
         assert_eq!(snapshot.plan_name.as_deref(), Some("CodeX Lite 年度"));
         assert_eq!(snapshot.total_balance_usd, None);
         assert_eq!(snapshot.quota_period.as_deref(), Some("daily"));
-        assert_eq!(snapshot.quota_remaining_usd.as_deref(), Some("0"));
+        assert_eq!(snapshot.quota_remaining_usd.as_deref(), Some("100"));
         assert_eq!(snapshot.quota_limit_usd.as_deref(), Some("100"));
-        assert_eq!(snapshot.quota_used_usd.as_deref(), Some("100.468025"));
+        assert_eq!(snapshot.quota_used_usd.as_deref(), Some("0"));
         assert_eq!(snapshot.monthly_budget_usd.as_deref(), Some("100"));
-        assert_eq!(snapshot.monthly_spent_usd.as_deref(), Some("100.468025"));
+        assert_eq!(snapshot.monthly_spent_usd.as_deref(), Some("0"));
         assert_eq!(snapshot.total_used_usd.as_deref(), Some("702.492098"));
         assert_eq!(snapshot.today_used_usd.as_deref(), Some("0"));
+        assert_eq!(snapshot.today_requests, Some(0));
+        assert_eq!(snapshot.today_tokens, Some(0));
+        assert_eq!(snapshot.usage_windows[0].period, "daily");
+        assert_eq!(snapshot.usage_windows[0].used_usd.as_deref(), Some("0"));
+        assert_eq!(
+            snapshot.usage_windows[0].remaining_usd.as_deref(),
+            Some("100")
+        );
+        assert!(
+            !snapshot
+                .usage_alerts
+                .iter()
+                .any(|alert| alert.kind == ProviderUsageAlertKind::DailyUsage95)
+        );
         assert!(
             !snapshot.routing_exhausted(),
             "sub2api /v1/usage skips billing checks; subscription windows are reset lazily on real requests"
         );
+    }
+
+    #[test]
+    fn sub2api_subscription_same_day_daily_exhaustion_remains_exhausted() {
+        let snapshot = sub2api_usage_snapshot_from_json(
+            &provider("sub2api", ProviderKind::Sub2ApiUsage),
+            &upstream(),
+            &serde_json::json!({
+                "isValid": true,
+                "mode": "unrestricted",
+                "planName": "CodeX Lite 年度",
+                "remaining": 0,
+                "subscription": {
+                    "daily_usage_usd": 100.468025,
+                    "daily_limit_usd": 100,
+                    "weekly_usage_usd": 401.441684,
+                    "weekly_limit_usd": 0,
+                    "monthly_usage_usd": 401.441684,
+                    "monthly_limit_usd": 0
+                },
+                "usage": {
+                    "today": { "cost": 100.468025, "requests": 8, "total_tokens": 1234 },
+                    "total": { "cost": 702.492098, "requests": 42, "total_tokens": 1234 }
+                }
+            }),
+            100,
+            Some(1_000),
+        );
+
+        assert_eq!(snapshot.status, BalanceSnapshotStatus::Exhausted);
+        assert_eq!(snapshot.exhausted, Some(true));
+        assert_eq!(snapshot.quota_period.as_deref(), Some("daily"));
+        assert_eq!(snapshot.quota_remaining_usd.as_deref(), Some("0"));
+        assert_eq!(snapshot.quota_used_usd.as_deref(), Some("100.468025"));
+        assert_eq!(snapshot.today_used_usd.as_deref(), Some("100.468025"));
+        assert!(!snapshot.routing_exhausted());
     }
 
     #[test]
