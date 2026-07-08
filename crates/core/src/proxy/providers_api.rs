@@ -15,7 +15,9 @@ use crate::logging::{log_retry_trace, now_ms};
 use crate::routing_ir::RouteCandidateConcurrency;
 use crate::runtime_identity::ProviderEndpointKey;
 use crate::state::RuntimeConfigState;
-use crate::usage_providers::{UsageProviderRefreshSummary, refresh_balances_for_service};
+use crate::usage_providers::{
+    UsageProviderRefreshOptions, UsageProviderRefreshSummary, refresh_balances_for_service,
+};
 
 use super::ProxyService;
 use super::control_plane_service::{
@@ -44,6 +46,8 @@ pub(super) struct ProviderBalanceRefreshQuery {
     station_name: Option<String>,
     #[serde(default)]
     provider_id: Option<String>,
+    #[serde(default)]
+    force: bool,
 }
 
 fn normalize_provider_name(value: &str) -> Result<String, (StatusCode, String)> {
@@ -137,6 +141,7 @@ struct ProviderBalanceRefreshKey {
     service_name: String,
     station_name: Option<String>,
     provider_id: Option<String>,
+    force: bool,
 }
 
 static IN_FLIGHT_PROVIDER_BALANCE_REFRESHES: OnceLock<Mutex<HashSet<ProviderBalanceRefreshKey>>> =
@@ -933,7 +938,7 @@ pub(super) async fn refresh_provider_balances(
     let station_name = normalize_optional_filter(query.station_name);
     let provider_id = normalize_optional_filter(query.provider_id);
     let response = proxy
-        .refresh_provider_balances(station_name.as_deref(), provider_id.as_deref())
+        .refresh_provider_balances(station_name.as_deref(), provider_id.as_deref(), query.force)
         .await
         .map_err(super::ProxyControlError::into_http_error)?;
     Ok(Json(response))
@@ -943,18 +948,21 @@ pub(super) async fn refresh_provider_balances_for_proxy(
     proxy: &ProxyService,
     station_name_filter: Option<&str>,
     provider_id_filter: Option<&str>,
+    force: bool,
 ) -> Result<UsageProviderRefreshSummary, (StatusCode, String)> {
     let refresh_key = ProviderBalanceRefreshKey {
         service_name: proxy.service_name.to_string(),
         station_name: station_name_filter.map(ToOwned::to_owned),
         provider_id: provider_id_filter.map(ToOwned::to_owned),
+        force,
     };
     let Some(_in_flight) = try_mark_provider_balance_refresh_in_flight(refresh_key) else {
         tracing::debug!(
-            "provider balance refresh deduplicated: service={}, station={:?}, provider_id={:?}",
+            "provider balance refresh deduplicated: service={}, station={:?}, provider_id={:?}, force={}",
             proxy.service_name,
             station_name_filter,
-            provider_id_filter
+            provider_id_filter,
+            force
         );
         return Ok(UsageProviderRefreshSummary {
             deduplicated: 1,
@@ -969,8 +977,11 @@ pub(super) async fn refresh_provider_balances_for_proxy(
         proxy.lb_states.clone(),
         proxy.state.clone(),
         proxy.service_name,
-        station_name_filter,
-        provider_id_filter,
+        UsageProviderRefreshOptions {
+            station_name_filter,
+            provider_id_filter,
+            force,
+        },
     )
     .await;
 
@@ -982,8 +993,11 @@ pub(super) async fn refresh_provider_balances_for_proxy(
             display_lb_states,
             proxy.state.clone(),
             proxy.service_name,
-            station_name_filter,
-            provider_id_filter,
+            UsageProviderRefreshOptions {
+                station_name_filter,
+                provider_id_filter,
+                force,
+            },
         )
         .await;
         merge_refresh_summary(&mut refresh, provider_summary);
@@ -1002,6 +1016,7 @@ mod tests {
             service_name: "codex-test-dedupe".to_string(),
             station_name: Some("monthly".to_string()),
             provider_id: Some("provider-a".to_string()),
+            force: false,
         };
 
         let guard = try_mark_provider_balance_refresh_in_flight(key.clone())
@@ -1010,5 +1025,27 @@ mod tests {
 
         drop(guard);
         assert!(try_mark_provider_balance_refresh_in_flight(key).is_some());
+    }
+
+    #[test]
+    fn provider_balance_refresh_in_flight_guard_keeps_force_separate() {
+        let normal = ProviderBalanceRefreshKey {
+            service_name: "codex-test-force-dedupe".to_string(),
+            station_name: Some("monthly".to_string()),
+            provider_id: Some("provider-a".to_string()),
+            force: false,
+        };
+        let forced = ProviderBalanceRefreshKey {
+            force: true,
+            ..normal.clone()
+        };
+
+        let normal_guard = try_mark_provider_balance_refresh_in_flight(normal)
+            .expect("normal refresh should enter");
+        let forced_guard =
+            try_mark_provider_balance_refresh_in_flight(forced).expect("forced refresh can enter");
+
+        drop(normal_guard);
+        drop(forced_guard);
     }
 }

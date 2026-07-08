@@ -235,6 +235,7 @@ struct RefreshProviderTargetParams<'a> {
     state: &'a Arc<ProxyState>,
     service_name: &'a str,
     interval_secs: u64,
+    force: bool,
 }
 
 // 全局节流状态：按 provider.id 记录最近一次查询时间，避免高频请求。
@@ -546,7 +547,11 @@ fn auto_probe_target_key(target: &UsageProviderTarget) -> AutoProbeTargetKey {
     }
 }
 
-fn auto_probe_kind_order(provider_id: &str, target: &UsageProviderTarget) -> Vec<ProviderKind> {
+fn auto_probe_kind_order(
+    provider_id: &str,
+    target: &UsageProviderTarget,
+    force: bool,
+) -> Vec<ProviderKind> {
     let now = Instant::now();
     let target_key = auto_probe_target_key(target);
     let mut ordered = Vec::new();
@@ -566,7 +571,7 @@ fn auto_probe_kind_order(provider_id: &str, target: &UsageProviderTarget) -> Vec
                 return false;
             }
             seen.insert(*kind)
-                && !auto_probe_kind_failure_active(provider_id, &target_key, *kind, now)
+                && (force || !auto_probe_kind_failure_active(provider_id, &target_key, *kind, now))
         })
         .collect()
 }
@@ -722,6 +727,41 @@ fn usage_provider_target_suppression_active(
         suppressions.remove(&key);
         None
     }
+}
+
+fn usage_provider_target_suppression_remaining_ttl(
+    suppression: &ProviderTargetSuppression,
+    now: Instant,
+) -> Option<Duration> {
+    suppression
+        .until
+        .checked_duration_since(now)
+        .filter(|ttl| !ttl.is_zero())
+}
+
+fn usage_provider_suppression_reason_is_refreshable_window(reason: &str) -> bool {
+    let normalized = normalized_error_text(reason);
+    normalized.contains("package quota exhausted for current period")
+        || normalized.contains("usage window exhausted for current period")
+}
+
+fn force_can_bypass_active_suppression(
+    force: bool,
+    suppression: &ProviderTargetSuppression,
+    snapshot_decision: Option<&ProviderTargetSuppressionDecision>,
+) -> bool {
+    force
+        && snapshot_decision.is_none()
+        && (!usage_provider_error_is_terminal(suppression.reason.as_str())
+            || usage_provider_suppression_reason_is_refreshable_window(suppression.reason.as_str()))
+}
+
+fn active_usage_provider_target_suppression(
+    provider_id: &str,
+    target: &UsageProviderTarget,
+    now: Instant,
+) -> Option<ProviderTargetSuppression> {
+    usage_provider_target_suppression_active(provider_id, target, now)
 }
 
 fn auto_openai_official_provider(target: &UsageProviderTarget) -> UsageProviderConfig {
@@ -2980,8 +3020,13 @@ fn openai_organization_costs_snapshot_from_json(
 fn balance_exhaustion_policy_action(
     endpoint_key: ProviderEndpointKey,
     observed_at_ms: u64,
+    cooldown: Duration,
 ) -> Option<PolicyAction> {
-    const BALANCE_EXHAUSTION_COOLDOWN_SECS: u64 = 24 * 60 * 60;
+    let cooldown_ms = duration_millis_u64(cooldown);
+    if cooldown_ms == 0 {
+        return None;
+    }
+    let cooldown_secs = cooldown_ms.div_ceil(1000);
     let mut signal = ProviderSignal::high_confidence_route_facing(
         ProviderSignalKind::Balance,
         ProviderSignalSource::BalanceSnapshot,
@@ -2990,7 +3035,7 @@ fn balance_exhaustion_policy_action(
         },
         observed_at_ms,
     );
-    signal.reset_after_secs = Some(BALANCE_EXHAUSTION_COOLDOWN_SECS);
+    signal.reset_after_secs = Some(cooldown_secs);
     signal.reason = Some("balance_exhausted".to_string());
     PolicyAction::cooldown_from_signal(signal, observed_at_ms, 0, observed_at_ms)
 }
@@ -3000,10 +3045,12 @@ async fn sync_balance_policy_action_for_endpoint(
     service_name: &str,
     endpoint_key: ProviderEndpointKey,
     exhausted: bool,
+    ttl: Option<Duration>,
 ) {
     if exhausted {
+        let cooldown = ttl.unwrap_or(USAGE_PROVIDER_EXHAUSTED_SUPPRESSION_TTL);
         if let Some(action) =
-            balance_exhaustion_policy_action(endpoint_key, crate::logging::now_ms())
+            balance_exhaustion_policy_action(endpoint_key, crate::logging::now_ms(), cooldown)
         {
             state.upsert_owned_policy_action(service_name, action).await;
         }
@@ -3027,6 +3074,7 @@ async fn update_usage_exhausted(
     service_name: &str,
     upstreams: &[UpstreamRef],
     exhausted: bool,
+    ttl: Option<Duration>,
 ) {
     if let Ok(mut map) = lb_states.lock() {
         for uref in upstreams {
@@ -3052,6 +3100,7 @@ async fn update_usage_exhausted(
                 service_name,
                 endpoint_key.clone(),
                 exhausted,
+                ttl,
             )
             .await;
             state
@@ -3173,14 +3222,26 @@ async fn refresh_provider_target(
         state,
         service_name,
         interval_secs,
+        force,
     } = params;
 
     let upstreams = vec![target.upstream.clone()];
     let fetched_at_ms = unix_now_ms();
     let stale_after_ms = stale_after_ms(fetched_at_ms, interval_secs);
-    if let Some(suppression) =
-        usage_provider_target_suppression_active(&provider.id, target, Instant::now())
+    let snapshot_decision = existing_usage_provider_target_suppression_decision(
+        state,
+        cfg,
+        service_name,
+        &provider.id,
+        target,
+        fetched_at_ms,
+    )
+    .await;
+    let now = Instant::now();
+    if let Some(suppression) = active_usage_provider_target_suppression(&provider.id, target, now)
+        && !force_can_bypass_active_suppression(force, &suppression, snapshot_decision.as_ref())
     {
+        let ttl = usage_provider_target_suppression_remaining_ttl(&suppression, now);
         update_usage_exhausted(
             lb_states,
             state,
@@ -3188,6 +3249,7 @@ async fn refresh_provider_target(
             service_name,
             &upstreams,
             suppression.routing_exhausted,
+            ttl,
         )
         .await;
         warn!(
@@ -3196,16 +3258,7 @@ async fn refresh_provider_target(
         );
         return UsageProviderRefreshOutcome::Failed;
     }
-    if let Some(decision) = existing_usage_provider_target_suppression_decision(
-        state,
-        cfg,
-        service_name,
-        &provider.id,
-        target,
-        fetched_at_ms,
-    )
-    .await
-    {
+    if let Some(decision) = snapshot_decision {
         remember_usage_provider_target_suppression(
             &provider.id,
             target,
@@ -3221,6 +3274,7 @@ async fn refresh_provider_target(
             service_name,
             &upstreams,
             decision.routing_exhausted,
+            Some(decision.ttl),
         )
         .await;
         warn!(
@@ -3240,7 +3294,7 @@ async fn refresh_provider_target(
         state
             .record_provider_balance_snapshot(service_name, snapshot)
             .await;
-        update_usage_exhausted(lb_states, state, cfg, service_name, &upstreams, false).await;
+        update_usage_exhausted(lb_states, state, cfg, service_name, &upstreams, false, None).await;
         if provider.kind == ProviderKind::OpenAiOrganizationCosts {
             warn!(
                 "usage provider '{}' is missing OPENAI_ADMIN_KEY; OpenAI official costs stay unknown",
@@ -3291,6 +3345,7 @@ async fn refresh_provider_target(
                 service_name,
                 &upstreams,
                 exhausted_for_lb,
+                suppression_decision.as_ref().map(|decision| decision.ttl),
             )
             .await;
             state
@@ -3340,6 +3395,7 @@ async fn refresh_provider_target(
                 service_name,
                 &upstreams,
                 terminal_failure,
+                terminal_failure.then_some(USAGE_PROVIDER_TERMINAL_FAILURE_TTL),
             )
             .await;
             warn!(
@@ -3355,10 +3411,19 @@ struct ConfiguredRefreshJob<'a> {
     provider: &'a UsageProviderConfig,
     target: UsageProviderTarget,
     interval_secs: u64,
+    force: bool,
 }
 
 struct AutoRefreshJob {
     target: UsageProviderTarget,
+    force: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UsageProviderRefreshOptions<'a> {
+    pub station_name_filter: Option<&'a str>,
+    pub provider_id_filter: Option<&'a str>,
+    pub force: bool,
 }
 
 async fn run_configured_refresh_job<'a>(
@@ -3379,6 +3444,7 @@ async fn run_configured_refresh_job<'a>(
         state,
         service_name,
         interval_secs: job.interval_secs,
+        force: job.force,
     })
     .await;
     (provider_id, outcome)
@@ -3392,7 +3458,16 @@ async fn run_auto_refresh_job(
     state: &Arc<ProxyState>,
     service_name: &str,
 ) -> UsageProviderRefreshOutcome {
-    auto_probe_provider_target(client, &job.target, cfg, lb_states, state, service_name).await
+    auto_probe_provider_target(
+        client,
+        &job.target,
+        cfg,
+        lb_states,
+        state,
+        service_name,
+        job.force,
+    )
+    .await
 }
 
 async fn run_configured_refresh_jobs<'a>(
@@ -3605,10 +3680,7 @@ fn current_day_quota_suppression_ttl(
         cfg.ui.usage_forecast.reset_utc_offset.as_str(),
         cfg.ui.usage_forecast.reset_time.as_str(),
     )?;
-    let suppress_until_ms = reset_at_ms.saturating_add(duration_millis_u64(
-        USAGE_PROVIDER_DAILY_RESET_SUPPRESSION_GRACE,
-    ));
-    duration_until_ms(suppress_until_ms, now_ms)
+    duration_until_ms(reset_at_ms, now_ms)
 }
 
 fn usage_provider_snapshot_suppression_ttl(
@@ -3620,13 +3692,11 @@ fn usage_provider_snapshot_suppression_ttl(
         let suppress_until_ms = reset_at_ms.saturating_add(duration_millis_u64(
             USAGE_PROVIDER_DAILY_RESET_SUPPRESSION_GRACE,
         ));
-        return duration_until_ms(suppress_until_ms, now_ms)
-            .or_else(|| snapshot_freshness_ttl(snapshot, now_ms));
+        return duration_until_ms(suppress_until_ms, now_ms);
     }
 
     if snapshot_has_current_day_quota_exhaustion(snapshot) {
-        return current_day_quota_suppression_ttl(snapshot, cfg, now_ms)
-            .or_else(|| snapshot_freshness_ttl(snapshot, now_ms));
+        return current_day_quota_suppression_ttl(snapshot, cfg, now_ms);
     }
 
     if snapshot_has_refreshable_window_exhaustion(snapshot) {
@@ -3768,6 +3838,7 @@ async fn auto_probe_provider_target(
     lb_states: &Arc<Mutex<HashMap<String, LbState>>>,
     state: &Arc<ProxyState>,
     service_name: &str,
+    force: bool,
 ) -> UsageProviderRefreshOutcome {
     let upstreams = vec![target.upstream.clone()];
     let fetched_at_ms = unix_now_ms();
@@ -3783,7 +3854,8 @@ async fn auto_probe_provider_target(
                     base_snapshot(&provider, &target.upstream, fetched_at_ms, stale_after_ms),
                 )
                 .await;
-            update_usage_exhausted(lb_states, state, cfg, service_name, &upstreams, false).await;
+            update_usage_exhausted(lb_states, state, cfg, service_name, &upstreams, false, None)
+                .await;
             warn!(
                 "OpenAI organization costs require OPENAI_ADMIN_KEY; balance stays unknown for {}[{}]",
                 target.upstream.station_name, target.upstream.index
@@ -3801,8 +3873,16 @@ async fn auto_probe_provider_target(
                     fetched_at_ms,
                     stale_after_ms,
                 );
-                update_usage_exhausted(lb_states, state, cfg, service_name, &upstreams, false)
-                    .await;
+                update_usage_exhausted(
+                    lb_states,
+                    state,
+                    cfg,
+                    service_name,
+                    &upstreams,
+                    false,
+                    None,
+                )
+                .await;
                 state
                     .record_provider_balance_snapshot(service_name, snapshot)
                     .await;
@@ -3816,8 +3896,16 @@ async fn auto_probe_provider_target(
                             .with_error(err.to_string()),
                     )
                     .await;
-                update_usage_exhausted(lb_states, state, cfg, service_name, &upstreams, false)
-                    .await;
+                update_usage_exhausted(
+                    lb_states,
+                    state,
+                    cfg,
+                    service_name,
+                    &upstreams,
+                    false,
+                    None,
+                )
+                .await;
                 warn!(
                     "OpenAI organization costs poll failed for {}[{}]: {}",
                     target.upstream.station_name, target.upstream.index, err
@@ -3829,9 +3917,20 @@ async fn auto_probe_provider_target(
 
     let first_provider = auto_usage_provider(target, first_auto_probe_kind(target));
     let provider_id = first_provider.id.clone();
-    if let Some(suppression) =
-        usage_provider_target_suppression_active(&provider_id, target, Instant::now())
+    let snapshot_decision = existing_usage_provider_target_suppression_decision(
+        state,
+        cfg,
+        service_name,
+        &provider_id,
+        target,
+        fetched_at_ms,
+    )
+    .await;
+    let now = Instant::now();
+    if let Some(suppression) = active_usage_provider_target_suppression(&provider_id, target, now)
+        && !force_can_bypass_active_suppression(force, &suppression, snapshot_decision.as_ref())
     {
+        let ttl = usage_provider_target_suppression_remaining_ttl(&suppression, now);
         update_usage_exhausted(
             lb_states,
             state,
@@ -3839,6 +3938,7 @@ async fn auto_probe_provider_target(
             service_name,
             &upstreams,
             suppression.routing_exhausted,
+            ttl,
         )
         .await;
         warn!(
@@ -3850,16 +3950,7 @@ async fn auto_probe_provider_target(
         );
         return UsageProviderRefreshOutcome::Failed;
     }
-    if let Some(decision) = existing_usage_provider_target_suppression_decision(
-        state,
-        cfg,
-        service_name,
-        &provider_id,
-        target,
-        fetched_at_ms,
-    )
-    .await
-    {
+    if let Some(decision) = snapshot_decision {
         remember_usage_provider_target_suppression(
             &provider_id,
             target,
@@ -3875,6 +3966,7 @@ async fn auto_probe_provider_target(
             service_name,
             &upstreams,
             decision.routing_exhausted,
+            Some(decision.ttl),
         )
         .await;
         warn!(
@@ -3897,11 +3989,11 @@ async fn auto_probe_provider_target(
                 .with_error("no usable token; checked upstream auth"),
             )
             .await;
-        update_usage_exhausted(lb_states, state, cfg, service_name, &upstreams, false).await;
+        update_usage_exhausted(lb_states, state, cfg, service_name, &upstreams, false, None).await;
         return UsageProviderRefreshOutcome::MissingToken;
     };
 
-    let probe_order = auto_probe_kind_order(&provider_id, target);
+    let probe_order = auto_probe_kind_order(&provider_id, target, force);
     if probe_order.is_empty() {
         let error = "all balance probe kinds are temporarily suppressed";
         warn!(
@@ -3920,7 +4012,7 @@ async fn auto_probe_provider_target(
                 .with_error(error),
             )
             .await;
-        update_usage_exhausted(lb_states, state, cfg, service_name, &upstreams, false).await;
+        update_usage_exhausted(lb_states, state, cfg, service_name, &upstreams, false, None).await;
         return UsageProviderRefreshOutcome::Failed;
     }
 
@@ -3966,6 +4058,7 @@ async fn auto_probe_provider_target(
                         service_name,
                         &upstreams,
                         exhausted_for_lb,
+                        suppression_decision.as_ref().map(|decision| decision.ttl),
                     )
                     .await;
                     state
@@ -4029,6 +4122,7 @@ async fn auto_probe_provider_target(
             service_name,
             &upstreams,
             terminal_failure,
+            terminal_failure.then_some(USAGE_PROVIDER_TERMINAL_FAILURE_TTL),
         )
         .await;
     }
@@ -4041,14 +4135,18 @@ pub async fn refresh_balances_for_service(
     lb_states: Arc<Mutex<HashMap<String, LbState>>>,
     state: Arc<ProxyState>,
     service_name: &str,
-    station_name_filter: Option<&str>,
-    provider_id_filter: Option<&str>,
+    options: UsageProviderRefreshOptions<'_>,
 ) -> UsageProviderRefreshSummary {
     // Tests should be hermetic and must not depend on real user `usage_providers.json`.
     if cfg!(test) {
         return UsageProviderRefreshSummary::default();
     }
 
+    let UsageProviderRefreshOptions {
+        station_name_filter,
+        provider_id_filter,
+        force,
+    } = options;
     let station_name_filter = station_name_filter
         .map(str::trim)
         .filter(|value| !value.is_empty());
@@ -4086,6 +4184,7 @@ pub async fn refresh_balances_for_service(
                 provider,
                 target,
                 interval_secs,
+                force,
             });
         }
     }
@@ -4124,7 +4223,7 @@ pub async fn refresh_balances_for_service(
 
         summary.attempted += 1;
         summary.auto_attempted += 1;
-        auto_jobs.push(AutoRefreshJob { target });
+        auto_jobs.push(AutoRefreshJob { target, force });
     }
 
     if !auto_jobs.is_empty() {
@@ -4271,6 +4370,7 @@ async fn poll_for_codex_target(
             provider,
             target: current_target.clone(),
             interval_secs,
+            force: false,
         });
     }
 
@@ -4322,6 +4422,7 @@ async fn poll_for_codex_target(
         &lb_states,
         &state,
         service_name,
+        false,
     )
     .await;
     RequestBalancePollOutcome::Attempted
@@ -4700,12 +4801,11 @@ mod tests {
             cfg.ui.usage_forecast.reset_time.as_str(),
         )
         .expect("default reset config is valid");
-        let grace_ms = duration_millis_u64(USAGE_PROVIDER_DAILY_RESET_SUPPRESSION_GRACE);
-        let suppress_until_ms = reset_at_ms + grace_ms;
+        let suppress_until_ms = reset_at_ms;
 
         let mut snapshot = ProviderBalanceSnapshot {
             fetched_at_ms,
-            stale_after_ms: Some(fetched_at_ms + 60_000),
+            stale_after_ms: Some(suppress_until_ms + 60_000),
             status: BalanceSnapshotStatus::Exhausted,
             exhausted: Some(true),
             exhaustion_affects_routing: false,
@@ -4720,14 +4820,14 @@ mod tests {
             &cfg,
             suppress_until_ms - 1,
         )
-        .expect("daily exhaustion should suppress until reset grace expires");
+        .expect("daily exhaustion should suppress until configured reset");
         assert_eq!(decision.ttl, Duration::from_millis(1));
         assert!(decision.routing_exhausted);
 
         assert!(
             usage_provider_suppression_decision_from_snapshot(&snapshot, &cfg, suppress_until_ms)
                 .is_none(),
-            "a stale daily exhaustion snapshot must not suppress refresh after the reset boundary"
+            "a fresh-looking daily exhaustion snapshot must not suppress refresh after reset"
         );
     }
 
@@ -5120,7 +5220,7 @@ mod tests {
 
         remember_auto_probe_kind_success(provider_id, &target, ProviderKind::NewApiUserSelf);
 
-        let order = auto_probe_kind_order(provider_id, &target);
+        let order = auto_probe_kind_order(provider_id, &target, false);
 
         assert_eq!(order.first(), Some(&ProviderKind::NewApiUserSelf));
         assert_eq!(
@@ -5142,7 +5242,7 @@ mod tests {
 
         remember_auto_probe_kind_failure(provider_id, &target, ProviderKind::Sub2ApiUsage, now);
 
-        let order = auto_probe_kind_order(provider_id, &target);
+        let order = auto_probe_kind_order(provider_id, &target, false);
 
         assert!(!order.contains(&ProviderKind::Sub2ApiUsage));
         assert!(order.contains(&ProviderKind::NewApiTokenUsage));
@@ -5160,7 +5260,7 @@ mod tests {
             );
         }
 
-        let order = auto_probe_kind_order(provider_id, &target);
+        let order = auto_probe_kind_order(provider_id, &target, false);
         assert!(order.contains(&ProviderKind::Sub2ApiUsage));
         clear_auto_probe_kind_state(provider_id);
     }
@@ -5179,7 +5279,11 @@ mod tests {
             remember_auto_probe_kind_failure(provider_id, &target, kind, now);
         }
 
-        assert!(auto_probe_kind_order(provider_id, &target).is_empty());
+        assert!(auto_probe_kind_order(provider_id, &target, false).is_empty());
+        assert!(
+            !auto_probe_kind_order(provider_id, &target, true).is_empty(),
+            "force refresh should bypass temporary probe-kind failures"
+        );
         clear_auto_probe_kind_state(provider_id);
     }
 
@@ -5200,9 +5304,9 @@ mod tests {
             remember_auto_probe_kind_failure(provider_id, &routing_target, kind, now);
         }
 
-        assert!(auto_probe_kind_order(provider_id, &routing_target).is_empty());
+        assert!(auto_probe_kind_order(provider_id, &routing_target, false).is_empty());
         assert!(
-            !auto_probe_kind_order(provider_id, &catalog_target).is_empty(),
+            !auto_probe_kind_order(provider_id, &catalog_target, false).is_empty(),
             "a routing target's temporary failures must not hide catalog balance probes for the same provider"
         );
         clear_auto_probe_kind_state(provider_id);
@@ -5228,9 +5332,16 @@ mod tests {
             remember_auto_probe_kind_failure(provider_id, &target, kind, now);
         }
 
-        let outcome =
-            auto_probe_provider_target(&Client::new(), &target, &cfg, &lb_states, &state, "codex")
-                .await;
+        let outcome = auto_probe_provider_target(
+            &Client::new(),
+            &target,
+            &cfg,
+            &lb_states,
+            &state,
+            "codex",
+            false,
+        )
+        .await;
 
         assert_eq!(outcome, UsageProviderRefreshOutcome::Failed);
         let view = state.get_provider_balance_view("codex").await;
@@ -5287,9 +5398,16 @@ mod tests {
         let state = ProxyState::new();
         let target = usage_provider_target(&base_url, provider_id);
 
-        let outcome =
-            auto_probe_provider_target(&Client::new(), &target, &cfg, &lb_states, &state, "codex")
-                .await;
+        let outcome = auto_probe_provider_target(
+            &Client::new(),
+            &target,
+            &cfg,
+            &lb_states,
+            &state,
+            "codex",
+            false,
+        )
+        .await;
 
         assert_eq!(outcome, UsageProviderRefreshOutcome::Failed);
         assert!(request_count.load(Ordering::SeqCst) > 0);
@@ -5321,22 +5439,49 @@ mod tests {
         );
 
         let requests_after_first_probe = request_count.load(Ordering::SeqCst);
-        let suppressed_outcome =
-            auto_probe_provider_target(&Client::new(), &target, &cfg, &lb_states, &state, "codex")
-                .await;
+        let suppressed_outcome = auto_probe_provider_target(
+            &Client::new(),
+            &target,
+            &cfg,
+            &lb_states,
+            &state,
+            "codex",
+            false,
+        )
+        .await;
 
         assert_eq!(suppressed_outcome, UsageProviderRefreshOutcome::Failed);
         assert_eq!(
             request_count.load(Ordering::SeqCst),
             requests_after_first_probe
         );
-        let guard = lb_states.lock().expect("lb states");
-        assert!(
-            guard
-                .get("routing")
-                .and_then(|entry| entry.usage_exhausted.first())
-                .copied()
-                .unwrap_or(false)
+        {
+            let guard = lb_states.lock().expect("lb states");
+            assert!(
+                guard
+                    .get("routing")
+                    .and_then(|entry| entry.usage_exhausted.first())
+                    .copied()
+                    .unwrap_or(false)
+            );
+        }
+
+        let forced_outcome = auto_probe_provider_target(
+            &Client::new(),
+            &target,
+            &cfg,
+            &lb_states,
+            &state,
+            "codex",
+            true,
+        )
+        .await;
+
+        assert_eq!(forced_outcome, UsageProviderRefreshOutcome::Failed);
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            requests_after_first_probe,
+            "force refresh must not bypass terminal auth/balance suppression"
         );
         clear_auto_probe_kind_state(provider_id);
         handle.abort();
@@ -5376,9 +5521,16 @@ mod tests {
         let state = ProxyState::new();
         let target = usage_provider_target(&base_url, provider_id);
 
-        let outcome =
-            auto_probe_provider_target(&Client::new(), &target, &cfg, &lb_states, &state, "codex")
-                .await;
+        let outcome = auto_probe_provider_target(
+            &Client::new(),
+            &target,
+            &cfg,
+            &lb_states,
+            &state,
+            "codex",
+            false,
+        )
+        .await;
 
         assert_eq!(outcome, UsageProviderRefreshOutcome::Refreshed);
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
@@ -5405,19 +5557,129 @@ mod tests {
         assert_eq!(snapshot.quota_period.as_deref(), Some("daily"));
         assert!(snapshot.routing_ignored_exhaustion());
 
-        let suppressed_outcome =
-            auto_probe_provider_target(&Client::new(), &target, &cfg, &lb_states, &state, "codex")
-                .await;
+        let suppressed_outcome = auto_probe_provider_target(
+            &Client::new(),
+            &target,
+            &cfg,
+            &lb_states,
+            &state,
+            "codex",
+            false,
+        )
+        .await;
 
         assert_eq!(suppressed_outcome, UsageProviderRefreshOutcome::Failed);
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        {
+            let guard = lb_states.lock().expect("lb states");
+            assert!(
+                guard
+                    .get("routing")
+                    .and_then(|entry| entry.usage_exhausted.first())
+                    .copied()
+                    .unwrap_or(false)
+            );
+        }
+
+        let forced_outcome = auto_probe_provider_target(
+            &Client::new(),
+            &target,
+            &cfg,
+            &lb_states,
+            &state,
+            "codex",
+            true,
+        )
+        .await;
+
+        assert_eq!(forced_outcome, UsageProviderRefreshOutcome::Failed);
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            1,
+            "force refresh must not re-query a snapshot that still proves today's package is exhausted"
+        );
+        clear_auto_probe_kind_state(provider_id);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn force_auto_probe_refreshes_orphaned_active_daily_suppression() {
+        let provider_id = "input-orphaned-daily-suppression";
+        clear_auto_probe_kind_state(provider_id);
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let counter = request_count.clone();
+        let app = axum::Router::new().fallback(get(move || {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                axum::Json(serde_json::json!({
+                    "isValid": true,
+                    "mode": "unrestricted",
+                    "planName": "CodeX Lite",
+                    "remaining": 12.5,
+                    "subscription": {
+                        "daily_usage_usd": 0,
+                        "daily_limit_usd": 100,
+                        "weekly_usage_usd": 0,
+                        "weekly_limit_usd": 0,
+                        "monthly_usage_usd": 0,
+                        "monthly_limit_usd": 0
+                    }
+                }))
+            }
+        }));
+        let (addr, handle) = spawn_axum_server(app).await;
+        let base_url = format!("http://{addr}/v1");
+        let mut upstream = endpoint_upstream_config(&base_url, provider_id, "default");
+        upstream.auth.auth_token = Some("model-key".to_string());
+        let cfg = proxy_config(vec![service_config("routing", vec![upstream])]);
+        let lb_states = Arc::new(Mutex::new(HashMap::new()));
+        let state = ProxyState::new();
+        let target = usage_provider_target(&base_url, provider_id);
+
+        remember_usage_provider_target_suppression(
+            provider_id,
+            &target,
+            Duration::from_secs(60),
+            "daily package quota exhausted for current period",
+            true,
+            Instant::now(),
+        );
+
+        let suppressed_outcome = auto_probe_provider_target(
+            &Client::new(),
+            &target,
+            &cfg,
+            &lb_states,
+            &state,
+            "codex",
+            false,
+        )
+        .await;
+
+        assert_eq!(suppressed_outcome, UsageProviderRefreshOutcome::Failed);
+        assert_eq!(request_count.load(Ordering::SeqCst), 0);
+
+        let forced_outcome = auto_probe_provider_target(
+            &Client::new(),
+            &target,
+            &cfg,
+            &lb_states,
+            &state,
+            "codex",
+            true,
+        )
+        .await;
+
+        assert_eq!(forced_outcome, UsageProviderRefreshOutcome::Refreshed);
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
         let guard = lb_states.lock().expect("lb states");
         assert!(
-            guard
+            !guard
                 .get("routing")
                 .and_then(|entry| entry.usage_exhausted.first())
                 .copied()
-                .unwrap_or(false)
+                .unwrap_or(true)
         );
         clear_auto_probe_kind_state(provider_id);
         handle.abort();
@@ -6095,7 +6357,7 @@ mod tests {
         };
         let upstreams = vec![target.upstream.clone()];
         let state = ProxyState::new();
-        update_usage_exhausted(&lb_states, &state, &cfg, "codex", &upstreams, true).await;
+        update_usage_exhausted(&lb_states, &state, &cfg, "codex", &upstreams, true, None).await;
         {
             let guard = lb_states.lock().expect("lb states");
             assert!(
@@ -6116,6 +6378,7 @@ mod tests {
             state: &state,
             service_name: "codex",
             interval_secs: 60,
+            force: false,
         })
         .await;
 
@@ -6143,13 +6406,23 @@ mod tests {
         let upstreams = vec![endpoint_upstream()];
         let state = ProxyState::new();
 
-        update_usage_exhausted(&lb_states, &state, &cfg, "codex", &upstreams, true).await;
+        update_usage_exhausted(
+            &lb_states,
+            &state,
+            &cfg,
+            "codex",
+            &upstreams,
+            true,
+            Some(Duration::from_secs(30)),
+        )
+        .await;
         let actions = state.list_policy_actions("codex").await;
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].source_signal.kind, ProviderSignalKind::Balance);
+        assert_eq!(actions[0].source_signal.reset_after_secs, Some(30));
         assert_eq!(actions[0].reason, "balance_exhausted");
 
-        update_usage_exhausted(&lb_states, &state, &cfg, "codex", &upstreams, false).await;
+        update_usage_exhausted(&lb_states, &state, &cfg, "codex", &upstreams, false, None).await;
         assert!(state.list_policy_actions("codex").await.is_empty());
     }
 

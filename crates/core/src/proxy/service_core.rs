@@ -166,8 +166,10 @@ impl ProxyService {
 
         let proxy = self.clone();
         tokio::spawn(async move {
-            match super::providers_api::refresh_provider_balances_for_proxy(&proxy, None, None)
-                .await
+            match super::providers_api::refresh_provider_balances_for_proxy(
+                &proxy, None, None, false,
+            )
+            .await
             {
                 Ok(summary) => {
                     tracing::info!(
@@ -194,11 +196,13 @@ impl ProxyService {
         &self,
         station_name_filter: Option<&str>,
         provider_id_filter: Option<&str>,
+        force: bool,
     ) -> Result<ProviderBalanceRefreshResponse, ProxyControlError> {
         let refresh = super::providers_api::refresh_provider_balances_for_proxy(
             self,
             station_name_filter,
             provider_id_filter,
+            force,
         )
         .await
         .map_err(ProxyControlError::from)?;

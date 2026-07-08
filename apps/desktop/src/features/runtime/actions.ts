@@ -97,7 +97,9 @@ export function useRuntimeActions() {
   );
   const probe = useMutation(mutationOptions<{ stationName: string }>(probeStation));
   const refreshBalances = useMutation(
-    mutationOptions<{ stationName?: string; providerId?: string }>(refreshProviderBalances),
+    mutationOptions<{ stationName?: string; providerId?: string; force?: boolean }>(
+      refreshProviderBalances,
+    ),
   );
   const setProviderOverride = useMutation(
     mutationOptions<{

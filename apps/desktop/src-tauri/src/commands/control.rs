@@ -135,6 +135,8 @@ pub struct ProviderBalanceRefreshPayload {
     pub station_name: Option<String>,
     #[serde(default)]
     pub provider_id: Option<String>,
+    #[serde(default)]
+    pub force: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -767,6 +769,9 @@ fn provider_balance_refresh_path(payload: ProviderBalanceRefreshPayload) -> Stri
         if let Some(provider_id) = clean_optional(payload.provider_id) {
             query.append_pair("provider_id", provider_id.as_str());
         }
+        if payload.force.unwrap_or(true) {
+            query.append_pair("force", "true");
+        }
     }
     match url.query() {
         Some(query) => format!("{}?{query}", url.path()),
@@ -1001,11 +1006,12 @@ mod tests {
         let path = provider_balance_refresh_path(ProviderBalanceRefreshPayload {
             station_name: Some("route alpha".to_string()),
             provider_id: Some("provider/one".to_string()),
+            force: None,
         });
 
         assert_eq!(
             path,
-            "/__codex_helper/api/v1/providers/balances/refresh?station_name=route+alpha&provider_id=provider%2Fone"
+            "/__codex_helper/api/v1/providers/balances/refresh?station_name=route+alpha&provider_id=provider%2Fone&force=true"
         );
     }
 

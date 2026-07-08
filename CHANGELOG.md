@@ -13,6 +13,11 @@ All notable changes to this project will be documented in this file.
 - 新增 request chain 诊断入口。可以用 `codex-helper usage chain --trace-id ... --json` 或本地 admin API `GET /__codex_helper/api/v1/request-ledger/chain?...` 查看单次请求的 route attempts、provider signals、policy actions 和时间线；桌面端 `Usage` 表格也支持按行展开 Chain。导出结果按 allowlist 脱敏，不包含 client address、cwd、upstream base URL 或原始上游细节。
 - 桌面端 Providers 现在会显示正在影响路由的 provider control badges，例如 cooldown、runtime override 和 helper 自动创建的控制动作，并在页面顶部汇总当前 control 总数。
 
+#### 修复
+
+- 修复日套餐耗尽后的跨天余额恢复：每日重置时间到达后不再继续沿用昨天的余额抑制；手动刷新可以穿透跨天遗留的临时抑制，但仍会避免重复请求今天已经确认耗尽的套餐。
+- 余额耗尽产生的自动路由控制现在按实际抑制窗口过期，不再固定保留 24 小时，避免次日仍显示或沿用旧的“不降级/耗尽”状态。
+
 ### English summary
 
 #### Added
@@ -20,6 +25,11 @@ All notable changes to this project will be documented in this file.
 - The desktop `Usage` page now uses the same local-day usage model as the TUI: today's requests, tokens, estimated cost, 24h activity, provider / model / project rankings, coverage warnings, and the global retry-gate count instead of deriving totals from only recent rows.
 - Added request-chain diagnostics. Use `codex-helper usage chain --trace-id ... --json` or `GET /__codex_helper/api/v1/request-ledger/chain?...` to inspect route attempts, provider signals, policy actions, and the timeline for a request; the desktop `Usage` table can expand Chain details per row. Exports are allowlisted and omit client addresses, cwd, upstream base URLs, and raw upstream internals.
 - Desktop Providers now shows route-affecting provider control badges such as cooldowns, runtime overrides, and helper-owned automatic actions, with a page-level active-control count.
+
+#### Fixed
+
+- Fixed daily-package balance recovery after reset. Once the configured daily reset time passes, yesterday's exhausted-balance suppression no longer blocks polling; manual refresh can clear orphaned cross-day suppression while still avoiding repeated calls for packages already confirmed exhausted today.
+- Balance-exhausted automatic route controls now expire with the actual suppression window instead of a fixed 24 hours, preventing stale exhausted/non-routing state from carrying into the next day.
 
 ## [0.20.2] - 2026-07-08
 

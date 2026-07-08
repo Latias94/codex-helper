@@ -197,7 +197,9 @@ export async function probeStation(payload: { stationName: string }) {
   return invoke<DesktopActionResult>("probe_station", { payload });
 }
 
-export async function refreshProviderBalances(payload: { stationName?: string; providerId?: string } = {}) {
+export async function refreshProviderBalances(
+  payload: { stationName?: string; providerId?: string; force?: boolean } = {},
+) {
   return invoke<DesktopActionResult>("refresh_provider_balances", { payload });
 }
 

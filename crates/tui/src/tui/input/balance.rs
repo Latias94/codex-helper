@@ -96,11 +96,12 @@ pub(in crate::tui) fn request_provider_balance_refresh(
     });
     ui.last_balance_refresh_error = None;
     ui.last_balance_refresh_summary = None;
+    let force = mode == BalanceRefreshMode::Force;
     let proxy = proxy.clone();
     let balance_refresh_tx = balance_refresh_tx.clone();
     tokio::spawn(async move {
         let outcome = proxy
-            .refresh_provider_balances(None, None)
+            .refresh_provider_balances(None, None, force)
             .await
             .map(|response| response.refresh)
             .map_err(|err| err.to_string());
