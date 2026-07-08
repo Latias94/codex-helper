@@ -118,11 +118,11 @@ Outside this product's identity:
 
 ### Assumptions
 
-- The user pre-authorized full-scope planning and goal execution in this prompt, so the solo scoping confirmation is skipped; these assumptions are intentionally visible for review.
+- The plan is intentionally split for full-scope execution, but each unit should still land as a reviewable slice with its own tests and commit.
 - The existing TUI daily usage work from `docs/plans/2026-07-07-002-refactor-tui-usage-day-panel-plan.md` is treated as implemented baseline, not new active scope.
 - The first implementation should not introduce SQLite because current core rollups and request ledger already support the daily and recent-window surfaces this plan needs.
 - Provider reset means targeted clearing of one explicit state kind: runtime override, owned automatic policy cooldown, or balance-refresh suppression. A broad "reset everything" action is outside this plan.
-- Type generation may use `specta`, `ts-rs`, or a repo-local schema generator after implementation discovery, but the contract gate must be deterministic and CI-enforced.
+- Type generation may use `specta`, `ts-rs`, or a repo-local schema generator after implementation discovery, but the contract gate must be deterministic, introduced before broad DTO expansion, and CI-enforced.
 
 ### Key Technical Decisions
 
@@ -130,10 +130,11 @@ Outside this product's identity:
 - KTD2. JSONL request ledger remains canonical durable evidence for this plan. The plan adds typed projections and bounded exports, not a second durable ledger.
 - KTD3. Use `snapshot.usage_day` immediately and add a smaller usage analytics endpoint only where desktop/CLI parity or payload size requires it. This keeps implementation grounded in the already-working daily rollup.
 - KTD4. Provider control timeline is a shared read model. TUI, desktop, CLI JSON, and export should consume the same route attempt/signal/action interpretation instead of each rebuilding it from strings.
-- KTD5. Stable codes are additive. Keep `reason`, `decision`, and `error_class` for log compatibility, but add `code` fields that tests, CI, desktop, and agents can rely on.
+- KTD5. Stable codes are additive and precede new timeline/export contracts. Keep `reason`, `decision`, and `error_class` for log compatibility, but add `code` fields that tests, CI, desktop, and agents can rely on.
 - KTD6. Tauri is a local host bridge, not the semantic contract. Admin API DTOs and capability flags define what exists; Tauri commands should fetch typed data and preserve section-level load errors instead of defaulting failures to empty arrays.
 - KTD7. Live smoke remains acknowledgement-gated. Capability diagnostics can be read-only and agent-safe, but any action that sends a real upstream request must require explicit acknowledgement and return auditable evidence.
 - KTD8. Release automation protects current product policy. CLI cargo-dist release remains public; desktop packaging remains internal/source-tree until signing, artifact hosting, updater, and rollback gates are explicitly enabled.
+- KTD9. Sanitized export is allowlist-based. Export DTOs must be purpose-built projections, never raw `FinishedRequest`, raw JSONL rows, raw HTTP debug payloads, or denylist-filtered blobs.
 
 ### High-Level Technical Design
 
@@ -234,13 +235,25 @@ flowchart TB
 
 ## Implementation Units
 
+### U0. Establish early desktop contract guardrails
+
+- **Goal:** Decide and install the lightweight Rust-to-TypeScript/schema drift guard before expanding desktop DTOs.
+- **Requirements:** R13, R14, R15.
+- **Dependencies:** None.
+- **Files:** `apps/desktop/src-tauri/Cargo.toml`, `apps/desktop/src-tauri/src/commands/admin_api.rs`, `apps/desktop/src/lib/api/admin-types.ts`, `apps/desktop/src/generated/`, `apps/desktop/scripts/`, `apps/desktop/package.json`, `.github/workflows/ci.yml`.
+- **Approach:** Choose `specta`, `ts-rs`, or a repo-local schema snapshot after a short implementation spike. The first contract gate may cover only `AdminReadModel` and the daily usage DTOs, but it must be deterministic and wired into local/CI checks before U3/U4/U5 add more contract surface.
+- **Execution note:** If generation is too invasive for the first slice, land a schema snapshot and drift check as the guardrail, then migrate to generated bindings later without losing CI enforcement.
+- **Patterns to follow:** Borrow the small deterministic check shape from `repo-ref/aio-coding-hub/scripts/check-generated-bindings.mjs`, not the full AIO command registry.
+- **Test scenarios:** Running the contract check twice is stable; changing the Rust read-model shape without updating the contract fails; hand-written view models remain separate from generated/checked API DTOs.
+- **Verification:** A local contract check command exists and is cheap enough to run in CI before broader desktop work.
+
 ### U1. Promote daily usage into the desktop contract
 
 - **Goal:** Make desktop read the existing daily usage model through typed DTOs with section-level load status.
 - **Requirements:** R1, R2, R3, R5, R13.
-- **Dependencies:** None.
+- **Dependencies:** U0 may be skeletal but must establish the chosen contract check path before U1 DTO expansion is considered complete.
 - **Files:** `apps/desktop/src-tauri/src/commands/admin_api.rs`, `apps/desktop/src/lib/tauri/commands.ts`, `apps/desktop/src/lib/api/admin-read-model.ts`, `apps/desktop/src/lib/api/admin-types.ts`, `apps/desktop/src/lib/api/mappers.ts`, `apps/desktop/src/lib/api/mappers.test.ts`, `apps/desktop/src/app/App.test.tsx`.
-- **Approach:** Extend `AdminReadModel` to fetch typed snapshot or a smaller usage analytics endpoint that includes `UsageDayView`, while preserving old-daemon tolerance. Replace silent `unwrap_or_default()` section failures with explicit section status so empty data and fetch failures are distinguishable.
+- **Approach:** Extend `AdminReadModel` to fetch `snapshot.usage_day` first, adding a smaller usage analytics endpoint only if payload size or CLI parity proves necessary. Preserve old-daemon tolerance. Replace silent `unwrap_or_default()` section failures with explicit section status so empty data and fetch failures are distinguishable.
 - **Execution note:** Start with mapper/fixture tests proving recent request rows no longer define today totals.
 - **Patterns to follow:** Use `DashboardSnapshot` assembly from `crates/core/src/dashboard_core/snapshot.rs` and desktop mapper tests in `apps/desktop/src/lib/api/mappers.test.ts`.
 - **Test scenarios:** Given `usage_day.summary.requests_total=12` and no recent rows, mapper returns 12 day requests; given old payload missing `usage_day`, mapper degrades to empty daily analytics with a capability warning; given providers fetch fails but usage succeeds, Usage page still renders daily data and a section warning; given replay partial coverage, mapper preserves `partial_reason`.
@@ -258,52 +271,55 @@ flowchart TB
 - **Test scenarios:** Usage page shows daily totals from `usage_day`; coverage partial banner appears when `day_may_be_partial` is true; hourly chart handles all-zero rows; provider/model/project rows sort by cost/tokens according to mapper rules; recent request table remains available as drilldown; empty state distinguishes "no usage today" from "admin API failed".
 - **Verification:** Desktop tests and build show the Usage page renders daily analytics without relying on request-ledger summary as the source of truth.
 
-### U3. Add shared request-chain and control timeline read models
+### U3. Add stable-code foundations for request/control contracts
+
+- **Goal:** Add the stable code taxonomy and additive DTO fields that request-chain, timeline, provider actions, desktop errors, and CLI/API tests can share.
+- **Requirements:** R6, R11, R12, R14.
+- **Dependencies:** U1.
+- **Files:** `crates/core/src/routing_explain.rs`, `crates/core/src/logging.rs`, `crates/core/src/provider_signals/model.rs`, `crates/core/src/policy_actions/model.rs`, `crates/core/src/proxy/runtime_admin_api.rs`, `apps/desktop/src-tauri/src/error.rs`, `apps/desktop/src-tauri/src/commands/admin_api.rs`, `apps/desktop/src/lib/tauri/commands.ts`, `apps/desktop/src/lib/api/admin-types.ts`, `apps/desktop/src/lib/api/mappers.ts`, `apps/desktop/src/lib/api/mappers.test.ts`, `crates/tui/src/tui/i18n.rs`, `crates/tui/src/tui/view/pages/requests.rs`.
+- **Approach:** Define additive `code` fields for existing decision/error/control categories, map current strings into those codes, and convert desktop command errors into structured envelopes containing code, message, retryability, and optional hint/details.
+- **Execution note:** Characterize current string-only behavior first so compatibility fields are not accidentally removed. Unknown legacy strings must round-trip with an `unknown` or `legacy` code.
+- **Patterns to follow:** Follow `RoutingExplainSkipReason::code()` style and preserve serde defaults for older logs.
+- **Test scenarios:** Known route skip reasons produce stable codes; unknown legacy reason maps to a stable legacy code without data loss; admin connection refused produces a desktop code instead of only a message; provider not found and live-smoke missing acknowledgement return distinct codes; UI tests assert code-derived categories rather than prose.
+- **Verification:** Core serialization tests, desktop command tests, and mapper tests prove stable codes are present and backward compatible.
+
+### U4. Add shared request-chain and control timeline read models
 
 - **Goal:** Expose a sanitized request-chain/timeline model that desktop, CLI JSON, export, and TUI can share.
 - **Requirements:** R6, R8, R9, R13, R17.
-- **Dependencies:** U1.
+- **Dependencies:** U3.
 - **Files:** `crates/core/src/logging.rs`, `crates/core/src/logging/control_trace.rs`, `crates/core/src/request_ledger.rs`, `crates/core/src/proxy/runtime_admin_api.rs`, `crates/core/src/proxy/control_plane_manifest.rs`, `src/commands/usage.rs`, `apps/desktop/src/lib/api/admin-types.ts`, `apps/desktop/src/lib/api/mappers.ts`, `apps/desktop/src/lib/api/mappers.test.ts`, `apps/desktop/src/features/usage/UsageTable.tsx`, `crates/tui/src/tui/view/pages/requests.rs`.
-- **Approach:** Build a timeline DTO from `FinishedRequest.retry.route_attempts_or_derived`, top-level provider signals/actions, and matching control trace entries when available. Add sanitized export by trace/request/session identity with stable ordering and redaction.
+- **Approach:** Build a timeline DTO from `FinishedRequest.retry.route_attempts_or_derived`, top-level provider signals/actions, and matching control trace entries when available. Add sanitized export by trace/request/session identity with stable ordering, redaction, hard caps, truncation markers, and capability/link discovery.
 - **Execution note:** Add characterization coverage around current route attempt rendering/export before changing DTO shape.
 - **Patterns to follow:** Use `request_route_attempt_line` in `crates/tui/src/tui/view/pages/requests.rs` as the current evidence inventory and keep `request_ledger.rs` legacy readers tolerant.
-- **Test scenarios:** Single successful request exports one final attempt; 429 with reset exports signal/action/cooldown evidence; route-unavailable exports skipped candidates and final failure; old ledger with only upstream chain derives attempts; export omits auth headers, raw prompt, raw body, and provider secrets; session export orders multiple requests by time.
-- **Verification:** Core request-ledger/runtime-admin tests and desktop mapper tests prove request-chain export is complete, ordered, and redacted.
+- **Security model:** Export DTOs are explicit allowlists. They must exclude auth headers, raw prompts, raw response bodies, provider secrets, raw HTTP debug bodies/headers, split debug references, cwd, client address, raw URL query strings, and unstructured route raw blobs unless a later human-approved debug mode intentionally opens them.
+- **API/CLI parity:** Add operator summary link and surface capability names for request-chain diagnostics/export, plus a CLI JSON command for the same sanitized model. Missing capability must produce a stable unsupported-code response instead of an empty successful export.
+- **Test scenarios:** Single successful request exports one final attempt; 429 with reset exports signal/action/cooldown evidence and stable codes; route-unavailable exports skipped candidates and final failure; old ledger with only upstream chain derives attempts; export omits auth headers, raw prompt, raw body, HTTP debug payloads, cwd, client address, and provider secrets; session export orders multiple requests by time; oversized session export returns a bounded result with truncation metadata; missing capability disables UI export and returns a stable unsupported code.
+- **Verification:** Core request-ledger/runtime-admin tests and desktop mapper tests prove request-chain export is complete, ordered, bounded, capability-aware, and redacted.
 
-### U4. Add provider control badges and targeted actions
+### U5. Add provider control badges and targeted actions
 
 - **Goal:** Make provider control state visible and actionable without conflating signals, cooldowns, manual overrides, balance exhaustion, and breaker state.
 - **Requirements:** R7, R8, R10, R13.
-- **Dependencies:** U3.
+- **Dependencies:** U4.
 - **Files:** `crates/core/src/policy_actions/model.rs`, `crates/core/src/state/policy_action_store.rs`, `crates/core/src/dashboard_core/operator_summary.rs`, `crates/core/src/dashboard_core/types.rs`, `crates/core/src/proxy/runtime_admin_api.rs`, `crates/core/src/proxy/control_plane_manifest.rs`, `apps/desktop/src/features/providers/ProviderCard.tsx`, `apps/desktop/src/features/providers/ProvidersPage.tsx`, `apps/desktop/src/features/runtime/actions.ts`, `apps/desktop/src/lib/api/mappers.ts`, `apps/desktop/src/lib/api/mappers.test.ts`, `crates/tui/src/tui/view/provider_control.rs`, `crates/tui/src/tui/view/pages/stations.rs`.
 - **Approach:** Add a provider/endpoint control summary with active action counts, top reason, max remaining cooldown, source kind, and endpoint identity. Add targeted action results for clearing owned cooldowns or runtime overrides while preserving manual state boundaries.
 - **Execution note:** Treat mutation tests as safety-critical because an overly broad reset could alter routing.
 - **Patterns to follow:** Extend existing runtime override and policy action projection patterns; do not add a separate circuit-breaker state machine.
-- **Test scenarios:** Provider with only recorded signal shows evidence but no active-control badge; one endpoint cooldown shows endpoint-specific badge and countdown; manual disable plus automatic cooldown shows both states and clearing owned cooldown preserves manual disable; targeted reset returns typed changed/unchanged counts; old providers without policy actions render normally.
+- **API/CLI parity:** Add explicit Admin API route, operator summary link, surface capability flag, and CLI JSON command for supported targeted actions. Human-only or missing-capability paths must return stable unsupported/acknowledgement codes.
+- **Test scenarios:** Provider with only recorded signal shows evidence but no active-control badge; one endpoint cooldown shows endpoint-specific badge and countdown; manual disable plus automatic cooldown shows both states and clearing owned cooldown preserves manual disable; targeted reset returns typed changed/unchanged counts; old providers without policy actions render normally; old daemon capability absence disables the action instead of showing a false empty state.
 - **Verification:** Core policy/action tests, runtime-admin tests, and desktop provider tests prove badge semantics and targeted action boundaries.
-
-### U5. Introduce stable error and control codes
-
-- **Goal:** Add stable machine-readable codes across route decisions, provider control, admin failures, and desktop command failures while retaining legacy text fields.
-- **Requirements:** R6, R11, R12, R14.
-- **Dependencies:** U3.
-- **Files:** `crates/core/src/routing_explain.rs`, `crates/core/src/logging.rs`, `crates/core/src/provider_signals/model.rs`, `crates/core/src/policy_actions/model.rs`, `crates/core/src/proxy/runtime_admin_api.rs`, `apps/desktop/src-tauri/src/error.rs`, `apps/desktop/src-tauri/src/commands/admin_api.rs`, `apps/desktop/src/lib/tauri/commands.ts`, `apps/desktop/src/lib/api/admin-types.ts`, `apps/desktop/src/lib/api/mappers.ts`, `apps/desktop/src/lib/api/mappers.test.ts`, `crates/tui/src/tui/i18n.rs`, `crates/tui/src/tui/view/pages/requests.rs`.
-- **Approach:** Define additive `code` fields for existing decision/error/control categories, map current strings into those codes, and convert desktop command errors into structured envelopes containing code, message, retryability, and optional hint/details.
-- **Execution note:** Characterize current string-only behavior first so compatibility fields are not accidentally removed.
-- **Patterns to follow:** Follow `RoutingExplainSkipReason::code()` style and preserve serde defaults for older logs.
-- **Test scenarios:** Known route skip reasons produce stable codes; unknown legacy reason maps to an `unknown` or `legacy` code without data loss; admin connection refused produces a desktop code instead of only a message; provider not found and live-smoke missing acknowledgement return distinct codes; UI tests assert code-derived categories rather than prose.
-- **Verification:** Core serialization tests, desktop command tests, and mapper tests prove stable codes are present and backward compatible.
 
 ### U6. Add generated or drift-checked desktop API contracts
 
 - **Goal:** Stop relying on hand-maintained TypeScript DTOs for the desktop contract.
 - **Requirements:** R14, R15, R16.
-- **Dependencies:** U1, U5.
+- **Dependencies:** U0, U3, U4, U5.
 - **Files:** `apps/desktop/src-tauri/Cargo.toml`, `apps/desktop/src-tauri/src/lib.rs`, `apps/desktop/src-tauri/src/commands/mod.rs`, `apps/desktop/src-tauri/src/commands/admin_api.rs`, `apps/desktop/src/lib/api/admin-types.ts`, `apps/desktop/src/lib/tauri/commands.ts`, `apps/desktop/src/generated/`, `apps/desktop/scripts/`, `apps/desktop/package.json`, `.github/workflows/ci.yml`.
-- **Approach:** Introduce a deterministic binding/schema export for Tauri command payloads and desktop-facing Admin read model DTOs. Keep generated files under a dedicated generated directory and keep hand-written view models/mappers separate.
+- **Approach:** Expand the deterministic binding/schema export from U0 to Tauri command payloads, desktop-facing Admin read model DTOs, stable codes, timeline/export DTOs, and provider action results. Keep generated files under a dedicated generated directory and keep hand-written view models/mappers separate.
 - **Execution note:** This is mostly contract/tooling work; prefer generation-drift and build/test verification over broad behavioral tests.
 - **Patterns to follow:** Borrow the contract-gate shape from `repo-ref/aio-coding-hub/scripts/check-generated-bindings.mjs`, but keep the dependency surface smaller than AIO's full command registry if implementation discovery supports it.
-- **Test scenarios:** Running the generator twice is stable; changing a Rust DTO without regenerating fails the contract check; generated TS imports do not replace hand-written UI view models; CI fails if generated contract output drifts; old mock data compiles against the generated contract.
+- **Test scenarios:** Running the generator twice is stable; changing a Rust DTO without regenerating fails the contract check; generated TS imports do not replace hand-written UI view models; CI fails if generated contract output drifts; old mock data compiles against the generated contract; missing capability/link fixtures compile and map to unsupported states rather than empty data.
 - **Verification:** Desktop generation check, Vitest, TypeScript build, and CI workflow changes prove Rust/TS contract drift is caught.
 
 ### U7. Add CI, version, and release-surface checks
@@ -337,12 +353,12 @@ flowchart TB
 | Gate | Applies to | Done signal |
 |---|---|---|
 | Core focused nextest | U3, U4, U5 | Request ledger, routing explain, provider signal, policy action, runtime admin, and export tests pass. |
-| TUI focused nextest | U3, U5 | Request detail and provider-control rendering tests pass with stable code/evidence fixtures. |
-| Desktop Rust nextest | U1, U5, U6 | Tauri command DTO/error tests pass. |
+| TUI focused nextest | U3, U4, U5 | Request detail and provider-control rendering tests pass with stable code/evidence fixtures. |
+| Desktop Rust nextest | U1, U3, U5, U6 | Tauri command DTO/error tests pass. |
 | Desktop Vitest | U1, U2, U3, U4, U5, U6 | Mapper, page, provider badge, and generated-contract tests pass. |
 | Desktop build | U2, U6, U7 | TypeScript and Vite build succeeds with generated contracts. |
 | Workspace Rust quality | All Rust units | `cargo fmt`, clippy, and workspace nextest remain green. |
-| Contract drift | U6, U7 | Generated bindings/schema check reports no uncommitted diff. |
+| Contract drift | U0, U6, U7 | Generated bindings/schema check reports no uncommitted diff. |
 | Version/release checks | U7, U8 | Version sync and release-surface policy checks pass. |
 | Docs review | U8 | README/CHANGELOG/desktop release docs match implemented behavior and do not claim deferred surfaces. |
 
