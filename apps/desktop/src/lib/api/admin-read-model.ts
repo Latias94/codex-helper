@@ -1,9 +1,11 @@
 import type {
   ApiFinishedRequest,
+  ApiAdminReadModelSectionStatus,
   ApiOperatorSummary,
   ApiProviderOption,
   ApiRequestUsageSummaryRow,
   ApiRuntimeStatus,
+  ApiUsageDayView,
 } from "@/lib/api/admin-types";
 import { getAdminReadModel } from "@/lib/tauri/commands";
 
@@ -19,6 +21,8 @@ export type AdminReadModelDto = {
   providers: ApiProviderOption[];
   recentRequests: ApiFinishedRequest[];
   usageSummary: ApiRequestUsageSummaryRow[];
+  usageDay?: ApiUsageDayView;
+  sectionStatuses: ApiAdminReadModelSectionStatus[];
 };
 
 export async function fetchAdminReadModelFromTauri(): Promise<AdminReadModelDto> {
@@ -30,5 +34,7 @@ export async function fetchAdminReadModelFromTauri(): Promise<AdminReadModelDto>
     providers: payload.providers as ApiProviderOption[],
     recentRequests: payload.recentRequests as ApiFinishedRequest[],
     usageSummary: payload.usageSummary as ApiRequestUsageSummaryRow[],
+    usageDay: payload.usageDay as ApiUsageDayView | undefined,
+    sectionStatuses: (payload.sectionStatuses ?? []) as ApiAdminReadModelSectionStatus[],
   };
 }

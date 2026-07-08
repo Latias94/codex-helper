@@ -177,6 +177,43 @@ export type UsageSummaryView = {
   estimatedCost: string;
   averageDuration: string;
   averageFirstToken: string;
+  cacheRate: string;
+  errorRate: string;
+  dayLabel: string;
+};
+
+export type UsageHourView = {
+  hour: number;
+  label: string;
+  requests: number;
+  totalTokens: number;
+  cost: string;
+  height: number;
+};
+
+export type UsageDimensionRowView = {
+  name: string;
+  requests: number;
+  totalTokens: string;
+  cost: string;
+  averageDuration: string;
+  errorRate: string;
+};
+
+export type UsageCoverageView = {
+  source: string;
+  isPartial: boolean;
+  reason?: string;
+  loadedRequests: number;
+  scannedLines: number;
+  truncated: boolean;
+};
+
+export type UsageRetryGateView = {
+  active: number;
+  activeCooldowns: number;
+  maxRemaining: string;
+  reasons: Array<{ reason: string; active: number }>;
 };
 
 export type DashboardData = {
@@ -194,6 +231,14 @@ export type ProvidersData = {
 
 export type UsageData = {
   summary: UsageSummaryView;
+  hourly: UsageHourView[];
+  providerRows: UsageDimensionRowView[];
+  stationRows: UsageDimensionRowView[];
+  modelRows: UsageDimensionRowView[];
+  sessionRows: UsageDimensionRowView[];
+  projectRows: UsageDimensionRowView[];
+  coverage: UsageCoverageView;
+  retryGate: UsageRetryGateView;
   rows: UsageRowView[];
 };
 

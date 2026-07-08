@@ -9,6 +9,7 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview --host 127.0.0.1",
     "test": "vitest run",
+    "check:contracts": "node ./scripts/check-admin-read-model-contract.mjs",
     "prepare:sidecar": "node ./scripts/prepare-sidecar.mjs",
     "tauri:build:assets": "pnpm build && pnpm prepare:sidecar",
     "tauri": "tauri",

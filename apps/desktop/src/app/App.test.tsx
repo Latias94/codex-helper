@@ -69,7 +69,7 @@ describe("desktop app routes", () => {
     expect(screen.getByText(/CODEX_HELPER_ADMIN_TOKEN/)).toBeInTheDocument();
   });
 
-  it("renders an empty usage state when live admin data has no request records", async () => {
+  it("renders an empty usage state when live admin data has no daily usage", async () => {
     window.location.hash = "#/usage";
     mockedInvoke.mockImplementation(async (command) => {
       if (command === "get_app_metadata") {
@@ -87,8 +87,8 @@ describe("desktop app routes", () => {
 
     render(<App />);
 
-    expect(await screen.findByText("实时数据已连接，但当前没有请求历史")).toBeInTheDocument();
-    expect(screen.getByText(/先让 Codex 通过本地代理发起一次请求/)).toBeInTheDocument();
+    expect(await screen.findByText("实时数据已连接，但今天还没有用量")).toBeInTheDocument();
+    expect(screen.getByText(/usage_day 写入后统计和 drilldown 会自动更新/)).toBeInTheDocument();
   });
 
   it("renders live admin data when the Tauri read model command succeeds", async () => {

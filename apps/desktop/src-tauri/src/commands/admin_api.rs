@@ -32,6 +32,34 @@ pub struct AdminReadModel {
     pub providers: Vec<Value>,
     pub recent_requests: Vec<Value>,
     pub usage_summary: Vec<Value>,
+    pub usage_day: Option<Value>,
+    pub section_statuses: Vec<AdminReadModelSectionStatus>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminReadModelSectionStatus {
+    pub section: String,
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
+impl AdminReadModelSectionStatus {
+    fn ok(section: impl Into<String>) -> Self {
+        Self {
+            section: section.into(),
+            ok: true,
+            error: None,
+        }
+    }
+
+    fn error(section: impl Into<String>, error: impl Into<String>) -> Self {
+        Self {
+            section: section.into(),
+            ok: false,
+            error: Some(error.into()),
+        }
+    }
 }
 
 #[tauri::command]
@@ -45,60 +73,111 @@ pub async fn get_admin_read_model() -> Result<AdminReadModel, CommandError> {
         "/__codex_helper/api/v1/operator/summary",
     )
     .await?;
+    let mut section_statuses = vec![AdminReadModelSectionStatus::ok("operatorSummary")];
 
-    let runtime_status = get_json::<RuntimeStatusResponse>(
-        &client,
-        &endpoint.admin_base_url,
-        link_or_default(
-            &operator_summary,
-            "runtime_status",
-            "/__codex_helper/api/v1/runtime/status",
-        ),
-    )
-    .await
-    .ok();
-
-    let providers = get_json::<Vec<Value>>(
-        &client,
-        &endpoint.admin_base_url,
-        link_or_default(
-            &operator_summary,
-            "providers",
-            "/__codex_helper/api/v1/providers",
-        ),
-    )
-    .await
-    .unwrap_or_default();
-
-    let recent_requests = get_json::<Vec<Value>>(
-        &client,
-        &endpoint.admin_base_url,
-        &format!(
-            "{}?limit=40",
+    let runtime_status = record_optional_section(
+        &mut section_statuses,
+        "runtimeStatus",
+        get_json::<RuntimeStatusResponse>(
+            &client,
+            &endpoint.admin_base_url,
             link_or_default(
                 &operator_summary,
-                "request_ledger_recent",
-                "/__codex_helper/api/v1/request-ledger/recent"
-            )
-        ),
-    )
-    .await
-    .unwrap_or_default();
+                "runtime_status",
+                "/__codex_helper/api/v1/runtime/status",
+            ),
+        )
+        .await,
+    );
 
-    let usage_summary = get_json::<Vec<Value>>(
-        &client,
-        &endpoint.admin_base_url,
-        &format!(
-            "{}?by=provider&limit=30",
+    let providers = record_optional_section(
+        &mut section_statuses,
+        "providers",
+        get_json::<Vec<Value>>(
+            &client,
+            &endpoint.admin_base_url,
             link_or_default(
                 &operator_summary,
-                "request_ledger_summary",
-                "/__codex_helper/api/v1/request-ledger/summary"
-            )
+                "providers",
+                "/__codex_helper/api/v1/providers",
+            ),
+        )
+        .await,
+    )
+    .unwrap_or_default();
+
+    let recent_requests = record_optional_section(
+        &mut section_statuses,
+        "recentRequests",
+        get_json::<Vec<Value>>(
+            &client,
+            &endpoint.admin_base_url,
+            &append_query(
+                link_or_default(
+                    &operator_summary,
+                    "request_ledger_recent",
+                    "/__codex_helper/api/v1/request-ledger/recent",
+                ),
+                "limit=40",
+            ),
+        )
+        .await,
+    )
+    .unwrap_or_default();
+
+    let usage_summary = record_optional_section(
+        &mut section_statuses,
+        "usageSummary",
+        get_json::<Vec<Value>>(
+            &client,
+            &endpoint.admin_base_url,
+            &append_query(
+                link_or_default(
+                    &operator_summary,
+                    "request_ledger_summary",
+                    "/__codex_helper/api/v1/request-ledger/summary",
+                ),
+                "by=provider&limit=30",
+            ),
+        )
+        .await,
+    )
+    .unwrap_or_default();
+
+    let usage_day = match get_json::<Value>(
+        &client,
+        &endpoint.admin_base_url,
+        &append_query(
+            link_or_default(
+                &operator_summary,
+                "snapshot",
+                "/__codex_helper/api/v1/snapshot",
+            ),
+            "recent_limit=40&stats_days=1",
         ),
     )
     .await
-    .unwrap_or_default();
+    {
+        Ok(snapshot) => {
+            let usage_day = snapshot
+                .get("snapshot")
+                .and_then(|snapshot| snapshot.get("usage_day"))
+                .cloned();
+            if usage_day.is_some() {
+                section_statuses.push(AdminReadModelSectionStatus::ok("usageDay"));
+            } else {
+                section_statuses.push(AdminReadModelSectionStatus::error(
+                    "usageDay",
+                    "snapshot response did not include snapshot.usage_day",
+                ));
+            }
+            usage_day
+        }
+        Err(err) => {
+            section_statuses.push(AdminReadModelSectionStatus::error("usageDay", err.message));
+            None
+        }
+    };
 
     Ok(AdminReadModel {
         endpoint,
@@ -107,7 +186,26 @@ pub async fn get_admin_read_model() -> Result<AdminReadModel, CommandError> {
         providers,
         recent_requests,
         usage_summary,
+        usage_day,
+        section_statuses,
     })
+}
+
+fn record_optional_section<T>(
+    statuses: &mut Vec<AdminReadModelSectionStatus>,
+    section: &str,
+    result: Result<T, CommandError>,
+) -> Option<T> {
+    match result {
+        Ok(value) => {
+            statuses.push(AdminReadModelSectionStatus::ok(section));
+            Some(value)
+        }
+        Err(err) => {
+            statuses.push(AdminReadModelSectionStatus::error(section, err.message));
+            None
+        }
+    }
 }
 
 pub(crate) fn admin_client() -> Result<reqwest::Client, CommandError> {
@@ -264,4 +362,47 @@ fn link_or_default<'a>(summary: &'a Value, key: &str, fallback: &'a str) -> &'a 
         .and_then(|value| value.as_str())
         .filter(|value| !value.is_empty())
         .unwrap_or(fallback)
+}
+
+fn append_query(path: &str, query: &str) -> String {
+    let separator = if path.contains('?') { '&' } else { '?' };
+    format!("{path}{separator}{query}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn append_query_preserves_existing_query_string() {
+        assert_eq!(
+            append_query("/snapshot", "stats_days=1"),
+            "/snapshot?stats_days=1"
+        );
+        assert_eq!(
+            append_query("/snapshot?recent_limit=40", "stats_days=1"),
+            "/snapshot?recent_limit=40&stats_days=1"
+        );
+    }
+
+    #[test]
+    fn optional_section_statuses_distinguish_empty_from_failed() {
+        let mut statuses = Vec::new();
+        let ok = record_optional_section::<Vec<Value>>(&mut statuses, "providers", Ok(Vec::new()));
+        assert_eq!(ok, Some(Vec::new()));
+        assert!(statuses[0].ok);
+        assert_eq!(statuses[0].section, "providers");
+
+        let failed = record_optional_section::<Vec<Value>>(
+            &mut statuses,
+            "usageDay",
+            Err(CommandError {
+                message: "admin API unavailable".to_string(),
+            }),
+        );
+        assert!(failed.is_none());
+        assert!(!statuses[1].ok);
+        assert_eq!(statuses[1].section, "usageDay");
+        assert_eq!(statuses[1].error.as_deref(), Some("admin API unavailable"));
+    }
 }

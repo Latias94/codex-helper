@@ -93,6 +93,47 @@ export const mockUsageData: UsageData = {
     estimatedCost: "$0.42",
     averageDuration: "2.4s",
     averageFirstToken: "780ms",
+    cacheRate: "42%",
+    errorRate: "2%",
+    dayLabel: "mock today",
+  },
+  hourly: Array.from({ length: 24 }, (_, hour) => ({
+    hour,
+    label: `${hour.toString().padStart(2, "0")}:00`,
+    requests: hour % 3 === 0 ? 8 : 3,
+    totalTokens: hour % 3 === 0 ? 92_000 : 28_000,
+    cost: hour % 3 === 0 ? "$0.04" : "$0.01",
+    height: hour % 3 === 0 ? 92 : 28,
+  })),
+  providerRows: [
+    { name: "CodeX Air", requests: 82, totalTokens: "1.2M", cost: "$0.28", averageDuration: "2.1s", errorRate: "1%" },
+    { name: "Backup", requests: 46, totalTokens: "640K", cost: "$0.14", averageDuration: "2.9s", errorRate: "4%" },
+  ],
+  stationRows: [
+    { name: "input", requests: 128, totalTokens: "1.84M", cost: "$0.42", averageDuration: "2.4s", errorRate: "2%" },
+  ],
+  modelRows: [
+    { name: "gpt-5.4", requests: 96, totalTokens: "1.4M", cost: "$0.31", averageDuration: "2.2s", errorRate: "1%" },
+    { name: "gpt-5.4-mini", requests: 32, totalTokens: "440K", cost: "$0.11", averageDuration: "2.9s", errorRate: "3%" },
+  ],
+  sessionRows: [
+    { name: "codex-session", requests: 44, totalTokens: "620K", cost: "$0.15", averageDuration: "2.5s", errorRate: "0%" },
+  ],
+  projectRows: [
+    { name: "codex-helper", requests: 75, totalTokens: "1.1M", cost: "$0.24", averageDuration: "2.3s", errorRate: "1%" },
+  ],
+  coverage: {
+    source: "mock",
+    isPartial: false,
+    loadedRequests: 128,
+    scannedLines: 128,
+    truncated: false,
+  },
+  retryGate: {
+    active: 2,
+    activeCooldowns: 1,
+    maxRemaining: "4m",
+    reasons: [{ reason: "upstream_rate_limited", active: 1 }],
   },
   rows: mockUsageRowViews,
 };

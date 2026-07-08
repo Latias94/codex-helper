@@ -44,6 +44,7 @@ export function useDashboardData(): QueryBackedData<typeof mockDashboardData> {
         providers: readModel.data.providers,
         recentRequests: readModel.data.recentRequests,
         usageSummary: readModel.data.usageSummary,
+        usageDay: readModel.data.usageDay,
         adminBaseUrl: readModel.data.endpoint.adminBaseUrl,
         appVersion,
       })

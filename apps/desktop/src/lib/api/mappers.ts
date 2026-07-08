@@ -21,6 +21,9 @@ import type {
   ApiProviderOption,
   ApiRequestUsageSummaryRow,
   ApiRuntimeStatus,
+  ApiUsageBucket,
+  ApiUsageDayDimensionRow,
+  ApiUsageDayView,
   ApiUsageMetrics,
 } from "@/lib/api/admin-types";
 import type {
@@ -31,6 +34,8 @@ import type {
   RecentRequestView,
   RuntimeSummary,
   UsageData,
+  UsageDimensionRowView,
+  UsageHourView,
   UsageRowView,
   UsageSummaryView,
 } from "@/lib/api/types";
@@ -62,12 +67,13 @@ export function mapAdminDashboardData(input: {
   providers?: ApiProviderOption[];
   recentRequests?: ApiFinishedRequest[];
   usageSummary?: ApiRequestUsageSummaryRow[];
+  usageDay?: ApiUsageDayView;
   adminBaseUrl: string;
   appVersion: string;
 }): DashboardData {
   const providers = mapProviders(input.providers ?? input.summary.providers ?? [], input.summary);
   const recentRequests = mapRecentRequests(input.recentRequests ?? []);
-  const usageSummary = summarizeUsage(input.usageSummary ?? [], input.recentRequests ?? []);
+  const usageSummary = summarizeUsageDay(input.usageDay) ?? summarizeUsage(input.usageSummary ?? [], input.recentRequests ?? []);
   const runtime = mapRuntimeSummary(input.summary, {
     adminBaseUrl: input.adminBaseUrl,
     appVersion: input.appVersion,
@@ -100,7 +106,7 @@ export function mapAdminDashboardData(input: {
       {
         label: "今日请求",
         value: usageSummary.totalRequests,
-        note: "request-ledger recent",
+        note: input.usageDay ? `usage_day ${usageSummary.dayLabel}` : "legacy request-ledger",
         tone: "blue",
       },
       {
@@ -130,7 +136,7 @@ export function mapAdminDashboardData(input: {
     ],
     recentRequests,
     providers,
-    chartBars: usageChartBars(input.usageSummary ?? [], input.recentRequests ?? []),
+    chartBars: usageChartBars(input.usageDay, input.usageSummary ?? [], input.recentRequests ?? []),
   };
 }
 
@@ -149,10 +155,32 @@ export function mapProvidersData(
 export function mapUsageData(input: {
   recentRequests?: ApiFinishedRequest[];
   usageSummary?: ApiRequestUsageSummaryRow[];
+  usageDay?: ApiUsageDayView;
 }): UsageData {
   const rows = mapUsageRows(input.recentRequests ?? []);
+  const usageDay = input.usageDay;
   return {
-    summary: summarizeUsage(input.usageSummary ?? [], input.recentRequests ?? []),
+    summary: summarizeUsageDay(usageDay) ?? summarizeUsage(input.usageSummary ?? [], input.recentRequests ?? []),
+    hourly: mapUsageHours(usageDay),
+    providerRows: mapUsageDimensionRows(usageDay?.provider_rows),
+    stationRows: mapUsageDimensionRows(usageDay?.station_rows),
+    modelRows: mapUsageDimensionRows(usageDay?.model_rows),
+    sessionRows: mapUsageDimensionRows(usageDay?.session_rows),
+    projectRows: mapUsageDimensionRows(usageDay?.project_rows),
+    coverage: {
+      source: usageDay?.coverage?.source ?? "unavailable",
+      isPartial: Boolean(usageDay?.coverage?.day_may_be_partial),
+      reason: usageDay?.coverage?.partial_reason ?? undefined,
+      loadedRequests: positive(usageDay?.coverage?.loaded_requests),
+      scannedLines: positive(usageDay?.coverage?.scanned_lines),
+      truncated: Boolean(usageDay?.coverage?.bytes_truncated || usageDay?.coverage?.lines_truncated),
+    },
+    retryGate: {
+      active: positive(usageDay?.retry_gate?.active),
+      activeCooldowns: positive(usageDay?.retry_gate?.active_cooldowns),
+      maxRemaining: formatSeconds(usageDay?.retry_gate?.max_remaining_secs ?? undefined),
+      reasons: usageDay?.retry_gate?.reasons ?? [],
+    },
     rows,
   };
 }
@@ -352,6 +380,28 @@ export function summarizeUsage(
       recentAggregate.ttfbCount > 0
         ? formatMs(Math.round(recentAggregate.ttfbMs / recentAggregate.ttfbCount))
         : "—",
+    cacheRate: "—",
+    errorRate: "—",
+    dayLabel: "recent",
+  };
+}
+
+function summarizeUsageDay(usageDay?: ApiUsageDayView): UsageSummaryView | undefined {
+  if (!usageDay?.summary) {
+    return undefined;
+  }
+  const bucket = usageDay.summary;
+  const requests = positive(bucket.requests_total);
+  return {
+    totalRequests: compactInteger(requests),
+    totalRows: requests,
+    totalTokens: compactInteger(bucketTotalTokens(bucket)),
+    estimatedCost: formatCostSummary(bucket),
+    averageDuration: formatAverageMs(bucket.duration_ms_total, bucket.requests_total),
+    averageFirstToken: formatAverageMs(bucket.ttfb_ms_total, bucket.ttfb_samples),
+    cacheRate: formatBucketCacheRate(bucket),
+    errorRate: formatRatio(bucket.requests_error, bucket.requests_total),
+    dayLabel: usageDay.label || "today",
   };
 }
 
@@ -456,7 +506,15 @@ function firstUnique(items: string[]): string[] {
   return items.filter((item, index) => items.indexOf(item) === index);
 }
 
-function usageChartBars(summaryRows: ApiRequestUsageSummaryRow[], recentRequests: ApiFinishedRequest[]) {
+function usageChartBars(
+  usageDay: ApiUsageDayView | undefined,
+  summaryRows: ApiRequestUsageSummaryRow[],
+  recentRequests: ApiFinishedRequest[],
+) {
+  if (usageDay?.hourly?.length) {
+    return mapUsageHours(usageDay).map((row) => row.height);
+  }
+
   const values = summaryRows.length > 0
     ? summaryRows.slice(0, 12).map((row) => row.aggregate.total_tokens ?? 0)
     : recentRequests.slice(0, 12).map((request) => totalTokens(request.usage, request.service));
@@ -467,6 +525,35 @@ function usageChartBars(summaryRows: ApiRequestUsageSummaryRow[], recentRequests
 
   const max = Math.max(...values, 1);
   return values.map((value) => Math.max(8, Math.round((value / max) * 100)));
+}
+
+function mapUsageHours(usageDay?: ApiUsageDayView): UsageHourView[] {
+  const rows = new Map((usageDay?.hourly ?? []).map((row) => [row.hour, row.bucket]));
+  const values = Array.from({ length: 24 }, (_, hour) => bucketTotalTokens(rows.get(hour)));
+  const max = Math.max(...values, 1);
+  return Array.from({ length: 24 }, (_, hour) => {
+    const bucket = rows.get(hour);
+    const totalTokens = bucketTotalTokens(bucket);
+    return {
+      hour,
+      label: `${hour.toString().padStart(2, "0")}:00`,
+      requests: positive(bucket?.requests_total),
+      totalTokens,
+      cost: formatCostSummary(bucket),
+      height: totalTokens > 0 ? Math.max(8, Math.round((totalTokens / max) * 100)) : 0,
+    };
+  });
+}
+
+function mapUsageDimensionRows(rows: ApiUsageDayDimensionRow[] | undefined): UsageDimensionRowView[] {
+  return (rows ?? []).slice(0, 8).map((row) => ({
+    name: row.name,
+    requests: positive(row.bucket.requests_total),
+    totalTokens: compactInteger(bucketTotalTokens(row.bucket)),
+    cost: formatCostSummary(row.bucket),
+    averageDuration: formatAverageMs(row.bucket.duration_ms_total, row.bucket.requests_total),
+    errorRate: formatRatio(row.bucket.requests_error, row.bucket.requests_total),
+  }));
 }
 
 function formatCostBreakdown(cost?: ApiCostBreakdown): UsageRowView["costBreakdown"] {
@@ -484,6 +571,54 @@ function formatCostBreakdown(cost?: ApiCostBreakdown): UsageRowView["costBreakdo
 
 function formatCost(cost?: ApiCostBreakdown) {
   return cost?.total_cost_usd ? `$${cost.total_cost_usd}` : "unknown";
+}
+
+function formatCostSummary(bucket?: ApiUsageBucket) {
+  const value = bucket?.cost?.total_cost_usd;
+  if (!value) {
+    return "unknown";
+  }
+  return value.startsWith("$") ? value : `$${value}`;
+}
+
+function bucketTotalTokens(bucket?: ApiUsageBucket) {
+  if (!bucket?.usage) {
+    return 0;
+  }
+  return totalTokens(bucket.usage, "codex");
+}
+
+function formatAverageMs(total: number | undefined, count: number | undefined) {
+  const denominator = positive(count);
+  if (denominator === 0) {
+    return "—";
+  }
+  return formatMs(Math.round(positive(total) / denominator));
+}
+
+function formatRatio(numerator: number | undefined, denominator: number | undefined) {
+  const bottom = positive(denominator);
+  if (bottom === 0) {
+    return "0%";
+  }
+  return `${Math.round((positive(numerator) / bottom) * 100)}%`;
+}
+
+function formatSeconds(value: number | undefined) {
+  if (!value) {
+    return "—";
+  }
+  if (value >= 3600) {
+    return `${(value / 3600).toFixed(value >= 36_000 ? 0 : 1)}h`;
+  }
+  if (value >= 60) {
+    return `${Math.round(value / 60)}m`;
+  }
+  return `${value}s`;
+}
+
+function formatBucketCacheRate(bucket: ApiUsageBucket) {
+  return formatCacheRate(bucket.usage, "codex");
 }
 
 function formatCacheRate(usage: ApiUsageMetrics | undefined, service: string) {
@@ -530,7 +665,7 @@ function hostFromUrl(value?: string) {
   }
 }
 
-function positive(value: number | undefined) {
+function positive(value: number | null | undefined) {
   return Math.max(value ?? 0, 0);
 }
 

@@ -46,6 +46,14 @@ export type AdminReadModel = {
   providers: unknown[];
   recentRequests: unknown[];
   usageSummary: unknown[];
+  usageDay?: unknown;
+  sectionStatuses?: AdminReadModelSectionStatus[];
+};
+
+export type AdminReadModelSectionStatus = {
+  section: string;
+  ok: boolean;
+  error?: string | null;
 };
 
 export type StopProxyScope = "owned" | "attached";

@@ -321,3 +321,82 @@ export type ApiRequestUsageSummaryRow = {
   group_value: string;
   aggregate: ApiRequestUsageAggregate;
 };
+
+export type ApiUsageCostSummary = {
+  total_cost_usd?: string;
+  confidence?: ApiCostConfidence | string;
+  priced_requests?: number;
+  unpriced_requests?: number;
+};
+
+export type ApiUsageBucket = {
+  requests_total?: number;
+  requests_error?: number;
+  duration_ms_total?: number;
+  requests_with_usage?: number;
+  duration_ms_with_usage_total?: number;
+  generation_ms_total?: number;
+  ttfb_ms_total?: number;
+  ttfb_samples?: number;
+  usage?: ApiUsageMetrics;
+  cost?: ApiUsageCostSummary;
+};
+
+export type ApiUsageDayHourRow = {
+  hour: number;
+  bucket: ApiUsageBucket;
+};
+
+export type ApiUsageDayDimensionRow = {
+  name: string;
+  bucket: ApiUsageBucket;
+};
+
+export type ApiUsageDayCoverage = {
+  source?: string;
+  loaded_first_ms?: number | null;
+  loaded_last_ms?: number | null;
+  loaded_requests?: number;
+  scanned_lines?: number;
+  max_lines?: number;
+  max_bytes?: number;
+  bytes_truncated?: boolean;
+  lines_truncated?: boolean;
+  day_may_be_partial?: boolean;
+  partial_reason?: string | null;
+};
+
+export type ApiUsageRetryGateReasonRow = {
+  reason: string;
+  active: number;
+};
+
+export type ApiUsageRetryGateSummary = {
+  active?: number;
+  active_cooldowns?: number;
+  max_remaining_secs?: number | null;
+  reasons?: ApiUsageRetryGateReasonRow[];
+};
+
+export type ApiUsageDayView = {
+  day?: number;
+  label?: string;
+  start_ms?: number;
+  end_ms?: number;
+  generated_at_ms?: number;
+  summary?: ApiUsageBucket;
+  hourly?: ApiUsageDayHourRow[];
+  provider_rows?: ApiUsageDayDimensionRow[];
+  station_rows?: ApiUsageDayDimensionRow[];
+  model_rows?: ApiUsageDayDimensionRow[];
+  session_rows?: ApiUsageDayDimensionRow[];
+  project_rows?: ApiUsageDayDimensionRow[];
+  retry_gate?: ApiUsageRetryGateSummary;
+  coverage?: ApiUsageDayCoverage;
+};
+
+export type ApiAdminReadModelSectionStatus = {
+  section: string;
+  ok: boolean;
+  error?: string | null;
+};

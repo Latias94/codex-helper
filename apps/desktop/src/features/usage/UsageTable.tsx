@@ -137,7 +137,7 @@ export function UsageTable({
         </table>
       </div>
       <div className="flex shrink-0 items-center justify-between border-t border-slate-100 p-4 text-sm text-slate-500">
-        <span>显示 1 至 {rows.length}，共 {totalRows} 条</span>
+        <span>最近请求 drilldown：显示 {rows.length} 条；今日总请求 {totalRows} 条</span>
         <div className="flex items-center gap-2">
           <SelectBox defaultValue="20">
             <option value="20">每页 20</option>

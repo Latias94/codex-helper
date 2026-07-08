@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import type { ApiFinishedRequest, ApiOperatorSummary } from "@/lib/api/admin-types";
+import type { ApiFinishedRequest, ApiOperatorSummary, ApiUsageDayView } from "@/lib/api/admin-types";
 import {
   mapAdminDashboardData,
   mapProvidersData,
@@ -104,11 +104,87 @@ const finishedRequest: ApiFinishedRequest = {
   ended_at_ms: Date.UTC(2026, 4, 21, 7, 30, 0),
 };
 
+const usageDay: ApiUsageDayView = {
+  day: 20_229,
+  label: "2026-05-21",
+  summary: {
+    requests_total: 12,
+    requests_error: 1,
+    duration_ms_total: 24_000,
+    ttfb_ms_total: 3_000,
+    ttfb_samples: 6,
+    usage: {
+      input_tokens: 10_000,
+      output_tokens: 2_000,
+      total_tokens: 12_000,
+      cache_read_input_tokens: 4_000,
+    },
+    cost: {
+      total_cost_usd: "0.025",
+      confidence: "estimated",
+      priced_requests: 12,
+    },
+  },
+  hourly: [
+    {
+      hour: 7,
+      bucket: {
+        requests_total: 12,
+        usage: { total_tokens: 12_000 },
+        cost: { total_cost_usd: "0.025", confidence: "estimated" },
+      },
+    },
+  ],
+  provider_rows: [
+    {
+      name: "codex-air",
+      bucket: {
+        requests_total: 12,
+        duration_ms_total: 24_000,
+        usage: { total_tokens: 12_000 },
+        cost: { total_cost_usd: "0.025", confidence: "estimated" },
+      },
+    },
+  ],
+  model_rows: [
+    {
+      name: "gpt-5.4",
+      bucket: {
+        requests_total: 12,
+        usage: { total_tokens: 12_000 },
+      },
+    },
+  ],
+  project_rows: [
+    {
+      name: "codex-helper",
+      bucket: {
+        requests_total: 8,
+        usage: { total_tokens: 8_000 },
+      },
+    },
+  ],
+  coverage: {
+    source: "request-ledger",
+    loaded_requests: 12,
+    scanned_lines: 12,
+    day_may_be_partial: true,
+    partial_reason: "replay started after local day start",
+  },
+  retry_gate: {
+    active: 2,
+    active_cooldowns: 1,
+    max_remaining_secs: 90,
+    reasons: [{ reason: "upstream_rate_limited", active: 1 }],
+  },
+};
+
 describe("admin API mappers", () => {
   it("maps operator summary into dashboard data", () => {
     const data = mapAdminDashboardData({
       summary: operatorSummary,
       recentRequests: [finishedRequest],
+      usageDay,
       usageSummary: [
         {
           group_value: "codex-air",
@@ -142,6 +218,7 @@ describe("admin API mappers", () => {
       status: "ok",
       cost: "$0.0031",
     });
+    expect(data.metrics.find((metric) => metric.label === "今日请求")?.value).toBe("12");
   });
 
   it("maps providers into route-order data", () => {
@@ -193,6 +270,35 @@ describe("admin API mappers", () => {
       duration: "1.5s",
     });
     expect(data.rows[0].tokens.cache).toBe("20%");
+  });
+
+  it("uses usage_day as the canonical daily usage source", () => {
+    const data = mapUsageData({
+      usageDay,
+      recentRequests: [],
+      usageSummary: [],
+    });
+
+    expect(data.summary).toMatchObject({
+      totalRows: 12,
+      totalRequests: "12",
+      estimatedCost: "$0.025",
+      averageDuration: "2.0s",
+      averageFirstToken: "500ms",
+      dayLabel: "2026-05-21",
+    });
+    expect(data.rows).toHaveLength(0);
+    expect(data.hourly[7]).toMatchObject({ requests: 12, totalTokens: 12000 });
+    expect(data.providerRows[0]).toMatchObject({ name: "codex-air", requests: 12 });
+    expect(data.coverage).toMatchObject({
+      isPartial: true,
+      reason: "replay started after local day start",
+    });
+    expect(data.retryGate).toMatchObject({
+      active: 2,
+      activeCooldowns: 1,
+      maxRemaining: "2m",
+    });
   });
 
   it("maps provider control evidence from top-level request evidence", () => {
