@@ -3,6 +3,22 @@ All notable changes to this project will be documented in this file.
 
 > Recent entries use **Chinese first, then an English summary**. Older entries keep the previous inline bilingual style.
 
+## [0.20.2] - 2026-07-08
+
+### 中文
+
+#### 修复
+
+- 修复 sub2api / new-api 日套餐在昨日耗尽后，次日可能仍被旧余额快照跳过的问题。超过每日重置时间后会重新查询余额，以便懒刷新额度恢复后自动放回路由。
+- 适配 Codex 新增的 GPT-5.6 Bedrock 模型变体。`openai.gpt-5.6-sol`、`openai.gpt-5.6-terra`、`openai.gpt-5.6-luna` 现在会按 `Sol` / `Terra` / `Luna` 展示，并保留 Codex 所需的 reasoning、图片输入和工具能力。
+
+### English summary
+
+#### Fixed
+
+- Fixed stale exhausted daily sub2api / new-api balance snapshots continuing to suppress routes after the next daily reset. Balance polling now retries after the configured reset time so lazily refreshed quota can return to routing.
+- Added support for the new Codex GPT-5.6 Bedrock variants. `openai.gpt-5.6-sol`, `openai.gpt-5.6-terra`, and `openai.gpt-5.6-luna` now appear as `Sol` / `Terra` / `Luna` with the expected reasoning, image-input, and tool capabilities.
+
 ## [0.20.1] - 2026-07-08
 
 ### 中文

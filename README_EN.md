@@ -6,7 +6,7 @@ Some Codex features do not appear just because `/responses` can be forwarded. Ch
 
 codex-helper keeps that compatibility layer local. Codex talks to the helper proxy, and the helper picks OpenAI or one of your relays through provider/routing config. It also handles model-list translation, client presets, capability diagnostics, balance visibility, and fallback policy.
 
-Current release: `v0.20.0`
+Current release: `v0.20.2`
 
 中文说明: [README.md](README.md)
 
@@ -39,7 +39,7 @@ It is probably unnecessary if you only use one official account and do not need 
 - **Balance and plan visibility**: probes common Sub2API, New API, and `/user/balance` endpoints; lookup failures are not treated as exhausted.
 - **Outbound proxy compatibility**: the local proxy and outbound network proxy are separate layers; outbound requests currently follow system/environment proxy variables, with no first-class `config.toml` proxy section yet.
 - **Request observability**: provider, model, tokens, cache tokens, cache hit rate, TTFB, duration, output rate, retry chain, provider signal / policy action evidence, and estimated cost.
-- **TUI and Desktop**: built-in TUI for terminal use; the old `codex-helper-gui`/egui entrypoint has been removed. The Tauri desktop source lives under `apps/desktop` and has passed Windows packaged smoke, but v0.20.0 does not ship a public desktop installer yet; that release path is deferred until signing, release-channel, and rollback operations are ready.
+- **TUI and Desktop**: built-in TUI for terminal use; the old `codex-helper-gui`/egui entrypoint has been removed. The Tauri desktop source lives under `apps/desktop` and has passed Windows packaged smoke, but the current public release still does not ship a desktop installer; that release path is deferred until signing, release-channel, and rollback operations are ready.
 
 ## Quick Start
 
@@ -50,16 +50,16 @@ Recommended: install prebuilt binaries with the release installer scripts. Rust 
 macOS / Linux:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Latias94/codex-helper/releases/download/v0.20.0/codex-helper-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Latias94/codex-helper/releases/download/v0.20.2/codex-helper-installer.sh | sh
 ```
 
 Windows PowerShell:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/Latias94/codex-helper/releases/download/v0.20.0/codex-helper-installer.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/Latias94/codex-helper/releases/download/v0.20.2/codex-helper-installer.ps1 | iex"
 ```
 
-This installs `codex-helper` and the short alias `ch`. The old egui GUI entrypoint `codex-helper-gui` has been removed. The Tauri desktop client remains a source-tree preview in v0.20.0 and is not uploaded as a public release artifact; local validation can still build it from `apps/desktop` with `pnpm tauri:build`.
+This installs `codex-helper` and the short alias `ch`. The old egui GUI entrypoint `codex-helper-gui` has been removed. The Tauri desktop client remains a source-tree preview and is not uploaded as a public release artifact; local validation can still build it from `apps/desktop` with `pnpm tauri:build`.
 
 If you do not want to pipe a shell script, download the archive for your platform from [GitHub Releases](https://github.com/Latias94/codex-helper/releases) and verify it with the matching `.sha256` file.
 
@@ -111,7 +111,7 @@ By default, the built-in `codex-helper serve` TUI follows “the console owns th
 
 `daemon status` best-effort shows the resident proxy owner marker (manual CLI, supervisor, or a future desktop/tray owner). The marker is only observability metadata: read or cleanup failures never block proxy startup or shutdown. A hidden managed sidecar mode is reserved for the future desktop shell, so ordinary users do not need to choose it manually.
 
-The Tauri desktop client uses a more Clash-like resident-client lifecycle: closing the main window hides it to the tray, `Quit App` exits only the desktop process, and stopping the proxy remains an explicit `Stop Proxy` action. The Windows NSIS packaged path has passed isolated lifecycle smoke, but it is not part of the v0.20.0 public release; macOS/Linux packaged parity, signing, and rollback operations still need separate follow-up work.
+The Tauri desktop client uses a more Clash-like resident-client lifecycle: closing the main window hides it to the tray, `Quit App` exits only the desktop process, and stopping the proxy remains an explicit `Stop Proxy` action. The Windows NSIS packaged path has passed isolated lifecycle smoke, but it is not part of the public release yet; macOS/Linux packaged parity, signing, and rollback operations still need separate follow-up work.
 
 Manage the Codex proxy patch explicitly:
 
@@ -412,7 +412,7 @@ Shortcut hints are shown at the bottom. Under v5 config, durable provider/routin
 
 ### Desktop Preview
 
-The new Tauri desktop client lives under `apps/desktop` and uses React 19, Tailwind CSS 4, shadcn/ui-style components, and TanStack Router/Query/Table. It already implements Dashboard, Providers, Usage, Settings, read-only admin data, safe control actions, close-to-tray semantics, single instance, launch-at-login settings, lightweight single-config import/export, config/log/cache path openers, common provider edit forms, and a Windows NSIS packaged sidecar build. Windows packaged smoke now covers tray Show/Hide/Quit, Detach, Stop Proxy, second-launch focus, launch-at-login registration, config import/export, and provider editing. v0.20.0 does not publish the desktop installer; the public desktop release remains gated on signing keys, HTTPS release endpoints, artifact hosting, and rollback operations. See [docs/DESKTOP_RELEASE.md](docs/DESKTOP_RELEASE.md) for the desktop packaging contract.
+The new Tauri desktop client lives under `apps/desktop` and uses React 19, Tailwind CSS 4, shadcn/ui-style components, and TanStack Router/Query/Table. It already implements Dashboard, Providers, Usage, Settings, read-only admin data, safe control actions, close-to-tray semantics, single instance, launch-at-login settings, lightweight single-config import/export, config/log/cache path openers, common provider edit forms, and a Windows NSIS packaged sidecar build. Windows packaged smoke now covers tray Show/Hide/Quit, Detach, Stop Proxy, second-launch focus, launch-at-login registration, config import/export, and provider editing. The current public release does not publish the desktop installer; the public desktop release remains gated on signing keys, HTTPS release endpoints, artifact hosting, and rollback operations. See [docs/DESKTOP_RELEASE.md](docs/DESKTOP_RELEASE.md) for the desktop packaging contract.
 
 ## File Locations
 
