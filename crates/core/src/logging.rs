@@ -432,6 +432,8 @@ pub struct RouteAttemptLog {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_upstreams: Option<usize>,
     pub decision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -463,6 +465,31 @@ pub struct RetryInfo {
     pub upstream_chain: Vec<String>,
     #[serde(default, skip_serializing_if = "route_attempts_is_empty")]
     pub route_attempts: Vec<RouteAttemptLog>,
+}
+
+impl RouteAttemptLog {
+    pub fn stable_code(&self) -> &str {
+        self.code.as_deref().unwrap_or_else(|| {
+            route_attempt_code(
+                self.decision.as_str(),
+                self.error_class.as_deref(),
+                self.reason.as_deref(),
+                self.skipped,
+            )
+        })
+    }
+
+    pub fn refresh_code(&mut self) {
+        self.code = Some(
+            route_attempt_code(
+                self.decision.as_str(),
+                self.error_class.as_deref(),
+                self.reason.as_deref(),
+                self.skipped,
+            )
+            .to_string(),
+        );
+    }
 }
 
 impl RetryInfo {
@@ -520,6 +547,7 @@ fn parse_route_attempt_from_chain_entry(raw: &str, attempt_index: u32) -> RouteA
         attempt.decision = "all_upstreams_avoided".to_string();
         attempt.reason = route_chain_value(raw, "total").map(|total| format!("total={total}"));
         attempt.skipped = true;
+        attempt.refresh_code();
         return attempt;
     }
 
@@ -591,7 +619,41 @@ fn parse_route_attempt_from_chain_entry(raw: &str, attempt_index: u32) -> RouteA
         attempt.error_class = Some("upstream_response_body_too_large".to_string());
     }
 
+    attempt.refresh_code();
     attempt
+}
+
+fn route_attempt_code(
+    decision: &str,
+    error_class: Option<&str>,
+    reason: Option<&str>,
+    skipped: bool,
+) -> &'static str {
+    if matches!(
+        error_class,
+        Some("reasoning_guard_triggered" | "reasoning_guard_blocked")
+    ) {
+        return "failed_reasoning_guard";
+    }
+    if skipped && reason == Some("unsupported_model") {
+        return "skipped_capability_mismatch";
+    }
+    match decision {
+        "selected" => "selected",
+        "observed" => "observed",
+        "completed" => "completed",
+        "failed_status" => "failed_status",
+        "failed_client_request" => "failed_client_request",
+        "failed_reasoning_guard" => "failed_reasoning_guard",
+        "failed_transport" => "failed_transport",
+        "failed_target_build" => "failed_target_build",
+        "failed_body_read" => "failed_body_read",
+        "failed_body_too_large" => "failed_body_too_large",
+        "skipped_capability_mismatch" => "skipped_capability_mismatch",
+        "all_upstreams_avoided" => "all_upstreams_avoided",
+        "route_unavailable" => "route_unavailable",
+        _ => "legacy_route_attempt",
+    }
 }
 
 fn apply_route_chain_identity_metadata(attempt: &mut RouteAttemptLog, raw: &str) {

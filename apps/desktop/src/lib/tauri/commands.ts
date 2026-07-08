@@ -53,7 +53,15 @@ export type AdminReadModel = {
 export type AdminReadModelSectionStatus = {
   section: string;
   ok: boolean;
+  code?: string | null;
   error?: string | null;
+};
+
+export type DesktopCommandError = {
+  code: string;
+  message: string;
+  retryable: boolean;
+  hint?: string | null;
 };
 
 export type StopProxyScope = "owned" | "attached";

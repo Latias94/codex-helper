@@ -656,7 +656,10 @@ fn request_route_attempt_line(attempt: &crate::logging::RouteAttemptLog) -> Stri
                 (None, None) => "target=-".to_string(),
             }
         });
-    let mut parts = vec![attempt.decision.clone()];
+    let mut parts = vec![attempt.stable_code().to_string()];
+    if attempt.stable_code() != attempt.decision {
+        parts.push(format!("decision={}", attempt.decision));
+    }
     if let Some(provider_id) = attempt.provider_id.as_deref() {
         parts.push(format!("prov={}", shorten_middle(provider_id, 18)));
     }
@@ -737,18 +740,17 @@ fn request_route_attempt_provider_control_line(
     let signals = attempt
         .provider_signals
         .iter()
-        .map(|signal| format!("{:?}", signal.kind).to_ascii_lowercase())
+        .map(|signal| signal.stable_code().to_string())
         .collect::<Vec<_>>();
     let actions = attempt
         .policy_actions
         .iter()
         .map(|action| {
             format!(
-                "{:?}:{}",
-                action.kind,
+                "{}:{}",
+                action.stable_code(),
                 shorten_middle(&action.provider_endpoint_key.stable_key(), endpoint_width)
             )
-            .to_ascii_lowercase()
         })
         .collect::<Vec<_>>();
     if signals.is_empty() && actions.is_empty() {

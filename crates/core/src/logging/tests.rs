@@ -170,6 +170,8 @@ fn route_attempts_are_derived_from_legacy_retry_chain() {
     );
     assert_eq!(attempts[0].upstream_index, Some(0));
     assert_eq!(attempts[0].decision, "failed_transport");
+    assert_eq!(attempts[0].stable_code(), "failed_transport");
+    assert_eq!(attempts[0].code.as_deref(), Some("failed_transport"));
     assert_eq!(
         attempts[0].error_class.as_deref(),
         Some("upstream_transport_error")
@@ -178,11 +180,16 @@ fn route_attempts_are_derived_from_legacy_retry_chain() {
     assert_eq!(attempts[0].reason.as_deref(), Some("operation timed out"));
 
     assert_eq!(attempts[1].decision, "skipped_capability_mismatch");
+    assert_eq!(
+        attempts[1].code.as_deref(),
+        Some("skipped_capability_mismatch")
+    );
     assert!(attempts[1].skipped);
     assert_eq!(attempts[1].station_name.as_deref(), Some("alpha"));
     assert_eq!(attempts[1].model.as_deref(), Some("gpt-5"));
 
     assert_eq!(attempts[2].decision, "completed");
+    assert_eq!(attempts[2].code.as_deref(), Some("completed"));
     assert_eq!(attempts[2].status_code, Some(200));
     assert_eq!(attempts[2].station_name, None);
     assert_eq!(
@@ -191,6 +198,7 @@ fn route_attempts_are_derived_from_legacy_retry_chain() {
     );
 
     assert_eq!(attempts[3].decision, "all_upstreams_avoided");
+    assert_eq!(attempts[3].code.as_deref(), Some("all_upstreams_avoided"));
     assert_eq!(attempts[3].reason.as_deref(), Some("total=3"));
     assert!(attempts[3].skipped);
 }
@@ -219,6 +227,7 @@ fn route_attempts_are_derived_from_provider_endpoint_retry_chain() {
         Some("https://input.example/v1")
     );
     assert_eq!(attempts[0].decision, "failed_status");
+    assert_eq!(attempts[0].code.as_deref(), Some("failed_status"));
 
     assert_eq!(
         attempts[1].provider_endpoint_key.as_deref(),
@@ -227,6 +236,10 @@ fn route_attempts_are_derived_from_provider_endpoint_retry_chain() {
     assert_eq!(attempts[1].provider_id.as_deref(), Some("right"));
     assert_eq!(attempts[1].preference_group, Some(1));
     assert_eq!(attempts[1].decision, "skipped_capability_mismatch");
+    assert_eq!(
+        attempts[1].code.as_deref(),
+        Some("skipped_capability_mismatch")
+    );
     assert!(attempts[1].skipped);
 }
 
@@ -250,12 +263,35 @@ fn retry_info_serializes_structured_route_attempts() {
         value["route_attempts"][0]["decision"].as_str(),
         Some("failed_transport")
     );
+    assert_eq!(
+        value["route_attempts"][0]["code"].as_str(),
+        Some("failed_transport")
+    );
     assert!(value["route_attempts"][0]["station_name"].is_null());
     assert!(value["route_attempts"][0]["upstream_index"].is_null());
     assert_eq!(
         value["route_attempts"][1]["decision"].as_str(),
         Some("completed")
     );
+    assert_eq!(
+        value["route_attempts"][1]["code"].as_str(),
+        Some("completed")
+    );
+}
+
+#[test]
+fn legacy_route_attempt_without_code_keeps_stable_code_fallback() {
+    let attempt: RouteAttemptLog = serde_json::from_value(serde_json::json!({
+        "attempt_index": 0,
+        "decision": "failed_status",
+        "status_code": 429,
+        "error_class": "upstream_rate_limited",
+        "raw": "status=429 class=upstream_rate_limited"
+    }))
+    .expect("legacy route attempt");
+
+    assert_eq!(attempt.code, None);
+    assert_eq!(attempt.stable_code(), "failed_status");
 }
 
 #[test]

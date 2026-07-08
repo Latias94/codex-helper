@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { buildRuntimeDataState, errorToMessage } from "@/lib/api/data-state";
+import { buildRuntimeDataState, errorToCode, errorToMessage } from "@/lib/api/data-state";
 
 describe("runtime data state", () => {
   it("shows a loading connection state before the first read model resolves", () => {
@@ -42,6 +42,21 @@ describe("runtime data state", () => {
     expect(state.canStartProxy).toBe(false);
   });
 
+  it("classifies structured admin error codes before message text", () => {
+    const state = buildRuntimeDataState({
+      hasLiveData: false,
+      isLoading: false,
+      isFetching: false,
+      error: {
+        code: "desktop_admin_http_403",
+        message: "admin API returned a forbidden response",
+      },
+    });
+
+    expect(state.status).toBe("auth-required");
+    expect(state.errorCode).toBe("desktop_admin_http_403");
+  });
+
   it("teaches the user what to do when the local proxy is disconnected", () => {
     const state = buildRuntimeDataState({
       hasLiveData: false,
@@ -73,6 +88,7 @@ describe("runtime data state", () => {
 
   it("normalizes non-Error command failures into readable messages", () => {
     expect(errorToMessage({ message: "command failed" })).toBe("command failed");
+    expect(errorToCode({ code: "desktop_admin_timeout", message: "timed out" })).toBe("desktop_admin_timeout");
     expect(errorToMessage("plain failure")).toBe("plain failure");
   });
 });

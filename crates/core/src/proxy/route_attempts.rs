@@ -222,7 +222,7 @@ pub(super) fn start_selected_route_attempt(
         params.model_note
     );
     let attempt_index = route_attempts.len() as u32;
-    route_attempts.push(RouteAttemptLog {
+    let mut attempt = RouteAttemptLog {
         attempt_index,
         provider_id: non_dash(params.provider_id)
             .map(ToOwned::to_owned)
@@ -249,7 +249,9 @@ pub(super) fn start_selected_route_attempt(
         model: normalize_model(params.model_note),
         raw,
         ..Default::default()
-    });
+    };
+    attempt.refresh_code();
+    route_attempts.push(attempt);
     route_attempts.len() - 1
 }
 
@@ -365,6 +367,7 @@ fn apply_attempt_outcome(attempt: &mut RouteAttemptLog, outcome: AttemptOutcome)
     attempt.policy_actions = outcome.policy_actions;
     attempt.skipped = outcome.skipped;
     attempt.raw = outcome.raw;
+    attempt.refresh_code();
 }
 
 fn sorted_avoid_set(avoid_set: &HashSet<usize>) -> Vec<usize> {

@@ -483,13 +483,13 @@ function providerControlSummary(request: ApiFinishedRequest): string | undefined
     ...(request.provider_signals ?? []),
     ...(request.retry?.route_attempts ?? []).flatMap((attempt) => attempt.provider_signals ?? []),
   ]
-    .map((signal) => signal.kind)
+    .map((signal) => signal.code ?? signal.kind)
     .filter((kind): kind is string => Boolean(kind));
   const actions = [
     ...(request.policy_actions ?? []),
     ...(request.retry?.route_attempts ?? []).flatMap((attempt) => attempt.policy_actions ?? []),
   ]
-    .map((action) => action.kind)
+    .map((action) => action.code ?? action.kind)
     .filter((kind): kind is string => Boolean(kind));
 
   const signal = firstUnique(signals)[0];

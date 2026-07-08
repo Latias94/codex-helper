@@ -225,6 +225,7 @@ export type ApiProviderSignalTrace = {
 
 export type ApiProviderSignal = {
   kind?: string;
+  code?: string;
   source?: string;
   target?: ApiProviderSignalTarget;
   confidence?: string;
@@ -240,6 +241,7 @@ export type ApiProviderSignal = {
 export type ApiPolicyAction = {
   id?: string;
   kind?: string;
+  code?: string;
   owner?: string;
   provider_endpoint_key?: string | ApiProviderEndpointKey;
   source_signal?: ApiProviderSignal;
@@ -254,6 +256,7 @@ export type ApiPolicyAction = {
 export type ApiPolicyActionProjection = {
   provider_endpoint_key?: string | ApiProviderEndpointKey;
   active_cooldown?: boolean;
+  code?: string;
   cooldown_remaining_secs?: number;
   reason?: string;
   action_id?: string;
@@ -266,6 +269,7 @@ export type ApiRouteAttempt = {
   endpoint_id?: string;
   upstream_base_url?: string;
   decision?: string;
+  code?: string;
   reason?: string;
   status_code?: number;
   error_class?: string;
@@ -398,5 +402,6 @@ export type ApiUsageDayView = {
 export type ApiAdminReadModelSectionStatus = {
   section: string;
   ok: boolean;
+  code?: string | null;
   error?: string | null;
 };

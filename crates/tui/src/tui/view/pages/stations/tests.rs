@@ -76,6 +76,7 @@ fn policy_action_projection(
             endpoint_id,
         ),
         active_cooldown: true,
+        code: Some("cooldown".to_string()),
         cooldown_remaining_secs: Some(cooldown_remaining_secs),
         reason: Some("upstream_rate_limited".to_string()),
         action_id: Some(format!("codex-helper:codex/{provider_id}/{endpoint_id}:1")),

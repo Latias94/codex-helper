@@ -2299,6 +2299,7 @@ mod tests {
         PolicyActionProjection {
             provider_endpoint_key: ProviderEndpointKey::new("codex", provider_id, endpoint_id),
             active_cooldown: true,
+            code: Some("cooldown".to_string()),
             cooldown_remaining_secs: Some(42),
             reason: Some("upstream_rate_limited".to_string()),
             action_id: Some(format!("codex-helper:codex/{provider_id}/{endpoint_id}:1")),

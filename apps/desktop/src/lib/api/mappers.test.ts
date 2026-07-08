@@ -308,8 +308,8 @@ describe("admin API mappers", () => {
         {
           ...finishedRequest,
           status_code: 429,
-          provider_signals: [{ kind: "rate_limit" }],
-          policy_actions: [{ kind: "cooldown" }],
+          provider_signals: [{ kind: "rate_limit", code: "provider_rate_limited" }],
+          policy_actions: [{ kind: "cooldown", code: "provider_cooldown" }],
         },
       ],
       usageSummary: [],
@@ -319,7 +319,7 @@ describe("admin API mappers", () => {
 
     expect(data.recentRequests[0]).toMatchObject({
       status: "warn",
-      providerControl: "signal rate_limit · action cooldown",
+      providerControl: "signal provider_rate_limited · action provider_cooldown",
     });
   });
 

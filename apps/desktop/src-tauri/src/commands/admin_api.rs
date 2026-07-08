@@ -8,7 +8,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use crate::error::{CommandError, DesktopError};
+use crate::error::CommandError;
 
 pub(crate) const DEFAULT_PROXY_PORT: u16 = 3211;
 const ADMIN_BASE_ENV: &str = "CODEX_HELPER_DESKTOP_ADMIN_URL";
@@ -41,6 +41,7 @@ pub struct AdminReadModel {
 pub struct AdminReadModelSectionStatus {
     pub section: String,
     pub ok: bool,
+    pub code: Option<String>,
     pub error: Option<String>,
 }
 
@@ -49,15 +50,30 @@ impl AdminReadModelSectionStatus {
         Self {
             section: section.into(),
             ok: true,
+            code: None,
             error: None,
         }
     }
 
-    fn error(section: impl Into<String>, error: impl Into<String>) -> Self {
+    fn error(
+        section: impl Into<String>,
+        code: impl Into<String>,
+        error: impl Into<String>,
+    ) -> Self {
         Self {
             section: section.into(),
             ok: false,
+            code: Some(code.into()),
             error: Some(error.into()),
+        }
+    }
+
+    fn command_error(section: impl Into<String>, error: CommandError) -> Self {
+        Self {
+            section: section.into(),
+            ok: false,
+            code: Some(error.code),
+            error: Some(error.message),
         }
     }
 }
@@ -168,13 +184,14 @@ pub async fn get_admin_read_model() -> Result<AdminReadModel, CommandError> {
             } else {
                 section_statuses.push(AdminReadModelSectionStatus::error(
                     "usageDay",
+                    "desktop_admin_missing_usage_day",
                     "snapshot response did not include snapshot.usage_day",
                 ));
             }
             usage_day
         }
         Err(err) => {
-            section_statuses.push(AdminReadModelSectionStatus::error("usageDay", err.message));
+            section_statuses.push(AdminReadModelSectionStatus::command_error("usageDay", err));
             None
         }
     };
@@ -202,7 +219,7 @@ fn record_optional_section<T>(
             Some(value)
         }
         Err(err) => {
-            statuses.push(AdminReadModelSectionStatus::error(section, err.message));
+            statuses.push(AdminReadModelSectionStatus::command_error(section, err));
             None
         }
     }
@@ -212,7 +229,13 @@ pub(crate) fn admin_client() -> Result<reqwest::Client, CommandError> {
     reqwest::Client::builder()
         .timeout(Duration::from_millis(REQUEST_TIMEOUT_MS))
         .build()
-        .map_err(|err| DesktopError::AdminApi(err.to_string()).into())
+        .map_err(|err| {
+            CommandError::new(
+                "desktop_admin_client_error",
+                format!("failed to build admin API client: {err}"),
+                false,
+            )
+        })
 }
 
 pub(crate) async fn get_json<T: DeserializeOwned>(
@@ -228,7 +251,7 @@ pub(crate) async fn get_json<T: DeserializeOwned>(
     )
     .send()
     .await
-    .map_err(|err| DesktopError::AdminApi(format!("{url}: {err}")))?;
+    .map_err(|err| admin_request_error(&url, err))?;
     decode_response(response, &url).await
 }
 
@@ -247,7 +270,7 @@ pub(crate) async fn post_json<T: DeserializeOwned, B: Serialize + ?Sized>(
     )
     .send()
     .await
-    .map_err(|err| DesktopError::AdminApi(format!("{url}: {err}")))?;
+    .map_err(|err| admin_request_error(&url, err))?;
     decode_response(response, &url).await
 }
 
@@ -264,11 +287,11 @@ pub(crate) async fn post_empty(
     )
     .send()
     .await
-    .map_err(|err| DesktopError::AdminApi(format!("{url}: {err}")))?;
+    .map_err(|err| admin_request_error(&url, err))?;
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        return Err(DesktopError::AdminApi(format!("{url}: HTTP {status} {body}")).into());
+        return Err(admin_status_error(&url, status, body));
     }
     Ok(())
 }
@@ -288,11 +311,11 @@ pub(crate) async fn post_json_no_response<B: Serialize + ?Sized>(
     )
     .send()
     .await
-    .map_err(|err| DesktopError::AdminApi(format!("{url}: {err}")))?;
+    .map_err(|err| admin_request_error(&url, err))?;
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        return Err(DesktopError::AdminApi(format!("{url}: HTTP {status} {body}")).into());
+        return Err(admin_status_error(&url, status, body));
     }
     Ok(())
 }
@@ -304,12 +327,46 @@ async fn decode_response<T: DeserializeOwned>(
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        return Err(DesktopError::AdminApi(format!("{url}: HTTP {status} {body}")).into());
+        return Err(admin_status_error(url, status, body));
     }
-    response
-        .json::<T>()
-        .await
-        .map_err(|err| DesktopError::AdminApi(format!("{url}: {err}")).into())
+    response.json::<T>().await.map_err(|err| {
+        CommandError::new(
+            "desktop_admin_decode_error",
+            format!("admin API {url}: decode JSON response failed: {err}"),
+            true,
+        )
+    })
+}
+
+fn admin_request_error(url: &str, err: reqwest::Error) -> CommandError {
+    let code = if err.is_timeout() {
+        "desktop_admin_timeout"
+    } else if err.is_connect() {
+        "desktop_admin_connection_failed"
+    } else {
+        "desktop_admin_request_failed"
+    };
+    CommandError::new(code, format!("admin API {url}: {err}"), true)
+}
+
+fn admin_status_error(url: &str, status: reqwest::StatusCode, body: String) -> CommandError {
+    let code = match status.as_u16() {
+        401 => "desktop_admin_http_401",
+        403 => "desktop_admin_http_403",
+        429 => "desktop_admin_http_429",
+        _ => "desktop_admin_http_status",
+    };
+    let retryable = status.is_server_error() || status.as_u16() == 429;
+    let error = CommandError::new(
+        code,
+        format!("admin API {url}: HTTP {status} {body}"),
+        retryable,
+    );
+    if matches!(status.as_u16(), 401 | 403) {
+        error.with_hint("set CODEX_HELPER_ADMIN_TOKEN for the desktop process")
+    } else {
+        error
+    }
 }
 
 fn with_admin_headers(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -396,13 +453,36 @@ mod tests {
         let failed = record_optional_section::<Vec<Value>>(
             &mut statuses,
             "usageDay",
-            Err(CommandError {
-                message: "admin API unavailable".to_string(),
-            }),
+            Err(CommandError::new(
+                "desktop_admin_connection_failed",
+                "admin API unavailable",
+                true,
+            )),
         );
         assert!(failed.is_none());
         assert!(!statuses[1].ok);
         assert_eq!(statuses[1].section, "usageDay");
+        assert_eq!(
+            statuses[1].code.as_deref(),
+            Some("desktop_admin_connection_failed")
+        );
         assert_eq!(statuses[1].error.as_deref(), Some("admin API unavailable"));
+    }
+
+    #[test]
+    fn admin_status_error_classifies_auth_failures() {
+        let err = admin_status_error(
+            "http://127.0.0.1:4211/__codex_helper/api/v1/providers",
+            reqwest::StatusCode::FORBIDDEN,
+            "forbidden".to_string(),
+        );
+        let value = serde_json::to_value(&err).expect("serialize admin status error");
+
+        assert_eq!(value["code"].as_str(), Some("desktop_admin_http_403"));
+        assert_eq!(value["retryable"].as_bool(), Some(false));
+        assert_eq!(
+            value["hint"].as_str(),
+            Some("set CODEX_HELPER_ADMIN_TOKEN for the desktop process")
+        );
     }
 }

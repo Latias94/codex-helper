@@ -22,7 +22,24 @@ pub enum ProviderSignalKind {
     ServiceStatus,
     Capability,
     LocalConcurrency,
+    #[serde(other)]
     Unknown,
+}
+
+impl ProviderSignalKind {
+    pub fn code(&self) -> &'static str {
+        match self {
+            ProviderSignalKind::Quota => "quota",
+            ProviderSignalKind::RateLimit => "rate_limit",
+            ProviderSignalKind::Capacity => "capacity",
+            ProviderSignalKind::Transport => "transport",
+            ProviderSignalKind::Balance => "balance",
+            ProviderSignalKind::ServiceStatus => "service_status",
+            ProviderSignalKind::Capability => "capability",
+            ProviderSignalKind::LocalConcurrency => "local_concurrency",
+            ProviderSignalKind::Unknown => "unknown",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -76,6 +93,8 @@ pub struct ProviderSignalTrace {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderSignal {
     pub kind: ProviderSignalKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
     pub source: ProviderSignalSource,
     pub target: ProviderSignalTarget,
     pub confidence: ProviderSignalConfidence,
@@ -102,6 +121,7 @@ impl ProviderSignal {
         observed_at_ms: u64,
     ) -> Self {
         Self {
+            code: Some(kind.code().to_string()),
             kind,
             source,
             target,
@@ -122,6 +142,10 @@ impl ProviderSignal {
 
     pub fn is_high_confidence_route_facing(&self) -> bool {
         self.route_facing && self.confidence >= ProviderSignalConfidence::High
+    }
+
+    pub fn stable_code(&self) -> &str {
+        self.code.as_deref().unwrap_or_else(|| self.kind.code())
     }
 }
 
@@ -164,5 +188,39 @@ mod tests {
 
         assert_eq!(signal.cooldown_horizon_secs(), Some(60));
         assert!(signal.is_high_confidence_route_facing());
+        assert_eq!(signal.stable_code(), "quota");
+    }
+
+    #[test]
+    fn provider_signal_serializes_additive_code() {
+        let signal = ProviderSignal::high_confidence_route_facing(
+            ProviderSignalKind::RateLimit,
+            ProviderSignalSource::UpstreamResponse,
+            ProviderSignalTarget::ProviderEndpoint {
+                provider_endpoint_key: ProviderEndpointKey::new("codex", "monthly", "default"),
+            },
+            100,
+        );
+        let value = serde_json::to_value(&signal).expect("serialize signal");
+
+        assert_eq!(value["kind"].as_str(), Some("rate_limit"));
+        assert_eq!(value["code"].as_str(), Some("rate_limit"));
+    }
+
+    #[test]
+    fn unknown_provider_signal_kind_deserializes_as_unknown_code() {
+        let signal: ProviderSignal = serde_json::from_value(serde_json::json!({
+            "kind": "future_signal",
+            "source": "upstream_response",
+            "target": {
+                "service": { "service": "codex" }
+            },
+            "confidence": "medium",
+            "observed_at_ms": 100
+        }))
+        .expect("deserialize unknown signal kind");
+
+        assert_eq!(signal.kind, ProviderSignalKind::Unknown);
+        assert_eq!(signal.stable_code(), "unknown");
     }
 }

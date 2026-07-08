@@ -65,6 +65,7 @@ pub(super) fn response_evidence_from_classification(
     let retry_after_secs = classified_response.retry_after_secs();
     let confidence = signal_confidence(class, classified_response, &kind, status_code);
     let mut signal = ProviderSignal {
+        code: Some(kind.code().to_string()),
         kind,
         source: ProviderSignalSource::UpstreamResponse,
         target: ProviderSignalTarget::ProviderEndpoint {

@@ -207,7 +207,7 @@ fn route_unavailable_attempt(
         request_model.unwrap_or("-")
     );
 
-    RouteAttemptLog {
+    let mut attempt = RouteAttemptLog {
         attempt_index: 0,
         provider_id: Some(candidate.provider_id.clone()),
         endpoint_id: Some(candidate.endpoint_id.clone()),
@@ -231,7 +231,9 @@ fn route_unavailable_attempt(
         skipped: true,
         raw,
         ..Default::default()
-    }
+    };
+    attempt.refresh_code();
+    attempt
 }
 
 fn reason_counts_for_log(route_attempts: &[RouteAttemptLog]) -> serde_json::Value {

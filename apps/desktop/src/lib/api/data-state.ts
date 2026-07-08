@@ -30,10 +30,12 @@ const LIVE_STATE: RuntimeDataState = {
 
 export function buildRuntimeDataState(input: BuildRuntimeDataStateInput): RuntimeDataState {
   const errorMessage = errorToMessage(input.error);
+  const errorCode = errorToCode(input.error);
   const ownerMode = input.ownerMode ?? "unknown";
   const base = {
     ownerMode,
     lastUpdatedAt: input.lastUpdatedAt,
+    errorCode,
     errorMessage,
   };
 
@@ -104,7 +106,7 @@ export function buildRuntimeDataState(input: BuildRuntimeDataStateInput): Runtim
     };
   }
 
-  const issue = classifyRuntimeIssue(errorMessage);
+  const issue = classifyRuntimeIssue(errorMessage, errorCode);
 
   if (issue === "auth-required") {
     return {
@@ -206,7 +208,29 @@ export function errorToMessage(error: unknown): string | undefined {
   return String(error);
 }
 
-function classifyRuntimeIssue(message: string | undefined): RuntimeIssueKind {
+export function errorToCode(error: unknown): string | undefined {
+  if (!error || typeof error !== "object") {
+    return undefined;
+  }
+  const maybeCode = (error as { code?: unknown }).code;
+  return typeof maybeCode === "string" && maybeCode.length > 0 ? maybeCode : undefined;
+}
+
+function classifyRuntimeIssue(message: string | undefined, code?: string): RuntimeIssueKind {
+  if (code === "desktop_admin_http_401" || code === "desktop_admin_http_403") {
+    return "auth-required";
+  }
+  if (
+    code === "desktop_admin_connection_failed" ||
+    code === "desktop_admin_timeout" ||
+    code === "desktop_admin_request_failed"
+  ) {
+    return "disconnected";
+  }
+  if (code === "desktop_admin_decode_error" || code === "desktop_admin_http_status") {
+    return "disconnected";
+  }
+
   if (!message) {
     return "unknown";
   }

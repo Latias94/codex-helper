@@ -5742,6 +5742,7 @@ mod tests {
             response_signal.reset_after_secs = Some(30);
             let balance_signal = crate::provider_signals::ProviderSignal {
                 kind: crate::provider_signals::ProviderSignalKind::Balance,
+                code: Some("balance".to_string()),
                 source: crate::provider_signals::ProviderSignalSource::BalanceSnapshot,
                 target: crate::provider_signals::ProviderSignalTarget::ProviderEndpoint {
                     provider_endpoint_key: endpoint.clone(),

@@ -9,6 +9,17 @@ use crate::runtime_identity::ProviderEndpointKey;
 #[serde(rename_all = "snake_case")]
 pub enum PolicyActionKind {
     Cooldown,
+    #[serde(other)]
+    Unknown,
+}
+
+impl PolicyActionKind {
+    pub fn code(&self) -> &'static str {
+        match self {
+            PolicyActionKind::Cooldown => "cooldown",
+            PolicyActionKind::Unknown => "unknown",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -28,6 +39,8 @@ pub enum PolicyActionRecoveryState {
 pub struct PolicyAction {
     pub id: String,
     pub kind: PolicyActionKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
     pub owner: PolicyActionOwner,
     pub provider_endpoint_key: ProviderEndpointKey,
     pub source_signal: ProviderSignal,
@@ -92,6 +105,7 @@ impl PolicyAction {
                 created_at_ms
             ),
             kind: PolicyActionKind::Cooldown,
+            code: Some(PolicyActionKind::Cooldown.code().to_string()),
             owner: PolicyActionOwner::CodexHelper,
             provider_endpoint_key,
             source_signal: signal.clone(),
@@ -112,12 +126,18 @@ impl PolicyAction {
         self.is_active_at(now_ms)
             .then(|| self.expires_at_ms.saturating_sub(now_ms).div_ceil(1000))
     }
+
+    pub fn stable_code(&self) -> &str {
+        self.code.as_deref().unwrap_or_else(|| self.kind.code())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PolicyActionProjection {
     pub provider_endpoint_key: ProviderEndpointKey,
     pub active_cooldown: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cooldown_remaining_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -132,6 +152,10 @@ impl PolicyActionProjection {
         Some(Self {
             provider_endpoint_key: action.provider_endpoint_key.clone(),
             active_cooldown: matches!(action.kind, PolicyActionKind::Cooldown),
+            code: action
+                .code
+                .clone()
+                .or_else(|| Some(action.kind.code().to_string())),
             cooldown_remaining_secs: Some(cooldown_remaining_secs),
             reason: Some(action.reason.clone()),
             action_id: Some(action.id.clone()),
@@ -164,6 +188,7 @@ mod tests {
             .expect("cooldown action");
 
         assert_eq!(action.owner, PolicyActionOwner::CodexHelper);
+        assert_eq!(action.code.as_deref(), Some("cooldown"));
         assert_eq!(action.expires_at_ms, 31_000);
         assert_eq!(action.generation, 7);
         assert!(action.is_active_at(30_999));
@@ -173,5 +198,25 @@ mod tests {
     #[test]
     fn quota_without_horizon_is_recorded_only() {
         assert!(PolicyAction::cooldown_from_signal(quota_signal(None), 1_000, 0, 1).is_none());
+    }
+
+    #[test]
+    fn policy_action_projection_serializes_code() {
+        let action = PolicyAction::cooldown_from_signal(quota_signal(Some(30)), 1_000, 0, 7)
+            .expect("cooldown action");
+        let projection = PolicyActionProjection::from_action(&action, 2_000).expect("projection");
+        let value = serde_json::to_value(&projection).expect("serialize projection");
+
+        assert_eq!(value["code"].as_str(), Some("cooldown"));
+        assert_eq!(value["active_cooldown"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn unknown_policy_action_kind_deserializes_as_unknown_code() {
+        let kind: PolicyActionKind =
+            serde_json::from_str("\"future_action\"").expect("deserialize action kind");
+
+        assert_eq!(kind, PolicyActionKind::Unknown);
+        assert_eq!(kind.code(), "unknown");
     }
 }

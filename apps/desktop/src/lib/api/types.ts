@@ -79,6 +79,7 @@ export type RuntimeDataState = {
   isStale: boolean;
   ownerMode: RuntimeOwnerMode;
   lastUpdatedAt?: number;
+  errorCode?: string;
   errorMessage?: string;
 };
 
