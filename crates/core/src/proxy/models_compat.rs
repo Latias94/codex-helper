@@ -310,6 +310,13 @@ impl ModelCapabilities {
         }
     }
 
+    const fn bedrock_gpt_5_6() -> Self {
+        Self {
+            reasoning_levels: ReasoningLevels::ModernWithMax,
+            ..Self::modern_gpt()
+        }
+    }
+
     const fn gpt_5_2() -> Self {
         Self {
             reasoning_levels: ReasoningLevels::Gpt52,
@@ -474,6 +481,7 @@ impl ModelCapabilities {
 enum ReasoningLevels {
     None,
     Modern,
+    ModernWithMax,
     Gpt52,
 }
 
@@ -481,24 +489,33 @@ impl ReasoningLevels {
     fn json(self) -> Value {
         match self {
             Self::None => serde_json::json!([]),
-            Self::Modern => serde_json::json!([
-                {
-                    "effort": "low",
-                    "description": "Fast responses with lighter reasoning"
-                },
-                {
-                    "effort": "medium",
-                    "description": "Balances speed and reasoning depth for everyday tasks"
-                },
-                {
-                    "effort": "high",
-                    "description": "Greater reasoning depth for complex problems"
-                },
-                {
-                    "effort": "xhigh",
-                    "description": "Extra high reasoning depth for complex problems"
+            Self::Modern | Self::ModernWithMax => {
+                let mut levels = vec![
+                    serde_json::json!({
+                        "effort": "low",
+                        "description": "Fast responses with lighter reasoning"
+                    }),
+                    serde_json::json!({
+                        "effort": "medium",
+                        "description": "Balances speed and reasoning depth for everyday tasks"
+                    }),
+                    serde_json::json!({
+                        "effort": "high",
+                        "description": "Greater reasoning depth for complex problems"
+                    }),
+                    serde_json::json!({
+                        "effort": "xhigh",
+                        "description": "Extra high reasoning depth for complex problems"
+                    }),
+                ];
+                if matches!(self, Self::ModernWithMax) {
+                    levels.push(serde_json::json!({
+                        "effort": "max",
+                        "description": "Maximum reasoning depth for the hardest problems"
+                    }));
                 }
-            ]),
+                serde_json::json!(levels)
+            }
             Self::Gpt52 => serde_json::json!([
                 {
                     "effort": "low",
@@ -667,6 +684,59 @@ fn known_codex_model(
             max_context_window: 272_000,
             hidden: false,
             capabilities: ModelCapabilities::codex_spark(),
+        },
+        "openai.gpt-5.5" => KnownCodexModel {
+            display_name: Some("GPT-5.5".to_string()),
+            description: Some(
+                "Frontier model for complex coding, research, and real-world work.".to_string(),
+            ),
+            priority: Some(0),
+            context_window: 272_000,
+            max_context_window: 272_000,
+            hidden: false,
+            capabilities: ModelCapabilities::modern_gpt(),
+        },
+        "openai.gpt-5.4" => KnownCodexModel {
+            display_name: Some("gpt-5.4".to_string()),
+            description: Some("Strong model for everyday coding.".to_string()),
+            priority: Some(1),
+            context_window: 272_000,
+            max_context_window: 272_000,
+            hidden: false,
+            capabilities: ModelCapabilities::modern_gpt(),
+        },
+        "openai.gpt-5.6-sol" | "gpt-5.6-sol" => KnownCodexModel {
+            display_name: Some("Sol".to_string()),
+            description: Some(
+                "Frontier model for complex coding, research, and real-world work.".to_string(),
+            ),
+            priority: Some(2),
+            context_window: 272_000,
+            max_context_window: 272_000,
+            hidden: false,
+            capabilities: ModelCapabilities::bedrock_gpt_5_6(),
+        },
+        "openai.gpt-5.6-terra" | "gpt-5.6-terra" => KnownCodexModel {
+            display_name: Some("Terra".to_string()),
+            description: Some(
+                "Frontier model for complex coding, research, and real-world work.".to_string(),
+            ),
+            priority: Some(3),
+            context_window: 272_000,
+            max_context_window: 272_000,
+            hidden: false,
+            capabilities: ModelCapabilities::bedrock_gpt_5_6(),
+        },
+        "openai.gpt-5.6-luna" | "gpt-5.6-luna" => KnownCodexModel {
+            display_name: Some("Luna".to_string()),
+            description: Some(
+                "Frontier model for complex coding, research, and real-world work.".to_string(),
+            ),
+            priority: Some(4),
+            context_window: 272_000,
+            max_context_window: 272_000,
+            hidden: false,
+            capabilities: ModelCapabilities::bedrock_gpt_5_6(),
         },
         "gpt-5.2" => KnownCodexModel {
             display_name: Some("GPT-5.2".to_string()),
@@ -1068,6 +1138,82 @@ mod tests {
             Some("freeform")
         );
         assert_input_modalities(model, &["text", "image"]);
+    }
+
+    #[test]
+    fn translated_openai_models_list_supports_bedrock_gpt_5_6_variants() {
+        let value = translated_models_value(&[
+            "openai.gpt-5.6-sol",
+            "openai.gpt-5.6-terra",
+            "openai.gpt-5.6-luna",
+        ]);
+
+        for (slug, display_name, priority) in [
+            ("openai.gpt-5.6-sol", "Sol", 2),
+            ("openai.gpt-5.6-terra", "Terra", 3),
+            ("openai.gpt-5.6-luna", "Luna", 4),
+        ] {
+            let model = model_by_slug(&value, slug);
+            assert_eq!(
+                model.get("display_name").and_then(Value::as_str),
+                Some(display_name)
+            );
+            assert_eq!(
+                model.get("priority").and_then(Value::as_i64),
+                Some(priority)
+            );
+            assert_eq!(
+                model.get("context_window").and_then(Value::as_i64),
+                Some(272_000)
+            );
+            assert_eq!(
+                model.get("max_context_window").and_then(Value::as_i64),
+                Some(272_000)
+            );
+            assert_reasoning_efforts(model, &["low", "medium", "high", "xhigh", "max"]);
+            assert_input_modalities(model, &["text", "image"]);
+            assert!(!model_has_fast_service_tier(model));
+            assert!(!model_has_legacy_fast_speed_tier(model));
+        }
+    }
+
+    #[test]
+    fn translated_openai_models_list_keeps_bedrock_gpt_5_4_and_5_5_on_default_tier() {
+        let value = translated_models_value(&["openai.gpt-5.5", "openai.gpt-5.4"]);
+
+        for (slug, priority) in [("openai.gpt-5.5", 0), ("openai.gpt-5.4", 1)] {
+            let model = model_by_slug(&value, slug);
+            assert_eq!(
+                model.get("priority").and_then(Value::as_i64),
+                Some(priority)
+            );
+            assert_eq!(
+                model.get("context_window").and_then(Value::as_i64),
+                Some(272_000)
+            );
+            assert_eq!(
+                model.get("max_context_window").and_then(Value::as_i64),
+                Some(272_000)
+            );
+            assert_reasoning_efforts(model, &["low", "medium", "high", "xhigh"]);
+            assert_input_modalities(model, &["text", "image"]);
+            assert!(!model_has_fast_service_tier(model));
+            assert!(!model_has_legacy_fast_speed_tier(model));
+        }
+    }
+
+    #[test]
+    fn translated_openai_models_list_handles_stripped_bedrock_gpt_5_6_slug() {
+        let value = translated_models_value(&["gpt-5.6-sol"]);
+        let model = model_by_slug(&value, "gpt-5.6-sol");
+
+        assert_eq!(
+            model.get("display_name").and_then(Value::as_str),
+            Some("Sol")
+        );
+        assert_reasoning_efforts(model, &["low", "medium", "high", "xhigh", "max"]);
+        assert!(!model_has_fast_service_tier(model));
+        assert!(!model_has_legacy_fast_speed_tier(model));
     }
 
     #[test]
