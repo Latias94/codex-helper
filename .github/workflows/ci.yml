@@ -48,8 +48,26 @@ jobs:
         with:
           node-version: 24
 
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install desktop dependencies
+        run: pnpm --dir apps/desktop install --frozen-lockfile
+
       - name: Prepare Tauri sidecar
         run: node apps/desktop/scripts/prepare-sidecar.mjs
+
+      - name: Check desktop version sync
+        run: pnpm --dir apps/desktop check:versions
+
+      - name: Check desktop contracts
+        run: pnpm --dir apps/desktop check:contracts
+
+      - name: Test desktop
+        run: pnpm --dir apps/desktop test -- --run
+
+      - name: Build desktop frontend
+        run: pnpm --dir apps/desktop build
 
       - name: Format
         run: cargo fmt --all -- --check
@@ -98,6 +116,9 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: 24
+
+      - name: Enable Corepack
+        run: corepack enable
 
       - name: Prepare Tauri sidecar
         run: node apps/desktop/scripts/prepare-sidecar.mjs
