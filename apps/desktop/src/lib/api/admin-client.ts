@@ -2,6 +2,7 @@ import type {
   ApiFinishedRequest,
   ApiOperatorSummary,
   ApiProviderOption,
+  ApiRequestChainExport,
   ApiRequestUsageSummaryRow,
   ApiRuntimeStatus,
 } from "@/lib/api/admin-types";
@@ -34,6 +35,13 @@ export type RequestLedgerRecentParams = {
 export type RequestLedgerSummaryParams = {
   limit?: number;
   by?: "station" | "provider" | "model" | "session";
+};
+
+export type RequestLedgerChainParams = {
+  limit?: number;
+  traceId?: string;
+  requestId?: number;
+  session?: string;
 };
 
 export class AdminApiClient {
@@ -78,6 +86,25 @@ export class AdminApiClient {
       by: params.by ?? "provider",
       limit: params.limit ?? 30,
     });
+  }
+
+  async getRequestLedgerChain(
+    path = "/__codex_helper/api/v1/request-ledger/chain",
+    params: RequestLedgerChainParams = {},
+  ) {
+    const query: Record<string, string | number | boolean> = {
+      limit: params.limit ?? 20,
+    };
+    if (params.traceId) {
+      query.trace_id = params.traceId;
+    }
+    if (params.requestId !== undefined) {
+      query.request_id = params.requestId;
+    }
+    if (params.session) {
+      query.session = params.session;
+    }
+    return this.get<ApiRequestChainExport>(path, query);
   }
 
   private async get<T>(path: string, params?: Record<string, string | number | boolean>) {

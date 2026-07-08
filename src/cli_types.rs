@@ -1049,6 +1049,24 @@ pub enum UsageCommand {
         #[arg(long)]
         raw: bool,
     },
+    /// Export a sanitized request chain by trace, request id, or session
+    Chain {
+        /// Maximum number of matching requests to export
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Match an exact trace id
+        #[arg(long)]
+        trace_id: Option<String>,
+        /// Match an exact request id
+        #[arg(long)]
+        request_id: Option<u64>,
+        /// Match session id substring
+        #[arg(long)]
+        session: Option<String>,
+        /// Print the sanitized chain as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]

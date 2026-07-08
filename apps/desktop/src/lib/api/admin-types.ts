@@ -138,6 +138,7 @@ export type ApiOperatorSummaryLinks = {
   status_station_health?: string;
   request_ledger_recent?: string;
   request_ledger_summary?: string;
+  request_ledger_chain?: string;
   control_trace?: string;
   retry_config?: string;
   pricing_catalog?: string;
@@ -153,6 +154,7 @@ export type ApiControlPlaneSurfaceCapabilities = {
   runtime_status?: boolean;
   request_ledger_recent?: boolean;
   request_ledger_summary?: boolean;
+  request_ledger_chain?: boolean;
   providers?: boolean;
   provider_balance_refresh?: boolean;
   provider_specs?: boolean;
@@ -282,6 +284,119 @@ export type ApiRetryInfo = {
   attempts?: number;
   upstream_chain?: string[];
   route_attempts?: ApiRouteAttempt[];
+};
+
+export type ApiRequestChainSelector = {
+  trace_id?: string;
+  request_id?: number;
+  session_id?: string;
+};
+
+export type ApiRequestChainRouteAttempt = {
+  attempt_index: number;
+  provider_id?: string;
+  endpoint_id?: string;
+  provider_endpoint_key?: string;
+  station_name?: string;
+  preference_group?: number;
+  route_path?: string[];
+  provider_attempt?: number;
+  upstream_attempt?: number;
+  provider_max_attempts?: number;
+  upstream_max_attempts?: number;
+  avoided_total?: number;
+  total_upstreams?: number;
+  decision: string;
+  code: string;
+  status_code?: number;
+  error_class?: string;
+  model?: string;
+  upstream_headers_ms?: number;
+  duration_ms?: number;
+  cooldown_secs?: number;
+  skipped?: boolean;
+  provider_signals?: ApiRequestChainProviderSignal[];
+  policy_actions?: ApiRequestChainPolicyAction[];
+};
+
+export type ApiRequestChainProviderSignal = {
+  kind: string;
+  code: string;
+  source: string;
+  target: ApiProviderSignalTarget;
+  confidence: string;
+  observed_at_ms: number;
+  route_facing?: boolean;
+  retry_after_secs?: number;
+  reset_after_secs?: number;
+  error_class?: string;
+  trace_id?: string;
+};
+
+export type ApiRequestChainPolicyAction = {
+  id: string;
+  kind: string;
+  code: string;
+  owner: string;
+  provider_endpoint_key: string;
+  source_signal: ApiRequestChainProviderSignal;
+  confidence: string;
+  created_at_ms: number;
+  expires_at_ms: number;
+  recovery_state: string;
+  generation: number;
+};
+
+export type ApiRequestChainTimelineEvent = {
+  order: number;
+  at_ms?: number;
+  kind: string;
+  code: string;
+  attempt_index?: number;
+  provider_id?: string;
+  endpoint_id?: string;
+  provider_endpoint_key?: string;
+  status_code?: number;
+  model?: string;
+};
+
+export type ApiRequestChainRequest = {
+  request_id: number;
+  trace_id?: string;
+  session_id?: string;
+  session_identity_source?: string;
+  client_name?: string;
+  model?: string;
+  reasoning_effort?: string;
+  service_tier?: string;
+  station_name?: string;
+  provider_id?: string;
+  usage?: ApiUsageMetrics;
+  cost?: ApiCostBreakdown;
+  observability: ApiRequestObservability;
+  service: string;
+  method: string;
+  path: string;
+  status_code: number;
+  duration_ms: number;
+  ttfb_ms?: number;
+  streaming: boolean;
+  ended_at_ms: number;
+  attempts_truncated: boolean;
+  provider_signals_truncated: boolean;
+  policy_actions_truncated: boolean;
+  route_attempts: ApiRequestChainRouteAttempt[];
+  provider_signals: ApiRequestChainProviderSignal[];
+  policy_actions: ApiRequestChainPolicyAction[];
+  timeline: ApiRequestChainTimelineEvent[];
+};
+
+export type ApiRequestChainExport = {
+  api_version: number;
+  selector: ApiRequestChainSelector;
+  limit: number;
+  truncated: boolean;
+  requests: ApiRequestChainRequest[];
 };
 
 export type ApiFinishedRequest = {

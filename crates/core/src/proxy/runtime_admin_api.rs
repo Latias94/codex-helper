@@ -35,6 +35,8 @@ pub(super) struct ControlTraceQuery {
 #[derive(serde::Deserialize)]
 pub(super) struct RequestLedgerRecentQuery {
     limit: Option<usize>,
+    trace_id: Option<String>,
+    request_id: Option<u64>,
     session: Option<String>,
     model: Option<String>,
     station: Option<String>,
@@ -51,6 +53,8 @@ pub(super) struct RequestLedgerRecentQuery {
 impl RequestLedgerRecentQuery {
     fn filters(&self) -> crate::request_ledger::RequestLogFilters {
         crate::request_ledger::RequestLogFilters {
+            trace_id: clean_filter(self.trace_id.clone()),
+            request_id: self.request_id,
             session: clean_filter(self.session.clone()),
             model: clean_filter(self.model.clone()),
             station: clean_filter(self.station.clone()),
@@ -70,6 +74,8 @@ impl RequestLedgerRecentQuery {
 pub(super) struct RequestLedgerSummaryQuery {
     limit: Option<usize>,
     by: Option<String>,
+    trace_id: Option<String>,
+    request_id: Option<u64>,
     session: Option<String>,
     model: Option<String>,
     station: Option<String>,
@@ -81,6 +87,26 @@ pub(super) struct RequestLedgerSummaryQuery {
     status_max: Option<u64>,
     fast: Option<bool>,
     retried: Option<bool>,
+}
+
+#[derive(serde::Deserialize)]
+pub(super) struct RequestLedgerChainQuery {
+    limit: Option<usize>,
+    trace_id: Option<String>,
+    request_id: Option<u64>,
+    session: Option<String>,
+    session_id: Option<String>,
+}
+
+impl RequestLedgerChainQuery {
+    fn selector(&self) -> crate::request_chain::RequestChainSelector {
+        crate::request_chain::RequestChainSelector {
+            trace_id: clean_filter(self.trace_id.clone()),
+            request_id: self.request_id,
+            session_id: clean_filter(self.session_id.clone())
+                .or_else(|| clean_filter(self.session.clone())),
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -104,6 +130,8 @@ pub(super) struct RoutingExplainQuery {
 impl RequestLedgerSummaryQuery {
     fn filters(&self) -> crate::request_ledger::RequestLogFilters {
         crate::request_ledger::RequestLogFilters {
+            trace_id: clean_filter(self.trace_id.clone()),
+            request_id: self.request_id,
             session: clean_filter(self.session.clone()),
             model: clean_filter(self.model.clone()),
             station: clean_filter(self.station.clone()),
@@ -421,6 +449,27 @@ pub(super) async fn get_request_ledger_summary(
     let filters = q.filters();
     crate::request_ledger::RequestLedgerStore::default()
         .summarize(group, &filters, limit)
+        .map(Json)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
+}
+
+pub(super) async fn get_request_ledger_chain(
+    _proxy: ProxyService,
+    Query(q): Query<RequestLedgerChainQuery>,
+) -> Result<Json<crate::request_chain::RequestChainExport>, (StatusCode, String)> {
+    let selector = q.selector();
+    if !selector.has_identity() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "trace_id, request_id, or session is required".to_string(),
+        ));
+    }
+    let limit = q
+        .limit
+        .unwrap_or(crate::request_chain::REQUEST_CHAIN_EXPORT_DEFAULT_LIMIT)
+        .clamp(1, crate::request_chain::REQUEST_CHAIN_EXPORT_MAX_LIMIT);
+    crate::request_ledger::RequestLedgerStore::default()
+        .export_request_chain(selector, limit)
         .map(Json)
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
 }

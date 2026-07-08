@@ -24,6 +24,7 @@ pub mod pricing;
 pub mod provider_signals;
 pub mod proxy;
 pub mod relay_target;
+pub mod request_chain;
 pub mod request_ledger;
 pub mod routing_explain;
 pub mod routing_ir;

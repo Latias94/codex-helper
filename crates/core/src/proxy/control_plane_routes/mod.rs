@@ -18,9 +18,9 @@ use super::control_plane_manifest::{
     API_V1_OPERATOR_SUMMARY, API_V1_PRICING_CATALOG, API_V1_PROFILE_BY_NAME, API_V1_PROFILES,
     API_V1_PROFILES_DEFAULT, API_V1_PROFILES_DEFAULT_PERSISTED, API_V1_PROVIDER_SPEC_BY_NAME,
     API_V1_PROVIDER_SPECS, API_V1_PROVIDERS, API_V1_PROVIDERS_BALANCES_REFRESH,
-    API_V1_PROVIDERS_RUNTIME, API_V1_REQUEST_LEDGER_RECENT, API_V1_REQUEST_LEDGER_SUMMARY,
-    API_V1_RETRY_CONFIG, API_V1_ROUTING, API_V1_ROUTING_EXPLAIN, API_V1_RUNTIME_RELOAD,
-    API_V1_RUNTIME_SHUTDOWN, API_V1_RUNTIME_STATUS, API_V1_SESSION_BY_ID,
+    API_V1_PROVIDERS_RUNTIME, API_V1_REQUEST_LEDGER_CHAIN, API_V1_REQUEST_LEDGER_RECENT,
+    API_V1_REQUEST_LEDGER_SUMMARY, API_V1_RETRY_CONFIG, API_V1_ROUTING, API_V1_ROUTING_EXPLAIN,
+    API_V1_RUNTIME_RELOAD, API_V1_RUNTIME_SHUTDOWN, API_V1_RUNTIME_STATUS, API_V1_SESSION_BY_ID,
     API_V1_SESSION_OVERRIDE_EFFORT, API_V1_SESSION_OVERRIDE_MODEL, API_V1_SESSION_OVERRIDE_PROFILE,
     API_V1_SESSION_OVERRIDE_RESET, API_V1_SESSION_OVERRIDE_ROUTE,
     API_V1_SESSION_OVERRIDE_SERVICE_TIER, API_V1_SESSION_OVERRIDE_STATION,
@@ -45,9 +45,9 @@ use super::providers_api::{
     apply_provider_runtime_meta, list_providers, refresh_provider_balances,
 };
 use super::runtime_admin_api::{
-    get_control_trace, get_pricing_catalog, get_request_ledger_recent, get_request_ledger_summary,
-    get_retry_config, get_routing_explain, list_profiles, reload_runtime_config, runtime_status,
-    set_retry_config, shutdown_runtime,
+    get_control_trace, get_pricing_catalog, get_request_ledger_chain, get_request_ledger_recent,
+    get_request_ledger_summary, get_retry_config, get_routing_explain, list_profiles,
+    reload_runtime_config, runtime_status, set_retry_config, shutdown_runtime,
 };
 use super::session_overrides::{
     apply_session_manual_overrides, get_global_route_target_override,

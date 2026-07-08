@@ -11,5 +11,7 @@ export const queryKeys = {
     requestLedgerRecent: (limit = 40) => ["admin", "request-ledger-recent", limit] as const,
     requestLedgerSummary: (by = "provider", limit = 30) =>
       ["admin", "request-ledger-summary", by, limit] as const,
+    requestLedgerChain: (identity: string, limit = 20) =>
+      ["admin", "request-ledger-chain", identity, limit] as const,
   },
 };

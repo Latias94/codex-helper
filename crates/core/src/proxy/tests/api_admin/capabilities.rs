@@ -208,6 +208,11 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
     assert!(caps["endpoints"].as_array().is_some_and(|items| {
         items
             .iter()
+            .any(|item| item.as_str() == Some("/__codex_helper/api/v1/request-ledger/chain"))
+    }));
+    assert!(caps["endpoints"].as_array().is_some_and(|items| {
+        items
+            .iter()
             .any(|item| item.as_str() == Some("/__codex_helper/api/v1/fleet/snapshot"))
     }));
     assert_eq!(
@@ -260,6 +265,10 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
     );
     assert_eq!(
         caps["surface_capabilities"]["request_ledger_summary"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        caps["surface_capabilities"]["request_ledger_chain"].as_bool(),
         Some(true)
     );
     assert_eq!(
@@ -398,6 +407,9 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
                 "station_name": "backup",
                 "provider_id": "fallback",
                 "session_id": "sid-b",
+                "client_addr": "127.0.0.1:65535",
+                "cwd": "C:/Users/Frankorz/secret-project",
+                "upstream_base_url": "https://fallback.example/v1?token=secret",
                 "service_tier": { "actual": "priority" },
                 "usage": {
                     "input_tokens": 100,
@@ -546,6 +558,63 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
         request_summary[0]["aggregate"]["total_tokens"].as_u64(),
         Some(150)
     );
+
+    let missing_selector_chain = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/request-ledger/chain?limit=10",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("missing selector request chain send");
+    assert_eq!(missing_selector_chain.status(), StatusCode::BAD_REQUEST);
+
+    let request_chain = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/request-ledger/chain?trace_id=codex-42&limit=1",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("request chain send")
+        .error_for_status()
+        .expect("request chain status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("request chain json");
+    assert_eq!(request_chain["api_version"].as_u64(), Some(1));
+    assert_eq!(
+        request_chain["selector"]["trace_id"].as_str(),
+        Some("codex-42")
+    );
+    assert_eq!(
+        request_chain["requests"]
+            .as_array()
+            .map(|requests| requests.len()),
+        Some(1)
+    );
+    assert_eq!(
+        request_chain["requests"][0]["request_id"].as_u64(),
+        Some(42)
+    );
+    assert_eq!(
+        request_chain["requests"][0]["route_attempts"][0]["code"].as_str(),
+        Some("failed_status")
+    );
+    assert!(
+        request_chain["requests"][0]["timeline"]
+            .as_array()
+            .is_some_and(|events| events
+                .iter()
+                .any(|event| event["kind"].as_str() == Some("route_attempt"))),
+        "request chain should expose route attempts in the timeline"
+    );
+    let chain_text = serde_json::to_string(&request_chain).expect("request chain text");
+    assert!(!chain_text.contains("client_addr"));
+    assert!(!chain_text.contains("secret-project"));
+    assert!(!chain_text.contains("upstream_base_url"));
+    assert!(!chain_text.contains("fallback.example"));
+    assert!(!chain_text.contains("raw"));
 
     let set_global = client
         .post(format!(

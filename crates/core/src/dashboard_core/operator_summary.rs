@@ -185,6 +185,8 @@ pub struct OperatorSummaryLinks {
     pub request_ledger_recent: String,
     #[serde(default)]
     pub request_ledger_summary: String,
+    #[serde(default)]
+    pub request_ledger_chain: String,
     pub control_trace: String,
     pub retry_config: String,
     #[serde(default)]

@@ -11,6 +11,9 @@ use crate::logging::request_log_retention;
 use crate::policy_actions::PolicyAction;
 use crate::pricing::{CostAdjustments, estimate_request_cost_from_operator_catalog_for_service};
 use crate::provider_signals::ProviderSignal;
+use crate::request_chain::{
+    REQUEST_CHAIN_EXPORT_MAX_LIMIT, RequestChainExport, RequestChainSelector,
+};
 use crate::runtime_identity::ProviderEndpointKey;
 use crate::state::{
     FinishedRequest, RequestObservability, RouteDecisionProvenance, SessionIdentitySource,
@@ -52,6 +55,8 @@ impl RequestLogLine {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RequestLogFilters {
+    pub trace_id: Option<String>,
+    pub request_id: Option<u64>,
     pub session: Option<String>,
     pub model: Option<String>,
     pub station: Option<String>,
@@ -67,7 +72,9 @@ pub struct RequestLogFilters {
 
 impl RequestLogFilters {
     pub fn is_empty(&self) -> bool {
-        self.session.is_none()
+        self.trace_id.is_none()
+            && self.request_id.is_none()
+            && self.session.is_none()
             && self.model.is_none()
             && self.station.is_none()
             && self.provider.is_none()
@@ -81,6 +88,16 @@ impl RequestLogFilters {
     }
 
     pub fn matches(&self, record: &JsonValue) -> bool {
+        if let Some(expected) = self.trace_id.as_deref()
+            && str_field(record, "trace_id") != Some(expected)
+        {
+            return false;
+        }
+        if let Some(expected) = self.request_id
+            && u64_field(record, "request_id").unwrap_or(0) != expected
+        {
+            return false;
+        }
         if let Some(expected) = self.session.as_deref()
             && !field_contains(str_field(record, "session_id"), expected)
         {
@@ -374,6 +391,27 @@ impl RequestLedgerStore {
             .collect())
     }
 
+    pub fn export_request_chain(
+        &self,
+        selector: RequestChainSelector,
+        limit: usize,
+    ) -> std::io::Result<RequestChainExport> {
+        let selector = selector.normalized();
+        let limit = limit.clamp(1, REQUEST_CHAIN_EXPORT_MAX_LIMIT);
+        let filters = RequestLogFilters {
+            trace_id: selector.trace_id.clone(),
+            request_id: selector.request_id,
+            session: selector.session_id.clone(),
+            ..RequestLogFilters::default()
+        };
+        let mut requests = self.find_finished_requests(&filters, limit.saturating_add(1))?;
+        let truncated = requests.len() > limit;
+        requests.truncate(limit);
+        Ok(RequestChainExport::from_finished_requests(
+            selector, limit, truncated, requests,
+        ))
+    }
+
     pub fn summarize(
         &self,
         group: RequestUsageSummaryGroup,
@@ -411,6 +449,14 @@ pub fn find_finished_requests_from_log(
     limit: usize,
 ) -> std::io::Result<Vec<FinishedRequest>> {
     RequestLedgerStore::from_path(path).find_finished_requests(filters, limit)
+}
+
+pub fn export_request_chain_from_log(
+    path: &Path,
+    selector: RequestChainSelector,
+    limit: usize,
+) -> std::io::Result<RequestChainExport> {
+    RequestLedgerStore::from_path(path).export_request_chain(selector, limit)
 }
 
 pub fn summarize_request_log(
@@ -1200,9 +1246,43 @@ mod tests {
             status_max: Some(499),
             fast: true,
             retried: true,
+            ..RequestLogFilters::default()
         };
 
         assert!(filters.matches(&record));
+    }
+
+    #[test]
+    fn filters_match_trace_and_request_id_exactly() {
+        let record = json!({
+            "trace_id": "trace-123",
+            "request_id": 42,
+            "status_code": 200
+        });
+
+        assert!(
+            RequestLogFilters {
+                trace_id: Some("trace-123".to_string()),
+                request_id: Some(42),
+                ..RequestLogFilters::default()
+            }
+            .matches(&record)
+        );
+        assert!(
+            !RequestLogFilters {
+                trace_id: Some("trace".to_string()),
+                request_id: Some(42),
+                ..RequestLogFilters::default()
+            }
+            .matches(&record)
+        );
+        assert!(
+            !RequestLogFilters {
+                request_id: Some(7),
+                ..RequestLogFilters::default()
+            }
+            .matches(&record)
+        );
     }
 
     #[test]
@@ -1480,6 +1560,43 @@ mod tests {
                 .value()
                 .and_then(|record| str_field(record, "provider_id")),
             Some("c")
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn request_ledger_store_exports_request_chain_with_limit_and_truncation() {
+        let path = temp_request_log_path("request-chain");
+        write_request_log_lines(
+            &path,
+            &[
+                r#"{"timestamp_ms":100,"request_id":1,"trace_id":"trace-1","session_id":"sid-a","service":"codex","method":"POST","path":"/v1/responses","status_code":200,"duration_ms":10}"#,
+                r#"{"timestamp_ms":200,"request_id":2,"trace_id":"trace-2","session_id":"sid-a","service":"codex","method":"POST","path":"/v1/responses","status_code":429,"duration_ms":20}"#,
+                r#"{"timestamp_ms":300,"request_id":3,"trace_id":"trace-3","session_id":"sid-a","service":"codex","method":"POST","path":"/v1/responses","status_code":200,"duration_ms":30}"#,
+            ],
+        );
+
+        let store = RequestLedgerStore::from_path(&path);
+        let export = store
+            .export_request_chain(
+                RequestChainSelector {
+                    session_id: Some("sid-a".to_string()),
+                    ..RequestChainSelector::default()
+                },
+                2,
+            )
+            .expect("export request chain");
+
+        assert!(export.truncated);
+        assert_eq!(export.limit, 2);
+        assert_eq!(
+            export
+                .requests
+                .iter()
+                .map(|request| request.request_id)
+                .collect::<Vec<_>>(),
+            vec![2, 3],
+            "session export should keep the newest limited window and order it by completion time"
         );
         let _ = std::fs::remove_file(path);
     }

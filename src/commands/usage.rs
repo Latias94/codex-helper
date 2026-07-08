@@ -1,3 +1,4 @@
+use crate::request_chain::RequestChainSelector;
 use crate::request_ledger::{RequestLedgerStore, RequestLogFilters, RequestUsageSummaryGroup};
 use crate::{CliError, CliResult, UsageCommand, UsageSummaryBy};
 use owo_colors::OwoColorize;
@@ -79,6 +80,7 @@ pub async fn handle_usage_cmd(cmd: UsageCommand) -> CliResult<()> {
                 retried,
                 signal_kind: None,
                 policy_action_kind: None,
+                ..RequestLogFilters::default()
             };
             let lines = store.find_lines(&filters, limit).map_err(|err| {
                 CliError::Usage(format!("无法打开请求日志 {:?}: {}", store.path(), err))
@@ -98,6 +100,74 @@ pub async fn handle_usage_cmd(cmd: UsageCommand) -> CliResult<()> {
                     "No request records matched the filters in {:?}.",
                     store.path()
                 );
+            }
+        }
+        UsageCommand::Chain {
+            limit,
+            trace_id,
+            request_id,
+            session,
+            json,
+        } => {
+            let selector = RequestChainSelector {
+                trace_id,
+                request_id,
+                session_id: session,
+            }
+            .normalized();
+            if !selector.has_identity() {
+                return Err(CliError::Usage(
+                    "usage chain requires --trace-id, --request-id, or --session".to_string(),
+                ));
+            }
+
+            let export = store.export_request_chain(selector, limit).map_err(|err| {
+                CliError::Usage(format!("无法打开请求日志 {:?}: {}", store.path(), err))
+            })?;
+            if json {
+                let text = serde_json::to_string_pretty(&export)
+                    .map_err(|err| CliError::Usage(format!("无法序列化请求链: {err}")))?;
+                println!("{text}");
+                return Ok(());
+            }
+
+            println!(
+                "{}",
+                format!(
+                    "Request chain export: {} request(s), truncated={} (from {:?})",
+                    export.requests.len(),
+                    export.truncated,
+                    store.path()
+                )
+                .bold()
+            );
+            for request in &export.requests {
+                println!(
+                    "[{}] request={} trace={} session={} status={} provider={} model={} attempts={} events={}",
+                    request.ended_at_ms,
+                    request.request_id,
+                    request.trace_id.as_deref().unwrap_or("-"),
+                    request.session_id.as_deref().unwrap_or("-"),
+                    request.status_code,
+                    request.provider_id.as_deref().unwrap_or("-"),
+                    request.model.as_deref().unwrap_or("-"),
+                    request.route_attempts.len(),
+                    request.timeline.len(),
+                );
+                for attempt in &request.route_attempts {
+                    println!(
+                        "    attempt#{} code={} decision={} status={} endpoint={} model={}",
+                        attempt.attempt_index,
+                        attempt.code,
+                        attempt.decision,
+                        attempt
+                            .status_code
+                            .map(|status| status.to_string())
+                            .unwrap_or_else(|| "-".to_string()),
+                        attempt.provider_endpoint_key.as_deref().unwrap_or("-"),
+                        attempt.model.as_deref().unwrap_or("-"),
+                    );
+                }
             }
         }
     }

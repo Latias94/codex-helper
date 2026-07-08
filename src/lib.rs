@@ -11,7 +11,7 @@ pub use cli_types::{
 pub use codex_helper_core::{
     basellm_metadata, codex_integration, codex_models_cache, config, control_plane_client,
     dashboard_core, filter, healthcheck, lb, logging, model_routing, notify, pricing, proxy,
-    relay_target, request_ledger, routing_explain, routing_ir, runtime_host, runtime_manager,
-    sessions, state, usage, usage_providers,
+    relay_target, request_chain, request_ledger, routing_explain, routing_ir, runtime_host,
+    runtime_manager, sessions, state, usage, usage_providers,
 };
 pub use codex_helper_tui::tui;

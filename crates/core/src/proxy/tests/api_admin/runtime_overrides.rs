@@ -539,6 +539,10 @@ async fn proxy_api_v1_operator_summary_reports_runtime_target_and_retry() {
         Some("/__codex_helper/api/v1/request-ledger/summary")
     );
     assert_eq!(
+        summary["links"]["request_ledger_chain"].as_str(),
+        Some("/__codex_helper/api/v1/request-ledger/chain")
+    );
+    assert_eq!(
         summary["links"]["station_probe"].as_str(),
         Some("/__codex_helper/api/v1/stations/probe")
     );

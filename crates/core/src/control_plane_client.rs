@@ -10,6 +10,7 @@ use crate::dashboard_core::{
 };
 use crate::fleet::FleetSnapshot;
 use crate::proxy::{ADMIN_TOKEN_ENV_VAR, ADMIN_TOKEN_HEADER, RuntimeStatusResponse};
+use crate::request_chain::{RequestChainExport, RequestChainSelector};
 
 const ADMIN_DISCOVERY_PATH: &str = "/.well-known/codex-helper-admin";
 
@@ -163,6 +164,14 @@ impl ControlPlaneClient {
             .await
     }
 
+    pub async fn request_chain(
+        &self,
+        selector: RequestChainSelector,
+        limit: usize,
+    ) -> Result<RequestChainExport> {
+        self.fetch_json(&request_chain_path(selector, limit)).await
+    }
+
     pub async fn providers(&self) -> Result<Vec<ProviderOption>> {
         self.fetch_json("/__codex_helper/api/v1/providers").await
     }
@@ -192,6 +201,29 @@ pub fn normalize_base_url(value: &str) -> Option<String> {
     }
 }
 
+fn request_chain_path(selector: RequestChainSelector, limit: usize) -> String {
+    let selector = selector.normalized();
+    let mut url =
+        Url::parse("http://localhost/__codex_helper/api/v1/request-ledger/chain").expect("url");
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("limit", &limit.to_string());
+        if let Some(trace_id) = selector.trace_id {
+            pairs.append_pair("trace_id", &trace_id);
+        }
+        if let Some(request_id) = selector.request_id {
+            pairs.append_pair("request_id", &request_id.to_string());
+        }
+        if let Some(session_id) = selector.session_id {
+            pairs.append_pair("session", &session_id);
+        }
+    }
+    match url.query() {
+        Some(query) => format!("{}?{query}", url.path()),
+        None => url.path().to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,5 +243,22 @@ mod tests {
             .expect_err("non-http admin url should fail");
 
         assert!(err.to_string().contains("admin base URL"));
+    }
+
+    #[test]
+    fn request_chain_path_encodes_selector_query_values() {
+        let path = request_chain_path(
+            RequestChainSelector {
+                trace_id: Some("trace/with space".to_string()),
+                request_id: Some(42),
+                session_id: Some("session a".to_string()),
+            },
+            20,
+        );
+
+        assert_eq!(
+            path,
+            "/__codex_helper/api/v1/request-ledger/chain?limit=20&trace_id=trace%2Fwith+space&request_id=42&session=session+a"
+        );
     }
 }
