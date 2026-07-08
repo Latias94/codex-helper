@@ -765,7 +765,7 @@ dependencies = [
 
 [[package]]
 name = "codex-helper"
-version = "0.20.0"
+version = "0.20.1"
 dependencies = [
  "anyhow",
  "atty",
@@ -797,7 +797,7 @@ dependencies = [
 
 [[package]]
 name = "codex-helper-core"
-version = "0.20.0"
+version = "0.20.1"
 dependencies = [
  "anyhow",
  "atty",
@@ -836,7 +836,7 @@ dependencies = [
 
 [[package]]
 name = "codex-helper-desktop"
-version = "0.20.0"
+version = "0.20.1"
 dependencies = [
  "codex-helper-core",
  "reqwest",
@@ -855,7 +855,7 @@ dependencies = [
 
 [[package]]
 name = "codex-helper-server"
-version = "0.20.0"
+version = "0.20.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -869,7 +869,7 @@ dependencies = [
 
 [[package]]
 name = "codex-helper-tui"
-version = "0.20.0"
+version = "0.20.1"
 dependencies = [
  "anyhow",
  "codex-helper-core",

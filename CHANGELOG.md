@@ -3,6 +3,26 @@ All notable changes to this project will be documented in this file.
 
 > Recent entries use **Chinese first, then an English summary**. Older entries keep the previous inline bilingual style.
 
+## [0.20.1] - 2026-07-08
+
+### 中文
+
+#### 修复
+
+- 修复余额耗尽抑制可能跨过套餐重置时间继续生效的问题。日套餐耗尽现在会在配置的每日重置时间后重新允许余额查询，避免隔天额度恢复后仍显示耗尽或继续跳过线路。
+- 优化 sub2api / new-api 余额查询节流。已耗尽或暂时不可用的余额快照过期后会重新查询，不再被旧快照反复续期抑制。
+- 兼容 sub2api `/v1/usage` 的 5h / 1d / 7d rate limit 窗口。窗口耗尽时会按 `reset_at` 临时避开，恢复后再重新尝试，不会误当成永久余额耗尽。
+- sub2api 订阅 weekly / monthly 窗口耗尽也会临时阻止继续放量，并在快照过期后重新查询。
+
+### English summary
+
+#### Fixed
+
+- Fixed exhausted balance suppression lasting past package reset time. Daily package exhaustion now expires after the configured daily reset so refreshed quota can be picked up automatically.
+- Improved sub2api / new-api balance polling throttling. Expired exhausted snapshots are no longer reused to renew suppression forever.
+- Added support for sub2api `/v1/usage` 5h / 1d / 7d rate-limit windows. Exhausted windows are treated as temporary and retried after `reset_at`.
+- Weekly and monthly sub2api subscription windows now temporarily block routing while fresh, then re-query after the snapshot expires.
+
 ## [0.20.0] - 2026-07-07
 
 ### 中文

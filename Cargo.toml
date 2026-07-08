@@ -1,6 +1,6 @@
 [package]
 name = "codex-helper"
-version = "0.20.0"
+version = "0.20.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["Mingzhen Zhuang <superfrankie621@gmail.com>"]
@@ -37,8 +37,8 @@ name = "ch"
 path = "src/bin/ch.rs"
 
 [dependencies]
-codex-helper-core = { path = "crates/core", version = "0.20.0" }
-codex-helper-tui = { path = "crates/tui", version = "0.20.0" }
+codex-helper-core = { path = "crates/core", version = "0.20.1" }
+codex-helper-tui = { path = "crates/tui", version = "0.20.1" }
 anyhow = "1.0.103"
 base64 = "0.22.1"
 serde = { version = "1.0.228", features = ["derive"] }
