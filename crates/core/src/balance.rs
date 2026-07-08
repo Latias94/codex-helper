@@ -70,6 +70,8 @@ pub struct ProviderBalanceSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota_used_usd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_resets_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unlimited_quota: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_used_usd: Option<String>,
@@ -197,6 +199,7 @@ impl Default for ProviderBalanceSnapshot {
             quota_remaining_usd: None,
             quota_limit_usd: None,
             quota_used_usd: None,
+            quota_resets_at_ms: None,
             unlimited_quota: None,
             total_used_usd: None,
             today_used_usd: None,
@@ -298,6 +301,7 @@ impl ProviderBalanceSnapshot {
             || self.quota_remaining_usd.is_some()
             || self.quota_limit_usd.is_some()
             || self.quota_used_usd.is_some()
+            || self.quota_resets_at_ms.is_some()
             || self.unlimited_quota == Some(true)
             || self.total_used_usd.is_some()
             || self.today_used_usd.is_some()
@@ -317,6 +321,7 @@ impl ProviderBalanceSnapshot {
         self.quota_remaining_usd = previous.quota_remaining_usd.clone();
         self.quota_limit_usd = previous.quota_limit_usd.clone();
         self.quota_used_usd = previous.quota_used_usd.clone();
+        self.quota_resets_at_ms = previous.quota_resets_at_ms;
         self.unlimited_quota = previous.unlimited_quota;
         self.total_used_usd = previous.total_used_usd.clone();
         self.today_used_usd = previous.today_used_usd.clone();

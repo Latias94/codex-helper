@@ -1696,6 +1696,12 @@ struct QuotaWindowSnapshot {
     limit: UsdAmount,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RateLimitWindowSnapshot {
+    period: String,
+    reset_at_ms: Option<u64>,
+}
+
 fn base_snapshot(
     provider: &UsageProviderConfig,
     upstream: &UpstreamRef,
@@ -2181,6 +2187,40 @@ fn sub2api_usage_windows(value: &serde_json::Value) -> Vec<ProviderUsageWindow> 
         .collect()
 }
 
+fn sub2api_rate_limit_window_from_json(
+    value: &serde_json::Value,
+) -> Option<RateLimitWindowSnapshot> {
+    let period = first_string_from_paths(value, &["window", "period", "name"])?;
+    let limit = first_u64_from_paths(value, &["limit"]);
+    if limit == Some(0) {
+        return None;
+    }
+    let remaining = first_u64_from_paths(value, &["remaining"])?;
+    if remaining > 0 {
+        return None;
+    }
+    let reset_at_ms = first_secs_from_paths(value, &["reset_at", "resets_at", "resetAt"])
+        .map(|secs| secs.saturating_mul(1000));
+    Some(RateLimitWindowSnapshot {
+        period: format!("rate_limit:{period}"),
+        reset_at_ms,
+    })
+}
+
+fn sub2api_limiting_rate_limit_window(
+    value: &serde_json::Value,
+) -> Option<RateLimitWindowSnapshot> {
+    ["rate_limits", "data.rate_limits"]
+        .into_iter()
+        .find_map(|path| array_from_json_path(value, path))
+        .and_then(|items| {
+            items
+                .iter()
+                .filter_map(sub2api_rate_limit_window_from_json)
+                .max_by_key(|window| window.reset_at_ms.unwrap_or(0))
+        })
+}
+
 fn sub2api_model_stats(value: &serde_json::Value) -> Vec<ProviderUsageModelStat> {
     [
         "model_stats",
@@ -2389,6 +2429,7 @@ fn sub2api_usage_snapshot_from_json(
     let has_subscription = has_any_json_path(value, &["subscription", "data.subscription"]);
 
     if mode.as_deref() == Some("quota_limited") {
+        let rate_limit_window = sub2api_limiting_rate_limit_window(value);
         let quota_remaining = first_amount_from_paths(
             value,
             &provider.extract.remaining_balance_paths,
@@ -2412,7 +2453,7 @@ fn sub2api_usage_snapshot_from_json(
             &["quota.used", "data.quota.used"],
             provider.extract.monthly_spent_divisor,
         );
-        let exhausted = first_bool_from_paths(
+        let quota_exhausted = first_bool_from_paths(
             value,
             &provider.extract.exhausted_paths,
             &[
@@ -2423,14 +2464,22 @@ fn sub2api_usage_snapshot_from_json(
             ],
         )
         .or_else(|| quota_remaining.map(UsdAmount::is_zero));
+        let exhausted = Some(quota_exhausted.unwrap_or(false) || rate_limit_window.is_some());
 
         let mut snapshot = base_snapshot(provider, upstream, fetched_at_ms, stale_after_ms);
-        snapshot.quota_period = Some("quota".to_string());
-        snapshot.quota_remaining_usd = quota_remaining.map(amount_to_string);
-        snapshot.quota_limit_usd = quota_limit.map(amount_to_string);
-        snapshot.quota_used_usd = quota_used.map(amount_to_string);
-        snapshot.monthly_budget_usd = quota_limit.map(amount_to_string);
-        snapshot.monthly_spent_usd = quota_used.map(amount_to_string);
+        if let Some(rate_limit_window) = rate_limit_window.clone()
+            && quota_exhausted != Some(true)
+        {
+            snapshot.quota_period = Some(rate_limit_window.period);
+            snapshot.quota_resets_at_ms = rate_limit_window.reset_at_ms;
+        } else {
+            snapshot.quota_period = Some("quota".to_string());
+            snapshot.quota_remaining_usd = quota_remaining.map(amount_to_string);
+            snapshot.quota_limit_usd = quota_limit.map(amount_to_string);
+            snapshot.quota_used_usd = quota_used.map(amount_to_string);
+            snapshot.monthly_budget_usd = quota_limit.map(amount_to_string);
+            snapshot.monthly_spent_usd = quota_used.map(amount_to_string);
+        }
         snapshot.exhausted = exhausted;
         populate_sub2api_usage_fields(&mut snapshot, value);
         snapshot.refresh_status(fetched_at_ms);
@@ -3404,12 +3453,30 @@ fn quota_period_is_current_day(period: &str) -> bool {
     )
 }
 
+fn quota_period_is_refreshable_window(period: &str) -> bool {
+    let normalized = period.trim().to_ascii_lowercase();
+    quota_period_is_current_day(&normalized)
+        || matches!(
+            normalized.as_str(),
+            "weekly" | "week" | "7d" | "monthly" | "month"
+        )
+        || normalized.starts_with("rate_limit:")
+}
+
 fn snapshot_has_current_day_quota_exhaustion(snapshot: &ProviderBalanceSnapshot) -> bool {
     snapshot.exhausted == Some(true)
         && snapshot
             .quota_period
             .as_deref()
             .is_some_and(quota_period_is_current_day)
+}
+
+fn snapshot_has_refreshable_window_exhaustion(snapshot: &ProviderBalanceSnapshot) -> bool {
+    snapshot.exhausted == Some(true)
+        && snapshot
+            .quota_period
+            .as_deref()
+            .is_some_and(quota_period_is_refreshable_window)
 }
 
 fn duration_millis_u64(duration: Duration) -> u64 {
@@ -3450,9 +3517,21 @@ fn usage_provider_snapshot_suppression_ttl(
     cfg: &ProxyConfig,
     now_ms: u64,
 ) -> Option<Duration> {
+    if let Some(reset_at_ms) = snapshot.quota_resets_at_ms {
+        let suppress_until_ms = reset_at_ms.saturating_add(duration_millis_u64(
+            USAGE_PROVIDER_DAILY_RESET_SUPPRESSION_GRACE,
+        ));
+        return duration_until_ms(suppress_until_ms, now_ms)
+            .or_else(|| snapshot_freshness_ttl(snapshot, now_ms));
+    }
+
     if snapshot_has_current_day_quota_exhaustion(snapshot) {
         return current_day_quota_suppression_ttl(snapshot, cfg, now_ms)
             .or_else(|| snapshot_freshness_ttl(snapshot, now_ms));
+    }
+
+    if snapshot_has_refreshable_window_exhaustion(snapshot) {
+        return snapshot_freshness_ttl(snapshot, now_ms);
     }
 
     if snapshot.stale_at(now_ms) {
@@ -3473,6 +3552,13 @@ fn usage_provider_snapshot_suppression_reason(
         let period = snapshot.quota_period.as_deref().unwrap_or("daily");
         return Some(format!(
             "{period} package quota exhausted for current period"
+        ));
+    }
+
+    if snapshot_has_refreshable_window_exhaustion(snapshot) {
+        let period = snapshot.quota_period.as_deref().unwrap_or("usage");
+        return Some(format!(
+            "{period} usage window exhausted for current period"
         ));
     }
 
@@ -4572,6 +4658,63 @@ mod tests {
     }
 
     #[test]
+    fn refreshable_weekly_window_exhaustion_suppresses_only_while_snapshot_is_fresh() {
+        let cfg = ProxyConfig::default();
+        let mut snapshot = ProviderBalanceSnapshot {
+            fetched_at_ms: 1_000,
+            stale_after_ms: Some(10_000),
+            status: BalanceSnapshotStatus::Exhausted,
+            exhausted: Some(true),
+            exhaustion_affects_routing: false,
+            quota_period: Some("weekly".to_string()),
+            quota_remaining_usd: Some("0".to_string()),
+            ..ProviderBalanceSnapshot::default()
+        };
+        snapshot.refresh_status(1_000);
+
+        let decision = usage_provider_suppression_decision_from_snapshot(&snapshot, &cfg, 4_000)
+            .expect("fresh weekly window exhaustion should block follow-up usage");
+        assert_eq!(decision.ttl, Duration::from_millis(6_000));
+        assert!(decision.routing_exhausted);
+
+        assert!(
+            usage_provider_suppression_decision_from_snapshot(&snapshot, &cfg, 10_001).is_none(),
+            "weekly/monthly windows without explicit reset_at should be re-queried after staleness"
+        );
+    }
+
+    #[test]
+    fn rate_limit_reset_at_drives_suppression_ttl() {
+        let cfg = ProxyConfig::default();
+        let reset_at_ms = 120_000;
+        let suppress_until_ms =
+            reset_at_ms + duration_millis_u64(USAGE_PROVIDER_DAILY_RESET_SUPPRESSION_GRACE);
+        let mut snapshot = ProviderBalanceSnapshot {
+            fetched_at_ms: 1_000,
+            stale_after_ms: Some(10_000),
+            status: BalanceSnapshotStatus::Exhausted,
+            exhausted: Some(true),
+            quota_period: Some("rate_limit:5h".to_string()),
+            quota_resets_at_ms: Some(reset_at_ms),
+            ..ProviderBalanceSnapshot::default()
+        };
+        snapshot.refresh_status(1_000);
+
+        let decision = usage_provider_suppression_decision_from_snapshot(
+            &snapshot,
+            &cfg,
+            suppress_until_ms - 1,
+        )
+        .expect("rate limit should suppress until reset grace expires");
+        assert_eq!(decision.ttl, Duration::from_millis(1));
+
+        assert!(
+            usage_provider_suppression_decision_from_snapshot(&snapshot, &cfg, suppress_until_ms)
+                .is_none()
+        );
+    }
+
+    #[test]
     fn auto_provider_uses_stable_target_id_across_probe_kinds() {
         let target = UsageProviderTarget {
             upstream: UpstreamRef {
@@ -5502,6 +5645,72 @@ mod tests {
         assert_eq!(snapshot.monthly_budget_usd.as_deref(), Some("10"));
         assert_eq!(snapshot.monthly_spent_usd.as_deref(), Some("10"));
         assert!(snapshot.routing_exhausted());
+    }
+
+    #[test]
+    fn sub2api_quota_limited_rate_limit_exhaustion_marks_temporary_window() {
+        let reset_at = "2026-01-02T03:04:05Z";
+        let reset_at_ms = parse_timestamp_secs(reset_at).expect("timestamp") * 1000;
+        let snapshot = sub2api_usage_snapshot_from_json(
+            &provider("sub2api", ProviderKind::Sub2ApiUsage),
+            &upstream(),
+            &serde_json::json!({
+                "isValid": true,
+                "mode": "quota_limited",
+                "rate_limits": [
+                    {
+                        "window": "5h",
+                        "limit": 100,
+                        "used": 100,
+                        "remaining": 0,
+                        "reset_at": reset_at
+                    }
+                ]
+            }),
+            100,
+            Some(1_000),
+        );
+
+        assert_eq!(snapshot.status, BalanceSnapshotStatus::Exhausted);
+        assert_eq!(snapshot.exhausted, Some(true));
+        assert_eq!(snapshot.quota_period.as_deref(), Some("rate_limit:5h"));
+        assert_eq!(snapshot.quota_resets_at_ms, Some(reset_at_ms));
+        assert_eq!(snapshot.quota_remaining_usd, None);
+        assert!(snapshot.routing_exhausted());
+    }
+
+    #[test]
+    fn sub2api_quota_limited_total_quota_exhaustion_wins_over_rate_limit_window() {
+        let snapshot = sub2api_usage_snapshot_from_json(
+            &provider("sub2api", ProviderKind::Sub2ApiUsage),
+            &upstream(),
+            &serde_json::json!({
+                "isValid": true,
+                "mode": "quota_limited",
+                "quota": {
+                    "limit": 10,
+                    "used": 10,
+                    "remaining": 0,
+                    "unit": "USD"
+                },
+                "rate_limits": [
+                    {
+                        "window": "5h",
+                        "limit": 100,
+                        "used": 100,
+                        "remaining": 0,
+                        "reset_at": "2026-01-02T03:04:05Z"
+                    }
+                ]
+            }),
+            100,
+            Some(1_000),
+        );
+
+        assert_eq!(snapshot.status, BalanceSnapshotStatus::Exhausted);
+        assert_eq!(snapshot.quota_period.as_deref(), Some("quota"));
+        assert_eq!(snapshot.quota_remaining_usd.as_deref(), Some("0"));
+        assert_eq!(snapshot.quota_resets_at_ms, None);
     }
 
     #[test]
