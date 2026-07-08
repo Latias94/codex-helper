@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::Query;
-use axum::http::StatusCode;
 use serde::de::{self, SeqAccess, Visitor};
 
 use crate::config::ProxyConfig;
@@ -14,6 +13,7 @@ use crate::routing_explain::{
 use crate::routing_ir::{RouteRequestContext, compile_legacy_route_plan_template};
 
 use super::ProxyService;
+use super::admin_api_error::{AdminApiHttpError, AdminApiResult};
 use super::api_responses::{
     ProfilesResponse, ReloadResult, RetryConfigResponse, RuntimeStatusResponse,
     build_retry_config_response, make_profiles_response,
@@ -212,9 +212,7 @@ impl RoutingExplainQuery {
     }
 }
 
-pub(super) async fn runtime_status(
-    proxy: ProxyService,
-) -> Result<Json<RuntimeStatusResponse>, (StatusCode, String)> {
+pub(super) async fn runtime_status(proxy: ProxyService) -> AdminApiResult<RuntimeStatusResponse> {
     Ok(Json(proxy.runtime_status().await))
 }
 
@@ -227,7 +225,7 @@ pub(super) struct RuntimeShutdownResponse {
 
 pub(super) async fn shutdown_runtime(
     proxy: ProxyService,
-) -> Result<Json<RuntimeShutdownResponse>, (StatusCode, String)> {
+) -> AdminApiResult<RuntimeShutdownResponse> {
     if proxy.request_shutdown() {
         return Ok(Json(RuntimeShutdownResponse {
             accepted: true,
@@ -236,32 +234,30 @@ pub(super) async fn shutdown_runtime(
         }));
     }
 
-    Err((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "runtime shutdown is not available for this proxy instance".to_string(),
+    Err(AdminApiHttpError::service_unavailable(
+        "admin_runtime_shutdown_unavailable",
+        "runtime shutdown is not available for this proxy instance",
     ))
 }
 
-pub(super) async fn get_retry_config(
-    proxy: ProxyService,
-) -> Result<Json<RetryConfigResponse>, (StatusCode, String)> {
+pub(super) async fn get_retry_config(proxy: ProxyService) -> AdminApiResult<RetryConfigResponse> {
     let cfg = proxy.config.snapshot().await;
     Ok(Json(build_retry_config_response(cfg.as_ref())))
 }
 
 pub(super) async fn get_pricing_catalog(
     _proxy: ProxyService,
-) -> Result<Json<crate::pricing::ModelPriceCatalogSnapshot>, (StatusCode, String)> {
+) -> AdminApiResult<crate::pricing::ModelPriceCatalogSnapshot> {
     Ok(Json(crate::pricing::operator_model_price_catalog_snapshot()))
 }
 
 pub(super) async fn get_routing_explain(
     proxy: ProxyService,
     Query(q): Query<RoutingExplainQuery>,
-) -> Result<Json<RoutingExplainResponse>, (StatusCode, String)> {
-    let request = q
-        .request_context()
-        .map_err(|err| (StatusCode::BAD_REQUEST, err))?;
+) -> AdminApiResult<RoutingExplainResponse> {
+    let request = q.request_context().map_err(|err| {
+        AdminApiHttpError::bad_request("admin_routing_explain_invalid_query", err)
+    })?;
     let session_id = q.session_id();
     routing_explain_for_proxy(&proxy, request, session_id)
         .await
@@ -272,7 +268,7 @@ pub(super) async fn routing_explain_for_proxy(
     proxy: &ProxyService,
     request: RouteRequestContext,
     session_id: Option<String>,
-) -> Result<RoutingExplainResponse, (StatusCode, String)> {
+) -> Result<RoutingExplainResponse, AdminApiHttpError> {
     let cfg = proxy.config.snapshot().await;
     let v4 = proxy.config.v4_snapshot().await;
     let route_selection = routing_explain_load_balancers(
@@ -342,7 +338,7 @@ pub(super) async fn routing_explain_for_proxy(
 pub(super) async fn get_request_ledger_recent(
     _proxy: ProxyService,
     Query(q): Query<RequestLedgerRecentQuery>,
-) -> Result<Json<Vec<crate::state::FinishedRequest>>, (StatusCode, String)> {
+) -> AdminApiResult<Vec<crate::state::FinishedRequest>> {
     let limit = q.limit.unwrap_or(1000).clamp(20, 5000);
     let filters = q.filters();
     let store = crate::request_ledger::RequestLedgerStore::default();
@@ -351,9 +347,9 @@ pub(super) async fn get_request_ledger_recent(
     } else {
         store.find_finished_requests(&filters, limit)
     };
-    records
-        .map(Json)
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
+    records.map(Json).map_err(|err| {
+        AdminApiHttpError::internal("admin_request_ledger_read_failed", err.to_string())
+    })
 }
 
 async fn routing_explain_load_balancers(
@@ -431,7 +427,7 @@ async fn routing_explain_load_balancers(
 pub(super) async fn get_request_ledger_summary(
     _proxy: ProxyService,
     Query(q): Query<RequestLedgerSummaryQuery>,
-) -> Result<Json<Vec<crate::request_ledger::RequestUsageSummaryRow>>, (StatusCode, String)> {
+) -> AdminApiResult<Vec<crate::request_ledger::RequestUsageSummaryRow>> {
     let limit = q.limit.unwrap_or(30).clamp(1, 100);
     let group = match q
         .by
@@ -450,18 +446,20 @@ pub(super) async fn get_request_ledger_summary(
     crate::request_ledger::RequestLedgerStore::default()
         .summarize(group, &filters, limit)
         .map(Json)
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
+        .map_err(|err| {
+            AdminApiHttpError::internal("admin_request_ledger_summary_failed", err.to_string())
+        })
 }
 
 pub(super) async fn get_request_ledger_chain(
     _proxy: ProxyService,
     Query(q): Query<RequestLedgerChainQuery>,
-) -> Result<Json<crate::request_chain::RequestChainExport>, (StatusCode, String)> {
+) -> AdminApiResult<crate::request_chain::RequestChainExport> {
     let selector = q.selector();
     if !selector.has_identity() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "trace_id, request_id, or session is required".to_string(),
+        return Err(AdminApiHttpError::bad_request(
+            "admin_request_chain_selector_required",
+            "trace_id, request_id, or session is required",
         ));
     }
     let limit = q
@@ -471,13 +469,15 @@ pub(super) async fn get_request_ledger_chain(
     crate::request_ledger::RequestLedgerStore::default()
         .export_request_chain(selector, limit)
         .map(Json)
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
+        .map_err(|err| {
+            AdminApiHttpError::internal("admin_request_chain_export_failed", err.to_string())
+        })
 }
 
 pub(super) async fn set_retry_config(
     proxy: ProxyService,
     Json(payload): Json<crate::config::RetryConfig>,
-) -> Result<Json<RetryConfigResponse>, (StatusCode, String)> {
+) -> AdminApiResult<RetryConfigResponse> {
     let cfg_snapshot = proxy.config.snapshot().await;
     let mut cfg = cfg_snapshot.as_ref().clone();
     cfg.retry = payload;
@@ -487,28 +487,26 @@ pub(super) async fn set_retry_config(
     Ok(Json(build_retry_config_response(cfg.as_ref())))
 }
 
-pub(super) async fn reload_runtime_config(
-    proxy: ProxyService,
-) -> Result<Json<ReloadResult>, (StatusCode, String)> {
+pub(super) async fn reload_runtime_config(proxy: ProxyService) -> AdminApiResult<ReloadResult> {
     proxy
         .reload_runtime_config()
         .await
         .map(Json)
-        .map_err(super::ProxyControlError::into_http_error)
+        .map_err(AdminApiHttpError::from)
 }
 
-pub(super) async fn list_profiles(
-    proxy: ProxyService,
-) -> Result<Json<ProfilesResponse>, (StatusCode, String)> {
+pub(super) async fn list_profiles(proxy: ProxyService) -> AdminApiResult<ProfilesResponse> {
     Ok(Json(make_profiles_response(&proxy).await))
 }
 
 pub(super) async fn get_control_trace(
     _proxy: ProxyService,
     Query(q): Query<ControlTraceQuery>,
-) -> Result<Json<Vec<crate::logging::ControlTraceLogEntry>>, (StatusCode, String)> {
+) -> AdminApiResult<Vec<crate::logging::ControlTraceLogEntry>> {
     let limit = q.limit.unwrap_or(80).clamp(20, 400);
     crate::logging::read_recent_control_trace_entries(limit)
         .map(Json)
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
+        .map_err(|err| {
+            AdminApiHttpError::internal("admin_control_trace_read_failed", err.to_string())
+        })
 }

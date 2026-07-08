@@ -60,4 +60,17 @@ async fn runtime_shutdown_endpoint_returns_unavailable_without_runtime_owner() {
         .expect("send shutdown request");
 
     assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let body = response
+        .json::<serde_json::Value>()
+        .await
+        .expect("shutdown unavailable body");
+    assert_eq!(
+        body["code"].as_str(),
+        Some("admin_runtime_shutdown_unavailable")
+    );
+    assert_eq!(
+        body["message"].as_str(),
+        Some("runtime shutdown is not available for this proxy instance")
+    );
+    assert_eq!(body["retryable"].as_bool(), Some(true));
 }

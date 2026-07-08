@@ -568,6 +568,19 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
         .await
         .expect("missing selector request chain send");
     assert_eq!(missing_selector_chain.status(), StatusCode::BAD_REQUEST);
+    let missing_selector_body = missing_selector_chain
+        .json::<serde_json::Value>()
+        .await
+        .expect("missing selector body");
+    assert_eq!(
+        missing_selector_body["code"].as_str(),
+        Some("admin_request_chain_selector_required")
+    );
+    assert_eq!(
+        missing_selector_body["message"].as_str(),
+        Some("trace_id, request_id, or session is required")
+    );
+    assert_eq!(missing_selector_body["retryable"].as_bool(), Some(false));
 
     let request_chain = client
         .get(format!(

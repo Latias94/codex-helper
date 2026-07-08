@@ -6,6 +6,7 @@ use reqwest::Client;
 use tokio::sync::watch;
 
 mod admin;
+mod admin_api_error;
 mod api_responses;
 mod attempt_execution;
 mod attempt_failures;
