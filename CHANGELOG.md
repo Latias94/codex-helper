@@ -3,7 +3,7 @@ All notable changes to this project will be documented in this file.
 
 > Recent entries use **Chinese first, then an English summary**. Older entries keep the previous inline bilingual style.
 
-## [0.20.2] - 2026-07-08
+## [Unreleased]
 
 ### 中文
 
@@ -13,11 +13,6 @@ All notable changes to this project will be documented in this file.
 - 新增 request chain 诊断入口。可以用 `codex-helper usage chain --trace-id ... --json` 或本地 admin API `GET /__codex_helper/api/v1/request-ledger/chain?...` 查看单次请求的 route attempts、provider signals、policy actions 和时间线；桌面端 `Usage` 表格也支持按行展开 Chain。导出结果按 allowlist 脱敏，不包含 client address、cwd、upstream base URL 或原始上游细节。
 - 桌面端 Providers 现在会显示正在影响路由的 provider control badges，例如 cooldown、runtime override 和 helper 自动创建的控制动作，并在页面顶部汇总当前 control 总数。
 
-#### 修复
-
-- 修复 sub2api / new-api 日套餐在昨日耗尽后，次日可能仍被旧余额快照跳过的问题。超过每日重置时间后会重新查询余额，以便懒刷新额度恢复后自动放回路由。
-- 适配 Codex 新增的 GPT-5.6 Bedrock 模型变体。`openai.gpt-5.6-sol`、`openai.gpt-5.6-terra`、`openai.gpt-5.6-luna` 现在会按 `Sol` / `Terra` / `Luna` 展示，并保留 Codex 所需的 reasoning、图片输入和工具能力。
-
 ### English summary
 
 #### Added
@@ -25,6 +20,17 @@ All notable changes to this project will be documented in this file.
 - The desktop `Usage` page now uses the same local-day usage model as the TUI: today's requests, tokens, estimated cost, 24h activity, provider / model / project rankings, coverage warnings, and the global retry-gate count instead of deriving totals from only recent rows.
 - Added request-chain diagnostics. Use `codex-helper usage chain --trace-id ... --json` or `GET /__codex_helper/api/v1/request-ledger/chain?...` to inspect route attempts, provider signals, policy actions, and the timeline for a request; the desktop `Usage` table can expand Chain details per row. Exports are allowlisted and omit client addresses, cwd, upstream base URLs, and raw upstream internals.
 - Desktop Providers now shows route-affecting provider control badges such as cooldowns, runtime overrides, and helper-owned automatic actions, with a page-level active-control count.
+
+## [0.20.2] - 2026-07-08
+
+### 中文
+
+#### 修复
+
+- 修复 sub2api / new-api 日套餐在昨日耗尽后，次日可能仍被旧余额快照跳过的问题。超过每日重置时间后会重新查询余额，以便懒刷新额度恢复后自动放回路由。
+- 适配 Codex 新增的 GPT-5.6 Bedrock 模型变体。`openai.gpt-5.6-sol`、`openai.gpt-5.6-terra`、`openai.gpt-5.6-luna` 现在会按 `Sol` / `Terra` / `Luna` 展示，并保留 Codex 所需的 reasoning、图片输入和工具能力。
+
+### English summary
 
 #### Fixed
 
