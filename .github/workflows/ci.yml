@@ -43,13 +43,18 @@ jobs:
         with:
           cache-bin: false
 
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.25.0
+          run_install: false
+
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
           node-version: 24
-
-      - name: Enable Corepack
-        run: corepack enable
+          cache: pnpm
+          cache-dependency-path: apps/desktop/pnpm-lock.yaml
 
       - name: Install desktop dependencies
         run: pnpm --dir apps/desktop install --frozen-lockfile
@@ -116,9 +121,6 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: 24
-
-      - name: Enable Corepack
-        run: corepack enable
 
       - name: Prepare Tauri sidecar
         run: node apps/desktop/scripts/prepare-sidecar.mjs
