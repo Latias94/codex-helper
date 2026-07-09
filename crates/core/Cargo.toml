@@ -1,6 +1,6 @@
 [package]
 name = "codex-helper-core"
-version = "0.20.2"
+version = "0.20.3"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Core library for codex-helper."

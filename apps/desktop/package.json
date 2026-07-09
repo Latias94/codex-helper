@@ -1,7 +1,7 @@
 {
   "name": "codex-helper-desktop",
   "private": true,
-  "version": "0.20.2",
+  "version": "0.20.3",
   "type": "module",
   "packageManager": "pnpm@10.25.0",
   "scripts": {
