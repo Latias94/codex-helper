@@ -1271,6 +1271,119 @@ async fn proxy_capacity_body_400_fails_over_by_overloaded_class() {
 }
 
 #[tokio::test]
+async fn proxy_new_api_saturated_group_429_fails_over_without_same_upstream_retry() {
+    let primary_hits = Arc::new(AtomicUsize::new(0));
+    let backup_hits = Arc::new(AtomicUsize::new(0));
+
+    let primary_counter = primary_hits.clone();
+    let primary = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let primary_counter = primary_counter.clone();
+            async move {
+                primary_counter.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(serde_json::json!({
+                        "error": {
+                            "type": "rate_limit_error",
+                            "message": "当前分组上游负载已饱和，请稍后再试"
+                        }
+                    })),
+                )
+            }
+        }),
+    );
+    let primary = spawn_test_upstream(primary);
+
+    let backup_counter = backup_hits.clone();
+    let backup = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let backup_counter = backup_counter.clone();
+            async move {
+                backup_counter.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "provider": "backup" })),
+                )
+            }
+        }),
+    );
+    let backup = spawn_test_upstream(backup);
+
+    let retry = RetryConfig {
+        upstream: Some(retry_layer_config(
+            2,
+            "429",
+            vec!["upstream_overloaded".to_string()],
+            RetryStrategy::SameUpstream,
+        )),
+        provider: Some(retry_layer_config(
+            2,
+            "429",
+            vec!["upstream_overloaded".to_string()],
+            RetryStrategy::Failover,
+        )),
+        transport_cooldown_secs: Some(30),
+        cooldown_backoff_factor: Some(1),
+        cooldown_backoff_max_secs: Some(0),
+        ..RetryConfig::default()
+    };
+    let cfg = make_proxy_config(
+        vec![primary.upstream_config(), backup.upstream_config()],
+        retry,
+    );
+    let proxy = proxy_service(cfg);
+    let state = proxy.state.clone();
+    let proxy = spawn_proxy_service(proxy);
+
+    let client = reqwest::Client::new();
+    let resp = post_responses_json(&client, &proxy, r#"{"model":"gpt-5","input":"hi"}"#)
+        .await
+        .error_for_status()
+        .expect("failover status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("json response");
+
+    assert_eq!(resp["provider"].as_str(), Some("backup"));
+    assert_eq!(
+        primary_hits.load(Ordering::SeqCst),
+        1,
+        "saturated upstream should not be retried before failover"
+    );
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 1);
+
+    let finished = find_finished_request(&state, 10, |request| {
+        request.status_code == StatusCode::OK.as_u16()
+    })
+    .await
+    .expect("finished request");
+    let retry = finished.retry.expect("retry trace");
+    let first = retry
+        .route_attempts
+        .first()
+        .expect("first route attempt should be recorded");
+    assert_eq!(
+        first.status_code,
+        Some(StatusCode::TOO_MANY_REQUESTS.as_u16())
+    );
+    assert_eq!(first.error_class.as_deref(), Some("upstream_overloaded"));
+    assert_eq!(
+        first.cooldown_reason.as_deref(),
+        Some("upstream_overloaded")
+    );
+    assert_eq!(first.provider_signals.len(), 1);
+    assert_eq!(
+        first.provider_signals[0].kind,
+        crate::provider_signals::ProviderSignalKind::Capacity
+    );
+
+    proxy.handle.abort();
+}
+
+#[tokio::test]
 async fn proxy_429_usage_limit_body_sets_retry_after_cooldown() {
     let primary_hits = Arc::new(AtomicUsize::new(0));
     let backup_hits = Arc::new(AtomicUsize::new(0));

@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 中文
+
+#### 修复
+
+- 当 new-api / sub2api 上游返回并发已满、排队已满或分组负载饱和时，路由会直接切换到其他可用上游，并短暂避开已饱和的 endpoint，减少 Codex 多 subagent 并发时反复命中同一限流上游的问题。
+
+### English summary
+
+#### Fixed
+
+- When new-api / sub2api reports full concurrency, a full pending queue, or saturated group load, routing now fails over to another available upstream and briefly avoids the saturated endpoint instead of repeatedly hitting the same limited upstream.
+
 ## [0.20.3] - 2026-07-09
 
 ### 中文

@@ -166,6 +166,8 @@ fn collect_throttle_json_text_parts(v: &Value, parts: &mut Vec<String>) {
         "status",
         "reason",
         "message",
+        "description",
+        "result",
         "error",
         "retryDelay",
         "retry_delay",
@@ -217,6 +219,9 @@ fn throttle_message_indicates_overloaded(message: &str) -> bool {
         || message.contains("capacity exhausted")
         || message.contains("capacity_exhausted")
         || message.contains("model_capacity_exhausted")
+        || message.contains("load saturated")
+        || message.contains("load is saturated")
+        || message.contains("upstream load saturated")
         || message.contains("concurrency limit")
         || message.contains("concurrency_limit")
         || message.contains("too many pending requests")
@@ -228,6 +233,8 @@ fn throttle_message_indicates_overloaded(message: &str) -> bool {
         || message.contains("maximum concurrent")
         || message.contains("max concurrent")
         || message.contains("too many concurrent")
+        || message.contains("负载已饱和")
+        || (message.contains("负载") && message.contains("饱和"))
         || message.contains("并发")
         || message.contains("排队")
         || (message.contains("capacity")
@@ -860,6 +867,24 @@ mod tests {
         let signal =
             classify_upstream_throttle_response(429, &headers, body).expect("overloaded signal");
         assert_eq!(signal.class, UPSTREAM_OVERLOADED_CLASS);
+    }
+
+    #[test]
+    fn classifies_new_api_saturated_group_as_overloaded() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+
+        let body = r#"{"error":{"type":"rate_limit_error","message":"当前分组上游负载已饱和，请稍后再试"}}"#
+            .as_bytes();
+        let signal =
+            classify_upstream_throttle_response(429, &headers, body).expect("overloaded signal");
+        assert_eq!(signal.class, UPSTREAM_OVERLOADED_CLASS);
+        assert!(signal.strong);
+
+        let body = r#"{"description":"relay error 当前分组负载已饱和，请稍后再试，或升级账户以提升服务质量。","type":"upstream_error","code":30}"#
+            .as_bytes();
+        let classified = classify_observed_upstream_response(429, &headers, body);
+        assert_eq!(classified.class.as_deref(), Some(UPSTREAM_OVERLOADED_CLASS));
     }
 
     #[test]

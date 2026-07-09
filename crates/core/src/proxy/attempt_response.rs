@@ -17,7 +17,9 @@ use super::attempt_health::{
     penalize_attempt_target, record_attempt_failure, record_attempt_success,
 };
 use super::attempt_target::AttemptTarget;
-use super::classify::{class_is_health_neutral, classify_observed_upstream_response};
+use super::classify::{
+    UPSTREAM_OVERLOADED_CLASS, class_is_health_neutral, classify_observed_upstream_response,
+};
 use super::concurrency_limits::ConcurrencyPermit;
 use super::http_debug::HttpDebugBase;
 use super::models_compat::maybe_decode_models_response_body;
@@ -191,8 +193,10 @@ fn decide_attempt_response(params: AttemptResponseDecisionParams<'_>) -> Attempt
         || reasoning_guard_blocked;
     let semantic_failure_requires_provider_failover =
         matches!(class, Some(IMAGE_GENERATION_MISSING_RESULT_CLASS));
+    let same_upstream_retryable_class = !matches!(class, Some(UPSTREAM_OVERLOADED_CLASS));
     let upstream_retryable = !never_retry
         && !semantic_failure_requires_provider_failover
+        && same_upstream_retryable_class
         && (should_retry_status(upstream_opt, status_code)
             || should_retry_class(upstream_opt, class));
     let retry_same_upstream =
