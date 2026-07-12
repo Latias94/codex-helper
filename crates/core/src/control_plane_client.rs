@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use reqwest::{Client, Url};
+use reqwest::{Client, Method, Url};
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -111,8 +111,28 @@ impl ControlPlaneClient {
     where
         T: serde::de::DeserializeOwned,
     {
+        self.request_json_classified(Method::GET, path).await
+    }
+
+    pub async fn post_json<T>(&self, path: &str) -> Result<T>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        self.request_json_classified(Method::POST, path)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn request_json_classified<T>(
+        &self,
+        method: Method,
+        path: &str,
+    ) -> Result<T, ControlPlaneError>
+    where
+        T: serde::de::DeserializeOwned,
+    {
         let url = format!("{}{}", self.endpoint.admin_base_url, path);
-        let mut request = self.client.get(url);
+        let mut request = self.client.request(method, url);
         if let Some(token) = self.admin_token() {
             request = request.header(ADMIN_TOKEN_HEADER, token);
         }

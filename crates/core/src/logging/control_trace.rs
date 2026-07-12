@@ -304,6 +304,31 @@ fn derive_control_trace_id(
     request_id: Option<u64>,
     payload: &JsonValue,
 ) -> Option<String> {
+    derive_control_trace_id_with(
+        trace_id,
+        service,
+        request_id,
+        payload,
+        legacy_request_trace_id,
+    )
+}
+
+fn derive_current_control_trace_id(
+    trace_id: Option<&str>,
+    service: Option<&str>,
+    request_id: Option<u64>,
+    payload: &JsonValue,
+) -> Option<String> {
+    derive_control_trace_id_with(trace_id, service, request_id, payload, request_trace_id)
+}
+
+fn derive_control_trace_id_with(
+    trace_id: Option<&str>,
+    service: Option<&str>,
+    request_id: Option<u64>,
+    payload: &JsonValue,
+    fallback: fn(&str, u64) -> String,
+) -> Option<String> {
     trace_id
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -315,7 +340,7 @@ fn derive_control_trace_id(
                 .map(str::to_string)
                 .or_else(|| json_string_field(payload, "service"))
                 .unwrap_or_default();
-            Some(request_trace_id(service.as_str(), request_id))
+            Some(fallback(service.as_str(), request_id))
         })
 }
 
@@ -492,7 +517,7 @@ fn make_control_trace_entry(
     payload: JsonValue,
 ) -> ControlTraceLogEntry {
     let detail = infer_control_trace_detail(kind, event, &payload);
-    let trace_id = derive_control_trace_id(None, service, request_id, &payload);
+    let trace_id = derive_current_control_trace_id(None, service, request_id, &payload);
     ControlTraceLogEntry {
         ts_ms,
         kind: kind.to_string(),
@@ -602,7 +627,13 @@ mod tests {
         assert_eq!(value["kind"].as_str(), Some("retry_trace"));
         assert_eq!(value["event"].as_str(), Some("attempt_select"));
         assert_eq!(value["request_id"].as_u64(), Some(7));
-        assert_eq!(value["trace_id"].as_str(), Some("codex-7"));
+        assert_eq!(
+            value["trace_id"].as_str(),
+            Some(request_trace_id("codex", 7).as_str())
+        );
+        assert!(is_versioned_request_trace_id(
+            value["trace_id"].as_str().expect("trace ID")
+        ));
         assert_eq!(value["service"].as_str(), Some("codex"));
         assert_eq!(value["payload"]["event"].as_str(), Some("attempt_select"));
         assert_eq!(value["detail"]["type"].as_str(), Some("attempt_select"));

@@ -159,39 +159,6 @@ impl ProxyService {
             .is_some_and(|shutdown_tx| shutdown_tx.send(true).is_ok())
     }
 
-    pub fn spawn_initial_balance_refresh(&self) {
-        if cfg!(test) {
-            return;
-        }
-
-        let proxy = self.clone();
-        tokio::spawn(async move {
-            match super::providers_api::refresh_provider_balances_for_proxy(
-                &proxy, None, None, false,
-            )
-            .await
-            {
-                Ok(summary) => {
-                    tracing::info!(
-                        "initial provider balance refresh finished: attempted={}, refreshed={}, failed={}, missing_token={}, auto_refreshed={}",
-                        summary.attempted,
-                        summary.refreshed,
-                        summary.failed,
-                        summary.missing_token,
-                        summary.auto_refreshed
-                    );
-                }
-                Err((status, message)) => {
-                    tracing::warn!(
-                        "initial provider balance refresh failed before polling: status={}, {}",
-                        status,
-                        message
-                    );
-                }
-            }
-        });
-    }
-
     pub async fn refresh_provider_balances(
         &self,
         station_name_filter: Option<&str>,

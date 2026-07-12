@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::pricing::{CostConfidence, UsdAmount};
 use crate::routing_explain::{RoutingExplainCandidate, RoutingExplainResponse};
@@ -9,6 +9,123 @@ use crate::state::{
     BalanceSnapshotStatus, FinishedRequest, ProviderBalanceSnapshot, UsageBucket, UsageRollupView,
 };
 use crate::usage_providers::UsageProviderRefreshSummary;
+
+const FEMTO_USD_PER_USD: i128 = 1_000_000_000_000_000;
+
+/// A signed reconciliation difference represented exactly in femto-USD.
+///
+/// Unlike [`UsdAmount`], this type retains negative gaps. Its JSON form is a canonical decimal
+/// string so consumers never lose precision through a floating-point number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Hash)]
+pub struct SignedUsdDelta {
+    femto_usd: i128,
+}
+
+impl SignedUsdDelta {
+    pub const ZERO: Self = Self { femto_usd: 0 };
+
+    pub const fn from_femto_usd(femto_usd: i128) -> Self {
+        Self { femto_usd }
+    }
+
+    pub fn from_decimal_str(value: &str) -> Option<Self> {
+        parse_signed_usd_delta(value).map(Self::from_femto_usd)
+    }
+
+    pub const fn femto_usd(self) -> i128 {
+        self.femto_usd
+    }
+
+    pub const fn is_zero(self) -> bool {
+        self.femto_usd == 0
+    }
+
+    pub fn checked_sub(self, other: Self) -> Option<Self> {
+        self.femto_usd
+            .checked_sub(other.femto_usd)
+            .map(Self::from_femto_usd)
+    }
+
+    pub fn checked_remote_minus_local(remote: UsdAmount, local: UsdAmount) -> Option<Self> {
+        remote
+            .femto_usd()
+            .checked_sub(local.femto_usd())
+            .map(Self::from_femto_usd)
+    }
+
+    pub fn external_unattributed(self) -> UsdAmount {
+        UsdAmount::from_femto_usd(self.femto_usd.max(0))
+    }
+
+    pub fn format_usd(self) -> String {
+        let negative = self.femto_usd < 0;
+        let magnitude = self.femto_usd.unsigned_abs();
+        let divisor = FEMTO_USD_PER_USD as u128;
+        let whole = magnitude / divisor;
+        let fraction = magnitude % divisor;
+        let prefix = if negative { "-" } else { "" };
+        if fraction == 0 {
+            return format!("{prefix}{whole}");
+        }
+        let mut fraction = format!("{fraction:015}");
+        while fraction.ends_with('0') {
+            fraction.pop();
+        }
+        format!("{prefix}{whole}.{fraction}")
+    }
+}
+
+impl Serialize for SignedUsdDelta {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.format_usd())
+    }
+}
+
+impl<'de> Deserialize<'de> for SignedUsdDelta {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::from_decimal_str(&value)
+            .ok_or_else(|| serde::de::Error::custom("invalid signed USD decimal"))
+    }
+}
+
+fn parse_signed_usd_delta(value: &str) -> Option<i128> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 64 || value.contains(['e', 'E']) {
+        return None;
+    }
+    let negative = value.starts_with('-');
+    let unsigned = value.strip_prefix(['-', '+']).unwrap_or(value);
+    let (whole, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    if unsigned.matches('.').count() > 1
+        || whole.is_empty() && fraction.is_empty()
+        || fraction.len() > 15
+        || !whole.chars().all(|character| character.is_ascii_digit())
+        || !fraction.chars().all(|character| character.is_ascii_digit())
+    {
+        return None;
+    }
+
+    let mut scaled = String::with_capacity(whole.len().max(1) + 15);
+    scaled.push_str(if whole.is_empty() { "0" } else { whole });
+    scaled.push_str(fraction);
+    scaled.extend(std::iter::repeat_n('0', 15 - fraction.len()));
+    let scaled = scaled.trim_start_matches('0');
+    if scaled.is_empty() {
+        return Some(0);
+    }
+    if negative {
+        format!("-{scaled}").parse().ok()
+    } else {
+        scaled.parse().ok()
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -1109,6 +1226,7 @@ mod tests {
                 ..UsageMetrics::default()
             }),
             cost: CostBreakdown::unknown(),
+            accounting: Default::default(),
             retry: None,
             provider_signals: Vec::new(),
             policy_actions: Vec::new(),
@@ -1195,5 +1313,46 @@ mod tests {
             Some("codex/right/default")
         );
         assert_eq!(endpoint.route_skip_reasons, vec!["usage_exhausted"]);
+    }
+
+    #[test]
+    fn signed_usd_delta_uses_canonical_decimal_serde() {
+        let delta = SignedUsdDelta::from_decimal_str("-10.500000000000000").expect("delta");
+
+        assert_eq!(delta.femto_usd(), -10_500_000_000_000_000);
+        assert_eq!(
+            serde_json::to_string(&delta).expect("serialize"),
+            "\"-10.5\""
+        );
+        assert_eq!(
+            serde_json::from_str::<SignedUsdDelta>("\"-0.000000000000000\"")
+                .expect("negative zero"),
+            SignedUsdDelta::ZERO
+        );
+        assert!(serde_json::from_str::<SignedUsdDelta>("\"0.0000000000000001\"").is_err());
+    }
+
+    #[test]
+    fn signed_usd_delta_round_trips_arithmetic_bounds() {
+        for value in [i128::MIN, i128::MAX] {
+            let delta = SignedUsdDelta::from_femto_usd(value);
+            let encoded = serde_json::to_string(&delta).expect("serialize bound");
+            let decoded = serde_json::from_str::<SignedUsdDelta>(&encoded).expect("parse bound");
+            assert_eq!(decoded, delta);
+        }
+    }
+
+    #[test]
+    fn signed_usd_delta_rejects_checked_subtraction_overflow() {
+        assert_eq!(
+            SignedUsdDelta::from_femto_usd(i128::MAX)
+                .checked_sub(SignedUsdDelta::from_femto_usd(-1)),
+            None
+        );
+        assert_eq!(
+            SignedUsdDelta::from_femto_usd(i128::MIN)
+                .checked_sub(SignedUsdDelta::from_femto_usd(1)),
+            None
+        );
     }
 }

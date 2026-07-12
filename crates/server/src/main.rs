@@ -81,7 +81,6 @@ async fn main() -> Result<()> {
         )
     })?;
 
-    runtime.proxy.spawn_initial_balance_refresh();
     let shutdown_tx = runtime.shutdown_tx.clone();
     tokio::spawn(async move {
         wait_for_shutdown_signal().await;

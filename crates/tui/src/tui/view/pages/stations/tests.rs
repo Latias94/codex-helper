@@ -49,9 +49,9 @@ fn empty_snapshot(
         global_route_target_override,
         station_meta_overrides: HashMap::new(),
         usage_day: crate::state::UsageDayView::default(),
+        quota_analytics: crate::quota_analytics::QuotaAnalyticsView::default(),
         usage_rollup: crate::state::UsageRollupView::default(),
         provider_balances,
-        provider_balance_history: HashMap::new(),
         station_health: HashMap::new(),
         health_checks: HashMap::new(),
         lb_view: HashMap::new(),
@@ -521,6 +521,7 @@ fn routing_provider_balance_brief_preserves_subscription_amount_in_narrow_table(
         global_route_target_override: None,
         station_meta_overrides: HashMap::new(),
         usage_day: crate::state::UsageDayView::default(),
+        quota_analytics: crate::quota_analytics::QuotaAnalyticsView::default(),
         usage_rollup: crate::state::UsageRollupView::default(),
         provider_balances: HashMap::from([(
             "input".to_string(),
@@ -532,7 +533,6 @@ fn routing_provider_balance_brief_preserves_subscription_amount_in_narrow_table(
                 ..crate::state::ProviderBalanceSnapshot::default()
             }],
         )]),
-        provider_balance_history: HashMap::new(),
         station_health: HashMap::new(),
         health_checks: HashMap::new(),
         lb_view: HashMap::new(),
@@ -569,6 +569,7 @@ fn routing_provider_balance_brief_fits_lazy_quota_in_zh_table_cell() {
         global_route_target_override: None,
         station_meta_overrides: HashMap::new(),
         usage_day: crate::state::UsageDayView::default(),
+        quota_analytics: crate::quota_analytics::QuotaAnalyticsView::default(),
         usage_rollup: crate::state::UsageRollupView::default(),
         provider_balances: HashMap::from([(
             "input".to_string(),
@@ -583,7 +584,6 @@ fn routing_provider_balance_brief_fits_lazy_quota_in_zh_table_cell() {
                 ..crate::state::ProviderBalanceSnapshot::default()
             }],
         )]),
-        provider_balance_history: HashMap::new(),
         station_health: HashMap::new(),
         health_checks: HashMap::new(),
         lb_view: HashMap::new(),

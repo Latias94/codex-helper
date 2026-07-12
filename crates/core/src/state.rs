@@ -5,19 +5,27 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 
 use serde_json::Value as JsonValue;
-use tokio::sync::{RwLock, watch};
+use tokio::sync::{RwLock, oneshot, watch};
 use tokio::time::{Duration, interval};
 
 pub use crate::balance::{
     BalanceSnapshotStatus, ProviderBalanceSnapshot, StationRoutingBalanceSummary,
 };
-use crate::config::ServiceConfigManager;
+use crate::config::{ServiceConfigManager, proxy_home_dir};
 use crate::lb::{COOLDOWN_SECS, CooldownBackoff, FAILURE_THRESHOLD, LbState};
 use crate::policy_actions::{PolicyAction, PolicyActionKind, PolicyActionProjection};
 use crate::pricing::{
     CostAdjustments, CostBreakdown, estimate_request_cost_from_operator_catalog_for_service,
+};
+use crate::quota_analytics::{
+    PoolAttributionResult, QuotaAnalyticsView, build_quota_analytics, plan_quota_attribution,
+};
+use crate::quota_pool::{
+    QuotaCounterKind, QuotaObservationContext, QuotaPoolRegistry, QuotaPoolState,
+    QuotaRegistryCheckpoint, QuotaUnit, RegistryUpdate,
 };
 use crate::routing_ir::{RoutePlanRuntimeState, RoutePlanUpstreamRuntimeState};
 use crate::runtime_identity::ProviderEndpointKey;
@@ -26,11 +34,23 @@ use crate::sessions;
 use crate::usage::UsageMetrics;
 use crate::usage_day;
 
+mod attribution_index;
 mod policy_action_store;
+pub mod quota_identity_store;
+pub mod quota_sample_store;
+pub use self::quota_identity_store::{IdentityLoadOutcome, InstallIdentity, QuotaIdentityStore};
+pub use self::quota_sample_store::{
+    QuotaSampleLoad, QuotaSampleSave, QuotaSampleStore, QuotaSampleStoreError,
+};
 mod runtime_types;
 mod session_identity;
 mod session_route_ledger;
 
+pub use self::attribution_index::{
+    AttributionAggregate, AttributionBucket, AttributionBucketKey, AttributionCoverage,
+    AttributionPoolKey, AttributionQuery, AttributionQueryResult,
+};
+use self::attribution_index::{AttributionIndex, AttributionInsert, request_replay_key};
 use self::policy_action_store::{PolicyActionMap, PolicyActionStore};
 use self::runtime_types::{
     ConfigMetaOverride, RuntimeDefaultProfileOverride, UsageRollup, merge_station_health,
@@ -42,12 +62,13 @@ pub use self::runtime_types::{
     UsageRetryGateSummary, UsageRollupCoverage, UsageRollupView,
 };
 pub use self::session_identity::{
-    ActiveRequest, FinishRequestParams, FinishedRequest, RequestObservability, ResolvedRouteValue,
-    RouteDecisionProvenance, RouteValueSource, SessionBinding, SessionContinuityMode,
-    SessionIdentityCard, SessionIdentityCardBuildInputs, SessionIdentitySource,
-    SessionManualOverrides, SessionObservationScope, SessionRouteAffinity,
+    AccountingPoolMembership, AccountingPriceCoverage, ActiveRequest, FinishRequestMetadata,
+    FinishRequestParams, FinishedRequest, RequestAccountingFacts, RequestObservability,
+    ResolvedRouteValue, RouteDecisionProvenance, RouteValueSource, SessionBinding,
+    SessionContinuityMode, SessionIdentityCard, SessionIdentityCardBuildInputs,
+    SessionIdentitySource, SessionManualOverrides, SessionObservationScope, SessionRouteAffinity,
     SessionRouteAffinityTarget, SessionStats, build_session_identity_cards_from_parts,
-    enrich_session_identity_cards_with_host_transcripts,
+    classify_captured_cost, enrich_session_identity_cards_with_host_transcripts,
     enrich_session_identity_cards_with_runtime,
 };
 use self::session_identity::{
@@ -55,15 +76,12 @@ use self::session_identity::{
     SessionRouteTargetOverride, SessionServiceTierOverride, SessionStationOverride,
 };
 use self::session_route_ledger::SessionRouteAffinityStore;
+pub use crate::sessions::{ProjectIdentity, ProjectIdentityKind};
 
 type PassiveStationHealthMap =
     HashMap<String, HashMap<String, HashMap<String, PassiveUpstreamHealth>>>;
 type ProviderBalanceMap =
     HashMap<String, HashMap<String, HashMap<usize, HashMap<String, ProviderBalanceSnapshot>>>>;
-type ProviderBalanceHistoryMap = HashMap<
-    String,
-    HashMap<String, HashMap<usize, HashMap<String, VecDeque<ProviderBalanceSnapshot>>>>,
->;
 type ProviderBalanceSummaryMap = HashMap<String, HashMap<String, StationRoutingBalanceSummary>>;
 type ServiceLayoutSignature = Vec<(String, Vec<String>)>;
 
@@ -122,23 +140,372 @@ fn recent_finished_max_from_env(raw: Option<String>) -> usize {
         .clamp(200, 10_000)
 }
 
-fn provider_balance_history_max() -> usize {
-    static MAX: OnceLock<usize> = OnceLock::new();
-    *MAX.get_or_init(|| {
-        std::env::var("CODEX_HELPER_PROVIDER_BALANCE_HISTORY_MAX")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .filter(|&n| n > 1)
-            .unwrap_or(64)
-            .clamp(2, 512)
-    })
-}
-
 fn unix_now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn merge_route_decision(
+    active: Option<RouteDecisionProvenance>,
+    terminal: Option<RouteDecisionProvenance>,
+) -> Option<RouteDecisionProvenance> {
+    match (active, terminal) {
+        (None, None) => None,
+        (Some(decision), None) | (None, Some(decision)) => Some(decision),
+        (Some(active), Some(terminal)) => Some(RouteDecisionProvenance {
+            decided_at_ms: if terminal.decided_at_ms == 0 {
+                active.decided_at_ms
+            } else {
+                terminal.decided_at_ms
+            },
+            binding_profile_name: terminal
+                .binding_profile_name
+                .or(active.binding_profile_name),
+            binding_continuity_mode: terminal
+                .binding_continuity_mode
+                .or(active.binding_continuity_mode),
+            effective_model: terminal.effective_model.or(active.effective_model),
+            effective_reasoning_effort: terminal
+                .effective_reasoning_effort
+                .or(active.effective_reasoning_effort),
+            effective_service_tier: terminal
+                .effective_service_tier
+                .or(active.effective_service_tier),
+            effective_station: terminal.effective_station.or(active.effective_station),
+            effective_upstream_base_url: terminal
+                .effective_upstream_base_url
+                .or(active.effective_upstream_base_url),
+            provider_id: terminal.provider_id.or(active.provider_id),
+            endpoint_id: terminal.endpoint_id.or(active.endpoint_id),
+            route_path: if terminal.route_path.is_empty() {
+                active.route_path
+            } else {
+                terminal.route_path
+            },
+        }),
+    }
+}
+
+fn provider_endpoint_for_balance_snapshot(
+    service_name: &str,
+    snapshot: &ProviderBalanceSnapshot,
+) -> ProviderEndpointKey {
+    if let Some(raw) = snapshot
+        .provider_endpoint_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let mut parts = raw.splitn(3, '/');
+        if let (Some(service), Some(provider), Some(endpoint)) =
+            (parts.next(), parts.next(), parts.next())
+            && !service.is_empty()
+            && !provider.is_empty()
+            && !endpoint.is_empty()
+        {
+            return ProviderEndpointKey::new(service, provider, endpoint);
+        }
+    }
+    ProviderEndpointKey::new(
+        service_name,
+        snapshot.provider_id.clone(),
+        snapshot
+            .upstream_index
+            .map(|index| index.to_string())
+            .unwrap_or_else(|| "default".to_string()),
+    )
+}
+
+fn quota_sample_store_from_env() -> Option<QuotaSampleStore> {
+    if let Ok(value) = std::env::var("CODEX_HELPER_QUOTA_SAMPLE_STATE") {
+        let trimmed = value.trim();
+        if trimmed.eq_ignore_ascii_case("off")
+            || trimmed.eq_ignore_ascii_case("false")
+            || trimmed == "0"
+        {
+            return None;
+        }
+        if !trimmed.is_empty() {
+            return Some(QuotaSampleStore::new(trimmed));
+        }
+    }
+
+    #[cfg(test)]
+    if std::env::var("CODEX_HELPER_HOME")
+        .ok()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        return None;
+    }
+
+    Some(QuotaSampleStore::new(
+        proxy_home_dir().join("state").join("quota-samples.json"),
+    ))
+}
+
+fn quota_identity_store_from_env() -> Option<QuotaIdentityStore> {
+    if let Ok(value) = std::env::var("CODEX_HELPER_QUOTA_IDENTITY_PATH") {
+        let trimmed = value.trim();
+        if trimmed.eq_ignore_ascii_case("off")
+            || trimmed.eq_ignore_ascii_case("false")
+            || trimmed == "0"
+        {
+            return None;
+        }
+        if !trimmed.is_empty() {
+            return Some(QuotaIdentityStore::new(trimmed));
+        }
+    }
+
+    #[cfg(test)]
+    if std::env::var("CODEX_HELPER_HOME")
+        .ok()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        return None;
+    }
+
+    Some(QuotaIdentityStore::new(
+        proxy_home_dir().join("state").join("quota-identity.key"),
+    ))
+}
+
+fn load_quota_install_identity() -> Option<InstallIdentity> {
+    let store = quota_identity_store_from_env()?;
+    match store.load_or_create() {
+        Ok((identity, _)) => Some(identity),
+        Err(error) => {
+            tracing::warn!(error = %error, "quota install identity is unavailable");
+            None
+        }
+    }
+}
+
+fn load_quota_registry_state() -> (QuotaPoolRegistry, Option<QuotaSampleStore>) {
+    let Some(mut store) = quota_sample_store_from_env() else {
+        return (QuotaPoolRegistry::default(), None);
+    };
+    let registry = match store.load() {
+        QuotaSampleLoad::Valid(checkpoint) => QuotaPoolRegistry::from_checkpoint_at(
+            checkpoint,
+            crate::quota_pool::DEFAULT_MAX_SAMPLES_PER_POOL,
+            crate::quota_pool::DEFAULT_SAMPLE_RETENTION_MS,
+            unix_now_ms(),
+        )
+        .unwrap_or_default(),
+        QuotaSampleLoad::Corrupt { ref message } => {
+            tracing::warn!(error = %message, "ignoring corrupt quota sample state");
+            QuotaPoolRegistry::default()
+        }
+        QuotaSampleLoad::Unsupported { schema_version } => {
+            tracing::warn!(
+                schema_version,
+                "quota sample state is newer than this binary; persistence is read-only"
+            );
+            QuotaPoolRegistry::default()
+        }
+        QuotaSampleLoad::Missing => QuotaPoolRegistry::default(),
+    };
+    (registry, Some(store))
+}
+
+enum QuotaCheckpointCommand {
+    Save(QuotaRegistryCheckpoint),
+    Flush(oneshot::Sender<Result<(), String>>),
+    Shutdown(oneshot::Sender<Result<(), String>>),
+}
+
+struct QuotaCheckpointWriter {
+    command_tx: Mutex<Option<mpsc::Sender<QuotaCheckpointCommand>>>,
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl std::fmt::Debug for QuotaCheckpointWriter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("QuotaCheckpointWriter")
+            .finish_non_exhaustive()
+    }
+}
+
+impl QuotaCheckpointWriter {
+    fn spawn(mut store: QuotaSampleStore) -> std::io::Result<Self> {
+        Self::spawn_with_saver(move |checkpoint| {
+            store
+                .save(checkpoint)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    fn spawn_with_saver<F>(mut save: F) -> std::io::Result<Self>
+    where
+        F: FnMut(&QuotaRegistryCheckpoint) -> Result<(), String> + Send + 'static,
+    {
+        let (command_tx, command_rx) = mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("quota-checkpoint-writer".to_string())
+            .spawn(move || {
+                let mut last_generation = None;
+                let mut last_save_result = Ok(());
+                while let Ok(command) = command_rx.recv() {
+                    match command {
+                        QuotaCheckpointCommand::Save(checkpoint) => {
+                            if last_generation.is_some_and(|last| checkpoint.generation < last) {
+                                let error = format!(
+                                    "quota checkpoint generation {} arrived after generation {}",
+                                    checkpoint.generation,
+                                    last_generation.unwrap_or_default()
+                                );
+                                tracing::warn!(
+                                    generation = checkpoint.generation,
+                                    error = %error,
+                                    "skipping out-of-order quota checkpoint"
+                                );
+                                last_save_result = Err(error);
+                                continue;
+                            }
+                            last_generation = Some(checkpoint.generation);
+                            last_save_result = save(&checkpoint);
+                            if let Err(error) = &last_save_result {
+                                tracing::warn!(
+                                    generation = checkpoint.generation,
+                                    error = %error,
+                                    "failed to checkpoint quota sample state"
+                                );
+                            }
+                        }
+                        QuotaCheckpointCommand::Flush(ack) => {
+                            let _ = ack.send(last_save_result.clone());
+                        }
+                        QuotaCheckpointCommand::Shutdown(ack) => {
+                            let _ = ack.send(last_save_result.clone());
+                            return;
+                        }
+                    }
+                }
+            })?;
+        Ok(Self {
+            command_tx: Mutex::new(Some(command_tx)),
+            worker: Mutex::new(Some(worker)),
+        })
+    }
+
+    fn submit(&self, checkpoint: QuotaRegistryCheckpoint) {
+        let generation = checkpoint.generation;
+        let mut command_tx = self
+            .command_tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(sender) = command_tx.as_ref() else {
+            tracing::debug!(generation, "quota checkpoint writer is already shut down");
+            return;
+        };
+        if let Err(error) = sender.send(QuotaCheckpointCommand::Save(checkpoint)) {
+            tracing::warn!(
+                generation,
+                error = %error,
+                "failed to enqueue quota checkpoint"
+            );
+            *command_tx = None;
+        }
+    }
+
+    async fn flush(&self) -> Result<(), String> {
+        let ack_rx = {
+            let mut command_tx = self
+                .command_tx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(sender) = command_tx.as_ref() else {
+                return Ok(());
+            };
+            let (ack_tx, ack_rx) = oneshot::channel();
+            if let Err(error) = sender.send(QuotaCheckpointCommand::Flush(ack_tx)) {
+                *command_tx = None;
+                return Err(format!("failed to enqueue quota checkpoint flush: {error}"));
+            }
+            ack_rx
+        };
+        ack_rx
+            .await
+            .map_err(|_| "quota checkpoint worker stopped before flush completed".to_string())?
+    }
+
+    async fn shutdown(&self) -> Result<(), String> {
+        let queued_save_result = self.flush().await;
+        let ack_rx = {
+            let mut command_tx = self
+                .command_tx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            command_tx.take().map(|sender| {
+                let (ack_tx, ack_rx) = oneshot::channel();
+                sender
+                    .send(QuotaCheckpointCommand::Shutdown(ack_tx))
+                    .map(|_| ack_rx)
+                    .map_err(|error| {
+                        format!("failed to enqueue quota checkpoint shutdown: {error}")
+                    })
+            })
+        };
+
+        let flush_result = match ack_rx {
+            Some(Ok(ack_rx)) => match ack_rx.await {
+                Ok(result) => result,
+                Err(_) => Err(
+                    "quota checkpoint worker stopped before shutdown flush completed".to_string(),
+                ),
+            },
+            Some(Err(error)) => Err(error),
+            None => Ok(()),
+        };
+        let worker = self
+            .worker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let join_result = match worker {
+            Some(worker) => match tokio::task::spawn_blocking(move || worker.join()).await {
+                Ok(result) => result.map_err(|_| "quota checkpoint worker panicked".to_string()),
+                Err(error) => Err(format!("quota checkpoint join task failed: {error}")),
+            },
+            None => Ok(()),
+        };
+        queued_save_result.and(flush_result).and(join_result)
+    }
+}
+
+impl Drop for QuotaCheckpointWriter {
+    fn drop(&mut self) {
+        if let Some(sender) = self
+            .command_tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let (ack_tx, _ack_rx) = oneshot::channel();
+            let _ = sender.send(QuotaCheckpointCommand::Shutdown(ack_tx));
+        }
+        let worker = self
+            .worker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(worker) = worker
+            && let Err(error) = std::thread::Builder::new()
+                .name("quota-checkpoint-reaper".to_string())
+                .spawn(move || {
+                    if worker.join().is_err() {
+                        tracing::warn!("quota checkpoint worker panicked during fallback shutdown");
+                    }
+                })
+        {
+            tracing::warn!(%error, "failed to start quota checkpoint fallback reaper");
+        }
+    }
 }
 
 fn usage_rollup_unknown_key(value: Option<&str>) -> String {
@@ -149,16 +516,15 @@ fn usage_rollup_unknown_key(value: Option<&str>) -> String {
         .to_string()
 }
 
-fn usage_rollup_project_key(cwd: Option<&str>) -> String {
-    usage_rollup_unknown_key(cwd)
+fn usage_rollup_project_key(request: &FinishedRequest) -> String {
+    if !request.accounting.is_legacy() {
+        return request.accounting.project.display_key().to_string();
+    }
+    usage_rollup_unknown_key(request.cwd.as_deref())
 }
 
 fn usage_rollup_request_key(request: &FinishedRequest) -> String {
-    request
-        .trace_id
-        .as_deref()
-        .map(|trace_id| format!("trace|{trace_id}"))
-        .unwrap_or_else(|| format!("{}|{}", request.ended_at_ms, request.id))
+    request_replay_key(request)
 }
 
 fn usage_rollup_record_bucket(
@@ -392,7 +758,7 @@ fn record_finished_request_into_usage_rollup(
     record_usage_entity(
         &mut rollup.by_project,
         &mut rollup.by_project_day,
-        usage_rollup_project_key(request.cwd.as_deref()),
+        usage_rollup_project_key(request),
         day,
         request,
         cost,
@@ -409,6 +775,98 @@ fn prune_usage_entity_days(
         days.retain(|day, _| *day >= cutoff_day);
         !days.is_empty()
     });
+}
+
+#[derive(Default)]
+struct UsageReplayBatch {
+    requests: Vec<FinishedRequest>,
+    scanned_lines: usize,
+    max_lines: usize,
+    max_bytes: usize,
+    bytes_truncated: bool,
+    lines_truncated: bool,
+}
+
+fn read_usage_replay_batch(
+    service_name: &str,
+    log_path: PathBuf,
+    base_url_to_provider_id: &HashMap<String, String>,
+) -> UsageReplayBatch {
+    let max_bytes = std::env::var("CODEX_HELPER_USAGE_REPLAY_MAX_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(8 * 1024 * 1024);
+    let max_lines = std::env::var("CODEX_HELPER_USAGE_REPLAY_MAX_LINES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(20_000);
+    let mut batch = UsageReplayBatch {
+        max_lines,
+        max_bytes,
+        ..UsageReplayBatch::default()
+    };
+    let mut file = match std::fs::File::open(&log_path) {
+        Ok(file) => file,
+        Err(_) => return batch,
+    };
+    let len = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+    let start = len.saturating_sub(max_bytes as u64);
+    batch.bytes_truncated = start > 0;
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return batch;
+    }
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
+        return batch;
+    }
+    if start > 0 {
+        let Some(position) = bytes.iter().position(|byte| *byte == b'\n') else {
+            return batch;
+        };
+        bytes = bytes[position + 1..].to_vec();
+    }
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return batch;
+    };
+    let lines = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    let start_index = lines.len().saturating_sub(max_lines);
+    batch.scanned_lines = lines.len().saturating_sub(start_index);
+    batch.lines_truncated = start_index > 0;
+
+    for line in &lines[start_index..] {
+        let Ok(value) = serde_json::from_str::<JsonValue>(line) else {
+            continue;
+        };
+        if value.get("service").and_then(JsonValue::as_str) != Some(service_name) {
+            continue;
+        }
+        let Some(mut request) =
+            crate::request_ledger::finished_request_from_request_log_record(&value)
+        else {
+            continue;
+        };
+        if request
+            .provider_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|provider_id| !provider_id.is_empty())
+            .is_none()
+            && let Some(provider_id) = request
+                .upstream_base_url
+                .as_deref()
+                .and_then(|base_url| base_url_to_provider_id.get(base_url))
+        {
+            request.provider_id = Some(provider_id.clone());
+        }
+        batch.requests.push(request);
+    }
+    batch
 }
 
 fn prune_lru_cache<T>(
@@ -546,11 +1004,16 @@ pub struct ProxyState {
     active_requests: RwLock<HashMap<u64, ActiveRequest>>,
     recent_finished: RwLock<VecDeque<FinishedRequest>>,
     usage_rollups: RwLock<HashMap<String, UsageRollup>>,
+    attribution_index: RwLock<AttributionIndex>,
     station_health: RwLock<HashMap<String, HashMap<String, StationHealth>>>,
     passive_station_health: RwLock<PassiveStationHealthMap>,
     provider_balances: RwLock<ProviderBalanceMap>,
-    provider_balance_history: RwLock<ProviderBalanceHistoryMap>,
     provider_balance_summaries: RwLock<ProviderBalanceSummaryMap>,
+    /// Canonical semantic quota state.  Legacy balance maps remain available for routing/UI
+    /// compatibility, while this registry is the sole source for pool membership and samples.
+    quota_pool_registry: RwLock<QuotaPoolRegistry>,
+    quota_checkpoint_writer: Option<QuotaCheckpointWriter>,
+    quota_install_identity: Option<InstallIdentity>,
     provider_endpoint_runtime_health:
         RwLock<HashMap<String, HashMap<ProviderEndpointKey, ProviderEndpointRuntimeHealth>>>,
     policy_action_store: PolicyActionStore,
@@ -655,6 +1118,16 @@ impl ProxyState {
         {
             tracing::warn!(error = %err, "failed to compact expired policy action ledger");
         }
+        let (quota_pool_registry, quota_sample_store) = load_quota_registry_state();
+        let quota_checkpoint_writer =
+            quota_sample_store.and_then(|store| match QuotaCheckpointWriter::spawn(store) {
+                Ok(writer) => Some(writer),
+                Err(error) => {
+                    tracing::warn!(error = %error, "failed to start quota checkpoint writer");
+                    None
+                }
+            });
+        let quota_install_identity = load_quota_install_identity();
 
         Arc::new(Self {
             next_request_id: AtomicU64::new(1),
@@ -688,11 +1161,14 @@ impl ProxyState {
             active_requests: RwLock::new(HashMap::new()),
             recent_finished: RwLock::new(VecDeque::new()),
             usage_rollups: RwLock::new(HashMap::new()),
+            attribution_index: RwLock::new(AttributionIndex::default()),
             station_health: RwLock::new(HashMap::new()),
             passive_station_health: RwLock::new(HashMap::new()),
             provider_balances: RwLock::new(HashMap::new()),
-            provider_balance_history: RwLock::new(HashMap::new()),
             provider_balance_summaries: RwLock::new(HashMap::new()),
+            quota_pool_registry: RwLock::new(quota_pool_registry),
+            quota_checkpoint_writer,
+            quota_install_identity,
             provider_endpoint_runtime_health: RwLock::new(HashMap::new()),
             policy_action_store,
             policy_actions: RwLock::new(restored_policy_actions),
@@ -1972,16 +2448,6 @@ impl ProxyState {
                         provider_balances.remove(service_name);
                     }
                 }
-                let mut provider_balance_history = self.provider_balance_history.write().await;
-                if let Some(per_service) = provider_balance_history.get_mut(service_name) {
-                    let before = per_service.len();
-                    per_service
-                        .retain(|station_name, _| !changed_layout_stations.contains(station_name));
-                    changed |= per_service.len() != before;
-                    if per_service.is_empty() {
-                        provider_balance_history.remove(service_name);
-                    }
-                }
                 let mut provider_balance_summaries = self.provider_balance_summaries.write().await;
                 if let Some(per_service) = provider_balance_summaries.get_mut(service_name) {
                     let before = per_service.len();
@@ -1996,8 +2462,6 @@ impl ProxyState {
             None => {
                 let mut provider_balances = self.provider_balances.write().await;
                 changed |= provider_balances.remove(service_name).is_some();
-                let mut provider_balance_history = self.provider_balance_history.write().await;
-                changed |= provider_balance_history.remove(service_name).is_some();
                 let mut provider_balance_summaries = self.provider_balance_summaries.write().await;
                 changed |= provider_balance_summaries.remove(service_name).is_some();
             }
@@ -2217,10 +2681,147 @@ impl ProxyState {
         merge_station_health(active, passive)
     }
 
+    /// Ingest one provider observation into the canonical quota registry.  All balance refresh
+    /// paths call this method through `record_provider_balance_snapshot`, while callers that
+    /// already have richer adapter context can supply it directly.
+    pub async fn record_quota_snapshot(
+        &self,
+        endpoint: ProviderEndpointKey,
+        mut context: QuotaObservationContext,
+        snapshot: &ProviderBalanceSnapshot,
+    ) -> RegistryUpdate {
+        if context.install_key.is_none()
+            && let Some(identity) = self.quota_install_identity.as_ref()
+        {
+            context.install_key = Some(identity.key().to_vec());
+        }
+        {
+            let mut registry = self.quota_pool_registry.write().await;
+            let update = registry.record_snapshot(&endpoint, &context, snapshot);
+            if let Some(writer) = self.quota_checkpoint_writer.as_ref() {
+                // Queue before releasing the registry lock so concurrent updates preserve
+                // checkpoint generation order without holding a Tokio mutex during file I/O.
+                writer.submit(registry.checkpoint());
+            }
+            update
+        }
+    }
+
+    pub(crate) async fn shutdown_quota_persistence(&self) -> Result<(), String> {
+        match self.quota_checkpoint_writer.as_ref() {
+            Some(writer) => writer.shutdown().await,
+            None => Ok(()),
+        }
+    }
+
+    pub async fn quota_pool_membership(
+        &self,
+        endpoint: &ProviderEndpointKey,
+    ) -> Option<crate::quota_pool::PoolMembership> {
+        self.quota_pool_registry
+            .read()
+            .await
+            .membership_for_endpoint(endpoint)
+    }
+
+    pub async fn quota_pool_states(&self) -> Vec<QuotaPoolState> {
+        self.quota_pool_registry.read().await.pools()
+    }
+
+    pub async fn quota_samples_for_pool(
+        &self,
+        pool_key: &str,
+    ) -> Vec<crate::quota_pool::QuotaObservation> {
+        self.quota_pool_registry
+            .read()
+            .await
+            .samples_for_pool(pool_key)
+    }
+
+    pub async fn quota_registry_checkpoint(&self) -> QuotaRegistryCheckpoint {
+        self.quota_pool_registry.read().await.checkpoint()
+    }
+
+    pub async fn quota_analytics_view(
+        &self,
+        service_name: &str,
+        now_ms: u64,
+    ) -> QuotaAnalyticsView {
+        let checkpoint = self.quota_registry_checkpoint().await;
+        let mut windows = plan_quota_attribution(&checkpoint, now_ms);
+        for window in &mut windows {
+            window.query.service_name = Some(service_name.to_string());
+        }
+
+        let attribution_index = self.attribution_index.read().await;
+        let attribution = windows
+            .into_iter()
+            .map(|window| PoolAttributionResult {
+                attribution: attribution_index.query(window.query.clone()),
+                window,
+            })
+            .collect::<Vec<_>>();
+        drop(attribution_index);
+
+        build_quota_analytics(&checkpoint, now_ms, &attribution)
+    }
+
+    /// Persist a snapshot using the supplied explicit path.  The path is intentionally supplied
+    /// by the caller so tests and multi-runtime deployments do not share an implicit writer.
+    pub async fn save_quota_registry(
+        &self,
+        path: impl Into<PathBuf>,
+    ) -> Result<crate::state::quota_sample_store::QuotaSampleSave, String> {
+        let checkpoint = self.quota_registry_checkpoint().await;
+        let path = path.into();
+        tokio::task::spawn_blocking(move || {
+            let mut store = QuotaSampleStore::new(path);
+            match store.load() {
+                QuotaSampleLoad::Unsupported { schema_version } => {
+                    return Err(format!(
+                        "quota sample state schema {schema_version} is newer than supported"
+                    ));
+                }
+                QuotaSampleLoad::Corrupt { .. }
+                | QuotaSampleLoad::Missing
+                | QuotaSampleLoad::Valid(_) => {}
+            }
+            store.save(&checkpoint).map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| format!("quota checkpoint save task failed: {error}"))?
+    }
+
     pub async fn record_provider_balance_snapshot(
         &self,
         service_name: &str,
+        snapshot: ProviderBalanceSnapshot,
+    ) {
+        let mut context =
+            QuotaObservationContext::new(format!("{}:{}", snapshot.source, snapshot.provider_id));
+        context.counter_kind = QuotaCounterKind::Used;
+        context.unit = if snapshot.quota_used_usd.is_some()
+            || snapshot.quota_remaining_usd.is_some()
+            || snapshot.quota_limit_usd.is_some()
+            || snapshot.today_used_usd.is_some()
+        {
+            QuotaUnit::Usd
+        } else {
+            QuotaUnit::Raw
+        };
+        context.capabilities.used = snapshot.quota_used_usd.is_some();
+        context.capabilities.remaining = snapshot.quota_remaining_usd.is_some();
+        context.capabilities.limit = snapshot.quota_limit_usd.is_some();
+        context.capabilities.direct_total = snapshot.today_used_usd.is_some();
+        self.record_provider_balance_snapshot_with_quota_context(service_name, snapshot, context)
+            .await;
+    }
+
+    pub async fn record_provider_balance_snapshot_with_quota_context(
+        &self,
+        service_name: &str,
         mut snapshot: ProviderBalanceSnapshot,
+        context: QuotaObservationContext,
     ) {
         let (Some(station_name), Some(upstream_index)) =
             (snapshot.station_name.clone(), snapshot.upstream_index)
@@ -2229,6 +2830,11 @@ impl ProxyState {
         };
         let now_ms = unix_now_ms();
         snapshot.refresh_status(now_ms);
+
+        let endpoint = provider_endpoint_for_balance_snapshot(service_name, &snapshot);
+        let _ = self
+            .record_quota_snapshot(endpoint, context, &snapshot)
+            .await;
 
         let station_summary = {
             let mut guard = self.provider_balances.write().await;
@@ -2265,45 +2871,7 @@ impl ProxyState {
                 .insert(station_name, station_summary);
         }
 
-        let history_station_name = snapshot.station_name.clone().unwrap_or_default();
-        self.record_provider_balance_history_snapshot(
-            service_name,
-            &history_station_name,
-            upstream_index,
-            snapshot,
-        )
-        .await;
         self.notify_state_changed();
-    }
-
-    async fn record_provider_balance_history_snapshot(
-        &self,
-        service_name: &str,
-        station_name: &str,
-        upstream_index: usize,
-        snapshot: ProviderBalanceSnapshot,
-    ) {
-        let mut guard = self.provider_balance_history.write().await;
-        let history = guard
-            .entry(service_name.to_string())
-            .or_default()
-            .entry(station_name.to_string())
-            .or_default()
-            .entry(upstream_index)
-            .or_default()
-            .entry(snapshot.provider_id.clone())
-            .or_default();
-        if history
-            .back()
-            .is_some_and(|previous| previous.fetched_at_ms == snapshot.fetched_at_ms)
-        {
-            history.pop_back();
-        }
-        history.push_back(snapshot);
-        let max = provider_balance_history_max();
-        while history.len() > max {
-            history.pop_front();
-        }
     }
 
     pub async fn get_provider_balance_view(
@@ -2329,38 +2897,6 @@ impl ProxyState {
                 snapshots.sort_by(|a, b| {
                     a.upstream_index
                         .cmp(&b.upstream_index)
-                        .then_with(|| a.provider_id.cmp(&b.provider_id))
-                });
-                (station_name.clone(), snapshots)
-            })
-            .collect()
-    }
-
-    pub async fn get_provider_balance_history_view(
-        &self,
-        service_name: &str,
-    ) -> HashMap<String, Vec<ProviderBalanceSnapshot>> {
-        let now_ms = unix_now_ms();
-        let guard = self.provider_balance_history.read().await;
-        let Some(per_service) = guard.get(service_name) else {
-            return HashMap::new();
-        };
-
-        per_service
-            .iter()
-            .map(|(station_name, upstreams)| {
-                let mut snapshots = upstreams
-                    .values()
-                    .flat_map(|providers| providers.values())
-                    .flat_map(|history| history.iter().cloned())
-                    .collect::<Vec<_>>();
-                for snapshot in &mut snapshots {
-                    snapshot.refresh_status(now_ms);
-                }
-                snapshots.sort_by(|a, b| {
-                    a.fetched_at_ms
-                        .cmp(&b.fetched_at_ms)
-                        .then_with(|| a.upstream_index.cmp(&b.upstream_index))
                         .then_with(|| a.provider_id.cmp(&b.provider_id))
                 });
                 (station_name.clone(), snapshots)
@@ -2892,117 +3428,44 @@ impl ProxyState {
             return 0;
         }
 
-        let already_has_data = {
-            let guard = self.usage_rollups.read().await;
-            guard
-                .get(service_name)
-                .is_some_and(|r| r.loaded.requests_total > 0)
-        };
-        if already_has_data {
-            return 0;
-        }
+        self.attribution_index.write().await.begin_replay();
+        let replay_service = service_name.to_string();
+        let batch = tokio::task::spawn_blocking(move || {
+            read_usage_replay_batch(replay_service.as_str(), log_path, &base_url_to_provider_id)
+        })
+        .await
+        .unwrap_or_default();
 
-        if !log_path.exists() {
-            return 0;
-        }
-
-        let max_bytes = std::env::var("CODEX_HELPER_USAGE_REPLAY_MAX_BYTES")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(8 * 1024 * 1024);
-        let max_lines = std::env::var("CODEX_HELPER_USAGE_REPLAY_MAX_LINES")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(20_000);
-
-        let mut file = match std::fs::File::open(&log_path) {
-            Ok(f) => f,
-            Err(_) => return 0,
-        };
-        let len: u64 = file.metadata().map(|m| m.len()).unwrap_or_default();
-        let start = len.saturating_sub(max_bytes as u64);
-        let bytes_truncated = start > 0;
-        if file.seek(SeekFrom::Start(start)).is_err() {
-            return 0;
-        }
-        let mut buf = Vec::new();
-        if file.read_to_end(&mut buf).is_err() {
-            return 0;
-        }
-        if start > 0 {
-            if let Some(pos) = buf.iter().position(|b| *b == b'\n') {
-                buf = buf[pos + 1..].to_vec();
-            } else {
-                return 0;
-            }
-        }
-
-        let text = match std::str::from_utf8(&buf) {
-            Ok(s) => s,
-            Err(_) => return 0,
-        };
-        let lines = text
-            .lines()
-            .map(|l| l.trim())
-            .filter(|l| !l.is_empty())
-            .collect::<Vec<_>>();
-        let start_idx = lines.len().saturating_sub(max_lines);
-        let scanned_lines = lines.len().saturating_sub(start_idx);
-        let lines_truncated = start_idx > 0;
-
-        let mut requests = Vec::new();
-        for line in &lines[start_idx..] {
-            let Ok(v) = serde_json::from_str::<JsonValue>(line) else {
-                continue;
-            };
-            let Some(svc) = v.get("service").and_then(|x| x.as_str()) else {
-                continue;
-            };
-            if svc != service_name {
-                continue;
-            }
-
-            let Some(mut request) =
-                crate::request_ledger::finished_request_from_request_log_record(&v)
-            else {
-                continue;
-            };
-            if request
-                .provider_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|provider_id| !provider_id.is_empty())
-                .is_none()
-                && let Some(provider_id) = request
-                    .upstream_base_url
-                    .as_deref()
-                    .and_then(|base_url| base_url_to_provider_id.get(base_url))
-            {
-                request.provider_id = Some(provider_id.clone());
-            }
-            requests.push(request);
-        }
-
-        if requests.is_empty() {
-            return 0;
-        }
-
-        let mut guard = self.usage_rollups.write().await;
-        let rollup = guard.entry(service_name.to_string()).or_default();
-        rollup.coverage_source = "request_log".to_string();
-        rollup.replay_scanned_lines = scanned_lines;
-        rollup.replay_max_lines = max_lines;
-        rollup.replay_max_bytes = max_bytes;
-        rollup.replay_bytes_truncated = bytes_truncated;
-        rollup.replay_lines_truncated = lines_truncated;
         let mut replayed = 0;
-        for request in &requests {
+        for request in &batch.requests {
+            let inserted = self.attribution_index.write().await.record(request);
+            if inserted == AttributionInsert::Duplicate {
+                continue;
+            }
+            let mut rollups = self.usage_rollups.write().await;
+            let rollup = rollups.entry(service_name.to_string()).or_default();
             if record_finished_request_into_usage_rollup(rollup, request) {
                 replayed += 1;
             }
         }
+
+        {
+            let mut rollups = self.usage_rollups.write().await;
+            let rollup = rollups.entry(service_name.to_string()).or_default();
+            rollup.coverage_source = "request_log".to_string();
+            rollup.replay_scanned_lines = batch.scanned_lines;
+            rollup.replay_max_lines = batch.max_lines;
+            rollup.replay_max_bytes = batch.max_bytes;
+            rollup.replay_bytes_truncated = batch.bytes_truncated;
+            rollup.replay_lines_truncated = batch.lines_truncated;
+        }
+        self.attribution_index.write().await.finish_replay(
+            batch.scanned_lines,
+            batch.max_lines,
+            batch.max_bytes,
+            batch.bytes_truncated,
+            batch.lines_truncated,
+        );
 
         self.notify_state_changed();
         replayed
@@ -3121,42 +3584,78 @@ impl ProxyState {
     }
 
     pub async fn finish_request(&self, params: FinishRequestParams) -> bool {
+        self.finish_request_with_endpoint(params, None, FinishRequestMetadata::default())
+            .await
+            .is_some()
+    }
+
+    pub async fn finish_request_with_endpoint(
+        &self,
+        params: FinishRequestParams,
+        provider_endpoint: Option<ProviderEndpointKey>,
+        metadata: FinishRequestMetadata,
+    ) -> Option<FinishedRequest> {
         let mut active = self.active_requests.write().await;
-        let Some(req) = active.remove(&params.id) else {
-            return false;
-        };
+        let req = active.remove(&params.id)?;
         drop(active);
 
-        let pricing_model = req
-            .route_decision
+        let route_decision = merge_route_decision(req.route_decision, metadata.route_decision);
+        let model = metadata.model.or(req.model);
+        let cwd = metadata.cwd.or(req.cwd);
+        let session_id = metadata.session_id.or(req.session_id);
+        let session_identity_source = metadata
+            .session_identity_source
+            .or(req.session_identity_source);
+        let reasoning_effort = metadata.reasoning_effort.or(req.reasoning_effort);
+        let station_name = metadata.station_name.or(req.station_name);
+        let provider_id = metadata.provider_id.or(req.provider_id);
+        let upstream_base_url = metadata.upstream_base_url.or(req.upstream_base_url);
+        let pricing_model = route_decision
             .as_ref()
             .and_then(|decision| decision.effective_model.as_ref())
             .map(|value| value.value.as_str())
-            .or(req.model.as_deref());
+            .or(model.as_deref());
         let cost = estimate_request_cost_from_operator_catalog_for_service(
             pricing_model,
             params.usage.as_ref(),
             CostAdjustments::default(),
             &req.service,
         );
+        let project = ProjectIdentity::from_cwd(cwd.as_deref());
+        let pool_membership = if let Some(endpoint) = provider_endpoint.as_ref() {
+            self.quota_pool_membership(endpoint)
+                .await
+                .as_ref()
+                .map(AccountingPoolMembership::from_membership)
+        } else {
+            None
+        };
+        let accounting = RequestAccountingFacts {
+            schema_version: RequestAccountingFacts::SCHEMA_VERSION,
+            project,
+            provider_endpoint,
+            pool_membership,
+            price_coverage: classify_captured_cost(&cost),
+        };
 
         let mut finished = FinishedRequest {
             id: params.id,
             trace_id: req.trace_id,
-            session_id: req.session_id,
-            session_identity_source: req.session_identity_source,
+            session_id,
+            session_identity_source,
             client_name: req.client_name,
             client_addr: req.client_addr,
-            cwd: req.cwd,
-            model: req.model,
-            reasoning_effort: req.reasoning_effort,
+            cwd,
+            model,
+            reasoning_effort,
             service_tier: params.observed_service_tier.or(req.service_tier),
-            station_name: req.station_name,
-            provider_id: req.provider_id,
-            upstream_base_url: req.upstream_base_url,
-            route_decision: req.route_decision,
+            station_name,
+            provider_id,
+            upstream_base_url,
+            route_decision,
             usage: params.usage.clone(),
             cost,
+            accounting,
             retry: params.retry,
             provider_signals: Vec::new(),
             policy_actions: Vec::new(),
@@ -3172,6 +3671,7 @@ impl ProxyState {
         };
         finished.refresh_observability();
 
+        self.attribution_index.write().await.record(&finished);
         {
             let mut rollups = self.usage_rollups.write().await;
             let rollup = rollups.entry(finished.service.clone()).or_default();
@@ -3243,12 +3743,24 @@ impl ProxyState {
         }
 
         let mut recent = self.recent_finished.write().await;
-        recent.push_front(finished);
+        recent.push_front(finished.clone());
         while recent.len() > recent_finished_max() {
             recent.pop_back();
         }
         self.notify_state_changed();
-        true
+        Some(finished)
+    }
+
+    pub async fn record_accounting_append_failure(&self, request: &FinishedRequest) {
+        self.attribution_index
+            .write()
+            .await
+            .mark_append_failure(request);
+        self.notify_state_changed();
+    }
+
+    pub async fn query_attribution(&self, query: AttributionQuery) -> AttributionQueryResult {
+        self.attribution_index.read().await.query(query)
     }
 
     pub async fn list_active_requests(&self) -> Vec<ActiveRequest> {
@@ -3733,6 +4245,71 @@ mod tests {
     use crate::runtime_identity::ProviderEndpointKey;
     use std::path::Path;
     use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+    fn route_value(value: &str) -> ResolvedRouteValue {
+        ResolvedRouteValue::new(value, RouteValueSource::RuntimeFallback)
+    }
+
+    #[test]
+    fn merge_route_decision_preserves_active_route_for_model_only_terminal_event() {
+        let active = RouteDecisionProvenance {
+            decided_at_ms: 10,
+            binding_profile_name: Some("daily".to_string()),
+            binding_continuity_mode: Some(SessionContinuityMode::DefaultProfile),
+            effective_model: Some(route_value("gpt-5.4")),
+            effective_reasoning_effort: Some(route_value("high")),
+            effective_service_tier: Some(route_value("priority")),
+            effective_station: Some(route_value("input20")),
+            effective_upstream_base_url: Some(route_value("https://relay.example/v1")),
+            provider_id: Some("new-api".to_string()),
+            endpoint_id: Some("1".to_string()),
+            route_path: vec!["legacy".to_string(), "input20".to_string()],
+        };
+        let terminal = RouteDecisionProvenance {
+            effective_model: Some(route_value("gpt-5.4-2026-06-01")),
+            ..RouteDecisionProvenance::default()
+        };
+
+        let merged = merge_route_decision(Some(active), Some(terminal)).expect("merged decision");
+
+        assert_eq!(merged.decided_at_ms, 10);
+        assert_eq!(
+            merged
+                .effective_model
+                .as_ref()
+                .map(|value| value.value.as_str()),
+            Some("gpt-5.4-2026-06-01")
+        );
+        assert_eq!(merged.binding_profile_name.as_deref(), Some("daily"));
+        assert_eq!(merged.endpoint_id.as_deref(), Some("1"));
+        assert_eq!(merged.route_path, ["legacy", "input20"]);
+    }
+
+    #[test]
+    fn merge_route_decision_prefers_complete_terminal_fields() {
+        let active = RouteDecisionProvenance {
+            decided_at_ms: 10,
+            provider_id: Some("active-provider".to_string()),
+            endpoint_id: Some("0".to_string()),
+            route_path: vec!["active".to_string()],
+            ..RouteDecisionProvenance::default()
+        };
+        let terminal = RouteDecisionProvenance {
+            decided_at_ms: 20,
+            provider_id: Some("terminal-provider".to_string()),
+            endpoint_id: Some("2".to_string()),
+            route_path: vec!["terminal".to_string()],
+            ..RouteDecisionProvenance::default()
+        };
+
+        let merged = merge_route_decision(Some(active), Some(terminal)).expect("merged decision");
+
+        assert_eq!(merged.decided_at_ms, 20);
+        assert_eq!(merged.provider_id.as_deref(), Some("terminal-provider"));
+        assert_eq!(merged.endpoint_id.as_deref(), Some("2"));
+        assert_eq!(merged.route_path, ["terminal"]);
+    }
 
     async fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
@@ -3797,6 +4374,180 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn provider_balance_convergence_records_only_fresh_quota_amounts() {
+        let state = ProxyState::new();
+        let mut valid = ProviderBalanceSnapshot::new("relay", "station", 0, "adapter", 100, None)
+            .with_provider_endpoint_key("codex/relay/default");
+        valid.quota_used_usd = Some("1.25".to_string());
+        state.record_provider_balance_snapshot("codex", valid).await;
+
+        let error = ProviderBalanceSnapshot::new("relay", "station", 0, "adapter", 200, None)
+            .with_provider_endpoint_key("codex/relay/default")
+            .with_error("temporary failure");
+        state.record_provider_balance_snapshot("codex", error).await;
+
+        let endpoint = ProviderEndpointKey::new("codex", "relay", "default");
+        let membership = state
+            .quota_pool_membership(&endpoint)
+            .await
+            .expect("membership");
+        let samples = state.quota_samples_for_pool(&membership.pool.key).await;
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].used.as_ref().map(|value| value.value), Some(125));
+        assert_eq!(state.quota_registry_checkpoint().await.generation, 2);
+    }
+
+    #[tokio::test]
+    async fn quota_analytics_view_is_supported_without_remote_pools() {
+        let state = ProxyState::new();
+        *state.quota_pool_registry.write().await = QuotaPoolRegistry::default();
+
+        let view = state.quota_analytics_view("codex", 42).await;
+
+        assert_eq!(
+            view.support,
+            crate::quota_analytics::QuotaAnalyticsSupport::Supported
+        );
+        assert_eq!(view.generated_at_ms, 42);
+        assert!(view.pools.is_empty());
+    }
+
+    fn quota_checkpoint_for_generation(generation: u64) -> QuotaRegistryCheckpoint {
+        QuotaRegistryCheckpoint {
+            generation,
+            ..QuotaRegistryCheckpoint::default()
+        }
+    }
+
+    async fn wait_for_atomic_flag(flag: &AtomicBool) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !flag.load(AtomicOrdering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker should enter injected saver");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocked_quota_checkpoint_save_does_not_stall_tokio_heartbeat() {
+        let save_started = Arc::new(AtomicBool::new(false));
+        let release_save = Arc::new(AtomicBool::new(false));
+        let save_started_for_worker = save_started.clone();
+        let release_save_for_worker = release_save.clone();
+        let writer = QuotaCheckpointWriter::spawn_with_saver(move |_| {
+            save_started_for_worker.store(true, AtomicOrdering::SeqCst);
+            while !release_save_for_worker.load(AtomicOrdering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Ok(())
+        })
+        .expect("spawn quota checkpoint writer");
+
+        writer.submit(quota_checkpoint_for_generation(1));
+        wait_for_atomic_flag(&save_started).await;
+
+        let heartbeat = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            true
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), heartbeat)
+                .await
+                .expect("Tokio heartbeat should progress while the saver is blocked")
+                .expect("heartbeat task should join")
+        );
+        assert!(!release_save.load(AtomicOrdering::SeqCst));
+
+        release_save.store(true, AtomicOrdering::SeqCst);
+        writer
+            .shutdown()
+            .await
+            .expect("shutdown should flush blocked save after release");
+    }
+
+    #[tokio::test]
+    async fn quota_checkpoint_writer_preserves_order_and_shutdown_flushes_tail() {
+        let saved_generations = Arc::new(Mutex::new(Vec::new()));
+        let saved_generations_for_worker = saved_generations.clone();
+        let writer = QuotaCheckpointWriter::spawn_with_saver(move |checkpoint| {
+            saved_generations_for_worker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(checkpoint.generation);
+            Ok(())
+        })
+        .expect("spawn quota checkpoint writer");
+
+        for generation in 1..=3 {
+            writer.submit(quota_checkpoint_for_generation(generation));
+        }
+        writer.flush().await.expect("flush first checkpoint batch");
+        assert_eq!(
+            *saved_generations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![1, 2, 3]
+        );
+
+        writer.submit(quota_checkpoint_for_generation(4));
+        writer
+            .shutdown()
+            .await
+            .expect("shutdown should flush final checkpoint");
+        assert_eq!(
+            *saved_generations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![1, 2, 3, 4]
+        );
+    }
+
+    #[tokio::test]
+    async fn quota_checkpoint_shutdown_joins_worker_after_saver_panic() {
+        let save_started = Arc::new(AtomicBool::new(false));
+        let save_started_for_worker = save_started.clone();
+        let writer = QuotaCheckpointWriter::spawn_with_saver(move |_| {
+            save_started_for_worker.store(true, AtomicOrdering::SeqCst);
+            panic!("injected quota saver panic");
+        })
+        .expect("spawn quota checkpoint writer");
+
+        writer.submit(quota_checkpoint_for_generation(1));
+        wait_for_atomic_flag(&save_started).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let finished = writer
+                    .worker
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                    .is_some_and(std::thread::JoinHandle::is_finished);
+                if finished {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("panicked worker should finish");
+
+        let error = writer
+            .shutdown()
+            .await
+            .expect_err("panicked saver should fail shutdown");
+        assert!(error.contains("checkpoint"), "{error}");
+        assert!(
+            writer
+                .worker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
+            "shutdown must consume and join the worker handle"
+        );
+    }
+
     fn temp_state_log_path(test_name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "codex-helper-state-{test_name}-{}-{}.jsonl",
@@ -3819,7 +4570,8 @@ mod tests {
                 .await;
 
             let active = state.list_active_requests().await;
-            assert_eq!(active[0].trace_id.as_deref(), Some("codex-1"));
+            let trace_id = active[0].trace_id.clone().expect("active trace ID");
+            assert!(crate::logging::is_versioned_request_trace_id(&trace_id));
 
             state
                 .finish_request(FinishRequestParams {
@@ -3836,8 +4588,11 @@ mod tests {
                 .await;
 
             let recent = state.list_recent_finished(1).await;
-            assert_eq!(recent[0].trace_id.as_deref(), Some("codex-1"));
-            assert_eq!(recent[0].observability.trace_id.as_deref(), Some("codex-1"));
+            assert_eq!(recent[0].trace_id.as_deref(), Some(trace_id.as_str()));
+            assert_eq!(
+                recent[0].observability.trace_id.as_deref(),
+                Some(trace_id.as_str())
+            );
             assert!(recent[0].observability.fast_mode);
             assert_eq!(recent[0].observability.generation_ms, Some(6));
         });
@@ -4100,10 +4855,11 @@ mod tests {
         runtime.block_on(async {
             let state = ProxyState::new();
             let ended_at_ms = 1_704_038_400_000_u64;
+            let cwd = env!("CARGO_MANIFEST_DIR").to_string();
             let request_id = state
                 .begin_request_for_test()
                 .session_id("sid-day")
-                .cwd("F:/SourceCodes/Rust/codex-helper")
+                .cwd(cwd.clone())
                 .model("gpt-5")
                 .started_at_ms(ended_at_ms.saturating_sub(1_000))
                 .begin()
@@ -4144,8 +4900,9 @@ mod tests {
             assert_eq!(rollup.by_model["gpt-5"].requests_total, 1);
             assert_eq!(rollup.by_model_day["gpt-5"][&day].usage.total_tokens, 42);
             assert_eq!(rollup.by_session["sid-day"].requests_total, 1);
+            let expected_project = ProjectIdentity::from_cwd(Some(&cwd));
             assert_eq!(
-                rollup.by_project["F:/SourceCodes/Rust/codex-helper"].requests_total,
+                rollup.by_project[expected_project.display_key()].requests_total,
                 1
             );
 
@@ -4155,6 +4912,40 @@ mod tests {
             ));
             assert_eq!(rollup.loaded.requests_total, before);
         });
+    }
+
+    #[test]
+    fn usage_rollup_keeps_reused_legacy_trace_from_distinct_completions() {
+        let request = |ended_at_ms| {
+            crate::request_ledger::finished_request_from_request_log_record(&serde_json::json!({
+                "timestamp_ms": ended_at_ms,
+                "request_id": 1,
+                "trace_id": "codex-1",
+                "service": "codex",
+                "method": "POST",
+                "path": "/v1/responses",
+                "status_code": 200,
+                "duration_ms": 10
+            }))
+            .expect("legacy request")
+        };
+        let first = request(120_001);
+        let after_restart = request(180_001);
+        let mut rollup = UsageRollup::default();
+
+        assert!(record_finished_request_into_usage_rollup(
+            &mut rollup,
+            &first
+        ));
+        assert!(!record_finished_request_into_usage_rollup(
+            &mut rollup,
+            &first
+        ));
+        assert!(record_finished_request_into_usage_rollup(
+            &mut rollup,
+            &after_restart
+        ));
+        assert_eq!(rollup.loaded.requests_total, 2);
     }
 
     #[test]
@@ -4213,8 +5004,10 @@ mod tests {
             );
             assert_eq!(rollup.by_model["gpt-5"].requests_total, 1);
             assert_eq!(rollup.by_session["sid-replay"].requests_total, 1);
+            let expected_project =
+                ProjectIdentity::from_cwd(Some("F:/SourceCodes/Rust/codex-helper"));
             assert_eq!(
-                rollup.by_project["F:/SourceCodes/Rust/codex-helper"].requests_total,
+                rollup.by_project[expected_project.display_key()].requests_total,
                 1
             );
 
@@ -4232,6 +5025,129 @@ mod tests {
             );
 
             let _ = std::fs::remove_file(log_path);
+        });
+    }
+
+    #[test]
+    fn replay_merges_with_live_requests_by_trace_instead_of_skipping_history() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let log_path = temp_state_log_path("usage-replay-live-merge");
+            let ended_at_ms = 120_001;
+            let state = ProxyState::new();
+            let request_id = state
+                .begin_request_for_test()
+                .model("gpt-5")
+                .started_at_ms(120_000)
+                .begin()
+                .await;
+            assert!(
+                state
+                    .finish_request(FinishRequestParams {
+                        id: request_id,
+                        status_code: 200,
+                        duration_ms: 1,
+                        ended_at_ms,
+                        observed_service_tier: None,
+                        usage: None,
+                        retry: None,
+                        ttfb_ms: None,
+                        streaming: false,
+                    })
+                    .await
+            );
+            let live_trace_id = state.list_recent_finished(1).await[0]
+                .trace_id
+                .clone()
+                .expect("live trace ID");
+            let duplicate = serde_json::json!({
+                "timestamp_ms": ended_at_ms,
+                "request_id": request_id,
+                "trace_id": live_trace_id,
+                "service": "codex",
+                "method": "POST",
+                "path": "/v1/responses",
+                "status_code": 200,
+                "duration_ms": 1
+            });
+            let historical = serde_json::json!({
+                "timestamp_ms": 180_001,
+                "request_id": 2,
+                "trace_id": "codex-replay-2",
+                "service": "codex",
+                "method": "POST",
+                "path": "/v1/responses",
+                "status_code": 200,
+                "duration_ms": 1
+            });
+            std::fs::write(&log_path, format!("{duplicate}\n{historical}\n"))
+                .expect("write replay merge log");
+
+            let replayed = state
+                .replay_usage_from_requests_log("codex", log_path.clone(), HashMap::new())
+                .await;
+
+            assert_eq!(replayed, 1);
+            let rollups = state.usage_rollups.read().await;
+            assert_eq!(rollups["codex"].loaded.requests_total, 2);
+            drop(rollups);
+            let attribution = state
+                .query_attribution(AttributionQuery::new(120_000, 240_000))
+                .await;
+            assert_eq!(attribution.coverage.duplicate_requests, 1);
+            assert!(!attribution.coverage.replay_in_progress);
+
+            let _ = std::fs::remove_file(log_path);
+        });
+    }
+
+    #[test]
+    fn append_failure_keeps_live_usage_and_marks_attribution_coverage() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            let request_id = state
+                .begin_request_for_test()
+                .started_at_ms(100)
+                .begin()
+                .await;
+            assert!(
+                state
+                    .finish_request(FinishRequestParams {
+                        id: request_id,
+                        status_code: 200,
+                        duration_ms: 10,
+                        ended_at_ms: 110,
+                        observed_service_tier: None,
+                        usage: None,
+                        retry: None,
+                        ttfb_ms: None,
+                        streaming: false,
+                    })
+                    .await
+            );
+            let request = state
+                .list_recent_finished(1)
+                .await
+                .into_iter()
+                .next()
+                .expect("finished request");
+
+            state.record_accounting_append_failure(&request).await;
+
+            assert_eq!(
+                state
+                    .get_usage_rollup_view("codex", 1, 1)
+                    .await
+                    .loaded
+                    .requests_total,
+                1
+            );
+            let attribution = state
+                .query_attribution(AttributionQuery::new(0, 60_000))
+                .await;
+            assert_eq!(attribution.coverage.append_failed_requests, 1);
+            assert!(!attribution.coverage.complete_for_reconciliation());
         });
     }
 
@@ -4467,6 +5383,7 @@ mod tests {
                     ..UsageMetrics::default()
                 }),
                 cost: CostBreakdown::default(),
+                accounting: Default::default(),
                 retry: None,
                 provider_signals: Vec::new(),
                 policy_actions: Vec::new(),
@@ -4497,6 +5414,7 @@ mod tests {
                 route_decision: None,
                 usage: None,
                 cost: CostBreakdown::default(),
+                accounting: Default::default(),
                 retry: None,
                 provider_signals: Vec::new(),
                 policy_actions: Vec::new(),
@@ -5079,40 +5997,6 @@ mod tests {
             assert_eq!(summary.snapshots, 1);
             assert_eq!(summary.stale, 1);
             assert_eq!(summary.routing_snapshots, 1);
-        });
-    }
-
-    #[test]
-    fn provider_balance_history_keeps_recent_refreshes() {
-        let runtime = tokio::runtime::Runtime::new().expect("runtime");
-        runtime.block_on(async {
-            let state = ProxyState::new();
-            for (fetched_at_ms, remaining) in [(10, "10"), (20, "8")] {
-                state
-                    .record_provider_balance_snapshot(
-                        "codex",
-                        ProviderBalanceSnapshot {
-                            provider_id: "packycode".to_string(),
-                            station_name: Some("right".to_string()),
-                            upstream_index: Some(2),
-                            source: "usage_provider:test".to_string(),
-                            fetched_at_ms,
-                            quota_period: Some("daily".to_string()),
-                            quota_remaining_usd: Some(remaining.to_string()),
-                            quota_limit_usd: Some("20".to_string()),
-                            exhausted: Some(false),
-                            ..ProviderBalanceSnapshot::default()
-                        },
-                    )
-                    .await;
-            }
-
-            let history = state.get_provider_balance_history_view("codex").await;
-            let balances = history.get("right").expect("station history");
-
-            assert_eq!(balances.len(), 2);
-            assert_eq!(balances[0].quota_remaining_usd.as_deref(), Some("10"));
-            assert_eq!(balances[1].quota_remaining_usd.as_deref(), Some("8"));
         });
     }
 

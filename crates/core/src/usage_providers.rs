@@ -6,11 +6,12 @@ use anyhow::{Context, Result};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::balance::{
     BalanceSnapshotStatus, ProviderBalanceSnapshot, ProviderUsageAlert, ProviderUsageAlertKind,
     ProviderUsageModelStat, ProviderUsageRateSnapshot, ProviderUsageWindow,
+    safe_provider_balance_error,
 };
 use crate::config::{ProxyConfig, ServiceConfigManager, proxy_home_dir};
 use crate::lb::LbState;
@@ -19,9 +20,12 @@ use crate::pricing::UsdAmount;
 use crate::provider_signals::{
     ProviderSignal, ProviderSignalKind, ProviderSignalSource, ProviderSignalTarget,
 };
+use crate::quota_pool::{
+    ConversionSource, QuotaConversion, QuotaCounterKind, QuotaObservationContext, QuotaQuantity,
+    QuotaScope, QuotaUnit, QuotaWindowSemantics, RemoteIdentityProof, next_configured_reset_at_ms,
+};
 use crate::runtime_identity::ProviderEndpointKey;
 use crate::state::ProxyState;
-use crate::usage_forecast::next_reset_at_ms;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -170,6 +174,13 @@ struct UsageProviderConfig {
     headers: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     variables: BTreeMap<String, String>,
+    /// Optional operator-supplied identity hint.  It is an opaque label, never a credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quota_pool_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quota_reset_timezone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quota_divisor: Option<u64>,
     #[serde(default, skip_serializing_if = "UsageProviderExtractConfig::is_empty")]
     extract: UsageProviderExtractConfig,
 }
@@ -201,6 +212,7 @@ struct UsageProviderTargetKey {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct UsageProviderRefreshSummary {
     pub providers_configured: usize,
     pub providers_matched: usize,
@@ -208,6 +220,10 @@ pub struct UsageProviderRefreshSummary {
     pub attempted: usize,
     pub refreshed: usize,
     pub failed: usize,
+    #[serde(skip_serializing_if = "usize_is_zero")]
+    pub suppressed: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_retry_at_ms: Option<u64>,
     pub missing_token: usize,
     #[serde(skip_serializing_if = "usize_is_zero")]
     pub auto_attempted: usize,
@@ -219,10 +235,45 @@ pub struct UsageProviderRefreshSummary {
     pub deduplicated: usize,
 }
 
+impl UsageProviderRefreshSummary {
+    pub(crate) fn merge_from(&mut self, extra: Self) {
+        self.providers_configured += extra.providers_configured;
+        self.providers_matched += extra.providers_matched;
+        self.upstreams_matched += extra.upstreams_matched;
+        self.attempted += extra.attempted;
+        self.refreshed += extra.refreshed;
+        self.failed += extra.failed;
+        self.suppressed += extra.suppressed;
+        self.next_retry_at_ms = earliest_timestamp(self.next_retry_at_ms, extra.next_retry_at_ms);
+        self.missing_token += extra.missing_token;
+        self.auto_attempted += extra.auto_attempted;
+        self.auto_refreshed += extra.auto_refreshed;
+        self.auto_failed += extra.auto_failed;
+        self.deduplicated += extra.deduplicated;
+    }
+
+    fn record_suppression(&mut self, wake_at: Instant) {
+        self.suppressed += 1;
+        let now = Instant::now();
+        let wake_at_ms = unix_now_ms()
+            .saturating_add(duration_millis_u64(wake_at.saturating_duration_since(now)));
+        self.next_retry_at_ms = earliest_timestamp(self.next_retry_at_ms, Some(wake_at_ms));
+    }
+}
+
+fn earliest_timestamp(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UsageProviderRefreshOutcome {
     Refreshed,
     Failed,
+    Suppressed { wake_at: Instant },
     MissingToken,
 }
 
@@ -248,6 +299,8 @@ static AUTO_PROBE_KIND_FAILURES: OnceLock<Mutex<HashMap<AutoProbeKindFailureKey,
 static USAGE_PROVIDER_TARGET_SUPPRESSIONS: OnceLock<
     Mutex<HashMap<ProviderTargetSuppressionKey, ProviderTargetSuppression>>,
 > = OnceLock::new();
+static NEW_API_QUOTA_DIVISORS: OnceLock<Mutex<HashMap<String, NewApiQuotaDivisorCacheEntry>>> =
+    OnceLock::new();
 
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 10 * 60;
 // Minimal request-driven poll interval per provider to avoid hammering usage APIs.
@@ -256,7 +309,10 @@ pub const REQUEST_BALANCE_REFRESH_DELAY: Duration = Duration::from_secs(60);
 const BALANCE_REFRESH_CONCURRENCY: usize = 6;
 const BALANCE_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
 const BALANCE_HTTP_ERROR_BODY_LIMIT: usize = 2_048;
+const NEW_API_STATUS_BODY_LIMIT: usize = 64 * 1_024;
 const AUTO_PROBE_KIND_FAILURE_TTL: Duration = Duration::from_secs(10 * 60);
+const NEW_API_QUOTA_DIVISOR_SUCCESS_TTL: Duration = Duration::from_secs(60 * 60);
+const NEW_API_QUOTA_DIVISOR_FAILURE_TTL: Duration = Duration::from_secs(10 * 60);
 const USAGE_PROVIDER_TERMINAL_FAILURE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const USAGE_PROVIDER_EXHAUSTED_SUPPRESSION_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const USAGE_PROVIDER_DAILY_RESET_SUPPRESSION_GRACE: Duration = Duration::from_secs(5 * 60);
@@ -296,6 +352,38 @@ struct ProviderTargetSuppressionDecision {
     reason: String,
     routing_exhausted: bool,
     ttl: Duration,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NewApiQuotaDivisorCacheEntry {
+    divisor: Option<u64>,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResolvedQuotaConversion {
+    source: ConversionSource,
+    divisor: Option<u64>,
+}
+
+impl Default for ResolvedQuotaConversion {
+    fn default() -> Self {
+        Self {
+            source: ConversionSource::Unknown,
+            divisor: None,
+        }
+    }
+}
+
+impl ResolvedQuotaConversion {
+    fn quota_conversion(self) -> Option<QuotaConversion> {
+        let divisor = self.divisor?;
+        Some(QuotaConversion {
+            source: self.source,
+            divisor: Some(divisor),
+            generation: Some(QuotaConversion::stable_generation(self.source, divisor)),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -419,6 +507,9 @@ fn default_provider_config(
         trust_exhaustion_for_routing: true,
         headers: BTreeMap::new(),
         variables: BTreeMap::new(),
+        quota_pool_id: None,
+        quota_reset_timezone: None,
+        quota_divisor: None,
         extract,
     }
 }
@@ -507,6 +598,9 @@ fn auto_usage_provider(target: &UsageProviderTarget, kind: ProviderKind) -> Usag
         trust_exhaustion_for_routing: true,
         headers: BTreeMap::new(),
         variables: BTreeMap::new(),
+        quota_pool_id: None,
+        quota_reset_timezone: None,
+        quota_divisor: None,
         extract: UsageProviderExtractConfig::default(),
     };
     if matches!(kind, ProviderKind::RightCodeAccountSummary) {
@@ -655,6 +749,30 @@ fn auto_probe_kind_failure_active(
         failures.remove(&key);
         false
     }
+}
+
+fn next_auto_probe_kind_retry_at(
+    provider_id: &str,
+    target: &UsageProviderTarget,
+    now: Instant,
+) -> Option<Instant> {
+    let target_key = auto_probe_target_key(target);
+    let failures = AUTO_PROBE_KIND_FAILURES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()?;
+    failures
+        .iter()
+        .filter(|(key, _)| key.provider_id == provider_id && key.target == target_key)
+        .filter(|(key, _)| {
+            key.kind != ProviderKind::RightCodeAccountSummary
+                || is_rightcode_base_url(&target.base_url)
+        })
+        .filter_map(|(_, failed_at)| {
+            let wake_at = *failed_at + AUTO_PROBE_KIND_FAILURE_TTL;
+            (wake_at > now).then_some(wake_at)
+        })
+        .min()
 }
 
 fn usage_provider_target_suppression_key(
@@ -1295,6 +1413,189 @@ fn endpoint_origin(endpoint: &str) -> String {
         .unwrap_or_else(|| "unknown-origin".to_string())
 }
 
+fn provider_uses_new_api_quota(provider: &UsageProviderConfig) -> bool {
+    matches!(
+        provider.kind,
+        ProviderKind::NewApiTokenUsage | ProviderKind::NewApiUserSelf
+    )
+}
+
+fn configured_new_api_quota_divisor(provider: &UsageProviderConfig) -> Option<u64> {
+    if let Some(divisor) = provider.quota_divisor.filter(|divisor| *divisor > 0) {
+        return Some(divisor);
+    }
+
+    let mut legacy = [
+        provider.extract.remaining_divisor,
+        provider.extract.monthly_budget_divisor,
+        provider.extract.monthly_spent_divisor,
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|divisor| *divisor > 0);
+    let first = legacy.next()?;
+    legacy.all(|divisor| divisor == first).then_some(first)
+}
+
+fn select_new_api_quota_conversion(
+    provider: &UsageProviderConfig,
+    remote_divisor: Option<u64>,
+) -> ResolvedQuotaConversion {
+    if !provider_uses_new_api_quota(provider) {
+        return ResolvedQuotaConversion::default();
+    }
+    if let Some(divisor) = remote_divisor.filter(|divisor| *divisor > 0) {
+        return ResolvedQuotaConversion {
+            source: ConversionSource::Remote,
+            divisor: Some(divisor),
+        };
+    }
+    if let Some(divisor) = configured_new_api_quota_divisor(provider) {
+        return ResolvedQuotaConversion {
+            source: ConversionSource::Configured,
+            divisor: Some(divisor),
+        };
+    }
+    ResolvedQuotaConversion::default()
+}
+
+fn new_api_status_target(base_url: &str) -> Option<(String, reqwest::Url)> {
+    let mut url = reqwest::Url::parse(base_url).ok()?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return None;
+    }
+    url.set_username("").ok()?;
+    url.set_password(None).ok()?;
+    url.set_path("/api/status");
+    url.set_query(None);
+    url.set_fragment(None);
+    let origin = endpoint_origin(url.as_str());
+    (origin != "unknown-origin").then_some((origin, url))
+}
+
+fn cached_new_api_quota_divisor(origin: &str, now: Instant) -> Option<Option<u64>> {
+    let mut cache = NEW_API_QUOTA_DIVISORS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()?;
+    let entry = cache.get(origin).copied()?;
+    if now < entry.expires_at {
+        Some(entry.divisor)
+    } else {
+        cache.remove(origin);
+        None
+    }
+}
+
+fn cache_new_api_quota_divisor(origin: String, divisor: Option<u64>, now: Instant) {
+    let ttl = if divisor.is_some() {
+        NEW_API_QUOTA_DIVISOR_SUCCESS_TTL
+    } else {
+        NEW_API_QUOTA_DIVISOR_FAILURE_TTL
+    };
+    if let Ok(mut cache) = NEW_API_QUOTA_DIVISORS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        cache.insert(
+            origin,
+            NewApiQuotaDivisorCacheEntry {
+                divisor,
+                expires_at: now + ttl,
+            },
+        );
+    }
+}
+
+fn quota_per_unit_from_status_json(value: &serde_json::Value) -> Option<u64> {
+    if json_value_at_path(value, "success").and_then(bool_from_json) == Some(false)
+        || json_value_at_path(value, "code").and_then(bool_from_json) == Some(false)
+    {
+        return None;
+    }
+    ["data.quota_per_unit", "quota_per_unit"]
+        .into_iter()
+        .find_map(|path| {
+            let raw = decimal_string_from_json(json_value_at_path(value, path)?)?;
+            let quantity = QuotaQuantity::from_decimal(&raw, QuotaUnit::Raw)?;
+            (quantity.scale == 0 && quantity.value > 0)
+                .then(|| u64::try_from(quantity.value).ok())
+                .flatten()
+        })
+}
+
+async fn read_limited_json_response(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<serde_json::Value> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        anyhow::bail!("response body exceeds {limit} bytes");
+    }
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("response body read failed")?;
+        if body.len().saturating_add(chunk.len()) > limit {
+            anyhow::bail!("response body exceeds {limit} bytes");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).context("response body is not valid JSON")
+}
+
+async fn fetch_new_api_quota_divisor(
+    client: &Client,
+    status_url: reqwest::Url,
+) -> Result<Option<u64>> {
+    let response = client
+        .get(status_url)
+        .timeout(BALANCE_HTTP_REQUEST_TIMEOUT)
+        .header("Accept", "application/json")
+        .header(
+            "User-Agent",
+            concat!("codex-helper/", env!("CARGO_PKG_VERSION")),
+        )
+        .send()
+        .await
+        .context("New API status request failed")?;
+    if !response.status().is_success() {
+        return Ok(None);
+    }
+    let value = read_limited_json_response(response, NEW_API_STATUS_BODY_LIMIT).await?;
+    Ok(quota_per_unit_from_status_json(&value))
+}
+
+async fn resolve_new_api_quota_conversion(
+    client: &Client,
+    provider: &UsageProviderConfig,
+    base_url: &str,
+) -> ResolvedQuotaConversion {
+    if !provider_uses_new_api_quota(provider) {
+        return ResolvedQuotaConversion::default();
+    }
+    let Some((origin, status_url)) = new_api_status_target(base_url) else {
+        return select_new_api_quota_conversion(provider, None);
+    };
+    let now = Instant::now();
+    let remote_divisor = if let Some(cached) = cached_new_api_quota_divisor(&origin, now) {
+        cached
+    } else {
+        let fetched = match fetch_new_api_quota_divisor(client, status_url).await {
+            Ok(divisor) => divisor,
+            Err(error) => {
+                debug!(origin, error = %error, "New API quota divisor probe failed");
+                None
+            }
+        };
+        cache_new_api_quota_divisor(origin, fetched, now);
+        fetched
+    };
+    select_new_api_quota_conversion(provider, remote_divisor)
+}
+
 async fn poll_provider_http_json(
     client: &Client,
     provider: &UsageProviderConfig,
@@ -1356,15 +1657,16 @@ async fn poll_provider_http_json(
                 origin, provider.kind
             )
         })?;
-        let detail = usage_provider_http_error_detail(&text)
-            .map(|detail| format!(": {detail}"))
-            .unwrap_or_default();
+        let classification_input = usage_provider_http_error_detail(&text)
+            .map(|detail| format!("HTTP {status}: {detail}"))
+            .unwrap_or_else(|| format!("HTTP {status}"));
+        let category = safe_usage_provider_error(&classification_input);
         anyhow::bail!(
-            "usage provider HTTP {} from {} via {:?}{}",
+            "usage provider HTTP {} from {} via {:?}: {}",
             status,
             origin,
             provider.kind,
-            detail
+            category
         );
     }
     let text = resp.text().await.with_context(|| {
@@ -1457,6 +1759,10 @@ fn usage_provider_http_error_detail(text: &str) -> Option<String> {
     }
 
     compact_error_detail(trimmed)
+}
+
+fn safe_usage_provider_error(error: &str) -> String {
+    safe_provider_balance_error(error).to_string()
 }
 
 fn amount_from_json(value: &serde_json::Value) -> Option<UsdAmount> {
@@ -2670,15 +2976,15 @@ fn sub2api_auth_me_snapshot_from_json(
     fetched_at_ms: u64,
     stale_after_ms: Option<u64>,
 ) -> ProviderBalanceSnapshot {
-    if json_value_at_path(value, "code")
+    if let Some(code) = json_value_at_path(value, "code")
         .and_then(|value| value.as_i64())
-        .is_some_and(|code| code != 0)
+        .filter(|code| *code != 0)
     {
         let message = json_value_at_path(value, "message")
             .and_then(|value| value.as_str())
             .unwrap_or("sub2api auth/me response reported failure");
         return base_snapshot(provider, upstream, fetched_at_ms, stale_after_ms)
-            .with_error(message.to_string());
+            .with_error(format!("status {code}: {message}"));
     }
 
     balance_http_snapshot_from_json(provider, upstream, value, fetched_at_ms, stale_after_ms)
@@ -2792,6 +3098,7 @@ fn new_api_token_usage_snapshot_from_json(
     value: &serde_json::Value,
     fetched_at_ms: u64,
     stale_after_ms: Option<u64>,
+    quota_divisor: Option<u64>,
 ) -> ProviderBalanceSnapshot {
     if json_value_at_path(value, "success").and_then(bool_from_json) == Some(false)
         || json_value_at_path(value, "code").and_then(bool_from_json) == Some(false)
@@ -2826,35 +3133,39 @@ fn new_api_token_usage_snapshot_from_json(
             "total_granted".to_string(),
         ];
     }
-    effective.remaining_divisor = effective.remaining_divisor.or(Some(500_000));
-    effective.monthly_spent_divisor = effective.monthly_spent_divisor.or(Some(500_000));
-    effective.monthly_budget_divisor = effective.monthly_budget_divisor.or(Some(500_000));
-
     let unlimited_quota =
         first_bool_from_paths(value, &[], &["data.unlimited_quota", "unlimited_quota"])
             == Some(true);
-    let remaining_balance = first_amount_from_paths(
-        value,
-        &effective.remaining_balance_paths,
-        &[],
-        effective.remaining_divisor,
-    );
-    let monthly_spent = first_amount_from_paths(
-        value,
-        &effective.monthly_spent_paths,
-        &[],
-        effective.monthly_spent_divisor,
-    );
-    let monthly_budget = first_amount_from_paths(
-        value,
-        &effective.monthly_budget_paths,
-        &[],
-        effective.monthly_budget_divisor,
-    )
-    .or_else(|| match (remaining_balance, monthly_spent) {
-        (Some(remaining), Some(spent)) => Some(remaining.saturating_add(spent)),
-        _ => None,
+    let remaining_balance = quota_divisor.and_then(|divisor| {
+        first_amount_from_paths(
+            value,
+            &effective.remaining_balance_paths,
+            &[],
+            Some(divisor),
+        )
     });
+    let monthly_spent = quota_divisor.and_then(|divisor| {
+        first_amount_from_paths(value, &effective.monthly_spent_paths, &[], Some(divisor))
+    });
+    let monthly_budget = quota_divisor
+        .and_then(|divisor| {
+            first_amount_from_paths(value, &effective.monthly_budget_paths, &[], Some(divisor))
+        })
+        .or_else(|| match (remaining_balance, monthly_spent) {
+            (Some(remaining), Some(spent)) => Some(remaining.saturating_add(spent)),
+            _ => None,
+        });
+    let raw_remaining_is_zero = raw_quota_quantity(
+        value,
+        &[
+            "data.total_available",
+            "data.remain_quota",
+            "total_available",
+            "remain_quota",
+        ],
+        None,
+    )
+    .map(|quantity| quantity.is_zero());
     let exhausted = if unlimited_quota {
         Some(false)
     } else {
@@ -2863,7 +3174,7 @@ fn new_api_token_usage_snapshot_from_json(
             &effective.exhausted_paths,
             &["data.exhausted", "exhausted"],
         )
-        .or_else(|| remaining_balance.map(UsdAmount::is_zero))
+        .or(raw_remaining_is_zero)
     };
 
     let mut snapshot = base_snapshot(provider, upstream, fetched_at_ms, stale_after_ms);
@@ -2890,6 +3201,7 @@ fn new_api_snapshot_from_json(
     value: &serde_json::Value,
     fetched_at_ms: u64,
     stale_after_ms: Option<u64>,
+    quota_divisor: Option<u64>,
 ) -> ProviderBalanceSnapshot {
     if json_value_at_path(value, "success").and_then(bool_from_json) == Some(false) {
         let message = json_value_at_path(value, "message")
@@ -2907,32 +3219,32 @@ fn new_api_snapshot_from_json(
         effective.monthly_spent_paths =
             vec!["data.used_quota".to_string(), "used_quota".to_string()];
     }
-    effective.remaining_divisor = effective.remaining_divisor.or(Some(500_000));
-    effective.monthly_spent_divisor = effective.monthly_spent_divisor.or(Some(500_000));
-    effective.monthly_budget_divisor = effective.monthly_budget_divisor.or(Some(500_000));
-
-    let remaining_balance = first_amount_from_paths(
-        value,
-        &effective.remaining_balance_paths,
-        &[],
-        effective.remaining_divisor,
-    );
-    let monthly_spent = first_amount_from_paths(
-        value,
-        &effective.monthly_spent_paths,
-        &[],
-        effective.monthly_spent_divisor,
-    );
-    let monthly_budget = first_amount_from_paths(
-        value,
-        &effective.monthly_budget_paths,
-        &["data.total_quota", "total_quota"],
-        effective.monthly_budget_divisor,
-    )
-    .or_else(|| match (remaining_balance, monthly_spent) {
-        (Some(remaining), Some(spent)) => Some(remaining.saturating_add(spent)),
-        _ => None,
+    let remaining_balance = quota_divisor.and_then(|divisor| {
+        first_amount_from_paths(
+            value,
+            &effective.remaining_balance_paths,
+            &[],
+            Some(divisor),
+        )
     });
+    let monthly_spent = quota_divisor.and_then(|divisor| {
+        first_amount_from_paths(value, &effective.monthly_spent_paths, &[], Some(divisor))
+    });
+    let monthly_budget = quota_divisor
+        .and_then(|divisor| {
+            first_amount_from_paths(
+                value,
+                &effective.monthly_budget_paths,
+                &["data.total_quota", "total_quota"],
+                Some(divisor),
+            )
+        })
+        .or_else(|| match (remaining_balance, monthly_spent) {
+            (Some(remaining), Some(spent)) => Some(remaining.saturating_add(spent)),
+            _ => None,
+        });
+    let raw_remaining_is_zero = raw_quota_quantity(value, &["data.quota", "quota"], None)
+        .map(|quantity| quantity.is_zero());
     let unlimited_quota =
         first_bool_from_paths(value, &[], &["data.unlimited_quota", "unlimited_quota"])
             == Some(true);
@@ -2944,7 +3256,7 @@ fn new_api_snapshot_from_json(
             &effective.exhausted_paths,
             &["data.exhausted", "exhausted"],
         )
-        .or_else(|| remaining_balance.map(UsdAmount::is_zero))
+        .or(raw_remaining_is_zero)
     };
 
     let mut snapshot = base_snapshot(provider, upstream, fetched_at_ms, stale_after_ms);
@@ -3153,6 +3465,7 @@ fn snapshot_from_provider_json(
     upstream_base_url: &str,
     fetched_at_ms: u64,
     stale_after_ms: Option<u64>,
+    quota_conversion: ResolvedQuotaConversion,
 ) -> ProviderBalanceSnapshot {
     match provider.kind {
         ProviderKind::BudgetHttpJson => {
@@ -3188,10 +3501,16 @@ fn snapshot_from_provider_json(
             value,
             fetched_at_ms,
             stale_after_ms,
+            quota_conversion.divisor,
         ),
-        ProviderKind::NewApiUserSelf => {
-            new_api_snapshot_from_json(provider, upstream, value, fetched_at_ms, stale_after_ms)
-        }
+        ProviderKind::NewApiUserSelf => new_api_snapshot_from_json(
+            provider,
+            upstream,
+            value,
+            fetched_at_ms,
+            stale_after_ms,
+            quota_conversion.divisor,
+        ),
         ProviderKind::RightCodeAccountSummary => rightcode_account_summary_snapshot_from_json(
             provider,
             upstream,
@@ -3208,6 +3527,168 @@ fn snapshot_from_provider_json(
             stale_after_ms,
         ),
     }
+}
+
+fn quota_context_for_provider_snapshot(
+    provider: &UsageProviderConfig,
+    target: &UsageProviderTarget,
+    credential: Option<&str>,
+    value: &serde_json::Value,
+    snapshot: &ProviderBalanceSnapshot,
+    interval_secs: u64,
+    quota_conversion: ResolvedQuotaConversion,
+) -> QuotaObservationContext {
+    let mut context = QuotaObservationContext::new(&target.base_url);
+    context.scope = match provider.kind {
+        ProviderKind::NewApiUserSelf
+        | ProviderKind::Sub2ApiAuthMe
+        | ProviderKind::RightCodeAccountSummary
+        | ProviderKind::YescodeProfile => QuotaScope::Account,
+        ProviderKind::OpenAiOrganizationCosts => QuotaScope::Organization,
+        ProviderKind::Sub2ApiUsage
+        | ProviderKind::NewApiTokenUsage
+        | ProviderKind::OpenAiBalanceHttpJson
+        | ProviderKind::BudgetHttpJson => QuotaScope::ApiKey,
+    };
+    context.explicit_pool_id = provider
+        .quota_pool_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    context.credential = credential.map(|credential| credential.as_bytes().to_vec());
+    context.unit = QuotaUnit::Usd;
+    context.expected_interval_ms = interval_secs.checked_mul(1_000);
+    context.fresh_until_ms = snapshot.stale_after_ms;
+    let window_period = if provider_uses_new_api_quota(provider)
+        && snapshot.quota_resets_at_ms.is_none()
+        && matches!(snapshot.quota_period.as_deref(), Some("quota" | "token"))
+    {
+        Some("wallet")
+    } else {
+        snapshot.quota_period.as_deref()
+    };
+    context.window = Some(QuotaWindowSemantics::from_provider_hint(
+        window_period,
+        snapshot.quota_resets_at_ms,
+        provider.quota_reset_timezone.as_deref(),
+        None,
+        None,
+    ));
+    context.capabilities.used = snapshot.quota_used_usd.is_some();
+    context.capabilities.remaining = snapshot.quota_remaining_usd.is_some();
+    context.capabilities.limit = snapshot.quota_limit_usd.is_some();
+    context.capabilities.direct_total = snapshot.today_used_usd.is_some();
+    context.capabilities.reset = snapshot.quota_resets_at_ms.is_some();
+    context.capabilities.window = snapshot.quota_period.is_some();
+    context.conversion = quota_conversion.quota_conversion();
+    if context.conversion.is_some() {
+        context.capabilities.conversion = true;
+    }
+    if context.conversion.is_none() {
+        match provider.kind {
+            ProviderKind::NewApiTokenUsage => {
+                context.remaining = raw_quota_quantity(
+                    value,
+                    &[
+                        "data.total_available",
+                        "data.remain_quota",
+                        "total_available",
+                    ],
+                    None,
+                );
+                context.used = raw_quota_quantity(
+                    value,
+                    &["data.total_used", "data.used_quota", "total_used"],
+                    None,
+                );
+                context.limit =
+                    raw_quota_quantity(value, &["data.total_granted", "total_granted"], None)
+                        .or_else(|| match (&context.remaining, &context.used) {
+                            (Some(remaining), Some(used)) => remaining.checked_add(used),
+                            _ => None,
+                        });
+            }
+            ProviderKind::NewApiUserSelf => {
+                context.remaining = raw_quota_quantity(value, &["data.quota", "quota"], None);
+                context.used = raw_quota_quantity(value, &["data.used_quota", "used_quota"], None);
+                context.limit =
+                    raw_quota_quantity(value, &["data.total_quota", "total_quota"], None).or_else(
+                        || match (&context.remaining, &context.used) {
+                            (Some(remaining), Some(used)) => remaining.checked_add(used),
+                            _ => None,
+                        },
+                    );
+            }
+            _ => {}
+        }
+        if context.used.is_some() || context.remaining.is_some() || context.limit.is_some() {
+            context.unit = QuotaUnit::Raw;
+            context.capabilities.raw_unit = true;
+        }
+    }
+    context.counter_kind = if context.used.is_some() || snapshot.quota_used_usd.is_some() {
+        QuotaCounterKind::Used
+    } else if context.remaining.is_some() || snapshot.quota_remaining_usd.is_some() {
+        QuotaCounterKind::Remaining
+    } else {
+        QuotaCounterKind::DirectTotal
+    };
+
+    // A user/account ID is useful diagnostic evidence but is not automatically proof that the
+    // subject owns the reported quota counter.  It therefore cannot outrank an explicit pool or
+    // installation-local credential fingerprint.
+    context.remote_stable_id = match provider.kind {
+        ProviderKind::NewApiUserSelf | ProviderKind::Sub2ApiAuthMe => {
+            json_value_at_path(value, "data.id").and_then(|value| {
+                string_from_json(value).or_else(|| decimal_string_from_json(value))
+            })
+        }
+        _ => None,
+    };
+    if context.remote_stable_id.is_some() {
+        context.remote_identity_proof = RemoteIdentityProof::StableSubject;
+    }
+    context
+}
+
+fn raw_quota_quantity(
+    value: &serde_json::Value,
+    paths: &[&str],
+    conversion_generation: Option<u64>,
+) -> Option<QuotaQuantity> {
+    paths.iter().find_map(|path| {
+        let value = json_value_at_path(value, path)?;
+        let decimal = decimal_string_from_json(value)?;
+        QuotaQuantity::from_decimal(&decimal, QuotaUnit::Raw)
+            .map(|quantity| quantity.with_conversion_generation(conversion_generation))
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_provider_snapshot_with_context(
+    state: &ProxyState,
+    service_name: &str,
+    provider: &UsageProviderConfig,
+    target: &UsageProviderTarget,
+    credential: Option<&str>,
+    value: &serde_json::Value,
+    snapshot: ProviderBalanceSnapshot,
+    interval_secs: u64,
+    quota_conversion: ResolvedQuotaConversion,
+) {
+    let context = quota_context_for_provider_snapshot(
+        provider,
+        target,
+        credential,
+        value,
+        &snapshot,
+        interval_secs,
+        quota_conversion,
+    );
+    state
+        .record_provider_balance_snapshot_with_quota_context(service_name, snapshot, context)
+        .await;
 }
 
 async fn refresh_provider_target(
@@ -3241,6 +3722,7 @@ async fn refresh_provider_target(
     if let Some(suppression) = active_usage_provider_target_suppression(&provider.id, target, now)
         && !force_can_bypass_active_suppression(force, &suppression, snapshot_decision.as_ref())
     {
+        let wake_at = suppression.until;
         let ttl = usage_provider_target_suppression_remaining_ttl(&suppression, now);
         update_usage_exhausted(
             lb_states,
@@ -3256,16 +3738,18 @@ async fn refresh_provider_target(
             "usage provider '{}' skipped {}[{}]: balance refresh suppressed: {}",
             provider.id, target.upstream.station_name, target.upstream.index, suppression.reason
         );
-        return UsageProviderRefreshOutcome::Failed;
+        return UsageProviderRefreshOutcome::Suppressed { wake_at };
     }
     if let Some(decision) = snapshot_decision {
+        let now = Instant::now();
+        let wake_at = now + decision.ttl;
         remember_usage_provider_target_suppression(
             &provider.id,
             target,
             decision.ttl,
             decision.reason.clone(),
             decision.routing_exhausted,
-            Instant::now(),
+            now,
         );
         update_usage_exhausted(
             lb_states,
@@ -3281,7 +3765,7 @@ async fn refresh_provider_target(
             "usage provider '{}' skipped {}[{}]: existing balance snapshot suppresses refresh: {}",
             provider.id, target.upstream.station_name, target.upstream.index, decision.reason
         );
-        return UsageProviderRefreshOutcome::Failed;
+        return UsageProviderRefreshOutcome::Suppressed { wake_at };
     }
 
     let Some(token) = resolve_token(provider, &upstreams, cfg, service_name) else {
@@ -3291,8 +3775,21 @@ async fn refresh_provider_target(
             base_snapshot(provider, &upstreams[0], fetched_at_ms, stale_after_ms)
                 .with_error("no usable token; checked provider token_env and upstream auth")
         };
+        let quota_context = quota_context_for_provider_snapshot(
+            provider,
+            target,
+            None,
+            &serde_json::Value::Null,
+            &snapshot,
+            interval_secs,
+            select_new_api_quota_conversion(provider, None),
+        );
         state
-            .record_provider_balance_snapshot(service_name, snapshot)
+            .record_provider_balance_snapshot_with_quota_context(
+                service_name,
+                snapshot,
+                quota_context,
+            )
             .await;
         update_usage_exhausted(lb_states, state, cfg, service_name, &upstreams, false, None).await;
         if provider.kind == ProviderKind::OpenAiOrganizationCosts {
@@ -3312,6 +3809,8 @@ async fn refresh_provider_target(
 
     match poll_provider_http_json(client, provider, &target.base_url, &token).await {
         Ok(value) => {
+            let quota_conversion =
+                resolve_new_api_quota_conversion(client, provider, &target.base_url).await;
             let snapshot = snapshot_from_provider_json(
                 provider,
                 &upstreams[0],
@@ -3319,6 +3818,7 @@ async fn refresh_provider_target(
                 &target.base_url,
                 fetched_at_ms,
                 stale_after_ms,
+                quota_conversion,
             );
             let snapshot_error = usage_provider_snapshot_error(&snapshot).map(str::to_string);
             let suppression_decision =
@@ -3348,8 +3848,21 @@ async fn refresh_provider_target(
                 suppression_decision.as_ref().map(|decision| decision.ttl),
             )
             .await;
+            let quota_context = quota_context_for_provider_snapshot(
+                provider,
+                target,
+                Some(&token),
+                &value,
+                &snapshot,
+                interval_secs,
+                quota_conversion,
+            );
             state
-                .record_provider_balance_snapshot(service_name, snapshot)
+                .record_provider_balance_snapshot_with_quota_context(
+                    service_name,
+                    snapshot,
+                    quota_context,
+                )
                 .await;
             if let Some(error) = snapshot_error {
                 warn!(
@@ -3369,7 +3882,7 @@ async fn refresh_provider_target(
             UsageProviderRefreshOutcome::Refreshed
         }
         Err(err) => {
-            let error = err.to_string();
+            let error = safe_usage_provider_error(&err.to_string());
             let terminal_failure = usage_provider_error_is_terminal(&error);
             if terminal_failure {
                 remember_usage_provider_target_suppression(
@@ -3381,11 +3894,22 @@ async fn refresh_provider_target(
                     Instant::now(),
                 );
             }
+            let snapshot = base_snapshot(provider, &upstreams[0], fetched_at_ms, stale_after_ms)
+                .with_error(error.clone());
+            let quota_context = quota_context_for_provider_snapshot(
+                provider,
+                target,
+                Some(&token),
+                &serde_json::Value::Null,
+                &snapshot,
+                interval_secs,
+                select_new_api_quota_conversion(provider, None),
+            );
             state
-                .record_provider_balance_snapshot(
+                .record_provider_balance_snapshot_with_quota_context(
                     service_name,
-                    base_snapshot(provider, &upstreams[0], fetched_at_ms, stale_after_ms)
-                        .with_error(error.clone()),
+                    snapshot,
+                    quota_context,
                 )
                 .await;
             update_usage_exhausted(
@@ -3579,6 +4103,9 @@ fn normalized_error_text(value: &str) -> String {
 fn usage_provider_error_is_terminal(error: &str) -> bool {
     let normalized = normalized_error_text(error);
     let terminal_markers = [
+        "authentication failed",
+        "provider account unavailable",
+        "provider quota exhausted",
         "user inactive",
         "user account is not active",
         "account is not active",
@@ -3675,7 +4202,7 @@ fn current_day_quota_suppression_ttl(
     cfg: &ProxyConfig,
     now_ms: u64,
 ) -> Option<Duration> {
-    let reset_at_ms = next_reset_at_ms(
+    let reset_at_ms = next_configured_reset_at_ms(
         snapshot.fetched_at_ms,
         cfg.ui.usage_forecast.reset_utc_offset.as_str(),
         cfg.ui.usage_forecast.reset_time.as_str(),
@@ -3848,12 +4375,20 @@ async fn auto_probe_provider_target(
     if is_official_openai_base_url(&target.base_url) {
         let provider = auto_openai_official_provider(target);
         let Some(token) = resolve_token(&provider, &upstreams, cfg, service_name) else {
-            state
-                .record_provider_balance_snapshot(
-                    service_name,
-                    base_snapshot(&provider, &target.upstream, fetched_at_ms, stale_after_ms),
-                )
-                .await;
+            let snapshot =
+                base_snapshot(&provider, &target.upstream, fetched_at_ms, stale_after_ms);
+            record_provider_snapshot_with_context(
+                state,
+                service_name,
+                &provider,
+                target,
+                None,
+                &serde_json::Value::Null,
+                snapshot,
+                interval_secs,
+                ResolvedQuotaConversion::default(),
+            )
+            .await;
             update_usage_exhausted(lb_states, state, cfg, service_name, &upstreams, false, None)
                 .await;
             warn!(
@@ -3872,6 +4407,7 @@ async fn auto_probe_provider_target(
                     &target.base_url,
                     fetched_at_ms,
                     stale_after_ms,
+                    ResolvedQuotaConversion::default(),
                 );
                 update_usage_exhausted(
                     lb_states,
@@ -3883,19 +4419,37 @@ async fn auto_probe_provider_target(
                     None,
                 )
                 .await;
-                state
-                    .record_provider_balance_snapshot(service_name, snapshot)
-                    .await;
+                record_provider_snapshot_with_context(
+                    state,
+                    service_name,
+                    &provider,
+                    target,
+                    Some(&token),
+                    &value,
+                    snapshot,
+                    interval_secs,
+                    ResolvedQuotaConversion::default(),
+                )
+                .await;
                 UsageProviderRefreshOutcome::Refreshed
             }
             Err(err) => {
-                state
-                    .record_provider_balance_snapshot(
-                        service_name,
-                        base_snapshot(&provider, &upstreams[0], fetched_at_ms, stale_after_ms)
-                            .with_error(err.to_string()),
-                    )
-                    .await;
+                let error = safe_usage_provider_error(&err.to_string());
+                let snapshot =
+                    base_snapshot(&provider, &upstreams[0], fetched_at_ms, stale_after_ms)
+                        .with_error(error.as_str());
+                record_provider_snapshot_with_context(
+                    state,
+                    service_name,
+                    &provider,
+                    target,
+                    Some(&token),
+                    &serde_json::Value::Null,
+                    snapshot,
+                    interval_secs,
+                    ResolvedQuotaConversion::default(),
+                )
+                .await;
                 update_usage_exhausted(
                     lb_states,
                     state,
@@ -3908,7 +4462,7 @@ async fn auto_probe_provider_target(
                 .await;
                 warn!(
                     "OpenAI organization costs poll failed for {}[{}]: {}",
-                    target.upstream.station_name, target.upstream.index, err
+                    target.upstream.station_name, target.upstream.index, error
                 );
                 UsageProviderRefreshOutcome::Failed
             }
@@ -3930,6 +4484,7 @@ async fn auto_probe_provider_target(
     if let Some(suppression) = active_usage_provider_target_suppression(&provider_id, target, now)
         && !force_can_bypass_active_suppression(force, &suppression, snapshot_decision.as_ref())
     {
+        let wake_at = suppression.until;
         let ttl = usage_provider_target_suppression_remaining_ttl(&suppression, now);
         update_usage_exhausted(
             lb_states,
@@ -3948,16 +4503,18 @@ async fn auto_probe_provider_target(
             target.upstream.index,
             suppression.reason
         );
-        return UsageProviderRefreshOutcome::Failed;
+        return UsageProviderRefreshOutcome::Suppressed { wake_at };
     }
     if let Some(decision) = snapshot_decision {
+        let now = Instant::now();
+        let wake_at = now + decision.ttl;
         remember_usage_provider_target_suppression(
             &provider_id,
             target,
             decision.ttl,
             decision.reason.clone(),
             decision.routing_exhausted,
-            Instant::now(),
+            now,
         );
         update_usage_exhausted(
             lb_states,
@@ -3973,47 +4530,63 @@ async fn auto_probe_provider_target(
             "auto usage provider '{}' skipped {}[{}]: existing balance snapshot suppresses refresh: {}",
             first_provider.id, target.upstream.station_name, target.upstream.index, decision.reason
         );
-        return UsageProviderRefreshOutcome::Failed;
+        return UsageProviderRefreshOutcome::Suppressed { wake_at };
     }
 
     let Some(token) = resolve_token(&first_provider, &upstreams, cfg, service_name) else {
-        state
-            .record_provider_balance_snapshot(
-                service_name,
-                base_snapshot(
-                    &first_provider,
-                    &target.upstream,
-                    fetched_at_ms,
-                    stale_after_ms,
-                )
-                .with_error("no usable token; checked upstream auth"),
-            )
-            .await;
+        let snapshot = base_snapshot(
+            &first_provider,
+            &target.upstream,
+            fetched_at_ms,
+            stale_after_ms,
+        )
+        .with_error("no usable token; checked upstream auth");
+        record_provider_snapshot_with_context(
+            state,
+            service_name,
+            &first_provider,
+            target,
+            None,
+            &serde_json::Value::Null,
+            snapshot,
+            interval_secs,
+            select_new_api_quota_conversion(&first_provider, None),
+        )
+        .await;
         update_usage_exhausted(lb_states, state, cfg, service_name, &upstreams, false, None).await;
         return UsageProviderRefreshOutcome::MissingToken;
     };
 
     let probe_order = auto_probe_kind_order(&provider_id, target, force);
     if probe_order.is_empty() {
+        let wake_at = next_auto_probe_kind_retry_at(&provider_id, target, Instant::now())
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(MIN_POLL_INTERVAL_SECS));
         let error = "all balance probe kinds are temporarily suppressed";
         warn!(
             "auto usage provider '{}' skipped {}[{}]: {}",
             first_provider.id, target.upstream.station_name, target.upstream.index, error
         );
-        state
-            .record_provider_balance_snapshot(
-                service_name,
-                base_snapshot(
-                    &first_provider,
-                    &target.upstream,
-                    fetched_at_ms,
-                    stale_after_ms,
-                )
-                .with_error(error),
-            )
-            .await;
+        let snapshot = base_snapshot(
+            &first_provider,
+            &target.upstream,
+            fetched_at_ms,
+            stale_after_ms,
+        )
+        .with_error(error);
+        record_provider_snapshot_with_context(
+            state,
+            service_name,
+            &first_provider,
+            target,
+            Some(&token),
+            &serde_json::Value::Null,
+            snapshot,
+            interval_secs,
+            select_new_api_quota_conversion(&first_provider, None),
+        )
+        .await;
         update_usage_exhausted(lb_states, state, cfg, service_name, &upstreams, false, None).await;
-        return UsageProviderRefreshOutcome::Failed;
+        return UsageProviderRefreshOutcome::Suppressed { wake_at };
     }
 
     let mut probe_errors = Vec::new();
@@ -4021,6 +4594,8 @@ async fn auto_probe_provider_target(
         let provider = auto_usage_provider(target, kind);
         match poll_provider_http_json(client, &provider, &target.base_url, &token).await {
             Ok(value) => {
+                let quota_conversion =
+                    resolve_new_api_quota_conversion(client, &provider, &target.base_url).await;
                 let snapshot = snapshot_from_provider_json(
                     &provider,
                     &upstreams[0],
@@ -4028,6 +4603,7 @@ async fn auto_probe_provider_target(
                     &target.base_url,
                     fetched_at_ms,
                     stale_after_ms,
+                    quota_conversion,
                 );
                 if auto_snapshot_is_usable(&snapshot) {
                     remember_auto_probe_kind_success(&provider_id, target, kind);
@@ -4061,9 +4637,18 @@ async fn auto_probe_provider_target(
                         suppression_decision.as_ref().map(|decision| decision.ttl),
                     )
                     .await;
-                    state
-                        .record_provider_balance_snapshot(service_name, snapshot)
-                        .await;
+                    record_provider_snapshot_with_context(
+                        state,
+                        service_name,
+                        &provider,
+                        target,
+                        Some(&token),
+                        &value,
+                        snapshot,
+                        interval_secs,
+                        quota_conversion,
+                    )
+                    .await;
                     info!(
                         "auto usage provider '{}' refreshed {}[{}] via {:?}, exhausted = {}",
                         provider.id,
@@ -4082,28 +4667,40 @@ async fn auto_probe_provider_target(
             }
             Err(err) => {
                 remember_auto_probe_kind_failure(&provider_id, target, kind, Instant::now());
-                probe_errors.push(format!("{:?}: {}", kind, err));
+                probe_errors.push(format!(
+                    "{:?}: {}",
+                    kind,
+                    safe_usage_provider_error(&err.to_string())
+                ));
             }
         }
     }
 
     if let Some(error) = auto_probe_error_summary(&probe_errors) {
+        let error = safe_usage_provider_error(&error);
         warn!(
             "auto usage provider '{}' found no usable balance endpoint for {}[{}]: {}",
             first_provider.id, target.upstream.station_name, target.upstream.index, error
         );
-        state
-            .record_provider_balance_snapshot(
-                service_name,
-                base_snapshot(
-                    &first_provider,
-                    &target.upstream,
-                    fetched_at_ms,
-                    stale_after_ms,
-                )
-                .with_error(error.clone()),
-            )
-            .await;
+        let snapshot = base_snapshot(
+            &first_provider,
+            &target.upstream,
+            fetched_at_ms,
+            stale_after_ms,
+        )
+        .with_error(error.clone());
+        record_provider_snapshot_with_context(
+            state,
+            service_name,
+            &first_provider,
+            target,
+            Some(&token),
+            &serde_json::Value::Null,
+            snapshot,
+            interval_secs,
+            select_new_api_quota_conversion(&first_provider, None),
+        )
+        .await;
         let terminal_failure = usage_provider_error_is_terminal(error.as_str());
         if terminal_failure {
             remember_usage_provider_target_suppression(
@@ -4207,6 +4804,9 @@ pub async fn refresh_balances_for_service(
                     refreshed_provider_ids.insert(provider_id);
                 }
                 UsageProviderRefreshOutcome::Failed => summary.failed += 1,
+                UsageProviderRefreshOutcome::Suppressed { wake_at } => {
+                    summary.record_suppression(wake_at);
+                }
                 UsageProviderRefreshOutcome::MissingToken => summary.missing_token += 1,
             }
         }
@@ -4238,6 +4838,9 @@ pub async fn refresh_balances_for_service(
                 UsageProviderRefreshOutcome::Failed => {
                     summary.failed += 1;
                     summary.auto_failed += 1;
+                }
+                UsageProviderRefreshOutcome::Suppressed { wake_at } => {
+                    summary.record_suppression(wake_at);
                 }
                 UsageProviderRefreshOutcome::MissingToken => {
                     summary.missing_token += 1;
@@ -4448,6 +5051,38 @@ mod tests {
         (addr, handle)
     }
 
+    fn assert_suppressed(outcome: UsageProviderRefreshOutcome) -> Instant {
+        match outcome {
+            UsageProviderRefreshOutcome::Suppressed { wake_at } => {
+                assert!(
+                    wake_at > Instant::now(),
+                    "suppression must have a future wake time"
+                );
+                wake_at
+            }
+            other => panic!("expected suppressed outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refresh_summary_tracks_suppression_without_counting_failure() {
+        let now_ms = unix_now_ms();
+        let mut summary = UsageProviderRefreshSummary::default();
+        summary.record_suppression(Instant::now() + Duration::from_secs(60));
+        summary.record_suppression(Instant::now() + Duration::from_secs(30));
+
+        assert_eq!(summary.suppressed, 2);
+        assert_eq!(summary.failed, 0);
+        let next_retry_at_ms = summary.next_retry_at_ms.expect("next retry");
+        assert!(next_retry_at_ms >= now_ms.saturating_add(29_000));
+        assert!(next_retry_at_ms <= now_ms.saturating_add(31_000));
+
+        let encoded = serde_json::to_string(&summary).expect("serialize refresh summary");
+        let decoded: UsageProviderRefreshSummary =
+            serde_json::from_str(&encoded).expect("deserialize refresh summary");
+        assert_eq!(decoded, summary);
+    }
+
     fn provider(id: &str, kind: ProviderKind) -> UsageProviderConfig {
         UsageProviderConfig {
             id: id.to_string(),
@@ -4461,8 +5096,132 @@ mod tests {
             trust_exhaustion_for_routing: true,
             headers: BTreeMap::new(),
             variables: BTreeMap::new(),
+            quota_pool_id: None,
+            quota_reset_timezone: None,
+            quota_divisor: None,
             extract: UsageProviderExtractConfig::default(),
         }
+    }
+
+    #[test]
+    fn quota_context_keeps_subject_id_unverified_and_redacts_credential_debug() {
+        let mut provider = provider("newapi", ProviderKind::NewApiUserSelf);
+        provider.quota_pool_id = Some("operator-pool".to_string());
+        let target = UsageProviderTarget {
+            upstream: endpoint_upstream(),
+            base_url: "https://relay.example/v1".to_string(),
+            provider_id: Some("newapi".to_string()),
+        };
+        let mut snapshot = base_snapshot(&provider, &target.upstream, 100, None);
+        snapshot.quota_used_usd = Some("1".to_string());
+        let context = quota_context_for_provider_snapshot(
+            &provider,
+            &target,
+            Some("raw-secret"),
+            &serde_json::json!({"data": {"id": 42}}),
+            &snapshot,
+            600,
+            ResolvedQuotaConversion::default(),
+        );
+
+        assert_eq!(context.remote_stable_id.as_deref(), Some("42"));
+        assert_eq!(
+            context.remote_identity_proof,
+            RemoteIdentityProof::StableSubject
+        );
+        assert_eq!(context.explicit_pool_id.as_deref(), Some("operator-pool"));
+        assert!(!format!("{context:?}").contains("raw-secret"));
+        assert_eq!(
+            context.identity(0).evidence,
+            crate::quota_pool::IdentityEvidence::ExplicitPoolId
+        );
+    }
+
+    #[test]
+    fn new_api_conversion_prefers_remote_then_configured_then_raw() {
+        let mut provider = provider("newapi", ProviderKind::NewApiUserSelf);
+        provider.quota_divisor = Some(500_000);
+
+        let remote = select_new_api_quota_conversion(&provider, Some(1_000_000));
+        let configured = select_new_api_quota_conversion(&provider, None);
+        provider.quota_divisor = None;
+        let raw = select_new_api_quota_conversion(&provider, None);
+
+        assert_eq!(remote.source, ConversionSource::Remote);
+        assert_eq!(remote.divisor, Some(1_000_000));
+        assert_eq!(configured.source, ConversionSource::Configured);
+        assert_eq!(configured.divisor, Some(500_000));
+        assert_ne!(
+            remote.quota_conversion().and_then(|value| value.generation),
+            configured
+                .quota_conversion()
+                .and_then(|value| value.generation)
+        );
+        assert_eq!(raw.source, ConversionSource::Unknown);
+        assert_eq!(raw.divisor, None);
+        assert_eq!(raw.quota_conversion(), None);
+    }
+
+    #[test]
+    fn new_api_status_parser_accepts_nested_or_top_level_positive_divisor_only() {
+        assert_eq!(
+            quota_per_unit_from_status_json(
+                &serde_json::json!({"success": true, "data": {"quota_per_unit": "500000.0"}})
+            ),
+            Some(500_000)
+        );
+        assert_eq!(
+            quota_per_unit_from_status_json(&serde_json::json!({"quota_per_unit": 1_000_000})),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            quota_per_unit_from_status_json(
+                &serde_json::json!({"success": false, "quota_per_unit": 500000})
+            ),
+            None
+        );
+        assert_eq!(
+            quota_per_unit_from_status_json(&serde_json::json!({"quota_per_unit": 0})),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn new_api_status_divisor_is_cached_per_origin_with_ttl() {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let counter = request_count.clone();
+        let app = axum::Router::new().route(
+            "/api/status",
+            get(move || {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(serde_json::json!({
+                        "success": true,
+                        "data": {"quota_per_unit": 750000}
+                    }))
+                }
+            }),
+        );
+        let (addr, handle) = spawn_axum_server(app).await;
+        let base_url = format!("http://{addr}/v1");
+        let provider = provider("newapi", ProviderKind::NewApiUserSelf);
+
+        let first = resolve_new_api_quota_conversion(&Client::new(), &provider, &base_url).await;
+        let second = resolve_new_api_quota_conversion(&Client::new(), &provider, &base_url).await;
+
+        assert_eq!(first.source, ConversionSource::Remote);
+        assert_eq!(first.divisor, Some(750_000));
+        assert_eq!(second, first);
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+
+        if let Some((origin, _)) = new_api_status_target(&base_url)
+            && let Some(cache) = NEW_API_QUOTA_DIVISORS.get()
+            && let Ok(mut cache) = cache.lock()
+        {
+            cache.remove(&origin);
+        }
+        handle.abort();
     }
 
     fn upstream() -> UpstreamRef {
@@ -4764,6 +5523,63 @@ mod tests {
         assert!(usage_provider_error_is_terminal(&detail));
     }
 
+    #[tokio::test]
+    async fn provider_http_error_never_returns_provider_controlled_secrets() {
+        let app = axum::Router::new().fallback(get(|| async {
+            (
+                axum::http::StatusCode::UNAUTHORIZED,
+                axum::Json(serde_json::json!({
+                    "code": "INVALID_API_KEY",
+                    "message": "Authorization: Bearer body-token api_key=body-key https://relay.example/v1?token=body-query"
+                })),
+            )
+        }));
+        let (addr, handle) = spawn_axum_server(app).await;
+        let base_url = format!("http://{addr}");
+        let mut provider = provider("secret-error", ProviderKind::OpenAiBalanceHttpJson);
+        provider.endpoint = format!("{base_url}/usage?api_key={{{{token}}}}");
+
+        let error =
+            poll_provider_http_json(&Client::new(), &provider, &base_url, "request-query-key")
+                .await
+                .expect_err("401 should fail")
+                .to_string();
+
+        assert!(error.contains("authentication failed"), "{error}");
+        for secret in [
+            "body-token",
+            "body-key",
+            "body-query",
+            "request-query-key",
+            "Authorization",
+            "Bearer",
+            "api_key=",
+            "?token=",
+        ] {
+            assert!(!error.contains(secret), "leaked {secret}: {error}");
+        }
+        assert!(!error.chars().any(char::is_control), "{error:?}");
+        handle.abort();
+    }
+
+    #[test]
+    fn sanitized_provider_error_categories_preserve_terminal_semantics() {
+        for error in [
+            "authentication failed",
+            "provider account unavailable",
+            "provider quota exhausted",
+        ] {
+            assert!(usage_provider_error_is_terminal(error), "{error}");
+        }
+        for error in [
+            "provider rate limited",
+            "provider request timed out",
+            "provider request failed",
+        ] {
+            assert!(!usage_provider_error_is_terminal(error), "{error}");
+        }
+    }
+
     #[test]
     fn current_day_quota_exhaustion_blocks_followup_usage_even_when_display_only() {
         let mut snapshot = ProviderBalanceSnapshot {
@@ -4795,7 +5611,7 @@ mod tests {
     fn current_day_quota_suppression_expires_after_configured_reset() {
         let cfg = ProxyConfig::default();
         let fetched_at_ms = 1_700_000_000_000;
-        let reset_at_ms = next_reset_at_ms(
+        let reset_at_ms = next_configured_reset_at_ms(
             fetched_at_ms,
             cfg.ui.usage_forecast.reset_utc_offset.as_str(),
             cfg.ui.usage_forecast.reset_time.as_str(),
@@ -5343,7 +6159,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(outcome, UsageProviderRefreshOutcome::Failed);
+        assert_suppressed(outcome);
         let view = state.get_provider_balance_view("codex").await;
         let snapshot = view
             .get("routing")
@@ -5356,7 +6172,7 @@ mod tests {
         assert_eq!(snapshot.status, BalanceSnapshotStatus::Error);
         assert_eq!(
             snapshot.error.as_deref(),
-            Some("all balance probe kinds are temporarily suppressed")
+            Some("provider refresh temporarily unavailable")
         );
         assert_eq!(snapshot.upstream_index, Some(0));
         let guard = lb_states.lock().expect("lb states");
@@ -5384,7 +6200,7 @@ mod tests {
                     axum::http::StatusCode::UNAUTHORIZED,
                     axum::Json(serde_json::json!({
                         "code": "USER_INACTIVE",
-                        "message": "User account is not active"
+                        "message": "User account is not active Authorization: Bearer body-token api_key=body-key https://relay.example/v1?token=body-query"
                     })),
                 )
             }
@@ -5430,13 +6246,14 @@ mod tests {
                     .find(|snapshot| snapshot.provider_id == provider_id)
             })
             .expect("terminal auth failure snapshot");
-        assert!(
-            snapshot
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("User account is not active")
-        );
+        assert_eq!(snapshot.error.as_deref(), Some("authentication failed"));
+        let suppression =
+            active_usage_provider_target_suppression(provider_id, &target, Instant::now())
+                .expect("terminal suppression");
+        assert_eq!(suppression.reason, "authentication failed");
+        for secret in ["body-token", "body-key", "body-query", "Authorization"] {
+            assert!(!suppression.reason.contains(secret));
+        }
 
         let requests_after_first_probe = request_count.load(Ordering::SeqCst);
         let suppressed_outcome = auto_probe_provider_target(
@@ -5450,7 +6267,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(suppressed_outcome, UsageProviderRefreshOutcome::Failed);
+        assert_suppressed(suppressed_outcome);
         assert_eq!(
             request_count.load(Ordering::SeqCst),
             requests_after_first_probe
@@ -5477,7 +6294,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(forced_outcome, UsageProviderRefreshOutcome::Failed);
+        assert_suppressed(forced_outcome);
         assert_eq!(
             request_count.load(Ordering::SeqCst),
             requests_after_first_probe,
@@ -5568,7 +6385,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(suppressed_outcome, UsageProviderRefreshOutcome::Failed);
+        assert_suppressed(suppressed_outcome);
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
         {
             let guard = lb_states.lock().expect("lb states");
@@ -5592,7 +6409,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(forced_outcome, UsageProviderRefreshOutcome::Failed);
+        assert_suppressed(forced_outcome);
         assert_eq!(
             request_count.load(Ordering::SeqCst),
             1,
@@ -5657,7 +6474,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(suppressed_outcome, UsageProviderRefreshOutcome::Failed);
+        assert_suppressed(suppressed_outcome);
         assert_eq!(request_count.load(Ordering::SeqCst), 0);
 
         let forced_outcome = auto_probe_provider_target(
@@ -6137,10 +6954,7 @@ mod tests {
         );
 
         assert_eq!(snapshot.status, BalanceSnapshotStatus::Error);
-        assert_eq!(
-            snapshot.error.as_deref(),
-            Some("sub2api usage response reported invalid API key")
-        );
+        assert_eq!(snapshot.error.as_deref(), Some("authentication failed"));
     }
 
     #[test]
@@ -6304,7 +7118,33 @@ mod tests {
         );
 
         assert_eq!(snapshot.status, BalanceSnapshotStatus::Error);
-        assert_eq!(snapshot.error.as_deref(), Some("login required"));
+        assert_eq!(snapshot.error.as_deref(), Some("authentication failed"));
+    }
+
+    #[test]
+    fn sub2api_auth_me_snapshot_redacts_remote_error_payload() {
+        let snapshot = sub2api_auth_me_snapshot_from_json(
+            &provider("sub2api-auth", ProviderKind::Sub2ApiAuthMe),
+            &upstream(),
+            &serde_json::json!({
+                "code": 401,
+                "message": "Authorization: Bearer sk-live-secret\nhttps://relay.example/v1?api_key=query-secret"
+            }),
+            100,
+            Some(1_000),
+        );
+
+        assert_eq!(snapshot.error.as_deref(), Some("authentication failed"));
+        let encoded = serde_json::to_string(&snapshot).expect("serialize provider balance");
+        for secret in [
+            "sk-live-secret",
+            "query-secret",
+            "Authorization",
+            "Bearer",
+            "api_key",
+        ] {
+            assert!(!encoded.contains(secret), "leaked {secret}: {encoded}");
+        }
     }
 
     #[test]
@@ -6453,7 +7293,7 @@ mod tests {
     }
 
     #[test]
-    fn new_api_snapshot_converts_quota_units_like_cc_switch_template() {
+    fn new_api_snapshot_converts_quota_units_with_explicit_divisor() {
         let snapshot = new_api_snapshot_from_json(
             &provider("newapi", ProviderKind::NewApiUserSelf),
             &upstream(),
@@ -6466,6 +7306,7 @@ mod tests {
             }),
             100,
             Some(1_000),
+            Some(500_000),
         );
 
         assert_eq!(snapshot.status, BalanceSnapshotStatus::Ok);
@@ -6477,6 +7318,150 @@ mod tests {
         assert_eq!(snapshot.quota_used_usd.as_deref(), Some("0.5"));
         assert_eq!(snapshot.monthly_spent_usd.as_deref(), Some("0.5"));
         assert_eq!(snapshot.monthly_budget_usd.as_deref(), Some("1.5"));
+    }
+
+    #[tokio::test]
+    async fn new_api_with_divisor_records_usd_observation_for_conversion_generation() {
+        let mut provider = provider("newapi", ProviderKind::NewApiUserSelf);
+        provider.quota_divisor = Some(500_000);
+        let value = serde_json::json!({
+            "success": true,
+            "data": {
+                "quota": 500000,
+                "used_quota": 250000
+            }
+        });
+        let conversion = select_new_api_quota_conversion(&provider, None);
+        let snapshot = new_api_snapshot_from_json(
+            &provider,
+            &upstream(),
+            &value,
+            100,
+            Some(1_000),
+            conversion.divisor,
+        );
+        let target = UsageProviderTarget {
+            upstream: endpoint_upstream(),
+            base_url: "https://relay.example/v1".to_string(),
+            provider_id: Some("newapi".to_string()),
+        };
+        let context = quota_context_for_provider_snapshot(
+            &provider,
+            &target,
+            Some("secret"),
+            &value,
+            &snapshot,
+            300,
+            conversion,
+        );
+        let expected_generation = conversion
+            .quota_conversion()
+            .and_then(|conversion| conversion.generation)
+            .expect("conversion generation");
+
+        assert_eq!(context.unit, QuotaUnit::Usd);
+        assert!(!context.capabilities.raw_unit);
+        assert!(context.remaining.is_none());
+        assert!(context.used.is_none());
+        assert!(context.limit.is_none());
+
+        let state = ProxyState::new();
+        let endpoint = target
+            .upstream
+            .provider_endpoint
+            .clone()
+            .expect("provider endpoint");
+        state
+            .record_quota_snapshot(endpoint.clone(), context, &snapshot)
+            .await;
+        let membership = state
+            .quota_pool_membership(&endpoint)
+            .await
+            .expect("quota membership");
+        let samples = state.quota_samples_for_pool(&membership.pool.key).await;
+        let observation = samples.last().expect("quota observation");
+
+        assert_eq!(observation.signature.unit, QuotaUnit::Usd);
+        assert_eq!(
+            observation.signature.conversion_generation,
+            Some(expected_generation)
+        );
+        assert_eq!(
+            observation.remaining.as_ref(),
+            Some(
+                &QuotaQuantity::from_decimal("1", QuotaUnit::Usd)
+                    .expect("remaining")
+                    .with_conversion_generation(Some(expected_generation))
+            )
+        );
+        assert_eq!(
+            observation.used.as_ref(),
+            Some(
+                &QuotaQuantity::from_decimal("0.5", QuotaUnit::Usd)
+                    .expect("used")
+                    .with_conversion_generation(Some(expected_generation))
+            )
+        );
+        assert_eq!(
+            observation.conversion.as_ref().map(|value| value.source),
+            Some(ConversionSource::Configured)
+        );
+    }
+
+    #[test]
+    fn new_api_without_divisor_keeps_raw_quota_without_claiming_usd() {
+        let provider = provider("newapi", ProviderKind::NewApiUserSelf);
+        let value = serde_json::json!({
+            "success": true,
+            "data": {
+                "quota": 500000,
+                "used_quota": 250000
+            }
+        });
+        let snapshot =
+            new_api_snapshot_from_json(&provider, &upstream(), &value, 100, Some(1_000), None);
+        let target = UsageProviderTarget {
+            upstream: endpoint_upstream(),
+            base_url: "https://relay.example/v1".to_string(),
+            provider_id: Some("newapi".to_string()),
+        };
+        let context = quota_context_for_provider_snapshot(
+            &provider,
+            &target,
+            Some("secret"),
+            &value,
+            &snapshot,
+            300,
+            ResolvedQuotaConversion::default(),
+        );
+
+        assert_eq!(snapshot.status, BalanceSnapshotStatus::Ok);
+        assert_eq!(snapshot.quota_remaining_usd, None);
+        assert_eq!(snapshot.quota_used_usd, None);
+        assert_eq!(snapshot.quota_limit_usd, None);
+        assert_eq!(snapshot.monthly_spent_usd, None);
+        assert_eq!(snapshot.monthly_budget_usd, None);
+        assert_eq!(context.unit, QuotaUnit::Raw);
+        assert_eq!(context.conversion, None);
+        assert!(context.capabilities.raw_unit);
+        assert_eq!(
+            context.remaining.as_ref().map(|value| value.value),
+            Some(500_000)
+        );
+        assert_eq!(
+            context.used.as_ref().map(|value| value.value),
+            Some(250_000)
+        );
+        assert_eq!(
+            context.limit.as_ref().map(|value| value.value),
+            Some(750_000)
+        );
+        assert_eq!(context.expected_interval_ms, Some(300_000));
+        assert_eq!(context.fresh_until_ms, Some(1_000));
+        assert_eq!(
+            context.window.as_ref().map(|window| window.kind),
+            Some(crate::quota_pool::QuotaWindowKind::Resetless)
+        );
     }
 
     #[test]
@@ -6494,6 +7479,7 @@ mod tests {
             }),
             100,
             Some(1_000),
+            Some(500_000),
         );
 
         assert_eq!(snapshot.status, BalanceSnapshotStatus::Ok);
@@ -6523,6 +7509,7 @@ mod tests {
             }),
             100,
             Some(1_000),
+            Some(500_000),
         );
 
         assert_eq!(snapshot.status, BalanceSnapshotStatus::Ok);

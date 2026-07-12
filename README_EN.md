@@ -377,6 +377,8 @@ codex-helper session last
 codex-helper session transcript <SESSION_ID> --tail 40
 
 # request logs and usage
+codex-helper usage quota --target local
+codex-helper usage quota --target local --json
 codex-helper usage summary
 codex-helper usage tail --limit 20
 codex-helper usage find --errors --limit 10
@@ -384,7 +386,9 @@ codex-helper usage chain --trace-id <TRACE_ID> --json
 
 # pricing
 codex-helper pricing list
-codex-helper pricing sync-basellm --model gpt-5 --dry-run
+codex-helper pricing status
+codex-helper pricing force-refresh
+codex-helper pricing import-basellm --model gpt-5 --dry-run
 
 # diagnostics
 codex-helper status
@@ -407,10 +411,11 @@ Useful pages:
 - `Overview`: proxy status, current sessions, and recent requests.
 - `Routing` / `Stations`: route graph, provider order, balance/plan, tags, health, and routing preview.
 - `Sessions`: session identity, effective route, route affinity, and per-session overrides.
-- `Usage`: local-day requests, tokens, estimated cost, 24h activity, provider/station/model/session/project rankings, coverage warnings, and the global retry-gate count.
+- `Usage`: remote shared quota-pool used/remaining, 15/60-minute rates, required rate until reset, pace, ETA, plus local-day requests, tokens, estimated cost, and project attribution.
 - `Requests`: request logs, recent endpoint samples, tokens, cache tokens, latency, retries, request chains, and cost.
 
 Shortcut hints are shown at the bottom. Under v5 config, durable provider/routing edits should go through the routing page, provider/routing CLI commands, or raw TOML. Press `R` after manual config edits to reload runtime config.
+Press `g` on Usage page 5 to ask the daemon for a forced remote-balance refresh. An attached TUI delegates that refresh to the target daemon and does not start another sampler. A remote pool counter may include other computers using the same account or key and is the source of truth for shared total burn; the local request ledger only attributes this daemon's requests to projects and never scales local prices to match a remote delta. See [Usage Page](docs/CONFIGURATION.md#usage-page) for source/scope/confidence, coverage, raw-unit, and conversion-generation limits.
 
 ### Desktop Preview
 

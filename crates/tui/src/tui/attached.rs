@@ -19,7 +19,7 @@ use super::model::{
 };
 use super::runtime_refresh::DashboardTiming;
 use super::state::{FleetViewMode, RuntimeConnectionKind, UiState, adjust_table_selection};
-use super::types::{Focus, Overlay, Page, StatsFocus};
+use super::types::{Focus, Overlay, Page};
 use super::{RenderInvalidation, enter_dashboard_terminal, input, leave_dashboard_terminal};
 
 struct AttachedDashboardRuntime {
@@ -59,6 +59,14 @@ impl AttachedDashboardRuntime {
     async fn snapshot(&self, stats_days: usize) -> anyhow::Result<ApiV1Snapshot> {
         self.client
             .snapshot(crate::state::recent_finished_max(), stats_days.min(365))
+            .await
+    }
+
+    async fn refresh_provider_balances(
+        &self,
+    ) -> anyhow::Result<crate::proxy::ProviderBalanceRefreshResponse> {
+        self.client
+            .post_json("/__codex_helper/api/v1/providers/balances/refresh?force=true")
             .await
     }
 }
@@ -106,7 +114,6 @@ async fn run_attached_dashboard_runtime(
         service_name,
         proxy_port: port,
         language,
-        usage_forecast: cfg.ui.usage_forecast.clone(),
         fleet_registry: cfg.fleet.clone(),
         refresh_ms: timing.refresh_ms,
         config_version: cfg.version,
@@ -188,6 +195,9 @@ async fn run_attached_dashboard_runtime(
                     {
                         if ui.needs_fleet_refresh && !ui.fleet_loading {
                             start_attached_fleet_refresh(&mut ui, &runtime, fleet_refresh_tx.clone());
+                        }
+                        if ui.needs_provider_balance_refresh {
+                            refresh_attached_provider_balances(&runtime, &mut ui).await;
                         }
                         if ui.needs_snapshot_refresh {
                             refresh_attached_snapshot(&runtime, &mut ui, &mut snapshot, providers.len()).await;
@@ -291,15 +301,57 @@ async fn refresh_attached_snapshot(
         }
     }
 
-    match runtime.snapshot(ui.stats_days).await {
+    let result = runtime.snapshot(ui.stats_days).await;
+    apply_attached_snapshot_result(ui, snapshot, providers_len, result).await;
+}
+
+async fn apply_attached_snapshot_result(
+    ui: &mut UiState,
+    snapshot: &mut Snapshot,
+    providers_len: usize,
+    result: anyhow::Result<ApiV1Snapshot>,
+) {
+    match result {
         Ok(api_snapshot) => {
             *snapshot = snapshot_from_api_v1(api_snapshot).await;
             ui.clamp_selection(snapshot, ui.station_page_rows_len(providers_len));
         }
         Err(err) => {
             ui.runtime_status_error = Some(err.to_string());
+            for pool in &mut snapshot.quota_analytics.pools {
+                pool.freshness = crate::quota_analytics::QuotaFreshnessStatus::Offline;
+            }
         }
     }
+}
+
+async fn refresh_attached_provider_balances(runtime: &AttachedDashboardRuntime, ui: &mut UiState) {
+    ui.needs_provider_balance_refresh = false;
+    ui.balance_refresh_in_flight = true;
+    ui.last_balance_refresh_requested_at = Some(Instant::now());
+    match runtime.refresh_provider_balances().await {
+        Ok(response) => {
+            ui.last_balance_refresh_summary = Some(response.refresh.clone());
+            ui.last_balance_refresh_message = Some(match ui.language {
+                super::Language::Zh => format!(
+                    "额度刷新完成：成功 {}，失败 {}",
+                    response.refresh.refreshed, response.refresh.failed
+                ),
+                super::Language::En => format!(
+                    "quota refresh complete: {} refreshed, {} failed",
+                    response.refresh.refreshed, response.refresh.failed
+                ),
+            });
+            ui.last_balance_refresh_error = None;
+        }
+        Err(error) => {
+            ui.last_balance_refresh_error = Some(error.to_string());
+            ui.last_balance_refresh_message = None;
+        }
+    }
+    ui.balance_refresh_in_flight = false;
+    ui.last_balance_refresh_finished_at = Some(Instant::now());
+    ui.needs_snapshot_refresh = true;
 }
 
 async fn hydrate_attached_profile_state(ui: &mut UiState, runtime: &AttachedDashboardRuntime) {
@@ -398,6 +450,10 @@ fn handle_attached_key(
         KeyCode::Down | KeyCode::Char('j') => {
             move_attached_selection(ui, snapshot, providers.len(), 1)
         }
+        KeyCode::Char('g') if ui.page == Page::Stats => {
+            ui.needs_provider_balance_refresh = true;
+            true
+        }
         KeyCode::Char('r') if ui.page == Page::Fleet => {
             ui.needs_fleet_refresh = true;
             true
@@ -449,11 +505,7 @@ fn cycle_attached_focus(ui: &mut UiState) {
         }
         Page::Stations => ui.focus = Focus::Stations,
         Page::Stats => {
-            ui.stats_focus = match ui.stats_focus {
-                StatsFocus::Stations => StatsFocus::Providers,
-                StatsFocus::Providers => StatsFocus::Stations,
-            };
-            ui.stats_provider_detail_scroll = 0;
+            ui.cycle_stats_focus();
         }
         Page::Fleet => {
             ui.focus = match ui.focus {
@@ -481,28 +533,7 @@ fn move_attached_selection(
             }
             false
         }
-        Page::Stats => match ui.stats_focus {
-            StatsFocus::Stations => {
-                let len = snapshot.usage_day.station_rows.len();
-                if let Some(next) = adjust_table_selection(&mut ui.stats_stations_table, delta, len)
-                {
-                    ui.selected_stats_station_idx = next;
-                    return true;
-                }
-                false
-            }
-            StatsFocus::Providers => {
-                let len = snapshot.usage_day.provider_rows.len();
-                if let Some(next) =
-                    adjust_table_selection(&mut ui.stats_providers_table, delta, len)
-                {
-                    ui.selected_stats_provider_idx = next;
-                    ui.stats_provider_detail_scroll = 0;
-                    return true;
-                }
-                false
-            }
-        },
+        Page::Stats => ui.move_stats_selection(snapshot, delta),
         Page::Sessions => {
             if let Some(next) =
                 adjust_table_selection(&mut ui.sessions_page_table, delta, snapshot.rows.len())
@@ -692,6 +723,88 @@ mod tests {
         assert!(text.contains("keeps the target proxy running"), "{text}");
     }
 
+    #[test]
+    fn attached_stats_refresh_is_delegated_to_daemon() {
+        let mut ui = UiState {
+            page: Page::Stats,
+            runtime_connection: RuntimeConnectionKind::Attached,
+            ..Default::default()
+        };
+
+        assert!(handle_attached_key(
+            &mut ui,
+            &empty_snapshot(),
+            &mut [],
+            KeyEvent::from(KeyCode::Char('g')),
+        ));
+
+        assert!(ui.needs_provider_balance_refresh);
+        assert!(!ui.balance_refresh_in_flight);
+    }
+
+    #[test]
+    fn attached_stats_tab_uses_shared_four_focus_cycle() {
+        let mut ui = UiState {
+            page: Page::Stats,
+            runtime_connection: RuntimeConnectionKind::Attached,
+            ..Default::default()
+        };
+
+        for expected in [
+            crate::tui::types::StatsFocus::Projects,
+            crate::tui::types::StatsFocus::Providers,
+            crate::tui::types::StatsFocus::Stations,
+            crate::tui::types::StatsFocus::Pools,
+        ] {
+            assert!(handle_attached_key(
+                &mut ui,
+                &empty_snapshot(),
+                &mut [],
+                KeyEvent::from(KeyCode::Tab),
+            ));
+            assert_eq!(ui.stats_focus, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn attached_snapshot_failure_keeps_cached_quota_values() {
+        let mut snapshot = empty_snapshot();
+        snapshot.quota_analytics = crate::quota_analytics::QuotaAnalyticsView {
+            support: crate::quota_analytics::QuotaAnalyticsSupport::Supported,
+            generated_at_ms: 42,
+            pools: vec![crate::quota_analytics::PoolQuotaAnalytics {
+                remote_direct_total: Some(crate::quota_pool::QuotaQuantity::from_integer(
+                    100,
+                    crate::quota_pool::QuotaUnit::Usd,
+                )),
+                ..crate::quota_analytics::PoolQuotaAnalytics::default()
+            }],
+            ..crate::quota_analytics::QuotaAnalyticsView::default()
+        };
+        let cached_total = snapshot.quota_analytics.pools[0]
+            .remote_direct_total
+            .clone();
+        let mut ui = UiState::default();
+
+        apply_attached_snapshot_result(
+            &mut ui,
+            &mut snapshot,
+            0,
+            Err(anyhow::anyhow!("daemon offline")),
+        )
+        .await;
+
+        assert_eq!(
+            snapshot.quota_analytics.pools[0].remote_direct_total,
+            cached_total
+        );
+        assert_eq!(
+            snapshot.quota_analytics.pools[0].freshness,
+            crate::quota_analytics::QuotaFreshnessStatus::Offline
+        );
+        assert_eq!(ui.runtime_status_error.as_deref(), Some("daemon offline"));
+    }
+
     fn empty_snapshot() -> Snapshot {
         Snapshot {
             rows: Vec::new(),
@@ -705,9 +818,9 @@ mod tests {
             global_route_target_override: None,
             station_meta_overrides: std::collections::HashMap::new(),
             usage_day: crate::state::UsageDayView::default(),
+            quota_analytics: crate::quota_analytics::QuotaAnalyticsView::default(),
             usage_rollup: crate::state::UsageRollupView::default(),
             provider_balances: std::collections::HashMap::new(),
-            provider_balance_history: std::collections::HashMap::new(),
             station_health: std::collections::HashMap::new(),
             health_checks: std::collections::HashMap::new(),
             lb_view: std::collections::HashMap::new(),

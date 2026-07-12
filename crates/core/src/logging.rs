@@ -11,8 +11,13 @@ use serde_json::Value as JsonValue;
 use crate::config::proxy_home_dir;
 use crate::local_log_store::{LogRetention, append_line};
 use crate::policy_actions::PolicyAction;
+use crate::pricing::CostBreakdown;
 use crate::provider_signals::ProviderSignal;
-use crate::state::{RouteDecisionProvenance, SessionIdentitySource};
+use crate::runtime_identity::ProviderEndpointKey;
+use crate::state::{
+    AccountingPriceCoverage, FinishedRequest, ProjectIdentity, RequestAccountingFacts,
+    RequestObservability, RouteDecisionProvenance, SessionIdentitySource,
+};
 use crate::usage::UsageMetrics;
 
 #[path = "logging/control_trace.rs"]
@@ -51,12 +56,54 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+const REQUEST_TRACE_ID_PREFIX: &str = "ch-trace:v1:";
+
 pub fn request_trace_id(service: &str, request_id: u64) -> String {
+    static PROCESS_BOOT_UUID: OnceLock<uuid::Uuid> = OnceLock::new();
+    request_trace_id_for_boot(
+        PROCESS_BOOT_UUID.get_or_init(uuid::Uuid::new_v4),
+        service,
+        request_id,
+    )
+}
+
+pub(crate) fn request_trace_id_for_boot(
+    boot_uuid: &uuid::Uuid,
+    service: &str,
+    request_id: u64,
+) -> String {
+    format!(
+        "{REQUEST_TRACE_ID_PREFIX}{boot_uuid}:{}:{request_id}",
+        request_trace_service(service)
+    )
+}
+
+pub(crate) fn is_versioned_request_trace_id(trace_id: &str) -> bool {
+    let Some(rest) = trace_id.strip_prefix(REQUEST_TRACE_ID_PREFIX) else {
+        return false;
+    };
+    let Some((boot_uuid, request_identity)) = rest.split_once(':') else {
+        return false;
+    };
+    let Some((service, request_id)) = request_identity.rsplit_once(':') else {
+        return false;
+    };
+
+    uuid::Uuid::parse_str(boot_uuid).is_ok()
+        && !service.is_empty()
+        && request_id.parse::<u64>().is_ok()
+}
+
+pub(crate) fn legacy_request_trace_id(service: &str, request_id: u64) -> String {
+    format!("{}-{request_id}", request_trace_service(service))
+}
+
+fn request_trace_service(service: &str) -> &str {
     let service = service.trim();
     if service.is_empty() {
-        format!("request-{request_id}")
+        "request"
     } else {
-        format!("{service}-{request_id}")
+        service
     }
 }
 
@@ -326,6 +373,10 @@ pub struct RequestLog<'a> {
     pub codex_bridge: Option<CodexBridgeLog>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageMetrics>,
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    pub streaming: bool,
+    pub cost: &'a CostBreakdown,
+    pub accounting: &'a RequestAccountingFacts,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub http_debug: Option<HttpDebugLog>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -896,46 +947,75 @@ pub fn request_log_retention() -> LogRetention {
     request_log_options().retention
 }
 
-fn append_json_line(path: &PathBuf, opt: RequestLogOptions, line: &str) -> bool {
-    append_line(path, opt.retention, line).is_ok()
+fn append_json_line(path: &PathBuf, opt: RequestLogOptions, line: &str) -> std::io::Result<()> {
+    append_line(path, opt.retention, line)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn log_request_with_debug(
-    request_id: Option<u64>,
-    service: &str,
-    method: &str,
-    path: &str,
-    status_code: u16,
-    duration_ms: u64,
-    ttfb_ms: Option<u64>,
-    station_name: Option<&str>,
-    provider_id: Option<String>,
-    endpoint_id: Option<String>,
-    provider_endpoint_key: Option<String>,
-    upstream_base_url: &str,
-    session_id: Option<String>,
-    session_identity_source: Option<SessionIdentitySource>,
-    cwd: Option<String>,
-    model: Option<String>,
-    reasoning_effort: Option<String>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestLogDetail {
+    MinimalAccounting,
+    Full,
+}
+
+fn request_log_detail(options: RequestLogOptions, status_code: u16) -> RequestLogDetail {
+    if options.only_errors && (200..300).contains(&status_code) {
+        RequestLogDetail::MinimalAccounting
+    } else {
+        RequestLogDetail::Full
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestLogWriteOutcome {
+    pub accounting_appended: bool,
+    pub error: Option<String>,
+}
+
+pub fn log_finished_request_with_debug(
+    request: &FinishedRequest,
     service_tier: ServiceTierLog,
     codex_bridge: Option<CodexBridgeLog>,
-    usage: Option<UsageMetrics>,
-    route_decision: Option<RouteDecisionProvenance>,
-    retry: Option<RetryInfo>,
     http_debug: Option<HttpDebugLog>,
-) {
+) -> RequestLogWriteOutcome {
     let opt = request_log_options();
-    if opt.only_errors && (200..300).contains(&status_code) {
-        return;
-    }
-
-    let ts = now_ms();
-    let trace_id = request_id.map(|id| request_trace_id(service, id));
+    let minimal_only =
+        request_log_detail(opt, request.status_code) == RequestLogDetail::MinimalAccounting;
+    let request_id = Some(request.id);
+    let service = request.service.as_str();
+    let method = request.method.as_str();
+    let path = request.path.as_str();
+    let status_code = request.status_code;
+    let duration_ms = request.duration_ms;
+    let ttfb_ms = request.ttfb_ms;
+    let station_name = request.station_name.as_deref();
+    let provider_id = request.provider_id.clone();
+    let endpoint_id = request
+        .accounting
+        .provider_endpoint
+        .as_ref()
+        .map(|endpoint| endpoint.endpoint_id.clone());
+    let provider_endpoint_key = request
+        .accounting
+        .provider_endpoint
+        .as_ref()
+        .map(ProviderEndpointKey::stable_key);
+    let upstream_base_url = request.upstream_base_url.as_deref().unwrap_or("-");
+    let session_id = request.session_id.clone();
+    let session_identity_source = request.session_identity_source;
+    let cwd = request.cwd.clone();
+    let model = request.model.clone();
+    let reasoning_effort = request.reasoning_effort.clone();
+    let usage = request.usage.clone();
+    let route_decision = request.route_decision.clone();
+    let retry = request.retry.clone();
+    let ts = request.ended_at_ms;
+    let trace_id = request
+        .trace_id
+        .clone()
+        .or_else(|| Some(request_trace_id(service, request.id)));
 
     static DEBUG_SEQ: AtomicU64 = AtomicU64::new(0);
-    let mut http_debug_for_main = http_debug;
+    let mut http_debug_for_main = (!minimal_only).then_some(http_debug).flatten();
     let mut http_debug_ref: Option<HttpDebugRef> = None;
 
     let log_file_path = request_log_path();
@@ -983,7 +1063,7 @@ pub fn log_request_with_debug(
         let debug_path = debug_log_path();
         let mut wrote_debug = false;
         if let Ok(line) = serde_json::to_string(&debug_entry) {
-            wrote_debug = append_json_line(&debug_path, opt, &line);
+            wrote_debug = append_json_line(&debug_path, opt, &line).is_ok();
         }
 
         if wrote_debug {
@@ -1004,7 +1084,7 @@ pub fn log_request_with_debug(
     let entry = RequestLog {
         timestamp_ms: ts,
         request_id,
-        trace_id,
+        trace_id: trace_id.clone(),
         service,
         method,
         path,
@@ -1024,6 +1104,9 @@ pub fn log_request_with_debug(
         service_tier,
         codex_bridge,
         usage,
+        streaming: request.streaming,
+        cost: &request.cost,
+        accounting: &request.accounting,
         http_debug: http_debug_for_main,
         http_debug_ref,
         route_decision,
@@ -1032,11 +1115,28 @@ pub fn log_request_with_debug(
         policy_actions,
     };
 
-    if let Ok(line) = serde_json::to_string(&entry) {
-        let _ = append_json_line(&log_file_path, opt, &line);
-    }
+    let append_result = serde_json::to_string(&entry)
+        .map_err(std::io::Error::other)
+        .and_then(|line| append_json_line(&log_file_path, opt, &line));
+    let outcome = match append_result {
+        Ok(()) => RequestLogWriteOutcome {
+            accounting_appended: true,
+            error: None,
+        },
+        Err(error) => {
+            tracing::warn!(
+                trace_id = trace_id.as_deref().unwrap_or("-"),
+                error = %error,
+                "failed to append immutable request accounting record"
+            );
+            RequestLogWriteOutcome {
+                accounting_appended: false,
+                error: Some(error.to_string()),
+            }
+        }
+    };
 
-    if let Ok(payload) = serde_json::to_value(&entry) {
+    if !minimal_only && let Ok(payload) = serde_json::to_value(&entry) {
         append_control_trace_payload(
             opt,
             "request_completed",
@@ -1046,6 +1146,96 @@ pub fn log_request_with_debug(
             ts,
             payload,
         );
+    }
+    outcome
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn log_request_with_debug(
+    request_id: Option<u64>,
+    service: &str,
+    method: &str,
+    path: &str,
+    status_code: u16,
+    duration_ms: u64,
+    ttfb_ms: Option<u64>,
+    station_name: Option<&str>,
+    provider_id: Option<String>,
+    endpoint_id: Option<String>,
+    provider_endpoint_key: Option<String>,
+    upstream_base_url: &str,
+    session_id: Option<String>,
+    session_identity_source: Option<SessionIdentitySource>,
+    cwd: Option<String>,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    service_tier: ServiceTierLog,
+    codex_bridge: Option<CodexBridgeLog>,
+    usage: Option<UsageMetrics>,
+    route_decision: Option<RouteDecisionProvenance>,
+    retry: Option<RetryInfo>,
+    http_debug: Option<HttpDebugLog>,
+) -> RequestLogWriteOutcome {
+    let ended_at_ms = now_ms();
+    let provider_endpoint = provider_endpoint_key
+        .as_deref()
+        .and_then(parse_provider_endpoint_key)
+        .or_else(|| {
+            Some(ProviderEndpointKey::new(
+                service,
+                provider_id.as_deref()?,
+                endpoint_id.as_deref()?,
+            ))
+        });
+    let request = FinishedRequest {
+        id: request_id.unwrap_or(ended_at_ms),
+        trace_id: request_id.map(|id| request_trace_id(service, id)),
+        session_id,
+        session_identity_source,
+        client_name: None,
+        client_addr: None,
+        cwd: cwd.clone(),
+        model,
+        reasoning_effort,
+        service_tier: service_tier.actual.clone(),
+        station_name: station_name.map(ToOwned::to_owned),
+        provider_id,
+        upstream_base_url: Some(upstream_base_url.to_string()),
+        route_decision,
+        usage,
+        cost: CostBreakdown::unknown(),
+        accounting: RequestAccountingFacts {
+            schema_version: RequestAccountingFacts::SCHEMA_VERSION,
+            project: ProjectIdentity::from_cwd(cwd.as_deref()),
+            provider_endpoint,
+            pool_membership: None,
+            price_coverage: AccountingPriceCoverage::Unpriced,
+        },
+        retry,
+        provider_signals: Vec::new(),
+        policy_actions: Vec::new(),
+        observability: RequestObservability::default(),
+        service: service.to_string(),
+        method: method.to_string(),
+        path: path.to_string(),
+        status_code,
+        duration_ms,
+        ttfb_ms,
+        streaming: false,
+        ended_at_ms,
+    };
+    log_finished_request_with_debug(&request, service_tier, codex_bridge, http_debug)
+}
+
+fn parse_provider_endpoint_key(value: &str) -> Option<ProviderEndpointKey> {
+    let mut parts = value.split('/');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(service), Some(provider), Some(endpoint), None)
+            if !service.is_empty() && !provider.is_empty() && !endpoint.is_empty() =>
+        {
+            Some(ProviderEndpointKey::new(service, provider, endpoint))
+        }
+        _ => None,
     }
 }
 

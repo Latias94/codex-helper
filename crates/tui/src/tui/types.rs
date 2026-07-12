@@ -10,6 +10,8 @@ pub(in crate::tui) enum Focus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::tui) enum StatsFocus {
+    Pools,
+    Projects,
     Stations,
     Providers,
 }

@@ -234,7 +234,6 @@ pub async fn run_dashboard(
         service_name,
         proxy_port: port,
         language,
-        usage_forecast: cfg.ui.usage_forecast.clone(),
         fleet_registry: cfg.fleet.clone(),
         refresh_ms: timing.refresh_ms,
         config_version: cfg.version,

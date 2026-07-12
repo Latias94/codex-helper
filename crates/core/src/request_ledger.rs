@@ -9,14 +9,17 @@ use crate::local_log_store::{LogRetention, repair_log};
 pub use crate::logging::request_log_path;
 use crate::logging::request_log_retention;
 use crate::policy_actions::PolicyAction;
-use crate::pricing::{CostAdjustments, estimate_request_cost_from_operator_catalog_for_service};
+use crate::pricing::{
+    CostAdjustments, CostBreakdown, estimate_request_cost_from_operator_catalog_for_service,
+};
 use crate::provider_signals::ProviderSignal;
 use crate::request_chain::{
     REQUEST_CHAIN_EXPORT_MAX_LIMIT, RequestChainExport, RequestChainSelector,
 };
 use crate::runtime_identity::ProviderEndpointKey;
 use crate::state::{
-    FinishedRequest, RequestObservability, RouteDecisionProvenance, SessionIdentitySource,
+    AccountingPriceCoverage, FinishedRequest, ProjectIdentity, RequestAccountingFacts,
+    RequestObservability, RouteDecisionProvenance, SessionIdentitySource, classify_captured_cost,
 };
 use crate::usage::{CacheInputAccounting, UsageMetrics};
 
@@ -617,12 +620,31 @@ pub fn finished_request_from_request_log_record(record: &JsonValue) -> Option<Fi
     let usage = usage_metrics(record);
     let model = request_model(record);
     let service = str_field(record, "service").unwrap_or("-");
-    let cost = estimate_request_cost_from_operator_catalog_for_service(
-        model.as_deref(),
-        usage.as_ref(),
-        CostAdjustments::default(),
-        service,
-    );
+    let (cost, price_coverage) = match record.get("cost") {
+        Some(value) => match serde_json::from_value::<CostBreakdown>(value.clone()) {
+            Ok(cost) => match classify_captured_cost(&cost) {
+                AccountingPriceCoverage::Captured => (cost, AccountingPriceCoverage::Captured),
+                AccountingPriceCoverage::Unpriced => (cost, AccountingPriceCoverage::Unpriced),
+                _ => (
+                    CostBreakdown::unknown(),
+                    AccountingPriceCoverage::InvalidCaptured,
+                ),
+            },
+            Err(_) => (
+                CostBreakdown::unknown(),
+                AccountingPriceCoverage::InvalidCaptured,
+            ),
+        },
+        None => (
+            estimate_request_cost_from_operator_catalog_for_service(
+                model.as_deref(),
+                usage.as_ref(),
+                CostAdjustments::default(),
+                service,
+            ),
+            AccountingPriceCoverage::Reconstructed,
+        ),
+    };
     let retry = record
         .get("retry")
         .and_then(|retry| serde_json::from_value(retry.clone()).ok());
@@ -640,6 +662,17 @@ pub fn finished_request_from_request_log_record(record: &JsonValue) -> Option<Fi
     let session_identity_source = record
         .get("session_identity_source")
         .and_then(|source| serde_json::from_value::<SessionIdentitySource>(source.clone()).ok());
+    let cwd = str_field(record, "cwd").map(ToOwned::to_owned);
+    let mut accounting = record
+        .get("accounting")
+        .and_then(|value| serde_json::from_value::<RequestAccountingFacts>(value.clone()).ok())
+        .unwrap_or_default();
+    if accounting.schema_version == 0 {
+        accounting.schema_version = RequestAccountingFacts::SCHEMA_VERSION;
+        accounting.project = ProjectIdentity::from_cwd(cwd.as_deref());
+        accounting.provider_endpoint = provider_endpoint_from_record(record, service);
+    }
+    accounting.price_coverage = price_coverage;
 
     let mut request = FinishedRequest {
         id: request_id,
@@ -648,7 +681,7 @@ pub fn finished_request_from_request_log_record(record: &JsonValue) -> Option<Fi
         session_identity_source,
         client_name: str_field(record, "client_name").map(ToOwned::to_owned),
         client_addr: str_field(record, "client_addr").map(ToOwned::to_owned),
-        cwd: str_field(record, "cwd").map(ToOwned::to_owned),
+        cwd,
         model,
         reasoning_effort: str_field(record, "reasoning_effort").map(ToOwned::to_owned),
         service_tier: service_tier_value(record),
@@ -658,6 +691,7 @@ pub fn finished_request_from_request_log_record(record: &JsonValue) -> Option<Fi
         route_decision,
         usage,
         cost,
+        accounting,
         retry,
         provider_signals,
         policy_actions,
@@ -838,6 +872,37 @@ fn provider_endpoint_key_value(value: &JsonValue) -> Option<String> {
             let endpoint = str_field(value, "endpoint_id")?;
             Some(ProviderEndpointKey::new(service, provider, endpoint).stable_key())
         })
+}
+
+fn provider_endpoint_from_record(
+    record: &JsonValue,
+    service_name: &str,
+) -> Option<ProviderEndpointKey> {
+    if let Some(stable_key) = record
+        .get("provider_endpoint_key")
+        .and_then(provider_endpoint_key_value)
+    {
+        let mut parts = stable_key.split('/');
+        let parsed = match (parts.next(), parts.next(), parts.next(), parts.next()) {
+            (Some(service), Some(provider), Some(endpoint), None)
+                if !service.is_empty() && !provider.is_empty() && !endpoint.is_empty() =>
+            {
+                Some(ProviderEndpointKey::new(service, provider, endpoint))
+            }
+            _ => None,
+        };
+        if parsed.is_some() {
+            return parsed;
+        }
+    }
+
+    let provider_id = str_field(record, "provider_id")?;
+    let endpoint_id = str_field(record, "endpoint_id")?;
+    Some(ProviderEndpointKey::new(
+        service_name,
+        provider_id,
+        endpoint_id,
+    ))
 }
 
 fn dedup_preserving_order(items: Vec<String>) -> Vec<String> {
@@ -1692,5 +1757,153 @@ mod tests {
         assert_eq!(request.attempt_count(), 2);
         assert_eq!(request.output_tokens_per_second(), Some(50.0));
         assert_eq!(request.ended_at_ms, 1234);
+        assert_eq!(
+            request.accounting.price_coverage,
+            AccountingPriceCoverage::Reconstructed
+        );
+        assert_eq!(
+            request.accounting.project.kind,
+            crate::state::ProjectIdentityKind::Unknown
+        );
+    }
+
+    #[test]
+    fn replay_prefers_strict_captured_cost_and_provenance() {
+        let record = json!({
+            "timestamp_ms": 1234,
+            "request_id": 42,
+            "trace_id": "codex-42",
+            "service": "codex",
+            "method": "POST",
+            "path": "/v1/responses",
+            "status_code": 200,
+            "duration_ms": 10,
+            "cost": {
+                "input_cost_usd": "1",
+                "total_cost_usd": "1",
+                "confidence": "estimated",
+                "pricing_source": "basellm",
+                "pricing_provider": "openai",
+                "pricing_generation": "row-7",
+                "effective_pricing_revision": "catalog-9",
+                "selected_tier": {
+                    "tier_type": "context",
+                    "threshold_tokens": 272000,
+                    "matched_input_tokens": 272001
+                }
+            },
+            "accounting": {
+                "schema_version": 1,
+                "project": { "kind": "git_root", "path": "C:/src/repo" },
+                "provider_endpoint": {
+                    "service_name": "codex",
+                    "provider_id": "input20",
+                    "endpoint_id": "default"
+                },
+                "pool_membership": {
+                    "pool_key": "pool-a",
+                    "revision": 3,
+                    "confidence": "high",
+                    "aggregation_eligible": true
+                },
+                "price_coverage": "captured"
+            }
+        });
+
+        let request =
+            finished_request_from_request_log_record(&record).expect("captured request projection");
+
+        assert_eq!(request.cost.total_cost_usd.as_deref(), Some("1"));
+        assert_eq!(
+            request.cost.effective_pricing_revision.as_deref(),
+            Some("catalog-9")
+        );
+        assert_eq!(
+            request
+                .cost
+                .selected_tier
+                .as_ref()
+                .map(|tier| tier.threshold_tokens),
+            Some(272_000)
+        );
+        assert_eq!(
+            request.accounting.price_coverage,
+            AccountingPriceCoverage::Captured
+        );
+        assert_eq!(
+            request
+                .accounting
+                .pool_membership
+                .as_ref()
+                .map(|membership| (membership.pool_key.as_str(), membership.revision)),
+            Some(("pool-a", 3))
+        );
+    }
+
+    #[test]
+    fn legacy_partial_captured_cost_is_preserved_without_repricing() {
+        let record = json!({
+            "timestamp_ms": 1234,
+            "request_id": 43,
+            "service": "codex",
+            "method": "POST",
+            "path": "/v1/responses",
+            "status_code": 200,
+            "duration_ms": 10,
+            "model": "gpt-5",
+            "usage": { "input_tokens": 1000, "total_tokens": 1000 },
+            "cost": {
+                "input_cost_usd": "1",
+                "total_cost_usd": "1",
+                "confidence": "partial",
+                "pricing_source": "legacy-captured"
+            }
+        });
+
+        let request = finished_request_from_request_log_record(&record)
+            .expect("legacy partial captured request");
+
+        assert_eq!(request.cost.total_cost_usd.as_deref(), Some("1"));
+        assert_eq!(
+            request.cost.confidence,
+            crate::pricing::CostConfidence::Partial
+        );
+        assert_eq!(
+            request.cost.pricing_source.as_deref(),
+            Some("legacy-captured")
+        );
+        assert_eq!(
+            request.accounting.price_coverage,
+            AccountingPriceCoverage::Captured
+        );
+    }
+
+    #[test]
+    fn malformed_captured_cost_is_not_repriced_during_replay() {
+        let record = json!({
+            "timestamp_ms": 1234,
+            "request_id": 42,
+            "service": "codex",
+            "method": "POST",
+            "path": "/v1/responses",
+            "status_code": 200,
+            "duration_ms": 10,
+            "model": "gpt-5",
+            "usage": { "input_tokens": 1000, "total_tokens": 1000 },
+            "cost": {
+                "input_cost_usd": "1",
+                "total_cost_usd": "2",
+                "confidence": "estimated"
+            }
+        });
+
+        let request =
+            finished_request_from_request_log_record(&record).expect("invalid captured request");
+
+        assert_eq!(
+            request.accounting.price_coverage,
+            AccountingPriceCoverage::InvalidCaptured
+        );
+        assert!(request.cost.is_unknown());
     }
 }

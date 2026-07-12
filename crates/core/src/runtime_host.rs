@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::Result;
 use axum::Router;
@@ -8,6 +9,7 @@ use reqwest::Client;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
+use crate::basellm_metadata::{BasellmCatalogSyncTask, initialize_basellm_runtime_state};
 use crate::config::{
     LoadedProxyConfig, ProxyConfig, ServiceKind, load_or_bootstrap_for_service_with_v4_source,
     model_routing_warnings,
@@ -18,12 +20,51 @@ use crate::proxy::{
     ProxyService, admin_listener_router, admin_loopback_addr_for_proxy_port,
     proxy_only_router_with_admin_base_url,
 };
+use crate::quota_sampler::{QuotaSampler, QuotaSamplerConfig, QuotaSamplerRefreshOutcome};
 use crate::state::ProxyState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProxyLifetimeMode {
     Ephemeral,
     Resident,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeBackgroundTaskKind {
+    QuotaSampler,
+    BasellmCatalogSync,
+}
+
+const RUNTIME_BACKGROUND_TASK_KINDS: [RuntimeBackgroundTaskKind; 2] = [
+    RuntimeBackgroundTaskKind::QuotaSampler,
+    RuntimeBackgroundTaskKind::BasellmCatalogSync,
+];
+
+struct RuntimeBackgroundTasks {
+    quota_sampler: JoinHandle<()>,
+    basellm_catalog_sync: JoinHandle<()>,
+}
+
+struct RuntimeShutdownResources {
+    background_tasks: RuntimeBackgroundTasks,
+    state: Arc<ProxyState>,
+}
+
+impl RuntimeBackgroundTasks {
+    fn new(quota_sampler: JoinHandle<()>, basellm_catalog_sync: JoinHandle<()>) -> Self {
+        tracing::debug!(
+            tasks = ?RUNTIME_BACKGROUND_TASK_KINDS,
+            "proxy runtime background tasks started"
+        );
+        Self {
+            quota_sampler,
+            basellm_catalog_sync,
+        }
+    }
+
+    fn into_handles(self) -> Vec<JoinHandle<()>> {
+        vec![self.quota_sampler, self.basellm_catalog_sync]
+    }
 }
 
 impl ProxyLifetimeMode {
@@ -124,8 +165,49 @@ impl ProxyRuntime {
             .take()
             .expect("proxy runtime admin app should exist before start");
         let shutdown_rx = self.shutdown_rx.clone();
-        let server_handle =
-            spawn_proxy_runtime_servers(listener, admin_listener, app, admin_app, shutdown_rx);
+        let sampler_proxy = self.proxy.clone();
+        let sampler = QuotaSampler::new_with_outcome(QuotaSamplerConfig::default(), move || {
+            let proxy = sampler_proxy.clone();
+            async move {
+                let response = match proxy.refresh_provider_balances(None, None, false).await {
+                    Ok(response) => response,
+                    Err(_) => {
+                        return QuotaSamplerRefreshOutcome::Failed(
+                            "quota provider refresh request failed".to_string(),
+                        );
+                    }
+                };
+                let summary = response.refresh;
+                tracing::debug!(
+                    attempted = summary.attempted,
+                    refreshed = summary.refreshed,
+                    failed = summary.failed,
+                    suppressed = summary.suppressed,
+                    next_retry_at_ms = summary.next_retry_at_ms,
+                    missing_token = summary.missing_token,
+                    deduplicated = summary.deduplicated,
+                    "quota sampler refresh completed"
+                );
+                quota_sampler_refresh_result(&summary)
+            }
+        });
+        let background_tasks = RuntimeBackgroundTasks::new(
+            sampler.spawn(self.shutdown_rx.clone()),
+            BasellmCatalogSyncTask::default().spawn(self.shutdown_rx.clone()),
+        );
+        let shutdown_resources = RuntimeShutdownResources {
+            background_tasks,
+            state: self.state.clone(),
+        };
+        let server_handle = spawn_proxy_runtime_servers(
+            listener,
+            admin_listener,
+            app,
+            admin_app,
+            shutdown_rx,
+            self.shutdown_tx.clone(),
+            shutdown_resources,
+        );
 
         RunningProxyRuntime {
             service_name: self.service_name,
@@ -139,6 +221,34 @@ impl ProxyRuntime {
             server_handle,
         }
     }
+}
+
+fn quota_sampler_refresh_result(
+    summary: &crate::usage_providers::UsageProviderRefreshSummary,
+) -> QuotaSamplerRefreshOutcome {
+    if summary.suppressed > 0
+        && let Some(next_retry_at_ms) = summary.next_retry_at_ms
+    {
+        let delay = Duration::from_millis(next_retry_at_ms.saturating_sub(unix_now_ms()));
+        return QuotaSamplerRefreshOutcome::Suppressed {
+            wake_at: tokio::time::Instant::now() + delay,
+        };
+    }
+    if summary.attempted > 0 && summary.failed >= summary.attempted {
+        QuotaSamplerRefreshOutcome::Failed(format!(
+            "all {} quota provider refresh attempts failed",
+            summary.attempted
+        ))
+    } else {
+        QuotaSamplerRefreshOutcome::Refreshed
+    }
+}
+
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl RunningProxyRuntime {
@@ -266,6 +376,7 @@ pub async fn build_proxy_runtime_from_bound_listeners_with_options(
 ) -> Result<ProxyRuntime> {
     let cfg = loaded.runtime;
     validate_service_has_upstream(service_name, &cfg)?;
+    let _effective_pricing = initialize_basellm_runtime_state();
     let v4_source = loaded.v4.map(Arc::new);
 
     let warnings = model_routing_warnings(&cfg, service_name);
@@ -378,6 +489,8 @@ fn spawn_proxy_runtime_servers(
     app: Router,
     admin_app: Router,
     shutdown_rx: watch::Receiver<bool>,
+    shutdown_tx: watch::Sender<bool>,
+    shutdown_resources: RuntimeShutdownResources,
 ) -> JoinHandle<Result<()>> {
     let proxy_server_shutdown = {
         let mut rx = shutdown_rx.clone();
@@ -393,7 +506,7 @@ fn spawn_proxy_runtime_servers(
     };
 
     tokio::spawn(async move {
-        tokio::try_join!(
+        let server_result = tokio::try_join!(
             axum::serve(
                 listener,
                 app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -404,14 +517,153 @@ fn spawn_proxy_runtime_servers(
                 admin_app.into_make_service_with_connect_info::<SocketAddr>(),
             )
             .with_graceful_shutdown(admin_server_shutdown),
-        )?;
+        );
+
+        let _ = shutdown_tx.send(true);
+        for handle in shutdown_resources.background_tasks.into_handles() {
+            if let Err(error) = handle.await {
+                tracing::warn!(%error, "proxy runtime background task failed to join");
+            }
+        }
+        if let Err(error) = shutdown_resources.state.shutdown_quota_persistence().await {
+            tracing::warn!(%error, "failed to flush quota checkpoint state during shutdown");
+        }
+
+        server_result?;
         Ok(())
     })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+
+    async fn wait_for_calls(calls: &AtomicUsize, expected: usize) {
+        for _ in 0..32 {
+            if calls.load(Ordering::SeqCst) == expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), expected);
+    }
+
+    #[test]
+    fn runtime_owns_one_task_for_each_background_track() {
+        assert_eq!(
+            RUNTIME_BACKGROUND_TASK_KINDS,
+            [
+                RuntimeBackgroundTaskKind::QuotaSampler,
+                RuntimeBackgroundTaskKind::BasellmCatalogSync,
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn background_tasks_start_once_and_stop_together_with_runtime_shutdown() {
+        let sampler_calls = Arc::new(AtomicUsize::new(0));
+        let sampler_calls_for_refresh = sampler_calls.clone();
+        let sampler = QuotaSampler::new_with_outcome(QuotaSamplerConfig::default(), move || {
+            let calls = sampler_calls_for_refresh.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                QuotaSamplerRefreshOutcome::Refreshed
+            }
+        });
+
+        let basellm_calls = Arc::new(AtomicUsize::new(0));
+        let basellm_calls_for_sync = basellm_calls.clone();
+        let basellm = BasellmCatalogSyncTask::new(Duration::from_secs(60 * 60), move || {
+            let calls = basellm_calls_for_sync.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let background_tasks = RuntimeBackgroundTasks::new(
+            sampler.spawn(shutdown_rx.clone()),
+            basellm.spawn(shutdown_rx.clone()),
+        );
+        let cloned_shutdown_rx = shutdown_rx.clone();
+
+        wait_for_calls(&sampler_calls, 1).await;
+        wait_for_calls(&basellm_calls, 1).await;
+        tokio::task::yield_now().await;
+        assert_eq!(sampler_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(basellm_calls.load(Ordering::SeqCst), 1);
+        drop(cloned_shutdown_rx);
+
+        shutdown_tx.send(true).expect("send runtime shutdown");
+        for handle in background_tasks.into_handles() {
+            handle.await.expect("join background task");
+        }
+        tokio::time::advance(Duration::from_secs(24 * 60 * 60)).await;
+
+        assert_eq!(sampler_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(basellm_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn sampler_result_retries_only_when_every_attempt_failed() {
+        let all_failed = crate::usage_providers::UsageProviderRefreshSummary {
+            attempted: 2,
+            failed: 2,
+            ..Default::default()
+        };
+        let partial_success = crate::usage_providers::UsageProviderRefreshSummary {
+            attempted: 2,
+            refreshed: 1,
+            failed: 1,
+            ..Default::default()
+        };
+        let missing_credentials = crate::usage_providers::UsageProviderRefreshSummary {
+            attempted: 1,
+            missing_token: 1,
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            quota_sampler_refresh_result(&all_failed),
+            QuotaSamplerRefreshOutcome::Failed(_)
+        ));
+        assert_eq!(
+            quota_sampler_refresh_result(&partial_success),
+            QuotaSamplerRefreshOutcome::Refreshed
+        );
+        assert_eq!(
+            quota_sampler_refresh_result(&missing_credentials),
+            QuotaSamplerRefreshOutcome::Refreshed
+        );
+        assert_eq!(
+            quota_sampler_refresh_result(
+                &crate::usage_providers::UsageProviderRefreshSummary::default()
+            ),
+            QuotaSamplerRefreshOutcome::Refreshed
+        );
+    }
+
+    #[test]
+    fn sampler_result_maps_suppression_to_a_monotonic_wake_time() {
+        let before = tokio::time::Instant::now();
+        let summary = crate::usage_providers::UsageProviderRefreshSummary {
+            attempted: 1,
+            suppressed: 1,
+            next_retry_at_ms: Some(unix_now_ms().saturating_add(30_000)),
+            ..Default::default()
+        };
+
+        let QuotaSamplerRefreshOutcome::Suppressed { wake_at } =
+            quota_sampler_refresh_result(&summary)
+        else {
+            panic!("expected suppressed sampler outcome");
+        };
+        let remaining = wake_at.saturating_duration_since(before);
+        assert!(remaining >= Duration::from_secs(29), "{remaining:?}");
+        assert!(remaining <= Duration::from_secs(31), "{remaining:?}");
+    }
 
     #[test]
     fn admin_discovery_url_is_not_advertised_for_unspecified_bind() {

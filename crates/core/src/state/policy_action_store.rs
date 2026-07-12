@@ -123,29 +123,11 @@ impl PolicyActionStore {
         let Some(path) = self.path.as_ref() else {
             return Ok(());
         };
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let ledger = persisted_ledger(entries, updated_at_ms);
         let text = serde_json::to_string_pretty(&ledger).map_err(std::io::Error::other)?;
-        let tmp_path = tmp_path_for(path, updated_at_ms);
-        std::fs::write(&tmp_path, text)?;
-        match std::fs::rename(&tmp_path, path) {
+        match crate::file_replace::write_bytes_file(path, text.as_bytes()) {
             Ok(()) => Ok(()),
-            Err(err) if should_retry_ledger_rename_after_remove(err.kind()) => {
-                let _ = std::fs::remove_file(path);
-                match std::fs::rename(&tmp_path, path) {
-                    Ok(()) => Ok(()),
-                    Err(err) => {
-                        let _ = std::fs::remove_file(&tmp_path);
-                        Err(err)
-                    }
-                }
-            }
-            Err(err) => {
-                let _ = std::fs::remove_file(&tmp_path);
-                Err(err)
-            }
+            Err(err) => recover_policy_action_candidate(path, text.as_bytes(), err),
         }
     }
 
@@ -157,31 +139,55 @@ impl PolicyActionStore {
         let Some(path) = self.path.as_ref() else {
             return Ok(());
         };
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
         let ledger = persisted_ledger(entries, updated_at_ms);
         let text = serde_json::to_string_pretty(&ledger).map_err(std::io::Error::other)?;
-        let tmp_path = tmp_path_for(path, updated_at_ms);
-        tokio::fs::write(&tmp_path, text).await?;
-        match tokio::fs::rename(&tmp_path, path).await {
+        match crate::file_replace::write_bytes_file_async(path, text.as_bytes()).await {
             Ok(()) => Ok(()),
-            Err(err) if should_retry_ledger_rename_after_remove(err.kind()) => {
-                let _ = tokio::fs::remove_file(path).await;
-                match tokio::fs::rename(&tmp_path, path).await {
-                    Ok(()) => Ok(()),
-                    Err(err) => {
-                        let _ = tokio::fs::remove_file(&tmp_path).await;
-                        Err(err)
-                    }
-                }
-            }
-            Err(err) => {
-                let _ = tokio::fs::remove_file(&tmp_path).await;
-                Err(err)
-            }
+            Err(err) => recover_policy_action_candidate_async(path, text.as_bytes(), err).await,
         }
     }
+}
+
+fn validate_policy_action_candidate(bytes: &[u8]) -> std::io::Result<()> {
+    let ledger = serde_json::from_slice::<PersistedPolicyActionLedger>(bytes)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    if ledger.schema_version != POLICY_ACTION_LEDGER_SCHEMA_VERSION {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "unsupported policy action ledger schema {}; expected {}",
+                ledger.schema_version, POLICY_ACTION_LEDGER_SCHEMA_VERSION
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn recover_policy_action_candidate(
+    path: &Path,
+    candidate: &[u8],
+    error: crate::file_replace::AtomicWriteError,
+) -> std::io::Result<()> {
+    crate::file_replace::recover_uncertain_candidate(
+        path,
+        candidate,
+        error,
+        validate_policy_action_candidate,
+    )
+}
+
+async fn recover_policy_action_candidate_async(
+    path: &Path,
+    candidate: &[u8],
+    error: crate::file_replace::AtomicWriteError,
+) -> std::io::Result<()> {
+    crate::file_replace::recover_uncertain_candidate_async(
+        path,
+        candidate,
+        error,
+        validate_policy_action_candidate,
+    )
+    .await
 }
 
 fn persisted_ledger(entries: &PolicyActionMap, updated_at_ms: u64) -> PersistedPolicyActionLedger {
@@ -205,16 +211,75 @@ fn persisted_ledger(entries: &PolicyActionMap, updated_at_ms: u64) -> PersistedP
     }
 }
 
-fn tmp_path_for(path: &Path, updated_at_ms: u64) -> PathBuf {
-    path.with_extension(format!(
-        "json.tmp-{}-{}-{}",
-        std::process::id(),
-        updated_at_ms,
-        uuid::Uuid::new_v4()
-    ))
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn should_retry_ledger_rename_after_remove(kind: std::io::ErrorKind) -> bool {
-    kind == std::io::ErrorKind::AlreadyExists
-        || (cfg!(windows) && kind == std::io::ErrorKind::PermissionDenied)
+    struct TestFile(PathBuf);
+
+    impl TestFile {
+        fn new() -> Self {
+            let directory = std::env::temp_dir().join(format!(
+                "codex-helper-policy-action-store-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&directory).expect("create test directory");
+            Self(directory.join("policy-actions.json"))
+        }
+    }
+
+    impl Drop for TestFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+            if let Some(parent) = self.0.parent() {
+                let _ = std::fs::remove_dir(parent);
+            }
+        }
+    }
+
+    fn uncertain_error(path: &Path) -> crate::file_replace::AtomicWriteError {
+        crate::file_replace::AtomicWriteError::CommitStateUnknown {
+            path: path.to_path_buf(),
+            stage: "injected test replacement",
+            source: std::io::Error::other("injected uncertainty"),
+        }
+    }
+
+    #[test]
+    fn uncertain_write_recovers_only_the_exact_valid_policy_candidate() {
+        let path = TestFile::new();
+        let candidate = serde_json::to_vec_pretty(&persisted_ledger(&HashMap::new(), 2))
+            .expect("serialize candidate");
+        std::fs::write(&path.0, &candidate).expect("write recovered candidate");
+
+        recover_policy_action_candidate(&path.0, &candidate, uncertain_error(&path.0))
+            .expect("exact valid candidate should recover");
+
+        let old = serde_json::to_vec_pretty(&persisted_ledger(&HashMap::new(), 1))
+            .expect("serialize old ledger");
+        std::fs::write(&path.0, &old).expect("write old ledger");
+        let err = recover_policy_action_candidate(&path.0, &candidate, uncertain_error(&path.0))
+            .expect_err("different valid bytes must not recover as the candidate");
+        assert!(err.to_string().contains("do not match the candidate"));
+        assert_eq!(std::fs::read(&path.0).expect("read old ledger"), old);
+    }
+
+    #[test]
+    fn uncertain_write_rejects_an_exact_unsupported_policy_schema() {
+        let path = TestFile::new();
+        let candidate = serde_json::to_vec_pretty(&PersistedPolicyActionLedger {
+            schema_version: POLICY_ACTION_LEDGER_SCHEMA_VERSION + 1,
+            updated_at_ms: 1,
+            entries: Vec::new(),
+        })
+        .expect("serialize unsupported candidate");
+        std::fs::write(&path.0, &candidate).expect("write unsupported candidate");
+
+        let err = recover_policy_action_candidate(&path.0, &candidate, uncertain_error(&path.0))
+            .expect_err("unsupported schema must not recover");
+        assert!(
+            err.to_string()
+                .contains("unsupported policy action ledger schema")
+        );
+    }
 }

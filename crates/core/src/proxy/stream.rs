@@ -12,7 +12,7 @@ use tracing::{info, warn};
 use crate::lb::LoadBalancer;
 use crate::logging::{
     CodexBridgeLog, HttpDebugLog, RetryInfo, ServiceTierLog, log_retry_trace, make_body_preview,
-    should_include_http_debug, should_include_http_warn,
+    request_trace_id, should_include_http_debug, should_include_http_warn,
 };
 use crate::state::{ProxyState, RouteDecisionProvenance, SessionIdentitySource};
 use crate::usage_providers;
@@ -687,7 +687,10 @@ impl StreamForwardState {
                 (None, 0)
             };
 
-        let trace_id = format!("codex-{}", self.finalize.request_id);
+        let trace_id = request_trace_id(
+            self.finalize.service_name.as_str(),
+            self.finalize.request_id,
+        );
         log_retry_trace(serde_json::json!({
             "event": "upstream_stream_error",
             "service": self.finalize.service_name,

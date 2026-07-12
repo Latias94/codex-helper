@@ -348,6 +348,51 @@ async fn balance_refresh_uses_in_process_proxy_not_admin_http() {
 }
 
 #[tokio::test]
+async fn stats_page_g_forces_daemon_owned_balance_refresh() {
+    let temp_home = make_temp_home("stats-page-g-refreshes-balances");
+    let _scoped_home = ScopedEnv::set_path("CODEX_HELPER_HOME", temp_home.as_path());
+    std::fs::write(temp_home.join("config.toml"), "version = 5\n")
+        .expect("write empty persisted config");
+
+    let (proxy, cfg) = proxy_with_single_station_without_upstreams();
+    let state = proxy.state_handle();
+    let snapshot = empty_snapshot(state.as_ref(), cfg).await;
+    let mut providers = Vec::new();
+    let mut ui = UiState {
+        page: Page::Stats,
+        ..UiState::default()
+    };
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (diagnostics_tx, _diagnostics_rx) = mpsc::unbounded_channel();
+    let (live_smoke_tx, _live_smoke_rx) = mpsc::unbounded_channel();
+
+    let handled = super::handle_key_event(
+        TestKeyEventContext {
+            state: &state,
+            providers: &mut providers,
+            ui: &mut ui,
+            snapshot: &snapshot,
+            proxy: &proxy,
+            balance_refresh_tx: &tx,
+            codex_relay_diagnostics_tx: &diagnostics_tx,
+            codex_relay_live_smoke_tx: &live_smoke_tx,
+        }
+        .into(),
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+    )
+    .await;
+
+    assert!(handled);
+    assert!(ui.needs_snapshot_refresh);
+    assert!(ui.last_balance_refresh_requested_at.is_some());
+    let result = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("balance refresh should finish")
+        .expect("balance refresh should send outcome");
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
 async fn routing_page_g_refreshes_balances() {
     let temp_home = make_temp_home("routing-page-g-refreshes-balances");
     let _scoped_home = ScopedEnv::set_path("CODEX_HELPER_HOME", temp_home.as_path());

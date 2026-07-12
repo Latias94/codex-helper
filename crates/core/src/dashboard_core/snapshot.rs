@@ -6,6 +6,7 @@ use crate::dashboard_core::WindowStats;
 use crate::dashboard_core::types::{ControlProfileOption, StationOption};
 use crate::dashboard_core::window_stats::compute_window_stats;
 use crate::policy_actions::PolicyActionProjection;
+use crate::quota_analytics::QuotaAnalyticsView;
 use crate::service_status::ServiceStatusSnapshot;
 use crate::state::{
     ActiveRequest, FinishedRequest, HealthCheckStatus, LbConfigView, ProviderBalanceSnapshot,
@@ -39,6 +40,7 @@ pub struct DashboardSnapshot {
     pub station_health: HashMap<String, StationHealth>,
     #[serde(default)]
     pub provider_balances: HashMap<String, Vec<ProviderBalanceSnapshot>>,
+    /// API v1 compatibility projection. Longitudinal quota history lives in `quota_analytics`.
     #[serde(default)]
     pub provider_balance_history: HashMap<String, Vec<ProviderBalanceSnapshot>>,
     pub health_checks: HashMap<String, HealthCheckStatus>,
@@ -47,6 +49,8 @@ pub struct DashboardSnapshot {
     pub policy_actions: Vec<PolicyActionProjection>,
     #[serde(default)]
     pub usage_day: UsageDayView,
+    #[serde(default)]
+    pub quota_analytics: QuotaAnalyticsView,
     pub usage_rollup: UsageRollupView,
     pub stats_5m: WindowStats,
     pub stats_1h: WindowStats,
@@ -119,10 +123,10 @@ pub async fn build_dashboard_snapshot(
         session_route_affinities,
         session_stats,
         mut usage_day,
+        quota_analytics,
         usage_rollup,
         station_health,
         provider_balances,
-        provider_balance_history,
         health_checks,
         lb_view,
         policy_actions,
@@ -140,16 +144,17 @@ pub async fn build_dashboard_snapshot(
         state.list_session_route_affinities(),
         state.list_session_stats(),
         state.get_usage_day_view(service_name, 12, now),
+        state.quota_analytics_view(service_name, now),
         state.get_usage_rollup_view(service_name, 12, stats_days),
         state.get_station_health(service_name),
         state.get_provider_balance_view(service_name),
-        state.get_provider_balance_history_view(service_name),
         state.list_health_checks(service_name),
         state.get_lb_view(),
         state.active_policy_action_projections(service_name, now),
     );
     usage_day.retry_gate =
         crate::state::UsageRetryGateSummary::from_policy_actions(&policy_actions);
+    let provider_balance_history = provider_balances.clone();
 
     let stats_5m = compute_window_stats(&recent_all, now, 5 * 60_000, |_| true);
     let stats_1h = compute_window_stats(&recent_all, now, 60 * 60_000, |_| true);
@@ -205,6 +210,7 @@ pub async fn build_dashboard_snapshot(
         lb_view,
         policy_actions,
         usage_day,
+        quota_analytics,
         usage_rollup,
         stats_5m,
         stats_1h,
@@ -220,11 +226,125 @@ fn clamp_recent_limit(recent_limit: usize) -> usize {
 mod tests {
     use super::*;
 
+    use crate::quota_analytics::{QuotaAnalyticsSupport, QuotaAnalyticsView};
+
     #[test]
     fn dashboard_recent_limit_clamps_to_retention() {
         let retention = crate::state::recent_finished_max();
 
         assert_eq!(clamp_recent_limit(retention.saturating_mul(2)), retention);
         assert_eq!(clamp_recent_limit(0), 1);
+    }
+
+    #[test]
+    fn api_v1_snapshot_preserves_legacy_provider_balance_history_shape() {
+        let snapshot = ApiV1Snapshot {
+            api_version: 1,
+            service_name: "codex".to_string(),
+            runtime_loaded_at_ms: None,
+            runtime_source_mtime_ms: None,
+            stations: Vec::new(),
+            configured_active_station: None,
+            effective_active_station: None,
+            default_profile: None,
+            profiles: Vec::new(),
+            snapshot: empty_dashboard_snapshot(),
+        };
+
+        let encoded = serde_json::to_value(snapshot).expect("serialize v1 snapshot");
+        assert_eq!(encoded["api_version"], 1);
+        assert!(
+            encoded["snapshot"]["provider_balance_history"].is_object(),
+            "v1 clients require the legacy provider_balance_history object"
+        );
+        assert!(
+            encoded["snapshot"]["quota_analytics"].is_object(),
+            "quota analytics must remain available beside the compatibility field"
+        );
+
+        let mut without_compatibility_field = encoded;
+        without_compatibility_field["snapshot"]
+            .as_object_mut()
+            .expect("snapshot object")
+            .remove("provider_balance_history");
+        let decoded: ApiV1Snapshot = serde_json::from_value(without_compatibility_field)
+            .expect("missing compatibility field defaults safely");
+        assert!(decoded.snapshot.provider_balance_history.is_empty());
+    }
+
+    #[test]
+    fn quota_analytics_distinguishes_legacy_unsupported_from_supported_empty() {
+        let mut snapshot = empty_dashboard_snapshot();
+        snapshot.quota_analytics = QuotaAnalyticsView {
+            support: QuotaAnalyticsSupport::Supported,
+            generated_at_ms: 42,
+            ..QuotaAnalyticsView::default()
+        };
+
+        let encoded = serde_json::to_value(&snapshot).expect("serialize snapshot");
+        let supported: DashboardSnapshot =
+            serde_json::from_value(encoded.clone()).expect("supported snapshot");
+        assert_eq!(
+            supported.quota_analytics.support,
+            QuotaAnalyticsSupport::Supported
+        );
+        assert!(supported.quota_analytics.pools.is_empty());
+
+        let mut legacy = encoded;
+        legacy
+            .as_object_mut()
+            .expect("snapshot object")
+            .remove("quota_analytics");
+        let unsupported: DashboardSnapshot =
+            serde_json::from_value(legacy).expect("legacy snapshot");
+        assert_eq!(
+            unsupported.quota_analytics.support,
+            QuotaAnalyticsSupport::Unsupported
+        );
+    }
+
+    #[tokio::test]
+    async fn dashboard_builder_populates_supported_quota_analytics() {
+        let state = ProxyState::new();
+
+        let snapshot = build_dashboard_snapshot(&state, "codex", 1, 1, None, None).await;
+
+        assert_eq!(
+            snapshot.quota_analytics.support,
+            QuotaAnalyticsSupport::Supported
+        );
+        assert_eq!(
+            snapshot.quota_analytics.generated_at_ms,
+            snapshot.refreshed_at_ms
+        );
+    }
+
+    fn empty_dashboard_snapshot() -> DashboardSnapshot {
+        DashboardSnapshot {
+            refreshed_at_ms: 0,
+            active: Vec::new(),
+            recent: Vec::new(),
+            session_cards: Vec::new(),
+            global_station_override: None,
+            global_route_target_override: None,
+            session_model_overrides: HashMap::new(),
+            session_station_overrides: HashMap::new(),
+            session_route_target_overrides: HashMap::new(),
+            session_effort_overrides: HashMap::new(),
+            session_service_tier_overrides: HashMap::new(),
+            session_stats: HashMap::new(),
+            station_health: HashMap::new(),
+            provider_balances: HashMap::new(),
+            provider_balance_history: HashMap::new(),
+            health_checks: HashMap::new(),
+            lb_view: HashMap::new(),
+            policy_actions: Vec::new(),
+            usage_day: UsageDayView::default(),
+            usage_rollup: UsageRollupView::default(),
+            stats_5m: WindowStats::default(),
+            stats_1h: WindowStats::default(),
+            service_status: None,
+            quota_analytics: QuotaAnalyticsView::default(),
+        }
     }
 }

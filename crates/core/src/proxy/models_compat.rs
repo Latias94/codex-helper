@@ -5,7 +5,7 @@ use axum::http::{HeaderMap, header};
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use serde_json::Value;
 
-use crate::basellm_metadata::BasellmOpenAiModelMetadata;
+use crate::basellm_metadata::{BasellmOpenAiMetadataSnapshot, BasellmOpenAiModelMetadata};
 
 const MAX_DECODED_MODELS_BYTES: usize = 8 * 1024 * 1024;
 
@@ -158,13 +158,30 @@ fn looks_like_json(bytes: &[u8]) -> bool {
 }
 
 fn maybe_translate_openai_models_list(body: &[u8]) -> Option<Bytes> {
-    let basellm_cache = crate::basellm_metadata::load_cached_basellm_metadata_cache();
-    translate_openai_models_list_with_basellm_cache(body, basellm_cache.as_ref())
+    let basellm_metadata = crate::basellm_metadata::basellm_openai_metadata_snapshot();
+    translate_openai_models_list_with_basellm_snapshot(body, basellm_metadata.as_ref())
 }
 
+fn translate_openai_models_list_with_basellm_snapshot(
+    body: &[u8],
+    basellm_metadata: Option<&BasellmOpenAiMetadataSnapshot>,
+) -> Option<Bytes> {
+    translate_openai_models_list_with_metadata_lookup(body, |slug| basellm_metadata?.model(slug))
+}
+
+#[cfg(test)]
 fn translate_openai_models_list_with_basellm_cache(
     body: &[u8],
     basellm_cache: Option<&crate::basellm_metadata::BasellmMetadataCache>,
+) -> Option<Bytes> {
+    translate_openai_models_list_with_metadata_lookup(body, |slug| {
+        basellm_cache?.openai_models.get(&slug.to_ascii_lowercase())
+    })
+}
+
+fn translate_openai_models_list_with_metadata_lookup<'a>(
+    body: &[u8],
+    metadata_for_model: impl Fn(&str) -> Option<&'a BasellmOpenAiModelMetadata>,
 ) -> Option<Bytes> {
     let value = serde_json::from_slice::<Value>(body).ok()?;
     if value.get("models").is_some() {
@@ -182,9 +199,7 @@ fn translate_openai_models_list_with_basellm_cache(
             continue;
         }
         let display_name = openai_model_display_name(item).unwrap_or_else(|| display_name(&slug));
-        let basellm_metadata = basellm_cache
-            .as_ref()
-            .and_then(|cache| cache.openai_models.get(&slug.to_ascii_lowercase()));
+        let basellm_metadata = metadata_for_model(&slug);
         models.push(codex_model_info_json(
             &slug,
             display_name.as_str(),

@@ -10,6 +10,7 @@ pub(in crate::tui) use crate::dashboard_core::window_stats::compute_window_stats
 use crate::dashboard_core::{ApiV1Snapshot, WindowStats};
 use crate::policy_actions::PolicyActionProjection;
 use crate::pricing::{ModelPriceCatalogSnapshot, UsdAmount};
+use crate::quota_analytics::QuotaAnalyticsView;
 use crate::runtime_identity::ProviderEndpointKey;
 use crate::state::{
     BalanceSnapshotStatus, FinishedRequest, HealthCheckStatus, LbConfigView,
@@ -21,7 +22,6 @@ use crate::tui::Language;
 use crate::tui::i18n;
 use crate::tui::state::RequestControlFilter;
 use crate::usage::UsageMetrics;
-use crate::usage_forecast::UsageForecastBalanceHistoryLike;
 
 pub type UpstreamSummary = crate::dashboard_core::RuntimeUpstreamOption;
 pub type ProviderOption = crate::dashboard_core::RuntimeProviderOption;
@@ -302,73 +302,6 @@ pub(in crate::tui) struct SessionRow {
     pub(in crate::tui) override_service_tier: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::tui) struct ForecastBalanceSample {
-    pub(in crate::tui) fetched_at_ms: u64,
-    pub(in crate::tui) provider_id: String,
-    pub(in crate::tui) station_name: Option<String>,
-    pub(in crate::tui) upstream_index: Option<usize>,
-    pub(in crate::tui) quota_remaining_usd: Option<String>,
-    pub(in crate::tui) subscription_balance_usd: Option<String>,
-    pub(in crate::tui) total_balance_usd: Option<String>,
-    pub(in crate::tui) error: Option<String>,
-    pub(in crate::tui) unlimited_quota: bool,
-}
-
-impl ForecastBalanceSample {
-    pub(in crate::tui) fn from_snapshot(snapshot: &ProviderBalanceSnapshot) -> Self {
-        Self {
-            fetched_at_ms: snapshot.fetched_at_ms,
-            provider_id: snapshot.provider_id.clone(),
-            station_name: snapshot.station_name.clone(),
-            upstream_index: snapshot.upstream_index,
-            quota_remaining_usd: snapshot.quota_remaining_usd.clone(),
-            subscription_balance_usd: snapshot.subscription_balance_usd.clone(),
-            total_balance_usd: snapshot.total_balance_usd.clone(),
-            error: snapshot.error.clone(),
-            unlimited_quota: snapshot.unlimited_quota == Some(true),
-        }
-    }
-}
-
-impl UsageForecastBalanceHistoryLike for ForecastBalanceSample {
-    fn fetched_at_ms(&self) -> u64 {
-        self.fetched_at_ms
-    }
-
-    fn provider_id(&self) -> &str {
-        self.provider_id.as_str()
-    }
-
-    fn station_name(&self) -> Option<&str> {
-        self.station_name.as_deref()
-    }
-
-    fn upstream_index(&self) -> Option<usize> {
-        self.upstream_index
-    }
-
-    fn quota_remaining_usd(&self) -> Option<&str> {
-        self.quota_remaining_usd.as_deref()
-    }
-
-    fn subscription_balance_usd(&self) -> Option<&str> {
-        self.subscription_balance_usd.as_deref()
-    }
-
-    fn total_balance_usd(&self) -> Option<&str> {
-        self.total_balance_usd.as_deref()
-    }
-
-    fn error(&self) -> Option<&str> {
-        self.error.as_deref()
-    }
-
-    fn unlimited_quota(&self) -> bool {
-        self.unlimited_quota
-    }
-}
-
 #[derive(Debug, Clone)]
 pub(in crate::tui) struct Snapshot {
     pub(in crate::tui) rows: Vec<SessionRow>,
@@ -382,11 +315,10 @@ pub(in crate::tui) struct Snapshot {
     pub(in crate::tui) global_route_target_override: Option<String>,
     pub(in crate::tui) station_meta_overrides: HashMap<String, (Option<bool>, Option<u8>)>,
     pub(in crate::tui) usage_day: UsageDayView,
+    pub(in crate::tui) quota_analytics: QuotaAnalyticsView,
     #[allow(dead_code)]
     pub(in crate::tui) usage_rollup: UsageRollupView,
     pub(in crate::tui) provider_balances: HashMap<String, Vec<ProviderBalanceSnapshot>>,
-    #[allow(dead_code)]
-    pub(in crate::tui) provider_balance_history: HashMap<String, Vec<ForecastBalanceSample>>,
     pub(in crate::tui) station_health: HashMap<String, StationHealth>,
     pub(in crate::tui) health_checks: HashMap<String, HealthCheckStatus>,
     pub(in crate::tui) lb_view: HashMap<String, LbConfigView>,
@@ -1967,21 +1899,9 @@ pub(in crate::tui) async fn refresh_snapshot(
         global_route_target_override,
         station_meta_overrides: config_meta,
         usage_day: snap.usage_day,
+        quota_analytics: snap.quota_analytics,
         usage_rollup: snap.usage_rollup,
         provider_balances: snap.provider_balances,
-        provider_balance_history: snap
-            .provider_balance_history
-            .into_iter()
-            .map(|(station, snapshots)| {
-                (
-                    station,
-                    snapshots
-                        .into_iter()
-                        .map(|snapshot| ForecastBalanceSample::from_snapshot(&snapshot))
-                        .collect(),
-                )
-            })
-            .collect(),
         station_health,
         health_checks: snap.health_checks,
         lb_view: snap.lb_view,
@@ -2020,21 +1940,9 @@ pub(in crate::tui) async fn snapshot_from_api_v1(api: ApiV1Snapshot) -> Snapshot
         global_route_target_override,
         station_meta_overrides: HashMap::new(),
         usage_day: snap.usage_day,
+        quota_analytics: snap.quota_analytics,
         usage_rollup: snap.usage_rollup,
         provider_balances: snap.provider_balances,
-        provider_balance_history: snap
-            .provider_balance_history
-            .into_iter()
-            .map(|(station, snapshots)| {
-                (
-                    station,
-                    snapshots
-                        .into_iter()
-                        .map(|snapshot| ForecastBalanceSample::from_snapshot(&snapshot))
-                        .collect(),
-                )
-            })
-            .collect(),
         station_health,
         health_checks: snap.health_checks,
         lb_view: snap.lb_view,
@@ -2253,6 +2161,7 @@ mod tests {
             route_decision: None,
             usage: None,
             cost: crate::pricing::CostBreakdown::default(),
+            accounting: Default::default(),
             retry: None,
             provider_signals: Vec::new(),
             policy_actions: Vec::new(),
@@ -2663,6 +2572,7 @@ mod tests {
                 lb_view: HashMap::new(),
                 policy_actions: vec![projection.clone()],
                 usage_day: UsageDayView::default(),
+                quota_analytics: QuotaAnalyticsView::default(),
                 usage_rollup: UsageRollupView::default(),
                 stats_5m: WindowStats::default(),
                 stats_1h: WindowStats::default(),
@@ -2837,9 +2747,9 @@ mod tests {
             global_route_target_override: None,
             station_meta_overrides: HashMap::new(),
             usage_day: UsageDayView::default(),
+            quota_analytics: QuotaAnalyticsView::default(),
             usage_rollup: UsageRollupView::default(),
             provider_balances: HashMap::new(),
-            provider_balance_history: HashMap::new(),
             station_health: HashMap::new(),
             health_checks: HashMap::new(),
             lb_view: HashMap::new(),
@@ -2913,9 +2823,9 @@ mod tests {
             global_route_target_override: None,
             station_meta_overrides: HashMap::new(),
             usage_day: UsageDayView::default(),
+            quota_analytics: QuotaAnalyticsView::default(),
             usage_rollup: UsageRollupView::default(),
             provider_balances: HashMap::new(),
-            provider_balance_history: HashMap::new(),
             station_health: HashMap::new(),
             health_checks: HashMap::new(),
             lb_view: HashMap::new(),
@@ -2958,9 +2868,9 @@ mod tests {
             global_route_target_override: None,
             station_meta_overrides: HashMap::new(),
             usage_day: UsageDayView::default(),
+            quota_analytics: QuotaAnalyticsView::default(),
             usage_rollup: UsageRollupView::default(),
             provider_balances: HashMap::new(),
-            provider_balance_history: HashMap::new(),
             station_health: HashMap::new(),
             health_checks: HashMap::new(),
             lb_view: HashMap::new(),
@@ -2989,9 +2899,9 @@ mod tests {
             global_route_target_override: None,
             station_meta_overrides: HashMap::new(),
             usage_day: UsageDayView::default(),
+            quota_analytics: QuotaAnalyticsView::default(),
             usage_rollup: UsageRollupView::default(),
             provider_balances: HashMap::new(),
-            provider_balance_history: HashMap::new(),
             station_health: HashMap::new(),
             health_checks: HashMap::new(),
             lb_view: HashMap::new(),

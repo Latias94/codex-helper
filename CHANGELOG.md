@@ -7,11 +7,37 @@ All notable changes to this project will be documented in this file.
 
 ### 中文
 
+#### 新增
+
+- TUI `5 用量` 首屏现在展示远端共享 quota pool 的 used/remaining、15/60 分钟消耗速率、reset 前所需速率、pace、耗尽 ETA、source/scope/身份置信度和 freshness；按 `g` 可要求 daemon 强制刷新，Projects 视图可查看本机 Git project 归因、unknown、external 和 signed gap。
+- 常驻 daemon 新增单一 quota sampler，默认约每 5 分钟加最多 10% jitter 采样，连续失败时退避，并把有界历史持久化用于跨重启速率分析；attached TUI 只读取目标 daemon，不会重复采样。
+- 新增 `usage quota --target ... [--json]`、`pricing status [--json]` 和 `pricing force-refresh [--approve-economic-changes] [--json]`，便于脚本读取 daemon-owned quota analytics、离线检查价格 LKG，以及显式刷新或批准被隔离的经济变化。
+- BaseLLM 价格目录会从 `https://basellm.github.io/llm-metadata/api/all.json` 自动执行约 6 小时一次的条件检查；无效或可疑 candidate 不会替换 last-known-good，也不会由自动任务写入 manual overrides。
+
+#### 变更
+
+- 远端 pool counter 现在作为跨电脑共享总消耗来源，本地 request ledger 只负责项目归因：`external = max(remote - local, 0)`，负 gap 会保留，远端差额不会再用于放大本地价格。Raw unit、conversion generation 或 window/coverage 不兼容时会明确限制对账。
+- New API quota 换算改为优先读取同源 `/api/status` 的 `quota_per_unit`，其次使用显式 `quota_divisor`，否则保留 raw unit，不再把某个固定 divisor 宣称为精确 USD 换算。
+- 有效价格优先级明确为 `bundled < remote LKG < manual whole-model override`；BaseLLM 272,000 context tier 按 `ordinary input + cache read > 272000` 严格选择。远端价格仍是成本估算，不是账单；手动导入主命令改为 `pricing import-basellm`，`sync-basellm` 仅保留兼容 alias。
+
 #### 修复
 
 - 当 new-api / sub2api 上游返回并发已满、排队已满或分组负载饱和时，路由会直接切换到其他可用上游，并短暂避开已饱和的 endpoint，减少 Codex 多 subagent 并发时反复命中同一限流上游的问题。
 
 ### English summary
+
+#### Added
+
+- TUI Usage page 5 now puts remote shared-pool used/remaining, 15/60-minute burn, required rate until reset, pace, exhaustion ETA, source/scope/identity confidence, and freshness in the first viewport. Press `g` for a daemon refresh; Projects shows this daemon's Git-project attribution, unknown, external, and signed gap.
+- The resident daemon now owns one quota sampler, scheduled about every five minutes with up to 10% positive jitter, bounded failure backoff, and persisted bounded history for cross-restart rate analysis. Attached TUIs only read the target daemon and do not duplicate sampling.
+- Added `usage quota --target ... [--json]`, `pricing status [--json]`, and `pricing force-refresh [--approve-economic-changes] [--json]` for daemon-owned quota output, offline LKG inspection, and explicit refresh or quarantine approval.
+- BaseLLM pricing now conditionally checks `https://basellm.github.io/llm-metadata/api/all.json` about every six hours. Invalid or suspicious candidates cannot replace the last-known-good catalog, and automatic refresh never writes manual overrides.
+
+#### Changed
+
+- Remote pool counters are now the source of truth for shared cross-computer burn, while the local request ledger only attributes projects: `external = max(remote - local, 0)`, negative gaps are retained, and remote differences never scale local prices. Raw units and incompatible conversion generations, windows, or coverage explicitly disable reconciliation.
+- New API conversion now prefers same-origin `/api/status` `quota_per_unit`, then an explicit `quota_divisor`, and otherwise preserves raw units instead of claiming one fixed divisor is exact USD.
+- Effective pricing precedence is now `bundled < remote LKG < manual whole-model override`; the BaseLLM 272,000 context tier uses the strict `ordinary input + cache read > 272000` boundary. Remote prices remain estimates rather than invoices. The primary manual import command is now `pricing import-basellm`, with `sync-basellm` retained only as a compatibility alias.
 
 #### Fixed
 

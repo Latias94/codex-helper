@@ -318,6 +318,7 @@ mod tests {
             route_decision: None,
             usage: None,
             cost: crate::pricing::CostBreakdown::default(),
+            accounting: Default::default(),
             retry,
             provider_signals: Vec::new(),
             policy_actions: Vec::new(),

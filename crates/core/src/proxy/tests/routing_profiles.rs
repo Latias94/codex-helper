@@ -294,6 +294,14 @@ async fn proxy_api_v1_snapshot_works() {
         "should include snapshot object"
     );
     assert!(
+        snap["snapshot"]["provider_balance_history"].is_object(),
+        "v1 snapshot should preserve provider_balance_history compatibility shape"
+    );
+    assert!(
+        snap["snapshot"]["quota_analytics"].is_object(),
+        "v1 snapshot should include quota analytics beside compatibility fields"
+    );
+    assert!(
         snap.get("stations").is_some(),
         "should include stations list"
     );
@@ -301,10 +309,12 @@ async fn proxy_api_v1_snapshot_works() {
         snap.get("configs").is_none(),
         "snapshot should not expose legacy configs alias"
     );
-    assert_eq!(
-        snap["snapshot"]["active"][0]["trace_id"].as_str(),
-        Some("codex-1")
-    );
+    let active_trace_id = snap["snapshot"]["active"][0]["trace_id"]
+        .as_str()
+        .expect("active request trace ID");
+    assert!(crate::logging::is_versioned_request_trace_id(
+        active_trace_id
+    ));
     assert_eq!(
         snap["snapshot"]["session_cards"][0]["effective_station"]["source"].as_str(),
         Some("session_override")

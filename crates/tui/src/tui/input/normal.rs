@@ -27,7 +27,7 @@ use crate::tui::report::build_stats_report;
 use crate::tui::state::{
     CodexHistoryExternalFocusOrigin, FleetViewMode, UiState, adjust_table_selection,
 };
-use crate::tui::types::{Focus, Overlay, Page, StatsFocus};
+use crate::tui::types::{Focus, Overlay, Page};
 
 use super::KeyEventContext;
 use super::balance::{BalanceRefreshMode, request_provider_balance_refresh};
@@ -674,19 +674,12 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
             } else if ui.page == Page::Stations {
                 ui.focus = Focus::Stations;
             } else if ui.page == Page::Stats {
-                ui.stats_focus = match ui.stats_focus {
-                    StatsFocus::Stations => StatsFocus::Providers,
-                    StatsFocus::Providers => StatsFocus::Stations,
-                };
-                ui.stats_provider_detail_scroll = 0;
+                ui.cycle_stats_focus();
                 ui.toast = Some((
                     format!(
                         "{}: {}",
                         i18n::label(ui.language, "focus"),
-                        match ui.stats_focus {
-                            StatsFocus::Stations => i18n::label(ui.language, "station"),
-                            StatsFocus::Providers => i18n::label(ui.language, "provider"),
-                        }
+                        ui.stats_focus_label()
                     ),
                     Instant::now(),
                 ));
@@ -763,51 +756,31 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
             false
         }
         KeyCode::Up | KeyCode::Char('k') if ui.page == Page::Stats => {
-            match ui.stats_focus {
-                StatsFocus::Stations => {
-                    let len = snapshot.usage_day.station_rows.len();
-                    if let Some(next) =
-                        adjust_table_selection(&mut ui.stats_stations_table, -1, len)
-                    {
-                        ui.selected_stats_station_idx = next;
-                        return true;
-                    }
-                }
-                StatsFocus::Providers => {
-                    let len = snapshot.usage_day.provider_rows.len();
-                    if let Some(next) =
-                        adjust_table_selection(&mut ui.stats_providers_table, -1, len)
-                    {
-                        ui.selected_stats_provider_idx = next;
-                        ui.stats_provider_detail_scroll = 0;
-                        return true;
-                    }
-                }
-            }
-            false
+            ui.move_stats_selection(snapshot, -1)
         }
         KeyCode::Down | KeyCode::Char('j') if ui.page == Page::Stats => {
-            match ui.stats_focus {
-                StatsFocus::Stations => {
-                    let len = snapshot.usage_day.station_rows.len();
-                    if let Some(next) = adjust_table_selection(&mut ui.stats_stations_table, 1, len)
-                    {
-                        ui.selected_stats_station_idx = next;
-                        return true;
-                    }
+            ui.move_stats_selection(snapshot, 1)
+        }
+        KeyCode::Char('g') if ui.page == Page::Stats => {
+            let requested = request_provider_balance_refresh(
+                ui,
+                snapshot,
+                proxy,
+                BalanceRefreshMode::Force,
+                balance_refresh_tx,
+            );
+            ui.needs_snapshot_refresh = true;
+            ui.toast = Some((
+                match (ui.language, requested) {
+                    (Language::Zh, true) => "额度：正在通过 daemon 刷新",
+                    (Language::En, true) => "quota: refreshing through daemon",
+                    (Language::Zh, false) => "额度：刷新请求仍在冷却中",
+                    (Language::En, false) => "quota: refresh request is cooling down",
                 }
-                StatsFocus::Providers => {
-                    let len = snapshot.usage_day.provider_rows.len();
-                    if let Some(next) =
-                        adjust_table_selection(&mut ui.stats_providers_table, 1, len)
-                    {
-                        ui.selected_stats_provider_idx = next;
-                        ui.stats_provider_detail_scroll = 0;
-                        return true;
-                    }
-                }
-            }
-            false
+                .to_string(),
+                Instant::now(),
+            ));
+            true
         }
         KeyCode::Char('y') if ui.page == Page::Stats => {
             let now = now_ms();

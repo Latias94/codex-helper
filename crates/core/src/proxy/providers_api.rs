@@ -123,17 +123,7 @@ fn merge_refresh_summary(
     summary: &mut UsageProviderRefreshSummary,
     extra: UsageProviderRefreshSummary,
 ) {
-    summary.providers_configured += extra.providers_configured;
-    summary.providers_matched += extra.providers_matched;
-    summary.upstreams_matched += extra.upstreams_matched;
-    summary.attempted += extra.attempted;
-    summary.refreshed += extra.refreshed;
-    summary.failed += extra.failed;
-    summary.missing_token += extra.missing_token;
-    summary.auto_attempted += extra.auto_attempted;
-    summary.auto_refreshed += extra.auto_refreshed;
-    summary.auto_failed += extra.auto_failed;
-    summary.deduplicated += extra.deduplicated;
+    summary.merge_from(extra);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1009,6 +999,28 @@ pub(super) async fn refresh_provider_balances_for_proxy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_refresh_summary_preserves_earliest_suppression_retry() {
+        let mut summary = UsageProviderRefreshSummary {
+            attempted: 1,
+            suppressed: 1,
+            next_retry_at_ms: Some(200),
+            ..Default::default()
+        };
+        let extra = UsageProviderRefreshSummary {
+            attempted: 2,
+            suppressed: 2,
+            next_retry_at_ms: Some(100),
+            ..Default::default()
+        };
+
+        merge_refresh_summary(&mut summary, extra);
+
+        assert_eq!(summary.attempted, 3);
+        assert_eq!(summary.suppressed, 3);
+        assert_eq!(summary.next_retry_at_ms, Some(100));
+    }
 
     #[test]
     fn provider_balance_refresh_in_flight_guard_deduplicates_exact_key() {

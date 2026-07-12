@@ -1184,6 +1184,8 @@ New API dashboard-style quota:
       "headers": {
         "New-Api-User": "{{env:RIGHTCODE_NEWAPI_USER_ID}}"
       },
+      "quota_pool_id": "rightcode-shared-account",
+      "quota_reset_timezone": "Asia/Shanghai",
       "poll_interval_secs": 600,
       "refresh_on_request": true,
       "trust_exhaustion_for_routing": true
@@ -1199,31 +1201,41 @@ Important balance behavior:
 - Terminal errors such as inactive accounts, invalid keys, insufficient balance, or exhausted quota temporarily disable that provider target and suppress follow-up balance requests for 6 hours to avoid repeatedly hitting unusable accounts.
 - Sub2API lazy subscription-window zeros are displayed as lazy reset state before a real request refreshes the period; they should not be confused with a durable package design choice.
 - Sub2API subscription-mode `remaining` is a period-limit capacity signal, not a wallet balance. A zero `remaining` means at least one configured subscription window is currently exhausted; when the current daily/today window is exhausted, codex-helper suppresses follow-up balance requests and temporarily skips that target even if the package signal is display-only.
-- New API quota values are quota units converted with `QuotaPerUnit = 500000`; token usage snapshots with `unlimited_quota = true` are never treated as exhausted.
+- New API conversion first probes the same origin's public `GET /api/status` and reads `quota_per_unit`, then falls back to the adapter's positive `quota_divisor`. If neither is available, codex-helper keeps the counters in `raw` units instead of claiming an exact USD conversion. Token usage snapshots with `unlimited_quota = true` are never treated as exhausted.
 - RightCode `balance` is shown as wallet balance. Matched `subscriptions[*].total_quota` and `remaining_quota` are shown as daily quota; `reset_today = false` means codex-helper includes today's fresh daily quota before displaying remaining quota.
 - If a provider reports misleading zero balances for active subscriptions, set `trust_exhaustion_for_routing = false`.
 - UI surfaces cached balance snapshots; manual refresh uses `POST /__codex_helper/api/v1/providers/balances/refresh` and also avoids targets with confirmed terminal errors or current-period exhaustion.
 - Balance HTTP calls are bounded and reuse the same outbound client as proxy runtime calls. A failed lookup should surface the probed origin and adapter kind in logs, for example whether `sub2api_usage` or `openai_balance_http_json` returned non-JSON.
 
+The resident proxy runtime owns one quota sampler. It refreshes once on startup and normally schedules another pass about every five minutes with up to 10% positive jitter; provider polling throttles, reset/exhaustion suppression, and `Retry-After` may delay actual HTTP requests. Repeated all-provider failures use bounded exponential backoff. Valid semantic observations are stored in the bounded `~/.codex-helper/state/quota-samples.json` checkpoint and resume across restarts; failures and offline gaps are not interpolated. An attached TUI only reads and refreshes through the target daemon, so it never starts a competing sampler.
+
 ## Usage Page
 
-TUI page 5 is labeled `Usage`. It is a local-day usage panel, not a durable multi-day analytics warehouse.
-The Tauri desktop `Usage` page consumes the same local-day read model; its recent request rows are drilldown samples, not the source of truth for today's totals.
+TUI page 5 is labeled `Usage`. It combines daemon-owned remote quota-window analytics with the existing local-day request view; it is not a durable multi-day analytics warehouse. The Tauri desktop `Usage` page continues to consume the local-day read model, and its recent request rows are drilldown samples rather than the source of truth for totals.
 
 How to read it:
 
-- The summary band shows today's request count, tokens, estimated cost, success rate, token mix, and the global retry gate count.
-- The 24h activity band shows local-day request distribution and whether the loaded request log may be partial.
-- Provider and station rows show today's request volume, error count, tokens, estimated cost, and average latency.
-- Model, session, and project panels highlight the main local-day usage drivers.
-- Coverage warnings mean codex-helper only loaded the bounded local request log window. They are not a claim that no earlier usage exists.
-- `unknown` means there is no trusted balance data or the lookup failed. Do not treat it as healthy balance.
-- `stale` means the snapshot expired; it is distinct from `exhausted`, `error`, and `unlimited`.
-- `unlimited` is a known unlimited quota state, not unknown.
-- Balance refresh remains on the routing/provider diagnostics surfaces; use Routing/Stations `g` in TUI or the `Refresh balances` button on the Tauri desktop Providers page.
-- A single provider balance refresh failure only updates that provider's error/unknown state. It does not interrupt other provider refreshes, TUI redraw, or snapshot refresh.
+- Remote pool rows make scoped `used` or `observed since <time>`, `remaining`, and state first-viewport signals. The selected pool also shows 15/60-minute burn rates, required rate until reset, faster/on-pace/slower status, exhaustion ETA, reset, source, scope, identity confidence, and freshness. A direct remote total may still be shown when there are too few continuous samples for rates or ETA.
+- Only a proven calendar-day window may be called `today` or use a `midnight` reset label. Rolling, custom, monthly, resetless, and reset-unknown counters keep their own window wording; a resetless wallet has an ETA when possible but no required reset pace.
+- Press `g` on Usage to force a daemon-owned balance refresh. In attached mode the request goes to the target daemon. One provider failure leaves its cached value visibly offline/stale and does not clear other pools or interrupt redraw.
+- The remote pool counter is authoritative for total burn in its declared account/key/subscription scope and can include traffic from other computers. The local request ledger is authoritative only for this daemon's project attribution. Reconciliation uses `external = max(remote - local, 0)`, retains a negative signed gap when local exceeds remote, and never multiplies local request prices or distributes external usage across projects.
+- Project rows normalize new requests to a Git root when possible, with explicit fallback/unknown and omitted rows. New request costs retain their selected tier and effective pricing source/generation; older reconstructed rows lower coverage instead of being presented as captured billing facts. The local-day provider/station/model/session context and 24-hour activity remain available below the remote quota panels.
+- Identity confidence reflects the evidence used to recognize a shared pool. Proven remote ownership is high confidence; an explicit `quota_pool_id` or installation-local keyed credential fingerprint is medium; endpoint-only or conflicting evidence is low/ambiguous. Ambiguous pools remain separate and are not summed into an exact shared total. Credentials and full fingerprints are not exposed.
+- Reconciliation requires aligned remote/local windows, USD units, the same conversion generation, and adequate request-log and price coverage. Raw units, divisor changes, incompatible generations, window mismatch, truncated/reconstructed records, unpriced or unmatched requests, deduplication/boundary uncertainty, and arithmetic overflow keep the available values visible but make the difference unavailable or incomplete. A coverage warning is not a claim that earlier usage was zero.
+- `unknown` means there is no trusted remote data or the lookup failed; `stale`, `offline`, `exhausted`, `error`, and `unlimited` are distinct states. Derived rates and predictions freeze or become unavailable when freshness or sample continuity is insufficient.
 - In the desktop Usage table, the per-row `Chain` action loads the sanitized request chain only on demand. Use it for single-request diagnosis after the totals show an unusual pattern.
-- The `Routing` page keeps compact balance context and refresh controls. Use TUI `Usage` to answer what was used today; use Routing/Stations to answer balance and route eligibility questions.
+- The `Routing` page keeps compact balance context and route-eligibility controls. Use TUI `Usage` for pool burn and pace; use Routing/Stations for route eligibility.
+
+The legacy `[ui.usage_forecast]` block is still accepted when reading existing configs, but it no longer defines a separate authoritative pacing model. New pacing comes from the daemon's typed quota-pool window, reset, samples, and conversion generation.
+
+The same daemon-owned DTO is available without a local request-log dependency:
+
+```bash
+codex-helper usage quota --target local
+codex-helper usage quota --target <RELAY_TARGET> --json
+```
+
+`--target` resolves a configured local or remote relay admin endpoint. JSON mode returns the daemon's bounded quota analytics and does not recalculate slopes, reset boundaries, or project reconciliation in the CLI.
 
 ## Runtime Safeguards
 
@@ -1276,22 +1288,32 @@ Useful adapter fields:
 | `poll_interval_secs` | Refresh throttle / cache window |
 | `refresh_on_request` | Whether routed requests may trigger balance refresh |
 | `trust_exhaustion_for_routing` | Whether exhausted snapshots may demote routing |
+| `quota_pool_id` | Optional opaque operator label indicating that matching adapter views within the same origin and scope share one remote quota pool; do not put credentials here |
+| `quota_reset_timezone` | Optional IANA timezone, such as `Asia/Shanghai`, for a provider-declared calendar-day reset when no absolute timestamp is returned |
+| `quota_divisor` | Optional positive New API quota-units-per-USD fallback, used only when `/api/status` does not provide `quota_per_unit` |
 | `extract` | JSON path extraction rules for custom balance fields |
 
 ## Pricing
 
-Pricing is separate from relay config:
+Pricing is separate from relay config. BaseLLM is an estimate catalog, not a relay invoice or authoritative billed-usage source:
 
 - Local overrides: `~/.codex-helper/pricing_overrides.toml`
-- Built-in and synced catalog: rendered by TUI/desktop surfaces and used for estimated cost
-- Sync commands:
+- Automatic remote source: `https://basellm.github.io/llm-metadata/api/all.json`
+- Effective precedence: `bundled < validated remote LKG < manual whole-model override`. A manual model row replaces the remote model, including its context tiers; rows stay namespaced by canonical provider.
+- The resident daemon checks BaseLLM on startup and about every six hours using conditional requests. A candidate must pass bounded parsing and semantic/economic validation before becoming last-known-good (LKG); failures preserve the prior LKG, while suspicious economic changes are quarantined for explicit approval. Automatic refresh never writes `pricing_overrides.toml`.
+- Operator commands:
 
 ```bash
-codex-helper pricing sync <URL> --dry-run
-codex-helper pricing sync-basellm --model gpt-5 --dry-run
+codex-helper pricing status
+codex-helper pricing status --json
+codex-helper pricing force-refresh
+codex-helper pricing force-refresh --approve-economic-changes --json
+codex-helper pricing import-basellm --model gpt-5 --dry-run
 ```
 
-Use pricing overrides for local corrections or relay-specific multipliers. Do not duplicate pricing tables inside provider config.
+`pricing status` works offline and distinguishes never-synced, fresh, stale, last-error, quarantined, read-only, and corrupt state. It also reports the last check, remote body/content/check generations, the effective revision, and manual shadow/reload status. `pricing force-refresh` validates and refreshes only the remote LKG; `--approve-economic-changes` approves the exact candidate hash from the last quarantine. `pricing import-basellm` is the explicit path that imports selected provider/model rows into manual overrides. `sync-basellm` remains only as a compatibility alias for `import-basellm`.
+
+For BaseLLM context tiers, the threshold input is `ordinary input + cache read`; the 272,000 tier boundary is strict. Exactly 272,000 uses the base row, while 272,001 selects the tier for the whole request, with cache-read tokens counted once. Use manual pricing overrides for known local corrections or relay-specific multipliers, and compare estimated local cost with the remote billed counter instead of treating the estimate as an invoice.
 
 ## CLI Editing
 

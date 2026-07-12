@@ -559,6 +559,7 @@ mod tests {
                 ..UsageMetrics::default()
             }),
             cost: CostBreakdown::unknown(),
+            accounting: Default::default(),
             retry: Some(RetryInfo {
                 attempts: 1,
                 upstream_chain: vec!["raw upstream chain secret-token".to_string()],

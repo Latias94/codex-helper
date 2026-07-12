@@ -5,8 +5,9 @@ use serde::{Deserialize, Serialize};
 use crate::config::ServiceConfigManager;
 use crate::logging::RetryInfo;
 use crate::policy_actions::PolicyAction;
-use crate::pricing::CostBreakdown;
+use crate::pricing::{CostBreakdown, CostConfidence, PriceMultiplier, UsdAmount};
 use crate::provider_signals::ProviderSignal;
+use crate::quota_pool::{IdentityConfidence, PoolMembership};
 use crate::runtime_identity::ProviderEndpointKey;
 use crate::sessions;
 use crate::usage::{CacheInputAccounting, UsageMetrics};
@@ -199,6 +200,124 @@ pub struct ActiveRequest {
     pub started_at_ms: u64,
 }
 
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountingPriceCoverage {
+    Captured,
+    Reconstructed,
+    InvalidCaptured,
+    Unpriced,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[serde(default)]
+pub struct AccountingPoolMembership {
+    pub pool_key: String,
+    pub revision: u64,
+    pub confidence: IdentityConfidence,
+    pub aggregation_eligible: bool,
+}
+
+impl AccountingPoolMembership {
+    pub fn from_membership(membership: &PoolMembership) -> Self {
+        Self {
+            pool_key: membership.pool.key.clone(),
+            revision: membership.pool.revision,
+            confidence: membership.pool.confidence,
+            aggregation_eligible: membership.pool.aggregation_eligible,
+        }
+    }
+
+    pub fn is_reconciliation_eligible(&self) -> bool {
+        self.aggregation_eligible && self.confidence.aggregation_eligible()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct RequestAccountingFacts {
+    pub schema_version: u32,
+    pub project: sessions::ProjectIdentity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_endpoint: Option<ProviderEndpointKey>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool_membership: Option<AccountingPoolMembership>,
+    pub price_coverage: AccountingPriceCoverage,
+}
+
+impl RequestAccountingFacts {
+    pub const SCHEMA_VERSION: u32 = 1;
+
+    pub fn is_legacy(&self) -> bool {
+        self.schema_version == 0
+            && self.project == sessions::ProjectIdentity::default()
+            && self.provider_endpoint.is_none()
+            && self.pool_membership.is_none()
+            && self.price_coverage == AccountingPriceCoverage::Unknown
+    }
+}
+
+pub fn classify_captured_cost(cost: &CostBreakdown) -> AccountingPriceCoverage {
+    if cost.total_cost_usd.is_none()
+        && cost.input_cost_usd.is_none()
+        && cost.output_cost_usd.is_none()
+        && cost.cache_read_cost_usd.is_none()
+        && cost.cache_creation_cost_usd.is_none()
+        && cost.confidence == CostConfidence::Unknown
+    {
+        return AccountingPriceCoverage::Unpriced;
+    }
+
+    let Some(total) = cost
+        .total_cost_usd
+        .as_deref()
+        .and_then(UsdAmount::from_decimal_str)
+    else {
+        return AccountingPriceCoverage::InvalidCaptured;
+    };
+    if cost.confidence == CostConfidence::Unknown {
+        return AccountingPriceCoverage::InvalidCaptured;
+    }
+
+    let mut expected = UsdAmount::ZERO;
+    for component in [
+        cost.input_cost_usd.as_deref(),
+        cost.output_cost_usd.as_deref(),
+        cost.cache_read_cost_usd.as_deref(),
+        cost.cache_creation_cost_usd.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let Some(component) = UsdAmount::from_decimal_str(component) else {
+            return AccountingPriceCoverage::InvalidCaptured;
+        };
+        expected = expected.saturating_add(component);
+    }
+
+    for multiplier in [
+        cost.service_tier_multiplier.as_deref(),
+        cost.provider_cost_multiplier.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let Some(multiplier) = PriceMultiplier::from_decimal_str(multiplier) else {
+            return AccountingPriceCoverage::InvalidCaptured;
+        };
+        expected = multiplier.apply(expected);
+    }
+
+    if expected != total {
+        return AccountingPriceCoverage::InvalidCaptured;
+    }
+    AccountingPriceCoverage::Captured
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FinishedRequest {
     pub id: u64,
@@ -232,6 +351,8 @@ pub struct FinishedRequest {
     pub usage: Option<UsageMetrics>,
     #[serde(default, skip_serializing_if = "CostBreakdown::is_unknown")]
     pub cost: CostBreakdown,
+    #[serde(default, skip_serializing_if = "RequestAccountingFacts::is_legacy")]
+    pub accounting: RequestAccountingFacts,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry: Option<crate::logging::RetryInfo>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -370,6 +491,19 @@ pub struct FinishRequestParams {
     pub retry: Option<crate::logging::RetryInfo>,
     pub ttfb_ms: Option<u64>,
     pub streaming: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FinishRequestMetadata {
+    pub station_name: Option<String>,
+    pub provider_id: Option<String>,
+    pub upstream_base_url: Option<String>,
+    pub session_id: Option<String>,
+    pub session_identity_source: Option<SessionIdentitySource>,
+    pub cwd: Option<String>,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub route_decision: Option<RouteDecisionProvenance>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -1300,6 +1434,7 @@ mod tests {
                 ..UsageMetrics::default()
             }),
             cost: CostBreakdown::default(),
+            accounting: RequestAccountingFacts::default(),
             retry: Some(RetryInfo {
                 attempts: 2,
                 upstream_chain: vec![

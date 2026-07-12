@@ -1,6 +1,46 @@
 use super::*;
 
 #[test]
+fn request_trace_id_is_versioned_and_stable_within_process() {
+    let first = request_trace_id("codex", 42);
+    let second = request_trace_id("codex", 42);
+
+    assert_eq!(first, second);
+    assert!(is_versioned_request_trace_id(&first));
+    assert_ne!(first, legacy_request_trace_id("codex", 42));
+}
+
+#[test]
+fn request_trace_id_changes_with_boot_uuid() {
+    let first_boot =
+        uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000001").expect("first boot UUID");
+    let second_boot =
+        uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000002").expect("second boot UUID");
+
+    let first = request_trace_id_for_boot(&first_boot, "codex", 42);
+    let second = request_trace_id_for_boot(&second_boot, "codex", 42);
+
+    assert_ne!(first, second);
+    assert!(is_versioned_request_trace_id(&first));
+    assert!(is_versioned_request_trace_id(&second));
+    assert_eq!(legacy_request_trace_id("codex", 42), "codex-42");
+}
+
+#[test]
+fn only_errors_mode_keeps_success_as_minimal_accounting() {
+    let options = RequestLogOptions {
+        retention: LogRetention::new(1024, 1),
+        only_errors: true,
+    };
+
+    assert_eq!(
+        request_log_detail(options, 200),
+        RequestLogDetail::MinimalAccounting
+    );
+    assert_eq!(request_log_detail(options, 500), RequestLogDetail::Full);
+}
+
+#[test]
 fn request_log_serializes_request_id_when_present() {
     let value = serde_json::to_value(RequestLog {
         timestamp_ms: 1,
@@ -29,6 +69,9 @@ fn request_log_serializes_request_id_when_present() {
         },
         codex_bridge: None,
         usage: None,
+        streaming: false,
+        cost: &crate::pricing::CostBreakdown::default(),
+        accounting: &crate::state::RequestAccountingFacts::default(),
         http_debug: None,
         http_debug_ref: None,
         route_decision: None,
@@ -39,7 +82,10 @@ fn request_log_serializes_request_id_when_present() {
     .expect("serialize request log");
 
     assert_eq!(value["request_id"].as_u64(), Some(42));
-    assert_eq!(value["trace_id"].as_str(), Some("codex-42"));
+    assert_eq!(
+        value["trace_id"].as_str(),
+        Some(request_trace_id("codex", 42).as_str())
+    );
     assert_eq!(value["model"].as_str(), Some("gpt-5"));
     assert_eq!(value["session_identity_source"].as_str(), Some("header"));
 }
@@ -69,6 +115,9 @@ fn request_log_can_serialize_provider_endpoint_without_station_identity() {
         service_tier: ServiceTierLog::default(),
         codex_bridge: None,
         usage: None,
+        streaming: false,
+        cost: &crate::pricing::CostBreakdown::default(),
+        accounting: &crate::state::RequestAccountingFacts::default(),
         http_debug: None,
         http_debug_ref: None,
         route_decision: None,
@@ -119,6 +168,9 @@ fn request_log_serializes_codex_bridge_metadata() {
             strips_client_auth: true,
         }),
         usage: None,
+        streaming: false,
+        cost: &crate::pricing::CostBreakdown::default(),
+        accounting: &crate::state::RequestAccountingFacts::default(),
         http_debug: None,
         http_debug_ref: None,
         route_decision: None,

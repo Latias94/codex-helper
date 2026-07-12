@@ -1,4 +1,3 @@
-use crate::basellm_metadata;
 use crate::cli_types::{
     Cli, CliError, CliResult, CodexClientPatchPresetArg, CodexCompactionStrategyArg, Command,
     DaemonCommand, NotifyCommand, RelayCommand, RemoteControlCommand, SwitchCommand,
@@ -1120,10 +1119,6 @@ async fn run_server(
     let _owner_marker_guard =
         RuntimeOwnerMarkerGuard::new(service_name, port, owner_kind.is_some());
 
-    if service_name == "codex" {
-        basellm_metadata::sync_basellm_metadata_cache_background().await;
-    }
-
     if let Some(owner_kind) = owner_kind {
         let marker = RuntimeOwnerMarker::new(owner_kind, service_name, port);
         if let Err(err) = write_owner_marker(&marker) {
@@ -1179,8 +1174,6 @@ async fn run_server(
         admin_addr,
         service_name
     );
-
-    proxy.spawn_initial_balance_refresh();
 
     {
         let shutdown_tx = shutdown_tx.clone();

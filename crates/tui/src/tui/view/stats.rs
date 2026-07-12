@@ -1,3 +1,4 @@
+use chrono::{DateTime, Local};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Color, Line, Modifier, Span, Style, Text};
@@ -5,6 +6,11 @@ use ratatui::widgets::{
     Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Sparkline, Table, Wrap,
 };
 
+use crate::quota_analytics::{
+    PoolQuotaAnalytics, QuotaAnalyticsSupport, QuotaFreshnessStatus, QuotaPaceStatus,
+    QuotaRateStatus, QuotaReconciliationStatus,
+};
+use crate::quota_pool::{IdentityConfidence, QuotaQuantity, QuotaUnit, QuotaWindowKind};
 use crate::state::{UsageBucket, UsageDayDimensionRow, UsageDayView};
 use crate::tui::Language;
 use crate::tui::ProviderOption;
@@ -22,81 +28,122 @@ pub(super) fn render_stats_page(
     _providers: &[ProviderOption],
     area: Rect,
 ) {
+    let compact = area.width < 100 || area.height < 18;
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(7),
-            Constraint::Length(7),
-            Constraint::Min(0),
-        ])
+        .constraints(if compact {
+            vec![Constraint::Length(6), Constraint::Min(0)]
+        } else {
+            vec![
+                Constraint::Length(7),
+                Constraint::Length(5),
+                Constraint::Min(0),
+            ]
+        })
         .split(area);
 
-    render_kpi_row(f, p, ui.language, &snapshot.usage_day, rows[0]);
-    render_activity_row(f, p, ui.language, &snapshot.usage_day, rows[1]);
-    render_dimension_area(f, p, ui, &snapshot.usage_day, rows[2]);
+    render_quota_kpi_row(f, p, ui, snapshot, rows[0], compact);
+    if compact {
+        render_dimension_area(f, p, ui, snapshot, rows[1], true);
+    } else {
+        render_activity_row(f, p, ui.language, &snapshot.usage_day, rows[1]);
+        render_dimension_area(f, p, ui, snapshot, rows[2], false);
+    }
 }
 
-fn render_kpi_row(f: &mut Frame<'_>, p: Palette, lang: Language, usage: &UsageDayView, area: Rect) {
+fn render_quota_kpi_row(
+    f: &mut Frame<'_>,
+    p: Palette,
+    ui: &UiState,
+    snapshot: &Snapshot,
+    area: Rect,
+    compact: bool,
+) {
+    let lang = ui.language;
+    let usage = &snapshot.usage_day;
+    let quota = &snapshot.quota_analytics;
+    let selected = ui.selected_quota_pool(snapshot);
+
+    if compact {
+        let (title, lines) = quota_summary_lines(p, lang, ui, quota.support, selected, usage);
+        render_info_block(f, p, title, lines, area);
+        return;
+    }
+
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(28),
-            Constraint::Percentage(24),
-            Constraint::Percentage(24),
+            Constraint::Percentage(26),
+            Constraint::Percentage(25),
+            Constraint::Percentage(25),
             Constraint::Percentage(24),
         ])
         .split(area);
 
-    let summary = &usage.summary;
-    let ok = summary
-        .requests_total
-        .saturating_sub(summary.requests_error);
+    let Some(pool) = selected else {
+        let (title, lines) = quota_summary_lines(p, lang, ui, quota.support, None, usage);
+        render_info_block(f, p, title, lines, area);
+        return;
+    };
+
     render_info_block(
         f,
         p,
         match lang {
-            Language::Zh => format!("今日用量 {}", usage.label),
-            Language::En => format!("Today {}", usage.label),
+            Language::Zh => format!("额度池 {}", ui.selected_stats_pool_idx + 1),
+            Language::En => format!("Quota Pool {}", ui.selected_stats_pool_idx + 1),
         },
         vec![
+            kv_line(p, "source", &shorten(&pool.source, 24), p.text),
             kv_line(
                 p,
-                "tokens",
-                &tokens_short(summary.usage.total_tokens),
-                p.accent,
+                "scope",
+                &format!(
+                    "{} / {}",
+                    pool.identity.scope.as_key(),
+                    identity_confidence(pool)
+                ),
+                identity_color(p, pool),
             ),
-            kv_line(p, "cost", &summary.cost.display_total(), p.text),
-            kv_line(p, "coverage", &cost_coverage_label(summary, lang), p.muted),
+            kv_line(
+                p,
+                "state",
+                &pool_state_label(pool, ui, lang),
+                pool_state_color(p, pool, ui),
+            ),
+            kv_line(p, "age", &pool_age(pool), p.muted),
         ],
         cols[0],
     );
 
+    let remote_usage = remote_usage_display(pool, lang);
     render_info_block(
         f,
         p,
         match lang {
-            Language::Zh => "请求",
-            Language::En => "Requests",
+            Language::Zh => "远端额度",
+            Language::En => "Remote Quota",
         },
         vec![
-            Line::from(vec![
-                muted(p, "total "),
-                Span::styled(
-                    summary.requests_total.to_string(),
-                    Style::default().fg(p.text),
-                ),
-                Span::raw("  "),
-                muted(p, "ok "),
-                Span::styled(ok.to_string(), Style::default().fg(p.good)),
-                Span::raw("  "),
-                muted(p, "err "),
-                Span::styled(
-                    summary.requests_error.to_string(),
-                    Style::default().fg(p.warn),
-                ),
-            ]),
-            kv_line(p, "success", &success_pct(summary), p.good),
-            kv_line(p, "avg latency", &avg_duration(summary), p.text),
+            kv_line(
+                p,
+                &remote_usage.label,
+                &quantity_text(remote_usage.quantity),
+                p.accent,
+            ),
+            kv_line(
+                p,
+                "remaining",
+                &quantity_text(pool.remote_remaining.as_ref()),
+                p.text,
+            ),
+            kv_line(
+                p,
+                "limit",
+                &quantity_text(pool.remote_limit.as_ref()),
+                p.muted,
+            ),
+            kv_line(p, "unit", pool.unit.as_str(), unit_color(p, pool.unit)),
         ],
         cols[1],
     );
@@ -105,79 +152,65 @@ fn render_kpi_row(f: &mut Frame<'_>, p: Palette, lang: Language, usage: &UsageDa
         f,
         p,
         match lang {
-            Language::Zh => "Token 结构",
-            Language::En => "Token Mix",
+            Language::Zh => "消耗速率",
+            Language::En => "Burn Rate",
         },
         vec![
-            Line::from(vec![
-                muted(p, "in "),
-                Span::styled(
-                    tokens_short(summary.usage.input_tokens),
-                    Style::default().fg(p.text),
-                ),
-                Span::raw("  "),
-                muted(p, "out "),
-                Span::styled(
-                    tokens_short(summary.usage.output_tokens),
-                    Style::default().fg(p.text),
-                ),
-            ]),
             kv_line(
                 p,
-                "cache read",
-                &tokens_short(summary.usage.cache_read_tokens_total()),
+                "15m",
+                &rate_text(&pool.rate_15m, lang),
+                rate_color(p, pool.rate_15m.status),
+            ),
+            kv_line(
+                p,
+                "60m",
+                &rate_text(&pool.rate_60m, lang),
+                rate_color(p, pool.rate_60m.status),
+            ),
+            kv_line(
+                p,
+                "required",
+                &hourly_quantity_text(pool.pacing.required_rate_per_hour.as_ref()),
                 p.muted,
             ),
             kv_line(
                 p,
-                "reasoning",
-                &tokens_short(summary.usage.reasoning_output_tokens_total()),
-                p.muted,
+                "ETA",
+                &pool
+                    .pacing
+                    .exhaustion_eta_ms
+                    .map(duration_short)
+                    .unwrap_or_else(|| "-".to_string()),
+                p.text,
             ),
         ],
         cols[2],
     );
 
-    let gate = &usage.retry_gate;
-    let reasons = if gate.reasons.is_empty() {
-        "-".to_string()
-    } else {
-        gate.reasons
-            .iter()
-            .map(|row| format!("{}:{}", shorten(&row.reason, 18), row.active))
-            .collect::<Vec<_>>()
-            .join("  ")
-    };
+    let summary = &usage.summary;
     render_info_block(
         f,
         p,
         match lang {
-            Language::Zh => "Retry Gate",
-            Language::En => "Retry Gate",
+            Language::Zh => "节奏 / 本机今日",
+            Language::En => "Pace / Local Today",
         },
         vec![
             kv_line(
                 p,
-                "active",
-                &gate.active.to_string(),
-                gate_style(p, gate.active),
+                "pace",
+                &pace_label(pool.pacing.status, lang),
+                pace_color(p, pool.pacing.status),
             ),
+            kv_line(p, "reset", &reset_text(pool, now_ms(), lang), p.muted),
+            kv_line(p, "local cost", &summary.cost.display_total(), p.text),
             kv_line(
                 p,
-                "cooldown",
-                &gate.active_cooldowns.to_string(),
-                gate_style(p, gate.active_cooldowns),
+                "local tokens",
+                &tokens_short(summary.usage.total_tokens),
+                p.accent,
             ),
-            kv_line(
-                p,
-                "max left",
-                &gate
-                    .max_remaining_secs
-                    .map(|secs| duration_short(secs.saturating_mul(1000)))
-                    .unwrap_or_else(|| "-".to_string()),
-                p.muted,
-            ),
-            kv_line(p, "reason", &shorten(&reasons, 56), p.muted),
         ],
         cols[3],
     );
@@ -292,24 +325,41 @@ fn render_dimension_area(
     f: &mut Frame<'_>,
     p: Palette,
     ui: &mut UiState,
-    usage: &UsageDayView,
+    snapshot: &Snapshot,
     area: Rect,
+    compact: bool,
 ) {
+    if compact {
+        render_focus_table(f, p, ui, snapshot, area);
+        return;
+    }
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .constraints([Constraint::Percentage(66), Constraint::Percentage(34)])
         .split(area);
-    render_focus_table(f, p, ui, usage, cols[0]);
-    render_side_lists(f, p, ui.language, usage, cols[1]);
+    render_focus_table(f, p, ui, snapshot, cols[0]);
+    render_side_lists(f, p, ui.language, &snapshot.usage_day, cols[1]);
 }
 
 fn render_focus_table(
     f: &mut Frame<'_>,
     p: Palette,
     ui: &mut UiState,
-    usage: &UsageDayView,
+    snapshot: &Snapshot,
     area: Rect,
 ) {
+    match ui.stats_focus {
+        StatsFocus::Pools => {
+            render_pool_table(f, p, ui, snapshot, area);
+            return;
+        }
+        StatsFocus::Projects => {
+            render_project_table(f, p, ui, snapshot, area);
+            return;
+        }
+        StatsFocus::Providers | StatsFocus::Stations => {}
+    }
+    let usage = &snapshot.usage_day;
     let (title, rows, table_state) = match ui.stats_focus {
         StatsFocus::Providers => (
             match ui.language {
@@ -327,6 +377,7 @@ fn render_focus_table(
             &usage.station_rows,
             &mut ui.stats_stations_table,
         ),
+        StatsFocus::Pools | StatsFocus::Projects => unreachable!("handled above"),
     };
 
     let table_rows = rows
@@ -357,6 +408,256 @@ fn render_focus_table(
     .highlight_symbol("  ")
     .highlight_spacing(HighlightSpacing::Always);
     f.render_stateful_widget(table, area, table_state);
+}
+
+fn render_pool_table(
+    f: &mut Frame<'_>,
+    p: Palette,
+    ui: &mut UiState,
+    snapshot: &Snapshot,
+    area: Rect,
+) {
+    let lang = ui.language;
+    let rows = snapshot
+        .quota_analytics
+        .pools
+        .iter()
+        .map(|pool| {
+            let displayed_used = remote_usage_display(pool, lang).quantity;
+            Row::new(vec![
+                Cell::from(Span::styled(pool_name(pool), Style::default().fg(p.text))),
+                Cell::from(Span::styled(
+                    quantity_text(displayed_used),
+                    Style::default().fg(p.accent),
+                )),
+                Cell::from(Span::styled(
+                    quantity_text(pool.remote_remaining.as_ref()),
+                    Style::default().fg(p.text),
+                )),
+                Cell::from(Span::styled(
+                    rate_text(&pool.rate_60m, lang),
+                    Style::default().fg(rate_color(p, pool.rate_60m.status)),
+                )),
+                Cell::from(Span::styled(
+                    pace_label(pool.pacing.status, lang),
+                    Style::default().fg(pace_color(p, pool.pacing.status)),
+                )),
+                Cell::from(Span::styled(pool_age(pool), Style::default().fg(p.muted))),
+                Cell::from(Span::styled(
+                    format!(
+                        "{} / {}",
+                        pool.identity.scope.as_key(),
+                        identity_confidence(pool)
+                    ),
+                    Style::default().fg(identity_color(p, pool)),
+                )),
+            ])
+            .style(Style::default().bg(p.panel).fg(p.text))
+        })
+        .collect::<Vec<_>>();
+    let title = match snapshot.quota_analytics.support {
+        QuotaAnalyticsSupport::Unsupported => match lang {
+            Language::Zh => "额度池（daemon 不支持）".to_string(),
+            Language::En => "Quota Pools (unsupported daemon)".to_string(),
+        },
+        QuotaAnalyticsSupport::Supported => match lang {
+            Language::Zh => format!(
+                "额度池 {}（省略 {}）",
+                snapshot.quota_analytics.pools.len(),
+                snapshot.quota_analytics.omitted_pools
+            ),
+            Language::En => format!(
+                "Quota Pools {} ({} omitted)",
+                snapshot.quota_analytics.pools.len(),
+                snapshot.quota_analytics.omitted_pools
+            ),
+        },
+    };
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Min(18),
+            Constraint::Length(12),
+            Constraint::Length(12),
+            Constraint::Length(12),
+            Constraint::Length(11),
+            Constraint::Length(8),
+            Constraint::Length(18),
+        ],
+    )
+    .header(Row::new(vec![
+        Cell::from(muted(p, "pool")),
+        Cell::from(muted(p, "remote total")),
+        Cell::from(muted(p, "remaining")),
+        Cell::from(muted(p, "60m")),
+        Cell::from(muted(p, "pace")),
+        Cell::from(muted(p, "age")),
+        Cell::from(muted(p, "scope / confidence")),
+    ]))
+    .block(panel_block(p, title))
+    .row_highlight_style(Style::default().bg(Color::Rgb(32, 39, 48)))
+    .highlight_symbol("  ")
+    .highlight_spacing(HighlightSpacing::Always);
+    f.render_stateful_widget(table, area, &mut ui.stats_pools_table);
+}
+
+fn render_project_table(
+    f: &mut Frame<'_>,
+    p: Palette,
+    ui: &mut UiState,
+    snapshot: &Snapshot,
+    area: Rect,
+) {
+    let lang = ui.language;
+    let selected_pool = ui.selected_quota_pool(snapshot).cloned();
+    let summary_height = if area.height >= 7 { 3 } else { 0 };
+    let areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(summary_height)])
+        .split(area);
+    let mut rows = selected_pool
+        .as_ref()
+        .map(|pool| {
+            pool.reconciliation
+                .projects
+                .iter()
+                .map(|row| {
+                    Row::new(vec![
+                        Cell::from(Span::styled("project", Style::default().fg(p.muted))),
+                        Cell::from(Span::styled(
+                            shorten(row.project.display_key(), 64),
+                            Style::default().fg(p.text),
+                        )),
+                        Cell::from(Span::styled(
+                            quantity_text(Some(&row.local_cost)),
+                            Style::default().fg(p.accent),
+                        )),
+                        Cell::from(Span::styled(
+                            row.requests.to_string(),
+                            Style::default().fg(p.text),
+                        )),
+                    ])
+                    .style(Style::default().bg(p.panel).fg(p.text))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if let Some(pool) = selected_pool.as_ref() {
+        let reconciliation = &pool.reconciliation;
+        if reconciliation.omitted_projects > 0 {
+            let label = match lang {
+                Language::Zh => format!("其余 {} 个项目", reconciliation.omitted_projects),
+                Language::En => format!("{} more projects", reconciliation.omitted_projects),
+            };
+            rows.push(
+                Row::new(vec![
+                    Cell::from(Span::styled("omitted", Style::default().fg(p.muted))),
+                    Cell::from(Span::styled(label, Style::default().fg(p.muted))),
+                    Cell::from(Span::styled(
+                        quantity_text(reconciliation.omitted_local_known.as_ref()),
+                        Style::default().fg(p.muted),
+                    )),
+                    Cell::from(Span::styled("-", Style::default().fg(p.muted))),
+                ])
+                .style(Style::default().bg(p.panel)),
+            );
+        }
+        for (kind, label, value, color) in [
+            (
+                "unknown",
+                match lang {
+                    Language::Zh => "本机未知项目",
+                    Language::En => "local unknown project",
+                },
+                reconciliation.local_unknown.as_ref(),
+                p.warn,
+            ),
+            (
+                "external",
+                match lang {
+                    Language::Zh => "外部 / 未归因",
+                    Language::En => "external / unattributed",
+                },
+                reconciliation.external_unattributed.as_ref(),
+                p.muted,
+            ),
+        ] {
+            if value.is_some() {
+                rows.push(
+                    Row::new(vec![
+                        Cell::from(Span::styled(kind, Style::default().fg(color))),
+                        Cell::from(Span::styled(label, Style::default().fg(color))),
+                        Cell::from(Span::styled(
+                            quantity_text(value),
+                            Style::default().fg(color),
+                        )),
+                        Cell::from(Span::styled("-", Style::default().fg(p.muted))),
+                    ])
+                    .style(Style::default().bg(p.panel)),
+                );
+            }
+        }
+        if let Some(gap) = reconciliation.signed_delta {
+            rows.push(
+                Row::new(vec![
+                    Cell::from(Span::styled("gap", Style::default().fg(gap_color(p, gap)))),
+                    Cell::from(Span::styled(
+                        match lang {
+                            Language::Zh => "远端 - 本机",
+                            Language::En => "remote - local",
+                        },
+                        Style::default().fg(gap_color(p, gap)),
+                    )),
+                    Cell::from(Span::styled(
+                        signed_usd_text(gap),
+                        Style::default().fg(gap_color(p, gap)),
+                    )),
+                    Cell::from(Span::styled("-", Style::default().fg(p.muted))),
+                ])
+                .style(Style::default().bg(p.panel)),
+            );
+        }
+    }
+    let title = match lang {
+        Language::Zh => "项目归因",
+        Language::En => "Project Attribution",
+    };
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(10),
+            Constraint::Min(22),
+            Constraint::Length(16),
+            Constraint::Length(8),
+        ],
+    )
+    .header(Row::new(vec![
+        Cell::from(muted(p, "kind")),
+        Cell::from(muted(p, "project")),
+        Cell::from(muted(p, "local cost")),
+        Cell::from(muted(p, "requests")),
+    ]))
+    .block(panel_block(p, title))
+    .row_highlight_style(Style::default().bg(Color::Rgb(32, 39, 48)))
+    .highlight_symbol("  ")
+    .highlight_spacing(HighlightSpacing::Always);
+    f.render_stateful_widget(table, areas[0], &mut ui.stats_projects_table);
+
+    if summary_height > 0 {
+        let line = selected_pool
+            .as_ref()
+            .map(|pool| reconciliation_summary(pool, lang))
+            .unwrap_or_else(|| match lang {
+                Language::Zh => "未选择额度池".to_string(),
+                Language::En => "no quota pool selected".to_string(),
+            });
+        f.render_widget(
+            Paragraph::new(line)
+                .style(Style::default().fg(p.muted).bg(p.panel))
+                .wrap(Wrap { trim: true }),
+            areas[1],
+        );
+    }
 }
 
 fn render_side_lists(
@@ -497,7 +798,7 @@ fn panel_block(p: Palette, title: impl Into<String>) -> Block<'static> {
         .style(Style::default().bg(p.panel))
 }
 
-fn kv_line(p: Palette, key: &'static str, value: &str, color: Color) -> Line<'static> {
+fn kv_line(p: Palette, key: &str, value: &str, color: Color) -> Line<'static> {
     Line::from(vec![
         muted(p, key),
         Span::raw(" "),
@@ -509,16 +810,575 @@ fn muted(p: Palette, value: &str) -> Span<'static> {
     Span::styled(value.to_string(), Style::default().fg(p.muted))
 }
 
-fn gate_style(p: Palette, value: u64) -> Color {
-    if value > 0 { p.warn } else { p.good }
+fn quota_summary_lines(
+    p: Palette,
+    lang: Language,
+    ui: &UiState,
+    support: QuotaAnalyticsSupport,
+    pool: Option<&PoolQuotaAnalytics>,
+    usage: &UsageDayView,
+) -> (String, Vec<Line<'static>>) {
+    if support == QuotaAnalyticsSupport::Unsupported {
+        return (
+            match lang {
+                Language::Zh => "远端额度（不支持）".to_string(),
+                Language::En => "Remote Quota (unsupported)".to_string(),
+            },
+            vec![
+                kv_line(
+                    p,
+                    "status",
+                    match lang {
+                        Language::Zh => "当前 daemon 未提供额度分析",
+                        Language::En => "current daemon has no quota analytics",
+                    },
+                    p.warn,
+                ),
+                kv_line(p, "local cost", &usage.summary.cost.display_total(), p.text),
+                kv_line(
+                    p,
+                    "local tokens",
+                    &tokens_short(usage.summary.usage.total_tokens),
+                    p.accent,
+                ),
+            ],
+        );
+    }
+    let Some(pool) = pool else {
+        return (
+            match lang {
+                Language::Zh => "远端额度".to_string(),
+                Language::En => "Remote Quota".to_string(),
+            },
+            vec![
+                kv_line(
+                    p,
+                    "status",
+                    match lang {
+                        Language::Zh => "没有支持的额度适配器或样本",
+                        Language::En => "no supported quota adapter or sample",
+                    },
+                    p.muted,
+                ),
+                kv_line(
+                    p,
+                    "refresh",
+                    if ui.balance_refresh_in_flight {
+                        match lang {
+                            Language::Zh => "同步中",
+                            Language::En => "syncing",
+                        }
+                    } else {
+                        "-"
+                    },
+                    if ui.balance_refresh_in_flight {
+                        p.accent
+                    } else {
+                        p.muted
+                    },
+                ),
+                kv_line(p, "local cost", &usage.summary.cost.display_total(), p.text),
+            ],
+        );
+    };
+
+    let remote_usage = remote_usage_display(pool, lang);
+    (
+        match lang {
+            Language::Zh => format!("远端额度 · {}", pool_name(pool)),
+            Language::En => format!("Remote Quota · {}", pool_name(pool)),
+        },
+        vec![
+            Line::from(vec![
+                muted(p, &format!("{} ", remote_usage.label)),
+                Span::styled(
+                    quantity_text(remote_usage.quantity),
+                    Style::default().fg(p.accent),
+                ),
+                Span::raw("  "),
+                muted(p, "remaining "),
+                Span::styled(
+                    quantity_text(pool.remote_remaining.as_ref()),
+                    Style::default().fg(p.text),
+                ),
+                Span::raw("  "),
+                muted(p, "state "),
+                Span::styled(
+                    pool_state_label(pool, ui, lang),
+                    Style::default().fg(pool_state_color(p, pool, ui)),
+                ),
+            ]),
+            Line::from(vec![
+                muted(p, "15m "),
+                Span::styled(
+                    rate_text(&pool.rate_15m, lang),
+                    Style::default().fg(rate_color(p, pool.rate_15m.status)),
+                ),
+                Span::raw("  "),
+                muted(p, "60m "),
+                Span::styled(
+                    rate_text(&pool.rate_60m, lang),
+                    Style::default().fg(rate_color(p, pool.rate_60m.status)),
+                ),
+                Span::raw("  "),
+                muted(p, "required "),
+                Span::styled(
+                    hourly_quantity_text(pool.pacing.required_rate_per_hour.as_ref()),
+                    Style::default().fg(p.muted),
+                ),
+            ]),
+            Line::from(vec![
+                muted(p, "pace "),
+                Span::styled(
+                    pace_label(pool.pacing.status, lang),
+                    Style::default().fg(pace_color(p, pool.pacing.status)),
+                ),
+                Span::raw("  "),
+                muted(p, "ETA "),
+                Span::styled(
+                    pool.pacing
+                        .exhaustion_eta_ms
+                        .map(duration_short)
+                        .unwrap_or_else(|| "-".to_string()),
+                    Style::default().fg(p.text),
+                ),
+                Span::raw("  "),
+                muted(p, "reset "),
+                Span::styled(
+                    reset_text(pool, now_ms(), lang),
+                    Style::default().fg(p.muted),
+                ),
+            ]),
+            Line::from(vec![
+                muted(p, "source "),
+                Span::styled(shorten(&pool.source, 12), Style::default().fg(p.text)),
+                Span::raw("  "),
+                muted(p, "scope "),
+                Span::styled(
+                    pool.identity.scope.as_key(),
+                    Style::default().fg(identity_color(p, pool)),
+                ),
+                Span::raw("  "),
+                muted(p, "confidence "),
+                Span::styled(
+                    identity_confidence(pool),
+                    Style::default().fg(identity_color(p, pool)),
+                ),
+            ]),
+        ],
+    )
 }
 
-fn success_pct(bucket: &UsageBucket) -> String {
-    if bucket.requests_total == 0 {
-        return "-".to_string();
+struct RemoteUsageDisplay<'a> {
+    label: String,
+    quantity: Option<&'a QuotaQuantity>,
+}
+
+fn remote_usage_display<'a>(
+    pool: &'a PoolQuotaAnalytics,
+    lang: Language,
+) -> RemoteUsageDisplay<'a> {
+    if let Some(quantity) = pool.remote_direct_total.as_ref() {
+        let label = if pool.window.allows_today_label() {
+            match lang {
+                Language::Zh => "今日已用",
+                Language::En => "today used",
+            }
+        } else {
+            match lang {
+                Language::Zh => "远端窗口",
+                Language::En => "remote window",
+            }
+        };
+        return RemoteUsageDisplay {
+            label: label.to_string(),
+            quantity: Some(quantity),
+        };
     }
-    let ok = bucket.requests_total.saturating_sub(bucket.requests_error);
-    format!("{:.0}%", (ok as f64 / bucket.requests_total as f64) * 100.0)
+
+    if let Some(quantity) = pool.observed_burn.as_ref() {
+        let since = local_clock_text(pool.epoch_start_ms);
+        let label = match lang {
+            Language::Zh => format!("自 {since} 观测"),
+            Language::En => format!("observed since {since}"),
+        };
+        return RemoteUsageDisplay {
+            label,
+            quantity: Some(quantity),
+        };
+    }
+
+    let label = if pool.capabilities.cumulative {
+        match lang {
+            Language::Zh => "累计已用",
+            Language::En => "cumulative used",
+        }
+    } else {
+        match lang {
+            Language::Zh => "已用",
+            Language::En => "used",
+        }
+    };
+    RemoteUsageDisplay {
+        label: label.to_string(),
+        quantity: pool.remote_used.as_ref(),
+    }
+}
+
+fn local_clock_text(timestamp_ms: u64) -> String {
+    i64::try_from(timestamp_ms)
+        .ok()
+        .and_then(DateTime::from_timestamp_millis)
+        .map(|timestamp| timestamp.with_timezone(&Local).format("%H:%M").to_string())
+        .unwrap_or_else(|| "?".to_string())
+}
+
+fn hourly_quantity_text(quantity: Option<&QuotaQuantity>) -> String {
+    let value = quantity_text(quantity);
+    if value == "-" {
+        value
+    } else {
+        format!("{value}/h")
+    }
+}
+
+fn pool_name(pool: &PoolQuotaAnalytics) -> String {
+    let origin = pool
+        .identity
+        .origin
+        .strip_prefix("https://")
+        .or_else(|| pool.identity.origin.strip_prefix("http://"))
+        .unwrap_or(pool.identity.origin.as_str());
+    if origin.is_empty() {
+        shorten(&pool.source, 30)
+    } else {
+        shorten(origin, 30)
+    }
+}
+
+fn identity_confidence(pool: &PoolQuotaAnalytics) -> &'static str {
+    match pool.identity.confidence {
+        IdentityConfidence::High => "high",
+        IdentityConfidence::Medium => "medium",
+        IdentityConfidence::Low => "low",
+        IdentityConfidence::Unknown => "unknown",
+    }
+}
+
+fn identity_color(p: Palette, pool: &PoolQuotaAnalytics) -> Color {
+    if pool.identity.aggregation_eligible {
+        match pool.identity.confidence {
+            IdentityConfidence::High => p.good,
+            IdentityConfidence::Medium => p.accent,
+            IdentityConfidence::Low | IdentityConfidence::Unknown => p.warn,
+        }
+    } else {
+        p.warn
+    }
+}
+
+fn unit_color(p: Palette, unit: QuotaUnit) -> Color {
+    match unit {
+        QuotaUnit::Usd | QuotaUnit::Tokens => p.text,
+        QuotaUnit::Raw | QuotaUnit::Unknown => p.warn,
+    }
+}
+
+fn quantity_text(quantity: Option<&QuotaQuantity>) -> String {
+    let Some(quantity) = quantity else {
+        return "-".to_string();
+    };
+    let Some(decimal) = decimal_text(quantity.value, quantity.scale) else {
+        return "-".to_string();
+    };
+    match quantity.unit {
+        QuotaUnit::Usd => format!("${decimal}"),
+        QuotaUnit::Tokens => format!("{decimal} tok"),
+        QuotaUnit::Raw => format!("{decimal} raw"),
+        QuotaUnit::Unknown => format!("{decimal} ?"),
+    }
+}
+
+fn decimal_text(value: i128, scale: u32) -> Option<String> {
+    let scale = usize::try_from(scale).ok()?;
+    if scale > 38 {
+        return None;
+    }
+    let negative = value < 0;
+    let mut digits = value.unsigned_abs().to_string();
+    if scale > 0 {
+        if digits.len() <= scale {
+            digits.insert_str(0, &"0".repeat(scale + 1 - digits.len()));
+        }
+        digits.insert(digits.len() - scale, '.');
+    }
+    Some(if negative {
+        format!("-{digits}")
+    } else {
+        digits
+    })
+}
+
+fn signed_usd_text(value: crate::usage_balance::SignedUsdDelta) -> String {
+    let decimal = value.format_usd();
+    decimal.strip_prefix('-').map_or_else(
+        || format!("${decimal}"),
+        |magnitude| format!("-${magnitude}"),
+    )
+}
+
+fn rate_text(rate: &crate::quota_analytics::QuotaRateWindow, lang: Language) -> String {
+    if rate.status == QuotaRateStatus::Available {
+        let value = quantity_text(rate.rate_per_hour.as_ref());
+        return if rate.lower_bound {
+            format!(">={value}/h")
+        } else {
+            format!("{value}/h")
+        };
+    }
+    match (rate.status, lang) {
+        (QuotaRateStatus::InsufficientSamples | QuotaRateStatus::ShortSpan, Language::Zh) => {
+            "样本不足".to_string()
+        }
+        (QuotaRateStatus::InsufficientSamples | QuotaRateStatus::ShortSpan, Language::En) => {
+            "low sample".to_string()
+        }
+        (QuotaRateStatus::Stale, Language::Zh) => "已过期".to_string(),
+        (QuotaRateStatus::Stale, Language::En) => "stale".to_string(),
+        (QuotaRateStatus::Gap, Language::Zh) => "采样中断".to_string(),
+        (QuotaRateStatus::Gap, Language::En) => "sample gap".to_string(),
+        (QuotaRateStatus::Adjustment | QuotaRateStatus::NegativeDelta, Language::Zh) => {
+            "额度调整".to_string()
+        }
+        (QuotaRateStatus::Adjustment | QuotaRateStatus::NegativeDelta, Language::En) => {
+            "adjustment".to_string()
+        }
+        _ => "-".to_string(),
+    }
+}
+
+fn rate_color(p: Palette, status: QuotaRateStatus) -> Color {
+    match status {
+        QuotaRateStatus::Available => p.accent,
+        QuotaRateStatus::Stale
+        | QuotaRateStatus::Gap
+        | QuotaRateStatus::Adjustment
+        | QuotaRateStatus::NegativeDelta => p.warn,
+        _ => p.muted,
+    }
+}
+
+fn pace_label(status: QuotaPaceStatus, lang: Language) -> String {
+    match (status, lang) {
+        (QuotaPaceStatus::Unlimited, Language::Zh) => "无限额度",
+        (QuotaPaceStatus::Unlimited, Language::En) => "unlimited",
+        (QuotaPaceStatus::Faster, Language::Zh) => "偏快",
+        (QuotaPaceStatus::Faster, Language::En) => "faster",
+        (QuotaPaceStatus::OnPace, Language::Zh) => "正常",
+        (QuotaPaceStatus::OnPace, Language::En) => "on pace",
+        (QuotaPaceStatus::Slower, Language::Zh) => "偏慢",
+        (QuotaPaceStatus::Slower, Language::En) => "slower",
+        (QuotaPaceStatus::NoReset, Language::Zh) => "不重置",
+        (QuotaPaceStatus::NoReset, Language::En) => "no reset",
+        (QuotaPaceStatus::ResetUnknown, Language::Zh) => "重置未知",
+        (QuotaPaceStatus::ResetUnknown, Language::En) => "reset unknown",
+        (QuotaPaceStatus::LowSample, Language::Zh) => "样本不足",
+        (QuotaPaceStatus::LowSample, Language::En) => "low sample",
+        (QuotaPaceStatus::Stale, Language::Zh) => "已过期",
+        (QuotaPaceStatus::Stale, Language::En) => "stale",
+        (QuotaPaceStatus::Unavailable, _) => "-",
+    }
+    .to_string()
+}
+
+fn pace_color(p: Palette, status: QuotaPaceStatus) -> Color {
+    match status {
+        QuotaPaceStatus::Unlimited | QuotaPaceStatus::OnPace | QuotaPaceStatus::Slower => p.good,
+        QuotaPaceStatus::Faster | QuotaPaceStatus::Stale => p.warn,
+        _ => p.muted,
+    }
+}
+
+fn pool_state_label(pool: &PoolQuotaAnalytics, ui: &UiState, lang: Language) -> String {
+    if ui.balance_refresh_in_flight {
+        return match lang {
+            Language::Zh => "同步中",
+            Language::En => "syncing",
+        }
+        .to_string();
+    }
+    if !pool.identity.aggregation_eligible {
+        return match lang {
+            Language::Zh => "身份模糊",
+            Language::En => "ambiguous identity",
+        }
+        .to_string();
+    }
+    if pool.capabilities.unlimited {
+        return pace_label(QuotaPaceStatus::Unlimited, lang);
+    }
+    if pool
+        .remote_remaining
+        .as_ref()
+        .is_some_and(QuotaQuantity::is_zero)
+    {
+        return match lang {
+            Language::Zh => "已用尽",
+            Language::En => "exhausted",
+        }
+        .to_string();
+    }
+    if pool.latest_adjustment
+        == Some(crate::quota_pool::QuotaAdjustmentKind::CounterResetOrRollback)
+    {
+        return match lang {
+            Language::Zh => "刚重置 / 回滚",
+            Language::En => "just reset / rollback",
+        }
+        .to_string();
+    }
+    match (pool.freshness, lang) {
+        (QuotaFreshnessStatus::Fresh, Language::Zh) => "新鲜",
+        (QuotaFreshnessStatus::Fresh, Language::En) => "fresh",
+        (QuotaFreshnessStatus::Stale, Language::Zh) => "已过期（缓存）",
+        (QuotaFreshnessStatus::Stale, Language::En) => "stale (cached)",
+        (QuotaFreshnessStatus::Offline, Language::Zh) => "离线（缓存）",
+        (QuotaFreshnessStatus::Offline, Language::En) => "offline (cached)",
+        (QuotaFreshnessStatus::Unknown, Language::Zh) => "未知",
+        (QuotaFreshnessStatus::Unknown, Language::En) => "unknown",
+    }
+    .to_string()
+}
+
+fn pool_state_color(p: Palette, pool: &PoolQuotaAnalytics, ui: &UiState) -> Color {
+    if ui.balance_refresh_in_flight {
+        return p.accent;
+    }
+    if !pool.identity.aggregation_eligible
+        || matches!(
+            pool.freshness,
+            QuotaFreshnessStatus::Stale | QuotaFreshnessStatus::Offline
+        )
+    {
+        return p.warn;
+    }
+    if pool
+        .remote_remaining
+        .as_ref()
+        .is_some_and(QuotaQuantity::is_zero)
+    {
+        return p.bad;
+    }
+    p.good
+}
+
+fn pool_age(pool: &PoolQuotaAnalytics) -> String {
+    duration_short(now_ms().saturating_sub(pool.observed_at_ms))
+}
+
+fn reset_text(pool: &PoolQuotaAnalytics, now_ms: u64, lang: Language) -> String {
+    if pool.pacing.status == QuotaPaceStatus::Unlimited {
+        return pace_label(pool.pacing.status, lang);
+    }
+    if pool.pacing.status == QuotaPaceStatus::NoReset
+        || pool.window.kind == QuotaWindowKind::Resetless
+    {
+        return pace_label(QuotaPaceStatus::NoReset, lang);
+    }
+    let Some(reset_at_ms) = pool.pacing.reset_at_ms else {
+        return match lang {
+            Language::Zh => "未知",
+            Language::En => "unknown",
+        }
+        .to_string();
+    };
+    let duration = duration_short(reset_at_ms.saturating_sub(now_ms));
+    if pool.window.allows_midnight_label() {
+        match lang {
+            Language::Zh => format!("午夜前 {duration}"),
+            Language::En => format!("midnight in {duration}"),
+        }
+    } else {
+        match lang {
+            Language::Zh => format!("{duration} 后重置"),
+            Language::En => format!("reset in {duration}"),
+        }
+    }
+}
+
+fn gap_color(p: Palette, gap: crate::usage_balance::SignedUsdDelta) -> Color {
+    if gap.femto_usd() < 0 { p.warn } else { p.muted }
+}
+
+fn reconciliation_summary(pool: &PoolQuotaAnalytics, lang: Language) -> String {
+    let reconciliation = &pool.reconciliation;
+    let status = match (reconciliation.status, lang) {
+        (QuotaReconciliationStatus::Available, Language::Zh) => "可对账",
+        (QuotaReconciliationStatus::Available, Language::En) => "reconciled",
+        (QuotaReconciliationStatus::IncompleteCoverage, Language::Zh) => "覆盖不完整",
+        (QuotaReconciliationStatus::IncompleteCoverage, Language::En) => "incomplete coverage",
+        (QuotaReconciliationStatus::IncompatibleUnit, Language::Zh) => "单位不兼容",
+        (QuotaReconciliationStatus::IncompatibleUnit, Language::En) => "incompatible unit",
+        (QuotaReconciliationStatus::IncompatibleGeneration, Language::Zh) => "换算版本不兼容",
+        (QuotaReconciliationStatus::IncompatibleGeneration, Language::En) => {
+            "incompatible conversion"
+        }
+        (QuotaReconciliationStatus::StaleRemote, Language::Zh) => "远端已过期",
+        (QuotaReconciliationStatus::StaleRemote, Language::En) => "stale remote",
+        (_, Language::Zh) => "暂不可对账",
+        (_, Language::En) => "reconciliation unavailable",
+    };
+    format!(
+        "{} | local={} unknown={} external={} gap={} | {}",
+        status,
+        quantity_text(reconciliation.local_known.as_ref()),
+        quantity_text(reconciliation.local_unknown.as_ref()),
+        quantity_text(reconciliation.external_unattributed.as_ref()),
+        reconciliation
+            .signed_delta
+            .map(signed_usd_text)
+            .unwrap_or_else(|| "-".to_string()),
+        attribution_coverage_label(&reconciliation.coverage, lang)
+    )
+}
+
+fn attribution_coverage_label(
+    coverage: &crate::state::AttributionCoverage,
+    lang: Language,
+) -> &'static str {
+    if coverage.replay_in_progress {
+        return match lang {
+            Language::Zh => "回放中",
+            Language::En => "replay in progress",
+        };
+    }
+    if coverage.bytes_truncated
+        || coverage.lines_truncated
+        || coverage.time_truncated
+        || coverage.count_truncated
+        || coverage.leading_boundary_partial
+    {
+        return match lang {
+            Language::Zh => "已截断",
+            Language::En => "truncated",
+        };
+    }
+    if coverage.append_failed_requests > 0 {
+        return match lang {
+            Language::Zh => "日志写入失败",
+            Language::En => "log append failure",
+        };
+    }
+    if !coverage.complete_for_reconciliation() {
+        return match lang {
+            Language::Zh => "覆盖不完整",
+            Language::En => "incomplete coverage",
+        };
+    }
+    match lang {
+        Language::Zh => "覆盖完整",
+        Language::En => "complete coverage",
+    }
 }
 
 fn avg_duration(bucket: &UsageBucket) -> String {
@@ -527,20 +1387,6 @@ fn avg_duration(bucket: &UsageBucket) -> String {
         .checked_div(bucket.requests_total)
         .map(duration_short)
         .unwrap_or_else(|| "-".to_string())
-}
-
-fn cost_coverage_label(bucket: &UsageBucket, lang: Language) -> String {
-    match (
-        bucket.cost.priced_requests,
-        bucket.cost.unpriced_requests,
-        lang,
-    ) {
-        (0, 0, _) => "-".to_string(),
-        (priced, 0, Language::Zh) => format!("估算 {priced}"),
-        (priced, 0, Language::En) => format!("estimated {priced}"),
-        (priced, unpriced, Language::Zh) => format!("估算 {priced} / 未知 {unpriced}"),
-        (priced, unpriced, Language::En) => format!("estimated {priced} / unknown {unpriced}"),
-    }
 }
 
 #[cfg(test)]
@@ -553,6 +1399,14 @@ mod tests {
     use ratatui::buffer::Buffer;
 
     use super::*;
+    use crate::quota_analytics::{
+        QuotaAnalyticsView, QuotaPacingView, QuotaProjectRow, QuotaReconciliationView,
+    };
+    use crate::quota_pool::{
+        IdentityEvidence, PoolIdentity, QuotaCapabilities, QuotaResetKind, QuotaScope,
+        QuotaWindowSemantics,
+    };
+    use crate::sessions::{ProjectIdentity, ProjectIdentityKind};
     use crate::state::{
         UsageDayCoverage, UsageDayDimensionRow, UsageDayHourRow, UsageDayView,
         UsageRetryGateReasonRow, UsageRetryGateSummary,
@@ -576,6 +1430,100 @@ mod tests {
         UsageDayDimensionRow {
             name: name.to_string(),
             bucket: bucket(requests, tokens),
+        }
+    }
+
+    fn sample_quota_analytics() -> QuotaAnalyticsView {
+        let generated_at_ms = 10 * 60 * 60_000;
+        let usd = |value| QuotaQuantity::from_integer(value, QuotaUnit::Usd);
+        QuotaAnalyticsView {
+            support: QuotaAnalyticsSupport::Supported,
+            generated_at_ms,
+            registry_generation: 7,
+            pools: vec![PoolQuotaAnalytics {
+                identity: PoolIdentity {
+                    key: "explicit:relay.example:account:input20".to_string(),
+                    origin: "https://relay.example".to_string(),
+                    scope: QuotaScope::Account,
+                    revision: 2,
+                    evidence: IdentityEvidence::ExplicitPoolId,
+                    confidence: IdentityConfidence::Medium,
+                    aggregation_eligible: true,
+                    conflicting_evidence: false,
+                },
+                observed_at_ms: generated_at_ms - 60_000,
+                last_success_at_ms: Some(generated_at_ms - 60_000),
+                last_attempt_at_ms: Some(generated_at_ms - 60_000),
+                freshness: QuotaFreshnessStatus::Fresh,
+                source: "sub2api".to_string(),
+                unit: QuotaUnit::Usd,
+                capabilities: QuotaCapabilities {
+                    used: true,
+                    remaining: true,
+                    direct_total: true,
+                    limit: true,
+                    reset: true,
+                    window: true,
+                    cumulative: true,
+                    ..QuotaCapabilities::default()
+                },
+                window: QuotaWindowSemantics {
+                    kind: QuotaWindowKind::CalendarDay,
+                    reset: QuotaResetKind::ExplicitTimestamp,
+                    reset_timezone: Some("Asia/Shanghai".to_string()),
+                    ..QuotaWindowSemantics::default()
+                },
+                epoch_start_ms: 0,
+                epoch_end_ms: Some(generated_at_ms + 8 * 60 * 60_000),
+                remote_used: Some(usd(100)),
+                remote_direct_total: Some(usd(100)),
+                remote_remaining: Some(usd(40)),
+                remote_limit: Some(usd(140)),
+                observed_burn: Some(usd(100)),
+                rate_15m: crate::quota_analytics::QuotaRateWindow {
+                    status: QuotaRateStatus::Available,
+                    rate_per_hour: Some(usd(12)),
+                    sample_count: 4,
+                    span_ms: 15 * 60_000,
+                    ..crate::quota_analytics::QuotaRateWindow::default()
+                },
+                rate_60m: crate::quota_analytics::QuotaRateWindow {
+                    status: QuotaRateStatus::Available,
+                    rate_per_hour: Some(usd(10)),
+                    sample_count: 12,
+                    span_ms: 60 * 60_000,
+                    ..crate::quota_analytics::QuotaRateWindow::default()
+                },
+                pacing: QuotaPacingView {
+                    status: QuotaPaceStatus::OnPace,
+                    required_rate_per_hour: Some(usd(5)),
+                    pace_ratio_basis_points: Some(10_000),
+                    exhaustion_eta_ms: Some(4 * 60 * 60_000),
+                    projected_remaining_at_reset: Some(usd(0)),
+                    reset_at_ms: Some(generated_at_ms + 8 * 60 * 60_000),
+                },
+                reconciliation: QuotaReconciliationView {
+                    status: QuotaReconciliationStatus::Available,
+                    remote_total: Some(usd(100)),
+                    local_known: Some(usd(55)),
+                    local_unknown: Some(usd(5)),
+                    external_unattributed: Some(usd(40)),
+                    signed_delta: Some(crate::usage_balance::SignedUsdDelta::from_femto_usd(
+                        40 * 10_i128.pow(15),
+                    )),
+                    projects: vec![QuotaProjectRow {
+                        project: ProjectIdentity {
+                            kind: ProjectIdentityKind::GitRoot,
+                            path: Some("F:/SourceCodes/Rust/codex-helper".to_string()),
+                        },
+                        local_cost: usd(55),
+                        requests: 11,
+                    }],
+                    ..QuotaReconciliationView::default()
+                },
+                ..PoolQuotaAnalytics::default()
+            }],
+            omitted_pools: 0,
         }
     }
 
@@ -632,9 +1580,9 @@ mod tests {
                     ..UsageDayCoverage::default()
                 },
             },
+            quota_analytics: sample_quota_analytics(),
             usage_rollup: crate::state::UsageRollupView::default(),
             provider_balances: HashMap::new(),
-            provider_balance_history: HashMap::new(),
             station_health: HashMap::new(),
             health_checks: HashMap::new(),
             lb_view: HashMap::new(),
@@ -670,21 +1618,21 @@ mod tests {
     }
 
     #[test]
-    fn stats_render_uses_usage_day_and_global_retry_gate() {
+    fn stats_render_prioritizes_remote_pool_and_pace() {
         let snapshot = sample_snapshot();
         let mut ui = UiState {
             page: crate::tui::types::Page::Stats,
-            stats_focus: StatsFocus::Providers,
+            stats_focus: StatsFocus::Pools,
             ..UiState::default()
         };
 
         let text = render_text(128, 26, &mut ui, &snapshot);
 
-        assert!(text.contains("Today"));
-        assert!(text.contains("Retry Gate"));
-        assert!(text.contains("active"));
-        assert!(text.contains("reasoning_tokens"));
-        assert!(text.contains("input"));
+        assert!(text.contains("Remote Quota"));
+        assert!(text.contains("relay.example"));
+        assert!(text.contains("on pace"));
+        assert!(text.contains("$100"));
+        assert!(!text.contains("Retry Gate"));
         assert!(text.contains("Coverage"));
     }
 
@@ -693,13 +1641,296 @@ mod tests {
         let snapshot = sample_snapshot();
         let mut ui = UiState {
             page: crate::tui::types::Page::Stats,
-            stats_focus: StatsFocus::Stations,
+            stats_focus: StatsFocus::Projects,
             ..UiState::default()
         };
 
         let text = render_text(76, 22, &mut ui, &snapshot);
 
-        assert!(text.contains("Stations") || text.contains("站点"));
-        assert!(!text.contains("15d"));
+        assert!(text.contains("Project Attribution"));
+        assert!(text.contains("F:/SourceCodes/Rust/codex-helper"));
+        assert!(text.contains("external"));
+        assert!(text.contains("required"), "{text}");
+        assert!(text.contains("ETA"), "{text}");
+        assert!(text.contains("confidence"), "{text}");
+    }
+
+    #[test]
+    fn remote_usage_label_never_calls_partial_observation_today() {
+        let mut pool = sample_quota_analytics().pools.remove(0);
+        pool.remote_direct_total = None;
+        pool.remote_used = None;
+        pool.observed_burn = Some(QuotaQuantity::from_integer(12, QuotaUnit::Usd));
+        pool.epoch_start_ms = 10 * 60 * 60_000;
+
+        let display = remote_usage_display(&pool, Language::En);
+
+        assert!(display.label.starts_with("observed since "));
+        assert!(!display.label.contains("today"));
+        assert_eq!(display.quantity, pool.observed_burn.as_ref());
+    }
+
+    #[test]
+    fn coverage_label_uses_the_complete_reconciliation_contract() {
+        let mut coverage = crate::state::AttributionCoverage {
+            unpriced_requests: 1,
+            ..crate::state::AttributionCoverage::default()
+        };
+
+        assert_eq!(
+            attribution_coverage_label(&coverage, Language::En),
+            "incomplete coverage"
+        );
+        coverage.unpriced_requests = 0;
+        assert_eq!(
+            attribution_coverage_label(&coverage, Language::En),
+            "complete coverage"
+        );
+    }
+
+    #[test]
+    fn stats_render_distinguishes_old_daemon_unsupported_from_empty_supported() {
+        let mut snapshot = sample_snapshot();
+        snapshot.quota_analytics = QuotaAnalyticsView::default();
+        let mut ui = UiState {
+            page: crate::tui::types::Page::Stats,
+            stats_focus: StatsFocus::Pools,
+            ..UiState::default()
+        };
+
+        let unsupported = render_text(76, 22, &mut ui, &snapshot);
+        assert!(unsupported.contains("unsupported"));
+
+        snapshot.quota_analytics.support = QuotaAnalyticsSupport::Supported;
+        let empty = render_text(76, 22, &mut ui, &snapshot);
+        assert!(empty.contains("no supported quota adapter"));
+        assert!(!empty.contains("unsupported daemon"));
+    }
+
+    struct QuotaPageScenario {
+        name: &'static str,
+        visible_label: &'static str,
+        compact_kpis: &'static [&'static str],
+        configure: fn(&mut Snapshot, &mut UiState),
+    }
+
+    #[test]
+    fn quota_page_state_matrix_keeps_compact_kpis_and_selected_row_visible() {
+        let scenarios = [
+            QuotaPageScenario {
+                name: "syncing",
+                visible_label: "syncing",
+                compact_kpis: &["today used $100", "remaining $40", "15m $12/h", "60m $10/h"],
+                configure: |_, ui| ui.balance_refresh_in_flight = true,
+            },
+            QuotaPageScenario {
+                name: "offline cached",
+                visible_label: "offline (cached)",
+                compact_kpis: &["today used $100", "remaining $40", "pace on pace"],
+                configure: |snapshot, _| {
+                    snapshot.quota_analytics.pools[0].freshness = QuotaFreshnessStatus::Offline;
+                },
+            },
+            QuotaPageScenario {
+                name: "unsupported",
+                visible_label: "unsupported",
+                compact_kpis: &[
+                    "current daemon has no quota analytics",
+                    "local cost",
+                    "local tokens",
+                ],
+                configure: |snapshot, _| {
+                    snapshot.quota_analytics.support = QuotaAnalyticsSupport::Unsupported;
+                },
+            },
+            QuotaPageScenario {
+                name: "ambiguous identity",
+                visible_label: "ambiguous identity",
+                compact_kpis: &["today used $100", "remaining $40", "confidence medium"],
+                configure: |snapshot, _| {
+                    snapshot.quota_analytics.pools[0]
+                        .identity
+                        .aggregation_eligible = false;
+                },
+            },
+            QuotaPageScenario {
+                name: "unlimited",
+                visible_label: "unlimited",
+                compact_kpis: &["today used $100", "pace unlimited", "reset unlimited"],
+                configure: |snapshot, _| {
+                    let pool = &mut snapshot.quota_analytics.pools[0];
+                    pool.capabilities.unlimited = true;
+                    pool.pacing.status = QuotaPaceStatus::Unlimited;
+                    pool.pacing.required_rate_per_hour = None;
+                    pool.pacing.exhaustion_eta_ms = None;
+                },
+            },
+            QuotaPageScenario {
+                name: "exhausted",
+                visible_label: "exhausted",
+                compact_kpis: &["today used $100", "remaining $0", "required $5/h"],
+                configure: |snapshot, _| {
+                    snapshot.quota_analytics.pools[0].remote_remaining =
+                        Some(QuotaQuantity::from_integer(0, QuotaUnit::Usd));
+                },
+            },
+            QuotaPageScenario {
+                name: "just reset",
+                visible_label: "just reset / rollback",
+                compact_kpis: &["today used $100", "remaining $40", "15m $12/h"],
+                configure: |snapshot, _| {
+                    snapshot.quota_analytics.pools[0].latest_adjustment =
+                        Some(crate::quota_pool::QuotaAdjustmentKind::CounterResetOrRollback);
+                },
+            },
+            QuotaPageScenario {
+                name: "low sample",
+                visible_label: "low sample",
+                compact_kpis: &["15m low sample", "60m low sample", "pace low sample"],
+                configure: |snapshot, _| {
+                    let pool = &mut snapshot.quota_analytics.pools[0];
+                    pool.rate_15m = crate::quota_analytics::QuotaRateWindow {
+                        status: QuotaRateStatus::InsufficientSamples,
+                        sample_count: 2,
+                        ..crate::quota_analytics::QuotaRateWindow::default()
+                    };
+                    pool.rate_60m = crate::quota_analytics::QuotaRateWindow {
+                        status: QuotaRateStatus::ShortSpan,
+                        sample_count: 2,
+                        ..crate::quota_analytics::QuotaRateWindow::default()
+                    };
+                    pool.pacing = QuotaPacingView {
+                        status: QuotaPaceStatus::LowSample,
+                        ..QuotaPacingView::default()
+                    };
+                },
+            },
+        ];
+
+        for scenario in scenarios {
+            let mut snapshot = sample_snapshot();
+            let mut ui = UiState {
+                page: crate::tui::types::Page::Stats,
+                stats_focus: StatsFocus::Pools,
+                ..UiState::default()
+            };
+            ui.stats_pools_table.select(Some(0));
+            (scenario.configure)(&mut snapshot, &mut ui);
+
+            let text = render_text(76, 22, &mut ui, &snapshot);
+            let lines = text.lines().collect::<Vec<_>>();
+            assert_eq!(
+                lines.len(),
+                22,
+                "{} rendered outside 76x22: {text}",
+                scenario.name
+            );
+            let compact = lines[..6].join("\n");
+            let table = lines[6..].join("\n");
+
+            assert!(
+                compact.contains(scenario.visible_label),
+                "{} did not show `{}` in compact summary: {text}",
+                scenario.name,
+                scenario.visible_label
+            );
+            for expected in scenario.compact_kpis {
+                assert!(
+                    compact.contains(expected),
+                    "{} did not show compact KPI `{expected}`: {text}",
+                    scenario.name
+                );
+            }
+            assert!(
+                table.contains("relay.example"),
+                "{} overwrote or clipped the selected pool row: {text}",
+                scenario.name
+            );
+        }
+    }
+
+    #[test]
+    fn stats_render_preserves_negative_gap_and_external_floor() {
+        let mut snapshot = sample_snapshot();
+        let reconciliation = &mut snapshot.quota_analytics.pools[0].reconciliation;
+        reconciliation.remote_total = Some(QuotaQuantity::from_integer(50, QuotaUnit::Usd));
+        reconciliation.local_known = Some(QuotaQuantity::from_integer(60, QuotaUnit::Usd));
+        reconciliation.local_unknown = None;
+        reconciliation.external_unattributed = Some(QuotaQuantity::from_integer(0, QuotaUnit::Usd));
+        reconciliation.signed_delta = Some(crate::usage_balance::SignedUsdDelta::from_femto_usd(
+            -10 * 10_i128.pow(15),
+        ));
+        let mut ui = UiState {
+            page: crate::tui::types::Page::Stats,
+            stats_focus: StatsFocus::Projects,
+            ..UiState::default()
+        };
+
+        let text = render_text(128, 26, &mut ui, &snapshot);
+
+        assert!(text.contains("external / unattributed"), "{text}");
+        assert!(text.contains("$0"), "{text}");
+        assert!(text.contains("-$10"), "{text}");
+        assert!(!text.contains("$-10"), "{text}");
+    }
+
+    #[test]
+    fn stats_render_keeps_raw_remote_and_mismatched_local_values_separate() {
+        let mut snapshot = sample_snapshot();
+        let pool = &mut snapshot.quota_analytics.pools[0];
+        pool.unit = QuotaUnit::Raw;
+        pool.remote_used = None;
+        pool.remote_direct_total = Some(QuotaQuantity::from_integer(500_000, QuotaUnit::Raw));
+        pool.remote_remaining = Some(QuotaQuantity::from_integer(250_000, QuotaUnit::Raw));
+        pool.remote_limit = Some(QuotaQuantity::from_integer(750_000, QuotaUnit::Raw));
+        pool.observed_burn = None;
+        pool.reconciliation.status = QuotaReconciliationStatus::IncompatibleGeneration;
+        pool.reconciliation.remote_total =
+            Some(QuotaQuantity::from_integer(500_000, QuotaUnit::Raw));
+        pool.reconciliation.local_known = Some(
+            QuotaQuantity::from_integer(1, QuotaUnit::Usd).with_conversion_generation(Some(42)),
+        );
+        pool.reconciliation.local_unknown = None;
+        pool.reconciliation.external_unattributed = None;
+        pool.reconciliation.signed_delta = None;
+        let mut ui = UiState {
+            page: crate::tui::types::Page::Stats,
+            stats_focus: StatsFocus::Projects,
+            ..UiState::default()
+        };
+
+        let text = render_text(128, 26, &mut ui, &snapshot);
+
+        assert!(text.contains("500000 raw"), "{text}");
+        assert!(text.contains("$1"), "{text}");
+        assert!(text.contains("incompatible conversion"), "{text}");
+        assert!(!text.contains("external / unattributed"), "{text}");
+    }
+
+    #[test]
+    fn resetless_pool_does_not_claim_midnight_reset() {
+        let mut snapshot = sample_snapshot();
+        let pool = &mut snapshot.quota_analytics.pools[0];
+        pool.window.kind = QuotaWindowKind::Resetless;
+        pool.window.reset = QuotaResetKind::NoReset;
+        pool.rate_60m = crate::quota_analytics::QuotaRateWindow {
+            status: QuotaRateStatus::NoCounter,
+            ..crate::quota_analytics::QuotaRateWindow::default()
+        };
+        pool.pacing = QuotaPacingView {
+            status: QuotaPaceStatus::NoReset,
+            ..QuotaPacingView::default()
+        };
+        assert_eq!(rate_text(&pool.rate_60m, Language::En), "-");
+        let mut ui = UiState {
+            page: crate::tui::types::Page::Stats,
+            stats_focus: StatsFocus::Pools,
+            ..UiState::default()
+        };
+
+        let text = render_text(76, 22, &mut ui, &snapshot);
+
+        assert!(text.contains("no reset"), "{text}");
+        assert!(!text.contains("midnight"), "{text}");
     }
 }

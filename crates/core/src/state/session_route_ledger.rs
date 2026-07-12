@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -98,43 +98,115 @@ impl SessionRouteAffinityStore {
         let Some(path) = self.path.as_ref() else {
             return Ok(());
         };
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
         let ledger = PersistedSessionRouteAffinityLedger {
             schema_version: SESSION_ROUTE_AFFINITY_LEDGER_SCHEMA_VERSION,
             updated_at_ms,
             entries: entries.clone(),
         };
         let text = serde_json::to_string_pretty(&ledger).map_err(std::io::Error::other)?;
-        let tmp_path = path.with_extension(format!(
-            "json.tmp-{}-{}-{}",
-            std::process::id(),
-            updated_at_ms,
-            uuid::Uuid::new_v4()
-        ));
-        tokio::fs::write(&tmp_path, text).await?;
-        match tokio::fs::rename(&tmp_path, path).await {
+        match crate::file_replace::write_bytes_file_async(path, text.as_bytes()).await {
             Ok(()) => Ok(()),
-            Err(err) if should_retry_ledger_rename_after_remove(err.kind()) => {
-                let _ = tokio::fs::remove_file(path).await;
-                match tokio::fs::rename(&tmp_path, path).await {
-                    Ok(()) => Ok(()),
-                    Err(err) => {
-                        let _ = tokio::fs::remove_file(&tmp_path).await;
-                        Err(err)
-                    }
-                }
-            }
-            Err(err) => {
-                let _ = tokio::fs::remove_file(&tmp_path).await;
-                Err(err)
-            }
+            Err(err) => recover_session_route_candidate(path, text.as_bytes(), err).await,
         }
     }
 }
 
-fn should_retry_ledger_rename_after_remove(kind: std::io::ErrorKind) -> bool {
-    kind == std::io::ErrorKind::AlreadyExists
-        || (cfg!(windows) && kind == std::io::ErrorKind::PermissionDenied)
+fn validate_session_route_candidate(bytes: &[u8]) -> std::io::Result<()> {
+    let ledger = serde_json::from_slice::<PersistedSessionRouteAffinityLedger>(bytes)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    if ledger.schema_version != SESSION_ROUTE_AFFINITY_LEDGER_SCHEMA_VERSION {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "unsupported session route affinity ledger schema {}; expected {}",
+                ledger.schema_version, SESSION_ROUTE_AFFINITY_LEDGER_SCHEMA_VERSION
+            ),
+        ));
+    }
+    Ok(())
+}
+
+async fn recover_session_route_candidate(
+    path: &Path,
+    candidate: &[u8],
+    error: crate::file_replace::AtomicWriteError,
+) -> std::io::Result<()> {
+    crate::file_replace::recover_uncertain_candidate_async(
+        path,
+        candidate,
+        error,
+        validate_session_route_candidate,
+    )
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestFile(PathBuf);
+
+    impl TestFile {
+        fn new() -> Self {
+            let directory = std::env::temp_dir().join(format!(
+                "codex-helper-session-route-store-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&directory).expect("create test directory");
+            Self(directory.join("session-routes.json"))
+        }
+    }
+
+    impl Drop for TestFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+            if let Some(parent) = self.0.parent() {
+                let _ = std::fs::remove_dir(parent);
+            }
+        }
+    }
+
+    fn uncertain_error(path: &Path) -> crate::file_replace::AtomicWriteError {
+        crate::file_replace::AtomicWriteError::CommitStateUnknown {
+            path: path.to_path_buf(),
+            stage: "injected test replacement",
+            source: std::io::Error::other("injected uncertainty"),
+        }
+    }
+
+    #[tokio::test]
+    async fn uncertain_write_recovers_only_the_exact_valid_session_route_candidate() {
+        let path = TestFile::new();
+        let candidate = serde_json::to_vec_pretty(&PersistedSessionRouteAffinityLedger {
+            schema_version: SESSION_ROUTE_AFFINITY_LEDGER_SCHEMA_VERSION,
+            updated_at_ms: 2,
+            entries: HashMap::new(),
+        })
+        .expect("serialize candidate");
+        tokio::fs::write(&path.0, &candidate)
+            .await
+            .expect("write recovered candidate");
+
+        recover_session_route_candidate(&path.0, &candidate, uncertain_error(&path.0))
+            .await
+            .expect("exact valid candidate should recover");
+
+        let old = serde_json::to_vec_pretty(&PersistedSessionRouteAffinityLedger {
+            schema_version: SESSION_ROUTE_AFFINITY_LEDGER_SCHEMA_VERSION,
+            updated_at_ms: 1,
+            entries: HashMap::new(),
+        })
+        .expect("serialize old ledger");
+        tokio::fs::write(&path.0, &old)
+            .await
+            .expect("write old ledger");
+        let err = recover_session_route_candidate(&path.0, &candidate, uncertain_error(&path.0))
+            .await
+            .expect_err("different valid bytes must not recover as the candidate");
+        assert!(err.to_string().contains("do not match the candidate"));
+        assert_eq!(
+            tokio::fs::read(&path.0).await.expect("read old ledger"),
+            old
+        );
+    }
 }

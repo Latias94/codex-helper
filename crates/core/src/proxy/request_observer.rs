@@ -3,10 +3,12 @@ use std::sync::Arc;
 use axum::http::Method;
 
 use crate::logging::{
-    CodexBridgeLog, HttpDebugLog, RetryInfo, ServiceTierLog, log_request_with_debug,
+    CodexBridgeLog, HttpDebugLog, RetryInfo, ServiceTierLog, log_finished_request_with_debug,
 };
+use crate::runtime_identity::ProviderEndpointKey;
 use crate::state::{
-    FinishRequestParams, ProxyState, RouteDecisionProvenance, SessionIdentitySource,
+    FinishRequestMetadata, FinishRequestParams, ProxyState, RouteDecisionProvenance,
+    SessionIdentitySource,
 };
 use crate::usage::UsageMetrics;
 
@@ -31,8 +33,6 @@ impl RequestPublicationGate {
 pub(super) struct RequestObserver {
     state: Arc<ProxyState>,
     service_name: String,
-    method: String,
-    path: String,
 }
 
 impl RequestObserver {
@@ -48,14 +48,12 @@ impl RequestObserver {
     pub(super) fn from_parts(
         state: Arc<ProxyState>,
         service_name: impl Into<String>,
-        method: impl Into<String>,
-        path: impl Into<String>,
+        _method: impl Into<String>,
+        _path: impl Into<String>,
     ) -> Self {
         Self {
             state,
             service_name: service_name.into(),
-            method: method.into(),
-            path: path.into(),
         }
     }
 
@@ -84,51 +82,77 @@ impl RequestObserver {
             http_debug,
             streaming,
         } = publication;
-
-        let published = self
-            .state
-            .finish_request(FinishRequestParams {
-                id: request_id,
-                status_code,
-                duration_ms,
-                ended_at_ms,
-                observed_service_tier: service_tier.actual.clone(),
-                usage: usage.clone(),
-                retry: retry.clone(),
-                ttfb_ms,
-                streaming,
-            })
-            .await;
-        if !published {
-            return false;
-        }
-
-        log_request_with_debug(
-            Some(request_id),
+        let provider_endpoint = provider_endpoint_from_publication(
             self.service_name.as_str(),
-            self.method.as_str(),
-            self.path.as_str(),
-            status_code,
-            duration_ms,
-            ttfb_ms,
-            station_name.as_deref(),
+            provider_id.as_deref(),
+            endpoint_id.as_deref(),
+            provider_endpoint_key.as_deref(),
+        );
+
+        let Some(finished) = self
+            .state
+            .finish_request_with_endpoint(
+                FinishRequestParams {
+                    id: request_id,
+                    status_code,
+                    duration_ms,
+                    ended_at_ms,
+                    observed_service_tier: service_tier.actual.clone(),
+                    usage,
+                    retry,
+                    ttfb_ms,
+                    streaming,
+                },
+                provider_endpoint,
+                FinishRequestMetadata {
+                    station_name,
+                    provider_id,
+                    upstream_base_url: (!upstream_base_url.trim().is_empty()
+                        && upstream_base_url != "-")
+                        .then_some(upstream_base_url),
+                    session_id,
+                    session_identity_source,
+                    cwd,
+                    model,
+                    reasoning_effort,
+                    route_decision,
+                },
+            )
+            .await
+        else {
+            return false;
+        };
+
+        let outcome =
+            log_finished_request_with_debug(&finished, service_tier, codex_bridge, http_debug);
+        if !outcome.accounting_appended {
+            self.state.record_accounting_append_failure(&finished).await;
+        }
+        true
+    }
+}
+
+fn provider_endpoint_from_publication(
+    service_name: &str,
+    provider_id: Option<&str>,
+    endpoint_id: Option<&str>,
+    stable_key: Option<&str>,
+) -> Option<ProviderEndpointKey> {
+    if let (Some(provider_id), Some(endpoint_id)) = (provider_id, endpoint_id) {
+        return Some(ProviderEndpointKey::new(
+            service_name,
             provider_id,
             endpoint_id,
-            provider_endpoint_key,
-            upstream_base_url.as_str(),
-            session_id,
-            session_identity_source,
-            cwd,
-            model,
-            reasoning_effort,
-            service_tier,
-            codex_bridge,
-            usage,
-            route_decision,
-            retry,
-            http_debug,
-        );
-        true
+        ));
+    }
+    let mut parts = stable_key?.split('/');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(service), Some(provider), Some(endpoint), None)
+            if !service.is_empty() && !provider.is_empty() && !endpoint.is_empty() =>
+        {
+            Some(ProviderEndpointKey::new(service, provider, endpoint))
+        }
+        _ => None,
     }
 }
 
@@ -213,6 +237,8 @@ impl RequestPublication {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::balance::ProviderBalanceSnapshot;
+    use crate::quota_pool::{QuotaObservationContext, QuotaScope};
     use crate::state::ProxyState;
     use std::path::{Path, PathBuf};
     use std::sync::OnceLock;
@@ -277,11 +303,31 @@ mod tests {
         let temp_home = temp_proxy_home("non_stream_publication_is_exactly_once");
         unsafe {
             scoped.set_path("CODEX_HELPER_HOME", temp_home.as_path());
+            scoped.set("CODEX_HELPER_QUOTA_SAMPLE_STATE", "off");
+            scoped.set("CODEX_HELPER_QUOTA_IDENTITY_PATH", "off");
         }
 
         let state = ProxyState::new();
+        let repository = temp_home.join("repository");
+        let nested = repository.join("crates").join("core");
+        std::fs::create_dir_all(repository.join(".git")).expect("create git marker");
+        std::fs::create_dir_all(&nested).expect("create nested cwd");
+        let endpoint = ProviderEndpointKey::new("codex", "provider-a", "endpoint-a");
+        let mut quota_context = QuotaObservationContext::new("https://relay.example");
+        quota_context.scope = QuotaScope::Account;
+        quota_context.explicit_pool_id = Some("shared-package".to_string());
+        let mut quota_snapshot =
+            ProviderBalanceSnapshot::new("provider-a", "station-a", 0, "test", 900, None);
+        quota_snapshot.quota_used_usd = Some("1".to_string());
+        quota_snapshot.quota_remaining_usd = Some("9".to_string());
+        quota_snapshot.quota_limit_usd = Some("10".to_string());
+        quota_snapshot.refresh_status(900);
+        state
+            .record_quota_snapshot(endpoint, quota_context, &quota_snapshot)
+            .await;
         let request_id = state
             .begin_request_for_test()
+            .cwd(nested.to_string_lossy())
             .started_at_ms(1_000)
             .begin()
             .await;
@@ -303,6 +349,35 @@ mod tests {
         assert_eq!(recent[0].id, request_id);
         assert_eq!(recent[0].status_code, 200);
         assert!(!recent[0].streaming);
+        assert_eq!(
+            recent[0].accounting.project.kind,
+            crate::state::ProjectIdentityKind::GitRoot
+        );
+        assert_eq!(
+            recent[0]
+                .accounting
+                .pool_membership
+                .as_ref()
+                .map(|membership| membership.revision),
+            Some(0)
+        );
+
+        let request_log = std::fs::read_to_string(crate::logging::request_log_path())
+            .expect("read immutable request accounting log");
+        let rows = request_log.lines().collect::<Vec<_>>();
+        assert_eq!(rows.len(), 1);
+        let logged: serde_json::Value =
+            serde_json::from_str(rows[0]).expect("request accounting row");
+        assert_eq!(logged["timestamp_ms"].as_u64(), Some(recent[0].ended_at_ms));
+        assert_eq!(logged["timestamp_ms"].as_u64(), Some(1_025));
+        assert_eq!(
+            logged.get("cost"),
+            serde_json::to_value(&recent[0].cost).ok().as_ref()
+        );
+        assert_eq!(
+            logged.get("accounting"),
+            serde_json::to_value(&recent[0].accounting).ok().as_ref()
+        );
     }
 
     #[tokio::test]
@@ -347,11 +422,17 @@ mod tests {
         publication.station_name = Some("station-a".to_string());
         publication.provider_id = Some("provider-a".to_string());
         publication.endpoint_id = Some("endpoint-a".to_string());
-        publication.provider_endpoint_key = Some("codex:provider-a:endpoint-a".to_string());
+        publication.provider_endpoint_key = Some("codex/provider-a/endpoint-a".to_string());
         publication.upstream_base_url = "http://upstream.test".to_string();
         publication.session_id = Some("session-a".to_string());
         publication.model = Some("gpt-5".to_string());
         publication.reasoning_effort = Some("medium".to_string());
+        publication.usage = Some(UsageMetrics {
+            input_tokens: 100,
+            output_tokens: 50,
+            total_tokens: 150,
+            ..UsageMetrics::default()
+        });
         publication
     }
 

@@ -130,6 +130,7 @@ mod tests {
             global_route_target_override: Some("input-light".to_string()),
             station_meta_overrides: HashMap::new(),
             usage_day: crate::state::UsageDayView::default(),
+            quota_analytics: crate::quota_analytics::QuotaAnalyticsView::default(),
             usage_rollup: crate::state::UsageRollupView {
                 by_config: vec![(
                     "超级路由入口".to_string(),
@@ -181,7 +182,6 @@ mod tests {
                     }],
                 ),
             ]),
-            provider_balance_history: HashMap::new(),
             station_health: HashMap::new(),
             health_checks: HashMap::new(),
             lb_view: HashMap::new(),
@@ -447,11 +447,16 @@ mod tests {
                 Page::Stats => {
                     let compact_text = text_without_whitespace(&text);
                     assert!(
-                        text.contains("Usage") || compact_text.contains("今日用量"),
+                        text.contains("Usage") || compact_text.contains("5用量"),
                         "{text}"
                     );
-                    assert!(text.contains("Retry Gate"), "{text}");
-                    assert!(compact_text.contains("覆盖范围"), "{text}");
+                    assert!(
+                        text.contains("Remote Quota") || compact_text.contains("远端额度"),
+                        "{text}"
+                    );
+                    if width >= 100 {
+                        assert!(compact_text.contains("覆盖范围"), "{text}");
+                    }
                 }
                 Page::Stations => {
                     assert!(text.contains("entry route main"), "{text}");

@@ -83,6 +83,7 @@ fn routing_provider_balance_line_falls_back_for_legacy_snapshot_keys() {
         global_route_target_override: None,
         station_meta_overrides: std::collections::HashMap::new(),
         usage_day: crate::state::UsageDayView::default(),
+        quota_analytics: crate::quota_analytics::QuotaAnalyticsView::default(),
         usage_rollup: crate::state::UsageRollupView::default(),
         provider_balances: std::collections::HashMap::from([(
             "input".to_string(),
@@ -93,7 +94,6 @@ fn routing_provider_balance_line_falls_back_for_legacy_snapshot_keys() {
                 ..crate::state::ProviderBalanceSnapshot::default()
             }],
         )]),
-        provider_balance_history: std::collections::HashMap::new(),
         station_health: std::collections::HashMap::new(),
         health_checks: std::collections::HashMap::new(),
         lb_view: std::collections::HashMap::new(),
@@ -125,6 +125,7 @@ fn routing_provider_balance_line_prefers_routing_context() {
         global_route_target_override: None,
         station_meta_overrides: std::collections::HashMap::new(),
         usage_day: crate::state::UsageDayView::default(),
+        quota_analytics: crate::quota_analytics::QuotaAnalyticsView::default(),
         usage_rollup: crate::state::UsageRollupView::default(),
         provider_balances: std::collections::HashMap::from([
             (
@@ -156,7 +157,6 @@ fn routing_provider_balance_line_prefers_routing_context() {
                 }],
             ),
         ]),
-        provider_balance_history: std::collections::HashMap::new(),
         station_health: std::collections::HashMap::new(),
         health_checks: std::collections::HashMap::new(),
         lb_view: std::collections::HashMap::new(),
