@@ -138,6 +138,7 @@
         "usage_summaries",
         "usage_day",
         "usage_rollup",
+        "quota_analytics",
         "stats_5m",
         "stats_1h",
         "pricing_catalog",
@@ -173,6 +174,11 @@
           "name": "usage_rollup",
           "optional": false,
           "type": "ApiUsageRollupView"
+        },
+        {
+          "name": "quota_analytics",
+          "optional": false,
+          "type": "ApiQuotaAnalyticsView"
         },
         {
           "name": "stats_5m",
@@ -2106,7 +2112,11 @@
         "provider_cost_multiplier",
         "total_cost_usd",
         "confidence",
-        "pricing_source"
+        "pricing_source",
+        "pricing_provider",
+        "pricing_generation",
+        "effective_pricing_revision",
+        "selected_tier"
       ],
       "shape": [
         {
@@ -2153,6 +2163,26 @@
           "name": "pricing_source",
           "optional": true,
           "type": "string"
+        },
+        {
+          "name": "pricing_provider",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "pricing_generation",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "effective_pricing_revision",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "selected_tier",
+          "optional": true,
+          "type": "ApiSelectedPriceTier"
         }
       ]
     },
@@ -2251,7 +2281,9 @@
         "total_cost_usd",
         "confidence",
         "priced_requests",
-        "unpriced_requests"
+        "unpriced_requests",
+        "partial_requests",
+        "exact_requests"
       ],
       "shape": [
         {
@@ -2271,6 +2303,16 @@
         },
         {
           "name": "unpriced_requests",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "partial_requests",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "exact_requests",
           "optional": true,
           "type": "number"
         }
@@ -2668,6 +2710,7 @@
       "file": "../../crates/core/src/pricing.rs",
       "struct": "ModelPriceView",
       "fields": [
+        "provider",
         "model_id",
         "display_name",
         "aliases",
@@ -2675,10 +2718,17 @@
         "output_per_1m_usd",
         "cache_read_input_per_1m_usd",
         "cache_creation_input_per_1m_usd",
+        "tiers",
         "source",
+        "source_generation",
         "confidence"
       ],
       "shape": [
+        {
+          "name": "provider",
+          "optional": false,
+          "type": "string"
+        },
         {
           "name": "model_id",
           "optional": false,
@@ -2715,8 +2765,18 @@
           "type": "string"
         },
         {
+          "name": "tiers",
+          "optional": true,
+          "type": "ApiModelPriceTierView[]"
+        },
+        {
           "name": "source",
           "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "source_generation",
+          "optional": true,
           "type": "string"
         },
         {
@@ -2749,6 +2809,38 @@
           "name": "models",
           "optional": false,
           "type": "ApiModelPriceView[]"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/quota_pool.rs",
+      "struct": "QuotaQuantity",
+      "fields": [
+        "value",
+        "scale",
+        "unit",
+        "conversion_generation"
+      ],
+      "shape": [
+        {
+          "name": "value",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "scale",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "unit",
+          "optional": false,
+          "type": "ApiQuotaUnit"
+        },
+        {
+          "name": "conversion_generation",
+          "optional": true,
+          "type": "number"
         }
       ]
     }
@@ -2890,6 +2982,7 @@
         "usage_summaries",
         "usage_day",
         "usage_rollup",
+        "quota_analytics",
         "stats_5m",
         "stats_1h",
         "pricing_catalog",
@@ -2925,6 +3018,11 @@
           "name": "usage_rollup",
           "optional": false,
           "type": "ApiUsageRollupView"
+        },
+        {
+          "name": "quota_analytics",
+          "optional": false,
+          "type": "ApiQuotaAnalyticsView"
         },
         {
           "name": "stats_5m",
@@ -4858,7 +4956,11 @@
         "provider_cost_multiplier",
         "total_cost_usd",
         "confidence",
-        "pricing_source"
+        "pricing_source",
+        "pricing_provider",
+        "pricing_generation",
+        "effective_pricing_revision",
+        "selected_tier"
       ],
       "shape": [
         {
@@ -4905,6 +5007,26 @@
           "name": "pricing_source",
           "optional": true,
           "type": "string"
+        },
+        {
+          "name": "pricing_provider",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "pricing_generation",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "effective_pricing_revision",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "selected_tier",
+          "optional": true,
+          "type": "ApiSelectedPriceTier"
         }
       ]
     },
@@ -5003,7 +5125,9 @@
         "total_cost_usd",
         "confidence",
         "priced_requests",
-        "unpriced_requests"
+        "unpriced_requests",
+        "partial_requests",
+        "exact_requests"
       ],
       "shape": [
         {
@@ -5023,6 +5147,16 @@
         },
         {
           "name": "unpriced_requests",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "partial_requests",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "exact_requests",
           "optional": true,
           "type": "number"
         }
@@ -5420,6 +5554,7 @@
       "file": "src/lib/api/admin-types.ts",
       "type": "ApiModelPriceView",
       "fields": [
+        "provider",
         "model_id",
         "display_name",
         "aliases",
@@ -5427,10 +5562,17 @@
         "output_per_1m_usd",
         "cache_read_input_per_1m_usd",
         "cache_creation_input_per_1m_usd",
+        "tiers",
         "source",
+        "source_generation",
         "confidence"
       ],
       "shape": [
+        {
+          "name": "provider",
+          "optional": false,
+          "type": "string"
+        },
         {
           "name": "model_id",
           "optional": false,
@@ -5467,8 +5609,18 @@
           "type": "string"
         },
         {
+          "name": "tiers",
+          "optional": true,
+          "type": "ApiModelPriceTierView[]"
+        },
+        {
           "name": "source",
           "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "source_generation",
+          "optional": true,
           "type": "string"
         },
         {
@@ -5501,6 +5653,38 @@
           "name": "models",
           "optional": false,
           "type": "ApiModelPriceView[]"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiQuotaQuantity",
+      "fields": [
+        "value",
+        "scale",
+        "unit",
+        "conversion_generation"
+      ],
+      "shape": [
+        {
+          "name": "value",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "scale",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "unit",
+          "optional": false,
+          "type": "ApiQuotaUnit"
+        },
+        {
+          "name": "conversion_generation",
+          "optional": true,
+          "type": "number"
         }
       ]
     }

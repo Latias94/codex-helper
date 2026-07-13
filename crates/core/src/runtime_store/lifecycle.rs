@@ -11,7 +11,7 @@ use crate::provider_catalog::{ProviderAdapter, ProviderPricingTier};
 use super::{
     CommittedRequestCursor, CommittedRequestIdentityQuery, CommittedRequestPage,
     CommittedRequestProjection, CommittedRequestProjectionMetadata, CommittedRequestQuery,
-    RuntimeStoreError, affinity, invalid_metadata, policy, sqlite_error,
+    RuntimeStoreError, affinity, invalid_metadata, metadata, policy, sqlite_error,
 };
 
 const STORE_META_SQL: &str = "CREATE TABLE store_meta (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), application TEXT NOT NULL CHECK (application = 'codex-helper'), schema TEXT NOT NULL CHECK (schema = 'canonical-relay-runtime'), schema_revision INTEGER NOT NULL CHECK (schema_revision >= 1), store_id TEXT NOT NULL UNIQUE CHECK (typeof(store_id) = 'text' AND length(store_id) = 36)) STRICT";
@@ -249,6 +249,18 @@ const EXPECTED_SCHEMA_OBJECTS: &[ExpectedSchemaObject] = &[
         name: "provider_eligibility",
         table_name: "provider_eligibility",
         sql: policy::PROVIDER_ELIGIBILITY_SQL,
+    },
+    ExpectedSchemaObject {
+        object_type: "table",
+        name: "runtime_private_keys",
+        table_name: "runtime_private_keys",
+        sql: metadata::RUNTIME_PRIVATE_KEYS_SQL,
+    },
+    ExpectedSchemaObject {
+        object_type: "table",
+        name: "runtime_documents",
+        table_name: "runtime_documents",
+        sql: metadata::RUNTIME_DOCUMENTS_SQL,
     },
     ExpectedSchemaObject {
         object_type: "table",
@@ -749,6 +761,26 @@ pub(super) fn validate_expected_schema_objects(
     connection: &Connection,
     path: &Path,
 ) -> Result<(), RuntimeStoreError> {
+    validate_schema_objects(connection, path, EXPECTED_SCHEMA_OBJECTS)
+}
+
+pub(super) fn validate_revision_one_schema_objects(
+    connection: &Connection,
+    path: &Path,
+) -> Result<(), RuntimeStoreError> {
+    let expected = EXPECTED_SCHEMA_OBJECTS
+        .iter()
+        .copied()
+        .filter(|object| !matches!(object.name, "runtime_private_keys" | "runtime_documents"))
+        .collect::<Vec<_>>();
+    validate_schema_objects(connection, path, &expected)
+}
+
+fn validate_schema_objects(
+    connection: &Connection,
+    path: &Path,
+    expected_objects: &[ExpectedSchemaObject],
+) -> Result<(), RuntimeStoreError> {
     let mut statement = connection
         .prepare(
             "SELECT type, name, tbl_name, sql
@@ -773,18 +805,18 @@ pub(super) fn validate_expected_schema_objects(
         );
     }
 
-    if actual.len() != EXPECTED_SCHEMA_OBJECTS.len() {
+    if actual.len() != expected_objects.len() {
         return Err(invalid_metadata(
             path,
             format!(
                 "runtime schema contains {} objects, expected {}",
                 actual.len(),
-                EXPECTED_SCHEMA_OBJECTS.len()
+                expected_objects.len()
             ),
         ));
     }
 
-    for expected in EXPECTED_SCHEMA_OBJECTS {
+    for expected in expected_objects {
         let Some((object_type, _, table_name, sql)) =
             actual.iter().find(|(_, name, _, _)| name == expected.name)
         else {

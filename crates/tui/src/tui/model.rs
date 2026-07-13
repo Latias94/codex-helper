@@ -10,7 +10,8 @@ use crate::dashboard_core::{
     OperatorProviderBalanceSummary, OperatorProviderEndpointSummary, OperatorProviderSummary,
     OperatorReadData, OperatorRequestSummary, OperatorSessionSummary, WindowStats,
 };
-use crate::pricing::UsdAmount;
+use crate::pricing::{ModelPriceCatalogSnapshot, UsdAmount};
+use crate::quota_analytics::QuotaAnalyticsView;
 use crate::runtime_identity::ProviderEndpointKey;
 #[cfg(test)]
 use crate::state::SessionIdentityCard;
@@ -159,16 +160,17 @@ impl RequestControlEvidence {
                 .any(|attempt| !attempt.policy_action_codes.is_empty())
     }
 }
-
 #[derive(Debug, Clone)]
 pub(in crate::tui) struct Snapshot {
     pub(in crate::tui) rows: Vec<SessionRow>,
     pub(in crate::tui) recent: Vec<OperatorRequestSummary>,
     pub(in crate::tui) request_control_evidence: HashMap<u64, RequestControlEvidence>,
     pub(in crate::tui) usage_day: UsageDayView,
+    pub(in crate::tui) quota_analytics: QuotaAnalyticsView,
     #[allow(dead_code)]
     pub(in crate::tui) usage_rollup: UsageRollupView,
     pub(in crate::tui) provider_balances: HashMap<String, Vec<ProviderBalanceSnapshot>>,
+    pub(in crate::tui) pricing_catalog: ModelPriceCatalogSnapshot,
     pub(in crate::tui) stats_5m: WindowStats,
     pub(in crate::tui) stats_1h: WindowStats,
     pub(in crate::tui) service_status: Option<crate::service_status::ServiceStatusSnapshot>,
@@ -182,8 +184,10 @@ impl Default for Snapshot {
             recent: Vec::new(),
             request_control_evidence: HashMap::new(),
             usage_day: UsageDayView::default(),
+            quota_analytics: QuotaAnalyticsView::default(),
             usage_rollup: UsageRollupView::default(),
             provider_balances: HashMap::new(),
+            pricing_catalog: ModelPriceCatalogSnapshot::default(),
             stats_5m: WindowStats::default(),
             stats_1h: WindowStats::default(),
             service_status: None,
@@ -1389,16 +1393,12 @@ pub(in crate::tui) struct SessionControlPosture {
 }
 
 #[cfg(test)]
-pub(in crate::tui) fn session_control_posture(
-    row: &SessionRow,
-    route_graph_routing: bool,
-) -> SessionControlPosture {
-    session_control_posture_lang(row, route_graph_routing, Language::En)
+pub(in crate::tui) fn session_control_posture(row: &SessionRow) -> SessionControlPosture {
+    session_control_posture_lang(row, Language::En)
 }
 
 pub(in crate::tui) fn session_control_posture_lang(
     row: &SessionRow,
-    route_graph_routing: bool,
     lang: Language,
 ) -> SessionControlPosture {
     if let Some(profile_name) = row.binding_profile_name.as_deref() {
@@ -1424,11 +1424,7 @@ pub(in crate::tui) fn session_control_posture_lang(
         headline: i18n::label(lang, "no stored profile binding").to_string(),
         detail: i18n::label(
             lang,
-            if route_graph_routing {
-                "Effective route comes from request payloads, route graph defaults, and runtime fallback."
-            } else {
-                "Effective route comes from request payloads, profile defaults, and runtime fallback."
-            },
+            "Effective route comes from request payloads, route graph defaults, and runtime fallback.",
         )
         .to_string(),
         color: Color::Rgb(144, 154, 164),
@@ -1452,11 +1448,13 @@ pub(in crate::tui) fn snapshot_from_operator_data(
             .map(|request| (request.id, request_control_evidence_from_operator(request)))
             .collect(),
         usage_day: data.usage_day.clone(),
+        quota_analytics: data.quota_analytics.clone(),
         usage_rollup: data.usage_rollup.clone(),
         provider_balances: operator_provider_balances(
             &data.summary.service_name,
             &data.provider_balances,
         ),
+        pricing_catalog: data.pricing_catalog.clone(),
         stats_5m: data.stats_5m.clone(),
         stats_1h: data.stats_1h.clone(),
         service_status: None,
@@ -2037,6 +2035,11 @@ mod tests {
             recent_requests: vec![request],
             usage_summaries: Vec::new(),
             usage_day: UsageDayView::default(),
+            quota_analytics: QuotaAnalyticsView {
+                support: crate::quota_analytics::QuotaAnalyticsSupport::Supported,
+                generated_at_ms: 31,
+                ..Default::default()
+            },
             usage_rollup: UsageRollupView::default(),
             stats_5m: WindowStats::default(),
             stats_1h: WindowStats::default(),
@@ -2089,6 +2092,11 @@ mod tests {
             snapshot.recent[0].provider_endpoint_key.as_deref(),
             Some("endpoint:sha256:opaque")
         );
+        assert_eq!(
+            snapshot.quota_analytics.support,
+            crate::quota_analytics::QuotaAnalyticsSupport::Supported
+        );
+        assert_eq!(snapshot.pricing_catalog.source, data.pricing_catalog.source);
     }
 
     #[test]
@@ -2403,6 +2411,7 @@ mod tests {
             recent_requests: Vec::new(),
             usage_summaries: Vec::new(),
             usage_day: UsageDayView::default(),
+            quota_analytics: QuotaAnalyticsView::default(),
             usage_rollup: UsageRollupView::default(),
             stats_5m: WindowStats::default(),
             stats_1h: WindowStats::default(),
@@ -2544,8 +2553,10 @@ mod tests {
             recent: Vec::new(),
             request_control_evidence: HashMap::new(),
             usage_day: UsageDayView::default(),
+            quota_analytics: QuotaAnalyticsView::default(),
             usage_rollup: UsageRollupView::default(),
             provider_balances: HashMap::new(),
+            pricing_catalog: ModelPriceCatalogSnapshot::default(),
             stats_5m: WindowStats::default(),
             stats_1h: WindowStats::default(),
             service_status: None,
@@ -2599,8 +2610,10 @@ mod tests {
             ],
             request_control_evidence: HashMap::new(),
             usage_day: UsageDayView::default(),
+            quota_analytics: QuotaAnalyticsView::default(),
             usage_rollup: UsageRollupView::default(),
             provider_balances: HashMap::new(),
+            pricing_catalog: ModelPriceCatalogSnapshot::default(),
             stats_5m: WindowStats::default(),
             stats_1h: WindowStats::default(),
             service_status: None,
@@ -2631,8 +2644,10 @@ mod tests {
             ],
             request_control_evidence: HashMap::new(),
             usage_day: UsageDayView::default(),
+            quota_analytics: QuotaAnalyticsView::default(),
             usage_rollup: UsageRollupView::default(),
             provider_balances: HashMap::new(),
+            pricing_catalog: ModelPriceCatalogSnapshot::default(),
             stats_5m: WindowStats::default(),
             stats_1h: WindowStats::default(),
             service_status: None,
@@ -2649,8 +2664,10 @@ mod tests {
             recent: Vec::new(),
             request_control_evidence: HashMap::new(),
             usage_day: UsageDayView::default(),
+            quota_analytics: QuotaAnalyticsView::default(),
             usage_rollup: UsageRollupView::default(),
             provider_balances: HashMap::new(),
+            pricing_catalog: ModelPriceCatalogSnapshot::default(),
             stats_5m: WindowStats::default(),
             stats_1h: WindowStats::default(),
             service_status: None,
@@ -2733,7 +2750,7 @@ mod tests {
         let mut row = empty_session_row();
         row.binding_profile_name = Some("fast".to_string());
 
-        let posture = session_control_posture(&row, false);
+        let posture = session_control_posture(&row);
 
         assert!(posture.headline.contains("profile fast"));
         assert!(posture.detail.contains("stored profile binding"));
@@ -2743,7 +2760,7 @@ mod tests {
     fn session_control_posture_reports_route_graph_fallback_context() {
         let row = empty_session_row();
 
-        let posture = session_control_posture(&row, true);
+        let posture = session_control_posture(&row);
 
         assert!(posture.headline.contains("no stored profile binding"));
         assert!(posture.detail.contains("route graph defaults"));

@@ -8,7 +8,7 @@ use crate::tui::model::{Palette, Snapshot, provider_balance_brief_lang, shorten_
 use crate::tui::state::UiState;
 use crate::tui::view::widgets::centered_rect;
 
-pub(in crate::tui::view) fn render_station_info_modal(
+pub(in crate::tui::view) fn render_provider_info_modal(
     f: &mut Frame<'_>,
     p: Palette,
     ui: &UiState,
@@ -17,7 +17,7 @@ pub(in crate::tui::view) fn render_station_info_modal(
 ) {
     let area = centered_rect(76, 78, f.area());
     f.render_widget(Clear, area);
-    let selected = providers.get(ui.selected_station_idx);
+    let selected = providers.get(ui.selected_provider_idx);
     let title = selected
         .map(|provider| {
             format!(
@@ -137,7 +137,7 @@ pub(in crate::tui::view) fn render_station_info_modal(
         Paragraph::new(Text::from(lines))
             .block(block)
             .style(Style::default().fg(p.text))
-            .scroll((ui.station_info_scroll, 0))
+            .scroll((ui.provider_info_scroll, 0))
             .wrap(Wrap { trim: false }),
         area,
     );

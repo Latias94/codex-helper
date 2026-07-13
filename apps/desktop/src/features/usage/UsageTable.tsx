@@ -51,6 +51,17 @@ const baseColumns = [
             <div>Service tier multiplier: {info.row.original.costBreakdown.serviceTierMultiplier}</div>
             <div>Provider multiplier: {info.row.original.costBreakdown.providerMultiplier}</div>
             <div>Confidence: {info.row.original.costBreakdown.confidence}</div>
+            <div>Pricing source: {info.row.original.costBreakdown.source}</div>
+            <div>Pricing provider: {info.row.original.costBreakdown.pricingProvider}</div>
+            <div>Pricing generation: {info.row.original.costBreakdown.pricingGeneration}</div>
+            <div>Pricing revision: {info.row.original.costBreakdown.effectivePricingRevision}</div>
+            {info.row.original.costBreakdown.selectedTier ? (
+              <div>
+                Selected tier: {info.row.original.costBreakdown.selectedTier.type} · threshold{" "}
+                {info.row.original.costBreakdown.selectedTier.thresholdTokens.toLocaleString()} · matched{" "}
+                {info.row.original.costBreakdown.selectedTier.matchedInputTokens.toLocaleString()}
+              </div>
+            ) : null}
             <div className="mt-1 border-t border-white/20 pt-1">实际费用以供应商结算为准</div>
           </div>
         }

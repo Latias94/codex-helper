@@ -546,6 +546,7 @@ mod tests {
                 ..UsageMetrics::default()
             }),
             cost,
+            accounting: crate::state::RequestAccountingFacts::default(),
             retry: None,
             provider_signals: Vec::new(),
             policy_actions: Vec::new(),

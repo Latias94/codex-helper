@@ -3,7 +3,6 @@ use std::time::Duration;
 
 use anyhow::Context;
 use reqwest::Client;
-use tokio::sync::watch;
 
 use crate::config::{
     HelperConfig, PersistedProviderSpec, PersistedProvidersCatalog, PersistedRoutingSpec,
@@ -22,6 +21,10 @@ use super::{
 };
 
 impl ProxyService {
+    pub(crate) async fn publish_operator_pricing_catalog(&self) -> anyhow::Result<bool> {
+        self.config.publish_operator_pricing_catalog().await
+    }
+
     #[cfg(test)]
     pub(crate) fn new(
         client: Client,
@@ -152,42 +155,6 @@ impl ProxyService {
                 observed_at_ms,
             )
             .await
-    }
-
-    pub(crate) fn spawn_initial_balance_refresh(
-        &self,
-        mut shutdown_rx: watch::Receiver<bool>,
-    ) -> tokio::task::JoinHandle<()> {
-        let proxy = self.clone();
-        tokio::spawn(async move {
-            let refresh = async {
-                super::providers_api::refresh_provider_balances_for_proxy(&proxy, None, None, false)
-                    .await
-            };
-            tokio::select! {
-                biased;
-                _ = wait_for_shutdown(&mut shutdown_rx) => {}
-                result = refresh => match result {
-                    Ok(summary) => {
-                        tracing::info!(
-                            "initial provider balance refresh finished: attempted={}, refreshed={}, failed={}, missing_token={}, auto_refreshed={}",
-                            summary.attempted,
-                            summary.refreshed,
-                            summary.failed,
-                            summary.missing_token,
-                            summary.auto_refreshed
-                        );
-                    }
-                    Err((status, message)) => {
-                        tracing::warn!(
-                            "initial provider balance refresh failed before polling: status={}, {}",
-                            status,
-                            message
-                        );
-                    }
-                }
-            }
-        })
     }
 
     pub async fn refresh_provider_balances(
@@ -391,17 +358,6 @@ fn persisted_routing_spec_from_config_for_service(
                 },
             )
             .collect(),
-    }
-}
-
-async fn wait_for_shutdown(shutdown_rx: &mut watch::Receiver<bool>) {
-    if *shutdown_rx.borrow() {
-        return;
-    }
-    while shutdown_rx.changed().await.is_ok() {
-        if *shutdown_rx.borrow() {
-            return;
-        }
     }
 }
 

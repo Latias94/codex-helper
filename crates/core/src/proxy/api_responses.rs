@@ -8,8 +8,8 @@ use crate::dashboard_core::{
     OperatorReadCapture, OperatorReadData, OperatorReadModel, OperatorRequestSummary,
     OperatorRetrySummary, OperatorRevisionBundle, OperatorRuntimeSummary, OperatorSessionSummary,
     OperatorSummaryCounts, build_operator_session_stats, build_profile_options_from_route_view,
-    redact_operator_pricing_catalog, redact_operator_usage_day, redact_operator_usage_summaries,
-    summarize_recent_retry_observations,
+    redact_operator_pricing_catalog, redact_operator_quota_analytics, redact_operator_usage_day,
+    redact_operator_usage_summaries, summarize_recent_retry_observations,
 };
 use crate::state::{
     OperatorLifecycleSnapshot, SessionIdentityCardBuildInputs,
@@ -220,6 +220,12 @@ async fn build_operator_read_model_once(
             stats_5m,
             stats_1h,
             pricing_catalog: redact_operator_pricing_catalog(operator_pricing_catalog.snapshot()),
+            quota_analytics: redact_operator_quota_analytics(
+                proxy
+                    .state
+                    .quota_analytics_view(proxy.service_name, captured_at_ms)
+                    .await,
+            ),
             provider_balances: operator_balances,
         },
     );

@@ -1,7 +1,6 @@
 use ratatui::widgets::TableState;
 
 use crate::codex_integration::CodexStartupReadiness;
-use crate::config::CURRENT_CONFIG_VERSION;
 use crate::dashboard_core::{ControlProfileOption, OperatorReadModel, OperatorRetrySummary};
 use crate::sessions::{
     SessionMeta, SessionSummary, SessionSummarySource, SessionTranscriptMessage,
@@ -10,6 +9,7 @@ use codex_helper_core::fleet::FleetSnapshot;
 use std::collections::HashMap;
 
 use super::Language;
+use super::i18n::{self, msg};
 use super::model::{
     Snapshot, codex_recent_window_threshold_ms, filtered_requests_len, now_ms,
     request_matches_page_filters, request_page_focus_session_id,
@@ -64,6 +64,123 @@ impl RuntimeConnectionKind {
     pub(in crate::tui) fn is_attached(self) -> bool {
         matches!(self, RuntimeConnectionKind::Attached)
     }
+
+    pub(in crate::tui) fn allows_local_codex_switch(self) -> bool {
+        matches!(self, RuntimeConnectionKind::Integrated)
+    }
+}
+
+const STATS_PROJECT_OMITTED_KEY: &str = "\0quota-project:omitted";
+const STATS_PROJECT_UNKNOWN_KEY: &str = "\0quota-project:unknown";
+const STATS_PROJECT_EXTERNAL_KEY: &str = "\0quota-project:external";
+const STATS_PROJECT_GAP_KEY: &str = "\0quota-project:gap";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::tui) enum StatsProjectRowKind {
+    Project(usize),
+    Omitted,
+    LocalUnknown,
+    ExternalUnattributed,
+    SignedGap,
+}
+
+fn stats_project_synthetic_keys(
+    reconciliation: &crate::quota_analytics::QuotaReconciliationView,
+) -> impl Iterator<Item = &'static str> {
+    [
+        (
+            reconciliation.omitted_projects > 0,
+            STATS_PROJECT_OMITTED_KEY,
+        ),
+        (
+            reconciliation.local_unknown.is_some(),
+            STATS_PROJECT_UNKNOWN_KEY,
+        ),
+        (
+            reconciliation.external_unattributed.is_some(),
+            STATS_PROJECT_EXTERNAL_KEY,
+        ),
+        (reconciliation.signed_delta.is_some(), STATS_PROJECT_GAP_KEY),
+    ]
+    .into_iter()
+    .filter_map(|(present, key)| present.then_some(key))
+}
+
+fn stats_project_rows_len(pool: &crate::quota_analytics::PoolQuotaAnalytics) -> usize {
+    pool.reconciliation.projects.len() + stats_project_synthetic_keys(&pool.reconciliation).count()
+}
+
+fn stats_project_row_key(
+    pool: &crate::quota_analytics::PoolQuotaAnalytics,
+    index: usize,
+) -> Option<String> {
+    pool.reconciliation
+        .projects
+        .get(index)
+        .map(|row| row.project.display_key().to_string())
+        .or_else(|| {
+            stats_project_synthetic_keys(&pool.reconciliation)
+                .nth(index.saturating_sub(pool.reconciliation.projects.len()))
+                .map(str::to_string)
+        })
+}
+
+fn stats_project_row_index(
+    pool: &crate::quota_analytics::PoolQuotaAnalytics,
+    key: &str,
+) -> Option<usize> {
+    pool.reconciliation
+        .projects
+        .iter()
+        .position(|row| row.project.display_key() == key)
+        .or_else(|| {
+            stats_project_synthetic_keys(&pool.reconciliation)
+                .position(|candidate| candidate == key)
+                .map(|index| pool.reconciliation.projects.len() + index)
+        })
+}
+
+fn stats_project_row_kind_from_key(
+    pool: &crate::quota_analytics::PoolQuotaAnalytics,
+    key: &str,
+) -> Option<StatsProjectRowKind> {
+    if let Some(index) = pool
+        .reconciliation
+        .projects
+        .iter()
+        .position(|row| row.project.display_key() == key)
+    {
+        return Some(StatsProjectRowKind::Project(index));
+    }
+
+    match key {
+        STATS_PROJECT_OMITTED_KEY if pool.reconciliation.omitted_projects > 0 => {
+            Some(StatsProjectRowKind::Omitted)
+        }
+        STATS_PROJECT_UNKNOWN_KEY if pool.reconciliation.local_unknown.is_some() => {
+            Some(StatsProjectRowKind::LocalUnknown)
+        }
+        STATS_PROJECT_EXTERNAL_KEY if pool.reconciliation.external_unattributed.is_some() => {
+            Some(StatsProjectRowKind::ExternalUnattributed)
+        }
+        STATS_PROJECT_GAP_KEY if pool.reconciliation.signed_delta.is_some() => {
+            Some(StatsProjectRowKind::SignedGap)
+        }
+        _ => None,
+    }
+}
+
+fn stats_project_row_kind(
+    pool: &crate::quota_analytics::PoolQuotaAnalytics,
+    index: usize,
+) -> Option<StatsProjectRowKind> {
+    if pool.reconciliation.projects.get(index).is_some() {
+        return Some(StatsProjectRowKind::Project(index));
+    }
+
+    stats_project_synthetic_keys(&pool.reconciliation)
+        .nth(index.saturating_sub(pool.reconciliation.projects.len()))
+        .and_then(|key| stats_project_row_kind_from_key(pool, key))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -103,7 +220,6 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) service_name: &'static str,
     pub(in crate::tui) proxy_port: u16,
     pub(in crate::tui) language: Language,
-    pub(in crate::tui) config_version: Option<u32>,
     pub(in crate::tui) runtime_connection: RuntimeConnectionKind,
     pub(in crate::tui) operator_read_model: Option<OperatorReadModel>,
     pub(in crate::tui) runtime_status_error: Option<String>,
@@ -111,7 +227,7 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) focus: Focus,
     pub(in crate::tui) overlay: Overlay,
     pub(in crate::tui) startup_readiness: Option<CodexStartupReadiness>,
-    pub(in crate::tui) selected_station_idx: usize,
+    pub(in crate::tui) selected_provider_idx: usize,
     pub(in crate::tui) selected_session_idx: usize,
     pub(in crate::tui) selected_session_id: Option<String>,
     pub(in crate::tui) selected_request_idx: usize,
@@ -142,6 +258,10 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) stats_errors_only: bool,
     pub(in crate::tui) stats_attention_only: bool,
     pub(in crate::tui) selected_stats_provider_endpoint_idx: usize,
+    pub(in crate::tui) selected_stats_pool_idx: usize,
+    pub(in crate::tui) selected_stats_pool_key: Option<String>,
+    pub(in crate::tui) selected_stats_project_idx: usize,
+    pub(in crate::tui) selected_stats_project_key: Option<String>,
     pub(in crate::tui) selected_stats_provider_idx: usize,
     pub(in crate::tui) stats_provider_detail_scroll: u16,
     pub(in crate::tui) needs_snapshot_refresh: bool,
@@ -178,7 +298,7 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) last_retry_summary: Option<OperatorRetrySummary>,
     pub(in crate::tui) last_runtime_config_refresh_at: Option<std::time::Instant>,
     pub(in crate::tui) should_exit: bool,
-    pub(in crate::tui) stations_table: TableState,
+    pub(in crate::tui) providers_table: TableState,
     pub(in crate::tui) sessions_table: TableState,
     pub(in crate::tui) requests_table: TableState,
     pub(in crate::tui) request_page_table: TableState,
@@ -189,7 +309,9 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) fleet_units_table: TableState,
     pub(in crate::tui) stats_provider_endpoints_table: TableState,
     pub(in crate::tui) stats_providers_table: TableState,
-    pub(in crate::tui) station_info_scroll: u16,
+    pub(in crate::tui) stats_pools_table: TableState,
+    pub(in crate::tui) stats_projects_table: TableState,
+    pub(in crate::tui) provider_info_scroll: u16,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -230,7 +352,6 @@ impl Default for UiState {
             service_name: "codex",
             proxy_port: 3211,
             language: Language::En,
-            config_version: None,
             runtime_connection: RuntimeConnectionKind::Integrated,
             operator_read_model: None,
             runtime_status_error: None,
@@ -238,7 +359,7 @@ impl Default for UiState {
             focus: Focus::Sessions,
             overlay: Overlay::None,
             startup_readiness: None,
-            selected_station_idx: 0,
+            selected_provider_idx: 0,
             selected_session_idx: 0,
             selected_session_id: None,
             selected_request_idx: 0,
@@ -265,10 +386,14 @@ impl Default for UiState {
             profile_options: Vec::new(),
             configured_default_profile: None,
             effective_default_profile: None,
-            stats_focus: StatsFocus::Providers,
+            stats_focus: StatsFocus::Pools,
             stats_errors_only: false,
             stats_attention_only: false,
             selected_stats_provider_endpoint_idx: 0,
+            selected_stats_pool_idx: 0,
+            selected_stats_pool_key: None,
+            selected_stats_project_idx: 0,
+            selected_stats_project_key: None,
             selected_stats_provider_idx: 0,
             stats_provider_detail_scroll: 0,
             needs_snapshot_refresh: false,
@@ -305,7 +430,7 @@ impl Default for UiState {
             last_retry_summary: None,
             last_runtime_config_refresh_at: None,
             should_exit: false,
-            stations_table: TableState::default(),
+            providers_table: TableState::default(),
             sessions_table: TableState::default(),
             requests_table: TableState::default(),
             request_page_table: TableState::default(),
@@ -316,20 +441,130 @@ impl Default for UiState {
             fleet_units_table: TableState::default(),
             stats_provider_endpoints_table: TableState::default(),
             stats_providers_table: TableState::default(),
-            station_info_scroll: 0,
+            stats_pools_table: TableState::default(),
+            stats_projects_table: TableState::default(),
+            provider_info_scroll: 0,
         }
     }
 }
 
 impl UiState {
-    pub(in crate::tui) fn uses_route_graph_routing(&self) -> bool {
-        self.config_version == Some(CURRENT_CONFIG_VERSION)
+    pub(in crate::tui) fn allows_local_codex_switch(&self) -> bool {
+        self.service_name == "codex" && self.runtime_connection.allows_local_codex_switch()
+    }
+
+    pub(in crate::tui) fn selected_quota_pool<'a>(
+        &self,
+        snapshot: &'a Snapshot,
+    ) -> Option<&'a crate::quota_analytics::PoolQuotaAnalytics> {
+        snapshot
+            .quota_analytics
+            .pools
+            .get(self.selected_stats_pool_idx)
+    }
+
+    pub(in crate::tui) fn selected_stats_project_row<'a>(
+        &self,
+        snapshot: &'a Snapshot,
+    ) -> Option<(
+        &'a crate::quota_analytics::PoolQuotaAnalytics,
+        StatsProjectRowKind,
+    )> {
+        let pool = self.selected_quota_pool(snapshot)?;
+        let row = self
+            .selected_stats_project_key
+            .as_deref()
+            .and_then(|key| stats_project_row_kind_from_key(pool, key))
+            .or_else(|| stats_project_row_kind(pool, self.selected_stats_project_idx))?;
+        Some((pool, row))
+    }
+
+    pub(in crate::tui) fn cycle_stats_focus(&mut self) -> StatsFocus {
+        self.stats_focus = match self.stats_focus {
+            StatsFocus::Pools => StatsFocus::Projects,
+            StatsFocus::Projects => StatsFocus::Providers,
+            StatsFocus::Providers => StatsFocus::ProviderEndpoints,
+            StatsFocus::ProviderEndpoints => StatsFocus::Pools,
+        };
+        self.stats_provider_detail_scroll = 0;
+        self.stats_focus
+    }
+
+    pub(in crate::tui) fn stats_focus_label(&self) -> &'static str {
+        i18n::text(
+            self.language,
+            match self.stats_focus {
+                StatsFocus::Pools => msg::STATS_FOCUS_POOLS,
+                StatsFocus::Projects => msg::STATS_FOCUS_PROJECTS,
+                StatsFocus::Providers => msg::STATS_FOCUS_PROVIDERS,
+                StatsFocus::ProviderEndpoints => msg::STATS_FOCUS_ENDPOINTS,
+            },
+        )
+    }
+
+    pub(in crate::tui) fn move_stats_selection(&mut self, snapshot: &Snapshot, delta: i32) -> bool {
+        match self.stats_focus {
+            StatsFocus::Pools => {
+                let len = snapshot.quota_analytics.pools.len();
+                let Some(next) = adjust_table_selection(&mut self.stats_pools_table, delta, len)
+                else {
+                    return false;
+                };
+                self.selected_stats_pool_idx = next;
+                self.selected_stats_pool_key = snapshot
+                    .quota_analytics
+                    .pools
+                    .get(next)
+                    .map(|pool| pool.identity.key.clone());
+                self.selected_stats_project_idx = 0;
+                self.selected_stats_project_key = None;
+                self.stats_projects_table.select(None);
+                *self.stats_projects_table.offset_mut() = 0;
+                true
+            }
+            StatsFocus::Projects => {
+                let pool = snapshot
+                    .quota_analytics
+                    .pools
+                    .get(self.selected_stats_pool_idx);
+                let len = pool.map(stats_project_rows_len).unwrap_or(0);
+                let Some(next) = adjust_table_selection(&mut self.stats_projects_table, delta, len)
+                else {
+                    return false;
+                };
+                self.selected_stats_project_idx = next;
+                self.selected_stats_project_key =
+                    pool.and_then(|pool| stats_project_row_key(pool, next));
+                true
+            }
+            StatsFocus::Providers => {
+                let len = snapshot.usage_day.provider_rows.len();
+                let Some(next) =
+                    adjust_table_selection(&mut self.stats_providers_table, delta, len)
+                else {
+                    return false;
+                };
+                self.selected_stats_provider_idx = next;
+                self.stats_provider_detail_scroll = 0;
+                true
+            }
+            StatsFocus::ProviderEndpoints => {
+                let len = snapshot.usage_day.provider_endpoint_rows.len();
+                let Some(next) =
+                    adjust_table_selection(&mut self.stats_provider_endpoints_table, delta, len)
+                else {
+                    return false;
+                };
+                self.selected_stats_provider_endpoint_idx = next;
+                true
+            }
+        }
     }
 
     pub(in crate::tui) fn clamp_selection(&mut self, snapshot: &Snapshot, providers_len: usize) {
-        self.selected_station_idx = clamp_table_selection(
-            &mut self.stations_table,
-            Some(self.selected_station_idx),
+        self.selected_provider_idx = clamp_table_selection(
+            &mut self.providers_table,
+            Some(self.selected_provider_idx),
             providers_len,
         )
         .unwrap_or(0);
@@ -341,34 +576,75 @@ impl UiState {
 
             self.selected_request_idx = 0;
             clamp_table_selection(&mut self.requests_table, None, 0);
-            return;
-        }
-
-        if let Some(sid) = self.selected_session_id.clone()
-            && let Some(idx) = snapshot
-                .rows
-                .iter()
-                .position(|r| r.session_id.as_deref() == Some(sid.as_str()))
-        {
-            self.selected_session_idx = idx;
         } else {
-            self.selected_session_idx = self.selected_session_idx.min(snapshot.rows.len() - 1);
-            self.selected_session_id = snapshot.rows[self.selected_session_idx].session_id.clone();
-        }
-        self.selected_session_idx = clamp_table_selection(
-            &mut self.sessions_table,
-            Some(self.selected_session_idx),
-            snapshot.rows.len(),
-        )
-        .unwrap_or(0);
+            if let Some(sid) = self.selected_session_id.clone()
+                && let Some(idx) = snapshot
+                    .rows
+                    .iter()
+                    .position(|r| r.session_id.as_deref() == Some(sid.as_str()))
+            {
+                self.selected_session_idx = idx;
+            } else {
+                self.selected_session_idx = self.selected_session_idx.min(snapshot.rows.len() - 1);
+                self.selected_session_id =
+                    snapshot.rows[self.selected_session_idx].session_id.clone();
+            }
+            self.selected_session_idx = clamp_table_selection(
+                &mut self.sessions_table,
+                Some(self.selected_session_idx),
+                snapshot.rows.len(),
+            )
+            .unwrap_or(0);
 
-        let req_len = filtered_requests_len(snapshot, self.selected_session_idx);
-        self.selected_request_idx = clamp_table_selection(
-            &mut self.requests_table,
-            Some(self.selected_request_idx),
-            req_len,
+            let req_len = filtered_requests_len(snapshot, self.selected_session_idx);
+            self.selected_request_idx = clamp_table_selection(
+                &mut self.requests_table,
+                Some(self.selected_request_idx),
+                req_len,
+            )
+            .unwrap_or(0);
+        }
+
+        if let Some(pool_key) = self.selected_stats_pool_key.as_deref()
+            && let Some(index) = snapshot
+                .quota_analytics
+                .pools
+                .iter()
+                .position(|pool| pool.identity.key == pool_key)
+        {
+            self.selected_stats_pool_idx = index;
+        }
+        self.selected_stats_pool_idx = clamp_table_selection(
+            &mut self.stats_pools_table,
+            Some(self.selected_stats_pool_idx),
+            snapshot.quota_analytics.pools.len(),
         )
         .unwrap_or(0);
+        self.selected_stats_pool_key = snapshot
+            .quota_analytics
+            .pools
+            .get(self.selected_stats_pool_idx)
+            .map(|pool| pool.identity.key.clone());
+
+        let selected_pool = snapshot
+            .quota_analytics
+            .pools
+            .get(self.selected_stats_pool_idx);
+        if let Some(project_key) = self.selected_stats_project_key.as_deref()
+            && let Some(index) =
+                selected_pool.and_then(|pool| stats_project_row_index(pool, project_key))
+        {
+            self.selected_stats_project_idx = index;
+        }
+        let project_rows_len = selected_pool.map(stats_project_rows_len).unwrap_or(0);
+        self.selected_stats_project_idx = clamp_table_selection(
+            &mut self.stats_projects_table,
+            Some(self.selected_stats_project_idx),
+            project_rows_len,
+        )
+        .unwrap_or(0);
+        self.selected_stats_project_key = selected_pool
+            .and_then(|pool| stats_project_row_key(pool, self.selected_stats_project_idx));
 
         let stats_provider_endpoints_len = snapshot.usage_day.provider_endpoint_rows.len();
         self.selected_stats_provider_endpoint_idx = clamp_table_selection(
@@ -392,7 +668,7 @@ impl UiState {
 
     pub(in crate::tui) fn reset_table_viewports(&mut self) {
         for table in [
-            &mut self.stations_table,
+            &mut self.providers_table,
             &mut self.sessions_table,
             &mut self.requests_table,
             &mut self.request_page_table,
@@ -403,20 +679,22 @@ impl UiState {
             &mut self.fleet_units_table,
             &mut self.stats_provider_endpoints_table,
             &mut self.stats_providers_table,
+            &mut self.stats_pools_table,
+            &mut self.stats_projects_table,
         ] {
             *table.offset_mut() = 0;
         }
         self.stats_provider_detail_scroll = 0;
     }
 
-    pub(in crate::tui) fn sync_stations_table_viewport(
+    pub(in crate::tui) fn sync_providers_table_viewport(
         &mut self,
         providers_len: usize,
         visible_rows: usize,
     ) {
-        self.selected_station_idx = clamp_table_viewport(
-            &mut self.stations_table,
-            Some(self.selected_station_idx),
+        self.selected_provider_idx = clamp_table_viewport(
+            &mut self.providers_table,
+            Some(self.selected_provider_idx),
             providers_len,
             visible_rows,
         )
@@ -758,6 +1036,11 @@ mod tests {
 
     use super::*;
     use crate::dashboard_core::{OperatorRequestObservability, OperatorRequestSummary};
+    use crate::quota_analytics::{
+        PoolQuotaAnalytics, QuotaAnalyticsSupport, QuotaProjectRow, QuotaReconciliationView,
+    };
+    use crate::quota_pool::{PoolIdentity, QuotaQuantity, QuotaUnit};
+    use crate::sessions::{ProjectIdentity, ProjectIdentityKind};
     use crate::state::{
         BalanceSnapshotStatus, ProviderBalanceSnapshot, SessionObservationScope, UsageBucket,
         UsageRollupView,
@@ -787,6 +1070,7 @@ mod tests {
             recent: Vec::new(),
             request_control_evidence: HashMap::new(),
             usage_day: crate::state::UsageDayView::default(),
+            quota_analytics: crate::quota_analytics::QuotaAnalyticsView::default(),
             usage_rollup: UsageRollupView {
                 by_provider: vec![(
                     "stale-provider".to_string(),
@@ -811,11 +1095,118 @@ mod tests {
                     ..ProviderBalanceSnapshot::default()
                 }],
             )]),
+            pricing_catalog: Default::default(),
             stats_5m: crate::dashboard_core::WindowStats::default(),
             stats_1h: crate::dashboard_core::WindowStats::default(),
             service_status: None,
             refreshed_at: std::time::Instant::now(),
         }
+    }
+
+    fn quota_pool(key: &str, project_path: &str) -> PoolQuotaAnalytics {
+        PoolQuotaAnalytics {
+            identity: PoolIdentity {
+                key: key.to_string(),
+                ..PoolIdentity::default()
+            },
+            reconciliation: QuotaReconciliationView {
+                projects: vec![QuotaProjectRow {
+                    project: ProjectIdentity {
+                        kind: ProjectIdentityKind::GitRoot,
+                        path: Some(project_path.to_string()),
+                    },
+                    local_cost: QuotaQuantity::from_integer(1, QuotaUnit::Usd),
+                    requests: 1,
+                }],
+                ..QuotaReconciliationView::default()
+            },
+            ..PoolQuotaAnalytics::default()
+        }
+    }
+
+    #[test]
+    fn stats_selection_restores_stable_pool_and_project_keys_without_sessions() {
+        let mut snapshot = sample_usage_snapshot();
+        snapshot.quota_analytics.support = QuotaAnalyticsSupport::Supported;
+        snapshot.quota_analytics.pools = vec![
+            quota_pool("pool-a", "C:/src/a"),
+            quota_pool("pool-b", "C:/src/b"),
+        ];
+        let mut ui = UiState {
+            selected_stats_pool_key: Some("pool-b".to_string()),
+            selected_stats_project_key: Some("C:/src/b".to_string()),
+            ..UiState::default()
+        };
+
+        ui.clamp_selection(&snapshot, 0);
+
+        assert_eq!(ui.selected_stats_pool_idx, 1);
+        assert_eq!(ui.selected_stats_project_idx, 0);
+        assert_eq!(ui.stats_pools_table.selected(), Some(1));
+        assert_eq!(ui.stats_projects_table.selected(), Some(0));
+
+        snapshot.quota_analytics.pools.swap(0, 1);
+        ui.clamp_selection(&snapshot, 0);
+        assert_eq!(ui.selected_stats_pool_idx, 0);
+        assert_eq!(ui.selected_stats_pool_key.as_deref(), Some("pool-b"));
+    }
+
+    #[test]
+    fn stats_focus_cycles_and_pool_move_resets_project_selection() {
+        let mut snapshot = sample_usage_snapshot();
+        snapshot.quota_analytics.support = QuotaAnalyticsSupport::Supported;
+        snapshot.quota_analytics.pools = vec![
+            quota_pool("pool-a", "C:/src/a"),
+            quota_pool("pool-b", "C:/src/b"),
+        ];
+        let mut ui = UiState::default();
+        ui.clamp_selection(&snapshot, 0);
+
+        assert_eq!(ui.stats_focus, StatsFocus::Pools);
+        assert_eq!(ui.cycle_stats_focus(), StatsFocus::Projects);
+        assert_eq!(ui.cycle_stats_focus(), StatsFocus::Providers);
+        assert_eq!(ui.cycle_stats_focus(), StatsFocus::ProviderEndpoints);
+        assert_eq!(ui.cycle_stats_focus(), StatsFocus::Pools);
+
+        ui.selected_stats_project_idx = 4;
+        ui.selected_stats_project_key = Some("old".to_string());
+        assert!(ui.move_stats_selection(&snapshot, 1));
+        assert_eq!(ui.selected_stats_pool_idx, 1);
+        assert_eq!(ui.selected_stats_project_idx, 0);
+        assert_eq!(ui.selected_stats_project_key, None);
+    }
+
+    #[test]
+    fn stats_project_selection_reaches_omitted_and_reconciliation_rows() {
+        let mut snapshot = sample_usage_snapshot();
+        let mut pool = quota_pool("pool-a", "C:/src/a");
+        pool.reconciliation.omitted_projects = 3;
+        pool.reconciliation.omitted_local_known =
+            Some(QuotaQuantity::from_integer(4, QuotaUnit::Usd));
+        pool.reconciliation.local_unknown = Some(QuotaQuantity::from_integer(1, QuotaUnit::Usd));
+        pool.reconciliation.external_unattributed =
+            Some(QuotaQuantity::from_integer(2, QuotaUnit::Usd));
+        pool.reconciliation.signed_delta = Some(
+            crate::quota_analytics::SignedUsdDelta::from_femto_usd(2 * 10_i128.pow(15)),
+        );
+        snapshot.quota_analytics.support = QuotaAnalyticsSupport::Supported;
+        snapshot.quota_analytics.pools = vec![pool];
+        let mut ui = UiState {
+            stats_focus: StatsFocus::Projects,
+            ..UiState::default()
+        };
+        ui.clamp_selection(&snapshot, 0);
+
+        for _ in 0..4 {
+            assert!(ui.move_stats_selection(&snapshot, 1));
+        }
+
+        assert_eq!(ui.selected_stats_project_idx, 4);
+        assert_eq!(
+            ui.selected_stats_project_key.as_deref(),
+            Some(STATS_PROJECT_GAP_KEY)
+        );
+        assert_eq!(ui.stats_projects_table.selected(), Some(4));
     }
 
     fn empty_session_row(id: &str) -> SessionRow {
@@ -1075,32 +1466,17 @@ mod tests {
     }
 
     #[test]
-    fn route_graph_routing_detection_only_accepts_current_v5_schema() {
-        let mut ui = UiState {
-            config_version: Some(crate::config::CURRENT_CONFIG_VERSION),
-            ..UiState::default()
-        };
-        assert!(ui.uses_route_graph_routing());
-
-        ui.config_version = Some(3);
-        assert!(!ui.uses_route_graph_routing());
-
-        ui.config_version = Some(2);
-        assert!(!ui.uses_route_graph_routing());
-    }
-
-    #[test]
     fn reset_table_viewports_keeps_selection_but_clears_offsets() {
         let mut ui = UiState {
-            stations_table: TableState::default().with_offset(8).with_selected(Some(9)),
+            providers_table: TableState::default().with_offset(8).with_selected(Some(9)),
             sessions_table: TableState::default().with_offset(3).with_selected(Some(4)),
             ..UiState::default()
         };
 
         ui.reset_table_viewports();
 
-        assert_eq!(ui.stations_table.selected(), Some(9));
-        assert_eq!(ui.stations_table.offset(), 0);
+        assert_eq!(ui.providers_table.selected(), Some(9));
+        assert_eq!(ui.providers_table.offset(), 0);
         assert_eq!(ui.sessions_table.selected(), Some(4));
         assert_eq!(ui.sessions_table.offset(), 0);
     }

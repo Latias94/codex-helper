@@ -52,6 +52,12 @@ export type ApiUsageEvidence = {
   aggregate_status?: ApiEconomicsStatus;
 };
 
+export type ApiSelectedPriceTier = {
+  tier_type: string;
+  threshold_tokens: number;
+  matched_input_tokens: number;
+};
+
 export type ApiUsageMetrics = {
   input_tokens: number;
   output_tokens: number;
@@ -77,6 +83,10 @@ export type ApiCostBreakdown = {
   total_cost_usd?: string;
   confidence: ApiCostConfidence;
   pricing_source?: string;
+  pricing_provider?: string;
+  pricing_generation?: string;
+  effective_pricing_revision?: string;
+  selected_tier?: ApiSelectedPriceTier;
 };
 
 export type ApiOperatorProfileSummary = {
@@ -381,6 +391,8 @@ export type ApiUsageCostSummary = {
   confidence: ApiCostConfidence;
   priced_requests?: number;
   unpriced_requests?: number;
+  partial_requests?: number;
+  exact_requests?: number;
 };
 
 export type ApiUsageBucket = {
@@ -650,7 +662,240 @@ export type ApiUsageRollupView = {
   by_provider_day: Record<string, Array<[number, ApiUsageBucket]>>;
 };
 
+export type ApiQuotaAnalyticsSupport = "unsupported" | "supported";
+
+export type ApiQuotaRateStatus =
+  | "available"
+  | "insufficient_samples"
+  | "short_span"
+  | "stale"
+  | "gap"
+  | "adjustment"
+  | "negative_delta"
+  | "unordered"
+  | "no_counter"
+  | "overflow";
+
+export type ApiQuotaPaceStatus =
+  | "unlimited"
+  | "faster"
+  | "on_pace"
+  | "slower"
+  | "no_reset"
+  | "reset_unknown"
+  | "low_sample"
+  | "stale"
+  | "unavailable";
+
+export type ApiQuotaFreshnessStatus = "fresh" | "stale" | "offline" | "unknown";
+
+export type ApiQuotaReconciliationStatus =
+  | "available"
+  | "incomplete_coverage"
+  | "stale_remote"
+  | "incompatible_unit"
+  | "incompatible_generation"
+  | "window_mismatch"
+  | "no_remote_delta"
+  | "overflow"
+  | "unavailable";
+
+export type ApiQuotaUnit = "raw" | "usd" | "tokens" | "unknown";
+
+export type ApiQuotaWindowKind =
+  | "calendar_day"
+  | "rolling"
+  | "custom"
+  | "monthly"
+  | "resetless"
+  | "unknown";
+
+export type ApiQuotaResetKind =
+  | "explicit_timestamp"
+  | "configured_calendar_boundary"
+  | "no_reset"
+  | "unknown";
+
+export type ApiQuotaAdjustmentKind =
+  | "discontinuity"
+  | "counter_reset_or_rollback"
+  | "top_up"
+  | "limit_or_plan_changed"
+  | "normalization_changed";
+
+export type ApiQuotaScope =
+  | { kind: "account" }
+  | { kind: "api_key" }
+  | { kind: "subscription" }
+  | { kind: "organization" }
+  | { kind: "endpoint" }
+  | { kind: "custom"; value: string }
+  | { kind: "unknown" };
+
+export type ApiQuotaIdentityEvidence =
+  | "remote_quota_owner_id"
+  | "remote_stable_id"
+  | "explicit_pool_id"
+  | "credential_fingerprint"
+  | "endpoint_origin"
+  | "unknown";
+
+export type ApiQuotaIdentityConfidence = "high" | "medium" | "low" | "unknown";
+
+export type ApiQuotaConversionSource = "remote" | "configured" | "bundled" | "unknown";
+
+export type ApiQuotaWindowSemantics = {
+  kind: ApiQuotaWindowKind;
+  reset: ApiQuotaResetKind;
+  reset_timezone?: string;
+  rolling_duration_ms?: number;
+};
+
+export type ApiQuotaCapabilities = {
+  used: boolean;
+  remaining: boolean;
+  direct_total: boolean;
+  limit: boolean;
+  reset: boolean;
+  window: boolean;
+  conversion: boolean;
+  cumulative: boolean;
+  unlimited?: boolean;
+  raw_unit?: boolean;
+};
+
+export type ApiQuotaPoolIdentity = {
+  key: string;
+  origin: string;
+  scope: ApiQuotaScope;
+  revision: number;
+  evidence: ApiQuotaIdentityEvidence;
+  confidence: ApiQuotaIdentityConfidence;
+  aggregation_eligible?: boolean;
+  conflicting_evidence?: boolean;
+};
+
+export type ApiQuotaQuantity = {
+  value: string;
+  scale: number;
+  unit: ApiQuotaUnit;
+  conversion_generation?: number;
+};
+
+export type ApiQuotaConversion = {
+  source: ApiQuotaConversionSource;
+  divisor: number | null;
+  generation: number | null;
+};
+
+export type ApiProjectIdentityKind = "git_root" | "path_fallback" | "unknown";
+
+export type ApiProjectIdentity = {
+  kind: ApiProjectIdentityKind;
+  path?: string;
+};
+
+export type ApiAttributionCoverage = {
+  loaded_first_ms: number | null;
+  loaded_last_ms: number | null;
+  queried_first_ms: number | null;
+  queried_last_ms: number | null;
+  time_truncated: boolean;
+  count_truncated: boolean;
+  dedupe_truncated: boolean;
+  boundary_partial: boolean;
+  leading_boundary_partial: boolean;
+  trailing_boundary_partial: boolean;
+  cost_overflow: boolean;
+  duplicate_requests: number;
+  partial_captured_price_requests: number;
+  reconstructed_price_requests: number;
+  invalid_captured_price_requests: number;
+  unpriced_requests: number;
+  unmatched_endpoint_requests: number;
+  unmatched_pool_requests: number;
+  unknown_project_requests: number;
+};
+
+export type ApiQuotaRateWindow = {
+  status: ApiQuotaRateStatus;
+  rate_per_hour: ApiQuotaQuantity | null;
+  lower_bound: boolean;
+  sample_count: number;
+  span_ms: number;
+};
+
+export type ApiQuotaPacingView = {
+  status: ApiQuotaPaceStatus;
+  required_rate_per_hour: ApiQuotaQuantity | null;
+  pace_ratio_basis_points: number | null;
+  exhaustion_eta_ms: number | null;
+  projected_remaining_at_reset: ApiQuotaQuantity | null;
+  reset_at_ms: number | null;
+};
+
+export type ApiQuotaProjectRow = {
+  project: ApiProjectIdentity;
+  local_cost: ApiQuotaQuantity;
+  requests: number;
+};
+
+export type ApiQuotaReconciliationView = {
+  status: ApiQuotaReconciliationStatus;
+  remote_total: ApiQuotaQuantity | null;
+  local_known: ApiQuotaQuantity | null;
+  local_unknown: ApiQuotaQuantity | null;
+  external_unattributed: ApiQuotaQuantity | null;
+  signed_delta: string | null;
+  projects: ApiQuotaProjectRow[];
+  omitted_projects: number;
+  omitted_local_known: ApiQuotaQuantity | null;
+  coverage: ApiAttributionCoverage;
+};
+
+export type ApiPoolQuotaAnalytics = {
+  identity: ApiQuotaPoolIdentity;
+  observed_at_ms: number;
+  last_success_at_ms: number | null;
+  last_attempt_at_ms: number | null;
+  freshness: ApiQuotaFreshnessStatus;
+  latest_adjustment: ApiQuotaAdjustmentKind | null;
+  source: string;
+  unit: ApiQuotaUnit;
+  conversion: ApiQuotaConversion | null;
+  capabilities: ApiQuotaCapabilities;
+  window: ApiQuotaWindowSemantics;
+  epoch_start_ms: number;
+  epoch_end_ms: number | null;
+  remote_used: ApiQuotaQuantity | null;
+  remote_direct_total: ApiQuotaQuantity | null;
+  remote_remaining: ApiQuotaQuantity | null;
+  remote_limit: ApiQuotaQuantity | null;
+  observed_burn: ApiQuotaQuantity | null;
+  rate_15m: ApiQuotaRateWindow;
+  rate_60m: ApiQuotaRateWindow;
+  pacing: ApiQuotaPacingView;
+  reconciliation: ApiQuotaReconciliationView;
+};
+
+export type ApiQuotaAnalyticsView = {
+  support: ApiQuotaAnalyticsSupport;
+  generated_at_ms: number;
+  registry_generation: number;
+  pools: ApiPoolQuotaAnalytics[];
+  omitted_pools: number;
+};
+
+export type ApiModelPriceTierView = {
+  threshold_tokens: number;
+  input_per_1m_usd?: string;
+  output_per_1m_usd?: string;
+  cache_read_input_per_1m_usd?: string;
+  cache_creation_input_per_1m_usd?: string;
+};
+
 export type ApiModelPriceView = {
+  provider: string;
   model_id: string;
   display_name?: string;
   aliases?: string[];
@@ -658,7 +903,9 @@ export type ApiModelPriceView = {
   output_per_1m_usd: string;
   cache_read_input_per_1m_usd?: string;
   cache_creation_input_per_1m_usd?: string;
+  tiers?: ApiModelPriceTierView[];
   source: string;
+  source_generation?: string;
   confidence: ApiCostConfidence;
 };
 
@@ -756,6 +1003,7 @@ export type ApiOperatorReadData = {
   usage_summaries: ApiRequestUsageSummary[];
   usage_day: ApiUsageDayView;
   usage_rollup: ApiUsageRollupView;
+  quota_analytics: ApiQuotaAnalyticsView;
   stats_5m: ApiWindowStats;
   stats_1h: ApiWindowStats;
   pricing_catalog: ApiModelPriceCatalogSnapshot;

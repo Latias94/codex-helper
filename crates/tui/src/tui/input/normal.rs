@@ -15,7 +15,7 @@ use crate::tui::report::build_stats_report;
 use crate::tui::state::{
     CodexHistoryExternalFocusOrigin, FleetViewMode, UiState, adjust_table_selection,
 };
-use crate::tui::types::{Focus, Overlay, Page, StatsFocus};
+use crate::tui::types::{Focus, Overlay, Page};
 
 use super::KeyEventContext;
 use super::history_bridge::{
@@ -70,7 +70,7 @@ pub(super) fn apply_page_shortcuts(ui: &mut UiState, code: KeyCode) -> bool {
     let previous_page = ui.page;
     let page = match code {
         KeyCode::Char('1') => Some(Page::Dashboard),
-        KeyCode::Char('2') => Some(Page::Stations),
+        KeyCode::Char('2') => Some(Page::Routing),
         KeyCode::Char('3') => Some(Page::Sessions),
         KeyCode::Char('4') => Some(Page::Requests),
         KeyCode::Char('5') => Some(Page::Stats),
@@ -87,14 +87,14 @@ pub(super) fn apply_page_shortcuts(ui: &mut UiState, code: KeyCode) -> bool {
         {
             ui.needs_snapshot_refresh = true;
         }
-        if ui.page == Page::Stations {
-            ui.focus = Focus::Stations;
+        if ui.page == Page::Routing {
+            ui.focus = Focus::Providers;
         } else if ui.page == Page::Requests {
             ui.focus = Focus::Requests;
         } else if ui.page == Page::Sessions
             || ui.page == Page::History
             || ui.page == Page::Recent
-            || (ui.page == Page::Dashboard && ui.focus == Focus::Stations)
+            || (ui.page == Page::Dashboard && ui.focus == Focus::Providers)
         {
             ui.focus = Focus::Sessions;
         }
@@ -169,7 +169,7 @@ fn move_fleet_selection(ui: &mut UiState, delta: i32) -> bool {
         return false;
     };
 
-    if ui.focus == Focus::Stations {
+    if ui.focus == Focus::Providers {
         if let Some(next) =
             adjust_table_selection(&mut ui.fleet_nodes_table, delta, snapshot.nodes.len())
         {
@@ -279,6 +279,74 @@ pub(super) fn try_copy_to_clipboard(report: &str) -> anyhow::Result<()> {
     }
 }
 
+pub(in crate::tui) fn export_selected_stats_report(ui: &mut UiState, snapshot: &Snapshot) -> bool {
+    let now = now_ms();
+    let Some(report) = build_stats_report(ui, snapshot, now) else {
+        ui.toast = Some((
+            match ui.language {
+                Language::Zh => "stats report: 未选择条目",
+                Language::En => "stats report: no selection",
+            }
+            .to_string(),
+            Instant::now(),
+        ));
+        return true;
+    };
+    let saved = write_report(&report, now);
+    let copied = try_copy_to_clipboard(&report);
+
+    match (saved, copied) {
+        (Ok(path), Ok(())) => {
+            ui.toast = Some((
+                match ui.language {
+                    Language::Zh => format!("stats report: 已复制并保存 {}", path.display()),
+                    Language::En => format!("stats report: copied + saved {}", path.display()),
+                },
+                Instant::now(),
+            ));
+        }
+        (Ok(path), Err(err)) => {
+            ui.toast = Some((
+                match ui.language {
+                    Language::Zh => {
+                        format!("stats report: 已保存 {}（复制失败：{err}）", path.display())
+                    }
+                    Language::En => {
+                        format!(
+                            "stats report: saved {} (copy failed: {err})",
+                            path.display()
+                        )
+                    }
+                },
+                Instant::now(),
+            ));
+        }
+        (Err(err), Ok(())) => {
+            ui.toast = Some((
+                match ui.language {
+                    Language::Zh => format!("stats report: 已复制（保存失败：{err}）"),
+                    Language::En => format!("stats report: copied (save failed: {err})"),
+                },
+                Instant::now(),
+            ));
+        }
+        (Err(err1), Err(err2)) => {
+            ui.toast = Some((
+                match ui.language {
+                    Language::Zh => {
+                        format!("stats report: 复制失败：{err2}（保存失败：{err1}）")
+                    }
+                    Language::En => {
+                        format!("stats report: copy failed: {err2} (save failed: {err1})")
+                    }
+                },
+                Instant::now(),
+            ));
+        }
+    }
+    true
+}
+
 pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -> bool {
     let KeyEventContext {
         providers,
@@ -292,7 +360,7 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
     }
 
     if ui.page == Page::Settings
-        && ui.service_name == "codex"
+        && ui.allows_local_codex_switch()
         && let Some(intent) = codex_switch_intent_for_key(key.code, ui.proxy_port)
     {
         apply_codex_switch(ui, intent);
@@ -312,9 +380,8 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
             ui.overlay = Overlay::Help;
             true
         }
-        KeyCode::Char('i') if ui.page == Page::Stations => {
-            ui.overlay = Overlay::StationInfo;
-            ui.station_info_scroll = 0;
+        KeyCode::Char('i') if ui.page == Page::Routing => {
+            super::open_provider_info(ui);
             true
         }
         KeyCode::Tab => {
@@ -322,39 +389,30 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                 ui.focus = match ui.focus {
                     Focus::Sessions => Focus::Requests,
                     Focus::Requests => Focus::Sessions,
-                    Focus::Stations => Focus::Sessions,
+                    Focus::Providers => Focus::Sessions,
                 };
-            } else if ui.page == Page::Stations {
-                ui.focus = Focus::Stations;
+            } else if ui.page == Page::Routing {
+                ui.focus = Focus::Providers;
             } else if ui.page == Page::Stats {
-                ui.stats_focus = match ui.stats_focus {
-                    StatsFocus::ProviderEndpoints => StatsFocus::Providers,
-                    StatsFocus::Providers => StatsFocus::ProviderEndpoints,
-                };
-                ui.stats_provider_detail_scroll = 0;
+                ui.cycle_stats_focus();
                 ui.toast = Some((
                     format!(
                         "{}: {}",
                         i18n::label(ui.language, "focus"),
-                        match ui.stats_focus {
-                            StatsFocus::ProviderEndpoints => {
-                                i18n::label(ui.language, "provider endpoint")
-                            }
-                            StatsFocus::Providers => i18n::label(ui.language, "provider"),
-                        }
+                        ui.stats_focus_label()
                     ),
                     Instant::now(),
                 ));
             } else if ui.page == Page::Fleet {
                 ui.focus = match ui.focus {
-                    Focus::Stations => Focus::Sessions,
-                    Focus::Sessions | Focus::Requests => Focus::Stations,
+                    Focus::Providers => Focus::Sessions,
+                    Focus::Sessions | Focus::Requests => Focus::Providers,
                 };
                 ui.toast = Some((
                     format!(
                         "{}: {}",
                         i18n::label(ui.language, "focus"),
-                        if ui.focus == Focus::Stations {
+                        if ui.focus == Focus::Providers {
                             i18n::label(ui.language, "nodes")
                         } else {
                             i18n::label(ui.language, "work units")
@@ -401,144 +459,41 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
         }
         KeyCode::Up | KeyCode::Char('k') if ui.page == Page::Fleet => move_fleet_selection(ui, -1),
         KeyCode::Down | KeyCode::Char('j') if ui.page == Page::Fleet => move_fleet_selection(ui, 1),
-        KeyCode::Up | KeyCode::Char('k') if ui.page == Page::Stations => {
+        KeyCode::Up | KeyCode::Char('k') if ui.page == Page::Routing => {
             let len = providers.len();
-            if let Some(next) = adjust_table_selection(&mut ui.stations_table, -1, len) {
-                ui.selected_station_idx = next;
+            if let Some(next) = adjust_table_selection(&mut ui.providers_table, -1, len) {
+                ui.selected_provider_idx = next;
                 return true;
             }
             false
         }
-        KeyCode::Down | KeyCode::Char('j') if ui.page == Page::Stations => {
+        KeyCode::Down | KeyCode::Char('j') if ui.page == Page::Routing => {
             let len = providers.len();
-            if let Some(next) = adjust_table_selection(&mut ui.stations_table, 1, len) {
-                ui.selected_station_idx = next;
+            if let Some(next) = adjust_table_selection(&mut ui.providers_table, 1, len) {
+                ui.selected_provider_idx = next;
                 return true;
             }
             false
         }
         KeyCode::Up | KeyCode::Char('k') if ui.page == Page::Stats => {
-            match ui.stats_focus {
-                StatsFocus::ProviderEndpoints => {
-                    let len = snapshot.usage_day.provider_endpoint_rows.len();
-                    if let Some(next) =
-                        adjust_table_selection(&mut ui.stats_provider_endpoints_table, -1, len)
-                    {
-                        ui.selected_stats_provider_endpoint_idx = next;
-                        return true;
-                    }
-                }
-                StatsFocus::Providers => {
-                    let len = snapshot.usage_day.provider_rows.len();
-                    if let Some(next) =
-                        adjust_table_selection(&mut ui.stats_providers_table, -1, len)
-                    {
-                        ui.selected_stats_provider_idx = next;
-                        ui.stats_provider_detail_scroll = 0;
-                        return true;
-                    }
-                }
-            }
-            false
+            ui.move_stats_selection(snapshot, -1)
         }
         KeyCode::Down | KeyCode::Char('j') if ui.page == Page::Stats => {
-            match ui.stats_focus {
-                StatsFocus::ProviderEndpoints => {
-                    let len = snapshot.usage_day.provider_endpoint_rows.len();
-                    if let Some(next) =
-                        adjust_table_selection(&mut ui.stats_provider_endpoints_table, 1, len)
-                    {
-                        ui.selected_stats_provider_endpoint_idx = next;
-                        return true;
-                    }
-                }
-                StatsFocus::Providers => {
-                    let len = snapshot.usage_day.provider_rows.len();
-                    if let Some(next) =
-                        adjust_table_selection(&mut ui.stats_providers_table, 1, len)
-                    {
-                        ui.selected_stats_provider_idx = next;
-                        ui.stats_provider_detail_scroll = 0;
-                        return true;
-                    }
-                }
-            }
-            false
+            ui.move_stats_selection(snapshot, 1)
         }
-        KeyCode::Char('y') if ui.page == Page::Stats => {
-            let now = now_ms();
-            let Some(report) = build_stats_report(ui, snapshot, now) else {
-                ui.toast = Some((
-                    match ui.language {
-                        Language::Zh => "stats report: 未选择条目",
-                        Language::En => "stats report: no selection",
-                    }
-                    .to_string(),
-                    Instant::now(),
-                ));
-                return true;
-            };
-            let saved = write_report(&report, now);
-            let copied = try_copy_to_clipboard(&report);
-
-            match (saved, copied) {
-                (Ok(path), Ok(())) => {
-                    ui.toast = Some((
-                        match ui.language {
-                            Language::Zh => {
-                                format!("stats report: 已复制并保存 {}", path.display())
-                            }
-                            Language::En => {
-                                format!("stats report: copied + saved {}", path.display())
-                            }
-                        },
-                        Instant::now(),
-                    ));
+        KeyCode::Char('g') if ui.page == Page::Stats => {
+            ui.needs_snapshot_refresh = true;
+            ui.toast = Some((
+                match ui.language {
+                    Language::Zh => "额度：正在刷新 operator read model",
+                    Language::En => "quota: refreshing operator read model",
                 }
-                (Ok(path), Err(err)) => {
-                    ui.toast = Some((
-                        match ui.language {
-                            Language::Zh => {
-                                format!(
-                                    "stats report: 已保存 {}（复制失败：{err}）",
-                                    path.display()
-                                )
-                            }
-                            Language::En => {
-                                format!(
-                                    "stats report: saved {} (copy failed: {err})",
-                                    path.display()
-                                )
-                            }
-                        },
-                        Instant::now(),
-                    ));
-                }
-                (Err(err), Ok(())) => {
-                    ui.toast = Some((
-                        match ui.language {
-                            Language::Zh => format!("stats report: 已复制（保存失败：{err}）"),
-                            Language::En => format!("stats report: copied (save failed: {err})"),
-                        },
-                        Instant::now(),
-                    ));
-                }
-                (Err(err1), Err(err2)) => {
-                    ui.toast = Some((
-                        match ui.language {
-                            Language::Zh => {
-                                format!("stats report: 复制失败：{err2}（保存失败：{err1}）")
-                            }
-                            Language::En => {
-                                format!("stats report: copy failed: {err2} (save failed: {err1})")
-                            }
-                        },
-                        Instant::now(),
-                    ));
-                }
-            }
+                .to_string(),
+                Instant::now(),
+            ));
             true
         }
+        KeyCode::Char('y') if ui.page == Page::Stats => export_selected_stats_report(ui, snapshot),
         KeyCode::Char('a') if ui.page == Page::Sessions => {
             ui.sessions_page_active_only = !ui.sessions_page_active_only;
             ui.selected_sessions_page_idx = 0;
@@ -1443,7 +1398,7 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                 }
                 false
             }
-            Focus::Stations => false,
+            Focus::Providers => false,
         },
         KeyCode::Down | KeyCode::Char('j') => match ui.focus {
             Focus::Sessions => {
@@ -1464,7 +1419,7 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                 }
                 false
             }
-            Focus::Stations => false,
+            Focus::Providers => false,
         },
         _ => false,
     }

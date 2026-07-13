@@ -5,7 +5,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "@/app/App";
 import { queryClient } from "@/app/query-client";
-import type { ApiUsageDayView } from "@/lib/api/admin-types";
+import type {
+  ApiOperatorProviderSummary,
+  ApiOperatorRequestSummary,
+  ApiUsageDayView,
+  ApiUsageRollupView,
+  ApiWindowStats,
+} from "@/lib/api/admin-types";
+import type { AdminReadModel } from "@/lib/tauri/commands";
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn().mockRejectedValue(new Error("tauri runtime unavailable in unit tests")),
@@ -538,10 +545,10 @@ describe("desktop app routes", () => {
 });
 
 function liveReadModel(overrides?: {
-  providers?: Array<unknown>;
-  recentRequests?: Array<unknown>;
+  providers?: ApiOperatorProviderSummary[];
+  recentRequests?: ApiOperatorRequestSummary[];
   usageDay?: ApiUsageDayView;
-}) {
+}): AdminReadModel {
   const providers = overrides?.providers ?? [
     {
       name: "live-provider",
@@ -629,7 +636,12 @@ function liveReadModel(overrides?: {
             id: 99,
             model: "gpt-live",
             provider_id: "live-provider",
-            usage: { input_tokens: 100, output_tokens: 20, total_tokens: 120 },
+            usage: {
+              input_tokens: 100,
+              output_tokens: 20,
+              reasoning_tokens: 0,
+              total_tokens: 120,
+            },
             cost: { total_cost_usd: "0.0005", confidence: "estimated" },
             observability: {
               attempt_count: 1,
@@ -665,13 +677,62 @@ function liveReadModel(overrides?: {
         ],
         usage_day:
           overrides?.usageDay ?? usageDayFixture(overrides?.recentRequests?.length ?? 1),
-        usage_rollup: {},
-        stats_5m: {},
-        stats_1h: {},
+        usage_rollup: emptyUsageRollup(),
+        quota_analytics: {
+          support: "unsupported",
+          generated_at_ms: Date.now(),
+          registry_generation: 0,
+          pools: [],
+          omitted_pools: 0,
+        },
+        stats_5m: emptyWindowStats(),
+        stats_1h: emptyWindowStats(),
         pricing_catalog: { source: "bundled", model_count: 0, models: [] },
         provider_balances: [],
       },
     },
+  };
+}
+
+function emptyUsageRollup(): ApiUsageRollupView {
+  const bucket = usageDayFixture(0).summary;
+  return {
+    loaded: bucket,
+    window: bucket,
+    coverage: {
+      requested_days: 0,
+      all_loaded: true,
+      loaded_first_day: null,
+      loaded_last_day: null,
+      loaded_days_with_data: 0,
+      loaded_requests: 0,
+      window_first_day: null,
+      window_last_day: null,
+      window_days_with_data: 0,
+      window_requests: 0,
+      window_exceeds_loaded_start: false,
+    },
+    by_day: [],
+    by_provider_endpoint: [],
+    by_provider_endpoint_day: {},
+    by_provider: [],
+    by_provider_day: {},
+  };
+}
+
+function emptyWindowStats(): ApiWindowStats {
+  return {
+    total: 0,
+    ok_2xx: 0,
+    err_429: 0,
+    err_4xx: 0,
+    err_5xx: 0,
+    p50_ms: null,
+    p95_ms: null,
+    avg_attempts: null,
+    retry_rate: null,
+    top_provider: null,
+    top_provider_endpoint: null,
   };
 }
 
@@ -727,19 +788,40 @@ function usageDayFixture(requests: number): ApiUsageDayView {
   };
 }
 
-function staleReadModel() {
+function staleReadModel(): AdminReadModel {
   const model = liveReadModel();
+  const readModel = model.operatorReadModel;
+  if (readModel.status !== "ready") {
+    throw new Error("live read-model fixture must be ready");
+  }
   return {
     ...model,
     operatorReadModel: {
-      ...model.operatorReadModel,
+      ...readModel,
       status: "stale",
       issue: "refresh_failed",
     },
   };
 }
 
-function unavailableReadModel(status: "disconnected" | "auth_required") {
+function unavailableReadModel(status: "disconnected" | "auth_required"): AdminReadModel {
+  if (status === "disconnected") {
+    return {
+      endpoint: {
+        proxyPort: 3211,
+        adminPort: 4211,
+        proxyBaseUrl: "http://127.0.0.1:3211",
+        adminBaseUrl: "http://127.0.0.1:4211",
+      },
+      operatorReadModel: {
+        api_version: 1,
+        service_name: "codex",
+        status: "disconnected",
+        captured_at_ms: 0,
+        issue: "disconnected",
+      },
+    };
+  }
   return {
     endpoint: {
       proxyPort: 3211,
@@ -750,9 +832,9 @@ function unavailableReadModel(status: "disconnected" | "auth_required") {
     operatorReadModel: {
       api_version: 1,
       service_name: "codex",
-      status,
+      status: "auth_required",
       captured_at_ms: 0,
-      issue: status,
+      issue: "auth_required",
     },
   };
 }

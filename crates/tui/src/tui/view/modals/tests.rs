@@ -3,13 +3,23 @@ use super::{
 };
 use crate::tui::Language;
 use crate::tui::model::Palette;
+use crate::tui::state::{RuntimeConnectionKind, UiState};
 use crate::tui::types::Page;
 use ratatui::prelude::Line;
 
+fn ui_for(page: Page, runtime_connection: RuntimeConnectionKind) -> UiState {
+    UiState {
+        page,
+        language: Language::En,
+        runtime_connection,
+        ..UiState::default()
+    }
+}
+
 #[test]
 fn routing_help_only_advertises_read_only_inspection() {
-    let lines =
-        current_page_help_lines(Language::En, Page::Stations, true, true, Palette::default());
+    let ui = ui_for(Page::Routing, RuntimeConnectionKind::Integrated);
+    let lines = current_page_help_lines(&ui, Palette::default());
     let text = help_text_for_tests(&lines);
 
     assert!(text.contains("Current page: Routing"), "{text}");
@@ -26,19 +36,24 @@ fn routing_help_only_advertises_read_only_inspection() {
 }
 
 #[test]
-fn usage_help_keeps_navigation_and_report_export() {
-    let lines = current_page_help_lines(Language::En, Page::Stats, true, true, Palette::default());
+fn usage_help_keeps_quota_navigation_refresh_and_report_export() {
+    let ui = ui_for(Page::Stats, RuntimeConnectionKind::Integrated);
+    let lines = current_page_help_lines(&ui, Palette::default());
     let text = help_text_for_tests(&lines);
 
-    assert!(text.contains("endpoint / provider day ranking"), "{text}");
-    assert!(text.contains("move the active ranking selection"), "{text}");
+    assert!(
+        text.contains("pool / project / provider / endpoint"),
+        "{text}"
+    );
+    assert!(text.contains("move the active"), "{text}");
+    assert!(text.contains("refresh"), "{text}");
     assert!(text.contains("export and copy"), "{text}");
 }
 
 #[test]
 fn settings_help_only_advertises_the_local_codex_switch_action() {
-    let lines =
-        current_page_help_lines(Language::En, Page::Settings, true, true, Palette::default());
+    let ui = ui_for(Page::Settings, RuntimeConnectionKind::Integrated);
+    let lines = current_page_help_lines(&ui, Palette::default());
     let text = help_text_for_tests(&lines);
 
     assert!(text.contains("n/o"), "{text}");
@@ -46,6 +61,17 @@ fn settings_help_only_advertises_the_local_codex_switch_action() {
     for removed in ["reload", "diagnos", "smoke", "manage profile", "patch"] {
         assert!(!text.contains(removed), "unexpected {removed:?} in {text}");
     }
+}
+
+#[test]
+fn attached_settings_help_does_not_advertise_local_codex_switch() {
+    let ui = ui_for(Page::Settings, RuntimeConnectionKind::Attached);
+    let lines = current_page_help_lines(&ui, Palette::default());
+    let text = help_text_for_tests(&lines);
+
+    assert!(text.contains("read-only operator bundle"), "{text}");
+    assert!(!text.contains("n/o"), "{text}");
+    assert!(!text.contains("switch the local Codex"), "{text}");
 }
 
 #[test]

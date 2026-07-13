@@ -7,7 +7,7 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::balance::{
     BalanceSnapshotStatus, ProviderBalanceSnapshot, ProviderUsageAlert, ProviderUsageAlertKind,
@@ -18,12 +18,16 @@ use crate::config::{
     proxy_home_dir,
 };
 use crate::pricing::UsdAmount;
+use crate::quota_pool::{
+    ConversionSource, QuotaConversion, QuotaCounterKind, QuotaObservationContext, QuotaQuantity,
+    QuotaScope, QuotaUnit, QuotaWindowSemantics, RemoteIdentityProof,
+};
 use crate::runtime_identity::{ProviderEndpointKey, RuntimeUpstreamIdentity};
 use crate::runtime_store::{
-    ProviderObservation, ProviderObservationAuthority, ProviderObservationReservation,
-    ProviderObservationScope, ProviderPolicyEffect,
+    ProviderObservation, ProviderObservationAuthority, ProviderObservationDisposition,
+    ProviderObservationReservation, ProviderObservationScope, ProviderPolicyEffect,
 };
-use crate::state::ProxyState;
+use crate::state::{ProviderBalanceSnapshotPublication, ProxyState};
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -169,6 +173,13 @@ struct UsageProviderConfig {
         skip_serializing_if = "bool_is_true"
     )]
     trust_exhaustion_for_routing: bool,
+    /// Optional operator-supplied identity hint. It is an opaque label, never a credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quota_pool_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quota_reset_timezone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quota_divisor: Option<u64>,
     #[serde(default, skip_serializing_if = "UsageProviderExtractConfig::is_empty")]
     extract: UsageProviderExtractConfig,
 }
@@ -215,6 +226,10 @@ pub struct UsageProviderRefreshSummary {
     pub attempted: usize,
     pub refreshed: usize,
     pub failed: usize,
+    #[serde(skip_serializing_if = "usize_is_zero")]
+    pub suppressed: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_retry_at_ms: Option<u64>,
     pub missing_token: usize,
     #[serde(skip_serializing_if = "usize_is_zero")]
     pub auto_attempted: usize,
@@ -226,10 +241,72 @@ pub struct UsageProviderRefreshSummary {
     pub deduplicated: usize,
 }
 
+impl UsageProviderRefreshSummary {
+    fn record_suppression(&mut self, wake_at: Instant) {
+        self.suppressed += 1;
+        let wake_at_ms = unix_now_ms().saturating_add(duration_millis_u64(
+            wake_at.saturating_duration_since(Instant::now()),
+        ));
+        self.next_retry_at_ms = earliest_timestamp(self.next_retry_at_ms, Some(wake_at_ms));
+    }
+
+    fn record_configured_outcome(&mut self, outcome: UsageProviderRefreshOutcome) -> bool {
+        match outcome {
+            UsageProviderRefreshOutcome::Refreshed => {
+                self.refreshed += 1;
+                true
+            }
+            UsageProviderRefreshOutcome::Ignored => false,
+            UsageProviderRefreshOutcome::Failed => {
+                self.failed += 1;
+                false
+            }
+            UsageProviderRefreshOutcome::Suppressed { wake_at } => {
+                self.record_suppression(wake_at);
+                false
+            }
+            UsageProviderRefreshOutcome::MissingToken => {
+                self.missing_token += 1;
+                false
+            }
+        }
+    }
+
+    fn record_auto_outcome(&mut self, outcome: UsageProviderRefreshOutcome) {
+        match outcome {
+            UsageProviderRefreshOutcome::Refreshed => {
+                self.refreshed += 1;
+                self.auto_refreshed += 1;
+            }
+            UsageProviderRefreshOutcome::Ignored => {}
+            UsageProviderRefreshOutcome::Failed => {
+                self.failed += 1;
+                self.auto_failed += 1;
+            }
+            UsageProviderRefreshOutcome::Suppressed { wake_at } => {
+                self.record_suppression(wake_at);
+            }
+            UsageProviderRefreshOutcome::MissingToken => {
+                self.missing_token += 1;
+            }
+        }
+    }
+}
+
+fn earliest_timestamp(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UsageProviderRefreshOutcome {
     Refreshed,
+    Ignored,
     Failed,
+    Suppressed { wake_at: Instant },
     MissingToken,
 }
 
@@ -253,6 +330,8 @@ static AUTO_PROBE_KIND_FAILURES: OnceLock<Mutex<HashMap<AutoProbeKindFailureKey,
 static USAGE_PROVIDER_TARGET_SUPPRESSIONS: OnceLock<
     Mutex<HashMap<ProviderTargetSuppressionKey, ProviderTargetSuppression>>,
 > = OnceLock::new();
+static NEW_API_QUOTA_DIVISORS: OnceLock<Mutex<HashMap<String, NewApiQuotaDivisorCacheEntry>>> =
+    OnceLock::new();
 
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 10 * 60;
 // Minimal request-driven poll interval per provider to avoid hammering usage APIs.
@@ -261,7 +340,10 @@ pub const REQUEST_BALANCE_REFRESH_DELAY: Duration = Duration::from_secs(60);
 const BALANCE_REFRESH_CONCURRENCY: usize = 6;
 const BALANCE_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
 const BALANCE_HTTP_ERROR_BODY_LIMIT: usize = 2_048;
+const NEW_API_STATUS_BODY_LIMIT: usize = 64 * 1_024;
 const AUTO_PROBE_KIND_FAILURE_TTL: Duration = Duration::from_secs(10 * 60);
+const NEW_API_QUOTA_DIVISOR_SUCCESS_TTL: Duration = Duration::from_secs(60 * 60);
+const NEW_API_QUOTA_DIVISOR_FAILURE_TTL: Duration = Duration::from_secs(10 * 60);
 const USAGE_PROVIDER_TERMINAL_FAILURE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const USAGE_PROVIDER_EXHAUSTED_SUPPRESSION_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const USAGE_PROVIDER_DAILY_RESET_SUPPRESSION_GRACE: Duration = Duration::from_secs(5 * 60);
@@ -303,6 +385,38 @@ struct ProviderTargetSuppression {
 struct ProviderTargetSuppressionDecision {
     reason: String,
     ttl: Duration,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NewApiQuotaDivisorCacheEntry {
+    divisor: Option<u64>,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResolvedQuotaConversion {
+    source: ConversionSource,
+    divisor: Option<u64>,
+}
+
+impl Default for ResolvedQuotaConversion {
+    fn default() -> Self {
+        Self {
+            source: ConversionSource::Unknown,
+            divisor: None,
+        }
+    }
+}
+
+impl ResolvedQuotaConversion {
+    fn quota_conversion(self) -> Option<QuotaConversion> {
+        let divisor = self.divisor?;
+        Some(QuotaConversion {
+            source: self.source,
+            divisor: Some(divisor),
+            generation: Some(QuotaConversion::stable_generation(self.source, divisor)),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -523,6 +637,9 @@ fn default_provider_config(
         poll_interval_secs: Some(DEFAULT_POLL_INTERVAL_SECS),
         refresh_on_request: true,
         trust_exhaustion_for_routing: true,
+        quota_pool_id: None,
+        quota_reset_timezone: None,
+        quota_divisor: None,
         extract,
     }
 }
@@ -577,6 +694,9 @@ fn auto_usage_provider(target: &UsageProviderTarget, kind: ProviderKind) -> Usag
         poll_interval_secs: Some(DEFAULT_POLL_INTERVAL_SECS),
         refresh_on_request: true,
         trust_exhaustion_for_routing: true,
+        quota_pool_id: None,
+        quota_reset_timezone: None,
+        quota_divisor: None,
         extract: UsageProviderExtractConfig::default(),
     };
     if matches!(kind, ProviderKind::RightCodeAccountSummary) {
@@ -1377,7 +1497,89 @@ fn resolve_endpoint(
 struct PreparedProviderPoll {
     endpoint: String,
     new_api_user_id: Option<String>,
-    reservation: Option<ProviderObservationReservation>,
+    reservation: ProviderObservationReservation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderPollPublication {
+    ObservationAccepted,
+    ObservationIgnoredStale,
+    ObservationIgnoredInactiveIncarnation,
+    UnreservedSnapshotPublished,
+    UnreservedSnapshotIgnoredOlder,
+    UnreservedSnapshotIgnoredInvalid,
+    PersistenceFailed,
+}
+
+impl ProviderPollPublication {
+    fn observation_accepted(self) -> bool {
+        self == Self::ObservationAccepted
+    }
+
+    fn active_snapshot_published(self) -> bool {
+        matches!(
+            self,
+            Self::ObservationAccepted | Self::UnreservedSnapshotPublished
+        )
+    }
+
+    fn persistence_failed(self) -> bool {
+        self == Self::PersistenceFailed
+    }
+
+    fn ignored(self) -> bool {
+        matches!(
+            self,
+            Self::ObservationIgnoredStale
+                | Self::ObservationIgnoredInactiveIncarnation
+                | Self::UnreservedSnapshotIgnoredOlder
+                | Self::UnreservedSnapshotIgnoredInvalid
+        )
+    }
+
+    fn successful_refresh_outcome(self) -> UsageProviderRefreshOutcome {
+        if self.persistence_failed() {
+            UsageProviderRefreshOutcome::Failed
+        } else if self.ignored() {
+            UsageProviderRefreshOutcome::Ignored
+        } else {
+            UsageProviderRefreshOutcome::Refreshed
+        }
+    }
+
+    fn failed_refresh_outcome(self) -> UsageProviderRefreshOutcome {
+        if self.ignored() {
+            UsageProviderRefreshOutcome::Ignored
+        } else {
+            UsageProviderRefreshOutcome::Failed
+        }
+    }
+}
+
+impl From<ProviderObservationDisposition> for ProviderPollPublication {
+    fn from(disposition: ProviderObservationDisposition) -> Self {
+        match disposition {
+            ProviderObservationDisposition::Accepted => Self::ObservationAccepted,
+            ProviderObservationDisposition::IgnoredStale => Self::ObservationIgnoredStale,
+            ProviderObservationDisposition::IgnoredInactiveIncarnation => {
+                Self::ObservationIgnoredInactiveIncarnation
+            }
+        }
+    }
+}
+
+impl From<ProviderBalanceSnapshotPublication> for ProviderPollPublication {
+    fn from(publication: ProviderBalanceSnapshotPublication) -> Self {
+        match publication {
+            ProviderBalanceSnapshotPublication::Published => Self::UnreservedSnapshotPublished,
+            ProviderBalanceSnapshotPublication::IgnoredOlder => {
+                Self::UnreservedSnapshotIgnoredOlder
+            }
+            ProviderBalanceSnapshotPublication::IgnoredInvalidIdentity => {
+                Self::UnreservedSnapshotIgnoredInvalid
+            }
+        }
+    }
 }
 
 fn credential_safe_digest(domain: &[u8], values: &[&[u8]]) -> String {
@@ -1448,7 +1650,7 @@ async fn prepare_provider_poll(
     let provider_endpoint = target.endpoint.provider_endpoint.clone();
     let account_fingerprint = usage_provider_account_fingerprint(token, new_api_user_id.as_deref());
     let route_scope = target.runtime_identity().policy_route_scope();
-    let scope = match ProviderObservationScope::new(
+    let scope = ProviderObservationScope::new(
         provider_endpoint,
         &target.base_url,
         route_scope,
@@ -1458,27 +1660,12 @@ async fn prepare_provider_poll(
         config_revision_override
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| usage_provider_config_revision(provider, target)),
-    ) {
-        Ok(scope) => scope,
-        Err(error) => {
-            warn!(error = %error, "failed to build provider observation scope");
-            return Ok(PreparedProviderPoll {
-                endpoint,
-                new_api_user_id,
-                reservation: None,
-            });
-        }
-    };
-    let reservation = match state
+    )
+    .context("failed to build provider observation scope")?;
+    let reservation = state
         .reserve_provider_observation(scope, observed_at_ms)
         .await
-    {
-        Ok(reservation) => Some(reservation),
-        Err(error) => {
-            warn!(error = %error, "failed to reserve provider observation");
-            None
-        }
-    };
+        .context("failed to reserve provider observation")?;
     Ok(PreparedProviderPoll {
         endpoint,
         new_api_user_id,
@@ -1486,16 +1673,11 @@ async fn prepare_provider_poll(
     })
 }
 
-async fn commit_provider_poll_observation(
-    state: &ProxyState,
-    reservation: Option<ProviderObservationReservation>,
+fn provider_poll_observation(
     snapshot: &ProviderBalanceSnapshot,
     suppression: Option<&ProviderTargetSuppressionDecision>,
     completed_at_ms: u64,
-) -> bool {
-    let Some(reservation) = reservation else {
-        return true;
-    };
+) -> ProviderObservation {
     let status = snapshot.status_at(completed_at_ms);
     let (authority, effect) = match status {
         BalanceSnapshotStatus::Exhausted if snapshot.exhaustion_affects_routing => {
@@ -1527,7 +1709,7 @@ async fn commit_provider_poll_observation(
             },
         ),
     };
-    let observation = ProviderObservation {
+    ProviderObservation {
         observed_at_unix_ms: snapshot.fetched_at_ms,
         completed_at_unix_ms: completed_at_ms.max(snapshot.fetched_at_ms),
         authority,
@@ -1539,15 +1721,80 @@ async fn commit_provider_poll_observation(
             })
         }),
         effect,
-    };
-    if let Err(error) = state
+    }
+}
+
+async fn commit_provider_poll_observation(
+    state: &ProxyState,
+    reservation: ProviderObservationReservation,
+    snapshot: &ProviderBalanceSnapshot,
+    suppression: Option<&ProviderTargetSuppressionDecision>,
+    completed_at_ms: u64,
+) -> ProviderPollPublication {
+    let observation = provider_poll_observation(snapshot, suppression, completed_at_ms);
+    match state
         .commit_provider_observation(reservation, observation)
         .await
     {
-        warn!(error = %error, "failed to commit provider balance observation");
-        return false;
+        Ok(committed) => committed.disposition.into(),
+        Err(error) => {
+            warn!(error = %error, "failed to commit provider balance observation");
+            ProviderPollPublication::PersistenceFailed
+        }
     }
-    true
+}
+
+async fn commit_provider_poll_snapshot(
+    state: &ProxyState,
+    reservation: Option<ProviderObservationReservation>,
+    snapshot: ProviderBalanceSnapshot,
+    suppression: Option<&ProviderTargetSuppressionDecision>,
+    completed_at_ms: u64,
+    quota_context: Option<QuotaObservationContext>,
+) -> ProviderPollPublication {
+    let result = match reservation {
+        Some(reservation) => {
+            let observation = provider_poll_observation(&snapshot, suppression, completed_at_ms);
+            match quota_context {
+                Some(context) => {
+                    state
+                        .commit_provider_observation_and_balance_snapshot_with_quota_context(
+                            reservation,
+                            observation,
+                            snapshot,
+                            context,
+                        )
+                        .await
+                }
+                None => {
+                    state
+                        .commit_provider_observation_and_balance_snapshot(
+                            reservation,
+                            observation,
+                            snapshot,
+                        )
+                        .await
+                }
+            }
+            .map(|committed| ProviderPollPublication::from(committed.disposition))
+        }
+        None => match quota_context {
+            Some(context) => {
+                state
+                    .try_record_provider_balance_snapshot_with_quota_context(snapshot, context)
+                    .await
+            }
+            None => state.try_record_provider_balance_snapshot(snapshot).await,
+        }
+        .map(ProviderPollPublication::from),
+    };
+    match result {
+        Ok(publication) => publication,
+        Err(error) => {
+            warn!(error = %error, "failed to atomically commit provider balance snapshot");
+            ProviderPollPublication::PersistenceFailed
+        }
+    }
 }
 
 fn endpoint_origin(endpoint: &str) -> String {
@@ -1562,6 +1809,189 @@ fn endpoint_origin(endpoint: &str) -> String {
             Some(origin)
         })
         .unwrap_or_else(|| "unknown-origin".to_string())
+}
+
+fn provider_uses_new_api_quota(provider: &UsageProviderConfig) -> bool {
+    matches!(
+        provider.kind,
+        ProviderKind::NewApiTokenUsage | ProviderKind::NewApiUserSelf
+    )
+}
+
+fn configured_new_api_quota_divisor(provider: &UsageProviderConfig) -> Option<u64> {
+    if let Some(divisor) = provider.quota_divisor.filter(|divisor| *divisor > 0) {
+        return Some(divisor);
+    }
+
+    let mut legacy = [
+        provider.extract.remaining_divisor,
+        provider.extract.monthly_budget_divisor,
+        provider.extract.monthly_spent_divisor,
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|divisor| *divisor > 0);
+    let first = legacy.next()?;
+    legacy.all(|divisor| divisor == first).then_some(first)
+}
+
+fn select_new_api_quota_conversion(
+    provider: &UsageProviderConfig,
+    remote_divisor: Option<u64>,
+) -> ResolvedQuotaConversion {
+    if !provider_uses_new_api_quota(provider) {
+        return ResolvedQuotaConversion::default();
+    }
+    if let Some(divisor) = remote_divisor.filter(|divisor| *divisor > 0) {
+        return ResolvedQuotaConversion {
+            source: ConversionSource::Remote,
+            divisor: Some(divisor),
+        };
+    }
+    if let Some(divisor) = configured_new_api_quota_divisor(provider) {
+        return ResolvedQuotaConversion {
+            source: ConversionSource::Configured,
+            divisor: Some(divisor),
+        };
+    }
+    ResolvedQuotaConversion::default()
+}
+
+fn new_api_status_target(base_url: &str) -> Option<(String, reqwest::Url)> {
+    let mut url = reqwest::Url::parse(base_url).ok()?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return None;
+    }
+    url.set_username("").ok()?;
+    url.set_password(None).ok()?;
+    url.set_path("/api/status");
+    url.set_query(None);
+    url.set_fragment(None);
+    let origin = endpoint_origin(url.as_str());
+    (origin != "unknown-origin").then_some((origin, url))
+}
+
+fn cached_new_api_quota_divisor(origin: &str, now: Instant) -> Option<Option<u64>> {
+    let mut cache = NEW_API_QUOTA_DIVISORS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()?;
+    let entry = cache.get(origin).copied()?;
+    if now < entry.expires_at {
+        Some(entry.divisor)
+    } else {
+        cache.remove(origin);
+        None
+    }
+}
+
+fn cache_new_api_quota_divisor(origin: String, divisor: Option<u64>, now: Instant) {
+    let ttl = if divisor.is_some() {
+        NEW_API_QUOTA_DIVISOR_SUCCESS_TTL
+    } else {
+        NEW_API_QUOTA_DIVISOR_FAILURE_TTL
+    };
+    if let Ok(mut cache) = NEW_API_QUOTA_DIVISORS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        cache.insert(
+            origin,
+            NewApiQuotaDivisorCacheEntry {
+                divisor,
+                expires_at: now + ttl,
+            },
+        );
+    }
+}
+
+fn quota_per_unit_from_status_json(value: &serde_json::Value) -> Option<u64> {
+    if json_value_at_path(value, "success").and_then(bool_from_json) == Some(false)
+        || json_value_at_path(value, "code").and_then(bool_from_json) == Some(false)
+    {
+        return None;
+    }
+    ["data.quota_per_unit", "quota_per_unit"]
+        .into_iter()
+        .find_map(|path| {
+            let raw = decimal_string_from_json(json_value_at_path(value, path)?)?;
+            let quantity = QuotaQuantity::from_decimal(&raw, QuotaUnit::Raw)?;
+            (quantity.scale == 0 && quantity.value > 0)
+                .then(|| u64::try_from(quantity.value).ok())
+                .flatten()
+        })
+}
+
+async fn read_limited_json_response(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<serde_json::Value> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        anyhow::bail!("response body exceeds {limit} bytes");
+    }
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("response body read failed")?;
+        if body.len().saturating_add(chunk.len()) > limit {
+            anyhow::bail!("response body exceeds {limit} bytes");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).context("response body is not valid JSON")
+}
+
+async fn fetch_new_api_quota_divisor(
+    client: &Client,
+    status_url: reqwest::Url,
+) -> Result<Option<u64>> {
+    let response = client
+        .get(status_url)
+        .timeout(BALANCE_HTTP_REQUEST_TIMEOUT)
+        .header("Accept", "application/json")
+        .header(
+            "User-Agent",
+            concat!("codex-helper/", env!("CARGO_PKG_VERSION")),
+        )
+        .send()
+        .await
+        .context("New API status request failed")?;
+    if !response.status().is_success() {
+        return Ok(None);
+    }
+    let value = read_limited_json_response(response, NEW_API_STATUS_BODY_LIMIT).await?;
+    Ok(quota_per_unit_from_status_json(&value))
+}
+
+async fn resolve_new_api_quota_conversion(
+    client: &Client,
+    provider: &UsageProviderConfig,
+    base_url: &str,
+) -> ResolvedQuotaConversion {
+    if !provider_uses_new_api_quota(provider) {
+        return ResolvedQuotaConversion::default();
+    }
+    let Some((origin, status_url)) = new_api_status_target(base_url) else {
+        return select_new_api_quota_conversion(provider, None);
+    };
+    let now = Instant::now();
+    let remote_divisor = if let Some(cached) = cached_new_api_quota_divisor(&origin, now) {
+        cached
+    } else {
+        let fetched = match fetch_new_api_quota_divisor(client, status_url).await {
+            Ok(divisor) => divisor,
+            Err(error) => {
+                debug!(origin, error = %error, "New API quota divisor probe failed");
+                None
+            }
+        };
+        cache_new_api_quota_divisor(origin, fetched, now);
+        fetched
+    };
+    select_new_api_quota_conversion(provider, remote_divisor)
 }
 
 fn provider_request_headers(
@@ -3080,6 +3510,7 @@ fn new_api_token_usage_snapshot_from_json(
     value: &serde_json::Value,
     fetched_at_ms: u64,
     stale_after_ms: Option<u64>,
+    quota_divisor: Option<u64>,
 ) -> ProviderBalanceSnapshot {
     if json_value_at_path(value, "success").and_then(bool_from_json) == Some(false)
         || json_value_at_path(value, "code").and_then(bool_from_json) == Some(false)
@@ -3114,35 +3545,39 @@ fn new_api_token_usage_snapshot_from_json(
             "total_granted".to_string(),
         ];
     }
-    effective.remaining_divisor = effective.remaining_divisor.or(Some(500_000));
-    effective.monthly_spent_divisor = effective.monthly_spent_divisor.or(Some(500_000));
-    effective.monthly_budget_divisor = effective.monthly_budget_divisor.or(Some(500_000));
-
     let unlimited_quota =
         first_bool_from_paths(value, &[], &["data.unlimited_quota", "unlimited_quota"])
             == Some(true);
-    let remaining_balance = first_amount_from_paths(
-        value,
-        &effective.remaining_balance_paths,
-        &[],
-        effective.remaining_divisor,
-    );
-    let monthly_spent = first_amount_from_paths(
-        value,
-        &effective.monthly_spent_paths,
-        &[],
-        effective.monthly_spent_divisor,
-    );
-    let monthly_budget = first_amount_from_paths(
-        value,
-        &effective.monthly_budget_paths,
-        &[],
-        effective.monthly_budget_divisor,
-    )
-    .or_else(|| match (remaining_balance, monthly_spent) {
-        (Some(remaining), Some(spent)) => Some(remaining.saturating_add(spent)),
-        _ => None,
+    let remaining_balance = quota_divisor.and_then(|divisor| {
+        first_amount_from_paths(
+            value,
+            &effective.remaining_balance_paths,
+            &[],
+            Some(divisor),
+        )
     });
+    let monthly_spent = quota_divisor.and_then(|divisor| {
+        first_amount_from_paths(value, &effective.monthly_spent_paths, &[], Some(divisor))
+    });
+    let monthly_budget = quota_divisor
+        .and_then(|divisor| {
+            first_amount_from_paths(value, &effective.monthly_budget_paths, &[], Some(divisor))
+        })
+        .or_else(|| match (remaining_balance, monthly_spent) {
+            (Some(remaining), Some(spent)) => Some(remaining.saturating_add(spent)),
+            _ => None,
+        });
+    let raw_remaining_is_zero = raw_quota_quantity(
+        value,
+        &[
+            "data.total_available",
+            "data.remain_quota",
+            "total_available",
+            "remain_quota",
+        ],
+        None,
+    )
+    .map(|quantity| quantity.is_zero());
     let exhausted = if unlimited_quota {
         Some(false)
     } else {
@@ -3151,7 +3586,7 @@ fn new_api_token_usage_snapshot_from_json(
             &effective.exhausted_paths,
             &["data.exhausted", "exhausted"],
         )
-        .or_else(|| remaining_balance.map(UsdAmount::is_zero))
+        .or(raw_remaining_is_zero)
     };
 
     let mut snapshot = base_snapshot(provider, upstream, fetched_at_ms, stale_after_ms);
@@ -3178,6 +3613,7 @@ fn new_api_snapshot_from_json(
     value: &serde_json::Value,
     fetched_at_ms: u64,
     stale_after_ms: Option<u64>,
+    quota_divisor: Option<u64>,
 ) -> ProviderBalanceSnapshot {
     if json_value_at_path(value, "success").and_then(bool_from_json) == Some(false) {
         let message = json_value_at_path(value, "message")
@@ -3195,35 +3631,35 @@ fn new_api_snapshot_from_json(
         effective.monthly_spent_paths =
             vec!["data.used_quota".to_string(), "used_quota".to_string()];
     }
-    effective.remaining_divisor = effective.remaining_divisor.or(Some(500_000));
-    effective.monthly_spent_divisor = effective.monthly_spent_divisor.or(Some(500_000));
-    effective.monthly_budget_divisor = effective.monthly_budget_divisor.or(Some(500_000));
-
-    let remaining_balance = first_amount_from_paths(
-        value,
-        &effective.remaining_balance_paths,
-        &[],
-        effective.remaining_divisor,
-    );
-    let monthly_spent = first_amount_from_paths(
-        value,
-        &effective.monthly_spent_paths,
-        &[],
-        effective.monthly_spent_divisor,
-    );
-    let monthly_budget = first_amount_from_paths(
-        value,
-        &effective.monthly_budget_paths,
-        &["data.total_quota", "total_quota"],
-        effective.monthly_budget_divisor,
-    )
-    .or_else(|| match (remaining_balance, monthly_spent) {
-        (Some(remaining), Some(spent)) => Some(remaining.saturating_add(spent)),
-        _ => None,
+    let remaining_balance = quota_divisor.and_then(|divisor| {
+        first_amount_from_paths(
+            value,
+            &effective.remaining_balance_paths,
+            &[],
+            Some(divisor),
+        )
     });
+    let monthly_spent = quota_divisor.and_then(|divisor| {
+        first_amount_from_paths(value, &effective.monthly_spent_paths, &[], Some(divisor))
+    });
+    let monthly_budget = quota_divisor
+        .and_then(|divisor| {
+            first_amount_from_paths(
+                value,
+                &effective.monthly_budget_paths,
+                &["data.total_quota", "total_quota"],
+                Some(divisor),
+            )
+        })
+        .or_else(|| match (remaining_balance, monthly_spent) {
+            (Some(remaining), Some(spent)) => Some(remaining.saturating_add(spent)),
+            _ => None,
+        });
     let unlimited_quota =
         first_bool_from_paths(value, &[], &["data.unlimited_quota", "unlimited_quota"])
             == Some(true);
+    let raw_remaining_is_zero = raw_quota_quantity(value, &["data.quota", "quota"], None)
+        .map(|quantity| quantity.is_zero());
     let exhausted = if unlimited_quota {
         Some(false)
     } else {
@@ -3232,7 +3668,7 @@ fn new_api_snapshot_from_json(
             &effective.exhausted_paths,
             &["data.exhausted", "exhausted"],
         )
-        .or_else(|| remaining_balance.map(UsdAmount::is_zero))
+        .or(raw_remaining_is_zero)
     };
 
     let mut snapshot = base_snapshot(provider, upstream, fetched_at_ms, stale_after_ms);
@@ -3346,6 +3782,7 @@ fn snapshot_from_provider_json(
     upstream_base_url: &str,
     fetched_at_ms: u64,
     stale_after_ms: Option<u64>,
+    quota_conversion: ResolvedQuotaConversion,
 ) -> ProviderBalanceSnapshot {
     match provider.kind {
         ProviderKind::BudgetHttpJson => {
@@ -3381,10 +3818,16 @@ fn snapshot_from_provider_json(
             value,
             fetched_at_ms,
             stale_after_ms,
+            quota_conversion.divisor,
         ),
-        ProviderKind::NewApiUserSelf => {
-            new_api_snapshot_from_json(provider, upstream, value, fetched_at_ms, stale_after_ms)
-        }
+        ProviderKind::NewApiUserSelf => new_api_snapshot_from_json(
+            provider,
+            upstream,
+            value,
+            fetched_at_ms,
+            stale_after_ms,
+            quota_conversion.divisor,
+        ),
         ProviderKind::RightCodeAccountSummary => rightcode_account_summary_snapshot_from_json(
             provider,
             upstream,
@@ -3401,6 +3844,202 @@ fn snapshot_from_provider_json(
             stale_after_ms,
         ),
     }
+}
+
+fn quota_context_for_provider_snapshot(
+    provider: &UsageProviderConfig,
+    target: &UsageProviderTarget,
+    credential: Option<&str>,
+    value: &serde_json::Value,
+    snapshot: &ProviderBalanceSnapshot,
+    interval_secs: u64,
+    quota_conversion: ResolvedQuotaConversion,
+) -> QuotaObservationContext {
+    let mut context = QuotaObservationContext::new(&target.base_url);
+    context.scope = match provider.kind {
+        ProviderKind::NewApiUserSelf
+        | ProviderKind::Sub2ApiAuthMe
+        | ProviderKind::RightCodeAccountSummary
+        | ProviderKind::YescodeProfile => QuotaScope::Account,
+        ProviderKind::OpenAiOrganizationCosts => QuotaScope::Organization,
+        ProviderKind::Sub2ApiUsage
+        | ProviderKind::NewApiTokenUsage
+        | ProviderKind::OpenAiBalanceHttpJson
+        | ProviderKind::BudgetHttpJson => QuotaScope::ApiKey,
+    };
+    context.explicit_pool_id = provider
+        .quota_pool_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    context.credential = credential.map(|credential| credential.as_bytes().to_vec());
+    context.unit = QuotaUnit::Usd;
+    context.expected_interval_ms = interval_secs.checked_mul(1_000);
+    context.fresh_until_ms = snapshot.stale_after_ms;
+    let window_period = if provider_uses_new_api_quota(provider)
+        && snapshot.quota_resets_at_ms.is_none()
+        && matches!(snapshot.quota_period.as_deref(), Some("quota" | "token"))
+    {
+        Some("wallet")
+    } else {
+        snapshot.quota_period.as_deref()
+    };
+    context.window = Some(QuotaWindowSemantics::from_provider_hint(
+        window_period,
+        snapshot.quota_resets_at_ms,
+        provider.quota_reset_timezone.as_deref(),
+        None,
+        None,
+    ));
+    context.capabilities.used = snapshot.quota_used_usd.is_some();
+    context.capabilities.remaining = snapshot.quota_remaining_usd.is_some();
+    context.capabilities.limit = snapshot.quota_limit_usd.is_some();
+    context.capabilities.direct_total = snapshot.today_used_usd.is_some();
+    context.capabilities.reset = snapshot.quota_resets_at_ms.is_some();
+    context.capabilities.window = snapshot.quota_period.is_some();
+    context.conversion = quota_conversion.quota_conversion();
+    context.capabilities.conversion = context.conversion.is_some();
+
+    if context.conversion.is_none() {
+        match provider.kind {
+            ProviderKind::NewApiTokenUsage => {
+                context.remaining = raw_quota_quantity(
+                    value,
+                    &[
+                        "data.total_available",
+                        "data.remain_quota",
+                        "total_available",
+                    ],
+                    None,
+                );
+                context.used = raw_quota_quantity(
+                    value,
+                    &["data.total_used", "data.used_quota", "total_used"],
+                    None,
+                );
+                context.limit =
+                    raw_quota_quantity(value, &["data.total_granted", "total_granted"], None)
+                        .or_else(|| match (&context.remaining, &context.used) {
+                            (Some(remaining), Some(used)) => remaining.checked_add(used),
+                            _ => None,
+                        });
+            }
+            ProviderKind::NewApiUserSelf => {
+                context.remaining = raw_quota_quantity(value, &["data.quota", "quota"], None);
+                context.used = raw_quota_quantity(value, &["data.used_quota", "used_quota"], None);
+                context.limit =
+                    raw_quota_quantity(value, &["data.total_quota", "total_quota"], None).or_else(
+                        || match (&context.remaining, &context.used) {
+                            (Some(remaining), Some(used)) => remaining.checked_add(used),
+                            _ => None,
+                        },
+                    );
+            }
+            _ => {}
+        }
+        if context.used.is_some() || context.remaining.is_some() || context.limit.is_some() {
+            context.unit = QuotaUnit::Raw;
+            context.capabilities.raw_unit = true;
+        }
+    }
+    context.counter_kind = if context.used.is_some() || snapshot.quota_used_usd.is_some() {
+        QuotaCounterKind::Used
+    } else if context.remaining.is_some() || snapshot.quota_remaining_usd.is_some() {
+        QuotaCounterKind::Remaining
+    } else {
+        QuotaCounterKind::DirectTotal
+    };
+
+    context.remote_stable_id = match provider.kind {
+        ProviderKind::NewApiUserSelf | ProviderKind::Sub2ApiAuthMe => {
+            json_value_at_path(value, "data.id").and_then(|value| {
+                string_from_json(value).or_else(|| decimal_string_from_json(value))
+            })
+        }
+        _ => None,
+    };
+    if context.remote_stable_id.is_some() {
+        context.remote_identity_proof = RemoteIdentityProof::StableSubject;
+    }
+    context
+}
+
+fn raw_quota_quantity(
+    value: &serde_json::Value,
+    paths: &[&str],
+    conversion_generation: Option<u64>,
+) -> Option<QuotaQuantity> {
+    paths.iter().find_map(|path| {
+        let value = json_value_at_path(value, path)?;
+        let decimal = decimal_string_from_json(value)?;
+        QuotaQuantity::from_decimal(&decimal, QuotaUnit::Raw)
+            .map(|quantity| quantity.with_conversion_generation(conversion_generation))
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn commit_provider_snapshot_with_context(
+    state: &ProxyState,
+    reservation: ProviderObservationReservation,
+    provider: &UsageProviderConfig,
+    target: &UsageProviderTarget,
+    credential: Option<&str>,
+    value: &serde_json::Value,
+    snapshot: ProviderBalanceSnapshot,
+    suppression: Option<&ProviderTargetSuppressionDecision>,
+    completed_at_ms: u64,
+    interval_secs: u64,
+    quota_conversion: ResolvedQuotaConversion,
+) -> ProviderPollPublication {
+    let context = quota_context_for_provider_snapshot(
+        provider,
+        target,
+        credential,
+        value,
+        &snapshot,
+        interval_secs,
+        quota_conversion,
+    );
+    commit_provider_poll_snapshot(
+        state,
+        Some(reservation),
+        snapshot,
+        suppression,
+        completed_at_ms,
+        Some(context),
+    )
+    .await
+}
+
+async fn publish_auto_probe_error_summary(
+    state: &ProxyState,
+    provider_id: &str,
+    provider: &UsageProviderConfig,
+    target: &UsageProviderTarget,
+    fetched_at_ms: u64,
+    stale_after_ms: Option<u64>,
+    error: &str,
+) -> ProviderPollPublication {
+    let publication = commit_provider_poll_snapshot(
+        state,
+        None,
+        base_snapshot(provider, &target.endpoint, fetched_at_ms, stale_after_ms).with_error(error),
+        None,
+        unix_now_ms(),
+        None,
+    )
+    .await;
+    if publication.active_snapshot_published() && usage_provider_error_is_terminal(error) {
+        remember_usage_provider_target_suppression(
+            provider_id,
+            target,
+            USAGE_PROVIDER_TERMINAL_FAILURE_TTL,
+            error,
+            Instant::now(),
+        );
+    }
+    publication
 }
 
 async fn refresh_provider_target(
@@ -3437,9 +4076,12 @@ async fn refresh_provider_target(
             target.endpoint.catalog_index,
             suppression.reason
         );
-        return UsageProviderRefreshOutcome::Failed;
+        return UsageProviderRefreshOutcome::Suppressed {
+            wake_at: suppression.until,
+        };
     }
     if let Some(decision) = snapshot_decision {
+        let wake_at = Instant::now() + decision.ttl;
         remember_usage_provider_target_suppression(
             &provider.id,
             target,
@@ -3454,7 +4096,7 @@ async fn refresh_provider_target(
             target.endpoint.catalog_index,
             decision.reason
         );
-        return UsageProviderRefreshOutcome::Failed;
+        return UsageProviderRefreshOutcome::Suppressed { wake_at };
     }
 
     let Some(token) = resolve_token(provider, target) else {
@@ -3464,7 +4106,18 @@ async fn refresh_provider_target(
             base_snapshot(provider, &target.endpoint, fetched_at_ms, stale_after_ms)
                 .with_error("no usable token; checked provider token_env and upstream auth")
         };
-        state.record_provider_balance_snapshot(snapshot).await;
+        let persisted = commit_provider_poll_snapshot(
+            state.as_ref(),
+            None,
+            snapshot,
+            None,
+            unix_now_ms(),
+            None,
+        )
+        .await;
+        if persisted.persistence_failed() {
+            return UsageProviderRefreshOutcome::Failed;
+        }
         if provider.kind == ProviderKind::OpenAiOrganizationCosts {
             warn!(
                 "usage provider '{}' is missing OPENAI_ADMIN_KEY; OpenAI official costs stay unknown",
@@ -3495,7 +4148,15 @@ async fn refresh_provider_target(
         Err(error) => {
             let snapshot = base_snapshot(provider, &target.endpoint, fetched_at_ms, stale_after_ms)
                 .with_error(error.to_string());
-            state.record_provider_balance_snapshot(snapshot).await;
+            let publication = commit_provider_poll_snapshot(
+                state.as_ref(),
+                None,
+                snapshot,
+                None,
+                unix_now_ms(),
+                None,
+            )
+            .await;
             warn!(
                 "usage provider '{}' could not prepare poll for {}[{}]: {}",
                 provider.id,
@@ -3503,7 +4164,7 @@ async fn refresh_provider_target(
                 target.endpoint.catalog_index,
                 error
             );
-            return UsageProviderRefreshOutcome::Failed;
+            return publication.failed_refresh_outcome();
         }
     };
 
@@ -3517,6 +4178,8 @@ async fn refresh_provider_target(
     .await
     {
         Ok(value) => {
+            let quota_conversion =
+                resolve_new_api_quota_conversion(client, provider, &target.base_url).await;
             let snapshot = snapshot_from_provider_json(
                 provider,
                 &target.endpoint,
@@ -3524,6 +4187,7 @@ async fn refresh_provider_target(
                 &target.base_url,
                 fetched_at_ms,
                 stale_after_ms,
+                quota_conversion,
             );
             let snapshot_error = usage_provider_snapshot_error(&snapshot).map(str::to_string);
             let suppression_decision =
@@ -3532,15 +4196,29 @@ async fn refresh_provider_target(
             let terminal_snapshot_error = snapshot_error
                 .as_deref()
                 .is_some_and(usage_provider_error_is_terminal);
-            let observation_committed = commit_provider_poll_observation(
+            let publication = commit_provider_snapshot_with_context(
                 state.as_ref(),
                 prepared_poll.reservation,
-                &snapshot,
+                provider,
+                target,
+                Some(&token),
+                &value,
+                snapshot,
                 suppression_decision.as_ref(),
                 unix_now_ms(),
+                interval_secs,
+                quota_conversion,
             )
             .await;
-            if observation_committed && let Some(decision) = suppression_decision.as_ref() {
+            if publication.persistence_failed() {
+                return UsageProviderRefreshOutcome::Failed;
+            }
+            if publication.ignored() {
+                return UsageProviderRefreshOutcome::Ignored;
+            }
+            if publication.observation_accepted()
+                && let Some(decision) = suppression_decision.as_ref()
+            {
                 remember_usage_provider_target_suppression(
                     &provider.id,
                     target,
@@ -3548,7 +4226,7 @@ async fn refresh_provider_target(
                     decision.reason.as_str(),
                     Instant::now(),
                 );
-            } else if observation_committed && terminal_snapshot_error {
+            } else if publication.observation_accepted() && terminal_snapshot_error {
                 remember_usage_provider_target_suppression(
                     &provider.id,
                     target,
@@ -3558,10 +4236,9 @@ async fn refresh_provider_target(
                         .unwrap_or("terminal provider error"),
                     Instant::now(),
                 );
-            } else if observation_committed {
+            } else if publication.observation_accepted() {
                 clear_usage_provider_target_suppression(&provider.id, target);
             }
-            state.record_provider_balance_snapshot(snapshot).await;
             if let Some(error) = snapshot_error {
                 warn!(
                     "usage provider '{}' returned error snapshot for {}[{}]: {}",
@@ -3585,7 +4262,18 @@ async fn refresh_provider_target(
         Err(err) => {
             let error = err.to_string();
             let terminal_failure = usage_provider_error_is_terminal(&error);
-            if terminal_failure {
+            let snapshot = base_snapshot(provider, &target.endpoint, fetched_at_ms, stale_after_ms)
+                .with_error(error.clone());
+            let persisted = commit_provider_poll_snapshot(
+                state.as_ref(),
+                Some(prepared_poll.reservation),
+                snapshot,
+                None,
+                unix_now_ms(),
+                None,
+            )
+            .await;
+            if persisted.observation_accepted() && terminal_failure {
                 remember_usage_provider_target_suppression(
                     &provider.id,
                     target,
@@ -3594,17 +4282,6 @@ async fn refresh_provider_target(
                     Instant::now(),
                 );
             }
-            let snapshot = base_snapshot(provider, &target.endpoint, fetched_at_ms, stale_after_ms)
-                .with_error(error.clone());
-            commit_provider_poll_observation(
-                state.as_ref(),
-                prepared_poll.reservation,
-                &snapshot,
-                None,
-                unix_now_ms(),
-            )
-            .await;
-            state.record_provider_balance_snapshot(snapshot).await;
             warn!(
                 "usage provider '{}' poll failed for {}[{}]: {}",
                 provider.id,
@@ -3612,7 +4289,7 @@ async fn refresh_provider_target(
                 target.endpoint.catalog_index,
                 error
             );
-            UsageProviderRefreshOutcome::Failed
+            persisted.failed_refresh_outcome()
         }
     }
 }
@@ -4014,14 +4691,18 @@ async fn auto_probe_provider_target(
     if is_official_openai_base_url(&target.base_url) {
         let provider = auto_openai_official_provider(target);
         let Some(token) = resolve_token(&provider, target) else {
-            state
-                .record_provider_balance_snapshot(base_snapshot(
-                    &provider,
-                    &target.endpoint,
-                    fetched_at_ms,
-                    stale_after_ms,
-                ))
-                .await;
+            let persisted = commit_provider_poll_snapshot(
+                state.as_ref(),
+                None,
+                base_snapshot(&provider, &target.endpoint, fetched_at_ms, stale_after_ms),
+                None,
+                unix_now_ms(),
+                None,
+            )
+            .await;
+            if persisted.persistence_failed() {
+                return UsageProviderRefreshOutcome::Failed;
+            }
             warn!(
                 "OpenAI organization costs require OPENAI_ADMIN_KEY; balance stays unknown for {}[{}]",
                 target.endpoint.provider_endpoint.provider_id, target.endpoint.catalog_index
@@ -4045,7 +4726,15 @@ async fn auto_probe_provider_target(
                 let snapshot =
                     base_snapshot(&provider, &target.endpoint, fetched_at_ms, stale_after_ms)
                         .with_error(error.to_string());
-                state.record_provider_balance_snapshot(snapshot).await;
+                let _ = commit_provider_poll_snapshot(
+                    state.as_ref(),
+                    None,
+                    snapshot,
+                    None,
+                    unix_now_ms(),
+                    None,
+                )
+                .await;
                 return UsageProviderRefreshOutcome::Failed;
             }
         };
@@ -4060,6 +4749,7 @@ async fn auto_probe_provider_target(
         .await
         {
             Ok(value) => {
+                let quota_conversion = select_new_api_quota_conversion(&provider, None);
                 let snapshot = snapshot_from_provider_json(
                     &provider,
                     &target.endpoint,
@@ -4067,38 +4757,44 @@ async fn auto_probe_provider_target(
                     &target.base_url,
                     fetched_at_ms,
                     stale_after_ms,
+                    quota_conversion,
                 );
-                commit_provider_poll_observation(
+                let publication = commit_provider_snapshot_with_context(
                     state.as_ref(),
                     prepared_poll.reservation,
-                    &snapshot,
+                    &provider,
+                    target,
+                    Some(&token),
+                    &value,
+                    snapshot,
                     None,
                     unix_now_ms(),
+                    interval_secs,
+                    quota_conversion,
                 )
                 .await;
-                state.record_provider_balance_snapshot(snapshot).await;
-                UsageProviderRefreshOutcome::Refreshed
+                publication.successful_refresh_outcome()
             }
             Err(err) => {
                 let snapshot =
                     base_snapshot(&provider, &target.endpoint, fetched_at_ms, stale_after_ms)
                         .with_error(err.to_string());
-                commit_provider_poll_observation(
+                let publication = commit_provider_poll_snapshot(
                     state.as_ref(),
-                    prepared_poll.reservation,
-                    &snapshot,
+                    Some(prepared_poll.reservation),
+                    snapshot,
                     None,
                     unix_now_ms(),
+                    None,
                 )
                 .await;
-                state.record_provider_balance_snapshot(snapshot).await;
                 warn!(
                     "OpenAI organization costs poll failed for {}[{}]: {}",
                     target.endpoint.provider_endpoint.provider_id,
                     target.endpoint.catalog_index,
                     err
                 );
-                UsageProviderRefreshOutcome::Failed
+                publication.failed_refresh_outcome()
             }
         };
     }
@@ -4124,9 +4820,12 @@ async fn auto_probe_provider_target(
             target.endpoint.catalog_index,
             suppression.reason
         );
-        return UsageProviderRefreshOutcome::Failed;
+        return UsageProviderRefreshOutcome::Suppressed {
+            wake_at: suppression.until,
+        };
     }
     if let Some(decision) = snapshot_decision {
+        let wake_at = Instant::now() + decision.ttl;
         remember_usage_provider_target_suppression(
             &provider_id,
             target,
@@ -4141,21 +4840,28 @@ async fn auto_probe_provider_target(
             target.endpoint.catalog_index,
             decision.reason
         );
-        return UsageProviderRefreshOutcome::Failed;
+        return UsageProviderRefreshOutcome::Suppressed { wake_at };
     }
 
     let Some(token) = resolve_token(&first_provider, target) else {
-        state
-            .record_provider_balance_snapshot(
-                base_snapshot(
-                    &first_provider,
-                    &target.endpoint,
-                    fetched_at_ms,
-                    stale_after_ms,
-                )
-                .with_error("no usable token; checked upstream auth"),
+        let persisted = commit_provider_poll_snapshot(
+            state.as_ref(),
+            None,
+            base_snapshot(
+                &first_provider,
+                &target.endpoint,
+                fetched_at_ms,
+                stale_after_ms,
             )
-            .await;
+            .with_error("no usable token; checked upstream auth"),
+            None,
+            unix_now_ms(),
+            None,
+        )
+        .await;
+        if persisted.persistence_failed() {
+            return UsageProviderRefreshOutcome::Failed;
+        }
         return UsageProviderRefreshOutcome::MissingToken;
     };
 
@@ -4169,22 +4875,27 @@ async fn auto_probe_provider_target(
             target.endpoint.catalog_index,
             error
         );
-        state
-            .record_provider_balance_snapshot(
-                base_snapshot(
-                    &first_provider,
-                    &target.endpoint,
-                    fetched_at_ms,
-                    stale_after_ms,
-                )
-                .with_error(error),
+        let _ = commit_provider_poll_snapshot(
+            state.as_ref(),
+            None,
+            base_snapshot(
+                &first_provider,
+                &target.endpoint,
+                fetched_at_ms,
+                stale_after_ms,
             )
-            .await;
+            .with_error(error),
+            None,
+            unix_now_ms(),
+            None,
+        )
+        .await;
         return UsageProviderRefreshOutcome::Failed;
     }
 
     let auto_config_revision = auto_usage_provider_config_revision(target);
     let mut probe_errors = Vec::new();
+    let mut last_observation_publication = None;
     for kind in probe_order {
         let provider = auto_usage_provider(target, kind);
         let prepared_poll = match prepare_provider_poll(
@@ -4200,7 +4911,6 @@ async fn auto_probe_provider_target(
         {
             Ok(prepared) => prepared,
             Err(error) => {
-                remember_auto_probe_kind_failure(&provider_id, target, kind, Instant::now());
                 probe_errors.push(format!("{kind:?}: {error}"));
                 continue;
             }
@@ -4215,6 +4925,8 @@ async fn auto_probe_provider_target(
         .await
         {
             Ok(value) => {
+                let quota_conversion =
+                    resolve_new_api_quota_conversion(client, &provider, &target.base_url).await;
                 let snapshot = snapshot_from_provider_json(
                     &provider,
                     &target.endpoint,
@@ -4222,32 +4934,46 @@ async fn auto_probe_provider_target(
                     &target.base_url,
                     fetched_at_ms,
                     stale_after_ms,
+                    quota_conversion,
                 );
                 if auto_snapshot_is_usable(&snapshot) {
-                    remember_auto_probe_kind_success(&provider_id, target, kind);
                     let suppression_decision =
                         usage_provider_suppression_decision_from_snapshot(&snapshot, fetched_at_ms);
                     let exhausted_for_routing = suppression_decision.is_some();
-                    let observation_committed = commit_provider_poll_observation(
+                    let publication = commit_provider_snapshot_with_context(
                         state.as_ref(),
                         prepared_poll.reservation,
-                        &snapshot,
+                        &provider,
+                        target,
+                        Some(&token),
+                        &value,
+                        snapshot,
                         suppression_decision.as_ref(),
                         unix_now_ms(),
+                        interval_secs,
+                        quota_conversion,
                     )
                     .await;
-                    if observation_committed && let Some(decision) = suppression_decision.as_ref() {
-                        remember_usage_provider_target_suppression(
-                            &provider_id,
-                            target,
-                            decision.ttl,
-                            decision.reason.as_str(),
-                            Instant::now(),
-                        );
-                    } else if observation_committed {
-                        clear_usage_provider_target_suppression(&provider_id, target);
+                    if publication.persistence_failed() {
+                        return UsageProviderRefreshOutcome::Failed;
                     }
-                    state.record_provider_balance_snapshot(snapshot).await;
+                    if publication.ignored() {
+                        return UsageProviderRefreshOutcome::Ignored;
+                    }
+                    if publication.observation_accepted() {
+                        remember_auto_probe_kind_success(&provider_id, target, kind);
+                        if let Some(decision) = suppression_decision.as_ref() {
+                            remember_usage_provider_target_suppression(
+                                &provider_id,
+                                target,
+                                decision.ttl,
+                                decision.reason.as_str(),
+                                Instant::now(),
+                            );
+                        } else {
+                            clear_usage_provider_target_suppression(&provider_id, target);
+                        }
+                    }
                     info!(
                         "auto usage provider '{}' refreshed {}[{}] via {:?}, exhausted = {}",
                         provider.id,
@@ -4258,7 +4984,7 @@ async fn auto_probe_provider_target(
                     );
                     return UsageProviderRefreshOutcome::Refreshed;
                 }
-                commit_provider_poll_observation(
+                let publication = commit_provider_poll_observation(
                     state.as_ref(),
                     prepared_poll.reservation,
                     &snapshot,
@@ -4266,7 +4992,13 @@ async fn auto_probe_provider_target(
                     unix_now_ms(),
                 )
                 .await;
-                remember_auto_probe_kind_failure(&provider_id, target, kind, Instant::now());
+                if publication.persistence_failed() {
+                    return UsageProviderRefreshOutcome::Failed;
+                }
+                last_observation_publication = Some(publication);
+                if publication.observation_accepted() {
+                    remember_auto_probe_kind_failure(&provider_id, target, kind, Instant::now());
+                }
                 let error = snapshot.error.unwrap_or_else(|| {
                     format!("auto probe {:?} returned no usable balance fields", kind)
                 });
@@ -4276,7 +5008,7 @@ async fn auto_probe_provider_target(
                 let snapshot =
                     base_snapshot(&provider, &target.endpoint, fetched_at_ms, stale_after_ms)
                         .with_error(err.to_string());
-                commit_provider_poll_observation(
+                let publication = commit_provider_poll_observation(
                     state.as_ref(),
                     prepared_poll.reservation,
                     &snapshot,
@@ -4284,12 +5016,21 @@ async fn auto_probe_provider_target(
                     unix_now_ms(),
                 )
                 .await;
-                remember_auto_probe_kind_failure(&provider_id, target, kind, Instant::now());
+                if publication.persistence_failed() {
+                    return UsageProviderRefreshOutcome::Failed;
+                }
+                last_observation_publication = Some(publication);
+                if publication.observation_accepted() {
+                    remember_auto_probe_kind_failure(&provider_id, target, kind, Instant::now());
+                }
                 probe_errors.push(format!("{:?}: {}", kind, err));
             }
         }
     }
 
+    if last_observation_publication.is_some_and(ProviderPollPublication::ignored) {
+        return UsageProviderRefreshOutcome::Ignored;
+    }
     if let Some(error) = auto_probe_error_summary(&probe_errors) {
         warn!(
             "auto usage provider '{}' found no usable balance endpoint for {}[{}]: {}",
@@ -4298,27 +5039,17 @@ async fn auto_probe_provider_target(
             target.endpoint.catalog_index,
             error
         );
-        state
-            .record_provider_balance_snapshot(
-                base_snapshot(
-                    &first_provider,
-                    &target.endpoint,
-                    fetched_at_ms,
-                    stale_after_ms,
-                )
-                .with_error(error.clone()),
-            )
-            .await;
-        let terminal_failure = usage_provider_error_is_terminal(error.as_str());
-        if terminal_failure {
-            remember_usage_provider_target_suppression(
-                &provider_id,
-                target,
-                USAGE_PROVIDER_TERMINAL_FAILURE_TTL,
-                error.clone(),
-                Instant::now(),
-            );
-        }
+        let publication = publish_auto_probe_error_summary(
+            state.as_ref(),
+            &provider_id,
+            &first_provider,
+            target,
+            fetched_at_ms,
+            stale_after_ms,
+            &error,
+        )
+        .await;
+        return publication.failed_refresh_outcome();
     }
     UsageProviderRefreshOutcome::Failed
 }
@@ -4388,13 +5119,8 @@ pub async fn refresh_balances_for_service(
         for (provider_id, outcome) in
             run_configured_refresh_jobs(client, configured_jobs, &state, service_name).await
         {
-            match outcome {
-                UsageProviderRefreshOutcome::Refreshed => {
-                    summary.refreshed += 1;
-                    refreshed_provider_ids.insert(provider_id);
-                }
-                UsageProviderRefreshOutcome::Failed => summary.failed += 1,
-                UsageProviderRefreshOutcome::MissingToken => summary.missing_token += 1,
+            if summary.record_configured_outcome(outcome) {
+                refreshed_provider_ids.insert(provider_id);
             }
         }
     }
@@ -4415,19 +5141,7 @@ pub async fn refresh_balances_for_service(
 
     if !auto_jobs.is_empty() {
         for outcome in run_auto_refresh_jobs(client, auto_jobs, &state, service_name).await {
-            match outcome {
-                UsageProviderRefreshOutcome::Refreshed => {
-                    summary.refreshed += 1;
-                    summary.auto_refreshed += 1;
-                }
-                UsageProviderRefreshOutcome::Failed => {
-                    summary.failed += 1;
-                    summary.auto_failed += 1;
-                }
-                UsageProviderRefreshOutcome::MissingToken => {
-                    summary.missing_token += 1;
-                }
-            }
+            summary.record_auto_outcome(outcome);
         }
     }
 
@@ -4619,6 +5333,55 @@ mod tests {
         (addr, handle)
     }
 
+    async fn spawn_ordered_balance_server() -> (
+        SocketAddr,
+        tokio::sync::oneshot::Receiver<()>,
+        Arc<tokio::sync::Semaphore>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let first_started = Arc::new(Mutex::new(Some(started_tx)));
+        let release_first = Arc::new(tokio::sync::Semaphore::new(0));
+        let app = axum::Router::new().fallback(get({
+            let request_count = Arc::clone(&request_count);
+            let first_started = Arc::clone(&first_started);
+            let release_first = Arc::clone(&release_first);
+            move |uri: axum::http::Uri| {
+                let request_count = Arc::clone(&request_count);
+                let first_started = Arc::clone(&first_started);
+                let release_first = Arc::clone(&release_first);
+                async move {
+                    let request_index = request_count.fetch_add(1, Ordering::SeqCst);
+                    if request_index == 0 {
+                        if let Some(started) = first_started
+                            .lock()
+                            .expect("first-started signal lock")
+                            .take()
+                        {
+                            let _ = started.send(());
+                        }
+                        let _permit = release_first
+                            .acquire()
+                            .await
+                            .expect("first request release semaphore");
+                        return axum::Json(serde_json::json!({ "balance": "0" }));
+                    }
+                    if uri.path().ends_with("/usage") {
+                        axum::Json(serde_json::json!({
+                            "isValid": true,
+                            "remaining": 10
+                        }))
+                    } else {
+                        axum::Json(serde_json::json!({ "balance": "10" }))
+                    }
+                }
+            }
+        }));
+        let (addr, handle) = spawn_axum_server(app).await;
+        (addr, started_rx, release_first, handle)
+    }
+
     fn provider(id: &str, kind: ProviderKind) -> UsageProviderConfig {
         UsageProviderConfig {
             id: id.to_string(),
@@ -4631,6 +5394,9 @@ mod tests {
             poll_interval_secs: Some(60),
             refresh_on_request: true,
             trust_exhaustion_for_routing: true,
+            quota_pool_id: None,
+            quota_reset_timezone: None,
+            quota_divisor: None,
             extract: UsageProviderExtractConfig::default(),
         }
     }
@@ -4749,6 +5515,41 @@ mod tests {
             .iter()
             .find(|projection| &projection.provider_endpoint == endpoint)
             .map(|projection| projection.automatic)
+    }
+
+    #[test]
+    fn ignored_outcomes_do_not_advance_success_accounting_or_poll_timestamp() {
+        let mut summary = UsageProviderRefreshSummary::default();
+
+        assert!(!summary.record_configured_outcome(UsageProviderRefreshOutcome::Ignored));
+        summary.record_auto_outcome(UsageProviderRefreshOutcome::Ignored);
+        assert_eq!(summary.refreshed, 0);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.auto_refreshed, 0);
+        assert_eq!(summary.auto_failed, 0);
+
+        assert!(summary.record_configured_outcome(UsageProviderRefreshOutcome::Refreshed));
+        summary.record_auto_outcome(UsageProviderRefreshOutcome::Refreshed);
+        assert_eq!(summary.refreshed, 2);
+        assert_eq!(summary.auto_refreshed, 1);
+    }
+
+    #[test]
+    fn ignored_publications_never_report_a_refresh() {
+        for publication in [
+            ProviderPollPublication::ObservationIgnoredStale,
+            ProviderPollPublication::ObservationIgnoredInactiveIncarnation,
+            ProviderPollPublication::UnreservedSnapshotIgnoredOlder,
+        ] {
+            assert_eq!(
+                publication.successful_refresh_outcome(),
+                UsageProviderRefreshOutcome::Ignored
+            );
+            assert_eq!(
+                publication.failed_refresh_outcome(),
+                UsageProviderRefreshOutcome::Ignored
+            );
+        }
     }
 
     #[test]
@@ -5869,13 +6670,302 @@ mod tests {
         assert_eq!(snapshot.status, BalanceSnapshotStatus::Error);
         assert_eq!(
             snapshot.error.as_deref(),
-            Some("all balance probe kinds are temporarily suppressed")
+            Some("provider refresh temporarily unavailable")
         );
         assert_eq!(snapshot.provider_endpoint.endpoint_id, "default");
         assert_eq!(
             target_automatic_eligibility(state.as_ref(), &target).await,
             None
         );
+        clear_auto_probe_kind_state(provider_id);
+    }
+
+    #[tokio::test]
+    async fn atomic_provider_quota_failure_is_reported_as_refresh_failure() {
+        let provider_id = "input-atomic-persistence-failure";
+        clear_auto_probe_kind_state(provider_id);
+        let app = axum::Router::new().fallback(get(|| async {
+            axum::Json(serde_json::json!({
+                "isValid": true,
+                "mode": "unrestricted",
+                "planName": "CodeX Lite",
+                "remaining": 12.5,
+                "subscription": {
+                    "daily_usage_usd": 0,
+                    "daily_limit_usd": 100,
+                    "weekly_usage_usd": 0,
+                    "weekly_limit_usd": 0,
+                    "monthly_usage_usd": 0,
+                    "monthly_limit_usd": 0
+                }
+            }))
+        }));
+        let (addr, handle) = spawn_axum_server(app).await;
+        let state = ProxyState::new();
+        let mut target = usage_provider_target(&format!("http://{addr}/v1"), provider_id);
+        target.auth.auth_token = Some("model-key".to_string());
+        state
+            .runtime_store()
+            .fail_next_provider_quota_commit_for_test();
+
+        let outcome =
+            auto_probe_provider_target(&Client::new(), &target, &state, "codex", false).await;
+
+        assert_eq!(outcome, UsageProviderRefreshOutcome::Failed);
+        assert_eq!(state.quota_registry_checkpoint().await.generation, 0);
+        assert!(state.get_provider_balance_view("codex").await.is_empty());
+        clear_auto_probe_kind_state(provider_id);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn configured_ignored_stale_completion_does_not_restore_suppression() {
+        let provider_id = "configured-stale-completion";
+        clear_auto_probe_kind_state(provider_id);
+        let (addr, first_started, release_first, handle) = spawn_ordered_balance_server().await;
+        let base_url = format!("http://{addr}/v1");
+        let mut configured_provider = provider(provider_id, ProviderKind::OpenAiBalanceHttpJson);
+        configured_provider.domains = vec!["127.0.0.1".to_string()];
+        configured_provider.endpoint = format!("http://{addr}/user/balance");
+        let configured_provider = Arc::new(configured_provider);
+        let mut target = usage_provider_target(&base_url, provider_id);
+        target.auth.auth_token = Some("model-key".to_string());
+        let state = ProxyState::new();
+
+        let slow_refresh = {
+            let client = Client::new();
+            let provider = Arc::clone(&configured_provider);
+            let target = target.clone();
+            let state = Arc::clone(&state);
+            tokio::spawn(async move {
+                refresh_provider_target(RefreshProviderTargetParams {
+                    client: &client,
+                    provider: provider.as_ref(),
+                    target: &target,
+                    state: &state,
+                    service_name: "codex",
+                    interval_secs: 60,
+                    force: false,
+                })
+                .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(30), first_started)
+            .await
+            .expect("first configured refresh should reach the server")
+            .expect("first configured refresh signal");
+
+        let newer = refresh_provider_target(RefreshProviderTargetParams {
+            client: &Client::new(),
+            provider: configured_provider.as_ref(),
+            target: &target,
+            state: &state,
+            service_name: "codex",
+            interval_secs: 60,
+            force: false,
+        })
+        .await;
+        assert_eq!(newer, UsageProviderRefreshOutcome::Refreshed);
+
+        release_first.add_permits(1);
+        let older = tokio::time::timeout(Duration::from_secs(30), slow_refresh)
+            .await
+            .expect("older configured refresh should finish")
+            .expect("older configured refresh task");
+        assert_eq!(older, UsageProviderRefreshOutcome::Ignored);
+
+        let snapshot = state
+            .get_provider_balance_view("codex")
+            .await
+            .into_iter()
+            .find(|snapshot| snapshot.provider_endpoint == target.endpoint.provider_endpoint)
+            .expect("newer configured balance snapshot");
+        assert_eq!(snapshot.total_balance_usd.as_deref(), Some("10"));
+        assert_eq!(snapshot.exhausted, Some(false));
+        assert!(
+            usage_provider_target_suppression_active(provider_id, &target, Instant::now())
+                .is_none()
+        );
+        let history = state
+            .runtime_store()
+            .read_provider_observation_history(&target.endpoint.provider_endpoint, 10)
+            .expect("configured observation history");
+        assert!(
+            history
+                .iter()
+                .any(|entry| { entry.disposition == ProviderObservationDisposition::IgnoredStale })
+        );
+        assert!(
+            history
+                .iter()
+                .any(|entry| { entry.disposition == ProviderObservationDisposition::Accepted })
+        );
+
+        clear_auto_probe_kind_state(provider_id);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn auto_ignored_stale_success_does_not_replace_hint_or_suppression() {
+        let provider_id = "auto-stale-completion";
+        clear_auto_probe_kind_state(provider_id);
+        let (addr, first_started, release_first, handle) = spawn_ordered_balance_server().await;
+        let mut target = usage_provider_target(&format!("http://{addr}/v1"), provider_id);
+        target.auth.auth_token = Some("model-key".to_string());
+        let state = ProxyState::new();
+        remember_auto_probe_kind_success(provider_id, &target, ProviderKind::OpenAiBalanceHttpJson);
+
+        let slow_probe = {
+            let client = Client::new();
+            let target = target.clone();
+            let state = Arc::clone(&state);
+            tokio::spawn(async move {
+                auto_probe_provider_target(&client, &target, &state, "codex", false).await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(30), first_started)
+            .await
+            .expect("first auto probe should reach the server")
+            .expect("first auto probe signal");
+
+        remember_auto_probe_kind_success(provider_id, &target, ProviderKind::Sub2ApiUsage);
+        let newer =
+            auto_probe_provider_target(&Client::new(), &target, &state, "codex", false).await;
+        assert_eq!(newer, UsageProviderRefreshOutcome::Refreshed);
+
+        release_first.add_permits(1);
+        let older = tokio::time::timeout(Duration::from_secs(30), slow_probe)
+            .await
+            .expect("older auto probe should finish")
+            .expect("older auto probe task");
+        assert_eq!(older, UsageProviderRefreshOutcome::Ignored);
+
+        assert_eq!(
+            remembered_auto_probe_kind(provider_id),
+            Some(ProviderKind::Sub2ApiUsage)
+        );
+        assert!(
+            usage_provider_target_suppression_active(provider_id, &target, Instant::now())
+                .is_none()
+        );
+        let snapshot = state
+            .get_provider_balance_view("codex")
+            .await
+            .into_iter()
+            .find(|snapshot| snapshot.provider_endpoint == target.endpoint.provider_endpoint)
+            .expect("newer auto balance snapshot");
+        assert_eq!(snapshot.source, ProviderKind::Sub2ApiUsage.source_name());
+        assert_eq!(snapshot.exhausted, Some(false));
+        let history = state
+            .runtime_store()
+            .read_provider_observation_history(&target.endpoint.provider_endpoint, 10)
+            .expect("auto observation history");
+        assert!(
+            history
+                .iter()
+                .any(|entry| { entry.disposition == ProviderObservationDisposition::IgnoredStale })
+        );
+
+        clear_auto_probe_kind_state(provider_id);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn equal_timestamp_late_unreserved_error_does_not_arm_terminal_suppression() {
+        let provider_id = "auto-late-unreserved-error";
+        clear_auto_probe_kind_state(provider_id);
+        let target = usage_provider_target("https://relay.example.com/v1", provider_id);
+        let provider = auto_usage_provider(&target, ProviderKind::Sub2ApiUsage);
+        let state = ProxyState::new();
+        let fetched_at_ms = unix_now_ms();
+        let mut healthy = base_snapshot(
+            &provider,
+            &target.endpoint,
+            fetched_at_ms,
+            Some(fetched_at_ms.saturating_add(60_000)),
+        );
+        healthy.total_balance_usd = Some("10".to_string());
+        healthy.quota_remaining_usd = Some("10".to_string());
+        healthy.quota_limit_usd = Some("10".to_string());
+        healthy.exhausted = Some(false);
+        healthy.refresh_status(fetched_at_ms);
+        assert_eq!(
+            commit_provider_poll_snapshot(
+                state.as_ref(),
+                None,
+                healthy,
+                None,
+                fetched_at_ms,
+                None,
+            )
+                .await,
+            ProviderPollPublication::UnreservedSnapshotPublished
+        );
+        let quota_before = state.quota_registry_checkpoint().await;
+
+        let publication = publish_auto_probe_error_summary(
+            state.as_ref(),
+            provider_id,
+            &provider,
+            &target,
+            fetched_at_ms,
+            Some(fetched_at_ms.saturating_add(60_000)),
+            "invalid token",
+        )
+        .await;
+
+        assert_eq!(
+            publication,
+            ProviderPollPublication::UnreservedSnapshotIgnoredOlder
+        );
+        assert!(
+            usage_provider_target_suppression_active(provider_id, &target, Instant::now())
+                .is_none()
+        );
+        let snapshot = state
+            .get_provider_balance_view("codex")
+            .await
+            .into_iter()
+            .find(|snapshot| snapshot.provider_endpoint == target.endpoint.provider_endpoint)
+            .expect("newer unreserved balance snapshot");
+        assert_eq!(snapshot.fetched_at_ms, fetched_at_ms);
+        assert_eq!(snapshot.total_balance_usd.as_deref(), Some("10"));
+        assert_eq!(snapshot.quota_remaining_usd.as_deref(), Some("10"));
+        assert!(snapshot.error.is_none());
+        assert_eq!(state.quota_registry_checkpoint().await, quota_before);
+
+        clear_auto_probe_kind_state(provider_id);
+    }
+
+    #[tokio::test]
+    async fn auto_prepare_failure_does_not_publish_adapter_hint() {
+        let provider_id = "auto-prepare-failure";
+        clear_auto_probe_kind_state(provider_id);
+        let state = ProxyState::new();
+        let mut target = usage_provider_target("not-a-valid-base-url", provider_id);
+        target.auth.auth_token = Some("model-key".to_string());
+
+        let outcome =
+            auto_probe_provider_target(&Client::new(), &target, &state, "codex", false).await;
+
+        assert_eq!(outcome, UsageProviderRefreshOutcome::Failed);
+        assert_eq!(remembered_auto_probe_kind(provider_id), None);
+        assert!(
+            AUTO_PROBE_KIND_FAILURES
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .expect("auto probe failure map")
+                .keys()
+                .all(|key| key.provider_id != provider_id)
+        );
+        assert!(
+            state
+                .runtime_store()
+                .read_provider_observation_history(&target.endpoint.provider_endpoint, 10)
+                .expect("prepare failure observation history")
+                .is_empty()
+        );
+
         clear_auto_probe_kind_state(provider_id);
     }
 
@@ -5920,19 +7010,16 @@ mod tests {
                 provider_balance_snapshot_matches_target(snapshot, provider_id, &target)
             })
             .expect("terminal auth failure snapshot");
-        assert!(
-            snapshot
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("User account is not active")
-        );
+        assert_eq!(snapshot.error.as_deref(), Some("authentication failed"));
 
         let requests_after_first_probe = request_count.load(Ordering::SeqCst);
         let suppressed_outcome =
             auto_probe_provider_target(&Client::new(), &target, &state, "codex", false).await;
 
-        assert_eq!(suppressed_outcome, UsageProviderRefreshOutcome::Failed);
+        assert!(matches!(
+            suppressed_outcome,
+            UsageProviderRefreshOutcome::Suppressed { .. }
+        ));
         assert_eq!(
             request_count.load(Ordering::SeqCst),
             requests_after_first_probe
@@ -5945,7 +7032,10 @@ mod tests {
         let forced_outcome =
             auto_probe_provider_target(&Client::new(), &target, &state, "codex", true).await;
 
-        assert_eq!(forced_outcome, UsageProviderRefreshOutcome::Failed);
+        assert!(matches!(
+            forced_outcome,
+            UsageProviderRefreshOutcome::Suppressed { .. }
+        ));
         assert_eq!(
             request_count.load(Ordering::SeqCst),
             requests_after_first_probe,
@@ -6009,7 +7099,10 @@ mod tests {
         let suppressed_outcome =
             auto_probe_provider_target(&Client::new(), &target, &state, "codex", false).await;
 
-        assert_eq!(suppressed_outcome, UsageProviderRefreshOutcome::Failed);
+        assert!(matches!(
+            suppressed_outcome,
+            UsageProviderRefreshOutcome::Suppressed { .. }
+        ));
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
         assert_eq!(
             target_automatic_eligibility(state.as_ref(), &target).await,
@@ -6019,7 +7112,10 @@ mod tests {
         let forced_outcome =
             auto_probe_provider_target(&Client::new(), &target, &state, "codex", true).await;
 
-        assert_eq!(forced_outcome, UsageProviderRefreshOutcome::Failed);
+        assert!(matches!(
+            forced_outcome,
+            UsageProviderRefreshOutcome::Suppressed { .. }
+        ));
         assert_eq!(
             request_count.load(Ordering::SeqCst),
             1,
@@ -6072,7 +7168,10 @@ mod tests {
         let suppressed_outcome =
             auto_probe_provider_target(&Client::new(), &target, &state, "codex", false).await;
 
-        assert_eq!(suppressed_outcome, UsageProviderRefreshOutcome::Failed);
+        assert!(matches!(
+            suppressed_outcome,
+            UsageProviderRefreshOutcome::Suppressed { .. }
+        ));
         assert_eq!(request_count.load(Ordering::SeqCst), 0);
 
         let forced_outcome =
@@ -6540,10 +7639,7 @@ mod tests {
         );
 
         assert_eq!(snapshot.status, BalanceSnapshotStatus::Error);
-        assert_eq!(
-            snapshot.error.as_deref(),
-            Some("sub2api usage response reported invalid API key")
-        );
+        assert_eq!(snapshot.error.as_deref(), Some("authentication failed"));
     }
 
     #[test]
@@ -6708,7 +7804,7 @@ mod tests {
         );
 
         assert_eq!(snapshot.status, BalanceSnapshotStatus::Error);
-        assert_eq!(snapshot.error.as_deref(), Some("login required"));
+        assert_eq!(snapshot.error.as_deref(), Some("authentication failed"));
     }
 
     #[test]
@@ -6808,7 +7904,7 @@ mod tests {
             ttl: Duration::from_secs(30),
         };
 
-        assert!(
+        assert_eq!(
             commit_provider_poll_observation(
                 state.as_ref(),
                 prepared.reservation,
@@ -6816,7 +7912,8 @@ mod tests {
                 Some(&suppression),
                 1_001,
             )
-            .await
+            .await,
+            ProviderPollPublication::ObservationAccepted
         );
         let blocked = state.capture_provider_policy_snapshot().await;
         let projection = blocked
@@ -6846,7 +7943,7 @@ mod tests {
             ..exhausted
         };
 
-        assert!(
+        assert_eq!(
             commit_provider_poll_observation(
                 state.as_ref(),
                 prepared.reservation,
@@ -6854,7 +7951,8 @@ mod tests {
                 None,
                 2_001,
             )
-            .await
+            .await,
+            ProviderPollPublication::ObservationAccepted
         );
         let recovered = state.capture_provider_policy_snapshot().await;
         let projection = recovered
@@ -6908,6 +8006,7 @@ mod tests {
             }),
             100,
             Some(1_000),
+            Some(500_000),
         );
 
         assert_eq!(snapshot.status, BalanceSnapshotStatus::Ok);
@@ -6936,6 +8035,7 @@ mod tests {
             }),
             100,
             Some(1_000),
+            Some(500_000),
         );
 
         assert_eq!(snapshot.status, BalanceSnapshotStatus::Ok);
@@ -6965,6 +8065,7 @@ mod tests {
             }),
             100,
             Some(1_000),
+            Some(500_000),
         );
 
         assert_eq!(snapshot.status, BalanceSnapshotStatus::Ok);

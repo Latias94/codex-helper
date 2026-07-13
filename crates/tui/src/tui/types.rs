@@ -5,11 +5,13 @@ use crate::tui::i18n::{self, msg};
 pub(in crate::tui) enum Focus {
     Sessions,
     Requests,
-    Stations,
+    Providers,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::tui) enum StatsFocus {
+    Pools,
+    Projects,
     ProviderEndpoints,
     Providers,
 }
@@ -17,7 +19,7 @@ pub(in crate::tui) enum StatsFocus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::tui) enum Page {
     Dashboard,
-    Stations,
+    Routing,
     Sessions,
     Requests,
     Stats,
@@ -32,22 +34,15 @@ pub(in crate::tui) enum Page {
 pub(in crate::tui) enum Overlay {
     None,
     Help,
-    StationInfo,
+    ProviderInfo,
     SessionTranscript,
     StartupAlert,
 }
 
-pub(in crate::tui) fn page_titles(
-    lang: Language,
-    uses_route_graph_routing: bool,
-) -> [&'static str; 10] {
+pub(in crate::tui) fn page_titles(lang: Language) -> [&'static str; 10] {
     [
         i18n::text(lang, msg::PAGE_DASHBOARD),
-        if uses_route_graph_routing {
-            i18n::text(lang, msg::PAGE_ROUTING)
-        } else {
-            i18n::text(lang, msg::PAGE_STATIONS)
-        },
+        i18n::text(lang, msg::PAGE_ROUTING),
         i18n::text(lang, msg::PAGE_SESSIONS),
         i18n::text(lang, msg::PAGE_REQUESTS),
         i18n::text(lang, msg::PAGE_STATS),
@@ -62,7 +57,7 @@ pub(in crate::tui) fn page_titles(
 pub(in crate::tui) fn page_index(page: Page) -> usize {
     match page {
         Page::Dashboard => 0,
-        Page::Stations => 1,
+        Page::Routing => 1,
         Page::Sessions => 2,
         Page::Requests => 3,
         Page::Stats => 4,

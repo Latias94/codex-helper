@@ -15,6 +15,7 @@ use crate::state::FinishedRequest;
 
 mod affinity;
 mod lifecycle;
+mod metadata;
 mod policy;
 
 pub use affinity::{SessionAffinityIdentitySource, SessionAffinityLimit, SessionAffinityRecord};
@@ -27,6 +28,10 @@ pub use lifecycle::{
     NilLifecycleId, RecoveryReport, RecoveryRunId, RequestAccountingScope, TerminalDisposition,
     TerminalOrigin,
 };
+pub use metadata::{
+    RuntimeDocument, RuntimeDocumentCommit, RuntimeDocumentKind, RuntimeDocumentWrite,
+    RuntimeQuotaIdentity,
+};
 pub use policy::{
     ProviderAutomaticEligibility, ProviderEffectiveEligibility, ProviderEligibilityProjection,
     ProviderManualEligibility, ProviderObservation, ProviderObservationAuthority,
@@ -37,7 +42,8 @@ pub use policy::{
 };
 
 const APPLICATION_ID: i32 = 0x4348_5354;
-const SCHEMA_REVISION: i32 = 1;
+const SCHEMA_REVISION: i32 = 2;
+const FIRST_MIGRATABLE_SCHEMA_REVISION: i32 = 1;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const APPLICATION_NAME: &str = "codex-helper";
 const SCHEMA_NAME: &str = "canonical-relay-runtime";
@@ -391,6 +397,8 @@ pub struct RuntimeStore {
     fail_next_attempt_terminal_commit: AtomicBool,
     #[cfg(test)]
     fail_next_policy_commit: AtomicBool,
+    #[cfg(test)]
+    fail_next_provider_quota_commit: AtomicBool,
     #[cfg(test)]
     fail_next_affinity_commit: AtomicBool,
     #[cfg(test)]
@@ -949,6 +957,85 @@ impl RuntimeStore {
         self.backing.path()
     }
 
+    /// Loads the installation-local quota identity, creating it in this store when absent.
+    pub fn load_or_create_quota_identity(&self) -> Result<RuntimeQuotaIdentity, RuntimeStoreError> {
+        let created_at_unix_ms = current_unix_time_ms()?;
+        self.write_store_transaction("load or create quota identity", |transaction, path| {
+            metadata::load_or_create_quota_identity(
+                transaction,
+                path,
+                self.identity.store_id,
+                created_at_unix_ms,
+            )
+        })
+    }
+
+    /// Reads one versioned document from the canonical runtime database.
+    pub fn read_runtime_document(
+        &self,
+        kind: RuntimeDocumentKind,
+    ) -> Result<Option<RuntimeDocument>, RuntimeStoreError> {
+        let connection = self
+            ._connection
+            .lock()
+            .map_err(|_| RuntimeStoreError::ConnectionPoisoned)?;
+        metadata::read_document(
+            &connection.connection,
+            &self.display_path(),
+            self.identity.store_id,
+            kind,
+        )
+    }
+
+    /// Atomically commits one or more versioned helper-owned documents.
+    pub fn write_runtime_documents(
+        &self,
+        writes: &[RuntimeDocumentWrite<'_>],
+    ) -> Result<Vec<RuntimeDocument>, RuntimeStoreError> {
+        let updated_at_unix_ms = current_unix_time_ms()?;
+        self.write_store_transaction("write runtime documents", |transaction, path| {
+            metadata::write_documents(
+                transaction,
+                path,
+                self.identity.store_id,
+                updated_at_unix_ms,
+                writes,
+            )
+        })
+    }
+
+    /// Commits one document only when its current revision matches the observed revision.
+    pub fn compare_and_write_runtime_document(
+        &self,
+        expected_revision: Option<u64>,
+        write: RuntimeDocumentWrite<'_>,
+    ) -> Result<RuntimeDocumentCommit, RuntimeStoreError> {
+        let updated_at_unix_ms = current_unix_time_ms()?;
+        self.write_store_transaction("compare and write runtime document", |transaction, path| {
+            let current =
+                metadata::read_document(transaction, path, self.identity.store_id, write.kind)?;
+            if current.as_ref().map(|document| document.revision) != expected_revision {
+                return Ok(RuntimeDocumentCommit::Stale(current));
+            }
+
+            let mut committed = metadata::write_documents(
+                transaction,
+                path,
+                self.identity.store_id,
+                updated_at_unix_ms,
+                &[write],
+            )?;
+            let Some(document) = committed.pop() else {
+                return Err(RuntimeStoreError::InvariantViolation {
+                    entity: "runtime document",
+                    id: "conditional commit".to_string(),
+                    detail: "document write returned no committed revision".to_string(),
+                });
+            };
+            Ok(RuntimeDocumentCommit::Committed(document))
+        })
+    }
+
     /// Returns the recovery transaction committed during this open.
     pub fn startup_recovery_report(&self) -> RecoveryReport {
         self.startup_recovery
@@ -1186,6 +1273,100 @@ impl RuntimeStore {
         })
     }
 
+    /// Atomically commits one provider observation and its quota-registry projection.
+    pub(crate) fn commit_provider_observation_and_quota_registry(
+        &self,
+        ticket: ProviderObservationTicket,
+        observation: ProviderObservation,
+        expected_quota_revision: Option<u64>,
+        quota_registry: RuntimeDocumentWrite<'_>,
+    ) -> Result<(ProviderObservationCommit, Option<RuntimeDocument>), RuntimeStoreError> {
+        if quota_registry.kind != RuntimeDocumentKind::QuotaRegistry {
+            return Err(RuntimeStoreError::InvariantViolation {
+                entity: "runtime document",
+                id: "quota_registry".to_string(),
+                detail: "atomic provider observation requires a quota registry document"
+                    .to_string(),
+            });
+        }
+        let updated_at_unix_ms = current_unix_time_ms()?;
+        self.write_store_transaction(
+            "commit provider observation and quota registry",
+            |transaction, path| {
+                let committed = policy::commit_provider_observation(
+                    transaction,
+                    path,
+                    self.identity.store_id,
+                    ticket,
+                    observation,
+                )?;
+                #[cfg(test)]
+                if self.fail_next_policy_commit.swap(false, Ordering::SeqCst) {
+                    return Err(RuntimeStoreError::InjectedFailure {
+                        operation: "commit provider observation",
+                    });
+                }
+                if committed.disposition != ProviderObservationDisposition::Accepted {
+                    return Ok((committed, None));
+                }
+
+                let current = metadata::read_document(
+                    transaction,
+                    path,
+                    self.identity.store_id,
+                    RuntimeDocumentKind::QuotaRegistry,
+                )?;
+                if let Some(current) = current.as_ref()
+                    && current.schema_version != quota_registry.schema_version
+                {
+                    return Err(RuntimeStoreError::InvariantViolation {
+                        entity: "runtime document",
+                        id: "quota_registry".to_string(),
+                        detail: format!(
+                            "refusing to replace schema {} with schema {}",
+                            current.schema_version, quota_registry.schema_version
+                        ),
+                    });
+                }
+                let actual_revision = current.as_ref().map(|document| document.revision);
+                if actual_revision != expected_quota_revision {
+                    return Err(RuntimeStoreError::InvariantViolation {
+                        entity: "runtime document",
+                        id: "quota_registry".to_string(),
+                        detail: format!(
+                            "expected revision {expected_quota_revision:?}, found {actual_revision:?}"
+                        ),
+                    });
+                }
+
+                let mut documents = metadata::write_documents(
+                    transaction,
+                    path,
+                    self.identity.store_id,
+                    updated_at_unix_ms,
+                    &[quota_registry],
+                )?;
+                let document = documents.pop().ok_or_else(|| {
+                    RuntimeStoreError::InvariantViolation {
+                        entity: "runtime document",
+                        id: "quota_registry".to_string(),
+                        detail: "quota registry write returned no committed document".to_string(),
+                    }
+                })?;
+                #[cfg(test)]
+                if self
+                    .fail_next_provider_quota_commit
+                    .swap(false, Ordering::SeqCst)
+                {
+                    return Err(RuntimeStoreError::InjectedFailure {
+                        operation: "commit provider observation and quota registry",
+                    });
+                }
+                Ok((committed, Some(document)))
+            },
+        )
+    }
+
     /// Invalidates automatic policy tied to removed or replaced upstream identities.
     pub fn reconcile_runtime_upstream_identities(
         &self,
@@ -1404,6 +1585,12 @@ impl RuntimeStore {
     }
 
     #[cfg(test)]
+    pub(crate) fn fail_next_provider_quota_commit_for_test(&self) {
+        self.fail_next_provider_quota_commit
+            .store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
     pub(crate) fn fail_next_affinity_commit_for_test(&self) {
         self.fail_next_affinity_commit.store(true, Ordering::SeqCst);
     }
@@ -1540,6 +1727,14 @@ impl RuntimeStore {
                 validate_open_file_identity(&mut persistent_files, &resources.backing)?;
                 identity
             }
+            DatabaseState::MigrationRequired => {
+                validate_open_file_identity(&mut persistent_files, &resources.backing)?;
+                configure_durability(&resources.connection, &display_path, persistent)?;
+                validate_open_file_identity(&mut persistent_files, &resources.backing)?;
+                let identity = migrate_database(&mut resources.connection, &display_path)?;
+                validate_open_file_identity(&mut persistent_files, &resources.backing)?;
+                identity
+            }
         };
         if persistent {
             secure_helper_owned_database_files(&display_path)?;
@@ -1571,6 +1766,8 @@ impl RuntimeStore {
             fail_next_attempt_terminal_commit: AtomicBool::new(false),
             #[cfg(test)]
             fail_next_policy_commit: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_provider_quota_commit: AtomicBool::new(false),
             #[cfg(test)]
             fail_next_affinity_commit: AtomicBool::new(false),
             #[cfg(test)]
@@ -1632,6 +1829,13 @@ impl RuntimeStoreReader {
             .map_err(|source| sqlite_error(&path, "enable read-only query mode", source))?;
         match inspect_database_state(&connection, &path)? {
             DatabaseState::Initialized => {}
+            DatabaseState::MigrationRequired => {
+                return Err(RuntimeStoreError::UnsupportedSchemaRevision {
+                    path,
+                    expected: SCHEMA_REVISION,
+                    actual: FIRST_MIGRATABLE_SCHEMA_REVISION,
+                });
+            }
             DatabaseState::Uninitialized => {
                 return Err(invalid_metadata(
                     &path,
@@ -1661,6 +1865,16 @@ impl RuntimeStoreReader {
     /// Returns the existing database path.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Reads one versioned document without acquiring writer ownership.
+    pub fn read_runtime_document(
+        &self,
+        kind: RuntimeDocumentKind,
+    ) -> Result<Option<RuntimeDocument>, RuntimeStoreError> {
+        self.with_connection(|connection| {
+            metadata::read_document(connection, &self.path, self.identity.store_id, kind)
+        })
     }
 
     /// Reads the latest committed startup recovery report without running recovery.
@@ -2187,6 +2401,7 @@ fn secure_private_file(_path: &Path) -> Result<(), RuntimeStoreError> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DatabaseState {
     Uninitialized,
+    MigrationRequired,
     Initialized,
 }
 
@@ -2226,7 +2441,10 @@ fn inspect_database_state(
             actual: application_id,
         });
     }
-    if application_id == APPLICATION_ID && schema_revision != SCHEMA_REVISION {
+    if application_id == APPLICATION_ID
+        && schema_revision != SCHEMA_REVISION
+        && schema_revision != FIRST_MIGRATABLE_SCHEMA_REVISION
+    {
         return Err(RuntimeStoreError::UnsupportedSchemaRevision {
             path: path.to_path_buf(),
             expected: SCHEMA_REVISION,
@@ -2242,6 +2460,10 @@ fn inspect_database_state(
     }
 
     if application_id == APPLICATION_ID {
+        if schema_revision == FIRST_MIGRATABLE_SCHEMA_REVISION {
+            validate_revision_one_schema(connection, path)?;
+            return Ok(DatabaseState::MigrationRequired);
+        }
         validate_schema(connection, path)?;
         return Ok(DatabaseState::Initialized);
     }
@@ -2303,6 +2525,10 @@ fn initialize_database(
 
     match inspect_database_state(connection, path)? {
         DatabaseState::Initialized => read_identity(connection, path),
+        DatabaseState::MigrationRequired => Err(invalid_metadata(
+            path,
+            "new runtime schema unexpectedly requires migration",
+        )),
         DatabaseState::Uninitialized => Err(invalid_metadata(
             path,
             format!("schema transaction did not persist store identity {store_id}"),
@@ -2310,9 +2536,74 @@ fn initialize_database(
     }
 }
 
+fn migrate_database(
+    connection: &mut Connection,
+    path: &Path,
+) -> Result<RuntimeStoreIdentity, RuntimeStoreError> {
+    migrate_database_with_sql(connection, path, &metadata::migration_sql())
+}
+
+fn migrate_database_with_sql(
+    connection: &mut Connection,
+    path: &Path,
+    migration_sql: &str,
+) -> Result<RuntimeStoreIdentity, RuntimeStoreError> {
+    validate_revision_one_schema(connection, path)?;
+    let identity = read_identity_for_revision(connection, path, FIRST_MIGRATABLE_SCHEMA_REVISION)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|source| sqlite_error(path, "begin runtime schema migration", source))?;
+    transaction
+        .execute_batch(migration_sql)
+        .map_err(|source| sqlite_error(path, "create runtime metadata tables", source))?;
+    transaction
+        .execute(
+            "UPDATE store_meta SET schema_revision = ?1 WHERE singleton = 1 AND schema_revision = ?2",
+            params![SCHEMA_REVISION, FIRST_MIGRATABLE_SCHEMA_REVISION],
+        )
+        .map_err(|source| sqlite_error(path, "update runtime schema identity", source))?;
+    if transaction.changes() != 1 {
+        return Err(invalid_metadata(
+            path,
+            "runtime schema identity changed before migration commit",
+        ));
+    }
+    transaction
+        .pragma_update(None, "user_version", SCHEMA_REVISION)
+        .map_err(|source| sqlite_error(path, "update runtime schema revision", source))?;
+    transaction
+        .commit()
+        .map_err(|source| sqlite_error(path, "commit runtime schema migration", source))?;
+
+    match inspect_database_state(connection, path)? {
+        DatabaseState::Initialized => {
+            let migrated = read_identity(connection, path)?;
+            if migrated != identity {
+                return Err(invalid_metadata(
+                    path,
+                    "runtime store identity changed during schema migration",
+                ));
+            }
+            Ok(migrated)
+        }
+        DatabaseState::MigrationRequired | DatabaseState::Uninitialized => Err(invalid_metadata(
+            path,
+            "runtime schema migration did not publish revision two",
+        )),
+    }
+}
+
 fn read_identity(
     connection: &Connection,
     path: &Path,
+) -> Result<RuntimeStoreIdentity, RuntimeStoreError> {
+    read_identity_for_revision(connection, path, SCHEMA_REVISION)
+}
+
+fn read_identity_for_revision(
+    connection: &Connection,
+    path: &Path,
+    expected_schema_revision: i32,
 ) -> Result<RuntimeStoreIdentity, RuntimeStoreError> {
     let row_count: i64 = connection
         .query_row("SELECT COUNT(*) FROM store_meta", [], |row| row.get(0))
@@ -2362,10 +2653,10 @@ fn read_identity(
             format!("schema is {schema:?}, expected {SCHEMA_NAME:?}"),
         ));
     }
-    if schema_revision != SCHEMA_REVISION {
+    if schema_revision != expected_schema_revision {
         return Err(RuntimeStoreError::UnsupportedSchemaRevision {
             path: path.to_path_buf(),
-            expected: SCHEMA_REVISION,
+            expected: expected_schema_revision,
             actual: schema_revision,
         });
     }
@@ -2378,7 +2669,19 @@ fn read_identity(
 
 fn validate_schema(connection: &Connection, path: &Path) -> Result<(), RuntimeStoreError> {
     lifecycle::validate_expected_schema_objects(connection, path)?;
+    validate_foreign_keys(connection, path)
+}
 
+fn validate_revision_one_schema(
+    connection: &Connection,
+    path: &Path,
+) -> Result<(), RuntimeStoreError> {
+    lifecycle::validate_revision_one_schema_objects(connection, path)?;
+    read_identity_for_revision(connection, path, FIRST_MIGRATABLE_SCHEMA_REVISION)?;
+    validate_foreign_keys(connection, path)
+}
+
+fn validate_foreign_keys(connection: &Connection, path: &Path) -> Result<(), RuntimeStoreError> {
     let mut statement = connection
         .prepare("PRAGMA foreign_key_check")
         .map_err(|source| sqlite_error(path, "prepare foreign key check", source))?;
@@ -2531,6 +2834,25 @@ mod tests {
     const LOCK_CHILD_PATH_ENV: &str = "CODEX_HELPER_TEST_RUNTIME_STORE_LOCK_CHILD_PATH";
     const LOCK_CHILD_READY_ENV: &str = "CODEX_HELPER_TEST_RUNTIME_STORE_LOCK_CHILD_READY";
 
+    fn create_revision_one_store(home: &Path) -> Uuid {
+        let path = runtime_store_path_in(home);
+        let store = RuntimeStore::open_in_home(home).expect("create current runtime store");
+        let store_id = store.identity().store_id();
+        drop(store);
+
+        let connection = Connection::open(&path).expect("open runtime store for downgrade");
+        connection
+            .execute_batch(
+                "DROP TABLE runtime_documents;
+                 DROP TABLE runtime_private_keys;
+                 UPDATE store_meta SET schema_revision = 1 WHERE singleton = 1;
+                 PRAGMA user_version = 1;",
+            )
+            .expect("downgrade runtime schema fixture to revision one");
+        drop(connection);
+        store_id
+    }
+
     fn test_logical_terminal_payload() -> LogicalRequestTerminalPayload {
         LogicalRequestTerminalPayload {
             finished_request: crate::state::FinishedRequest {
@@ -2548,6 +2870,7 @@ mod tests {
                 route_decision: None,
                 usage: None,
                 cost: crate::pricing::CostBreakdown::unknown(),
+                accounting: Default::default(),
                 retry: None,
                 provider_signals: Vec::new(),
                 policy_actions: Vec::new(),
@@ -2579,6 +2902,57 @@ mod tests {
             billable_usage: None,
             accounting_scope: RequestAccountingScope::Economic,
         }
+    }
+
+    #[test]
+    fn runtime_document_compare_and_write_rejects_stale_revision() {
+        let store = RuntimeStore::open_in_memory().expect("open runtime store");
+        let first_payload = r#"{"generation":1}"#;
+        let first = store
+            .compare_and_write_runtime_document(
+                None,
+                RuntimeDocumentWrite {
+                    kind: RuntimeDocumentKind::BasellmCatalog,
+                    schema_version: 1,
+                    payload_json: first_payload,
+                },
+            )
+            .expect("commit absent document");
+        let RuntimeDocumentCommit::Committed(first) = first else {
+            panic!("absent document should commit");
+        };
+        assert_eq!(first.revision, 1);
+
+        let stale = store
+            .compare_and_write_runtime_document(
+                None,
+                RuntimeDocumentWrite {
+                    kind: RuntimeDocumentKind::BasellmCatalog,
+                    schema_version: 1,
+                    payload_json: r#"{"generation":0}"#,
+                },
+            )
+            .expect("reject stale document");
+        let RuntimeDocumentCommit::Stale(Some(current)) = stale else {
+            panic!("stale absent observation should return the current document");
+        };
+        assert_eq!(current.revision, 1);
+        assert_eq!(current.payload_json, first_payload);
+
+        let second = store
+            .compare_and_write_runtime_document(
+                Some(first.revision),
+                RuntimeDocumentWrite {
+                    kind: RuntimeDocumentKind::BasellmCatalog,
+                    schema_version: 1,
+                    payload_json: r#"{"generation":2}"#,
+                },
+            )
+            .expect("commit matching revision");
+        let RuntimeDocumentCommit::Committed(second) = second else {
+            panic!("matching revision should commit");
+        };
+        assert_eq!(second.revision, 2);
     }
 
     fn test_attempt_evidence() -> AttemptPendingEvidence {
@@ -3421,6 +3795,85 @@ mod tests {
         let reopened = RuntimeStore::open_in_home(home.path()).expect("reopen store");
         assert_eq!(reopened.identity().store_id(), store_id);
         assert_eq!(reopened.path(), Some(expected_path.as_path()));
+    }
+
+    #[test]
+    fn persistent_store_migrates_revision_one_atomically() {
+        let home = TestDir::new("migrate-revision-one");
+        let store_id = create_revision_one_store(home.path());
+
+        let migrated = RuntimeStore::open_in_home(home.path()).expect("migrate runtime store");
+
+        assert_eq!(migrated.identity().store_id(), store_id);
+        assert_eq!(migrated.identity().schema_revision(), SCHEMA_REVISION);
+        assert!(
+            migrated
+                .read_runtime_document(RuntimeDocumentKind::BasellmCatalog)
+                .expect("read migrated document table")
+                .is_none()
+        );
+        migrated
+            .load_or_create_quota_identity()
+            .expect("write migrated private-key table");
+    }
+
+    #[test]
+    fn reader_rejects_revision_one_until_writer_migrates_it() {
+        let home = TestDir::new("reader-before-migration");
+        create_revision_one_store(home.path());
+
+        let error = RuntimeStoreReader::open_in_home(home.path())
+            .expect_err("reader must not observe a partially compatible schema");
+
+        assert!(matches!(
+            error,
+            RuntimeStoreError::UnsupportedSchemaRevision {
+                expected: SCHEMA_REVISION,
+                actual: FIRST_MIGRATABLE_SCHEMA_REVISION,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn failed_revision_one_migration_rolls_back_all_schema_changes() {
+        let home = TestDir::new("migration-rollback");
+        let path = runtime_store_path_in(home.path());
+        create_revision_one_store(home.path());
+        let mut connection = Connection::open(&path).expect("open revision-one store");
+        configure_connection_basics(&connection, &path).expect("configure migration connection");
+        let failing_sql = format!(
+            "{}; SELECT * FROM runtime_migration_failure_injection;",
+            metadata::RUNTIME_PRIVATE_KEYS_SQL
+        );
+
+        migrate_database_with_sql(&mut connection, &path, &failing_sql)
+            .expect_err("injected migration must fail");
+
+        assert_eq!(
+            pragma_i32(&connection, &path, "user_version").expect("read rolled-back revision"),
+            FIRST_MIGRATABLE_SCHEMA_REVISION
+        );
+        let schema_revision: i32 = connection
+            .query_row(
+                "SELECT schema_revision FROM store_meta WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read rolled-back metadata revision");
+        assert_eq!(schema_revision, FIRST_MIGRATABLE_SCHEMA_REVISION);
+        let metadata_table_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type = 'table' AND name IN ('runtime_private_keys', 'runtime_documents')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count rolled-back metadata tables");
+        assert_eq!(metadata_table_count, 0);
+        drop(connection);
+
+        RuntimeStore::open_in_home(home.path()).expect("migrate normally after rollback");
     }
 
     #[test]
@@ -5283,7 +5736,7 @@ mod tests {
 
         let connection = Connection::open(&path).expect("open database for tampering");
         connection
-            .execute("UPDATE store_meta SET schema_revision = 2", [])
+            .execute("UPDATE store_meta SET schema_revision = 99", [])
             .expect("tamper store identity metadata");
         drop(connection);
 
@@ -5292,7 +5745,7 @@ mod tests {
             error,
             RuntimeStoreError::UnsupportedSchemaRevision {
                 expected: SCHEMA_REVISION,
-                actual: 2,
+                actual: 99,
                 ..
             }
         ));

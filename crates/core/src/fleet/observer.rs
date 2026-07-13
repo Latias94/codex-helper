@@ -286,6 +286,7 @@ mod tests {
                 usage_summaries: Vec::new(),
                 usage_day: Default::default(),
                 usage_rollup: Default::default(),
+                quota_analytics: Default::default(),
                 stats_5m: Default::default(),
                 stats_1h: Default::default(),
                 pricing_catalog: Default::default(),

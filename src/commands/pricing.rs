@@ -1,33 +1,171 @@
 use crate::cli_types::PricingCommand;
 use crate::{CliError, CliResult};
+use codex_helper_core::basellm_catalog::{
+    self, BasellmCatalogAttemptState, BasellmCatalogLkg, BasellmCatalogLoad,
+    BasellmCatalogSyncOptions, BasellmSyncErrorCategory, BasellmSyncOutcome,
+};
 use codex_helper_core::pricing::{
     self, CostConfidence, LocalModelPriceOverride, LocalModelPriceOverridesDocument,
-    ModelPriceCatalogSnapshot, ModelPriceView,
+    LocalModelPriceTier, ManualPricingLayerStatus, ModelPriceCatalogSnapshot, ModelPriceView,
 };
+use codex_helper_core::runtime_store::{RuntimeStore, RuntimeStoreError};
 use owo_colors::OwoColorize;
+use serde::Serialize;
+use std::io::Write;
+use std::sync::Arc;
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const PRICING_SYNC_TIMEOUT_SECS: u64 = 20;
+const BASELLM_STATUS_STALE_SECS: i64 = 6 * 60 * 60;
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum PricingRemoteState {
+    NeverSynced,
+    Fresh,
+    Stale,
+    LastError,
+    Quarantined,
+    ReadOnly,
+    Corrupt,
+}
+
+#[derive(Debug, Serialize)]
+struct PricingStatusOutput {
+    remote_state: PricingRemoteState,
+    lkg_available: bool,
+    source_url: Option<String>,
+    fetched_at_unix: Option<i64>,
+    validated_at_unix: Option<i64>,
+    last_checked_at_unix: Option<i64>,
+    last_check_outcome: Option<BasellmSyncOutcome>,
+    last_error_category: Option<BasellmSyncErrorCategory>,
+    quarantined: bool,
+    read_only_schema_version: Option<u32>,
+    retry_after_unix: Option<i64>,
+    body_generation: Option<u64>,
+    content_generation: Option<u64>,
+    check_generation: Option<u64>,
+    provider_count: usize,
+    model_count: usize,
+    priced_model_count: usize,
+    tier_count: usize,
+    effective_revision: String,
+    effective_source: String,
+    effective_model_count: usize,
+    bundled_model_count: usize,
+    remote_model_count: usize,
+    remote_projection_warning_count: usize,
+    manual_status: ManualPricingLayerStatus,
+    manual_model_count: usize,
+    manual_shadowed_remote_models: usize,
+    manual_error_present: bool,
+    effective_reloaded: bool,
+    effective_changed: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct PricingRefreshOutput {
+    outcome: BasellmSyncOutcome,
+    error_category: Option<BasellmSyncErrorCategory>,
+    approved_quarantined_candidate: bool,
+    status: PricingStatusOutput,
+}
 
 pub async fn handle_pricing_cmd(cmd: PricingCommand) -> CliResult<()> {
+    let mut stdout = std::io::stdout();
+    handle_pricing_cmd_with_writer(cmd, &mut stdout).await
+}
+
+async fn handle_pricing_cmd_with_writer(
+    cmd: PricingCommand,
+    writer: &mut dyn Write,
+) -> CliResult<()> {
     match cmd {
         PricingCommand::Path => {
             println!("{}", pricing::model_price_overrides_path().display());
         }
-        PricingCommand::List { json, local, model } => {
+        PricingCommand::Status { json } => {
+            let status = load_pricing_status()?;
+            if json {
+                write_json(writer, &status)?;
+            } else {
+                print_pricing_status(&status);
+            }
+        }
+        PricingCommand::ForceRefresh {
+            url,
+            approve_economic_changes,
+            json,
+        } => {
+            let runtime_store = tokio::task::spawn_blocking(RuntimeStore::open_default)
+                .await
+                .map_err(|error| {
+                    CliError::Pricing(format!("join BaseLLM runtime store open: {error}"))
+                })?
+                .map_err(pricing_runtime_store_open_error)?;
+            let runtime_state = basellm_catalog::load_basellm_catalog_runtime_state(&runtime_store)
+                .map_err(|error| {
+                    CliError::Pricing(format!("read BaseLLM runtime state: {error}"))
+                })?;
+            basellm_catalog::install_basellm_catalog_runtime_state(&runtime_state);
+            let mut options = BasellmCatalogSyncOptions::default()
+                .with_source_url(url)
+                .with_force(true);
+            let approved_hash = if approve_economic_changes {
+                Some(quarantined_candidate_hash_for_approval(
+                    runtime_state.attempt.as_ref(),
+                )?)
+            } else {
+                None
+            };
+            if let Some(hash) = approved_hash.as_deref() {
+                options = options.with_approved_quarantine_hash(hash);
+            }
+
+            let report =
+                basellm_catalog::sync_basellm_catalog(Arc::new(runtime_store), options).await;
+            let output = PricingRefreshOutput {
+                outcome: report.outcome,
+                error_category: report.attempt.last_error_category,
+                approved_quarantined_candidate: approved_hash.is_some(),
+                status: load_pricing_status()?,
+            };
+            if json {
+                write_json(writer, &output)?;
+            } else {
+                println!(
+                    "BaseLLM refresh: {:?}{}",
+                    output.outcome,
+                    output
+                        .error_category
+                        .map(|category| format!(" ({category:?})"))
+                        .unwrap_or_default()
+                );
+                print_pricing_status(&output.status);
+            }
+        }
+        PricingCommand::List {
+            json,
+            local,
+            model,
+            provider,
+        } => {
             let snapshot = load_snapshot_for_list(local)?;
-            let snapshot = filter_snapshot(snapshot, model.as_deref());
+            let snapshot = filter_snapshot(snapshot, model.as_deref(), provider.as_deref())?;
 
             if json {
                 let text = serde_json::to_string_pretty(&snapshot)
                     .map_err(|e| CliError::Pricing(e.to_string()))?;
-                println!("{text}");
+                writeln!(writer, "{text}").map_err(|error| CliError::Pricing(error.to_string()))?;
             } else {
                 print_snapshot_text(&snapshot, local, model.as_deref());
             }
         }
         PricingCommand::Set {
             model_id,
+            provider,
             display_name,
             aliases,
             input_per_1m_usd,
@@ -41,35 +179,45 @@ pub async fn handle_pricing_cmd(cmd: PricingCommand) -> CliResult<()> {
                 .and_then(|document| document.normalized())
                 .map_err(CliError::Pricing)?;
 
-            document.models.insert(
-                model_id.clone(),
-                LocalModelPriceOverride {
-                    display_name,
-                    aliases,
-                    input_per_1m_usd,
-                    output_per_1m_usd,
-                    cache_read_input_per_1m_usd,
-                    cache_creation_input_per_1m_usd,
-                    confidence: Some(confidence.into()),
-                },
-            );
+            let provider = normalize_provider(&provider)?;
+            document
+                .insert_model(
+                    &provider,
+                    &model_id,
+                    LocalModelPriceOverride {
+                        display_name,
+                        aliases,
+                        input_per_1m_usd,
+                        output_per_1m_usd,
+                        cache_read_input_per_1m_usd,
+                        cache_creation_input_per_1m_usd,
+                        tiers: Vec::new(),
+                        confidence: Some(confidence.into()),
+                    },
+                )
+                .map_err(CliError::Pricing)?;
 
             let path = pricing::save_model_price_overrides_document(&document)
                 .map_err(CliError::Pricing)?;
             println!(
-                "Updated local price override for '{}' at {:?}",
-                model_id, path
+                "Updated local price override for '{}/{}' at {:?}",
+                provider, model_id, path
             );
         }
-        PricingCommand::Remove { model_id } => {
+        PricingCommand::Remove { model_id, provider } => {
             let model_id = normalize_model_id(&model_id)?;
+            let provider = normalize_provider(&provider)?;
             let mut document = pricing::load_model_price_overrides_document()
                 .and_then(|document| document.normalized())
                 .map_err(CliError::Pricing)?;
-            if document.models.remove(&model_id).is_none() {
+            if document
+                .remove_model(&provider, &model_id)
+                .map_err(CliError::Pricing)?
+                .is_none()
+            {
                 println!(
-                    "No local price override found for '{}'; nothing changed.",
-                    model_id
+                    "No local price override found for '{}/{}'; nothing changed.",
+                    provider, model_id
                 );
                 return Ok(());
             }
@@ -77,33 +225,315 @@ pub async fn handle_pricing_cmd(cmd: PricingCommand) -> CliResult<()> {
             let path = pricing::save_model_price_overrides_document(&document)
                 .map_err(CliError::Pricing)?;
             println!(
-                "Removed local price override for '{}' and rewrote {:?}",
-                model_id, path
+                "Removed local price override for '{}/{}' and rewrote {:?}",
+                provider, model_id, path
             );
         }
         PricingCommand::Sync {
             url,
             models,
+            provider,
             replace,
             dry_run,
         } => {
             let snapshot = fetch_remote_pricing_catalog(&url).await?;
-            import_snapshot(snapshot, models, replace, dry_run)?;
+            import_snapshot(
+                snapshot,
+                models,
+                provider.as_deref(),
+                replace,
+                dry_run,
+                writer,
+            )?;
         }
-        PricingCommand::SyncBasellm {
+        PricingCommand::ImportBasellm {
             url,
             models,
+            provider,
             replace,
             dry_run,
         } => {
-            let text = fetch_remote_pricing_text(&url).await?;
-            let snapshot = pricing::basellm_model_price_catalog_snapshot_from_json(&url, &text)
-                .map_err(CliError::Pricing)?;
-            import_snapshot(snapshot, models, replace, dry_run)?;
+            let catalog = basellm_catalog::fetch_basellm_catalog_for_import(&url)
+                .await
+                .map_err(|error| CliError::Pricing(error.to_string()))?;
+            let snapshot = pricing::basellm_model_price_catalog_snapshot(&catalog);
+            import_snapshot(snapshot, models, Some(&provider), replace, dry_run, writer)?;
         }
     }
 
     Ok(())
+}
+
+fn pricing_runtime_store_open_error(error: RuntimeStoreError) -> CliError {
+    if matches!(error, RuntimeStoreError::WriterAlreadyOwned { .. }) {
+        CliError::Pricing(
+            "the resident runtime owns state.sqlite; it refreshes BaseLLM in the background, so stop it before forcing a local refresh"
+                .to_string(),
+        )
+    } else {
+        CliError::Pricing(format!("open BaseLLM runtime store: {error}"))
+    }
+}
+
+fn load_runtime_pricing_state() -> Result<basellm_catalog::BasellmCatalogRuntimeState, CliError> {
+    let state = basellm_catalog::load_default_basellm_catalog_runtime_state()
+        .map_err(|error| CliError::Pricing(format!("read BaseLLM runtime state: {error}")))?;
+    basellm_catalog::install_basellm_catalog_runtime_state(&state);
+    Ok(state)
+}
+
+fn load_pricing_status() -> Result<PricingStatusOutput, CliError> {
+    let runtime_state = load_runtime_pricing_state()?;
+    let lkg_load = runtime_state.lkg;
+    let attempt = runtime_state.attempt;
+    let previous_effective = pricing::effective_pricing_catalog_snapshot();
+    let effective = pricing::refresh_effective_pricing_catalog();
+    let effective_changed = previous_effective.revision != effective.revision
+        || previous_effective.manual_content_hash != effective.manual_content_hash
+        || previous_effective.manual_status != effective.manual_status;
+    let lkg = match &lkg_load {
+        BasellmCatalogLoad::Valid(snapshot) => Some(snapshot.clone()),
+        _ => None,
+    };
+    let counts = lkg
+        .as_ref()
+        .map(|snapshot| snapshot.counts)
+        .unwrap_or_default();
+    let read_only_schema_version = match &lkg_load {
+        BasellmCatalogLoad::UnsupportedSchema(version) => Some(*version),
+        _ => attempt
+            .as_ref()
+            .and_then(|attempt| attempt.read_only_schema_version),
+    };
+
+    Ok(PricingStatusOutput {
+        remote_state: classify_pricing_remote_state(&lkg_load, attempt.as_ref(), unix_now()),
+        lkg_available: lkg.is_some(),
+        source_url: lkg
+            .as_ref()
+            .map(|snapshot| snapshot.source_url.clone())
+            .or_else(|| attempt.as_ref().map(|attempt| attempt.source_url.clone())),
+        fetched_at_unix: lkg.as_ref().map(|snapshot| snapshot.fetched_at_unix),
+        validated_at_unix: lkg.as_ref().map(|snapshot| snapshot.validated_at_unix),
+        last_checked_at_unix: attempt.as_ref().map(|attempt| attempt.last_checked_at_unix),
+        last_check_outcome: attempt.as_ref().map(|attempt| attempt.outcome),
+        last_error_category: attempt
+            .as_ref()
+            .and_then(|attempt| attempt.last_error_category),
+        quarantined: attempt
+            .as_ref()
+            .is_some_and(|attempt| attempt.outcome == BasellmSyncOutcome::Quarantined),
+        read_only_schema_version,
+        retry_after_unix: attempt
+            .as_ref()
+            .and_then(|attempt| attempt.retry_after_unix),
+        body_generation: lkg.as_ref().map(|snapshot| snapshot.body_generation),
+        content_generation: lkg.as_ref().map(|snapshot| snapshot.content_generation),
+        check_generation: attempt.as_ref().map(|attempt| attempt.check_generation),
+        provider_count: counts.provider_count,
+        model_count: counts.model_count,
+        priced_model_count: counts.priced_model_count,
+        tier_count: counts.tier_count,
+        effective_revision: effective.revision.clone(),
+        effective_source: effective.source.clone(),
+        effective_model_count: effective.model_count,
+        bundled_model_count: effective.bundled_model_count,
+        remote_model_count: effective.remote_model_count,
+        remote_projection_warning_count: effective.remote_projection_warnings.len(),
+        manual_status: effective.manual_status,
+        manual_model_count: effective.manual_model_count,
+        manual_shadowed_remote_models: count_manual_shadows(lkg.as_deref()),
+        manual_error_present: effective.manual_error.is_some(),
+        effective_reloaded: true,
+        effective_changed,
+    })
+}
+
+fn classify_pricing_remote_state(
+    load: &BasellmCatalogLoad,
+    attempt: Option<&BasellmCatalogAttemptState>,
+    now_unix: i64,
+) -> PricingRemoteState {
+    if matches!(load, BasellmCatalogLoad::UnsupportedSchema(_))
+        || attempt.is_some_and(|attempt| attempt.outcome == BasellmSyncOutcome::ReadOnly)
+    {
+        return PricingRemoteState::ReadOnly;
+    }
+    if matches!(load, BasellmCatalogLoad::Corrupt) {
+        return PricingRemoteState::Corrupt;
+    }
+    if attempt.is_some_and(|attempt| attempt.outcome == BasellmSyncOutcome::Quarantined) {
+        return PricingRemoteState::Quarantined;
+    }
+    if attempt.is_some_and(|attempt| attempt.last_error_category.is_some()) {
+        return PricingRemoteState::LastError;
+    }
+
+    let BasellmCatalogLoad::Valid(snapshot) = load else {
+        return PricingRemoteState::NeverSynced;
+    };
+    let freshness_anchor = attempt
+        .map(|attempt| attempt.last_checked_at_unix)
+        .unwrap_or(snapshot.validated_at_unix);
+    if now_unix.saturating_sub(freshness_anchor) > BASELLM_STATUS_STALE_SECS {
+        PricingRemoteState::Stale
+    } else {
+        PricingRemoteState::Fresh
+    }
+}
+
+fn count_manual_shadows(lkg: Option<&BasellmCatalogLkg>) -> usize {
+    let Some(lkg) = lkg else {
+        return 0;
+    };
+    let Ok(document) =
+        pricing::load_model_price_overrides_document().and_then(|document| document.normalized())
+    else {
+        return 0;
+    };
+    document
+        .providers
+        .iter()
+        .flat_map(|(provider, rows)| {
+            rows.models
+                .keys()
+                .map(move |model| (provider.as_str(), model.as_str()))
+        })
+        .filter(|(provider, model)| {
+            lkg.model(provider, model)
+                .is_some_and(|model| model.price.is_some())
+        })
+        .count()
+}
+
+fn quarantined_candidate_hash_for_approval(
+    attempt: Option<&BasellmCatalogAttemptState>,
+) -> Result<String, CliError> {
+    let Some(attempt) = attempt else {
+        return Err(CliError::Pricing(
+            "no quarantined BaseLLM economic-change candidate is available".to_string(),
+        ));
+    };
+    if attempt.outcome != BasellmSyncOutcome::Quarantined
+        || attempt.last_error_category != Some(BasellmSyncErrorCategory::EconomicAnomaly)
+    {
+        return Err(CliError::Pricing(
+            "the latest BaseLLM attempt is not an economic-change quarantine".to_string(),
+        ));
+    }
+    attempt.quarantined_candidate_hash.clone().ok_or_else(|| {
+        CliError::Pricing("the quarantined BaseLLM attempt has no valid candidate hash".to_string())
+    })
+}
+
+fn write_json(output: &mut dyn Write, value: &impl Serialize) -> CliResult<()> {
+    let text = serde_json::to_string_pretty(value)
+        .map_err(|error| CliError::Pricing(error.to_string()))?;
+    writeln!(output, "{text}").map_err(|error| CliError::Pricing(error.to_string()))?;
+    Ok(())
+}
+
+fn print_pricing_status(status: &PricingStatusOutput) {
+    println!(
+        "{}",
+        format!(
+            "BaseLLM pricing: {}",
+            remote_state_label(status.remote_state)
+        )
+        .bold()
+    );
+    println!(
+        "source={} lkg={} last_check={} outcome={} error={}",
+        status.source_url.as_deref().unwrap_or("-"),
+        if status.lkg_available {
+            "available"
+        } else {
+            "unavailable"
+        },
+        status
+            .last_checked_at_unix
+            .map(age_text)
+            .unwrap_or_else(|| "never".to_string()),
+        status
+            .last_check_outcome
+            .map(|outcome| format!("{outcome:?}"))
+            .unwrap_or_else(|| "-".to_string()),
+        status
+            .last_error_category
+            .map(|category| format!("{category:?}"))
+            .unwrap_or_else(|| "-".to_string()),
+    );
+    println!(
+        "generations: body={} content={} check={} effective={}",
+        optional_u64_text(status.body_generation),
+        optional_u64_text(status.content_generation),
+        optional_u64_text(status.check_generation),
+        short_revision(&status.effective_revision),
+    );
+    println!(
+        "remote: providers={} models={} priced={} tiers={} projected={} warnings={}",
+        status.provider_count,
+        status.model_count,
+        status.priced_model_count,
+        status.tier_count,
+        status.remote_model_count,
+        status.remote_projection_warning_count,
+    );
+    println!(
+        "manual: {:?} models={} shadows={} invalid={} reloaded={} changed={}",
+        status.manual_status,
+        status.manual_model_count,
+        status.manual_shadowed_remote_models,
+        status.manual_error_present,
+        status.effective_reloaded,
+        status.effective_changed,
+    );
+    println!(
+        "effective: source={} models={} bundled={}",
+        status.effective_source, status.effective_model_count, status.bundled_model_count,
+    );
+}
+
+fn remote_state_label(state: PricingRemoteState) -> &'static str {
+    match state {
+        PricingRemoteState::NeverSynced => "never synced",
+        PricingRemoteState::Fresh => "fresh",
+        PricingRemoteState::Stale => "stale",
+        PricingRemoteState::LastError => "last refresh failed; LKG retained",
+        PricingRemoteState::Quarantined => "economic change quarantined",
+        PricingRemoteState::ReadOnly => "read-only (newer schema)",
+        PricingRemoteState::Corrupt => "corrupt LKG",
+    }
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+        .unwrap_or(0)
+}
+
+fn age_text(timestamp_unix: i64) -> String {
+    let seconds = unix_now().saturating_sub(timestamp_unix).max(0);
+    if seconds < 60 {
+        return format!("{seconds}s ago");
+    }
+    if seconds < 60 * 60 {
+        return format!("{}m ago", seconds / 60);
+    }
+    if seconds < 24 * 60 * 60 {
+        return format!("{}h ago", seconds / (60 * 60));
+    }
+    format!("{}d ago", seconds / (24 * 60 * 60))
+}
+
+fn optional_u64_text(value: Option<u64>) -> String {
+    value.map_or_else(|| "-".to_string(), |value| value.to_string())
+}
+
+fn short_revision(revision: &str) -> &str {
+    revision.get(..revision.len().min(20)).unwrap_or(revision)
 }
 
 async fn fetch_remote_pricing_catalog(url: &str) -> Result<ModelPriceCatalogSnapshot, CliError> {
@@ -145,8 +575,10 @@ async fn fetch_remote_pricing_text(url: &str) -> Result<String, CliError> {
 fn import_snapshot(
     snapshot: ModelPriceCatalogSnapshot,
     models: Vec<String>,
+    provider: Option<&str>,
     replace: bool,
     dry_run: bool,
+    writer: &mut dyn Write,
 ) -> CliResult<()> {
     let base_document = if replace {
         LocalModelPriceOverridesDocument::default()
@@ -155,30 +587,37 @@ fn import_snapshot(
             .and_then(|document| document.normalized())
             .map_err(CliError::Pricing)?
     };
-    let (document, imported) = merge_snapshot_into_overrides(base_document, &snapshot, &models)?;
+    let (document, imported) =
+        merge_snapshot_into_overrides(base_document, &snapshot, &models, provider)?;
 
     if imported == 0 {
-        println!(
+        writeln!(
+            writer,
             "No pricing rows matched the requested filters from {}.",
             snapshot.source
-        );
+        )
+        .map_err(|error| CliError::Pricing(error.to_string()))?;
         return Ok(());
     }
 
     if dry_run {
-        println!(
+        writeln!(
+            writer,
             "Would import {} pricing row(s) from {} into {:?}.",
             imported,
             snapshot.source,
             pricing::model_price_overrides_path()
-        );
+        )
+        .map_err(|error| CliError::Pricing(error.to_string()))?;
     } else {
         let path =
             pricing::save_model_price_overrides_document(&document).map_err(CliError::Pricing)?;
-        println!(
+        writeln!(
+            writer,
             "Imported {} pricing row(s) from {} into {:?}.",
             imported, snapshot.source, path
-        );
+        )
+        .map_err(|error| CliError::Pricing(error.to_string()))?;
     }
     Ok(())
 }
@@ -187,14 +626,22 @@ fn merge_snapshot_into_overrides(
     mut document: LocalModelPriceOverridesDocument,
     snapshot: &ModelPriceCatalogSnapshot,
     model_filters: &[String],
+    provider_filter: Option<&str>,
 ) -> Result<(LocalModelPriceOverridesDocument, usize), CliError> {
     let filters = model_filters
         .iter()
         .map(|model| normalize_model_id(model))
         .collect::<Result<Vec<_>, _>>()?;
+    let provider_filter = provider_filter.map(normalize_provider).transpose()?;
     let mut imported = 0usize;
 
     for row in &snapshot.models {
+        if provider_filter
+            .as_deref()
+            .is_some_and(|provider| !row.matches_provider(provider))
+        {
+            continue;
+        }
         if !filters.is_empty()
             && !filters
                 .iter()
@@ -204,18 +651,22 @@ fn merge_snapshot_into_overrides(
         }
 
         let model_id = normalize_model_id(&row.model_id)?;
-        document.models.insert(
-            model_id,
-            LocalModelPriceOverride {
-                display_name: row.display_name.clone(),
-                aliases: row.aliases.clone(),
-                input_per_1m_usd: row.input_per_1m_usd.clone(),
-                output_per_1m_usd: row.output_per_1m_usd.clone(),
-                cache_read_input_per_1m_usd: row.cache_read_input_per_1m_usd.clone(),
-                cache_creation_input_per_1m_usd: row.cache_creation_input_per_1m_usd.clone(),
-                confidence: Some(row.confidence),
-            },
-        );
+        document
+            .insert_model(
+                &row.provider,
+                &model_id,
+                LocalModelPriceOverride {
+                    display_name: row.display_name.clone(),
+                    aliases: row.aliases.clone(),
+                    input_per_1m_usd: row.input_per_1m_usd.clone(),
+                    output_per_1m_usd: row.output_per_1m_usd.clone(),
+                    cache_read_input_per_1m_usd: row.cache_read_input_per_1m_usd.clone(),
+                    cache_creation_input_per_1m_usd: row.cache_creation_input_per_1m_usd.clone(),
+                    tiers: row.tiers.iter().map(LocalModelPriceTier::from).collect(),
+                    confidence: Some(row.confidence),
+                },
+            )
+            .map_err(CliError::Pricing)?;
         imported += 1;
     }
 
@@ -228,6 +679,7 @@ fn load_snapshot_for_list(local: bool) -> Result<ModelPriceCatalogSnapshot, CliE
         return pricing::local_model_price_catalog_snapshot().map_err(CliError::Pricing);
     }
 
+    load_runtime_pricing_state()?;
     pricing::load_model_price_overrides_document().map_err(CliError::Pricing)?;
     Ok(pricing::operator_model_price_catalog_snapshot())
 }
@@ -235,14 +687,20 @@ fn load_snapshot_for_list(local: bool) -> Result<ModelPriceCatalogSnapshot, CliE
 fn filter_snapshot(
     mut snapshot: ModelPriceCatalogSnapshot,
     model: Option<&str>,
-) -> ModelPriceCatalogSnapshot {
-    let Some(model) = model.map(str::trim).filter(|value| !value.is_empty()) else {
-        return snapshot;
-    };
-
-    snapshot.models.retain(|row| row.matches_model(model));
+    provider: Option<&str>,
+) -> Result<ModelPriceCatalogSnapshot, CliError> {
+    let provider = provider.map(normalize_provider).transpose()?;
+    snapshot.models.retain(|row| {
+        model
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_none_or(|model| row.matches_model(model))
+            && provider
+                .as_deref()
+                .is_none_or(|provider| row.matches_provider(provider))
+    });
     snapshot.model_count = snapshot.models.len();
-    snapshot
+    Ok(snapshot)
 }
 
 fn print_snapshot_text(snapshot: &ModelPriceCatalogSnapshot, local: bool, model: Option<&str>) {
@@ -272,7 +730,7 @@ fn print_snapshot_text(snapshot: &ModelPriceCatalogSnapshot, local: bool, model:
 
     println!(
         "{}",
-        "model | input/1m | output/1m | cache read/1m | cache create/1m | confidence | source | aliases"
+        "provider/model | input/1m | output/1m | cache read/1m | cache create/1m | tiers | confidence | source | aliases"
             .bold()
     );
     for row in &snapshot.models {
@@ -283,9 +741,9 @@ fn print_snapshot_text(snapshot: &ModelPriceCatalogSnapshot, local: bool, model:
 fn print_snapshot_row(row: &ModelPriceView) {
     let label = match row.display_name.as_deref() {
         Some(display_name) if !display_name.trim().is_empty() => {
-            format!("{} [{}]", row.model_id, display_name)
+            format!("{}/{} [{}]", row.provider, row.model_id, display_name)
         }
-        _ => row.model_id.clone(),
+        _ => format!("{}/{}", row.provider, row.model_id),
     };
     let aliases = if row.aliases.is_empty() {
         "-".to_string()
@@ -294,12 +752,13 @@ fn print_snapshot_row(row: &ModelPriceView) {
     };
 
     println!(
-        "{} | {} | {} | {} | {} | {} | {} | {}",
+        "{} | {} | {} | {} | {} | {} | {} | {} | {}",
         label,
         format_usd(row.input_per_1m_usd.as_str()),
         format_usd(row.output_per_1m_usd.as_str()),
         format_optional_usd(row.cache_read_input_per_1m_usd.as_deref()),
         format_optional_usd(row.cache_creation_input_per_1m_usd.as_deref()),
+        row.tiers.len(),
         confidence_label(row.confidence),
         row.source,
         aliases,
@@ -333,12 +792,27 @@ fn normalize_model_id(value: &str) -> Result<String, CliError> {
     Ok(model_id.to_string())
 }
 
+fn normalize_provider(value: &str) -> Result<String, CliError> {
+    pricing::canonical_provider(value)
+        .ok_or_else(|| CliError::Pricing("provider cannot be empty or whitespace".to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli_types::{Cli, Command};
+    use crate::commands::test_support::{ScopedEnv, TempTestDir, env_lock};
+    use axum::Router;
+    use axum::http::StatusCode;
+    use axum::routing::get;
+    use clap::Parser;
+    use codex_helper_core::basellm_catalog::{BasellmCatalogContent, BasellmCatalogCounts};
+    use codex_helper_core::pricing::ModelPriceTierView;
+    use std::sync::Arc;
 
-    fn price_row(model_id: &str, aliases: Vec<&str>) -> ModelPriceView {
+    fn price_row(provider: &str, model_id: &str, aliases: Vec<&str>) -> ModelPriceView {
         ModelPriceView {
+            provider: provider.to_string(),
             model_id: model_id.to_string(),
             display_name: Some(format!("{model_id} display")),
             aliases: aliases.into_iter().map(str::to_string).collect(),
@@ -346,7 +820,9 @@ mod tests {
             output_per_1m_usd: "10.00".to_string(),
             cache_read_input_per_1m_usd: Some("0.125".to_string()),
             cache_creation_input_per_1m_usd: None,
+            tiers: Vec::new(),
             source: "remote-test".to_string(),
+            source_generation: Some("generation-7".to_string()),
             confidence: CostConfidence::Exact,
         }
     }
@@ -367,7 +843,85 @@ mod tests {
             output_per_1m_usd: output.to_string(),
             cache_read_input_per_1m_usd: None,
             cache_creation_input_per_1m_usd: None,
+            tiers: Vec::new(),
             confidence: Some(CostConfidence::Estimated),
+        }
+    }
+
+    fn basellm_import_fixture() -> &'static str {
+        r#"{
+          "openai": {
+            "models": {
+              "imported-model": {
+                "name": "Imported Model",
+                "aliases": ["imported-alias"],
+                "cost": {
+                  "input": "1.5",
+                  "output": 6,
+                  "cache_read": "0.15",
+                  "tiers": [{
+                    "tier": { "type": "context", "size": 272000 },
+                    "input": 3,
+                    "output": 12
+                  }]
+                }
+              }
+            }
+          }
+        }"#
+    }
+
+    async fn spawn_basellm_import_fixture() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let app = Router::new().route(
+            "/all.json",
+            get(|| async { (StatusCode::OK, basellm_import_fixture()) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind BaseLLM import fixture");
+        let address = listener.local_addr().expect("BaseLLM fixture address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve BaseLLM import fixture");
+        });
+        (address, server)
+    }
+
+    fn valid_lkg(validated_at_unix: i64) -> BasellmCatalogLoad {
+        BasellmCatalogLoad::Valid(Arc::new(BasellmCatalogLkg {
+            schema_version: 1,
+            manifest_generation: 1,
+            body_generation: 2,
+            content_generation: 3,
+            source_url: "https://basellm.github.io/llm-metadata/api/all.json".to_string(),
+            fetched_at_unix: validated_at_unix,
+            validated_at_unix,
+            etag: Some("validator-must-not-leak".to_string()),
+            last_modified: Some("validator-must-not-leak".to_string()),
+            content_hash: format!("sha256:{}", "a".repeat(64)),
+            counts: BasellmCatalogCounts::default(),
+            warnings: vec!["payload-must-not-leak".to_string()],
+            catalog: BasellmCatalogContent::default(),
+        }))
+    }
+
+    fn attempt(
+        outcome: BasellmSyncOutcome,
+        category: Option<BasellmSyncErrorCategory>,
+    ) -> BasellmCatalogAttemptState {
+        BasellmCatalogAttemptState {
+            schema_version: 1,
+            check_generation: 4,
+            source_url: "https://basellm.github.io/llm-metadata/api/all.json".to_string(),
+            last_checked_at_unix: 10_000,
+            outcome,
+            last_error_category: category,
+            content_hash: None,
+            content_generation: Some(3),
+            quarantined_candidate_hash: None,
+            read_only_schema_version: None,
+            retry_after_unix: None,
         }
     }
 
@@ -375,16 +929,22 @@ mod tests {
     fn sync_merge_imports_remote_rows_without_dropping_existing_overrides() {
         let mut document = LocalModelPriceOverridesDocument::default();
         document
-            .models
-            .insert("existing-model".to_string(), local_override("0.10", "0.20"));
-        let snapshot = catalog_snapshot(vec![price_row("remote-model", vec!["relay-fast"])]);
+            .insert_model("openai", "existing-model", local_override("0.10", "0.20"))
+            .expect("insert existing");
+        let snapshot = catalog_snapshot(vec![price_row(
+            "openai",
+            "remote-model",
+            vec!["relay-fast"],
+        )]);
 
         let (document, imported) =
-            merge_snapshot_into_overrides(document, &snapshot, &[]).expect("merge");
+            merge_snapshot_into_overrides(document, &snapshot, &[], Some("openai")).expect("merge");
 
         assert_eq!(imported, 1);
-        assert!(document.models.contains_key("existing-model"));
-        let imported = document.models.get("remote-model").expect("remote model");
+        assert!(document.model("openai", "existing-model").is_some());
+        let imported = document
+            .model("openai", "remote-model")
+            .expect("remote model");
         assert_eq!(
             imported.display_name.as_deref(),
             Some("remote-model display")
@@ -400,19 +960,451 @@ mod tests {
     #[test]
     fn sync_merge_filters_by_model_alias() {
         let snapshot = catalog_snapshot(vec![
-            price_row("gpt-relay", vec!["relay-fast"]),
-            price_row("other-model", vec![]),
+            price_row("openai", "gpt-relay", vec!["relay-fast"]),
+            price_row("openai", "other-model", vec![]),
         ]);
 
         let (document, imported) = merge_snapshot_into_overrides(
             LocalModelPriceOverridesDocument::default(),
             &snapshot,
             &[String::from("relay-fast")],
+            Some("openai"),
         )
         .expect("merge");
 
         assert_eq!(imported, 1);
-        assert!(document.models.contains_key("gpt-relay"));
-        assert!(!document.models.contains_key("other-model"));
+        assert!(document.model("openai", "gpt-relay").is_some());
+        assert!(document.model("openai", "other-model").is_none());
+    }
+
+    #[test]
+    fn basellm_import_filters_provider_and_preserves_tiers() {
+        let mut openai = price_row("openai", "shared-model", vec![]);
+        openai.tiers.push(ModelPriceTierView {
+            threshold_tokens: 272_000,
+            input_per_1m_usd: Some("10".to_string()),
+            output_per_1m_usd: Some("45".to_string()),
+            cache_read_input_per_1m_usd: Some("1".to_string()),
+            cache_creation_input_per_1m_usd: Some("12.5".to_string()),
+        });
+        let routing = price_row("routing-run", "shared-model", vec![]);
+        let snapshot = catalog_snapshot(vec![openai, routing]);
+
+        let (document, imported) = merge_snapshot_into_overrides(
+            LocalModelPriceOverridesDocument::default(),
+            &snapshot,
+            &[],
+            Some("codex"),
+        )
+        .expect("merge");
+
+        assert_eq!(imported, 1);
+        let imported = document
+            .model("openai", "shared-model")
+            .expect("openai model");
+        assert_eq!(imported.tiers.len(), 1);
+        assert_eq!(imported.tiers[0].threshold_tokens, 272_000);
+        assert!(document.model("routing-run", "shared-model").is_none());
+    }
+
+    #[test]
+    fn pricing_remote_state_distinguishes_operator_states() {
+        let now = 100_000;
+        assert_eq!(
+            classify_pricing_remote_state(&BasellmCatalogLoad::Missing, None, now),
+            PricingRemoteState::NeverSynced
+        );
+        assert_eq!(
+            classify_pricing_remote_state(&valid_lkg(now), None, now),
+            PricingRemoteState::Fresh
+        );
+        assert_eq!(
+            classify_pricing_remote_state(
+                &valid_lkg(now - BASELLM_STATUS_STALE_SECS - 1),
+                None,
+                now,
+            ),
+            PricingRemoteState::Stale
+        );
+        assert_eq!(
+            classify_pricing_remote_state(
+                &valid_lkg(now),
+                Some(&attempt(
+                    BasellmSyncOutcome::Unavailable,
+                    Some(BasellmSyncErrorCategory::Transport),
+                )),
+                now,
+            ),
+            PricingRemoteState::LastError
+        );
+        assert_eq!(
+            classify_pricing_remote_state(
+                &valid_lkg(now),
+                Some(&attempt(
+                    BasellmSyncOutcome::Quarantined,
+                    Some(BasellmSyncErrorCategory::EconomicAnomaly),
+                )),
+                now,
+            ),
+            PricingRemoteState::Quarantined
+        );
+        assert_eq!(
+            classify_pricing_remote_state(&BasellmCatalogLoad::UnsupportedSchema(9), None, now,),
+            PricingRemoteState::ReadOnly
+        );
+        assert_eq!(
+            classify_pricing_remote_state(&BasellmCatalogLoad::Corrupt, None, now),
+            PricingRemoteState::Corrupt
+        );
+    }
+
+    #[test]
+    fn economic_change_approval_is_bound_to_latest_quarantine() {
+        let mut quarantined = attempt(
+            BasellmSyncOutcome::Quarantined,
+            Some(BasellmSyncErrorCategory::EconomicAnomaly),
+        );
+        let candidate_hash = format!("sha256:{}", "c".repeat(64));
+        quarantined.quarantined_candidate_hash = Some(candidate_hash.clone());
+        assert_eq!(
+            quarantined_candidate_hash_for_approval(Some(&quarantined)).expect("approval"),
+            candidate_hash
+        );
+
+        let unavailable = attempt(
+            BasellmSyncOutcome::Unavailable,
+            Some(BasellmSyncErrorCategory::Transport),
+        );
+        assert!(quarantined_candidate_hash_for_approval(Some(&unavailable)).is_err());
+        assert!(quarantined_candidate_hash_for_approval(None).is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pricing_status_json_runs_the_command_path_without_leaking_corrupt_state() {
+        let _env_lock = env_lock().await;
+        let helper_home = TempTestDir::new("codex-helper-cli-test-pricing-status");
+        let mut scoped_env = ScopedEnv::default();
+        unsafe {
+            scoped_env.set_path("CODEX_HELPER_HOME", helper_home.path());
+        }
+
+        let runtime_store =
+            codex_helper_core::runtime_store::RuntimeStore::open_in_home(helper_home.path())
+                .expect("open runtime store");
+        runtime_store
+            .write_runtime_documents(&[codex_helper_core::runtime_store::RuntimeDocumentWrite {
+                kind: codex_helper_core::runtime_store::RuntimeDocumentKind::BasellmCatalog,
+                schema_version: 1,
+                payload_json: r#"{
+                    "schema_version": 1,
+                    "lkg": {
+                        "schema_version": 1,
+                        "etag": "validator-must-not-leak",
+                        "last_modified": "validator-must-not-leak",
+                        "catalog": "payload-must-not-leak",
+                        "source_url": "https://user:credential@example.invalid/private?token=secret"
+                    }
+                }"#,
+            }])
+            .expect("write corrupt BaseLLM runtime fixture");
+        drop(runtime_store);
+
+        let cli = Cli::try_parse_from(["codex-helper", "pricing", "status", "--json"])
+            .expect("parse pricing status command");
+        let Some(Command::Pricing { cmd }) = cli.command else {
+            panic!("expected pricing command");
+        };
+        let mut stdout = Vec::new();
+        handle_pricing_cmd_with_writer(cmd, &mut stdout)
+            .await
+            .expect("run pricing status command");
+        let text = String::from_utf8(stdout).expect("UTF-8 stdout");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("pricing status JSON");
+
+        assert_eq!(value["remote_state"], "corrupt");
+        assert_eq!(value["lkg_available"], false);
+        assert!(value["source_url"].is_null());
+        assert!(value["fetched_at_unix"].is_null());
+        assert!(value["last_error_category"].is_null());
+        for forbidden in [
+            "catalog",
+            "etag",
+            "last_modified",
+            "quarantined_candidate_hash",
+            "payload-must-not-leak",
+            "validator-must-not-leak",
+            "credential",
+            "token=secret",
+        ] {
+            assert!(!text.contains(forbidden), "leaked {forbidden}: {text}");
+        }
+        assert!(value.get("body_generation").is_some());
+        assert!(value.get("content_generation").is_some());
+        assert!(value.get("check_generation").is_some());
+        assert!(value.get("effective_revision").is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pricing_force_refresh_rejects_a_resident_runtime_writer() {
+        let _env_lock = env_lock().await;
+        let helper_home = TempTestDir::new("codex-helper-cli-test-pricing-writer-owned");
+        let mut scoped_env = ScopedEnv::default();
+        unsafe {
+            scoped_env.set_path("CODEX_HELPER_HOME", helper_home.path());
+        }
+
+        let _resident_runtime = RuntimeStore::open_in_home(helper_home.path())
+            .expect("resident runtime owns canonical store");
+        let cli = Cli::try_parse_from(["codex-helper", "pricing", "force-refresh"])
+            .expect("parse pricing force-refresh command");
+        let Some(Command::Pricing { cmd }) = cli.command else {
+            panic!("expected pricing command");
+        };
+        let mut stdout = Vec::new();
+        let error = handle_pricing_cmd_with_writer(cmd, &mut stdout)
+            .await
+            .expect_err("force-refresh must not compete with the resident writer");
+
+        assert!(
+            matches!(error, CliError::Pricing(message) if message.contains("resident runtime owns state.sqlite"))
+        );
+        assert!(stdout.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pricing_force_refresh_json_reports_offline_category_without_leaking_source_query() {
+        let _env_lock = env_lock().await;
+        let helper_home = TempTestDir::new("codex-helper-cli-test-pricing-refresh");
+        let mut scoped_env = ScopedEnv::default();
+        unsafe {
+            scoped_env.set_path("CODEX_HELPER_HOME", helper_home.path());
+            scoped_env.set("NO_PROXY", "127.0.0.1,localhost");
+            scoped_env.set("no_proxy", "127.0.0.1,localhost");
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind offline fixture");
+        let address = listener.local_addr().expect("offline fixture address");
+        let rejector = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        let secret = "credential-query-must-not-leak";
+        let source_url =
+            format!("https://{address}/private/catalog.json?api_key={secret}#operator-fragment");
+        let cli = Cli::try_parse_from([
+            "codex-helper",
+            "pricing",
+            "force-refresh",
+            "--url",
+            source_url.as_str(),
+            "--json",
+        ])
+        .expect("parse pricing force-refresh command");
+        let Some(Command::Pricing { cmd }) = cli.command else {
+            panic!("expected pricing command");
+        };
+        let mut stdout = Vec::new();
+        let result = handle_pricing_cmd_with_writer(cmd, &mut stdout).await;
+        rejector.abort();
+        let _ = rejector.await;
+        result.expect("run pricing force-refresh command");
+
+        let text = String::from_utf8(stdout).expect("UTF-8 stdout");
+        let value: serde_json::Value =
+            serde_json::from_str(&text).expect("pricing force-refresh JSON");
+        assert_eq!(value["outcome"], "unavailable");
+        assert_eq!(value["error_category"], "transport");
+        assert_eq!(value["status"]["remote_state"], "last_error");
+        assert_eq!(value["status"]["last_error_category"], "transport");
+        assert!(value["status"]["source_url"].is_string());
+        for forbidden in [
+            secret,
+            "api_key",
+            "operator-fragment",
+            "user:credential",
+            "etag",
+            "last_modified",
+            "raw_payload",
+        ] {
+            assert!(!text.contains(forbidden), "leaked {forbidden}: {text}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn basellm_import_transport_error_does_not_echo_source_credentials() {
+        let _env_lock = env_lock().await;
+        let helper_home = TempTestDir::new("codex-helper-cli-test-basellm-import-error");
+        let mut scoped_env = ScopedEnv::default();
+        unsafe {
+            scoped_env.set_path("CODEX_HELPER_HOME", helper_home.path());
+            scoped_env.set("NO_PROXY", "127.0.0.1,localhost");
+            scoped_env.set("no_proxy", "127.0.0.1,localhost");
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind rejected import fixture");
+        let address = listener.local_addr().expect("rejected fixture address");
+        let rejector = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        let secret = "transport-query-secret";
+        let source = format!("http://{address}/all.json?api_key={secret}#private-fragment");
+        let mut output = Vec::new();
+
+        let error = handle_pricing_cmd_with_writer(
+            PricingCommand::ImportBasellm {
+                url: source,
+                models: Vec::new(),
+                provider: "openai".to_string(),
+                replace: false,
+                dry_run: true,
+            },
+            &mut output,
+        )
+        .await
+        .expect_err("rejected BaseLLM import request");
+        rejector.abort();
+        let _ = rejector.await;
+
+        let message = error.to_string();
+        for forbidden in [secret, "api_key", "private-fragment"] {
+            assert!(
+                !message.contains(forbidden),
+                "leaked {forbidden}: {message}"
+            );
+        }
+        assert!(output.is_empty());
+        assert!(!pricing::model_price_overrides_path().exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn basellm_import_dry_run_redacts_source_and_preserves_manual_file() {
+        let _env_lock = env_lock().await;
+        let helper_home = TempTestDir::new("codex-helper-cli-test-basellm-import-dry-run");
+        let mut scoped_env = ScopedEnv::default();
+        unsafe {
+            scoped_env.set_path("CODEX_HELPER_HOME", helper_home.path());
+            scoped_env.set("NO_PROXY", "127.0.0.1,localhost");
+            scoped_env.set("no_proxy", "127.0.0.1,localhost");
+        }
+        let mut existing = LocalModelPriceOverridesDocument::default();
+        existing
+            .insert_model("openai", "manual-model", local_override("0.1", "0.2"))
+            .expect("insert existing manual override");
+        let path = pricing::save_model_price_overrides_document(&existing)
+            .expect("save existing manual override");
+        let before = std::fs::read(&path).expect("read manual override before dry run");
+        let (address, server) = spawn_basellm_import_fixture().await;
+        let secret = "dry-run-query-secret";
+        let source = format!("http://{address}/all.json?token={secret}#private-fragment");
+        let mut output = Vec::new();
+
+        let result = handle_pricing_cmd_with_writer(
+            PricingCommand::ImportBasellm {
+                url: source,
+                models: vec!["imported-alias".to_string()],
+                provider: "openai".to_string(),
+                replace: false,
+                dry_run: true,
+            },
+            &mut output,
+        )
+        .await;
+        server.abort();
+        let _ = server.await;
+        result.expect("run BaseLLM import dry run");
+
+        assert_eq!(
+            std::fs::read(&path).expect("read manual override after dry run"),
+            before
+        );
+        let text = String::from_utf8(output).expect("UTF-8 dry-run output");
+        assert!(text.contains("Would import 1 pricing row(s)"));
+        assert!(text.contains("from basellm-import"));
+        for forbidden in [secret, "token=", "private-fragment", "userinfo"] {
+            assert!(!text.contains(forbidden), "leaked {forbidden}: {text}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn basellm_import_saves_and_reloads_without_losing_manual_overrides_or_leaking_source() {
+        let _env_lock = env_lock().await;
+        let helper_home = TempTestDir::new("codex-helper-cli-test-basellm-import-save");
+        let mut scoped_env = ScopedEnv::default();
+        unsafe {
+            scoped_env.set_path("CODEX_HELPER_HOME", helper_home.path());
+            scoped_env.set("NO_PROXY", "127.0.0.1,localhost");
+            scoped_env.set("no_proxy", "127.0.0.1,localhost");
+        }
+        let mut existing = LocalModelPriceOverridesDocument::default();
+        existing
+            .insert_model("openai", "manual-model", local_override("0.1", "0.2"))
+            .expect("insert existing manual override");
+        pricing::save_model_price_overrides_document(&existing)
+            .expect("save existing manual override");
+        let (address, server) = spawn_basellm_import_fixture().await;
+        let secret = "success-query-secret";
+        let source = format!("http://{address}/all.json?api_key={secret}#private-fragment");
+        let mut output = Vec::new();
+
+        let result = handle_pricing_cmd_with_writer(
+            PricingCommand::ImportBasellm {
+                url: source,
+                models: Vec::new(),
+                provider: "openai".to_string(),
+                replace: false,
+                dry_run: false,
+            },
+            &mut output,
+        )
+        .await;
+        server.abort();
+        let _ = server.await;
+        result.expect("import BaseLLM prices");
+
+        let reloaded = pricing::load_model_price_overrides_document()
+            .and_then(|document| document.normalized())
+            .expect("reload imported manual overrides");
+        assert!(reloaded.model("openai", "manual-model").is_some());
+        let imported = reloaded
+            .model("openai", "imported-model")
+            .expect("reload imported model");
+        assert_eq!(imported.aliases, vec!["imported-alias"]);
+        assert_eq!(imported.input_per_1m_usd, "1.5");
+        assert_eq!(imported.output_per_1m_usd, "6");
+        assert_eq!(imported.tiers.len(), 1);
+        assert_eq!(imported.tiers[0].threshold_tokens, 272_000);
+
+        let snapshot = pricing::local_model_price_catalog_snapshot()
+            .expect("reload local price catalog snapshot");
+        assert!(
+            snapshot
+                .models
+                .iter()
+                .any(|row| row.model_id == "manual-model")
+        );
+        assert!(
+            snapshot
+                .models
+                .iter()
+                .any(|row| row.model_id == "imported-model")
+        );
+        let text = String::from_utf8(output).expect("UTF-8 import output");
+        assert!(text.contains("Imported 1 pricing row(s)"));
+        let persisted = std::fs::read_to_string(pricing::model_price_overrides_path())
+            .expect("read imported manual file");
+        for forbidden in [secret, "api_key", "private-fragment", "userinfo"] {
+            assert!(!text.contains(forbidden), "leaked {forbidden}: {text}");
+            assert!(
+                !persisted.contains(forbidden),
+                "persisted {forbidden}: {persisted}"
+            );
+        }
     }
 }

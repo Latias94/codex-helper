@@ -45,6 +45,8 @@ const POLICY_CRASH_CHILD_TEST: &str =
     "proxy::tests::crash_recovery::crash_gate_policy_boundary_child";
 const POLICY_TEST_DIGEST: &str =
     "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+const CRASH_CHILD_COORDINATION_TIMEOUT: Duration = Duration::from_secs(30);
+const CRASH_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DirectCrashPhase {
@@ -135,7 +137,7 @@ impl Drop for KillOnDrop {
 }
 
 async fn wait_for_proxy_address(path: &Path, child: &mut Child) -> SocketAddr {
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(CRASH_CHILD_COORDINATION_TIMEOUT, async {
         loop {
             if let Ok(value) = std::fs::read_to_string(path)
                 && let Ok(address) = value.trim().parse()
@@ -145,11 +147,34 @@ async fn wait_for_proxy_address(path: &Path, child: &mut Child) -> SocketAddr {
             if let Some(status) = child.try_wait().expect("inspect crash child status") {
                 panic!("crash child exited before publishing its proxy address: {status}");
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(CRASH_CHILD_POLL_INTERVAL).await;
         }
     })
     .await
     .expect("crash child must publish its proxy address")
+}
+
+async fn wait_for_upstream_attempt(
+    upstream_hits: &AtomicUsize,
+    upstream_received: &Notify,
+    child: &mut Child,
+) {
+    tokio::time::timeout(CRASH_CHILD_COORDINATION_TIMEOUT, async {
+        loop {
+            if upstream_hits.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            if let Some(status) = child.try_wait().expect("inspect crash child status") {
+                panic!("crash child exited before reaching the upstream attempt: {status}");
+            }
+            tokio::select! {
+                _ = upstream_received.notified() => {}
+                _ = tokio::time::sleep(CRASH_CHILD_POLL_INTERVAL) => {}
+            }
+        }
+    })
+    .await
+    .expect("upstream must receive the request before the child is killed");
 }
 
 async fn wait_for_crash_marker(path: &Path, expected: &str) {
@@ -249,6 +274,7 @@ fn direct_terminal_payload(
             route_decision: None,
             usage: Some(usage),
             cost,
+            accounting: Default::default(),
             retry: None,
             provider_signals: Vec::new(),
             policy_actions: Vec::new(),
@@ -1010,9 +1036,7 @@ async fn crash_gate_during_attempt_recovers_without_success_projection() {
             .await
     });
 
-    tokio::time::timeout(Duration::from_secs(10), upstream_received.notified())
-        .await
-        .expect("upstream must receive the request before the child is killed");
+    wait_for_upstream_attempt(&upstream_hits, &upstream_received, &mut child.0).await;
     assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
     child
         .0
@@ -1020,7 +1044,7 @@ async fn crash_gate_during_attempt_recovers_without_success_projection() {
         .expect("kill proxy child during upstream attempt");
     let status = child.0.wait().expect("wait for killed proxy child");
     assert!(!status.success(), "proxy child must not exit cleanly");
-    let request_result = tokio::time::timeout(Duration::from_secs(10), request)
+    let request_result = tokio::time::timeout(CRASH_CHILD_COORDINATION_TIMEOUT, request)
         .await
         .expect("downstream request must observe the child exit")
         .expect("join downstream request task");

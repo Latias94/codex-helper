@@ -219,7 +219,7 @@ fn render_details_panel(
         None => {
             lines.push(Line::from(Span::styled(
                 match lang {
-                    Language::Zh => "尚未从 dashboard snapshot 读取服务状态。",
+                    Language::Zh => "尚未从 operator read model 读取服务状态。",
                     Language::En => "No service status snapshot has been loaded yet.",
                 },
                 Style::default().fg(p.muted),

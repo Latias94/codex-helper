@@ -174,6 +174,14 @@ const finishedRequest: ApiOperatorRequestSummary = {
     total_cost_usd: "0.0031",
     confidence: "estimated",
     pricing_source: "operator catalog",
+    pricing_provider: "openai",
+    pricing_generation: "remote:generation-7",
+    effective_pricing_revision: "pricing:sha256:test",
+    selected_tier: {
+      tier_type: "context_length",
+      threshold_tokens: 200_000,
+      matched_input_tokens: 240_000,
+    },
   },
   observability: {
     attempt_count: 1,
@@ -217,8 +225,11 @@ const usageDay: ApiUsageDayView = {
     },
     cost: {
       total_cost_usd: "0.025",
-      confidence: "estimated",
-      priced_requests: 12,
+      confidence: "partial",
+      priced_requests: 10,
+      unpriced_requests: 2,
+      partial_requests: 3,
+      exact_requests: 4,
     },
   }),
   hourly: [
@@ -422,6 +433,17 @@ describe("admin API mappers", () => {
       firstToken: "420ms",
       duration: "1.5s",
       cost: "$0.0031",
+      costBreakdown: {
+        source: "operator catalog",
+        pricingProvider: "openai",
+        pricingGeneration: "remote:generation-7",
+        effectivePricingRevision: "pricing:sha256:test",
+        selectedTier: {
+          type: "context_length",
+          thresholdTokens: 200_000,
+          matchedInputTokens: 240_000,
+        },
+      },
     });
     expect(data.rows[0].tokens.cache).toBe("—");
   });
@@ -474,6 +496,13 @@ describe("admin API mappers", () => {
       averageDuration: "2.0s",
       averageFirstToken: "500ms",
       dayLabel: "2026-05-21",
+      costCoverage: {
+        confidence: "partial",
+        pricedRequests: 10,
+        unpricedRequests: 2,
+        partialRequests: 3,
+        exactRequests: 4,
+      },
     });
     expect(data.rows).toHaveLength(0);
     expect(data.hourly[7]).toMatchObject({ requests: 12, totalTokens: 12000 });

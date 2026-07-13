@@ -8,16 +8,25 @@ const removedPaths = [
   "apps/desktop/src/lib/api/admin-client.ts",
   "crates/core/src/codex_models_cache.rs",
   "crates/core/src/codex_patch_plan.rs",
+  "crates/core/src/basellm_metadata.rs",
+  "crates/core/src/config_bootstrap.rs",
   "crates/core/src/config_v2.rs",
   "crates/core/src/config_v4.rs",
+  "crates/core/src/dashboard_core/snapshot.rs",
   "crates/core/src/proxy/attempt_target.rs",
   "crates/core/src/proxy/provider_orchestration.rs",
   "crates/core/src/proxy/request_routing.rs",
   "crates/core/src/proxy/session_overrides.rs",
+  "crates/core/src/state/quota_identity_store.rs",
+  "crates/core/src/state/quota_sample_store.rs",
   "crates/core/src/state/policy_action_store.rs",
   "crates/core/src/state/session_route_ledger.rs",
   "crates/core/src/usage_balance.rs",
   "crates/core/src/usage_forecast.rs",
+  "crates/tui/src/tui/codex_relay_diagnostics.rs",
+  "crates/tui/src/tui/view/modals/station_info.rs",
+  "crates/tui/src/tui/view/pages/stations.rs",
+  "crates/tui/src/tui/view/pages/stations/tests.rs",
 ];
 
 const removedControlPlanePaths = [
@@ -76,7 +85,15 @@ const forbiddenFieldNames = [
   "station_name_filter",
 ];
 const forbiddenProductionStrings = [
+  "CODEX_HELPER_POLICY_ACTION_LEDGER",
+  "CODEX_HELPER_SESSION_ROUTE_AFFINITY_LEDGER",
+  "basellm-catalog-attempt-v1.json",
+  "basellm-catalog-lkg-v1.json",
+  "client_patch",
+  "policy-actions.json",
+  "quota-samples.json",
   "station_mapping",
+  "session-route-affinities.json",
   "remote_connections",
 ];
 

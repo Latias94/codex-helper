@@ -290,8 +290,7 @@ fn render_session_details(
         .filter(|u| u.total_tokens > 0)
         .map(|usage| usage_line_lang(usage, lang))
         .unwrap_or_else(|| format!("{}: -", l("tok in/out/rsn/ttl")));
-    let posture =
-        selected.map(|row| session_control_posture_lang(row, ui.uses_route_graph_routing(), lang));
+    let posture = selected.map(|row| session_control_posture_lang(row, lang));
 
     let lines = vec![
         kv_line(

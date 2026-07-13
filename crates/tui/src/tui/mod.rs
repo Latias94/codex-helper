@@ -97,7 +97,7 @@ struct RenderSurfaceKey {
     stats_focus: types::StatsFocus,
     stats_attention_only: bool,
     stats_errors_only: bool,
-    selected_station_idx: usize,
+    selected_provider_idx: usize,
     selected_session_idx: usize,
     selected_request_idx: usize,
     selected_request_page_idx: usize,
@@ -112,7 +112,7 @@ struct RenderSurfaceKey {
     selected_stats_provider_endpoint_idx: usize,
     selected_stats_provider_idx: usize,
     stats_provider_detail_scroll: u16,
-    station_info_scroll: u16,
+    provider_info_scroll: u16,
     session_transcript_scroll: u16,
 }
 
@@ -127,7 +127,7 @@ impl RenderSurfaceKey {
             stats_focus: ui.stats_focus,
             stats_attention_only: ui.stats_attention_only,
             stats_errors_only: ui.stats_errors_only,
-            selected_station_idx: ui.selected_station_idx,
+            selected_provider_idx: ui.selected_provider_idx,
             selected_session_idx: ui.selected_session_idx,
             selected_request_idx: ui.selected_request_idx,
             selected_request_page_idx: ui.selected_request_page_idx,
@@ -142,7 +142,7 @@ impl RenderSurfaceKey {
             selected_stats_provider_endpoint_idx: ui.selected_stats_provider_endpoint_idx,
             selected_stats_provider_idx: ui.selected_stats_provider_idx,
             stats_provider_detail_scroll: ui.stats_provider_detail_scroll,
-            station_info_scroll: ui.station_info_scroll,
+            provider_info_scroll: ui.provider_info_scroll,
             session_transcript_scroll: ui.session_transcript_scroll,
         }
     }
@@ -225,7 +225,6 @@ pub async fn run_dashboard(
         service_name,
         proxy_port: port,
         language,
-        config_version: Some(cfg.version),
         overlay: if show_startup_alert {
             types::Overlay::StartupAlert
         } else {

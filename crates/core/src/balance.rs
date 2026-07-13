@@ -233,8 +233,10 @@ impl ProviderBalanceSnapshot {
         snapshot
     }
 
+    /// Records a public diagnostic category without retaining provider-controlled error text.
     pub fn with_error(mut self, error: impl Into<String>) -> Self {
-        self.error = Some(error.into());
+        let error = error.into();
+        self.error = Some(safe_provider_balance_error(&error).to_string());
         self.exhausted = None;
         self.refresh_status(self.fetched_at_ms);
         self
@@ -525,9 +527,231 @@ fn bool_is_true(value: &bool) -> bool {
     *value
 }
 
+const ERROR_CLASSIFICATION_MAX_CHARS: usize = 2_048;
+
+pub(crate) fn safe_provider_balance_error(error: &str) -> &'static str {
+    let normalized = error
+        .chars()
+        .take(ERROR_CLASSIFICATION_MAX_CHARS)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if contains_any(
+        &normalized,
+        &[
+            "no usable token",
+            "missing token",
+            "missing credential",
+            "token env",
+            "credential unavailable",
+        ],
+    ) {
+        "provider credential unavailable"
+    } else if contains_any(
+        &normalized,
+        &[
+            "authentication failed",
+            "authorization failed",
+            "authorization required",
+            "invalid api key",
+            "api key invalid",
+            "api key is invalid",
+            "api key rejected",
+            "api key disabled",
+            "api key inactive",
+            "invalid apikey",
+            "apikey invalid",
+            "invalid bearer token",
+            "bearer token invalid",
+            "unauthorized",
+            "forbidden",
+            "invalid token",
+            "token invalid",
+            "login required",
+            "http 401",
+            "status 401",
+            "http 403",
+            "status 403",
+            "密钥无效",
+            "令牌无效",
+        ],
+    ) {
+        "authentication failed"
+    } else if contains_any(
+        &normalized,
+        &[
+            "user inactive",
+            "account inactive",
+            "account is not active",
+            "account unavailable",
+            "account disabled",
+            "user disabled",
+            "账户未激活",
+            "账号未激活",
+            "用户未激活",
+            "账户已禁用",
+            "账号已禁用",
+            "用户已禁用",
+        ],
+    ) {
+        "provider account unavailable"
+    } else if contains_any(
+        &normalized,
+        &[
+            "insufficient balance",
+            "balance insufficient",
+            "insufficient quota",
+            "quota exhausted",
+            "quota exceeded",
+            "no balance",
+            "余额不足",
+            "额度不足",
+            "配额不足",
+        ],
+    ) {
+        "provider quota exhausted"
+    } else if contains_any(
+        &normalized,
+        &["http 429", "status 429", "too many requests", "rate limit"],
+    ) {
+        "provider rate limited"
+    } else if contains_any(&normalized, &["timed out", "timeout", "deadline exceeded"]) {
+        "provider request timed out"
+    } else if contains_any(
+        &normalized,
+        &[
+            "connection",
+            "connect error",
+            "error sending request",
+            "network error",
+            "dns error",
+            "tls error",
+            "certificate error",
+            "socket error",
+        ],
+    ) {
+        "provider connection failed"
+    } else if contains_any(
+        &normalized,
+        &[
+            "invalid provider response",
+            "decode response",
+            "deserialize response",
+            "parse response",
+            "invalid response",
+            "malformed response",
+            "unexpected response",
+            "response body",
+            "response read failed",
+            "schema validation",
+        ],
+    ) {
+        "invalid provider response"
+    } else if contains_any(
+        &normalized,
+        &[
+            "provider refresh temporarily unavailable",
+            "temporarily suppressed",
+            "refresh cooldown",
+            "refresh cooling down",
+        ],
+    ) {
+        "provider refresh temporarily unavailable"
+    } else {
+        "provider request failed"
+    }
+}
+
+fn contains_any(value: &str, markers: &[&str]) -> bool {
+    markers.iter().any(|marker| value.contains(marker))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_balance_error_is_reduced_to_safe_authentication_category() {
+        let snapshot = ProviderBalanceSnapshot::default().with_error(
+            "HTTP 401: {\"message\":\"Authorization: Bearer sk-live-secret\\napi_key=key-secret\",\"url\":\"https://relay.example/v1?token=query-secret\"}",
+        );
+
+        assert_eq!(snapshot.error.as_deref(), Some("authentication failed"));
+        let encoded = serde_json::to_string(&snapshot).expect("serialize provider balance");
+        for secret in [
+            "sk-live-secret",
+            "key-secret",
+            "query-secret",
+            "Authorization",
+            "Bearer",
+            "api_key",
+            "?token=",
+            "{\\\"message\\\"",
+        ] {
+            assert!(!encoded.contains(secret), "leaked {secret}: {encoded}");
+        }
+        assert!(!encoded.chars().any(char::is_control), "{encoded:?}");
+    }
+
+    #[test]
+    fn provider_balance_error_preserves_only_diagnostic_category() {
+        for (error, expected) in [
+            (
+                "USER_INACTIVE: User account is not active",
+                "provider account unavailable",
+            ),
+            (
+                "insufficient balance for this request",
+                "provider quota exhausted",
+            ),
+            ("HTTP 429 Too Many Requests", "provider rate limited"),
+            (
+                "request timed out while reading response",
+                "provider request timed out",
+            ),
+            (
+                "connection refused by upstream",
+                "provider connection failed",
+            ),
+            (
+                "failed to decode response body as JSON",
+                "invalid provider response",
+            ),
+            (
+                "no usable token; checked upstream auth",
+                "provider credential unavailable",
+            ),
+            (
+                "all balance probe kinds are temporarily suppressed",
+                "provider refresh temporarily unavailable",
+            ),
+            (
+                "opaque failure Authorization: Bearer sk-secret url=https://relay.example/v1?api_key=query-secret",
+                "provider request failed",
+            ),
+        ] {
+            let snapshot = ProviderBalanceSnapshot::default().with_error(error);
+            assert_eq!(snapshot.error.as_deref(), Some(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn provider_balance_error_categories_are_idempotent() {
+        for category in [
+            "authentication failed",
+            "provider account unavailable",
+            "provider quota exhausted",
+            "provider rate limited",
+            "provider request timed out",
+            "provider connection failed",
+            "invalid provider response",
+            "provider credential unavailable",
+            "provider refresh temporarily unavailable",
+            "provider request failed",
+        ] {
+            let snapshot = ProviderBalanceSnapshot::default().with_error(category);
+            assert_eq!(snapshot.error.as_deref(), Some(category), "{category}");
+        }
+    }
 
     #[test]
     fn balance_snapshot_status_labels_are_stable() {

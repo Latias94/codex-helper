@@ -50,7 +50,6 @@ define_messages! {
 
     PAGE_DASHBOARD => { zh: "1 总览", en: "1 Dashboard" },
     PAGE_ROUTING => { zh: "2 路由", en: "2 Routing" },
-    PAGE_STATIONS => { zh: "2 站点", en: "2 Stations" },
     PAGE_SESSIONS => { zh: "3 会话", en: "3 Sessions" },
     PAGE_REQUESTS => { zh: "4 请求", en: "4 Requests" },
     PAGE_SERVICE_STATUS => { zh: "6 状态", en: "6 Status" },
@@ -62,9 +61,12 @@ define_messages! {
 
     FOCUS_SESSIONS => { zh: "会话", en: "Sessions" },
     FOCUS_REQUESTS => { zh: "请求", en: "Requests" },
-    FOCUS_ROUTING => { zh: "路由", en: "Routing" },
-    FOCUS_STATIONS => { zh: "站点", en: "Stations" },
+    FOCUS_PROVIDERS => { zh: "提供商", en: "Providers" },
     FOCUS_LABEL => { zh: "焦点：", en: "focus: " },
+    STATS_FOCUS_POOLS => { zh: "额度池", en: "pools" },
+    STATS_FOCUS_PROJECTS => { zh: "项目", en: "projects" },
+    STATS_FOCUS_PROVIDERS => { zh: "提供商", en: "providers" },
+    STATS_FOCUS_ENDPOINTS => { zh: "端点", en: "endpoints" },
 
     STATUS_ACTIVE_SHORT => { zh: "活跃 ", en: "active " },
     STATUS_ERRORS_SHORT => { zh: "错误(80) ", en: "errors(80) " },
@@ -79,12 +81,10 @@ define_messages! {
     OVERLAY_STARTUP_GUARDRAIL => { zh: "启动检查", en: "Startup guardrail" },
 
     FOOTER_DASHBOARD => { zh: "1-9/0 页面  q 退出  L 语言  Tab 焦点  ↑/↓ 移动  o/h 跳转  ? 帮助", en: "1-9/0 pages  q quit  L language  Tab focus  ↑/↓ move  o/h navigate  ? help" },
-    FOOTER_DASHBOARD_ROUTE_GRAPH => { zh: "1-9/0 页面  q 退出  L 语言  Tab 焦点  ↑/↓ 移动  o/h 跳转  ? 帮助", en: "1-9/0 pages  q quit  L language  Tab focus  ↑/↓ move  o/h navigate  ? help" },
-    FOOTER_ROUTING => { zh: "1-9/0 页面  q 退出  L 语言  ↑/↓ provider  i 详情  ? 帮助", en: "1-9/0 pages  q quit  L language  ↑/↓ provider  i details  ? help" },
-    FOOTER_STATIONS => { zh: "1-9/0 页面  q 退出  L 语言  ↑/↓ 选择  i 详情  ? 帮助", en: "1-9/0 pages  q quit  L language  ↑/↓ select  i details  ? help" },
+    FOOTER_ROUTING => { zh: "1-9/0 页面  q 退出  L 语言  ↑/↓ 提供商  i 详情  ? 帮助", en: "1-9/0 pages  q quit  L language  ↑/↓ provider  i details  ? help" },
     FOOTER_REQUESTS => { zh: "1-9/0 页面  q 退出  L 语言  ↑/↓ 选择  e 错误  s scope  o/h 跳转  ? 帮助", en: "1-9/0 pages  q quit  L language  ↑/↓ select  e errors  s scope  o/h navigate  ? help" },
     FOOTER_SESSIONS => { zh: "1-9/0 页面  q 退出  L 语言  ↑/↓ 选择  a/e/v 筛选  t 记录  ? 帮助", en: "1-9/0 pages  q quit  L language  ↑/↓ select  a/e/v filters  t transcript  ? help" },
-    FOOTER_STATS => { zh: "1-9/0 页面  q 退出  L 语言  Tab endpoint/provider  ↑/↓ 选择  y 导出  ? 帮助", en: "1-9/0 pages  q quit  L language  Tab endpoint/provider  ↑/↓ select  y export  ? help" },
+    FOOTER_STATS => { zh: "1-9/0 页面  q 退出  L 语言  Tab 池/项目/提供商/端点  ↑/↓ 选择  g 刷新  y 报告  ? 帮助", en: "1-9/0 pages  q quit  L language  Tab pool/project/provider/endpoint  ↑/↓ select  g refresh  y report  ? help" },
     FOOTER_SETTINGS_CODEX => { zh: "1-9/0 页面  q 退出  L 语言  n/o 本地 Codex switch  ? 帮助", en: "1-9/0 pages  q quit  L language  n/o local Codex switch  ? help" },
     FOOTER_SETTINGS_OTHER => { zh: "1-9/0 页面  q 退出  L 语言  ? 帮助", en: "1-9/0 pages  q quit  L language  ? help" },
     FOOTER_HISTORY => { zh: "1-9/0 页面  q 退出  L 语言  ↑/↓ 选择  r 刷新  t/Enter 记录  s/f 跳转  ? 帮助", en: "1-9/0 pages  q quit  L language  ↑/↓ select  r refresh  t/Enter transcript  s/f navigate  ? help" },
@@ -92,7 +92,7 @@ define_messages! {
     FOOTER_FLEET => { zh: "1-9/0 页面  q 退出  L 语言  Tab 视图  ↑/↓ 选择  ? 帮助", en: "1-9/0 pages  q quit  L language  Tab view  ↑/↓ select  ? help" },
     FOOTER_SERVICE_STATUS => { zh: "1-9/0 页面  q 退出  L 语言  r 刷新状态  ? 帮助", en: "1-9/0 pages  q quit  L language  r refresh status  ? help" },
     FOOTER_HELP => { zh: "Esc 关闭帮助  L 语言", en: "Esc close help  L language" },
-    FOOTER_STATION_INFO => { zh: "↑/↓ 滚动  PgUp/PgDn 翻页  Esc 关闭  L 语言", en: "↑/↓ scroll  PgUp/PgDn page  Esc close  L language" },
+    FOOTER_PROVIDER_INFO => { zh: "↑/↓ 滚动  PgUp/PgDn 翻页  Esc 关闭  L 语言", en: "↑/↓ scroll  PgUp/PgDn page  Esc close  L language" },
     FOOTER_SESSION_TRANSCRIPT => { zh: "↑/↓ 滚动  PgUp/PgDn 翻页  g/G 顶/底  A 全量/尾部  y 复制  t/Esc 关闭  L 语言", en: "↑/↓ scroll  PgUp/PgDn page  g/G top/bottom  A all/tail  y copy  t/Esc close  L language" },
     FOOTER_STARTUP_GUARDRAIL => { zh: "Esc/Enter 关闭启动检查  L 语言", en: "Esc/Enter close startup guardrail  L language" },
 
@@ -178,15 +178,18 @@ fn zh_label(en: &'static str) -> Option<&'static str> {
         "Model" => "模型",
         "Name" => "名称",
         "No data in this window." => "当前窗口没有数据。",
+        "No provider selected." => "未选择提供商。",
+        "No providers available." => "没有可用提供商。",
         "No requests match the current filters." => "没有请求匹配当前筛选。",
         "No sessions match the current filters." => "没有会话匹配当前筛选。",
-        "No stations available." => "没有可用站点。",
         "Observed route" => "观测路由",
         "On" => "启用",
         "Out" => "输出",
         "Path" => "路径",
         "Provider" => "提供商",
-        "Provider routing" => "Provider 路由",
+        "Provider details" => "提供商详情",
+        "Provider routing" => "提供商路由",
+        "Providers" => "提供商",
         "Recent sample" => "最近样本",
         "reasoning guard" => "推理保护",
         "Requests" => "请求",
@@ -202,8 +205,6 @@ fn zh_label(en: &'static str) -> Option<&'static str> {
         "Set reasoning effort" => "设置推理强度",
         "Spend & tokens" => "花费 / Token",
         "St" => "状态",
-        "Station details" => "站点详情",
-        "Stations" => "站点",
         "Usage page" => "用量页",
         "TTFB" => "首包",
         "Tok" => "Tok",
@@ -468,7 +469,6 @@ fn zh_label(en: &'static str) -> Option<&'static str> {
         "slow" => "慢",
         "source" => "来源",
         "stale" => "过期",
-        "station" => "站点",
         "provider mapping" => "提供商映射",
         "status" => "状态",
         "strategy" => "策略",
@@ -520,9 +520,6 @@ fn zh_label(en: &'static str) -> Option<&'static str> {
         }
         "This session keeps its stored profile binding while runtime observations explain the effective route." => {
             "该会话保留已存储的 profile 绑定，生效路由由运行时观测解释。"
-        }
-        "Effective route comes from request payloads, profile defaults, and runtime fallback." => {
-            "生效路由来自请求负载、profile 默认值和运行时回退。"
         }
         "Effective route comes from request payloads, route graph defaults, and runtime fallback." => {
             "生效路由来自请求负载、路由图默认值和运行时回退。"
@@ -662,6 +659,14 @@ mod tests {
                 "missing zh message: {id}"
             );
         }
+    }
+
+    #[test]
+    fn routing_and_provider_labels_are_canonical_in_both_languages() {
+        assert_eq!(text(Language::En, msg::PAGE_ROUTING), "2 Routing");
+        assert_eq!(text(Language::Zh, msg::PAGE_ROUTING), "2 路由");
+        assert_eq!(text(Language::En, msg::FOCUS_PROVIDERS), "Providers");
+        assert_eq!(text(Language::Zh, msg::FOCUS_PROVIDERS), "提供商");
     }
 
     #[test]

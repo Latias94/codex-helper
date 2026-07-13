@@ -221,7 +221,7 @@ pub(super) fn render_sessions_page(
             format_resolved_route_value(row.effective_reasoning_effort.as_ref(), lang);
         let effective_service_tier =
             format_resolved_route_value(row.effective_service_tier.as_ref(), lang);
-        let posture = session_control_posture_lang(row, ui.uses_route_graph_routing(), lang);
+        let posture = session_control_posture_lang(row, lang);
         let route_affinity = row
             .route_affinity
             .as_ref()

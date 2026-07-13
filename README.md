@@ -349,6 +349,8 @@ codex-helper session last
 codex-helper session transcript <SESSION_ID> --tail 40
 
 # 请求日志与统计
+codex-helper usage quota --target local
+codex-helper usage quota --target local --json
 codex-helper usage summary
 codex-helper usage tail --limit 20
 codex-helper usage find --errors --limit 10
@@ -356,7 +358,9 @@ codex-helper usage chain --trace-id <TRACE_ID> --json
 
 # 价格
 codex-helper pricing list
-codex-helper pricing sync-basellm --model gpt-5 --dry-run
+codex-helper pricing status
+codex-helper pricing force-refresh
+codex-helper pricing import-basellm --model gpt-5 --dry-run
 
 # 诊断
 codex-helper status
@@ -377,12 +381,14 @@ codex-helper --version
 常用页面：
 
 - `Overview`：代理状态、当前会话和最近请求。
-- `Routing` / `Stations`：route graph、provider 顺序、余额/套餐、tags、健康状态和 routing 预览。
-- `Sessions`：session identity、effective route 和 route affinity。
-- `Usage`：来自 committed request events 的今日请求、token、估算成本、provider/model/session 排行和 coverage state。
-- `Requests`：committed request/attempt 样本、token、cache evidence、耗时、重试、request chain 和成本。
+- `Routing`：provider/endpoint 顺序、configured/effective/routable 状态、自动控制、capacity 和紧凑余额/配额；完整 route graph 与候选路径请使用 `routing show` / `routing explain` 查看。
+- `Sessions`：session identity、effective route、route affinity、单会话覆盖。
+- `Usage`：远端共享 quota pool 的 used/remaining、15/60 分钟速率、reset 前所需速率、pace、ETA，以及本地今日请求、token、估算成本和 project 归因。
+- `Requests`：已提交的 request/attempt 事实、endpoint 最近样本、token、cache token、耗时、重试、request chain 和成本。
 
-TUI 和桌面端消费同一份 typed、redacted `OperatorReadModel`，对远程 runtime control plane 只使用 `GET` / `HEAD`。模型明确区分 `ready`、`stale`、`disconnected` 和 `auth_required`；连接或认证失败时不会用本机配置、SQLite 或空 runtime 伪造 fallback view。持久 provider/routing intent 通过本地 CLI 或 `config.toml` 修改。在 TUI 中，`n` / `o` 是唯一的局部例外：它们只显式 patch 本机 Codex 配置里的 helper provider selector/stanza，不是远程 runtime mutation。
+TUI 和桌面端消费同一份 typed、redacted `OperatorReadModel`，对远程 runtime control plane 只使用 `GET` / `HEAD`。模型明确区分 `ready`、`stale`、`disconnected` 和 `auth_required`；连接或认证失败时不会用本机配置、SQLite 或空 runtime 伪造 fallback view。远程 operator clients 与 control plane 都是只读的；attached TUI 不处理 `n` / `o`，也不会检查或修改本机 Codex 配置。持久 provider/routing intent 通过本地 CLI 或 `config.toml` 修改。终端场景需要切换 Codex 客户端时，只能另行显式执行本地 `switch on/off` CLI，或在 integrated local TUI 的 Settings 页面使用 `n` / `o`；两者都不是远程 control-plane 操作。
+
+远端 quota sampler 由目标 daemon 独占，附着客户端不会启动第二个 sampler，也不会通过远端 control plane 强制刷新或修改运行态。远端 pool counter 可能包含使用同一账号或 key 的其他电脑，是共享总消耗的事实源；本机 project 归因来自 daemon 已提交到 `state.sqlite` 的 request ledger，绝不会按远端差额放大本地请求价格。更完整的 source/scope/confidence、coverage、raw unit 和 conversion-generation 限制见 [中文配置参考](docs/CONFIGURATION.zh.md#usage-页面)。
 
 ### Desktop Preview
 

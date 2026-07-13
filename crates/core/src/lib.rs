@@ -1,4 +1,5 @@
 pub mod balance;
+pub mod basellm_catalog;
 mod client_config;
 pub mod codex_capability_profile;
 pub mod codex_integration;
@@ -20,6 +21,9 @@ pub mod pricing;
 pub mod provider_catalog;
 pub mod provider_signals;
 pub mod proxy;
+pub mod quota_analytics;
+pub mod quota_pool;
+pub mod quota_sampler;
 pub mod relay_target;
 pub mod request_chain;
 pub mod request_ledger;

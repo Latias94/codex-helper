@@ -62,6 +62,13 @@ export const emptyUsageData: UsageData = {
     cacheRate: "—",
     errorRate: "—",
     dayLabel: "—",
+    costCoverage: {
+      confidence: "unknown",
+      pricedRequests: 0,
+      unpricedRequests: 0,
+      partialRequests: 0,
+      exactRequests: 0,
+    },
   },
   hourly: [],
   providerRows: [],

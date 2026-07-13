@@ -191,18 +191,12 @@ fn footer_help_text(ui: &UiState) -> &'static str {
 
     match ui.overlay {
         Overlay::None => match ui.page {
-            Page::Dashboard if ui.uses_route_graph_routing() => {
-                i18n::text(ui.language, msg::FOOTER_DASHBOARD_ROUTE_GRAPH)
-            }
             Page::Dashboard => i18n::text(ui.language, msg::FOOTER_DASHBOARD),
-            Page::Stations if ui.uses_route_graph_routing() => {
-                i18n::text(ui.language, msg::FOOTER_ROUTING)
-            }
-            Page::Stations => i18n::text(ui.language, msg::FOOTER_STATIONS),
+            Page::Routing => i18n::text(ui.language, msg::FOOTER_ROUTING),
             Page::Requests => i18n::text(ui.language, msg::FOOTER_REQUESTS),
             Page::Sessions => i18n::text(ui.language, msg::FOOTER_SESSIONS),
             Page::Stats => i18n::text(ui.language, msg::FOOTER_STATS),
-            Page::Settings if ui.service_name == "codex" => {
+            Page::Settings if ui.allows_local_codex_switch() => {
                 i18n::text(ui.language, msg::FOOTER_SETTINGS_CODEX)
             }
             Page::Settings => i18n::text(ui.language, msg::FOOTER_SETTINGS_OTHER),
@@ -212,7 +206,7 @@ fn footer_help_text(ui: &UiState) -> &'static str {
             Page::ServiceStatus => i18n::text(ui.language, msg::FOOTER_SERVICE_STATUS),
         },
         Overlay::Help => i18n::text(ui.language, msg::FOOTER_HELP),
-        Overlay::StationInfo => i18n::text(ui.language, msg::FOOTER_STATION_INFO),
+        Overlay::ProviderInfo => i18n::text(ui.language, msg::FOOTER_PROVIDER_INFO),
         Overlay::SessionTranscript => i18n::text(ui.language, msg::FOOTER_SESSION_TRANSCRIPT),
         Overlay::StartupAlert => i18n::text(ui.language, msg::FOOTER_STARTUP_GUARDRAIL),
     }
@@ -247,7 +241,7 @@ fn compact_page_key(idx: usize) -> String {
 
 fn header_tabs_line(p: Palette, ui: &UiState, max_width: u16) -> Line<'static> {
     let selected = page_index(ui.page);
-    let titles = page_titles(ui.language, ui.uses_route_graph_routing());
+    let titles = page_titles(ui.language);
 
     let mut full = Vec::new();
     for (idx, title) in titles.iter().enumerate() {
@@ -330,10 +324,7 @@ pub(super) fn render_header(
         _ => match ui.focus {
             Focus::Sessions => i18n::text(ui.language, msg::FOCUS_SESSIONS),
             Focus::Requests => i18n::text(ui.language, msg::FOCUS_REQUESTS),
-            Focus::Stations if ui.uses_route_graph_routing() => {
-                i18n::text(ui.language, msg::FOCUS_ROUTING)
-            }
-            Focus::Stations => i18n::text(ui.language, msg::FOCUS_STATIONS),
+            Focus::Providers => i18n::text(ui.language, msg::FOCUS_PROVIDERS),
         },
     };
     let connection = ui.runtime_connection.label(ui.language);
@@ -720,9 +711,8 @@ mod tests {
     #[test]
     fn footer_help_text_uses_query_only_routing_copy() {
         let ui = UiState {
-            page: Page::Stations,
+            page: Page::Routing,
             language: crate::tui::Language::En,
-            config_version: Some(5),
             ..Default::default()
         };
 
@@ -768,11 +758,10 @@ mod tests {
     }
 
     #[test]
-    fn header_tabs_line_uses_routing_label_for_route_graph() {
+    fn header_tabs_line_uses_canonical_routing_label() {
         let ui = UiState {
-            page: Page::Stations,
+            page: Page::Routing,
             language: crate::tui::Language::En,
-            config_version: Some(crate::config::CURRENT_CONFIG_VERSION),
             ..Default::default()
         };
 

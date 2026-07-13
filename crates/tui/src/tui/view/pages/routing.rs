@@ -16,6 +16,8 @@ use crate::tui::view::provider_control::{
     policy_action_control_details, policy_action_control_summary,
 };
 
+const TWO_COLUMN_MIN_WIDTH: u16 = 132;
+
 fn provider_capacity_summary(capacity: &OperatorProviderCapacity) -> Option<String> {
     if capacity.is_empty() {
         return None;
@@ -47,7 +49,7 @@ fn yes_no(value: bool, lang: crate::tui::Language) -> &'static str {
     i18n::label(lang, if value { "yes" } else { "no" })
 }
 
-pub(super) fn render_stations_page(
+pub(super) fn render_routing_page(
     f: &mut Frame<'_>,
     p: Palette,
     ui: &mut UiState,
@@ -58,8 +60,13 @@ pub(super) fn render_stations_page(
     let lang = ui.language;
     let l = |text| i18n::label(lang, text);
 
+    let is_narrow = area.width < TWO_COLUMN_MIN_WIDTH;
     let columns = Layout::default()
-        .direction(Direction::Horizontal)
+        .direction(if is_narrow {
+            Direction::Vertical
+        } else {
+            Direction::Horizontal
+        })
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(area);
     let left_block = Block::default()
@@ -120,7 +127,7 @@ pub(super) fn render_stations_page(
         .collect::<Vec<_>>();
 
     let table_visible_rows = usize::from(left_block.inner(columns[0]).height.saturating_sub(1));
-    ui.sync_stations_table_viewport(providers.len(), table_visible_rows);
+    ui.sync_providers_table_viewport(providers.len(), table_visible_rows);
 
     let table = Table::new(
         rows,
@@ -138,9 +145,9 @@ pub(super) fn render_stations_page(
     .row_highlight_style(Style::default().bg(Color::Rgb(32, 39, 48)).fg(p.text))
     .highlight_symbol("  ")
     .highlight_spacing(HighlightSpacing::Always);
-    f.render_stateful_widget(table, columns[0], &mut ui.stations_table);
+    f.render_stateful_widget(table, columns[0], &mut ui.providers_table);
 
-    let selected = providers.get(ui.selected_station_idx);
+    let selected = providers.get(ui.selected_provider_idx);
     let right_title = selected
         .map(|provider| format!("{}: {}", l("Provider details"), provider.name))
         .unwrap_or_else(|| l("Provider details").to_string());

@@ -10,6 +10,7 @@ use crate::balance::{
 use crate::config::RetryProfileName;
 use crate::logging::{RouteAttemptLog, upstream_origin};
 use crate::pricing::{CostBreakdown, ModelPriceCatalogSnapshot};
+use crate::quota_analytics::QuotaAnalyticsView;
 use crate::request_ledger::{RequestUsageSummary, RequestUsageSummaryGroup};
 use crate::runtime_identity::ProviderEndpointKey;
 use crate::state::{
@@ -86,6 +87,8 @@ pub struct OperatorReadData {
     pub usage_day: UsageDayView,
     #[serde(default)]
     pub usage_rollup: UsageRollupView,
+    #[serde(default)]
+    pub quota_analytics: QuotaAnalyticsView,
     #[serde(default)]
     pub stats_5m: WindowStats,
     #[serde(default)]
@@ -931,6 +934,20 @@ pub fn redact_operator_usage_summaries(
     summaries
 }
 
+pub fn redact_operator_quota_analytics(mut analytics: QuotaAnalyticsView) -> QuotaAnalyticsView {
+    for pool in &mut analytics.pools {
+        for row in &mut pool.reconciliation.projects {
+            row.project.path = row
+                .project
+                .path
+                .as_deref()
+                .filter(|path| !path.is_empty())
+                .map(|path| opaque_operator_key("project", path));
+        }
+    }
+    analytics
+}
+
 pub fn build_operator_session_stats(recent: &[FinishedRequest]) -> HashMap<String, SessionStats> {
     let mut stats = HashMap::<String, SessionStats>::new();
     for request in recent {
@@ -1231,12 +1248,59 @@ mod tests {
                 usage_summaries: Vec::new(),
                 usage_day: Default::default(),
                 usage_rollup: Default::default(),
+                quota_analytics: Default::default(),
                 stats_5m: Default::default(),
                 stats_1h: Default::default(),
                 pricing_catalog: Default::default(),
                 provider_balances: Vec::new(),
             },
         )
+    }
+
+    #[test]
+    fn operator_read_model_defaults_missing_quota_analytics_to_unsupported() {
+        let mut encoded = serde_json::to_value(ready_operator_model()).expect("serialize model");
+        encoded["data"]
+            .as_object_mut()
+            .expect("operator data")
+            .remove("quota_analytics");
+
+        let decoded: OperatorReadModel =
+            serde_json::from_value(encoded).expect("deserialize legacy model");
+
+        assert_eq!(
+            decoded.data.expect("operator data").quota_analytics.support,
+            crate::quota_analytics::QuotaAnalyticsSupport::Unsupported
+        );
+    }
+
+    #[test]
+    fn operator_quota_analytics_redacts_project_paths() {
+        let mut analytics = QuotaAnalyticsView::default();
+        let mut pool = crate::quota_analytics::PoolQuotaAnalytics::default();
+        pool.reconciliation.projects = vec![crate::quota_analytics::QuotaProjectRow {
+            project: crate::sessions::ProjectIdentity {
+                kind: crate::sessions::ProjectIdentityKind::GitRoot,
+                path: Some("/home/operator/private-project".to_string()),
+            },
+            ..Default::default()
+        }];
+        analytics.pools.push(pool);
+
+        let redacted = redact_operator_quota_analytics(analytics);
+        let project = &redacted.pools[0].reconciliation.projects[0].project;
+
+        assert_eq!(project.kind, crate::sessions::ProjectIdentityKind::GitRoot);
+        assert!(
+            project
+                .path
+                .as_deref()
+                .is_some_and(|path| path.starts_with("project:sha256:"))
+        );
+        assert_ne!(
+            project.path.as_deref(),
+            Some("/home/operator/private-project")
+        );
     }
 
     #[test]
@@ -1648,6 +1712,7 @@ mod tests {
                 source: "local:/home/operator/catalog-path-secret.toml".to_string(),
                 model_count: 1,
                 models: vec![crate::pricing::ModelPriceView {
+                    provider: "openai".to_string(),
                     model_id: "gpt-test".to_string(),
                     display_name: None,
                     aliases: Vec::new(),
@@ -1655,7 +1720,9 @@ mod tests {
                     output_per_1m_usd: "2".to_string(),
                     cache_read_input_per_1m_usd: None,
                     cache_creation_input_per_1m_usd: None,
+                    tiers: Vec::new(),
                     source: "local:/home/operator/model-price-path-secret.toml".to_string(),
+                    source_generation: None,
                     confidence: crate::pricing::CostConfidence::Estimated,
                 }],
             },

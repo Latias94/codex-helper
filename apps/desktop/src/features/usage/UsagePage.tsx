@@ -75,6 +75,13 @@ export function UsagePage() {
               <div className="mt-2 text-xs text-slate-400">
                 source {coverage.source} · loaded {coverage.loadedRequests.toLocaleString()}
               </div>
+              <div className="mt-1 text-xs text-slate-400">
+                pricing {summary.costCoverage.confidence} · priced{" "}
+                {summary.costCoverage.pricedRequests.toLocaleString()} · exact{" "}
+                {summary.costCoverage.exactRequests.toLocaleString()} · partial{" "}
+                {summary.costCoverage.partialRequests.toLocaleString()} · unpriced{" "}
+                {summary.costCoverage.unpricedRequests.toLocaleString()}
+              </div>
             </div>
             <div className="rounded-xl border border-slate-100 bg-slate-50 p-3">
               <div className="flex items-center gap-2 font-medium text-slate-800">

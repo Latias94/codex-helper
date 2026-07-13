@@ -1,6 +1,32 @@
 use super::*;
 
 #[test]
+fn request_trace_id_is_versioned_and_stable_within_process() {
+    let first = request_trace_id("codex", 42);
+    let second = request_trace_id("codex", 42);
+
+    assert_eq!(first, second);
+    assert!(is_versioned_request_trace_id(&first));
+    assert_ne!(first, legacy_request_trace_id("codex", 42));
+}
+
+#[test]
+fn request_trace_id_changes_with_boot_uuid() {
+    let first_boot =
+        uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000001").expect("first boot UUID");
+    let second_boot =
+        uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000002").expect("second boot UUID");
+
+    let first = request_trace_id_for_boot(&first_boot, "codex", 42);
+    let second = request_trace_id_for_boot(&second_boot, "codex", 42);
+
+    assert_ne!(first, second);
+    assert!(is_versioned_request_trace_id(&first));
+    assert!(is_versioned_request_trace_id(&second));
+    assert_eq!(legacy_request_trace_id("codex", 42), "codex-42");
+}
+
+#[test]
 fn request_log_serializes_request_id_when_present() {
     let value = serde_json::to_value(RequestLog {
         timestamp_ms: 1,
@@ -38,7 +64,10 @@ fn request_log_serializes_request_id_when_present() {
     .expect("serialize request log");
 
     assert_eq!(value["request_id"].as_u64(), Some(42));
-    assert_eq!(value["trace_id"].as_str(), Some("codex-42"));
+    assert_eq!(
+        value["trace_id"].as_str(),
+        Some(request_trace_id("codex", 42).as_str())
+    );
     assert_eq!(value["model"].as_str(), Some("gpt-5"));
     assert_eq!(value["session_identity_source"].as_str(), Some("header"));
 }

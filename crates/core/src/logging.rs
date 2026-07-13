@@ -54,11 +54,53 @@ pub fn now_ms() -> u64 {
 }
 
 pub fn request_trace_id(service: &str, request_id: u64) -> String {
+    static PROCESS_BOOT_UUID: OnceLock<uuid::Uuid> = OnceLock::new();
+    request_trace_id_for_boot(
+        PROCESS_BOOT_UUID.get_or_init(uuid::Uuid::new_v4),
+        service,
+        request_id,
+    )
+}
+
+const REQUEST_TRACE_ID_PREFIX: &str = "ch-trace:v1:";
+
+pub(crate) fn request_trace_id_for_boot(
+    boot_uuid: &uuid::Uuid,
+    service: &str,
+    request_id: u64,
+) -> String {
+    format!(
+        "{REQUEST_TRACE_ID_PREFIX}{boot_uuid}:{}:{request_id}",
+        request_trace_service(service)
+    )
+}
+
+pub(crate) fn is_versioned_request_trace_id(trace_id: &str) -> bool {
+    let Some(rest) = trace_id.strip_prefix(REQUEST_TRACE_ID_PREFIX) else {
+        return false;
+    };
+    let Some((boot_uuid, request_identity)) = rest.split_once(':') else {
+        return false;
+    };
+    let Some((service, request_id)) = request_identity.rsplit_once(':') else {
+        return false;
+    };
+
+    uuid::Uuid::parse_str(boot_uuid).is_ok()
+        && !service.is_empty()
+        && request_id.parse::<u64>().is_ok()
+}
+
+pub(crate) fn legacy_request_trace_id(service: &str, request_id: u64) -> String {
+    format!("{}-{request_id}", request_trace_service(service))
+}
+
+fn request_trace_service(service: &str) -> &str {
     let service = service.trim();
     if service.is_empty() {
-        format!("request-{request_id}")
+        "request"
     } else {
-        format!("{service}-{request_id}")
+        service
     }
 }
 

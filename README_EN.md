@@ -340,6 +340,8 @@ codex-helper session last
 codex-helper session transcript <SESSION_ID> --tail 40
 
 # request logs and usage
+codex-helper usage quota --target local
+codex-helper usage quota --target local --json
 codex-helper usage summary
 codex-helper usage tail --limit 20
 codex-helper usage find --errors --limit 10
@@ -347,7 +349,9 @@ codex-helper usage chain --trace-id <TRACE_ID> --json
 
 # pricing
 codex-helper pricing list
-codex-helper pricing sync-basellm --model gpt-5 --dry-run
+codex-helper pricing status
+codex-helper pricing force-refresh
+codex-helper pricing import-basellm --model gpt-5 --dry-run
 
 # diagnostics
 codex-helper status
@@ -368,12 +372,14 @@ codex-helper --version
 Useful pages:
 
 - `Overview`: proxy status, current sessions, and recent requests.
-- `Routing` / `Stations`: route graph, provider order, balance/plan, tags, health, and routing preview.
-- `Sessions`: session identity, effective route, and route affinity.
-- `Usage`: local-day requests, tokens, estimated cost, provider/model/session rankings, and coverage state from committed request events.
-- `Requests`: committed request/attempt samples, token/cache evidence, latency, retries, request chains, and cost.
+- `Routing`: provider/endpoint order, configured/effective/routable state, automatic controls, capacity, and compact balance/quota context. Use `routing show` / `routing explain` for the full route graph and candidate paths.
+- `Sessions`: session identity, effective route, route affinity, and per-session overrides.
+- `Usage`: remote shared quota-pool used/remaining, 15/60-minute rates, required rate until reset, pace, ETA, plus local-day requests, tokens, estimated cost, and project attribution.
+- `Requests`: committed request/attempt facts, recent endpoint samples, tokens, cache tokens, latency, retries, request chains, and cost.
 
-TUI and desktop consume the same typed, redacted `OperatorReadModel` and use only `GET` / `HEAD` against a remote runtime control plane. The model distinguishes `ready`, `stale`, `disconnected`, and `auth_required`; connection or authentication failures never synthesize a fallback view from local config, SQLite, or an empty runtime. Edit durable provider/routing intent with local CLI commands or `config.toml`. Within the TUI, `n` / `o` is the only local exception: it explicitly patches only the helper provider selector/stanza in this machine's Codex config and is not a remote runtime mutation.
+TUI and desktop consume the same typed, redacted `OperatorReadModel` and use only `GET` / `HEAD` against a remote runtime control plane. The model distinguishes `ready`, `stale`, `disconnected`, and `auth_required`; connection or authentication failures never synthesize a fallback view from local config, SQLite, or an empty runtime. Remote operator clients and the control plane are read-only: an attached TUI neither handles `n` / `o` nor inspects or changes local Codex configuration. Edit durable provider/routing intent with local CLI commands or `config.toml`. In terminal workflows, switch the Codex client only through a separate explicit local `switch on/off` CLI action or `n` / `o` on the integrated local TUI Settings page; neither path is a remote control-plane operation.
+
+The target daemon exclusively owns its remote quota sampler. Attached clients neither start a second sampler nor force refreshes or mutations through the remote control plane. A remote pool counter may include other computers using the same account or key and is the source of truth for shared total burn; project attribution comes from request-ledger facts committed by that daemon to `state.sqlite` and never scales local prices to match a remote delta. See [Usage Page](docs/CONFIGURATION.md#usage-page) for source/scope/confidence, coverage, raw-unit, and conversion-generation limits.
 
 ### Desktop Preview
 

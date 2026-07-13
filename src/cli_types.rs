@@ -874,6 +874,15 @@ pub enum RecentTerminal {
 
 #[derive(Subcommand, Debug)]
 pub enum UsageCommand {
+    /// Show daemon-owned remote quota pools and pacing without recalculating them locally
+    Quota {
+        /// Configured relay target whose canonical operator read model should be queried
+        #[arg(long, default_value = "local")]
+        target: String,
+        /// Output the quota analytics DTO as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Show recent requests from the runtime operator read model
     Tail {
         /// Maximum number of recent entries to print
@@ -1003,6 +1012,27 @@ impl FromStr for ProviderEndpointArg {
 pub enum PricingCommand {
     /// Print the local pricing override path
     Path,
+    /// Show BaseLLM LKG, last-check, effective catalog, and manual override status
+    Status {
+        /// Output JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Force an immediate validated BaseLLM LKG refresh without changing manual overrides
+    ForceRefresh {
+        /// URL returning BaseLLM all.json data
+        #[arg(
+            long,
+            default_value = "https://basellm.github.io/llm-metadata/api/all.json"
+        )]
+        url: String,
+        /// Approve the exact economic-change candidate from the last quarantine
+        #[arg(long)]
+        approve_economic_changes: bool,
+        /// Output JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
     /// List the merged price catalog or only local overrides
     List {
         /// Output JSON instead of text
@@ -1014,10 +1044,16 @@ pub enum PricingCommand {
         /// Filter rows by model id or alias match
         #[arg(long)]
         model: Option<String>,
+        /// Filter rows by canonical pricing provider
+        #[arg(long)]
+        provider: Option<String>,
     },
     /// Add or replace a local model price override
     Set {
         model_id: String,
+        /// Canonical pricing provider namespace
+        #[arg(long, default_value = "openai")]
+        provider: String,
         #[arg(long)]
         display_name: Option<String>,
         #[arg(long = "alias")]
@@ -1034,7 +1070,12 @@ pub enum PricingCommand {
         confidence: PricingConfidence,
     },
     /// Remove a local model price override
-    Remove { model_id: String },
+    Remove {
+        model_id: String,
+        /// Canonical pricing provider namespace
+        #[arg(long, default_value = "openai")]
+        provider: String,
+    },
     /// Pull a remote pricing catalog JSON into local overrides
     Sync {
         /// URL returning a ModelPriceCatalogSnapshot JSON payload
@@ -1042,6 +1083,9 @@ pub enum PricingCommand {
         /// Import only rows matching these model ids or aliases
         #[arg(long = "model")]
         models: Vec<String>,
+        /// Import only rows from this canonical provider
+        #[arg(long)]
+        provider: Option<String>,
         /// Replace local overrides instead of merging into them
         #[arg(long)]
         replace: bool,
@@ -1049,8 +1093,9 @@ pub enum PricingCommand {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Pull basellm llm-metadata pricing JSON into local overrides
-    SyncBasellm {
+    /// Explicitly import BaseLLM pricing rows into manual overrides
+    #[command(name = "import-basellm", visible_alias = "sync-basellm")]
+    ImportBasellm {
         /// URL returning basellm all.json data
         #[arg(
             long,
@@ -1060,6 +1105,9 @@ pub enum PricingCommand {
         /// Import only rows matching these model ids or aliases
         #[arg(long = "model")]
         models: Vec<String>,
+        /// BaseLLM provider namespace to import for this Codex catalog
+        #[arg(long, default_value = "openai")]
+        provider: String,
         /// Replace local overrides instead of merging into them
         #[arg(long)]
         replace: bool,
@@ -1765,6 +1813,119 @@ mod tests {
         assert!(codex);
         assert_eq!(port, Some(4211));
         assert_eq!(max_restarts, 3);
+    }
+
+    #[test]
+    fn pricing_sync_basellm_defaults_to_openai_provider() {
+        let cli = Cli::try_parse_from(["codex-helper", "pricing", "sync-basellm", "--dry-run"])
+            .expect("parse pricing sync-basellm");
+
+        let Some(Command::Pricing {
+            cmd: PricingCommand::ImportBasellm {
+                provider, dry_run, ..
+            },
+        }) = cli.command
+        else {
+            panic!("expected pricing sync-basellm command");
+        };
+        assert_eq!(provider, "openai");
+        assert!(dry_run);
+    }
+
+    #[test]
+    fn pricing_status_and_force_refresh_parse_operator_flags() {
+        let status = Cli::try_parse_from(["codex-helper", "pricing", "status", "--json"])
+            .expect("parse pricing status");
+        assert!(matches!(
+            status.command,
+            Some(Command::Pricing {
+                cmd: PricingCommand::Status { json: true }
+            })
+        ));
+
+        let refresh = Cli::try_parse_from([
+            "codex-helper",
+            "pricing",
+            "force-refresh",
+            "--json",
+            "--approve-economic-changes",
+        ])
+        .expect("parse pricing force refresh");
+        assert!(matches!(
+            refresh.command,
+            Some(Command::Pricing {
+                cmd: PricingCommand::ForceRefresh {
+                    json: true,
+                    approve_economic_changes: true,
+                    ..
+                }
+            })
+        ));
+    }
+
+    #[test]
+    fn pricing_import_basellm_is_primary_name_with_legacy_alias() {
+        for command in ["import-basellm", "sync-basellm"] {
+            let cli = Cli::try_parse_from(["codex-helper", "pricing", command, "--dry-run"])
+                .expect("parse BaseLLM manual import");
+            assert!(matches!(
+                cli.command,
+                Some(Command::Pricing {
+                    cmd: PricingCommand::ImportBasellm { dry_run: true, .. }
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn usage_quota_parses_target_and_json_passthrough() {
+        let cli = Cli::try_parse_from([
+            "codex-helper",
+            "usage",
+            "quota",
+            "--target",
+            "nas",
+            "--json",
+        ])
+        .expect("parse usage quota");
+
+        let Some(Command::Usage {
+            cmd: UsageCommand::Quota { target, json },
+            ..
+        }) = cli.command
+        else {
+            panic!("expected usage quota command");
+        };
+        assert_eq!(target, "nas");
+        assert!(json);
+    }
+
+    #[test]
+    fn pricing_set_accepts_explicit_provider_namespace() {
+        let cli = Cli::try_parse_from([
+            "codex-helper",
+            "pricing",
+            "set",
+            "shared-model",
+            "--provider",
+            "routing-run",
+            "--input-per-1m-usd",
+            "1",
+            "--output-per-1m-usd",
+            "2",
+        ])
+        .expect("parse provider-scoped pricing set");
+
+        let Some(Command::Pricing {
+            cmd: PricingCommand::Set {
+                provider, model_id, ..
+            },
+        }) = cli.command
+        else {
+            panic!("expected pricing set command");
+        };
+        assert_eq!(provider, "routing-run");
+        assert_eq!(model_id, "shared-model");
     }
 }
 

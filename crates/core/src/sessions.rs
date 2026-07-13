@@ -75,7 +75,53 @@ pub struct RecentSession {
     pub mtime_ms: u64,
 }
 
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectIdentityKind {
+    GitRoot,
+    PathFallback,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[serde(default)]
+pub struct ProjectIdentity {
+    pub kind: ProjectIdentityKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+impl ProjectIdentity {
+    pub fn from_cwd(cwd: Option<&str>) -> Self {
+        let Some(cwd) = cwd.map(str::trim).filter(|cwd| !cwd.is_empty()) else {
+            return Self::default();
+        };
+        let cwd_path = PathBuf::from(cwd);
+        let path = infer_project_root_from_cwd(cwd);
+        let kind = if cwd_path.is_absolute() && Path::new(&path).join(".git").exists() {
+            ProjectIdentityKind::GitRoot
+        } else {
+            ProjectIdentityKind::PathFallback
+        };
+        Self {
+            kind,
+            path: Some(path),
+        }
+    }
+
+    pub fn display_key(&self) -> &str {
+        self.path.as_deref().unwrap_or("-")
+    }
+}
+
 pub fn infer_project_root_from_cwd(cwd: &str) -> String {
+    let cwd = cwd.trim();
+    if cwd.is_empty() {
+        return String::new();
+    }
     let path = std::path::PathBuf::from(cwd);
     if !path.is_absolute() {
         return cwd.to_string();
@@ -85,7 +131,10 @@ pub fn infer_project_root_from_cwd(cwd: &str) -> String {
     let mut cur = canonical.clone();
     loop {
         if cur.join(".git").exists() {
-            return cur.to_string_lossy().to_string();
+            return std::fs::canonicalize(&cur)
+                .unwrap_or(cur)
+                .to_string_lossy()
+                .to_string();
         }
         if !cur.pop() {
             break;
@@ -1196,6 +1245,42 @@ fn sort_by_updated_desc(vec: &mut [SessionSummary]) {
             (None, None) => Ordering::Equal,
         }
     });
+}
+
+#[cfg(test)]
+mod project_identity_tests {
+    use super::*;
+
+    #[test]
+    fn nested_and_missing_paths_resolve_to_git_root_while_relative_paths_fallback() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "codex-helper-project-identity-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let repository = temp_root.join("repository");
+        let nested = repository.join("crates").join("core");
+        std::fs::create_dir_all(repository.join(".git")).expect("create git marker");
+        std::fs::create_dir_all(&nested).expect("create nested project path");
+        let expected = std::fs::canonicalize(&repository).expect("canonical repository");
+
+        let nested_identity = ProjectIdentity::from_cwd(nested.to_str());
+        let missing_identity =
+            ProjectIdentity::from_cwd(repository.join("deleted").join("child").to_str());
+        let relative_identity = ProjectIdentity::from_cwd(Some("crates/core"));
+
+        assert_eq!(nested_identity.kind, ProjectIdentityKind::GitRoot);
+        assert_eq!(nested_identity.path.as_deref(), expected.to_str());
+        assert_eq!(missing_identity.kind, ProjectIdentityKind::GitRoot);
+        assert_eq!(missing_identity.path.as_deref(), expected.to_str());
+        assert_eq!(relative_identity.kind, ProjectIdentityKind::PathFallback);
+        assert_eq!(relative_identity.path.as_deref(), Some("crates/core"));
+
+        std::fs::remove_dir_all(temp_root).expect("remove project identity test directory");
+    }
 }
 
 #[cfg(test)]

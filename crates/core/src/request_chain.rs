@@ -614,6 +614,7 @@ mod tests {
                 ..UsageMetrics::default()
             }),
             cost: CostBreakdown::unknown(),
+            accounting: Default::default(),
             retry: Some(RetryInfo {
                 attempts: 1,
                 route_attempts: vec![RouteAttemptLog {

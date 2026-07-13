@@ -39,7 +39,7 @@ pub(in crate::tui) fn render_app(
     match ui.overlay {
         Overlay::None => {}
         Overlay::Help => modals::render_help_modal(f, p, ui),
-        Overlay::StationInfo => modals::render_station_info_modal(f, p, ui, snapshot, providers),
+        Overlay::ProviderInfo => modals::render_provider_info_modal(f, p, ui, snapshot, providers),
         Overlay::StartupAlert => modals::render_startup_alert_modal(f, p, ui),
         Overlay::SessionTranscript => modals::render_session_transcript_modal(f, p, ui),
     }
@@ -64,7 +64,7 @@ mod tests {
     };
     use crate::tui::Language;
     use crate::tui::model::{SessionRow, Snapshot, UpstreamSummary};
-    use crate::tui::types::{Overlay, Page, StatsFocus};
+    use crate::tui::types::{Focus, Overlay, Page, StatsFocus};
     use codex_helper_core::fleet::{
         FleetConfidence, FleetEvidence, FleetEvidenceSource, FleetNodeHealth, FleetNodeKind,
         FleetNodeSnapshot, FleetProcessSummary, FleetSnapshot, FleetTopology, FleetUsageSummary,
@@ -94,6 +94,7 @@ mod tests {
             recent: Vec::new(),
             request_control_evidence: HashMap::new(),
             usage_day: crate::state::UsageDayView::default(),
+            quota_analytics: crate::quota_analytics::QuotaAnalyticsView::default(),
             usage_rollup: crate::state::UsageRollupView {
                 by_provider_endpoint: vec![(
                     "超级路由入口".to_string(),
@@ -155,6 +156,7 @@ mod tests {
                     }],
                 ),
             ]),
+            pricing_catalog: Default::default(),
             stats_5m: crate::dashboard_core::WindowStats::default(),
             stats_1h: crate::dashboard_core::WindowStats::default(),
             service_status: None,
@@ -379,15 +381,15 @@ mod tests {
         let cases = [
             (Page::Stats, 118, 32),
             (Page::Stats, 76, 24),
-            (Page::Stations, 118, 32),
-            (Page::Stations, 76, 24),
+            (Page::Routing, 118, 32),
+            (Page::Routing, 76, 24),
         ];
 
         for (page, width, height) in cases {
             let mut ui = UiState {
                 page,
-                config_version: Some(crate::config::CURRENT_CONFIG_VERSION),
-                selected_station_idx: 3,
+                focus: Focus::Providers,
+                selected_provider_idx: 3,
                 selected_stats_provider_idx: 0,
                 stats_focus: StatsFocus::Providers,
                 language: Language::Zh,
@@ -403,18 +405,53 @@ mod tests {
             match page {
                 Page::Stats => {
                     assert!(
-                        text.contains("Usage") || compact_text.contains("今日用量"),
+                        text.contains("Usage") || compact_text.contains("5用量"),
                         "{text}"
                     );
-                    assert!(text.contains("Retry Gate"), "{text}");
-                    assert!(compact_text.contains("覆盖范围"), "{text}");
+                    assert!(
+                        text.contains("Remote Quota") || compact_text.contains("远端额度"),
+                        "{text}"
+                    );
+                    if width >= 100 {
+                        assert!(compact_text.contains("覆盖范围"), "{text}");
+                    }
                 }
-                Page::Stations => {
+                Page::Routing => {
                     assert!(text.contains("input-light"), "{text}");
                     assert!(compact_text.contains("路由"), "{text}");
+                    assert!(compact_text.contains("提供商"), "{text}");
                 }
                 _ => unreachable!(),
             }
+        }
+    }
+
+    #[test]
+    fn routing_narrow_layout_keeps_provider_table_and_details_scannable() {
+        let snapshot = sample_snapshot();
+        let providers = sample_providers();
+        let mut ui = UiState {
+            page: Page::Routing,
+            focus: Focus::Providers,
+            selected_provider_idx: 3,
+            language: Language::En,
+            ..UiState::default()
+        };
+
+        let text = render_app_text_with_providers(76, 22, &mut ui, &snapshot, &providers);
+
+        for expected in [
+            "Providers",
+            "Name",
+            "Cfg",
+            "Eff",
+            "Routable",
+            "Balance/Quota",
+            "Provider details: input-light",
+            "Balance / quota",
+            "Endpoints",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?}\n{text}");
         }
     }
 

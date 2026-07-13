@@ -15,8 +15,8 @@ pub use operator_summary::{
     OperatorRetrySummary, OperatorRetrySummaryView, OperatorRevisionBundle,
     OperatorRouteAttemptSummary, OperatorRuntimeSummary, OperatorSessionRouteAffinitySummary,
     OperatorSessionSummary, OperatorSummaryCounts, build_operator_session_stats,
-    redact_operator_pricing_catalog, redact_operator_usage_day, redact_operator_usage_summaries,
-    summarize_recent_retry_observations,
+    redact_operator_pricing_catalog, redact_operator_quota_analytics, redact_operator_usage_day,
+    redact_operator_usage_summaries, summarize_recent_retry_observations,
 };
 pub use types::{ControlProfileOption, ProviderCapacity, ProviderEndpointOption, ProviderOption};
 pub use window_stats::WindowStats;

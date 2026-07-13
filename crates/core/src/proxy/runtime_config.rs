@@ -201,6 +201,35 @@ impl RuntimeSnapshot {
         }
     }
 
+    fn with_operator_pricing_catalog(
+        &self,
+        operator_pricing_catalog: Arc<CapturedModelPriceCatalog>,
+        revision: u64,
+        loaded_at_ms: u64,
+    ) -> Result<Self> {
+        let digest_seed = runtime_snapshot_digest_seed(
+            self.config.as_ref(),
+            self.codex_route_graph.as_ref(),
+            self.claude_route_graph.as_ref(),
+            self.provider_catalog.as_ref(),
+            operator_pricing_catalog.revision(),
+        )?;
+        let digest = runtime_snapshot_digest_from_seed(digest_seed.clone(), &self.provider_policy);
+        Ok(Self {
+            config: Arc::clone(&self.config),
+            codex_route_graph: Arc::clone(&self.codex_route_graph),
+            claude_route_graph: Arc::clone(&self.claude_route_graph),
+            provider_catalog: Arc::clone(&self.provider_catalog),
+            operator_pricing_catalog,
+            provider_policy: Arc::clone(&self.provider_policy),
+            revision,
+            digest,
+            digest_seed,
+            loaded_at_ms,
+            source_stamp: self.source_stamp,
+        })
+    }
+
     pub(super) fn config(&self) -> Arc<HelperConfig> {
         Arc::clone(&self.config)
     }
@@ -602,6 +631,37 @@ impl RuntimeConfig {
             previous.revision().saturating_add(1),
             now_ms(),
         );
+        self.store_current(next);
+        Ok(true)
+    }
+
+    pub(super) async fn publish_operator_pricing_catalog(&self) -> Result<bool> {
+        let operator_pricing_catalog =
+            tokio::task::spawn_blocking(try_capture_operator_model_price_catalog)
+                .await
+                .context("join operator pricing catalog loader")?
+                .map(Arc::new)
+                .map_err(anyhow::Error::msg)
+                .context("load operator pricing catalog")?;
+
+        self.publish_captured_operator_pricing_catalog(operator_pricing_catalog)
+            .await
+    }
+
+    async fn publish_captured_operator_pricing_catalog(
+        &self,
+        operator_pricing_catalog: Arc<CapturedModelPriceCatalog>,
+    ) -> Result<bool> {
+        let _publisher_guard = self.publish.lock().await;
+        let previous = self.capture_current();
+        if previous.operator_pricing_catalog().revision() == operator_pricing_catalog.revision() {
+            return Ok(false);
+        }
+        let next = previous.with_operator_pricing_catalog(
+            operator_pricing_catalog,
+            previous.revision().saturating_add(1),
+            now_ms(),
+        )?;
         self.store_current(next);
         Ok(true)
     }
@@ -1529,5 +1589,44 @@ mod tests {
 
         assert!(error.to_string().contains("invalid pricing override"));
         assert!(Arc::ptr_eq(&before, &runtime.capture().await));
+    }
+
+    #[tokio::test]
+    async fn basellm_publish_advances_only_the_pricing_runtime_generation() {
+        let runtime = runtime_config("pricing-publish");
+        let before = runtime.capture().await;
+        let replacement = Arc::new(
+            before
+                .operator_pricing_catalog()
+                .as_ref()
+                .clone()
+                .with_test_revision("test:basellm-runtime-revision"),
+        );
+
+        assert!(
+            runtime
+                .publish_captured_operator_pricing_catalog(Arc::clone(&replacement))
+                .await
+                .expect("publish BaseLLM pricing")
+        );
+
+        let after = runtime.capture().await;
+        assert_eq!(after.revision(), before.revision().saturating_add(1));
+        assert_eq!(
+            after.operator_pricing_catalog().revision(),
+            replacement.revision()
+        );
+        assert!(Arc::ptr_eq(&before.config(), &after.config()));
+        assert!(Arc::ptr_eq(
+            &before.provider_catalog(),
+            &after.provider_catalog()
+        ));
+        assert_eq!(before.provider_policy(), after.provider_policy());
+        assert!(
+            !runtime
+                .publish_captured_operator_pricing_catalog(replacement)
+                .await
+                .expect("skip duplicate BaseLLM pricing")
+        );
     }
 }

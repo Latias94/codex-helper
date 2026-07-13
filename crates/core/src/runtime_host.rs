@@ -1,16 +1,23 @@
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::Router;
 use thiserror::Error;
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 
+use crate::basellm_catalog::{
+    BasellmCatalogSyncOptions, install_basellm_catalog_runtime_state,
+    load_basellm_catalog_runtime_state, sync_basellm_catalog,
+};
 use crate::config::{HelperConfig, LoadedConfig, ServiceKind, load_config_with_source};
 use crate::proxy::{
     ProxyService, admin_listener_router, admin_loopback_addr_for_proxy_port, proxy_only_router,
 };
+use crate::quota_sampler::{QuotaSampler, QuotaSamplerConfig, QuotaSamplerRefreshOutcome};
 use crate::runtime_store::RuntimeStore;
 use crate::state::ProxyState;
 
@@ -36,6 +43,7 @@ pub struct ProxyRuntime {
     pub state: Arc<ProxyState>,
     pub shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
+    runtime_store: Arc<RuntimeStore>,
     listener: Option<tokio::net::TcpListener>,
     admin_listener: Option<tokio::net::TcpListener>,
     app: Option<Router>,
@@ -48,8 +56,15 @@ pub struct RunningProxyRuntime {
     pub port: u16,
     pub admin_addr: SocketAddr,
     pub shutdown_tx: watch::Sender<bool>,
-    server_handle: JoinHandle<Result<()>>,
-    initial_balance_refresh_handle: JoinHandle<()>,
+    runtime_join_handle: JoinHandle<RuntimeTaskJoinResults>,
+    server_abort_handle: AbortHandle,
+    quota_sampler_abort_handle: AbortHandle,
+}
+
+struct RuntimeTaskJoinResults {
+    server: Result<Result<()>, tokio::task::JoinError>,
+    quota_sampler: Result<(), tokio::task::JoinError>,
+    basellm_sync: Result<(), tokio::task::JoinError>,
 }
 
 #[derive(Debug, Clone)]
@@ -150,11 +165,37 @@ impl ProxyRuntime {
             .take()
             .expect("proxy runtime admin app should exist before start");
         let shutdown_rx = self.shutdown_rx.clone();
-        let initial_balance_refresh_handle = self
-            .proxy
-            .spawn_initial_balance_refresh(self.shutdown_rx.clone());
+        let sampler_proxy = self.proxy.clone();
+        let sampler = QuotaSampler::new_with_outcome(QuotaSamplerConfig::default(), move || {
+            let proxy = sampler_proxy.clone();
+            async move {
+                let response = match proxy.refresh_provider_balances(None, None, false).await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        return QuotaSamplerRefreshOutcome::Failed(format!(
+                            "quota provider refresh failed: {error}"
+                        ));
+                    }
+                };
+                quota_sampler_refresh_result(&response.refresh)
+            }
+        });
+        let quota_sampler_handle = sampler.spawn(self.shutdown_rx.clone());
+        let basellm_sync_handle = spawn_basellm_catalog_sync(
+            Arc::clone(&self.runtime_store),
+            self.proxy.clone(),
+            self.shutdown_rx.clone(),
+        );
         let server_handle =
             spawn_proxy_runtime_servers(listener, admin_listener, app, admin_app, shutdown_rx);
+        let server_abort_handle = server_handle.abort_handle();
+        let quota_sampler_abort_handle = quota_sampler_handle.abort_handle();
+        let runtime_join_handle = spawn_runtime_task_joiner(
+            self.shutdown_tx.clone(),
+            server_handle,
+            quota_sampler_handle,
+            basellm_sync_handle,
+        );
 
         RunningProxyRuntime {
             service_name: self.service_name,
@@ -162,45 +203,111 @@ impl ProxyRuntime {
             port: self.port,
             admin_addr: self.admin_addr,
             shutdown_tx: self.shutdown_tx,
-            server_handle,
-            initial_balance_refresh_handle,
+            runtime_join_handle,
+            server_abort_handle,
+            quota_sampler_abort_handle,
         }
     }
 }
 
+fn quota_sampler_refresh_result(
+    summary: &crate::usage_providers::UsageProviderRefreshSummary,
+) -> QuotaSamplerRefreshOutcome {
+    if summary.suppressed > 0
+        && let Some(next_retry_at_ms) = summary.next_retry_at_ms
+    {
+        let delay = Duration::from_millis(next_retry_at_ms.saturating_sub(unix_now_ms()));
+        return QuotaSamplerRefreshOutcome::Suppressed {
+            wake_at: tokio::time::Instant::now() + delay,
+        };
+    }
+    if summary.attempted > 0 && summary.failed >= summary.attempted {
+        QuotaSamplerRefreshOutcome::Failed(format!(
+            "all {} quota provider refresh attempts failed",
+            summary.attempted
+        ))
+    } else {
+        QuotaSamplerRefreshOutcome::Refreshed
+    }
+}
+
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 impl RunningProxyRuntime {
     pub async fn wait(&mut self) -> Result<()> {
-        let server_result = (&mut self.server_handle)
+        let results = (&mut self.runtime_join_handle)
             .await
-            .map_err(|error| anyhow::anyhow!("server task join error: {error}"))?;
-        let _ = self.shutdown_tx.send(true);
-        (&mut self.initial_balance_refresh_handle)
-            .await
-            .map_err(|error| anyhow::anyhow!("initial balance refresh task join error: {error}"))?;
-        server_result
+            .map_err(|error| anyhow::anyhow!("runtime task coordinator join error: {error}"))?;
+        results.graceful_result()
     }
 
+    /// Stops request-serving tasks immediately while allowing an in-flight catalog sync to finish.
     pub fn abort(&self) {
-        self.server_handle.abort();
-        self.initial_balance_refresh_handle.abort();
+        let _ = self.shutdown_tx.send(true);
+        self.server_abort_handle.abort();
+        self.quota_sampler_abort_handle.abort();
     }
 
     pub async fn abort_and_wait(&mut self) -> Result<()> {
         self.abort();
-        match (&mut self.server_handle).await {
+        let results = (&mut self.runtime_join_handle)
+            .await
+            .map_err(|error| anyhow::anyhow!("runtime task coordinator join error: {error}"))?;
+        results.aborted_result()
+    }
+}
+
+impl RuntimeTaskJoinResults {
+    fn graceful_result(self) -> Result<()> {
+        match self.server {
+            Ok(result) => result?,
+            Err(error) => return Err(anyhow::anyhow!("server task join error: {error}")),
+        }
+        self.quota_sampler
+            .map_err(|error| anyhow::anyhow!("quota sampler task join error: {error}"))?;
+        self.basellm_sync
+            .map_err(|error| anyhow::anyhow!("BaseLLM sync task join error: {error}"))?;
+        Ok(())
+    }
+
+    fn aborted_result(self) -> Result<()> {
+        match self.server {
             Ok(Ok(())) => {}
             Ok(Err(error)) => return Err(error),
             Err(error) if error.is_cancelled() => {}
             Err(error) => return Err(anyhow::anyhow!("server task join error: {error}")),
         }
-        match (&mut self.initial_balance_refresh_handle).await {
-            Ok(()) => Ok(()),
-            Err(error) if error.is_cancelled() => Ok(()),
-            Err(error) => Err(anyhow::anyhow!(
-                "initial balance refresh task join error: {error}"
-            )),
+        match self.quota_sampler {
+            Ok(()) => {}
+            Err(error) if error.is_cancelled() => {}
+            Err(error) => return Err(anyhow::anyhow!("quota sampler task join error: {error}")),
         }
+        self.basellm_sync
+            .map_err(|error| anyhow::anyhow!("BaseLLM sync task join error: {error}"))
     }
+}
+
+fn spawn_runtime_task_joiner(
+    shutdown_tx: watch::Sender<bool>,
+    server_handle: JoinHandle<Result<()>>,
+    quota_sampler_handle: JoinHandle<()>,
+    basellm_sync_handle: JoinHandle<()>,
+) -> JoinHandle<RuntimeTaskJoinResults> {
+    tokio::spawn(async move {
+        let server = server_handle.await;
+        let _ = shutdown_tx.send(true);
+        let (quota_sampler, basellm_sync) = tokio::join!(quota_sampler_handle, basellm_sync_handle);
+        RuntimeTaskJoinResults {
+            server,
+            quota_sampler,
+            basellm_sync,
+        }
+    })
 }
 
 impl Drop for RunningProxyRuntime {
@@ -291,6 +398,7 @@ async fn build_proxy_runtime_from_loaded_with_options_and_runtime_store(
     loaded: LoadedConfig,
     runtime_store: Arc<RuntimeStore>,
 ) -> Result<ProxyRuntime> {
+    initialize_basellm_catalog(Arc::clone(&runtime_store)).await?;
     let addr: SocketAddr = SocketAddr::from((host, port));
     let listener = bind_listener(addr, ProxyListenerKind::Proxy).await?;
     let admin_listener = bind_listener(options.admin_addr, ProxyListenerKind::Admin).await?;
@@ -334,7 +442,7 @@ async fn build_proxy_runtime_from_bound_listeners_with_options(
         client,
         config_source.clone(),
         service_name,
-        runtime_store,
+        Arc::clone(&runtime_store),
     )?;
     let state = proxy.state_handle();
     let app = proxy_only_router(proxy.clone());
@@ -350,11 +458,103 @@ async fn build_proxy_runtime_from_bound_listeners_with_options(
         state,
         shutdown_tx,
         shutdown_rx,
+        runtime_store,
         listener: Some(listener),
         admin_listener: Some(admin_listener),
         app: Some(app),
         admin_app: Some(admin_app),
     })
+}
+
+async fn initialize_basellm_catalog(runtime_store: Arc<RuntimeStore>) -> Result<()> {
+    tokio::task::spawn_blocking(move || {
+        let state = load_basellm_catalog_runtime_state(runtime_store.as_ref())
+            .context("load BaseLLM catalog from canonical runtime store")?;
+        install_basellm_catalog_runtime_state(&state);
+        crate::pricing::refresh_effective_pricing_catalog();
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .context("join BaseLLM catalog initialization")??;
+    Ok(())
+}
+
+fn spawn_basellm_catalog_sync(
+    runtime_store: Arc<RuntimeStore>,
+    proxy: ProxyService,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    const SYNC_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+
+    tokio::spawn(async move {
+        loop {
+            if *shutdown_rx.borrow() {
+                return;
+            }
+            let sync = sync_basellm_catalog(
+                Arc::clone(&runtime_store),
+                BasellmCatalogSyncOptions::default(),
+            );
+            let (sync_result, shutdown_observed) =
+                join_in_flight_on_shutdown(sync, wait_for_runtime_shutdown(&mut shutdown_rx)).await;
+            let report = match sync_result {
+                Ok(report) => report,
+                Err(error) => {
+                    tracing::warn!(%error, "BaseLLM catalog sync task failed to join");
+                    return;
+                }
+            };
+            if shutdown_observed || *shutdown_rx.borrow() {
+                return;
+            }
+            if let Err(error) = proxy.publish_operator_pricing_catalog().await {
+                tracing::warn!(error = %error, "failed to publish refreshed BaseLLM pricing catalog");
+            }
+
+            let delay = report
+                .attempt
+                .retry_after_unix
+                .and_then(|retry_at| retry_at.checked_sub(unix_now_secs()))
+                .and_then(|seconds| u64::try_from(seconds).ok())
+                .map(Duration::from_secs)
+                .unwrap_or(SYNC_INTERVAL);
+            tokio::select! {
+                biased;
+                () = wait_for_runtime_shutdown(&mut shutdown_rx) => return,
+                () = tokio::time::sleep(delay) => {}
+            }
+        }
+    })
+}
+
+async fn join_in_flight_on_shutdown<T>(
+    task: impl Future<Output = T> + Send + 'static,
+    shutdown: impl Future<Output = ()>,
+) -> (Result<T, tokio::task::JoinError>, bool)
+where
+    T: Send + 'static,
+{
+    let mut task = tokio::spawn(task);
+    tokio::select! {
+        biased;
+        () = shutdown => (task.await, true),
+        result = &mut task => (result, false),
+    }
+}
+
+async fn wait_for_runtime_shutdown(shutdown_rx: &mut watch::Receiver<bool>) {
+    loop {
+        if *shutdown_rx.borrow() || shutdown_rx.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
 }
 
 async fn bind_listener(
@@ -435,7 +635,47 @@ fn spawn_proxy_runtime_servers(
 mod tests {
     use super::*;
     use std::path::Path;
-    use std::sync::{Mutex as StdMutex, OnceLock};
+    use std::sync::{Condvar, Mutex as StdMutex, OnceLock};
+
+    struct TaskDropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for TaskDropSignal {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    struct BlockingGate {
+        state: Arc<(StdMutex<bool>, Condvar)>,
+    }
+
+    impl BlockingGate {
+        fn new() -> Self {
+            Self {
+                state: Arc::new((StdMutex::new(false), Condvar::new())),
+            }
+        }
+
+        fn waiter(&self) -> Arc<(StdMutex<bool>, Condvar)> {
+            Arc::clone(&self.state)
+        }
+
+        fn release(&self) {
+            let (released, wake) = self.state.as_ref();
+            *released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            wake.notify_all();
+        }
+    }
+
+    impl Drop for BlockingGate {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
 
     struct ScopedEnv {
         saved: Vec<(String, Option<String>)>,
@@ -807,6 +1047,170 @@ env_key = "EXTERNAL_API_KEY"
 
         drop(env);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_and_wait_joins_in_flight_basellm_runtime_document_commit() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-helper-basellm-shutdown-commit-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let helper_home = root.join(".codex-helper");
+        let release_commit = BlockingGate::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            run_in_flight_basellm_shutdown_case(&helper_home, &release_commit),
+        )
+        .await;
+        release_commit.release();
+        result.expect("in-flight BaseLLM shutdown case timed out");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    async fn run_in_flight_basellm_shutdown_case(
+        helper_home: &Path,
+        release_commit: &BlockingGate,
+    ) {
+        let runtime_store = Arc::new(
+            RuntimeStore::open_in_home(helper_home).expect("open runtime store for catalog sync"),
+        );
+        let release_commit_for_sync = release_commit.waiter();
+        let runtime_store_for_sync = Arc::clone(&runtime_store);
+        let (commit_started_tx, commit_started_rx) = tokio::sync::oneshot::channel();
+        let (shutdown_observed_tx, shutdown_observed_rx) = tokio::sync::oneshot::channel();
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
+        let basellm_sync_handle = tokio::spawn(async move {
+            let commit = async move {
+                tokio::task::spawn_blocking(move || {
+                    let _ = commit_started_tx.send(());
+                    let (released, wake) = release_commit_for_sync.as_ref();
+                    let mut released = released
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    while !*released {
+                        released = wake
+                            .wait(released)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    }
+                    runtime_store_for_sync.compare_and_write_runtime_document(
+                        None,
+                        crate::runtime_store::RuntimeDocumentWrite {
+                            kind: crate::runtime_store::RuntimeDocumentKind::BasellmCatalog,
+                            schema_version: crate::basellm_catalog::BASELLM_CATALOG_SCHEMA_VERSION,
+                            payload_json: r#"{"schema_version":1,"attempt":null}"#,
+                        },
+                    )
+                })
+                .await
+                .expect("join blocking BaseLLM catalog commit")
+            };
+            let shutdown = async {
+                wait_for_runtime_shutdown(&mut shutdown_rx).await;
+                let _ = shutdown_observed_tx.send(());
+            };
+            let (commit_result, shutdown_observed) =
+                join_in_flight_on_shutdown(commit, shutdown).await;
+
+            assert!(shutdown_observed);
+            let commit = commit_result
+                .expect("join supervised BaseLLM sync")
+                .expect("commit BaseLLM runtime document");
+            assert!(matches!(
+                commit,
+                crate::runtime_store::RuntimeDocumentCommit::Committed(_)
+            ));
+        });
+        drop(runtime_store);
+
+        let (server_started_tx, server_started_rx) = tokio::sync::oneshot::channel();
+        let (server_stopped_tx, server_stopped_rx) = tokio::sync::oneshot::channel();
+        let server_handle = tokio::spawn(async move {
+            let _stopped = TaskDropSignal(Some(server_stopped_tx));
+            let _ = server_started_tx.send(());
+            std::future::pending::<Result<()>>().await
+        });
+        let (quota_sampler_started_tx, quota_sampler_started_rx) = tokio::sync::oneshot::channel();
+        let (quota_sampler_stopped_tx, quota_sampler_stopped_rx) = tokio::sync::oneshot::channel();
+        let quota_sampler_handle = tokio::spawn(async move {
+            let _stopped = TaskDropSignal(Some(quota_sampler_stopped_tx));
+            let _ = quota_sampler_started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        let server_abort_handle = server_handle.abort_handle();
+        let quota_sampler_abort_handle = quota_sampler_handle.abort_handle();
+        let runtime_join_handle = spawn_runtime_task_joiner(
+            shutdown_tx.clone(),
+            server_handle,
+            quota_sampler_handle,
+            basellm_sync_handle,
+        );
+        let mut running = RunningProxyRuntime {
+            service_name: "codex",
+            host: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            port: 0,
+            admin_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            shutdown_tx,
+            runtime_join_handle,
+            server_abort_handle,
+            quota_sampler_abort_handle,
+        };
+
+        commit_started_rx
+            .await
+            .expect("blocking catalog commit started");
+        server_started_rx.await.expect("server task started");
+        quota_sampler_started_rx
+            .await
+            .expect("quota sampler task started");
+        running.abort();
+        server_stopped_rx.await.expect("server task was cancelled");
+        quota_sampler_stopped_rx
+            .await
+            .expect("quota sampler task was cancelled");
+        shutdown_observed_rx
+            .await
+            .expect("BaseLLM supervisor observed shutdown");
+        assert!(
+            !running.runtime_join_handle.is_finished(),
+            "shutdown must join the already-started catalog commit"
+        );
+
+        let mut graceful_wait = Box::pin(running.wait());
+        let wait_poll = std::future::poll_fn(|context| {
+            std::task::Poll::Ready(graceful_wait.as_mut().poll(context))
+        })
+        .await;
+        assert!(
+            wait_poll.is_pending(),
+            "runtime wait must remain pending while the catalog commit is blocked"
+        );
+        drop(graceful_wait);
+
+        let (wait_started_tx, wait_started_rx) = tokio::sync::oneshot::channel();
+        let wait = tokio::spawn(async move {
+            let _ = wait_started_tx.send(());
+            running.abort_and_wait().await
+        });
+        wait_started_rx.await.expect("runtime wait started");
+        assert!(
+            !wait.is_finished(),
+            "abort_and_wait must remain pending while the catalog commit is blocked"
+        );
+
+        release_commit.release();
+        wait.await
+            .expect("join runtime shutdown waiter")
+            .expect("abort runtime and wait for catalog commit");
+
+        let reopened = RuntimeStore::open_in_home(helper_home)
+            .expect("runtime shutdown releases the writer lease after catalog commit");
+        let document = reopened
+            .read_runtime_document(crate::runtime_store::RuntimeDocumentKind::BasellmCatalog)
+            .expect("read committed BaseLLM runtime document")
+            .expect("BaseLLM runtime document was committed");
+        assert_eq!(document.revision, 1);
+        drop(reopened);
     }
 
     #[test]

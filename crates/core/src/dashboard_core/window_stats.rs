@@ -144,6 +144,7 @@ mod tests {
             }),
             usage: None,
             cost: Default::default(),
+            accounting: Default::default(),
             retry: None,
             provider_signals: Vec::new(),
             policy_actions: Vec::new(),

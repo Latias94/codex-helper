@@ -318,6 +318,7 @@ export function mapUsageRows(requests: ApiOperatorRequestSummary[]): UsageRowVie
 
 function summarizeUsageDay(usageDay: ApiUsageDayView): UsageSummaryView {
   const bucket = usageDay.summary;
+  const cost = bucket.cost;
   const requests = positive(bucket.requests_total);
   return {
     totalRequests: compactInteger(requests),
@@ -329,6 +330,13 @@ function summarizeUsageDay(usageDay: ApiUsageDayView): UsageSummaryView {
     cacheRate: "—",
     errorRate: formatRatio(bucket.requests_error, bucket.requests_total),
     dayLabel: usageDay.label || "today",
+    costCoverage: {
+      confidence: cost?.confidence ?? "unknown",
+      pricedRequests: positive(cost?.priced_requests),
+      unpricedRequests: positive(cost?.unpriced_requests),
+      partialRequests: positive(cost?.partial_requests),
+      exactRequests: positive(cost?.exact_requests),
+    },
   };
 }
 
@@ -451,6 +459,7 @@ function mapUsageDimensionRows(rows: ApiUsageDayDimensionRow[] | undefined): Usa
 }
 
 function formatCostBreakdown(cost?: ApiCostBreakdown): UsageRowView["costBreakdown"] {
+  const selectedTier = cost?.selected_tier;
   return {
     input: cost?.input_cost_usd ? `$${cost.input_cost_usd}` : "—",
     output: cost?.output_cost_usd ? `$${cost.output_cost_usd}` : "—",
@@ -460,6 +469,16 @@ function formatCostBreakdown(cost?: ApiCostBreakdown): UsageRowView["costBreakdo
     providerMultiplier: cost?.provider_cost_multiplier ?? "—",
     confidence: cost?.confidence ?? "unknown",
     source: cost?.pricing_source ?? "unknown",
+    pricingProvider: cost?.pricing_provider ?? "—",
+    pricingGeneration: cost?.pricing_generation ?? "—",
+    effectivePricingRevision: cost?.effective_pricing_revision ?? "—",
+    selectedTier: selectedTier
+      ? {
+          type: selectedTier.tier_type,
+          thresholdTokens: positive(selectedTier.threshold_tokens),
+          matchedInputTokens: positive(selectedTier.matched_input_tokens),
+        }
+      : undefined,
   };
 }
 

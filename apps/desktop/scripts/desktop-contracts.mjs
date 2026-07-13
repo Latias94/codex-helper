@@ -312,6 +312,12 @@ const contractDefinitions = [
         struct: "ModelPriceCatalogSnapshot",
         shape: true,
       },
+      {
+        id: "quotaQuantity",
+        file: "../../crates/core/src/quota_pool.rs",
+        struct: "QuotaQuantity",
+        shape: true,
+      },
     ],
     enums: [
       {
@@ -699,6 +705,12 @@ const contractDefinitions = [
         file: "src/lib/api/admin-types.ts",
         type: "ApiModelPriceCatalogSnapshot",
         fieldsFrom: "modelPriceCatalogSnapshot",
+        strictShape: true,
+      },
+      {
+        file: "src/lib/api/admin-types.ts",
+        type: "ApiQuotaQuantity",
+        fieldsFrom: "quotaQuantity",
         strictShape: true,
       },
     ],

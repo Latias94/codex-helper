@@ -15,8 +15,8 @@ pub(super) use help::render_help_modal;
 #[cfg(test)]
 use help::{current_page_help_lines, help_quit_line_for_tests, help_text_for_tests};
 
-mod station_info;
-pub(super) use station_info::render_station_info_modal;
+mod provider_info;
+pub(super) use provider_info::render_provider_info_modal;
 
 struct StartupIssueCopy {
     title: String,

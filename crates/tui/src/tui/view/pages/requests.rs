@@ -339,6 +339,15 @@ pub(super) fn render_requests_page(
                     Span::styled(cost_parts, Style::default().fg(p.muted)),
                 ]));
             }
+            if let Some(source) = r.cost.pricing_source.as_deref() {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{}: ", l("pricing source")),
+                        Style::default().fg(p.muted),
+                    ),
+                    Span::styled(source.to_string(), Style::default().fg(p.text)),
+                ]));
+            }
 
             if let Some(rate) = observability.output_tokens_per_second {
                 lines.push(Line::from(vec![
@@ -753,8 +762,10 @@ mod tests {
             recent: Vec::new(),
             request_control_evidence: HashMap::new(),
             usage_day: crate::state::UsageDayView::default(),
+            quota_analytics: crate::quota_analytics::QuotaAnalyticsView::default(),
             usage_rollup: UsageRollupView::default(),
             provider_balances: HashMap::new(),
+            pricing_catalog: Default::default(),
             stats_5m: WindowStats::default(),
             stats_1h: WindowStats::default(),
             service_status: None,
@@ -874,6 +885,28 @@ mod tests {
         assert!(text.contains("limited"), "{text}");
         assert!(!text.contains("plain"), "{text}");
         assert!(text.contains("control: evidence"), "{text}");
+    }
+
+    #[test]
+    fn requests_page_shows_redacted_pricing_source() {
+        let mut snapshot = empty_snapshot();
+        let mut request = request_fixture("priced", 200);
+        request.usage = Some(crate::usage::UsageMetrics {
+            total_tokens: 10,
+            ..Default::default()
+        });
+        request.cost.pricing_source = Some("remote".to_string());
+        snapshot.recent = vec![request];
+        let mut ui = UiState {
+            page: crate::tui::types::Page::Requests,
+            language: crate::tui::Language::En,
+            ..UiState::default()
+        };
+
+        let text = render_requests_text(140, 28, &mut ui, &snapshot);
+
+        assert!(text.contains("pricing source"), "{text}");
+        assert!(text.contains("remote"), "{text}");
     }
 
     #[test]

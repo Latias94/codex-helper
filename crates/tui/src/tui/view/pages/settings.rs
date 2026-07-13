@@ -265,7 +265,7 @@ pub(super) fn render_settings_page(
         ),
     ]));
 
-    if ui.service_name == "codex" {
+    if ui.allows_local_codex_switch() {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             match ui.language {
@@ -314,10 +314,27 @@ pub(super) fn render_settings_page(
 
 #[cfg(test)]
 mod tests {
-    use super::{read_status_label, retry_profile_name};
+    use super::{read_status_label, render_settings_page, retry_profile_name};
     use crate::config::RetryProfileName;
     use crate::dashboard_core::OperatorReadStatus;
     use crate::tui::Language;
+    use crate::tui::model::{Palette, Snapshot};
+    use crate::tui::state::{RuntimeConnectionKind, UiState};
+    use crate::tui::types::Page;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+
+    fn buffer_text(buffer: &Buffer) -> String {
+        let mut out = String::new();
+        for y in buffer.area.y..buffer.area.y.saturating_add(buffer.area.height) {
+            for x in buffer.area.x..buffer.area.x.saturating_add(buffer.area.width) {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
 
     #[test]
     fn settings_labels_preserve_explicit_read_states() {
@@ -337,6 +354,30 @@ mod tests {
             read_status_label(OperatorReadStatus::AuthRequired, Language::En),
             "auth required"
         );
+    }
+
+    #[test]
+    fn attached_settings_do_not_advertise_local_codex_switch() {
+        let backend = TestBackend::new(120, 32);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut ui = UiState {
+            page: Page::Settings,
+            language: Language::En,
+            runtime_connection: RuntimeConnectionKind::Attached,
+            ..UiState::default()
+        };
+        let snapshot = Snapshot::default();
+
+        let frame = terminal
+            .draw(|frame| {
+                render_settings_page(frame, Palette::default(), &mut ui, &snapshot, frame.area());
+            })
+            .expect("draw attached Settings");
+        let text = buffer_text(frame.buffer);
+
+        assert!(text.contains("connection: attached"), "{text}");
+        assert!(!text.contains("Codex Local Switch"), "{text}");
+        assert!(!text.contains("n/o"), "{text}");
     }
 
     #[test]

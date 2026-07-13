@@ -78,6 +78,7 @@ pub enum WireType {
 struct SerdeAttributes {
     rename: Option<String>,
     rename_all: Option<String>,
+    with: Option<String>,
     skip_serializing: bool,
     skip_serializing_if: bool,
     flatten: bool,
@@ -115,6 +116,7 @@ fn extract_target_from_source(target: TargetRequest, source: &str) -> Result<Tar
             let item = only_item(item, &target)?;
             ensure_public(&item.vis, &target)?;
             let container = serde_attributes(&item.attrs, &target)?;
+            reject_container_serde_with(&container, &target)?;
             let fields = extract_struct_fields(&item.fields, &container, &target)?;
             Ok(TargetSchema {
                 id: target.id,
@@ -137,6 +139,7 @@ fn extract_target_from_source(target: TargetRequest, source: &str) -> Result<Tar
             let item = only_item(item, &target)?;
             ensure_public(&item.vis, &target)?;
             let container = serde_attributes(&item.attrs, &target)?;
+            reject_container_serde_with(&container, &target)?;
             let variants = extract_enum_variants(&item.variants, &container, &target)?;
             Ok(TargetSchema {
                 id: target.id,
@@ -147,6 +150,20 @@ fn extract_target_from_source(target: TargetRequest, source: &str) -> Result<Tar
                 variants: Some(variants),
             })
         }
+    }
+}
+
+fn reject_container_serde_with(
+    attributes: &SerdeAttributes,
+    target: &TargetRequest,
+) -> Result<(), String> {
+    if let Some(adapter) = attributes.with.as_deref() {
+        Err(format!(
+            "contract {:?} {} in {} uses unsupported container serde(with) adapter {adapter}",
+            target.kind, target.item, target.file
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -208,6 +225,12 @@ fn extract_struct_fields(
             .as_ref()
             .ok_or_else(|| format!("unnamed field in {}", target.file))?
             .to_string();
+        let optional = attributes.skip_serializing_if;
+        let mut wire_type =
+            parse_field_wire_type(&field.ty, attributes.with.as_deref(), &ident, target)?;
+        if optional && let WireType::Nullable { inner } = wire_type {
+            wire_type = *inner;
+        }
         let name = attributes.rename.unwrap_or_else(|| {
             container
                 .rename_all
@@ -215,11 +238,6 @@ fn extract_struct_fields(
                 .map(|rule| rename(&ident, rule))
                 .unwrap_or(ident)
         });
-        let optional = attributes.skip_serializing_if;
-        let mut wire_type = parse_wire_type(&field.ty, target)?;
-        if optional && let WireType::Nullable { inner } = wire_type {
-            wire_type = *inner;
-        }
         output.push(FieldSchema {
             name,
             optional,
@@ -233,6 +251,39 @@ fn extract_struct_fields(
         ));
     }
     Ok(output)
+}
+
+fn parse_field_wire_type(
+    ty: &Type,
+    serde_with: Option<&str>,
+    field: &str,
+    target: &TargetRequest,
+) -> Result<WireType, String> {
+    match serde_with {
+        None => parse_wire_type(ty, target),
+        Some("i128_decimal_string") if is_i128_primitive(ty) => Ok(WireType::String),
+        Some("i128_decimal_string") => Err(format!(
+            "contract field {field} in {} uses serde(with = \"i128_decimal_string\") on a non-i128 field",
+            target.file
+        )),
+        Some(adapter) => Err(format!(
+            "contract field {field} in {} uses unsupported serde(with) adapter {adapter}",
+            target.file
+        )),
+    }
+}
+
+fn is_i128_primitive(ty: &Type) -> bool {
+    let Type::Path(path) = ty else {
+        return false;
+    };
+    path.qself.is_none()
+        && path.path.segments.len() == 1
+        && path
+            .path
+            .segments
+            .first()
+            .is_some_and(|segment| segment.ident == "i128" && segment.arguments.is_empty())
 }
 
 fn extract_enum_variants(
@@ -249,6 +300,12 @@ fn extract_enum_variants(
             ));
         }
         let attributes = serde_attributes(&variant.attrs, target)?;
+        if let Some(adapter) = attributes.with.as_deref() {
+            return Err(format!(
+                "contract variant {} in {} uses unsupported serde(with) adapter {adapter}",
+                variant.ident, target.file
+            ));
+        }
         if attributes.skip_serializing {
             continue;
         }
@@ -403,6 +460,8 @@ fn serde_attributes(
                     output.rename = Some(meta.value()?.parse::<LitStr>()?.value());
                 } else if meta.path.is_ident("rename_all") {
                     output.rename_all = Some(meta.value()?.parse::<LitStr>()?.value());
+                } else if meta.path.is_ident("with") {
+                    output.with = Some(meta.value()?.parse::<LitStr>()?.value());
                 } else if meta.path.is_ident("skip_serializing_if") {
                     let _predicate = meta.value()?.parse::<LitStr>()?;
                     output.skip_serializing_if = true;
@@ -556,5 +615,54 @@ mod tests {
         let error = extract_target_from_source(request("Wire", TargetKind::Struct), source)
             .expect_err("flatten must fail closed");
         assert!(error.contains("serde(flatten)"));
+    }
+
+    #[test]
+    fn serde_i128_decimal_string_adapter_changes_the_wire_type_to_string() {
+        let source = r#"
+            pub struct Wire {
+                #[serde(with = "i128_decimal_string")]
+                pub value: i128,
+            }
+        "#;
+
+        let schema = extract_target_from_source(request("Wire", TargetKind::Struct), source)
+            .expect("parse exact decimal string adapter");
+        assert_eq!(
+            schema.fields,
+            Some(vec![FieldSchema {
+                name: "value".to_owned(),
+                optional: false,
+                wire_type: WireType::String,
+            }])
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_serde_with_adapters() {
+        let source = r#"
+            pub struct Wire {
+                #[serde(with = "unverified_wire_adapter")]
+                pub value: i128,
+            }
+        "#;
+
+        let error = extract_target_from_source(request("Wire", TargetKind::Struct), source)
+            .expect_err("unknown serde(with) adapter must fail closed");
+        assert!(error.contains("unsupported serde(with)"));
+    }
+
+    #[test]
+    fn rejects_i128_decimal_string_adapter_on_other_types() {
+        let source = r#"
+            pub struct Wire {
+                #[serde(with = "i128_decimal_string")]
+                pub value: u64,
+            }
+        "#;
+
+        let error = extract_target_from_source(request("Wire", TargetKind::Struct), source)
+            .expect_err("exact decimal adapter must only apply to i128");
+        assert!(error.contains("non-i128 field"));
     }
 }

@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(test)]
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, RwLock as SyncRwLock};
 
 use tokio::sync::{Mutex as AsyncMutex, RwLock, watch};
 use tokio::time::Duration;
@@ -23,6 +23,14 @@ use crate::provider_catalog::{
     AccountFingerprint, ProviderAdapter, ProviderCatalogEpoch, ProviderCatalogScope,
     ProviderCatalogSnapshot, ProviderModelRequestContract, ProviderPricingTier,
 };
+use crate::quota_analytics::{
+    PoolAttributionResult, QuotaAnalyticsView, build_quota_analytics, plan_quota_attribution,
+};
+use crate::quota_pool::{
+    DEFAULT_MAX_SAMPLES_PER_POOL, DEFAULT_SAMPLE_RETENTION_MS, QUOTA_CHECKPOINT_SCHEMA_VERSION,
+    QuotaCapabilities, QuotaCounterKind, QuotaObservationContext, QuotaPoolRegistry,
+    QuotaPoolState, QuotaRegistryCheckpoint, QuotaUnit, RegistryUpdate,
+};
 use crate::request_ledger::{
     RequestUsageAggregate, RequestUsageSummary, RequestUsageSummaryCoverage,
     RequestUsageSummaryGroup, RequestUsageSummaryRow, sort_usage_summary_rows,
@@ -37,8 +45,9 @@ use crate::runtime_store::{
     LogicalRequestTerminalPayload, NewAttempt, NewLogicalRequest, OperatorLedgerRevision,
     ProviderAutomaticEligibility, ProviderEffectiveEligibility, ProviderEligibilityProjection,
     ProviderManualEligibility, ProviderObservation, ProviderObservationCommit,
-    ProviderObservationReservation, ProviderObservationScope, ProviderPolicySnapshot,
-    RequestAccountingScope, RuntimeStore, RuntimeStoreError, SessionAffinityIdentitySource,
+    ProviderObservationDisposition, ProviderObservationReservation, ProviderObservationScope,
+    ProviderPolicySnapshot, RequestAccountingScope, RuntimeDocumentCommit, RuntimeDocumentKind,
+    RuntimeDocumentWrite, RuntimeStore, RuntimeStoreError, SessionAffinityIdentitySource,
     SessionAffinityLimit, SessionAffinityRecord, TerminalDisposition,
 };
 #[cfg(test)]
@@ -48,8 +57,15 @@ use crate::sessions;
 use crate::usage::UsageMetrics;
 use crate::usage_day;
 
+mod attribution_index;
 mod runtime_types;
 mod session_identity;
+
+use self::attribution_index::AttributionIndex;
+pub use self::attribution_index::{
+    AttributionAggregate, AttributionBucket, AttributionBucketKey, AttributionCoverage,
+    AttributionPoolKey, AttributionQuery, AttributionQueryResult,
+};
 
 use self::runtime_types::UsageRollup;
 pub use self::runtime_types::{
@@ -59,13 +75,24 @@ pub use self::runtime_types::{
 };
 use self::session_identity::SessionBindingEntry;
 pub use self::session_identity::{
-    ActiveRequest, FinishRequestParams, FinishedRequest, RequestObservability, ResolvedRouteValue,
+    AccountingPoolMembership, AccountingPriceCoverage, ActiveRequest, FinishRequestParams,
+    FinishedRequest, RequestAccountingFacts, RequestObservability, ResolvedRouteValue,
     RouteDecisionProvenance, RouteValueSource, SessionBinding, SessionContinuityMode,
     SessionIdentityCard, SessionIdentityCardBuildInputs, SessionIdentitySource,
     SessionObservationScope, SessionRouteAffinity, SessionRouteAffinityTarget, SessionStats,
-    build_session_identity_cards_from_parts, enrich_session_identity_cards_with_host_transcripts,
+    build_session_identity_cards_from_parts, classify_captured_cost,
+    enrich_session_identity_cards_with_host_transcripts,
 };
+pub use crate::sessions::{ProjectIdentity, ProjectIdentityKind};
 type ProviderBalanceMap = HashMap<ProviderEndpointKey, HashMap<String, ProviderBalanceSnapshot>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderBalanceSnapshotPublication {
+    Published,
+    IgnoredOlder,
+    IgnoredInvalidIdentity,
+}
+
 type OperatorUsageSummaryDayMap = HashMap<i32, RequestUsageAggregate>;
 type OperatorUsageSummaryServiceMap =
     HashMap<RequestUsageSummaryGroup, HashMap<String, OperatorUsageSummaryDayMap>>;
@@ -147,6 +174,123 @@ fn runtime_store_blocking<T>(operation: impl FnOnce() -> T) -> T {
     }
 }
 
+fn quota_runtime_error(detail: impl Into<String>) -> RuntimeStoreError {
+    RuntimeStoreError::InvariantViolation {
+        entity: "quota registry",
+        id: "quota_registry".to_string(),
+        detail: detail.into(),
+    }
+}
+
+fn load_quota_runtime_state(
+    runtime_store: &RuntimeStore,
+) -> Result<(QuotaPoolRegistry, [u8; 32], Option<u64>), RuntimeStoreError> {
+    let identity = runtime_store.load_or_create_quota_identity()?;
+    let install_key = *identity.key();
+    let Some(document) = runtime_store.read_runtime_document(RuntimeDocumentKind::QuotaRegistry)?
+    else {
+        return Ok((QuotaPoolRegistry::default(), install_key, None));
+    };
+    if document.schema_version != QUOTA_CHECKPOINT_SCHEMA_VERSION {
+        return Err(quota_runtime_error(format!(
+            "unsupported document schema version {}",
+            document.schema_version
+        )));
+    }
+    let checkpoint = serde_json::from_str::<QuotaRegistryCheckpoint>(&document.payload_json)
+        .map_err(|error| quota_runtime_error(format!("invalid checkpoint payload: {error}")))?;
+    if checkpoint.schema_version != document.schema_version {
+        return Err(quota_runtime_error(format!(
+            "checkpoint schema {} conflicts with document schema {}",
+            checkpoint.schema_version, document.schema_version
+        )));
+    }
+    let registry = QuotaPoolRegistry::from_checkpoint(
+        checkpoint,
+        DEFAULT_MAX_SAMPLES_PER_POOL,
+        DEFAULT_SAMPLE_RETENTION_MS,
+    )
+    .ok_or_else(|| quota_runtime_error("checkpoint cannot be restored"))?;
+    Ok((registry, install_key, Some(document.revision)))
+}
+
+struct PreparedQuotaRegistryCheckpoint {
+    expected_revision: Option<u64>,
+    payload_json: String,
+}
+
+fn prepare_quota_registry_checkpoint(
+    runtime_store: &RuntimeStore,
+    checkpoint: &QuotaRegistryCheckpoint,
+) -> Result<PreparedQuotaRegistryCheckpoint, RuntimeStoreError> {
+    let current = runtime_store.read_runtime_document(RuntimeDocumentKind::QuotaRegistry)?;
+    if let Some(document) = current.as_ref() {
+        if document.schema_version != QUOTA_CHECKPOINT_SCHEMA_VERSION {
+            return Err(quota_runtime_error(format!(
+                "refusing to replace document schema {}",
+                document.schema_version
+            )));
+        }
+        let persisted = serde_json::from_str::<QuotaRegistryCheckpoint>(&document.payload_json)
+            .map_err(|error| {
+                quota_runtime_error(format!("invalid persisted checkpoint: {error}"))
+            })?;
+        if persisted.generation > checkpoint.generation {
+            return Err(quota_runtime_error(format!(
+                "stale checkpoint generation {} is older than persisted generation {}",
+                checkpoint.generation, persisted.generation
+            )));
+        }
+        if persisted.generation == checkpoint.generation && persisted != *checkpoint {
+            return Err(quota_runtime_error(format!(
+                "checkpoint generation {} has conflicting content",
+                checkpoint.generation
+            )));
+        }
+    }
+    let payload_json = serialize_quota_registry_checkpoint(checkpoint)?;
+    Ok(PreparedQuotaRegistryCheckpoint {
+        expected_revision: current.map(|document| document.revision),
+        payload_json,
+    })
+}
+
+fn serialize_quota_registry_checkpoint(
+    checkpoint: &QuotaRegistryCheckpoint,
+) -> Result<String, RuntimeStoreError> {
+    serde_json::to_string(checkpoint)
+        .map_err(|error| quota_runtime_error(format!("serialize checkpoint: {error}")))
+}
+
+fn persist_quota_registry_checkpoint(
+    runtime_store: &RuntimeStore,
+    checkpoint: &QuotaRegistryCheckpoint,
+    expected_revision: Option<u64>,
+) -> Result<u64, RuntimeStoreError> {
+    let prepared = prepare_quota_registry_checkpoint(runtime_store, checkpoint)?;
+    if prepared.expected_revision != expected_revision {
+        return Err(quota_runtime_error(format!(
+            "quota registry revision changed before validation: expected {expected_revision:?}, found {:?}",
+            prepared.expected_revision
+        )));
+    }
+    match runtime_store.compare_and_write_runtime_document(
+        prepared.expected_revision,
+        RuntimeDocumentWrite {
+            kind: RuntimeDocumentKind::QuotaRegistry,
+            schema_version: QUOTA_CHECKPOINT_SCHEMA_VERSION,
+            payload_json: &prepared.payload_json,
+        },
+    )? {
+        RuntimeDocumentCommit::Committed(document) => Ok(document.revision),
+        RuntimeDocumentCommit::Stale(current) => Err(quota_runtime_error(format!(
+            "quota registry revision changed before commit: expected {:?}, found {:?}",
+            prepared.expected_revision,
+            current.map(|document| document.revision)
+        ))),
+    }
+}
+
 fn usage_rollup_unknown_key(value: Option<&str>) -> String {
     value
         .map(str::trim)
@@ -155,8 +299,11 @@ fn usage_rollup_unknown_key(value: Option<&str>) -> String {
         .to_string()
 }
 
-fn usage_rollup_project_key(cwd: Option<&str>) -> String {
-    usage_rollup_unknown_key(cwd)
+fn usage_rollup_project_key(request: &FinishedRequest) -> String {
+    if request.accounting.project != ProjectIdentity::default() {
+        return request.accounting.project.display_key().to_string();
+    }
+    usage_rollup_unknown_key(request.cwd.as_deref())
 }
 
 fn usage_rollup_record_bucket(
@@ -428,7 +575,7 @@ fn record_finished_request_into_usage_rollup(
     record_usage_entity(
         &mut rollup.by_project,
         &mut rollup.by_project_day,
-        usage_rollup_project_key(request.cwd.as_deref()),
+        usage_rollup_project_key(request),
         day,
         request,
         cost,
@@ -543,6 +690,7 @@ struct RequestLifecycleProjectionState {
     usage_rollups: HashMap<String, UsageRollup>,
     operator_usage_summaries: OperatorUsageSummaryMap,
     session_stats: HashMap<String, SessionStats>,
+    attribution_index: AttributionIndex,
 }
 
 #[derive(Debug)]
@@ -635,6 +783,7 @@ fn hydrate_runtime_projections(
             let billable_usage = projection.payload.billable_usage;
             let finished = projection.payload.finished_request;
             if accounting_scope == RequestAccountingScope::Economic {
+                hydrated.attribution_index.record(&finished);
                 let rollup = hydrated
                     .usage_rollups
                     .entry(finished.service.clone())
@@ -998,6 +1147,9 @@ pub struct ProxyState {
     session_transcript_path_cache: RwLock<HashMap<String, SessionTranscriptPathCacheEntry>>,
     request_lifecycle_projection: RwLock<RequestLifecycleProjectionState>,
     provider_balances: RwLock<ProviderBalanceMap>,
+    quota_pool_registry: SyncRwLock<QuotaPoolRegistry>,
+    quota_registry_document_revision: AtomicU64,
+    quota_install_key: [u8; 32],
     provider_endpoint_runtime_health:
         RwLock<HashMap<String, HashMap<ProviderEndpointKey, ProviderEndpointRuntimeHealth>>>,
     provider_policy_updates: AsyncMutex<()>,
@@ -1008,6 +1160,8 @@ pub struct ProxyState {
     terminal_publication_pause: AsyncMutex<Option<TerminalPublicationPause>>,
     #[cfg(test)]
     operator_aggregation_pause: AsyncMutex<Option<OperatorAggregationPause>>,
+    #[cfg(test)]
+    provider_balance_lock_wait_signal: AsyncMutex<Option<tokio::sync::oneshot::Sender<()>>>,
     runtime_store: Arc<RuntimeStore>,
 }
 
@@ -1078,6 +1232,8 @@ impl ProxyState {
         policy: RuntimePolicy,
         runtime_store: Arc<RuntimeStore>,
     ) -> Result<Arc<Self>, RuntimeStoreError> {
+        let (quota_pool_registry, quota_install_key, quota_registry_document_revision) =
+            load_quota_runtime_state(runtime_store.as_ref())?;
         let hydrated = hydrate_runtime_projections(&runtime_store)?;
         runtime_store.prune_session_affinities(
             unix_now_ms(),
@@ -1100,6 +1256,11 @@ impl ProxyState {
             session_transcript_path_cache: RwLock::new(HashMap::new()),
             request_lifecycle_projection: RwLock::new(hydrated),
             provider_balances: RwLock::new(HashMap::new()),
+            quota_pool_registry: SyncRwLock::new(quota_pool_registry),
+            quota_registry_document_revision: AtomicU64::new(
+                quota_registry_document_revision.unwrap_or(0),
+            ),
+            quota_install_key,
             provider_endpoint_runtime_health: RwLock::new(HashMap::new()),
             provider_policy_updates: AsyncMutex::new(()),
             provider_policy_snapshot: RwLock::new(provider_policy_snapshot),
@@ -1109,6 +1270,8 @@ impl ProxyState {
             terminal_publication_pause: AsyncMutex::new(None),
             #[cfg(test)]
             operator_aggregation_pause: AsyncMutex::new(None),
+            #[cfg(test)]
+            provider_balance_lock_wait_signal: AsyncMutex::new(None),
             runtime_store,
         }))
     }
@@ -1127,6 +1290,22 @@ impl ProxyState {
 
     fn with_runtime_store_blocking<T>(&self, operation: impl FnOnce(&RuntimeStore) -> T) -> T {
         runtime_store_blocking(|| operation(self.runtime_store.as_ref()))
+    }
+
+    fn quota_registry_document_revision(&self) -> Option<u64> {
+        match self
+            .quota_registry_document_revision
+            .load(Ordering::Acquire)
+        {
+            0 => None,
+            revision => Some(revision),
+        }
+    }
+
+    fn publish_quota_registry_document_revision(&self, revision: u64) {
+        debug_assert!(revision > 0);
+        self.quota_registry_document_revision
+            .store(revision, Ordering::Release);
     }
 
     #[cfg(test)]
@@ -1250,6 +1429,27 @@ impl ProxyState {
         if let Some(pause) = pause {
             let _ = pause.committed.send(());
             let _ = pause.resume.await;
+        }
+    }
+
+    #[cfg(test)]
+    async fn arm_provider_balance_lock_wait_signal_for_test(
+        &self,
+    ) -> tokio::sync::oneshot::Receiver<()> {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let mut signal = self.provider_balance_lock_wait_signal.lock().await;
+        assert!(
+            signal.is_none(),
+            "a provider balance lock wait signal is already armed"
+        );
+        *signal = Some(reached_tx);
+        reached_rx
+    }
+
+    #[cfg(test)]
+    async fn signal_provider_balance_lock_wait_for_test(&self) {
+        if let Some(signal) = self.provider_balance_lock_wait_signal.lock().await.take() {
+            let _ = signal.send(());
         }
     }
 
@@ -1683,16 +1883,27 @@ impl ProxyState {
         policy_revision: u64,
         projection: ProviderEligibilityProjection,
     ) {
+        if self.update_provider_policy_projection(current, policy_revision, projection) {
+            self.notify_state_changed();
+        }
+    }
+
+    fn update_provider_policy_projection(
+        &self,
+        current: &mut Arc<ProviderPolicySnapshot>,
+        policy_revision: u64,
+        projection: ProviderEligibilityProjection,
+    ) -> bool {
         let next = Arc::new(provider_policy_snapshot_with_projection(
             current.as_ref(),
             policy_revision,
             projection,
         ));
         if **current == *next {
-            return;
+            return false;
         }
         *current = next;
-        self.notify_state_changed();
+        true
     }
 
     pub async fn active_policy_action_projections(
@@ -1904,32 +2115,331 @@ impl ProxyState {
         }
     }
 
-    pub async fn record_provider_balance_snapshot(&self, mut snapshot: ProviderBalanceSnapshot) {
+    async fn try_record_quota_snapshot(
+        &self,
+        endpoint: ProviderEndpointKey,
+        mut context: QuotaObservationContext,
+        snapshot: &ProviderBalanceSnapshot,
+    ) -> Result<RegistryUpdate, RuntimeStoreError> {
+        if context.install_key.is_none() {
+            context.install_key = Some(self.quota_install_key.to_vec());
+        }
+        let mut registry = self
+            .quota_pool_registry
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut candidate = registry.clone();
+        let update = candidate.record_snapshot(&endpoint, &context, snapshot);
+        let checkpoint = candidate.checkpoint();
+        let expected_revision = self.quota_registry_document_revision();
+        let committed_revision = self.with_runtime_store_blocking(|runtime_store| {
+            persist_quota_registry_checkpoint(runtime_store, &checkpoint, expected_revision)
+        })?;
+        self.publish_quota_registry_document_revision(committed_revision);
+        *registry = candidate;
+        drop(registry);
+        self.notify_state_changed();
+        Ok(update)
+    }
+
+    pub async fn record_quota_snapshot(
+        &self,
+        endpoint: ProviderEndpointKey,
+        context: QuotaObservationContext,
+        snapshot: &ProviderBalanceSnapshot,
+    ) -> RegistryUpdate {
+        match self
+            .try_record_quota_snapshot(endpoint, context, snapshot)
+            .await
+        {
+            Ok(update) => update,
+            Err(error) => {
+                tracing::warn!(error = %error, "quota registry commit failed");
+                RegistryUpdate::default()
+            }
+        }
+    }
+
+    pub async fn quota_pool_membership(
+        &self,
+        endpoint: &ProviderEndpointKey,
+    ) -> Option<crate::quota_pool::PoolMembership> {
+        self.quota_pool_registry
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .membership_for_endpoint(endpoint)
+    }
+
+    pub async fn quota_pool_states(&self) -> Vec<QuotaPoolState> {
+        self.quota_pool_registry
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pools()
+    }
+
+    pub async fn quota_samples_for_pool(
+        &self,
+        pool_key: &str,
+    ) -> Vec<crate::quota_pool::QuotaObservation> {
+        self.quota_pool_registry
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .samples_for_pool(pool_key)
+    }
+
+    pub async fn quota_registry_checkpoint(&self) -> QuotaRegistryCheckpoint {
+        self.quota_pool_registry
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .checkpoint()
+    }
+
+    pub async fn quota_analytics_view(
+        &self,
+        service_name: &str,
+        now_ms: u64,
+    ) -> QuotaAnalyticsView {
+        let checkpoint = self.quota_registry_checkpoint().await;
+        let mut windows = plan_quota_attribution(&checkpoint, now_ms);
+        for window in &mut windows {
+            window.query.service_name = Some(service_name.to_string());
+        }
+
+        let request_state = self.request_lifecycle_projection.read().await;
+        let attribution = windows
+            .into_iter()
+            .map(|window| PoolAttributionResult {
+                attribution: request_state.attribution_index.query(window.query.clone()),
+                window,
+            })
+            .collect::<Vec<_>>();
+        drop(request_state);
+
+        build_quota_analytics(&checkpoint, now_ms, &attribution)
+    }
+
+    pub async fn query_attribution(&self, query: AttributionQuery) -> AttributionQueryResult {
+        self.request_lifecycle_projection
+            .read()
+            .await
+            .attribution_index
+            .query(query)
+    }
+
+    fn quota_context_for_balance_snapshot(
+        snapshot: &ProviderBalanceSnapshot,
+    ) -> QuotaObservationContext {
+        let mut context = QuotaObservationContext::new(format!(
+            "{}:{}",
+            snapshot.source, snapshot.observation_provider_id
+        ));
+        context.counter_kind = QuotaCounterKind::Used;
+        context.unit = if snapshot.quota_used_usd.is_some()
+            || snapshot.quota_remaining_usd.is_some()
+            || snapshot.quota_limit_usd.is_some()
+            || snapshot.today_used_usd.is_some()
+        {
+            QuotaUnit::Usd
+        } else {
+            QuotaUnit::Raw
+        };
+        context.capabilities = QuotaCapabilities {
+            used: snapshot.quota_used_usd.is_some(),
+            remaining: snapshot.quota_remaining_usd.is_some(),
+            limit: snapshot.quota_limit_usd.is_some(),
+            direct_total: snapshot.today_used_usd.is_some(),
+            ..QuotaCapabilities::default()
+        };
+        context
+    }
+
+    fn provider_balance_snapshot_is_not_newer(
+        balances: &ProviderBalanceMap,
+        snapshot: &ProviderBalanceSnapshot,
+    ) -> bool {
+        balances
+            .get(&snapshot.provider_endpoint)
+            .and_then(|endpoint_balances| endpoint_balances.get(&snapshot.observation_provider_id))
+            .is_some_and(|previous| snapshot.fetched_at_ms <= previous.fetched_at_ms)
+    }
+
+    fn publish_provider_balance_snapshot_locked(
+        balances: &mut ProviderBalanceMap,
+        mut snapshot: ProviderBalanceSnapshot,
+        now_ms: u64,
+    ) {
+        let provider_endpoint = snapshot.provider_endpoint.clone();
+        let observation_provider_id = snapshot.observation_provider_id.clone();
+        snapshot.refresh_status(now_ms);
+        let endpoint_balances = balances.entry(provider_endpoint).or_default();
+        if !snapshot.has_amount_data()
+            && let Some(previous) = endpoint_balances.get(&observation_provider_id)
+        {
+            snapshot.carry_forward_amount_data_from(previous);
+            snapshot.refresh_status(now_ms);
+        }
+        endpoint_balances.insert(observation_provider_id, snapshot);
+    }
+
+    pub(crate) async fn try_record_provider_balance_snapshot(
+        &self,
+        snapshot: ProviderBalanceSnapshot,
+    ) -> Result<ProviderBalanceSnapshotPublication, RuntimeStoreError> {
+        let context = Self::quota_context_for_balance_snapshot(&snapshot);
+        self.try_record_provider_balance_snapshot_with_quota_context(snapshot, context)
+            .await
+    }
+
+    pub async fn record_provider_balance_snapshot(&self, snapshot: ProviderBalanceSnapshot) {
+        if let Err(error) = self.try_record_provider_balance_snapshot(snapshot).await {
+            tracing::warn!(error = %error, "provider balance snapshot commit failed");
+        }
+    }
+
+    pub(crate) async fn try_record_provider_balance_snapshot_with_quota_context(
+        &self,
+        mut snapshot: ProviderBalanceSnapshot,
+        mut context: QuotaObservationContext,
+    ) -> Result<ProviderBalanceSnapshotPublication, RuntimeStoreError> {
         if snapshot.observation_provider_id.trim().is_empty()
             || snapshot.provider_endpoint.service_name.trim().is_empty()
             || snapshot.provider_endpoint.provider_id.trim().is_empty()
             || snapshot.provider_endpoint.endpoint_id.trim().is_empty()
         {
-            return;
+            return Ok(ProviderBalanceSnapshotPublication::IgnoredInvalidIdentity);
         }
         let provider_endpoint = snapshot.provider_endpoint.clone();
-        let observation_provider_id = snapshot.observation_provider_id.clone();
         let now_ms = unix_now_ms();
         snapshot.refresh_status(now_ms);
-
-        {
-            let mut guard = self.provider_balances.write().await;
-            let endpoint_balances = guard.entry(provider_endpoint).or_default();
-            if !snapshot.has_amount_data()
-                && let Some(previous) = endpoint_balances.get(&observation_provider_id)
-            {
-                snapshot.carry_forward_amount_data_from(previous);
-                snapshot.refresh_status(now_ms);
-            }
-            endpoint_balances.insert(observation_provider_id, snapshot);
+        let mut balances = self.provider_balances.write().await;
+        if Self::provider_balance_snapshot_is_not_newer(&balances, &snapshot) {
+            return Ok(ProviderBalanceSnapshotPublication::IgnoredOlder);
         }
+        if context.install_key.is_none() {
+            context.install_key = Some(self.quota_install_key.to_vec());
+        }
+        let mut registry = self
+            .quota_pool_registry
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut candidate = registry.clone();
+        candidate.record_snapshot(&provider_endpoint, &context, &snapshot);
+        let checkpoint = candidate.checkpoint();
+        let expected_revision = self.quota_registry_document_revision();
+        let committed_revision = self.with_runtime_store_blocking(|runtime_store| {
+            persist_quota_registry_checkpoint(runtime_store, &checkpoint, expected_revision)
+        })?;
 
+        self.publish_quota_registry_document_revision(committed_revision);
+        *registry = candidate;
+        Self::publish_provider_balance_snapshot_locked(&mut balances, snapshot, now_ms);
+        drop(registry);
+        drop(balances);
         self.notify_state_changed();
+        Ok(ProviderBalanceSnapshotPublication::Published)
+    }
+
+    pub(crate) async fn commit_provider_observation_and_balance_snapshot(
+        &self,
+        reservation: ProviderObservationReservation,
+        observation: ProviderObservation,
+        snapshot: ProviderBalanceSnapshot,
+    ) -> Result<ProviderObservationCommit, RuntimeStoreError> {
+        let context = Self::quota_context_for_balance_snapshot(&snapshot);
+        self.commit_provider_observation_and_balance_snapshot_with_quota_context(
+            reservation,
+            observation,
+            snapshot,
+            context,
+        )
+        .await
+    }
+
+    pub(crate) async fn commit_provider_observation_and_balance_snapshot_with_quota_context(
+        &self,
+        reservation: ProviderObservationReservation,
+        observation: ProviderObservation,
+        mut snapshot: ProviderBalanceSnapshot,
+        mut context: QuotaObservationContext,
+    ) -> Result<ProviderObservationCommit, RuntimeStoreError> {
+        if snapshot.observation_provider_id.trim().is_empty()
+            || snapshot.provider_endpoint.service_name.trim().is_empty()
+            || snapshot.provider_endpoint.provider_id.trim().is_empty()
+            || snapshot.provider_endpoint.endpoint_id.trim().is_empty()
+        {
+            return Err(quota_runtime_error(
+                "provider balance snapshot has an incomplete endpoint identity",
+            ));
+        }
+        if reservation.ticket.provider_endpoint() != &snapshot.provider_endpoint {
+            return Err(quota_runtime_error(format!(
+                "provider observation endpoint {} does not match quota endpoint {}",
+                reservation.ticket.provider_endpoint().stable_key(),
+                snapshot.provider_endpoint.stable_key()
+            )));
+        }
+        if context.install_key.is_none() {
+            context.install_key = Some(self.quota_install_key.to_vec());
+        }
+        snapshot.refresh_status(unix_now_ms());
+
+        let committed = {
+            let _update_guard = self.provider_policy_updates.lock().await;
+            let mut current_policy = self.provider_policy_snapshot.write().await;
+            #[cfg(test)]
+            self.signal_provider_balance_lock_wait_for_test().await;
+            let mut balances = self.provider_balances.write().await;
+            let mut registry = self
+                .quota_pool_registry
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut candidate = registry.clone();
+            candidate.record_snapshot(&snapshot.provider_endpoint, &context, &snapshot);
+            let checkpoint = candidate.checkpoint();
+            let expected_revision = self.quota_registry_document_revision();
+            let payload_json = serialize_quota_registry_checkpoint(&checkpoint)?;
+            let (committed, quota_document) =
+                self.with_runtime_store_blocking(|runtime_store| {
+                    runtime_store.commit_provider_observation_and_quota_registry(
+                        reservation.ticket,
+                        observation,
+                        expected_revision,
+                        RuntimeDocumentWrite {
+                            kind: RuntimeDocumentKind::QuotaRegistry,
+                            schema_version: QUOTA_CHECKPOINT_SCHEMA_VERSION,
+                            payload_json: &payload_json,
+                        },
+                    )
+                })?;
+
+            if committed.disposition == ProviderObservationDisposition::Accepted {
+                let quota_document = quota_document.ok_or_else(|| {
+                    quota_runtime_error(
+                        "accepted provider observation did not commit quota registry",
+                    )
+                })?;
+                self.publish_quota_registry_document_revision(quota_document.revision);
+                *registry = candidate;
+                self.update_provider_policy_projection(
+                    &mut current_policy,
+                    committed.policy_revision,
+                    committed.projection.clone(),
+                );
+                Self::publish_provider_balance_snapshot_locked(
+                    &mut balances,
+                    snapshot,
+                    unix_now_ms(),
+                );
+                drop(registry);
+                drop(balances);
+                drop(current_policy);
+                self.notify_state_changed();
+            } else {
+                debug_assert!(quota_document.is_none());
+            }
+            committed
+        };
+        Ok(committed)
     }
 
     pub async fn get_provider_balance_view(
@@ -2724,6 +3234,7 @@ impl ProxyState {
             route_decision,
             usage: params.usage.clone(),
             cost,
+            accounting: RequestAccountingFacts::default(),
             retry: params.retry,
             provider_signals: Vec::new(),
             policy_actions: Vec::new(),
@@ -2736,6 +3247,22 @@ impl ProxyState {
             ttfb_ms: params.ttfb_ms,
             streaming: params.streaming,
             ended_at_ms: params.ended_at_ms,
+        };
+        let provider_endpoint = finished.provider_endpoint();
+        let pool_membership = provider_endpoint.as_ref().and_then(|endpoint| {
+            self.quota_pool_registry
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .membership_for_endpoint(endpoint)
+                .as_ref()
+                .map(AccountingPoolMembership::from_membership)
+        });
+        finished.accounting = RequestAccountingFacts {
+            schema_version: RequestAccountingFacts::SCHEMA_VERSION,
+            project: ProjectIdentity::from_cwd(finished.cwd.as_deref()),
+            provider_endpoint,
+            pool_membership,
+            price_coverage: classify_captured_cost(&finished.cost),
         };
         finished.refresh_observability();
 
@@ -2812,6 +3339,7 @@ impl ProxyState {
         }
 
         if include_in_economics {
+            request_state.attribution_index.record(&finished);
             let recorded = {
                 let rollup = request_state
                     .usage_rollups
@@ -3796,7 +4324,8 @@ mod tests {
                 .await;
 
             let active = state.list_active_requests().await;
-            assert_eq!(active[0].trace_id.as_deref(), Some("codex-1"));
+            let trace_id = active[0].trace_id.clone().expect("active trace ID");
+            assert!(crate::logging::is_versioned_request_trace_id(&trace_id));
 
             state
                 .finish_request(FinishRequestParams {
@@ -3815,8 +4344,11 @@ mod tests {
                 .await;
 
             let recent = state.list_recent_finished(1).await;
-            assert_eq!(recent[0].trace_id.as_deref(), Some("codex-1"));
-            assert_eq!(recent[0].observability.trace_id.as_deref(), Some("codex-1"));
+            assert_eq!(recent[0].trace_id.as_deref(), Some(trace_id.as_str()));
+            assert_eq!(
+                recent[0].observability.trace_id.as_deref(),
+                Some(trace_id.as_str())
+            );
             assert!(recent[0].observability.fast_mode);
             assert_eq!(recent[0].observability.generation_ms, Some(6));
         });
@@ -5444,6 +5976,7 @@ confidence = "exact"
                     ..UsageMetrics::default()
                 }),
                 cost: CostBreakdown::default(),
+                accounting: RequestAccountingFacts::default(),
                 retry: None,
                 provider_signals: Vec::new(),
                 policy_actions: Vec::new(),
@@ -5472,6 +6005,7 @@ confidence = "exact"
                 route_decision: None,
                 usage: None,
                 cost: CostBreakdown::default(),
+                accounting: RequestAccountingFacts::default(),
                 retry: None,
                 provider_signals: Vec::new(),
                 policy_actions: Vec::new(),
@@ -5767,12 +6301,13 @@ confidence = "exact"
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         runtime.block_on(async {
             let state = ProxyState::new();
+            let fetched_at_ms = unix_now_ms();
             state
                 .record_provider_balance_snapshot(ProviderBalanceSnapshot {
                     observation_provider_id: "input".to_string(),
                     provider_endpoint: ProviderEndpointKey::new("codex", "routing", "default"),
                     source: "usage_provider:sub2api_usage".to_string(),
-                    fetched_at_ms: unix_now_ms(),
+                    fetched_at_ms,
                     stale_after_ms: None,
                     exhausted: Some(false),
                     quota_period: Some("daily".to_string()),
@@ -5787,7 +6322,7 @@ confidence = "exact"
                     observation_provider_id: "input".to_string(),
                     provider_endpoint: ProviderEndpointKey::new("codex", "routing", "default"),
                     source: "usage_provider:openai_balance_http_json".to_string(),
-                    fetched_at_ms: unix_now_ms(),
+                    fetched_at_ms: fetched_at_ms.saturating_add(1),
                     stale_after_ms: None,
                     error: Some("usage provider response read failed".to_string()),
                     ..ProviderBalanceSnapshot::default()
@@ -6475,6 +7010,423 @@ confidence = "exact"
         });
     }
 
+    fn atomic_quota_scope_with_revision(
+        endpoint: &ProviderEndpointKey,
+        config_revision: &str,
+    ) -> ProviderObservationScope {
+        const DIGEST: &str =
+            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        ProviderObservationScope::new(
+            endpoint.clone(),
+            "https://provider.test",
+            endpoint.stable_key(),
+            "test:atomic-quota",
+            "https://provider.test/usage",
+            DIGEST,
+            config_revision,
+        )
+        .expect("provider observation scope")
+    }
+
+    fn atomic_quota_scope(endpoint: &ProviderEndpointKey) -> ProviderObservationScope {
+        const CONFIG_REVISION: &str =
+            "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        atomic_quota_scope_with_revision(endpoint, CONFIG_REVISION)
+    }
+
+    fn exhausted_quota_snapshot(
+        endpoint: &ProviderEndpointKey,
+        observed_at_ms: u64,
+    ) -> ProviderBalanceSnapshot {
+        let mut snapshot = ProviderBalanceSnapshot::new(
+            "quota-test",
+            endpoint.clone(),
+            "usage_provider:test",
+            observed_at_ms,
+            Some(observed_at_ms.saturating_add(60_000)),
+        );
+        snapshot.exhausted = Some(true);
+        snapshot.exhaustion_affects_routing = true;
+        snapshot.quota_remaining_usd = Some("0".to_string());
+        snapshot.quota_limit_usd = Some("10".to_string());
+        snapshot.refresh_status(observed_at_ms);
+        snapshot
+    }
+
+    fn exhausted_provider_observation(observed_at_ms: u64) -> ProviderObservation {
+        ProviderObservation {
+            observed_at_unix_ms: observed_at_ms,
+            completed_at_unix_ms: observed_at_ms.saturating_add(1),
+            authority: ProviderObservationAuthority::Authoritative,
+            evidence: serde_json::json!({ "exhausted": true }),
+            effect: ProviderPolicyEffect::Block {
+                action_kind: "balance_exhausted".to_string(),
+                code: Some("balance_exhausted".to_string()),
+                reason: "test exhaustion".to_string(),
+                expires_at_unix_ms: None,
+            },
+        }
+    }
+
+    fn healthy_quota_snapshot(
+        endpoint: &ProviderEndpointKey,
+        observed_at_ms: u64,
+    ) -> ProviderBalanceSnapshot {
+        let mut snapshot = ProviderBalanceSnapshot::new(
+            "quota-test",
+            endpoint.clone(),
+            "usage_provider:test",
+            observed_at_ms,
+            Some(observed_at_ms.saturating_add(60_000)),
+        );
+        snapshot.exhausted = Some(false);
+        snapshot.exhaustion_affects_routing = true;
+        snapshot.quota_remaining_usd = Some("10".to_string());
+        snapshot.quota_limit_usd = Some("10".to_string());
+        snapshot.refresh_status(observed_at_ms);
+        snapshot
+    }
+
+    fn recovered_provider_observation(observed_at_ms: u64) -> ProviderObservation {
+        ProviderObservation {
+            observed_at_unix_ms: observed_at_ms,
+            completed_at_unix_ms: observed_at_ms.saturating_add(1),
+            authority: ProviderObservationAuthority::Authoritative,
+            evidence: serde_json::json!({ "exhausted": false }),
+            effect: ProviderPolicyEffect::Recover {
+                reason: "test recovery".to_string(),
+            },
+        }
+    }
+
+    fn explicit_quota_context(
+        snapshot: &ProviderBalanceSnapshot,
+        pool_id: &str,
+    ) -> QuotaObservationContext {
+        let mut context = ProxyState::quota_context_for_balance_snapshot(snapshot);
+        context.explicit_pool_id = Some(pool_id.to_string());
+        context
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct AtomicProjectionBundle {
+        durable_policy: ProviderPolicySnapshot,
+        quota_document: Option<crate::runtime_store::RuntimeDocument>,
+        memory_policy: ProviderPolicySnapshot,
+        quota_checkpoint: QuotaRegistryCheckpoint,
+        balances: ProviderBalanceMap,
+        state_revision: u64,
+    }
+
+    async fn atomic_projection_bundle(state: &ProxyState) -> AtomicProjectionBundle {
+        AtomicProjectionBundle {
+            durable_policy: state
+                .runtime_store()
+                .provider_policy_snapshot()
+                .expect("read durable provider policy"),
+            quota_document: state
+                .runtime_store()
+                .read_runtime_document(RuntimeDocumentKind::QuotaRegistry)
+                .expect("read quota document"),
+            memory_policy: state
+                .capture_provider_policy_snapshot()
+                .await
+                .as_ref()
+                .clone(),
+            quota_checkpoint: state.quota_registry_checkpoint().await,
+            balances: state.provider_balances.read().await.clone(),
+            state_revision: state.operator_revision(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn atomic_provider_observation_abort_before_balance_lock_commits_nothing() {
+        let state = ProxyState::new();
+        let endpoint = ProviderEndpointKey::new("codex", "abort", "default");
+        let observed_at_ms = unix_now_ms();
+        let reservation = state
+            .reserve_provider_observation(atomic_quota_scope(&endpoint), observed_at_ms)
+            .await
+            .expect("reserve observation");
+        let before = atomic_projection_bundle(state.as_ref()).await;
+        let history_before = state
+            .runtime_store()
+            .read_provider_observation_history(&endpoint, 10)
+            .expect("read observation history");
+        let balance_guard = state.provider_balances.write().await;
+        let reached = state.arm_provider_balance_lock_wait_signal_for_test().await;
+
+        let commit_state = Arc::clone(&state);
+        let commit = tokio::spawn(async move {
+            commit_state
+                .commit_provider_observation_and_balance_snapshot(
+                    reservation,
+                    exhausted_provider_observation(observed_at_ms),
+                    exhausted_quota_snapshot(&endpoint, observed_at_ms),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(30), reached)
+            .await
+            .expect("commit reached balance lock")
+            .expect("balance lock signal sender retained");
+        commit.abort();
+        let cancelled = commit.await.expect_err("commit task must be cancelled");
+        assert!(cancelled.is_cancelled());
+        drop(balance_guard);
+
+        assert_eq!(atomic_projection_bundle(state.as_ref()).await, before);
+        assert_eq!(
+            state
+                .runtime_store()
+                .read_provider_observation_history(
+                    &ProviderEndpointKey::new("codex", "abort", "default"),
+                    10,
+                )
+                .expect("read observation history after abort"),
+            history_before
+        );
+    }
+
+    #[tokio::test]
+    async fn ignored_stale_observation_changes_only_history() {
+        let state = ProxyState::new();
+        let endpoint = ProviderEndpointKey::new("codex", "stale", "default");
+        let observed_at_ms = unix_now_ms();
+        let stale = state
+            .reserve_provider_observation(atomic_quota_scope(&endpoint), observed_at_ms)
+            .await
+            .expect("reserve stale generation");
+        let current = state
+            .reserve_provider_observation(
+                atomic_quota_scope(&endpoint),
+                observed_at_ms.saturating_add(10),
+            )
+            .await
+            .expect("reserve current generation");
+        state
+            .commit_provider_observation_and_balance_snapshot(
+                current,
+                recovered_provider_observation(observed_at_ms.saturating_add(10)),
+                healthy_quota_snapshot(&endpoint, observed_at_ms.saturating_add(10)),
+            )
+            .await
+            .expect("commit current generation");
+        let before = atomic_projection_bundle(state.as_ref()).await;
+        let changes = state.subscribe_state_changes();
+
+        let ignored = state
+            .commit_provider_observation_and_balance_snapshot(
+                stale,
+                exhausted_provider_observation(observed_at_ms),
+                exhausted_quota_snapshot(&endpoint, observed_at_ms),
+            )
+            .await
+            .expect("record ignored stale observation");
+
+        assert_eq!(
+            ignored.disposition,
+            ProviderObservationDisposition::IgnoredStale
+        );
+        assert_eq!(atomic_projection_bundle(state.as_ref()).await, before);
+        assert!(!changes.has_changed().expect("read state change flag"));
+        let history = state
+            .runtime_store()
+            .read_provider_observation_history(&endpoint, 10)
+            .expect("read observation history");
+        assert_eq!(history.len(), 2);
+        assert!(
+            history
+                .iter()
+                .any(|entry| { entry.disposition == ProviderObservationDisposition::Accepted })
+        );
+        assert!(
+            history
+                .iter()
+                .any(|entry| { entry.disposition == ProviderObservationDisposition::IgnoredStale })
+        );
+    }
+
+    #[tokio::test]
+    async fn ignored_stale_observation_is_independent_of_quota_document_schema() {
+        let state = ProxyState::new();
+        let endpoint = ProviderEndpointKey::new("codex", "stale-schema", "default");
+        let observed_at_ms = unix_now_ms();
+        let stale = state
+            .reserve_provider_observation(atomic_quota_scope(&endpoint), observed_at_ms)
+            .await
+            .expect("reserve stale generation");
+        let current = state
+            .reserve_provider_observation(
+                atomic_quota_scope(&endpoint),
+                observed_at_ms.saturating_add(10),
+            )
+            .await
+            .expect("reserve current generation");
+        state
+            .commit_provider_observation_and_balance_snapshot(
+                current,
+                recovered_provider_observation(observed_at_ms.saturating_add(10)),
+                healthy_quota_snapshot(&endpoint, observed_at_ms.saturating_add(10)),
+            )
+            .await
+            .expect("commit current generation");
+        let quota_document = state
+            .runtime_store()
+            .read_runtime_document(RuntimeDocumentKind::QuotaRegistry)
+            .expect("read quota document")
+            .expect("quota document exists");
+        let tampered = state
+            .runtime_store()
+            .compare_and_write_runtime_document(
+                Some(quota_document.revision),
+                RuntimeDocumentWrite {
+                    kind: RuntimeDocumentKind::QuotaRegistry,
+                    schema_version: QUOTA_CHECKPOINT_SCHEMA_VERSION.saturating_add(1),
+                    payload_json: r#"{"future":true}"#,
+                },
+            )
+            .expect("install future quota document");
+        assert!(matches!(tampered, RuntimeDocumentCommit::Committed(_)));
+
+        let ignored = state
+            .commit_provider_observation_and_balance_snapshot(
+                stale,
+                exhausted_provider_observation(observed_at_ms),
+                exhausted_quota_snapshot(&endpoint, observed_at_ms),
+            )
+            .await
+            .expect("record ignored observation without parsing quota document");
+
+        assert_eq!(
+            ignored.disposition,
+            ProviderObservationDisposition::IgnoredStale
+        );
+        let history = state
+            .runtime_store()
+            .read_provider_observation_history(&endpoint, 10)
+            .expect("read observation history");
+        assert_eq!(history.len(), 2);
+        assert!(
+            history
+                .iter()
+                .any(|entry| { entry.disposition == ProviderObservationDisposition::IgnoredStale })
+        );
+        let quota_document = state
+            .runtime_store()
+            .read_runtime_document(RuntimeDocumentKind::QuotaRegistry)
+            .expect("read future quota document")
+            .expect("future quota document exists");
+        assert_eq!(
+            quota_document.schema_version,
+            QUOTA_CHECKPOINT_SCHEMA_VERSION.saturating_add(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn inactive_incarnation_cannot_replace_active_quota_or_balance() {
+        const OLD_REVISION: &str =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const NEW_REVISION: &str =
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let state = ProxyState::new();
+        let endpoint = ProviderEndpointKey::new("codex", "incarnation", "default");
+        let observed_at_ms = unix_now_ms();
+        let old = state
+            .reserve_provider_observation(
+                atomic_quota_scope_with_revision(&endpoint, OLD_REVISION),
+                observed_at_ms,
+            )
+            .await
+            .expect("reserve old incarnation");
+        let current = state
+            .reserve_provider_observation(
+                atomic_quota_scope_with_revision(&endpoint, NEW_REVISION),
+                observed_at_ms.saturating_add(10),
+            )
+            .await
+            .expect("reserve current incarnation");
+        let current_snapshot = healthy_quota_snapshot(&endpoint, observed_at_ms.saturating_add(10));
+        state
+            .commit_provider_observation_and_balance_snapshot_with_quota_context(
+                current,
+                recovered_provider_observation(observed_at_ms.saturating_add(10)),
+                current_snapshot.clone(),
+                explicit_quota_context(&current_snapshot, "new-pool"),
+            )
+            .await
+            .expect("commit current incarnation");
+        let before = atomic_projection_bundle(state.as_ref()).await;
+        let changes = state.subscribe_state_changes();
+        let old_snapshot = exhausted_quota_snapshot(&endpoint, observed_at_ms);
+
+        let ignored = state
+            .commit_provider_observation_and_balance_snapshot_with_quota_context(
+                old,
+                exhausted_provider_observation(observed_at_ms),
+                old_snapshot.clone(),
+                explicit_quota_context(&old_snapshot, "old-pool"),
+            )
+            .await
+            .expect("record inactive incarnation observation");
+
+        assert_eq!(
+            ignored.disposition,
+            ProviderObservationDisposition::IgnoredInactiveIncarnation
+        );
+        assert_eq!(atomic_projection_bundle(state.as_ref()).await, before);
+        assert!(!changes.has_changed().expect("read state change flag"));
+        let membership = state
+            .quota_pool_membership(&endpoint)
+            .await
+            .expect("active pool membership");
+        assert!(membership.pool.key.contains("new-pool"));
+        assert!(!membership.pool.key.contains("old-pool"));
+    }
+
+    #[tokio::test]
+    async fn equal_timestamp_late_unreserved_error_does_not_replace_balance_or_quota() {
+        let state = ProxyState::new();
+        let endpoint = ProviderEndpointKey::new("codex", "unreserved", "default");
+        let fetched_at_ms = unix_now_ms();
+        let current = healthy_quota_snapshot(&endpoint, fetched_at_ms);
+        let published = state
+            .try_record_provider_balance_snapshot_with_quota_context(
+                current.clone(),
+                explicit_quota_context(&current, "fresh-pool"),
+            )
+            .await
+            .expect("publish current balance");
+        assert_eq!(published, ProviderBalanceSnapshotPublication::Published);
+        let before = atomic_projection_bundle(state.as_ref()).await;
+        let changes = state.subscribe_state_changes();
+        let mut stale = ProviderBalanceSnapshot::new(
+            current.observation_provider_id.clone(),
+            endpoint,
+            "usage_provider:test",
+            fetched_at_ms,
+            Some(fetched_at_ms.saturating_add(60_000)),
+        )
+        .with_error("authentication failed");
+        stale.refresh_status(fetched_at_ms);
+
+        let ignored = state
+            .try_record_provider_balance_snapshot(stale)
+            .await
+            .expect("ignore stale unreserved balance");
+
+        assert_eq!(ignored, ProviderBalanceSnapshotPublication::IgnoredOlder);
+        assert_eq!(atomic_projection_bundle(state.as_ref()).await, before);
+        assert!(!changes.has_changed().expect("read state change flag"));
+        let pool = state
+            .quota_pool_states()
+            .await
+            .into_iter()
+            .next()
+            .expect("quota pool");
+        assert_eq!(pool.last_attempt_at_ms, Some(fetched_at_ms));
+    }
+
     #[test]
     fn provider_policy_snapshot_restores_from_helper_sqlite() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
@@ -6564,35 +7516,159 @@ confidence = "exact"
     }
 
     #[test]
-    fn legacy_policy_json_is_ignored_without_being_deleted_or_rewritten() {
+    fn provider_policy_failure_does_not_write_quota_registry() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            let endpoint = ProviderEndpointKey::new("codex", "monthly", "default");
+            let observed_at_ms = unix_now_ms();
+            let reservation = state
+                .reserve_provider_observation(atomic_quota_scope(&endpoint), observed_at_ms)
+                .await
+                .expect("reserve observation");
+            let policy_before = state.capture_provider_policy_snapshot().await;
+            let quota_before = state.quota_registry_checkpoint().await;
+            state.runtime_store().fail_next_policy_commit_for_test();
+
+            let error = state
+                .commit_provider_observation_and_balance_snapshot(
+                    reservation,
+                    exhausted_provider_observation(observed_at_ms),
+                    exhausted_quota_snapshot(&endpoint, observed_at_ms),
+                )
+                .await
+                .expect_err("policy failure must roll back quota");
+
+            assert!(matches!(error, RuntimeStoreError::InjectedFailure { .. }));
+            assert_eq!(
+                *state.capture_provider_policy_snapshot().await,
+                *policy_before
+            );
+            assert_eq!(state.quota_registry_checkpoint().await, quota_before);
+            assert!(state.get_provider_balance_view("codex").await.is_empty());
+            assert!(
+                state
+                    .runtime_store()
+                    .read_runtime_document(RuntimeDocumentKind::QuotaRegistry)
+                    .expect("read quota document")
+                    .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn atomic_provider_quota_failure_stays_consistent_after_reopen() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         runtime.block_on(async {
             let temp_dir = std::env::temp_dir().join(format!(
-                "codex-helper-ignored-policy-json-test-{}",
+                "codex-helper-provider-quota-rollback-test-{}",
                 uuid::Uuid::new_v4()
             ));
             std::fs::create_dir_all(&temp_dir).expect("create temp dir");
-            let legacy_path = temp_dir.join("policy-actions.json");
-            let legacy_bytes = br#"{"schema_version":1,"entries":[{"legacy":true}]}"#;
-            std::fs::write(&legacy_path, legacy_bytes).expect("write legacy policy JSON");
-
+            let endpoint = ProviderEndpointKey::new("codex", "monthly", "default");
+            let observed_at_ms = unix_now_ms();
             let store =
                 Arc::new(RuntimeStore::open_in_home(&temp_dir).expect("open runtime store"));
-            let state = ProxyState::new_with_runtime_store(store).expect("hydrate runtime state");
+            let state =
+                ProxyState::new_with_runtime_store(Arc::clone(&store)).expect("hydrate state");
+            let reservation = state
+                .reserve_provider_observation(atomic_quota_scope(&endpoint), observed_at_ms)
+                .await
+                .expect("reserve observation");
+            let policy_before = state.capture_provider_policy_snapshot().await;
+            let quota_before = state.quota_registry_checkpoint().await;
+            store.fail_next_provider_quota_commit_for_test();
 
-            assert!(
-                state
-                    .capture_provider_policy_snapshot()
-                    .await
-                    .projections
-                    .is_empty()
-            );
+            let error = state
+                .commit_provider_observation_and_balance_snapshot(
+                    reservation,
+                    exhausted_provider_observation(observed_at_ms),
+                    exhausted_quota_snapshot(&endpoint, observed_at_ms),
+                )
+                .await
+                .expect_err("transaction-end failure must roll back both projections");
+
+            assert!(matches!(error, RuntimeStoreError::InjectedFailure { .. }));
             assert_eq!(
-                std::fs::read(&legacy_path).expect("read untouched legacy policy JSON"),
-                legacy_bytes
+                *state.capture_provider_policy_snapshot().await,
+                *policy_before
             );
-
+            assert_eq!(state.quota_registry_checkpoint().await, quota_before);
+            assert!(state.get_provider_balance_view("codex").await.is_empty());
             drop(state);
+            drop(store);
+
+            let reopened_store =
+                Arc::new(RuntimeStore::open_in_home(&temp_dir).expect("reopen runtime store"));
+            let restored = ProxyState::new_with_runtime_store(Arc::clone(&reopened_store))
+                .expect("restore runtime state");
+            assert_eq!(
+                *restored.capture_provider_policy_snapshot().await,
+                *policy_before
+            );
+            assert_eq!(restored.quota_registry_checkpoint().await, quota_before);
+            assert!(
+                reopened_store
+                    .read_runtime_document(RuntimeDocumentKind::QuotaRegistry)
+                    .expect("read rolled-back quota document")
+                    .is_none()
+            );
+            drop(restored);
+            drop(reopened_store);
+            std::fs::remove_dir_all(temp_dir).expect("remove temp dir");
+        });
+    }
+
+    #[test]
+    fn atomic_provider_quota_commit_restores_both_projections() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let temp_dir = std::env::temp_dir().join(format!(
+                "codex-helper-provider-quota-reopen-test-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&temp_dir).expect("create temp dir");
+            let endpoint = ProviderEndpointKey::new("codex", "monthly", "default");
+            let observed_at_ms = unix_now_ms();
+            let store =
+                Arc::new(RuntimeStore::open_in_home(&temp_dir).expect("open runtime store"));
+            let state =
+                ProxyState::new_with_runtime_store(Arc::clone(&store)).expect("hydrate state");
+            let reservation = state
+                .reserve_provider_observation(atomic_quota_scope(&endpoint), observed_at_ms)
+                .await
+                .expect("reserve observation");
+
+            state
+                .commit_provider_observation_and_balance_snapshot(
+                    reservation,
+                    exhausted_provider_observation(observed_at_ms),
+                    exhausted_quota_snapshot(&endpoint, observed_at_ms),
+                )
+                .await
+                .expect("commit provider observation and quota");
+            let expected_policy = state.capture_provider_policy_snapshot().await;
+            let expected_quota = state.quota_registry_checkpoint().await;
+            assert_eq!(expected_quota.generation, 1);
+            drop(state);
+            drop(store);
+
+            let reopened_store =
+                Arc::new(RuntimeStore::open_in_home(&temp_dir).expect("reopen runtime store"));
+            let restored =
+                ProxyState::new_with_runtime_store(reopened_store).expect("restore runtime state");
+            assert_eq!(
+                *restored.capture_provider_policy_snapshot().await,
+                *expected_policy
+            );
+            assert_eq!(restored.quota_registry_checkpoint().await, expected_quota);
+            let projection = expected_policy
+                .projections
+                .iter()
+                .find(|projection| projection.provider_endpoint == endpoint)
+                .expect("restored provider projection");
+            assert_eq!(projection.automatic, ProviderAutomaticEligibility::Blocked);
+            drop(restored);
             std::fs::remove_dir_all(temp_dir).expect("remove temp dir");
         });
     }

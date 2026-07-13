@@ -17,7 +17,7 @@ use super::model::{
 use super::operator_projection::apply_operator_read_model;
 use super::runtime_refresh::DashboardTiming;
 use super::state::{FleetViewMode, RuntimeConnectionKind, UiState, adjust_table_selection};
-use super::types::{Focus, Overlay, Page, StatsFocus};
+use super::types::{Focus, Overlay, Page};
 use super::{RenderInvalidation, enter_dashboard_terminal, input, leave_dashboard_terminal};
 
 struct AttachedDashboardRuntime {
@@ -86,7 +86,6 @@ async fn run_attached_dashboard_runtime(
         service_name,
         proxy_port: port,
         language,
-        config_version: None,
         runtime_connection: RuntimeConnectionKind::Attached,
         toast: Some((
             attached_start_toast(language, runtime.admin_base_url()),
@@ -286,12 +285,17 @@ fn handle_attached_key(
         };
     }
 
-    if ui.page == Page::Settings
-        && ui.service_name == "codex"
-        && let Some(intent) = input::codex_switch_intent_for_key(key.code, ui.proxy_port)
-    {
-        input::apply_codex_switch(ui, intent);
-        return true;
+    if ui.overlay == Overlay::ProviderInfo {
+        if input::handle_provider_info_key(ui, key) {
+            return true;
+        }
+        return match key.code {
+            KeyCode::Char('L') => {
+                toggle_attached_language(ui);
+                true
+            }
+            _ => false,
+        };
     }
 
     match key.code {
@@ -303,6 +307,10 @@ fn handle_attached_key(
             ui.overlay = Overlay::Help;
             true
         }
+        KeyCode::Char('i') if ui.page == Page::Routing => {
+            input::open_provider_info(ui);
+            true
+        }
         KeyCode::Esc => {
             ui.overlay = Overlay::None;
             true
@@ -312,7 +320,7 @@ fn handle_attached_key(
             true
         }
         KeyCode::Char('1') => switch_attached_page(ui, Page::Dashboard),
-        KeyCode::Char('2') => switch_attached_page(ui, Page::Stations),
+        KeyCode::Char('2') => switch_attached_page(ui, Page::Routing),
         KeyCode::Char('3') => switch_attached_page(ui, Page::Sessions),
         KeyCode::Char('4') => switch_attached_page(ui, Page::Requests),
         KeyCode::Char('5') => switch_attached_page(ui, Page::Stats),
@@ -330,6 +338,13 @@ fn handle_attached_key(
         }
         KeyCode::Down | KeyCode::Char('j') => {
             move_attached_selection(ui, snapshot, providers.len(), 1)
+        }
+        KeyCode::Char('g') if ui.page == Page::Stats => {
+            ui.needs_snapshot_refresh = true;
+            true
+        }
+        KeyCode::Char('y') if ui.page == Page::Stats => {
+            input::export_selected_stats_report(ui, snapshot)
         }
         KeyCode::Char('r') if ui.page == Page::Fleet => {
             ui.needs_fleet_refresh = true;
@@ -357,16 +372,16 @@ fn switch_attached_page(ui: &mut UiState, page: Page) -> bool {
         ui.needs_snapshot_refresh = true;
     }
     match ui.page {
-        Page::Stations => ui.focus = Focus::Stations,
+        Page::Routing => ui.focus = Focus::Providers,
         Page::Requests => ui.focus = Focus::Requests,
         Page::Sessions | Page::History | Page::Recent => ui.focus = Focus::Sessions,
         Page::ServiceStatus => {}
         Page::Fleet => {
-            ui.focus = Focus::Stations;
+            ui.focus = Focus::Providers;
             ui.needs_fleet_refresh = true;
             ui.sync_fleet_selection();
         }
-        Page::Dashboard if ui.focus == Focus::Stations => ui.focus = Focus::Sessions,
+        Page::Dashboard if ui.focus == Focus::Providers => ui.focus = Focus::Sessions,
         _ => {}
     }
     true
@@ -377,21 +392,17 @@ fn cycle_attached_focus(ui: &mut UiState) {
         Page::Dashboard => {
             ui.focus = match ui.focus {
                 Focus::Sessions => Focus::Requests,
-                Focus::Requests | Focus::Stations => Focus::Sessions,
+                Focus::Requests | Focus::Providers => Focus::Sessions,
             };
         }
-        Page::Stations => ui.focus = Focus::Stations,
+        Page::Routing => ui.focus = Focus::Providers,
         Page::Stats => {
-            ui.stats_focus = match ui.stats_focus {
-                StatsFocus::ProviderEndpoints => StatsFocus::Providers,
-                StatsFocus::Providers => StatsFocus::ProviderEndpoints,
-            };
-            ui.stats_provider_detail_scroll = 0;
+            ui.cycle_stats_focus();
         }
         Page::Fleet => {
             ui.focus = match ui.focus {
-                Focus::Stations => Focus::Sessions,
-                Focus::Sessions | Focus::Requests => Focus::Stations,
+                Focus::Providers => Focus::Sessions,
+                Focus::Sessions | Focus::Requests => Focus::Providers,
             };
         }
         Page::ServiceStatus => {}
@@ -406,37 +417,16 @@ fn move_attached_selection(
     delta: i32,
 ) -> bool {
     match ui.page {
-        Page::Stations => {
-            if let Some(next) = adjust_table_selection(&mut ui.stations_table, delta, providers_len)
+        Page::Routing => {
+            if let Some(next) =
+                adjust_table_selection(&mut ui.providers_table, delta, providers_len)
             {
-                ui.selected_station_idx = next;
+                ui.selected_provider_idx = next;
                 return true;
             }
             false
         }
-        Page::Stats => match ui.stats_focus {
-            StatsFocus::ProviderEndpoints => {
-                let len = snapshot.usage_day.provider_endpoint_rows.len();
-                if let Some(next) =
-                    adjust_table_selection(&mut ui.stats_provider_endpoints_table, delta, len)
-                {
-                    ui.selected_stats_provider_endpoint_idx = next;
-                    return true;
-                }
-                false
-            }
-            StatsFocus::Providers => {
-                let len = snapshot.usage_day.provider_rows.len();
-                if let Some(next) =
-                    adjust_table_selection(&mut ui.stats_providers_table, delta, len)
-                {
-                    ui.selected_stats_provider_idx = next;
-                    ui.stats_provider_detail_scroll = 0;
-                    return true;
-                }
-                false
-            }
-        },
+        Page::Stats => ui.move_stats_selection(snapshot, delta),
         Page::Sessions => {
             if let Some(next) =
                 adjust_table_selection(&mut ui.sessions_page_table, delta, snapshot.rows.len())
@@ -493,7 +483,7 @@ fn move_attached_selection(
                 }
                 false
             }
-            Focus::Stations => false,
+            Focus::Providers => false,
         },
     }
 }
@@ -503,7 +493,7 @@ fn move_attached_fleet_selection(ui: &mut UiState, delta: i32) -> bool {
         return false;
     };
 
-    if ui.focus == Focus::Stations {
+    if ui.focus == Focus::Providers {
         if let Some(next) =
             adjust_table_selection(&mut ui.fleet_nodes_table, delta, snapshot.nodes.len())
         {
@@ -650,6 +640,7 @@ mod tests {
                 recent_requests: Vec::new(),
                 usage_summaries: Vec::new(),
                 usage_day: Default::default(),
+                quota_analytics: Default::default(),
                 usage_rollup: Default::default(),
                 stats_5m: Default::default(),
                 stats_1h: Default::default(),
@@ -779,12 +770,46 @@ mod tests {
     }
 
     #[test]
+    fn attached_settings_do_not_handle_local_codex_switch_keys() {
+        let mut ui = UiState {
+            service_name: "codex",
+            runtime_connection: RuntimeConnectionKind::Attached,
+            page: Page::Settings,
+            ..Default::default()
+        };
+        let snapshot = empty_snapshot();
+
+        for code in ['n', 'o'] {
+            assert!(
+                !handle_attached_key(
+                    &mut ui,
+                    &snapshot,
+                    &mut [],
+                    KeyEvent::from(KeyCode::Char(code)),
+                ),
+                "{code:?} must remain unhandled in attached Settings"
+            );
+            assert!(ui.toast.is_none(), "{code:?} must not trigger a switch");
+        }
+        assert!(!ui.allows_local_codex_switch());
+    }
+
+    #[test]
     fn attached_navigation_supports_core_pages() {
         let mut ui = UiState {
             runtime_connection: RuntimeConnectionKind::Attached,
             ..Default::default()
         };
         let snapshot = empty_snapshot();
+
+        assert!(handle_attached_key(
+            &mut ui,
+            &snapshot,
+            &mut [],
+            KeyEvent::from(KeyCode::Char('2')),
+        ));
+        assert_eq!(ui.page, Page::Routing);
+        assert_eq!(ui.focus, Focus::Providers);
 
         assert!(handle_attached_key(
             &mut ui,
@@ -813,7 +838,7 @@ mod tests {
         ));
 
         assert_eq!(ui.page, Page::Fleet);
-        assert_eq!(ui.focus, Focus::Stations);
+        assert_eq!(ui.focus, Focus::Providers);
         assert!(ui.needs_fleet_refresh);
     }
 
@@ -825,14 +850,112 @@ mod tests {
         assert!(text.contains("keeps the target proxy running"), "{text}");
     }
 
+    #[test]
+    fn attached_stats_refresh_reloads_operator_read_model() {
+        let mut ui = UiState {
+            page: Page::Stats,
+            runtime_connection: RuntimeConnectionKind::Attached,
+            ..Default::default()
+        };
+
+        assert!(handle_attached_key(
+            &mut ui,
+            &empty_snapshot(),
+            &mut [],
+            KeyEvent::from(KeyCode::Char('g')),
+        ));
+
+        assert!(ui.needs_snapshot_refresh);
+    }
+
+    #[test]
+    fn attached_stats_tab_uses_shared_four_focus_cycle() {
+        let mut ui = UiState {
+            page: Page::Stats,
+            runtime_connection: RuntimeConnectionKind::Attached,
+            ..Default::default()
+        };
+
+        for expected in [
+            crate::tui::types::StatsFocus::Projects,
+            crate::tui::types::StatsFocus::Providers,
+            crate::tui::types::StatsFocus::ProviderEndpoints,
+            crate::tui::types::StatsFocus::Pools,
+        ] {
+            assert!(handle_attached_key(
+                &mut ui,
+                &empty_snapshot(),
+                &mut [],
+                KeyEvent::from(KeyCode::Tab),
+            ));
+            assert_eq!(ui.stats_focus, expected);
+        }
+    }
+
+    #[test]
+    fn attached_routing_provider_info_uses_read_only_overlay_controls() {
+        let mut ui = UiState {
+            page: Page::Routing,
+            runtime_connection: RuntimeConnectionKind::Attached,
+            provider_info_scroll: 9,
+            ..Default::default()
+        };
+        let snapshot = empty_snapshot();
+
+        assert!(handle_attached_key(
+            &mut ui,
+            &snapshot,
+            &mut [],
+            KeyEvent::from(KeyCode::Char('i')),
+        ));
+        assert_eq!(ui.overlay, Overlay::ProviderInfo);
+        assert_eq!(ui.provider_info_scroll, 0);
+
+        assert!(handle_attached_key(
+            &mut ui,
+            &snapshot,
+            &mut [],
+            KeyEvent::from(KeyCode::PageDown),
+        ));
+        assert_eq!(ui.provider_info_scroll, 10);
+
+        assert!(handle_attached_key(
+            &mut ui,
+            &snapshot,
+            &mut [],
+            KeyEvent::from(KeyCode::Char('i')),
+        ));
+        assert_eq!(ui.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn attached_stats_report_export_key_handles_empty_selection() {
+        let mut ui = UiState {
+            page: Page::Stats,
+            runtime_connection: RuntimeConnectionKind::Attached,
+            ..Default::default()
+        };
+
+        assert!(handle_attached_key(
+            &mut ui,
+            &empty_snapshot(),
+            &mut [],
+            KeyEvent::from(KeyCode::Char('y')),
+        ));
+        let toast = ui.toast.as_ref().expect("report toast").0.as_str();
+        assert!(toast.contains("no selection"), "{toast}");
+    }
+
     fn empty_snapshot() -> Snapshot {
         Snapshot {
             rows: Vec::new(),
             recent: Vec::new(),
             request_control_evidence: std::collections::HashMap::new(),
             usage_day: crate::state::UsageDayView::default(),
+            quota_analytics: crate::quota_analytics::QuotaAnalyticsView::default(),
             usage_rollup: crate::state::UsageRollupView::default(),
             provider_balances: std::collections::HashMap::new(),
+            pricing_catalog: Default::default(),
             stats_5m: crate::dashboard_core::WindowStats::default(),
             stats_1h: crate::dashboard_core::WindowStats::default(),
             service_status: None,

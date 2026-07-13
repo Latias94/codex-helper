@@ -167,6 +167,14 @@ export type UsageRowView = {
     providerMultiplier: string;
     confidence: string;
     source: string;
+    pricingProvider: string;
+    pricingGeneration: string;
+    effectivePricingRevision: string;
+    selectedTier?: {
+      type: string;
+      thresholdTokens: number;
+      matchedInputTokens: number;
+    };
   };
   firstToken: string;
   duration: string;
@@ -183,6 +191,13 @@ export type UsageSummaryView = {
   cacheRate: string;
   errorRate: string;
   dayLabel: string;
+  costCoverage: {
+    confidence: string;
+    pricedRequests: number;
+    unpricedRequests: number;
+    partialRequests: number;
+    exactRequests: number;
+  };
 };
 
 export type UsageHourView = {

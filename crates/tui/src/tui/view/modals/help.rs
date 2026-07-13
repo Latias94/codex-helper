@@ -16,53 +16,45 @@ fn help_heading(text: impl Into<String>, p: Palette) -> Line<'static> {
     ))
 }
 
-fn help_current_page_title(lang: Language, page: Page, routing: bool) -> &'static str {
-    match (lang, page, routing) {
-        (Language::Zh, Page::Dashboard, _) => "当前页面：总览",
-        (Language::Zh, Page::Stations, true) => "当前页面：路由",
-        (Language::Zh, Page::Stations, false) => "当前页面：站点",
-        (Language::Zh, Page::Sessions, _) => "当前页面：会话",
-        (Language::Zh, Page::Requests, _) => "当前页面：请求",
-        (Language::Zh, Page::Stats, _) => "当前页面：用量",
-        (Language::Zh, Page::Settings, _) => "当前页面：设置",
-        (Language::Zh, Page::History, _) => "当前页面：历史",
-        (Language::Zh, Page::Recent, _) => "当前页面：最近",
-        (Language::Zh, Page::Fleet, _) => "当前页面：Fleet",
-        (Language::Zh, Page::ServiceStatus, _) => "当前页面：服务状态",
-        (Language::En, Page::Dashboard, _) => "Current page: Dashboard",
-        (Language::En, Page::Stations, true) => "Current page: Routing",
-        (Language::En, Page::Stations, false) => "Current page: Stations",
-        (Language::En, Page::Sessions, _) => "Current page: Sessions",
-        (Language::En, Page::Requests, _) => "Current page: Requests",
-        (Language::En, Page::Stats, _) => "Current page: Usage",
-        (Language::En, Page::Settings, _) => "Current page: Settings",
-        (Language::En, Page::History, _) => "Current page: History",
-        (Language::En, Page::Recent, _) => "Current page: Recent",
-        (Language::En, Page::Fleet, _) => "Current page: Fleet",
-        (Language::En, Page::ServiceStatus, _) => "Current page: Service Status",
+fn help_current_page_title(lang: Language, page: Page) -> &'static str {
+    match (lang, page) {
+        (Language::Zh, Page::Dashboard) => "当前页面：总览",
+        (Language::Zh, Page::Routing) => "当前页面：路由",
+        (Language::Zh, Page::Sessions) => "当前页面：会话",
+        (Language::Zh, Page::Requests) => "当前页面：请求",
+        (Language::Zh, Page::Stats) => "当前页面：用量",
+        (Language::Zh, Page::Settings) => "当前页面：设置",
+        (Language::Zh, Page::History) => "当前页面：历史",
+        (Language::Zh, Page::Recent) => "当前页面：最近",
+        (Language::Zh, Page::Fleet) => "当前页面：Fleet",
+        (Language::Zh, Page::ServiceStatus) => "当前页面：服务状态",
+        (Language::En, Page::Dashboard) => "Current page: Dashboard",
+        (Language::En, Page::Routing) => "Current page: Routing",
+        (Language::En, Page::Sessions) => "Current page: Sessions",
+        (Language::En, Page::Requests) => "Current page: Requests",
+        (Language::En, Page::Stats) => "Current page: Usage",
+        (Language::En, Page::Settings) => "Current page: Settings",
+        (Language::En, Page::History) => "Current page: History",
+        (Language::En, Page::Recent) => "Current page: Recent",
+        (Language::En, Page::Fleet) => "Current page: Fleet",
+        (Language::En, Page::ServiceStatus) => "Current page: Service Status",
     }
 }
 
-pub(super) fn current_page_help_lines(
-    lang: Language,
-    page: Page,
-    routing: bool,
-    codex: bool,
-    p: Palette,
-) -> Vec<Line<'static>> {
-    let mut lines = vec![help_heading(
-        help_current_page_title(lang, page, routing),
-        p,
-    )];
-    let entries = match (lang, page, codex) {
+pub(super) fn current_page_help_lines(ui: &UiState, p: Palette) -> Vec<Line<'static>> {
+    let lang = ui.language;
+    let page = ui.page;
+    let local_codex_switch = ui.allows_local_codex_switch();
+    let mut lines = vec![help_heading(help_current_page_title(lang, page), p)];
+    let entries = match (lang, page, local_codex_switch) {
         (Language::Zh, Page::Dashboard, _) => vec![
             "  Tab        切换会话/请求焦点",
             "  ↑/↓        移动当前选择",
             "  O/H o/h    跳到关联请求、会话或历史",
         ],
-        (Language::Zh, Page::Stations, _) => vec![
-            "  ↑/↓        移动 provider 选择",
-            "  i          查看只读 provider 详情",
+        (Language::Zh, Page::Routing, _) => vec![
+            "  ↑/↓        移动提供商选择",
+            "  i          查看只读提供商详情",
         ],
         (Language::Zh, Page::Sessions, _) => vec![
             "  a/e        活跃、错误筛选；r 重置筛选",
@@ -75,8 +67,9 @@ pub(super) fn current_page_help_lines(
             "  o/h        跳到 Sessions / History",
         ],
         (Language::Zh, Page::Stats, _) => vec![
-            "  Tab        切换 endpoint / provider 今日排行",
-            "  ↑/↓        移动当前排行选择",
+            "  Tab        切换额度池 / 项目 / 提供商 / 端点",
+            "  ↑/↓        移动当前视图选择",
+            "  g          刷新 operator read model",
             "  y          导出并复制选中报告",
         ],
         (Language::Zh, Page::Settings, true) => vec![
@@ -106,7 +99,7 @@ pub(super) fn current_page_help_lines(
             "  ↑/↓        move the active selection",
             "  O/H o/h    jump to related requests, sessions, or history",
         ],
-        (Language::En, Page::Stations, _) => vec![
+        (Language::En, Page::Routing, _) => vec![
             "  ↑/↓        move the provider selection",
             "  i          inspect read-only provider details",
         ],
@@ -121,8 +114,9 @@ pub(super) fn current_page_help_lines(
             "  o/h        jump to Sessions / History",
         ],
         (Language::En, Page::Stats, _) => vec![
-            "  Tab        switch endpoint / provider day ranking",
-            "  ↑/↓        move the active ranking selection",
+            "  Tab        switch pool / project / provider / endpoint",
+            "  ↑/↓        move the active view selection",
+            "  g          refresh the operator read model",
             "  y          export and copy the selected report",
         ],
         (Language::En, Page::Settings, true) => vec![
@@ -196,13 +190,7 @@ pub(in crate::tui::view) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui:
         .borders(Borders::ALL)
         .border_style(Style::default().fg(p.focus))
         .style(Style::default().bg(p.panel));
-    let mut lines = current_page_help_lines(
-        ui.language,
-        ui.page,
-        ui.uses_route_graph_routing(),
-        ui.service_name == "codex",
-        p,
-    );
+    let mut lines = current_page_help_lines(ui, p);
     lines.push(help_heading(
         match ui.language {
             Language::Zh => "通用",
