@@ -59,9 +59,14 @@ const sourceRoots = [
 const sourceFiles = sourceRoots.flatMap((root) =>
   collectSourceFiles(path.join(repositoryRoot, root)),
 );
-const productionFiles = sourceFiles.filter(
-  (file) => !/(?:^|\.)tests?(?:\.|$)|(?:^|\.)spec(?:\.|$)/.test(path.basename(file)),
-);
+const productionFiles = sourceFiles.filter((file) => {
+  const relativePath = path.relative(repositoryRoot, file).split(path.sep).join("/");
+  const basename = path.basename(file);
+  return (
+    !/(?:^|\/)tests?(?:\/|$)/.test(relativePath) &&
+    !/(?:^|[._-])tests?(?:[._-]|$)|(?:^|[._-])spec(?:[._-]|$)/.test(basename)
+  );
+});
 const failures = [];
 
 for (const relativePath of [...removedPaths, ...removedControlPlanePaths]) {
@@ -96,6 +101,12 @@ const forbiddenProductionStrings = [
   "session-route-affinities.json",
   "remote_connections",
 ];
+const allowedForbiddenProductionSnippets = new Map([
+  [
+    "crates/core/src/config_storage.rs",
+    ['(&["codex", "client_patch"][..], "codex.client_patch"),'],
+  ],
+]);
 
 for (const file of sourceFiles) {
   const relativePath = path.relative(repositoryRoot, file);
@@ -117,7 +128,14 @@ for (const file of sourceFiles) {
 
 for (const file of productionFiles) {
   const relativePath = path.relative(repositoryRoot, file);
-  const text = fs.readFileSync(file, "utf8");
+  let text = fs.readFileSync(file, "utf8");
+  for (const snippet of allowedForbiddenProductionSnippets.get(relativePath) ?? []) {
+    if (!text.includes(snippet)) {
+      failures.push(`${relativePath}: expected retired-config diagnostic allowlist drifted`);
+      continue;
+    }
+    text = text.replace(snippet, "");
+  }
   for (const value of forbiddenProductionStrings) {
     if (text.includes(value)) {
       failures.push(`${relativePath}: contains removed production surface ${value}`);

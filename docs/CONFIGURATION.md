@@ -107,6 +107,22 @@ codex-helper switch off
 
 The switch never changes `~/.codex/auth.json`, `models_cache.json`, Codex SQLite, unrelated providers, feature flags, compaction settings, WebSocket settings, or hosted-tool settings. Provider capabilities come from the selected provider contract and live observations, not from switch configuration.
 
+### Upgrading From 0.20.3 Or Earlier
+
+Releases through 0.20.3 used a different switch implementation and stored recovery data in `~/.codex/codex-helper-switch-state.json`. That state can contain the original provider selector and, for the old bridge presets, the original `auth.json` content. The current switch journal does not consume that file and intentionally does not read Codex auth state.
+
+Use this upgrade order if the legacy state file exists:
+
+1. Before replacing the old binary, run `codex-helper switch off` with the version that created the legacy state. This restores the old selector/provider stanza and any auth facade managed by that switch.
+2. Keep `~/.codex/codex-helper-switch-state.json` until the old `switch off` succeeds. Do not delete, edit, share, or paste it into an issue because it may contain authentication material.
+3. Upgrade codex-helper, run `codex-helper switch status`, and only then run the new `switch on` if the helper should be selected again.
+
+If the new version is already installed, temporarily run the previous binary's `switch off` before using the new switch. Do not run old and new switch commands concurrently. The new implementation detects the legacy state path without reading its contents, reports `recovery_required`, and will not claim or overwrite the old state or provider stanza.
+
+The removed `switch remote-control enable` command also had persistent side effects outside codex-helper: it could add `[features].remote_connections = true` to `~/.codex/config.toml` and enable a `remote_control` row in Codex App SQLite. Upgrading does not undo either value, and the current helper never reads or writes that database. If the TOML key was added solely for the old helper workflow and is no longer wanted, back up the Codex config before removing that key manually. Do not edit Codex SQLite with ad hoc SQL; leave database cleanup to Codex-supported controls or Codex support guidance.
+
+The 0.20.3 `~/.codex-helper/state/session-route-affinities.json` file is generated runtime state rather than user configuration. The new release neither imports it into `state.sqlite` nor rewrites or deletes it. An in-flight multi-endpoint session therefore has no restored affinity after upgrading. Before sending a state-bound compact request for such a session, complete one ordinary Responses request with the same session key so the new runtime can record its provider endpoint; `hard` affinity explicitly rejects a state-bound compact request until that affinity has been re-established.
+
 Proxy lifecycle is independent. `codex-helper serve` is foreground by default, `--resident` keeps it running after the console exits, and `codex-helper tui` attaches a read-only console. None of these commands run `switch on` or `switch off`. Resident runtimes write advisory owner markers under `~/.codex-helper/run/`; inspect them with the read-only `codex-helper daemon status`. Manage an installed local runtime with `codex-helper service start/stop/restart`; there is no remote HTTP shutdown command.
 
 codex-helper normalizes HTTP request `Content-Encoding` before inspection and forwarding. Supported encodings are `zstd`, `gzip` / `x-gzip`, `br`, and `deflate`; after decoding, helper forwards ordinary JSON and removes stale `Content-Encoding` / `Content-Length`. Set `CODEX_HELPER_REQUEST_BODY_ENCODING=passthrough` only when an upstream requires the exact compressed body.
@@ -808,7 +824,7 @@ Do not use endpoints just to model unrelated providers. Put unrelated accounts u
 
 ### Provider Concurrency Limits
 
-Use `limits.max_concurrent_requests` when an upstream relay account only allows a small number of simultaneous requests. This is a local-process cap: one running codex-helper process tracks active requests and skips saturated candidates during routing. It is not a distributed quota across several codex-helper processes.
+Use `limits.max_concurrent_requests` when an upstream relay account only allows a small number of simultaneous requests. This is a local-process cap: one running codex-helper process tracks active requests and applies the route's configured queue/failover policy. It is not a distributed quota across several codex-helper processes.
 
 ```toml
 [codex.providers.relay.limits]
@@ -838,9 +854,22 @@ max_concurrent_requests = 2
 limit_group = "relay-us"
 ```
 
-When a candidate is saturated, routing treats it as temporarily unavailable and continues to the next fallback. Saturation does not count as a provider failure, does not open cooldown, and does not poison session affinity. `routing explain` reports `concurrency_saturated` with the active count and limit.
+`scheduling_preset` under `[codex.routing]` or `[claude.routing]` controls what happens when the selected candidate reaches that local cap:
 
-If only one or two candidates remain, failover still follows the configured route order. A saturated candidate is skipped first; if every remaining candidate is saturated or unavailable, the request exits through the normal route-unavailable path instead of inventing a new provider. For shared upstream accounts, put the same `limit_group` on every endpoint that consumes the same quota so the runtime treats them as one concurrency pool.
+```toml
+[codex.routing]
+entry = "main"
+affinity_policy = "fallback-sticky"
+scheduling_preset = "balanced"
+```
+
+| Preset | Saturated-candidate behavior |
+| --- | --- |
+| `continuity-first` | Wait up to 8 seconds for capacity before trying another candidate |
+| `balanced` | Wait up to 2 seconds, then continue through the configured fallback order; this is the new default |
+| `throughput-first` | Do not wait; immediately try the next available candidate |
+
+Version 0.20.3 and earlier immediately failed over when the local cap was saturated. Set `scheduling_preset = "throughput-first"` explicitly to preserve that behavior after upgrading. Saturation does not count as a provider failure, open a cooldown, or poison session affinity. If every candidate remains saturated or unavailable after the selected wait policy, the request exits through the normal route-unavailable path instead of inventing a provider. For shared upstream accounts, put the same `limit_group` on every endpoint that consumes the same quota so the runtime treats them as one concurrency pool.
 
 ## Route Strategies
 
@@ -999,7 +1028,7 @@ OpenAI's public platform surface is not a wallet-balance API. It exposes organiz
       "domains": ["api.openai.com"],
       "token_env": "OPENAI_ADMIN_KEY",
       "require_token_env": true,
-      "endpoint": "https://api.openai.com/v1/organization/costs?start_time={{unix_days_ago:30}}&limit=30",
+      "endpoint": "/v1/organization/costs",
       "poll_interval_secs": 600,
       "refresh_on_request": false,
       "trust_exhaustion_for_routing": false
@@ -1010,7 +1039,7 @@ OpenAI's public platform surface is not a wallet-balance API. It exposes organiz
 
 `OPENAI_ADMIN_KEY` must be an organization-level admin key; a normal model API key is not a stable substitute.
 
-In balance adapter templates, `{{base_url}}` is normalized without a trailing `/v1`. Use `{{upstream_base_url}}` only when a balance endpoint really lives under the same `/v1` prefix as model requests. Time helpers such as `{{unix_now}}`, `{{unix_now_ms}}`, and `{{unix_days_ago:30}}` are available for official usage/cost APIs that require query windows. Custom `headers` may reference environment variables with `{{env:NAME}}`; credentials remain environment-owned and are never persisted in RuntimeStore.
+`endpoint` accepts a literal absolute URL or a literal path relative to the normalized provider origin. Endpoint templates are not supported. For `openai_organization_costs`, codex-helper supplies a bounded 30-day `start_time` and `limit=30` on every poll, so the endpoint should not embed those query parameters. Generic `headers` and `variables` are not part of the schema; an adapter containing them fails to load instead of being silently accepted. Credentials must use `token_env` or a provider-kind-specific typed field.
 
 Sub2API API-key telemetry:
 
@@ -1059,12 +1088,10 @@ New API dashboard-style quota:
       "id": "right-newapi",
       "kind": "new_api_user_self",
       "domains": ["www.right.codes"],
-      "endpoint": "{{base_url}}/api/user/self",
+      "endpoint": "/api/user/self",
       "token_env": "RIGHTCODE_NEWAPI_ACCESS_TOKEN",
       "require_token_env": true,
-      "headers": {
-        "New-Api-User": "{{env:RIGHTCODE_NEWAPI_USER_ID}}"
-      },
+      "new_api_user_id_env": "RIGHTCODE_NEWAPI_USER_ID",
       "quota_pool_id": "rightcode-shared-account",
       "quota_reset_timezone": "Asia/Shanghai",
       "poll_interval_secs": 600,
@@ -1074,6 +1101,8 @@ New API dashboard-style quota:
   ]
 }
 ```
+
+`new_api_user_id_env` names the environment variable whose value is sent through the fixed `New-Api-User` header. It is accepted only by `new_api_user_self`; the variable must be set and non-empty when configured. Arbitrary request headers are intentionally unsupported.
 
 Important balance behavior:
 
@@ -1163,7 +1192,7 @@ Useful adapter fields:
 | `endpoint` | Absolute balance URL or path relative to the normalized provider base URL |
 | `token_env` | Environment variable used for adapter auth |
 | `require_token_env` | Require `token_env` instead of falling back to the model API key |
-| `headers` | Optional adapter headers; values may use `{{env:NAME}}` without persisting the credential |
+| `new_api_user_id_env` | For `new_api_user_self`, environment variable containing the value for the fixed `New-Api-User` header |
 | `poll_interval_secs` | Refresh throttle / cache window |
 | `refresh_on_request` | Whether routed requests may trigger balance refresh |
 | `trust_exhaustion_for_routing` | Whether exhausted snapshots may demote routing |
@@ -1199,6 +1228,8 @@ For BaseLLM context tiers, the threshold input is `ordinary input + cache read`;
 Initialize the canonical config:
 
 Normal startup, including the default TUI path, requires `~/.codex-helper/config.toml` with `version = 5`. `config init` creates a current template; `--force` replaces an existing canonical file only after writing `config.toml.bak`. Historical schemas and `config.json` are unsupported and are never imported, migrated, rewritten, or deleted automatically.
+
+Read-only loading may follow a valid `config.toml` symbolic link, but helper commands that rewrite the typed configuration refuse a final-file link so an atomic replacement cannot detach or retarget it. Point `CODEX_HELPER_HOME` (or the whole `.codex-helper` directory) at a stable linked directory instead if the configuration is managed in dotfiles. Mutations are serialized with a helper-owned lock, backups inherit the source file permissions, and a dangling or retargeted configuration directory fails closed.
 
 ```bash
 codex-helper config init
@@ -1364,6 +1395,21 @@ These operator clients and the remote control plane are query-only. Edit durable
 `version = 5` in `~/.codex-helper/config.toml` is the only public helper configuration contract. Older versioned or unversioned TOML and `config.json` are unsupported inputs. Startup reports the unsupported file/schema without importing, converting, deleting, or treating it as generated state; there is no migration command or compatibility runtime reader.
 
 Create a separate version 5 file with `config init`, then express provider and routing intent directly through `[service.providers]`, `[service.routing]`, and route nodes. Keep any historical file outside the canonical path if it is needed for manual reference.
+
+Provider, endpoint, route-graph, retry-profile, notification, fleet, and service-status settings from a normal 0.20.3 version 5 file remain usable. However, several optional fields that were also published under version 5 have been retired. The version number alone cannot identify them, so startup and typed config saves reject these exact paths and list all matches instead of silently dropping them. The source file remains unchanged.
+
+| Retired input | Current behavior | Upgrade action |
+| --- | --- | --- |
+| `[codex.client_patch]` | Startup rejects the table; presets, auth facades, compaction, hosted-tool switches, and WebSocket patching are no longer helper config | Remove the table and use only the explicit URL switch described above |
+| `[codex.compaction]` / `[claude.compaction]` | Startup rejects either table; the shared v0.20.3 schema accepted the Claude table even though it had no Claude runtime effect | Delete the entire table; helper no longer performs remote-v2-to-v1 downgrade |
+| `[ui.usage_forecast]` | Startup rejects the table; the old local forecast was removed | Delete the table; use committed quota pace and reset-window views instead |
+| `codex.profiles.*.station` / `claude.profiles.*.station` | Startup rejects every matching profile field | Remove it and express provider selection in the service route graph |
+| `[retry].allow_cross_station_before_first_output` | Startup rejects the retired retry field | Delete the field; failover is controlled by the canonical route/retry policy |
+| `relay_targets.*.client_preset` / `responses_websocket` | Startup rejects every matching relay-target field | Delete them; a relay bookmark stores network/admin connection data only |
+| server `advertised-admin-base-url` / `host-local-session-history` and matching CLI flags | Server config parsing rejects these keys; CLI flags no longer exist | Remove them; configure each client's trusted relay `admin_url` explicitly |
+| `usage_providers.json` endpoint templates, `headers`, or `variables` | The operator-owned file fails to load | Use literal relative/absolute endpoints and typed fields such as `new_api_user_id_env` |
+
+An older route graph without `scheduling_preset` now defaults to `balanced`, which waits up to two seconds for local concurrency capacity. Set `scheduling_preset = "throughput-first"` to retain the 0.20.3 behavior of immediately trying the next candidate when the selected local limit is saturated.
 
 ## Design Boundaries
 

@@ -1250,8 +1250,19 @@ fn new_api_user_id_env_name(provider: &UsageProviderConfig) -> Result<Option<&st
     Ok(Some(env_name))
 }
 
+fn reject_endpoint_template_syntax(provider: &UsageProviderConfig, endpoint: &str) -> Result<()> {
+    if endpoint.trim().contains("{{") || endpoint.trim().contains("}}") {
+        anyhow::bail!(
+            "usage provider '{}' endpoint templates are not supported; use a literal absolute URL or relative path",
+            provider.id
+        );
+    }
+    Ok(())
+}
+
 fn validate_usage_provider_config(provider: &UsageProviderConfig) -> Result<()> {
     new_api_user_id_env_name(provider)?;
+    reject_endpoint_template_syntax(provider, &provider.endpoint)?;
     Ok(())
 }
 
@@ -1446,12 +1457,7 @@ fn resolve_endpoint(
             provider.kind
         );
     }
-    if endpoint.contains("{{") || endpoint.contains("}}") {
-        anyhow::bail!(
-            "usage provider '{}' endpoint templates are not supported; use an absolute URL or relative path",
-            provider.id
-        );
-    }
+    reject_endpoint_template_syntax(provider, &endpoint)?;
 
     let resolved = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
         endpoint
@@ -5588,6 +5594,55 @@ mod tests {
             original
         );
         std::fs::remove_dir_all(directory).expect("remove isolated test directory");
+    }
+
+    #[test]
+    fn endpoint_templates_fail_during_operator_file_load_without_rewriting_input() {
+        for (id, kind, domains, endpoint) in [
+            (
+                "legacy-siliconflow",
+                "openai_balance_http_json",
+                vec!["api.siliconflow.cn"],
+                "{{base_url}}/v1/user/info",
+            ),
+            (
+                "legacy-openai-costs",
+                "openai_organization_costs",
+                vec!["api.openai.com"],
+                "https://api.openai.com/v1/organization/costs?start_time={{unix_days_ago:30}}",
+            ),
+        ] {
+            let (directory, path) = isolated_usage_provider_path(id);
+            let original = serde_json::to_vec_pretty(&serde_json::json!({
+                "providers": [{
+                    "id": id,
+                    "kind": kind,
+                    "domains": domains,
+                    "endpoint": endpoint,
+                }]
+            }))
+            .expect("serialize legacy operator config");
+            std::fs::write(&path, &original).expect("write legacy operator config");
+
+            let error = load_providers_from_path(&path)
+                .expect_err("endpoint templates must fail during file load");
+
+            let detail = format!("{error:#}");
+            assert!(
+                detail.contains(id),
+                "error must identify provider: {detail}"
+            );
+            assert!(
+                detail.contains("endpoint templates are not supported")
+                    && detail.contains("literal absolute URL or relative path"),
+                "error must include migration guidance: {detail}"
+            );
+            assert_eq!(
+                std::fs::read(&path).expect("read preserved operator config"),
+                original
+            );
+            std::fs::remove_dir_all(directory).expect("remove isolated test directory");
+        }
     }
 
     #[test]

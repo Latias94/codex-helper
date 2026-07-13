@@ -145,6 +145,8 @@ Container and server runtimes do not provide access to a client's local transcri
 
 The client switch only points Codex at one helper URL. `switch on` records the original selector and helper stanza, then writes `model_providers.codex_proxy`; `switch off` restores only the recorded content. Conflicting external edits move the state to `recovery_required` and leave the file untouched. Codex `auth.json`, `models_cache.json`, SQLite, feature flags, compaction, and WebSocket settings are never read or changed.
 
+When upgrading from 0.20.3 or earlier, if `~/.codex/codex-helper-switch-state.json` still exists, first run `codex-helper switch off` with the old binary that created it; upgrade and run the new `switch on` only after that succeeds. The legacy state may contain original auth content, so do not delete or share it before recovery. The new release does not undo `remote_connections` or Codex SQLite state written by the removed `switch remote-control enable`, and that database must not be cleaned with an SQL hack. See [Configuration Compatibility](docs/CONFIGURATION.md#configuration-compatibility) for the full sequence and retired version 5 fields.
+
 Relay capabilities come from the selected provider adapter, catalog, and bounded observations rather than switch configuration. Inspect the provider contract, live `/models` / `/responses` / `/responses/compact` results, continuity, and mismatches with:
 
 ```bash

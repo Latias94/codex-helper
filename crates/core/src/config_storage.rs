@@ -1,5 +1,7 @@
 use super::*;
-use crate::file_replace::write_bytes_file_async;
+use crate::file_replace::{write_bytes_file_async, write_bytes_file_async_with_permissions};
+use std::fs::{File, OpenOptions, TryLockError};
+use std::path::Path;
 
 fn config_dir() -> PathBuf {
     proxy_home_dir()
@@ -7,15 +9,6 @@ fn config_dir() -> PathBuf {
 
 fn config_toml_path() -> PathBuf {
     config_dir().join("config.toml")
-}
-
-fn config_toml_backup_path() -> PathBuf {
-    config_dir().join("config.toml.bak")
-}
-
-fn config_backup_source_and_path() -> (PathBuf, PathBuf) {
-    let toml_path = config_toml_path();
-    (toml_path, config_toml_backup_path())
 }
 
 /// Return the canonical path for the current configuration contract.
@@ -31,7 +24,7 @@ pub struct LoadedConfig {
 const CONFIG_TOML_DOC_HEADER: &str = r#"# codex-helper config.toml
 #
 # 启动路径只接受当前 `version = 5` TOML；其他版本会被拒绝，历史
-# config.json 会被忽略。
+# config.json 不受支持，且会在没有 canonical config.toml 时被明确拒绝。
 #
 # 常用命令：
 # - 生成带注释的模板：`codex-helper config init`
@@ -45,7 +38,7 @@ const CONFIG_TOML_DOC_HEADER: &str = r#"# codex-helper config.toml
 const CONFIG_TOML_TEMPLATE: &str = r#"# codex-helper config.toml
 #
 # codex-helper 启动路径只读取当前 `version = 5` 的 config.toml。
-# 其他版本的 TOML 会被拒绝，历史 config.json 会被忽略。
+# 其他版本的 TOML 会被拒绝；历史 config.json 不受支持，且不会被导入。
 #
 # 本模板以“可发现性”为主：包含可直接抄的示例，以及每个字段的说明。
 #
@@ -322,41 +315,398 @@ fn toml_schema_version(value: &TomlValue) -> Option<u32> {
         .and_then(|value| u32::try_from(value).ok())
 }
 
-fn reject_removed_codex_compaction_config(value: &TomlValue) -> Result<()> {
-    let has_removed_config = value
-        .get("codex")
-        .and_then(TomlValue::as_table)
-        .is_some_and(|codex| codex.contains_key("compaction"));
+fn nested_toml_value<'a>(value: &'a TomlValue, path: &[&str]) -> Option<&'a TomlValue> {
+    path.iter()
+        .try_fold(value, |current, key| current.get(*key))
+}
 
-    if has_removed_config {
-        anyhow::bail!(
-            "`[codex.compaction].remote_v2_downgrade` has been removed; codex-helper no longer performs remote compaction v2-to-v1 downgrade. Delete the entire `[codex.compaction]` table from config.toml."
+fn toml_path_key(key: &str) -> String {
+    if !key.is_empty()
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        key.to_string()
+    } else {
+        format!("{key:?}")
+    }
+}
+
+fn collect_retired_profile_settings(value: &TomlValue, service: &str, retired: &mut Vec<String>) {
+    let Some(profiles) =
+        nested_toml_value(value, &[service, "profiles"]).and_then(TomlValue::as_table)
+    else {
+        return;
+    };
+
+    for (profile_name, profile) in profiles {
+        if profile
+            .as_table()
+            .is_some_and(|profile| profile.contains_key("station"))
+        {
+            retired.push(format!(
+                "{service}.profiles.{}.station",
+                toml_path_key(profile_name)
+            ));
+        }
+    }
+}
+
+fn collect_retired_relay_target_settings(value: &TomlValue, retired: &mut Vec<String>) {
+    let Some(targets) = value.get("relay_targets").and_then(TomlValue::as_table) else {
+        return;
+    };
+
+    for (target_name, target) in targets {
+        let Some(target) = target.as_table() else {
+            continue;
+        };
+        for field in ["client_preset", "responses_websocket"] {
+            if target.contains_key(field) {
+                retired.push(format!(
+                    "relay_targets.{}.{field}",
+                    toml_path_key(target_name)
+                ));
+            }
+        }
+    }
+}
+
+fn reject_retired_v5_settings(value: &TomlValue) -> Result<()> {
+    let mut retired = Vec::new();
+    for (path, label) in [
+        (&["codex", "client_patch"][..], "codex.client_patch"),
+        (&["codex", "compaction"][..], "codex.compaction"),
+        (&["claude", "compaction"][..], "claude.compaction"),
+        (&["ui", "usage_forecast"][..], "ui.usage_forecast"),
+        (
+            &["retry", "allow_cross_station_before_first_output"][..],
+            "retry.allow_cross_station_before_first_output",
+        ),
+    ] {
+        if nested_toml_value(value, path).is_some() {
+            retired.push(label.to_string());
+        }
+    }
+    collect_retired_profile_settings(value, "codex", &mut retired);
+    collect_retired_profile_settings(value, "claude", &mut retired);
+    collect_retired_relay_target_settings(value, &mut retired);
+
+    if retired.is_empty() {
+        return Ok(());
+    }
+
+    retired.sort();
+    let labels = retired
+        .iter()
+        .map(|path| format!("`{path}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut compaction_guidance = String::new();
+    if retired.iter().any(|path| path == "codex.compaction") {
+        compaction_guidance.push_str(
+            " `[codex.compaction].remote_v2_downgrade` has been removed because codex-helper no longer performs remote compaction v2-to-v1 downgrade. Delete the entire `[codex.compaction]` table.",
+        );
+    }
+    if retired.iter().any(|path| path == "claude.compaction") {
+        compaction_guidance.push_str(
+            " `[claude.compaction]` was accepted by the shared v0.20.3 version 5 service schema but had no Claude runtime effect. Delete the entire `[claude.compaction]` table.",
         );
     }
 
+    anyhow::bail!(
+        "config.toml contains retired version 5 setting(s): {labels}. Each listed setting has been removed from the runtime contract. Remove or replace every listed setting before retrying; config.toml was not modified, preventing a typed save from silently deleting it.{compaction_guidance}"
+    )
+}
+
+fn unsupported_legacy_json_error(path: &Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{} is an unsupported legacy config source; normal startup only reads ~/.codex-helper/config.toml with version = {}. Back up config.json, run `codex-helper config init`, and copy any needed settings into TOML manually. config.json was not imported, rewritten, or deleted.",
+        path.display(),
+        CURRENT_CONFIG_VERSION
+    )
+}
+
+#[derive(Debug)]
+struct ResolvedConfigDirectory {
+    logical_path: PathBuf,
+    resolved_path: PathBuf,
+}
+
+impl ResolvedConfigDirectory {
+    async fn inspect() -> Result<Option<Self>> {
+        let logical_path = config_dir();
+        let entry_metadata = match fs::symlink_metadata(&logical_path).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("inspect config directory {}", logical_path.display())
+                });
+            }
+        };
+        if !entry_metadata.is_dir() && !entry_metadata.file_type().is_symlink() {
+            anyhow::bail!(
+                "config directory path {} is not a directory",
+                logical_path.display()
+            );
+        }
+
+        let resolved_path = fs::canonicalize(&logical_path)
+            .await
+            .with_context(|| format!("resolve config directory {}", logical_path.display()))?;
+        let resolved_metadata = fs::metadata(&resolved_path).await.with_context(|| {
+            format!(
+                "inspect resolved config directory {}",
+                resolved_path.display()
+            )
+        })?;
+        if !resolved_metadata.is_dir() {
+            anyhow::bail!(
+                "config directory path {} does not resolve to a directory",
+                logical_path.display()
+            );
+        }
+
+        Ok(Some(Self {
+            logical_path,
+            resolved_path,
+        }))
+    }
+
+    async fn prepare() -> Result<Self> {
+        if let Some(paths) = Self::inspect().await? {
+            return Ok(paths);
+        }
+
+        let logical_path = config_dir();
+        fs::create_dir_all(&logical_path)
+            .await
+            .with_context(|| format!("create config directory {}", logical_path.display()))?;
+        Self::inspect().await?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "config directory {} disappeared after creation",
+                logical_path.display()
+            )
+        })
+    }
+
+    fn logical_file(&self, name: &str) -> PathBuf {
+        self.logical_path.join(name)
+    }
+
+    fn resolved_file(&self, name: &str) -> PathBuf {
+        self.resolved_path.join(name)
+    }
+
+    async fn ensure_unchanged(&self) -> Result<()> {
+        let current = fs::canonicalize(&self.logical_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "re-resolve config directory {}",
+                    self.logical_path.display()
+                )
+            })?;
+        if current != self.resolved_path {
+            anyhow::bail!(
+                "config directory {} changed target during the operation; expected {}, found {}",
+                self.logical_path.display(),
+                self.resolved_path.display(),
+                current.display()
+            );
+        }
+        Ok(())
+    }
+}
+
+struct ConfigMutationLock {
+    _file: File,
+}
+
+impl ConfigMutationLock {
+    fn acquire(paths: &ResolvedConfigDirectory) -> Result<Self> {
+        let path = paths.resolved_file("config.toml.lock");
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options
+            .open(&path)
+            .with_context(|| format!("open config mutation lock {}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Self { _file: file }),
+            Err(TryLockError::WouldBlock) => anyhow::bail!(
+                "another config mutation is already running; lock is held at {}",
+                paths.logical_file("config.toml.lock").display()
+            ),
+            Err(TryLockError::Error(source)) => {
+                Err(source).with_context(|| format!("lock config mutation path {}", path.display()))
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ExistingConfigToml {
+    entry_is_symlink: bool,
+    permissions: std::fs::Permissions,
+    contents: Vec<u8>,
+}
+
+impl ExistingConfigToml {
+    fn text(&self) -> Result<&str> {
+        std::str::from_utf8(&self.contents).context("config.toml is not valid UTF-8")
+    }
+}
+
+async fn read_existing_config_toml(
+    paths: &ResolvedConfigDirectory,
+) -> Result<Option<ExistingConfigToml>> {
+    let logical_path = paths.logical_file("config.toml");
+    let entry_path = paths.resolved_file("config.toml");
+    let entry_metadata = match fs::symlink_metadata(&entry_path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspect config {}", logical_path.display()));
+        }
+    };
+
+    let entry_is_symlink = entry_metadata.file_type().is_symlink();
+    let source_path = if entry_is_symlink {
+        fs::canonicalize(&entry_path)
+            .await
+            .with_context(|| format!("resolve config symlink {}", logical_path.display()))?
+    } else {
+        entry_path
+    };
+    let source_metadata = fs::metadata(&source_path)
+        .await
+        .with_context(|| format!("inspect config target {}", source_path.display()))?;
+    if !source_metadata.is_file() {
+        anyhow::bail!(
+            "config path {} does not resolve to a regular file",
+            logical_path.display()
+        );
+    }
+    let contents = fs::read(&source_path)
+        .await
+        .with_context(|| format!("read config {}", logical_path.display()))?;
+    Ok(Some(ExistingConfigToml {
+        entry_is_symlink,
+        permissions: source_metadata.permissions(),
+        contents,
+    }))
+}
+
+fn validate_current_config_toml(text: &str) -> Result<TomlValue> {
+    let raw_config = toml::from_str::<TomlValue>(text).map_err(|source| {
+        let location = source.span().map_or_else(
+            || "unknown location".to_string(),
+            |span| {
+                let prefix = &text[..span.start.min(text.len())];
+                let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+                let column = prefix
+                    .rsplit_once('\n')
+                    .map_or(prefix.len(), |(_, suffix)| suffix.len())
+                    + 1;
+                format!("line {line}, column {column}")
+            },
+        );
+        anyhow::anyhow!(
+            "parse current config.toml at {location}: {}",
+            source.message()
+        )
+    })?;
+    let version = toml_schema_version(&raw_config);
+    if version != Some(CURRENT_CONFIG_VERSION) {
+        return Err(unsupported_config_error("config.toml", version));
+    }
+
+    reject_retired_v5_settings(&raw_config)?;
+    Ok(raw_config)
+}
+
+fn reject_symlink_config_mutation(existing: &ExistingConfigToml, action: &str) -> Result<()> {
+    if existing.entry_is_symlink {
+        anyhow::bail!(
+            "refusing to {action} config.toml because it is a symbolic link; edit the link target directly or replace the link with a regular config.toml. The link and its target were not modified"
+        );
+    }
     Ok(())
 }
 
-pub async fn init_config_toml(force: bool) -> Result<PathBuf> {
-    let dir = config_dir();
-    fs::create_dir_all(&dir).await?;
-    let path = config_toml_path();
-    let backup_path = config_toml_backup_path();
+async fn write_config_backup(
+    paths: &ResolvedConfigDirectory,
+    existing: &ExistingConfigToml,
+) -> Result<()> {
+    paths.ensure_unchanged().await?;
+    let backup_path = paths.resolved_file("config.toml.bak");
+    write_bytes_file_async_with_permissions(
+        &backup_path,
+        &existing.contents,
+        existing.permissions.clone(),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "back up config.toml to {}",
+            paths.logical_file("config.toml.bak").display()
+        )
+    })?;
+    paths.ensure_unchanged().await
+}
 
-    if path.exists() && !force {
+async fn preflight_existing_config_before_save(
+    paths: &ResolvedConfigDirectory,
+) -> Result<Option<ExistingConfigToml>> {
+    if let Some(existing) = read_existing_config_toml(paths).await? {
+        validate_current_config_toml(existing.text()?)?;
+        reject_symlink_config_mutation(&existing, "save")?;
+        return Ok(Some(existing));
+    }
+
+    let logical_json_path = paths.logical_file("config.json");
+    let json_path = paths.resolved_file("config.json");
+    match fs::symlink_metadata(json_path).await {
+        Ok(_) => Err(unsupported_legacy_json_error(&logical_json_path)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error)
+            .with_context(|| format!("inspect legacy config {}", logical_json_path.display())),
+    }
+}
+
+pub async fn init_config_toml(force: bool) -> Result<PathBuf> {
+    let paths = ResolvedConfigDirectory::prepare().await?;
+    let _lock = ConfigMutationLock::acquire(&paths)?;
+    paths.ensure_unchanged().await?;
+    let path = paths.logical_file("config.toml");
+
+    let existing = read_existing_config_toml(&paths).await?;
+    if existing.is_some() && !force {
         anyhow::bail!(
             "config.toml already exists at {:?}; use --force to overwrite",
             path
         );
     }
 
-    if path.exists()
-        && let Err(err) = fs::copy(&path, &backup_path).await
-    {
-        warn!("failed to backup {:?} to {:?}: {}", path, backup_path, err);
+    if let Some(existing) = existing.as_ref() {
+        reject_symlink_config_mutation(existing, "initialize")?;
+        write_config_backup(&paths, existing).await?;
     }
 
-    write_bytes_file_async(&path, CONFIG_TOML_TEMPLATE.as_bytes()).await?;
+    paths.ensure_unchanged().await?;
+    write_bytes_file_async(
+        &paths.resolved_file("config.toml"),
+        CONFIG_TOML_TEMPLATE.as_bytes(),
+    )
+    .await?;
+    paths.ensure_unchanged().await?;
     Ok(path)
 }
 
@@ -365,26 +715,35 @@ pub async fn load_config() -> Result<HelperConfig> {
 }
 
 pub async fn load_config_with_source() -> Result<LoadedConfig> {
-    let toml_path = config_toml_path();
-    if toml_path.exists() {
-        let text = fs::read_to_string(&toml_path).await?;
-        let raw_config = toml::from_str::<TomlValue>(&text).ok();
-        let version = raw_config.as_ref().and_then(toml_schema_version);
+    let Some(paths) = ResolvedConfigDirectory::inspect().await? else {
+        let source = HelperConfig::default();
+        validate_helper_config(&source)?;
+        return Ok(LoadedConfig { source });
+    };
 
-        if version != Some(CURRENT_CONFIG_VERSION) {
-            return Err(unsupported_config_error("config.toml", version));
-        }
-
-        let raw_config = raw_config.with_context(|| "parse current config.toml")?;
-        reject_removed_codex_compaction_config(&raw_config)?;
-
-        let config_source = toml::from_str::<HelperConfig>(&text)?;
+    if let Some(existing) = read_existing_config_toml(&paths).await? {
+        let text = existing.text()?;
+        validate_current_config_toml(text)?;
+        let config_source = toml::from_str::<HelperConfig>(text)?;
         validate_helper_config(&config_source)?;
+        paths.ensure_unchanged().await?;
         return Ok(LoadedConfig {
             source: config_source,
         });
     }
 
+    let logical_json_path = paths.logical_file("config.json");
+    let json_path = paths.resolved_file("config.json");
+    match fs::symlink_metadata(json_path).await {
+        Ok(_) => return Err(unsupported_legacy_json_error(&logical_json_path)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspect legacy config {}", logical_json_path.display()));
+        }
+    }
+
+    paths.ensure_unchanged().await?;
     let source = HelperConfig::default();
     validate_helper_config(&source)?;
     Ok(LoadedConfig { source })
@@ -403,27 +762,26 @@ fn unsupported_config_error(source: &str, source_version: Option<u32>) -> anyhow
 }
 
 pub async fn save_helper_config(cfg: &HelperConfig) -> Result<PathBuf> {
+    let paths = ResolvedConfigDirectory::prepare().await?;
+    let _lock = ConfigMutationLock::acquire(&paths)?;
+    paths.ensure_unchanged().await?;
+    let existing = preflight_existing_config_before_save(&paths).await?;
+
     let mut normalized = cfg.clone();
     normalized.version = CURRENT_CONFIG_VERSION;
     validate_helper_config(&normalized)?;
 
-    let dir = config_dir();
-    fs::create_dir_all(&dir).await?;
-    let path = config_toml_path();
-    let (backup_source_path, backup_path) = config_backup_source_and_path();
+    let path = paths.logical_file("config.toml");
     let body = toml::to_string_pretty(&normalized)?;
     let text = format!("{CONFIG_TOML_DOC_HEADER}\n{body}");
     let data = text.into_bytes();
 
-    if backup_source_path.exists()
-        && let Err(err) = fs::copy(&backup_source_path, &backup_path).await
-    {
-        warn!(
-            "failed to backup {:?} to {:?}: {}",
-            backup_source_path, backup_path, err
-        );
+    if let Some(existing) = existing.as_ref() {
+        write_config_backup(&paths, existing).await?;
     }
 
-    write_bytes_file_async(&path, &data).await?;
+    paths.ensure_unchanged().await?;
+    write_bytes_file_async(&paths.resolved_file("config.toml"), &data).await?;
+    paths.ensure_unchanged().await?;
     Ok(path)
 }

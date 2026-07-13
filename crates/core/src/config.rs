@@ -7,7 +7,6 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use toml::Value as TomlValue;
-use tracing::warn;
 
 pub use crate::client_config::{
     claude_settings_backup_path, claude_settings_path, codex_config_path,

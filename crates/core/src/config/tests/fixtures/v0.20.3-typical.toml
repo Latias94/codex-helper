@@ -1,0 +1,117 @@
+# Representative supported version 5 settings from codex-helper v0.20.3 (tag 6a9600f).
+version = 5
+default_service = "codex"
+
+[codex]
+default_profile = "daily"
+
+[codex.profiles.base]
+reasoning_effort = "medium"
+
+[codex.profiles.daily]
+extends = "base"
+model = "gpt-5.4"
+service_tier = "priority"
+
+[codex.providers.primary]
+alias = "Primary relay"
+base_url = "https://primary.example.com/v1"
+continuity_domain = "primary-account"
+auth_token_env = "PRIMARY_API_KEY"
+tags = { billing = "monthly", region = "hk" }
+supportedModels = { "gpt-5.4" = true }
+modelMapping = { "gpt-5.4" = "openai/gpt-5.4" }
+
+[codex.providers.primary.limits]
+max_concurrent_requests = 2
+limit_group = "primary-account"
+
+[codex.providers.regional]
+auth_token_env = "REGIONAL_API_KEY"
+tags = { billing = "paygo" }
+
+[codex.providers.regional.endpoints.fast]
+base_url = "https://regional.example.com/v1"
+continuity_domain = "regional-account"
+priority = 5
+supported_models = { "gpt-5.4" = true }
+
+[codex.routing]
+entry = "main"
+affinity_policy = "fallback-sticky"
+fallback_ttl_ms = 90000
+reprobe_preferred_after_ms = 30000
+
+[codex.routing.routes.main]
+strategy = "ordered-failover"
+children = ["primary", "regional"]
+
+[claude]
+default_profile = "daily"
+
+[claude.profiles.daily]
+model = "claude-sonnet-4"
+
+[claude.providers.primary]
+base_url = "https://claude.example.com/v1"
+api_key_env = "CLAUDE_RELAY_API_KEY"
+
+[claude.routing]
+entry = "main"
+
+[claude.routing.routes.main]
+strategy = "manual-sticky"
+target = "primary"
+
+[retry]
+profile = "cost-primary"
+never_on_status = "413,415,422"
+transport_cooldown_secs = 45
+cooldown_backoff_factor = 2
+cooldown_backoff_max_secs = 900
+
+[retry.upstream]
+max_attempts = 3
+strategy = "same_upstream"
+
+[retry.provider]
+max_attempts = 2
+strategy = "failover"
+
+[notify]
+enabled = true
+
+[notify.policy]
+min_duration_ms = 30000
+global_cooldown_ms = 60000
+merge_window_ms = 10000
+per_thread_cooldown_ms = 180000
+recent_search_window_ms = 300000
+recent_endpoint_timeout_ms = 500
+
+[relay_targets.nas]
+service = "codex"
+proxy_url = "http://nas.local:3211"
+admin_url = "https://nas.example.com:4211"
+admin_token_env = "CODEX_HELPER_NAS_ADMIN_TOKEN"
+
+[fleet.nodes.local]
+label = "Local"
+admin_url = "http://127.0.0.1:4211"
+enabled = true
+
+[ui]
+language = "zh"
+
+[ui.service_status]
+enabled = true
+refresh_interval_secs = 120
+timeout_ms = 2500
+high_latency_ms = 2000
+history_cells = 30
+
+[[ui.service_status.probes]]
+id = "primary"
+provider = "primary"
+endpoint = "default"
+models = ["gpt-5.4"]

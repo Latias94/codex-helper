@@ -157,6 +157,8 @@ ch relay off
 
 客户端 switch 只负责把 Codex 指向一个 helper URL。`switch on` 记录原 selector 和 helper stanza，只写入 `model_providers.codex_proxy`；`switch off` 只恢复记录过的内容。外部编辑发生冲突时，状态进入 `recovery_required` 并保持文件不动。Codex `auth.json`、`models_cache.json`、SQLite、feature flags、compaction 和 WebSocket 设置都不会被读取或修改。
 
+从 0.20.3 或更早版本升级时，如果 `~/.codex/codex-helper-switch-state.json` 仍存在，请先用创建它的旧 binary 运行 `codex-helper switch off`，成功后再升级并重新 `switch on`；旧 state 可能包含原始 auth 内容，恢复前不要删除或分享。旧 `switch remote-control enable` 写入的 `remote_connections` 和 Codex SQLite 状态不会被新版自动撤销，也不要用 SQL hack 清理；完整顺序和 v5 退休字段见[中文配置兼容性说明](docs/CONFIGURATION.zh.md#配置兼容性)。
+
 Relay 能力由选中 provider 的 adapter、catalog 和有界观测决定，不由 switch 配置推断。可用下面的本地命令查看 provider contract、实际 `/models` / `/responses` / `/responses/compact` 结果、continuity 和 mismatches：
 
 ```bash

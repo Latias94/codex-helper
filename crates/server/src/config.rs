@@ -8,6 +8,7 @@ use codex_helper_core::control_plane_client::validate_admin_token_header_value;
 use codex_helper_core::proxy::{ADMIN_TOKEN_ENV_VAR, admin_port_for_proxy_port};
 use codex_helper_core::runtime_host::ProxyRuntimeOptions;
 use serde::Deserialize;
+use toml::Value as TomlValue;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
@@ -134,8 +135,33 @@ pub fn load_server_config(path: Option<&Path>) -> Result<ServerConfigSection> {
 }
 
 fn parse_server_config(contents: &str) -> Result<ServerConfigSection> {
+    let raw: TomlValue = toml::from_str(contents)?;
+    reject_retired_server_settings(&raw)?;
     let file: ServerConfigFile = toml::from_str(contents)?;
     Ok(file.server)
+}
+
+fn reject_retired_server_settings(value: &TomlValue) -> Result<()> {
+    let Some(server) = value.get("server").and_then(TomlValue::as_table) else {
+        return Ok(());
+    };
+    let mut retired = ["advertised-admin-base-url", "host-local-session-history"]
+        .into_iter()
+        .filter(|field| server.contains_key(*field))
+        .map(|field| format!("server.{field}"))
+        .collect::<Vec<_>>();
+    if retired.is_empty() {
+        return Ok(());
+    }
+    retired.sort();
+    let labels = retired
+        .iter()
+        .map(|path| format!("`{path}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    bail!(
+        "server config contains retired setting(s): {labels}. Each listed setting has been removed. Remove every listed setting before retrying; configure trusted relay admin_url values on each client, and keep client-local session history on the client"
+    )
 }
 
 fn default_proxy_port_for_service(service_kind: ServiceKind) -> u16 {
@@ -229,6 +255,83 @@ mod tests {
         assert_eq!(config.port, Some(3211));
         assert_eq!(config.admin_host, Some("127.0.0.1".parse().unwrap()));
         assert_eq!(config.admin_port, Some(4211));
+    }
+
+    #[test]
+    fn retired_server_fields_are_rejected_with_migration_guidance() {
+        for field in [
+            "advertised-admin-base-url = \"http://nas.local:4211\"",
+            "host-local-session-history = true",
+        ] {
+            let error = parse_server_config(format!("[server]\n{field}\n").as_str())
+                .expect_err("retired server field must not be ignored");
+            let message = error.to_string();
+            let field_name = field.split_once(" = ").expect("field assignment").0;
+            assert!(
+                message.contains(field_name),
+                "error must identify {field_name}: {message}"
+            );
+            assert!(
+                message.contains("has been removed") && message.contains("Remove"),
+                "error must include migration guidance: {message}"
+            );
+        }
+
+        let error = parse_server_config(
+            r#"
+            [server]
+            host-local-session-history = false
+            advertised-admin-base-url = "https://relay.example:4211"
+            "#,
+        )
+        .expect_err("all retired server fields must be reported");
+        let message = error.to_string();
+        let advertised = message
+            .find("server.advertised-admin-base-url")
+            .expect("advertised field path");
+        let history = message
+            .find("server.host-local-session-history")
+            .expect("history field path");
+        assert!(
+            advertised < history,
+            "paths must have stable order: {message}"
+        );
+
+        parse_server_config(
+            r#"
+            [server]
+            advertised-admin-base-url-hint = "extension"
+            host-local-session-history-note = true
+            "#,
+        )
+        .expect("similarly named extension keys must not trigger retired-field checks");
+    }
+
+    #[test]
+    fn load_server_config_rejects_retired_fields_from_file() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "codex-helper-server-retired-config-{}-{nonce}.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, "[server]\nhost-local-session-history = true\n")
+            .expect("write temporary server config");
+
+        let result = load_server_config(Some(&path));
+        std::fs::remove_file(&path).expect("remove temporary server config");
+
+        let error = result.expect_err("file loader must reject retired server fields");
+        let message = error
+            .chain()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(": ");
+        assert!(message.contains(path.to_string_lossy().as_ref()));
+        assert!(message.contains("server.host-local-session-history"));
+        assert!(message.contains("has been removed"));
     }
 
     #[test]

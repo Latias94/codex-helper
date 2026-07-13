@@ -15,6 +15,7 @@ const PROVIDER_ID: &str = "codex_proxy";
 const PROVIDER_NAME: &str = "codex-helper";
 const STATE_FILE_NAME: &str = "codex-switch.json";
 const LOCK_FILE_NAME: &str = "codex-switch.lock";
+const LEGACY_STATE_FILE_NAME: &str = "codex-helper-switch-state.json";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedCodexBaseUrl(String);
@@ -147,6 +148,10 @@ pub enum CodexSwitchError {
         "Codex config already selects codex_proxy without helper ownership state; manual reconciliation is required"
     )]
     OrphanedActiveProvider,
+    #[error(
+        "legacy Codex switch state exists at {path:?}. Use codex-helper v0.20.3 (or the older binary that created it) to run `switch off` before upgrading. Do not run old and new switch commands concurrently. Do not delete, edit, or share this file because it may contain authentication recovery data"
+    )]
+    LegacySwitchState { path: PathBuf },
     #[error("unsupported Codex config file topology at {path:?}: {reason}")]
     UnsupportedConfigTopology { path: PathBuf, reason: String },
     #[error(
@@ -300,19 +305,22 @@ pub fn apply(intent: CodexSwitchIntent) -> Result<CodexSwitchOutcome, CodexSwitc
 
 pub fn inspect() -> Result<CodexSwitchStatus, CodexSwitchError> {
     let paths = SwitchPaths::resolve()?;
+    if legacy_state_present(paths.legacy_state.as_path())? {
+        return legacy_switch_status(&paths);
+    }
     for _ in 0..3 {
         let before = read_journal_snapshot(paths.state.as_path())?;
         let current = read_config_snapshot(paths.config.as_path())?;
         let after = read_optional_text(paths.state.as_path())?;
         match (before, after) {
-            (None, None) => return status_from_snapshot(&paths, &current, None),
+            (None, None) => return status_after_legacy_recheck(&paths, &current, None),
             (Some(before), Some(after_raw)) if before.raw == after_raw => {
-                return status_from_snapshot(&paths, &current, Some(&before.journal));
+                return status_after_legacy_recheck(&paths, &current, Some(&before.journal));
             }
             (Some(before), Some(after_raw)) => {
                 let after = parse_journal(paths.state.as_path(), after_raw)?;
                 if before.journal == after.journal {
-                    return status_from_snapshot(&paths, &current, Some(&after.journal));
+                    return status_after_legacy_recheck(&paths, &current, Some(&after.journal));
                 }
             }
             _ => {}
@@ -326,7 +334,9 @@ fn apply_with_failpoint(
     failpoint: ApplyFailpoint,
 ) -> Result<CodexSwitchOutcome, CodexSwitchError> {
     let paths = SwitchPaths::resolve()?;
+    reject_legacy_switch_state(&paths)?;
     let _lock = OperationLock::acquire(paths.lock.as_path())?;
+    reject_legacy_switch_state(&paths)?;
     let journal = read_journal(paths.state.as_path())?;
     if let Some(journal) = journal.as_ref() {
         ensure_journal_config_matches(&paths, journal)?;
@@ -339,6 +349,97 @@ fn apply_with_failpoint(
         }
         CodexSwitchIntent::Off => apply_off(&paths, current, journal, failpoint),
     }
+}
+
+fn legacy_state_present(path: &Path) -> Result<bool, CodexSwitchError> {
+    switch_path_entry_present(path, "inspect legacy switch state at")
+}
+
+fn switch_path_entry_present(path: &Path, action: &'static str) -> Result<bool, CodexSwitchError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(io_error(action, path, error)),
+    }
+}
+
+fn legacy_switch_error(paths: &SwitchPaths) -> CodexSwitchError {
+    CodexSwitchError::LegacySwitchState {
+        path: paths.legacy_state.clone(),
+    }
+}
+
+fn reject_legacy_switch_state(paths: &SwitchPaths) -> Result<(), CodexSwitchError> {
+    if legacy_state_present(paths.legacy_state.as_path())? {
+        return Err(legacy_switch_error(paths));
+    }
+    Ok(())
+}
+
+fn legacy_switch_status(paths: &SwitchPaths) -> Result<CodexSwitchStatus, CodexSwitchError> {
+    let current_state_present =
+        switch_path_entry_present(paths.state.as_path(), "inspect current switch state at")?;
+    let config = read_config_snapshot(paths.config.as_path())
+        .and_then(|current| inspect_config(paths.config.as_path(), current.text.as_str()))
+        .ok();
+    let enabled = config.as_ref().is_some_and(|config| {
+        config.model_provider.as_deref() == Some(PROVIDER_ID) && config.helper_stanza.is_some()
+    });
+    let base_url = config.and_then(|config| config.helper_base_url);
+    let mut recovery_reason = legacy_switch_error(paths).to_string();
+    if current_state_present {
+        recovery_reason.push_str(
+            format!(
+                ". A current switch journal also exists at {:?}; neither journal was modified",
+                paths.state
+            )
+            .as_str(),
+        );
+    }
+
+    Ok(CodexSwitchStatus {
+        phase: CodexSwitchPhase::RecoveryRequired,
+        enabled,
+        managed: current_state_present,
+        base_url,
+        recovery_reason: Some(recovery_reason),
+        config_path: paths.config.clone(),
+        state_path: paths.legacy_state.clone(),
+    })
+}
+
+fn status_after_legacy_recheck(
+    paths: &SwitchPaths,
+    current: &ConfigSnapshot,
+    journal: Option<&SwitchJournal>,
+) -> Result<CodexSwitchStatus, CodexSwitchError> {
+    if legacy_state_present(paths.legacy_state.as_path())? {
+        return legacy_switch_status(paths);
+    }
+    status_from_snapshot(paths, current, journal)
+}
+
+fn write_current_journal(
+    paths: &SwitchPaths,
+    journal: &SwitchJournal,
+) -> Result<(), CodexSwitchError> {
+    reject_legacy_switch_state(paths)?;
+    write_journal(paths.state.as_path(), journal)
+}
+
+fn remove_current_journal(paths: &SwitchPaths) -> Result<(), CodexSwitchError> {
+    reject_legacy_switch_state(paths)?;
+    remove_journal(paths.state.as_path())
+}
+
+fn write_current_config_edit(
+    paths: &SwitchPaths,
+    edit: ConfigEdit,
+    journal: &SwitchJournal,
+    expected: ExpectedConfigState,
+) -> Result<(), CodexSwitchError> {
+    reject_legacy_switch_state(paths)?;
+    write_config_edit(paths.config.as_path(), edit, journal, expected)
 }
 
 fn apply_on(
@@ -370,7 +471,7 @@ fn apply_on(
             JournalPhase::Prepared => match journal.operation {
                 JournalOperation::On if current.matches_applied(&journal) => {
                     journal.phase = JournalPhase::Applied;
-                    write_journal(paths.state.as_path(), &journal)?;
+                    write_current_journal(paths, &journal)?;
                     ensure_target_matches(&journal, &target)?;
                     outcome(paths, CodexSwitchChange::Recovered)
                 }
@@ -379,13 +480,13 @@ fn apply_on(
                     resume_on(paths, journal, failpoint, None)
                 }
                 JournalOperation::Off if current.matches_original(&journal) => {
-                    remove_journal(paths.state.as_path())?;
+                    remove_current_journal(paths)?;
                     begin_on(paths, current, target, failpoint)
                 }
                 JournalOperation::Off if current.matches_applied(&journal) => {
                     journal.phase = JournalPhase::Applied;
                     journal.operation = JournalOperation::On;
-                    write_journal(paths.state.as_path(), &journal)?;
+                    write_current_journal(paths, &journal)?;
                     ensure_target_matches(&journal, &target)?;
                     outcome(paths, CodexSwitchChange::Recovered)
                 }
@@ -456,7 +557,7 @@ fn begin_on(
         target_base_url: target.0,
         recovery_reason: None,
     };
-    write_journal(paths.state.as_path(), &journal)?;
+    write_current_journal(paths, &journal)?;
     resume_on(paths, journal, failpoint, Some(planned_write))
 }
 
@@ -498,8 +599,8 @@ fn resume_on(
         );
     }
 
-    match write_config_edit(
-        paths.config.as_path(),
+    match write_current_config_edit(
+        paths,
         ConfigEdit::Write(applied_text),
         &journal,
         ExpectedConfigState::Original,
@@ -521,7 +622,7 @@ fn resume_on(
     }
 
     journal.phase = JournalPhase::Applied;
-    write_journal(paths.state.as_path(), &journal)?;
+    write_current_journal(paths, &journal)?;
     outcome(paths, CodexSwitchChange::Applied)
 }
 
@@ -555,13 +656,13 @@ fn apply_off(
         }
         JournalPhase::Prepared => {
             if current.matches_original(&journal) {
-                remove_journal(paths.state.as_path())?;
+                remove_current_journal(paths)?;
                 return outcome(paths, CodexSwitchChange::Recovered);
             }
             match journal.operation {
                 JournalOperation::On if current.matches_applied(&journal) => {
                     journal.phase = JournalPhase::Applied;
-                    write_journal(paths.state.as_path(), &journal)?;
+                    write_current_journal(paths, &journal)?;
                     begin_off(paths, journal, failpoint)
                 }
                 JournalOperation::Off if current.matches_applied(&journal) => {
@@ -586,7 +687,7 @@ fn begin_off(
     journal.operation = JournalOperation::Off;
     journal.operation_id = Uuid::new_v4().to_string();
     journal.recovery_reason = None;
-    write_journal(paths.state.as_path(), &journal)?;
+    write_current_journal(paths, &journal)?;
     resume_off(paths, journal, failpoint)
 }
 
@@ -614,16 +715,11 @@ fn resume_off(
         journal.recovery_reason = Some(
             "restoring the helper stanza would not reproduce the original fingerprint".to_string(),
         );
-        write_journal(paths.state.as_path(), &journal)?;
+        write_current_journal(paths, &journal)?;
         return Err(CodexSwitchError::RestoreFingerprintMismatch);
     }
 
-    match write_config_edit(
-        paths.config.as_path(),
-        edit,
-        &journal,
-        ExpectedConfigState::Applied,
-    ) {
+    match write_current_config_edit(paths, edit, &journal, ExpectedConfigState::Applied) {
         Ok(()) => {}
         Err(CodexSwitchError::RecoveryRequired { reason }) => {
             return mark_recovery(paths, journal, reason);
@@ -639,7 +735,7 @@ fn resume_off(
             "Codex config changed before switch-off completion was committed",
         );
     }
-    remove_journal(paths.state.as_path())?;
+    remove_current_journal(paths)?;
     outcome(paths, CodexSwitchChange::Removed)
 }
 
@@ -651,7 +747,7 @@ fn mark_recovery<T>(
     let reason = reason.into();
     journal.phase = JournalPhase::RecoveryRequired;
     journal.recovery_reason = Some(reason.clone());
-    write_journal(paths.state.as_path(), &journal)?;
+    write_current_journal(paths, &journal)?;
     Err(CodexSwitchError::RecoveryRequired { reason })
 }
 
@@ -672,6 +768,7 @@ fn outcome(
     paths: &SwitchPaths,
     change: CodexSwitchChange,
 ) -> Result<CodexSwitchOutcome, CodexSwitchError> {
+    reject_legacy_switch_state(paths)?;
     let current = read_config_snapshot(paths.config.as_path())?;
     let journal = read_journal(paths.state.as_path())?;
     Ok(CodexSwitchOutcome {
@@ -1458,6 +1555,7 @@ struct SwitchPaths {
     config_fingerprint: String,
     state: PathBuf,
     lock: PathBuf,
+    legacy_state: PathBuf,
 }
 
 impl SwitchPaths {
@@ -1466,11 +1564,13 @@ impl SwitchPaths {
         let state_dir = absolute_path(state_dir.as_path())?;
         let state_dir = resolve_existing_ancestor(state_dir.as_path())?;
         let config = resolve_config_path(crate::config::codex_config_path().as_path())?;
+        let legacy_state = config.with_file_name(LEGACY_STATE_FILE_NAME);
         Ok(Self {
             config_fingerprint: config_path_fingerprint(config.as_path()),
             config,
             state: state_dir.join(STATE_FILE_NAME),
             lock: state_dir.join(LOCK_FILE_NAME),
+            legacy_state,
         })
     }
 }
@@ -1632,6 +1732,10 @@ mod tests {
 
         fn state_path(&self) -> PathBuf {
             self.helper_home.join("state").join(STATE_FILE_NAME)
+        }
+
+        fn legacy_state_path(&self) -> PathBuf {
+            self.codex_home.join(LEGACY_STATE_FILE_NAME)
         }
 
         fn lock_path(&self) -> PathBuf {
@@ -1961,6 +2065,129 @@ request_max_retries = 0
             Err(CodexSwitchError::OrphanedActiveProvider)
         ));
         assert_eq!(env.read_config(), orphaned);
+    }
+
+    #[test]
+    fn legacy_switch_state_requires_previous_version_recovery_without_being_read() {
+        let env = TestEnvironment::new();
+        let original = r#"model_provider = "codex_proxy"
+
+[model_providers.codex_proxy]
+name = "codex-helper"
+base_url = "http://127.0.0.1:3211"
+wire_api = "responses"
+request_max_retries = 0
+"#;
+        let legacy_state = b"\xff\xfe; preserved-auth-material-must-not-appear";
+        env.write_config(original);
+        std::fs::write(env.legacy_state_path(), legacy_state).expect("write legacy state");
+        let resolved_legacy_state =
+            std::fs::canonicalize(env.legacy_state_path()).expect("resolve legacy state");
+        let legacy_metadata =
+            std::fs::symlink_metadata(env.legacy_state_path()).expect("inspect legacy state");
+
+        let status = inspect().expect("legacy state must remain inspectable");
+        assert_eq!(status.phase, CodexSwitchPhase::RecoveryRequired);
+        assert!(!status.managed);
+        assert!(status.enabled);
+        assert_eq!(status.base_url.as_deref(), Some("http://127.0.0.1:3211"));
+        assert_eq!(status.state_path, resolved_legacy_state);
+        let reason = status.recovery_reason.expect("legacy recovery reason");
+        assert!(reason.contains("codex-helper-switch-state.json"));
+        assert!(reason.contains("v0.20.3"));
+        assert!(reason.contains("switch off"));
+        assert!(reason.contains("Do not delete, edit, or share"));
+        assert!(!reason.contains("preserved-auth-material"));
+
+        for intent in [
+            CodexSwitchIntent::On {
+                validated_base_url: ValidatedCodexBaseUrl::local(3211),
+            },
+            CodexSwitchIntent::Off,
+        ] {
+            let error = apply(intent).expect_err("legacy state must block switch mutation");
+            assert!(matches!(
+                &error,
+                CodexSwitchError::LegacySwitchState { path }
+                    if path == &resolved_legacy_state
+            ));
+            let message = error.to_string();
+            assert!(message.contains("codex-helper-switch-state.json"));
+            assert!(message.contains("v0.20.3"));
+            assert!(message.contains("switch off"));
+            assert!(!message.contains("preserved-auth-material"));
+        }
+
+        assert_eq!(env.read_config(), original);
+        let preserved_metadata =
+            std::fs::symlink_metadata(env.legacy_state_path()).expect("inspect preserved state");
+        assert_eq!(preserved_metadata.len(), legacy_metadata.len());
+        assert_eq!(preserved_metadata.file_type(), legacy_metadata.file_type());
+        assert!(!env.state_path().exists());
+        assert!(!env.lock_path().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_legacy_switch_state_symlink_still_blocks_switching() {
+        use std::os::unix::fs::symlink;
+
+        let env = TestEnvironment::new();
+        symlink(
+            env.root.join("missing-legacy-state"),
+            env.legacy_state_path(),
+        )
+        .expect("create dangling legacy state symlink");
+
+        let status = inspect().expect("dangling legacy state must remain diagnosable");
+        assert_eq!(status.phase, CodexSwitchPhase::RecoveryRequired);
+        assert!(
+            status
+                .recovery_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("v0.20.3"))
+        );
+        assert!(matches!(
+            apply(CodexSwitchIntent::Off),
+            Err(CodexSwitchError::LegacySwitchState { .. })
+        ));
+        assert!(std::fs::symlink_metadata(env.legacy_state_path()).is_ok());
+        assert!(!env.lock_path().exists());
+    }
+
+    #[test]
+    fn legacy_switch_state_takes_precedence_over_a_new_journal() {
+        let env = TestEnvironment::new();
+        env.write_config("model_provider = \"openai\"\n");
+        apply(CodexSwitchIntent::On {
+            validated_base_url: ValidatedCodexBaseUrl::local(3211),
+        })
+        .expect("create current switch journal");
+        let applied_config = env.read_config();
+        let current_state = std::fs::read(env.state_path()).expect("read current journal");
+
+        std::fs::write(env.legacy_state_path(), b"legacy recovery authority")
+            .expect("write legacy state");
+
+        let status = inspect().expect("legacy state must remain diagnosable");
+        assert_eq!(status.phase, CodexSwitchPhase::RecoveryRequired);
+        assert!(status.managed);
+        assert!(status.state_path.ends_with(LEGACY_STATE_FILE_NAME));
+        assert!(
+            status
+                .recovery_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("current switch journal also exists"))
+        );
+        assert!(matches!(
+            apply(CodexSwitchIntent::Off),
+            Err(CodexSwitchError::LegacySwitchState { .. })
+        ));
+        assert_eq!(env.read_config(), applied_config);
+        assert_eq!(
+            std::fs::read(env.state_path()).expect("read preserved current journal"),
+            current_state
+        );
     }
 
     #[cfg(unix)]

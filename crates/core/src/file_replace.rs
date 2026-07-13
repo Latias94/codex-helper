@@ -179,6 +179,17 @@ fn preserve_destination_permissions(destination: &Path, staged_file: &File) -> i
     }
 }
 
+fn apply_staged_permissions(
+    destination: &Path,
+    staged_file: &File,
+    explicit_permissions: Option<fs::Permissions>,
+) -> io::Result<()> {
+    match explicit_permissions {
+        Some(permissions) => staged_file.set_permissions(permissions),
+        None => preserve_destination_permissions(destination, staged_file),
+    }
+}
+
 fn before_replace_noop(_staged_path: &Path, _destination: &Path) -> io::Result<()> {
     Ok(())
 }
@@ -282,6 +293,7 @@ struct AtomicWriteOperations<W, S, B, R, D> {
 fn write_bytes_file_with_operations<V, W, S, B, R, D>(
     path: &Path,
     data: &[u8],
+    explicit_permissions: Option<fs::Permissions>,
     validate: V,
     operations: AtomicWriteOperations<W, S, B, R, D>,
 ) -> std::result::Result<(), AtomicWriteError>
@@ -308,10 +320,10 @@ where
 
     let (mut staged_file, mut staged_guard) = create_staged_file(&parent)
         .map_err(|err| AtomicWriteError::before_commit(path, "create staging file", err))?;
+    apply_staged_permissions(path, &staged_file, explicit_permissions)
+        .map_err(|err| AtomicWriteError::before_commit(path, "apply permissions", err))?;
     write_staged(&mut staged_file, data)
         .map_err(|err| AtomicWriteError::before_commit(path, "write staging file", err))?;
-    preserve_destination_permissions(path, &staged_file)
-        .map_err(|err| AtomicWriteError::before_commit(path, "preserve permissions", err))?;
     sync_staged(&mut staged_file)
         .map_err(|err| AtomicWriteError::before_commit(path, "sync staging file", err))?;
     drop(staged_file);
@@ -363,9 +375,22 @@ pub(crate) fn write_bytes_file_validated<V>(
 where
     V: FnOnce(&[u8]) -> io::Result<()>,
 {
+    write_bytes_file_validated_with_permissions(path, data, None, validate)
+}
+
+fn write_bytes_file_validated_with_permissions<V>(
+    path: &Path,
+    data: &[u8],
+    permissions: Option<fs::Permissions>,
+    validate: V,
+) -> std::result::Result<(), AtomicWriteError>
+where
+    V: FnOnce(&[u8]) -> io::Result<()>,
+{
     write_bytes_file_with_operations(
         path,
         data,
+        permissions,
         validate,
         AtomicWriteOperations {
             write_staged: write_staged_file,
@@ -386,6 +411,27 @@ pub async fn write_bytes_file_async(
     data: &[u8],
 ) -> std::result::Result<(), AtomicWriteError> {
     write_bytes_file_validated_async(path, data, |_| Ok(())).await
+}
+
+pub(crate) async fn write_bytes_file_async_with_permissions(
+    path: &Path,
+    data: &[u8],
+    permissions: fs::Permissions,
+) -> std::result::Result<(), AtomicWriteError> {
+    let path = path.to_path_buf();
+    let error_path = path.clone();
+    let data = data.to_vec();
+    tokio::task::spawn_blocking(move || {
+        write_bytes_file_validated_with_permissions(&path, &data, Some(permissions), |_| Ok(()))
+    })
+    .await
+    .map_err(|err| {
+        AtomicWriteError::commit_state_unknown(
+            &error_path,
+            "join blocking writer",
+            io::Error::other(err),
+        )
+    })?
 }
 
 pub(crate) async fn write_bytes_file_validated_async<V>(
@@ -459,6 +505,20 @@ mod tests {
         Err(io::Error::other("injected staging write failure"))
     }
 
+    #[cfg(unix)]
+    fn require_private_mode_before_write(file: &mut File, data: &[u8]) -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = file.metadata()?.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("staging mode was {mode:o}, expected 600"),
+            ));
+        }
+        file.write_all(data)
+    }
+
     fn fail_sync(_file: &mut File) -> io::Result<()> {
         Err(io::Error::other("injected staging sync failure"))
     }
@@ -512,6 +572,36 @@ mod tests {
         assert_eq!(mode & 0o777, 0o640);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn explicit_permissions_are_applied_before_sensitive_bytes_are_written() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TestDir::new();
+        let path = directory.join("backup.toml");
+        write_bytes_file_with_operations(
+            &path,
+            b"token = 'secret'",
+            Some(fs::Permissions::from_mode(0o600)),
+            |_| Ok(()),
+            AtomicWriteOperations {
+                write_staged: require_private_mode_before_write,
+                sync_staged: flush_and_sync_staged_file,
+                before_replace: before_replace_noop,
+                replace: replace_existing_file,
+                sync_parent: sync_parent_directory,
+            },
+        )
+        .expect("write sensitive bytes only after applying private mode");
+
+        let mode = fs::metadata(&path)
+            .expect("read destination mode")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
     #[tokio::test]
     async fn write_bytes_file_async_overwrites_existing_file() {
         let directory = TestDir::new();
@@ -535,6 +625,7 @@ mod tests {
         let err = write_bytes_file_with_operations(
             &path,
             b"new",
+            None,
             |_| Ok(()),
             AtomicWriteOperations {
                 write_staged: fail_write,
@@ -560,6 +651,7 @@ mod tests {
         let err = write_bytes_file_with_operations(
             &path,
             b"new",
+            None,
             |_| Ok(()),
             AtomicWriteOperations {
                 write_staged: write_staged_file,
@@ -604,6 +696,7 @@ mod tests {
         let err = write_bytes_file_with_operations(
             &path,
             b"new",
+            None,
             |_| Ok(()),
             AtomicWriteOperations {
                 write_staged: write_staged_file,
@@ -629,6 +722,7 @@ mod tests {
         let err = write_bytes_file_with_operations(
             &path,
             b"new",
+            None,
             |_| Ok(()),
             AtomicWriteOperations {
                 write_staged: write_staged_file,
@@ -654,6 +748,7 @@ mod tests {
         let err = write_bytes_file_with_operations(
             &path,
             b"new",
+            None,
             |_| Ok(()),
             AtomicWriteOperations {
                 write_staged: write_staged_file,
@@ -679,6 +774,7 @@ mod tests {
         let err = write_bytes_file_with_operations(
             &path,
             b"new",
+            None,
             |_| Ok(()),
             AtomicWriteOperations {
                 write_staged: write_staged_file,
