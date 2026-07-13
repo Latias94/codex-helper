@@ -1,31 +1,109 @@
 import { describe, expect, it } from "vitest";
 
-import type { ApiFinishedRequest, ApiOperatorSummary, ApiUsageDayView } from "@/lib/api/admin-types";
+import type {
+  ApiOperatorRequestSummary,
+  ApiOperatorSummary,
+  ApiUsageBucket,
+  ApiUsageDayView,
+  ApiUsageMetrics,
+} from "@/lib/api/admin-types";
 import {
   mapAdminDashboardData,
   mapProvidersData,
   mapUsageData,
 } from "@/lib/api/mappers";
 
+function usageMetrics(overrides: Partial<ApiUsageMetrics> = {}): ApiUsageMetrics {
+  return {
+    input_tokens: 0,
+    output_tokens: 0,
+    reasoning_tokens: 0,
+    total_tokens: 0,
+    ...overrides,
+  };
+}
+
+function usageBucket(
+  overrides: Omit<Partial<ApiUsageBucket>, "usage"> & {
+    usage?: Partial<ApiUsageMetrics>;
+  } = {},
+): ApiUsageBucket {
+  const { usage, ...bucketOverrides } = overrides;
+  return {
+    requests_total: 0,
+    requests_error: 0,
+    duration_ms_total: 0,
+    requests_with_usage: 0,
+    duration_ms_with_usage_total: 0,
+    generation_ms_total: 0,
+    ttfb_ms_total: 0,
+    ttfb_samples: 0,
+    usage: usageMetrics(usage),
+    ...bucketOverrides,
+  };
+}
+
+function emptyUsageDay(): ApiUsageDayView {
+  return {
+    day: 0,
+    label: "",
+    start_ms: 0,
+    end_ms: 0,
+    generated_at_ms: 0,
+    summary: usageBucket(),
+    hourly: [],
+    provider_rows: [],
+    provider_endpoint_rows: [],
+    model_rows: [],
+    session_rows: [],
+    project_rows: [],
+    retry_gate: {
+      active: 0,
+      active_cooldowns: 0,
+      max_remaining_secs: null,
+      reasons: [],
+    },
+    coverage: {
+      source: "runtime_store",
+      loaded_first_ms: null,
+      loaded_last_ms: null,
+      loaded_requests: 0,
+      day_may_be_partial: false,
+    },
+  };
+}
+
 const operatorSummary: ApiOperatorSummary = {
   api_version: 1,
   service_name: "codex",
   runtime: {
     runtime_loaded_at_ms: Date.now(),
-    configured_active_station: "codex-air",
-    effective_active_station: "codex-air",
+    runtime_source_mtime_ms: null,
+    configured_default_profile: "chatgpt-bridge",
     default_profile: "chatgpt-bridge",
+    default_profile_summary: {
+      name: "chatgpt-bridge",
+      model: null,
+      reasoning_effort: null,
+      service_tier: null,
+      fast_mode: false,
+    },
   },
   counts: {
+    active_requests: 0,
     providers: 2,
     recent_requests: 1,
+    sessions: 0,
+    profiles: 0,
   },
   retry: {
+    configured_profile: "balanced",
     upstream_max_attempts: 2,
     provider_max_attempts: 2,
-  },
-  health: {
-    stations_with_probe_failures: 1,
+    recent_retried_requests: 0,
+    recent_cross_provider_failovers: 0,
+    recent_same_provider_retries: 0,
+    recent_fast_mode_requests: 0,
   },
   providers: [
     {
@@ -38,9 +116,9 @@ const operatorSummary: ApiOperatorSummary = {
         {
           provider_name: "codex-air",
           name: "responses-compact",
-          base_url: "https://ai.input.im/v1",
-          continuity_domain: "relay-cluster-a",
-          effective_continuity_domain: "relay-cluster-a",
+          provider_endpoint_key: "endpoint:sha256:air",
+          origin: "https://ai.input.im",
+          priority: 0,
           configured_enabled: true,
           effective_enabled: true,
           routable: true,
@@ -57,7 +135,9 @@ const operatorSummary: ApiOperatorSummary = {
         {
           provider_name: "backup",
           name: "openai",
-          base_url: "https://api.openai.com/v1",
+          provider_endpoint_key: "endpoint:sha256:backup",
+          origin: "https://api.openai.com",
+          priority: 0,
           configured_enabled: true,
           effective_enabled: true,
           routable: false,
@@ -66,23 +146,27 @@ const operatorSummary: ApiOperatorSummary = {
       ],
     },
   ],
+  sessions: [],
+  profiles: [],
 };
 
-const finishedRequest: ApiFinishedRequest = {
+const finishedRequest: ApiOperatorRequestSummary = {
   id: 7,
-  trace_id: "codex-7",
+  session_key: "session:sha256:test",
   model: "gpt-5.4",
   reasoning_effort: "high",
   service_tier: "priority",
-  station_name: "codex-air",
   provider_id: "codex-air",
-  upstream_base_url: "https://ai.input.im/v1",
-  usage: {
+  endpoint_id: "responses",
+  provider_endpoint_key: "endpoint:sha256:air",
+  route_path: ["default", "codex-air", "responses"],
+  upstream_origin: "https://ai.input.im",
+  usage: usageMetrics({
     input_tokens: 1000,
     output_tokens: 500,
     total_tokens: 1500,
     cached_input_tokens: 200,
-  },
+  }),
   cost: {
     input_cost_usd: "0.001",
     output_cost_usd: "0.002",
@@ -92,6 +176,12 @@ const finishedRequest: ApiFinishedRequest = {
     pricing_source: "operator catalog",
   },
   observability: {
+    attempt_count: 1,
+    route_attempt_count: 1,
+    retried: false,
+    cross_provider_failover: false,
+    same_provider_retry: false,
+    fast_mode: false,
     streaming: true,
   },
   service: "codex",
@@ -107,10 +197,16 @@ const finishedRequest: ApiFinishedRequest = {
 const usageDay: ApiUsageDayView = {
   day: 20_229,
   label: "2026-05-21",
-  summary: {
+  start_ms: Date.UTC(2026, 4, 21),
+  end_ms: Date.UTC(2026, 4, 22),
+  generated_at_ms: Date.UTC(2026, 4, 21, 8),
+  summary: usageBucket({
     requests_total: 12,
     requests_error: 1,
     duration_ms_total: 24_000,
+    requests_with_usage: 12,
+    duration_ms_with_usage_total: 24_000,
+    generation_ms_total: 21_000,
     ttfb_ms_total: 3_000,
     ttfb_samples: 6,
     usage: {
@@ -124,52 +220,65 @@ const usageDay: ApiUsageDayView = {
       confidence: "estimated",
       priced_requests: 12,
     },
-  },
+  }),
   hourly: [
     {
       hour: 7,
-      bucket: {
+      bucket: usageBucket({
         requests_total: 12,
         usage: { total_tokens: 12_000 },
         cost: { total_cost_usd: "0.025", confidence: "estimated" },
-      },
+      }),
     },
   ],
   provider_rows: [
     {
       name: "codex-air",
-      bucket: {
+      bucket: usageBucket({
         requests_total: 12,
         duration_ms_total: 24_000,
         usage: { total_tokens: 12_000 },
         cost: { total_cost_usd: "0.025", confidence: "estimated" },
-      },
+      }),
+    },
+  ],
+  provider_endpoint_rows: [
+    {
+      name: "codex/codex-air/default",
+      bucket: usageBucket({
+        requests_total: 12,
+        duration_ms_total: 24_000,
+        usage: { total_tokens: 12_000 },
+        cost: { total_cost_usd: "0.025", confidence: "estimated" },
+      }),
     },
   ],
   model_rows: [
     {
       name: "gpt-5.4",
-      bucket: {
+      bucket: usageBucket({
         requests_total: 12,
         usage: { total_tokens: 12_000 },
-      },
+      }),
     },
   ],
   project_rows: [
     {
       name: "codex-helper",
-      bucket: {
+      bucket: usageBucket({
         requests_total: 8,
         usage: { total_tokens: 8_000 },
-      },
+      }),
     },
   ],
+  session_rows: [],
   coverage: {
-    source: "request-ledger",
+    source: "runtime_store",
+    loaded_first_ms: null,
+    loaded_last_ms: null,
     loaded_requests: 12,
-    scanned_lines: 12,
     day_may_be_partial: true,
-    partial_reason: "replay started after local day start",
+    partial_reason: "loaded data starts after local day start",
   },
   retry_gate: {
     active: 2,
@@ -185,35 +294,28 @@ describe("admin API mappers", () => {
       summary: operatorSummary,
       recentRequests: [finishedRequest],
       usageDay,
-      usageSummary: [
-        {
-          group_value: "codex-air",
-          aggregate: {
-            requests: 1,
-            total_tokens: 1500,
-            duration_ms_total: 1500,
-          },
-        },
-      ],
-      adminBaseUrl: "http://127.0.0.1:4211",
+      endpoint: {
+        proxyPort: 3211,
+        adminPort: 4211,
+        proxyBaseUrl: "http://127.0.0.1:3211",
+        adminBaseUrl: "http://127.0.0.1:4211",
+      },
       appVersion: "0.20.0",
+      capturedAtMs: Date.now(),
     });
 
     expect(data.runtime.port).toBe(3211);
     expect(data.runtime.adminPort).toBe(4211);
     expect(data.runtime.provider).toBe("codex-air");
     expect(data.providers[0]).toMatchObject({
-      name: "CodeX Air",
-      baseUrl: "https://ai.input.im/v1",
-      continuityDomain: "relay-cluster-a",
-      host: "ai.input.im",
+      name: "codex-air",
+      alias: "CodeX Air",
       endpointCount: 1,
-      editable: true,
-      health: "Healthy",
-      active: true,
+      routableEndpoints: 1,
     });
+    expect(data.providers[0]).not.toHaveProperty("active");
     expect(data.recentRequests[0]).toMatchObject({
-      id: "codex-7",
+      id: "7",
       model: "gpt-5.4",
       status: "ok",
       cost: "$0.0031",
@@ -221,31 +323,60 @@ describe("admin API mappers", () => {
     expect(data.metrics.find((metric) => metric.label === "今日请求")?.value).toBe("12");
   });
 
-  it("maps providers into route-order data", () => {
+  it("maps canonical provider inventory without fabricating route order", () => {
     const data = mapProvidersData(operatorSummary);
 
     expect(data.providers).toHaveLength(2);
-    expect(data.providers[0].capabilities).toContain("continuity domain");
-    expect(data.providers[1].health).toBe("Error");
-    expect(data.routeOrder[0].active).toBe(true);
+    expect(data.providers[0]).not.toHaveProperty("capabilities");
+    expect(data.providers[1]).toMatchObject({
+      configuredEnabled: true,
+      effectiveEnabled: true,
+      routableEndpoints: 0,
+    });
+    expect(data.providers[1].endpoints[0]).toMatchObject({
+      runtimeState: "breaker_open",
+      routable: false,
+    });
+    expect(Object.keys(data)).toEqual(["providers"]);
   });
 
-  it("maps active policy action projections into provider health", () => {
+  it("does not infer an active provider without an explicit canonical fact", () => {
+    const data = mapAdminDashboardData({
+      summary: operatorSummary,
+      recentRequests: [],
+      usageDay: emptyUsageDay(),
+      endpoint: {
+        proxyPort: 3211,
+        adminPort: 4211,
+        proxyBaseUrl: "http://127.0.0.1:3211",
+        adminBaseUrl: "http://127.0.0.1:4211",
+      },
+      appVersion: "0.20.0",
+      capturedAtMs: Date.now(),
+    });
+
+    expect(data.runtime.provider).toBe("unknown");
+    expect(data.providers.every((provider) => !("active" in provider))).toBe(true);
+    expect(data.metrics).toContainEqual(expect.objectContaining({
+      label: "最近供应商",
+      value: "unknown",
+    }));
+  });
+
+  it("maps active policy action projections into provider control inventory", () => {
     const data = mapProvidersData({
       ...operatorSummary,
       providers: [
         {
-          ...operatorSummary.providers![0],
+          ...operatorSummary.providers[0],
           endpoints: [
             {
-              ...operatorSummary.providers![0].endpoints![0],
+              ...operatorSummary.providers[0].endpoints[0],
               policy_actions: [
                 {
                   active_cooldown: true,
                   code: "cooldown",
-                  reason: "upstream_rate_limited",
                   cooldown_remaining_secs: 30,
-                  action_id: "a1",
                 },
               ],
               runtime_state_override: "breaker_open",
@@ -255,7 +386,11 @@ describe("admin API mappers", () => {
       ],
     });
 
-    expect(data.providers[0].health).toBe("Warning");
+    expect(data.providers[0].endpoints[0]).toMatchObject({
+      runtimeState: "normal",
+      routable: true,
+      policyActionCount: 1,
+    });
     expect(data.providers[0].controlSummary).toBe("2 active control events");
     expect(data.providers[0].controlBadges).toEqual([
       expect.objectContaining({
@@ -264,7 +399,7 @@ describe("admin API mappers", () => {
         tone: "warning",
       }),
       expect.objectContaining({
-        key: expect.stringContaining("policy:a1"),
+        key: expect.stringContaining("policy:cooldown"),
         label: "cooldown",
         detail: expect.stringContaining("remaining 30s"),
         tone: "warning",
@@ -272,28 +407,64 @@ describe("admin API mappers", () => {
     ]);
   });
 
-  it("maps request-ledger rows into usage table rows and summary cards", () => {
+  it("does not rebuild daily economics from recent request rows", () => {
     const data = mapUsageData({
       recentRequests: [finishedRequest],
-      usageSummary: [],
+      usageDay: emptyUsageDay(),
     });
 
-    expect(data.summary.totalRows).toBe(1);
-    expect(data.summary.estimatedCost).toBe("$0.0031");
+    expect(data.summary.totalRows).toBe(0);
+    expect(data.summary.totalTokens).toBe("0");
+    expect(data.summary.estimatedCost).toBe("unknown");
     expect(data.rows[0]).toMatchObject({
       provider: "codex-air",
       type: "流式",
       firstToken: "420ms",
       duration: "1.5s",
+      cost: "$0.0031",
     });
-    expect(data.rows[0].tokens.cache).toBe("20%");
+    expect(data.rows[0].tokens.cache).toBe("—");
+  });
+
+  it("does not reconstruct canonical totals or cache rate from token aliases", () => {
+    const data = mapUsageData({
+      usageDay: {
+        ...usageDay,
+        summary: {
+          ...usageDay.summary,
+          usage: usageMetrics({
+            input_tokens: 10_000,
+            output_tokens: 2_000,
+            cached_input_tokens: 4_000,
+            cache_creation_input_tokens: 1_000,
+          }),
+        },
+        hourly: [
+          {
+            hour: 7,
+            bucket: usageBucket({
+              requests_total: 12,
+              usage: {
+                input_tokens: 10_000,
+                output_tokens: 2_000,
+                cache_read_input_tokens: 4_000,
+              },
+            }),
+          },
+        ],
+      },
+      recentRequests: [],
+    });
+
+    expect(data.summary.totalTokens).toBe("0");
+    expect(data.summary.cacheRate).toBe("—");
+    expect(data.hourly[7].totalTokens).toBe(0);
   });
 
   it("uses usage_day as the canonical daily usage source", () => {
     const data = mapUsageData({
       usageDay,
       recentRequests: [],
-      usageSummary: [],
     });
 
     expect(data.summary).toMatchObject({
@@ -307,9 +478,15 @@ describe("admin API mappers", () => {
     expect(data.rows).toHaveLength(0);
     expect(data.hourly[7]).toMatchObject({ requests: 12, totalTokens: 12000 });
     expect(data.providerRows[0]).toMatchObject({ name: "codex-air", requests: 12 });
-    expect(data.coverage).toMatchObject({
+    expect(data.providerEndpointRows[0]).toMatchObject({
+      name: "codex/codex-air/default",
+      requests: 12,
+    });
+    expect(data.coverage).toEqual({
+      source: "runtime_store",
       isPartial: true,
-      reason: "replay started after local day start",
+      reason: "loaded data starts after local day start",
+      loadedRequests: 12,
     });
     expect(data.retryGate).toMatchObject({
       active: 2,
@@ -325,13 +502,19 @@ describe("admin API mappers", () => {
         {
           ...finishedRequest,
           status_code: 429,
-          provider_signals: [{ kind: "rate_limit", code: "provider_rate_limited" }],
-          policy_actions: [{ kind: "cooldown", code: "provider_cooldown" }],
+          provider_signal_codes: ["provider_rate_limited"],
+          policy_action_codes: ["provider_cooldown"],
         },
       ],
-      usageSummary: [],
-      adminBaseUrl: "http://127.0.0.1:4211",
+      usageDay,
+      endpoint: {
+        proxyPort: 3211,
+        adminPort: 4211,
+        proxyBaseUrl: "http://127.0.0.1:3211",
+        adminBaseUrl: "http://127.0.0.1:4211",
+      },
       appVersion: "0.20.0",
+      capturedAtMs: Date.now(),
     });
 
     expect(data.recentRequests[0]).toMatchObject({
@@ -349,20 +532,27 @@ describe("admin API mappers", () => {
           status_code: 429,
           retry: {
             attempts: 2,
-            upstream_chain: [],
             route_attempts: [
               {
-                decision: "failed_status",
-                provider_signals: [{ kind: "rate_limit" }],
-                policy_actions: [{ kind: "cooldown" }],
+                attempt_index: 0,
+                code: "failed_status",
+                skipped: false,
+                provider_signal_codes: ["rate_limit"],
+                policy_action_codes: ["cooldown"],
               },
             ],
           },
         },
       ],
-      usageSummary: [],
-      adminBaseUrl: "http://127.0.0.1:4211",
+      usageDay,
+      endpoint: {
+        proxyPort: 3211,
+        adminPort: 4211,
+        proxyBaseUrl: "http://127.0.0.1:3211",
+        adminBaseUrl: "http://127.0.0.1:4211",
+      },
       appVersion: "0.20.0",
+      capturedAtMs: Date.now(),
     });
 
     expect(data.recentRequests[0]).toMatchObject({

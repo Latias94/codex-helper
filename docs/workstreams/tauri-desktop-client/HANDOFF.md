@@ -3,6 +3,8 @@
 Status: Closed with follow-ups
 Last updated: 2026-05-22
 
+> Historical product status (superseded 2026-07-12): the visual exploration and packaging evidence remain useful, but the current desktop client consumes the typed, redacted operator read model and does not mutate provider, routing, or config state through the remote control plane. Client patch presets and auth-facade controls shown in historical briefs/prototypes are not current product features.
+
 ## Current State
 
 This workstream has reached replacement-readiness closeout. The Tauri desktop client is the preferred long-term replacement path for the existing egui GUI, but the released egui GUI remains in place until desktop parity and packaging gates pass. See `REPLACEMENT_READINESS.md` for the current decision, parity gaps, and follow-on split.
@@ -456,5 +458,4 @@ Implementation structure expectation:
 - Prefer admin API for live data and Tauri commands only for host-local desktop concerns.
 - Keep egui GUI in place until replacement parity is proven.
 - Any future code tasks should update `EVIDENCE_AND_GATES.md` with fresh command evidence.
-
 

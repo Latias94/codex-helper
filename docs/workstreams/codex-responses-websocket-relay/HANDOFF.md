@@ -1,7 +1,9 @@
 # Codex Responses WebSocket Relay — Handoff
 
-Status: Active
+Status: Historical (superseded 2026-07-12)
 Last updated: 2026-05-19
+
+> Historical status (superseded 2026-07-12): the client-side WebSocket switch and preset compatibility described below were removed. Responses WebSocket support is now a provider/catalog capability, and the relay performs the upstream handshake before downstream upgrade while binding each accepted connection to one captured endpoint/runtime revision.
 
 ## Current objective
 
@@ -36,4 +38,3 @@ The first shippable slice is in place:
    behavior more closely for certain relays.
 3. If needed, report the ciii WebSocket close code 1011 to the relay operator; its HTTP endpoints
    pass validation probes, so the failure is specific to WebSocket upstream proxying.
-

@@ -2,6 +2,9 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::config::UpstreamAuth;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ProviderEndpointKey {
@@ -91,136 +94,168 @@ impl fmt::Display for ContinuityDomainKey {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct LegacyUpstreamKey {
-    pub service_name: String,
-    pub station_name: String,
-    pub upstream_index: usize,
-}
-
-impl LegacyUpstreamKey {
-    pub fn new(
-        service_name: impl Into<String>,
-        station_name: impl Into<String>,
-        upstream_index: usize,
-    ) -> Self {
-        Self {
-            service_name: service_name.into(),
-            station_name: station_name.into(),
-            upstream_index,
-        }
-    }
-
-    pub fn stable_key(&self) -> String {
-        format!(
-            "{}/{}/{}",
-            self.service_name, self.station_name, self.upstream_index
-        )
-    }
-}
-
-impl fmt::Display for LegacyUpstreamKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.stable_key().as_str())
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeUpstreamIdentity {
     pub provider_endpoint: ProviderEndpointKey,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub compatibility: Option<LegacyUpstreamKey>,
     pub base_url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuity_domain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_scope: Option<String>,
 }
 
 impl RuntimeUpstreamIdentity {
-    pub fn new(
-        provider_endpoint: ProviderEndpointKey,
-        compatibility: Option<LegacyUpstreamKey>,
-        base_url: impl Into<String>,
-    ) -> Self {
+    pub fn new(provider_endpoint: ProviderEndpointKey, base_url: impl Into<String>) -> Self {
         Self {
             provider_endpoint,
-            compatibility,
             base_url: base_url.into(),
             continuity_domain: None,
+            credential_scope: None,
         }
     }
 
     pub fn new_with_continuity_domain(
         provider_endpoint: ProviderEndpointKey,
-        compatibility: Option<LegacyUpstreamKey>,
         base_url: impl Into<String>,
         continuity_domain: Option<String>,
     ) -> Self {
         Self {
             provider_endpoint,
-            compatibility,
             base_url: base_url.into(),
             continuity_domain: continuity_domain
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
+            credential_scope: None,
         }
+    }
+
+    pub fn new_with_auth(
+        provider_endpoint: ProviderEndpointKey,
+        base_url: impl Into<String>,
+        continuity_domain: Option<String>,
+        auth: &UpstreamAuth,
+    ) -> Self {
+        Self {
+            provider_endpoint,
+            base_url: base_url.into(),
+            continuity_domain: continuity_domain
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            credential_scope: runtime_credential_scope(auth),
+        }
+    }
+
+    pub fn policy_route_scope(&self) -> String {
+        let mut digest = Sha256::new();
+        digest.update(b"codex-helper:runtime-upstream-policy-scope:v2\0");
+        let provider_endpoint = self.provider_endpoint.stable_key();
+        for value in [provider_endpoint.as_bytes(), self.base_url.as_bytes()] {
+            digest.update((value.len() as u64).to_be_bytes());
+            digest.update(value);
+        }
+        match self.continuity_domain.as_deref() {
+            Some(domain) => {
+                digest.update([1]);
+                digest.update((domain.len() as u64).to_be_bytes());
+                digest.update(domain.as_bytes());
+            }
+            None => digest.update([0]),
+        }
+        match self.credential_scope.as_deref() {
+            Some(scope) => {
+                digest.update([1]);
+                digest.update((scope.len() as u64).to_be_bytes());
+                digest.update(scope.as_bytes());
+            }
+            None => digest.update([0]),
+        }
+        format!("sha256:{:x}", digest.finalize())
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeUpstreamCompatibilityChange {
-    pub provider_endpoint: ProviderEndpointKey,
-    pub previous_compatibility: Option<LegacyUpstreamKey>,
-    pub current_compatibility: Option<LegacyUpstreamKey>,
+fn runtime_credential_scope(auth: &UpstreamAuth) -> Option<String> {
+    let mut digest = Sha256::new();
+    digest.update(b"codex-helper:runtime-upstream-credentials:v1\0");
+    let mut present = false;
+    present |= hash_effective_credential(
+        &mut digest,
+        b"bearer",
+        auth.auth_token.as_deref(),
+        auth.auth_token_env.as_deref(),
+    );
+    present |= hash_effective_credential(
+        &mut digest,
+        b"api-key",
+        auth.api_key.as_deref(),
+        auth.api_key_env.as_deref(),
+    );
+    present.then(|| format!("sha256:{:x}", digest.finalize()))
+}
+
+fn hash_effective_credential(
+    digest: &mut Sha256,
+    kind: &[u8],
+    inline: Option<&str>,
+    env_name: Option<&str>,
+) -> bool {
+    digest.update((kind.len() as u64).to_be_bytes());
+    digest.update(kind);
+    if let Some(value) = inline.filter(|value| !value.trim().is_empty()) {
+        digest.update([1]);
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value.as_bytes());
+        return true;
+    }
+    let Some(env_name) = env_name.filter(|value| !value.trim().is_empty()) else {
+        digest.update([0]);
+        return false;
+    };
+    digest.update([2]);
+    digest.update((env_name.len() as u64).to_be_bytes());
+    digest.update(env_name.as_bytes());
+    match std::env::var(env_name) {
+        Ok(value) if !value.trim().is_empty() => {
+            digest.update([1]);
+            digest.update((value.len() as u64).to_be_bytes());
+            digest.update(value.as_bytes());
+        }
+        _ => digest.update([0]),
+    }
+    true
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct RuntimeUpstreamIdentityMigrationPlan {
+pub struct RuntimeUpstreamIdentityDelta {
     pub retained: Vec<RuntimeUpstreamIdentity>,
     pub added: Vec<RuntimeUpstreamIdentity>,
     pub removed: Vec<RuntimeUpstreamIdentity>,
-    pub compatibility_changed: Vec<RuntimeUpstreamCompatibilityChange>,
 }
 
-pub fn plan_runtime_upstream_identity_migration(
+pub fn diff_runtime_upstream_identities(
     previous: &[RuntimeUpstreamIdentity],
     current: &[RuntimeUpstreamIdentity],
-) -> RuntimeUpstreamIdentityMigrationPlan {
+) -> RuntimeUpstreamIdentityDelta {
     let previous_by_endpoint = identities_by_provider_endpoint(previous);
     let current_by_endpoint = identities_by_provider_endpoint(current);
-    let mut plan = RuntimeUpstreamIdentityMigrationPlan::default();
+    let mut delta = RuntimeUpstreamIdentityDelta::default();
 
     for current_identity in current_by_endpoint.values() {
         match previous_by_endpoint.get(&current_identity.provider_endpoint) {
-            Some(previous_identity)
-                if previous_identity.base_url == current_identity.base_url
-                    && previous_identity.continuity_domain
-                        == current_identity.continuity_domain =>
-            {
-                plan.retained.push(current_identity.clone());
-                if previous_identity.compatibility != current_identity.compatibility {
-                    plan.compatibility_changed
-                        .push(RuntimeUpstreamCompatibilityChange {
-                            provider_endpoint: current_identity.provider_endpoint.clone(),
-                            previous_compatibility: previous_identity.compatibility.clone(),
-                            current_compatibility: current_identity.compatibility.clone(),
-                        });
-                }
+            Some(previous_identity) if previous_identity == current_identity => {
+                delta.retained.push(current_identity.clone());
             }
-            _ => plan.added.push(current_identity.clone()),
+            _ => delta.added.push(current_identity.clone()),
         }
     }
 
     for previous_identity in previous_by_endpoint.values() {
         match current_by_endpoint.get(&previous_identity.provider_endpoint) {
-            Some(current_identity)
-                if current_identity.base_url == previous_identity.base_url
-                    && current_identity.continuity_domain
-                        == previous_identity.continuity_domain => {}
-            _ => plan.removed.push(previous_identity.clone()),
+            Some(current_identity) if current_identity == previous_identity => {}
+            _ => delta.removed.push(previous_identity.clone()),
         }
     }
 
-    plan
+    delta
 }
 
 fn identities_by_provider_endpoint(
@@ -235,6 +270,7 @@ fn identities_by_provider_endpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::UpstreamAuth;
 
     #[test]
     fn provider_endpoint_key_uses_stable_service_provider_endpoint_shape() {
@@ -242,14 +278,6 @@ mod tests {
 
         assert_eq!(key.stable_key(), "codex/openai/default");
         assert_eq!(key.to_string(), "codex/openai/default");
-    }
-
-    #[test]
-    fn legacy_upstream_key_uses_stable_service_station_index_shape() {
-        let key = LegacyUpstreamKey::new("codex", "routing", 2);
-
-        assert_eq!(key.stable_key(), "codex/routing/2");
-        assert_eq!(key.to_string(), "codex/routing/2");
     }
 
     #[test]
@@ -275,10 +303,9 @@ mod tests {
     }
 
     #[test]
-    fn runtime_identity_serializes_both_target_and_compatibility_keys() {
+    fn runtime_identity_serializes_canonical_endpoint_and_continuity_facts() {
         let identity = RuntimeUpstreamIdentity::new_with_continuity_domain(
             ProviderEndpointKey::new("codex", "openai", "default"),
-            Some(LegacyUpstreamKey::new("codex", "routing", 0)),
             "https://api.openai.com/v1",
             Some("official-openai:acct-1".to_string()),
         );
@@ -290,11 +317,6 @@ mod tests {
             Some("openai")
         );
         assert_eq!(
-            value["compatibility"]["station_name"].as_str(),
-            Some("routing")
-        );
-        assert_eq!(value["compatibility"]["upstream_index"].as_u64(), Some(0));
-        assert_eq!(
             value["base_url"].as_str(),
             Some("https://api.openai.com/v1")
         );
@@ -305,108 +327,137 @@ mod tests {
     }
 
     #[test]
-    fn migration_plan_retains_provider_endpoint_state_across_legacy_index_changes() {
-        let previous = vec![RuntimeUpstreamIdentity::new(
-            ProviderEndpointKey::new("codex", "input", "default"),
-            Some(LegacyUpstreamKey::new("codex", "routing", 1)),
-            "https://api.example/v1",
-        )];
-        let current = vec![RuntimeUpstreamIdentity::new(
-            ProviderEndpointKey::new("codex", "input", "default"),
-            Some(LegacyUpstreamKey::new("codex", "routing", 0)),
-            "https://api.example/v1",
-        )];
+    fn policy_route_scope_changes_with_origin_and_continuity_identity() {
+        let endpoint = ProviderEndpointKey::new("codex", "openai", "default");
+        let original = RuntimeUpstreamIdentity::new_with_continuity_domain(
+            endpoint.clone(),
+            "https://api.openai.com/v1",
+            Some("account-a".to_string()),
+        );
+        let changed_origin = RuntimeUpstreamIdentity::new_with_continuity_domain(
+            endpoint.clone(),
+            "https://relay.example/v1",
+            Some("account-a".to_string()),
+        );
+        let changed_continuity = RuntimeUpstreamIdentity::new_with_continuity_domain(
+            endpoint,
+            "https://api.openai.com/v1",
+            Some("account-b".to_string()),
+        );
 
-        let plan = plan_runtime_upstream_identity_migration(&previous, &current);
-
-        assert_eq!(plan.retained, current);
-        assert!(plan.added.is_empty());
-        assert!(plan.removed.is_empty());
-        assert_eq!(plan.compatibility_changed.len(), 1);
-        assert_eq!(
-            plan.compatibility_changed[0].provider_endpoint.stable_key(),
-            "codex/input/default"
+        assert_eq!(original.policy_route_scope(), original.policy_route_scope());
+        assert_ne!(
+            original.policy_route_scope(),
+            changed_origin.policy_route_scope()
         );
-        assert_eq!(
-            plan.compatibility_changed[0]
-                .previous_compatibility
-                .as_ref()
-                .map(LegacyUpstreamKey::stable_key)
-                .as_deref(),
-            Some("codex/routing/1")
+        assert_ne!(
+            original.policy_route_scope(),
+            changed_continuity.policy_route_scope()
         );
-        assert_eq!(
-            plan.compatibility_changed[0]
-                .current_compatibility
-                .as_ref()
-                .map(LegacyUpstreamKey::stable_key)
-                .as_deref(),
-            Some("codex/routing/0")
-        );
+        assert!(original.policy_route_scope().starts_with("sha256:"));
+        assert!(!original.policy_route_scope().contains("api.openai.com"));
     }
 
     #[test]
-    fn migration_plan_replaces_provider_endpoint_state_when_base_url_changes() {
+    fn identity_delta_retains_unchanged_provider_endpoint_state() {
         let previous = vec![RuntimeUpstreamIdentity::new(
             ProviderEndpointKey::new("codex", "input", "default"),
-            Some(LegacyUpstreamKey::new("codex", "routing", 0)),
+            "https://api.example/v1",
+        )];
+        let current = previous.clone();
+
+        let delta = diff_runtime_upstream_identities(&previous, &current);
+
+        assert_eq!(delta.retained, current);
+        assert!(delta.added.is_empty());
+        assert!(delta.removed.is_empty());
+    }
+
+    #[test]
+    fn identity_delta_replaces_provider_endpoint_state_when_base_url_changes() {
+        let previous = vec![RuntimeUpstreamIdentity::new(
+            ProviderEndpointKey::new("codex", "input", "default"),
             "https://old.example/v1",
         )];
         let current = vec![RuntimeUpstreamIdentity::new(
             ProviderEndpointKey::new("codex", "input", "default"),
-            Some(LegacyUpstreamKey::new("codex", "routing", 0)),
             "https://new.example/v1",
         )];
 
-        let plan = plan_runtime_upstream_identity_migration(&previous, &current);
+        let delta = diff_runtime_upstream_identities(&previous, &current);
 
-        assert!(plan.retained.is_empty());
-        assert_eq!(plan.added, current);
-        assert_eq!(plan.removed, previous);
-        assert!(plan.compatibility_changed.is_empty());
+        assert!(delta.retained.is_empty());
+        assert_eq!(delta.added, current);
+        assert_eq!(delta.removed, previous);
     }
 
     #[test]
-    fn migration_plan_replaces_provider_endpoint_state_when_continuity_domain_changes() {
+    fn identity_delta_replaces_provider_endpoint_state_when_continuity_domain_changes() {
         let previous = vec![RuntimeUpstreamIdentity::new_with_continuity_domain(
             ProviderEndpointKey::new("codex", "input", "default"),
-            Some(LegacyUpstreamKey::new("codex", "routing", 0)),
             "https://api.example/v1",
             Some("old-domain".to_string()),
         )];
         let current = vec![RuntimeUpstreamIdentity::new_with_continuity_domain(
             ProviderEndpointKey::new("codex", "input", "default"),
-            Some(LegacyUpstreamKey::new("codex", "routing", 0)),
             "https://api.example/v1",
             Some("new-domain".to_string()),
         )];
 
-        let plan = plan_runtime_upstream_identity_migration(&previous, &current);
+        let delta = diff_runtime_upstream_identities(&previous, &current);
 
-        assert!(plan.retained.is_empty());
-        assert_eq!(plan.added, current);
-        assert_eq!(plan.removed, previous);
-        assert!(plan.compatibility_changed.is_empty());
+        assert!(delta.retained.is_empty());
+        assert_eq!(delta.added, current);
+        assert_eq!(delta.removed, previous);
     }
 
     #[test]
-    fn migration_plan_classifies_added_and_removed_provider_endpoints() {
+    fn identity_delta_replaces_provider_endpoint_state_when_credentials_change() {
+        let endpoint = ProviderEndpointKey::new("codex", "input", "default");
+        let previous = vec![RuntimeUpstreamIdentity::new_with_auth(
+            endpoint.clone(),
+            "https://api.example/v1",
+            None,
+            &UpstreamAuth {
+                auth_token: Some("account-a-secret".to_string()),
+                ..UpstreamAuth::default()
+            },
+        )];
+        let current = vec![RuntimeUpstreamIdentity::new_with_auth(
+            endpoint,
+            "https://api.example/v1",
+            None,
+            &UpstreamAuth {
+                auth_token: Some("account-b-secret".to_string()),
+                ..UpstreamAuth::default()
+            },
+        )];
+
+        let delta = diff_runtime_upstream_identities(&previous, &current);
+
+        assert!(delta.retained.is_empty());
+        assert_eq!(delta.added, current);
+        assert_eq!(delta.removed, previous);
+        let serialized = serde_json::to_string(&delta.added).expect("serialize safe identity");
+        assert!(!serialized.contains("account-a-secret"));
+        assert!(!serialized.contains("account-b-secret"));
+    }
+
+    #[test]
+    fn identity_delta_classifies_added_and_removed_provider_endpoints() {
         let previous = vec![RuntimeUpstreamIdentity::new(
             ProviderEndpointKey::new("codex", "old", "default"),
-            Some(LegacyUpstreamKey::new("codex", "routing", 0)),
             "https://old.example/v1",
         )];
         let current = vec![RuntimeUpstreamIdentity::new(
             ProviderEndpointKey::new("codex", "new", "default"),
-            Some(LegacyUpstreamKey::new("codex", "routing", 0)),
             "https://new.example/v1",
         )];
 
-        let plan = plan_runtime_upstream_identity_migration(&previous, &current);
+        let delta = diff_runtime_upstream_identities(&previous, &current);
 
-        assert!(plan.retained.is_empty());
-        assert_eq!(plan.added, current);
-        assert_eq!(plan.removed, previous);
-        assert!(plan.compatibility_changed.is_empty());
+        assert!(delta.retained.is_empty());
+        assert_eq!(delta.added, current);
+        assert_eq!(delta.removed, previous);
     }
 }

@@ -105,7 +105,7 @@ pub(super) async fn handle_key_session_transcript(ui: &mut UiState, key: KeyEven
             true
         }
         KeyCode::Char('L') => {
-            super::normal::toggle_language(ui).await;
+            super::normal::toggle_language(ui);
             true
         }
         _ => false,

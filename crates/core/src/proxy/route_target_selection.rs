@@ -1,63 +1,32 @@
-use axum::http::StatusCode;
+use std::time::Duration;
 
-use crate::logging::{RouteAttemptLog, log_retry_trace};
+use crate::config::SchedulingPreset;
+use crate::logging::log_control_trace_event;
 use crate::routing_ir::{
     RouteCandidate, RoutePlanAttemptSelection, RoutePlanAttemptState, RoutePlanExecutor,
     RoutePlanRuntimeState, RoutePlanTemplate,
 };
+use crate::runtime_store::ProviderPolicySnapshot;
 
 use super::ProxyService;
-use super::attempt_target::AttemptTarget;
-use super::concurrency_limits::{ConcurrencyAcquireError, ConcurrencyPermit};
+use super::concurrency_limits::{
+    ConcurrencyAcquireError, ConcurrencyLimit, ConcurrencyPermit, ConcurrencyWaitPolicy,
+};
 use super::request_continuity::RequestContinuityContract;
 use super::route_affinity::apply_session_route_affinity_for_template;
-use super::route_unavailability::route_unavailable_report;
-
-pub(super) struct RouteGraphTargetSelection {
-    pub(super) target: AttemptTarget,
-    pub(super) avoided_candidate_indices: Vec<usize>,
-    pub(super) avoided_total: usize,
-    pub(super) total_upstreams: usize,
-    pub(super) concurrency_permit: Option<ConcurrencyPermit>,
-}
-
-pub(super) struct RouteGraphSelectionFailure {
-    pub(super) status: StatusCode,
-    pub(super) message: String,
-    pub(super) route_attempts: Vec<RouteAttemptLog>,
-}
-
-pub(super) struct WebSocketRouteGraphSelectionParams<'a, 'b> {
-    pub(super) proxy: &'b ProxyService,
-    pub(super) executor: &'a RoutePlanExecutor<'a>,
-    pub(super) runtime: &'b RoutePlanRuntimeState,
-    pub(super) route_state: &'b mut RoutePlanAttemptState,
-    pub(super) request_id: u64,
-    pub(super) request_model: Option<&'b str>,
-    pub(super) request_is_remote_compaction: bool,
-    pub(super) continuity_contract: RequestContinuityContract,
-}
-
-impl RouteGraphSelectionFailure {
-    fn new(status: StatusCode, message: impl Into<String>) -> Self {
-        Self {
-            status,
-            message: message.into(),
-            route_attempts: Vec::new(),
-        }
-    }
-}
 
 pub(super) async fn route_graph_runtime_for_request(
     proxy: &ProxyService,
     template: &RoutePlanTemplate,
+    runtime_revision: u64,
+    provider_policy: &ProviderPolicySnapshot,
     session_id: Option<&str>,
 ) -> RoutePlanRuntimeState {
     let mut runtime = proxy
         .state
-        .route_plan_runtime_state_for_provider_endpoints(proxy.service_name)
+        .route_plan_runtime_state_with_provider_policy(proxy.service_name, provider_policy)
         .await;
-    apply_concurrency_snapshots_to_runtime(proxy, template, &mut runtime);
+    apply_concurrency_snapshots_to_runtime(proxy, template, runtime_revision, &mut runtime);
     apply_session_route_affinity_for_template(proxy, session_id, template, &mut runtime).await;
     runtime
 }
@@ -65,6 +34,7 @@ pub(super) async fn route_graph_runtime_for_request(
 pub(super) fn apply_concurrency_snapshots_to_runtime(
     proxy: &ProxyService,
     template: &RoutePlanTemplate,
+    runtime_revision: u64,
     runtime: &mut RoutePlanRuntimeState,
 ) {
     for candidate in &template.candidates {
@@ -81,6 +51,9 @@ pub(super) fn apply_concurrency_snapshots_to_runtime(
         else {
             continue;
         };
+        let Some(limit) = ConcurrencyLimit::new(limit, runtime_revision) else {
+            continue;
+        };
         let snapshot = proxy.concurrency_limiter.snapshot(key.as_str(), limit);
         let mut state = runtime.provider_endpoint(&provider_endpoint);
         state.concurrency_saturated = snapshot.saturated;
@@ -90,15 +63,17 @@ pub(super) fn apply_concurrency_snapshots_to_runtime(
     }
 }
 
-pub(super) fn try_acquire_candidate_concurrency_permit(
+pub(super) async fn acquire_candidate_concurrency_permit(
     proxy: &ProxyService,
     template: &RoutePlanTemplate,
     candidate: &RouteCandidate,
+    runtime_revision: u64,
+    session_id: Option<&str>,
 ) -> Result<Option<ConcurrencyPermit>, ConcurrencyAcquireError> {
-    let Some(limit) = candidate.concurrency.max_concurrent_requests else {
+    let Some(limit_value) = candidate.concurrency.max_concurrent_requests else {
         return Ok(None);
     };
-    if limit == 0 {
+    if limit_value == 0 {
         return Ok(None);
     }
     let provider_endpoint = template.candidate_provider_endpoint_key(candidate);
@@ -108,7 +83,66 @@ pub(super) fn try_acquire_candidate_concurrency_permit(
     else {
         return Ok(None);
     };
-    proxy.concurrency_limiter.try_acquire(key, limit).map(Some)
+    let Some(limit) = ConcurrencyLimit::new(limit_value, runtime_revision) else {
+        return Ok(None);
+    };
+    proxy
+        .concurrency_limiter
+        .acquire(
+            key,
+            limit,
+            session_id.map(ToOwned::to_owned),
+            concurrency_wait_policy(template.scheduling_preset, limit_value),
+        )
+        .await
+        .map(Some)
+}
+
+pub(super) fn runtime_for_capacity_wait_selection(
+    template: &RoutePlanTemplate,
+    runtime: &RoutePlanRuntimeState,
+) -> RoutePlanRuntimeState {
+    let mut selection_runtime = runtime.clone();
+    if template.scheduling_preset == SchedulingPreset::ThroughputFirst {
+        return selection_runtime;
+    }
+    for candidate in &template.candidates {
+        clear_candidate_concurrency_saturation(template, candidate, &mut selection_runtime);
+    }
+    selection_runtime
+}
+
+pub(super) fn runtime_for_acquired_candidate_revalidation(
+    template: &RoutePlanTemplate,
+    runtime: &RoutePlanRuntimeState,
+    candidate: &RouteCandidate,
+) -> RoutePlanRuntimeState {
+    let mut validation_runtime = runtime.clone();
+    clear_candidate_concurrency_saturation(template, candidate, &mut validation_runtime);
+    validation_runtime
+}
+
+fn clear_candidate_concurrency_saturation(
+    template: &RoutePlanTemplate,
+    candidate: &RouteCandidate,
+    runtime: &mut RoutePlanRuntimeState,
+) {
+    let provider_endpoint = template.candidate_provider_endpoint_key(candidate);
+    let mut state = runtime.provider_endpoint(&provider_endpoint);
+    state.concurrency_saturated = false;
+    runtime.set_provider_endpoint(provider_endpoint, state);
+}
+
+fn concurrency_wait_policy(preset: SchedulingPreset, limit: u32) -> ConcurrencyWaitPolicy {
+    match preset {
+        SchedulingPreset::ContinuityFirst => {
+            ConcurrencyWaitPolicy::new(Duration::from_secs(8), limit.saturating_mul(4).max(4))
+        }
+        SchedulingPreset::Balanced => {
+            ConcurrencyWaitPolicy::new(Duration::from_secs(2), limit.saturating_mul(2).max(2))
+        }
+        SchedulingPreset::ThroughputFirst => ConcurrencyWaitPolicy::new(Duration::ZERO, 0),
+    }
 }
 
 pub(super) fn route_graph_request_requires_existing_affinity(
@@ -225,84 +259,5 @@ pub(super) fn log_route_continuity_blocked(
             serde_json::Value::String(transport.to_string()),
         );
     }
-    log_retry_trace(payload);
-}
-
-pub(super) async fn select_websocket_route_graph_target(
-    params: WebSocketRouteGraphSelectionParams<'_, '_>,
-) -> Result<RouteGraphTargetSelection, RouteGraphSelectionFailure> {
-    let WebSocketRouteGraphSelectionParams {
-        proxy,
-        executor,
-        runtime,
-        route_state,
-        request_id,
-        request_model,
-        request_is_remote_compaction,
-        continuity_contract,
-    } = params;
-
-    loop {
-        let selection = select_route_graph_candidate(
-            executor,
-            route_state,
-            runtime,
-            request_model,
-            request_is_remote_compaction,
-            continuity_contract,
-        );
-        if let Some(selected) = selection.selected {
-            let candidate = selected.candidate;
-            let concurrency_permit = match try_acquire_candidate_concurrency_permit(
-                proxy,
-                executor.template(),
-                candidate,
-            ) {
-                Ok(permit) => permit,
-                Err(ConcurrencyAcquireError::Saturated { active, limit }) => {
-                    let provider_endpoint = executor
-                        .template()
-                        .candidate_provider_endpoint_key(candidate);
-                    route_state.avoid_provider_endpoint(provider_endpoint.clone());
-                    log_retry_trace(serde_json::json!({
-                        "event": "route_candidate_concurrency_saturated",
-                        "service": proxy.service_name,
-                        "request_id": request_id,
-                        "provider_endpoint_key": provider_endpoint.stable_key(),
-                        "active": active,
-                        "limit": limit,
-                    }));
-                    continue;
-                }
-            };
-
-            return Ok(RouteGraphTargetSelection {
-                target: AttemptTarget::from_candidate(proxy.service_name, candidate),
-                avoided_candidate_indices: selection.avoided_candidate_indices,
-                avoided_total: selection.avoided_total,
-                total_upstreams: selection.total_upstreams,
-                concurrency_permit,
-            });
-        }
-
-        if let Some(report) = route_unavailable_report(
-            proxy.service_name,
-            request_id,
-            executor,
-            runtime,
-            route_state,
-            request_model,
-        ) {
-            let (status, message) = report.failure_status_message();
-            return Err(RouteGraphSelectionFailure {
-                status,
-                message,
-                route_attempts: report.route_attempts,
-            });
-        }
-        return Err(RouteGraphSelectionFailure::new(
-            StatusCode::BAD_GATEWAY,
-            format!("no route candidate supports model {request_model:?}"),
-        ));
-    }
+    log_control_trace_event(payload);
 }

@@ -1,25 +1,17 @@
-use std::sync::Arc;
-
 use tokio::sync::mpsc;
 
-use crate::config::ProxyConfig;
-use crate::state::ProxyState;
-
-use super::model::{Snapshot, refresh_snapshot};
+use crate::dashboard_core::OperatorReadCapture;
+use crate::proxy::ProxyService;
 
 #[derive(Debug)]
 pub(super) struct SnapshotRefreshResult {
     pub(super) generation: u64,
-    pub(super) config_version: Option<u32>,
-    pub(super) stats_days: usize,
-    pub(super) snapshot: Snapshot,
+    pub(super) capture: Result<OperatorReadCapture, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SnapshotRefreshKey {
     generation: u64,
-    config_version: Option<u32>,
-    stats_days: usize,
 }
 
 fn snapshot_refresh_result_is_current(
@@ -53,19 +45,11 @@ impl SnapshotRefreshController {
         self.pending = false;
     }
 
-    pub(super) fn request(
-        &mut self,
-        state: Arc<ProxyState>,
-        cfg: Arc<ProxyConfig>,
-        service_name: &'static str,
-        stats_days: usize,
-    ) {
-        if self.in_flight.is_some() {
-            self.pending = true;
+    pub(super) fn request(&mut self, proxy: ProxyService) {
+        let Some(generation) = self.begin_request() else {
             return;
-        }
-
-        self.start(state, cfg, service_name, stats_days);
+        };
+        self.spawn(proxy, generation);
     }
 
     pub(super) fn finish(&mut self, generation: u64) {
@@ -74,59 +58,52 @@ impl SnapshotRefreshController {
         }
     }
 
-    pub(super) fn result_is_current(
-        &self,
-        result: &SnapshotRefreshResult,
-        current_config_version: Option<u32>,
-        current_stats_days: usize,
-    ) -> bool {
+    pub(super) fn result_is_current(&self, result: &SnapshotRefreshResult) -> bool {
         snapshot_refresh_result_is_current(
             SnapshotRefreshKey {
                 generation: result.generation,
-                config_version: result.config_version,
-                stats_days: result.stats_days,
             },
             SnapshotRefreshKey {
                 generation: self.generation,
-                config_version: current_config_version,
-                stats_days: current_stats_days,
             },
         )
     }
 
-    pub(super) fn request_pending_if_idle(
-        &mut self,
-        state: Arc<ProxyState>,
-        cfg: Arc<ProxyConfig>,
-        service_name: &'static str,
-        stats_days: usize,
-    ) {
-        if self.pending && self.in_flight.is_none() {
-            self.request(state, cfg, service_name, stats_days);
+    pub(super) fn request_pending_if_idle(&mut self, proxy: ProxyService) {
+        if let Some(generation) = self.begin_pending_request() {
+            self.spawn(proxy, generation);
         }
     }
 
-    fn start(
-        &mut self,
-        state: Arc<ProxyState>,
-        cfg: Arc<ProxyConfig>,
-        service_name: &'static str,
-        stats_days: usize,
-    ) {
-        debug_assert!(self.in_flight.is_none());
+    fn begin_request(&mut self) -> Option<u64> {
+        if self.in_flight.is_some() {
+            self.pending = true;
+            return None;
+        }
+
         self.pending = false;
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         self.in_flight = Some(generation);
-        let config_version = cfg.version;
+        Some(generation)
+    }
+
+    fn begin_pending_request(&mut self) -> Option<u64> {
+        (self.pending && self.in_flight.is_none())
+            .then(|| self.begin_request())
+            .flatten()
+    }
+
+    fn spawn(&self, proxy: ProxyService, generation: u64) {
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let snapshot = refresh_snapshot(&state, cfg, service_name, stats_days).await;
+            let capture = proxy
+                .operator_read_capture()
+                .await
+                .map_err(|error| error.to_string());
             let _ = tx.send(SnapshotRefreshResult {
                 generation,
-                config_version,
-                stats_days,
-                snapshot,
+                capture,
             });
         });
     }
@@ -134,45 +111,20 @@ impl SnapshotRefreshController {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::{
         SnapshotRefreshController, SnapshotRefreshKey, snapshot_refresh_result_is_current,
     };
-    use crate::config::ProxyConfig;
-    use crate::state::ProxyState;
 
     #[test]
     fn snapshot_refresh_result_guard_rejects_stale_results() {
-        let current = SnapshotRefreshKey {
-            generation: 3,
-            config_version: Some(5),
-            stats_days: 7,
-        };
+        let current = SnapshotRefreshKey { generation: 3 };
 
         assert!(snapshot_refresh_result_is_current(
             SnapshotRefreshKey { ..current },
             current
         ));
         assert!(!snapshot_refresh_result_is_current(
-            SnapshotRefreshKey {
-                generation: 2,
-                ..current
-            },
-            current
-        ));
-        assert!(!snapshot_refresh_result_is_current(
-            SnapshotRefreshKey {
-                config_version: Some(4),
-                ..current
-            },
-            current
-        ));
-        assert!(!snapshot_refresh_result_is_current(
-            SnapshotRefreshKey {
-                stats_days: 30,
-                ..current
-            },
+            SnapshotRefreshKey { generation: 2 },
             current
         ));
     }
@@ -199,20 +151,15 @@ mod tests {
         controller.generation = 7;
         controller.in_flight = Some(7);
 
-        controller.request(
-            ProxyState::new(),
-            Arc::new(ProxyConfig::default()),
-            "codex",
-            7,
-        );
+        assert_eq!(controller.begin_request(), None);
 
         assert_eq!(controller.generation, 7);
         assert_eq!(controller.in_flight, Some(7));
         assert!(controller.pending);
     }
 
-    #[tokio::test]
-    async fn snapshot_refresh_controller_restarts_pending_work_after_current_finish() {
+    #[test]
+    fn snapshot_refresh_controller_restarts_pending_work_after_current_finish() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut controller = SnapshotRefreshController::new(tx);
         controller.generation = 7;
@@ -220,12 +167,7 @@ mod tests {
         controller.pending = true;
 
         controller.finish(7);
-        controller.request_pending_if_idle(
-            ProxyState::new(),
-            Arc::new(ProxyConfig::default()),
-            "codex",
-            7,
-        );
+        assert_eq!(controller.begin_pending_request(), Some(8));
 
         assert_eq!(controller.generation, 8);
         assert_eq!(controller.in_flight, Some(8));

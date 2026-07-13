@@ -18,17 +18,13 @@ use tower::util::ServiceExt;
 
 use super::{
     ADMIN_TOKEN_ENV_VAR, ADMIN_TOKEN_HEADER, CLIENT_NAME_HEADER, claude_settings_env_value,
-    codex_auth_json_value,
 };
 use crate::config::{
-    GroupConfigV2, GroupMemberRefV2, ProviderConcurrencyLimits, ProviderConfigV2, ProviderConfigV4,
-    ProviderEndpointV2, ProxyConfig, ProxyConfigV2, ProxyConfigV4, RetryConfig, RetryProfileName,
-    RetryStrategy, RoutingConditionV4, RoutingConfigV4, RoutingNodeV4, RoutingPolicyV4,
-    ServiceConfig, ServiceConfigManager, ServiceControlProfile, ServiceViewV2, ServiceViewV4,
-    UiConfig, UpstreamAuth, UpstreamConfig,
+    HelperConfig, ProviderConcurrencyLimits, ProviderConfig, RetryConfig, RetryProfileName,
+    RetryStrategy, RouteCondition, RouteGraphConfig, RouteNodeConfig, RouteStrategy,
+    SchedulingPreset, ServiceControlProfile, ServiceRouteConfig, UpstreamAuth, UpstreamConfig,
 };
 use crate::proxy::ProxyService;
-use crate::state::RuntimeConfigState;
 
 fn spawn_axum_server(app: axum::Router) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -104,62 +100,58 @@ fn write_text_file(path: &Path, content: &str) {
     std::fs::write(path, content).expect("write test file");
 }
 
-fn make_proxy_config(upstreams: Vec<UpstreamConfig>, retry: RetryConfig) -> ProxyConfig {
-    let mut mgr = ServiceConfigManager {
-        active: Some("test".to_string()),
-        ..Default::default()
-    };
-    mgr.configs.insert(
-        "test".to_string(),
-        ServiceConfig {
-            name: "test".to_string(),
-            alias: None,
-            enabled: true,
-            level: 1,
-            upstreams,
-        },
-    );
+fn make_helper_config(upstreams: Vec<UpstreamConfig>, retry: RetryConfig) -> HelperConfig {
+    let mut providers = std::collections::BTreeMap::new();
+    let mut route_order = Vec::new();
+    for (index, upstream) in upstreams.into_iter().enumerate() {
+        let preferred_name = upstream
+            .tags
+            .get("provider_id")
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| {
+                if index == 0 {
+                    "test".to_string()
+                } else {
+                    format!("test-{}", index + 1)
+                }
+            });
+        let mut provider_name = preferred_name.clone();
+        let mut suffix = 2;
+        while providers.contains_key(provider_name.as_str()) {
+            provider_name = format!("{preferred_name}-{suffix}");
+            suffix += 1;
+        }
+        route_order.push(provider_name.clone());
+        providers.insert(
+            provider_name,
+            ProviderConfig {
+                base_url: Some(upstream.base_url),
+                auth: upstream.auth,
+                tags: upstream.tags.into_iter().collect(),
+                supported_models: upstream.supported_models.into_iter().collect(),
+                model_mapping: upstream.model_mapping.into_iter().collect(),
+                ..ProviderConfig::default()
+            },
+        );
+    }
 
-    ProxyConfig {
-        version: Some(1),
-        codex: mgr,
-        claude: ServiceConfigManager::default(),
+    HelperConfig {
+        codex: ServiceRouteConfig {
+            providers,
+            routing: (!route_order.is_empty())
+                .then(|| RouteGraphConfig::ordered_failover(route_order)),
+            ..ServiceRouteConfig::default()
+        },
         retry,
-        notify: Default::default(),
-        default_service: None,
-        relay_targets: std::collections::BTreeMap::new(),
-        fleet: Default::default(),
-        ui: UiConfig::default(),
+        ..HelperConfig::default()
     }
 }
 
-async fn save_v2_as_route_graph_config_and_load(
-    cfg: &ProxyConfigV2,
-    context: &str,
-) -> crate::config::LoadedProxyConfig {
-    let migrated = crate::config::migrate_v2_to_v4_with_report(cfg)
-        .expect("explicitly migrate v2 test config to route graph")
-        .config;
-    crate::config::save_config_v4(&migrated)
-        .await
-        .expect("write migrated route graph test config");
-    crate::config::load_config_with_v4_source()
-        .await
-        .expect(context)
-}
-
-fn proxy_with_loaded_route_graph_config(loaded: crate::config::LoadedProxyConfig) -> ProxyService {
-    let v4_source = loaded
-        .v4
-        .clone()
-        .expect("route graph test config source should be available");
-    ProxyService::new_with_v4_source(
-        Client::new(),
-        Arc::new(loaded.runtime),
-        Some(Arc::new(v4_source)),
-        "codex",
-        Arc::new(std::sync::Mutex::new(HashMap::new())),
-    )
+fn proxy_with_loaded_route_graph_config(loaded: crate::config::LoadedConfig) -> ProxyService {
+    ProxyService::new(Client::new(), Arc::new(loaded.source), "codex")
 }
 
 fn reserve_unused_local_addr() -> std::net::SocketAddr {
@@ -197,6 +189,7 @@ async fn send_responses_json(
 }
 
 mod api_admin;
+mod crash_recovery;
 mod failover;
 mod harness;
 mod openai_images_generation;

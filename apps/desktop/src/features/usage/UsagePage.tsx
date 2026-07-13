@@ -35,8 +35,8 @@ export function UsagePage() {
                 <CardTitle>24 小时活动</CardTitle>
                 <CardDescription>按本地日窗口聚合，recent request 不参与日总量计算。</CardDescription>
               </div>
-              <Badge variant={coverage.isPartial || coverage.truncated ? "warning" : "success"}>
-                {coverage.isPartial || coverage.truncated ? "Partial" : "Complete"}
+              <Badge variant={coverage.isPartial ? "warning" : "success"}>
+                {coverage.isPartial ? "Partial" : "Complete"}
               </Badge>
             </div>
           </CardHeader>
@@ -59,7 +59,7 @@ export function UsagePage() {
         <Card>
           <CardHeader>
             <CardTitle>覆盖与 Retry Gate</CardTitle>
-            <CardDescription>区分完整统计、部分回放和当前控制动作。</CardDescription>
+            <CardDescription>本地日窗口与当前控制动作。</CardDescription>
           </CardHeader>
           <CardContent className="space-y-3 text-sm">
             <div className="rounded-xl border border-slate-100 bg-slate-50 p-3">
@@ -68,12 +68,12 @@ export function UsagePage() {
                 覆盖状态
               </div>
               <div className="mt-1 text-slate-500">
-                {coverage.isPartial || coverage.truncated
-                  ? coverage.reason ?? "日志回放覆盖不完整，今日统计可能偏低。"
+                {coverage.isPartial
+                  ? coverage.reason ?? "可用数据晚于本地日窗口起点，今日统计可能不完整。"
                   : `已加载 ${coverage.loadedRequests.toLocaleString()} 条请求。`}
               </div>
               <div className="mt-2 text-xs text-slate-400">
-                source {coverage.source} · scanned {coverage.scannedLines.toLocaleString()}
+                source {coverage.source} · loaded {coverage.loadedRequests.toLocaleString()}
               </div>
             </div>
             <div className="rounded-xl border border-slate-100 bg-slate-50 p-3">

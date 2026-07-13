@@ -26,8 +26,6 @@ pub struct ResolvedRetryConfig {
     pub route: ResolvedRetryLayerConfig,
     #[serde(default = "ReasoningGuardConfig::default_resolved")]
     pub reasoning_guard: ResolvedReasoningGuardConfig,
-    /// Guarded cross-station failover before any upstream output is committed to the client.
-    pub allow_cross_station_before_first_output: bool,
     pub never_on_status: String,
     pub never_on_class: Vec<String>,
     pub cloudflare_challenge_cooldown_secs: u64,
@@ -69,10 +67,6 @@ pub struct RetryConfig {
     pub provider: Option<RetryLayerConfig>,
     #[serde(default)]
     pub reasoning_guard: Option<ReasoningGuardConfig>,
-    /// Allow automatic failover to another station, but only before any output has been
-    /// committed to the client. Session-pinned routes remain sticky regardless of this setting.
-    #[serde(default)]
-    pub allow_cross_station_before_first_output: Option<bool>,
     #[serde(default)]
     pub never_on_status: Option<String>,
     #[serde(default)]
@@ -184,7 +178,6 @@ impl Default for RetryConfig {
             upstream: None,
             provider: None,
             reasoning_guard: None,
-            allow_cross_station_before_first_output: None,
             never_on_status: None,
             never_on_class: None,
             cloudflare_challenge_cooldown_secs: None,
@@ -231,7 +224,6 @@ impl RetryProfileName {
                     strategy: RetryStrategy::Failover,
                 },
                 reasoning_guard: ReasoningGuardConfig::default_resolved(),
-                allow_cross_station_before_first_output: false,
                 never_on_status: "413,415,422".to_string(),
                 never_on_class: vec!["client_error_non_retryable".to_string()],
                 cloudflare_challenge_cooldown_secs: 300,
@@ -281,7 +273,6 @@ impl RetryProfileName {
                     ],
                     strategy: RetryStrategy::Failover,
                 },
-                allow_cross_station_before_first_output: true,
                 ..RetryProfileName::Balanced.defaults()
             },
             RetryProfileName::CostPrimary => ResolvedRetryConfig {
@@ -289,7 +280,6 @@ impl RetryProfileName {
                     max_attempts: 2,
                     ..RetryProfileName::Balanced.defaults().route
                 },
-                allow_cross_station_before_first_output: true,
                 transport_cooldown_secs: 30,
                 cooldown_backoff_factor: 2,
                 cooldown_backoff_max_secs: 900,
@@ -425,9 +415,6 @@ impl RetryConfig {
                 out.route.strategy = v;
             }
         }
-        if let Some(v) = self.allow_cross_station_before_first_output {
-            out.allow_cross_station_before_first_output = v;
-        }
         if let Some(v) = self.never_on_status.as_deref() {
             out.never_on_status = v.to_string();
         }
@@ -504,7 +491,6 @@ mod tests {
                 "on_class": ["upstream_transport_error"],
                 "strategy": "failover"
             },
-            "allow_cross_station_before_first_output": true,
             "never_on_status": "413,415,422",
             "never_on_class": ["client_error_non_retryable"],
             "cloudflare_challenge_cooldown_secs": 300,
@@ -551,7 +537,6 @@ mod tests {
                 "max_guard_retries": 1,
                 "log_matches": true
             },
-            "allow_cross_station_before_first_output": true,
             "never_on_status": "413,415,422",
             "never_on_class": ["client_error_non_retryable"],
             "cloudflare_challenge_cooldown_secs": 300,

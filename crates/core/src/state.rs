@@ -1,77 +1,84 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{Read, Seek, SeekFrom};
+#[cfg(test)]
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-use serde_json::Value as JsonValue;
-use tokio::sync::{RwLock, watch};
-use tokio::time::{Duration, interval};
+use tokio::sync::{Mutex as AsyncMutex, RwLock, watch};
+use tokio::time::Duration;
 
 pub use crate::balance::{
-    BalanceSnapshotStatus, ProviderBalanceSnapshot, StationRoutingBalanceSummary,
+    BalanceSnapshotStatus, ProviderBalanceSnapshot, ProviderRoutingBalanceSummary,
 };
-use crate::config::ServiceConfigManager;
-use crate::lb::{COOLDOWN_SECS, CooldownBackoff, FAILURE_THRESHOLD, LbState};
-use crate::policy_actions::{PolicyAction, PolicyActionKind, PolicyActionProjection};
+use crate::config::ServiceRouteConfig;
+use crate::endpoint_health::{COOLDOWN_SECS, CooldownBackoff, FAILURE_THRESHOLD};
+use crate::policy_actions::PolicyActionProjection;
+#[cfg(test)]
+use crate::pricing::capture_operator_model_price_catalog;
 use crate::pricing::{
-    CostAdjustments, CostBreakdown, estimate_request_cost_from_operator_catalog_for_service,
+    CapturedModelPriceCatalog, CostAdjustments, CostBreakdown, CostConfidence,
+    estimate_usage_cost_from_captured_provider_price,
+};
+use crate::provider_catalog::{
+    AccountFingerprint, ProviderAdapter, ProviderCatalogEpoch, ProviderCatalogScope,
+    ProviderCatalogSnapshot, ProviderModelRequestContract, ProviderPricingTier,
+};
+use crate::request_ledger::{
+    RequestUsageAggregate, RequestUsageSummary, RequestUsageSummaryCoverage,
+    RequestUsageSummaryGroup, RequestUsageSummaryRow, sort_usage_summary_rows,
 };
 use crate::routing_ir::{RoutePlanRuntimeState, RoutePlanUpstreamRuntimeState};
-use crate::runtime_identity::ProviderEndpointKey;
+use crate::runtime_identity::{ProviderEndpointKey, RuntimeUpstreamIdentity};
+use crate::runtime_store::{
+    AttemptHandle, AttemptId, AttemptOutcome, AttemptPendingEvidence, AttemptRouteEvidence,
+    AttemptTerminal, BeginDisposition, CommittedRequestQuery, EconomicsState,
+    FrozenProviderCatalogScope, FrozenProviderEpochIdentity, FrozenProviderPriceKey,
+    LogicalRequestHandle, LogicalRequestId, LogicalRequestOutcome, LogicalRequestTerminal,
+    LogicalRequestTerminalPayload, NewAttempt, NewLogicalRequest, OperatorLedgerRevision,
+    ProviderAutomaticEligibility, ProviderEffectiveEligibility, ProviderEligibilityProjection,
+    ProviderManualEligibility, ProviderObservation, ProviderObservationCommit,
+    ProviderObservationReservation, ProviderObservationScope, ProviderPolicySnapshot,
+    RequestAccountingScope, RuntimeStore, RuntimeStoreError, SessionAffinityIdentitySource,
+    SessionAffinityLimit, SessionAffinityRecord, TerminalDisposition,
+};
+#[cfg(test)]
+use crate::runtime_store::{ProviderObservationAuthority, ProviderPolicyEffect};
 use crate::sessions;
 #[cfg(test)]
 use crate::usage::UsageMetrics;
 use crate::usage_day;
 
-mod policy_action_store;
 mod runtime_types;
 mod session_identity;
-mod session_route_ledger;
 
-use self::policy_action_store::{PolicyActionMap, PolicyActionStore};
-use self::runtime_types::{
-    ConfigMetaOverride, RuntimeDefaultProfileOverride, UsageRollup, merge_station_health,
-};
+use self::runtime_types::UsageRollup;
 pub use self::runtime_types::{
-    HealthCheckStatus, LbConfigView, LbUpstreamView, PassiveHealthState, PassiveUpstreamHealth,
-    RuntimeConfigState, StationHealth, UpstreamHealth, UsageBucket, UsageDayCoverage,
-    UsageDayDimensionRow, UsageDayHourRow, UsageDayView, UsageRetryGateReasonRow,
-    UsageRetryGateSummary, UsageRollupCoverage, UsageRollupView,
+    RuntimeConfigState, UsageBucket, UsageDayCoverage, UsageDayDimensionRow, UsageDayHourRow,
+    UsageDayView, UsageRetryGateReasonRow, UsageRetryGateSummary, UsageRollupCoverage,
+    UsageRollupView,
 };
+use self::session_identity::SessionBindingEntry;
 pub use self::session_identity::{
     ActiveRequest, FinishRequestParams, FinishedRequest, RequestObservability, ResolvedRouteValue,
     RouteDecisionProvenance, RouteValueSource, SessionBinding, SessionContinuityMode,
     SessionIdentityCard, SessionIdentityCardBuildInputs, SessionIdentitySource,
-    SessionManualOverrides, SessionObservationScope, SessionRouteAffinity,
-    SessionRouteAffinityTarget, SessionStats, build_session_identity_cards_from_parts,
-    enrich_session_identity_cards_with_host_transcripts,
-    enrich_session_identity_cards_with_runtime,
+    SessionObservationScope, SessionRouteAffinity, SessionRouteAffinityTarget, SessionStats,
+    build_session_identity_cards_from_parts, enrich_session_identity_cards_with_host_transcripts,
 };
-use self::session_identity::{
-    SessionBindingEntry, SessionCwdCacheEntry, SessionEffortOverride, SessionModelOverride,
-    SessionRouteTargetOverride, SessionServiceTierOverride, SessionStationOverride,
-};
-use self::session_route_ledger::SessionRouteAffinityStore;
+type ProviderBalanceMap = HashMap<ProviderEndpointKey, HashMap<String, ProviderBalanceSnapshot>>;
+type OperatorUsageSummaryDayMap = HashMap<i32, RequestUsageAggregate>;
+type OperatorUsageSummaryServiceMap =
+    HashMap<RequestUsageSummaryGroup, HashMap<String, OperatorUsageSummaryDayMap>>;
+type OperatorUsageSummaryMap = HashMap<String, OperatorUsageSummaryServiceMap>;
 
-type PassiveStationHealthMap =
-    HashMap<String, HashMap<String, HashMap<String, PassiveUpstreamHealth>>>;
-type ProviderBalanceMap =
-    HashMap<String, HashMap<String, HashMap<usize, HashMap<String, ProviderBalanceSnapshot>>>>;
-type ProviderBalanceHistoryMap = HashMap<
-    String,
-    HashMap<String, HashMap<usize, HashMap<String, VecDeque<ProviderBalanceSnapshot>>>>,
->;
-type ProviderBalanceSummaryMap = HashMap<String, HashMap<String, StationRoutingBalanceSummary>>;
-type ServiceLayoutSignature = Vec<(String, Vec<String>)>;
+pub(crate) fn is_logical_request_success_status(status_code: u16) -> bool {
+    status_code == 101 || (200..300).contains(&status_code)
+}
 
 #[derive(Debug, Clone, Default)]
 struct ProviderEndpointRuntimeHealth {
     failure_count: u32,
     cooldown_until: Option<std::time::Instant>,
-    usage_exhausted: bool,
     penalty_streak: u32,
     last_good_at_ms: Option<u64>,
 }
@@ -85,26 +92,27 @@ struct SessionTranscriptPathCacheEntry {
 
 #[derive(Debug, Clone)]
 struct RuntimePolicy {
-    session_override_ttl_ms: u64,
+    session_stats_ttl_ms: u64,
     session_binding_ttl_ms: u64,
     session_binding_max_entries: usize,
     session_route_affinity_ttl_ms: u64,
     session_route_affinity_max_entries: usize,
-    session_route_affinity_store: SessionRouteAffinityStore,
-    session_cwd_cache_ttl_ms: u64,
-    session_cwd_cache_max_entries: usize,
     session_transcript_path_cache_ttl_ms: u64,
     session_transcript_path_cache_max_entries: usize,
 }
 
-pub struct PassiveUpstreamFailureRecord {
-    pub service_name: String,
-    pub station_name: String,
-    pub base_url: String,
-    pub status_code: Option<u16>,
-    pub error_class: Option<String>,
-    pub error: Option<String>,
-    pub now_ms: u64,
+#[cfg(test)]
+#[derive(Debug)]
+struct TerminalPublicationPause {
+    committed: tokio::sync::oneshot::Sender<()>,
+    resume: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct OperatorAggregationPause {
+    captured: tokio::sync::oneshot::Sender<()>,
+    resume: tokio::sync::oneshot::Receiver<()>,
 }
 
 pub fn recent_finished_max() -> usize {
@@ -122,23 +130,21 @@ fn recent_finished_max_from_env(raw: Option<String>) -> usize {
         .clamp(200, 10_000)
 }
 
-fn provider_balance_history_max() -> usize {
-    static MAX: OnceLock<usize> = OnceLock::new();
-    *MAX.get_or_init(|| {
-        std::env::var("CODEX_HELPER_PROVIDER_BALANCE_HISTORY_MAX")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .filter(|&n| n > 1)
-            .unwrap_or(64)
-            .clamp(2, 512)
-    })
-}
-
 fn unix_now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn runtime_store_blocking<T>(operation: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            // Hand scheduling off without yielding across durable commit and projection publication.
+            tokio::task::block_in_place(operation)
+        }
+        Ok(_) | Err(_) => operation(),
+    }
 }
 
 fn usage_rollup_unknown_key(value: Option<&str>) -> String {
@@ -151,14 +157,6 @@ fn usage_rollup_unknown_key(value: Option<&str>) -> String {
 
 fn usage_rollup_project_key(cwd: Option<&str>) -> String {
     usage_rollup_unknown_key(cwd)
-}
-
-fn usage_rollup_request_key(request: &FinishedRequest) -> String {
-    request
-        .trace_id
-        .as_deref()
-        .map(|trace_id| format!("trace|{trace_id}"))
-        .unwrap_or_else(|| format!("{}|{}", request.ended_at_ms, request.id))
 }
 
 fn usage_rollup_record_bucket(
@@ -190,7 +188,7 @@ fn usage_rollup_hourly_buckets(
     buckets
 }
 
-fn usage_rollup_mark_loaded_timestamp(rollup: &mut UsageRollup, timestamp_ms: u64) {
+fn usage_rollup_mark_loaded_timestamp(rollup: &mut UsageRollup, day: i32, timestamp_ms: u64) {
     rollup.loaded_first_ms = Some(
         rollup
             .loaded_first_ms
@@ -203,9 +201,50 @@ fn usage_rollup_mark_loaded_timestamp(rollup: &mut UsageRollup, timestamp_ms: u6
             .map(|current| current.max(timestamp_ms))
             .unwrap_or(timestamp_ms),
     );
+    let range = rollup
+        .terminal_range_by_day
+        .entry(day)
+        .or_insert((timestamp_ms, timestamp_ms));
+    range.0 = range.0.min(timestamp_ms);
+    range.1 = range.1.max(timestamp_ms);
     if rollup.coverage_source.is_empty() {
-        rollup.coverage_source = "live".to_string();
+        rollup.coverage_source = "runtime_store".to_string();
     }
+}
+
+fn sum_usage_buckets<'a>(buckets: impl Iterator<Item = &'a UsageBucket>) -> UsageBucket {
+    buckets.fold(UsageBucket::default(), |mut total, bucket| {
+        total.add_assign(bucket);
+        total
+    })
+}
+
+fn usage_entity_totals(
+    by_day: &HashMap<String, HashMap<i32, UsageBucket>>,
+) -> HashMap<String, UsageBucket> {
+    by_day
+        .iter()
+        .map(|(key, days)| (key.clone(), sum_usage_buckets(days.values())))
+        .collect()
+}
+
+fn rebuild_usage_rollup_totals(rollup: &mut UsageRollup) {
+    rollup.loaded = sum_usage_buckets(rollup.by_day.values());
+    rollup.loaded_first_ms = rollup
+        .terminal_range_by_day
+        .values()
+        .map(|(first_ms, _)| *first_ms)
+        .min();
+    rollup.loaded_last_ms = rollup
+        .terminal_range_by_day
+        .values()
+        .map(|(_, last_ms)| *last_ms)
+        .max();
+    rollup.by_provider_endpoint = usage_entity_totals(&rollup.by_provider_endpoint_day);
+    rollup.by_provider = usage_entity_totals(&rollup.by_provider_day);
+    rollup.by_model = usage_entity_totals(&rollup.by_model_day);
+    rollup.by_session = usage_entity_totals(&rollup.by_session_day);
+    rollup.by_project = usage_entity_totals(&rollup.by_project_day);
 }
 
 fn usage_bucket_cost_sort_key(bucket: &UsageBucket) -> Option<f64> {
@@ -286,12 +325,6 @@ fn usage_day_hour_rows(rollup: &UsageRollup, day: i32) -> Vec<UsageDayHourRow> {
 
 fn usage_day_coverage(rollup: &UsageRollup, window: usage_day::UsageDayWindow) -> UsageDayCoverage {
     let mut reasons = Vec::new();
-    if rollup.replay_bytes_truncated {
-        reasons.push("request log byte limit truncated older data");
-    }
-    if rollup.replay_lines_truncated {
-        reasons.push("request log line limit truncated older data");
-    }
     if rollup
         .loaded_first_ms
         .is_some_and(|loaded_first_ms| loaded_first_ms > window.start_ms)
@@ -308,11 +341,6 @@ fn usage_day_coverage(rollup: &UsageRollup, window: usage_day::UsageDayWindow) -
         loaded_first_ms: rollup.loaded_first_ms,
         loaded_last_ms: rollup.loaded_last_ms,
         loaded_requests: rollup.loaded.requests_total,
-        scanned_lines: rollup.replay_scanned_lines,
-        max_lines: rollup.replay_max_lines,
-        max_bytes: rollup.replay_max_bytes,
-        bytes_truncated: rollup.replay_bytes_truncated,
-        lines_truncated: rollup.replay_lines_truncated,
         day_may_be_partial: !reasons.is_empty(),
         partial_reason: (!reasons.is_empty()).then(|| reasons.join("; ")),
     }
@@ -336,17 +364,19 @@ fn record_usage_entity(
 
 fn record_finished_request_into_usage_rollup(
     rollup: &mut UsageRollup,
+    logical_request_id: &str,
     request: &FinishedRequest,
 ) -> bool {
-    let request_key = usage_rollup_request_key(request);
-    if rollup.recorded_requests.contains_key(&request_key) {
+    if rollup.recorded_requests.contains_key(logical_request_id) {
         return false;
     }
 
     let day = usage_day::local_day_from_ms(request.ended_at_ms);
     let hour = usize::from(usage_day::local_hour_from_ms(request.ended_at_ms).min(23));
-    rollup.recorded_requests.insert(request_key, day);
-    usage_rollup_mark_loaded_timestamp(rollup, request.ended_at_ms);
+    rollup
+        .recorded_requests
+        .insert(logical_request_id.to_string(), day);
+    usage_rollup_mark_loaded_timestamp(rollup, day, request.ended_at_ms);
 
     let cost = Some(&request.cost);
     usage_rollup_record_bucket(&mut rollup.loaded, request, cost);
@@ -358,9 +388,15 @@ fn record_finished_request_into_usage_rollup(
     );
 
     record_usage_entity(
-        &mut rollup.by_config,
-        &mut rollup.by_config_day,
-        usage_rollup_unknown_key(request.station_name.as_deref()),
+        &mut rollup.by_provider_endpoint,
+        &mut rollup.by_provider_endpoint_day,
+        usage_rollup_unknown_key(
+            request
+                .provider_endpoint()
+                .as_ref()
+                .map(ProviderEndpointKey::stable_key)
+                .as_deref(),
+        ),
         day,
         request,
         cost,
@@ -401,6 +437,317 @@ fn record_finished_request_into_usage_rollup(
     true
 }
 
+fn record_finished_request_into_operator_usage_summary(
+    summaries: &mut OperatorUsageSummaryMap,
+    request: &FinishedRequest,
+    billable_usage: Option<&crate::usage::CanonicalUsageBuckets>,
+) {
+    let day = usage_day::local_day_from_ms(request.ended_at_ms);
+    let service = summaries.entry(request.service.clone()).or_default();
+    for group in RequestUsageSummaryGroup::ALL {
+        service
+            .entry(group)
+            .or_default()
+            .entry(group.key(request))
+            .or_default()
+            .entry(day)
+            .or_default()
+            .record_request(request, billable_usage);
+    }
+}
+
+fn operator_usage_summary_rows(
+    summaries: Option<&OperatorUsageSummaryServiceMap>,
+    group: RequestUsageSummaryGroup,
+    limit: usize,
+) -> Vec<RequestUsageSummaryRow> {
+    let mut rows = summaries
+        .and_then(|groups| groups.get(&group))
+        .into_iter()
+        .flat_map(|groups| groups.iter())
+        .map(|(group_value, days)| RequestUsageSummaryRow {
+            group_value: group_value.clone(),
+            aggregate: days.values().fold(
+                RequestUsageAggregate::default(),
+                |mut total, aggregate| {
+                    total.add_assign(aggregate);
+                    total
+                },
+            ),
+        })
+        .collect::<Vec<_>>();
+    sort_usage_summary_rows(&mut rows, limit);
+    rows
+}
+
+#[cfg(test)]
+fn operator_usage_summaries(
+    state: &RequestLifecycleProjectionState,
+    service_name: &str,
+    limit: usize,
+) -> Vec<RequestUsageSummary> {
+    operator_usage_summaries_from_sources(
+        state.usage_rollups.get(service_name),
+        state.operator_usage_summaries.get(service_name),
+        limit,
+    )
+}
+
+fn operator_usage_summaries_from_sources(
+    rollup: Option<&UsageRollup>,
+    summaries: Option<&OperatorUsageSummaryServiceMap>,
+    limit: usize,
+) -> Vec<RequestUsageSummary> {
+    let coverage = rollup
+        .map(|rollup| RequestUsageSummaryCoverage {
+            source: if rollup.coverage_source.is_empty() {
+                "runtime_store_retained_terminals".to_string()
+            } else {
+                format!("{}_retained_terminals", rollup.coverage_source)
+            },
+            first_terminal_at_ms: rollup.loaded_first_ms,
+            last_terminal_at_ms: rollup.loaded_last_ms,
+            requests: rollup.loaded.requests_total,
+            all_history: false,
+        })
+        .unwrap_or_else(|| RequestUsageSummaryCoverage {
+            source: "runtime_store_retained_terminals".to_string(),
+            first_terminal_at_ms: None,
+            last_terminal_at_ms: None,
+            requests: 0,
+            all_history: false,
+        });
+    RequestUsageSummaryGroup::ALL
+        .into_iter()
+        .map(|group| RequestUsageSummary {
+            group,
+            coverage: coverage.clone(),
+            rows: operator_usage_summary_rows(summaries, group, limit),
+        })
+        .collect()
+}
+
+const RUNTIME_PROJECTION_PAGE_SIZE: usize = 1_024;
+const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
+
+#[derive(Debug, Default)]
+struct RequestLifecycleProjectionState {
+    next_request_id: u64,
+    committed_terminal_count: u64,
+    active_requests: HashMap<u64, ActiveRequest>,
+    lifecycle_handles: HashMap<u64, LogicalRequestHandle>,
+    provider_catalogs: HashMap<u64, Arc<ProviderCatalogSnapshot>>,
+    attempt_epochs: HashMap<u64, HashMap<AttemptId, ProviderCatalogEpoch>>,
+    pricing_catalogs: HashMap<u64, Arc<CapturedModelPriceCatalog>>,
+    recent_finished: VecDeque<FinishedRequest>,
+    usage_rollups: HashMap<String, UsageRollup>,
+    operator_usage_summaries: OperatorUsageSummaryMap,
+    session_stats: HashMap<String, SessionStats>,
+}
+
+#[derive(Debug)]
+pub(crate) struct OperatorLifecycleSnapshot {
+    pub(crate) state_revision: u64,
+    pub(crate) ledger_revision: OperatorLedgerRevision,
+    pub(crate) active_requests: Vec<ActiveRequest>,
+    pub(crate) recent_finished: Vec<FinishedRequest>,
+    usage_rollup: Option<UsageRollup>,
+    usage_summaries: OperatorUsageSummaryServiceMap,
+}
+
+impl OperatorLifecycleSnapshot {
+    pub(crate) fn usage_summaries(&self, limit: usize) -> Vec<RequestUsageSummary> {
+        operator_usage_summaries_from_sources(
+            self.usage_rollup.as_ref(),
+            Some(&self.usage_summaries),
+            limit,
+        )
+    }
+
+    pub(crate) fn usage_rollup_view(&self, top_n: usize, days: usize) -> UsageRollupView {
+        ProxyState::usage_rollup_view_from(self.usage_rollup.as_ref(), top_n, days)
+    }
+
+    pub(crate) fn usage_day_view(&self, top_n: usize, generated_at_ms: u64) -> UsageDayView {
+        ProxyState::usage_day_view_from(self.usage_rollup.as_ref(), top_n, generated_at_ms)
+    }
+}
+
+fn snapshot_usage_rollup(rollup: &UsageRollup) -> UsageRollup {
+    UsageRollup {
+        loaded: rollup.loaded.clone(),
+        loaded_first_ms: rollup.loaded_first_ms,
+        loaded_last_ms: rollup.loaded_last_ms,
+        coverage_source: rollup.coverage_source.clone(),
+        terminal_range_by_day: rollup.terminal_range_by_day.clone(),
+        recorded_requests: HashMap::new(),
+        by_day: rollup.by_day.clone(),
+        by_hour: rollup.by_hour.clone(),
+        by_provider_endpoint: rollup.by_provider_endpoint.clone(),
+        by_provider_endpoint_day: rollup.by_provider_endpoint_day.clone(),
+        by_provider: rollup.by_provider.clone(),
+        by_provider_day: rollup.by_provider_day.clone(),
+        by_model: rollup.by_model.clone(),
+        by_model_day: rollup.by_model_day.clone(),
+        by_session: rollup.by_session.clone(),
+        by_session_day: rollup.by_session_day.clone(),
+        by_project: rollup.by_project.clone(),
+        by_project_day: rollup.by_project_day.clone(),
+    }
+}
+
+fn hydrate_runtime_projections(
+    runtime_store: &RuntimeStore,
+) -> Result<RequestLifecycleProjectionState, RuntimeStoreError> {
+    let metadata = runtime_store.committed_request_projection_metadata()?;
+    let mut hydrated = RequestLifecycleProjectionState {
+        next_request_id: metadata
+            .max_numeric_request_id
+            .map(|request_id| request_id.saturating_add(1))
+            .unwrap_or(1),
+        committed_terminal_count: metadata.terminal_count,
+        ..RequestLifecycleProjectionState::default()
+    };
+
+    let recent = runtime_store.query_committed_requests(&CommittedRequestQuery {
+        limit: recent_finished_max(),
+        ..CommittedRequestQuery::default()
+    })?;
+    hydrated.recent_finished.extend(
+        recent
+            .items
+            .into_iter()
+            .map(|projection| projection.payload.finished_request),
+    );
+
+    let mut cursor = None;
+    let cutoff_ms = usage_rollup_cutoff_ms(unix_now_ms());
+
+    loop {
+        let page = runtime_store.query_committed_requests(&CommittedRequestQuery {
+            limit: RUNTIME_PROJECTION_PAGE_SIZE,
+            cursor,
+            terminal_at_or_after_unix_ms: Some(cutoff_ms),
+            ..CommittedRequestQuery::default()
+        })?;
+        for projection in page.items {
+            let accounting_scope = projection.payload.accounting_scope;
+            let billable_usage = projection.payload.billable_usage;
+            let finished = projection.payload.finished_request;
+            if accounting_scope == RequestAccountingScope::Economic {
+                let rollup = hydrated
+                    .usage_rollups
+                    .entry(finished.service.clone())
+                    .or_default();
+                if record_finished_request_into_usage_rollup(
+                    rollup,
+                    &projection.logical_request_id.to_string(),
+                    &finished,
+                ) {
+                    record_finished_request_into_operator_usage_summary(
+                        &mut hydrated.operator_usage_summaries,
+                        &finished,
+                        billable_usage.as_ref(),
+                    );
+                    hydrate_session_stats_newest_first(&mut hydrated.session_stats, &finished);
+                }
+            }
+        }
+        let Some(next_cursor) = page.next_cursor else {
+            break;
+        };
+        cursor = Some(next_cursor);
+    }
+
+    Ok(hydrated)
+}
+
+fn usage_rollup_keep_days() -> i32 {
+    std::env::var("CODEX_HELPER_USAGE_ROLLUP_KEEP_DAYS")
+        .ok()
+        .and_then(|value| value.trim().parse::<i32>().ok())
+        .filter(|days| *days > 0)
+        .unwrap_or(60)
+}
+
+fn usage_rollup_cutoff_day(now_ms: u64) -> i32 {
+    usage_day::local_day_from_ms(now_ms).saturating_sub(usage_rollup_keep_days())
+}
+
+fn usage_rollup_cutoff_ms(now_ms: u64) -> u64 {
+    let keep_days = usage_rollup_keep_days();
+    usage_day::local_day_window(usage_rollup_cutoff_day(now_ms))
+        .map(|window| window.start_ms)
+        .unwrap_or_else(|| now_ms.saturating_sub((keep_days as u64).saturating_mul(DAY_MS)))
+}
+
+fn hydrate_session_stats_newest_first(
+    stats: &mut HashMap<String, SessionStats>,
+    finished: &FinishedRequest,
+) {
+    let Some(session_id) = finished.session_id.as_deref() else {
+        return;
+    };
+    let entry = stats.entry(session_id.to_string()).or_default();
+    entry.turns_total = entry.turns_total.saturating_add(1);
+    if entry.last_session_identity_source.is_none() {
+        entry.last_session_identity_source = finished.session_identity_source;
+    }
+    if entry.last_client_name.is_none() {
+        entry.last_client_name = finished.client_name.clone();
+    }
+    if entry.last_client_addr.is_none() {
+        entry.last_client_addr = finished.client_addr.clone();
+    }
+    if entry.last_model.is_none() {
+        entry.last_model = finished.model.clone();
+    }
+    if entry.last_reasoning_effort.is_none() {
+        entry.last_reasoning_effort = finished.reasoning_effort.clone();
+    }
+    if entry.last_service_tier.is_none() {
+        entry.last_service_tier = finished.service_tier.clone();
+    }
+    if entry.last_provider_id.is_none() {
+        entry.last_provider_id = finished.provider_id.clone();
+    }
+    if entry.last_route_decision.is_none() {
+        entry.last_route_decision = finished.route_decision.clone();
+    }
+    if let Some(usage) = finished.usage.as_ref() {
+        if entry.last_usage.is_none() {
+            entry.last_usage = Some(usage.clone());
+        }
+        entry.total_usage.add_assign(usage);
+        entry.turns_with_usage = entry.turns_with_usage.saturating_add(1);
+    }
+    if finished
+        .usage
+        .as_ref()
+        .is_some_and(|usage| usage.output_tokens > 0)
+    {
+        if entry.last_output_tokens_per_second.is_none() {
+            entry.last_output_tokens_per_second = finished.observability.output_tokens_per_second;
+        }
+        if let Some(generation_ms) = finished.observability.generation_ms {
+            entry.output_generation_ms_total = entry
+                .output_generation_ms_total
+                .saturating_add(generation_ms);
+        }
+    }
+    entry.avg_output_tokens_per_second =
+        self::session_identity::token_weighted_output_tokens_per_second(
+            entry.total_usage.output_tokens,
+            entry.output_generation_ms_total,
+        );
+    if entry.last_ended_at_ms.is_none() {
+        entry.last_status = Some(finished.status_code);
+        entry.last_duration_ms = Some(finished.duration_ms);
+        entry.last_ended_at_ms = Some(finished.ended_at_ms);
+    }
+    entry.last_seen_ms = entry.last_seen_ms.max(finished.ended_at_ms);
+}
+
 fn prune_usage_entity_days(
     by_day: &mut HashMap<String, HashMap<i32, UsageBucket>>,
     cutoff_day: i32,
@@ -408,6 +755,19 @@ fn prune_usage_entity_days(
     by_day.retain(|_, days| {
         days.retain(|day, _| *day >= cutoff_day);
         !days.is_empty()
+    });
+}
+
+fn prune_operator_usage_summary_days(summaries: &mut OperatorUsageSummaryMap, cutoff_day: i32) {
+    summaries.retain(|_, groups| {
+        groups.retain(|_, values| {
+            values.retain(|_, days| {
+                days.retain(|day, _| *day >= cutoff_day);
+                !days.is_empty()
+            });
+            !values.is_empty()
+        });
+        !groups.is_empty()
     });
 }
 
@@ -431,153 +791,237 @@ fn prune_lru_cache<T>(
     }
 }
 
-fn session_route_affinity_is_expired_with_ttl(
-    ttl_ms: u64,
+fn session_affinity_limit(max_entries: usize) -> SessionAffinityLimit {
+    if max_entries == 0 {
+        SessionAffinityLimit::Unlimited
+    } else {
+        SessionAffinityLimit::MaxEntries(max_entries)
+    }
+}
+
+fn session_affinity_identity_source(
+    source: SessionIdentitySource,
+) -> SessionAffinityIdentitySource {
+    match source {
+        SessionIdentitySource::Header => SessionAffinityIdentitySource::Header,
+        SessionIdentitySource::BodySessionId => SessionAffinityIdentitySource::BodySessionId,
+        SessionIdentitySource::PromptCacheKey => SessionAffinityIdentitySource::PromptCacheKey,
+        SessionIdentitySource::MetadataSessionId => {
+            SessionAffinityIdentitySource::MetadataSessionId
+        }
+        SessionIdentitySource::PreviousResponseId => {
+            SessionAffinityIdentitySource::PreviousResponseId
+        }
+    }
+}
+
+fn session_identity_source(source: SessionAffinityIdentitySource) -> SessionIdentitySource {
+    match source {
+        SessionAffinityIdentitySource::Header => SessionIdentitySource::Header,
+        SessionAffinityIdentitySource::BodySessionId => SessionIdentitySource::BodySessionId,
+        SessionAffinityIdentitySource::PromptCacheKey => SessionIdentitySource::PromptCacheKey,
+        SessionAffinityIdentitySource::MetadataSessionId => {
+            SessionIdentitySource::MetadataSessionId
+        }
+        SessionAffinityIdentitySource::PreviousResponseId => {
+            SessionIdentitySource::PreviousResponseId
+        }
+    }
+}
+
+fn session_route_affinity_from_record(record: SessionAffinityRecord) -> SessionRouteAffinity {
+    SessionRouteAffinity {
+        route_graph_key: record.route_graph_key,
+        session_identity_source: record.session_identity_source.map(session_identity_source),
+        provider_endpoint: record.provider_endpoint,
+        upstream_base_url: record.upstream_base_url,
+        route_path: record.route_path,
+        last_selected_at_ms: record.last_selected_at_unix_ms,
+        last_changed_at_ms: record.last_changed_at_unix_ms,
+        change_reason: record.change_reason,
+    }
+}
+
+fn session_affinity_record(
+    session_id: &str,
     affinity: &SessionRouteAffinity,
-    now_ms: u64,
-) -> bool {
-    ttl_ms > 0 && now_ms.saturating_sub(affinity.last_selected_at_ms) >= ttl_ms
+) -> SessionAffinityRecord {
+    SessionAffinityRecord {
+        session_id: session_id.to_string(),
+        route_graph_key: affinity.route_graph_key.clone(),
+        session_identity_source: affinity
+            .session_identity_source
+            .map(session_affinity_identity_source),
+        provider_endpoint: affinity.provider_endpoint.clone(),
+        upstream_base_url: affinity.upstream_base_url.clone(),
+        route_path: affinity.route_path.clone(),
+        last_selected_at_unix_ms: affinity.last_selected_at_ms,
+        last_changed_at_unix_ms: affinity.last_changed_at_ms,
+        change_reason: affinity.change_reason.clone(),
+    }
 }
 
-fn prune_session_route_affinity_map(
-    affinities: &mut HashMap<String, SessionRouteAffinity>,
-    ttl_ms: u64,
-    max_entries: usize,
-    now_ms: u64,
-) {
-    affinities.retain(|_, affinity| {
-        !session_route_affinity_is_expired_with_ttl(ttl_ms, affinity, now_ms)
+fn provider_policy_snapshot_with_projection(
+    current: &ProviderPolicySnapshot,
+    policy_revision: u64,
+    projection: ProviderEligibilityProjection,
+) -> ProviderPolicySnapshot {
+    let mut projections = current.projections.clone();
+    if let Some(existing) = projections
+        .iter_mut()
+        .find(|existing| existing.provider_endpoint == projection.provider_endpoint)
+    {
+        *existing = projection;
+    } else {
+        projections.push(projection);
+    }
+    projections.sort_by(|left, right| {
+        left.provider_endpoint
+            .stable_key()
+            .cmp(&right.provider_endpoint.stable_key())
     });
-    prune_lru_cache(affinities, max_entries, |entry| entry.last_selected_at_ms);
+    ProviderPolicySnapshot {
+        policy_revision,
+        projections,
+    }
 }
 
-fn service_layout_signature(mgr: &ServiceConfigManager) -> ServiceLayoutSignature {
-    let mut entries = mgr
-        .stations()
-        .iter()
-        .map(|(station_name, service)| {
-            (
-                station_name.clone(),
-                service
-                    .upstreams
-                    .iter()
-                    .map(|upstream| upstream.base_url.clone())
-                    .collect::<Vec<_>>(),
-            )
-        })
-        .collect::<Vec<_>>();
-    entries.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-    entries
+fn policy_action_projection(
+    projection: &ProviderEligibilityProjection,
+    now_ms: u64,
+) -> Option<PolicyActionProjection> {
+    let action = projection.active_action.as_ref()?;
+    let cooldown_remaining_secs = action
+        .expires_at_unix_ms
+        .map(|expires_at| expires_at.saturating_sub(now_ms).div_ceil(1_000))
+        .filter(|remaining| *remaining > 0);
+    Some(PolicyActionProjection {
+        provider_endpoint_key: projection.provider_endpoint.clone(),
+        active_cooldown: projection.automatic == ProviderAutomaticEligibility::Blocked,
+        code: action
+            .code
+            .clone()
+            .or_else(|| Some(action.action_kind.clone())),
+        cooldown_remaining_secs,
+        reason: Some(action.reason.clone()),
+        action_id: Some(action.action_id.to_string()),
+    })
 }
 
-fn changed_service_layout_stations(
-    previous: &ServiceLayoutSignature,
-    current: &ServiceLayoutSignature,
-) -> HashSet<String> {
-    let previous_by_station = previous
-        .iter()
-        .map(|(station_name, upstreams)| (station_name.as_str(), upstreams.as_slice()))
-        .collect::<HashMap<_, _>>();
-    let current_by_station = current
-        .iter()
-        .map(|(station_name, upstreams)| (station_name.as_str(), upstreams.as_slice()))
-        .collect::<HashMap<_, _>>();
-    let mut changed = HashSet::new();
+#[derive(Debug, Clone)]
+pub(crate) struct AttemptProviderScopeCapture {
+    pub endpoint: reqwest::Url,
+    pub route_scope: String,
+    pub account_fingerprint: AccountFingerprint,
+}
 
-    for (station_name, upstreams) in previous {
-        if current_by_station
-            .get(station_name.as_str())
-            .is_none_or(|current_upstreams| *current_upstreams != upstreams.as_slice())
-        {
-            changed.insert(station_name.clone());
-        }
+#[derive(Debug, Clone)]
+pub(crate) struct CapturedUpstreamAttemptContext {
+    request_id: u64,
+    logical_request: LogicalRequestHandle,
+    runtime_revision: u64,
+    runtime_digest: String,
+    route_evidence: AttemptRouteEvidence,
+    scope: ProviderCatalogScope,
+    provider_epoch: Option<ProviderCatalogEpoch>,
+    request_contract: Option<ProviderModelRequestContract>,
+}
+
+impl CapturedUpstreamAttemptContext {
+    pub(crate) fn request_contract(&self) -> Option<&ProviderModelRequestContract> {
+        self.request_contract.as_ref()
     }
+}
 
-    for (station_name, upstreams) in current {
-        if previous_by_station
-            .get(station_name.as_str())
-            .is_none_or(|previous_upstreams| *previous_upstreams != upstreams.as_slice())
-        {
-            changed.insert(station_name.clone());
-        }
+fn freeze_provider_epoch(
+    scope: &ProviderCatalogScope,
+    epoch: Option<&ProviderCatalogEpoch>,
+) -> FrozenProviderEpochIdentity {
+    FrozenProviderEpochIdentity {
+        scope: FrozenProviderCatalogScope {
+            adapter: scope.adapter(),
+            endpoint_origin: scope.endpoint_origin().to_string(),
+            route_scope: scope.route_scope().to_string(),
+            account_fingerprint: scope.account_fingerprint().to_string(),
+            config_revision: scope.config_revision().to_string(),
+        },
+        catalog_revision: epoch.map(|epoch| epoch.revision().as_str().to_string()),
+        pricing_revision: epoch.map(|epoch| epoch.pricing_revision().as_str().to_string()),
     }
+}
 
-    changed
+fn winning_route_decision(
+    previous: Option<RouteDecisionProvenance>,
+    route: &AttemptRouteEvidence,
+) -> RouteDecisionProvenance {
+    let mut decision = previous.unwrap_or_default();
+    let model_source = decision
+        .effective_model
+        .as_ref()
+        .map(|value| value.source)
+        .unwrap_or(RouteValueSource::RuntimeFallback);
+    let upstream_source = decision
+        .effective_upstream_base_url
+        .as_ref()
+        .map(|value| value.source)
+        .unwrap_or(RouteValueSource::RuntimeFallback);
+    decision.effective_model = route
+        .mapped_model
+        .clone()
+        .map(|value| ResolvedRouteValue::new(value, model_source));
+    decision.effective_upstream_base_url = route
+        .upstream_base_url
+        .clone()
+        .map(|value| ResolvedRouteValue::new(value, upstream_source));
+    decision.provider_id = route.provider_id.clone();
+    decision.endpoint_id = route.endpoint_id.clone();
+    decision.route_path = route.route_path.clone();
+    decision
 }
 
 /// Runtime-only state for the proxy process.
 ///
-/// Most state is process-local. Session route affinity is persisted separately
-/// because Codex remote compaction can depend on provider-endpoint continuity.
+/// Most state is process-local. Session route affinity is persisted in the
+/// helper-owned runtime store because compaction can depend on endpoint continuity.
 #[derive(Debug)]
 pub struct ProxyState {
-    next_request_id: AtomicU64,
-    // Manual per-session overrides remain runtime-scoped and expire after inactivity.
-    session_override_ttl_ms: u64,
+    session_stats_ttl_ms: u64,
     // Bindings are sticky by default; operators can opt into pruning with a separate TTL.
     session_binding_ttl_ms: u64,
     session_binding_max_entries: usize,
     session_route_affinity_ttl_ms: u64,
     session_route_affinity_max_entries: usize,
-    session_route_affinity_store: SessionRouteAffinityStore,
-    session_cwd_cache_ttl_ms: u64,
-    session_cwd_cache_max_entries: usize,
+    session_route_affinity_updates: AsyncMutex<()>,
     session_transcript_path_cache_ttl_ms: u64,
     session_transcript_path_cache_max_entries: usize,
-    session_effort_overrides: RwLock<HashMap<String, SessionEffortOverride>>,
-    session_station_overrides: RwLock<HashMap<String, SessionStationOverride>>,
-    session_route_target_overrides: RwLock<HashMap<String, SessionRouteTargetOverride>>,
-    session_model_overrides: RwLock<HashMap<String, SessionModelOverride>>,
-    session_service_tier_overrides: RwLock<HashMap<String, SessionServiceTierOverride>>,
     session_bindings: RwLock<HashMap<String, SessionBindingEntry>>,
-    session_route_affinities: RwLock<HashMap<String, SessionRouteAffinity>>,
-    global_station_override: RwLock<Option<String>>,
-    global_route_target_override: RwLock<Option<String>>,
-    runtime_default_profiles: RwLock<HashMap<String, RuntimeDefaultProfileOverride>>,
-    station_meta_overrides: RwLock<HashMap<String, HashMap<String, ConfigMetaOverride>>>,
-    // Primary provider-endpoint overrides keyed by stable provider identity.
-    provider_endpoint_meta_overrides:
-        RwLock<HashMap<String, HashMap<ProviderEndpointKey, ConfigMetaOverride>>>,
-    // Legacy base_url-keyed overrides kept for compatibility with station-oriented callers.
-    upstream_meta_overrides: RwLock<HashMap<String, HashMap<String, ConfigMetaOverride>>>,
-    session_cwd_cache: RwLock<HashMap<String, SessionCwdCacheEntry>>,
     session_transcript_path_cache: RwLock<HashMap<String, SessionTranscriptPathCacheEntry>>,
-    session_stats: RwLock<HashMap<String, SessionStats>>,
-    active_requests: RwLock<HashMap<u64, ActiveRequest>>,
-    recent_finished: RwLock<VecDeque<FinishedRequest>>,
-    usage_rollups: RwLock<HashMap<String, UsageRollup>>,
-    station_health: RwLock<HashMap<String, HashMap<String, StationHealth>>>,
-    passive_station_health: RwLock<PassiveStationHealthMap>,
+    request_lifecycle_projection: RwLock<RequestLifecycleProjectionState>,
     provider_balances: RwLock<ProviderBalanceMap>,
-    provider_balance_history: RwLock<ProviderBalanceHistoryMap>,
-    provider_balance_summaries: RwLock<ProviderBalanceSummaryMap>,
     provider_endpoint_runtime_health:
         RwLock<HashMap<String, HashMap<ProviderEndpointKey, ProviderEndpointRuntimeHealth>>>,
-    policy_action_store: PolicyActionStore,
-    policy_actions: RwLock<PolicyActionMap>,
-    station_health_checks: RwLock<HashMap<String, HashMap<String, HealthCheckStatus>>>,
-    service_layout_signatures: RwLock<HashMap<String, ServiceLayoutSignature>>,
+    provider_policy_updates: AsyncMutex<()>,
+    provider_policy_snapshot: RwLock<Arc<ProviderPolicySnapshot>>,
     state_version_tx: watch::Sender<u64>,
-    lb_states: Option<Arc<Mutex<HashMap<String, LbState>>>>,
+    operator_capture: RwLock<()>,
+    #[cfg(test)]
+    terminal_publication_pause: AsyncMutex<Option<TerminalPublicationPause>>,
+    #[cfg(test)]
+    operator_aggregation_pause: AsyncMutex<Option<OperatorAggregationPause>>,
+    runtime_store: Arc<RuntimeStore>,
 }
 
 impl ProxyState {
-    const MAX_HEALTH_RECORDS_PER_STATION: usize = 200;
-
-    #[allow(dead_code)]
-    pub fn new() -> Arc<Self> {
-        Self::new_with_lb_states(None)
+    #[cfg(test)]
+    pub(crate) fn new() -> Arc<Self> {
+        Self::new_with_runtime_store(Self::isolated_runtime_store())
+            .expect("hydrate isolated runtime projections")
     }
 
-    pub fn new_with_lb_states(
-        lb_states: Option<Arc<Mutex<HashMap<String, LbState>>>>,
-    ) -> Arc<Self> {
-        let ttl_secs = std::env::var("CODEX_HELPER_SESSION_OVERRIDE_TTL_SECS")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(30 * 60);
-        let ttl_ms = ttl_secs.saturating_mul(1000);
+    pub fn new_with_runtime_store(
+        runtime_store: Arc<RuntimeStore>,
+    ) -> Result<Arc<Self>, RuntimeStoreError> {
+        let session_stats_ttl_ms = 30_u64 * 60 * 1000;
         let binding_ttl_secs = std::env::var("CODEX_HELPER_SESSION_BINDING_TTL_SECS")
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
@@ -598,15 +1042,6 @@ impl ProxyState {
                 .and_then(|s| s.trim().parse::<usize>().ok())
                 .unwrap_or(5_000);
 
-        let cwd_cache_ttl_secs = std::env::var("CODEX_HELPER_SESSION_CWD_CACHE_TTL_SECS")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .unwrap_or(12 * 60 * 60);
-        let cwd_cache_ttl_ms = cwd_cache_ttl_secs.saturating_mul(1000);
-        let cwd_cache_max_entries = std::env::var("CODEX_HELPER_SESSION_CWD_CACHE_MAX_ENTRIES")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .unwrap_or(2_000);
         let transcript_path_cache_ttl_secs =
             std::env::var("CODEX_HELPER_SESSION_TRANSCRIPT_PATH_CACHE_TTL_SECS")
                 .ok()
@@ -619,264 +1054,239 @@ impl ProxyState {
                 .and_then(|s| s.trim().parse::<usize>().ok())
                 .unwrap_or(5_000);
 
-        Self::new_with_runtime_policy(
-            lb_states,
+        Self::new_with_runtime_policy_and_store(
             RuntimePolicy {
-                session_override_ttl_ms: ttl_ms,
+                session_stats_ttl_ms,
                 session_binding_ttl_ms: binding_ttl_ms,
                 session_binding_max_entries: binding_max_entries,
                 session_route_affinity_ttl_ms: route_affinity_ttl_ms,
                 session_route_affinity_max_entries: route_affinity_max_entries,
-                session_route_affinity_store: SessionRouteAffinityStore::from_env(),
-                session_cwd_cache_ttl_ms: cwd_cache_ttl_ms,
-                session_cwd_cache_max_entries: cwd_cache_max_entries,
                 session_transcript_path_cache_ttl_ms: transcript_path_cache_ttl_ms,
                 session_transcript_path_cache_max_entries: transcript_path_cache_max_entries,
             },
+            runtime_store,
         )
     }
 
-    fn new_with_runtime_policy(
-        lb_states: Option<Arc<Mutex<HashMap<String, LbState>>>>,
-        policy: RuntimePolicy,
-    ) -> Arc<Self> {
-        let mut restored_session_route_affinities = policy.session_route_affinity_store.load();
-        prune_session_route_affinity_map(
-            &mut restored_session_route_affinities,
-            policy.session_route_affinity_ttl_ms,
-            policy.session_route_affinity_max_entries,
-            unix_now_ms(),
-        );
-        let policy_action_store = PolicyActionStore::from_env();
-        let now_ms = unix_now_ms();
-        let (restored_policy_actions, pruned_policy_actions) = policy_action_store.load(now_ms);
-        if pruned_policy_actions
-            && let Err(err) = policy_action_store.save_blocking(&restored_policy_actions, now_ms)
-        {
-            tracing::warn!(error = %err, "failed to compact expired policy action ledger");
-        }
+    #[cfg(test)]
+    fn new_with_runtime_policy(policy: RuntimePolicy) -> Arc<Self> {
+        Self::new_with_runtime_policy_and_store(policy, Self::isolated_runtime_store())
+            .expect("hydrate isolated runtime projections")
+    }
 
-        Arc::new(Self {
-            next_request_id: AtomicU64::new(1),
-            session_override_ttl_ms: policy.session_override_ttl_ms,
+    fn new_with_runtime_policy_and_store(
+        policy: RuntimePolicy,
+        runtime_store: Arc<RuntimeStore>,
+    ) -> Result<Arc<Self>, RuntimeStoreError> {
+        let hydrated = hydrate_runtime_projections(&runtime_store)?;
+        runtime_store.prune_session_affinities(
+            unix_now_ms(),
+            policy.session_route_affinity_ttl_ms,
+            session_affinity_limit(policy.session_route_affinity_max_entries),
+        )?;
+        let provider_policy_snapshot = Arc::new(runtime_store.provider_policy_snapshot()?);
+
+        Ok(Arc::new(Self {
+            session_stats_ttl_ms: policy.session_stats_ttl_ms,
             session_binding_ttl_ms: policy.session_binding_ttl_ms,
             session_binding_max_entries: policy.session_binding_max_entries,
             session_route_affinity_ttl_ms: policy.session_route_affinity_ttl_ms,
             session_route_affinity_max_entries: policy.session_route_affinity_max_entries,
-            session_route_affinity_store: policy.session_route_affinity_store,
-            session_cwd_cache_ttl_ms: policy.session_cwd_cache_ttl_ms,
-            session_cwd_cache_max_entries: policy.session_cwd_cache_max_entries,
+            session_route_affinity_updates: AsyncMutex::new(()),
             session_transcript_path_cache_ttl_ms: policy.session_transcript_path_cache_ttl_ms,
             session_transcript_path_cache_max_entries: policy
                 .session_transcript_path_cache_max_entries,
-            session_effort_overrides: RwLock::new(HashMap::new()),
-            session_station_overrides: RwLock::new(HashMap::new()),
-            session_route_target_overrides: RwLock::new(HashMap::new()),
-            session_model_overrides: RwLock::new(HashMap::new()),
-            session_service_tier_overrides: RwLock::new(HashMap::new()),
             session_bindings: RwLock::new(HashMap::new()),
-            session_route_affinities: RwLock::new(restored_session_route_affinities),
-            global_station_override: RwLock::new(None),
-            global_route_target_override: RwLock::new(None),
-            runtime_default_profiles: RwLock::new(HashMap::new()),
-            station_meta_overrides: RwLock::new(HashMap::new()),
-            provider_endpoint_meta_overrides: RwLock::new(HashMap::new()),
-            upstream_meta_overrides: RwLock::new(HashMap::new()),
-            session_cwd_cache: RwLock::new(HashMap::new()),
             session_transcript_path_cache: RwLock::new(HashMap::new()),
-            session_stats: RwLock::new(HashMap::new()),
-            active_requests: RwLock::new(HashMap::new()),
-            recent_finished: RwLock::new(VecDeque::new()),
-            usage_rollups: RwLock::new(HashMap::new()),
-            station_health: RwLock::new(HashMap::new()),
-            passive_station_health: RwLock::new(HashMap::new()),
+            request_lifecycle_projection: RwLock::new(hydrated),
             provider_balances: RwLock::new(HashMap::new()),
-            provider_balance_history: RwLock::new(HashMap::new()),
-            provider_balance_summaries: RwLock::new(HashMap::new()),
             provider_endpoint_runtime_health: RwLock::new(HashMap::new()),
-            policy_action_store,
-            policy_actions: RwLock::new(restored_policy_actions),
-            station_health_checks: RwLock::new(HashMap::new()),
-            service_layout_signatures: RwLock::new(HashMap::new()),
+            provider_policy_updates: AsyncMutex::new(()),
+            provider_policy_snapshot: RwLock::new(provider_policy_snapshot),
             state_version_tx: watch::channel(0).0,
-            lb_states,
-        })
+            operator_capture: RwLock::new(()),
+            #[cfg(test)]
+            terminal_publication_pause: AsyncMutex::new(None),
+            #[cfg(test)]
+            operator_aggregation_pause: AsyncMutex::new(None),
+            runtime_store,
+        }))
+    }
+
+    #[cfg(test)]
+    fn isolated_runtime_store() -> Arc<RuntimeStore> {
+        Arc::new(
+            RuntimeStore::open_in_memory()
+                .expect("an isolated in-memory runtime store should open"),
+        )
+    }
+
+    pub(crate) fn runtime_store(&self) -> &RuntimeStore {
+        self.runtime_store.as_ref()
+    }
+
+    fn with_runtime_store_blocking<T>(&self, operation: impl FnOnce(&RuntimeStore) -> T) -> T {
+        runtime_store_blocking(|| operation(self.runtime_store.as_ref()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn runtime_store_handle(&self) -> Arc<RuntimeStore> {
+        self.runtime_store.clone()
+    }
+
+    #[cfg(test)]
+    async fn hold_request_publication_for_test(&self) -> impl Drop + '_ {
+        self.request_lifecycle_projection.write().await
+    }
+
+    #[cfg(test)]
+    async fn hold_attempt_publication_for_test(&self) -> impl Drop + '_ {
+        self.request_lifecycle_projection.write().await
+    }
+
+    #[cfg(test)]
+    async fn lifecycle_handle_count_for_test(&self) -> usize {
+        self.request_lifecycle_projection
+            .read()
+            .await
+            .lifecycle_handles
+            .len()
     }
 
     pub fn subscribe_state_changes(&self) -> watch::Receiver<u64> {
         self.state_version_tx.subscribe()
     }
 
+    pub fn operator_revision(&self) -> u64 {
+        *self.state_version_tx.borrow()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn operator_ledger_revision(&self) -> OperatorLedgerRevision {
+        let request_state = self.request_lifecycle_projection.read().await;
+        OperatorLedgerRevision::new(
+            self.runtime_store.identity().store_id(),
+            request_state.committed_terminal_count,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn operator_usage_summaries(
+        &self,
+        service_name: &str,
+        limit: usize,
+    ) -> Vec<RequestUsageSummary> {
+        let request_state = self.request_lifecycle_projection.read().await;
+        operator_usage_summaries(&request_state, service_name, limit)
+    }
+
+    pub(crate) async fn capture_operator_lifecycle_snapshot(
+        &self,
+        service_name: &str,
+        recent_limit: usize,
+    ) -> OperatorLifecycleSnapshot {
+        let _capture = self.operator_capture.read().await;
+        let state_revision = self.operator_revision();
+        let request_state = self.request_lifecycle_projection.read().await;
+        let mut active_requests = request_state
+            .active_requests
+            .values()
+            .filter(|request| request.service == service_name)
+            .cloned()
+            .collect::<Vec<_>>();
+        active_requests.sort_by_key(|request| request.started_at_ms);
+        let recent_finished = request_state
+            .recent_finished
+            .iter()
+            .take(recent_limit)
+            .filter(|request| request.service == service_name)
+            .cloned()
+            .collect();
+
+        OperatorLifecycleSnapshot {
+            state_revision,
+            ledger_revision: OperatorLedgerRevision::new(
+                self.runtime_store.identity().store_id(),
+                request_state.committed_terminal_count,
+            ),
+            active_requests,
+            recent_finished,
+            usage_rollup: request_state
+                .usage_rollups
+                .get(service_name)
+                .map(snapshot_usage_rollup),
+            usage_summaries: request_state
+                .operator_usage_summaries
+                .get(service_name)
+                .cloned()
+                .unwrap_or_default(),
+        }
+    }
+
+    #[cfg(test)]
+    async fn pause_next_terminal_publication_after_commit_for_test(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (committed_tx, committed_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        let mut pause = self.terminal_publication_pause.lock().await;
+        assert!(
+            pause.is_none(),
+            "a terminal publication pause is already armed"
+        );
+        *pause = Some(TerminalPublicationPause {
+            committed: committed_tx,
+            resume: resume_rx,
+        });
+        (committed_rx, resume_tx)
+    }
+
+    #[cfg(test)]
+    async fn pause_terminal_publication_after_commit_for_test(&self) {
+        let pause = self.terminal_publication_pause.lock().await.take();
+        if let Some(pause) = pause {
+            let _ = pause.committed.send(());
+            let _ = pause.resume.await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn pause_next_operator_aggregation_after_snapshot_for_test(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (captured_tx, captured_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        let mut pause = self.operator_aggregation_pause.lock().await;
+        assert!(
+            pause.is_none(),
+            "an operator aggregation pause is already armed"
+        );
+        *pause = Some(OperatorAggregationPause {
+            captured: captured_tx,
+            resume: resume_rx,
+        });
+        (captured_rx, resume_tx)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn pause_operator_aggregation_after_snapshot_for_test(&self) {
+        let pause = self.operator_aggregation_pause.lock().await.take();
+        if let Some(pause) = pause {
+            let _ = pause.captured.send(());
+            let _ = pause.resume.await;
+        }
+    }
+
     fn notify_state_changed(&self) {
         self.state_version_tx.send_modify(|version| {
             *version = version.wrapping_add(1);
         });
-    }
-
-    pub async fn get_session_effort_override(&self, session_id: &str) -> Option<String> {
-        let guard = self.session_effort_overrides.read().await;
-        guard.get(session_id).map(|v| v.effort.clone())
-    }
-
-    pub async fn get_session_reasoning_effort_override(&self, session_id: &str) -> Option<String> {
-        self.get_session_effort_override(session_id).await
-    }
-
-    pub async fn set_session_effort_override(
-        &self,
-        session_id: String,
-        effort: String,
-        now_ms: u64,
-    ) {
-        let mut guard = self.session_effort_overrides.write().await;
-        guard.insert(
-            session_id,
-            SessionEffortOverride {
-                effort,
-                updated_at_ms: now_ms,
-                last_seen_ms: now_ms,
-            },
-        );
-        self.notify_state_changed();
-    }
-
-    pub async fn set_session_reasoning_effort_override(
-        &self,
-        session_id: String,
-        reasoning_effort: String,
-        now_ms: u64,
-    ) {
-        self.set_session_effort_override(session_id, reasoning_effort, now_ms)
-            .await;
-    }
-
-    pub async fn clear_session_effort_override(&self, session_id: &str) {
-        let mut guard = self.session_effort_overrides.write().await;
-        if guard.remove(session_id).is_some() {
-            self.notify_state_changed();
-        }
-    }
-
-    pub async fn clear_session_reasoning_effort_override(&self, session_id: &str) {
-        self.clear_session_effort_override(session_id).await;
-    }
-
-    pub async fn list_session_effort_overrides(&self) -> HashMap<String, String> {
-        let guard = self.session_effort_overrides.read().await;
-        guard
-            .iter()
-            .map(|(k, v)| (k.clone(), v.effort.clone()))
-            .collect()
-    }
-
-    pub async fn list_session_reasoning_effort_overrides(&self) -> HashMap<String, String> {
-        self.list_session_effort_overrides().await
-    }
-
-    pub async fn touch_session_override(&self, session_id: &str, now_ms: u64) {
-        let mut guard = self.session_effort_overrides.write().await;
-        if let Some(v) = guard.get_mut(session_id) {
-            v.last_seen_ms = now_ms;
-        }
-    }
-
-    pub async fn touch_session_reasoning_effort_override(&self, session_id: &str, now_ms: u64) {
-        self.touch_session_override(session_id, now_ms).await;
-    }
-
-    pub async fn get_session_station_override(&self, session_id: &str) -> Option<String> {
-        let guard = self.session_station_overrides.read().await;
-        guard.get(session_id).map(|v| v.station_name.clone())
-    }
-
-    pub async fn get_session_route_target_override(&self, session_id: &str) -> Option<String> {
-        let guard = self.session_route_target_overrides.read().await;
-        guard.get(session_id).map(|v| v.target.clone())
-    }
-
-    pub async fn get_session_model_override(&self, session_id: &str) -> Option<String> {
-        let guard = self.session_model_overrides.read().await;
-        guard.get(session_id).map(|v| v.model.clone())
-    }
-
-    pub async fn set_session_model_override(&self, session_id: String, model: String, now_ms: u64) {
-        let mut guard = self.session_model_overrides.write().await;
-        guard.insert(
-            session_id,
-            SessionModelOverride {
-                model,
-                updated_at_ms: now_ms,
-                last_seen_ms: now_ms,
-            },
-        );
-        self.notify_state_changed();
-    }
-
-    pub async fn clear_session_model_override(&self, session_id: &str) {
-        let mut guard = self.session_model_overrides.write().await;
-        if guard.remove(session_id).is_some() {
-            self.notify_state_changed();
-        }
-    }
-
-    pub async fn list_session_model_overrides(&self) -> HashMap<String, String> {
-        let guard = self.session_model_overrides.read().await;
-        guard
-            .iter()
-            .map(|(k, v)| (k.clone(), v.model.clone()))
-            .collect()
-    }
-
-    pub async fn touch_session_model_override(&self, session_id: &str, now_ms: u64) {
-        let mut guard = self.session_model_overrides.write().await;
-        if let Some(v) = guard.get_mut(session_id) {
-            v.last_seen_ms = now_ms;
-        }
-    }
-
-    pub async fn get_session_service_tier_override(&self, session_id: &str) -> Option<String> {
-        let guard = self.session_service_tier_overrides.read().await;
-        guard.get(session_id).map(|v| v.service_tier.clone())
-    }
-
-    pub async fn set_session_service_tier_override(
-        &self,
-        session_id: String,
-        service_tier: String,
-        now_ms: u64,
-    ) {
-        let mut guard = self.session_service_tier_overrides.write().await;
-        guard.insert(
-            session_id,
-            SessionServiceTierOverride {
-                service_tier,
-                updated_at_ms: now_ms,
-                last_seen_ms: now_ms,
-            },
-        );
-        self.notify_state_changed();
-    }
-
-    pub async fn clear_session_service_tier_override(&self, session_id: &str) {
-        let mut guard = self.session_service_tier_overrides.write().await;
-        if guard.remove(session_id).is_some() {
-            self.notify_state_changed();
-        }
-    }
-
-    pub async fn list_session_service_tier_overrides(&self) -> HashMap<String, String> {
-        let guard = self.session_service_tier_overrides.read().await;
-        guard
-            .iter()
-            .map(|(k, v)| (k.clone(), v.service_tier.clone()))
-            .collect()
-    }
-
-    pub async fn touch_session_service_tier_override(&self, session_id: &str, now_ms: u64) {
-        let mut guard = self.session_service_tier_overrides.write().await;
-        if let Some(v) = guard.get_mut(session_id) {
-            v.last_seen_ms = now_ms;
-        }
     }
 
     pub async fn get_session_binding(&self, session_id: &str) -> Option<SessionBinding> {
@@ -896,36 +1306,46 @@ impl ProxyState {
         &self,
         session_id: &str,
     ) -> Option<SessionRouteAffinity> {
-        let (affinity, snapshot) = {
-            let mut guard = self.session_route_affinities.write().await;
-            let affinity = guard.get(session_id).cloned()?;
-            if self.session_route_affinity_is_expired(&affinity, unix_now_ms()) {
-                guard.remove(session_id);
-                (None, Some(guard.clone()))
-            } else {
-                (Some(affinity), None)
+        match self.read_session_route_affinity(session_id, unix_now_ms()) {
+            Ok(affinity) => affinity,
+            Err(error) => {
+                tracing::warn!(
+                    session_id,
+                    error = %error,
+                    "failed to read session route affinity from runtime store"
+                );
+                None
             }
-        };
-        if let Some(snapshot) = snapshot {
-            self.persist_session_route_affinities(snapshot).await;
         }
-        affinity
+    }
+
+    /// Reads route affinity without pruning expired durable state.
+    pub async fn peek_session_route_affinity(
+        &self,
+        session_id: &str,
+    ) -> Option<SessionRouteAffinity> {
+        self.get_session_route_affinity(session_id).await
     }
 
     pub async fn list_session_route_affinities(&self) -> HashMap<String, SessionRouteAffinity> {
-        let (affinities, snapshot) = {
-            let mut guard = self.session_route_affinities.write().await;
-            let now_ms = unix_now_ms();
-            let before_len = guard.len();
-            guard.retain(|_, affinity| !self.session_route_affinity_is_expired(affinity, now_ms));
-            let affinities = guard.clone();
-            let snapshot = (guard.len() != before_len).then(|| guard.clone());
-            (affinities, snapshot)
-        };
-        if let Some(snapshot) = snapshot {
-            self.persist_session_route_affinities(snapshot).await;
+        match self.with_runtime_store_blocking(|runtime_store| {
+            runtime_store.list_session_affinities(unix_now_ms(), self.session_route_affinity_ttl_ms)
+        }) {
+            Ok(records) => records
+                .into_iter()
+                .map(|record| {
+                    let session_id = record.session_id.clone();
+                    (session_id, session_route_affinity_from_record(record))
+                })
+                .collect(),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "failed to list session route affinities from runtime store"
+                );
+                HashMap::new()
+            }
         }
-        affinities
     }
 
     pub async fn record_session_route_affinity_success(
@@ -934,83 +1354,62 @@ impl ProxyState {
         target: SessionRouteAffinityTarget,
         reason_hint: Option<String>,
         now_ms: u64,
-    ) -> SessionRouteAffinity {
-        let (affinity, snapshot) = {
-            let mut guard = self.session_route_affinities.write().await;
-            let affinity = match guard.get_mut(session_id) {
-                Some(existing) if target.same_target(existing) => {
-                    existing.last_selected_at_ms = now_ms;
-                    if target.session_identity_source.is_some() {
-                        existing.session_identity_source = target.session_identity_source;
-                    }
-                    existing.clone()
+    ) -> Result<SessionRouteAffinity, RuntimeStoreError> {
+        let _update_guard = self.session_route_affinity_updates.lock().await;
+        let existing = self.read_session_route_affinity(session_id, now_ms)?;
+        let affinity = match existing {
+            Some(mut existing) if target.same_target(&existing) => {
+                existing.last_selected_at_ms = existing.last_selected_at_ms.max(now_ms);
+                if target.session_identity_source.is_some() {
+                    existing.session_identity_source = target.session_identity_source;
                 }
-                Some(_) => {
-                    let reason = reason_hint.unwrap_or_else(|| "target_changed".to_string());
-                    let affinity = SessionRouteAffinity {
-                        route_graph_key: target.route_graph_key,
-                        session_identity_source: target.session_identity_source,
-                        provider_endpoint: target.provider_endpoint,
-                        upstream_base_url: target.upstream_base_url,
-                        route_path: target.route_path,
-                        last_selected_at_ms: now_ms,
-                        last_changed_at_ms: now_ms,
-                        change_reason: reason,
-                    };
-                    guard.insert(session_id.to_string(), affinity.clone());
-                    affinity
+                existing
+            }
+            Some(existing) => {
+                let selected_at_ms = existing.last_selected_at_ms.max(now_ms);
+                SessionRouteAffinity {
+                    route_graph_key: target.route_graph_key,
+                    session_identity_source: target.session_identity_source,
+                    provider_endpoint: target.provider_endpoint,
+                    upstream_base_url: target.upstream_base_url,
+                    route_path: target.route_path,
+                    last_selected_at_ms: selected_at_ms,
+                    last_changed_at_ms: selected_at_ms,
+                    change_reason: reason_hint.unwrap_or_else(|| "target_changed".to_string()),
                 }
-                None => {
-                    let reason = reason_hint.unwrap_or_else(|| "first_success".to_string());
-                    let affinity = SessionRouteAffinity {
-                        route_graph_key: target.route_graph_key,
-                        session_identity_source: target.session_identity_source,
-                        provider_endpoint: target.provider_endpoint,
-                        upstream_base_url: target.upstream_base_url,
-                        route_path: target.route_path,
-                        last_selected_at_ms: now_ms,
-                        last_changed_at_ms: now_ms,
-                        change_reason: reason,
-                    };
-                    guard.insert(session_id.to_string(), affinity.clone());
-                    affinity
-                }
-            };
-            prune_lru_cache(
-                &mut guard,
-                self.session_route_affinity_max_entries,
-                |entry| entry.last_selected_at_ms,
-            );
-            (affinity, guard.clone())
+            }
+            None => SessionRouteAffinity {
+                route_graph_key: target.route_graph_key,
+                session_identity_source: target.session_identity_source,
+                provider_endpoint: target.provider_endpoint,
+                upstream_base_url: target.upstream_base_url,
+                route_path: target.route_path,
+                last_selected_at_ms: now_ms,
+                last_changed_at_ms: now_ms,
+                change_reason: reason_hint.unwrap_or_else(|| "first_success".to_string()),
+            },
         };
-        self.persist_session_route_affinities(snapshot).await;
+        self.with_runtime_store_blocking(|runtime_store| {
+            runtime_store.upsert_session_affinity(
+                session_affinity_record(session_id, &affinity),
+                session_affinity_limit(self.session_route_affinity_max_entries),
+            )
+        })?;
+        drop(_update_guard);
         self.notify_state_changed();
-        affinity
+        Ok(affinity)
     }
 
-    fn session_route_affinity_is_expired(
+    fn read_session_route_affinity(
         &self,
-        affinity: &SessionRouteAffinity,
+        session_id: &str,
         now_ms: u64,
-    ) -> bool {
-        session_route_affinity_is_expired_with_ttl(
-            self.session_route_affinity_ttl_ms,
-            affinity,
-            now_ms,
-        )
-    }
-
-    async fn persist_session_route_affinities(
-        &self,
-        snapshot: HashMap<String, SessionRouteAffinity>,
-    ) {
-        if let Err(err) = self
-            .session_route_affinity_store
-            .save(&snapshot, unix_now_ms())
-            .await
-        {
-            tracing::warn!(error = %err, "failed to persist session route affinity ledger");
-        }
+    ) -> Result<Option<SessionRouteAffinity>, RuntimeStoreError> {
+        self.with_runtime_store_blocking(|runtime_store| {
+            runtime_store
+                .get_session_affinity(session_id, now_ms, self.session_route_affinity_ttl_ms)
+                .map(|record| record.map(session_route_affinity_from_record))
+        })
     }
 
     pub async fn set_session_binding(&self, binding: SessionBinding) {
@@ -1034,95 +1433,6 @@ impl ProxyState {
         }
     }
 
-    pub async fn clear_session_manual_overrides(&self, session_id: &str) {
-        self.clear_session_station_override(session_id).await;
-        self.clear_session_route_target_override(session_id).await;
-        self.clear_session_model_override(session_id).await;
-        self.clear_session_effort_override(session_id).await;
-        self.clear_session_service_tier_override(session_id).await;
-    }
-
-    pub async fn get_session_manual_overrides(&self, session_id: &str) -> SessionManualOverrides {
-        let (reasoning_effort, station_name, route_target, model, service_tier) = tokio::join!(
-            self.get_session_reasoning_effort_override(session_id),
-            self.get_session_station_override(session_id),
-            self.get_session_route_target_override(session_id),
-            self.get_session_model_override(session_id),
-            self.get_session_service_tier_override(session_id),
-        );
-
-        SessionManualOverrides {
-            reasoning_effort,
-            station_name,
-            route_target,
-            model,
-            service_tier,
-        }
-    }
-
-    pub async fn list_session_manual_overrides(&self) -> HashMap<String, SessionManualOverrides> {
-        let (reasoning_effort_map, station_map, route_target_map, model_map, service_tier_map) = tokio::join!(
-            self.list_session_reasoning_effort_overrides(),
-            self.list_session_station_overrides(),
-            self.list_session_route_target_overrides(),
-            self.list_session_model_overrides(),
-            self.list_session_service_tier_overrides(),
-        );
-
-        let mut merged = HashMap::<String, SessionManualOverrides>::new();
-        for (session_id, reasoning_effort) in reasoning_effort_map {
-            merged.entry(session_id).or_default().reasoning_effort = Some(reasoning_effort);
-        }
-        for (session_id, station_name) in station_map {
-            merged.entry(session_id).or_default().station_name = Some(station_name);
-        }
-        for (session_id, route_target) in route_target_map {
-            merged.entry(session_id).or_default().route_target = Some(route_target);
-        }
-        for (session_id, model) in model_map {
-            merged.entry(session_id).or_default().model = Some(model);
-        }
-        for (session_id, service_tier) in service_tier_map {
-            merged.entry(session_id).or_default().service_tier = Some(service_tier);
-        }
-        merged.retain(|_, overrides| !overrides.is_empty());
-        merged
-    }
-
-    pub async fn apply_session_profile_binding(
-        &self,
-        service_name: &str,
-        mgr: &ServiceConfigManager,
-        session_id: String,
-        profile_name: String,
-        now_ms: u64,
-    ) -> anyhow::Result<()> {
-        let profile = crate::config::resolve_service_profile(mgr, profile_name.as_str())?;
-        crate::config::validate_profile_station_compatibility(
-            service_name,
-            mgr,
-            profile_name.as_str(),
-            &profile,
-        )?;
-
-        self.set_session_binding(SessionBinding {
-            session_id: session_id.clone(),
-            profile_name: Some(profile_name),
-            station_name: profile.station.clone(),
-            model: profile.model.clone(),
-            reasoning_effort: profile.reasoning_effort.clone(),
-            service_tier: profile.service_tier.clone(),
-            continuity_mode: SessionContinuityMode::ManualProfile,
-            created_at_ms: now_ms,
-            updated_at_ms: now_ms,
-            last_seen_ms: now_ms,
-        })
-        .await;
-        self.clear_session_manual_overrides(session_id.as_str())
-            .await;
-        Ok(())
-    }
-
     pub async fn touch_session_binding(&self, session_id: &str, now_ms: u64) {
         let mut guard = self.session_bindings.write().await;
         if let Some(entry) = guard.get_mut(session_id) {
@@ -1130,474 +1440,19 @@ impl ProxyState {
         }
     }
 
-    pub async fn set_session_station_override(
-        &self,
-        session_id: String,
-        station_name: String,
-        now_ms: u64,
-    ) {
-        let mut guard = self.session_station_overrides.write().await;
-        guard.insert(
-            session_id,
-            SessionStationOverride {
-                station_name,
-                updated_at_ms: now_ms,
-                last_seen_ms: now_ms,
-            },
-        );
-        self.notify_state_changed();
-    }
-
-    pub async fn set_session_route_target_override(
-        &self,
-        session_id: String,
-        target: String,
-        now_ms: u64,
-    ) {
-        let mut guard = self.session_route_target_overrides.write().await;
-        guard.insert(
-            session_id,
-            SessionRouteTargetOverride {
-                target,
-                updated_at_ms: now_ms,
-                last_seen_ms: now_ms,
-            },
-        );
-        self.notify_state_changed();
-    }
-
-    pub async fn clear_session_station_override(&self, session_id: &str) {
-        let mut guard = self.session_station_overrides.write().await;
-        if guard.remove(session_id).is_some() {
-            self.notify_state_changed();
-        }
-    }
-
-    pub async fn clear_session_route_target_override(&self, session_id: &str) {
-        let mut guard = self.session_route_target_overrides.write().await;
-        if guard.remove(session_id).is_some() {
-            self.notify_state_changed();
-        }
-    }
-
-    pub async fn list_session_station_overrides(&self) -> HashMap<String, String> {
-        let guard = self.session_station_overrides.read().await;
-        guard
-            .iter()
-            .map(|(k, v)| (k.clone(), v.station_name.clone()))
-            .collect()
-    }
-
-    pub async fn list_session_route_target_overrides(&self) -> HashMap<String, String> {
-        let guard = self.session_route_target_overrides.read().await;
-        guard
-            .iter()
-            .map(|(k, v)| (k.clone(), v.target.clone()))
-            .collect()
-    }
-
-    pub async fn touch_session_station_override(&self, session_id: &str, now_ms: u64) {
-        let mut guard = self.session_station_overrides.write().await;
-        if let Some(v) = guard.get_mut(session_id) {
-            v.last_seen_ms = now_ms;
-        }
-    }
-
-    pub async fn touch_session_route_target_override(&self, session_id: &str, now_ms: u64) {
-        let mut guard = self.session_route_target_overrides.write().await;
-        if let Some(v) = guard.get_mut(session_id) {
-            v.last_seen_ms = now_ms;
-        }
-    }
-
-    pub async fn get_global_station_override(&self) -> Option<String> {
-        let guard = self.global_station_override.read().await;
-        guard.clone()
-    }
-
-    pub async fn get_global_route_target_override(&self) -> Option<String> {
-        let guard = self.global_route_target_override.read().await;
-        guard.clone()
-    }
-
-    pub async fn set_global_station_override(&self, station_name: String, _now_ms: u64) {
-        let mut guard = self.global_station_override.write().await;
-        *guard = Some(station_name);
-        self.notify_state_changed();
-    }
-
-    pub async fn set_global_route_target_override(&self, target: String, _now_ms: u64) {
-        let mut guard = self.global_route_target_override.write().await;
-        *guard = Some(target);
-        self.notify_state_changed();
-    }
-
-    pub async fn clear_global_station_override(&self) {
-        let mut guard = self.global_station_override.write().await;
-        if guard.take().is_some() {
-            self.notify_state_changed();
-        }
-    }
-
-    pub async fn clear_global_route_target_override(&self) {
-        let mut guard = self.global_route_target_override.write().await;
-        if guard.take().is_some() {
-            self.notify_state_changed();
-        }
-    }
-
-    pub async fn get_runtime_default_profile_override(&self, service_name: &str) -> Option<String> {
-        let guard = self.runtime_default_profiles.read().await;
-        guard
-            .get(service_name)
-            .map(|entry| entry.profile_name.clone())
-    }
-
-    pub async fn set_runtime_default_profile_override(
-        &self,
-        service_name: String,
-        profile_name: String,
-        now_ms: u64,
-    ) {
-        let mut guard = self.runtime_default_profiles.write().await;
-        guard.insert(
-            service_name,
-            RuntimeDefaultProfileOverride {
-                profile_name,
-                updated_at_ms: now_ms,
-            },
-        );
-        self.notify_state_changed();
-    }
-
-    pub async fn clear_runtime_default_profile_override(&self, service_name: &str) {
-        let mut guard = self.runtime_default_profiles.write().await;
-        if guard.remove(service_name).is_some() {
-            self.notify_state_changed();
-        }
-    }
-
-    pub async fn set_station_enabled_override(
-        &self,
-        service_name: &str,
-        station_name: String,
-        enabled: bool,
-        now_ms: u64,
-    ) {
-        let mut guard = self.station_meta_overrides.write().await;
-        let per_service = guard.entry(service_name.to_string()).or_default();
-        let entry = per_service.entry(station_name).or_default();
-        entry.enabled = Some(enabled);
-        entry.updated_at_ms = now_ms;
-        self.notify_state_changed();
-    }
-
-    pub async fn set_station_level_override(
-        &self,
-        service_name: &str,
-        station_name: String,
-        level: u8,
-        now_ms: u64,
-    ) {
-        let mut guard = self.station_meta_overrides.write().await;
-        let per_service = guard.entry(service_name.to_string()).or_default();
-        let entry = per_service.entry(station_name).or_default();
-        entry.level = Some(level.clamp(1, 10));
-        entry.updated_at_ms = now_ms;
-        self.notify_state_changed();
-    }
-
-    pub async fn set_station_runtime_state_override(
-        &self,
-        service_name: &str,
-        station_name: String,
-        state: RuntimeConfigState,
-        now_ms: u64,
-    ) {
-        let mut guard = self.station_meta_overrides.write().await;
-        let per_service = guard.entry(service_name.to_string()).or_default();
-        let entry = per_service.entry(station_name).or_default();
-        entry.state = Some(state);
-        entry.updated_at_ms = now_ms;
-        self.notify_state_changed();
-    }
-
-    pub async fn clear_station_enabled_override(&self, service_name: &str, station_name: &str) {
-        let mut guard = self.station_meta_overrides.write().await;
-        let Some(per_service) = guard.get_mut(service_name) else {
-            return;
-        };
-        let Some(entry) = per_service.get_mut(station_name) else {
-            return;
-        };
-        if entry.enabled.take().is_none() {
-            return;
-        }
-        if entry.enabled.is_none() && entry.level.is_none() && entry.state.is_none() {
-            per_service.remove(station_name);
-        }
-        if per_service.is_empty() {
-            guard.remove(service_name);
-        }
-        self.notify_state_changed();
-    }
-
-    pub async fn clear_station_level_override(&self, service_name: &str, station_name: &str) {
-        let mut guard = self.station_meta_overrides.write().await;
-        let Some(per_service) = guard.get_mut(service_name) else {
-            return;
-        };
-        let Some(entry) = per_service.get_mut(station_name) else {
-            return;
-        };
-        if entry.level.take().is_none() {
-            return;
-        }
-        if entry.enabled.is_none() && entry.level.is_none() && entry.state.is_none() {
-            per_service.remove(station_name);
-        }
-        if per_service.is_empty() {
-            guard.remove(service_name);
-        }
-        self.notify_state_changed();
-    }
-
-    pub async fn clear_station_runtime_state_override(
-        &self,
-        service_name: &str,
-        station_name: &str,
-    ) {
-        let mut guard = self.station_meta_overrides.write().await;
-        let Some(per_service) = guard.get_mut(service_name) else {
-            return;
-        };
-        let Some(entry) = per_service.get_mut(station_name) else {
-            return;
-        };
-        if entry.state.take().is_none() {
-            return;
-        }
-        if entry.enabled.is_none() && entry.level.is_none() && entry.state.is_none() {
-            per_service.remove(station_name);
-        }
-        if per_service.is_empty() {
-            guard.remove(service_name);
-        }
-        self.notify_state_changed();
-    }
-
-    pub async fn get_station_meta_overrides(
-        &self,
-        service_name: &str,
-    ) -> HashMap<String, (Option<bool>, Option<u8>)> {
-        let guard = self.station_meta_overrides.read().await;
-        guard
-            .get(service_name)
-            .map(|m| {
-                m.iter()
-                    .map(|(k, v)| (k.clone(), (v.enabled, v.level)))
-                    .collect::<HashMap<_, _>>()
-            })
-            .unwrap_or_default()
-    }
-
-    pub async fn get_station_runtime_state_overrides(
-        &self,
-        service_name: &str,
-    ) -> HashMap<String, RuntimeConfigState> {
-        let guard = self.station_meta_overrides.read().await;
-        guard
-            .get(service_name)
-            .map(|m| {
-                m.iter()
-                    .filter_map(|(k, v)| v.state.map(|state| (k.clone(), state)))
-                    .collect::<HashMap<_, _>>()
-            })
-            .unwrap_or_default()
-    }
-
-    pub async fn set_provider_endpoint_enabled_override(
-        &self,
-        service_name: &str,
-        endpoint_key: ProviderEndpointKey,
-        enabled: bool,
-        now_ms: u64,
-    ) {
-        let mut guard = self.provider_endpoint_meta_overrides.write().await;
-        let per_service = guard.entry(service_name.to_string()).or_default();
-        let entry = per_service.entry(endpoint_key).or_default();
-        entry.enabled = Some(enabled);
-        entry.updated_at_ms = now_ms;
-        self.notify_state_changed();
-    }
-
-    pub async fn clear_provider_endpoint_enabled_override(
-        &self,
-        service_name: &str,
-        endpoint_key: &ProviderEndpointKey,
-    ) {
-        let mut guard = self.provider_endpoint_meta_overrides.write().await;
-        let Some(per_service) = guard.get_mut(service_name) else {
-            return;
-        };
-        let Some(entry) = per_service.get_mut(endpoint_key) else {
-            return;
-        };
-        if entry.enabled.take().is_none() {
-            return;
-        }
-        if entry.enabled.is_none() && entry.level.is_none() && entry.state.is_none() {
-            per_service.remove(endpoint_key);
-        }
-        if per_service.is_empty() {
-            guard.remove(service_name);
-        }
-        self.notify_state_changed();
-    }
-
-    pub async fn set_provider_endpoint_runtime_state_override(
-        &self,
-        service_name: &str,
-        endpoint_key: ProviderEndpointKey,
-        state: RuntimeConfigState,
-        now_ms: u64,
-    ) {
-        let mut guard = self.provider_endpoint_meta_overrides.write().await;
-        let per_service = guard.entry(service_name.to_string()).or_default();
-        let entry = per_service.entry(endpoint_key).or_default();
-        entry.state = Some(state);
-        entry.updated_at_ms = now_ms;
-        self.notify_state_changed();
-    }
-
-    pub async fn clear_provider_endpoint_runtime_state_override(
-        &self,
-        service_name: &str,
-        endpoint_key: &ProviderEndpointKey,
-    ) {
-        let mut guard = self.provider_endpoint_meta_overrides.write().await;
-        let Some(per_service) = guard.get_mut(service_name) else {
-            return;
-        };
-        let Some(entry) = per_service.get_mut(endpoint_key) else {
-            return;
-        };
-        if entry.state.take().is_none() {
-            return;
-        }
-        if entry.enabled.is_none() && entry.level.is_none() && entry.state.is_none() {
-            per_service.remove(endpoint_key);
-        }
-        if per_service.is_empty() {
-            guard.remove(service_name);
-        }
-        self.notify_state_changed();
-    }
-
-    pub async fn set_upstream_enabled_override(
-        &self,
-        service_name: &str,
-        base_url: String,
-        enabled: bool,
-        now_ms: u64,
-    ) {
-        let mut guard = self.upstream_meta_overrides.write().await;
-        let per_service = guard.entry(service_name.to_string()).or_default();
-        let entry = per_service.entry(base_url).or_default();
-        entry.enabled = Some(enabled);
-        entry.updated_at_ms = now_ms;
-        self.notify_state_changed();
-    }
-
-    pub async fn clear_upstream_enabled_override(&self, service_name: &str, base_url: &str) {
-        let mut guard = self.upstream_meta_overrides.write().await;
-        let Some(per_service) = guard.get_mut(service_name) else {
-            return;
-        };
-        let Some(entry) = per_service.get_mut(base_url) else {
-            return;
-        };
-        if entry.enabled.take().is_none() {
-            return;
-        }
-        if entry.enabled.is_none() && entry.level.is_none() && entry.state.is_none() {
-            per_service.remove(base_url);
-        }
-        if per_service.is_empty() {
-            guard.remove(service_name);
-        }
-        self.notify_state_changed();
-    }
-
-    pub async fn set_upstream_runtime_state_override(
-        &self,
-        service_name: &str,
-        base_url: String,
-        state: RuntimeConfigState,
-        now_ms: u64,
-    ) {
-        let mut guard = self.upstream_meta_overrides.write().await;
-        let per_service = guard.entry(service_name.to_string()).or_default();
-        let entry = per_service.entry(base_url).or_default();
-        entry.state = Some(state);
-        entry.updated_at_ms = now_ms;
-        self.notify_state_changed();
-    }
-
-    pub async fn clear_upstream_runtime_state_override(&self, service_name: &str, base_url: &str) {
-        let mut guard = self.upstream_meta_overrides.write().await;
-        let Some(per_service) = guard.get_mut(service_name) else {
-            return;
-        };
-        let Some(entry) = per_service.get_mut(base_url) else {
-            return;
-        };
-        if entry.state.take().is_none() {
-            return;
-        }
-        if entry.enabled.is_none() && entry.level.is_none() && entry.state.is_none() {
-            per_service.remove(base_url);
-        }
-        if per_service.is_empty() {
-            guard.remove(service_name);
-        }
-        self.notify_state_changed();
-    }
-
-    pub async fn get_upstream_meta_overrides(
-        &self,
-        service_name: &str,
-    ) -> HashMap<String, (Option<bool>, Option<RuntimeConfigState>)> {
-        let mut overrides = HashMap::new();
-
-        {
-            let guard = self.upstream_meta_overrides.read().await;
-            if let Some(per_service) = guard.get(service_name) {
-                overrides.extend(
-                    per_service
-                        .iter()
-                        .map(|(k, v)| (k.clone(), (v.enabled, v.state))),
-                );
-            }
-        }
-
-        {
-            let guard = self.provider_endpoint_meta_overrides.read().await;
-            if let Some(per_service) = guard.get(service_name) {
-                overrides.extend(
-                    per_service
-                        .iter()
-                        .map(|(k, v)| (k.stable_key(), (v.enabled, v.state))),
-                );
-            }
-        }
-
-        overrides
-    }
-
     pub async fn route_plan_runtime_state_for_provider_endpoints(
         &self,
         service_name: &str,
+    ) -> RoutePlanRuntimeState {
+        let policy_snapshot = self.capture_provider_policy_snapshot().await;
+        self.route_plan_runtime_state_with_provider_policy(service_name, &policy_snapshot)
+            .await
+    }
+
+    pub async fn route_plan_runtime_state_with_provider_policy(
+        &self,
+        service_name: &str,
+        policy_snapshot: &ProviderPolicySnapshot,
     ) -> RoutePlanRuntimeState {
         let mut runtime = RoutePlanRuntimeState::default();
         let now = std::time::Instant::now();
@@ -1626,7 +1481,7 @@ impl ProxyState {
                             failure_count: health.failure_count,
                             cooldown_active,
                             cooldown_remaining_secs,
-                            usage_exhausted: health.usage_exhausted,
+                            usage_exhausted: false,
                             missing_auth: false,
                             concurrency_saturated: false,
                             concurrency_active: None,
@@ -1647,142 +1502,197 @@ impl ProxyState {
             }
         }
 
+        for projection in policy_snapshot
+            .projections
+            .iter()
+            .filter(|projection| projection.provider_endpoint.service_name == service_name)
         {
-            let guard = self.policy_actions.read().await;
-            if let Some(per_service) = guard.get(service_name) {
-                for (endpoint_key, actions) in per_service {
-                    for action in actions {
-                        let Some(projection) = PolicyActionProjection::from_action(action, now_ms)
-                        else {
-                            continue;
-                        };
-                        let mut upstream_state = runtime.provider_endpoint(endpoint_key);
-                        if projection.active_cooldown {
-                            upstream_state.cooldown_active = true;
-                            upstream_state.cooldown_remaining_secs =
-                                projection.cooldown_remaining_secs;
-                            if matches!(action.kind, PolicyActionKind::Cooldown)
-                                && matches!(
-                                    action.source_signal.kind,
-                                    crate::provider_signals::ProviderSignalKind::Quota
-                                        | crate::provider_signals::ProviderSignalKind::RateLimit
-                                )
-                            {
-                                upstream_state.usage_exhausted = true;
-                            }
-                        }
-                        runtime.set_provider_endpoint(endpoint_key.clone(), upstream_state);
-                    }
+            let mut upstream_state = runtime.provider_endpoint(&projection.provider_endpoint);
+            if projection.automatic == ProviderAutomaticEligibility::Blocked {
+                upstream_state.usage_exhausted = true;
+                if let Some(action) = projection.active_action.as_ref() {
+                    upstream_state.cooldown_active = true;
+                    upstream_state.cooldown_remaining_secs = action
+                        .expires_at_unix_ms
+                        .map(|expires_at| expires_at.saturating_sub(now_ms).div_ceil(1_000))
+                        .filter(|remaining| *remaining > 0);
                 }
             }
-        }
-
-        {
-            let guard = self.provider_endpoint_meta_overrides.read().await;
-            if let Some(per_service) = guard.get(service_name) {
-                for (endpoint_key, meta) in per_service {
-                    let mut upstream_state = runtime.provider_endpoint(endpoint_key);
-                    if meta.enabled == Some(false)
-                        || meta
-                            .state
-                            .is_some_and(|state| state != RuntimeConfigState::Normal)
-                    {
-                        upstream_state.runtime_disabled = true;
-                    }
-                    runtime.set_provider_endpoint(endpoint_key.clone(), upstream_state);
-                }
+            if projection.effective == ProviderEffectiveEligibility::Ineligible
+                && projection.manual != ProviderManualEligibility::Enabled
+            {
+                upstream_state.runtime_disabled = true;
             }
+            runtime.set_provider_endpoint(projection.provider_endpoint.clone(), upstream_state);
         }
 
         runtime
     }
 
-    pub async fn upsert_owned_policy_action(&self, service_name: &str, action: PolicyAction) {
-        let mut guard = self.policy_actions.write().await;
-        let mut snapshot = guard.clone();
-        {
-            let per_service = snapshot.entry(service_name.to_string()).or_default();
-            let actions = per_service
-                .entry(action.provider_endpoint_key.clone())
-                .or_default();
-            if let Some(existing) = actions.iter_mut().find(|existing| {
-                existing.kind == action.kind
-                    && existing.owner == action.owner
-                    && existing.source_signal.kind == action.source_signal.kind
-                    && existing.source_signal.source == action.source_signal.source
-            }) {
-                *existing = action;
-            } else {
-                actions.push(action);
-            }
-        }
-        if !self.persist_policy_actions(&snapshot).await {
-            return;
-        }
-        *guard = snapshot;
-        self.notify_state_changed();
+    pub async fn capture_provider_policy_snapshot(&self) -> Arc<ProviderPolicySnapshot> {
+        self.provider_policy_snapshot.read().await.clone()
     }
 
-    pub async fn clear_owned_policy_action(
+    pub async fn reconcile_runtime_upstream_identities(
         &self,
-        service_name: &str,
-        endpoint_key: &ProviderEndpointKey,
-        kind: PolicyActionKind,
-        source_kind: crate::provider_signals::ProviderSignalKind,
-        source: crate::provider_signals::ProviderSignalSource,
-    ) {
-        let mut guard = self.policy_actions.write().await;
-        let mut snapshot = guard.clone();
-        let changed = {
-            let mut changed = false;
-            if let Some(per_service) = snapshot.get_mut(service_name) {
-                if let Some(actions) = per_service.get_mut(endpoint_key) {
-                    let before = actions.len();
-                    actions.retain(|action| {
-                        !(action.kind == kind
-                            && action.owner
-                                == crate::policy_actions::PolicyActionOwner::CodexHelper)
-                            || action.source_signal.kind != source_kind
-                            || action.source_signal.source != source
-                    });
-                    changed |= actions.len() != before;
-                    if actions.is_empty() {
-                        per_service.remove(endpoint_key);
-                    }
-                }
-                if per_service.is_empty() {
-                    snapshot.remove(service_name);
-                }
-            }
-            changed
-        };
-        if changed {
-            if !self.persist_policy_actions(&snapshot).await {
-                return;
-            }
-            *guard = snapshot;
+        identities: &[RuntimeUpstreamIdentity],
+        updated_at_ms: u64,
+    ) -> Result<Arc<ProviderPolicySnapshot>, RuntimeStoreError> {
+        let _update_guard = self.provider_policy_updates.lock().await;
+        let mut current = self.provider_policy_snapshot.write().await;
+        let next = Arc::new(self.with_runtime_store_blocking(|runtime_store| {
+            runtime_store.reconcile_runtime_upstream_identities(identities, updated_at_ms)
+        })?);
+        if **current != *next {
+            *current = Arc::clone(&next);
             self.notify_state_changed();
         }
+        Ok(next)
     }
 
-    async fn persist_policy_actions(&self, snapshot: &PolicyActionMap) -> bool {
-        match self.policy_action_store.save(snapshot, unix_now_ms()).await {
-            Ok(()) => true,
-            Err(err) => {
-                tracing::warn!(error = %err, "failed to persist policy action ledger");
-                false
-            }
+    pub async fn reserve_provider_observation(
+        &self,
+        scope: ProviderObservationScope,
+        reserved_at_ms: u64,
+    ) -> Result<ProviderObservationReservation, RuntimeStoreError> {
+        let _update_guard = self.provider_policy_updates.lock().await;
+        let mut current = self.provider_policy_snapshot.write().await;
+        let reservation = self.with_runtime_store_blocking(|runtime_store| {
+            runtime_store.reserve_provider_observation(scope, reserved_at_ms)
+        })?;
+        self.publish_provider_policy_projection(
+            &mut current,
+            reservation.policy_revision,
+            reservation.projection.clone(),
+        );
+        Ok(reservation)
+    }
+
+    pub async fn commit_provider_observation(
+        &self,
+        reservation: ProviderObservationReservation,
+        observation: ProviderObservation,
+    ) -> Result<ProviderObservationCommit, RuntimeStoreError> {
+        let _update_guard = self.provider_policy_updates.lock().await;
+        let mut current = self.provider_policy_snapshot.write().await;
+        let committed = self.with_runtime_store_blocking(|runtime_store| {
+            runtime_store.commit_provider_observation(reservation.ticket, observation)
+        })?;
+        self.publish_provider_policy_projection(
+            &mut current,
+            committed.policy_revision,
+            committed.projection.clone(),
+        );
+        Ok(committed)
+    }
+
+    pub async fn set_provider_manual_eligibility(
+        &self,
+        provider_endpoint: ProviderEndpointKey,
+        manual: ProviderManualEligibility,
+        reason: Option<String>,
+        updated_at_ms: u64,
+    ) -> Result<ProviderEligibilityProjection, RuntimeStoreError> {
+        let _update_guard = self.provider_policy_updates.lock().await;
+        let mut current = self.provider_policy_snapshot.write().await;
+        let projection = self.with_runtime_store_blocking(|runtime_store| {
+            runtime_store.set_provider_manual_eligibility(
+                provider_endpoint,
+                manual,
+                reason,
+                updated_at_ms,
+            )
+        })?;
+        self.publish_provider_policy_projection(
+            &mut current,
+            projection.policy_revision,
+            projection.clone(),
+        );
+        Ok(projection)
+    }
+
+    #[cfg(test)]
+    async fn set_provider_automatic_block_for_test(
+        &self,
+        provider_endpoint: ProviderEndpointKey,
+        blocked: bool,
+        observed_at_ms: u64,
+    ) -> ProviderObservationCommit {
+        self.set_provider_automatic_block_for_runtime_identity_for_test(
+            RuntimeUpstreamIdentity::new(provider_endpoint, "https://provider.test"),
+            blocked,
+            observed_at_ms,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn set_provider_automatic_block_for_runtime_identity_for_test(
+        &self,
+        identity: RuntimeUpstreamIdentity,
+        blocked: bool,
+        observed_at_ms: u64,
+    ) -> ProviderObservationCommit {
+        const ACCOUNT_FINGERPRINT: &str =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const CONFIG_REVISION: &str =
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let route_scope = identity.policy_route_scope();
+        let scope = ProviderObservationScope::new(
+            identity.provider_endpoint,
+            identity.base_url,
+            route_scope,
+            "test:provider-policy",
+            "https://provider.test/usage",
+            ACCOUNT_FINGERPRINT,
+            CONFIG_REVISION,
+        )
+        .expect("test provider observation scope");
+        let reservation = self
+            .reserve_provider_observation(scope, observed_at_ms)
+            .await
+            .expect("reserve test provider observation");
+        self.commit_provider_observation(
+            reservation,
+            ProviderObservation {
+                observed_at_unix_ms: observed_at_ms,
+                completed_at_unix_ms: observed_at_ms,
+                authority: ProviderObservationAuthority::Authoritative,
+                evidence: serde_json::json!({ "blocked": blocked }),
+                effect: if blocked {
+                    ProviderPolicyEffect::Block {
+                        action_kind: "balance_exhausted".to_string(),
+                        code: Some("balance_exhausted".to_string()),
+                        reason: "test authoritative balance exhaustion".to_string(),
+                        expires_at_unix_ms: None,
+                    }
+                } else {
+                    ProviderPolicyEffect::Recover {
+                        reason: "test authoritative balance recovery".to_string(),
+                    }
+                },
+            },
+        )
+        .await
+        .expect("commit test provider observation")
+    }
+
+    fn publish_provider_policy_projection(
+        &self,
+        current: &mut Arc<ProviderPolicySnapshot>,
+        policy_revision: u64,
+        projection: ProviderEligibilityProjection,
+    ) {
+        let next = Arc::new(provider_policy_snapshot_with_projection(
+            current.as_ref(),
+            policy_revision,
+            projection,
+        ));
+        if **current == *next {
+            return;
         }
-    }
-
-    pub async fn list_policy_actions(&self, service_name: &str) -> Vec<PolicyAction> {
-        let guard = self.policy_actions.read().await;
-        guard
-            .get(service_name)
-            .into_iter()
-            .flat_map(|per_service| per_service.values())
-            .flat_map(|actions| actions.iter().cloned())
-            .collect()
+        *current = next;
+        self.notify_state_changed();
     }
 
     pub async fn active_policy_action_projections(
@@ -1790,13 +1700,21 @@ impl ProxyState {
         service_name: &str,
         now_ms: u64,
     ) -> Vec<PolicyActionProjection> {
-        let guard = self.policy_actions.read().await;
-        guard
-            .get(service_name)
-            .into_iter()
-            .flat_map(|per_service| per_service.values())
-            .flat_map(|actions| actions.iter())
-            .filter_map(|action| PolicyActionProjection::from_action(action, now_ms))
+        let snapshot = self.capture_provider_policy_snapshot().await;
+        self.policy_action_projections_for_snapshot(service_name, now_ms, snapshot.as_ref())
+    }
+
+    pub fn policy_action_projections_for_snapshot(
+        &self,
+        service_name: &str,
+        now_ms: u64,
+        snapshot: &ProviderPolicySnapshot,
+    ) -> Vec<PolicyActionProjection> {
+        snapshot
+            .projections
+            .iter()
+            .filter(|projection| projection.provider_endpoint.service_name == service_name)
+            .filter_map(|projection| policy_action_projection(projection, now_ms))
             .collect()
     }
 
@@ -1876,169 +1794,68 @@ impl ProxyState {
         entry.last_good_at_ms = None;
     }
 
-    pub async fn set_provider_endpoint_usage_exhausted(
+    pub async fn prune_provider_endpoint_runtime_for_service(
         &self,
         service_name: &str,
-        endpoint_key: ProviderEndpointKey,
-        exhausted: bool,
+        active_provider_endpoints: &HashSet<ProviderEndpointKey>,
     ) {
-        let mut guard = self.provider_endpoint_runtime_health.write().await;
-        let entry = guard
-            .entry(service_name.to_string())
-            .or_default()
-            .entry(endpoint_key)
-            .or_default();
-        if entry.usage_exhausted == exhausted {
-            return;
+        let mut changed = false;
+        {
+            let mut guard = self.provider_endpoint_runtime_health.write().await;
+            if let Some(per_service) = guard.get_mut(service_name) {
+                let before = per_service.len();
+                per_service.retain(|key, _| active_provider_endpoints.contains(key));
+                changed |= before != per_service.len();
+                if per_service.is_empty() {
+                    guard.remove(service_name);
+                }
+            }
         }
-        entry.usage_exhausted = exhausted;
-        self.notify_state_changed();
+        if changed {
+            self.notify_state_changed();
+        }
     }
 
     pub async fn prune_runtime_observability_for_service(
         &self,
         service_name: &str,
-        mgr: &ServiceConfigManager,
+        view: &ServiceRouteConfig,
     ) {
+        let Ok(route) = crate::routing_ir::compile_route_handshake_plan(service_name, view) else {
+            return;
+        };
         let mut changed = false;
-        let active_stations = mgr.stations().keys().cloned().collect::<HashSet<_>>();
-        let active_upstreams = mgr
-            .stations()
+        let active_provider_endpoint_keys = route
+            .candidates
             .iter()
-            .map(|(station_name, service)| {
-                (
-                    station_name.clone(),
-                    service
-                        .upstreams
-                        .iter()
-                        .map(|upstream| upstream.base_url.clone())
-                        .collect::<HashSet<_>>(),
+            .map(|candidate| {
+                ProviderEndpointKey::new(
+                    service_name,
+                    &candidate.provider_id,
+                    &candidate.endpoint_id,
                 )
             })
-            .collect::<HashMap<_, _>>();
-        let active_base_urls = active_upstreams
-            .values()
-            .flat_map(|upstreams| upstreams.iter().cloned())
             .collect::<HashSet<_>>();
-        let active_provider_endpoint_keys = mgr
-            .stations()
-            .iter()
-            .flat_map(|(station_name, service)| {
-                service.upstreams.iter().enumerate().map(|(idx, upstream)| {
-                    Self::active_provider_endpoint_key_for_upstream(
-                        service_name,
-                        station_name.as_str(),
-                        idx,
-                        upstream,
-                    )
-                })
-            })
+        let active_provider_endpoint_stable_keys = std::iter::once("-".to_string())
+            .chain(
+                active_provider_endpoint_keys
+                    .iter()
+                    .map(ProviderEndpointKey::stable_key),
+            )
             .collect::<HashSet<_>>();
         let mut active_provider_ids = HashSet::from(["-".to_string()]);
-        for service in mgr.stations().values() {
-            for upstream in &service.upstreams {
-                if let Some(provider_id) = upstream.tags.get("provider_id") {
-                    active_provider_ids.insert(provider_id.clone());
-                }
-            }
-        }
-
-        let layout = service_layout_signature(mgr);
-        let balance_prune_stations = {
-            let mut signatures = self.service_layout_signatures.write().await;
-            let changed = signatures.get(service_name).map_or_else(
-                || {
-                    if active_stations.len() == 1 && active_stations.contains("routing") {
-                        Some(HashSet::from(["routing".to_string()]))
-                    } else {
-                        None
-                    }
-                },
-                |previous| Some(changed_service_layout_stations(previous, &layout)),
-            );
-            signatures.insert(service_name.to_string(), layout);
-            changed
-        };
-
-        match balance_prune_stations {
-            Some(changed_layout_stations) if !changed_layout_stations.is_empty() => {
-                let mut provider_balances = self.provider_balances.write().await;
-                if let Some(per_service) = provider_balances.get_mut(service_name) {
-                    let before = per_service.len();
-                    per_service
-                        .retain(|station_name, _| !changed_layout_stations.contains(station_name));
-                    changed |= per_service.len() != before;
-                    if per_service.is_empty() {
-                        provider_balances.remove(service_name);
-                    }
-                }
-                let mut provider_balance_history = self.provider_balance_history.write().await;
-                if let Some(per_service) = provider_balance_history.get_mut(service_name) {
-                    let before = per_service.len();
-                    per_service
-                        .retain(|station_name, _| !changed_layout_stations.contains(station_name));
-                    changed |= per_service.len() != before;
-                    if per_service.is_empty() {
-                        provider_balance_history.remove(service_name);
-                    }
-                }
-                let mut provider_balance_summaries = self.provider_balance_summaries.write().await;
-                if let Some(per_service) = provider_balance_summaries.get_mut(service_name) {
-                    let before = per_service.len();
-                    per_service
-                        .retain(|station_name, _| !changed_layout_stations.contains(station_name));
-                    changed |= per_service.len() != before;
-                    if per_service.is_empty() {
-                        provider_balance_summaries.remove(service_name);
-                    }
-                }
-            }
-            None => {
-                let mut provider_balances = self.provider_balances.write().await;
-                changed |= provider_balances.remove(service_name).is_some();
-                let mut provider_balance_history = self.provider_balance_history.write().await;
-                changed |= provider_balance_history.remove(service_name).is_some();
-                let mut provider_balance_summaries = self.provider_balance_summaries.write().await;
-                changed |= provider_balance_summaries.remove(service_name).is_some();
-            }
-            Some(_) => {}
+        for candidate in &route.candidates {
+            active_provider_ids.insert(candidate.provider_id.clone());
         }
 
         {
-            let mut guard = self.station_meta_overrides.write().await;
-            if let Some(per_service) = guard.get_mut(service_name) {
-                let before = per_service.len();
-                per_service.retain(|station_name, _| active_stations.contains(station_name));
-                changed |= per_service.len() != before;
-                if per_service.is_empty() {
-                    guard.remove(service_name);
-                }
-            }
-        }
-
-        {
-            let mut guard = self.upstream_meta_overrides.write().await;
-            if let Some(per_service) = guard.get_mut(service_name) {
-                let before = per_service.len();
-                per_service.retain(|base_url, _| active_base_urls.contains(base_url));
-                changed |= per_service.len() != before;
-                if per_service.is_empty() {
-                    guard.remove(service_name);
-                }
-            }
-        }
-
-        {
-            let mut guard = self.provider_endpoint_meta_overrides.write().await;
-            if let Some(per_service) = guard.get_mut(service_name) {
-                let before = per_service.len();
-                per_service
-                    .retain(|endpoint_key, _| active_provider_endpoint_keys.contains(endpoint_key));
-                changed |= per_service.len() != before;
-                if per_service.is_empty() {
-                    guard.remove(service_name);
-                }
-            }
+            let mut provider_balances = self.provider_balances.write().await;
+            let before = provider_balances.len();
+            provider_balances.retain(|provider_endpoint, _| {
+                provider_endpoint.service_name != service_name
+                    || active_provider_endpoint_keys.contains(provider_endpoint)
+            });
+            changed |= provider_balances.len() != before;
         }
 
         {
@@ -2053,106 +1870,20 @@ impl ProxyState {
         }
 
         {
-            let mut guard = self.policy_actions.write().await;
-            let mut snapshot = guard.clone();
-            let mut policy_actions_changed = false;
-            if let Some(per_service) = snapshot.get_mut(service_name) {
-                let before = per_service.len();
-                per_service
-                    .retain(|endpoint_key, _| active_provider_endpoint_keys.contains(endpoint_key));
-                policy_actions_changed |= per_service.len() != before;
-                if per_service.is_empty() {
-                    snapshot.remove(service_name);
-                }
-            }
-            if policy_actions_changed && self.persist_policy_actions(&snapshot).await {
-                *guard = snapshot;
-                changed = true;
-            }
-        }
-
-        {
-            let mut guard = self.station_health.write().await;
-            if let Some(per_service) = guard.get_mut(service_name) {
-                let before_stations = per_service.len();
-                let before_upstreams = per_service
-                    .values()
-                    .map(|station_health| station_health.upstreams.len())
-                    .sum::<usize>();
-                per_service.retain(|station_name, station_health| {
-                    if !active_stations.contains(station_name) {
-                        return false;
-                    }
-                    if let Some(allowed_upstreams) = active_upstreams.get(station_name) {
-                        station_health
-                            .upstreams
-                            .retain(|upstream| allowed_upstreams.contains(&upstream.base_url));
-                    }
-                    !station_health.upstreams.is_empty()
+            let mut request_state = self.request_lifecycle_projection.write().await;
+            if let Some(rollup) = request_state.usage_rollups.get_mut(service_name) {
+                let before_by_provider_endpoint = rollup.by_provider_endpoint.len();
+                rollup.by_provider_endpoint.retain(|endpoint_key, _| {
+                    active_provider_endpoint_stable_keys.contains(endpoint_key)
                 });
-                let after_upstreams = per_service
-                    .values()
-                    .map(|station_health| station_health.upstreams.len())
-                    .sum::<usize>();
-                changed |=
-                    per_service.len() != before_stations || after_upstreams != before_upstreams;
-                if per_service.is_empty() {
-                    guard.remove(service_name);
-                }
-            }
-        }
-
-        {
-            let mut guard = self.passive_station_health.write().await;
-            if let Some(per_service) = guard.get_mut(service_name) {
-                let before_stations = per_service.len();
-                let before_upstreams = per_service.values().map(HashMap::len).sum::<usize>();
-                per_service.retain(|station_name, station_health| {
-                    if !active_stations.contains(station_name) {
-                        return false;
-                    }
-                    if let Some(allowed_upstreams) = active_upstreams.get(station_name) {
-                        station_health.retain(|base_url, _| allowed_upstreams.contains(base_url));
-                    }
-                    !station_health.is_empty()
-                });
-                let after_upstreams = per_service.values().map(HashMap::len).sum::<usize>();
-                changed |=
-                    per_service.len() != before_stations || after_upstreams != before_upstreams;
-                if per_service.is_empty() {
-                    guard.remove(service_name);
-                }
-            }
-        }
-
-        {
-            let mut guard = self.station_health_checks.write().await;
-            if let Some(per_service) = guard.get_mut(service_name) {
-                let before = per_service.len();
-                per_service.retain(|station_name, _| active_stations.contains(station_name));
-                changed |= per_service.len() != before;
-                if per_service.is_empty() {
-                    guard.remove(service_name);
-                }
-            }
-        }
-
-        {
-            let mut guard = self.usage_rollups.write().await;
-            if let Some(rollup) = guard.get_mut(service_name) {
-                let before_by_config = rollup.by_config.len();
+                changed |= rollup.by_provider_endpoint.len() != before_by_provider_endpoint;
+                let before_by_provider_endpoint_day = rollup.by_provider_endpoint_day.len();
                 rollup
-                    .by_config
-                    .retain(|station_name, _| active_stations.contains(station_name));
-                changed |= rollup.by_config.len() != before_by_config;
-                let before_by_config_day = rollup.by_config_day.len();
-                rollup.by_config_day.retain(|station_name, _day_map| {
-                    if !active_stations.contains(station_name) {
-                        return false;
-                    }
-                    true
-                });
-                changed |= rollup.by_config_day.len() != before_by_config_day;
+                    .by_provider_endpoint_day
+                    .retain(|endpoint_key, _day_map| {
+                        active_provider_endpoint_stable_keys.contains(endpoint_key)
+                    });
+                changed |= rollup.by_provider_endpoint_day.len() != before_by_provider_endpoint_day;
                 let before_by_provider = rollup.by_provider.len();
                 rollup
                     .by_provider
@@ -2173,452 +1904,57 @@ impl ProxyState {
         }
     }
 
-    fn active_provider_endpoint_key_for_upstream(
-        service_name: &str,
-        station_name: &str,
-        upstream_index: usize,
-        upstream: &crate::config::UpstreamConfig,
-    ) -> ProviderEndpointKey {
-        let provider_id = upstream
-            .tags
-            .get("provider_id")
-            .cloned()
-            .unwrap_or_else(|| format!("{station_name}#{upstream_index}"));
-        let endpoint_id = upstream
-            .tags
-            .get("endpoint_id")
-            .cloned()
-            .unwrap_or_else(|| upstream_index.to_string());
-
-        ProviderEndpointKey::new(service_name, provider_id, endpoint_id)
-    }
-
-    pub async fn record_station_health(
-        &self,
-        service_name: &str,
-        station_name: String,
-        health: StationHealth,
-    ) {
-        let mut guard = self.station_health.write().await;
-        let per_service = guard.entry(service_name.to_string()).or_default();
-        per_service.insert(station_name, health);
-        self.notify_state_changed();
-    }
-
-    pub async fn get_station_health(&self, service_name: &str) -> HashMap<String, StationHealth> {
-        let active = {
-            let guard = self.station_health.read().await;
-            guard.get(service_name).cloned().unwrap_or_default()
-        };
-        let passive = {
-            let guard = self.passive_station_health.read().await;
-            guard.get(service_name).cloned().unwrap_or_default()
-        };
-        merge_station_health(active, passive)
-    }
-
-    pub async fn record_provider_balance_snapshot(
-        &self,
-        service_name: &str,
-        mut snapshot: ProviderBalanceSnapshot,
-    ) {
-        let (Some(station_name), Some(upstream_index)) =
-            (snapshot.station_name.clone(), snapshot.upstream_index)
-        else {
+    pub async fn record_provider_balance_snapshot(&self, mut snapshot: ProviderBalanceSnapshot) {
+        if snapshot.observation_provider_id.trim().is_empty()
+            || snapshot.provider_endpoint.service_name.trim().is_empty()
+            || snapshot.provider_endpoint.provider_id.trim().is_empty()
+            || snapshot.provider_endpoint.endpoint_id.trim().is_empty()
+        {
             return;
-        };
+        }
+        let provider_endpoint = snapshot.provider_endpoint.clone();
+        let observation_provider_id = snapshot.observation_provider_id.clone();
         let now_ms = unix_now_ms();
         snapshot.refresh_status(now_ms);
 
-        let station_summary = {
+        {
             let mut guard = self.provider_balances.write().await;
-            let station_balances = guard
-                .entry(service_name.to_string())
-                .or_default()
-                .entry(station_name.clone())
-                .or_default();
+            let endpoint_balances = guard.entry(provider_endpoint).or_default();
             if !snapshot.has_amount_data()
-                && let Some(previous) = station_balances
-                    .get(&upstream_index)
-                    .and_then(|providers| providers.get(&snapshot.provider_id))
+                && let Some(previous) = endpoint_balances.get(&observation_provider_id)
             {
                 snapshot.carry_forward_amount_data_from(previous);
                 snapshot.refresh_status(now_ms);
             }
-            station_balances
-                .entry(upstream_index)
-                .or_default()
-                .insert(snapshot.provider_id.clone(), snapshot.clone());
-            StationRoutingBalanceSummary::from_snapshot_iter_at(
-                station_balances
-                    .values()
-                    .flat_map(|providers| providers.values()),
-                now_ms,
-            )
-        };
-
-        {
-            let mut summaries = self.provider_balance_summaries.write().await;
-            summaries
-                .entry(service_name.to_string())
-                .or_default()
-                .insert(station_name, station_summary);
+            endpoint_balances.insert(observation_provider_id, snapshot);
         }
 
-        let history_station_name = snapshot.station_name.clone().unwrap_or_default();
-        self.record_provider_balance_history_snapshot(
-            service_name,
-            &history_station_name,
-            upstream_index,
-            snapshot,
-        )
-        .await;
         self.notify_state_changed();
-    }
-
-    async fn record_provider_balance_history_snapshot(
-        &self,
-        service_name: &str,
-        station_name: &str,
-        upstream_index: usize,
-        snapshot: ProviderBalanceSnapshot,
-    ) {
-        let mut guard = self.provider_balance_history.write().await;
-        let history = guard
-            .entry(service_name.to_string())
-            .or_default()
-            .entry(station_name.to_string())
-            .or_default()
-            .entry(upstream_index)
-            .or_default()
-            .entry(snapshot.provider_id.clone())
-            .or_default();
-        if history
-            .back()
-            .is_some_and(|previous| previous.fetched_at_ms == snapshot.fetched_at_ms)
-        {
-            history.pop_back();
-        }
-        history.push_back(snapshot);
-        let max = provider_balance_history_max();
-        while history.len() > max {
-            history.pop_front();
-        }
     }
 
     pub async fn get_provider_balance_view(
         &self,
         service_name: &str,
-    ) -> HashMap<String, Vec<ProviderBalanceSnapshot>> {
+    ) -> Vec<ProviderBalanceSnapshot> {
         let now_ms = unix_now_ms();
         let guard = self.provider_balances.read().await;
-        let Some(per_service) = guard.get(service_name) else {
-            return HashMap::new();
-        };
-
-        per_service
+        let mut snapshots = guard
             .iter()
-            .map(|(station_name, upstreams)| {
-                let mut snapshots = upstreams
-                    .values()
-                    .flat_map(|providers| providers.values().cloned())
-                    .collect::<Vec<_>>();
-                for snapshot in &mut snapshots {
-                    snapshot.refresh_status(now_ms);
-                }
-                snapshots.sort_by(|a, b| {
-                    a.upstream_index
-                        .cmp(&b.upstream_index)
-                        .then_with(|| a.provider_id.cmp(&b.provider_id))
-                });
-                (station_name.clone(), snapshots)
-            })
-            .collect()
-    }
-
-    pub async fn get_provider_balance_history_view(
-        &self,
-        service_name: &str,
-    ) -> HashMap<String, Vec<ProviderBalanceSnapshot>> {
-        let now_ms = unix_now_ms();
-        let guard = self.provider_balance_history.read().await;
-        let Some(per_service) = guard.get(service_name) else {
-            return HashMap::new();
-        };
-
-        per_service
-            .iter()
-            .map(|(station_name, upstreams)| {
-                let mut snapshots = upstreams
-                    .values()
-                    .flat_map(|providers| providers.values())
-                    .flat_map(|history| history.iter().cloned())
-                    .collect::<Vec<_>>();
-                for snapshot in &mut snapshots {
-                    snapshot.refresh_status(now_ms);
-                }
-                snapshots.sort_by(|a, b| {
-                    a.fetched_at_ms
-                        .cmp(&b.fetched_at_ms)
-                        .then_with(|| a.upstream_index.cmp(&b.upstream_index))
-                        .then_with(|| a.provider_id.cmp(&b.provider_id))
-                });
-                (station_name.clone(), snapshots)
-            })
-            .collect()
-    }
-
-    pub async fn get_provider_balance_summary_view(
-        &self,
-        service_name: &str,
-    ) -> HashMap<String, StationRoutingBalanceSummary> {
-        let guard = self.provider_balance_summaries.read().await;
-        let Some(per_service) = guard.get(service_name) else {
-            return HashMap::new();
-        };
-
-        per_service.clone()
-    }
-
-    pub async fn record_passive_upstream_success(
-        &self,
-        service_name: &str,
-        station_name: &str,
-        base_url: &str,
-        status_code: Option<u16>,
-        now_ms: u64,
-    ) {
-        let mut guard = self.passive_station_health.write().await;
-        let entry = guard
-            .entry(service_name.to_string())
-            .or_default()
-            .entry(station_name.to_string())
-            .or_default()
-            .entry(base_url.to_string())
-            .or_default();
-        entry.record_success(now_ms, status_code);
-        self.notify_state_changed();
-    }
-
-    pub async fn record_passive_upstream_failure(&self, params: PassiveUpstreamFailureRecord) {
-        let PassiveUpstreamFailureRecord {
-            service_name,
-            station_name,
-            base_url,
-            status_code,
-            error_class,
-            error,
-            now_ms,
-        } = params;
-
-        let mut guard = self.passive_station_health.write().await;
-        let entry = guard
-            .entry(service_name)
-            .or_default()
-            .entry(station_name)
-            .or_default()
-            .entry(base_url)
-            .or_default();
-        entry.record_failure(now_ms, status_code, error_class, error);
-        self.notify_state_changed();
-    }
-
-    pub async fn get_lb_view(&self) -> HashMap<String, LbConfigView> {
-        let Some(lb_states) = self.lb_states.as_ref() else {
-            return HashMap::new();
-        };
-        let mut map = match lb_states.lock() {
-            Ok(m) => m,
-            Err(e) => e.into_inner(),
-        };
-
-        let now = std::time::Instant::now();
-        let mut out = HashMap::new();
-        for (cfg_name, st) in map.iter_mut() {
-            let len = st
-                .failure_counts
-                .len()
-                .max(st.cooldown_until.len())
-                .max(st.usage_exhausted.len());
-            if len == 0 {
-                continue;
-            }
-
-            // 如果结构变化导致长度不一致，做一次对齐，避免 UI 读到越界/脏数据。
-            if st.failure_counts.len() != len {
-                st.failure_counts.resize(len, 0);
-            }
-            if st.cooldown_until.len() != len {
-                st.cooldown_until.resize(len, None);
-            }
-            if st.usage_exhausted.len() != len {
-                st.usage_exhausted.resize(len, false);
-            }
-
-            let mut upstreams = Vec::with_capacity(len);
-            for idx in 0..len {
-                let failure_count = st.failure_counts.get(idx).copied().unwrap_or(0);
-                let cooldown_remaining_secs = st
-                    .cooldown_until
-                    .get(idx)
-                    .and_then(|v| *v)
-                    .map(|until| until.saturating_duration_since(now).as_secs())
-                    .filter(|&s| s > 0);
-                let usage_exhausted = st.usage_exhausted.get(idx).copied().unwrap_or(false);
-                upstreams.push(LbUpstreamView {
-                    failure_count,
-                    cooldown_remaining_secs,
-                    usage_exhausted,
-                });
-            }
-
-            out.insert(
-                cfg_name.clone(),
-                LbConfigView {
-                    last_good_index: st.last_good_index,
-                    upstreams,
-                },
-            );
+            .filter(|(provider_endpoint, _)| provider_endpoint.service_name == service_name)
+            .flat_map(|(_, providers)| providers.values().cloned())
+            .collect::<Vec<_>>();
+        for snapshot in &mut snapshots {
+            snapshot.refresh_status(now_ms);
         }
-        out
-    }
-
-    pub async fn list_health_checks(
-        &self,
-        service_name: &str,
-    ) -> HashMap<String, HealthCheckStatus> {
-        let guard = self.station_health_checks.read().await;
-        guard.get(service_name).cloned().unwrap_or_default()
-    }
-
-    pub async fn try_begin_station_health_check(
-        &self,
-        service_name: &str,
-        station_name: &str,
-        total: usize,
-        now_ms: u64,
-    ) -> bool {
-        let mut guard = self.station_health_checks.write().await;
-        let per_service = guard.entry(service_name.to_string()).or_default();
-        if let Some(existing) = per_service.get(station_name)
-            && !existing.done
-        {
-            return false;
-        }
-        per_service.insert(
-            station_name.to_string(),
-            HealthCheckStatus {
-                started_at_ms: now_ms,
-                updated_at_ms: now_ms,
-                total: total.min(u32::MAX as usize) as u32,
-                completed: 0,
-                ok: 0,
-                err: 0,
-                cancel_requested: false,
-                canceled: false,
-                done: false,
-                last_error: None,
-            },
-        );
-        self.notify_state_changed();
-        true
-    }
-
-    pub async fn request_cancel_station_health_check(
-        &self,
-        service_name: &str,
-        station_name: &str,
-        now_ms: u64,
-    ) -> bool {
-        let mut guard = self.station_health_checks.write().await;
-        let Some(per_service) = guard.get_mut(service_name) else {
-            return false;
-        };
-        let Some(st) = per_service.get_mut(station_name) else {
-            return false;
-        };
-        if st.done {
-            return false;
-        }
-        st.cancel_requested = true;
-        st.updated_at_ms = now_ms;
-        self.notify_state_changed();
-        true
-    }
-
-    pub async fn is_station_health_check_cancel_requested(
-        &self,
-        service_name: &str,
-        station_name: &str,
-    ) -> bool {
-        let guard = self.station_health_checks.read().await;
-        guard
-            .get(service_name)
-            .and_then(|m| m.get(station_name))
-            .is_some_and(|s| s.cancel_requested && !s.done)
-    }
-
-    pub async fn record_station_health_check_result(
-        &self,
-        service_name: &str,
-        station_name: &str,
-        now_ms: u64,
-        upstream: UpstreamHealth,
-    ) {
-        {
-            let mut guard = self.station_health.write().await;
-            let per_service = guard.entry(service_name.to_string()).or_default();
-            let entry = per_service
-                .entry(station_name.to_string())
-                .or_insert_with(|| StationHealth {
-                    checked_at_ms: now_ms,
-                    upstreams: Vec::new(),
-                });
-            entry.checked_at_ms = entry.checked_at_ms.max(now_ms);
-            entry.upstreams.push(upstream.clone());
-            if entry.upstreams.len() > Self::MAX_HEALTH_RECORDS_PER_STATION {
-                let extra = entry
-                    .upstreams
-                    .len()
-                    .saturating_sub(Self::MAX_HEALTH_RECORDS_PER_STATION);
-                if extra > 0 {
-                    entry.upstreams.drain(0..extra);
-                }
-            }
-        }
-
-        let mut guard = self.station_health_checks.write().await;
-        let per_service = guard.entry(service_name.to_string()).or_default();
-        let st = per_service.entry(station_name.to_string()).or_default();
-        st.updated_at_ms = now_ms;
-        st.completed = st.completed.saturating_add(1);
-        match upstream.ok {
-            Some(true) => st.ok = st.ok.saturating_add(1),
-            Some(false) => {
-                st.err = st.err.saturating_add(1);
-                if st.last_error.is_none() {
-                    st.last_error = upstream.error.clone();
-                }
-            }
-            None => {}
-        }
-        self.notify_state_changed();
-    }
-
-    pub async fn finish_station_health_check(
-        &self,
-        service_name: &str,
-        station_name: &str,
-        now_ms: u64,
-        canceled: bool,
-    ) {
-        let mut guard = self.station_health_checks.write().await;
-        let per_service = guard.entry(service_name.to_string()).or_default();
-        let st = per_service.entry(station_name.to_string()).or_default();
-        st.updated_at_ms = now_ms;
-        st.canceled = canceled;
-        st.done = true;
-        self.notify_state_changed();
+        snapshots.sort_by(|left, right| {
+            left.provider_endpoint
+                .cmp(&right.provider_endpoint)
+                .then_with(|| {
+                    left.observation_provider_id
+                        .cmp(&right.observation_provider_id)
+                })
+        });
+        snapshots
     }
 
     pub async fn get_usage_rollup_view(
@@ -2627,8 +1963,16 @@ impl ProxyState {
         top_n: usize,
         days: usize,
     ) -> UsageRollupView {
-        let guard = self.usage_rollups.read().await;
-        let Some(rollup) = guard.get(service_name) else {
+        let request_state = self.request_lifecycle_projection.read().await;
+        Self::usage_rollup_view_from(request_state.usage_rollups.get(service_name), top_n, days)
+    }
+
+    fn usage_rollup_view_from(
+        rollup: Option<&UsageRollup>,
+        top_n: usize,
+        days: usize,
+    ) -> UsageRollupView {
+        let Some(rollup) = rollup else {
             return UsageRollupView::default();
         };
 
@@ -2721,15 +2065,15 @@ impl ProxyState {
             sum_series(&by_day)
         };
 
-        let mut by_config =
-            aggregate_entity_window(&rollup.by_config_day, start_day, end_day, top_n);
-        if all_loaded && by_config.is_empty() {
-            by_config = rollup
-                .by_config
+        let mut by_provider_endpoint =
+            aggregate_entity_window(&rollup.by_provider_endpoint_day, start_day, end_day, top_n);
+        if all_loaded && by_provider_endpoint.is_empty() {
+            by_provider_endpoint = rollup
+                .by_provider_endpoint
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect::<Vec<_>>();
-            by_config.sort_by(|(left_name, left), (right_name, right)| {
+            by_provider_endpoint.sort_by(|(left_name, left), (right_name, right)| {
                 right
                     .usage
                     .total_tokens
@@ -2737,7 +2081,7 @@ impl ProxyState {
                     .then_with(|| right.requests_total.cmp(&left.requests_total))
                     .then_with(|| left_name.cmp(right_name))
             });
-            by_config.truncate(top_n);
+            by_provider_endpoint.truncate(top_n);
         }
 
         let mut by_provider =
@@ -2759,10 +2103,10 @@ impl ProxyState {
             by_provider.truncate(top_n);
         }
 
-        let mut by_config_day = HashMap::new();
-        for (name, _) in &by_config {
+        let mut by_provider_endpoint_day = HashMap::new();
+        for (name, _) in &by_provider_endpoint {
             let series = rollup
-                .by_config_day
+                .by_provider_endpoint_day
                 .get(name)
                 .map(|m| match (all_loaded, start_day, end_day) {
                     (true, _, _) => sorted_day_series(m),
@@ -2770,7 +2114,7 @@ impl ProxyState {
                     _ => Vec::new(),
                 })
                 .unwrap_or_default();
-            by_config_day.insert(name.clone(), series);
+            by_provider_endpoint_day.insert(name.clone(), series);
         }
 
         let mut by_provider_day = HashMap::new();
@@ -2813,8 +2157,8 @@ impl ProxyState {
             window,
             coverage,
             by_day,
-            by_config,
-            by_config_day,
+            by_provider_endpoint,
+            by_provider_endpoint_day,
             by_provider,
             by_provider_day,
         }
@@ -2826,6 +2170,19 @@ impl ProxyState {
         top_n: usize,
         generated_at_ms: u64,
     ) -> UsageDayView {
+        let request_state = self.request_lifecycle_projection.read().await;
+        Self::usage_day_view_from(
+            request_state.usage_rollups.get(service_name),
+            top_n,
+            generated_at_ms,
+        )
+    }
+
+    fn usage_day_view_from(
+        rollup: Option<&UsageRollup>,
+        top_n: usize,
+        generated_at_ms: u64,
+    ) -> UsageDayView {
         let day = usage_day::current_local_day();
         let window = usage_day::local_day_window(day).unwrap_or(usage_day::UsageDayWindow {
             day,
@@ -2833,8 +2190,7 @@ impl ProxyState {
             end_ms: 0,
         });
 
-        let guard = self.usage_rollups.read().await;
-        let Some(rollup) = guard.get(service_name) else {
+        let Some(rollup) = rollup else {
             return UsageDayView {
                 day,
                 label: usage_day::format_day(day),
@@ -2864,7 +2220,11 @@ impl ProxyState {
             summary: rollup.by_day.get(&day).cloned().unwrap_or_default(),
             hourly: usage_day_hour_rows(rollup, day),
             provider_rows: usage_day_dimension_rows(&rollup.by_provider_day, day, top_n),
-            station_rows: usage_day_dimension_rows(&rollup.by_config_day, day, top_n),
+            provider_endpoint_rows: usage_day_dimension_rows(
+                &rollup.by_provider_endpoint_day,
+                day,
+                top_n,
+            ),
             model_rows: usage_day_dimension_rows(&rollup.by_model_day, day, top_n),
             session_rows: usage_day_dimension_rows(&rollup.by_session_day, day, top_n),
             project_rows: usage_day_dimension_rows(&rollup.by_project_day, day, top_n),
@@ -2873,187 +2233,80 @@ impl ProxyState {
         }
     }
 
-    pub async fn replay_usage_from_requests_log(
-        &self,
-        service_name: &str,
-        log_path: PathBuf,
-        base_url_to_provider_id: HashMap<String, String>,
-    ) -> usize {
-        let enabled = std::env::var("CODEX_HELPER_USAGE_REPLAY_ON_STARTUP")
-            .ok()
-            .map(|v| {
-                matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "y" | "on"
-                )
-            })
-            .unwrap_or(true);
-        if !enabled {
-            return 0;
-        }
-
-        let already_has_data = {
-            let guard = self.usage_rollups.read().await;
-            guard
-                .get(service_name)
-                .is_some_and(|r| r.loaded.requests_total > 0)
-        };
-        if already_has_data {
-            return 0;
-        }
-
-        if !log_path.exists() {
-            return 0;
-        }
-
-        let max_bytes = std::env::var("CODEX_HELPER_USAGE_REPLAY_MAX_BYTES")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(8 * 1024 * 1024);
-        let max_lines = std::env::var("CODEX_HELPER_USAGE_REPLAY_MAX_LINES")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(20_000);
-
-        let mut file = match std::fs::File::open(&log_path) {
-            Ok(f) => f,
-            Err(_) => return 0,
-        };
-        let len: u64 = file.metadata().map(|m| m.len()).unwrap_or_default();
-        let start = len.saturating_sub(max_bytes as u64);
-        let bytes_truncated = start > 0;
-        if file.seek(SeekFrom::Start(start)).is_err() {
-            return 0;
-        }
-        let mut buf = Vec::new();
-        if file.read_to_end(&mut buf).is_err() {
-            return 0;
-        }
-        if start > 0 {
-            if let Some(pos) = buf.iter().position(|b| *b == b'\n') {
-                buf = buf[pos + 1..].to_vec();
-            } else {
-                return 0;
-            }
-        }
-
-        let text = match std::str::from_utf8(&buf) {
-            Ok(s) => s,
-            Err(_) => return 0,
-        };
-        let lines = text
-            .lines()
-            .map(|l| l.trim())
-            .filter(|l| !l.is_empty())
-            .collect::<Vec<_>>();
-        let start_idx = lines.len().saturating_sub(max_lines);
-        let scanned_lines = lines.len().saturating_sub(start_idx);
-        let lines_truncated = start_idx > 0;
-
-        let mut requests = Vec::new();
-        for line in &lines[start_idx..] {
-            let Ok(v) = serde_json::from_str::<JsonValue>(line) else {
-                continue;
-            };
-            let Some(svc) = v.get("service").and_then(|x| x.as_str()) else {
-                continue;
-            };
-            if svc != service_name {
-                continue;
-            }
-
-            let Some(mut request) =
-                crate::request_ledger::finished_request_from_request_log_record(&v)
-            else {
-                continue;
-            };
-            if request
-                .provider_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|provider_id| !provider_id.is_empty())
-                .is_none()
-                && let Some(provider_id) = request
-                    .upstream_base_url
-                    .as_deref()
-                    .and_then(|base_url| base_url_to_provider_id.get(base_url))
-            {
-                request.provider_id = Some(provider_id.clone());
-            }
-            requests.push(request);
-        }
-
-        if requests.is_empty() {
-            return 0;
-        }
-
-        let mut guard = self.usage_rollups.write().await;
-        let rollup = guard.entry(service_name.to_string()).or_default();
-        rollup.coverage_source = "request_log".to_string();
-        rollup.replay_scanned_lines = scanned_lines;
-        rollup.replay_max_lines = max_lines;
-        rollup.replay_max_bytes = max_bytes;
-        rollup.replay_bytes_truncated = bytes_truncated;
-        rollup.replay_lines_truncated = lines_truncated;
-        let mut replayed = 0;
-        for request in &requests {
-            if record_finished_request_into_usage_rollup(rollup, request) {
-                replayed += 1;
-            }
-        }
-
-        self.notify_state_changed();
-        replayed
-    }
-
-    pub async fn resolve_session_cwd(&self, session_id: &str) -> Option<String> {
-        if self.session_cwd_cache_max_entries == 0 {
-            return sessions::find_codex_session_cwd_by_id(session_id)
-                .await
-                .ok()
-                .flatten();
-        }
-
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-
-        {
-            let guard = self.session_cwd_cache.read().await;
-            if let Some(v) = guard.get(session_id) {
-                let out = v.cwd.clone();
-                drop(guard);
-                let mut guard = self.session_cwd_cache.write().await;
-                if let Some(v) = guard.get_mut(session_id) {
-                    v.last_seen_ms = now_ms;
-                }
-                return out;
-            }
-        }
-
-        // Cache miss: resolve from disk and record last_seen.
-
-        let resolved = sessions::find_codex_session_cwd_by_id(session_id)
-            .await
-            .ok()
-            .flatten();
-
-        let mut guard = self.session_cwd_cache.write().await;
-        guard.insert(
-            session_id.to_string(),
-            SessionCwdCacheEntry {
-                cwd: resolved.clone(),
-                last_seen_ms: now_ms,
-            },
-        );
-        resolved
-    }
-
     #[allow(clippy::too_many_arguments)]
-    pub async fn begin_request(
+    pub async fn try_begin_request(
+        &self,
+        service: &str,
+        method: &str,
+        path: &str,
+        session_id: Option<String>,
+        session_identity_source: Option<SessionIdentitySource>,
+        client_name: Option<String>,
+        client_addr: Option<String>,
+        cwd: Option<String>,
+        model: Option<String>,
+        requested_model: Option<String>,
+        reasoning_effort: Option<String>,
+        service_tier: Option<String>,
+        requested_service_tier: Option<String>,
+        provider_catalog: Arc<ProviderCatalogSnapshot>,
+        operator_pricing_catalog: Arc<CapturedModelPriceCatalog>,
+        runtime_revision: u64,
+        runtime_digest: String,
+        policy_revision: u64,
+        started_at_ms: u64,
+    ) -> Result<u64, RuntimeStoreError> {
+        let lifecycle_id = LogicalRequestId::new();
+        let mut request_state = self.request_lifecycle_projection.write().await;
+        let lifecycle = self.with_runtime_store_blocking(|runtime_store| {
+            runtime_store.transaction(|transaction| {
+                transaction.begin_logical_request(NewLogicalRequest {
+                    id: lifecycle_id,
+                    begun_at_unix_ms: started_at_ms,
+                })
+            })
+        })?;
+        debug_assert_eq!(lifecycle.disposition, BeginDisposition::Inserted);
+
+        let id = request_state.next_request_id;
+        request_state.next_request_id = request_state.next_request_id.saturating_add(1);
+        let trace_id = Some(crate::logging::request_trace_id(service, id));
+        let req = ActiveRequest {
+            id,
+            runtime_revision,
+            runtime_digest,
+            policy_revision,
+            trace_id,
+            session_id,
+            session_identity_source,
+            client_name,
+            client_addr,
+            cwd,
+            model,
+            requested_model,
+            reasoning_effort,
+            service_tier,
+            requested_service_tier,
+            provider_id: None,
+            route_decision: None,
+            service: service.to_string(),
+            method: method.to_string(),
+            path: path.to_string(),
+            started_at_ms,
+        };
+        request_state.lifecycle_handles.insert(id, lifecycle.handle);
+        request_state.provider_catalogs.insert(id, provider_catalog);
+        request_state
+            .pricing_catalogs
+            .insert(id, operator_pricing_catalog);
+        request_state.active_requests.insert(id, req);
+        self.notify_state_changed();
+        Ok(id)
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn begin_request(
         &self,
         service: &str,
         method: &str,
@@ -3068,32 +2321,31 @@ impl ProxyState {
         service_tier: Option<String>,
         started_at_ms: u64,
     ) -> u64 {
-        let id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
-        let trace_id = Some(crate::logging::request_trace_id(service, id));
-        let req = ActiveRequest {
-            id,
-            trace_id,
+        self.try_begin_request(
+            service,
+            method,
+            path,
             session_id,
             session_identity_source,
             client_name,
             client_addr,
             cwd,
+            model.clone(),
             model,
             reasoning_effort,
+            service_tier.clone(),
             service_tier,
-            station_name: None,
-            provider_id: None,
-            upstream_base_url: None,
-            route_decision: None,
-            service: service.to_string(),
-            method: method.to_string(),
-            path: path.to_string(),
+            Arc::new(ProviderCatalogSnapshot::bundled()),
+            Arc::new(capture_operator_model_price_catalog()),
+            1,
+            "test-runtime".to_string(),
+            self.capture_provider_policy_snapshot()
+                .await
+                .policy_revision,
             started_at_ms,
-        };
-        let mut guard = self.active_requests.write().await;
-        guard.insert(id, req);
-        self.notify_state_changed();
-        id
+        )
+        .await
+        .expect("test logical request should begin durably")
     }
 
     #[cfg(test)]
@@ -3104,41 +2356,356 @@ impl ProxyState {
     pub async fn update_request_route(
         &self,
         request_id: u64,
-        station_name: Option<String>,
-        provider_id: Option<String>,
-        upstream_base_url: String,
-        route_decision: Option<RouteDecisionProvenance>,
+        route_decision: RouteDecisionProvenance,
     ) {
-        let mut guard = self.active_requests.write().await;
-        let Some(req) = guard.get_mut(&request_id) else {
+        let mut request_state = self.request_lifecycle_projection.write().await;
+        let Some(req) = request_state.active_requests.get_mut(&request_id) else {
             return;
         };
-        req.station_name = station_name;
-        req.provider_id = provider_id;
-        req.upstream_base_url = Some(upstream_base_url);
-        req.route_decision = route_decision;
+        req.provider_id = route_decision.provider_id.clone();
+        req.route_decision = Some(route_decision);
         self.notify_state_changed();
     }
 
+    pub(crate) async fn capture_upstream_attempt_context(
+        &self,
+        request_id: u64,
+        route_evidence: AttemptRouteEvidence,
+        provider_scope: AttemptProviderScopeCapture,
+    ) -> Result<CapturedUpstreamAttemptContext, RuntimeStoreError> {
+        let request_state = self.request_lifecycle_projection.read().await;
+        let logical_request = request_state
+            .lifecycle_handles
+            .get(&request_id)
+            .copied()
+            .ok_or_else(|| RuntimeStoreError::InvariantViolation {
+                entity: "upstream attempt",
+                id: request_id.to_string(),
+                detail: "logical request handle is unavailable".to_string(),
+            })?;
+        let (runtime_revision, runtime_digest) = request_state
+            .active_requests
+            .get(&request_id)
+            .map(|request| (request.runtime_revision, request.runtime_digest.clone()))
+            .ok_or_else(|| RuntimeStoreError::InvariantViolation {
+                entity: "upstream attempt",
+                id: request_id.to_string(),
+                detail: "active request evidence is unavailable".to_string(),
+            })?;
+        let catalog_snapshot = request_state
+            .provider_catalogs
+            .get(&request_id)
+            .cloned()
+            .ok_or_else(|| RuntimeStoreError::InvariantViolation {
+                entity: "upstream attempt",
+                id: request_id.to_string(),
+                detail: "captured provider catalog is unavailable".to_string(),
+            })?;
+        drop(request_state);
+        let adapter = ProviderAdapter::for_endpoint(&provider_scope.endpoint);
+        let scope = ProviderCatalogScope::new(
+            adapter,
+            provider_scope.endpoint.as_str(),
+            provider_scope.route_scope,
+            provider_scope.account_fingerprint,
+            runtime_digest.as_str(),
+        )
+        .map_err(|error| RuntimeStoreError::InvariantViolation {
+            entity: "upstream attempt",
+            id: request_id.to_string(),
+            detail: format!("provider scope is invalid: {error}"),
+        })?;
+        let provider_epoch = if adapter == ProviderAdapter::OpenAiCodex {
+            Some(
+                catalog_snapshot
+                    .capture_epoch(scope.clone())
+                    .map_err(|error| RuntimeStoreError::InvariantViolation {
+                        entity: "upstream attempt",
+                        id: request_id.to_string(),
+                        detail: format!("provider catalog capture failed: {error}"),
+                    })?,
+            )
+        } else {
+            None
+        };
+        let request_contract = provider_epoch.as_ref().and_then(|epoch| {
+            route_evidence
+                .mapped_model
+                .as_deref()
+                .and_then(|model| epoch.capture_model_request_contract(model))
+        });
+
+        Ok(CapturedUpstreamAttemptContext {
+            request_id,
+            logical_request,
+            runtime_revision,
+            runtime_digest,
+            route_evidence,
+            scope,
+            provider_epoch,
+            request_contract,
+        })
+    }
+
+    pub(crate) async fn begin_upstream_attempt(
+        &self,
+        context: &CapturedUpstreamAttemptContext,
+        begun_at_unix_ms: u64,
+    ) -> Result<AttemptHandle, RuntimeStoreError> {
+        let frozen_epoch = freeze_provider_epoch(&context.scope, context.provider_epoch.as_ref());
+        let attempt_id = AttemptId::new();
+        let mut request_state = self.request_lifecycle_projection.write().await;
+        let result = self.with_runtime_store_blocking(|runtime_store| {
+            runtime_store.transaction(|transaction| {
+                transaction.begin_attempt(
+                    context.logical_request,
+                    NewAttempt {
+                        id: attempt_id,
+                        logical_request_id: context.logical_request.id(),
+                        begun_at_unix_ms,
+                        evidence: AttemptPendingEvidence::new(
+                            context.runtime_revision,
+                            context.runtime_digest.clone(),
+                            context.route_evidence.clone(),
+                        )
+                        .with_provider_epoch(frozen_epoch),
+                    },
+                )
+            })
+        })?;
+        debug_assert_eq!(result.disposition, BeginDisposition::Inserted);
+        if let Some(provider_epoch) = context.provider_epoch.clone() {
+            request_state
+                .attempt_epochs
+                .entry(context.request_id)
+                .or_default()
+                .insert(attempt_id, provider_epoch);
+        }
+        Ok(result.handle)
+    }
+
+    pub fn finish_upstream_attempt(
+        &self,
+        attempt: AttemptHandle,
+        outcome: AttemptOutcome,
+        terminal_at_unix_ms: u64,
+        economics_state: EconomicsState,
+    ) -> Result<TerminalDisposition, RuntimeStoreError> {
+        self.with_runtime_store_blocking(|runtime_store| {
+            runtime_store.transaction(|transaction| {
+                transaction.commit_attempt_terminal(
+                    attempt,
+                    AttemptTerminal {
+                        outcome,
+                        terminal_at_unix_ms,
+                        economics_state,
+                    },
+                )
+            })
+        })
+    }
+
     pub async fn finish_request(&self, params: FinishRequestParams) -> bool {
-        let mut active = self.active_requests.write().await;
-        let Some(req) = active.remove(&params.id) else {
+        self.finish_request_inner(params, true).await
+    }
+
+    pub async fn finish_non_economic_request(&self, mut params: FinishRequestParams) -> bool {
+        params.usage = None;
+        self.finish_request_inner(params, false).await
+    }
+
+    async fn finish_request_inner(
+        &self,
+        params: FinishRequestParams,
+        include_in_economics: bool,
+    ) -> bool {
+        let _operator_capture = self.operator_capture.write().await;
+        let winning_attempt = match params.winning_attempt {
+            Some(attempt) if attempt.store_id() == self.runtime_store.identity().store_id() => {
+                Some(attempt)
+            }
+            Some(attempt) => {
+                tracing::error!(
+                    request_id = params.id,
+                    attempt_id = %attempt.id(),
+                    "refusing logical terminal with an attempt from another runtime store"
+                );
+                return false;
+            }
+            None => None,
+        };
+        let winning_attempt_record = match winning_attempt {
+            Some(attempt) => match self
+                .with_runtime_store_blocking(|runtime_store| runtime_store.read_attempt(attempt))
+            {
+                Ok(Some(record)) => Some(record),
+                Ok(None) => {
+                    tracing::error!(
+                        request_id = params.id,
+                        attempt_id = %attempt.id(),
+                        "winning attempt is missing from the runtime store"
+                    );
+                    return false;
+                }
+                Err(error) => {
+                    tracing::error!(
+                        request_id = params.id,
+                        attempt_id = %attempt.id(),
+                        error = %error,
+                        "failed to read winning attempt evidence"
+                    );
+                    return false;
+                }
+            },
+            None => None,
+        };
+        let winning_attempt_id = winning_attempt.map(|attempt| attempt.id());
+        let mut request_state = self.request_lifecycle_projection.write().await;
+        let Some(lifecycle) = request_state.lifecycle_handles.get(&params.id).copied() else {
             return false;
         };
-        drop(active);
+        let captured_pricing_catalog = request_state.pricing_catalogs.get(&params.id).cloned();
+        let captured_provider_epoch = match winning_attempt_id {
+            Some(attempt_id) => request_state
+                .attempt_epochs
+                .get(&params.id)
+                .and_then(|epochs| epochs.get(&attempt_id))
+                .cloned(),
+            None => None,
+        };
+        let Some(req) = request_state.active_requests.get(&params.id).cloned() else {
+            return false;
+        };
 
-        let pricing_model = req
-            .route_decision
+        let winner_evidence = winning_attempt_record
             .as_ref()
-            .and_then(|decision| decision.effective_model.as_ref())
-            .map(|value| value.value.as_str())
-            .or(req.model.as_deref());
-        let cost = estimate_request_cost_from_operator_catalog_for_service(
-            pricing_model,
-            params.usage.as_ref(),
-            CostAdjustments::default(),
-            &req.service,
+            .map(|record| &record.attempt.evidence);
+        let winner_route = winner_evidence.map(|evidence| &evidence.route);
+        let requested_model = req.requested_model.clone();
+        let mapped_model = match winner_route {
+            Some(route) => route.mapped_model.clone(),
+            None => req
+                .route_decision
+                .as_ref()
+                .and_then(|decision| decision.effective_model.as_ref())
+                .map(|value| value.value.clone())
+                .or_else(|| requested_model.clone()),
+        };
+        let requested_service_tier = req.requested_service_tier.clone();
+        let effective_service_tier = req.service_tier.clone();
+        let actual_service_tier = params.observed_service_tier.clone();
+        let reported_model = params.reported_model.clone();
+        let model_conflict = mapped_model
+            .as_deref()
+            .zip(reported_model.as_deref())
+            .is_some_and(|(mapped, reported)| !mapped.trim().eq_ignore_ascii_case(reported.trim()));
+        let actual_pricing_tier =
+            ProviderPricingTier::from_actual_service_tier(actual_service_tier.as_deref());
+        let pricing_service_tier = actual_service_tier
+            .as_ref()
+            .map(|_| actual_pricing_tier.as_str().to_string());
+        let provider_epoch = winner_evidence.and_then(|evidence| evidence.provider_epoch.clone());
+        if let (Some(captured), Some(frozen)) =
+            (captured_provider_epoch.as_ref(), provider_epoch.as_ref())
+            && freeze_provider_epoch(captured.scope(), Some(captured)) != *frozen
+        {
+            tracing::error!(
+                request_id = params.id,
+                attempt_id = ?winning_attempt_id,
+                "captured provider catalog conflicts with durable winning attempt epoch"
+            );
+            return false;
+        }
+        if provider_epoch
+            .as_ref()
+            .is_some_and(|epoch| epoch.catalog_revision.is_some())
+            && captured_provider_epoch.is_none()
+        {
+            tracing::error!(
+                request_id = params.id,
+                attempt_id = ?winning_attempt_id,
+                "winning attempt provider catalog is unavailable"
+            );
+            return false;
+        }
+
+        let mut cache_accounting_convention = crate::usage::CacheAccountingConvention::UNKNOWN;
+        let mut provider_price_key = None;
+        let mut pricing_model = None;
+        let mut cost = CostBreakdown::unknown();
+        if include_in_economics && !model_conflict {
+            if let (Some(epoch), Some(model), Some(frozen_epoch)) = (
+                captured_provider_epoch.as_ref(),
+                mapped_model.as_deref(),
+                provider_epoch.clone(),
+            ) {
+                let key = epoch.capture_price_key(model, actual_pricing_tier);
+                if let Some(quote) = epoch.price_quote(&key) {
+                    cache_accounting_convention = quote.cache_accounting_convention();
+                }
+                pricing_model = Some(key.model().to_string());
+                provider_price_key = Some(FrozenProviderPriceKey {
+                    epoch: frozen_epoch,
+                    model: key.model().to_string(),
+                    tier: key.tier(),
+                });
+                if let Some(usage) = params.usage.as_ref() {
+                    cost = estimate_usage_cost_from_captured_provider_price(epoch, &key, usage);
+                }
+            } else if winning_attempt_record.is_none()
+                && let (Some(catalog), Some(model), Some(usage)) = (
+                    captured_pricing_catalog.as_ref(),
+                    mapped_model.as_deref(),
+                    params.usage.as_ref(),
+                )
+            {
+                pricing_model = Some(model.to_string());
+                cost = catalog.estimate_usage_cost_with_convention(
+                    model,
+                    usage,
+                    CostAdjustments::default(),
+                    cache_accounting_convention,
+                );
+            }
+        }
+        let billable_usage = if include_in_economics {
+            params
+                .usage
+                .as_ref()
+                .map(|usage| usage.canonical_usage_buckets(cache_accounting_convention))
+        } else {
+            None
+        };
+        let billable_usage_for_projection = billable_usage;
+
+        let route_decision = winner_route.map_or_else(
+            || req.route_decision.clone(),
+            |route| Some(winning_route_decision(req.route_decision.clone(), route)),
         );
+        let reasoning_effort = route_decision
+            .as_ref()
+            .and_then(|decision| decision.effective_reasoning_effort.as_ref())
+            .map(|effort| effort.value.clone())
+            .or(req.reasoning_effort);
+        let provider_id = winner_route
+            .and_then(|route| route.provider_id.clone())
+            .or_else(|| {
+                winning_attempt_record
+                    .is_none()
+                    .then(|| {
+                        req.route_decision
+                            .as_ref()
+                            .and_then(|decision| decision.provider_id.clone())
+                            .or(req.provider_id.clone())
+                    })
+                    .flatten()
+            });
+        let runtime_revision = winner_evidence
+            .map(|evidence| evidence.runtime_revision)
+            .unwrap_or(req.runtime_revision);
+        let runtime_digest = winner_evidence
+            .map(|evidence| evidence.runtime_digest.clone())
+            .unwrap_or_else(|| req.runtime_digest.clone());
 
         let mut finished = FinishedRequest {
             id: params.id,
@@ -3149,12 +2716,12 @@ impl ProxyState {
             client_addr: req.client_addr,
             cwd: req.cwd,
             model: req.model,
-            reasoning_effort: req.reasoning_effort,
-            service_tier: params.observed_service_tier.or(req.service_tier),
-            station_name: req.station_name,
-            provider_id: req.provider_id,
-            upstream_base_url: req.upstream_base_url,
-            route_decision: req.route_decision,
+            reasoning_effort,
+            service_tier: actual_service_tier
+                .clone()
+                .or_else(|| effective_service_tier.clone()),
+            provider_id,
+            route_decision,
             usage: params.usage.clone(),
             cost,
             retry: params.retry,
@@ -3172,15 +2739,104 @@ impl ProxyState {
         };
         finished.refresh_observability();
 
-        {
-            let mut rollups = self.usage_rollups.write().await;
-            let rollup = rollups.entry(finished.service.clone()).or_default();
-            record_finished_request_into_usage_rollup(rollup, &finished);
+        let outcome = if is_logical_request_success_status(params.status_code) {
+            LogicalRequestOutcome::Succeeded
+        } else {
+            LogicalRequestOutcome::Failed
+        };
+        let economics_state = if !include_in_economics || finished.cost.is_unknown() {
+            EconomicsState::Unknown
+        } else {
+            match finished.cost.confidence {
+                CostConfidence::Exact => EconomicsState::Known,
+                CostConfidence::Estimated | CostConfidence::Partial => EconomicsState::Partial,
+                CostConfidence::Unknown => EconomicsState::Unknown,
+            }
+        };
+        let terminal = LogicalRequestTerminal {
+            outcome,
+            terminal_at_unix_ms: params.ended_at_ms,
+            economics_state,
+            payload: Some(LogicalRequestTerminalPayload {
+                finished_request: finished.clone(),
+                winning_attempt_id,
+                runtime_revision,
+                runtime_digest,
+                policy_revision: Some(req.policy_revision),
+                provider_epoch,
+                provider_price_key,
+                requested_model,
+                mapped_model,
+                reported_model,
+                pricing_model,
+                requested_service_tier,
+                effective_service_tier,
+                actual_service_tier,
+                pricing_service_tier,
+                cache_accounting_convention,
+                billable_usage,
+                accounting_scope: if include_in_economics {
+                    RequestAccountingScope::Economic
+                } else {
+                    RequestAccountingScope::NonEconomic
+                },
+            }),
+        };
+        let terminal_disposition = match self.with_runtime_store_blocking(|runtime_store| {
+            runtime_store.transaction(|transaction| {
+                transaction.commit_logical_request_terminal(lifecycle, terminal)
+            })
+        }) {
+            Ok(disposition) => disposition,
+            Err(error) => {
+                tracing::error!(
+                    request_id = params.id,
+                    error = %error,
+                    "failed to commit durable logical request terminal"
+                );
+                return false;
+            }
+        };
+        #[cfg(test)]
+        self.pause_terminal_publication_after_commit_for_test()
+            .await;
+        request_state.active_requests.remove(&params.id);
+        request_state.lifecycle_handles.remove(&params.id);
+        request_state.provider_catalogs.remove(&params.id);
+        request_state.attempt_epochs.remove(&params.id);
+        request_state.pricing_catalogs.remove(&params.id);
+
+        if terminal_disposition == TerminalDisposition::Committed {
+            request_state.committed_terminal_count =
+                request_state.committed_terminal_count.saturating_add(1);
         }
 
-        if let Some(sid) = finished.session_id.as_deref() {
-            let mut stats = self.session_stats.write().await;
-            let entry = stats.entry(sid.to_string()).or_default();
+        if include_in_economics {
+            let recorded = {
+                let rollup = request_state
+                    .usage_rollups
+                    .entry(finished.service.clone())
+                    .or_default();
+                record_finished_request_into_usage_rollup(
+                    rollup,
+                    &lifecycle.id().to_string(),
+                    &finished,
+                )
+            };
+            if recorded {
+                record_finished_request_into_operator_usage_summary(
+                    &mut request_state.operator_usage_summaries,
+                    &finished,
+                    billable_usage_for_projection.as_ref(),
+                );
+            }
+        }
+
+        if include_in_economics && let Some(sid) = finished.session_id.as_deref() {
+            let entry = request_state
+                .session_stats
+                .entry(sid.to_string())
+                .or_default();
             entry.turns_total = entry.turns_total.saturating_add(1);
             if finished.session_identity_source.is_some() {
                 entry.last_session_identity_source = finished.session_identity_source;
@@ -3206,10 +2862,6 @@ impl ProxyState {
                 .provider_id
                 .clone()
                 .or(entry.last_provider_id.clone());
-            entry.last_station_name = finished
-                .station_name
-                .clone()
-                .or(entry.last_station_name.clone());
             if finished.route_decision.is_some() {
                 entry.last_route_decision = finished.route_decision.clone();
             }
@@ -3242,30 +2894,42 @@ impl ProxyState {
             entry.last_seen_ms = finished.ended_at_ms;
         }
 
-        let mut recent = self.recent_finished.write().await;
-        recent.push_front(finished);
-        while recent.len() > recent_finished_max() {
-            recent.pop_back();
+        request_state.recent_finished.push_front(finished);
+        while request_state.recent_finished.len() > recent_finished_max() {
+            request_state.recent_finished.pop_back();
         }
         self.notify_state_changed();
         true
     }
 
     pub async fn list_active_requests(&self) -> Vec<ActiveRequest> {
-        let guard = self.active_requests.read().await;
-        let mut vec = guard.values().cloned().collect::<Vec<_>>();
+        let request_state = self.request_lifecycle_projection.read().await;
+        let mut vec = request_state
+            .active_requests
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
         vec.sort_by_key(|r| r.started_at_ms);
         vec
     }
 
     pub async fn list_recent_finished(&self, limit: usize) -> Vec<FinishedRequest> {
-        let guard = self.recent_finished.read().await;
-        guard.iter().take(limit).cloned().collect()
+        self.request_lifecycle_projection
+            .read()
+            .await
+            .recent_finished
+            .iter()
+            .take(limit)
+            .cloned()
+            .collect()
     }
 
     pub async fn list_session_stats(&self) -> HashMap<String, SessionStats> {
-        let guard = self.session_stats.read().await;
-        guard.clone()
+        self.request_lifecycle_projection
+            .read()
+            .await
+            .session_stats
+            .clone()
     }
 
     pub async fn list_session_identity_cards(
@@ -3273,39 +2937,18 @@ impl ProxyState {
         recent_limit: usize,
     ) -> Vec<SessionIdentityCard> {
         let recent_limit = recent_limit.clamp(1, recent_finished_max());
-        let (
-            active,
-            recent,
-            overrides,
-            station_overrides,
-            model_overrides,
-            service_tier_overrides,
-            bindings,
-            route_affinities,
-            global_station_override,
-            stats,
-        ) = tokio::join!(
+        let (active, recent, bindings, route_affinities, stats) = tokio::join!(
             self.list_active_requests(),
             self.list_recent_finished(recent_limit),
-            self.list_session_effort_overrides(),
-            self.list_session_station_overrides(),
-            self.list_session_model_overrides(),
-            self.list_session_service_tier_overrides(),
             self.list_session_bindings(),
             self.list_session_route_affinities(),
-            self.get_global_station_override(),
             self.list_session_stats(),
         );
         build_session_identity_cards_from_parts(SessionIdentityCardBuildInputs {
             active: &active,
             recent: &recent,
-            overrides: &overrides,
-            station_overrides: &station_overrides,
-            model_overrides: &model_overrides,
-            service_tier_overrides: &service_tier_overrides,
             bindings: &bindings,
             route_affinities: &route_affinities,
-            global_station_override: global_station_override.as_deref(),
             stats: &stats,
         })
     }
@@ -3423,12 +3066,14 @@ impl ProxyState {
         cards
     }
 
-    pub fn spawn_cleanup_task(state: Arc<Self>) {
-        // Run periodically; no need to be super frequent.
+    pub fn spawn_cleanup_task(state: &Arc<Self>) {
+        let state = Arc::downgrade(state);
         tokio::spawn(async move {
-            let mut tick = interval(Duration::from_secs(30));
             loop {
-                tick.tick().await;
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                let Some(state) = state.upgrade() else {
+                    break;
+                };
                 state.prune_periodic().await;
             }
         });
@@ -3441,68 +3086,15 @@ impl ProxyState {
             .unwrap_or(0);
 
         // Collect active session_ids to avoid clearing overrides for currently running requests.
-        let active = self.active_requests.read().await;
-        let mut active_sessions: HashMap<String, ()> = HashMap::new();
-        for req in active.values() {
-            if let Some(sid) = req.session_id.as_deref() {
-                active_sessions.insert(sid.to_string(), ());
-            }
-        }
-
-        if self.session_override_ttl_ms > 0 && now_ms >= self.session_override_ttl_ms {
-            let cutoff_override = now_ms - self.session_override_ttl_ms;
-            let mut overrides = self.session_effort_overrides.write().await;
-            overrides.retain(|sid, v| {
-                if active_sessions.contains_key(sid) {
-                    return true;
-                }
-                v.last_seen_ms >= cutoff_override
-            });
-        }
-
-        if self.session_override_ttl_ms > 0 && now_ms >= self.session_override_ttl_ms {
-            let cutoff_override = now_ms - self.session_override_ttl_ms;
-            let mut overrides = self.session_station_overrides.write().await;
-            overrides.retain(|sid, v| {
-                if active_sessions.contains_key(sid) {
-                    return true;
-                }
-                v.last_seen_ms >= cutoff_override
-            });
-        }
-
-        if self.session_override_ttl_ms > 0 && now_ms >= self.session_override_ttl_ms {
-            let cutoff_override = now_ms - self.session_override_ttl_ms;
-            let mut overrides = self.session_route_target_overrides.write().await;
-            overrides.retain(|sid, v| {
-                if active_sessions.contains_key(sid) {
-                    return true;
-                }
-                v.last_seen_ms >= cutoff_override
-            });
-        }
-
-        if self.session_override_ttl_ms > 0 && now_ms >= self.session_override_ttl_ms {
-            let cutoff_override = now_ms - self.session_override_ttl_ms;
-            let mut overrides = self.session_model_overrides.write().await;
-            overrides.retain(|sid, v| {
-                if active_sessions.contains_key(sid) {
-                    return true;
-                }
-                v.last_seen_ms >= cutoff_override
-            });
-        }
-
-        if self.session_override_ttl_ms > 0 && now_ms >= self.session_override_ttl_ms {
-            let cutoff_override = now_ms - self.session_override_ttl_ms;
-            let mut overrides = self.session_service_tier_overrides.write().await;
-            overrides.retain(|sid, v| {
-                if active_sessions.contains_key(sid) {
-                    return true;
-                }
-                v.last_seen_ms >= cutoff_override
-            });
-        }
+        let active_sessions = {
+            let request_state = self.request_lifecycle_projection.read().await;
+            request_state
+                .active_requests
+                .values()
+                .filter_map(|request| request.session_id.as_ref())
+                .map(|session_id| (session_id.clone(), ()))
+                .collect::<HashMap<_, _>>()
+        };
 
         if self.session_binding_ttl_ms > 0 && now_ms >= self.session_binding_ttl_ms {
             let cutoff_binding = now_ms - self.session_binding_ttl_ms;
@@ -3534,91 +3126,47 @@ impl ProxyState {
         }
 
         {
-            let mut affinities = self.session_route_affinities.write().await;
-            if self.session_route_affinity_ttl_ms > 0
-                && now_ms >= self.session_route_affinity_ttl_ms
-            {
-                let cutoff_affinity = now_ms - self.session_route_affinity_ttl_ms;
-                affinities.retain(|sid, affinity| {
-                    active_sessions.contains_key(sid)
-                        || affinity.last_selected_at_ms >= cutoff_affinity
-                });
+            let _update_guard = self.session_route_affinity_updates.lock().await;
+            if let Err(error) = self.with_runtime_store_blocking(|runtime_store| {
+                runtime_store.prune_session_affinities(
+                    now_ms,
+                    self.session_route_affinity_ttl_ms,
+                    session_affinity_limit(self.session_route_affinity_max_entries),
+                )
+            }) {
+                tracing::warn!(
+                    error = %error,
+                    "failed to prune session route affinities in runtime store"
+                );
             }
-            prune_lru_cache(
-                &mut affinities,
-                self.session_route_affinity_max_entries,
-                |entry| entry.last_selected_at_ms,
-            );
         }
 
         // Keep a bounded number of days of rollup data to avoid unbounded growth.
-        let keep_days: i32 = std::env::var("CODEX_HELPER_USAGE_ROLLUP_KEEP_DAYS")
-            .ok()
-            .and_then(|s| s.trim().parse::<i32>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(60);
-        let now_day = usage_day::local_day_from_ms(now_ms);
-        let cutoff_day = now_day.saturating_sub(keep_days);
-        let mut rollups = self.usage_rollups.write().await;
-        for rollup in rollups.values_mut() {
+        let cutoff_day = usage_rollup_cutoff_day(now_ms);
+        self.prune_session_transcript_path_cache(now_ms).await;
+
+        let mut request_state = self.request_lifecycle_projection.write().await;
+        for rollup in request_state.usage_rollups.values_mut() {
             rollup.recorded_requests.retain(|_, day| *day >= cutoff_day);
+            rollup
+                .terminal_range_by_day
+                .retain(|day, _| *day >= cutoff_day);
             rollup.by_day.retain(|day, _| *day >= cutoff_day);
             rollup.by_hour.retain(|day, _| *day >= cutoff_day);
-            prune_usage_entity_days(&mut rollup.by_config_day, cutoff_day);
+            prune_usage_entity_days(&mut rollup.by_provider_endpoint_day, cutoff_day);
             prune_usage_entity_days(&mut rollup.by_provider_day, cutoff_day);
             prune_usage_entity_days(&mut rollup.by_model_day, cutoff_day);
             prune_usage_entity_days(&mut rollup.by_session_day, cutoff_day);
             prune_usage_entity_days(&mut rollup.by_project_day, cutoff_day);
+            rebuild_usage_rollup_totals(rollup);
         }
+        prune_operator_usage_summary_days(&mut request_state.operator_usage_summaries, cutoff_day);
 
-        let cutoff_cwd =
-            if self.session_cwd_cache_ttl_ms == 0 || now_ms < self.session_cwd_cache_ttl_ms {
-                0
-            } else {
-                now_ms - self.session_cwd_cache_ttl_ms
-            };
-        self.prune_session_cwd_cache(&active_sessions, cutoff_cwd)
-            .await;
-        self.prune_session_transcript_path_cache(now_ms).await;
-
-        if self.session_override_ttl_ms > 0 && now_ms >= self.session_override_ttl_ms {
-            let cutoff_stats = now_ms - self.session_override_ttl_ms;
-            let mut stats = self.session_stats.write().await;
-            stats.retain(|sid, v| {
-                active_sessions.contains_key(sid) || v.last_seen_ms >= cutoff_stats
+        if self.session_stats_ttl_ms > 0 && now_ms >= self.session_stats_ttl_ms {
+            let cutoff_stats = now_ms - self.session_stats_ttl_ms;
+            request_state.session_stats.retain(|sid, stats| {
+                active_sessions.contains_key(sid) || stats.last_seen_ms >= cutoff_stats
             });
-        }
-    }
-
-    async fn prune_session_cwd_cache(&self, active_sessions: &HashMap<String, ()>, cutoff: u64) {
-        if self.session_cwd_cache_max_entries == 0 {
-            return;
-        }
-        let mut cache = self.session_cwd_cache.write().await;
-
-        if self.session_cwd_cache_ttl_ms > 0 {
-            cache.retain(|sid, v| {
-                if active_sessions.contains_key(sid) {
-                    return true;
-                }
-                v.last_seen_ms >= cutoff
-            });
-        }
-
-        let max = self.session_cwd_cache_max_entries;
-        if max == 0 || cache.len() <= max {
-            return;
-        }
-
-        // Drop least-recently-seen entries first.
-        let mut keys = cache
-            .iter()
-            .map(|(sid, v)| (sid.clone(), v.last_seen_ms))
-            .collect::<Vec<_>>();
-        keys.sort_by_key(|(_, t)| *t);
-        let remove_count = keys.len().saturating_sub(max);
-        for (sid, _) in keys.into_iter().take(remove_count) {
-            cache.remove(&sid);
         }
     }
 
@@ -3729,10 +3277,107 @@ impl<'a> BeginRequestTestBuilder<'a> {
 mod tests {
     use super::*;
 
-    use crate::config::{ServiceConfig, ServiceConfigManager, UpstreamAuth, UpstreamConfig};
+    use crate::config::{ProviderConfig, RouteGraphConfig, ServiceRouteConfig};
     use crate::runtime_identity::ProviderEndpointKey;
     use std::path::Path;
     use std::sync::OnceLock;
+
+    fn route_view(providers: &[(&str, &str)]) -> ServiceRouteConfig {
+        ServiceRouteConfig {
+            providers: providers
+                .iter()
+                .map(|(provider_id, base_url)| {
+                    (
+                        (*provider_id).to_string(),
+                        ProviderConfig {
+                            base_url: Some((*base_url).to_string()),
+                            ..ProviderConfig::default()
+                        },
+                    )
+                })
+                .collect(),
+            routing: Some(RouteGraphConfig::ordered_failover(
+                providers
+                    .iter()
+                    .map(|(provider_id, _)| (*provider_id).to_string())
+                    .collect(),
+            )),
+            ..ServiceRouteConfig::default()
+        }
+    }
+
+    fn provider_route_decision(
+        provider_id: &str,
+        endpoint_id: &str,
+        upstream_base_url: &str,
+    ) -> RouteDecisionProvenance {
+        RouteDecisionProvenance {
+            effective_upstream_base_url: Some(ResolvedRouteValue::new(
+                upstream_base_url,
+                RouteValueSource::RuntimeFallback,
+            )),
+            provider_id: Some(provider_id.to_string()),
+            endpoint_id: Some(endpoint_id.to_string()),
+            route_path: vec![provider_id.to_string(), endpoint_id.to_string()],
+            ..RouteDecisionProvenance::default()
+        }
+    }
+
+    async fn provider_attempt_context_for_test(
+        state: &ProxyState,
+        request_id: u64,
+        provider_id: &str,
+        endpoint_id: &str,
+        route_scope: &str,
+        mapped_model: &str,
+        fingerprint_seed: u8,
+    ) -> CapturedUpstreamAttemptContext {
+        state
+            .capture_upstream_attempt_context(
+                request_id,
+                AttemptRouteEvidence {
+                    provider_endpoint_key: Some(format!("codex/{provider_id}/{endpoint_id}")),
+                    provider_id: Some(provider_id.to_string()),
+                    endpoint_id: Some(endpoint_id.to_string()),
+                    route_path: vec![provider_id.to_string(), endpoint_id.to_string()],
+                    upstream_base_url: Some(format!("https://api.openai.com/v1/{provider_id}")),
+                    mapped_model: Some(mapped_model.to_string()),
+                },
+                AttemptProviderScopeCapture {
+                    endpoint: reqwest::Url::parse("https://api.openai.com/v1/responses")
+                        .expect("OpenAI endpoint"),
+                    route_scope: route_scope.to_string(),
+                    account_fingerprint: AccountFingerprint::from_digest([fingerprint_seed; 32]),
+                },
+            )
+            .await
+            .expect("capture provider attempt context")
+    }
+
+    async fn begin_provider_attempt_for_test(
+        state: &ProxyState,
+        request_id: u64,
+        provider_id: &str,
+        endpoint_id: &str,
+        route_scope: &str,
+        mapped_model: &str,
+        fingerprint_seed: u8,
+    ) -> AttemptHandle {
+        let context = provider_attempt_context_for_test(
+            state,
+            request_id,
+            provider_id,
+            endpoint_id,
+            route_scope,
+            mapped_model,
+            fingerprint_seed,
+        )
+        .await;
+        state
+            .begin_upstream_attempt(&context, 101)
+            .await
+            .expect("begin provider attempt")
+    }
 
     async fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
@@ -3779,30 +3424,362 @@ mod tests {
     }
 
     fn test_runtime_policy(
-        session_override_ttl_ms: u64,
+        session_stats_ttl_ms: u64,
         session_binding_ttl_ms: u64,
         session_binding_max_entries: usize,
     ) -> RuntimePolicy {
         RuntimePolicy {
-            session_override_ttl_ms,
+            session_stats_ttl_ms,
             session_binding_ttl_ms,
             session_binding_max_entries,
             session_route_affinity_ttl_ms: 0,
             session_route_affinity_max_entries: 5_000,
-            session_route_affinity_store: SessionRouteAffinityStore::from_env(),
-            session_cwd_cache_ttl_ms: 0,
-            session_cwd_cache_max_entries: 0,
             session_transcript_path_cache_ttl_ms: 30_000,
             session_transcript_path_cache_max_entries: 5_000,
         }
     }
 
-    fn temp_state_log_path(test_name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "codex-helper-state-{test_name}-{}-{}.jsonl",
-            std::process::id(),
-            unix_now_ms()
-        ))
+    struct TempStateHome(PathBuf);
+
+    impl TempStateHome {
+        fn new(test_name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "codex-helper-state-home-{test_name}-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&path).expect("create temporary helper home");
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempStateHome {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn explicitly_injected_runtime_store_is_retained() {
+        let runtime_store = Arc::new(
+            RuntimeStore::open_in_memory().expect("open injected in-memory runtime store"),
+        );
+        let state = ProxyState::new_with_runtime_policy_and_store(
+            test_runtime_policy(0, 0, 2_000),
+            runtime_store.clone(),
+        )
+        .expect("hydrate injected runtime projections");
+
+        assert!(Arc::ptr_eq(&runtime_store, &state.runtime_store_handle()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn runtime_store_blocking_boundary_keeps_tokio_worker_available() {
+        let state = ProxyState::new();
+        state
+            .runtime_store()
+            .delay_next_transaction_for_test(Duration::from_millis(500));
+
+        let timer_started = std::time::Instant::now();
+        let timer = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        });
+        tokio::task::yield_now().await;
+
+        let begin_state = Arc::clone(&state);
+        let begin = tokio::spawn(async move {
+            begin_state
+                .begin_request_for_test()
+                .started_at_ms(100)
+                .begin()
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        timer.await.expect("unrelated timer task should complete");
+        assert!(
+            timer_started.elapsed() < Duration::from_millis(250),
+            "slow runtime-store work blocked the only Tokio worker"
+        );
+        assert!(
+            !begin.is_finished(),
+            "delayed runtime-store transaction unexpectedly completed before the timer"
+        );
+        let request_id = begin.await.expect("join delayed request begin");
+        assert_eq!(request_id, 1);
+    }
+
+    #[test]
+    fn request_begin_does_not_publish_partial_state_when_cancelled() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            let begin_state = Arc::clone(&state);
+            let publication = state.hold_request_publication_for_test().await;
+            let begin = tokio::spawn(async move {
+                begin_state
+                    .begin_request_for_test()
+                    .started_at_ms(100)
+                    .begin()
+                    .await
+            });
+
+            let partial_publication = tokio::time::timeout(Duration::from_millis(200), async {
+                loop {
+                    if state.lifecycle_handle_count_for_test().await > 0 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok();
+
+            begin.abort();
+            drop(publication);
+            let _ = begin.await;
+            assert!(
+                !partial_publication,
+                "logical request state became partially visible before publication could finish"
+            );
+        });
+    }
+
+    #[test]
+    fn attempt_begin_does_not_commit_before_projection_is_available() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            let request_id = state
+                .begin_request_for_test()
+                .model("gpt-5.6-sol")
+                .started_at_ms(100)
+                .begin()
+                .await;
+            let context = provider_attempt_context_for_test(
+                state.as_ref(),
+                request_id,
+                "official",
+                "default",
+                "codex/official/default",
+                "gpt-5.6-sol",
+                7,
+            )
+            .await;
+            let logical_request = context.logical_request;
+            let store = state.runtime_store_handle();
+            let attempt_state = Arc::clone(&state);
+            let publication = state.hold_attempt_publication_for_test().await;
+            let begin =
+                tokio::spawn(
+                    async move { attempt_state.begin_upstream_attempt(&context, 101).await },
+                );
+
+            let durable_attempt = tokio::time::timeout(Duration::from_millis(200), async {
+                loop {
+                    if !store
+                        .read_attempts_for_logical_request(logical_request)
+                        .expect("read durable attempts")
+                        .is_empty()
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok();
+
+            begin.abort();
+            drop(publication);
+            let _ = begin.await;
+            assert!(
+                !durable_attempt,
+                "durable attempt committed before its in-process projection was publishable"
+            );
+        });
+    }
+
+    #[test]
+    fn terminal_does_not_commit_before_projection_is_available() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            let request_id = state
+                .begin_request_for_test()
+                .session_id("sid-terminal-cancellation")
+                .started_at_ms(100)
+                .begin()
+                .await;
+            let store = state.runtime_store_handle();
+            let initial_revision = store
+                .operator_ledger_revision()
+                .expect("read initial ledger revision");
+            let finish_state = Arc::clone(&state);
+            let publication = state.hold_request_publication_for_test().await;
+            let finish = tokio::spawn(async move {
+                finish_state
+                    .finish_request(FinishRequestParams {
+                        id: request_id,
+                        winning_attempt: None,
+                        status_code: 200,
+                        duration_ms: 10,
+                        ended_at_ms: 110,
+                        observed_service_tier: None,
+                        reported_model: None,
+                        usage: Some(UsageMetrics {
+                            input_tokens: 10,
+                            total_tokens: 10,
+                            ..UsageMetrics::default()
+                        }),
+                        retry: None,
+                        ttfb_ms: Some(4),
+                        streaming: false,
+                    })
+                    .await
+            });
+
+            let durable_terminal = tokio::time::timeout(Duration::from_millis(200), async {
+                loop {
+                    if store
+                        .operator_ledger_revision()
+                        .expect("read ledger revision")
+                        != initial_revision
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok();
+
+            finish.abort();
+            drop(publication);
+            let _ = finish.await;
+            assert!(
+                !durable_terminal,
+                "durable terminal committed before all in-process projections were publishable"
+            );
+        });
+    }
+
+    #[test]
+    fn policy_reconcile_does_not_commit_before_snapshot_is_publishable() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            let store = state.runtime_store_handle();
+            let initial_snapshot = store
+                .provider_policy_snapshot()
+                .expect("read initial policy snapshot");
+            let reconcile_state = Arc::clone(&state);
+            let current = state.provider_policy_snapshot.read().await;
+            let reconcile = tokio::spawn(async move {
+                reconcile_state
+                    .reconcile_runtime_upstream_identities(
+                        &[RuntimeUpstreamIdentity::new(
+                            ProviderEndpointKey::new("codex", "official", "default"),
+                            "https://api.openai.com/v1",
+                        )],
+                        100,
+                    )
+                    .await
+            });
+
+            let durable_policy = tokio::time::timeout(Duration::from_millis(200), async {
+                loop {
+                    if store
+                        .provider_policy_snapshot()
+                        .expect("read durable policy snapshot")
+                        != initial_snapshot
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok();
+
+            reconcile.abort();
+            drop(current);
+            let _ = reconcile.await;
+            assert!(
+                !durable_policy,
+                "durable policy committed before the in-memory snapshot was publishable"
+            );
+        });
+    }
+
+    #[test]
+    fn attempt_context_uses_scoped_effective_model_contract_and_fails_closed() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            let request_id = state
+                .begin_request_for_test()
+                .model("gpt-5.6-alias")
+                .started_at_ms(100)
+                .begin()
+                .await;
+            let fingerprint = AccountFingerprint::from_digest([11; 32]);
+            let route_evidence = |model: &str| AttemptRouteEvidence {
+                provider_endpoint_key: Some("codex/official/default".to_string()),
+                provider_id: Some("official".to_string()),
+                endpoint_id: Some("default".to_string()),
+                route_path: vec!["provider:official".to_string()],
+                upstream_base_url: Some("https://api.openai.com/v1".to_string()),
+                mapped_model: Some(model.to_string()),
+            };
+            let provider_scope = |endpoint: &str| AttemptProviderScopeCapture {
+                endpoint: reqwest::Url::parse(endpoint).expect("provider endpoint"),
+                route_scope: "codex/official/default".to_string(),
+                account_fingerprint: fingerprint,
+            };
+
+            let sol = state
+                .capture_upstream_attempt_context(
+                    request_id,
+                    route_evidence("gpt-5.6-sol"),
+                    provider_scope("https://api.openai.com/v1/responses"),
+                )
+                .await
+                .expect("official Sol context");
+            let sol_contract = sol.request_contract().expect("official Sol contract");
+            assert_eq!(sol_contract.model(), "gpt-5.6-sol");
+            assert!(sol_contract.ultra_maps_to_max());
+            assert_eq!(sol_contract.scope().account_fingerprint(), fingerprint);
+
+            let luna = state
+                .capture_upstream_attempt_context(
+                    request_id,
+                    route_evidence("gpt-5.6-luna"),
+                    provider_scope("https://api.openai.com/v1/responses"),
+                )
+                .await
+                .expect("official Luna context");
+            assert!(
+                !luna
+                    .request_contract()
+                    .expect("official Luna contract")
+                    .ultra_maps_to_max()
+            );
+
+            let compatible = state
+                .capture_upstream_attempt_context(
+                    request_id,
+                    route_evidence("gpt-5.6-sol"),
+                    provider_scope("https://relay.example/v1/responses"),
+                )
+                .await
+                .expect("compatible relay context");
+            assert!(compatible.request_contract().is_none());
+        });
     }
 
     #[test]
@@ -3824,10 +3801,12 @@ mod tests {
             state
                 .finish_request(FinishRequestParams {
                     id: request_id,
+                    winning_attempt: None,
                     status_code: 200,
                     duration_ms: 10,
                     ended_at_ms: 110,
                     observed_service_tier: Some("priority".to_string()),
+                    reported_model: None,
                     usage: None,
                     retry: None,
                     ttfb_ms: Some(4),
@@ -3862,10 +3841,12 @@ mod tests {
             let first = state
                 .finish_request(FinishRequestParams {
                     id: request_id,
+                    winning_attempt: None,
                     status_code: 200,
                     duration_ms: 10,
                     ended_at_ms: 110,
                     observed_service_tier: None,
+                    reported_model: None,
                     usage: None,
                     retry: None,
                     ttfb_ms: Some(4),
@@ -3875,10 +3856,12 @@ mod tests {
             let second = state
                 .finish_request(FinishRequestParams {
                     id: request_id,
+                    winning_attempt: None,
                     status_code: 500,
                     duration_ms: 20,
                     ended_at_ms: 120,
                     observed_service_tier: None,
+                    reported_model: None,
                     usage: None,
                     retry: None,
                     ttfb_ms: None,
@@ -3897,6 +3880,630 @@ mod tests {
     }
 
     #[test]
+    fn terminal_commit_failure_keeps_request_active_and_skips_projections() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            let request_id = state
+                .begin_request_for_test()
+                .session_id("sid-terminal-failure")
+                .started_at_ms(100)
+                .begin()
+                .await;
+            state
+                .runtime_store_handle()
+                .fail_next_logical_terminal_commit_for_test();
+
+            let published = state
+                .finish_request(FinishRequestParams {
+                    id: request_id,
+                    winning_attempt: None,
+                    status_code: 200,
+                    duration_ms: 10,
+                    ended_at_ms: 110,
+                    observed_service_tier: None,
+                    reported_model: None,
+                    usage: Some(UsageMetrics {
+                        input_tokens: 10,
+                        total_tokens: 10,
+                        ..UsageMetrics::default()
+                    }),
+                    retry: None,
+                    ttfb_ms: Some(4),
+                    streaming: false,
+                })
+                .await;
+
+            assert!(!published, "a failed durable commit must not publish");
+            assert_eq!(state.list_active_requests().await.len(), 1);
+            assert!(state.list_recent_finished(10).await.is_empty());
+            assert!(
+                state
+                    .request_lifecycle_projection
+                    .read()
+                    .await
+                    .usage_rollups
+                    .is_empty()
+            );
+            assert!(state.list_session_stats().await.is_empty());
+        });
+    }
+
+    #[test]
+    fn operator_capture_waits_for_terminal_publication_to_finish() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            let request_id = state
+                .begin_request_for_test()
+                .session_id("sid-operator-capture")
+                .started_at_ms(100)
+                .begin()
+                .await;
+            let (committed, resume) = state
+                .pause_next_terminal_publication_after_commit_for_test()
+                .await;
+
+            let finishing_state = Arc::clone(&state);
+            let finish = tokio::spawn(async move {
+                finishing_state
+                    .finish_request(FinishRequestParams {
+                        id: request_id,
+                        winning_attempt: None,
+                        status_code: 200,
+                        duration_ms: 10,
+                        ended_at_ms: 110,
+                        observed_service_tier: None,
+                        reported_model: None,
+                        usage: Some(UsageMetrics {
+                            input_tokens: 10,
+                            total_tokens: 10,
+                            ..UsageMetrics::default()
+                        }),
+                        retry: None,
+                        ttfb_ms: Some(4),
+                        streaming: false,
+                    })
+                    .await
+            });
+            committed
+                .await
+                .expect("terminal commit pause must be reached");
+
+            let mut capture = Box::pin(state.capture_operator_lifecycle_snapshot("codex", 200));
+            tokio::select! {
+                biased;
+                _snapshot = &mut capture => panic!("capture crossed a partially published terminal"),
+                () = async {} => {}
+            }
+
+            resume.send(()).expect("resume terminal publication");
+            assert!(finish.await.expect("join terminal publication"));
+            let snapshot = capture.await;
+            assert!(snapshot.active_requests.is_empty());
+            assert_eq!(snapshot.recent_finished.len(), 1);
+            assert_eq!(snapshot.usage_rollup_view(12, 1).loaded.requests_total, 1);
+            assert!(state.list_active_requests().await.is_empty());
+            assert_eq!(state.list_recent_finished(10).await.len(), 1);
+            assert_eq!(
+                state
+                    .get_usage_rollup_view("codex", 12, 1)
+                    .await
+                    .loaded
+                    .requests_total,
+                1
+            );
+        });
+    }
+
+    #[test]
+    fn crash_gate_after_commit_abort_rehydrates_exactly_once() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let _environment = env_lock().await;
+            let home = TempStateHome::new("after-commit-abort");
+            let mut scoped = ScopedEnv::default();
+            unsafe {
+                scoped.set_path("CODEX_HELPER_HOME", home.path());
+            }
+            std::fs::write(
+                home.path().join("pricing_overrides.toml"),
+                r#"[models.crash-gate-model]
+input_per_1m_usd = "1"
+output_per_1m_usd = "2"
+confidence = "exact"
+"#,
+            )
+            .expect("write crash-gate pricing override");
+
+            let store = Arc::new(
+                RuntimeStore::open_in_home(home.path()).expect("open crash-gate runtime store"),
+            );
+            let state = ProxyState::new_with_runtime_store(Arc::clone(&store))
+                .expect("hydrate initial crash-gate state");
+            let terminal_at_ms = unix_now_ms();
+            let request_id = state
+                .begin_request_for_test()
+                .session_id("sid-after-commit-abort")
+                .model("crash-gate-model")
+                .started_at_ms(terminal_at_ms.saturating_sub(10))
+                .begin()
+                .await;
+            let (committed, resume) = state
+                .pause_next_terminal_publication_after_commit_for_test()
+                .await;
+
+            let finishing_state = Arc::clone(&state);
+            let finish = tokio::spawn(async move {
+                finishing_state
+                    .finish_request(FinishRequestParams {
+                        id: request_id,
+                        winning_attempt: None,
+                        status_code: 200,
+                        duration_ms: 10,
+                        ended_at_ms: terminal_at_ms,
+                        observed_service_tier: None,
+                        reported_model: None,
+                        usage: Some(UsageMetrics {
+                            input_tokens: 1_000_000,
+                            total_tokens: 1_000_000,
+                            ..UsageMetrics::default()
+                        }),
+                        retry: None,
+                        ttfb_ms: Some(4),
+                        streaming: false,
+                    })
+                    .await
+            });
+            committed
+                .await
+                .expect("durable terminal commit pause must be reached");
+            finish.abort();
+            let aborted = finish
+                .await
+                .expect_err("terminal publication task is aborted");
+            assert!(aborted.is_cancelled());
+            drop(resume);
+
+            assert_eq!(state.list_active_requests().await.len(), 1);
+            assert!(state.list_recent_finished(10).await.is_empty());
+            assert!(
+                state
+                    .request_lifecycle_projection
+                    .read()
+                    .await
+                    .usage_rollups
+                    .is_empty()
+            );
+            assert!(state.list_session_stats().await.is_empty());
+            let committed_revision = store
+                .operator_ledger_revision()
+                .expect("read post-commit operator revision");
+            let committed_page = store
+                .query_committed_requests(&CommittedRequestQuery::default())
+                .expect("read post-commit ledger");
+            assert_eq!(committed_page.items.len(), 1);
+            assert_eq!(
+                committed_page.items[0]
+                    .payload
+                    .finished_request
+                    .cost
+                    .total_cost_usd
+                    .as_deref(),
+                Some("1")
+            );
+            drop(state);
+            drop(store);
+
+            for expected_recovery_ordinal in [2, 3] {
+                let reopened_store = Arc::new(
+                    RuntimeStore::open_in_home(home.path())
+                        .expect("reopen after committed terminal abort"),
+                );
+                let recovery = reopened_store.startup_recovery_report();
+                assert_eq!(recovery.recovery_ordinal, expected_recovery_ordinal);
+                assert_eq!(recovery.interrupted_logical_count, 0);
+                assert_eq!(recovery.interrupted_attempt_count, 0);
+                assert_eq!(
+                    reopened_store
+                        .operator_ledger_revision()
+                        .expect("read reopened operator revision"),
+                    committed_revision
+                );
+                let ledger = reopened_store
+                    .query_committed_requests(&CommittedRequestQuery::default())
+                    .expect("read reopened committed ledger");
+                assert_eq!(ledger.items.len(), 1);
+                assert_eq!(
+                    ledger.items[0]
+                        .payload
+                        .finished_request
+                        .cost
+                        .total_cost_usd
+                        .as_deref(),
+                    Some("1")
+                );
+
+                let reopened = ProxyState::new_with_runtime_store(Arc::clone(&reopened_store))
+                    .expect("rehydrate committed terminal projection");
+                let recent = reopened.list_recent_finished(10).await;
+                assert_eq!(recent.len(), 1);
+                assert_eq!(recent[0].id, request_id);
+                assert_eq!(recent[0].cost.total_cost_usd.as_deref(), Some("1"));
+                let rollup = reopened.get_usage_rollup_view("codex", 12, 0).await;
+                assert_eq!(rollup.loaded.requests_total, 1);
+                assert_eq!(rollup.loaded.usage.input_tokens, 1_000_000);
+                assert_eq!(rollup.loaded.usage.total_tokens, 1_000_000);
+                assert_eq!(rollup.loaded.cost.total_cost_usd.as_deref(), Some("1"));
+                assert_eq!(rollup.loaded.cost.priced_requests, 1);
+                assert_eq!(rollup.loaded.cost.unpriced_requests, 0);
+                let sessions = reopened.list_session_stats().await;
+                assert_eq!(sessions.len(), 1);
+                assert_eq!(sessions["sid-after-commit-abort"].turns_total, 1);
+
+                drop(reopened);
+                drop(reopened_store);
+            }
+        });
+    }
+
+    #[test]
+    fn persistent_state_hydrates_committed_projections_across_restart() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let home = TempStateHome::new("projection-hydration");
+            let store = Arc::new(
+                RuntimeStore::open_in_home(home.path()).expect("open first runtime store"),
+            );
+            let state = ProxyState::new_with_runtime_store(store.clone())
+                .expect("hydrate first runtime projections");
+            let base_ms = unix_now_ms();
+
+            let economic_id = state
+                .begin_request_for_test()
+                .session_id("sid-economic")
+                .model("gpt-5")
+                .started_at_ms(base_ms)
+                .begin()
+                .await;
+            assert!(
+                state
+                    .finish_request(FinishRequestParams {
+                        id: economic_id,
+                        winning_attempt: None,
+                        status_code: 200,
+                        duration_ms: 10,
+                        ended_at_ms: base_ms.saturating_add(10),
+                        observed_service_tier: None,
+                        reported_model: None,
+                        usage: Some(UsageMetrics {
+                            input_tokens: 1_000,
+                            total_tokens: 1_000,
+                            ..UsageMetrics::default()
+                        }),
+                        retry: None,
+                        ttfb_ms: Some(4),
+                        streaming: false,
+                    })
+                    .await
+            );
+
+            let non_economic_id = state
+                .begin_request_for_test()
+                .session_id("sid-non-economic")
+                .started_at_ms(base_ms.saturating_add(100))
+                .begin()
+                .await;
+            assert!(
+                state
+                    .finish_non_economic_request(FinishRequestParams {
+                        id: non_economic_id,
+                        winning_attempt: None,
+                        status_code: 426,
+                        duration_ms: 10,
+                        ended_at_ms: base_ms.saturating_add(110),
+                        observed_service_tier: None,
+                        reported_model: None,
+                        usage: Some(UsageMetrics {
+                            input_tokens: 999,
+                            total_tokens: 999,
+                            ..UsageMetrics::default()
+                        }),
+                        retry: None,
+                        ttfb_ms: None,
+                        streaming: false,
+                    })
+                    .await
+            );
+            drop(state);
+            drop(store);
+
+            let reopened_store =
+                Arc::new(RuntimeStore::open_in_home(home.path()).expect("reopen runtime store"));
+            let reopened = ProxyState::new_with_runtime_store(reopened_store)
+                .expect("hydrate reopened runtime projections");
+
+            assert_eq!(
+                reopened
+                    .list_recent_finished(10)
+                    .await
+                    .iter()
+                    .map(|request| request.id)
+                    .collect::<Vec<_>>(),
+                vec![non_economic_id, economic_id]
+            );
+            let rollup = reopened.get_usage_rollup_view("codex", 12, 1).await;
+            assert_eq!(rollup.loaded.requests_total, 1);
+            assert_eq!(rollup.loaded.usage.input_tokens, 1_000);
+            let usage_summaries = reopened.operator_usage_summaries("codex", 100).await;
+            let provider_summary = usage_summaries
+                .iter()
+                .find(|summary| summary.group == RequestUsageSummaryGroup::Provider)
+                .expect("provider usage summary");
+            assert_eq!(provider_summary.rows.len(), 1);
+            assert_eq!(provider_summary.rows[0].group_value, "-");
+            assert_eq!(provider_summary.rows[0].aggregate.requests, 1);
+            assert_eq!(provider_summary.rows[0].aggregate.total_tokens, 1_000);
+            assert_eq!(
+                reopened.operator_ledger_revision().await,
+                reopened
+                    .runtime_store()
+                    .operator_ledger_revision()
+                    .expect("read durable operator ledger revision")
+            );
+            assert_eq!(
+                reopened
+                    .request_lifecycle_projection
+                    .read()
+                    .await
+                    .usage_rollups["codex"]
+                    .coverage_source,
+                "runtime_store"
+            );
+            let stats = reopened.list_session_stats().await;
+            assert_eq!(stats["sid-economic"].turns_total, 1);
+            assert!(!stats.contains_key("sid-non-economic"));
+
+            let next_id = reopened
+                .begin_request_for_test()
+                .started_at_ms(base_ms.saturating_add(200))
+                .begin()
+                .await;
+            assert!(next_id > non_economic_id);
+        });
+    }
+
+    #[test]
+    fn startup_hydration_does_not_resurrect_economic_projections_outside_retention() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let store = Arc::new(RuntimeStore::open_in_memory().expect("open runtime store"));
+            let state = ProxyState::new_with_runtime_store(Arc::clone(&store))
+                .expect("hydrate empty runtime projections");
+            let now_ms = unix_now_ms();
+            let old_ms = now_ms.saturating_sub(90 * 24 * 60 * 60 * 1_000);
+
+            let old_id = state
+                .begin_request_for_test()
+                .session_id("sid-expired")
+                .started_at_ms(old_ms.saturating_sub(10))
+                .begin()
+                .await;
+            assert!(
+                state
+                    .finish_request(FinishRequestParams {
+                        id: old_id,
+                        winning_attempt: None,
+                        status_code: 200,
+                        duration_ms: 10,
+                        ended_at_ms: old_ms,
+                        observed_service_tier: None,
+                        reported_model: None,
+                        usage: Some(UsageMetrics {
+                            input_tokens: 100,
+                            total_tokens: 100,
+                            ..UsageMetrics::default()
+                        }),
+                        retry: None,
+                        ttfb_ms: None,
+                        streaming: false,
+                    })
+                    .await
+            );
+
+            let current_id = state
+                .begin_request_for_test()
+                .session_id("sid-current")
+                .started_at_ms(now_ms.saturating_sub(10))
+                .begin()
+                .await;
+            assert!(
+                state
+                    .finish_request(FinishRequestParams {
+                        id: current_id,
+                        winning_attempt: None,
+                        status_code: 200,
+                        duration_ms: 10,
+                        ended_at_ms: now_ms,
+                        observed_service_tier: None,
+                        reported_model: None,
+                        usage: Some(UsageMetrics {
+                            input_tokens: 200,
+                            total_tokens: 200,
+                            ..UsageMetrics::default()
+                        }),
+                        retry: None,
+                        ttfb_ms: None,
+                        streaming: false,
+                    })
+                    .await
+            );
+
+            state.prune_periodic().await;
+            let live_rollup = state.get_usage_rollup_view("codex", 12, 60).await;
+            assert_eq!(live_rollup.loaded.requests_total, 1);
+            assert_eq!(live_rollup.loaded.usage.input_tokens, 200);
+            let live_provider_summary = state
+                .operator_usage_summaries("codex", 100)
+                .await
+                .into_iter()
+                .find(|summary| summary.group == RequestUsageSummaryGroup::Provider)
+                .expect("live provider usage summary");
+            assert_eq!(live_provider_summary.coverage.requests, 1);
+            assert_eq!(live_provider_summary.rows.len(), 1);
+            assert_eq!(live_provider_summary.rows[0].aggregate.requests, 1);
+            assert_eq!(live_provider_summary.rows[0].aggregate.input_tokens, 200);
+
+            let hydrated =
+                hydrate_runtime_projections(&store).expect("rehydrate bounded runtime projections");
+            assert_eq!(hydrated.committed_terminal_count, 2);
+            assert_eq!(hydrated.next_request_id, current_id + 1);
+            assert_eq!(hydrated.usage_rollups["codex"].loaded.requests_total, 1);
+            assert_eq!(
+                hydrated.usage_rollups["codex"].loaded.usage.input_tokens,
+                200
+            );
+            let hydrated_provider_summary = operator_usage_summaries(&hydrated, "codex", 100)
+                .into_iter()
+                .find(|summary| summary.group == RequestUsageSummaryGroup::Provider)
+                .expect("hydrated provider usage summary");
+            assert_eq!(hydrated_provider_summary.coverage.requests, 1);
+            assert_eq!(hydrated_provider_summary.rows[0].aggregate.requests, 1);
+            assert!(!hydrated.session_stats.contains_key("sid-expired"));
+            assert!(hydrated.session_stats.contains_key("sid-current"));
+        });
+    }
+
+    #[test]
+    fn canonical_usage_summaries_use_frozen_buckets_beyond_recent_window_and_restart() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            const REQUEST_COUNT: u64 = 201;
+
+            let store = Arc::new(RuntimeStore::open_in_memory().expect("open runtime store"));
+            let state = ProxyState::new_with_runtime_store(Arc::clone(&store))
+                .expect("hydrate empty runtime projections");
+            let now_ms = unix_now_ms();
+
+            for index in 0..REQUEST_COUNT {
+                let request_id = state
+                    .begin_request_for_test()
+                    .session_id("sid-canonical-summary")
+                    .model("gpt-5.6-sol")
+                    .started_at_ms(now_ms.saturating_add(index))
+                    .begin()
+                    .await;
+                let winner = begin_provider_attempt_for_test(
+                    state.as_ref(),
+                    request_id,
+                    "sol",
+                    "responses",
+                    "codex/sol/responses",
+                    "gpt-5.6-sol",
+                    7,
+                )
+                .await;
+                state
+                    .finish_upstream_attempt(
+                        winner,
+                        AttemptOutcome::Succeeded,
+                        now_ms.saturating_add(index).saturating_add(1),
+                        EconomicsState::Known,
+                    )
+                    .expect("finish winning attempt");
+                assert!(
+                    state
+                        .finish_request(FinishRequestParams {
+                            id: request_id,
+                            winning_attempt: Some(winner),
+                            status_code: 200,
+                            duration_ms: 10,
+                            ended_at_ms: now_ms.saturating_add(index).saturating_add(2),
+                            observed_service_tier: Some("default".to_string()),
+                            reported_model: Some("gpt-5.6-sol".to_string()),
+                            usage: Some(UsageMetrics {
+                                input_tokens: 1_000,
+                                cache_read_input_tokens: 100,
+                                cache_creation_input_tokens: 200,
+                                total_tokens: 1_000,
+                                ..UsageMetrics::default()
+                            }),
+                            retry: None,
+                            ttfb_ms: None,
+                            streaming: false,
+                        })
+                        .await
+                );
+            }
+
+            let terminal_payload = store
+                .read_recent_logical_requests(1)
+                .expect("read canonical summary terminal")
+                .pop()
+                .and_then(|request| request.terminal)
+                .and_then(|terminal| terminal.terminal.payload)
+                .expect("canonical summary terminal payload");
+            assert_eq!(
+                terminal_payload.cache_accounting_convention,
+                crate::usage::CacheAccountingConvention::INCLUDED_IN_INPUT
+            );
+            assert!(terminal_payload.provider_price_key.is_some());
+            let frozen_buckets = terminal_payload
+                .billable_usage
+                .expect("frozen billable usage");
+            assert_eq!(
+                frozen_buckets.status,
+                crate::usage::EconomicsStatus::Complete
+            );
+            assert_eq!(frozen_buckets.ordinary_input_tokens, 700);
+            assert_eq!(frozen_buckets.cache_read_input_tokens, 100);
+            assert_eq!(frozen_buckets.cache_write_input_tokens, 200);
+
+            assert_eq!(state.list_recent_finished(200).await.len(), 200);
+            let assert_summaries = |summaries: Vec<RequestUsageSummary>| {
+                let expected = [
+                    (
+                        RequestUsageSummaryGroup::ProviderEndpoint,
+                        "codex/sol/responses",
+                    ),
+                    (RequestUsageSummaryGroup::Provider, "sol"),
+                    (RequestUsageSummaryGroup::Model, "gpt-5.6-sol"),
+                    (RequestUsageSummaryGroup::Session, "sid-canonical-summary"),
+                ];
+                for (group, group_value) in expected {
+                    let summary = summaries
+                        .iter()
+                        .find(|summary| summary.group == group)
+                        .expect("canonical usage summary group");
+                    assert_eq!(summary.coverage.requests, REQUEST_COUNT);
+                    assert_eq!(summary.rows.len(), 1);
+                    assert_eq!(summary.rows[0].group_value, group_value);
+                    assert_eq!(summary.rows[0].aggregate.requests, REQUEST_COUNT);
+                    assert_eq!(
+                        summary.rows[0].aggregate.input_tokens,
+                        i64::try_from(REQUEST_COUNT).expect("request count") * 700
+                    );
+                    assert_eq!(
+                        summary.rows[0].aggregate.cache_read_input_tokens,
+                        i64::try_from(REQUEST_COUNT).expect("request count") * 100
+                    );
+                    assert_eq!(
+                        summary.rows[0].aggregate.cache_creation_input_tokens,
+                        i64::try_from(REQUEST_COUNT).expect("request count") * 200
+                    );
+                }
+            };
+
+            assert_summaries(state.operator_usage_summaries("codex", 100).await);
+            drop(state);
+
+            let reopened = ProxyState::new_with_runtime_store(store)
+                .expect("rehydrate canonical usage summaries");
+            assert_summaries(reopened.operator_usage_summaries("codex", 100).await);
+        });
+    }
+
+    #[test]
     fn session_cards_expose_last_and_average_output_token_speed() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         runtime.block_on(async {
@@ -3911,10 +4518,12 @@ mod tests {
             state
                 .finish_request(FinishRequestParams {
                     id: first_id,
+                    winning_attempt: None,
                     status_code: 200,
                     duration_ms: 1_500,
                     ended_at_ms: 1_600,
                     observed_service_tier: None,
+                    reported_model: None,
                     usage: Some(UsageMetrics {
                         output_tokens: 200,
                         total_tokens: 200,
@@ -3935,10 +4544,12 @@ mod tests {
             state
                 .finish_request(FinishRequestParams {
                     id: second_id,
+                    winning_attempt: None,
                     status_code: 200,
                     duration_ms: 2_500,
                     ended_at_ms: 4_500,
                     observed_service_tier: None,
+                    reported_model: None,
                     usage: Some(UsageMetrics {
                         output_tokens: 300,
                         total_tokens: 300,
@@ -3973,29 +4584,25 @@ mod tests {
             let mut changes = state.subscribe_state_changes();
 
             state
-                .record_provider_balance_snapshot(
-                    "codex",
-                    ProviderBalanceSnapshot {
-                        provider_id: "input6".to_string(),
-                        station_name: Some("routing".to_string()),
-                        upstream_index: Some(0),
-                        fetched_at_ms: 100,
-                        stale_after_ms: Some(1_000),
-                        status: BalanceSnapshotStatus::Ok,
-                        total_balance_usd: Some("12.50".to_string()),
-                        ..ProviderBalanceSnapshot::default()
-                    },
-                )
+                .record_provider_balance_snapshot(ProviderBalanceSnapshot {
+                    observation_provider_id: "input6".to_string(),
+                    provider_endpoint: ProviderEndpointKey::new("codex", "routing", "default"),
+                    fetched_at_ms: 100,
+                    stale_after_ms: Some(1_000),
+                    status: BalanceSnapshotStatus::Ok,
+                    total_balance_usd: Some("12.50".to_string()),
+                    ..ProviderBalanceSnapshot::default()
+                })
                 .await;
             changes.changed().await.expect("balance change");
             let balance_version = *changes.borrow();
             assert!(balance_version > 0);
 
             state
-                .set_provider_endpoint_usage_exhausted(
-                    "codex",
+                .set_provider_automatic_block_for_test(
                     ProviderEndpointKey::new("codex", "input6", "default"),
                     true,
+                    100,
                 )
                 .await;
             changes.changed().await.expect("usage exhausted change");
@@ -4016,10 +4623,12 @@ mod tests {
             state
                 .finish_request(FinishRequestParams {
                     id: request_id,
+                    winning_attempt: None,
                     status_code: 200,
                     duration_ms: 25,
                     ended_at_ms: 250,
                     observed_service_tier: None,
+                    reported_model: None,
                     usage: None,
                     retry: None,
                     ttfb_ms: Some(5),
@@ -4032,25 +4641,414 @@ mod tests {
     }
 
     #[test]
-    fn state_change_subscription_ignores_session_touch_only_updates() {
+    fn finish_request_keeps_captured_price_across_reload_and_reopen() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         runtime.block_on(async {
-            let state = ProxyState::new();
-            let mut changes = state.subscribe_state_changes();
+            let _home = env_lock().await;
+            let temp_dir = std::env::temp_dir().join(format!(
+                "codex-helper-pricing-capture-test-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&temp_dir).expect("create temp helper home");
+            let mut scoped = ScopedEnv::default();
+            unsafe {
+                scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
+            }
+            let pricing_path = temp_dir.join("pricing_overrides.toml");
+            std::fs::write(
+                &pricing_path,
+                r#"[models.catalog-race]
+input_per_1m_usd = "1"
+output_per_1m_usd = "2"
+confidence = "exact"
+"#,
+            )
+            .expect("write initial pricing override");
 
-            state
-                .set_session_model_override("sid-1".to_string(), "gpt-5".to_string(), 100)
+            let state = ProxyState::new_with_runtime_store(Arc::new(
+                RuntimeStore::open_in_home(&temp_dir).expect("open persistent runtime store"),
+            ))
+            .expect("hydrate persistent runtime state");
+            let request_id = state
+                .begin_request_for_test()
+                .model("catalog-race")
+                .started_at_ms(100)
+                .begin()
                 .await;
-            changes.changed().await.expect("model override change");
-            let version = *changes.borrow();
 
-            state.touch_session_model_override("sid-1", 200).await;
-            assert_eq!(*changes.borrow(), version);
+            std::fs::write(
+                &pricing_path,
+                r#"[models.catalog-race]
+input_per_1m_usd = "9"
+output_per_1m_usd = "18"
+confidence = "exact"
+"#,
+            )
+            .expect("reload pricing override during request");
+
+            let reloaded_request_id = state
+                .begin_request_for_test()
+                .model("catalog-race")
+                .started_at_ms(101)
+                .begin()
+                .await;
+
+            let finish_params = |id, ended_at_ms| FinishRequestParams {
+                id,
+                winning_attempt: None,
+                status_code: 200,
+                duration_ms: 10,
+                ended_at_ms,
+                observed_service_tier: None,
+                reported_model: None,
+                usage: Some(UsageMetrics {
+                    input_tokens: 1_000_000,
+                    total_tokens: 1_000_000,
+                    ..UsageMetrics::default()
+                }),
+                retry: None,
+                ttfb_ms: Some(4),
+                streaming: false,
+            };
+
+            assert!(state.finish_request(finish_params(request_id, 110)).await);
+            assert!(
+                state
+                    .finish_request(finish_params(reloaded_request_id, 111))
+                    .await
+            );
+
+            drop(state);
+
+            let reader = crate::runtime_store::RuntimeStoreReader::open_in_home(&temp_dir)
+                .expect("reopen runtime store reader");
+            {
+                let ledger = crate::request_ledger::RequestLedger::new(&reader);
+                let request_by_id = |id| {
+                    ledger
+                        .find_finished_requests(
+                            &crate::request_ledger::RequestLogFilters {
+                                request_id: Some(id),
+                                ..crate::request_ledger::RequestLogFilters::default()
+                            },
+                            1,
+                        )
+                        .expect("read reopened request ledger")
+                        .pop()
+                        .expect("request remains in reopened ledger")
+                };
+                let captured_request = request_by_id(request_id);
+                let reloaded_request = request_by_id(reloaded_request_id);
+                assert_eq!(captured_request.cost.total_cost_usd.as_deref(), Some("1"));
+                assert_eq!(reloaded_request.cost.total_cost_usd.as_deref(), Some("9"));
+                assert!(
+                    crate::request_ledger::format_finished_request_lines(&captured_request)[1]
+                        .contains("cost=$1 (exact)")
+                );
+            }
+            drop(reader);
+            drop(scoped);
+            std::fs::remove_dir_all(temp_dir).expect("remove temp helper home");
         });
     }
 
     #[test]
-    fn finish_request_estimates_cost_and_rolls_up_cost() {
+    fn logical_terminal_uses_winning_attempt_provider_epoch_and_route() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            let request_id = state
+                .begin_request_for_test()
+                .model("gpt-5.6-sol")
+                .started_at_ms(100)
+                .begin()
+                .await;
+
+            let failed = begin_provider_attempt_for_test(
+                state.as_ref(),
+                request_id,
+                "provider-a",
+                "endpoint-a",
+                "route/provider-a",
+                "gpt-5.6-sol",
+                1,
+            )
+            .await;
+            state
+                .finish_upstream_attempt(
+                    failed,
+                    AttemptOutcome::Failed,
+                    102,
+                    EconomicsState::Unknown,
+                )
+                .expect("finish failed attempt");
+
+            let winner = begin_provider_attempt_for_test(
+                state.as_ref(),
+                request_id,
+                "provider-b",
+                "endpoint-b",
+                "route/provider-b",
+                "gpt-5.6-terra",
+                2,
+            )
+            .await;
+            state
+                .finish_upstream_attempt(
+                    winner,
+                    AttemptOutcome::Succeeded,
+                    103,
+                    EconomicsState::Unknown,
+                )
+                .expect("finish winning attempt");
+
+            state
+                .update_request_route(
+                    request_id,
+                    RouteDecisionProvenance {
+                        effective_model: Some(ResolvedRouteValue::new(
+                            "gpt-5.6-luna",
+                            RouteValueSource::RuntimeFallback,
+                        )),
+                        effective_reasoning_effort: Some(ResolvedRouteValue::new(
+                            "max",
+                            RouteValueSource::RequestPayload,
+                        )),
+                        provider_id: Some("provider-c".to_string()),
+                        endpoint_id: Some("endpoint-c".to_string()),
+                        route_path: vec!["provider-c".to_string()],
+                        ..RouteDecisionProvenance::default()
+                    },
+                )
+                .await;
+
+            assert!(
+                state
+                    .finish_request(FinishRequestParams {
+                        id: request_id,
+                        winning_attempt: Some(winner),
+                        status_code: 200,
+                        duration_ms: 10,
+                        ended_at_ms: 110,
+                        observed_service_tier: Some("priority".to_string()),
+                        reported_model: Some("gpt-5.6-terra".to_string()),
+                        usage: Some(UsageMetrics {
+                            input_tokens: 1_000_000,
+                            total_tokens: 1_000_000,
+                            ..UsageMetrics::default()
+                        }),
+                        retry: None,
+                        ttfb_ms: Some(4),
+                        streaming: false,
+                    })
+                    .await
+            );
+
+            let terminal = state
+                .runtime_store_handle()
+                .read_recent_logical_requests(1)
+                .expect("read durable terminal")
+                .pop()
+                .and_then(|request| request.terminal)
+                .and_then(|terminal| terminal.terminal.payload)
+                .expect("runtime terminal payload");
+            assert_eq!(terminal.winning_attempt_id, Some(winner.id()));
+            assert_eq!(terminal.mapped_model.as_deref(), Some("gpt-5.6-terra"));
+            assert_eq!(
+                terminal.finished_request.reasoning_effort.as_deref(),
+                Some("max")
+            );
+            assert_eq!(
+                terminal.finished_request.provider_id.as_deref(),
+                Some("provider-b")
+            );
+            assert_eq!(
+                terminal
+                    .finished_request
+                    .route_decision
+                    .as_ref()
+                    .and_then(|decision| decision.endpoint_id.as_deref()),
+                Some("endpoint-b")
+            );
+            let epoch = terminal.provider_epoch.as_ref().expect("provider epoch");
+            assert_eq!(epoch.scope.route_scope, "route/provider-b");
+            assert_eq!(
+                epoch.catalog_revision.as_deref(),
+                Some(crate::provider_catalog::OPENAI_CODEX_CATALOG_REVISION)
+            );
+            let price_key = terminal
+                .provider_price_key
+                .as_ref()
+                .expect("provider price key");
+            assert_eq!(price_key.epoch, *epoch);
+            assert_eq!(price_key.model, "gpt-5.6-terra");
+            assert_eq!(price_key.tier, ProviderPricingTier::Priority);
+            assert_eq!(
+                terminal.finished_request.cost.total_cost_usd.as_deref(),
+                Some("5")
+            );
+            let request_state = state.request_lifecycle_projection.read().await;
+            assert!(!request_state.active_requests.contains_key(&request_id));
+            assert!(!request_state.attempt_epochs.contains_key(&request_id));
+        });
+    }
+
+    #[test]
+    fn reported_model_conflict_forces_unknown_winner_economics() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            let request_id = state
+                .begin_request_for_test()
+                .model("gpt-5.6-terra")
+                .started_at_ms(100)
+                .begin()
+                .await;
+            let winner = begin_provider_attempt_for_test(
+                state.as_ref(),
+                request_id,
+                "provider-b",
+                "endpoint-b",
+                "route/provider-b",
+                "gpt-5.6-terra",
+                3,
+            )
+            .await;
+            state
+                .finish_upstream_attempt(
+                    winner,
+                    AttemptOutcome::Succeeded,
+                    103,
+                    EconomicsState::Unknown,
+                )
+                .expect("finish winning attempt");
+
+            assert!(
+                state
+                    .finish_request(FinishRequestParams {
+                        id: request_id,
+                        winning_attempt: Some(winner),
+                        status_code: 200,
+                        duration_ms: 10,
+                        ended_at_ms: 110,
+                        observed_service_tier: Some("standard".to_string()),
+                        reported_model: Some("gpt-5.6-sol".to_string()),
+                        usage: Some(UsageMetrics {
+                            input_tokens: 1_000_000,
+                            total_tokens: 1_000_000,
+                            ..UsageMetrics::default()
+                        }),
+                        retry: None,
+                        ttfb_ms: Some(4),
+                        streaming: false,
+                    })
+                    .await
+            );
+            let terminal = state
+                .runtime_store_handle()
+                .read_recent_logical_requests(1)
+                .expect("read durable terminal")
+                .pop()
+                .and_then(|request| request.terminal)
+                .expect("logical terminal");
+            assert_eq!(terminal.terminal.economics_state, EconomicsState::Unknown);
+            let payload = terminal.terminal.payload.expect("terminal payload");
+            assert!(payload.provider_epoch.is_some());
+            assert!(payload.provider_price_key.is_none());
+            assert!(payload.pricing_model.is_none());
+            assert!(payload.finished_request.cost.is_unknown());
+        });
+    }
+
+    #[test]
+    fn provider_pricing_uses_only_actual_service_tier() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            let cases = [
+                (None, ProviderPricingTier::Unknown, None),
+                (Some(""), ProviderPricingTier::Unknown, None),
+                (Some("flex"), ProviderPricingTier::Unknown, None),
+                (Some("garbage"), ProviderPricingTier::Unknown, None),
+                (Some("default"), ProviderPricingTier::Standard, Some("2.5")),
+                (Some("standard"), ProviderPricingTier::Standard, Some("2.5")),
+                (Some("priority"), ProviderPricingTier::Priority, Some("5")),
+            ];
+
+            for (index, (actual_tier, expected_tier, expected_cost)) in
+                cases.into_iter().enumerate()
+            {
+                let request_id = state
+                    .begin_request_for_test()
+                    .model("gpt-5.6-terra")
+                    .service_tier("priority")
+                    .started_at_ms(100 + index as u64)
+                    .begin()
+                    .await;
+                let winner = begin_provider_attempt_for_test(
+                    state.as_ref(),
+                    request_id,
+                    "provider-tier",
+                    "endpoint-tier",
+                    "route/provider-tier",
+                    "gpt-5.6-terra",
+                    index as u8,
+                )
+                .await;
+                state
+                    .finish_upstream_attempt(
+                        winner,
+                        AttemptOutcome::Succeeded,
+                        200 + index as u64,
+                        EconomicsState::Unknown,
+                    )
+                    .expect("finish winning attempt");
+                assert!(
+                    state
+                        .finish_request(FinishRequestParams {
+                            id: request_id,
+                            winning_attempt: Some(winner),
+                            status_code: 200,
+                            duration_ms: 10,
+                            ended_at_ms: 300 + index as u64,
+                            observed_service_tier: actual_tier.map(str::to_string),
+                            reported_model: Some("gpt-5.6-terra".to_string()),
+                            usage: Some(UsageMetrics {
+                                input_tokens: 1_000_000,
+                                total_tokens: 1_000_000,
+                                ..UsageMetrics::default()
+                            }),
+                            retry: None,
+                            ttfb_ms: Some(4),
+                            streaming: false,
+                        })
+                        .await,
+                    "actual tier: {actual_tier:?}"
+                );
+                let payload = state
+                    .runtime_store_handle()
+                    .read_recent_logical_requests(1)
+                    .expect("read durable terminal")
+                    .pop()
+                    .and_then(|request| request.terminal)
+                    .and_then(|terminal| terminal.terminal.payload)
+                    .expect("runtime terminal payload");
+                assert_eq!(
+                    payload.provider_price_key.as_ref().map(|key| key.tier),
+                    Some(expected_tier),
+                    "actual tier: {actual_tier:?}"
+                );
+                assert_eq!(
+                    payload.finished_request.cost.total_cost_usd.as_deref(),
+                    expected_cost,
+                    "actual tier: {actual_tier:?}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn finish_request_without_captured_convention_keeps_cache_economics_unknown() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         runtime.block_on(async {
             let state = ProxyState::new();
@@ -4064,10 +5062,12 @@ mod tests {
             state
                 .finish_request(FinishRequestParams {
                     id: request_id,
+                    winning_attempt: None,
                     status_code: 200,
                     duration_ms: 10,
                     ended_at_ms: 110,
                     observed_service_tier: None,
+                    reported_model: None,
                     usage: Some(UsageMetrics {
                         input_tokens: 1_000,
                         output_tokens: 500,
@@ -4081,16 +5081,30 @@ mod tests {
                 })
                 .await;
 
+            let payload = state
+                .runtime_store_handle()
+                .read_recent_logical_requests(1)
+                .expect("read durable terminal")
+                .pop()
+                .and_then(|request| request.terminal)
+                .and_then(|terminal| terminal.terminal.payload)
+                .expect("terminal payload");
+            assert_eq!(
+                payload.cache_accounting_convention,
+                crate::usage::CacheAccountingConvention::UNKNOWN
+            );
+            assert_eq!(
+                payload.billable_usage.map(|usage| usage.status),
+                Some(crate::usage::EconomicsStatus::Partial)
+            );
+
             let recent = state.list_recent_finished(1).await;
-            assert_eq!(recent[0].cost.total_cost_usd.as_deref(), Some("0.0061375"));
+            assert!(recent[0].cost.is_unknown());
 
             let rollup = state.get_usage_rollup_view("codex", 12, 1).await;
-            assert_eq!(
-                rollup.loaded.cost.total_cost_usd.as_deref(),
-                Some("0.0061375")
-            );
-            assert_eq!(rollup.loaded.cost.priced_requests, 1);
-            assert_eq!(rollup.loaded.cost.unpriced_requests, 0);
+            assert_eq!(rollup.loaded.cost.total_cost_usd, None);
+            assert_eq!(rollup.loaded.cost.priced_requests, 0);
+            assert_eq!(rollup.loaded.cost.unpriced_requests, 1);
         });
     }
 
@@ -4111,19 +5125,22 @@ mod tests {
             state
                 .update_request_route(
                     request_id,
-                    Some("station-day".to_string()),
-                    Some("provider-day".to_string()),
-                    "https://provider.example/v1".to_string(),
-                    None,
+                    provider_route_decision(
+                        "provider-day",
+                        "default",
+                        "https://provider.example/v1",
+                    ),
                 )
                 .await;
             state
                 .finish_request(FinishRequestParams {
                     id: request_id,
+                    winning_attempt: None,
                     status_code: 200,
                     duration_ms: 10,
                     ended_at_ms,
                     observed_service_tier: None,
+                    reported_model: None,
                     usage: Some(UsageMetrics {
                         total_tokens: 42,
                         ..UsageMetrics::default()
@@ -4137,8 +5154,11 @@ mod tests {
             let recent = state.list_recent_finished(1).await;
             let day = usage_day::local_day_from_ms(ended_at_ms);
             let hour = usize::from(usage_day::local_hour_from_ms(ended_at_ms));
-            let mut rollups = state.usage_rollups.write().await;
-            let rollup = rollups.get_mut("codex").expect("codex rollup");
+            let mut request_state = state.request_lifecycle_projection.write().await;
+            let rollup = request_state
+                .usage_rollups
+                .get_mut("codex")
+                .expect("codex rollup");
 
             assert_eq!(rollup.by_hour[&day][hour].requests_total, 1);
             assert_eq!(rollup.by_model["gpt-5"].requests_total, 1);
@@ -4150,88 +5170,18 @@ mod tests {
             );
 
             let before = rollup.loaded.requests_total;
+            let logical_request_id = rollup
+                .recorded_requests
+                .keys()
+                .next()
+                .expect("durable logical request key")
+                .clone();
             assert!(!record_finished_request_into_usage_rollup(
-                rollup, &recent[0]
+                rollup,
+                &logical_request_id,
+                &recent[0]
             ));
             assert_eq!(rollup.loaded.requests_total, before);
-        });
-    }
-
-    #[test]
-    fn usage_replay_projects_finished_requests_and_keeps_provider_fallback() {
-        let runtime = tokio::runtime::Runtime::new().expect("runtime");
-        runtime.block_on(async {
-            let log_path = temp_state_log_path("usage-replay-projection");
-            let window =
-                usage_day::local_day_window(usage_day::current_local_day()).expect("window");
-            let ended_at_ms = window.start_ms.saturating_add(3_600_000);
-            let record = serde_json::json!({
-                "timestamp_ms": ended_at_ms,
-                "request_id": 77,
-                "trace_id": "codex-replay-77",
-                "service": "codex",
-                "method": "POST",
-                "path": "/v1/responses",
-                "status_code": 200,
-                "duration_ms": 100,
-                "ttfb_ms": 25,
-                "station_name": "station-replay",
-                "upstream_base_url": "https://legacy.example/v1",
-                "session_id": "sid-replay",
-                "cwd": "F:/SourceCodes/Rust/codex-helper",
-                "model": "gpt-5",
-                "usage": {
-                    "input_tokens": 1,
-                    "output_tokens": 2,
-                    "total_tokens": 3
-                }
-            });
-            std::fs::write(&log_path, format!("{record}\n")).expect("write request log");
-
-            let state = ProxyState::new();
-            let replayed = state
-                .replay_usage_from_requests_log(
-                    "codex",
-                    log_path.clone(),
-                    HashMap::from([(
-                        "https://legacy.example/v1".to_string(),
-                        "provider-fallback".to_string(),
-                    )]),
-                )
-                .await;
-
-            assert_eq!(replayed, 1);
-            let day = usage_day::local_day_from_ms(ended_at_ms);
-            let rollups = state.usage_rollups.read().await;
-            let rollup = rollups.get("codex").expect("codex rollup");
-            assert_eq!(rollup.by_provider["provider-fallback"].requests_total, 1);
-            assert_eq!(
-                rollup.by_provider_day["provider-fallback"][&day]
-                    .usage
-                    .total_tokens,
-                3
-            );
-            assert_eq!(rollup.by_model["gpt-5"].requests_total, 1);
-            assert_eq!(rollup.by_session["sid-replay"].requests_total, 1);
-            assert_eq!(
-                rollup.by_project["F:/SourceCodes/Rust/codex-helper"].requests_total,
-                1
-            );
-
-            let day_view = state.get_usage_day_view("codex", 12, ended_at_ms).await;
-            assert_eq!(day_view.coverage.source, "request_log");
-            assert_eq!(day_view.coverage.loaded_first_ms, Some(ended_at_ms));
-            assert!(day_view.coverage.day_may_be_partial);
-            assert!(
-                day_view
-                    .coverage
-                    .partial_reason
-                    .as_deref()
-                    .unwrap_or_default()
-                    .contains("loaded data starts after local day start")
-            );
-
-            let _ = std::fs::remove_file(log_path);
         });
     }
 
@@ -4256,19 +5206,22 @@ mod tests {
             state
                 .update_request_route(
                     small_id,
-                    Some("station-small".to_string()),
-                    Some("provider-small".to_string()),
-                    "https://small.example/v1".to_string(),
-                    None,
+                    provider_route_decision(
+                        "provider-small",
+                        "default",
+                        "https://small.example/v1",
+                    ),
                 )
                 .await;
             state
                 .finish_request(FinishRequestParams {
                     id: small_id,
+                    winning_attempt: None,
                     status_code: 200,
                     duration_ms: 50,
                     ended_at_ms: small_ended_at_ms,
                     observed_service_tier: None,
+                    reported_model: None,
                     usage: Some(UsageMetrics {
                         input_tokens: 100,
                         output_tokens: 10,
@@ -4292,19 +5245,22 @@ mod tests {
             state
                 .update_request_route(
                     large_id,
-                    Some("station-large".to_string()),
-                    Some("provider-large".to_string()),
-                    "https://large.example/v1".to_string(),
-                    None,
+                    provider_route_decision(
+                        "provider-large",
+                        "default",
+                        "https://large.example/v1",
+                    ),
                 )
                 .await;
             state
                 .finish_request(FinishRequestParams {
                     id: large_id,
+                    winning_attempt: None,
                     status_code: 200,
                     duration_ms: 100,
                     ended_at_ms: large_ended_at_ms,
                     observed_service_tier: None,
+                    reported_model: None,
                     usage: Some(UsageMetrics {
                         input_tokens: 1_000,
                         output_tokens: 500,
@@ -4324,11 +5280,23 @@ mod tests {
             assert_eq!(view.hourly.len(), 24);
             assert_eq!(view.summary.requests_total, 2);
             assert_eq!(view.provider_rows[0].name, "provider-large");
-            assert_eq!(view.station_rows[0].name, "station-large");
+            assert_eq!(
+                view.provider_endpoint_rows[0].name,
+                "codex/provider-large/default"
+            );
             assert_eq!(view.session_rows[0].name, "sid-large");
             assert_eq!(view.project_rows[0].name, "F:/large");
             assert_eq!(view.model_rows[0].name, "gpt-5");
             assert_eq!(view.retry_gate.active, 0);
+            assert_eq!(view.coverage.source, "runtime_store");
+            assert_eq!(view.coverage.loaded_first_ms, Some(small_ended_at_ms));
+            assert_eq!(view.coverage.loaded_last_ms, Some(large_ended_at_ms));
+            assert_eq!(view.coverage.loaded_requests, 2);
+            assert!(view.coverage.day_may_be_partial);
+            assert_eq!(
+                view.coverage.partial_reason.as_deref(),
+                Some("loaded data starts after local day start")
+            );
         });
     }
 
@@ -4352,19 +5320,18 @@ mod tests {
             state
                 .update_request_route(
                     old_id,
-                    Some("old-station".to_string()),
-                    Some("old-provider".to_string()),
-                    "https://old.example/v1".to_string(),
-                    None,
+                    provider_route_decision("old-provider", "default", "https://old.example/v1"),
                 )
                 .await;
             state
                 .finish_request(FinishRequestParams {
                     id: old_id,
+                    winning_attempt: None,
                     status_code: 200,
                     duration_ms: 20,
                     ended_at_ms: old_ms,
                     observed_service_tier: None,
+                    reported_model: None,
                     usage: Some(UsageMetrics {
                         total_tokens: 100_000,
                         ..UsageMetrics::default()
@@ -4384,19 +5351,22 @@ mod tests {
             state
                 .update_request_route(
                     fresh_id,
-                    Some("fresh-station".to_string()),
-                    Some("fresh-provider".to_string()),
-                    "https://fresh.example/v1".to_string(),
-                    None,
+                    provider_route_decision(
+                        "fresh-provider",
+                        "default",
+                        "https://fresh.example/v1",
+                    ),
                 )
                 .await;
             state
                 .finish_request(FinishRequestParams {
                     id: fresh_id,
+                    winning_attempt: None,
                     status_code: 200,
                     duration_ms: 10,
                     ended_at_ms: now_ms,
                     observed_service_tier: None,
+                    reported_model: None,
                     usage: Some(UsageMetrics {
                         total_tokens: 10,
                         ..UsageMetrics::default()
@@ -4411,12 +5381,18 @@ mod tests {
             assert_eq!(week.loaded.requests_total, 2);
             assert_eq!(week.window.requests_total, 1);
             assert_eq!(week.by_day.len(), 7);
-            assert_eq!(week.by_config[0].0, "fresh-station");
+            assert_eq!(
+                week.by_provider_endpoint[0].0,
+                "codex/fresh-provider/default"
+            );
             assert_eq!(week.by_provider[0].0, "fresh-provider");
 
             let loaded = state.get_usage_rollup_view("codex", 10, 0).await;
             assert_eq!(loaded.window.requests_total, 2);
-            assert_eq!(loaded.by_config[0].0, "old-station");
+            assert_eq!(
+                loaded.by_provider_endpoint[0].0,
+                "codex/old-provider/default"
+            );
             assert_eq!(loaded.by_provider[0].0, "old-provider");
         });
     }
@@ -4425,6 +5401,9 @@ mod tests {
     fn build_session_identity_cards_merges_sources_and_sorts_newest_first() {
         let active = vec![ActiveRequest {
             id: 1,
+            runtime_revision: 1,
+            runtime_digest: "test-runtime".to_string(),
+            policy_revision: 0,
             trace_id: Some("codex-1".to_string()),
             session_id: Some("sid-active".to_string()),
             session_identity_source: Some(SessionIdentitySource::Header),
@@ -4432,11 +5411,11 @@ mod tests {
             client_addr: Some("100.64.0.8".to_string()),
             cwd: Some("G:/codes/project".to_string()),
             model: Some("gpt-5.4".to_string()),
+            requested_model: Some("gpt-5.4".to_string()),
             reasoning_effort: Some("medium".to_string()),
             service_tier: Some("priority".to_string()),
-            station_name: Some("right".to_string()),
+            requested_service_tier: Some("priority".to_string()),
             provider_id: Some("right".to_string()),
-            upstream_base_url: Some("https://right.example/v1".to_string()),
             route_decision: None,
             service: "codex".to_string(),
             method: "POST".to_string(),
@@ -4455,9 +5434,7 @@ mod tests {
                 model: Some("gpt-5.3".to_string()),
                 reasoning_effort: Some("high".to_string()),
                 service_tier: Some("default".to_string()),
-                station_name: Some("vibe".to_string()),
                 provider_id: Some("vibe".to_string()),
-                upstream_base_url: Some("https://vibe.example/v1".to_string()),
                 route_decision: None,
                 usage: Some(UsageMetrics {
                     input_tokens: 1,
@@ -4491,9 +5468,7 @@ mod tests {
                 model: Some("gpt-5.4".to_string()),
                 reasoning_effort: Some("low".to_string()),
                 service_tier: Some("flex".to_string()),
-                station_name: Some("right".to_string()),
                 provider_id: Some("right".to_string()),
-                upstream_base_url: Some("https://right.example/v1".to_string()),
                 route_decision: None,
                 usage: None,
                 cost: CostBreakdown::default(),
@@ -4511,12 +5486,6 @@ mod tests {
                 ended_at_ms: 1_000,
             },
         ];
-        let overrides = HashMap::from([("sid-active".to_string(), "xhigh".to_string())]);
-        let config_overrides = HashMap::from([("sid-active".to_string(), "temp".to_string())]);
-        let model_overrides =
-            HashMap::from([("sid-active".to_string(), "gpt-5.4-mini".to_string())]);
-        let service_tier_overrides =
-            HashMap::from([("sid-active".to_string(), "priority".to_string())]);
         let stats = HashMap::from([(
             "sid-active".to_string(),
             SessionStats {
@@ -4528,7 +5497,6 @@ mod tests {
                 last_reasoning_effort: Some("low".to_string()),
                 last_service_tier: Some("flex".to_string()),
                 last_provider_id: Some("right".to_string()),
-                last_station_name: Some("right".to_string()),
                 last_route_decision: None,
                 last_usage: None,
                 total_usage: UsageMetrics {
@@ -4552,13 +5520,8 @@ mod tests {
         let cards = build_session_identity_cards_from_parts(SessionIdentityCardBuildInputs {
             active: &active,
             recent: &recent,
-            overrides: &overrides,
-            station_overrides: &config_overrides,
-            model_overrides: &model_overrides,
-            service_tier_overrides: &service_tier_overrides,
             bindings: &HashMap::new(),
             route_affinities: &HashMap::new(),
-            global_station_override: None,
             stats: &stats,
         });
 
@@ -4587,46 +5550,30 @@ mod tests {
         assert_eq!(cards[1].last_client_name.as_deref(), Some("Frank-Laptop"));
         assert_eq!(cards[1].last_client_addr.as_deref(), Some("100.64.0.8"));
         assert_eq!(cards[1].last_status, Some(429));
-        assert_eq!(cards[1].override_effort.as_deref(), Some("xhigh"));
-        assert_eq!(cards[1].override_station_name.as_deref(), Some("temp"));
-        assert_eq!(cards[1].override_model.as_deref(), Some("gpt-5.4-mini"));
-        assert_eq!(cards[1].override_service_tier.as_deref(), Some("priority"));
         assert_eq!(
             cards[1]
                 .effective_model
                 .as_ref()
                 .map(|value| value.value.as_str()),
-            Some("gpt-5.4-mini")
+            Some("gpt-5.4")
         );
         assert_eq!(
             cards[1].effective_model.as_ref().map(|value| value.source),
-            Some(RouteValueSource::SessionOverride)
+            Some(RouteValueSource::RequestPayload)
         );
         assert_eq!(
             cards[1]
                 .effective_reasoning_effort
                 .as_ref()
                 .map(|value| value.source),
-            Some(RouteValueSource::SessionOverride)
+            Some(RouteValueSource::RequestPayload)
         );
         assert_eq!(
             cards[1]
                 .effective_service_tier
                 .as_ref()
                 .map(|value| value.source),
-            Some(RouteValueSource::SessionOverride)
-        );
-        assert_eq!(
-            cards[1]
-                .effective_station
-                .as_ref()
-                .map(|value| value.source),
-            Some(RouteValueSource::SessionOverride)
-        );
-        assert!(cards[1].effective_upstream_base_url.is_none());
-        assert_eq!(
-            cards[1].last_upstream_base_url.as_deref(),
-            Some("https://right.example/v1")
+            Some(RouteValueSource::RequestPayload)
         );
         assert_eq!(cards[1].turns_total, Some(3));
         assert_eq!(cards[1].last_service_tier.as_deref(), Some("flex"));
@@ -4640,6 +5587,9 @@ mod tests {
     fn build_session_identity_cards_default_profile_keeps_request_fields() {
         let active = vec![ActiveRequest {
             id: 1,
+            runtime_revision: 1,
+            runtime_digest: "test-runtime".to_string(),
+            policy_revision: 0,
             trace_id: Some("codex-1".to_string()),
             session_id: Some("sid-bound".to_string()),
             session_identity_source: Some(SessionIdentitySource::Header),
@@ -4647,11 +5597,11 @@ mod tests {
             client_addr: Some("100.64.0.10".to_string()),
             cwd: None,
             model: Some("gpt-observed".to_string()),
+            requested_model: Some("gpt-observed".to_string()),
             reasoning_effort: Some("medium".to_string()),
             service_tier: Some("default".to_string()),
-            station_name: Some("right".to_string()),
+            requested_service_tier: Some("default".to_string()),
             provider_id: None,
-            upstream_base_url: None,
             route_decision: None,
             service: "codex".to_string(),
             method: "POST".to_string(),
@@ -4663,7 +5613,6 @@ mod tests {
             SessionBinding {
                 session_id: "sid-bound".to_string(),
                 profile_name: Some("daily".to_string()),
-                station_name: Some("vibe".to_string()),
                 model: Some("gpt-bound".to_string()),
                 reasoning_effort: Some("high".to_string()),
                 service_tier: Some("priority".to_string()),
@@ -4677,13 +5626,8 @@ mod tests {
         let cards = build_session_identity_cards_from_parts(SessionIdentityCardBuildInputs {
             active: &active,
             recent: &[],
-            overrides: &HashMap::new(),
-            station_overrides: &HashMap::new(),
-            model_overrides: &HashMap::new(),
-            service_tier_overrides: &HashMap::new(),
             bindings: &bindings,
             route_affinities: &HashMap::new(),
-            global_station_override: None,
             stats: &HashMap::new(),
         });
 
@@ -4717,402 +5661,38 @@ mod tests {
                 .map(|value| (value.value.as_str(), value.source)),
             Some(("default", RouteValueSource::RequestPayload))
         );
-        assert_eq!(
-            cards[0]
-                .effective_station
-                .as_ref()
-                .map(|value| (value.value.as_str(), value.source)),
-            Some(("vibe", RouteValueSource::ProfileDefault))
-        );
     }
 
     #[test]
-    fn build_session_identity_cards_keeps_request_fields_but_allows_global_config_override() {
-        let active = vec![ActiveRequest {
-            id: 1,
-            trace_id: Some("codex-1".to_string()),
-            session_id: Some("sid-bound".to_string()),
-            session_identity_source: Some(SessionIdentitySource::Header),
-            client_name: Some("Workstation".to_string()),
-            client_addr: Some("100.64.0.10".to_string()),
-            cwd: None,
-            model: Some("gpt-observed".to_string()),
-            reasoning_effort: Some("medium".to_string()),
-            service_tier: Some("default".to_string()),
-            station_name: Some("vibe".to_string()),
-            provider_id: None,
-            upstream_base_url: Some("https://vibe.example/v1".to_string()),
-            route_decision: None,
-            service: "codex".to_string(),
-            method: "POST".to_string(),
-            path: "/v1/responses".to_string(),
-            started_at_ms: 10,
-        }];
-        let bindings = HashMap::from([(
-            "sid-bound".to_string(),
-            SessionBinding {
-                session_id: "sid-bound".to_string(),
-                profile_name: Some("daily".to_string()),
-                station_name: Some("vibe".to_string()),
-                model: Some("gpt-bound".to_string()),
-                reasoning_effort: Some("high".to_string()),
-                service_tier: Some("priority".to_string()),
-                continuity_mode: SessionContinuityMode::DefaultProfile,
-                created_at_ms: 1,
-                updated_at_ms: 1,
-                last_seen_ms: 10,
-            },
-        )]);
-
-        let cards = build_session_identity_cards_from_parts(SessionIdentityCardBuildInputs {
-            active: &active,
-            recent: &[],
-            overrides: &HashMap::new(),
-            station_overrides: &HashMap::new(),
-            model_overrides: &HashMap::new(),
-            service_tier_overrides: &HashMap::new(),
-            bindings: &bindings,
-            route_affinities: &HashMap::new(),
-            global_station_override: Some("right"),
-            stats: &HashMap::new(),
-        });
-
-        assert_eq!(cards[0].binding_profile_name.as_deref(), Some("daily"));
-        assert_eq!(
-            cards[0]
-                .effective_model
-                .as_ref()
-                .map(|value| (value.value.as_str(), value.source)),
-            Some(("gpt-observed", RouteValueSource::RequestPayload))
-        );
-        assert_eq!(
-            cards[0]
-                .effective_reasoning_effort
-                .as_ref()
-                .map(|value| (value.value.as_str(), value.source)),
-            Some(("medium", RouteValueSource::RequestPayload))
-        );
-        assert_eq!(
-            cards[0]
-                .effective_service_tier
-                .as_ref()
-                .map(|value| (value.value.as_str(), value.source)),
-            Some(("default", RouteValueSource::RequestPayload))
-        );
-        assert_eq!(
-            cards[0]
-                .effective_station
-                .as_ref()
-                .map(|value| (value.value.as_str(), value.source)),
-            Some(("right", RouteValueSource::GlobalOverride))
-        );
-        assert!(cards[0].effective_upstream_base_url.is_none());
-    }
-
-    #[test]
-    fn enrich_session_identity_cards_with_runtime_applies_station_mapping_and_single_upstream() {
-        let mut cards = vec![SessionIdentityCard {
-            session_id: Some("sid-1".to_string()),
-            last_model: Some("gpt-5.4".to_string()),
-            last_station_name: Some("right".to_string()),
-            last_upstream_base_url: Some("https://right.example/v1".to_string()),
-            effective_model: Some(ResolvedRouteValue::new(
-                "gpt-5.4",
-                RouteValueSource::RequestPayload,
-            )),
-            effective_station: Some(ResolvedRouteValue::new(
-                "right",
-                RouteValueSource::RuntimeFallback,
-            )),
-            ..SessionIdentityCard::default()
-        }];
-
-        let mut mgr = ServiceConfigManager {
-            active: Some("right".to_string()),
-            ..ServiceConfigManager::default()
-        };
-        mgr.configs.insert(
-            "right".to_string(),
-            ServiceConfig {
-                name: "right".to_string(),
-                alias: None,
-                enabled: true,
-                level: 1,
-                upstreams: vec![UpstreamConfig {
-                    base_url: "https://right.example/v1".to_string(),
-                    auth: UpstreamAuth::default(),
-                    tags: HashMap::new(),
-                    supported_models: HashMap::new(),
-                    model_mapping: HashMap::from([(
-                        "gpt-5.4".to_string(),
-                        "gpt-5.4-fast".to_string(),
-                    )]),
-                }],
-            },
-        );
-
-        enrich_session_identity_cards_with_runtime(&mut cards, &mgr);
-
-        assert_eq!(
-            cards[0]
-                .effective_model
-                .as_ref()
-                .map(|value| value.value.as_str()),
-            Some("gpt-5.4-fast")
-        );
-        assert_eq!(
-            cards[0].effective_model.as_ref().map(|value| value.source),
-            Some(RouteValueSource::StationMapping)
-        );
-        assert_eq!(
-            cards[0]
-                .effective_upstream_base_url
-                .as_ref()
-                .map(|value| value.value.as_str()),
-            Some("https://right.example/v1")
-        );
-    }
-
-    #[test]
-    fn apply_session_profile_binding_sets_binding_and_clears_manual_overrides() {
+    fn provider_balance_snapshots_are_keyed_by_canonical_endpoint_identity() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         runtime.block_on(async {
             let state = ProxyState::new();
-            let now_ms = 42;
-            let mut mgr = ServiceConfigManager::default();
-            mgr.configs.insert(
-                "right".to_string(),
-                ServiceConfig {
-                    name: "right".to_string(),
-                    alias: None,
-                    enabled: true,
-                    level: 1,
-                    upstreams: vec![UpstreamConfig {
-                        base_url: "https://right.example/v1".to_string(),
-                        auth: UpstreamAuth::default(),
-                        tags: HashMap::from([
-                            ("supports_reasoning_effort".to_string(), "true".to_string()),
-                            ("supports_service_tier".to_string(), "true".to_string()),
-                        ]),
-                        supported_models: HashMap::from([("gpt-5.4".to_string(), true)]),
-                        model_mapping: HashMap::new(),
-                    }],
-                },
+            let provider_endpoint = ProviderEndpointKey::new("codex", "right", "responses");
+            let mut snapshot = ProviderBalanceSnapshot::new(
+                "packycode",
+                provider_endpoint.clone(),
+                "usage_provider:budget_http_json",
+                10,
+                Some(0),
             );
-            mgr.profiles.insert(
-                "fast".to_string(),
-                crate::config::ServiceControlProfile {
-                    extends: None,
-                    station: Some("right".to_string()),
-                    model: Some("gpt-5.4".to_string()),
-                    reasoning_effort: Some("low".to_string()),
-                    service_tier: Some("flex".to_string()),
-                },
-            );
-
-            state
-                .set_session_station_override("sid-1".to_string(), "other".to_string(), 1)
-                .await;
-            state
-                .set_session_model_override("sid-1".to_string(), "gpt-x".to_string(), 1)
-                .await;
-            state
-                .set_session_effort_override("sid-1".to_string(), "high".to_string(), 1)
-                .await;
-            state
-                .set_session_service_tier_override("sid-1".to_string(), "priority".to_string(), 1)
-                .await;
-
-            state
-                .apply_session_profile_binding(
-                    "codex",
-                    &mgr,
-                    "sid-1".to_string(),
-                    "fast".to_string(),
-                    now_ms,
-                )
-                .await
-                .expect("apply profile");
-
-            let binding = state
-                .get_session_binding("sid-1")
-                .await
-                .expect("binding exists");
-            assert_eq!(binding.profile_name.as_deref(), Some("fast"));
-            assert_eq!(binding.station_name.as_deref(), Some("right"));
-            assert_eq!(binding.model.as_deref(), Some("gpt-5.4"));
-            assert_eq!(binding.reasoning_effort.as_deref(), Some("low"));
-            assert_eq!(binding.service_tier.as_deref(), Some("flex"));
-            assert_eq!(
-                binding.continuity_mode,
-                SessionContinuityMode::ManualProfile
-            );
-            assert_eq!(binding.updated_at_ms, now_ms);
-            assert!(state.get_session_station_override("sid-1").await.is_none());
-            assert!(state.get_session_model_override("sid-1").await.is_none());
-            assert!(state.get_session_effort_override("sid-1").await.is_none());
-            assert!(
-                state
-                    .get_session_service_tier_override("sid-1")
-                    .await
-                    .is_none()
-            );
-        });
-    }
-
-    #[test]
-    fn list_session_manual_overrides_merges_all_dimensions() {
-        let runtime = tokio::runtime::Runtime::new().expect("runtime");
-        runtime.block_on(async {
-            let state = ProxyState::new();
-            state
-                .set_session_reasoning_effort_override("sid-1".to_string(), "high".to_string(), 1)
-                .await;
-            state
-                .set_session_station_override("sid-1".to_string(), "right".to_string(), 1)
-                .await;
-            state
-                .set_session_model_override("sid-1".to_string(), "gpt-5.4".to_string(), 1)
-                .await;
-            state
-                .set_session_service_tier_override("sid-1".to_string(), "priority".to_string(), 1)
-                .await;
-            state
-                .set_session_model_override("sid-2".to_string(), "gpt-5.4-mini".to_string(), 2)
-                .await;
-
-            let merged = state.list_session_manual_overrides().await;
-            assert_eq!(merged.len(), 2);
-            assert_eq!(
-                merged
-                    .get("sid-1")
-                    .and_then(|overrides| overrides.reasoning_effort.as_deref()),
-                Some("high")
-            );
-            assert_eq!(
-                merged
-                    .get("sid-1")
-                    .and_then(|overrides| overrides.station_name.as_deref()),
-                Some("right")
-            );
-            assert_eq!(
-                merged
-                    .get("sid-1")
-                    .and_then(|overrides| overrides.model.as_deref()),
-                Some("gpt-5.4")
-            );
-            assert_eq!(
-                merged
-                    .get("sid-1")
-                    .and_then(|overrides| overrides.service_tier.as_deref()),
-                Some("priority")
-            );
-            assert_eq!(
-                merged
-                    .get("sid-2")
-                    .and_then(|overrides| overrides.model.as_deref()),
-                Some("gpt-5.4-mini")
-            );
-            assert!(
-                merged
-                    .get("sid-2")
-                    .is_some_and(|overrides| overrides.reasoning_effort.is_none())
-            );
-        });
-    }
-
-    #[test]
-    fn provider_balance_snapshots_are_recorded_and_refreshed() {
-        let runtime = tokio::runtime::Runtime::new().expect("runtime");
-        runtime.block_on(async {
-            let state = ProxyState::new();
-            state
-                .record_provider_balance_snapshot(
-                    "codex",
-                    ProviderBalanceSnapshot {
-                        provider_id: "packycode".to_string(),
-                        station_name: Some("right".to_string()),
-                        upstream_index: Some(2),
-                        source: "usage_provider:budget_http_json".to_string(),
-                        fetched_at_ms: 10,
-                        stale_after_ms: Some(0),
-                        stale: false,
-                        status: BalanceSnapshotStatus::Unknown,
-                        exhausted: Some(false),
-                        exhaustion_affects_routing: true,
-                        plan_name: None,
-                        total_balance_usd: Some("3.5".to_string()),
-                        subscription_balance_usd: None,
-                        paygo_balance_usd: None,
-                        monthly_budget_usd: Some("5".to_string()),
-                        monthly_spent_usd: Some("1.5".to_string()),
-                        quota_period: None,
-                        quota_remaining_usd: None,
-                        quota_limit_usd: None,
-                        quota_used_usd: None,
-                        unlimited_quota: None,
-                        total_used_usd: None,
-                        today_used_usd: None,
-                        total_requests: None,
-                        today_requests: None,
-                        total_tokens: None,
-                        today_tokens: None,
-                        error: None,
-                        ..ProviderBalanceSnapshot::default()
-                    },
-                )
-                .await;
+            snapshot.exhausted = Some(false);
+            snapshot.total_balance_usd = Some("3.5".to_string());
+            snapshot.monthly_budget_usd = Some("5".to_string());
+            snapshot.monthly_spent_usd = Some("1.5".to_string());
+            state.record_provider_balance_snapshot(snapshot).await;
 
             let view = state.get_provider_balance_view("codex").await;
-            let balances = view.get("right").expect("station balance");
-            assert_eq!(balances.len(), 1);
-            assert_eq!(balances[0].provider_id, "packycode");
-            assert_eq!(balances[0].status, BalanceSnapshotStatus::Stale);
-            assert_eq!(balances[0].exhausted, Some(false));
+            assert_eq!(view.len(), 1);
+            assert_eq!(view[0].observation_provider_id, "packycode");
+            assert_eq!(view[0].provider_endpoint, provider_endpoint);
+            assert_eq!(view[0].status, BalanceSnapshotStatus::Stale);
+            assert_eq!(view[0].exhausted, Some(false));
 
-            let summary = state
-                .get_provider_balance_summary_view("codex")
-                .await
-                .get("right")
-                .cloned()
-                .expect("station balance summary");
+            let summary = ProviderRoutingBalanceSummary::from_snapshots(Some(&view));
             assert_eq!(summary.snapshots, 1);
             assert_eq!(summary.stale, 1);
             assert_eq!(summary.routing_snapshots, 1);
-        });
-    }
-
-    #[test]
-    fn provider_balance_history_keeps_recent_refreshes() {
-        let runtime = tokio::runtime::Runtime::new().expect("runtime");
-        runtime.block_on(async {
-            let state = ProxyState::new();
-            for (fetched_at_ms, remaining) in [(10, "10"), (20, "8")] {
-                state
-                    .record_provider_balance_snapshot(
-                        "codex",
-                        ProviderBalanceSnapshot {
-                            provider_id: "packycode".to_string(),
-                            station_name: Some("right".to_string()),
-                            upstream_index: Some(2),
-                            source: "usage_provider:test".to_string(),
-                            fetched_at_ms,
-                            quota_period: Some("daily".to_string()),
-                            quota_remaining_usd: Some(remaining.to_string()),
-                            quota_limit_usd: Some("20".to_string()),
-                            exhausted: Some(false),
-                            ..ProviderBalanceSnapshot::default()
-                        },
-                    )
-                    .await;
-            }
-
-            let history = state.get_provider_balance_history_view("codex").await;
-            let balances = history.get("right").expect("station history");
-
-            assert_eq!(balances.len(), 2);
-            assert_eq!(balances[0].quota_remaining_usd.as_deref(), Some("10"));
-            assert_eq!(balances[1].quota_remaining_usd.as_deref(), Some("8"));
         });
     }
 
@@ -5126,62 +5706,56 @@ mod tests {
                 ("newapi", BalanceSnapshotStatus::Ok),
             ] {
                 state
-                    .record_provider_balance_snapshot(
-                        "codex",
-                        ProviderBalanceSnapshot {
-                            provider_id: provider_id.to_string(),
-                            station_name: Some("routing".to_string()),
-                            upstream_index: Some(1),
-                            source: "usage_provider:test".to_string(),
-                            fetched_at_ms: 10,
-                            stale_after_ms: None,
-                            stale: false,
-                            status,
-                            exhausted: if status == BalanceSnapshotStatus::Ok {
-                                Some(false)
-                            } else {
-                                None
-                            },
-                            exhaustion_affects_routing: true,
-                            plan_name: None,
-                            total_balance_usd: if status == BalanceSnapshotStatus::Ok {
-                                Some("3.5".to_string())
-                            } else {
-                                None
-                            },
-                            subscription_balance_usd: None,
-                            paygo_balance_usd: None,
-                            monthly_budget_usd: None,
-                            monthly_spent_usd: None,
-                            quota_period: None,
-                            quota_remaining_usd: None,
-                            quota_limit_usd: None,
-                            quota_used_usd: None,
-                            unlimited_quota: None,
-                            total_used_usd: None,
-                            today_used_usd: None,
-                            total_requests: None,
-                            today_requests: None,
-                            total_tokens: None,
-                            today_tokens: None,
-                            error: if status == BalanceSnapshotStatus::Error {
-                                Some("decode failed".to_string())
-                            } else {
-                                None
-                            },
-                            ..ProviderBalanceSnapshot::default()
+                    .record_provider_balance_snapshot(ProviderBalanceSnapshot {
+                        observation_provider_id: provider_id.to_string(),
+                        provider_endpoint: ProviderEndpointKey::new("codex", "routing", "default"),
+                        source: "usage_provider:test".to_string(),
+                        fetched_at_ms: 10,
+                        stale_after_ms: None,
+                        stale: false,
+                        status,
+                        exhausted: if status == BalanceSnapshotStatus::Ok {
+                            Some(false)
+                        } else {
+                            None
                         },
-                    )
+                        exhaustion_affects_routing: true,
+                        plan_name: None,
+                        total_balance_usd: if status == BalanceSnapshotStatus::Ok {
+                            Some("3.5".to_string())
+                        } else {
+                            None
+                        },
+                        subscription_balance_usd: None,
+                        paygo_balance_usd: None,
+                        monthly_budget_usd: None,
+                        monthly_spent_usd: None,
+                        quota_period: None,
+                        quota_remaining_usd: None,
+                        quota_limit_usd: None,
+                        quota_used_usd: None,
+                        unlimited_quota: None,
+                        total_used_usd: None,
+                        today_used_usd: None,
+                        total_requests: None,
+                        today_requests: None,
+                        total_tokens: None,
+                        today_tokens: None,
+                        error: if status == BalanceSnapshotStatus::Error {
+                            Some("decode failed".to_string())
+                        } else {
+                            None
+                        },
+                        ..ProviderBalanceSnapshot::default()
+                    })
                     .await;
             }
 
             let view = state.get_provider_balance_view("codex").await;
-            let balances = view.get("routing").expect("station balance");
-            assert_eq!(balances.len(), 2);
+            assert_eq!(view.len(), 2);
             assert_eq!(
-                balances
-                    .iter()
-                    .map(|snapshot| snapshot.provider_id.as_str())
+                view.iter()
+                    .map(|snapshot| snapshot.observation_provider_id.as_str())
                     .collect::<Vec<_>>(),
                 vec!["general", "newapi"]
             );
@@ -5194,44 +5768,40 @@ mod tests {
         runtime.block_on(async {
             let state = ProxyState::new();
             state
-                .record_provider_balance_snapshot(
-                    "codex",
-                    ProviderBalanceSnapshot {
-                        provider_id: "input".to_string(),
-                        station_name: Some("routing".to_string()),
-                        upstream_index: Some(0),
-                        source: "usage_provider:sub2api_usage".to_string(),
-                        fetched_at_ms: unix_now_ms(),
-                        stale_after_ms: None,
-                        exhausted: Some(false),
-                        quota_period: Some("daily".to_string()),
-                        quota_remaining_usd: Some("263.68".to_string()),
-                        quota_limit_usd: Some("300.00".to_string()),
-                        ..ProviderBalanceSnapshot::default()
-                    },
-                )
+                .record_provider_balance_snapshot(ProviderBalanceSnapshot {
+                    observation_provider_id: "input".to_string(),
+                    provider_endpoint: ProviderEndpointKey::new("codex", "routing", "default"),
+                    source: "usage_provider:sub2api_usage".to_string(),
+                    fetched_at_ms: unix_now_ms(),
+                    stale_after_ms: None,
+                    exhausted: Some(false),
+                    quota_period: Some("daily".to_string()),
+                    quota_remaining_usd: Some("263.68".to_string()),
+                    quota_limit_usd: Some("300.00".to_string()),
+                    ..ProviderBalanceSnapshot::default()
+                })
                 .await;
 
             state
-                .record_provider_balance_snapshot(
-                    "codex",
-                    ProviderBalanceSnapshot {
-                        provider_id: "input".to_string(),
-                        station_name: Some("routing".to_string()),
-                        upstream_index: Some(0),
-                        source: "usage_provider:openai_balance_http_json".to_string(),
-                        fetched_at_ms: unix_now_ms(),
-                        stale_after_ms: None,
-                        error: Some("usage provider response read failed".to_string()),
-                        ..ProviderBalanceSnapshot::default()
-                    },
-                )
+                .record_provider_balance_snapshot(ProviderBalanceSnapshot {
+                    observation_provider_id: "input".to_string(),
+                    provider_endpoint: ProviderEndpointKey::new("codex", "routing", "default"),
+                    source: "usage_provider:openai_balance_http_json".to_string(),
+                    fetched_at_ms: unix_now_ms(),
+                    stale_after_ms: None,
+                    error: Some("usage provider response read failed".to_string()),
+                    ..ProviderBalanceSnapshot::default()
+                })
                 .await;
 
             let view = state.get_provider_balance_view("codex").await;
             let snapshot = view
-                .get("routing")
-                .and_then(|snapshots| snapshots.first())
+                .iter()
+                .find(|snapshot| {
+                    snapshot.provider_endpoint
+                        == ProviderEndpointKey::new("codex", "routing", "default")
+                        && snapshot.observation_provider_id == "input"
+                })
                 .expect("routing balance snapshot");
 
             assert_eq!(snapshot.status, BalanceSnapshotStatus::Error);
@@ -5251,102 +5821,111 @@ mod tests {
         runtime.block_on(async {
             let state = ProxyState::new();
 
-            let mut initial_mgr = ServiceConfigManager::default();
-            initial_mgr.configs.insert(
-                "routing".to_string(),
-                ServiceConfig {
-                    name: "routing".to_string(),
-                    alias: None,
-                    enabled: true,
-                    level: 1,
-                    upstreams: vec![
-                        UpstreamConfig {
-                            base_url: "https://input.example/v1".to_string(),
-                            auth: UpstreamAuth::default(),
-                            tags: HashMap::from([("provider_id".to_string(), "input".to_string())]),
-                            supported_models: HashMap::new(),
-                            model_mapping: HashMap::new(),
-                        },
-                        UpstreamConfig {
-                            base_url: "https://backup.example/v1".to_string(),
-                            auth: UpstreamAuth::default(),
-                            tags: HashMap::from([(
-                                "provider_id".to_string(),
-                                "backup".to_string(),
-                            )]),
-                            supported_models: HashMap::new(),
-                            model_mapping: HashMap::new(),
-                        },
-                    ],
-                },
-            );
+            let initial_view = route_view(&[
+                ("input", "https://input.example/v1"),
+                ("backup", "https://backup.example/v1"),
+            ]);
             state
-                .prune_runtime_observability_for_service("codex", &initial_mgr)
+                .prune_runtime_observability_for_service("codex", &initial_view)
                 .await;
 
             state
-                .record_provider_balance_snapshot(
-                    "codex",
-                    ProviderBalanceSnapshot {
-                        provider_id: "input".to_string(),
-                        station_name: Some("input".to_string()),
-                        upstream_index: Some(0),
-                        source: "usage_provider:test".to_string(),
-                        fetched_at_ms: 10,
-                        stale_after_ms: None,
-                        stale: false,
-                        status: BalanceSnapshotStatus::Ok,
-                        exhausted: Some(false),
-                        exhaustion_affects_routing: true,
-                        total_balance_usd: Some("3.5".to_string()),
-                        ..ProviderBalanceSnapshot::default()
-                    },
-                )
+                .record_provider_balance_snapshot(ProviderBalanceSnapshot {
+                    observation_provider_id: "balance".to_string(),
+                    provider_endpoint: ProviderEndpointKey::new("codex", "input", "default"),
+                    source: "usage_provider:test".to_string(),
+                    fetched_at_ms: 10,
+                    stale_after_ms: None,
+                    stale: false,
+                    status: BalanceSnapshotStatus::Ok,
+                    exhausted: Some(false),
+                    exhaustion_affects_routing: true,
+                    total_balance_usd: Some("3.5".to_string()),
+                    ..ProviderBalanceSnapshot::default()
+                })
                 .await;
             state
-                .record_provider_balance_snapshot(
-                    "codex",
-                    ProviderBalanceSnapshot {
-                        provider_id: "input".to_string(),
-                        station_name: Some("routing".to_string()),
-                        upstream_index: Some(0),
-                        source: "usage_provider:test".to_string(),
-                        fetched_at_ms: 10,
-                        stale_after_ms: None,
-                        stale: false,
-                        status: BalanceSnapshotStatus::Ok,
-                        exhausted: Some(false),
-                        exhaustion_affects_routing: true,
-                        total_balance_usd: Some("3.5".to_string()),
-                        ..ProviderBalanceSnapshot::default()
-                    },
-                )
+                .record_provider_balance_snapshot(ProviderBalanceSnapshot {
+                    observation_provider_id: "balance".to_string(),
+                    provider_endpoint: ProviderEndpointKey::new("codex", "routing", "default"),
+                    source: "usage_provider:test".to_string(),
+                    fetched_at_ms: 10,
+                    stale_after_ms: None,
+                    stale: false,
+                    status: BalanceSnapshotStatus::Ok,
+                    exhausted: Some(false),
+                    exhaustion_affects_routing: true,
+                    total_balance_usd: Some("3.5".to_string()),
+                    ..ProviderBalanceSnapshot::default()
+                })
                 .await;
 
-            let mut pinned_mgr = ServiceConfigManager::default();
-            pinned_mgr.configs.insert(
-                "routing".to_string(),
-                ServiceConfig {
-                    name: "routing".to_string(),
-                    alias: None,
-                    enabled: true,
-                    level: 1,
-                    upstreams: vec![UpstreamConfig {
-                        base_url: "https://input.example/v1".to_string(),
-                        auth: UpstreamAuth::default(),
-                        tags: HashMap::from([("provider_id".to_string(), "input".to_string())]),
-                        supported_models: HashMap::new(),
-                        model_mapping: HashMap::new(),
-                    }],
-                },
-            );
+            let pinned_view = route_view(&[("input", "https://input.example/v1")]);
             state
-                .prune_runtime_observability_for_service("codex", &pinned_mgr)
+                .prune_runtime_observability_for_service("codex", &pinned_view)
                 .await;
 
             let view = state.get_provider_balance_view("codex").await;
-            assert!(view.contains_key("input"));
-            assert!(!view.contains_key("routing"));
+            assert!(view.iter().any(|snapshot| {
+                snapshot.provider_endpoint == ProviderEndpointKey::new("codex", "input", "default")
+            }));
+            assert!(!view.iter().any(|snapshot| {
+                snapshot.provider_endpoint
+                    == ProviderEndpointKey::new("codex", "routing", "default")
+            }));
+        });
+    }
+
+    #[test]
+    fn prune_runtime_observability_keeps_active_provider_endpoint_usage() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            let request_id = state
+                .begin_request_for_test()
+                .model("gpt-5")
+                .started_at_ms(30)
+                .begin()
+                .await;
+            state
+                .update_request_route(
+                    request_id,
+                    provider_route_decision(
+                        "provider-active",
+                        "default",
+                        "https://active.example/v1",
+                    ),
+                )
+                .await;
+            state
+                .finish_request(FinishRequestParams {
+                    id: request_id,
+                    winning_attempt: None,
+                    status_code: 200,
+                    duration_ms: 5,
+                    ended_at_ms: 35,
+                    observed_service_tier: None,
+                    reported_model: None,
+                    usage: None,
+                    retry: None,
+                    ttfb_ms: None,
+                    streaming: false,
+                })
+                .await;
+
+            let view = route_view(&[("provider-active", "https://active.example/v1")]);
+            state
+                .prune_runtime_observability_for_service("codex", &view)
+                .await;
+
+            let rollup = state.get_usage_rollup_view("codex", 10, 0).await;
+            assert_eq!(
+                rollup
+                    .by_provider_endpoint
+                    .first()
+                    .map(|(key, _)| key.as_str()),
+                Some("codex/provider-active/default")
+            );
         });
     }
 
@@ -5357,95 +5936,36 @@ mod tests {
             let state = ProxyState::new();
 
             state
-                .set_station_enabled_override("codex", "old".to_string(), false, 1)
-                .await;
-            state
-                .set_upstream_enabled_override(
-                    "codex",
-                    "https://old.example/v1".to_string(),
-                    false,
-                    1,
-                )
-                .await;
-            state
-                .set_provider_endpoint_enabled_override(
-                    "codex",
-                    ProviderEndpointKey::new("codex", "provider-old", "default"),
-                    false,
-                    1,
-                )
-                .await;
-            state
-                .set_provider_endpoint_runtime_state_override(
-                    "codex",
-                    ProviderEndpointKey::new("codex", "provider-old", "default"),
-                    RuntimeConfigState::BreakerOpen,
-                    1,
-                )
-                .await;
-            state
-                .record_station_health(
-                    "codex",
-                    "old".to_string(),
-                    StationHealth {
-                        checked_at_ms: 10,
-                        upstreams: vec![UpstreamHealth {
-                            base_url: "https://old.example/v1".to_string(),
-                            ok: Some(false),
-                            status_code: Some(500),
-                            latency_ms: Some(10),
-                            error: Some("boom".to_string()),
-                            passive: None,
-                        }],
-                    },
-                )
-                .await;
-            state
-                .record_passive_upstream_failure(PassiveUpstreamFailureRecord {
-                    service_name: "codex".to_string(),
-                    station_name: "old".to_string(),
-                    base_url: "https://old.example/v1".to_string(),
-                    status_code: Some(500),
-                    error_class: Some("upstream_transport_error".to_string()),
-                    error: Some("boom".to_string()),
-                    now_ms: 20,
+                .record_provider_balance_snapshot(ProviderBalanceSnapshot {
+                    observation_provider_id: "budget".to_string(),
+                    provider_endpoint: ProviderEndpointKey::new("codex", "provider-old", "default"),
+                    source: "usage_provider:budget_http_json".to_string(),
+                    fetched_at_ms: 10,
+                    stale_after_ms: None,
+                    stale: false,
+                    status: BalanceSnapshotStatus::Ok,
+                    exhausted: Some(false),
+                    exhaustion_affects_routing: true,
+                    plan_name: None,
+                    total_balance_usd: Some("3.5".to_string()),
+                    subscription_balance_usd: None,
+                    paygo_balance_usd: None,
+                    monthly_budget_usd: None,
+                    monthly_spent_usd: None,
+                    quota_period: None,
+                    quota_remaining_usd: None,
+                    quota_limit_usd: None,
+                    quota_used_usd: None,
+                    unlimited_quota: None,
+                    total_used_usd: None,
+                    today_used_usd: None,
+                    total_requests: None,
+                    today_requests: None,
+                    total_tokens: None,
+                    today_tokens: None,
+                    error: None,
+                    ..ProviderBalanceSnapshot::default()
                 })
-                .await;
-            state
-                .record_provider_balance_snapshot(
-                    "codex",
-                    ProviderBalanceSnapshot {
-                        provider_id: "provider-old".to_string(),
-                        station_name: Some("old".to_string()),
-                        upstream_index: Some(0),
-                        source: "usage_provider:budget_http_json".to_string(),
-                        fetched_at_ms: 10,
-                        stale_after_ms: None,
-                        stale: false,
-                        status: BalanceSnapshotStatus::Ok,
-                        exhausted: Some(false),
-                        exhaustion_affects_routing: true,
-                        plan_name: None,
-                        total_balance_usd: Some("3.5".to_string()),
-                        subscription_balance_usd: None,
-                        paygo_balance_usd: None,
-                        monthly_budget_usd: None,
-                        monthly_spent_usd: None,
-                        quota_period: None,
-                        quota_remaining_usd: None,
-                        quota_limit_usd: None,
-                        quota_used_usd: None,
-                        unlimited_quota: None,
-                        total_used_usd: None,
-                        today_used_usd: None,
-                        total_requests: None,
-                        today_requests: None,
-                        total_tokens: None,
-                        today_tokens: None,
-                        error: None,
-                        ..ProviderBalanceSnapshot::default()
-                    },
-                )
                 .await;
 
             let request_id = state
@@ -5458,19 +5978,18 @@ mod tests {
             state
                 .update_request_route(
                     request_id,
-                    Some("old".to_string()),
-                    Some("provider-old".to_string()),
-                    "https://old.example/v1".to_string(),
-                    None,
+                    provider_route_decision("provider-old", "default", "https://old.example/v1"),
                 )
                 .await;
             state
                 .finish_request(FinishRequestParams {
                     id: request_id,
+                    winning_attempt: None,
                     status_code: 200,
                     duration_ms: 5,
                     ended_at_ms: 35,
                     observed_service_tier: None,
+                    reported_model: None,
                     usage: None,
                     retry: None,
                     ttfb_ms: None,
@@ -5478,91 +5997,17 @@ mod tests {
                 })
                 .await;
 
-            let mut mgr = ServiceConfigManager::default();
-            mgr.configs.insert(
-                "new".to_string(),
-                ServiceConfig {
-                    name: "new".to_string(),
-                    alias: None,
-                    enabled: true,
-                    level: 1,
-                    upstreams: vec![UpstreamConfig {
-                        base_url: "https://new.example/v1".to_string(),
-                        auth: UpstreamAuth::default(),
-                        tags: HashMap::from([(
-                            "provider_id".to_string(),
-                            "provider-new".to_string(),
-                        )]),
-                        supported_models: HashMap::new(),
-                        model_mapping: HashMap::new(),
-                    }],
-                },
-            );
+            let view = route_view(&[("provider-new", "https://new.example/v1")]);
 
             state
-                .prune_runtime_observability_for_service("codex", &mgr)
+                .prune_runtime_observability_for_service("codex", &view)
                 .await;
 
-            assert!(state.get_station_meta_overrides("codex").await.is_empty());
-            assert!(state.get_upstream_meta_overrides("codex").await.is_empty());
-            assert!(state.get_station_health("codex").await.is_empty());
             assert!(state.get_provider_balance_view("codex").await.is_empty());
 
             let rollup = state.get_usage_rollup_view("codex", 10, 10).await;
-            assert!(rollup.by_config.is_empty());
+            assert!(rollup.by_provider_endpoint.is_empty());
             assert!(rollup.by_provider.is_empty());
-        });
-    }
-
-    #[test]
-    fn get_upstream_meta_overrides_merges_endpoint_and_legacy_base_url_entries() {
-        let runtime = tokio::runtime::Runtime::new().expect("runtime");
-        runtime.block_on(async {
-            let state = ProxyState::new();
-
-            state
-                .set_provider_endpoint_enabled_override(
-                    "codex",
-                    ProviderEndpointKey::new("codex", "alpha", "default"),
-                    false,
-                    1,
-                )
-                .await;
-            state
-                .set_provider_endpoint_runtime_state_override(
-                    "codex",
-                    ProviderEndpointKey::new("codex", "alpha", "default"),
-                    RuntimeConfigState::BreakerOpen,
-                    2,
-                )
-                .await;
-            state
-                .set_upstream_enabled_override(
-                    "codex",
-                    "https://legacy.example/v1".to_string(),
-                    true,
-                    3,
-                )
-                .await;
-            state
-                .set_upstream_runtime_state_override(
-                    "codex",
-                    "https://legacy.example/v1".to_string(),
-                    RuntimeConfigState::Draining,
-                    4,
-                )
-                .await;
-
-            let overrides = state.get_upstream_meta_overrides("codex").await;
-
-            assert_eq!(
-                overrides.get("codex/alpha/default"),
-                Some(&(Some(false), Some(RuntimeConfigState::BreakerOpen)))
-            );
-            assert_eq!(
-                overrides.get("https://legacy.example/v1"),
-                Some(&(Some(true), Some(RuntimeConfigState::Draining)))
-            );
         });
     }
 
@@ -5578,14 +6023,14 @@ mod tests {
                 .record_provider_endpoint_attempt_success("codex", fallback.clone(), 10)
                 .await;
             state
-                .set_provider_endpoint_usage_exhausted("codex", monthly.clone(), true)
+                .set_provider_automatic_block_for_test(monthly.clone(), true, 10)
                 .await;
             state
                 .record_provider_endpoint_attempt_failure(
                     "codex",
                     monthly.clone(),
                     0,
-                    crate::lb::CooldownBackoff {
+                    crate::endpoint_health::CooldownBackoff {
                         factor: 1,
                         max_secs: 0,
                     },
@@ -5596,7 +6041,7 @@ mod tests {
                     "codex",
                     monthly.clone(),
                     0,
-                    crate::lb::CooldownBackoff {
+                    crate::endpoint_health::CooldownBackoff {
                         factor: 1,
                         max_secs: 0,
                     },
@@ -5607,7 +6052,7 @@ mod tests {
                     "codex",
                     monthly.clone(),
                     30,
-                    crate::lb::CooldownBackoff {
+                    crate::endpoint_health::CooldownBackoff {
                         factor: 1,
                         max_secs: 0,
                     },
@@ -5618,19 +6063,23 @@ mod tests {
                 .route_plan_runtime_state_for_provider_endpoints("codex")
                 .await;
             let monthly_state = runtime.provider_endpoint(&monthly);
-            assert_eq!(monthly_state.failure_count, crate::lb::FAILURE_THRESHOLD);
+            assert_eq!(
+                monthly_state.failure_count,
+                crate::endpoint_health::FAILURE_THRESHOLD
+            );
             assert!(monthly_state.cooldown_active);
             assert!(monthly_state.usage_exhausted);
             assert_eq!(runtime.affinity_provider_endpoint(), Some(&fallback));
 
             state
-                .set_provider_endpoint_runtime_state_override(
-                    "codex",
+                .set_provider_manual_eligibility(
                     fallback.clone(),
-                    RuntimeConfigState::BreakerOpen,
+                    ProviderManualEligibility::Disabled,
+                    Some("operator disabled endpoint".to_string()),
                     20,
                 )
-                .await;
+                .await
+                .expect("commit manual eligibility");
             let runtime = state
                 .route_plan_runtime_state_for_provider_endpoints("codex")
                 .await;
@@ -5639,27 +6088,19 @@ mod tests {
     }
 
     #[test]
-    fn owned_policy_action_projects_to_runtime_state_below_manual_overrides() {
+    fn committed_provider_observation_projects_below_manual_eligibility() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         runtime.block_on(async {
             let state = ProxyState::new();
             let endpoint = ProviderEndpointKey::new("codex", "monthly", "default");
             let now_ms = unix_now_ms();
-            let mut signal = crate::provider_signals::ProviderSignal::high_confidence_route_facing(
-                crate::provider_signals::ProviderSignalKind::Quota,
-                crate::provider_signals::ProviderSignalSource::UpstreamResponse,
-                crate::provider_signals::ProviderSignalTarget::ProviderEndpoint {
-                    provider_endpoint_key: endpoint.clone(),
-                },
-                now_ms,
+            let committed = state
+                .set_provider_automatic_block_for_test(endpoint.clone(), true, now_ms)
+                .await;
+            assert_eq!(
+                committed.disposition,
+                crate::runtime_store::ProviderObservationDisposition::Accepted
             );
-            signal.reset_after_secs = Some(60);
-            signal.reason = Some("usage_limit_reached".to_string());
-            let action =
-                crate::policy_actions::PolicyAction::cooldown_from_signal(signal, now_ms, 0, 1)
-                    .expect("owned cooldown action");
-
-            state.upsert_owned_policy_action("codex", action).await;
             let runtime = state
                 .route_plan_runtime_state_for_provider_endpoints("codex")
                 .await;
@@ -5669,13 +6110,14 @@ mod tests {
             assert!(!projected.runtime_disabled);
 
             state
-                .set_provider_endpoint_runtime_state_override(
-                    "codex",
+                .set_provider_manual_eligibility(
                     endpoint.clone(),
-                    RuntimeConfigState::BreakerOpen,
+                    ProviderManualEligibility::Disabled,
+                    Some("operator disabled endpoint".to_string()),
                     now_ms.saturating_add(1_000),
                 )
-                .await;
+                .await
+                .expect("commit manual eligibility");
             let runtime = state
                 .route_plan_runtime_state_for_provider_endpoints("codex")
                 .await;
@@ -5684,353 +6126,154 @@ mod tests {
             assert!(projected.usage_exhausted);
             assert!(
                 projected.runtime_disabled,
-                "manual runtime override must outrank automatic action projection"
+                "manual eligibility must outrank automatic observation projection"
             );
         });
     }
 
     #[test]
-    fn owned_policy_action_upsert_replaces_existing_action_for_same_source() {
+    fn newer_provider_observation_replaces_active_action() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         runtime.block_on(async {
             let state = ProxyState::new();
             let endpoint = ProviderEndpointKey::new("codex", "monthly", "default");
-            let signal = crate::provider_signals::ProviderSignal::high_confidence_route_facing(
-                crate::provider_signals::ProviderSignalKind::Capacity,
-                crate::provider_signals::ProviderSignalSource::UpstreamResponse,
-                crate::provider_signals::ProviderSignalTarget::ProviderEndpoint {
-                    provider_endpoint_key: endpoint,
-                },
-                1_000,
-            );
-            let first = crate::policy_actions::PolicyAction::cooldown_from_signal(
-                signal.clone(),
-                1_000,
-                10,
-                1,
-            )
-            .expect("first cooldown");
-            let second =
-                crate::policy_actions::PolicyAction::cooldown_from_signal(signal, 2_000, 20, 2)
-                    .expect("second cooldown");
+            let first = state
+                .set_provider_automatic_block_for_test(endpoint.clone(), true, 1_000)
+                .await;
+            let second = state
+                .set_provider_automatic_block_for_test(endpoint.clone(), true, 2_000)
+                .await;
 
-            state.upsert_owned_policy_action("codex", first).await;
-            state.upsert_owned_policy_action("codex", second).await;
-
-            let actions = state.list_policy_actions("codex").await;
-            assert_eq!(actions.len(), 1);
-            assert_eq!(actions[0].generation, 2);
-            assert_eq!(actions[0].expires_at_ms, 22_000);
+            assert!(second.policy_revision > first.policy_revision);
+            let snapshot = state.capture_provider_policy_snapshot().await;
+            let projection = snapshot
+                .projections
+                .iter()
+                .find(|projection| projection.provider_endpoint == endpoint)
+                .expect("provider projection");
+            let action = projection.active_action.as_ref().expect("active action");
+            assert_eq!(action.generation, 2);
+            assert_eq!(action.opened_at_unix_ms, 2_000);
         });
     }
 
     #[test]
-    fn owned_policy_action_clear_is_source_aware() {
+    fn logical_terminal_keeps_request_captured_policy_revision() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         runtime.block_on(async {
             let state = ProxyState::new();
             let endpoint = ProviderEndpointKey::new("codex", "monthly", "default");
-            let mut response_signal =
-                crate::provider_signals::ProviderSignal::high_confidence_route_facing(
-                    crate::provider_signals::ProviderSignalKind::RateLimit,
-                    crate::provider_signals::ProviderSignalSource::UpstreamResponse,
-                    crate::provider_signals::ProviderSignalTarget::ProviderEndpoint {
-                        provider_endpoint_key: endpoint.clone(),
-                    },
-                    1_000,
-                );
-            response_signal.reset_after_secs = Some(30);
-            let balance_signal = crate::provider_signals::ProviderSignal {
-                kind: crate::provider_signals::ProviderSignalKind::Balance,
-                code: Some("balance".to_string()),
-                source: crate::provider_signals::ProviderSignalSource::BalanceSnapshot,
-                target: crate::provider_signals::ProviderSignalTarget::ProviderEndpoint {
-                    provider_endpoint_key: endpoint.clone(),
-                },
-                confidence: crate::provider_signals::ProviderSignalConfidence::High,
-                observed_at_ms: 1_000,
-                route_facing: true,
-                retry_after_secs: None,
-                reset_after_secs: Some(60),
-                reason: Some("balance_exhausted".to_string()),
-                error_class: None,
-                trace: Default::default(),
-            };
-            let response_action = crate::policy_actions::PolicyAction::cooldown_from_signal(
-                response_signal,
-                1_000,
-                30,
-                1,
-            )
-            .expect("response cooldown");
-            let balance_action = crate::policy_actions::PolicyAction::cooldown_from_signal(
-                balance_signal,
-                1_100,
-                0,
-                2,
-            )
-            .expect("balance cooldown");
-
             state
-                .upsert_owned_policy_action("codex", response_action)
+                .set_provider_automatic_block_for_test(endpoint.clone(), true, 1_000)
                 .await;
-            state
-                .upsert_owned_policy_action("codex", balance_action)
-                .await;
-            assert_eq!(state.list_policy_actions("codex").await.len(), 2);
-
-            state
-                .clear_owned_policy_action(
-                    "codex",
-                    &endpoint,
-                    crate::policy_actions::PolicyActionKind::Cooldown,
-                    crate::provider_signals::ProviderSignalKind::Balance,
-                    crate::provider_signals::ProviderSignalSource::BalanceSnapshot,
-                )
+            let captured_revision = state
+                .capture_provider_policy_snapshot()
+                .await
+                .policy_revision;
+            let request_id = state
+                .begin_request_for_test()
+                .model("gpt-5")
+                .started_at_ms(1_100)
+                .begin()
                 .await;
 
-            let actions = state.list_policy_actions("codex").await;
-            assert_eq!(actions.len(), 1);
-            assert_eq!(
-                actions[0].source_signal.kind,
-                crate::provider_signals::ProviderSignalKind::RateLimit
-            );
-        });
-    }
-
-    #[test]
-    fn expired_owned_policy_action_is_not_projected() {
-        let runtime = tokio::runtime::Runtime::new().expect("runtime");
-        runtime.block_on(async {
-            let state = ProxyState::new();
-            let endpoint = ProviderEndpointKey::new("codex", "monthly", "default");
-            let signal = crate::provider_signals::ProviderSignal::high_confidence_route_facing(
-                crate::provider_signals::ProviderSignalKind::Transport,
-                crate::provider_signals::ProviderSignalSource::UpstreamResponse,
-                crate::provider_signals::ProviderSignalTarget::ProviderEndpoint {
-                    provider_endpoint_key: endpoint.clone(),
-                },
-                1_000,
-            );
-            let action =
-                crate::policy_actions::PolicyAction::cooldown_from_signal(signal, 1_000, 1, 1)
-                    .expect("transport cooldown");
-
-            state.upsert_owned_policy_action("codex", action).await;
-
+            state
+                .set_provider_automatic_block_for_test(endpoint, false, 2_000)
+                .await;
             assert!(
                 state
-                    .active_policy_action_projections("codex", 2_001)
+                    .capture_provider_policy_snapshot()
                     .await
-                    .is_empty()
+                    .policy_revision
+                    > captured_revision
             );
+            assert!(
+                state
+                    .finish_request(FinishRequestParams {
+                        id: request_id,
+                        winning_attempt: None,
+                        status_code: 200,
+                        duration_ms: 1_000,
+                        ended_at_ms: 2_100,
+                        observed_service_tier: None,
+                        reported_model: None,
+                        usage: None,
+                        retry: None,
+                        ttfb_ms: Some(10),
+                        streaming: false,
+                    })
+                    .await
+            );
+
+            let records = state
+                .runtime_store_handle()
+                .read_recent_logical_requests(10)
+                .expect("read durable logical requests");
+            let terminal = records
+                .iter()
+                .filter_map(|record| record.terminal.as_ref()?.terminal.payload.as_ref())
+                .find(|payload| payload.finished_request.id == request_id)
+                .expect("durable request terminal payload");
+            assert_eq!(terminal.policy_revision, Some(captured_revision));
+        });
+    }
+
+    #[test]
+    fn authoritative_recovery_closes_active_action() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            let endpoint = ProviderEndpointKey::new("codex", "monthly", "default");
+            state
+                .set_provider_automatic_block_for_test(endpoint.clone(), true, 1_000)
+                .await;
+            state
+                .set_provider_automatic_block_for_test(endpoint.clone(), false, 2_000)
+                .await;
+
+            let snapshot = state.capture_provider_policy_snapshot().await;
+            let projection = snapshot
+                .projections
+                .iter()
+                .find(|projection| projection.provider_endpoint == endpoint)
+                .expect("provider projection");
+            assert_eq!(projection.automatic, ProviderAutomaticEligibility::Eligible);
+            assert_eq!(projection.effective, ProviderEffectiveEligibility::Eligible);
+            assert!(projection.active_action.is_none());
+        });
+    }
+
+    #[test]
+    fn passive_attempt_success_does_not_recover_quota_eligibility() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            let endpoint = ProviderEndpointKey::new("codex", "monthly", "default");
+            state
+                .set_provider_automatic_block_for_test(endpoint.clone(), true, 1_000)
+                .await;
+            state
+                .record_provider_endpoint_attempt_success("codex", endpoint.clone(), 2_000)
+                .await;
+
             let runtime = state
                 .route_plan_runtime_state_for_provider_endpoints("codex")
                 .await;
             let projected = runtime.provider_endpoint(&endpoint);
-            assert!(!projected.cooldown_active);
-            assert!(!projected.usage_exhausted);
+            assert!(projected.cooldown_active);
+            assert!(projected.usage_exhausted);
         });
     }
 
     #[test]
-    fn get_station_health_merges_passive_runtime_observations() {
+    fn prune_periodic_keeps_sticky_binding_when_session_stats_expire() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         runtime.block_on(async {
-            let state = ProxyState::new();
-            state
-                .record_station_health(
-                    "codex",
-                    "right".to_string(),
-                    StationHealth {
-                        checked_at_ms: 10,
-                        upstreams: vec![UpstreamHealth {
-                            base_url: "https://right.example/v1".to_string(),
-                            ok: Some(true),
-                            status_code: Some(200),
-                            latency_ms: Some(120),
-                            error: None,
-                            passive: None,
-                        }],
-                    },
-                )
-                .await;
-            state
-                .record_passive_upstream_failure(PassiveUpstreamFailureRecord {
-                    service_name: "codex".to_string(),
-                    station_name: "right".to_string(),
-                    base_url: "https://right.example/v1".to_string(),
-                    status_code: Some(500),
-                    error_class: Some("cloudflare_timeout".to_string()),
-                    error: Some("upstream timed out".to_string()),
-                    now_ms: 20,
-                })
-                .await;
-            state
-                .record_passive_upstream_success(
-                    "codex",
-                    "right",
-                    "https://backup.example/v1",
-                    Some(200),
-                    30,
-                )
-                .await;
-
-            let health = state.get_station_health("codex").await;
-            let right = health.get("right").expect("right health");
-            assert_eq!(right.checked_at_ms, 30);
-            assert_eq!(right.upstreams.len(), 2);
-
-            let primary = right
-                .upstreams
-                .iter()
-                .find(|upstream| upstream.base_url == "https://right.example/v1")
-                .expect("primary upstream");
-            assert_eq!(primary.ok, Some(true));
-            let primary_passive = primary.passive.as_ref().expect("primary passive");
-            assert_eq!(primary_passive.state, PassiveHealthState::Degraded);
-            assert_eq!(primary_passive.score, 50);
-            assert_eq!(primary_passive.last_status_code, Some(500));
-            assert_eq!(
-                primary_passive.last_error_class.as_deref(),
-                Some("cloudflare_timeout")
-            );
-
-            let backup = right
-                .upstreams
-                .iter()
-                .find(|upstream| upstream.base_url == "https://backup.example/v1")
-                .expect("backup upstream");
-            assert_eq!(backup.ok, None);
-            let backup_passive = backup.passive.as_ref().expect("backup passive");
-            assert_eq!(backup_passive.state, PassiveHealthState::Healthy);
-            assert_eq!(backup_passive.score, 100);
-            assert_eq!(backup_passive.last_status_code, Some(200));
-        });
-    }
-
-    #[test]
-    fn passive_health_success_recovers_after_failure() {
-        let runtime = tokio::runtime::Runtime::new().expect("runtime");
-        runtime.block_on(async {
-            let state = ProxyState::new();
-            state
-                .record_passive_upstream_failure(PassiveUpstreamFailureRecord {
-                    service_name: "codex".to_string(),
-                    station_name: "right".to_string(),
-                    base_url: "https://right.example/v1".to_string(),
-                    status_code: Some(500),
-                    error_class: Some("cloudflare_timeout".to_string()),
-                    error: Some("upstream timed out".to_string()),
-                    now_ms: 10,
-                })
-                .await;
-            state
-                .record_passive_upstream_success(
-                    "codex",
-                    "right",
-                    "https://right.example/v1",
-                    Some(200),
-                    20,
-                )
-                .await;
-
-            let health = state.get_station_health("codex").await;
-            let right = health.get("right").expect("right health");
-            let upstream = right.upstreams.first().expect("upstream");
-            let passive = upstream.passive.as_ref().expect("passive");
-            assert_eq!(passive.state, PassiveHealthState::Healthy);
-            assert_eq!(passive.score, 100);
-            assert_eq!(passive.consecutive_failures, 0);
-            assert_eq!(passive.last_success_at_ms, Some(20));
-            assert_eq!(passive.last_failure_at_ms, Some(10));
-            assert_eq!(passive.last_error_class, None);
-            assert_eq!(passive.last_error, None);
-        });
-    }
-
-    #[test]
-    fn apply_session_profile_binding_uses_inherited_profile_values() {
-        let runtime = tokio::runtime::Runtime::new().expect("runtime");
-        runtime.block_on(async {
-            let state = ProxyState::new();
-            let mut mgr = ServiceConfigManager::default();
-            mgr.configs.insert(
-                "right".to_string(),
-                ServiceConfig {
-                    name: "right".to_string(),
-                    alias: None,
-                    enabled: true,
-                    level: 1,
-                    upstreams: vec![UpstreamConfig {
-                        base_url: "https://right.example/v1".to_string(),
-                        auth: UpstreamAuth::default(),
-                        tags: HashMap::from([
-                            ("supports_reasoning_effort".to_string(), "true".to_string()),
-                            ("supports_service_tier".to_string(), "true".to_string()),
-                        ]),
-                        supported_models: HashMap::from([("gpt-5.4".to_string(), true)]),
-                        model_mapping: HashMap::new(),
-                    }],
-                },
-            );
-            mgr.profiles.insert(
-                "base".to_string(),
-                crate::config::ServiceControlProfile {
-                    extends: None,
-                    station: Some("right".to_string()),
-                    model: Some("gpt-5.4".to_string()),
-                    reasoning_effort: None,
-                    service_tier: Some("priority".to_string()),
-                },
-            );
-            mgr.profiles.insert(
-                "fast".to_string(),
-                crate::config::ServiceControlProfile {
-                    extends: Some("base".to_string()),
-                    station: None,
-                    model: None,
-                    reasoning_effort: Some("low".to_string()),
-                    service_tier: None,
-                },
-            );
-
-            state
-                .apply_session_profile_binding(
-                    "codex",
-                    &mgr,
-                    "sid-inherited".to_string(),
-                    "fast".to_string(),
-                    100,
-                )
-                .await
-                .expect("apply inherited profile");
-
-            let binding = state
-                .get_session_binding("sid-inherited")
-                .await
-                .expect("binding exists");
-            assert_eq!(binding.profile_name.as_deref(), Some("fast"));
-            assert_eq!(binding.station_name.as_deref(), Some("right"));
-            assert_eq!(binding.model.as_deref(), Some("gpt-5.4"));
-            assert_eq!(binding.reasoning_effort.as_deref(), Some("low"));
-            assert_eq!(binding.service_tier.as_deref(), Some("priority"));
-        });
-    }
-
-    #[test]
-    fn prune_periodic_keeps_sticky_binding_after_manual_override_ttl_expires() {
-        let runtime = tokio::runtime::Runtime::new().expect("runtime");
-        runtime.block_on(async {
-            let state = ProxyState::new_with_runtime_policy(None, test_runtime_policy(1, 0, 2_000));
-            state
-                .set_session_model_override("sid-sticky".to_string(), "gpt-5.4".to_string(), 0)
-                .await;
+            let state = ProxyState::new_with_runtime_policy(test_runtime_policy(1, 0, 2_000));
             state
                 .set_session_binding(SessionBinding {
                     session_id: "sid-sticky".to_string(),
                     profile_name: Some("daily".to_string()),
-                    station_name: Some("right".to_string()),
                     model: Some("gpt-5.4".to_string()),
                     reasoning_effort: Some("medium".to_string()),
                     service_tier: Some("default".to_string()),
@@ -6043,12 +6286,6 @@ mod tests {
 
             state.prune_periodic().await;
 
-            assert!(
-                state
-                    .get_session_model_override("sid-sticky")
-                    .await
-                    .is_none()
-            );
             assert!(state.get_session_binding("sid-sticky").await.is_some());
         });
     }
@@ -6057,12 +6294,11 @@ mod tests {
     fn prune_periodic_honors_opt_in_binding_ttl() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         runtime.block_on(async {
-            let state = ProxyState::new_with_runtime_policy(None, test_runtime_policy(0, 1, 2_000));
+            let state = ProxyState::new_with_runtime_policy(test_runtime_policy(0, 1, 2_000));
             state
                 .set_session_binding(SessionBinding {
                     session_id: "sid-expire".to_string(),
                     profile_name: Some("daily".to_string()),
-                    station_name: Some("right".to_string()),
                     model: Some("gpt-5.4".to_string()),
                     reasoning_effort: Some("medium".to_string()),
                     service_tier: Some("default".to_string()),
@@ -6085,7 +6321,7 @@ mod tests {
         runtime.block_on(async {
             let mut policy = test_runtime_policy(0, 0, 2_000);
             policy.session_route_affinity_ttl_ms = 1;
-            let state = ProxyState::new_with_runtime_policy(None, policy);
+            let state = ProxyState::new_with_runtime_policy(policy);
             state
                 .record_session_route_affinity_success(
                     "sid-expire",
@@ -6099,7 +6335,8 @@ mod tests {
                     Some("first_success".to_string()),
                     0,
                 )
-                .await;
+                .await
+                .expect("persist route affinity");
 
             assert!(
                 state
@@ -6112,23 +6349,58 @@ mod tests {
     }
 
     #[test]
-    fn session_route_affinity_ledger_does_not_restore_expired_entries() {
+    fn session_route_affinity_peek_does_not_prune_expired_ledger_entry() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         runtime.block_on(async {
-            let _home = env_lock().await;
-            let temp_dir = std::env::temp_dir().join(format!(
-                "codex-helper-route-ledger-test-{}",
-                uuid::Uuid::new_v4()
-            ));
-            std::fs::create_dir_all(&temp_dir).expect("create temp dir");
-            let mut scoped = ScopedEnv::default();
-            unsafe {
-                scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
-            }
-
             let mut policy = test_runtime_policy(0, 0, 2_000);
             policy.session_route_affinity_ttl_ms = 1;
-            let first_state = ProxyState::new_with_runtime_policy(None, policy.clone());
+            let state = ProxyState::new_with_runtime_policy(policy);
+            state
+                .record_session_route_affinity_success(
+                    "sid-peek-expired",
+                    SessionRouteAffinityTarget {
+                        route_graph_key: "graph".to_string(),
+                        session_identity_source: None,
+                        provider_endpoint: ProviderEndpointKey::new("codex", "monthly", "default"),
+                        upstream_base_url: "https://monthly.example/v1".to_string(),
+                        route_path: vec!["monthly".to_string()],
+                    },
+                    None,
+                    1,
+                )
+                .await
+                .expect("persist route affinity");
+
+            assert!(
+                state
+                    .peek_session_route_affinity("sid-peek-expired")
+                    .await
+                    .is_none()
+            );
+            assert!(
+                state
+                    .runtime_store()
+                    .count_session_affinities()
+                    .expect("count durable affinities")
+                    == 1,
+                "preflight peek must not mutate the affinity ledger"
+            );
+        });
+    }
+
+    #[test]
+    fn session_route_affinity_sqlite_does_not_restore_expired_entries() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let home = TempStateHome::new("expired-affinity");
+            let mut policy = test_runtime_policy(0, 0, 2_000);
+            policy.session_route_affinity_ttl_ms = 1;
+            let first_store = Arc::new(
+                RuntimeStore::open_in_home(home.path()).expect("open first runtime store"),
+            );
+            let first_state =
+                ProxyState::new_with_runtime_policy_and_store(policy.clone(), first_store.clone())
+                    .expect("create first state");
             first_state
                 .record_session_route_affinity_success(
                     "sid-expired-ledger",
@@ -6142,243 +6414,211 @@ mod tests {
                     Some("first_success".to_string()),
                     0,
                 )
-                .await;
+                .await
+                .expect("persist route affinity");
 
-            let second_state = ProxyState::new_with_runtime_policy(None, policy);
+            drop(first_state);
+            drop(first_store);
+
+            let second_store =
+                Arc::new(RuntimeStore::open_in_home(home.path()).expect("reopen runtime store"));
+            let second_state = ProxyState::new_with_runtime_policy_and_store(policy, second_store)
+                .expect("create second state");
             assert!(
                 second_state
                     .get_session_route_affinity("sid-expired-ledger")
                     .await
                     .is_none()
             );
+            assert_eq!(
+                second_state
+                    .runtime_store()
+                    .count_session_affinities()
+                    .expect("count pruned affinities"),
+                0
+            );
         });
     }
 
     #[test]
-    fn policy_action_ledger_restores_owned_actions() {
+    fn session_route_affinity_commit_failure_is_not_published() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         runtime.block_on(async {
-            let _home = env_lock().await;
+            let state = ProxyState::new();
+            let state_changes = state.subscribe_state_changes();
+            state.runtime_store().fail_next_affinity_commit_for_test();
+
+            let error = state
+                .record_session_route_affinity_success(
+                    "sid-failed-commit",
+                    SessionRouteAffinityTarget {
+                        route_graph_key: "graph".to_string(),
+                        session_identity_source: Some(SessionIdentitySource::Header),
+                        provider_endpoint: ProviderEndpointKey::new("codex", "monthly", "default"),
+                        upstream_base_url: "https://monthly.example/v1".to_string(),
+                        route_path: vec!["monthly".to_string()],
+                    },
+                    None,
+                    100,
+                )
+                .await
+                .expect_err("failed SQLite commit must not return affinity success");
+
+            assert!(matches!(error, RuntimeStoreError::InjectedFailure { .. }));
+            assert!(
+                state
+                    .peek_session_route_affinity("sid-failed-commit")
+                    .await
+                    .is_none()
+            );
+            assert!(!state_changes.has_changed().expect("read state change flag"));
+        });
+    }
+
+    #[test]
+    fn provider_policy_snapshot_restores_from_helper_sqlite() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
             let temp_dir = std::env::temp_dir().join(format!(
-                "codex-helper-policy-action-ledger-test-{}",
+                "codex-helper-provider-policy-sqlite-test-{}",
                 uuid::Uuid::new_v4()
             ));
             std::fs::create_dir_all(&temp_dir).expect("create temp dir");
-            let mut scoped = ScopedEnv::default();
-            unsafe {
-                scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
-                scoped.set_path(
-                    "CODEX_HELPER_POLICY_ACTION_LEDGER",
-                    temp_dir.join("policy-actions.json").as_path(),
-                );
-            }
-
+            let endpoint = ProviderEndpointKey::new("codex", "monthly", "default");
+            let store = Arc::new(RuntimeStore::open_in_home(&temp_dir).expect("open policy store"));
             let first_state =
-                ProxyState::new_with_runtime_policy(None, test_runtime_policy(0, 0, 2_000));
-            let mut signal = crate::provider_signals::ProviderSignal::high_confidence_route_facing(
-                crate::provider_signals::ProviderSignalKind::RateLimit,
-                crate::provider_signals::ProviderSignalSource::UpstreamResponse,
-                crate::provider_signals::ProviderSignalTarget::ProviderEndpoint {
-                    provider_endpoint_key: ProviderEndpointKey::new("codex", "monthly", "default"),
-                },
-                unix_now_ms(),
-            );
-            signal.reset_after_secs = Some(60);
-            let action = crate::policy_actions::PolicyAction::cooldown_from_signal(
-                signal,
-                unix_now_ms(),
-                0,
-                1,
-            )
-            .expect("cooldown action");
+                ProxyState::new_with_runtime_store(Arc::clone(&store)).expect("hydrate state");
             first_state
-                .upsert_owned_policy_action("codex", action)
+                .set_provider_automatic_block_for_test(endpoint.clone(), true, 1_000)
                 .await;
+            drop(first_state);
+            drop(store);
 
-            let second_state =
-                ProxyState::new_with_runtime_policy(None, test_runtime_policy(0, 0, 2_000));
-            let actions = second_state.list_policy_actions("codex").await;
-            assert_eq!(actions.len(), 1);
+            let reopened_store =
+                Arc::new(RuntimeStore::open_in_home(&temp_dir).expect("reopen policy store"));
+            let restored = ProxyState::new_with_runtime_store(reopened_store)
+                .expect("restore provider policy projection");
+            let snapshot = restored.capture_provider_policy_snapshot().await;
+            let projection = snapshot
+                .projections
+                .iter()
+                .find(|projection| projection.provider_endpoint == endpoint)
+                .expect("restored provider projection");
+            assert_eq!(projection.automatic, ProviderAutomaticEligibility::Blocked);
+            assert!(projection.active_action.is_some());
+
+            drop(restored);
+            std::fs::remove_dir_all(temp_dir).expect("remove temp dir");
+        });
+    }
+
+    #[test]
+    fn provider_policy_commit_failure_preserves_last_known_good_snapshot() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            const DIGEST: &str =
+                "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+            let state = ProxyState::new();
+            let endpoint = ProviderEndpointKey::new("codex", "monthly", "default");
+            let scope = ProviderObservationScope::new(
+                endpoint.clone(),
+                "https://provider.test",
+                endpoint.stable_key(),
+                "test:commit-failure",
+                "https://provider.test/usage",
+                DIGEST,
+                DIGEST,
+            )
+            .expect("provider observation scope");
+            let reservation = state
+                .reserve_provider_observation(scope, 1_000)
+                .await
+                .expect("reserve observation");
+            let before = state.capture_provider_policy_snapshot().await;
+            let changes = state.subscribe_state_changes();
+            state.runtime_store().fail_next_policy_commit_for_test();
+
+            let error = state
+                .commit_provider_observation(
+                    reservation,
+                    ProviderObservation {
+                        observed_at_unix_ms: 1_000,
+                        completed_at_unix_ms: 1_001,
+                        authority: ProviderObservationAuthority::Authoritative,
+                        evidence: serde_json::json!({ "exhausted": true }),
+                        effect: ProviderPolicyEffect::Block {
+                            action_kind: "balance_exhausted".to_string(),
+                            code: Some("balance_exhausted".to_string()),
+                            reason: "test exhaustion".to_string(),
+                            expires_at_unix_ms: None,
+                        },
+                    },
+                )
+                .await
+                .expect_err("injected persistence failure");
+
+            assert!(matches!(error, RuntimeStoreError::InjectedFailure { .. }));
+            assert_eq!(*state.capture_provider_policy_snapshot().await, *before);
+            assert!(!changes.has_changed().expect("read state change flag"));
+        });
+    }
+
+    #[test]
+    fn legacy_policy_json_is_ignored_without_being_deleted_or_rewritten() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let temp_dir = std::env::temp_dir().join(format!(
+                "codex-helper-ignored-policy-json-test-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&temp_dir).expect("create temp dir");
+            let legacy_path = temp_dir.join("policy-actions.json");
+            let legacy_bytes = br#"{"schema_version":1,"entries":[{"legacy":true}]}"#;
+            std::fs::write(&legacy_path, legacy_bytes).expect("write legacy policy JSON");
+
+            let store =
+                Arc::new(RuntimeStore::open_in_home(&temp_dir).expect("open runtime store"));
+            let state = ProxyState::new_with_runtime_store(store).expect("hydrate runtime state");
+
+            assert!(
+                state
+                    .capture_provider_policy_snapshot()
+                    .await
+                    .projections
+                    .is_empty()
+            );
             assert_eq!(
-                actions[0].provider_endpoint_key.stable_key(),
-                "codex/monthly/default"
+                std::fs::read(&legacy_path).expect("read untouched legacy policy JSON"),
+                legacy_bytes
             );
+
+            drop(state);
+            std::fs::remove_dir_all(temp_dir).expect("remove temp dir");
         });
     }
 
     #[test]
-    fn policy_action_upsert_does_not_publish_when_ledger_save_fails() {
+    fn runtime_health_prune_does_not_delete_durable_provider_policy() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         runtime.block_on(async {
-            let _home = env_lock().await;
-            let temp_dir = std::env::temp_dir().join(format!(
-                "codex-helper-policy-action-save-failure-test-{}",
-                uuid::Uuid::new_v4()
-            ));
-            std::fs::create_dir_all(&temp_dir).expect("create temp dir");
-            let mut scoped = ScopedEnv::default();
-            unsafe {
-                scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
-                scoped.set_path("CODEX_HELPER_POLICY_ACTION_LEDGER", temp_dir.as_path());
-            }
-
-            let state = ProxyState::new_with_runtime_policy(None, test_runtime_policy(0, 0, 2_000));
+            let state = ProxyState::new();
             let endpoint = ProviderEndpointKey::new("codex", "monthly", "default");
-            let mut signal = crate::provider_signals::ProviderSignal::high_confidence_route_facing(
-                crate::provider_signals::ProviderSignalKind::RateLimit,
-                crate::provider_signals::ProviderSignalSource::UpstreamResponse,
-                crate::provider_signals::ProviderSignalTarget::ProviderEndpoint {
-                    provider_endpoint_key: endpoint.clone(),
-                },
-                unix_now_ms(),
-            );
-            signal.reset_after_secs = Some(60);
-            let action = crate::policy_actions::PolicyAction::cooldown_from_signal(
-                signal,
-                unix_now_ms(),
-                0,
-                1,
-            )
-            .expect("cooldown action");
-
-            state.upsert_owned_policy_action("codex", action).await;
-
-            assert!(state.list_policy_actions("codex").await.is_empty());
-            let runtime_state = state
-                .route_plan_runtime_state_for_provider_endpoints("codex")
-                .await;
-            assert!(!runtime_state.provider_endpoint(&endpoint).cooldown_active);
-        });
-    }
-
-    #[test]
-    fn policy_action_ledger_drops_expired_actions_on_restore() {
-        let runtime = tokio::runtime::Runtime::new().expect("runtime");
-        runtime.block_on(async {
-            let _home = env_lock().await;
-            let temp_dir = std::env::temp_dir().join(format!(
-                "codex-helper-policy-action-expired-ledger-test-{}",
-                uuid::Uuid::new_v4()
-            ));
-            std::fs::create_dir_all(&temp_dir).expect("create temp dir");
-            let ledger_path = temp_dir.join("policy-actions.json");
-            let mut scoped = ScopedEnv::default();
-            unsafe {
-                scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
-                scoped.set_path("CODEX_HELPER_POLICY_ACTION_LEDGER", ledger_path.as_path());
-            }
-
-            let endpoint = ProviderEndpointKey::new("codex", "monthly", "default");
-            let signal = crate::provider_signals::ProviderSignal::high_confidence_route_facing(
-                crate::provider_signals::ProviderSignalKind::Transport,
-                crate::provider_signals::ProviderSignalSource::UpstreamResponse,
-                crate::provider_signals::ProviderSignalTarget::ProviderEndpoint {
-                    provider_endpoint_key: endpoint,
-                },
-                1_000,
-            );
-            let action =
-                crate::policy_actions::PolicyAction::cooldown_from_signal(signal, 1_000, 1, 1)
-                    .expect("transport cooldown");
-            let ledger = serde_json::json!({
-                "schema_version": 1,
-                "updated_at_ms": 2_000,
-                "entries": [
-                    {
-                        "service_name": "codex",
-                        "action": action
-                    }
-                ]
-            });
-            std::fs::write(
-                &ledger_path,
-                serde_json::to_string_pretty(&ledger).expect("ledger json"),
-            )
-            .expect("write ledger");
-
-            let state = ProxyState::new_with_runtime_policy(None, test_runtime_policy(0, 0, 2_000));
-
-            assert!(state.list_policy_actions("codex").await.is_empty());
-            let compacted: serde_json::Value = serde_json::from_str(
-                &std::fs::read_to_string(&ledger_path).expect("compacted ledger"),
-            )
-            .expect("parse compacted ledger");
-            assert_eq!(
-                compacted
-                    .get("entries")
-                    .and_then(|entries| entries.as_array())
-                    .map(Vec::len),
-                Some(0)
-            );
-        });
-    }
-
-    #[test]
-    fn policy_action_prune_persists_removed_endpoint_actions() {
-        let runtime = tokio::runtime::Runtime::new().expect("runtime");
-        runtime.block_on(async {
-            let _home = env_lock().await;
-            let temp_dir = std::env::temp_dir().join(format!(
-                "codex-helper-policy-action-prune-ledger-test-{}",
-                uuid::Uuid::new_v4()
-            ));
-            std::fs::create_dir_all(&temp_dir).expect("create temp dir");
-            let ledger_path = temp_dir.join("policy-actions.json");
-            let mut scoped = ScopedEnv::default();
-            unsafe {
-                scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
-                scoped.set_path("CODEX_HELPER_POLICY_ACTION_LEDGER", ledger_path.as_path());
-            }
-
-            let state = ProxyState::new_with_runtime_policy(None, test_runtime_policy(0, 0, 2_000));
-            let endpoint = ProviderEndpointKey::new("codex", "monthly", "default");
-            let mut signal = crate::provider_signals::ProviderSignal::high_confidence_route_facing(
-                crate::provider_signals::ProviderSignalKind::RateLimit,
-                crate::provider_signals::ProviderSignalSource::UpstreamResponse,
-                crate::provider_signals::ProviderSignalTarget::ProviderEndpoint {
-                    provider_endpoint_key: endpoint,
-                },
-                unix_now_ms(),
-            );
-            signal.reset_after_secs = Some(60);
-            let action = crate::policy_actions::PolicyAction::cooldown_from_signal(
-                signal,
-                unix_now_ms(),
-                0,
-                1,
-            )
-            .expect("cooldown action");
-            state.upsert_owned_policy_action("codex", action).await;
-            assert_eq!(state.list_policy_actions("codex").await.len(), 1);
-
-            let mut mgr = ServiceConfigManager::default();
-            mgr.configs.insert(
-                "routing".to_string(),
-                ServiceConfig {
-                    name: "routing".to_string(),
-                    alias: None,
-                    enabled: true,
-                    level: 1,
-                    upstreams: vec![UpstreamConfig {
-                        base_url: "https://backup.example/v1".to_string(),
-                        auth: UpstreamAuth::default(),
-                        tags: HashMap::from([
-                            ("provider_id".to_string(), "backup".to_string()),
-                            ("endpoint_id".to_string(), "default".to_string()),
-                        ]),
-                        supported_models: HashMap::new(),
-                        model_mapping: HashMap::new(),
-                    }],
-                },
-            );
             state
-                .prune_runtime_observability_for_service("codex", &mgr)
+                .set_provider_automatic_block_for_test(endpoint.clone(), true, 1_000)
                 .await;
-            assert!(state.list_policy_actions("codex").await.is_empty());
 
-            let restored =
-                ProxyState::new_with_runtime_policy(None, test_runtime_policy(0, 0, 2_000));
-            assert!(restored.list_policy_actions("codex").await.is_empty());
+            let view = route_view(&[("backup", "https://backup.example/v1")]);
+            state
+                .prune_runtime_observability_for_service("codex", &view)
+                .await;
+
+            let snapshot = state.capture_provider_policy_snapshot().await;
+            let projection = snapshot
+                .projections
+                .iter()
+                .find(|projection| projection.provider_endpoint == endpoint)
+                .expect("durable provider projection");
+            assert_eq!(projection.automatic, ProviderAutomaticEligibility::Blocked);
         });
     }
 
@@ -6386,13 +6626,12 @@ mod tests {
     fn prune_periodic_caps_sticky_bindings_by_last_seen() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         runtime.block_on(async {
-            let state = ProxyState::new_with_runtime_policy(None, test_runtime_policy(0, 0, 2));
+            let state = ProxyState::new_with_runtime_policy(test_runtime_policy(0, 0, 2));
             for idx in 0..3 {
                 state
                     .set_session_binding(SessionBinding {
                         session_id: format!("sid-{idx}"),
                         profile_name: Some("daily".to_string()),
-                        station_name: Some("right".to_string()),
                         model: Some("gpt-5.4".to_string()),
                         reasoning_effort: Some("medium".to_string()),
                         service_tier: Some("default".to_string()),
@@ -6416,7 +6655,7 @@ mod tests {
     fn transcript_path_cache_records_negative_lookups() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         runtime.block_on(async {
-            let state = ProxyState::new_with_runtime_policy(None, test_runtime_policy(0, 0, 2_000));
+            let state = ProxyState::new_with_runtime_policy(test_runtime_policy(0, 0, 2_000));
             let paths = state
                 .resolve_host_transcript_paths_cached(&["missing-session".to_string()])
                 .await;

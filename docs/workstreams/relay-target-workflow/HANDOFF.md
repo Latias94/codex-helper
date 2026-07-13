@@ -3,6 +3,8 @@
 Status: Complete
 Last updated: 2026-05-31
 
+> Historical status (superseded 2026-07-12): selecting a relay target no longer switches the local Codex client. `ch relay <name>` only starts or attaches to the target runtime and optionally opens a read-only TUI; pointing Codex at that proxy requires a separate explicit local `switch on --base-url ...` action.
+
 ## Current State
 
 The lane is complete. The shipped product shape is target-first daily use:

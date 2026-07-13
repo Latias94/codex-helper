@@ -1,65 +1,9 @@
 use crate::config::{
-    CURRENT_ROUTE_GRAPH_CONFIG_VERSION, ConfigV4MigrationReport, ProviderConfigV4, ProxyConfig,
-    ProxyConfigV2, ProxyConfigV4, RoutingConfigV4, RoutingExhaustedActionV4, RoutingPolicyV4,
-    ServiceConfigManager, ServiceKind, ServiceViewV4,
-    collect_route_graph_affinity_migration_warnings, compile_v2_to_runtime, compile_v4_to_runtime,
-    is_supported_route_graph_config_version, migrate_legacy_to_v4_with_report,
-    migrate_v2_to_v4_with_report,
-    storage::{config_file_path, load_config},
+    CURRENT_CONFIG_VERSION, HelperConfig, ProviderConfig, RouteExhaustedAction, RouteGraphConfig,
+    RouteStrategy, ServiceKind, ServiceRouteConfig,
+    storage::{config_file_path, load_config, load_config_with_source},
 };
 use std::collections::BTreeMap;
-use tokio::fs;
-
-#[derive(Debug, Clone)]
-pub(super) enum ConfigDocument {
-    Legacy(Box<ProxyConfig>),
-    V2(Box<ProxyConfigV2>),
-    V4(Box<ProxyConfigV4>),
-}
-
-impl ConfigDocument {
-    pub(super) fn schema_version(&self) -> u32 {
-        match self {
-            Self::Legacy(cfg) => cfg.version.unwrap_or(1),
-            Self::V2(cfg) => cfg.version,
-            Self::V4(cfg) => cfg.version,
-        }
-    }
-
-    pub(super) fn runtime(&self) -> anyhow::Result<ProxyConfig> {
-        match self {
-            Self::Legacy(cfg) => Ok((**cfg).clone()),
-            Self::V2(cfg) => compile_v2_to_runtime(cfg),
-            Self::V4(cfg) => compile_v4_to_runtime(cfg),
-        }
-    }
-
-    pub(super) fn v4_migration_report(&self) -> anyhow::Result<ConfigV4MigrationReport> {
-        match self {
-            Self::Legacy(cfg) => migrate_legacy_to_v4_with_report(cfg),
-            Self::V2(cfg) => migrate_v2_to_v4_with_report(cfg),
-            Self::V4(cfg) => {
-                let mut warnings = Vec::new();
-                if cfg.version < CURRENT_ROUTE_GRAPH_CONFIG_VERSION {
-                    collect_route_graph_affinity_migration_warnings(
-                        "codex",
-                        &cfg.codex,
-                        &mut warnings,
-                    );
-                    collect_route_graph_affinity_migration_warnings(
-                        "claude",
-                        &cfg.claude,
-                        &mut warnings,
-                    );
-                }
-                Ok(ConfigV4MigrationReport {
-                    config: (**cfg).clone(),
-                    warnings,
-                })
-            }
-        }
-    }
-}
 
 pub(super) async fn resolve_service(codex: bool, claude: bool) -> anyhow::Result<&'static str> {
     if codex && claude {
@@ -82,111 +26,40 @@ pub(super) async fn resolve_service(codex: bool, claude: bool) -> anyhow::Result
     }
 }
 
-pub(super) async fn load_config_document() -> anyhow::Result<ConfigDocument> {
+pub(super) async fn load_config_document() -> anyhow::Result<HelperConfig> {
     let path = config_file_path();
-    if !path.exists() {
-        return Ok(ConfigDocument::Legacy(Box::new(load_config().await?)));
-    }
-
-    let is_toml = path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"));
-    if !is_toml {
-        let bytes = fs::read(&path).await?;
-        return Ok(ConfigDocument::Legacy(Box::new(serde_json::from_slice(
-            &bytes,
-        )?)));
-    }
-
-    let text = fs::read_to_string(&path).await?;
-    let value = toml::from_str::<toml::Value>(&text).ok();
-    let version = value
-        .as_ref()
-        .and_then(|value| value.get("version").and_then(|v| v.as_integer()))
-        .map(|value| value as u32)
-        .or_else(|| {
-            let has_v4_routing = ["codex", "claude"].iter().any(|service| {
-                value
-                    .as_ref()
-                    .and_then(|value| value.get(*service))
-                    .and_then(|service| service.get("routing"))
-                    .and_then(|routing| routing.get("entry").or_else(|| routing.get("routes")))
-                    .is_some()
-            });
-            if has_v4_routing {
-                Some(4)
-            } else {
-                let has_legacy_routing = ["codex", "claude"].iter().any(|service| {
-                    value
-                        .as_ref()
-                        .and_then(|value| value.get(*service))
-                        .and_then(|service| service.get("routing"))
-                        .is_some()
-                });
-                if has_legacy_routing { Some(3) } else { None }
-            }
-        });
-
-    if version.is_some_and(is_supported_route_graph_config_version) {
-        let mut cfg = toml::from_str::<ProxyConfigV4>(&text)?;
-        cfg.normalize_routing_authoring();
-        compile_v4_to_runtime(&cfg)?;
-        Ok(ConfigDocument::V4(Box::new(cfg)))
-    } else if version == Some(3) {
-        let legacy = toml::from_str::<crate::config::legacy::ProxyConfigV3Legacy>(&text)?;
-        let migrated = crate::config::legacy::migrate_v3_legacy_to_v4(&legacy)?;
-        let mut cfg = migrated.config;
-        cfg.normalize_routing_authoring();
-        compile_v4_to_runtime(&cfg)?;
-        Ok(ConfigDocument::V4(Box::new(cfg)))
-    } else if version == Some(2) {
-        let cfg = toml::from_str::<ProxyConfigV2>(&text)?;
-        compile_v2_to_runtime(&cfg)?;
-        Ok(ConfigDocument::V2(Box::new(cfg)))
-    } else {
-        Ok(ConfigDocument::Legacy(Box::new(toml::from_str::<
-            ProxyConfig,
-        >(&text)?)))
-    }
+    anyhow::ensure!(
+        path.exists(),
+        "canonical version = {} config is missing at {:?}",
+        CURRENT_CONFIG_VERSION,
+        path
+    );
+    Ok(load_config_with_source().await?.source)
 }
 
-pub(super) async fn load_v4_config(
+pub(super) async fn load_helper_config(
     codex: bool,
     claude: bool,
     command_group: &str,
-) -> anyhow::Result<(ProxyConfigV4, &'static str, &'static str)> {
+) -> anyhow::Result<(HelperConfig, &'static str, &'static str)> {
     let service = resolve_service(codex, claude).await?;
-    let document = load_config_document().await?;
-    let ConfigDocument::V4(cfg) = document else {
-        anyhow::bail!(
-            "{} commands require a version = 5 route graph config; run `codex-helper config migrate --write --yes` first",
-            command_group
-        );
-    };
+    let cfg = load_config_document().await.map_err(|error| {
+        anyhow::anyhow!(
+            "{command_group} commands require the canonical version = {CURRENT_CONFIG_VERSION} route graph config: {error}"
+        )
+    })?;
     let label = if service == "claude" {
         "Claude"
     } else {
         "Codex"
     };
-    Ok((*cfg, service, label))
+    Ok((cfg, service, label))
 }
 
-pub(super) fn select_service_manager<'a>(
-    cfg: &'a ProxyConfig,
+pub(super) fn select_service_route_config_mut<'a>(
+    cfg: &'a mut HelperConfig,
     service: &str,
-) -> (&'a ServiceConfigManager, &'static str) {
-    if service == "claude" {
-        (&cfg.claude, "Claude")
-    } else {
-        (&cfg.codex, "Codex")
-    }
-}
-
-pub(super) fn select_v4_service_view_mut<'a>(
-    cfg: &'a mut ProxyConfigV4,
-    service: &str,
-) -> (&'a mut ServiceViewV4, &'static str) {
+) -> (&'a mut ServiceRouteConfig, &'static str) {
     if service == "claude" {
         (&mut cfg.claude, "Claude")
     } else {
@@ -194,10 +67,10 @@ pub(super) fn select_v4_service_view_mut<'a>(
     }
 }
 
-pub(super) fn select_v4_service_view<'a>(
-    cfg: &'a ProxyConfigV4,
+pub(super) fn select_service_route_config<'a>(
+    cfg: &'a HelperConfig,
     service: &str,
-) -> (&'a ServiceViewV4, &'static str) {
+) -> (&'a ServiceRouteConfig, &'static str) {
     if service == "claude" {
         (&cfg.claude, "Claude")
     } else {
@@ -205,11 +78,11 @@ pub(super) fn select_v4_service_view<'a>(
     }
 }
 
-pub(super) fn ensure_v4_routing(view: &mut ServiceViewV4) -> &mut RoutingConfigV4 {
+pub(super) fn ensure_routing(view: &mut ServiceRouteConfig) -> &mut RouteGraphConfig {
     view.ensure_routing_mut()
 }
 
-pub(super) fn ensure_v4_routing_order_contains(view: &mut ServiceViewV4, provider_name: &str) {
+pub(super) fn ensure_routing_order_contains(view: &mut ServiceRouteConfig, provider_name: &str) {
     view.ensure_routing_mut()
         .ensure_entry_order_contains(provider_name);
 }
@@ -259,23 +132,23 @@ pub(super) fn parse_cli_string_map(
     Ok(map)
 }
 
-pub(super) fn routing_policy_label(policy: RoutingPolicyV4) -> &'static str {
+pub(super) fn routing_policy_label(policy: RouteStrategy) -> &'static str {
     match policy {
-        RoutingPolicyV4::ManualSticky => "manual-sticky",
-        RoutingPolicyV4::OrderedFailover => "ordered-failover",
-        RoutingPolicyV4::TagPreferred => "tag-preferred",
-        RoutingPolicyV4::Conditional => "conditional",
+        RouteStrategy::ManualSticky => "manual-sticky",
+        RouteStrategy::OrderedFailover => "ordered-failover",
+        RouteStrategy::TagPreferred => "tag-preferred",
+        RouteStrategy::Conditional => "conditional",
     }
 }
 
-pub(super) fn routing_exhausted_label(action: RoutingExhaustedActionV4) -> &'static str {
+pub(super) fn routing_exhausted_label(action: RouteExhaustedAction) -> &'static str {
     match action {
-        RoutingExhaustedActionV4::Continue => "continue",
-        RoutingExhaustedActionV4::Stop => "stop",
+        RouteExhaustedAction::Continue => "continue",
+        RouteExhaustedAction::Stop => "stop",
     }
 }
 
-pub(super) fn v4_provider_endpoint_count(provider: &ProviderConfigV4) -> usize {
+pub(super) fn provider_endpoint_count(provider: &ProviderConfig) -> usize {
     let inline = provider
         .base_url
         .as_deref()
@@ -284,32 +157,29 @@ pub(super) fn v4_provider_endpoint_count(provider: &ProviderConfigV4) -> usize {
     inline + provider.endpoints.len()
 }
 
-fn push_v4_provider_name_once(names: &mut Vec<String>, view: &ServiceViewV4, name: &str) {
+fn push_provider_name_once(names: &mut Vec<String>, view: &ServiceRouteConfig, name: &str) {
     if view.providers.contains_key(name) && !names.iter().any(|existing| existing == name) {
         names.push(name.to_string());
     }
 }
 
-pub(super) fn ordered_v4_provider_names(view: &ServiceViewV4) -> Vec<String> {
-    let mut names =
-        crate::config::resolved_v4_provider_order("config_doc", view).unwrap_or_default();
+pub(super) fn ordered_provider_names(view: &ServiceRouteConfig) -> Vec<String> {
+    let mut names = crate::config::resolved_provider_order("config_doc", view).unwrap_or_default();
     for provider_name in view.providers.keys() {
-        push_v4_provider_name_once(&mut names, view, provider_name);
+        push_provider_name_once(&mut names, view, provider_name);
     }
     names
 }
 
-pub(super) fn print_v4_provider_list(label: &str, view: &ServiceViewV4) {
-    let provider_names = ordered_v4_provider_names(view);
+pub(super) fn print_provider_list(label: &str, view: &ServiceRouteConfig) {
+    let provider_names = ordered_provider_names(view);
     if view.providers.is_empty() {
-        println!(
-            "No {label} providers in v{CURRENT_ROUTE_GRAPH_CONFIG_VERSION} route graph config."
-        );
+        println!("No {label} providers in v{CURRENT_CONFIG_VERSION} route graph config.");
         return;
     }
 
     if view.routing.is_some() {
-        let routing = crate::config::effective_v4_routing(view);
+        let routing = crate::config::effective_routing(view);
         let entry = routing.entry_node();
         let target = entry
             .and_then(|node| node.target.as_deref())
@@ -322,34 +192,34 @@ pub(super) fn print_v4_provider_list(label: &str, view: &ServiceViewV4) {
                 .unwrap_or_default()
         };
         println!(
-            "{label} providers (v{CURRENT_ROUTE_GRAPH_CONFIG_VERSION}): entry={} policy={} target={} order=[{}] on_exhausted={}",
+            "{label} providers (v{CURRENT_CONFIG_VERSION}): entry={} policy={} target={} order=[{}] on_exhausted={}",
             routing.entry,
             routing_policy_label(
                 entry
                     .map(|node| node.strategy)
-                    .unwrap_or(RoutingPolicyV4::OrderedFailover)
+                    .unwrap_or(RouteStrategy::OrderedFailover)
             ),
             target,
             order,
             routing_exhausted_label(
                 entry
                     .map(|node| node.on_exhausted)
-                    .unwrap_or(RoutingExhaustedActionV4::Continue)
+                    .unwrap_or(RouteExhaustedAction::Continue)
             )
         );
     } else {
         println!(
-            "{label} providers (v{CURRENT_ROUTE_GRAPH_CONFIG_VERSION}): routing=<implicit ordered-failover>"
+            "{label} providers (v{CURRENT_CONFIG_VERSION}): routing=<implicit ordered-failover>"
         );
     }
 
-    let effective = crate::config::effective_v4_routing(view);
+    let effective = crate::config::effective_routing(view);
     let target = effective.entry_node().and_then(|node| {
-        matches!(node.strategy, RoutingPolicyV4::ManualSticky)
+        matches!(node.strategy, RouteStrategy::ManualSticky)
             .then(|| node.target.as_deref())
             .flatten()
     });
-    let first_ordered = crate::config::resolved_v4_provider_order("config_doc", view)
+    let first_ordered = crate::config::resolved_provider_order("config_doc", view)
         .ok()
         .and_then(|order| order.first().cloned());
 
@@ -365,7 +235,7 @@ pub(super) fn print_v4_provider_list(label: &str, view: &ServiceViewV4) {
             " "
         };
         let enabled = if provider.enabled { "on" } else { "off" };
-        let endpoints = v4_provider_endpoint_count(provider);
+        let endpoints = provider_endpoint_count(provider);
         let tags = if provider.tags.is_empty() {
             "-".to_string()
         } else {

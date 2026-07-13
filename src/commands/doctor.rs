@@ -1,42 +1,27 @@
 use crate::CliResult;
-use crate::codex_integration::{CodexBridgeDiagnosticStatus, codex_bridge_diagnostics};
-use crate::config::{
-    codex_auth_path, codex_config_path, load_config, probe_codex_bootstrap_from_cli, proxy_home_dir,
-};
-use crate::request_ledger::request_log_path;
+use crate::codex_switch::{CodexSwitchPhase, inspect as inspect_codex_switch};
+use crate::config::{load_config, proxy_home_dir};
+use crate::dashboard_core::{OperatorReadModel, OperatorReadStatus};
+use crate::logging::request_log_path;
 use owo_colors::OwoColorize;
 use serde::Serialize;
-use serde_json::Value as JsonValue;
 use std::env;
-use std::fs::File;
-use std::io::BufReader;
 use std::path::PathBuf;
 
-#[derive(Debug, Serialize)]
-struct StatusJson<'a> {
-    version: Option<u32>,
-    #[serde(borrow)]
-    codex: &'a crate::config::ServiceConfigManager,
-    #[serde(borrow)]
-    claude: &'a crate::config::ServiceConfigManager,
-    lb_failure_threshold: u32,
-    lb_cooldown_secs: u64,
-    codex_bridge: crate::codex_integration::CodexBridgeDiagnostics,
-}
-
-pub async fn handle_status_cmd(json: bool) -> CliResult<()> {
-    let cfg = load_config().await?;
-
+pub async fn handle_status_cmd(
+    json: bool,
+    codex: &OperatorReadModel,
+    claude: &OperatorReadModel,
+) -> CliResult<()> {
     if json {
-        let payload = StatusJson {
-            version: cfg.version,
-            codex: &cfg.codex,
-            claude: &cfg.claude,
-            lb_failure_threshold: crate::lb::FAILURE_THRESHOLD,
-            lb_cooldown_secs: crate::lb::COOLDOWN_SECS,
-            codex_bridge: codex_bridge_diagnostics(),
-        };
-        let text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string());
+        let payload = serde_json::json!({
+            "api_version": 1,
+            "source": "operator_read_model",
+            "codex": codex,
+            "claude": claude,
+        });
+        let text = serde_json::to_string_pretty(&payload)
+            .map_err(|error| crate::CliError::Other(error.to_string()))?;
         println!("{text}");
         return Ok(());
     }
@@ -44,105 +29,56 @@ pub async fn handle_status_cmd(json: bool) -> CliResult<()> {
     println!("{}", "codex-helper status".bold());
     println!("{}", "===================".bold());
 
-    if let Some(ver) = cfg.version {
-        println!("{} {}", "Config version:".bold(), ver);
-    }
-    let bridge = codex_bridge_diagnostics();
-    let bridge_status = bridge.worst_status();
-    println!(
-        "{} {} (preset={}, remote_compaction_v1_ready={}, imagegen_facade_ready={}, upstream_auth_ready={})",
-        "Codex bridge:".bold(),
-        bridge_status.as_str(),
-        bridge
-            .patch_mode
-            .map(|mode| mode.as_preset_str())
-            .unwrap_or("<none>"),
-        bridge.remote_compaction_v1_ready,
-        bridge.imagegen_facade_ready,
-        bridge.upstream_auth_ready,
-    );
-    for check in bridge
-        .checks
-        .iter()
-        .filter(|check| check.status != CodexBridgeDiagnosticStatus::Ok)
-        .take(3)
-    {
-        println!(
-            "  [{}] {}",
-            check.status.as_str().to_uppercase(),
-            check.message
-        );
-        if let Some(action) = check.action.as_deref() {
-            println!("      Action: {action}");
-        }
-    }
-
-    // Codex section
-    if cfg.codex.configs.is_empty() {
-        println!(
-            "{} none in ~/.codex-helper/config.toml/json",
-            "Codex routing candidates:".bold()
-        );
-    } else {
-        let active = cfg.codex.active.as_deref();
-        println!(
-            "{}",
-            "Codex routing candidates in ~/.codex-helper/config.toml/json:".bold()
-        );
-        for (name, svc) in &cfg.codex.configs {
-            let marker = if Some(name.as_str()) == active {
-                "*"
-            } else {
-                " "
-            };
-            println!("  {} {}", marker, name.bold());
-            if svc.upstreams.is_empty() {
-                println!("      {}", "<no upstreams configured>".yellow());
-            } else {
-                for (idx, up) in svc.upstreams.iter().enumerate() {
-                    let role = if idx == 0 { "primary" } else { "backup" };
-                    println!("      [{}] {} ({})", idx, up.base_url, role);
-                }
-            }
-        }
-        println!(
-            "  {}",
-            format!(
-                "LB policy: FAILURE_THRESHOLD = {}, COOLDOWN_SECS = {}",
-                crate::lb::FAILURE_THRESHOLD,
-                crate::lb::COOLDOWN_SECS
-            )
-            .dimmed()
-        );
-    }
-
-    // Claude section
-    if cfg.claude.configs.is_empty() {
-        println!(
-            "{} none in ~/.codex-helper/config.toml/json",
-            "Claude routing candidates:".bold()
-        );
-    } else {
-        let active = cfg.claude.active.as_deref();
-        println!(
-            "{}",
-            "Claude routing candidates in ~/.codex-helper/config.toml/json:".bold()
-        );
-        for (name, svc) in &cfg.claude.configs {
-            let marker = if Some(name.as_str()) == active {
-                "*"
-            } else {
-                " "
-            };
-            let upstream = svc.upstreams.first();
-            let base_url = upstream
-                .map(|u| u.base_url.as_str())
-                .unwrap_or("<no upstream>");
-            println!("  {} {} -> {}", marker, name, base_url);
-        }
-    }
+    print_operator_status("Codex", codex);
+    print_operator_status("Claude", claude);
 
     Ok(())
+}
+
+fn print_operator_status(label: &str, model: &OperatorReadModel) {
+    let status = match model.status {
+        OperatorReadStatus::Ready => "ready".green().to_string(),
+        OperatorReadStatus::Stale => "stale".yellow().to_string(),
+        OperatorReadStatus::Disconnected => "disconnected".yellow().to_string(),
+        OperatorReadStatus::AuthRequired => "auth_required".yellow().to_string(),
+    };
+    println!("{} {status}", format!("{label} runtime:").bold());
+
+    let Some(data) = model.data.as_ref() else {
+        if let Some(issue) = model.issue {
+            println!("  issue: {issue:?}");
+        }
+        return;
+    };
+
+    println!("  captured_at_ms: {}", model.captured_at_ms);
+    println!(
+        "  default profile: {}",
+        data.summary
+            .runtime
+            .default_profile
+            .as_deref()
+            .unwrap_or("<none>")
+    );
+    println!(
+        "  active requests: {}, recent requests: {}, providers: {}",
+        data.summary.counts.active_requests,
+        data.summary.counts.recent_requests,
+        data.summary.counts.providers
+    );
+    for provider in &data.summary.providers {
+        let state = if provider.effective_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        };
+        println!(
+            "    {} [{state}; routable endpoints: {}/{}]",
+            provider.name,
+            provider.routable_endpoints,
+            provider.endpoints.len()
+        );
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -157,24 +93,6 @@ struct DoctorReport {
     checks: Vec<DoctorCheck>,
 }
 
-fn doctor_status_label(status: CodexBridgeDiagnosticStatus) -> &'static str {
-    match status {
-        CodexBridgeDiagnosticStatus::Ok => "ok",
-        CodexBridgeDiagnosticStatus::Info => "info",
-        CodexBridgeDiagnosticStatus::Warn => "warn",
-        CodexBridgeDiagnosticStatus::Fail => "fail",
-    }
-}
-
-fn print_doctor_bridge_check(status: CodexBridgeDiagnosticStatus, message: &str) {
-    match status {
-        CodexBridgeDiagnosticStatus::Ok => println!("{}   {}", "[OK]".green(), message),
-        CodexBridgeDiagnosticStatus::Info => println!("{} {}", "[INFO]".cyan(), message),
-        CodexBridgeDiagnosticStatus::Warn => println!("{} {}", "[WARN]".yellow(), message),
-        CodexBridgeDiagnosticStatus::Fail => println!("{} {}", "[FAIL]".red(), message),
-    }
-}
-
 pub async fn handle_doctor_cmd(json: bool) -> CliResult<()> {
     let mut checks: Vec<DoctorCheck> = Vec::new();
 
@@ -186,9 +104,9 @@ pub async fn handle_doctor_cmd(json: bool) -> CliResult<()> {
     // 1) 检查 codex-helper 主配置是否可读
     match load_config().await {
         Ok(cfg) => {
-            let codex_count = cfg.codex.configs.len();
+            let codex_count = cfg.codex.providers.len();
             if codex_count == 0 {
-                let msg = "检测到 ~/.codex-helper/config.toml/json 中尚无 Codex provider；建议先运行 `codex-helper config init`，再用 `codex-helper provider add` 手动添加，或运行 `codex-helper config import-from-codex` 从 Codex CLI 配置导入。".to_string();
+                let msg = "检测到 canonical ~/.codex-helper/config.toml 中尚无 Codex provider；请用 `codex-helper provider add` 显式添加。".to_string();
                 if !json {
                     println!("{} {}", "[WARN]".yellow(), msg);
                 }
@@ -199,8 +117,8 @@ pub async fn handle_doctor_cmd(json: bool) -> CliResult<()> {
                 });
             } else {
                 let msg = format!(
-                    "已从 ~/.codex-helper/config.toml/json 读取到 {} 个 Codex 路由候选（runtime active target = {:?}）",
-                    codex_count, cfg.codex.active
+                    "已从 canonical ~/.codex-helper/config.toml 读取到 {} 个 Codex provider",
+                    codex_count
                 );
                 if !json {
                     println!("{}   {}", "[OK]".green(), msg);
@@ -220,20 +138,15 @@ pub async fn handle_doctor_cmd(json: bool) -> CliResult<()> {
                     .unwrap_or(false)
             }
 
-            for (svc_label, mgr) in [("Codex", &cfg.codex), ("Claude", &cfg.claude)] {
-                let Some(active_name) = mgr.active.as_deref() else {
-                    continue;
-                };
-                let Some(active_cfg) = mgr.active_station() else {
-                    continue;
-                };
-                for (idx, up) in active_cfg.upstreams.iter().enumerate() {
-                    if let Some(env_name) = up.auth.auth_token_env.as_deref()
+            for (svc_label, view) in [("Codex", &cfg.codex), ("Claude", &cfg.claude)] {
+                for (provider_id, provider) in &view.providers {
+                    let auth = provider.effective_auth();
+                    if let Some(env_name) = auth.auth_token_env.as_deref()
                         && !env_is_set(env_name)
                     {
                         let msg = format!(
-                            "{} active route '{}' upstream[{}] 缺少环境变量 {}（Bearer token）；请在运行 codex-helper 前设置该变量",
-                            svc_label, active_name, idx, env_name
+                            "{} provider '{}' 缺少环境变量 {}（Bearer token）；请在运行 codex-helper 前设置该变量",
+                            svc_label, provider_id, env_name
                         );
                         if !json {
                             println!("{} {}", "[WARN]".yellow(), msg);
@@ -244,12 +157,12 @@ pub async fn handle_doctor_cmd(json: bool) -> CliResult<()> {
                             message: msg,
                         });
                     }
-                    if let Some(env_name) = up.auth.api_key_env.as_deref()
+                    if let Some(env_name) = auth.api_key_env.as_deref()
                         && !env_is_set(env_name)
                     {
                         let msg = format!(
-                            "{} active route '{}' upstream[{}] 缺少环境变量 {}（X-API-Key）；请在运行 codex-helper 前设置该变量",
-                            svc_label, active_name, idx, env_name
+                            "{} provider '{}' 缺少环境变量 {}（X-API-Key）；请在运行 codex-helper 前设置该变量",
+                            svc_label, provider_id, env_name
                         );
                         if !json {
                             println!("{} {}", "[WARN]".yellow(), msg);
@@ -260,22 +173,21 @@ pub async fn handle_doctor_cmd(json: bool) -> CliResult<()> {
                             message: msg,
                         });
                     }
-                    if up
-                        .auth
-                        .auth_token
-                        .as_deref()
-                        .map(|s| !s.trim().is_empty())
-                        .unwrap_or(false)
-                        || up
-                            .auth
-                            .api_key
-                            .as_deref()
-                            .map(|s| !s.trim().is_empty())
-                            .unwrap_or(false)
+                    if [&provider.auth, &provider.inline_auth]
+                        .into_iter()
+                        .any(|auth| {
+                            auth.auth_token
+                                .as_deref()
+                                .is_some_and(|value| !value.trim().is_empty())
+                                || auth
+                                    .api_key
+                                    .as_deref()
+                                    .is_some_and(|value| !value.trim().is_empty())
+                        })
                     {
                         let msg = format!(
-                            "{} active route '{}' upstream[{}] 在 ~/.codex-helper/config.toml/json 中检测到明文密钥字段（建议改用 auth_token_env/api_key_env 以避免落盘泄露）",
-                            svc_label, active_name, idx
+                            "{} provider '{}' 在 ~/.codex-helper/config.toml 中检测到明文密钥字段（建议改用 auth_token_env/api_key_env 以避免落盘泄露）",
+                            svc_label, provider_id
                         );
                         if !json {
                             println!("{} {}", "[WARN]".yellow(), msg);
@@ -291,7 +203,7 @@ pub async fn handle_doctor_cmd(json: bool) -> CliResult<()> {
         }
         Err(err) => {
             let msg = format!(
-                "无法读取 ~/.codex-helper/config.toml/json：{}；请检查配置文件是否有效，或尝试备份后删除以重新初始化。",
+                "无法读取 canonical ~/.codex-helper/config.toml：{}；请确认它是有效的 version = 5 TOML。",
                 err
             );
             if !json {
@@ -305,227 +217,51 @@ pub async fn handle_doctor_cmd(json: bool) -> CliResult<()> {
         }
     }
 
-    // 2) 检查 Codex 官方配置目录与文件
-    let codex_cfg_path = codex_config_path();
-    let codex_auth_path = codex_auth_path();
-
-    if codex_cfg_path.exists() {
-        let msg = format!("检测到 Codex 配置文件：{:?}", codex_cfg_path);
-        if !json {
-            println!("{}   {}", "[OK]".green(), msg);
-        }
-        checks.push(DoctorCheck {
-            id: "codex.config.toml",
+    // 2) Helper-owned explicit Codex switch state. This path never reads auth.json.
+    let switch_check = match inspect_codex_switch() {
+        Ok(status) if status.phase == CodexSwitchPhase::Off => DoctorCheck {
+            id: "codex.switch_state",
+            status: "info",
+            message:
+                "未检测到 codex-helper 显式 switch state；doctor 不推断或导入 Codex CLI 配置。"
+                    .to_string(),
+        },
+        Ok(status) if status.phase == CodexSwitchPhase::Applied && status.enabled => DoctorCheck {
+            id: "codex.switch_state",
             status: "ok",
-            message: msg.clone(),
-        });
-        match std::fs::read_to_string(&codex_cfg_path)
-            .ok()
-            .and_then(|s| toml::from_str::<toml::Value>(&s).ok())
-        {
-            Some(value) => {
-                let provider = value
-                    .get("model_provider")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("openai");
-                let msg = format!(
-                    "当前 Codex model_provider = \"{}\"（doctor 仅做读取，不会修改该文件）",
-                    provider
-                );
-                if !json {
-                    println!("       {}", msg);
-                }
-            }
-            None => {
-                let msg = format!(
-                    "无法解析 {:?} 为有效 TOML，codex-helper 将无法自动推导上游配置",
-                    codex_cfg_path
-                );
-                if !json {
-                    println!("{} {}", "[WARN]".yellow(), msg);
-                }
-                checks.push(DoctorCheck {
-                    id: "codex.config.toml",
-                    status: "warn",
-                    message: msg,
-                });
-            }
-        }
-    } else {
-        let msg = format!(
-            "未找到 Codex 配置文件：{:?}；建议先安装并运行 Codex CLI，完成登录和基础配置。",
-            codex_cfg_path
-        );
-        if !json {
-            println!("{} {}", "[WARN]".yellow(), msg);
-        }
-        checks.push(DoctorCheck {
-            id: "codex.config.toml",
+            message: format!(
+                "显式 switch state 与当前 Codex helper stanza 一致（base_url = {}）。",
+                status.base_url.as_deref().unwrap_or("<missing>")
+            ),
+        },
+        Ok(status) => DoctorCheck {
+            id: "codex.switch_state",
             status: "warn",
-            message: msg,
-        });
-    }
-
-    if codex_auth_path.exists() {
-        let msg = format!("检测到 Codex 认证文件：{:?}", codex_auth_path);
-        if !json {
-            println!("{}   {}", "[OK]".green(), msg);
-        }
-        checks.push(DoctorCheck {
-            id: "codex.auth.json",
-            status: "ok",
-            message: msg.clone(),
-        });
-        match File::open(&codex_auth_path).ok().and_then(|f| {
-            let reader = BufReader::new(f);
-            serde_json::from_reader::<_, JsonValue>(reader).ok()
-        }) {
-            Some(json_val) => {
-                if let Some(obj) = json_val.as_object() {
-                    let api_keys: Vec<_> = obj
-                        .iter()
-                        .filter_map(|(k, v)| {
-                            if k.ends_with("_API_KEY")
-                                && v.as_str().map(|s| !s.trim().is_empty()).unwrap_or(false)
-                            {
-                                Some(k.clone())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    if api_keys.is_empty() {
-                        let msg = "`~/.codex/auth.json` 中未找到任何 `*_API_KEY` 字段，可能尚未通过 API Key 方式配置 Codex".to_string();
-                        if !json {
-                            println!("{} {}", "[WARN]".yellow(), msg);
-                        }
-                        checks.push(DoctorCheck {
-                            id: "codex.auth.api_key",
-                            status: "warn",
-                            message: msg,
-                        });
-                    } else if api_keys.len() == 1 {
-                        let msg = format!(
-                            "检测到唯一 API Key 字段：{}（codex-helper 可在缺少 env_key 时自动复用）",
-                            api_keys[0]
-                        );
-                        if !json {
-                            println!("{}   {}", "[OK]".green(), msg);
-                        }
-                        checks.push(DoctorCheck {
-                            id: "codex.auth.api_key",
-                            status: "ok",
-                            message: msg,
-                        });
-                    } else {
-                        let msg = format!(
-                            "检测到多个 `*_API_KEY` 字段：{:?}，自动推断 token 时可能需要手动指定 env_key",
-                            api_keys
-                        );
-                        if !json {
-                            println!("{} {}", "[WARN]".yellow(), msg);
-                        }
-                        checks.push(DoctorCheck {
-                            id: "codex.auth.api_key",
-                            status: "warn",
-                            message: msg,
-                        });
-                    }
-                } else {
-                    let msg =
-                        "`~/.codex/auth.json` 根节点不是 JSON 对象，可能不是 Codex CLI 生成的标准格式"
-                            .to_string();
-                    if !json {
-                        println!("{} {}", "[WARN]".yellow(), msg);
-                    }
-                    checks.push(DoctorCheck {
-                        id: "codex.auth.json",
-                        status: "warn",
-                        message: msg,
-                    });
-                }
-            }
-            None => {
-                let msg = format!(
-                    "无法解析 {:?} 为 JSON，codex-helper 将无法从中读取 token",
-                    codex_auth_path
-                );
-                if !json {
-                    println!("{} {}", "[WARN]".yellow(), msg);
-                }
-                checks.push(DoctorCheck {
-                    id: "codex.auth.json",
-                    status: "warn",
-                    message: msg,
-                });
-            }
-        }
-    } else {
-        let msg = format!(
-            "未找到 Codex 认证文件：{:?}；建议运行 `codex login` 完成登录，或按照 Codex 文档手动创建 auth.json。",
-            codex_auth_path
-        );
-        if !json {
-            println!("{} {}", "[WARN]".yellow(), msg);
-        }
-        checks.push(DoctorCheck {
-            id: "codex.auth.json",
+            message: format!(
+                "Codex switch 状态需要核对；请运行 `codex-helper switch status`，不要直接覆盖 config.toml。{}",
+                status
+                    .recovery_reason
+                    .as_deref()
+                    .map(|reason| format!(" {reason}"))
+                    .unwrap_or_default()
+            ),
+        },
+        Err(err) => DoctorCheck {
+            id: "codex.switch_state",
             status: "warn",
-            message: msg,
-        });
-    }
-
-    // 2.5) Codex official bridge diagnostics. Keep this offline: no live upstream probe here.
-    let bridge = codex_bridge_diagnostics();
+            message: format!("无法验证 codex-helper 显式 switch state：{err}"),
+        },
+    };
     if !json {
-        println!("{}", "Codex official bridge diagnostics:".bold());
-    }
-    for check in bridge.checks {
-        let message = if let Some(action) = check.action {
-            format!("{} Action: {}", check.message, action)
-        } else {
-            check.message
-        };
-        if !json {
-            print_doctor_bridge_check(check.status, &message);
+        match switch_check.status {
+            "ok" => println!("{}   {}", "[OK]".green(), switch_check.message),
+            "warn" => println!("{} {}", "[WARN]".yellow(), switch_check.message),
+            _ => println!("{} {}", "[INFO]".cyan(), switch_check.message),
         }
-        checks.push(DoctorCheck {
-            id: check.id,
-            status: doctor_status_label(check.status),
-            message,
-        });
     }
+    checks.push(switch_check);
 
-    // 3) 尝试模拟一次从 Codex CLI 配置推导上游（不落盘），用于验证整体链路
-    match probe_codex_bootstrap_from_cli().await {
-        Ok(()) => {
-            let msg = "成功从 ~/.codex/config.toml 与 ~/.codex/auth.json 模拟推导 Codex 上游；如需导入，可运行 `codex-helper config import-from-codex`".to_string();
-            if !json {
-                println!("{}   {}", "[OK]".green(), msg);
-            }
-            checks.push(DoctorCheck {
-                id: "bootstrap.codex",
-                status: "ok",
-                message: msg,
-            });
-        }
-        Err(err) => {
-            let msg = format!(
-                "无法从 ~/.codex 自动推导 Codex 上游：{}；这不会影响手动在 ~/.codex-helper/config.toml 中配置 provider/routing，但自动导入功能将不可用。",
-                err
-            );
-            if !json {
-                println!("{} {}", "[WARN]".yellow(), msg);
-            }
-            checks.push(DoctorCheck {
-                id: "bootstrap.codex",
-                status: "warn",
-                message: msg,
-            });
-        }
-    }
-
-    // 4) 检查请求日志与 usage_providers 配置
+    // 3) Check request logs and usage_providers configuration.
     let log_path = request_log_path();
     if log_path.exists() {
         let msg = format!("检测到请求日志文件：{:?}", log_path);

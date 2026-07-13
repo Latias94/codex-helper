@@ -1,5 +1,7 @@
 # Design: Codex Operator Experience
 
+> Historical note (superseded 2026-07-13): this document preserves the original design. References below to station/upstream identity, raw upstream URLs, JSONL accounting authority, forecast, or versioned DTO/config types are not current architecture; the canonical runtime uses `provider_id`/`endpoint_id`/`provider_endpoint_key`, the helper-owned SQLite store, semantic unversioned types, and the typed `OperatorReadModel`.
+
 > 中文速览：目标不是把 GUI 做成另一个供应商列表，而是让用户在 Codex 工作流中清楚看到“当前请求走了哪里、为什么这么走、花了多少钱、还能不能继续用、是否应该切换”。核心设计是统一请求观测模型、成本模型、余额模型和策略解释模型。
 
 ## Problem Statement

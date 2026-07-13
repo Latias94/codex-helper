@@ -2,9 +2,9 @@ use std::sync::OnceLock;
 
 use axum::http::{HeaderMap, HeaderName, HeaderValue, header};
 
-use crate::codex_integration::CodexPatchMode;
 use crate::config::UpstreamAuth;
-use crate::logging::{BodyPreview, HeaderEntry};
+use crate::logging::{BodyPreview, HeaderEntry, upstream_origin};
+use crate::provider_catalog::{AccountFingerprint, ProviderAdapter};
 
 use super::ProxyService;
 use super::auth_resolution::{resolve_api_key_with_source, resolve_auth_token_with_source};
@@ -14,7 +14,23 @@ use super::request_preparation::codex_path_is_responses_compact;
 
 pub(super) struct AttemptRequestSetup {
     pub(super) headers: HeaderMap,
+    #[cfg(test)]
+    pub(super) account_fingerprint: AccountFingerprint,
     pub(super) debug_base: Option<HttpDebugBase>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct AttemptRequestIdentity {
+    pub(super) headers: HeaderMap,
+    pub(super) account_fingerprint: AccountFingerprint,
+}
+
+pub(super) struct AttemptRequestIdentityParams<'a> {
+    pub(super) proxy: &'a ProxyService,
+    pub(super) auth: &'a UpstreamAuth,
+    pub(super) client_headers: &'a HeaderMap,
+    pub(super) client_uri: &'a str,
+    pub(super) target_url: &'a str,
 }
 
 struct HttpDebugBaseParams<'a> {
@@ -33,10 +49,10 @@ struct HttpDebugBaseParams<'a> {
     upstream_request_body_warn: Option<&'a BodyPreview>,
 }
 
+#[cfg(test)]
 pub(super) struct AttemptRequestSetupParams<'a> {
     pub(super) proxy: &'a ProxyService,
     pub(super) auth: &'a UpstreamAuth,
-    pub(super) codex_client_patch_mode: CodexPatchMode,
     pub(super) client_headers: &'a HeaderMap,
     pub(super) client_headers_entries_cache: &'a OnceLock<Vec<HeaderEntry>>,
     pub(super) request_body_len: usize,
@@ -51,13 +67,56 @@ pub(super) struct AttemptRequestSetupParams<'a> {
     pub(super) upstream_request_body_warn: Option<&'a BodyPreview>,
 }
 
+pub(super) struct FrozenAttemptRequestSetupParams<'a> {
+    pub(super) identity: &'a AttemptRequestIdentity,
+    pub(super) client_headers: &'a HeaderMap,
+    pub(super) client_headers_entries_cache: &'a OnceLock<Vec<HeaderEntry>>,
+    pub(super) request_body_len: usize,
+    pub(super) upstream_request_body_len: usize,
+    pub(super) debug_max: usize,
+    pub(super) warn_max: usize,
+    pub(super) client_uri: &'a str,
+    pub(super) target_url: &'a str,
+    pub(super) client_body_debug: Option<&'a BodyPreview>,
+    pub(super) upstream_request_body_debug: Option<&'a BodyPreview>,
+    pub(super) client_body_warn: Option<&'a BodyPreview>,
+    pub(super) upstream_request_body_warn: Option<&'a BodyPreview>,
+}
+
+pub(super) fn prepare_attempt_request_identity(
+    params: AttemptRequestIdentityParams<'_>,
+) -> AttemptRequestIdentity {
+    let AttemptRequestIdentityParams {
+        proxy,
+        auth,
+        client_headers,
+        client_uri,
+        target_url,
+    } = params;
+
+    // Codex client credentials pass through only to the official origin when helper auth is absent.
+    let mut headers = filter_request_headers(client_headers);
+    headers.insert(
+        header::ACCEPT_ENCODING,
+        HeaderValue::from_static("identity"),
+    );
+    inject_auth_headers(proxy.service_name, auth, target_url, &mut headers);
+    normalize_codex_compact_headers(proxy.service_name, client_uri, &mut headers);
+    let account_fingerprint = AccountFingerprint::from_final_headers(&headers);
+
+    AttemptRequestIdentity {
+        headers,
+        account_fingerprint,
+    }
+}
+
+#[cfg(test)]
 pub(super) fn prepare_attempt_request(
     params: AttemptRequestSetupParams<'_>,
 ) -> AttemptRequestSetup {
     let AttemptRequestSetupParams {
         proxy,
         auth,
-        codex_client_patch_mode,
         client_headers,
         client_headers_entries_cache,
         request_body_len,
@@ -72,24 +131,54 @@ pub(super) fn prepare_attempt_request(
         upstream_request_body_warn,
     } = params;
 
-    // 复制客户端请求头，并按上游配置覆盖认证头；未提供上游凭证时保留客户端值。
-    let mut headers = filter_request_headers(client_headers);
-    headers.insert(
-        header::ACCEPT_ENCODING,
-        HeaderValue::from_static("identity"),
-    );
-    inject_auth_headers(
-        proxy.service_name,
+    let identity = prepare_attempt_request_identity(AttemptRequestIdentityParams {
+        proxy,
         auth,
-        codex_client_patch_mode,
-        &mut headers,
-    );
-    normalize_codex_compact_headers(proxy.service_name, client_uri, &mut headers);
+        client_headers,
+        client_uri,
+        target_url,
+    });
+
+    prepare_attempt_request_with_identity(FrozenAttemptRequestSetupParams {
+        identity: &identity,
+        client_headers,
+        client_headers_entries_cache,
+        request_body_len,
+        upstream_request_body_len,
+        debug_max,
+        warn_max,
+        client_uri,
+        target_url,
+        client_body_debug,
+        upstream_request_body_debug,
+        client_body_warn,
+        upstream_request_body_warn,
+    })
+}
+
+pub(super) fn prepare_attempt_request_with_identity(
+    params: FrozenAttemptRequestSetupParams<'_>,
+) -> AttemptRequestSetup {
+    let FrozenAttemptRequestSetupParams {
+        identity,
+        client_headers,
+        client_headers_entries_cache,
+        request_body_len,
+        upstream_request_body_len,
+        debug_max,
+        warn_max,
+        client_uri,
+        target_url,
+        client_body_debug,
+        upstream_request_body_debug,
+        client_body_warn,
+        upstream_request_body_warn,
+    } = params;
 
     let debug_base = build_http_debug_base(HttpDebugBaseParams {
         client_headers,
         client_headers_entries_cache,
-        upstream_request_headers: &headers,
+        upstream_request_headers: &identity.headers,
         request_body_len,
         upstream_request_body_len,
         debug_max,
@@ -103,7 +192,9 @@ pub(super) fn prepare_attempt_request(
     });
 
     AttemptRequestSetup {
-        headers,
+        headers: identity.headers.clone(),
+        #[cfg(test)]
+        account_fingerprint: identity.account_fingerprint,
         debug_base,
     }
 }
@@ -124,21 +215,21 @@ fn client_uri_path(client_uri: &str) -> &str {
 pub(super) fn inject_auth_headers(
     service_name: &str,
     auth: &UpstreamAuth,
-    codex_client_patch_mode: CodexPatchMode,
+    target_url: &str,
     headers: &mut HeaderMap,
 ) {
-    let allow_client_passthrough =
-        !(service_name == "codex" && codex_client_patch_mode.strips_codex_client_auth());
-    if !allow_client_passthrough {
+    let client_has_auth = headers.contains_key("authorization");
+    let client_has_x_api_key = headers.contains_key("x-api-key");
+    let (token, _token_src) = resolve_auth_token_with_source(service_name, auth);
+    let (api_key, _api_key_src) = resolve_api_key_with_source(service_name, auth);
+    let helper_credential_contract = upstream_auth_contract_is_configured(auth);
+    let allow_client_passthrough = service_name != "codex"
+        || (!helper_credential_contract && trusted_codex_passthrough_origin(target_url));
+
+    if service_name == "codex" && !allow_client_passthrough {
         strip_codex_client_account_headers(headers);
     }
 
-    let client_has_auth = headers.contains_key("authorization");
-    let (token, _token_src) = resolve_auth_token_with_source(
-        service_name,
-        auth,
-        client_has_auth && allow_client_passthrough,
-    );
     if let Some(token) = token
         && let Ok(value) = HeaderValue::from_str(&format!("Bearer {token}"))
     {
@@ -147,12 +238,6 @@ pub(super) fn inject_auth_headers(
         headers.remove("authorization");
     }
 
-    let client_has_x_api_key = headers.contains_key("x-api-key");
-    let (api_key, _api_key_src) = resolve_api_key_with_source(
-        service_name,
-        auth,
-        client_has_x_api_key && allow_client_passthrough,
-    );
     if let Some(key) = api_key
         && let Ok(value) = HeaderValue::from_str(&key)
     {
@@ -162,9 +247,41 @@ pub(super) fn inject_auth_headers(
     }
 }
 
+fn upstream_auth_contract_is_configured(auth: &UpstreamAuth) -> bool {
+    [
+        auth.auth_token.as_deref(),
+        auth.auth_token_env.as_deref(),
+        auth.api_key.as_deref(),
+        auth.api_key_env.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|value| !value.trim().is_empty())
+}
+
+fn trusted_codex_passthrough_origin(target_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(target_url) else {
+        return false;
+    };
+    url.scheme() == "https" && ProviderAdapter::for_endpoint(&url) == ProviderAdapter::OpenAiCodex
+}
+
 fn strip_codex_client_account_headers(headers: &mut HeaderMap) {
-    headers.remove(HeaderName::from_static("chatgpt-account-id"));
-    headers.remove(HeaderName::from_static("x-openai-fedramp"));
+    for name in [
+        "authorization",
+        "chatgpt-account-id",
+        "openai-organization",
+        "openai-project",
+        "x-api-key",
+        "x-oai-attestation",
+        "x-openai-fedramp",
+        "x-openai-organization",
+        "x-openai-project",
+        "x-organization-id",
+        "x-project-id",
+    ] {
+        headers.remove(HeaderName::from_static(name));
+    }
 }
 
 fn build_http_debug_base(params: HttpDebugBaseParams<'_>) -> Option<HttpDebugBase> {
@@ -194,7 +311,7 @@ fn build_http_debug_base(params: HttpDebugBaseParams<'_>) -> Option<HttpDebugBas
         request_body_len,
         upstream_request_body_len,
         client_uri: client_uri.to_string(),
-        target_url: target_url.to_string(),
+        upstream_origin: upstream_origin(target_url),
         client_headers: client_headers_entries_cache
             .get_or_init(|| header_map_to_entries(client_headers))
             .clone(),
@@ -209,22 +326,19 @@ fn build_http_debug_base(params: HttpDebugBaseParams<'_>) -> Option<HttpDebugBas
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use axum::http::HeaderValue;
 
     use super::*;
-    use crate::config::ProxyConfig;
-    use crate::lb::LbState;
+    use crate::config::HelperConfig;
+    use crate::provider_catalog::AccountFingerprint;
 
     fn test_proxy_service() -> ProxyService {
         ProxyService::new(
             reqwest::Client::new(),
-            Arc::new(ProxyConfig::default()),
+            Arc::new(HelperConfig::default()),
             "codex",
-            Arc::new(Mutex::new(
-                std::collections::HashMap::<String, LbState>::new(),
-            )),
         )
     }
 
@@ -248,7 +362,6 @@ mod tests {
                 api_key: Some("server-key".to_string()),
                 api_key_env: None,
             },
-            codex_client_patch_mode: CodexPatchMode::Default,
             client_headers: &client_headers,
             client_headers_entries_cache: &cache,
             request_body_len: 12,
@@ -275,12 +388,19 @@ mod tests {
             setup.headers.get("accept-encoding"),
             Some(&HeaderValue::from_static("identity"))
         );
+        assert_eq!(
+            setup.account_fingerprint,
+            AccountFingerprint::from_final_headers(&setup.headers)
+        );
+        assert_ne!(
+            setup.account_fingerprint,
+            AccountFingerprint::from_final_headers(&client_headers)
+        );
         assert!(setup.debug_base.is_none());
     }
 
     #[tokio::test]
-    async fn prepare_attempt_request_strips_client_auth_in_chatgpt_bridge_without_upstream_secret()
-    {
+    async fn prepare_attempt_request_strips_client_credentials_for_untrusted_relay() {
         let proxy = test_proxy_service();
         let mut client_headers = HeaderMap::new();
         client_headers.insert(
@@ -293,13 +413,16 @@ mod tests {
             HeaderValue::from_static("account-client"),
         );
         client_headers.insert("x-openai-fedramp", HeaderValue::from_static("true"));
+        client_headers.insert(
+            "x-oai-attestation",
+            HeaderValue::from_static("device-attestation"),
+        );
         client_headers.insert("content-type", HeaderValue::from_static("application/json"));
 
         let cache = OnceLock::new();
         let setup = prepare_attempt_request(AttemptRequestSetupParams {
             proxy: &proxy,
             auth: &UpstreamAuth::default(),
-            codex_client_patch_mode: CodexPatchMode::ChatGptBridge,
             client_headers: &client_headers,
             client_headers_entries_cache: &cache,
             request_body_len: 12,
@@ -318,6 +441,7 @@ mod tests {
         assert!(!setup.headers.contains_key("x-api-key"));
         assert!(!setup.headers.contains_key("chatgpt-account-id"));
         assert!(!setup.headers.contains_key("x-openai-fedramp"));
+        assert!(!setup.headers.contains_key("x-oai-attestation"));
         assert_eq!(
             setup.headers.get("content-type"),
             Some(&HeaderValue::from_static("application/json"))
@@ -325,7 +449,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_attempt_request_bridge_still_uses_explicit_upstream_secret() {
+    async fn prepare_attempt_request_uses_explicit_upstream_secret_and_strips_client_account_metadata()
+     {
         let proxy = test_proxy_service();
         let mut client_headers = HeaderMap::new();
         client_headers.insert(
@@ -347,7 +472,6 @@ mod tests {
                 api_key: None,
                 api_key_env: None,
             },
-            codex_client_patch_mode: CodexPatchMode::ChatGptBridge,
             client_headers: &client_headers,
             client_headers_entries_cache: &cache,
             request_body_len: 12,
@@ -371,26 +495,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_attempt_request_strips_client_auth_in_imagegen_bridge_without_upstream_secret()
-    {
+    async fn prepare_attempt_request_allows_passthrough_only_for_official_openai_origin() {
         let proxy = test_proxy_service();
         let mut client_headers = HeaderMap::new();
         client_headers.insert(
             "authorization",
-            HeaderValue::from_static("Bearer facade-token"),
+            HeaderValue::from_static("Bearer official-token"),
         );
-        client_headers.insert("x-api-key", HeaderValue::from_static("client-key"));
         client_headers.insert(
             "chatgpt-account-id",
             HeaderValue::from_static("account-client"),
         );
-        client_headers.insert("x-openai-fedramp", HeaderValue::from_static("true"));
 
         let cache = OnceLock::new();
         let setup = prepare_attempt_request(AttemptRequestSetupParams {
             proxy: &proxy,
             auth: &UpstreamAuth::default(),
-            codex_client_patch_mode: CodexPatchMode::ImagegenBridge,
             client_headers: &client_headers,
             client_headers_entries_cache: &cache,
             request_body_len: 12,
@@ -398,48 +518,55 @@ mod tests {
             debug_max: 0,
             warn_max: 0,
             client_uri: "/v1/responses",
-            target_url: "https://third-party.example/v1/responses",
+            target_url: "https://api.openai.com/v1/responses",
             client_body_debug: None,
             upstream_request_body_debug: None,
             client_body_warn: None,
             upstream_request_body_warn: None,
         });
 
-        assert!(!setup.headers.contains_key("authorization"));
-        assert!(!setup.headers.contains_key("x-api-key"));
-        assert!(!setup.headers.contains_key("chatgpt-account-id"));
-        assert!(!setup.headers.contains_key("x-openai-fedramp"));
+        assert_eq!(
+            setup.headers.get("authorization"),
+            Some(&HeaderValue::from_static("Bearer official-token"))
+        );
+        assert_eq!(
+            setup.headers.get("chatgpt-account-id"),
+            Some(&HeaderValue::from_static("account-client"))
+        );
     }
 
     #[tokio::test]
-    async fn prepare_attempt_request_strips_client_auth_in_official_relay_bridge_without_upstream_secret()
-     {
+    async fn prepare_attempt_request_missing_helper_env_contract_fails_closed_on_official_origin() {
         let proxy = test_proxy_service();
         let mut client_headers = HeaderMap::new();
         client_headers.insert(
             "authorization",
-            HeaderValue::from_static("Bearer codex-client-token"),
+            HeaderValue::from_static("Bearer official-token"),
         );
-        client_headers.insert("x-api-key", HeaderValue::from_static("client-key"));
         client_headers.insert(
             "chatgpt-account-id",
             HeaderValue::from_static("account-client"),
         );
-        client_headers.insert("x-openai-fedramp", HeaderValue::from_static("true"));
 
         let cache = OnceLock::new();
         let setup = prepare_attempt_request(AttemptRequestSetupParams {
             proxy: &proxy,
-            auth: &UpstreamAuth::default(),
-            codex_client_patch_mode: CodexPatchMode::OfficialRelayBridge,
+            auth: &UpstreamAuth {
+                auth_token: None,
+                auth_token_env: Some(
+                    "CODEX_HELPER_TEST_DEFINITELY_MISSING_PROVIDER_TOKEN_7C2A".to_string(),
+                ),
+                api_key: None,
+                api_key_env: None,
+            },
             client_headers: &client_headers,
             client_headers_entries_cache: &cache,
             request_body_len: 12,
             upstream_request_body_len: 12,
             debug_max: 0,
             warn_max: 0,
-            client_uri: "/responses/compact",
-            target_url: "https://third-party.example/v1/responses/compact",
+            client_uri: "/v1/responses",
+            target_url: "https://api.openai.com/v1/responses",
             client_body_debug: None,
             upstream_request_body_debug: None,
             client_body_warn: None,
@@ -447,9 +574,7 @@ mod tests {
         });
 
         assert!(!setup.headers.contains_key("authorization"));
-        assert!(!setup.headers.contains_key("x-api-key"));
         assert!(!setup.headers.contains_key("chatgpt-account-id"));
-        assert!(!setup.headers.contains_key("x-openai-fedramp"));
     }
 
     #[tokio::test]
@@ -462,7 +587,6 @@ mod tests {
         let setup = prepare_attempt_request(AttemptRequestSetupParams {
             proxy: &proxy,
             auth: &UpstreamAuth::default(),
-            codex_client_patch_mode: CodexPatchMode::Default,
             client_headers: &client_headers,
             client_headers_entries_cache: &cache,
             request_body_len: 12,
@@ -493,7 +617,6 @@ mod tests {
         let setup = prepare_attempt_request(AttemptRequestSetupParams {
             proxy: &proxy,
             auth: &UpstreamAuth::default(),
-            codex_client_patch_mode: CodexPatchMode::Default,
             client_headers: &client_headers,
             client_headers_entries_cache: &cache,
             request_body_len: 12,
@@ -524,7 +647,6 @@ mod tests {
         let setup = prepare_attempt_request(AttemptRequestSetupParams {
             proxy: &proxy,
             auth: &UpstreamAuth::default(),
-            codex_client_patch_mode: CodexPatchMode::Default,
             client_headers: &client_headers,
             client_headers_entries_cache: &cache,
             request_body_len: 12,
@@ -555,7 +677,6 @@ mod tests {
         let setup = prepare_attempt_request(AttemptRequestSetupParams {
             proxy: &proxy,
             auth: &UpstreamAuth::default(),
-            codex_client_patch_mode: CodexPatchMode::Default,
             client_headers: &client_headers,
             client_headers_entries_cache: &cache,
             request_body_len: 12,
@@ -577,47 +698,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_attempt_request_strips_client_auth_in_official_imagegen_bridge_without_upstream_secret()
-     {
-        let proxy = test_proxy_service();
-        let mut client_headers = HeaderMap::new();
-        client_headers.insert(
-            "authorization",
-            HeaderValue::from_static("Bearer facade-token"),
-        );
-        client_headers.insert("x-api-key", HeaderValue::from_static("client-key"));
-        client_headers.insert(
-            "chatgpt-account-id",
-            HeaderValue::from_static("account-client"),
-        );
-        client_headers.insert("x-openai-fedramp", HeaderValue::from_static("true"));
-
-        let cache = OnceLock::new();
-        let setup = prepare_attempt_request(AttemptRequestSetupParams {
-            proxy: &proxy,
-            auth: &UpstreamAuth::default(),
-            codex_client_patch_mode: CodexPatchMode::OfficialImagegenBridge,
-            client_headers: &client_headers,
-            client_headers_entries_cache: &cache,
-            request_body_len: 12,
-            upstream_request_body_len: 12,
-            debug_max: 0,
-            warn_max: 0,
-            client_uri: "/v1/responses",
-            target_url: "https://third-party.example/v1/responses",
-            client_body_debug: None,
-            upstream_request_body_debug: None,
-            client_body_warn: None,
-            upstream_request_body_warn: None,
-        });
-
-        assert!(!setup.headers.contains_key("authorization"));
-        assert!(!setup.headers.contains_key("x-api-key"));
-        assert!(!setup.headers.contains_key("chatgpt-account-id"));
-        assert!(!setup.headers.contains_key("x-openai-fedramp"));
-    }
-
-    #[tokio::test]
     async fn prepare_attempt_request_builds_debug_base_when_limits_enabled() {
         let proxy = test_proxy_service();
         let mut client_headers = HeaderMap::new();
@@ -627,7 +707,6 @@ mod tests {
         let setup = prepare_attempt_request(AttemptRequestSetupParams {
             proxy: &proxy,
             auth: &UpstreamAuth::default(),
-            codex_client_patch_mode: CodexPatchMode::Default,
             client_headers: &client_headers,
             client_headers_entries_cache: &cache,
             request_body_len: 18,
@@ -635,7 +714,7 @@ mod tests {
             debug_max: 128,
             warn_max: 64,
             client_uri: "/v1/responses",
-            target_url: "https://example.com/v1/responses",
+            target_url: "https://user:secret@example.com:8443/private/secret-path?token=hidden#fragment",
             client_body_debug: None,
             upstream_request_body_debug: None,
             client_body_warn: None,
@@ -644,7 +723,10 @@ mod tests {
 
         let debug_base = setup.debug_base.expect("debug_base");
         assert_eq!(debug_base.client_uri, "/v1/responses");
-        assert_eq!(debug_base.target_url, "https://example.com/v1/responses");
+        assert_eq!(
+            debug_base.upstream_origin.as_deref(),
+            Some("https://example.com:8443")
+        );
         assert_eq!(debug_base.request_body_len, 18);
         assert_eq!(debug_base.upstream_request_body_len, 22);
         assert!(!debug_base.client_headers.is_empty());

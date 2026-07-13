@@ -1,5 +1,7 @@
 # Milestones: Codex Operator Experience
 
+> Historical note (superseded 2026-07-13): this milestone record preserves the original implementation sequence. References below to JSONL accounting authority, forecast, or versioned config/runtime types are not current architecture; the canonical runtime uses the helper-owned SQLite store, semantic unversioned types, and the typed `OperatorReadModel`.
+
 > 中文速览：优先级按“先修信任，再建事实，再做体验”的顺序排。P0 修 TUI 稳定性和观测语义；P1 做价格、余额和 GUI/TUI 可见体验；P2 再做高级策略、长周期审计和更多产品化能力。
 
 ## Milestone Strategy

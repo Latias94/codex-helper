@@ -1,5 +1,10 @@
 # Evidence And Gates
 
+> Historical artifact (superseded 2026-07-12): startup readiness no longer reads
+> Codex auth, model cache, SQLite, or remote-control state. The retained guardrail
+> reports helper config/runtime readiness and explicit local switch-journal
+> conflicts. The remote control plane is GET/HEAD-only.
+
 ## Planned Gates
 
 - `cargo fmt --all --check`

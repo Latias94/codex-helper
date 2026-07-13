@@ -3,6 +3,8 @@
 Status: Complete
 Last updated: 2026-05-19
 
+> Historical status (superseded 2026-07-12): patch-mode profiles and deterministic preset recommendations were replaced by provider-owned expected decisions, captured catalog revisions, request dialects, observations, continuity, and mismatches. Capability diagnostics are explicit process-local CLI/TUI actions; the remote control plane no longer exposes a diagnostic POST route.
+
 ## Current State
 
 The workstream has been opened as a follow-on to the completed official relay and official imagegen

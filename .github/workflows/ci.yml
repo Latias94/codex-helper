@@ -68,6 +68,9 @@ jobs:
       - name: Check desktop contracts
         run: pnpm --dir apps/desktop check:contracts
 
+      - name: Check canonical runtime source surface
+        run: node tools/check-canonical-runtime-surface.mjs
+
       - name: Test desktop
         run: pnpm --dir apps/desktop test -- --run
 

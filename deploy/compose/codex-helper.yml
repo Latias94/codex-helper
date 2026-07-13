@@ -30,7 +30,7 @@ services:
     entrypoint: ["/usr/bin/tini", "--", "sh", "-c"]
     command: test -f /data/config.toml || cp /config/config.toml /data/config.toml; exec codex-helper-server --config /config/server.toml
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:4211/__codex_helper/api/v1/capabilities >/dev/null"]
+      test: ["CMD-SHELL", "curl -fsS -H \"x-codex-helper-admin-token: $$CODEX_HELPER_ADMIN_TOKEN\" http://127.0.0.1:4211/__codex_helper/api/v1/operator/read-model >/dev/null"]
       interval: 30s
       timeout: 5s
       retries: 5

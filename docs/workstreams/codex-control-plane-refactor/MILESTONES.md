@@ -1,5 +1,10 @@
 # Fearless Refactor Milestones: Codex Control Plane
 
+> Historical status (superseded 2026-07-13): these milestones describe the
+> earlier station-first mutable control-plane workstream, not the current remote
+> API or operator-read contract. See [Configuration](../../CONFIGURATION.md) and
+> the [canonical relay/runtime modernization plan](../../plans/2026-07-10-002-refactor-canonical-relay-runtime-modernization-plan.md).
+
 > 中文速览：这些里程碑按“先建立会话语义，再补控制模板，再做站点管理和高可用，最后承接局域网共享与远程 UI”的顺序排列。每个阶段都要求能回答一个更清晰的问题，而不是只堆功能。
 
 ## Milestone Strategy

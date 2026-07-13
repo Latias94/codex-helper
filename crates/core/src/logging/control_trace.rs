@@ -8,39 +8,28 @@ pub enum ControlTraceDetail {
         path: Option<String>,
         status_code: Option<u16>,
         duration_ms: Option<u64>,
-        station_name: Option<String>,
         provider_id: Option<String>,
-        upstream_base_url: Option<String>,
+        endpoint_id: Option<String>,
+        provider_endpoint_key: Option<String>,
+        upstream_origin: Option<String>,
         service_tier: ServiceTierLog,
     },
     RetryOptions {
         upstream_max_attempts: Option<u32>,
         provider_max_attempts: Option<u32>,
-        allow_cross_station_before_first_output: Option<bool>,
     },
     AttemptSelect {
-        station_name: Option<String>,
-        upstream_index: Option<u64>,
-        upstream_base_url: Option<String>,
+        upstream_origin: Option<String>,
         provider_id: Option<String>,
         endpoint_id: Option<String>,
         provider_endpoint_key: Option<String>,
         preference_group: Option<u64>,
         model: Option<String>,
     },
-    LoadBalancerSelection {
-        mode: Option<String>,
-        pinned_source: Option<String>,
-        pinned_name: Option<String>,
-        selected_station: Option<String>,
-        selected_stations: Vec<String>,
-        active_station: Option<String>,
-        note: Option<String>,
-    },
     ProviderRuntimeOverride {
         provider_name: Option<String>,
         endpoint_name: Option<String>,
-        base_urls: Vec<String>,
+        upstream_origins: Vec<String>,
         enabled: Option<bool>,
         clear_enabled: bool,
         runtime_state: Option<String>,
@@ -65,8 +54,7 @@ pub enum ControlTraceDetail {
     },
     RetryEvent {
         event_name: String,
-        station_name: Option<String>,
-        upstream_base_url: Option<String>,
+        upstream_origin: Option<String>,
         mode: Option<String>,
         note: Option<String>,
     },
@@ -131,20 +119,6 @@ fn control_trace_enabled() -> bool {
     *ENABLED.get_or_init(|| env_bool_default("CODEX_HELPER_CONTROL_TRACE", true))
 }
 
-fn retry_trace_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_bool("CODEX_HELPER_RETRY_TRACE"))
-}
-
-fn retry_trace_path() -> PathBuf {
-    std::env::var("CODEX_HELPER_RETRY_TRACE_PATH")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| proxy_home_dir().join("logs").join("retry_trace.jsonl"))
-}
-
 fn control_trace_read_window(limit: usize) -> usize {
     limit.saturating_mul(4).clamp(80, 400)
 }
@@ -198,13 +172,12 @@ fn read_recent_control_trace_entries_from_path(
 }
 
 fn hydrate_control_trace_entry(mut entry: ControlTraceLogEntry) -> ControlTraceLogEntry {
+    sanitize_control_trace_payload(&mut entry.payload);
     if entry.trace_id.is_none() {
         entry.trace_id = entry.resolved_trace_id();
     }
-    if entry.detail.is_none() {
-        entry.detail =
-            infer_control_trace_detail(entry.kind.as_str(), entry.event.as_deref(), &entry.payload);
-    }
+    entry.detail =
+        infer_control_trace_detail(entry.kind.as_str(), entry.event.as_deref(), &entry.payload);
     entry
 }
 
@@ -273,6 +246,81 @@ fn json_string_vec_field(value: &JsonValue, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn json_upstream_origin_field(value: &JsonValue, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| json_string_field(value, key))
+        .and_then(|value| upstream_origin(value.as_str()))
+}
+
+fn json_upstream_origins_field(value: &JsonValue, keys: &[&str]) -> Vec<String> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(JsonValue::as_array))
+        .into_iter()
+        .flatten()
+        .filter_map(JsonValue::as_str)
+        .filter_map(upstream_origin)
+        .collect()
+}
+
+fn sanitize_control_trace_payload(value: &mut JsonValue) {
+    let JsonValue::Object(fields) = value else {
+        if let JsonValue::Array(values) = value {
+            values.iter_mut().for_each(sanitize_control_trace_payload);
+        }
+        return;
+    };
+
+    fields.values_mut().for_each(sanitize_control_trace_payload);
+
+    let existing_origin = fields
+        .remove("upstream_origin")
+        .and_then(|value| value.as_str().and_then(upstream_origin));
+    let legacy_url_values = ["upstream_base_url", "base_url", "target_url"]
+        .into_iter()
+        .filter_map(|key| fields.remove(key))
+        .collect::<Vec<_>>();
+    let derived_origin = legacy_url_values
+        .into_iter()
+        .find_map(|value| value.as_str().and_then(upstream_origin));
+    if let Some(origin) = existing_origin.or(derived_origin) {
+        fields.insert("upstream_origin".to_string(), JsonValue::String(origin));
+    }
+
+    let existing_effective_origin = fields.remove("effective_upstream_origin");
+    let legacy_effective_base_url = fields.remove("effective_upstream_base_url");
+    if let Some(effective) = existing_effective_origin.or(legacy_effective_base_url) {
+        let origin = effective
+            .get("value")
+            .and_then(JsonValue::as_str)
+            .and_then(upstream_origin);
+        if let Some(origin) = origin {
+            let mut redacted = serde_json::Map::new();
+            redacted.insert("value".to_string(), JsonValue::String(origin));
+            if let Some(source) = effective.get("source").cloned() {
+                redacted.insert("source".to_string(), source);
+            }
+            fields.insert(
+                "effective_upstream_origin".to_string(),
+                JsonValue::Object(redacted),
+            );
+        }
+    }
+
+    let existing_origins = fields.remove("upstream_origins");
+    let legacy_base_urls = fields.remove("base_urls");
+    let origins = existing_origins
+        .or(legacy_base_urls)
+        .and_then(|value| value.as_array().cloned())
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str().and_then(upstream_origin))
+        .map(JsonValue::String)
+        .collect::<Vec<_>>();
+    if !origins.is_empty() {
+        fields.insert("upstream_origins".to_string(), JsonValue::Array(origins));
+    }
+}
+
 fn json_u64_vec_field(value: &JsonValue, key: &str) -> Vec<u64> {
     value
         .get(key)
@@ -338,32 +386,35 @@ fn infer_control_trace_detail(
             path: json_string_field(payload, "path"),
             status_code: json_u16_field(payload, "status_code"),
             duration_ms: json_u64_field(payload, "duration_ms"),
-            station_name: json_string_field(payload, "station_name"),
             provider_id: json_string_field(payload, "provider_id"),
-            upstream_base_url: json_string_field(payload, "upstream_base_url"),
+            endpoint_id: json_string_field(payload, "endpoint_id"),
+            provider_endpoint_key: json_string_field(payload, "provider_endpoint_key"),
+            upstream_origin: json_upstream_origin_field(
+                payload,
+                &["upstream_origin", "upstream_base_url"],
+            ),
             service_tier: json_service_tier_field(payload),
         }),
-        "retry_trace" => infer_retry_control_trace_detail(event, payload),
+        "control_event" => infer_control_event_detail(event, payload),
         _ => None,
     }
 }
 
-fn infer_retry_control_trace_detail(
+fn infer_control_event_detail(
     event: Option<&str>,
     payload: &JsonValue,
 ) -> Option<ControlTraceDetail> {
     let event_name = event
         .map(str::to_string)
         .or_else(|| json_string_field(payload, "event"))
-        .unwrap_or_else(|| "retry_trace".to_string());
+        .unwrap_or_else(|| "control_event".to_string());
 
     match event_name.as_str() {
         "attempt_select" => Some(ControlTraceDetail::AttemptSelect {
-            station_name: json_nested_string_field(payload, &["compatibility", "station_name"])
-                .or_else(|| json_string_field(payload, "station_name")),
-            upstream_index: json_nested_u64_field(payload, &["compatibility", "upstream_index"])
-                .or_else(|| json_u64_field(payload, "upstream_index")),
-            upstream_base_url: json_string_field(payload, "upstream_base_url"),
+            upstream_origin: json_upstream_origin_field(
+                payload,
+                &["upstream_origin", "upstream_base_url"],
+            ),
             provider_id: json_string_field(payload, "provider_id"),
             endpoint_id: json_string_field(payload, "endpoint_id"),
             provider_endpoint_key: json_string_field(payload, "provider_endpoint_key"),
@@ -375,24 +426,14 @@ fn infer_retry_control_trace_detail(
                 .and_then(|value| u32::try_from(value).ok()),
             provider_max_attempts: json_nested_u64_field(payload, &["provider", "max_attempts"])
                 .and_then(|value| u32::try_from(value).ok()),
-            allow_cross_station_before_first_output: json_bool_field(
-                payload,
-                "allow_cross_station_before_first_output",
-            ),
-        }),
-        "lbs_for_request" => Some(ControlTraceDetail::LoadBalancerSelection {
-            mode: json_string_field(payload, "mode"),
-            pinned_source: json_string_field(payload, "pinned_source"),
-            pinned_name: json_string_field(payload, "pinned_name"),
-            selected_station: json_string_field(payload, "selected_station"),
-            selected_stations: json_string_vec_field(payload, "selected_stations"),
-            active_station: json_string_field(payload, "active_station"),
-            note: json_string_field(payload, "note"),
         }),
         "provider_runtime_override" => Some(ControlTraceDetail::ProviderRuntimeOverride {
             provider_name: json_string_field(payload, "provider_name"),
             endpoint_name: json_string_field(payload, "endpoint_name"),
-            base_urls: json_string_vec_field(payload, "base_urls"),
+            upstream_origins: json_upstream_origins_field(
+                payload,
+                &["upstream_origins", "base_urls"],
+            ),
             enabled: json_bool_field(payload, "enabled"),
             clear_enabled: json_bool_field(payload, "clear_enabled").unwrap_or(false),
             runtime_state: json_string_field(payload, "runtime_state"),
@@ -401,9 +442,15 @@ fn infer_retry_control_trace_detail(
         "route_graph_selection_explain" => Some(route_graph_selection_explain_detail(payload)),
         _ => Some(ControlTraceDetail::RetryEvent {
             event_name,
-            station_name: json_string_field(payload, "station_name")
-                .or_else(|| json_string_field(payload, "selected_station")),
-            upstream_base_url: json_string_field(payload, "upstream_base_url"),
+            upstream_origin: json_upstream_origin_field(
+                payload,
+                &[
+                    "upstream_origin",
+                    "upstream_base_url",
+                    "base_url",
+                    "target_url",
+                ],
+            ),
             mode: json_string_field(payload, "mode"),
             note: json_string_field(payload, "note"),
         }),
@@ -489,8 +536,9 @@ fn make_control_trace_entry(
     request_id: Option<u64>,
     event: Option<&str>,
     ts_ms: u64,
-    payload: JsonValue,
+    mut payload: JsonValue,
 ) -> ControlTraceLogEntry {
+    sanitize_control_trace_payload(&mut payload);
     let detail = infer_control_trace_detail(kind, event, &payload);
     let trace_id = derive_control_trace_id(None, service, request_id, &payload);
     ControlTraceLogEntry {
@@ -505,13 +553,7 @@ fn make_control_trace_entry(
     }
 }
 
-pub fn log_retry_trace(mut event: JsonValue) {
-    let legacy_enabled = retry_trace_enabled();
-    let unified_enabled = control_trace_enabled();
-    if !legacy_enabled && !unified_enabled {
-        return;
-    }
-
+fn make_control_trace_event_entry(mut event: JsonValue) -> ControlTraceLogEntry {
     if let JsonValue::Object(ref mut obj) = event {
         obj.entry("ts_ms".to_string())
             .or_insert_with(|| JsonValue::Number(serde_json::Number::from(now_ms())));
@@ -521,28 +563,30 @@ pub fn log_retry_trace(mut event: JsonValue) {
     let service = json_string_field(&event, "service");
     let request_id = json_u64_field(&event, "request_id");
     let event_name = json_string_field(&event, "event");
-    let opt = request_log_options();
-    let _guard = match log_lock().lock() {
-        Ok(g) => g,
-        Err(e) => e.into_inner(),
-    };
-
-    if legacy_enabled {
-        let path = retry_trace_path();
-        if let Ok(line) = serde_json::to_string(&event) {
-            let _ = append_json_line(&path, opt, &line);
-        }
-    }
-
-    append_control_trace_payload(
-        opt,
-        "retry_trace",
+    make_control_trace_entry(
+        "control_event",
         service.as_deref(),
         request_id,
         event_name.as_deref(),
         ts_ms,
         event,
-    );
+    )
+}
+
+pub fn log_control_trace_event(event: JsonValue) {
+    if !control_trace_enabled() {
+        return;
+    }
+
+    let opt = request_log_options();
+    let entry = make_control_trace_event_entry(event);
+    let _guard = match log_lock().lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    if let Ok(line) = serde_json::to_string(&entry) {
+        let _ = append_json_line(&control_trace_path(), opt, &line);
+    }
 }
 
 #[cfg(test)]
@@ -576,30 +620,24 @@ mod tests {
     }
 
     #[test]
-    fn make_control_trace_entry_keeps_kind_event_and_request_id() {
-        let entry = make_control_trace_entry(
-            "retry_trace",
-            Some("codex"),
-            Some(7),
-            Some("attempt_select"),
-            123,
-            serde_json::json!({
-                "event": "attempt_select",
-                "service": "codex",
-                "request_id": 7,
-                "provider_id": "monthly",
-                "endpoint_id": "default",
-                "provider_endpoint_key": "codex/monthly/default",
-                "preference_group": 0,
-                "compatibility": {
-                    "station_name": "routing",
-                    "upstream_index": 0
-                },
-            }),
-        );
+    fn make_control_trace_event_entry_ignores_legacy_nested_compatibility() {
+        let entry = make_control_trace_event_entry(serde_json::json!({
+            "ts_ms": 123,
+            "event": "attempt_select",
+            "service": "codex",
+            "request_id": 7,
+            "provider_id": "monthly",
+            "endpoint_id": "default",
+            "provider_endpoint_key": "codex/monthly/default",
+            "preference_group": 0,
+            "compatibility": {
+                "station_name": "routing",
+                "upstream_index": 0
+            },
+        }));
 
         let value = serde_json::to_value(entry).expect("serialize control trace entry");
-        assert_eq!(value["kind"].as_str(), Some("retry_trace"));
+        assert_eq!(value["kind"].as_str(), Some("control_event"));
         assert_eq!(value["event"].as_str(), Some("attempt_select"));
         assert_eq!(value["request_id"].as_u64(), Some(7));
         assert_eq!(value["trace_id"].as_str(), Some("codex-7"));
@@ -611,15 +649,15 @@ mod tests {
             Some("codex/monthly/default")
         );
         assert_eq!(value["detail"]["preference_group"].as_u64(), Some(0));
-        assert_eq!(value["detail"]["station_name"].as_str(), Some("routing"));
-        assert_eq!(value["detail"]["upstream_index"].as_u64(), Some(0));
+        assert!(value["detail"].get("station_name").is_none());
+        assert!(value["detail"].get("upstream_index").is_none());
     }
 
     #[test]
-    fn hydrate_control_trace_entry_adds_trace_id_to_legacy_event() {
+    fn hydrate_control_trace_entry_adds_trace_id_to_event_without_derived_fields() {
         let entry: ControlTraceLogEntry = serde_json::from_value(serde_json::json!({
             "ts_ms": 1,
-            "kind": "retry_trace",
+            "kind": "control_event",
             "service": "codex",
             "request_id": 7,
             "event": "attempt_select",
@@ -628,7 +666,7 @@ mod tests {
                 "station_name": "right"
             }
         }))
-        .expect("deserialize legacy control trace");
+        .expect("deserialize control trace");
 
         let entry = hydrate_control_trace_entry(entry);
 
@@ -636,9 +674,7 @@ mod tests {
         assert_eq!(
             entry.detail,
             Some(ControlTraceDetail::AttemptSelect {
-                station_name: Some("right".to_string()),
-                upstream_index: None,
-                upstream_base_url: None,
+                upstream_origin: None,
                 provider_id: None,
                 endpoint_id: None,
                 provider_endpoint_key: None,
@@ -673,7 +709,7 @@ mod tests {
     fn resolved_trace_id_prefers_payload_trace_id() {
         let entry: ControlTraceLogEntry = serde_json::from_value(serde_json::json!({
             "ts_ms": 1,
-            "kind": "retry_trace",
+            "kind": "control_event",
             "service": "codex",
             "request_id": 7,
             "payload": {
@@ -688,7 +724,7 @@ mod tests {
     }
 
     #[test]
-    fn control_trace_entry_resolved_detail_infers_request_completed_from_legacy_payload() {
+    fn control_trace_entry_resolved_detail_infers_request_completed_from_payload() {
         let entry: ControlTraceLogEntry = serde_json::from_value(serde_json::json!({
             "ts_ms": 1,
             "kind": "request_completed",
@@ -702,6 +738,8 @@ mod tests {
                 "duration_ms": 321,
                 "station_name": "right",
                 "provider_id": "right",
+                "endpoint_id": "default",
+                "provider_endpoint_key": "codex/right/default",
                 "service_tier": {
                     "effective": "priority"
                 }
@@ -716,9 +754,10 @@ mod tests {
                 path: Some("/v1/responses".to_string()),
                 status_code: Some(200),
                 duration_ms: Some(321),
-                station_name: Some("right".to_string()),
                 provider_id: Some("right".to_string()),
-                upstream_base_url: None,
+                endpoint_id: Some("default".to_string()),
+                provider_endpoint_key: Some("codex/right/default".to_string()),
+                upstream_origin: None,
                 service_tier: ServiceTierLog {
                     requested: None,
                     effective: Some("priority".to_string()),
@@ -732,7 +771,7 @@ mod tests {
     fn control_trace_entry_resolved_detail_infers_provider_runtime_override() {
         let entry: ControlTraceLogEntry = serde_json::from_value(serde_json::json!({
             "ts_ms": 1,
-            "kind": "retry_trace",
+            "kind": "control_event",
             "service": "codex",
             "event": "provider_runtime_override",
             "payload": {
@@ -753,7 +792,7 @@ mod tests {
             Some(ControlTraceDetail::ProviderRuntimeOverride {
                 provider_name: Some("alpha".to_string()),
                 endpoint_name: Some("default".to_string()),
-                base_urls: vec!["https://alpha.example/v1".to_string()],
+                upstream_origins: vec!["https://alpha.example".to_string()],
                 enabled: Some(false),
                 clear_enabled: false,
                 runtime_state: Some("breaker_open".to_string()),
@@ -763,10 +802,64 @@ mod tests {
     }
 
     #[test]
+    fn hydrate_control_trace_redacts_legacy_upstream_urls_with_url_parser() {
+        let poisoned =
+            "https://user:secret@relay.example.test:8443/private/secret-path?token=hidden#fragment";
+        let entry: ControlTraceLogEntry = serde_json::from_value(serde_json::json!({
+            "ts_ms": 1,
+            "kind": "control_event",
+            "service": "codex",
+            "request_id": 7,
+            "event": "attempt_select",
+            "payload": {
+                "event": "attempt_select",
+                "provider_id": "relay",
+                "endpoint_id": "default",
+                "provider_endpoint_key": "codex/relay/default",
+                "upstream_base_url": poisoned,
+                "base_url": poisoned,
+                "target_url": poisoned,
+                "route_decision": {
+                    "effective_upstream_base_url": {
+                        "value": poisoned,
+                        "source": "runtime_fallback"
+                    }
+                }
+            }
+        }))
+        .expect("deserialize legacy control trace");
+
+        let entry = hydrate_control_trace_entry(entry);
+        let text = serde_json::to_string(&entry).expect("serialize redacted control trace");
+        let value = serde_json::to_value(&entry).expect("control trace value");
+
+        assert_eq!(
+            value["payload"]["upstream_origin"].as_str(),
+            Some("https://relay.example.test:8443")
+        );
+        assert_eq!(
+            value["detail"]["provider_endpoint_key"].as_str(),
+            Some("codex/relay/default")
+        );
+        assert_eq!(
+            value["detail"]["upstream_origin"].as_str(),
+            Some("https://relay.example.test:8443")
+        );
+        assert_eq!(
+            value["payload"]["route_decision"]["effective_upstream_origin"]["value"].as_str(),
+            Some("https://relay.example.test:8443")
+        );
+        for secret in ["user:secret", "secret-path", "token=hidden", "fragment"] {
+            assert!(!text.contains(secret));
+        }
+        assert!(!text.contains("upstream_base_url"));
+    }
+
+    #[test]
     fn control_trace_entry_resolved_detail_infers_route_graph_selection_explain() {
         let entry: ControlTraceLogEntry = serde_json::from_value(serde_json::json!({
             "ts_ms": 1,
-            "kind": "retry_trace",
+            "kind": "control_event",
             "service": "codex",
             "request_id": 42,
             "event": "route_graph_selection_explain",

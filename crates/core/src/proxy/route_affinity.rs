@@ -1,10 +1,35 @@
 use crate::logging::{RouteAttemptLog, now_ms};
 use crate::routing_ir::{RoutePlanRuntimeState, RoutePlanTemplate};
-use crate::runtime_identity::ProviderEndpointKey;
-use crate::state::{SessionIdentitySource, SessionRouteAffinityTarget};
+use crate::state::{ProxyState, SessionIdentitySource, SessionRouteAffinityTarget};
 
 use super::ProxyService;
-use super::attempt_target::AttemptTarget;
+use crate::routing_ir::CapturedRouteCandidate;
+
+pub(super) struct SessionRouteAffinitySuccess {
+    session_id: String,
+    target: SessionRouteAffinityTarget,
+    reason_hint: Option<String>,
+}
+
+impl SessionRouteAffinitySuccess {
+    pub(super) async fn publish(self, state: &ProxyState) {
+        if let Err(error) = state
+            .record_session_route_affinity_success(
+                self.session_id.as_str(),
+                self.target,
+                self.reason_hint,
+                now_ms(),
+            )
+            .await
+        {
+            tracing::warn!(
+                session_id = self.session_id,
+                error = %error,
+                "failed to publish durable session route affinity"
+            );
+        }
+    }
+}
 
 pub(super) async fn apply_session_route_affinity_to_runtime(
     proxy: &ProxyService,
@@ -13,7 +38,7 @@ pub(super) async fn apply_session_route_affinity_to_runtime(
     route_graph_key: &str,
     runtime: &mut RoutePlanRuntimeState,
 ) {
-    // V4 route graphs must not inherit any previously cached affinity.
+    // A fresh route runtime must not inherit any previously cached affinity.
     // Session stickiness is isolated by session_id below.
     runtime.clear_affinity_provider_endpoint();
 
@@ -62,44 +87,48 @@ pub(super) async fn record_session_route_affinity_success(
     session_id: Option<&str>,
     session_identity_source: Option<SessionIdentitySource>,
     route_graph_key: Option<&str>,
-    target: &AttemptTarget,
+    target: &CapturedRouteCandidate,
     route_attempts: &[RouteAttemptLog],
     route_attempt_index: usize,
 ) {
-    let Some(session_id) = session_id.map(str::trim).filter(|value| !value.is_empty()) else {
+    let Some(success) = prepare_session_route_affinity_success(
+        session_id,
+        session_identity_source,
+        route_graph_key,
+        target,
+        route_attempts,
+        route_attempt_index,
+    ) else {
         return;
     };
-    let Some(route_graph_key) = route_graph_key else {
-        return;
-    };
-    let Some(provider_id) = target
-        .provider_id()
+    success.publish(proxy.state.as_ref()).await;
+}
+
+pub(super) fn prepare_session_route_affinity_success(
+    session_id: Option<&str>,
+    session_identity_source: Option<SessionIdentitySource>,
+    route_graph_key: Option<&str>,
+    target: &CapturedRouteCandidate,
+    route_attempts: &[RouteAttemptLog],
+    route_attempt_index: usize,
+) -> Option<SessionRouteAffinitySuccess> {
+    let session_id = session_id
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return;
-    };
-    let Some(endpoint_id) = target
-        .endpoint_id()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-    else {
-        return;
-    };
-    let provider_endpoint =
-        ProviderEndpointKey::new(proxy.service_name, provider_id.to_string(), endpoint_id);
+        .filter(|value| !value.is_empty())?;
+    let route_graph_key = route_graph_key?;
     let target = SessionRouteAffinityTarget {
         route_graph_key: route_graph_key.to_string(),
         session_identity_source,
-        provider_endpoint,
-        upstream_base_url: target.upstream().base_url.clone(),
-        route_path: target.route_path(),
+        provider_endpoint: target.provider_endpoint().clone(),
+        upstream_base_url: target.base_url().to_owned(),
+        route_path: target.route_path().to_vec(),
     };
     let reason_hint = route_affinity_change_reason(route_attempts, route_attempt_index);
-    proxy
-        .state
-        .record_session_route_affinity_success(session_id, target, reason_hint, now_ms())
-        .await;
+    Some(SessionRouteAffinitySuccess {
+        session_id: session_id.to_string(),
+        target,
+        reason_hint,
+    })
 }
 
 fn route_affinity_change_reason(
@@ -120,10 +149,7 @@ fn route_affinity_change_reason(
             if let Some(error_class) = attempt.error_class.as_deref() {
                 return format!("failover_after_{error_class}");
             }
-            if let Some(reason) = attempt.reason.as_deref() {
-                return format!("failover_after_{reason}");
-            }
-            format!("failover_after_{}", attempt.decision)
+            format!("failover_after_{}", attempt.stable_code())
         })
 }
 
@@ -149,6 +175,45 @@ mod tests {
         assert_eq!(
             route_affinity_change_reason(&attempts, 1).as_deref(),
             Some("failover_after_status_502")
+        );
+    }
+
+    #[test]
+    fn route_affinity_reason_uses_previous_error_class_without_status() {
+        let attempts = vec![
+            RouteAttemptLog {
+                decision: "failed_transport".to_string(),
+                error_class: Some("upstream_transport_error".to_string()),
+                ..RouteAttemptLog::default()
+            },
+            RouteAttemptLog {
+                decision: "completed".to_string(),
+                ..RouteAttemptLog::default()
+            },
+        ];
+
+        assert_eq!(
+            route_affinity_change_reason(&attempts, 1).as_deref(),
+            Some("failover_after_upstream_transport_error")
+        );
+    }
+
+    #[test]
+    fn route_affinity_reason_falls_back_to_stable_attempt_code() {
+        let attempts = vec![
+            RouteAttemptLog {
+                decision: "failed_target_build".to_string(),
+                ..RouteAttemptLog::default()
+            },
+            RouteAttemptLog {
+                decision: "completed".to_string(),
+                ..RouteAttemptLog::default()
+            },
+        ];
+
+        assert_eq!(
+            route_affinity_change_reason(&attempts, 1).as_deref(),
+            Some("failover_after_failed_target_build")
         );
     }
 }

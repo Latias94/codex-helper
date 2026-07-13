@@ -3,6 +3,8 @@
 Status: Implemented
 Last updated: 2026-05-19
 
+> Historical status (superseded 2026-07-12): the manual TUI diagnostic remains, but it now renders provider contract decisions, observations, continuity, and mismatches without patch-mode recommendations. Capability diagnostics are process-local and are not exposed through a remote mutation endpoint.
+
 ## Current State
 
 Core diagnostics are reusable through `ProxyService::codex_relay_capabilities`. TUI Settings now exposes a manual `C` action that runs a bounded async diagnostic and renders expected/observed/mismatch/recommendation details. Docs and changelog have been updated, and final targeted plus package gates pass.

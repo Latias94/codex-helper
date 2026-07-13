@@ -1,27 +1,15 @@
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
+use codex_helper_core::codex_switch::{self, CodexSwitchIntent, ValidatedCodexBaseUrl};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::codex_integration::{self, CodexPatchMode};
-use crate::config::{
-    bootstrap::overwrite_codex_config_from_codex_cli_in_place,
-    proxy_home_dir,
-    storage::{load_config, save_config},
-};
-use crate::proxy::ProxyService;
+use crate::config::proxy_home_dir;
 use crate::sessions::find_codex_session_file_by_id;
-use crate::state::ProxyState;
 use crate::tui::Language;
-use crate::tui::codex_relay_diagnostics::request_codex_relay_diagnostics;
-use crate::tui::codex_relay_live_smoke::{
-    CodexRelayLiveSmokeMode, confirm_or_request_codex_relay_live_smoke,
-};
 use crate::tui::i18n::{self, msg};
 use crate::tui::model::{
-    CODEX_RECENT_WINDOWS, ProviderOption, Snapshot, codex_recent_window_label,
-    codex_recent_window_threshold_ms, filtered_requests_len, find_session_idx, now_ms,
-    session_row_has_any_override, short_sid,
+    CODEX_RECENT_WINDOWS, Snapshot, codex_recent_window_label, codex_recent_window_threshold_ms,
+    filtered_requests_len, find_session_idx, now_ms, short_sid,
 };
 use crate::tui::report::build_stats_report;
 use crate::tui::state::{
@@ -30,31 +18,54 @@ use crate::tui::state::{
 use crate::tui::types::{Focus, Overlay, Page, StatsFocus};
 
 use super::KeyEventContext;
-use super::balance::{BalanceRefreshMode, request_provider_balance_refresh};
-use super::health::{
-    begin_station_health_check, load_upstreams_for_station, spawn_all_station_health_checks,
-    spawn_station_health_check,
-};
 use super::history_bridge::{
-    host_transcript_path_from_row, prepare_select_history_from_external,
-    recent_history_summary_from_row, request_history_summary_from_request,
-    selected_dashboard_request, selected_recent_row, selected_request_page_request,
-    session_history_summary_from_row,
-};
-use super::profile::{
-    default_profile_menu_idx, refresh_profile_control_state, runtime_default_profile_menu_idx,
-};
-use super::routing::{
-    apply_global_route_target_pin, invalidate_route_target_preview, open_routing_editor,
-    refresh_route_graph_balances, refresh_routing_control_state,
-};
-use super::routing_menu::handle_key_routing_menu;
-use super::session_overrides::{
-    add_model_option_if_missing, apply_effort_override, current_model_override,
-    current_service_tier_override, load_model_options_for_service, selected_session_model_hint,
-    selected_session_service_tier_hint,
+    host_transcript_path_from_row, local_session_id_for_opaque_key,
+    prepare_select_history_from_external, recent_history_summary_from_row,
+    request_history_summary_from_request, selected_dashboard_request, selected_recent_row,
+    selected_request_page_request, session_history_summary_from_row,
 };
 use super::transcript::open_session_transcript_from_path;
+
+pub(in crate::tui) fn codex_switch_intent_for_key(
+    code: KeyCode,
+    proxy_port: u16,
+) -> Option<CodexSwitchIntent> {
+    match code {
+        KeyCode::Char('n') => Some(CodexSwitchIntent::On {
+            validated_base_url: ValidatedCodexBaseUrl::local(proxy_port),
+        }),
+        KeyCode::Char('o') => Some(CodexSwitchIntent::Off),
+        _ => None,
+    }
+}
+
+pub(in crate::tui) fn apply_codex_switch(ui: &mut UiState, intent: CodexSwitchIntent) {
+    let action = if matches!(&intent, CodexSwitchIntent::On { .. }) {
+        "on"
+    } else {
+        "off"
+    };
+    let message = match codex_switch::apply(intent) {
+        Ok(outcome) => match ui.language {
+            Language::Zh => format!(
+                "Codex 本地 switch {action}：{}（phase={}）；重启已有 Codex app 后生效",
+                outcome.change.as_str(),
+                outcome.status.phase.as_str()
+            ),
+            Language::En => format!(
+                "Codex local switch {action}: {} (phase={}); restart existing Codex apps to apply it",
+                outcome.change.as_str(),
+                outcome.status.phase.as_str()
+            ),
+        },
+        Err(err) => match ui.language {
+            Language::Zh => format!("Codex 本地 switch {action} 失败：{err}"),
+            Language::En => format!("Codex local switch {action} failed: {err}"),
+        },
+    };
+    ui.toast = Some((message, Instant::now()));
+}
+
 pub(super) fn apply_page_shortcuts(ui: &mut UiState, code: KeyCode) -> bool {
     let previous_page = ui.page;
     let page = match code {
@@ -132,7 +143,6 @@ fn focus_session_in_sessions(ui: &mut UiState, snapshot: &Snapshot, sid: &str) -
 
     ui.sessions_page_active_only = false;
     ui.sessions_page_errors_only = false;
-    ui.sessions_page_overrides_only = false;
     ui.selected_sessions_page_idx = 0;
     ui.page = Page::Sessions;
     ui.focus = Focus::Sessions;
@@ -201,76 +211,13 @@ fn move_fleet_selection(ui: &mut UiState, delta: i32) -> bool {
     false
 }
 
-async fn apply_session_provider_override(state: &ProxyState, sid: String, cfg: Option<String>) {
-    let now = now_ms();
-    if let Some(cfg) = cfg {
-        state.set_session_station_override(sid, cfg, now).await;
-    } else {
-        state.clear_session_station_override(&sid).await;
-    }
-}
-
-async fn apply_session_route_target_override(
-    state: &ProxyState,
-    sid: String,
-    target: Option<String>,
-) {
-    let now = now_ms();
-    if let Some(target) = target {
-        state
-            .set_session_route_target_override(sid, target, now)
-            .await;
-    } else {
-        state.clear_session_route_target_override(&sid).await;
-    }
-}
-
-async fn clear_session_manual_overrides(state: &ProxyState, sid: String) {
-    state.clear_session_manual_overrides(&sid).await;
-}
-
-async fn apply_global_station_pin(
-    state: &ProxyState,
-    providers: &[ProviderOption],
-    station_name: Option<String>,
-) -> anyhow::Result<()> {
-    if let Some(name) = station_name.as_deref() {
-        if !providers.iter().any(|provider| provider.name == name) {
-            anyhow::bail!("unknown station: {name}");
-        }
-        state
-            .set_global_station_override(name.to_string(), now_ms())
-            .await;
-    } else {
-        state.clear_global_station_override().await;
-    }
-    Ok(())
-}
-
-async fn persist_ui_language(language: Language) -> anyhow::Result<()> {
-    let mut cfg = load_config().await?;
-    cfg.ui.language = Some(i18n::storage_code(language).to_string());
-    save_config(&cfg).await?;
-    Ok(())
-}
-
-pub(super) async fn toggle_language(ui: &mut UiState) {
+pub(super) fn toggle_language(ui: &mut UiState) {
     let next = i18n::next_language(ui.language);
     ui.language = next;
-    match persist_ui_language(next).await {
-        Ok(()) => {
-            ui.toast = Some((
-                i18n::format_language_saved(ui.language, next),
-                Instant::now(),
-            ));
-        }
-        Err(err) => {
-            ui.toast = Some((
-                i18n::format_language_save_failed(ui.language, next, &err),
-                Instant::now(),
-            ));
-        }
-    }
+    ui.toast = Some((
+        i18n::format_language_changed(ui.language, next),
+        Instant::now(),
+    ));
 }
 
 fn reports_dir() -> std::path::PathBuf {
@@ -334,18 +281,21 @@ pub(super) fn try_copy_to_clipboard(report: &str) -> anyhow::Result<()> {
 
 pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -> bool {
     let KeyEventContext {
-        state,
         providers,
         ui,
         snapshot,
-        proxy,
-        balance_refresh_tx,
-        codex_relay_diagnostics_tx,
-        codex_relay_live_smoke_tx,
     } = ctx;
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
         ui.should_exit = true;
+        return true;
+    }
+
+    if ui.page == Page::Settings
+        && ui.service_name == "codex"
+        && let Some(intent) = codex_switch_intent_for_key(key.code, ui.proxy_port)
+    {
+        apply_codex_switch(ui, intent);
         return true;
     }
 
@@ -355,311 +305,14 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
             true
         }
         KeyCode::Char('L') => {
-            toggle_language(ui).await;
+            toggle_language(ui);
             true
         }
         KeyCode::Char('?') => {
             ui.overlay = Overlay::Help;
             true
         }
-        KeyCode::Char('O') if ui.page == Page::Settings => {
-            if ui.service_name != "codex" {
-                ui.toast = Some((
-                    i18n::label(
-                        ui.language,
-                        "overwrite-from-codex is only supported for Codex service",
-                    )
-                    .to_string(),
-                    Instant::now(),
-                ));
-                return true;
-            }
-
-            let now = Instant::now();
-            if let Some(prev) = ui.pending_overwrite_from_codex_confirm_at
-                && now.duration_since(prev) <= Duration::from_secs(3)
-            {
-                ui.pending_overwrite_from_codex_confirm_at = None;
-            } else {
-                ui.pending_overwrite_from_codex_confirm_at = Some(now);
-                ui.toast = Some((
-                    i18n::text(ui.language, msg::CONFIRM_OVERWRITE).to_string(),
-                    now,
-                ));
-                return true;
-            }
-
-            match load_config().await {
-                Ok(mut cfg) => {
-                    if let Err(err) = overwrite_codex_config_from_codex_cli_in_place(&mut cfg) {
-                        ui.toast = Some((
-                            match ui.language {
-                                Language::Zh => format!("overwrite-from-codex 失败：{err}"),
-                                Language::En => format!("overwrite-from-codex failed: {err}"),
-                            },
-                            Instant::now(),
-                        ));
-                        return true;
-                    }
-                    if let Err(err) = save_config(&cfg).await {
-                        ui.toast = Some((
-                            match ui.language {
-                                Language::Zh => format!("保存失败：{err}"),
-                                Language::En => format!("save failed: {err}"),
-                            },
-                            Instant::now(),
-                        ));
-                        return true;
-                    }
-
-                    *providers = crate::tui::build_provider_options(&cfg, ui.service_name);
-                    ui.clamp_selection(snapshot, providers.len());
-                    let _ = refresh_profile_control_state(ui, proxy).await;
-                    ui.toast = Some((
-                        match ui.language {
-                            Language::Zh => {
-                                format!("已从 ~/.codex 覆盖导入站点（n={}）", providers.len())
-                            }
-                            Language::En => {
-                                format!("overwrote stations from ~/.codex (n={})", providers.len())
-                            }
-                        },
-                        Instant::now(),
-                    ));
-                    true
-                }
-                Err(err) => {
-                    ui.toast = Some((
-                        match ui.language {
-                            Language::Zh => format!("加载配置失败：{err}"),
-                            Language::En => format!("load config failed: {err}"),
-                        },
-                        Instant::now(),
-                    ));
-                    true
-                }
-            }
-        }
-        KeyCode::Char('B') if ui.page == Page::Settings && ui.service_name == "codex" => {
-            match codex_integration::switch_on_with_mode(
-                ui.proxy_port,
-                CodexPatchMode::ChatGptBridge,
-            ) {
-                Ok(()) => {
-                    ui.toast = Some((
-                        match ui.language {
-                            Language::Zh => {
-                                "已启用 ChatGPT bridge；重启已有 Codex app 后生效".to_string()
-                            }
-                            Language::En => {
-                                "ChatGPT bridge enabled; restart existing Codex apps to apply it"
-                                    .to_string()
-                            }
-                        },
-                        Instant::now(),
-                    ));
-                }
-                Err(err) => {
-                    ui.toast = Some((
-                        match ui.language {
-                            Language::Zh => format!("启用 ChatGPT bridge 失败：{err}"),
-                            Language::En => format!("enable ChatGPT bridge failed: {err}"),
-                        },
-                        Instant::now(),
-                    ));
-                }
-            }
-            true
-        }
-        KeyCode::Char('I') if ui.page == Page::Settings && ui.service_name == "codex" => {
-            match codex_integration::switch_on_with_mode(
-                ui.proxy_port,
-                CodexPatchMode::ImagegenBridge,
-            ) {
-                Ok(()) => {
-                    ui.toast = Some((
-                        match ui.language {
-                            Language::Zh => {
-                                "已启用 Imagegen bridge；重启已有 Codex app 后生效".to_string()
-                            }
-                            Language::En => {
-                                "Imagegen bridge enabled; restart existing Codex apps to apply it"
-                                    .to_string()
-                            }
-                        },
-                        Instant::now(),
-                    ));
-                }
-                Err(err) => {
-                    ui.toast = Some((
-                        match ui.language {
-                            Language::Zh => format!("启用 Imagegen bridge 失败：{err}"),
-                            Language::En => format!("enable Imagegen bridge failed: {err}"),
-                        },
-                        Instant::now(),
-                    ));
-                }
-            }
-            true
-        }
-        KeyCode::Char('F') if ui.page == Page::Settings && ui.service_name == "codex" => {
-            match codex_integration::switch_on_with_mode(
-                ui.proxy_port,
-                CodexPatchMode::OfficialRelayBridge,
-            ) {
-                Ok(()) => {
-                    ui.toast = Some((
-                        match ui.language {
-                            Language::Zh => {
-                                "已启用 Official relay preset；重启已有 Codex app 后生效"
-                                    .to_string()
-                            }
-                            Language::En => {
-                                "Official relay preset enabled; restart existing Codex apps to apply it"
-                                    .to_string()
-                            }
-                        },
-                        Instant::now(),
-                    ));
-                }
-                Err(err) => {
-                    ui.toast = Some((
-                        match ui.language {
-                            Language::Zh => format!("启用 Official relay preset 失败：{err}"),
-                            Language::En => {
-                                format!("enable Official relay preset failed: {err}")
-                            }
-                        },
-                        Instant::now(),
-                    ));
-                }
-            }
-            true
-        }
-        KeyCode::Char('V') if ui.page == Page::Settings && ui.service_name == "codex" => {
-            match codex_integration::switch_on_with_mode(
-                ui.proxy_port,
-                CodexPatchMode::OfficialImagegenBridge,
-            ) {
-                Ok(()) => {
-                    ui.toast = Some((
-                        match ui.language {
-                            Language::Zh => {
-                                "已启用 Official imagegen preset；重启已有 Codex app 后生效"
-                                    .to_string()
-                            }
-                            Language::En => {
-                                "Official imagegen preset enabled; restart existing Codex apps to apply it"
-                                    .to_string()
-                            }
-                        },
-                        Instant::now(),
-                    ));
-                }
-                Err(err) => {
-                    ui.toast = Some((
-                        match ui.language {
-                            Language::Zh => {
-                                format!("启用 Official imagegen preset 失败：{err}")
-                            }
-                            Language::En => {
-                                format!("enable Official imagegen preset failed: {err}")
-                            }
-                        },
-                        Instant::now(),
-                    ));
-                }
-            }
-            true
-        }
-        KeyCode::Char('D') if ui.page == Page::Settings && ui.service_name == "codex" => {
-            match codex_integration::switch_on_with_mode(ui.proxy_port, CodexPatchMode::Default) {
-                Ok(()) => {
-                    ui.toast = Some((
-                        match ui.language {
-                            Language::Zh => "已切回默认客户端 preset；重启已有 Codex app 后生效"
-                                .to_string(),
-                            Language::En => {
-                                "Default client preset enabled; restart existing Codex apps to apply it"
-                                    .to_string()
-                            }
-                        },
-                        Instant::now(),
-                    ));
-                }
-                Err(err) => {
-                    ui.toast = Some((
-                        match ui.language {
-                            Language::Zh => format!("切回默认 preset 失败：{err}"),
-                            Language::En => format!("enable default preset failed: {err}"),
-                        },
-                        Instant::now(),
-                    ));
-                }
-            }
-            true
-        }
-        KeyCode::Char('C') if ui.page == Page::Settings && ui.service_name == "codex" => {
-            request_codex_relay_diagnostics(ui, snapshot, proxy, codex_relay_diagnostics_tx)
-        }
-        KeyCode::Char('X') if ui.page == Page::Settings && ui.service_name == "codex" => {
-            confirm_or_request_codex_relay_live_smoke(
-                ui,
-                snapshot,
-                proxy,
-                codex_relay_live_smoke_tx,
-                CodexRelayLiveSmokeMode::CompactOnly,
-            )
-        }
-        KeyCode::Char('Y') if ui.page == Page::Settings && ui.service_name == "codex" => {
-            confirm_or_request_codex_relay_live_smoke(
-                ui,
-                snapshot,
-                proxy,
-                codex_relay_live_smoke_tx,
-                CodexRelayLiveSmokeMode::CompactAndImage,
-            )
-        }
-        KeyCode::Char('R') if ui.page == Page::Settings => {
-            let now = Instant::now();
-            match proxy.reload_runtime_config().await {
-                Ok(result) => {
-                    ui.last_runtime_config_loaded_at_ms = Some(result.status.loaded_at_ms);
-                    ui.last_runtime_config_source_mtime_ms = result.status.source_mtime_ms;
-                    ui.last_runtime_retry = Some(result.status.retry);
-                    ui.last_runtime_config_refresh_at = Some(now);
-                    let _ = refresh_profile_control_state(ui, proxy).await;
-
-                    ui.toast = Some((
-                        i18n::format_config_reloaded(ui.language, result.reloaded),
-                        now,
-                    ));
-                    true
-                }
-                Err(err) => {
-                    ui.toast = Some((
-                        match ui.language {
-                            Language::Zh => format!("重载失败：{err}"),
-                            Language::En => format!("reload failed: {err}"),
-                        },
-                        now,
-                    ));
-                    true
-                }
-            }
-        }
         KeyCode::Char('i') if ui.page == Page::Stations => {
-            if ui.uses_route_graph_routing() {
-                open_routing_editor(
-                    ui,
-                    snapshot,
-                    proxy,
-                    i18n::label(ui.language, "routing: provider details/edit"),
-                    balance_refresh_tx,
-                )
-                .await;
-                return true;
-            }
             ui.overlay = Overlay::StationInfo;
             ui.station_info_scroll = 0;
             true
@@ -675,8 +328,8 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                 ui.focus = Focus::Stations;
             } else if ui.page == Page::Stats {
                 ui.stats_focus = match ui.stats_focus {
-                    StatsFocus::Stations => StatsFocus::Providers,
-                    StatsFocus::Providers => StatsFocus::Stations,
+                    StatsFocus::ProviderEndpoints => StatsFocus::Providers,
+                    StatsFocus::Providers => StatsFocus::ProviderEndpoints,
                 };
                 ui.stats_provider_detail_scroll = 0;
                 ui.toast = Some((
@@ -684,7 +337,9 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                         "{}: {}",
                         i18n::label(ui.language, "focus"),
                         match ui.stats_focus {
-                            StatsFocus::Stations => i18n::label(ui.language, "station"),
+                            StatsFocus::ProviderEndpoints => {
+                                i18n::label(ui.language, "provider endpoint")
+                            }
                             StatsFocus::Providers => i18n::label(ui.language, "provider"),
                         }
                     ),
@@ -747,7 +402,7 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
         KeyCode::Up | KeyCode::Char('k') if ui.page == Page::Fleet => move_fleet_selection(ui, -1),
         KeyCode::Down | KeyCode::Char('j') if ui.page == Page::Fleet => move_fleet_selection(ui, 1),
         KeyCode::Up | KeyCode::Char('k') if ui.page == Page::Stations => {
-            let len = ui.station_page_rows_len(providers.len());
+            let len = providers.len();
             if let Some(next) = adjust_table_selection(&mut ui.stations_table, -1, len) {
                 ui.selected_station_idx = next;
                 return true;
@@ -755,7 +410,7 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
             false
         }
         KeyCode::Down | KeyCode::Char('j') if ui.page == Page::Stations => {
-            let len = ui.station_page_rows_len(providers.len());
+            let len = providers.len();
             if let Some(next) = adjust_table_selection(&mut ui.stations_table, 1, len) {
                 ui.selected_station_idx = next;
                 return true;
@@ -764,12 +419,12 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
         }
         KeyCode::Up | KeyCode::Char('k') if ui.page == Page::Stats => {
             match ui.stats_focus {
-                StatsFocus::Stations => {
-                    let len = snapshot.usage_day.station_rows.len();
+                StatsFocus::ProviderEndpoints => {
+                    let len = snapshot.usage_day.provider_endpoint_rows.len();
                     if let Some(next) =
-                        adjust_table_selection(&mut ui.stats_stations_table, -1, len)
+                        adjust_table_selection(&mut ui.stats_provider_endpoints_table, -1, len)
                     {
-                        ui.selected_stats_station_idx = next;
+                        ui.selected_stats_provider_endpoint_idx = next;
                         return true;
                     }
                 }
@@ -788,11 +443,12 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
         }
         KeyCode::Down | KeyCode::Char('j') if ui.page == Page::Stats => {
             match ui.stats_focus {
-                StatsFocus::Stations => {
-                    let len = snapshot.usage_day.station_rows.len();
-                    if let Some(next) = adjust_table_selection(&mut ui.stats_stations_table, 1, len)
+                StatsFocus::ProviderEndpoints => {
+                    let len = snapshot.usage_day.provider_endpoint_rows.len();
+                    if let Some(next) =
+                        adjust_table_selection(&mut ui.stats_provider_endpoints_table, 1, len)
                     {
-                        ui.selected_stats_station_idx = next;
+                        ui.selected_stats_provider_endpoint_idx = next;
                         return true;
                     }
                 }
@@ -883,369 +539,6 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
             }
             true
         }
-        KeyCode::Enter if ui.page == Page::Stations => {
-            if ui.uses_route_graph_routing() {
-                let Some(name) = ui.selected_route_graph_provider_name() else {
-                    return true;
-                };
-                match apply_global_route_target_pin(state, providers, Some(name.clone())).await {
-                    Ok(()) => {
-                        invalidate_route_target_preview(ui);
-                        ui.toast = Some((
-                            match ui.language {
-                                Language::Zh => format!("全局 route target：{name}"),
-                                Language::En => format!("global route target: {name}"),
-                            },
-                            Instant::now(),
-                        ));
-                    }
-                    Err(err) => {
-                        ui.toast = Some((
-                            match ui.language {
-                                Language::Zh => format!("设置全局 route target 失败：{err}"),
-                                Language::En => format!("set global route target failed: {err}"),
-                            },
-                            Instant::now(),
-                        ));
-                    }
-                }
-                return true;
-            }
-            let Some(name) = providers
-                .get(ui.selected_station_idx)
-                .map(|p| p.name.clone())
-            else {
-                return true;
-            };
-            match apply_global_station_pin(state, providers, Some(name.clone())).await {
-                Ok(()) => {
-                    ui.toast = Some((
-                        match ui.language {
-                            Language::Zh => format!("全局站点 pin：{name}"),
-                            Language::En => format!("global station pin: {name}"),
-                        },
-                        Instant::now(),
-                    ));
-                }
-                Err(err) => {
-                    ui.toast = Some((
-                        match ui.language {
-                            Language::Zh => format!("设置全局 pin 失败：{err}"),
-                            Language::En => format!("set global pin failed: {err}"),
-                        },
-                        Instant::now(),
-                    ));
-                }
-            }
-            true
-        }
-        KeyCode::Char('r') if ui.page == Page::Stations => {
-            open_routing_editor(
-                ui,
-                snapshot,
-                proxy,
-                i18n::label(ui.language, "routing: edit persisted policy/order"),
-                balance_refresh_tx,
-            )
-            .await;
-            true
-        }
-        KeyCode::Char('g') if ui.page == Page::Stations && ui.uses_route_graph_routing() => {
-            refresh_route_graph_balances(ui, snapshot, proxy, balance_refresh_tx).await;
-            true
-        }
-        KeyCode::Backspace | KeyCode::Delete if ui.page == Page::Stations => {
-            if ui.uses_route_graph_routing() {
-                match apply_global_route_target_pin(state, providers, None).await {
-                    Ok(()) => {
-                        invalidate_route_target_preview(ui);
-                        ui.toast = Some((
-                            match ui.language {
-                                Language::Zh => "全局 route target：<auto>",
-                                Language::En => "global route target: <auto>",
-                            }
-                            .to_string(),
-                            Instant::now(),
-                        ));
-                    }
-                    Err(err) => {
-                        ui.toast = Some((
-                            match ui.language {
-                                Language::Zh => format!("清除全局 route target 失败：{err}"),
-                                Language::En => format!("clear global route target failed: {err}"),
-                            },
-                            Instant::now(),
-                        ));
-                    }
-                }
-                return true;
-            }
-            match apply_global_station_pin(state, providers, None).await {
-                Ok(()) => {
-                    let message = match ui.language {
-                        Language::Zh => "全局站点 pin：<auto>",
-                        Language::En => "global station pin: <auto>",
-                    };
-                    ui.toast = Some((message.to_string(), Instant::now()));
-                }
-                Err(err) => {
-                    ui.toast = Some((
-                        match ui.language {
-                            Language::Zh => format!("设置全局 pin 失败：{err}"),
-                            Language::En => format!("set global pin failed: {err}"),
-                        },
-                        Instant::now(),
-                    ));
-                }
-            }
-            true
-        }
-        KeyCode::Char('o') if ui.page == Page::Stations => {
-            let Some(sid) = snapshot
-                .rows
-                .get(ui.selected_session_idx)
-                .and_then(|r| r.session_id.clone())
-            else {
-                let label = if ui.uses_route_graph_routing() {
-                    "session route target: <no session>"
-                } else {
-                    "session station override: <no session>"
-                };
-                ui.toast = Some((i18n::label(ui.language, label).to_string(), Instant::now()));
-                return true;
-            };
-            if ui.uses_route_graph_routing() {
-                let Some(name) = ui.selected_route_graph_provider_name() else {
-                    return true;
-                };
-                apply_session_route_target_override(state, sid, Some(name.clone())).await;
-                invalidate_route_target_preview(ui);
-                ui.toast = Some((
-                    match ui.language {
-                        Language::Zh => format!("会话 route target：{name}"),
-                        Language::En => format!("session route target: {name}"),
-                    },
-                    Instant::now(),
-                ));
-                return true;
-            }
-            let Some(pvd) = providers.get(ui.selected_station_idx) else {
-                return true;
-            };
-            apply_session_provider_override(state, sid, Some(pvd.name.clone())).await;
-            ui.toast = Some((
-                format!(
-                    "{}: {}",
-                    i18n::label(ui.language, "session station override"),
-                    pvd.name
-                ),
-                Instant::now(),
-            ));
-            true
-        }
-        KeyCode::Char('O') if ui.page == Page::Stations => {
-            let Some(sid) = snapshot
-                .rows
-                .get(ui.selected_session_idx)
-                .and_then(|r| r.session_id.clone())
-            else {
-                let label = if ui.uses_route_graph_routing() {
-                    "session route target: <no session>"
-                } else {
-                    "session station override: <no session>"
-                };
-                ui.toast = Some((i18n::label(ui.language, label).to_string(), Instant::now()));
-                return true;
-            };
-            if ui.uses_route_graph_routing() {
-                apply_session_route_target_override(state, sid.clone(), None).await;
-                state.clear_session_station_override(&sid).await;
-                invalidate_route_target_preview(ui);
-                ui.toast = Some((
-                    match ui.language {
-                        Language::Zh => "会话 route target：<清除>",
-                        Language::En => "session route target: <clear>",
-                    }
-                    .to_string(),
-                    Instant::now(),
-                ));
-                return true;
-            }
-            apply_session_provider_override(state, sid, None).await;
-            let message = i18n::label(ui.language, "session station override: <clear>");
-            ui.toast = Some((message.to_string(), Instant::now()));
-            true
-        }
-        KeyCode::Char('e')
-        | KeyCode::Char('f')
-        | KeyCode::Char('s')
-        | KeyCode::Char('1')
-        | KeyCode::Char('2')
-        | KeyCode::Char('0')
-        | KeyCode::Char('[')
-        | KeyCode::Char(']')
-        | KeyCode::Char('u')
-        | KeyCode::Char('d')
-            if ui.page == Page::Stations && ui.uses_route_graph_routing() =>
-        {
-            if ui.routing_spec.is_none()
-                && let Err(err) = refresh_routing_control_state(ui, proxy).await
-            {
-                ui.toast = Some((
-                    format!(
-                        "{}: {err}",
-                        i18n::label(ui.language, "routing: load failed")
-                    ),
-                    Instant::now(),
-                ));
-                return true;
-            }
-            ui.sync_routing_menu_with_station_selection();
-            let handled =
-                handle_key_routing_menu(providers, ui, snapshot, proxy, balance_refresh_tx, key)
-                    .await;
-            ui.sync_station_selection_with_routing_menu();
-            handled
-        }
-        KeyCode::Char('h') if ui.page == Page::Stations => {
-            if ui.uses_route_graph_routing() {
-                ui.toast = Some((
-                    i18n::label(ui.language, "routing: use g to refresh balances").to_string(),
-                    Instant::now(),
-                ));
-                return true;
-            }
-            let Some(pvd) = providers.get(ui.selected_station_idx) else {
-                return true;
-            };
-            let service_name = ui.service_name;
-            let station_name = pvd.name.clone();
-
-            let upstreams = match load_upstreams_for_station(service_name, &station_name).await {
-                Ok(v) => v,
-                Err(err) => {
-                    ui.toast = Some((
-                        format!(
-                            "{}: {err}",
-                            i18n::label(ui.language, "health check load failed")
-                        ),
-                        Instant::now(),
-                    ));
-                    return true;
-                }
-            };
-
-            if !begin_station_health_check(
-                state.as_ref(),
-                service_name,
-                &station_name,
-                upstreams.len(),
-            )
-            .await
-            {
-                ui.toast = Some((
-                    format!(
-                        "{}: {station_name}",
-                        i18n::label(ui.language, "health check already running")
-                    ),
-                    Instant::now(),
-                ));
-                return true;
-            }
-
-            ui.toast = Some((
-                format!(
-                    "{}: {station_name}",
-                    i18n::label(ui.language, "health check queued")
-                ),
-                Instant::now(),
-            ));
-            spawn_station_health_check(Arc::clone(state), service_name, station_name, upstreams);
-            true
-        }
-        KeyCode::Char('H') if ui.page == Page::Stations => {
-            if ui.uses_route_graph_routing() {
-                ui.toast = Some((
-                    i18n::label(ui.language, "routing: use g to refresh balances").to_string(),
-                    Instant::now(),
-                ));
-                return true;
-            }
-            let service_name = ui.service_name;
-            let stations = providers.iter().map(|p| p.name.clone()).collect::<Vec<_>>();
-            ui.toast = Some((
-                match ui.language {
-                    Language::Zh => format!("健康检查已排队：{} 个站点", stations.len()),
-                    Language::En => format!("health check queued: {} stations", stations.len()),
-                },
-                Instant::now(),
-            ));
-            spawn_all_station_health_checks(Arc::clone(state), service_name, stations);
-            true
-        }
-        KeyCode::Char('c') if ui.page == Page::Stations => {
-            if ui.uses_route_graph_routing() {
-                ui.toast = Some((
-                    i18n::label(ui.language, "routing: no health check is running").to_string(),
-                    Instant::now(),
-                ));
-                return true;
-            }
-            let Some(pvd) = providers.get(ui.selected_station_idx) else {
-                return true;
-            };
-            let now = now_ms();
-            if state
-                .request_cancel_station_health_check(ui.service_name, pvd.name.as_str(), now)
-                .await
-            {
-                ui.toast = Some((
-                    format!(
-                        "{}: {}",
-                        i18n::label(ui.language, "health check cancel requested"),
-                        pvd.name
-                    ),
-                    Instant::now(),
-                ));
-            } else {
-                ui.toast = Some((
-                    format!(
-                        "{}: {}",
-                        i18n::label(ui.language, "health check not running"),
-                        pvd.name
-                    ),
-                    Instant::now(),
-                ));
-            }
-            true
-        }
-        KeyCode::Char('C') if ui.page == Page::Stations => {
-            if ui.uses_route_graph_routing() {
-                ui.toast = Some((
-                    i18n::label(ui.language, "routing: no health check is running").to_string(),
-                    Instant::now(),
-                ));
-                return true;
-            }
-            let now = now_ms();
-            let mut count = 0usize;
-            for p in providers {
-                if state
-                    .request_cancel_station_health_check(ui.service_name, p.name.as_str(), now)
-                    .await
-                {
-                    count += 1;
-                }
-            }
-            ui.toast = Some((
-                match ui.language {
-                    Language::Zh => format!("已请求取消健康检查：{count} 个站点"),
-                    Language::En => format!("health check cancel requested: {count} stations"),
-                },
-                Instant::now(),
-            ));
-            true
-        }
         KeyCode::Char('a') if ui.page == Page::Sessions => {
             ui.sessions_page_active_only = !ui.sessions_page_active_only;
             ui.selected_sessions_page_idx = 0;
@@ -1274,24 +567,9 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
             ));
             true
         }
-        KeyCode::Char('v') if ui.page == Page::Sessions => {
-            ui.sessions_page_overrides_only = !ui.sessions_page_overrides_only;
-            ui.selected_sessions_page_idx = 0;
-            ui.toast = Some((
-                format!(
-                    "{}: {}={}",
-                    i18n::label(ui.language, "sessions filter"),
-                    i18n::label(ui.language, "overrides_only"),
-                    ui.sessions_page_overrides_only
-                ),
-                Instant::now(),
-            ));
-            true
-        }
         KeyCode::Char('r') if ui.page == Page::Sessions => {
             ui.sessions_page_active_only = false;
             ui.sessions_page_errors_only = false;
-            ui.sessions_page_overrides_only = false;
             ui.selected_sessions_page_idx = 0;
             ui.toast = Some((
                 i18n::label(ui.language, "sessions filter: reset").to_string(),
@@ -1311,274 +589,6 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
             ui.needs_codex_recent_refresh = true;
             ui.toast = Some((
                 i18n::text(ui.language, msg::RECENT_REFRESHING).to_string(),
-                Instant::now(),
-            ));
-            true
-        }
-        KeyCode::Char('b')
-            if ui.focus == Focus::Sessions
-                && matches!(ui.page, Page::Dashboard | Page::Sessions) =>
-        {
-            let Some(sid) = snapshot
-                .rows
-                .get(ui.selected_session_idx)
-                .and_then(|row| row.session_id.as_deref())
-            else {
-                ui.toast = Some((
-                    i18n::label(ui.language, "no session selected").to_string(),
-                    Instant::now(),
-                ));
-                return true;
-            };
-
-            match refresh_profile_control_state(ui, proxy).await {
-                Ok(()) if ui.profile_options.is_empty() => {
-                    ui.toast = Some((
-                        i18n::text(ui.language, msg::PROFILE_NO_OPTIONS).to_string(),
-                        Instant::now(),
-                    ));
-                }
-                Ok(()) => {
-                    let selected_profile = snapshot
-                        .rows
-                        .get(ui.selected_session_idx)
-                        .and_then(|row| row.binding_profile_name.as_deref());
-                    ui.profile_menu_idx =
-                        default_profile_menu_idx(&ui.profile_options, selected_profile);
-                    ui.overlay = Overlay::ProfileMenuSession;
-                    ui.toast = Some((
-                        match ui.language {
-                            Language::Zh => {
-                                format!("profile: 管理 {} 的绑定", short_sid(sid, 18))
-                            }
-                            Language::En => {
-                                format!("profile: manage binding for {}", short_sid(sid, 18))
-                            }
-                        },
-                        Instant::now(),
-                    ));
-                }
-                Err(e) => {
-                    ui.toast = Some((
-                        match ui.language {
-                            Language::Zh => format!("profile: 加载失败：{e}"),
-                            Language::En => format!("profile: load failed: {e}"),
-                        },
-                        Instant::now(),
-                    ));
-                }
-            }
-            true
-        }
-        KeyCode::Char('p') if ui.page == Page::Settings => {
-            match refresh_profile_control_state(ui, proxy).await {
-                Ok(()) if ui.profile_options.is_empty() => {
-                    ui.toast = Some((
-                        i18n::text(ui.language, msg::DEFAULT_PROFILE_NO_OPTIONS).to_string(),
-                        Instant::now(),
-                    ));
-                }
-                Ok(()) => {
-                    ui.profile_menu_idx = default_profile_menu_idx(
-                        &ui.profile_options,
-                        ui.configured_default_profile.as_deref(),
-                    );
-                    ui.overlay = Overlay::ProfileMenuDefaultPersisted;
-                    ui.toast = Some((
-                        i18n::text(ui.language, msg::DEFAULT_PROFILE_MANAGE_CONFIGURED).to_string(),
-                        Instant::now(),
-                    ));
-                }
-                Err(err) => {
-                    ui.toast = Some((
-                        match ui.language {
-                            Language::Zh => format!("default profile 加载失败：{err}"),
-                            Language::En => format!("default profile load failed: {err}"),
-                        },
-                        Instant::now(),
-                    ));
-                }
-            }
-            true
-        }
-        KeyCode::Char('P') if ui.page == Page::Settings => {
-            match refresh_profile_control_state(ui, proxy).await {
-                Ok(()) if ui.profile_options.is_empty() => {
-                    ui.toast = Some((
-                        i18n::text(ui.language, msg::RUNTIME_DEFAULT_PROFILE_NO_OPTIONS)
-                            .to_string(),
-                        Instant::now(),
-                    ));
-                }
-                Ok(()) => {
-                    ui.profile_menu_idx = runtime_default_profile_menu_idx(
-                        &ui.profile_options,
-                        ui.runtime_default_profile_override.as_deref(),
-                    );
-                    ui.overlay = Overlay::ProfileMenuDefaultRuntime;
-                    ui.toast = Some((
-                        i18n::text(ui.language, msg::RUNTIME_DEFAULT_PROFILE_MANAGE).to_string(),
-                        Instant::now(),
-                    ));
-                }
-                Err(err) => {
-                    ui.toast = Some((
-                        match ui.language {
-                            Language::Zh => {
-                                format!("runtime default profile 加载失败：{err}")
-                            }
-                            Language::En => {
-                                format!("runtime default profile load failed: {err}")
-                            }
-                        },
-                        Instant::now(),
-                    ));
-                }
-            }
-            true
-        }
-        KeyCode::Char('M')
-            if ui.focus == Focus::Sessions
-                && matches!(ui.page, Page::Dashboard | Page::Sessions) =>
-        {
-            let Some(sid) = snapshot
-                .rows
-                .get(ui.selected_session_idx)
-                .and_then(|row| row.session_id.as_deref())
-            else {
-                ui.toast = Some((
-                    i18n::label(ui.language, "no session selected").to_string(),
-                    Instant::now(),
-                ));
-                return true;
-            };
-
-            match load_model_options_for_service(ui.service_name).await {
-                Ok(mut models) => {
-                    let current = selected_session_model_hint(snapshot, ui);
-                    add_model_option_if_missing(&mut models, current.as_deref());
-                    if models.is_empty() {
-                        ui.toast = Some((
-                            i18n::text(ui.language, msg::MODEL_NO_CATALOG).to_string(),
-                            Instant::now(),
-                        ));
-                        return true;
-                    }
-
-                    let current_override = snapshot
-                        .rows
-                        .get(ui.selected_session_idx)
-                        .and_then(|row| row.override_model.as_deref())
-                        .unwrap_or("");
-                    ui.model_menu_idx = models
-                        .iter()
-                        .position(|model| model == current_override)
-                        .map(|idx| idx + 1)
-                        .unwrap_or(0);
-                    ui.session_model_options = models;
-                    ui.session_model_input =
-                        current_model_override(snapshot, ui).unwrap_or_default();
-                    ui.session_model_input_hint = selected_session_model_hint(snapshot, ui);
-                    ui.overlay = Overlay::ModelMenuSession;
-                    ui.toast = Some((
-                        match ui.language {
-                            Language::Zh => format!("model: 为 {} 选择目标", short_sid(sid, 18)),
-                            Language::En => {
-                                format!("model: select target for {}", short_sid(sid, 18))
-                            }
-                        },
-                        Instant::now(),
-                    ));
-                }
-                Err(err) => {
-                    ui.toast = Some((
-                        match ui.language {
-                            Language::Zh => format!("model: 加载失败：{err}"),
-                            Language::En => format!("model: load failed: {err}"),
-                        },
-                        Instant::now(),
-                    ));
-                }
-            }
-            true
-        }
-        KeyCode::Char('f')
-            if ui.focus == Focus::Sessions
-                && matches!(ui.page, Page::Dashboard | Page::Sessions) =>
-        {
-            let Some(sid) = snapshot
-                .rows
-                .get(ui.selected_session_idx)
-                .and_then(|row| row.session_id.as_deref())
-            else {
-                ui.toast = Some((
-                    i18n::label(ui.language, "no session selected").to_string(),
-                    Instant::now(),
-                ));
-                return true;
-            };
-
-            let current = snapshot
-                .rows
-                .get(ui.selected_session_idx)
-                .and_then(|row| row.override_service_tier.as_deref())
-                .unwrap_or("");
-            ui.service_tier_menu_idx = match current {
-                "default" => 1,
-                "priority" => 2,
-                "flex" => 3,
-                _ => 0,
-            };
-            ui.session_service_tier_input =
-                current_service_tier_override(snapshot, ui).unwrap_or_default();
-            ui.session_service_tier_input_hint = selected_session_service_tier_hint(snapshot, ui);
-            ui.overlay = Overlay::ServiceTierMenuSession;
-            ui.toast = Some((
-                match ui.language {
-                    Language::Zh => {
-                        format!("service_tier: 为 {} 选择目标", short_sid(sid, 18))
-                    }
-                    Language::En => {
-                        format!("service_tier: select target for {}", short_sid(sid, 18))
-                    }
-                },
-                Instant::now(),
-            ));
-            true
-        }
-        KeyCode::Char('R')
-            if ui.focus == Focus::Sessions
-                && matches!(ui.page, Page::Dashboard | Page::Sessions) =>
-        {
-            let Some(row) = snapshot.rows.get(ui.selected_session_idx) else {
-                ui.toast = Some((
-                    i18n::label(ui.language, "no session selected").to_string(),
-                    Instant::now(),
-                ));
-                return true;
-            };
-            let Some(sid) = row.session_id.clone() else {
-                ui.toast = Some((
-                    i18n::label(ui.language, "no session selected").to_string(),
-                    Instant::now(),
-                ));
-                return true;
-            };
-            if !session_row_has_any_override(row) {
-                ui.toast = Some((
-                    i18n::label(ui.language, "session overrides already clear").to_string(),
-                    Instant::now(),
-                ));
-                return true;
-            }
-
-            clear_session_manual_overrides(state, sid).await;
-            ui.needs_snapshot_refresh = true;
-            if ui.uses_route_graph_routing() && row.override_route_target.is_some() {
-                invalidate_route_target_preview(ui);
-            }
-            ui.toast = Some((
-                i18n::label(ui.language, "session manual overrides reset").to_string(),
                 Instant::now(),
             ));
             true
@@ -1645,10 +655,13 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                 ));
                 return true;
             };
-            let Some(sid) = row.session_id.as_deref() else {
+            let Some(local_sid) = row.local_command_session_id() else {
                 ui.toast = Some((
-                    i18n::label(ui.language, "sessions: selected row has no session id")
-                        .to_string(),
+                    i18n::label(
+                        ui.language,
+                        "sessions: selected row has no local session id",
+                    )
+                    .to_string(),
                     Instant::now(),
                 ));
                 return true;
@@ -1656,7 +669,7 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
             let path = if let Some(path) = host_transcript_path_from_row(row) {
                 Some(path)
             } else {
-                match find_codex_session_file_by_id(sid).await {
+                match find_codex_session_file_by_id(local_sid).await {
                     Ok(path) => path,
                     Err(e) => {
                         ui.toast = Some((
@@ -1678,7 +691,7 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                 ));
                 return true;
             };
-            let sid_label = short_sid(sid, 18);
+            let sid_label = short_sid(row.session_id.as_deref().unwrap_or(local_sid), 18);
             prepare_select_history_from_external(
                 ui,
                 summary,
@@ -1720,10 +733,13 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                 ));
                 return true;
             };
-            let Some(sid) = row.session_id.as_deref() else {
+            let Some(local_sid) = row.local_command_session_id() else {
                 ui.toast = Some((
-                    i18n::label(ui.language, "dashboard: selected row has no session id")
-                        .to_string(),
+                    i18n::label(
+                        ui.language,
+                        "dashboard: selected row has no local session id",
+                    )
+                    .to_string(),
                     Instant::now(),
                 ));
                 return true;
@@ -1731,7 +747,7 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
             let path = if let Some(path) = host_transcript_path_from_row(row) {
                 Some(path)
             } else {
-                match find_codex_session_file_by_id(sid).await {
+                match find_codex_session_file_by_id(local_sid).await {
                     Ok(path) => path,
                     Err(e) => {
                         ui.toast = Some((
@@ -1753,7 +769,7 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                 ));
                 return true;
             };
-            let sid_label = short_sid(sid, 18);
+            let sid_label = short_sid(row.session_id.as_deref().unwrap_or(local_sid), 18);
             prepare_select_history_from_external(
                 ui,
                 summary,
@@ -1769,25 +785,33 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
             true
         }
         KeyCode::Char('t') if ui.page == Page::Sessions => {
-            let Some(sid) = ui.selected_session_id.clone() else {
+            let Some(_opaque_sid) = ui.selected_session_id.as_deref() else {
                 ui.toast = Some((
                     i18n::label(ui.language, "no session selected").to_string(),
                     Instant::now(),
                 ));
                 return true;
             };
-            ui.session_transcript_sid = Some(sid.clone());
+            let Some(selected_row) = snapshot.rows.get(ui.selected_session_idx) else {
+                return true;
+            };
+            let Some(local_sid) = selected_row.local_command_session_id().map(str::to_owned) else {
+                ui.toast = Some((
+                    i18n::label(ui.language, "no local session selected").to_string(),
+                    Instant::now(),
+                ));
+                return true;
+            };
+            ui.session_transcript_sid = Some(local_sid.clone());
 
-            let selected_row = snapshot.rows.get(ui.selected_session_idx);
-            let resolved_path =
-                if let Some(path) = selected_row.and_then(host_transcript_path_from_row) {
-                    Ok(Some(path))
-                } else {
-                    find_codex_session_file_by_id(&sid).await
-                };
+            let resolved_path = if let Some(path) = host_transcript_path_from_row(selected_row) {
+                Ok(Some(path))
+            } else {
+                find_codex_session_file_by_id(&local_sid).await
+            };
             match resolved_path {
                 Ok(Some(path)) => {
-                    open_session_transcript_from_path(ui, sid, &path, Some(80)).await;
+                    open_session_transcript_from_path(ui, local_sid, &path, Some(80)).await;
                 }
                 Ok(None) => {
                     ui.toast = Some((
@@ -2001,7 +1025,7 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                 ));
                 return true;
             };
-            let Some(sid) = request.session_id.as_deref() else {
+            let Some(opaque_sid) = request.session_key.as_deref() else {
                 ui.toast = Some((
                     i18n::label(ui.language, "dashboard: selected request has no session id")
                         .to_string(),
@@ -2009,12 +1033,12 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                 ));
                 return true;
             };
-            if focus_session_in_sessions(ui, snapshot, sid) {
+            if focus_session_in_sessions(ui, snapshot, opaque_sid) {
                 ui.toast = Some((
                     format!(
                         "{} {}",
                         i18n::label(ui.language, "sessions: focused"),
-                        short_sid(sid, 18)
+                        short_sid(opaque_sid, 18)
                     ),
                     Instant::now(),
                 ));
@@ -2034,7 +1058,7 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                 ));
                 return true;
             };
-            let Some(sid) = request.session_id.as_deref() else {
+            let Some(opaque_sid) = request.session_key.as_deref() else {
                 ui.toast = Some((
                     i18n::label(ui.language, "dashboard: selected request has no session id")
                         .to_string(),
@@ -2042,7 +1066,18 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                 ));
                 return true;
             };
-            let path = match find_codex_session_file_by_id(sid).await {
+            let Some(local_sid) = local_session_id_for_opaque_key(snapshot, opaque_sid) else {
+                ui.toast = Some((
+                    i18n::label(
+                        ui.language,
+                        "dashboard: selected request has no local session id",
+                    )
+                    .to_string(),
+                    Instant::now(),
+                ));
+                return true;
+            };
+            let path = match find_codex_session_file_by_id(local_sid).await {
                 Ok(path) => path,
                 Err(e) => {
                     ui.toast = Some((
@@ -2055,15 +1090,8 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                     return true;
                 }
             };
-            let Some(summary) = request_history_summary_from_request(&request, path) else {
-                ui.toast = Some((
-                    i18n::label(ui.language, "history: failed to prepare request focus")
-                        .to_string(),
-                    Instant::now(),
-                ));
-                return true;
-            };
-            let sid_label = short_sid(sid, 18);
+            let summary = request_history_summary_from_request(&request, local_sid, path);
+            let sid_label = short_sid(opaque_sid, 18);
             prepare_select_history_from_external(
                 ui,
                 summary,
@@ -2297,7 +1325,7 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                 ));
                 return true;
             };
-            let Some(sid) = request.session_id.as_deref() else {
+            let Some(opaque_sid) = request.session_key.as_deref() else {
                 ui.toast = Some((
                     i18n::label(ui.language, "requests: selected request has no session id")
                         .to_string(),
@@ -2305,12 +1333,12 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                 ));
                 return true;
             };
-            if focus_session_in_sessions(ui, snapshot, sid) {
+            if focus_session_in_sessions(ui, snapshot, opaque_sid) {
                 ui.toast = Some((
                     format!(
                         "{} {}",
                         i18n::label(ui.language, "sessions: focused"),
-                        short_sid(sid, 18)
+                        short_sid(opaque_sid, 18)
                     ),
                     Instant::now(),
                 ));
@@ -2330,7 +1358,7 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                 ));
                 return true;
             };
-            let Some(sid) = request.session_id.as_deref() else {
+            let Some(opaque_sid) = request.session_key.as_deref() else {
                 ui.toast = Some((
                     i18n::label(ui.language, "requests: selected request has no session id")
                         .to_string(),
@@ -2338,7 +1366,18 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                 ));
                 return true;
             };
-            let path = match find_codex_session_file_by_id(sid).await {
+            let Some(local_sid) = local_session_id_for_opaque_key(snapshot, opaque_sid) else {
+                ui.toast = Some((
+                    i18n::label(
+                        ui.language,
+                        "requests: selected request has no local session id",
+                    )
+                    .to_string(),
+                    Instant::now(),
+                ));
+                return true;
+            };
+            let path = match find_codex_session_file_by_id(local_sid).await {
                 Ok(path) => path,
                 Err(e) => {
                     ui.toast = Some((
@@ -2351,15 +1390,8 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                     return true;
                 }
             };
-            let Some(summary) = request_history_summary_from_request(&request, path) else {
-                ui.toast = Some((
-                    i18n::label(ui.language, "history: failed to prepare request focus")
-                        .to_string(),
-                    Instant::now(),
-                ));
-                return true;
-            };
-            let sid_label = short_sid(sid, 18);
+            let summary = request_history_summary_from_request(&request, local_sid, path);
+            let sid_label = short_sid(opaque_sid, 18);
             prepare_select_history_from_external(
                 ui,
                 summary,
@@ -2434,273 +1466,6 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
             }
             Focus::Stations => false,
         },
-        KeyCode::Enter => {
-            if ui.focus != Focus::Sessions {
-                return false;
-            }
-            if snapshot
-                .rows
-                .get(ui.selected_session_idx)
-                .and_then(|r| r.session_id.as_deref())
-                .is_none()
-            {
-                return false;
-            }
-
-            ui.overlay = Overlay::EffortMenu;
-            let current = snapshot
-                .rows
-                .get(ui.selected_session_idx)
-                .and_then(|r| r.override_effort.as_deref())
-                .unwrap_or("");
-            ui.effort_menu_idx = match current {
-                "low" => 1,
-                "medium" => 2,
-                "high" => 3,
-                "xhigh" => 4,
-                _ => 0,
-            };
-            true
-        }
-        KeyCode::Char('l') | KeyCode::Char('m') | KeyCode::Char('h') | KeyCode::Char('X') => {
-            if ui.focus != Focus::Sessions {
-                return false;
-            }
-            let Some(sid) = snapshot
-                .rows
-                .get(ui.selected_session_idx)
-                .and_then(|r| r.session_id.clone())
-            else {
-                return false;
-            };
-            let eff = match key.code {
-                KeyCode::Char('l') => Some("low"),
-                KeyCode::Char('m') => Some("medium"),
-                KeyCode::Char('h') => Some("high"),
-                KeyCode::Char('X') => Some("xhigh"),
-                _ => None,
-            }
-            .map(|s| s.to_string());
-            apply_effort_override(state, sid, eff.clone()).await;
-            ui.toast = Some((
-                format!(
-                    "{}: {}",
-                    i18n::label(ui.language, "effort override"),
-                    eff.as_deref()
-                        .unwrap_or_else(|| i18n::label(ui.language, "<clear>"))
-                ),
-                Instant::now(),
-            ));
-            true
-        }
-        KeyCode::Char('x') => {
-            if ui.focus != Focus::Sessions {
-                return false;
-            }
-            let Some(sid) = snapshot
-                .rows
-                .get(ui.selected_session_idx)
-                .and_then(|r| r.session_id.clone())
-            else {
-                return false;
-            };
-            apply_effort_override(state, sid, None).await;
-            ui.toast = Some((
-                i18n::label(ui.language, "effort override cleared").to_string(),
-                Instant::now(),
-            ));
-            true
-        }
-        KeyCode::Char('p') => {
-            if ui.focus != Focus::Sessions {
-                return false;
-            }
-            let Some(sid) = snapshot
-                .rows
-                .get(ui.selected_session_idx)
-                .and_then(|r| r.session_id.clone())
-            else {
-                return false;
-            };
-            let current = if ui.uses_route_graph_routing() {
-                snapshot
-                    .route_target_overrides
-                    .get(&sid)
-                    .map(|s| s.as_str())
-                    .unwrap_or("")
-            } else {
-                snapshot
-                    .station_overrides
-                    .get(&sid)
-                    .map(|s| s.as_str())
-                    .unwrap_or("")
-            };
-            ui.provider_menu_idx = providers
-                .iter()
-                .position(|p| p.name == current)
-                .map(|i| i + 1)
-                .unwrap_or(0);
-            let balance_started = request_provider_balance_refresh(
-                ui,
-                snapshot,
-                proxy,
-                BalanceRefreshMode::Auto,
-                balance_refresh_tx,
-            );
-            ui.overlay = Overlay::ProviderMenuSession;
-            if balance_started {
-                ui.toast = Some((
-                    i18n::label(ui.language, "balance refresh started").to_string(),
-                    Instant::now(),
-                ));
-            }
-            true
-        }
-        KeyCode::Char('P') => {
-            let current = if ui.uses_route_graph_routing() {
-                snapshot
-                    .global_route_target_override
-                    .as_deref()
-                    .filter(|s| !s.trim().is_empty())
-                    .unwrap_or("")
-            } else {
-                snapshot
-                    .global_station_override
-                    .as_deref()
-                    .filter(|s| !s.trim().is_empty())
-                    .unwrap_or("")
-            };
-            ui.provider_menu_idx = providers
-                .iter()
-                .position(|p| p.name == current)
-                .map(|i| i + 1)
-                .unwrap_or(0);
-            let balance_started = request_provider_balance_refresh(
-                ui,
-                snapshot,
-                proxy,
-                BalanceRefreshMode::Auto,
-                balance_refresh_tx,
-            );
-            ui.overlay = Overlay::ProviderMenuGlobal;
-            if balance_started {
-                ui.toast = Some((
-                    i18n::label(ui.language, "balance refresh started").to_string(),
-                    Instant::now(),
-                ));
-            }
-            true
-        }
-        _ => false,
-    }
-}
-
-pub(super) async fn handle_key_provider_menu(
-    state: &ProxyState,
-    providers: &mut [ProviderOption],
-    ui: &mut UiState,
-    snapshot: &Snapshot,
-    _proxy: &ProxyService,
-    key: KeyEvent,
-) -> bool {
-    match key.code {
-        KeyCode::Esc => {
-            ui.overlay = Overlay::None;
-            true
-        }
-        KeyCode::Up | KeyCode::Char('k') => {
-            ui.provider_menu_idx = ui.provider_menu_idx.saturating_sub(1);
-            true
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            let max = providers.len();
-            ui.provider_menu_idx = (ui.provider_menu_idx + 1).min(max);
-            true
-        }
-        KeyCode::Enter => {
-            let idx = ui.provider_menu_idx;
-            let chosen = if idx == 0 {
-                None
-            } else {
-                providers.get(idx - 1).map(|p| p.name.clone())
-            };
-
-            match ui.overlay {
-                Overlay::ProviderMenuGlobal => {
-                    let result = if ui.uses_route_graph_routing() {
-                        apply_global_route_target_pin(state, providers, chosen.clone()).await
-                    } else {
-                        apply_global_station_pin(state, providers, chosen.clone()).await
-                    };
-                    match result {
-                        Ok(()) => {
-                            let label = if ui.uses_route_graph_routing() {
-                                invalidate_route_target_preview(ui);
-                                "global route target"
-                            } else {
-                                "global station pin"
-                            };
-                            ui.toast = Some((
-                                format!(
-                                    "{}: {}",
-                                    i18n::label(ui.language, label),
-                                    chosen
-                                        .as_deref()
-                                        .unwrap_or_else(|| i18n::label(ui.language, "<auto>"))
-                                ),
-                                Instant::now(),
-                            ));
-                        }
-                        Err(err) => {
-                            let label = if ui.uses_route_graph_routing() {
-                                "set global route target failed"
-                            } else {
-                                "set global pin failed"
-                            };
-                            ui.toast = Some((
-                                format!("{}: {err}", i18n::label(ui.language, label)),
-                                Instant::now(),
-                            ));
-                        }
-                    }
-                }
-                Overlay::ProviderMenuSession => {
-                    let Some(sid) = snapshot
-                        .rows
-                        .get(ui.selected_session_idx)
-                        .and_then(|r| r.session_id.clone())
-                    else {
-                        ui.overlay = Overlay::None;
-                        return true;
-                    };
-                    if ui.uses_route_graph_routing() {
-                        apply_session_route_target_override(state, sid, chosen.clone()).await;
-                        invalidate_route_target_preview(ui);
-                    } else {
-                        apply_session_provider_override(state, sid, chosen.clone()).await;
-                    }
-                    let label = if ui.uses_route_graph_routing() {
-                        "session route target"
-                    } else {
-                        "session station override"
-                    };
-                    ui.toast = Some((
-                        format!(
-                            "{}: {}",
-                            i18n::label(ui.language, label),
-                            chosen
-                                .as_deref()
-                                .unwrap_or_else(|| i18n::label(ui.language, "<clear>"))
-                        ),
-                        Instant::now(),
-                    ));
-                }
-                _ => {}
-            }
-
-            ui.overlay = Overlay::None;
-            true
-        }
         _ => false,
     }
 }

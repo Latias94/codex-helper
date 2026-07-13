@@ -15,7 +15,7 @@ use super::retry::retry_info_for_failed_attempts;
 use super::route_unavailability::route_unavailable_response_for_request;
 
 #[instrument(skip_all, fields(service = %proxy.service_name))]
-pub async fn handle_proxy(
+pub(crate) async fn handle_proxy(
     proxy: ProxyService,
     req: Request<Body>,
 ) -> Result<Response<Body>, (StatusCode, String)> {
@@ -29,7 +29,7 @@ pub async fn handle_proxy(
     log_retry_options(proxy.service_name, prepared.request_id, &prepared.plan);
     let provider_chain_params = ExecuteProviderChainParams {
         proxy: &proxy,
-        route_selection: &prepared.route_selection,
+        route_plan: &prepared.route_plan,
         method: &prepared.method,
         uri: &prepared.uri,
         client_headers: &prepared.client_headers,
@@ -40,14 +40,11 @@ pub async fn handle_proxy(
         request_id: prepared.request_id,
         request_body_len: prepared.request_body_len,
         body_for_upstream: &prepared.body_for_upstream,
+        request_dialect: prepared.request_dialect,
         request_model: prepared.request_model.as_deref(),
         session_binding: prepared.session_binding.as_ref(),
-        session_override_config: prepared.session_override_config.as_deref(),
-        global_station_override: prepared.global_station_override.as_deref(),
-        override_model: prepared.override_model.as_deref(),
-        override_effort: prepared.override_effort.as_deref(),
-        override_service_tier: prepared.override_service_tier.as_deref(),
         effective_effort: prepared.effective_effort.as_deref(),
+        deferred_reasoning_intent: prepared.deferred_reasoning_intent,
         effective_service_tier: prepared.effective_service_tier.as_deref(),
         base_service_tier: &prepared.base_service_tier,
         session_id: prepared.session_id.as_deref(),
@@ -65,15 +62,13 @@ pub async fn handle_proxy(
     };
     let provider_execution =
         execute_provider_chain_with_route_executor(provider_chain_params).await;
-    let (upstream_chain, route_attempts, last_err) = match provider_execution {
+    let (route_attempts, last_err) = match provider_execution {
         ProviderExecutionOutcome::Return(response) => return Ok(response),
-        ProviderExecutionOutcome::Exhausted(state) => {
-            (state.upstream_chain, state.route_attempts, state.last_err)
-        }
+        ProviderExecutionOutcome::Exhausted(state) => (state.route_attempts, state.last_err),
     };
 
     let dur = start.elapsed().as_millis() as u64;
-    let retry = retry_info_for_failed_attempts(&upstream_chain, &route_attempts);
+    let retry = retry_info_for_failed_attempts(&route_attempts);
     let (status, msg) = last_err.unwrap_or_else(|| {
         (
             StatusCode::BAD_GATEWAY,

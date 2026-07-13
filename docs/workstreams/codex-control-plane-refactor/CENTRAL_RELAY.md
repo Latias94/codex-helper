@@ -1,5 +1,10 @@
 # Central Relay Mode: LAN / Tailscale Deployment
 
+> Historical artifact (superseded 2026-07-12): the shared mutable
+> station/profile/override control plane described below was removed. Central
+> relay traffic remains supported through configured relay targets, while the
+> remote control plane exposes only typed, redacted GET/HEAD reads.
+
 > 中文速览：这份文档说明 `codex-helper` 作为“中心中转 + 控制平面”在局域网或 Tailscale 网络中的正确产品形态。重点不是远程附着宿主机桌面，而是让多台设备共享同一个 relay / station / profile 控制面，同时明确哪些能力天然可共享，哪些仍然是宿主机本地能力。
 
 ## Goal

@@ -10,7 +10,7 @@ pub(in crate::tui) enum Focus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::tui) enum StatsFocus {
-    Stations,
+    ProviderEndpoints,
     Providers,
 }
 
@@ -32,87 +32,9 @@ pub(in crate::tui) enum Page {
 pub(in crate::tui) enum Overlay {
     None,
     Help,
-    EffortMenu,
-    ModelMenuSession,
-    ModelInputSession,
-    ServiceTierMenuSession,
-    ServiceTierInputSession,
-    ProfileMenuSession,
-    ProfileMenuDefaultRuntime,
-    ProfileMenuDefaultPersisted,
-    ProviderMenuSession,
-    ProviderMenuGlobal,
-    RoutingMenu,
     StationInfo,
     SessionTranscript,
     StartupAlert,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::tui) enum EffortChoice {
-    Clear,
-    Low,
-    Medium,
-    High,
-    XHigh,
-}
-
-impl EffortChoice {
-    fn label_en(self) -> &'static str {
-        match self {
-            EffortChoice::Clear => "Clear (use request value)",
-            EffortChoice::Low => "low",
-            EffortChoice::Medium => "medium",
-            EffortChoice::High => "high",
-            EffortChoice::XHigh => "xhigh",
-        }
-    }
-
-    pub(in crate::tui) fn label(self, lang: Language) -> &'static str {
-        i18n::label(lang, self.label_en())
-    }
-
-    pub(in crate::tui) fn value(self) -> Option<&'static str> {
-        match self {
-            EffortChoice::Clear => None,
-            EffortChoice::Low => Some("low"),
-            EffortChoice::Medium => Some("medium"),
-            EffortChoice::High => Some("high"),
-            EffortChoice::XHigh => Some("xhigh"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::tui) enum ServiceTierChoice {
-    Clear,
-    Default,
-    Priority,
-    Flex,
-}
-
-impl ServiceTierChoice {
-    fn label_en(self) -> &'static str {
-        match self {
-            ServiceTierChoice::Clear => "Clear (use request/binding value)",
-            ServiceTierChoice::Default => "default",
-            ServiceTierChoice::Priority => "priority (fast)",
-            ServiceTierChoice::Flex => "flex",
-        }
-    }
-
-    pub(in crate::tui) fn label(self, lang: Language) -> &'static str {
-        i18n::label(lang, self.label_en())
-    }
-
-    pub(in crate::tui) fn value(self) -> Option<&'static str> {
-        match self {
-            ServiceTierChoice::Clear => None,
-            ServiceTierChoice::Default => Some("default"),
-            ServiceTierChoice::Priority => Some("priority"),
-            ServiceTierChoice::Flex => Some("flex"),
-        }
-    }
 }
 
 pub(in crate::tui) fn page_titles(

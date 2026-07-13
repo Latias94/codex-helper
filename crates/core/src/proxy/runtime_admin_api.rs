@@ -1,93 +1,13 @@
-use std::sync::Arc;
-
 use axum::Json;
 use axum::extract::Query;
-use serde::de::{self, SeqAccess, Visitor};
 
-use crate::config::ProxyConfig;
-use crate::lb::LoadBalancer;
-use crate::routing_explain::{
-    RoutingExplainResponse, build_routing_explain_response_with_request,
-    parse_routing_explain_headers,
-};
-use crate::routing_ir::{RouteRequestContext, compile_legacy_route_plan_template};
+use crate::routing_explain::{RoutingExplainResponse, build_routing_explain_response_with_request};
+use crate::routing_ir::RouteRequestContext;
 
 use super::ProxyService;
 use super::admin_api_error::{AdminApiHttpError, AdminApiResult};
-use super::api_responses::{
-    ProfilesResponse, ReloadResult, RetryConfigResponse, RuntimeStatusResponse,
-    build_retry_config_response, make_profiles_response,
-};
-use super::control_plane_service::save_runtime_proxy_settings_and_reload;
-use super::request_routing::RequestRouteSelection;
 use super::route_affinity::apply_session_route_affinity_for_template;
-use super::route_executor_runtime::route_plan_runtime_state_from_lbs_with_overrides;
 use super::route_target_selection::apply_concurrency_snapshots_to_runtime;
-use super::routing_plan::{
-    PinnedRoutingSelection, build_station_routing_plan, resolve_pinned_station_selection,
-};
-
-#[derive(serde::Deserialize)]
-pub(super) struct ControlTraceQuery {
-    limit: Option<usize>,
-}
-
-#[derive(serde::Deserialize)]
-pub(super) struct RequestLedgerRecentQuery {
-    limit: Option<usize>,
-    trace_id: Option<String>,
-    request_id: Option<u64>,
-    session: Option<String>,
-    model: Option<String>,
-    station: Option<String>,
-    provider: Option<String>,
-    path: Option<String>,
-    signal_kind: Option<String>,
-    policy_action_kind: Option<String>,
-    status_min: Option<u64>,
-    status_max: Option<u64>,
-    fast: Option<bool>,
-    retried: Option<bool>,
-}
-
-impl RequestLedgerRecentQuery {
-    fn filters(&self) -> crate::request_ledger::RequestLogFilters {
-        crate::request_ledger::RequestLogFilters {
-            trace_id: clean_filter(self.trace_id.clone()),
-            request_id: self.request_id,
-            session: clean_filter(self.session.clone()),
-            model: clean_filter(self.model.clone()),
-            station: clean_filter(self.station.clone()),
-            provider: clean_filter(self.provider.clone()),
-            path: clean_filter(self.path.clone()),
-            signal_kind: clean_filter(self.signal_kind.clone()),
-            policy_action_kind: clean_filter(self.policy_action_kind.clone()),
-            status_min: self.status_min,
-            status_max: self.status_max,
-            fast: self.fast.unwrap_or(false),
-            retried: self.retried.unwrap_or(false),
-        }
-    }
-}
-
-#[derive(serde::Deserialize)]
-pub(super) struct RequestLedgerSummaryQuery {
-    limit: Option<usize>,
-    by: Option<String>,
-    trace_id: Option<String>,
-    request_id: Option<u64>,
-    session: Option<String>,
-    model: Option<String>,
-    station: Option<String>,
-    provider: Option<String>,
-    path: Option<String>,
-    signal_kind: Option<String>,
-    policy_action_kind: Option<String>,
-    status_min: Option<u64>,
-    status_max: Option<u64>,
-    fast: Option<bool>,
-    retried: Option<bool>,
-}
 
 #[derive(serde::Deserialize)]
 pub(super) struct RequestLedgerChainQuery {
@@ -109,159 +29,10 @@ impl RequestLedgerChainQuery {
     }
 }
 
-#[derive(serde::Deserialize)]
-pub(super) struct RoutingExplainQuery {
-    model: Option<String>,
-    service_tier: Option<String>,
-    reasoning_effort: Option<String>,
-    path: Option<String>,
-    method: Option<String>,
-    #[serde(
-        default,
-        rename = "header",
-        alias = "headers",
-        deserialize_with = "deserialize_query_string_list"
-    )]
-    headers: Vec<String>,
-    session: Option<String>,
-    session_id: Option<String>,
-}
-
-impl RequestLedgerSummaryQuery {
-    fn filters(&self) -> crate::request_ledger::RequestLogFilters {
-        crate::request_ledger::RequestLogFilters {
-            trace_id: clean_filter(self.trace_id.clone()),
-            request_id: self.request_id,
-            session: clean_filter(self.session.clone()),
-            model: clean_filter(self.model.clone()),
-            station: clean_filter(self.station.clone()),
-            provider: clean_filter(self.provider.clone()),
-            path: clean_filter(self.path.clone()),
-            signal_kind: clean_filter(self.signal_kind.clone()),
-            policy_action_kind: clean_filter(self.policy_action_kind.clone()),
-            status_min: self.status_min,
-            status_max: self.status_max,
-            fast: self.fast.unwrap_or(false),
-            retried: self.retried.unwrap_or(false),
-        }
-    }
-}
-
 fn clean_filter(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-}
-
-fn deserialize_query_string_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    struct StringListVisitor;
-
-    impl<'de> Visitor<'de> for StringListVisitor {
-        type Value = Vec<String>;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("a string or repeated string query parameter")
-        }
-
-        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            Ok(vec![value.to_string()])
-        }
-
-        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            Ok(vec![value])
-        }
-
-        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-        where
-            A: SeqAccess<'de>,
-        {
-            let mut out = Vec::new();
-            while let Some(value) = seq.next_element::<String>()? {
-                out.push(value);
-            }
-            Ok(out)
-        }
-    }
-
-    deserializer.deserialize_any(StringListVisitor)
-}
-
-impl RoutingExplainQuery {
-    fn request_context(&self) -> Result<RouteRequestContext, String> {
-        Ok(RouteRequestContext {
-            model: clean_filter(self.model.clone()),
-            service_tier: clean_filter(self.service_tier.clone()),
-            reasoning_effort: clean_filter(self.reasoning_effort.clone()),
-            path: clean_filter(self.path.clone()),
-            method: clean_filter(self.method.clone()),
-            headers: parse_routing_explain_headers(&self.headers)?,
-        })
-    }
-
-    fn session_id(&self) -> Option<String> {
-        clean_filter(self.session_id.clone()).or_else(|| clean_filter(self.session.clone()))
-    }
-}
-
-pub(super) async fn runtime_status(proxy: ProxyService) -> AdminApiResult<RuntimeStatusResponse> {
-    Ok(Json(proxy.runtime_status().await))
-}
-
-#[derive(serde::Serialize)]
-pub(super) struct RuntimeShutdownResponse {
-    accepted: bool,
-    service_name: String,
-    message: String,
-}
-
-pub(super) async fn shutdown_runtime(
-    proxy: ProxyService,
-) -> AdminApiResult<RuntimeShutdownResponse> {
-    if proxy.request_shutdown() {
-        return Ok(Json(RuntimeShutdownResponse {
-            accepted: true,
-            service_name: proxy.service_name.to_string(),
-            message: "runtime shutdown requested".to_string(),
-        }));
-    }
-
-    Err(AdminApiHttpError::service_unavailable(
-        "admin_runtime_shutdown_unavailable",
-        "runtime shutdown is not available for this proxy instance",
-    ))
-}
-
-pub(super) async fn get_retry_config(proxy: ProxyService) -> AdminApiResult<RetryConfigResponse> {
-    let cfg = proxy.config.snapshot().await;
-    Ok(Json(build_retry_config_response(cfg.as_ref())))
-}
-
-pub(super) async fn get_pricing_catalog(
-    _proxy: ProxyService,
-) -> AdminApiResult<crate::pricing::ModelPriceCatalogSnapshot> {
-    Ok(Json(crate::pricing::operator_model_price_catalog_snapshot()))
-}
-
-pub(super) async fn get_routing_explain(
-    proxy: ProxyService,
-    Query(q): Query<RoutingExplainQuery>,
-) -> AdminApiResult<RoutingExplainResponse> {
-    let request = q.request_context().map_err(|err| {
-        AdminApiHttpError::bad_request("admin_routing_explain_invalid_query", err)
-    })?;
-    let session_id = q.session_id();
-    routing_explain_for_proxy(&proxy, request, session_id)
-        .await
-        .map(Json)
 }
 
 pub(super) async fn routing_explain_for_proxy(
@@ -269,244 +40,65 @@ pub(super) async fn routing_explain_for_proxy(
     request: RouteRequestContext,
     session_id: Option<String>,
 ) -> Result<RoutingExplainResponse, AdminApiHttpError> {
-    let cfg = proxy.config.snapshot().await;
-    let v4 = proxy.config.v4_snapshot().await;
-    let route_selection = routing_explain_load_balancers(
+    let runtime_snapshot = proxy.config.capture().await;
+    let provider_policy = runtime_snapshot.provider_policy();
+    let graph = runtime_snapshot
+        .route_graph(proxy.service_name)
+        .ok_or_else(|| {
+            AdminApiHttpError::internal(
+                "admin_routing_explain_unknown_service",
+                "captured runtime snapshot has no route graph for the service",
+            )
+        })?;
+    let template = graph.route_plan(&request).map_err(|error| {
+        AdminApiHttpError::internal("admin_routing_explain_route_plan_failed", error.to_string())
+    })?;
+    let mut runtime = proxy
+        .state
+        .route_plan_runtime_state_with_provider_policy(proxy.service_name, provider_policy.as_ref())
+        .await;
+    apply_concurrency_snapshots_to_runtime(
         proxy,
-        cfg.as_ref(),
-        v4.as_deref(),
-        &request,
+        &template,
+        runtime_snapshot.revision(),
+        &mut runtime,
+    );
+    apply_session_route_affinity_for_template(
+        proxy,
         session_id.as_deref(),
+        &template,
+        &mut runtime,
     )
     .await;
-    match &route_selection {
-        RequestRouteSelection::RouteGraph { template } => {
-            let mut runtime = proxy
-                .state
-                .route_plan_runtime_state_for_provider_endpoints(proxy.service_name)
-                .await;
-            apply_concurrency_snapshots_to_runtime(proxy, template, &mut runtime);
-            apply_session_route_affinity_for_template(
-                proxy,
-                session_id.as_deref(),
-                template,
-                &mut runtime,
-            )
-            .await;
-            Ok(build_routing_explain_response_with_request(
-                proxy.service_name,
-                Some(proxy.config.last_loaded_at_ms()),
-                request,
-                session_id,
-                template,
-                &runtime,
-            ))
-        }
-        RequestRouteSelection::Legacy { lbs } => {
-            let legacy_template = compile_legacy_route_plan_template(
-                proxy.service_name,
-                lbs.iter().map(|lb| lb.service.as_ref()),
-            );
-            let upstream_overrides = proxy
-                .state
-                .get_upstream_meta_overrides(proxy.service_name)
-                .await;
-            let mut runtime = route_plan_runtime_state_from_lbs_with_overrides(
-                proxy.service_name,
-                lbs,
-                &upstream_overrides,
-            );
-            apply_session_route_affinity_for_template(
-                proxy,
-                session_id.as_deref(),
-                &legacy_template,
-                &mut runtime,
-            )
-            .await;
-            Ok(build_routing_explain_response_with_request(
-                proxy.service_name,
-                Some(proxy.config.last_loaded_at_ms()),
-                request,
-                session_id,
-                &legacy_template,
-                &runtime,
-            ))
-        }
-    }
-}
-
-pub(super) async fn get_request_ledger_recent(
-    _proxy: ProxyService,
-    Query(q): Query<RequestLedgerRecentQuery>,
-) -> AdminApiResult<Vec<crate::state::FinishedRequest>> {
-    let limit = q.limit.unwrap_or(1000).clamp(20, 5000);
-    let filters = q.filters();
-    let store = crate::request_ledger::RequestLedgerStore::default();
-    let records = if filters.is_empty() {
-        store.tail_finished_requests(limit)
-    } else {
-        store.find_finished_requests(&filters, limit)
-    };
-    records.map(Json).map_err(|err| {
-        AdminApiHttpError::internal("admin_request_ledger_read_failed", err.to_string())
-    })
-}
-
-async fn routing_explain_load_balancers(
-    proxy: &ProxyService,
-    cfg: &ProxyConfig,
-    v4: Option<&crate::config::ProxyConfigV4>,
-    request: &RouteRequestContext,
-    session_id: Option<&str>,
-) -> super::request_routing::RequestRouteSelection {
-    let mgr = proxy.service_manager(cfg);
-    let (meta_overrides, state_overrides, upstream_overrides, provider_balances) = tokio::join!(
-        proxy.state.get_station_meta_overrides(proxy.service_name),
-        proxy
-            .state
-            .get_station_runtime_state_overrides(proxy.service_name),
-        proxy.state.get_upstream_meta_overrides(proxy.service_name),
-        proxy
-            .state
-            .get_provider_balance_summary_view(proxy.service_name),
-    );
-
-    let route_target_override = if v4.is_some() {
-        proxy
-            .route_target_override_for_session(session_id)
-            .await
-            .map(|(target, _)| target)
-    } else {
-        None
-    };
-    if let Some(v4) = v4
-        && let Some(selection) =
-            proxy.v4_route_selection_for_request(v4, request, route_target_override.as_deref())
-    {
-        return selection;
-    }
-
-    if let Some((name, _source)) = proxy.pinned_config(mgr, session_id).await {
-        return match resolve_pinned_station_selection(
-            mgr,
-            name.as_str(),
-            &state_overrides,
-            &upstream_overrides,
-        ) {
-            PinnedRoutingSelection::Selected(candidate) => vec![LoadBalancer::new(
-                Arc::new(candidate.service),
-                proxy.lb_states.clone(),
-            )]
-            .into(),
-            PinnedRoutingSelection::BlockedBreakerOpen | PinnedRoutingSelection::Missing => {
-                Vec::new().into()
-            }
-        };
-    }
-
-    let plan = build_station_routing_plan(
-        mgr,
-        mgr.active.as_deref(),
-        &meta_overrides,
-        &state_overrides,
-        &upstream_overrides,
-        &provider_balances,
-    );
-
-    RequestRouteSelection::Legacy {
-        lbs: plan
-            .selected_stations
-            .into_iter()
-            .map(|candidate| {
-                LoadBalancer::new(Arc::new(candidate.service), proxy.lb_states.clone())
-            })
-            .collect::<Vec<_>>(),
-    }
-}
-
-pub(super) async fn get_request_ledger_summary(
-    _proxy: ProxyService,
-    Query(q): Query<RequestLedgerSummaryQuery>,
-) -> AdminApiResult<Vec<crate::request_ledger::RequestUsageSummaryRow>> {
-    let limit = q.limit.unwrap_or(30).clamp(1, 100);
-    let group = match q
-        .by
-        .as_deref()
-        .unwrap_or("station")
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "provider" => crate::request_ledger::RequestUsageSummaryGroup::Provider,
-        "model" => crate::request_ledger::RequestUsageSummaryGroup::Model,
-        "session" => crate::request_ledger::RequestUsageSummaryGroup::Session,
-        _ => crate::request_ledger::RequestUsageSummaryGroup::Station,
-    };
-    let filters = q.filters();
-    crate::request_ledger::RequestLedgerStore::default()
-        .summarize(group, &filters, limit)
-        .map(Json)
-        .map_err(|err| {
-            AdminApiHttpError::internal("admin_request_ledger_summary_failed", err.to_string())
-        })
+    Ok(build_routing_explain_response_with_request(
+        proxy.service_name,
+        Some(runtime_snapshot.loaded_at_ms()),
+        request,
+        session_id,
+        &template,
+        &runtime,
+    ))
 }
 
 pub(super) async fn get_request_ledger_chain(
-    _proxy: ProxyService,
-    Query(q): Query<RequestLedgerChainQuery>,
+    proxy: ProxyService,
+    Query(query): Query<RequestLedgerChainQuery>,
 ) -> AdminApiResult<crate::request_chain::RequestChainExport> {
-    let selector = q.selector();
+    let selector = query.selector();
     if !selector.has_identity() {
         return Err(AdminApiHttpError::bad_request(
             "admin_request_chain_selector_required",
             "trace_id, request_id, or session is required",
         ));
     }
-    let limit = q
+    let limit = query
         .limit
         .unwrap_or(crate::request_chain::REQUEST_CHAIN_EXPORT_DEFAULT_LIMIT)
         .clamp(1, crate::request_chain::REQUEST_CHAIN_EXPORT_MAX_LIMIT);
-    crate::request_ledger::RequestLedgerStore::default()
-        .export_request_chain(selector, limit)
+    crate::request_ledger::RequestLedger::new(proxy.state.runtime_store())
+        .export_request_chain(proxy.service_name, selector, limit)
         .map(Json)
-        .map_err(|err| {
-            AdminApiHttpError::internal("admin_request_chain_export_failed", err.to_string())
-        })
-}
-
-pub(super) async fn set_retry_config(
-    proxy: ProxyService,
-    Json(payload): Json<crate::config::RetryConfig>,
-) -> AdminApiResult<RetryConfigResponse> {
-    let cfg_snapshot = proxy.config.snapshot().await;
-    let mut cfg = cfg_snapshot.as_ref().clone();
-    cfg.retry = payload;
-
-    save_runtime_proxy_settings_and_reload(&proxy, cfg).await?;
-    let cfg = proxy.config.snapshot().await;
-    Ok(Json(build_retry_config_response(cfg.as_ref())))
-}
-
-pub(super) async fn reload_runtime_config(proxy: ProxyService) -> AdminApiResult<ReloadResult> {
-    proxy
-        .reload_runtime_config()
-        .await
-        .map(Json)
-        .map_err(AdminApiHttpError::from)
-}
-
-pub(super) async fn list_profiles(proxy: ProxyService) -> AdminApiResult<ProfilesResponse> {
-    Ok(Json(make_profiles_response(&proxy).await))
-}
-
-pub(super) async fn get_control_trace(
-    _proxy: ProxyService,
-    Query(q): Query<ControlTraceQuery>,
-) -> AdminApiResult<Vec<crate::logging::ControlTraceLogEntry>> {
-    let limit = q.limit.unwrap_or(80).clamp(20, 400);
-    crate::logging::read_recent_control_trace_entries(limit)
-        .map(Json)
-        .map_err(|err| {
-            AdminApiHttpError::internal("admin_control_trace_read_failed", err.to_string())
+        .map_err(|error| {
+            AdminApiHttpError::internal("admin_request_chain_export_failed", error.to_string())
         })
 }

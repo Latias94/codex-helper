@@ -122,12 +122,7 @@ fn render_kpi_row(f: &mut Frame<'_>, p: Palette, lang: Language, usage: &UsageDa
                     Style::default().fg(p.text),
                 ),
             ]),
-            kv_line(
-                p,
-                "cache read",
-                &tokens_short(summary.usage.cache_read_tokens_total()),
-                p.muted,
-            ),
+            kv_line(p, "cache read", "-", p.muted),
             kv_line(
                 p,
                 "reasoning",
@@ -254,19 +249,6 @@ fn render_activity_row(
             Span::styled(last, Style::default().fg(p.muted)),
         ]),
     ];
-    if coverage.scanned_lines > 0 {
-        lines.push(Line::from(vec![
-            muted(p, "scan "),
-            Span::styled(
-                format!(
-                    "{} lines / {} MiB cap",
-                    coverage.scanned_lines,
-                    coverage.max_bytes / 1024 / 1024
-                ),
-                Style::default().fg(p.muted),
-            ),
-        ]));
-    }
     if let Some(reason) = coverage.partial_reason.as_deref() {
         lines.push(Line::from(vec![
             muted(p, "note "),
@@ -319,13 +301,13 @@ fn render_focus_table(
             &usage.provider_rows,
             &mut ui.stats_providers_table,
         ),
-        StatsFocus::Stations => (
+        StatsFocus::ProviderEndpoints => (
             match ui.language {
-                Language::Zh => "站点排行",
-                Language::En => "Stations",
+                Language::Zh => "提供商端点排行",
+                Language::En => "Provider endpoints",
             },
-            &usage.station_rows,
-            &mut ui.stats_stations_table,
+            &usage.provider_endpoint_rows,
+            &mut ui.stats_provider_endpoints_table,
         ),
     };
 
@@ -589,14 +571,7 @@ mod tests {
         Snapshot {
             rows: Vec::new(),
             recent: Vec::new(),
-            model_overrides: HashMap::new(),
-            overrides: HashMap::new(),
-            station_overrides: HashMap::new(),
-            route_target_overrides: HashMap::new(),
-            service_tier_overrides: HashMap::new(),
-            global_station_override: None,
-            global_route_target_override: None,
-            station_meta_overrides: HashMap::new(),
+            request_control_evidence: HashMap::new(),
             usage_day: UsageDayView {
                 day: crate::usage_day::current_local_day(),
                 label: "2026-07-07".to_string(),
@@ -606,7 +581,7 @@ mod tests {
                 summary: bucket(12, 4096),
                 hourly,
                 provider_rows: vec![row("input", 7, 3000), row("input1", 5, 1096)],
-                station_rows: vec![row("routing", 12, 4096)],
+                provider_endpoint_rows: vec![row("routing", 12, 4096)],
                 model_rows: vec![row("gpt-5", 12, 4096)],
                 session_rows: vec![row("sid-main", 8, 3000)],
                 project_rows: vec![row("F:/SourceCodes/Rust/codex-helper", 12, 4096)],
@@ -620,29 +595,19 @@ mod tests {
                     }],
                 },
                 coverage: UsageDayCoverage {
-                    source: "request_log".to_string(),
+                    source: "runtime_store".to_string(),
                     loaded_first_ms: Some(1),
                     loaded_last_ms: Some(2),
                     loaded_requests: 12,
-                    scanned_lines: 12,
-                    max_lines: 20_000,
-                    max_bytes: 8 * 1024 * 1024,
                     day_may_be_partial: true,
                     partial_reason: Some("loaded data starts after local day start".to_string()),
-                    ..UsageDayCoverage::default()
                 },
             },
             usage_rollup: crate::state::UsageRollupView::default(),
             provider_balances: HashMap::new(),
-            provider_balance_history: HashMap::new(),
-            station_health: HashMap::new(),
-            health_checks: HashMap::new(),
-            lb_view: HashMap::new(),
-            provider_endpoint_policy_actions: HashMap::new(),
             stats_5m: crate::dashboard_core::WindowStats::default(),
             stats_1h: crate::dashboard_core::WindowStats::default(),
             service_status: None,
-            pricing_catalog: crate::pricing::ModelPriceCatalogSnapshot::default(),
             refreshed_at: Instant::now(),
         }
     }
@@ -693,13 +658,13 @@ mod tests {
         let snapshot = sample_snapshot();
         let mut ui = UiState {
             page: crate::tui::types::Page::Stats,
-            stats_focus: StatsFocus::Stations,
+            stats_focus: StatsFocus::ProviderEndpoints,
             ..UiState::default()
         };
 
         let text = render_text(76, 22, &mut ui, &snapshot);
 
-        assert!(text.contains("Stations") || text.contains("站点"));
+        assert!(text.contains("Provider endpoints") || text.contains("提供商端点"));
         assert!(!text.contains("15d"));
     }
 }

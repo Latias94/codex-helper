@@ -1,32 +1,30 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 
 use crate::config::{
-    ProviderConcurrencyLimits, ProviderConfigV4, RoutingAffinityPolicyV5, RoutingConditionV4,
-    RoutingConfigV4, RoutingExhaustedActionV4, RoutingNodeV4, RoutingPolicyV4, ServiceConfig,
-    ServiceViewV4, UpstreamAuth, UpstreamConfig, effective_v4_routing,
+    ProviderConcurrencyLimits, ProviderConfig, RouteAffinityPolicy, RouteCondition,
+    RouteExhaustedAction, RouteGraphConfig, RouteNodeConfig, RouteStrategy, SchedulingPreset,
+    ServiceRouteConfig, UpstreamAuth, effective_routing,
 };
-use crate::lb::{FAILURE_THRESHOLD, SelectedUpstream};
+use crate::endpoint_health::FAILURE_THRESHOLD;
 use crate::model_routing;
-use crate::runtime_identity::{
-    ContinuityDomainKey, LegacyUpstreamKey, ProviderEndpointKey, RuntimeUpstreamIdentity,
-};
-
-const V4_COMPATIBILITY_STATION_NAME: &str = "routing";
+use crate::runtime_identity::{ContinuityDomainKey, ProviderEndpointKey, RuntimeUpstreamIdentity};
 
 #[derive(Debug, Clone)]
 pub struct RoutePlanTemplate {
     pub service_name: String,
     pub entry: String,
-    pub affinity_policy: RoutingAffinityPolicyV5,
+    pub affinity_policy: RouteAffinityPolicy,
+    pub scheduling_preset: SchedulingPreset,
     pub fallback_ttl_ms: Option<u64>,
     pub reprobe_preferred_after_ms: Option<u64>,
     pub nodes: BTreeMap<String, RouteNodePlan>,
     pub expanded_provider_order: Vec<String>,
     pub candidates: Vec<RouteCandidate>,
-    pub compatibility_station_name: Option<String>,
 }
 
 impl RoutePlanTemplate {
@@ -35,15 +33,15 @@ impl RoutePlanTemplate {
         self.service_name.hash(&mut hasher);
         self.entry.hash(&mut hasher);
         self.affinity_policy.hash(&mut hasher);
+        self.scheduling_preset.hash(&mut hasher);
         self.fallback_ttl_ms.hash(&mut hasher);
         self.reprobe_preferred_after_ms.hash(&mut hasher);
-        self.compatibility_station_name.hash(&mut hasher);
         self.expanded_provider_order.hash(&mut hasher);
         hash_route_nodes(&self.nodes, &mut hasher);
         for candidate in &self.candidates {
             hash_route_candidate(candidate, &mut hasher);
         }
-        format!("v4:{:016x}", hasher.finish())
+        format!("route:{:016x}", hasher.finish())
     }
 
     pub fn contains_provider_endpoint(&self, key: &ProviderEndpointKey, base_url: &str) -> bool {
@@ -75,11 +73,11 @@ impl RoutePlanTemplate {
     }
 
     pub fn candidate_identity(&self, candidate: &RouteCandidate) -> RuntimeUpstreamIdentity {
-        RuntimeUpstreamIdentity::new_with_continuity_domain(
+        RuntimeUpstreamIdentity::new_with_auth(
             candidate_provider_endpoint_key(self, candidate),
-            self.candidate_compatibility_key(candidate),
             candidate.base_url.clone(),
             candidate.continuity_domain.clone(),
+            &candidate.auth,
         )
     }
 
@@ -90,29 +88,12 @@ impl RoutePlanTemplate {
             .collect()
     }
 
-    pub fn continuity_topology(&self) -> RoutePlanContinuityTopology<'_> {
-        RoutePlanContinuityTopology { template: self }
+    pub(crate) fn capture_candidate(&self, candidate: &RouteCandidate) -> CapturedRouteCandidate {
+        CapturedRouteCandidate::from_candidate(self.service_name.as_str(), candidate)
     }
 
-    pub fn candidate_compatibility_key(
-        &self,
-        candidate: &RouteCandidate,
-    ) -> Option<LegacyUpstreamKey> {
-        candidate
-            .compatibility_station_name
-            .as_ref()
-            .or(self.compatibility_station_name.as_ref())
-            .and_then(|station_name| {
-                candidate
-                    .compatibility_upstream_index
-                    .map(|upstream_index| {
-                        LegacyUpstreamKey::new(
-                            self.service_name.clone(),
-                            station_name.clone(),
-                            upstream_index,
-                        )
-                    })
-            })
+    pub fn continuity_topology(&self) -> RoutePlanContinuityTopology<'_> {
+        RoutePlanContinuityTopology { template: self }
     }
 }
 
@@ -230,8 +211,6 @@ fn hash_route_candidate<H: Hasher>(candidate: &RouteCandidate, hasher: &mut H) {
     candidate.preference_group.hash(hasher);
     candidate.stable_index.hash(hasher);
     candidate.concurrency.hash(hasher);
-    candidate.compatibility_station_name.hash(hasher);
-    candidate.compatibility_upstream_index.hash(hasher);
 }
 
 #[derive(Debug, Clone)]
@@ -245,13 +224,13 @@ pub struct RoutePlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteNodePlan {
     pub name: String,
-    pub strategy: RoutingPolicyV4,
+    pub strategy: RouteStrategy,
     pub children: Vec<RouteRef>,
     pub target: Option<RouteRef>,
     pub prefer_tags: Vec<BTreeMap<String, String>>,
-    pub on_exhausted: RoutingExhaustedActionV4,
+    pub on_exhausted: RouteExhaustedAction,
     pub metadata: BTreeMap<String, String>,
-    pub when: Option<RoutingConditionV4>,
+    pub when: Option<RouteCondition>,
     pub then: Option<RouteRef>,
     pub default_route: Option<RouteRef>,
 }
@@ -277,12 +256,11 @@ pub struct RouteCandidate {
     pub tags: BTreeMap<String, String>,
     pub supported_models: BTreeMap<String, bool>,
     pub model_mapping: BTreeMap<String, String>,
+    pub(crate) model_rules: Arc<model_routing::CompiledModelRules>,
     pub route_path: Vec<String>,
     pub preference_group: u32,
     pub stable_index: usize,
     pub concurrency: RouteCandidateConcurrency,
-    pub compatibility_station_name: Option<String>,
-    pub compatibility_upstream_index: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
@@ -308,30 +286,108 @@ impl RouteCandidateConcurrency {
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            return Some(format!("{service_name}/{scope}"));
+            return Some(format!("group:{service_name}/{scope}"));
         }
-        Some(provider_endpoint.stable_key())
+        Some(format!("endpoint:{}", provider_endpoint.stable_key()))
     }
 }
 
 impl RouteCandidate {
-    pub fn to_upstream_config(&self) -> UpstreamConfig {
-        let mut tags = self.tags.clone();
-        tags.insert("endpoint_id".to_string(), self.endpoint_id.clone());
-        if let Ok(route_path) = serde_json::to_string(&self.route_path) {
-            tags.insert("route_path".to_string(), route_path);
-        }
-        tags.insert(
-            "preference_group".to_string(),
-            self.preference_group.to_string(),
+    pub fn effective_model(&self, requested_model: &str) -> String {
+        self.model_rules.effective_model(requested_model)
+    }
+
+    pub fn is_model_supported(&self, requested_model: &str) -> bool {
+        self.model_rules.is_model_supported(requested_model)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CapturedRouteCandidate {
+    candidate: Arc<RouteCandidate>,
+    provider_endpoint: ProviderEndpointKey,
+    continuity_domain: ContinuityDomainKey,
+}
+
+impl CapturedRouteCandidate {
+    fn from_candidate(service_name: &str, candidate: &RouteCandidate) -> Self {
+        let provider_endpoint = ProviderEndpointKey::new(
+            service_name,
+            candidate.provider_id.clone(),
+            candidate.endpoint_id.clone(),
         );
-        UpstreamConfig {
-            base_url: self.base_url.clone(),
-            auth: self.auth.clone(),
-            tags: btree_string_map_to_hash_map(&tags),
-            supported_models: btree_bool_map_to_hash_map(&self.supported_models),
-            model_mapping: btree_string_map_to_hash_map(&self.model_mapping),
+        let continuity_domain = candidate
+            .continuity_domain
+            .as_ref()
+            .and_then(|domain| ContinuityDomainKey::explicit(service_name, domain))
+            .unwrap_or_else(|| ContinuityDomainKey::provider_endpoint(provider_endpoint.clone()));
+
+        Self {
+            candidate: Arc::new(candidate.clone()),
+            provider_endpoint,
+            continuity_domain,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capture_for_service(service_name: &str, candidate: &RouteCandidate) -> Self {
+        Self::from_candidate(service_name, candidate)
+    }
+
+    pub(crate) fn candidate(&self) -> &RouteCandidate {
+        self.candidate.as_ref()
+    }
+
+    pub(crate) fn base_url(&self) -> &str {
+        self.candidate.base_url.as_str()
+    }
+
+    pub(crate) fn auth(&self) -> &UpstreamAuth {
+        &self.candidate.auth
+    }
+
+    pub(crate) fn effective_model(&self, requested_model: &str) -> String {
+        self.candidate.effective_model(requested_model)
+    }
+
+    pub(crate) fn is_model_supported(&self, requested_model: &str) -> bool {
+        self.candidate.is_model_supported(requested_model)
+    }
+
+    pub(crate) fn log_target_label(&self) -> String {
+        self.provider_endpoint.stable_key()
+    }
+
+    pub(crate) fn attempt_avoid_index(&self) -> usize {
+        self.candidate.stable_index
+    }
+
+    pub(crate) fn provider_id(&self) -> &str {
+        self.provider_endpoint.provider_id.as_str()
+    }
+
+    pub(crate) fn endpoint_id(&self) -> &str {
+        self.provider_endpoint.endpoint_id.as_str()
+    }
+
+    pub(crate) fn provider_endpoint(&self) -> &ProviderEndpointKey {
+        &self.provider_endpoint
+    }
+
+    pub(crate) fn continuity_domain(&self) -> &ContinuityDomainKey {
+        &self.continuity_domain
+    }
+
+    pub(crate) fn provider_endpoint_key(&self) -> String {
+        self.provider_endpoint.stable_key()
+    }
+
+    pub(crate) fn preference_group(&self) -> u32 {
+        self.candidate.preference_group
+    }
+
+    pub(crate) fn route_path(&self) -> &[String] {
+        &self.candidate.route_path
     }
 }
 
@@ -345,7 +401,6 @@ pub struct SelectedRouteCandidate<'a> {
 pub struct RoutePlanAttemptState {
     avoided_provider_endpoints: BTreeSet<ProviderEndpointKey>,
     allowed_continuity_domain: Option<ContinuityDomainKey>,
-    avoid_by_station: BTreeMap<String, BTreeSet<usize>>,
     avoided_total: usize,
 }
 
@@ -398,52 +453,12 @@ impl RoutePlanAttemptState {
                 })
     }
 
-    pub fn avoid_upstream(&mut self, station_name: &str, upstream_index: usize) -> bool {
-        if self
-            .avoid_by_station
-            .entry(station_name.to_string())
-            .or_default()
-            .insert(upstream_index)
-        {
-            self.avoided_total = self.avoided_total.saturating_add(1);
-            return true;
-        }
-        false
-    }
-
     pub fn avoid_selected(&mut self, selected: &SelectedRouteCandidate<'_>) -> bool {
         self.avoid_provider_endpoint(selected.provider_endpoint.clone())
     }
 
-    pub fn avoid_selected_upstream(&mut self, selected: &SelectedUpstream) -> bool {
-        self.avoid_upstream(selected.station_name.as_str(), selected.index)
-    }
-
-    pub fn avoids_upstream(&self, station_name: &str, upstream_index: usize) -> bool {
-        self.avoid_by_station
-            .get(station_name)
-            .is_some_and(|indices| indices.contains(&upstream_index))
-    }
-
-    pub fn avoid_for_station_name(&self, station_name: &str) -> Vec<usize> {
-        self.avoid_by_station
-            .get(station_name)
-            .map(|indices| indices.iter().copied().collect())
-            .unwrap_or_default()
-    }
-
     pub fn avoided_total(&self) -> usize {
         self.avoided_total
-    }
-
-    pub fn station_exhausted_for(&self, station_name: &str, upstream_total: usize) -> bool {
-        upstream_total > 0
-            && self
-                .avoid_by_station
-                .get(station_name)
-                .map(|indices| indices.iter().filter(|&&idx| idx < upstream_total).count())
-                .unwrap_or_default()
-                >= upstream_total
     }
 
     pub fn route_candidates_exhausted(&self, template: &RoutePlanTemplate) -> bool {
@@ -713,35 +728,10 @@ pub struct RouteCandidateSkipExplanation<'a> {
 }
 
 #[derive(Debug, Clone)]
-pub struct SelectedStationRouteCandidate<'a> {
-    pub candidate: &'a RouteCandidate,
-    pub selected_upstream: SelectedUpstream,
-}
-
-#[derive(Debug, Clone)]
-pub struct SkippedStationRouteCandidate<'a> {
-    pub candidate: &'a RouteCandidate,
-    pub selected_upstream: SelectedUpstream,
-    pub reason: RoutePlanSkipReason,
-    pub avoid_for_station: Vec<usize>,
-    pub avoided_total: usize,
-    pub total_upstreams: usize,
-}
-
-#[derive(Debug, Clone)]
 pub struct RoutePlanAttemptSelection<'a> {
     pub selected: Option<SelectedRouteCandidate<'a>>,
     pub skipped: Vec<SkippedRouteCandidate<'a>>,
     pub avoided_candidate_indices: Vec<usize>,
-    pub avoided_total: usize,
-    pub total_upstreams: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct RoutePlanStationAttemptSelection<'a> {
-    pub selected: Option<SelectedStationRouteCandidate<'a>>,
-    pub skipped: Vec<SkippedStationRouteCandidate<'a>>,
-    pub avoid_for_station: Vec<usize>,
     pub avoided_total: usize,
     pub total_upstreams: usize,
 }
@@ -767,15 +757,6 @@ impl<'a> RoutePlanExecutor<'a> {
 
     pub fn template(&self) -> &'a RoutePlanTemplate {
         self.template
-    }
-
-    pub fn iter_selected_upstreams(
-        &self,
-    ) -> impl Iterator<Item = SelectedStationRouteCandidate<'_>> + '_ {
-        self.template
-            .candidates
-            .iter()
-            .map(|candidate| self.selected_station_route_candidate_for_candidate(candidate))
     }
 
     pub fn explain_candidate_skip_reasons_with_runtime_state(
@@ -964,121 +945,6 @@ impl<'a> RoutePlanExecutor<'a> {
         }
     }
 
-    pub fn select_supported_station_candidate_with_runtime_state(
-        &self,
-        state: &mut RoutePlanAttemptState,
-        runtime: &RoutePlanRuntimeState,
-        station_name: &str,
-        request_model: Option<&str>,
-    ) -> RoutePlanStationAttemptSelection<'_> {
-        self.select_supported_station_candidate_with_affinity_mode(
-            state,
-            runtime,
-            station_name,
-            request_model,
-            RoutePlanAffinitySelectionMode::Configured,
-        )
-    }
-
-    pub fn select_supported_station_candidate_with_soft_affinity_runtime_state(
-        &self,
-        state: &mut RoutePlanAttemptState,
-        runtime: &RoutePlanRuntimeState,
-        station_name: &str,
-        request_model: Option<&str>,
-    ) -> RoutePlanStationAttemptSelection<'_> {
-        self.select_supported_station_candidate_with_affinity_mode(
-            state,
-            runtime,
-            station_name,
-            request_model,
-            RoutePlanAffinitySelectionMode::SoftSessionPreferred,
-        )
-    }
-
-    fn select_supported_station_candidate_with_affinity_mode(
-        &self,
-        state: &mut RoutePlanAttemptState,
-        runtime: &RoutePlanRuntimeState,
-        station_name: &str,
-        request_model: Option<&str>,
-        affinity_mode: RoutePlanAffinitySelectionMode,
-    ) -> RoutePlanStationAttemptSelection<'_> {
-        let total_upstreams = self.template.candidates.len();
-        let mut skipped = Vec::new();
-
-        loop {
-            if state.station_exhausted_for(station_name, self.station_candidate_count(station_name))
-            {
-                return RoutePlanStationAttemptSelection {
-                    selected: None,
-                    skipped,
-                    avoid_for_station: state.avoid_for_station_name(station_name),
-                    avoided_total: state.avoided_total(),
-                    total_upstreams,
-                };
-            }
-
-            let Some(candidate) =
-                self.next_unavoided_station_candidate(state, runtime, station_name, affinity_mode)
-            else {
-                return RoutePlanStationAttemptSelection {
-                    selected: None,
-                    skipped,
-                    avoid_for_station: state.avoid_for_station_name(station_name),
-                    avoided_total: state.avoided_total(),
-                    total_upstreams,
-                };
-            };
-            let selected_upstream = self.legacy_selected_upstream_for_candidate(candidate);
-
-            if let Some(requested_model) = request_model
-                && !candidate_supports_model(candidate, requested_model)
-            {
-                state.avoid_selected_upstream(&selected_upstream);
-                let avoid_for_station =
-                    state.avoid_for_station_name(selected_upstream.station_name.as_str());
-                skipped.push(SkippedStationRouteCandidate {
-                    candidate,
-                    selected_upstream,
-                    reason: RoutePlanSkipReason::UnsupportedModel {
-                        requested_model: requested_model.to_string(),
-                    },
-                    avoid_for_station,
-                    avoided_total: state.avoided_total(),
-                    total_upstreams,
-                });
-                continue;
-            }
-
-            let avoid_for_station =
-                state.avoid_for_station_name(selected_upstream.station_name.as_str());
-            return RoutePlanStationAttemptSelection {
-                selected: Some(self.selected_station_route_candidate_for_candidate(candidate)),
-                skipped,
-                avoid_for_station,
-                avoided_total: state.avoided_total(),
-                total_upstreams,
-            };
-        }
-    }
-
-    pub fn legacy_selected_upstream_for_candidate(
-        &self,
-        candidate: &RouteCandidate,
-    ) -> SelectedUpstream {
-        let mut upstream = candidate.to_upstream_config();
-        upstream.tags.insert(
-            "provider_endpoint_key".to_string(),
-            candidate_provider_endpoint_key(self.template, candidate).stable_key(),
-        );
-        SelectedUpstream {
-            station_name: candidate_compatibility_station_name(self.template, candidate),
-            index: candidate_compatibility_upstream_index(candidate),
-            upstream,
-        }
-    }
-
     fn selected_route_candidate_for_candidate(
         &self,
         candidate: &'a RouteCandidate,
@@ -1086,16 +952,6 @@ impl<'a> RoutePlanExecutor<'a> {
         SelectedRouteCandidate {
             candidate,
             provider_endpoint: candidate_provider_endpoint_key(self.template, candidate),
-        }
-    }
-
-    fn selected_station_route_candidate_for_candidate(
-        &self,
-        candidate: &'a RouteCandidate,
-    ) -> SelectedStationRouteCandidate<'a> {
-        SelectedStationRouteCandidate {
-            candidate,
-            selected_upstream: self.legacy_selected_upstream_for_candidate(candidate),
         }
     }
 
@@ -1123,97 +979,46 @@ impl<'a> RoutePlanExecutor<'a> {
     fn candidates_exhausted(&self, state: &RoutePlanAttemptState) -> bool {
         state.route_candidates_exhausted(self.template)
     }
-
-    fn station_candidate_count(&self, station_name: &str) -> usize {
-        self.template
-            .candidates
-            .iter()
-            .filter(|candidate| {
-                candidate_compatibility_station_name(self.template, candidate) == station_name
-            })
-            .count()
-    }
-
-    fn next_unavoided_station_candidate(
-        &self,
-        state: &RoutePlanAttemptState,
-        runtime: &RoutePlanRuntimeState,
-        station_name: &str,
-        affinity_mode: RoutePlanAffinitySelectionMode,
-    ) -> Option<&'a RouteCandidate> {
-        let station_candidates = self
-            .template
-            .candidates
-            .iter()
-            .filter(|candidate| {
-                candidate_compatibility_station_name(self.template, candidate) == station_name
-            })
-            .filter(|candidate| {
-                !state.avoids_upstream(
-                    station_name,
-                    candidate_compatibility_upstream_index(candidate),
-                )
-            })
-            .collect::<Vec<_>>();
-
-        best_candidate_by_affinity_selection_mode(
-            self.template,
-            runtime,
-            &station_candidates,
-            affinity_mode,
-        )
-    }
 }
 
 fn best_candidate_by_affinity_selection_mode<'a>(
     template: &RoutePlanTemplate,
     runtime: &RoutePlanRuntimeState,
-    station_candidates: &[&'a RouteCandidate],
+    candidates: &[&'a RouteCandidate],
     affinity_mode: RoutePlanAffinitySelectionMode,
 ) -> Option<&'a RouteCandidate> {
     let affinity_policy = affinity_policy_for_selection(template.affinity_policy, affinity_mode);
     match affinity_policy {
-        RoutingAffinityPolicyV5::Off => {
-            first_candidate_in_best_preference_group(template, runtime, station_candidates)
+        RouteAffinityPolicy::Off => {
+            first_candidate_in_best_preference_group(template, runtime, candidates)
         }
-        RoutingAffinityPolicyV5::PreferredGroup => {
-            best_candidate_in_preference_group(template, runtime, station_candidates)
+        RouteAffinityPolicy::PreferredGroup => {
+            best_candidate_in_preference_group(template, runtime, candidates)
         }
-        RoutingAffinityPolicyV5::FallbackSticky => {
-            affinity_candidate(template, runtime, station_candidates)
-                .filter(|candidate| {
-                    fallback_affinity_within_configured_window(
-                        template,
-                        runtime,
-                        station_candidates,
-                    ) || first_candidate_in_best_preference_group(
-                        template,
-                        runtime,
-                        station_candidates,
-                    )
-                    .is_none_or(|best| best.preference_group >= candidate.preference_group)
-                })
-                .or_else(|| {
-                    first_candidate_in_best_preference_group(template, runtime, station_candidates)
-                })
-        }
-        RoutingAffinityPolicyV5::Hard => {
+        RouteAffinityPolicy::FallbackSticky => affinity_candidate(template, runtime, candidates)
+            .filter(|candidate| {
+                fallback_affinity_within_configured_window(template, runtime, candidates)
+                    || first_candidate_in_best_preference_group(template, runtime, candidates)
+                        .is_none_or(|best| best.preference_group >= candidate.preference_group)
+            })
+            .or_else(|| first_candidate_in_best_preference_group(template, runtime, candidates)),
+        RouteAffinityPolicy::Hard => {
             if runtime.affinity_provider_endpoint().is_some() {
-                affinity_candidate(template, runtime, station_candidates)
+                affinity_candidate(template, runtime, candidates)
             } else {
-                first_candidate_in_best_preference_group(template, runtime, station_candidates)
+                first_candidate_in_best_preference_group(template, runtime, candidates)
             }
         }
     }
 }
 
 fn affinity_policy_for_selection(
-    configured: RoutingAffinityPolicyV5,
+    configured: RouteAffinityPolicy,
     affinity_mode: RoutePlanAffinitySelectionMode,
-) -> RoutingAffinityPolicyV5 {
+) -> RouteAffinityPolicy {
     match (configured, affinity_mode) {
-        (RoutingAffinityPolicyV5::Hard, RoutePlanAffinitySelectionMode::SoftSessionPreferred) => {
-            RoutingAffinityPolicyV5::FallbackSticky
+        (RouteAffinityPolicy::Hard, RoutePlanAffinitySelectionMode::SoftSessionPreferred) => {
+            RouteAffinityPolicy::FallbackSticky
         }
         _ => configured,
     }
@@ -1222,16 +1027,16 @@ fn affinity_policy_for_selection(
 fn first_candidate_in_best_preference_group<'a>(
     template: &RoutePlanTemplate,
     runtime: &RoutePlanRuntimeState,
-    station_candidates: &[&'a RouteCandidate],
+    candidates: &[&'a RouteCandidate],
 ) -> Option<&'a RouteCandidate> {
-    let best_group = station_candidates
+    let best_group = candidates
         .iter()
         .copied()
         .filter(|candidate| candidate_available_in_runtime(template, runtime, candidate))
         .map(|candidate| candidate.preference_group)
         .min()?;
 
-    station_candidates.iter().copied().find(|candidate| {
+    candidates.iter().copied().find(|candidate| {
         candidate.preference_group == best_group
             && candidate_available_in_runtime(template, runtime, candidate)
     })
@@ -1240,22 +1045,21 @@ fn first_candidate_in_best_preference_group<'a>(
 fn best_candidate_in_preference_group<'a>(
     template: &RoutePlanTemplate,
     runtime: &RoutePlanRuntimeState,
-    station_candidates: &[&'a RouteCandidate],
+    candidates: &[&'a RouteCandidate],
 ) -> Option<&'a RouteCandidate> {
-    let best_group = station_candidates
+    let best_group = candidates
         .iter()
         .copied()
         .filter(|candidate| candidate_available_in_runtime(template, runtime, candidate))
         .map(|candidate| candidate.preference_group)
         .min()?;
 
-    if let Some(candidate) =
-        affinity_candidate_in_group(template, runtime, station_candidates, best_group)
+    if let Some(candidate) = affinity_candidate_in_group(template, runtime, candidates, best_group)
     {
         return Some(candidate);
     }
 
-    station_candidates.iter().copied().find(|candidate| {
+    candidates.iter().copied().find(|candidate| {
         candidate.preference_group == best_group
             && candidate_available_in_runtime(template, runtime, candidate)
     })
@@ -1264,10 +1068,10 @@ fn best_candidate_in_preference_group<'a>(
 fn affinity_candidate<'a>(
     template: &RoutePlanTemplate,
     runtime: &RoutePlanRuntimeState,
-    station_candidates: &[&'a RouteCandidate],
+    candidates: &[&'a RouteCandidate],
 ) -> Option<&'a RouteCandidate> {
     let affinity_key = runtime.affinity_provider_endpoint()?;
-    station_candidates.iter().copied().find(|candidate| {
+    candidates.iter().copied().find(|candidate| {
         candidate_provider_endpoint_key(template, candidate) == *affinity_key
             && candidate_available_in_runtime(template, runtime, candidate)
     })
@@ -1276,11 +1080,11 @@ fn affinity_candidate<'a>(
 fn affinity_candidate_in_group<'a>(
     template: &RoutePlanTemplate,
     runtime: &RoutePlanRuntimeState,
-    station_candidates: &[&'a RouteCandidate],
+    candidates: &[&'a RouteCandidate],
     preference_group: u32,
 ) -> Option<&'a RouteCandidate> {
     let affinity_key = runtime.affinity_provider_endpoint()?;
-    station_candidates.iter().copied().find(|candidate| {
+    candidates.iter().copied().find(|candidate| {
         candidate.preference_group == preference_group
             && candidate_provider_endpoint_key(template, candidate) == *affinity_key
             && candidate_available_in_runtime(template, runtime, candidate)
@@ -1290,19 +1094,19 @@ fn affinity_candidate_in_group<'a>(
 fn fallback_affinity_within_configured_window(
     template: &RoutePlanTemplate,
     runtime: &RoutePlanRuntimeState,
-    station_candidates: &[&RouteCandidate],
+    candidates: &[&RouteCandidate],
 ) -> bool {
     let Some(affinity_key) = runtime.affinity_provider_endpoint() else {
         return true;
     };
-    let Some(affinity_candidate) = station_candidates
+    let Some(affinity_candidate) = candidates
         .iter()
         .copied()
         .find(|candidate| candidate_provider_endpoint_key(template, candidate) == *affinity_key)
     else {
         return true;
     };
-    let Some(best_group) = station_candidates
+    let Some(best_group) = candidates
         .iter()
         .copied()
         .filter(|candidate| candidate_routable_except_usage(template, runtime, candidate))
@@ -1415,7 +1219,7 @@ struct EndpointParts {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConditionalExpansion {
     MatchRequest,
-    AllBranchesForCompatibility,
+    AllConditionalBranches,
 }
 
 struct RouteExpansionContext<'a> {
@@ -1425,149 +1229,154 @@ struct RouteExpansionContext<'a> {
 
 struct RouteExpansionFrame<'a> {
     route_name: &'a str,
-    node: &'a RoutingNodeV4,
+    node: &'a RouteNodeConfig,
     node_path: &'a [String],
 }
 
-pub fn compile_v4_route_plan_template(
-    service_name: &str,
-    view: &ServiceViewV4,
-) -> Result<RoutePlanTemplate> {
-    compile_v4_route_plan_template_with_request(service_name, view, &RouteRequestContext::default())
+#[derive(Debug, Clone)]
+pub struct CompiledRouteGraph {
+    service_name: String,
+    view: ServiceRouteConfig,
+    routing: RouteGraphConfig,
+    nodes: BTreeMap<String, RouteNodePlan>,
+    static_leaves: Vec<RouteLeaf>,
+    static_candidates: Vec<RouteCandidate>,
+    digest: String,
 }
 
-pub fn compile_v4_route_plan_template_with_request(
-    service_name: &str,
-    view: &ServiceViewV4,
-    request: &RouteRequestContext,
-) -> Result<RoutePlanTemplate> {
-    compile_v4_route_plan_template_with_expansion(
-        service_name,
-        view,
-        request,
-        ConditionalExpansion::MatchRequest,
-    )
-}
+impl CompiledRouteGraph {
+    pub fn compile(service_name: &str, view: &ServiceRouteConfig) -> Result<Self> {
+        let routing = effective_routing(view);
+        validate_route_provider_name_conflicts(service_name, view, &routing)?;
+        let nodes = normalize_route_nodes(service_name, view, &routing)?;
+        let expansion = RouteExpansionContext {
+            request: &RouteRequestContext::default(),
+            conditional: ConditionalExpansion::AllConditionalBranches,
+        };
+        let static_leaves = expand_route_leaves(service_name, view, &routing, &expansion)?;
+        ensure_unique_route_leaves(service_name, &static_leaves)?;
+        let static_candidates = route_candidates_from_leaves(service_name, view, &static_leaves)?;
+        validate_candidate_concurrency_groups(service_name, &static_candidates)?;
+        let digest = static_route_graph_digest(service_name, &routing, &nodes, &static_candidates);
 
-pub fn compile_v4_route_plan_template_for_compat_runtime(
-    service_name: &str,
-    view: &ServiceViewV4,
-) -> Result<RoutePlanTemplate> {
-    compile_v4_route_plan_template_with_expansion(
-        service_name,
-        view,
-        &RouteRequestContext::default(),
-        ConditionalExpansion::AllBranchesForCompatibility,
-    )
-}
+        Ok(Self {
+            service_name: service_name.to_string(),
+            view: view.clone(),
+            routing,
+            nodes,
+            static_leaves,
+            static_candidates,
+            digest,
+        })
+    }
 
-fn compile_v4_route_plan_template_with_expansion(
-    service_name: &str,
-    view: &ServiceViewV4,
-    request: &RouteRequestContext,
-    conditional: ConditionalExpansion,
-) -> Result<RoutePlanTemplate> {
-    let routing = effective_v4_routing(view);
-    validate_route_provider_name_conflicts(service_name, view, &routing)?;
+    pub fn digest(&self) -> &str {
+        self.digest.as_str()
+    }
 
-    let nodes = normalize_route_nodes(service_name, view, &routing)?;
-    let expansion = RouteExpansionContext {
-        request,
-        conditional,
-    };
-    let leaves = expand_v4_route_leaves(service_name, view, &routing, &expansion)?;
-    ensure_unique_route_leaves(service_name, &leaves)?;
+    pub fn service_name(&self) -> &str {
+        self.service_name.as_str()
+    }
 
-    let expanded_provider_order = leaves
-        .iter()
-        .map(|leaf| leaf.provider_id.clone())
-        .collect::<Vec<_>>();
-    let candidates = route_candidates_from_leaves(service_name, view, &leaves)?;
+    pub fn candidates(&self) -> &[RouteCandidate] {
+        self.static_candidates.as_slice()
+    }
 
-    Ok(RoutePlanTemplate {
-        service_name: service_name.to_string(),
-        entry: routing.entry,
-        affinity_policy: routing.affinity_policy,
-        fallback_ttl_ms: routing.fallback_ttl_ms,
-        reprobe_preferred_after_ms: routing.reprobe_preferred_after_ms,
-        nodes,
-        expanded_provider_order,
-        compatibility_station_name: None,
-        candidates,
-    })
-}
+    pub fn candidate_identities(&self) -> Vec<RuntimeUpstreamIdentity> {
+        self.static_candidates
+            .iter()
+            .map(|candidate| {
+                RuntimeUpstreamIdentity::new_with_auth(
+                    ProviderEndpointKey::new(
+                        self.service_name.clone(),
+                        candidate.provider_id.clone(),
+                        candidate.endpoint_id.clone(),
+                    ),
+                    candidate.base_url.clone(),
+                    candidate.continuity_domain.clone(),
+                    &candidate.auth,
+                )
+            })
+            .collect()
+    }
 
-pub fn compile_legacy_route_plan_template<'a>(
-    service_name: &str,
-    services: impl IntoIterator<Item = &'a ServiceConfig>,
-) -> RoutePlanTemplate {
-    let entry = "legacy".to_string();
-    let mut candidates = Vec::new();
-    let mut station_names = BTreeSet::new();
+    pub fn route_plan(&self, request: &RouteRequestContext) -> Result<RoutePlanTemplate> {
+        self.route_plan_with_expansion(request, ConditionalExpansion::MatchRequest)
+    }
 
-    for service in services {
-        station_names.insert(service.name.clone());
-        for (upstream_index, upstream) in service.upstreams.iter().enumerate() {
-            let provider_id = upstream
-                .tags
-                .get("provider_id")
-                .cloned()
-                .unwrap_or_else(|| format!("{}#{upstream_index}", service.name));
-            let endpoint_id = upstream
-                .tags
-                .get("endpoint_id")
-                .cloned()
-                .unwrap_or_else(|| upstream_index.to_string());
-            let stable_index = candidates.len();
-            let route_path = vec![entry.clone(), service.name.clone(), provider_id.clone()];
-            candidates.push(RouteCandidate {
-                provider_id,
-                provider_alias: service.alias.clone(),
-                endpoint_id,
-                base_url: upstream.base_url.clone(),
-                continuity_domain: upstream
-                    .tags
-                    .get("continuity_domain")
-                    .map(|value| value.trim().to_string())
-                    .filter(|value| !value.is_empty()),
-                auth: upstream.auth.clone(),
-                tags: hash_string_map_to_btree(&upstream.tags),
-                supported_models: hash_bool_map_to_btree(&upstream.supported_models),
-                model_mapping: hash_string_map_to_btree(&upstream.model_mapping),
-                route_path,
-                preference_group: 0,
-                stable_index,
-                concurrency: RouteCandidateConcurrency::default(),
-                compatibility_station_name: Some(service.name.clone()),
-                compatibility_upstream_index: Some(upstream_index),
-            });
+    pub fn handshake_plan(&self) -> RoutePlanTemplate {
+        self.route_plan_from_parts(
+            self.static_leaves.as_slice(),
+            self.static_candidates.clone(),
+        )
+    }
+
+    fn route_plan_with_expansion(
+        &self,
+        request: &RouteRequestContext,
+        conditional: ConditionalExpansion,
+    ) -> Result<RoutePlanTemplate> {
+        let expansion = RouteExpansionContext {
+            request,
+            conditional,
+        };
+        let leaves = expand_route_leaves(
+            self.service_name.as_str(),
+            &self.view,
+            &self.routing,
+            &expansion,
+        )?;
+        ensure_unique_route_leaves(self.service_name.as_str(), &leaves)?;
+        let candidates =
+            route_candidates_from_leaves(self.service_name.as_str(), &self.view, &leaves)?;
+        Ok(self.route_plan_from_parts(leaves.as_slice(), candidates))
+    }
+
+    fn route_plan_from_parts(
+        &self,
+        leaves: &[RouteLeaf],
+        candidates: Vec<RouteCandidate>,
+    ) -> RoutePlanTemplate {
+        RoutePlanTemplate {
+            service_name: self.service_name.clone(),
+            entry: self.routing.entry.clone(),
+            affinity_policy: self.routing.affinity_policy,
+            scheduling_preset: self.routing.scheduling_preset,
+            fallback_ttl_ms: self.routing.fallback_ttl_ms,
+            reprobe_preferred_after_ms: self.routing.reprobe_preferred_after_ms,
+            nodes: self.nodes.clone(),
+            expanded_provider_order: leaves.iter().map(|leaf| leaf.provider_id.clone()).collect(),
+            candidates,
         }
     }
+}
 
-    RoutePlanTemplate {
-        service_name: service_name.to_string(),
-        entry,
-        affinity_policy: RoutingAffinityPolicyV5::FallbackSticky,
-        fallback_ttl_ms: None,
-        reprobe_preferred_after_ms: None,
-        nodes: BTreeMap::new(),
-        expanded_provider_order: candidates
-            .iter()
-            .map(|candidate| candidate.provider_id.clone())
-            .collect(),
-        candidates,
-        compatibility_station_name: if station_names.len() == 1 {
-            station_names.into_iter().next()
-        } else {
-            None
-        },
-    }
+pub fn compile_route_plan_template(
+    service_name: &str,
+    view: &ServiceRouteConfig,
+) -> Result<RoutePlanTemplate> {
+    compile_route_plan_template_with_request(service_name, view, &RouteRequestContext::default())
+}
+
+pub fn compile_route_plan_template_with_request(
+    service_name: &str,
+    view: &ServiceRouteConfig,
+    request: &RouteRequestContext,
+) -> Result<RoutePlanTemplate> {
+    CompiledRouteGraph::compile(service_name, view)?.route_plan(request)
+}
+
+pub fn compile_route_handshake_plan(
+    service_name: &str,
+    view: &ServiceRouteConfig,
+) -> Result<RoutePlanTemplate> {
+    Ok(CompiledRouteGraph::compile(service_name, view)?.handshake_plan())
 }
 
 fn validate_route_provider_name_conflicts(
     service_name: &str,
-    view: &ServiceViewV4,
-    routing: &RoutingConfigV4,
+    view: &ServiceRouteConfig,
+    routing: &RouteGraphConfig,
 ) -> Result<()> {
     for route_name in routing.routes.keys() {
         if view.providers.contains_key(route_name.as_str()) {
@@ -1581,8 +1390,8 @@ fn validate_route_provider_name_conflicts(
 
 fn normalize_route_nodes(
     service_name: &str,
-    view: &ServiceViewV4,
-    routing: &RoutingConfigV4,
+    view: &ServiceRouteConfig,
+    routing: &RouteGraphConfig,
 ) -> Result<BTreeMap<String, RouteNodePlan>> {
     let mut out = BTreeMap::new();
     for (route_name, node) in &routing.routes {
@@ -1628,13 +1437,13 @@ fn normalize_route_nodes(
 
 fn validate_route_node_shape(
     service_name: &str,
-    view: &ServiceViewV4,
-    routing: &RoutingConfigV4,
+    view: &ServiceRouteConfig,
+    routing: &RouteGraphConfig,
     route_name: &str,
-    node: &RoutingNodeV4,
+    node: &RouteNodeConfig,
 ) -> Result<()> {
     match node.strategy {
-        RoutingPolicyV4::Conditional => {
+        RouteStrategy::Conditional => {
             let Some(condition) = node.when.as_ref() else {
                 anyhow::bail!("[{service_name}] conditional route '{route_name}' requires when");
             };
@@ -1674,8 +1483,8 @@ fn validate_route_node_shape(
 
 fn normalize_route_ref(
     service_name: &str,
-    view: &ServiceViewV4,
-    routing: &RoutingConfigV4,
+    view: &ServiceRouteConfig,
+    routing: &RouteGraphConfig,
     name: &str,
 ) -> Result<RouteRef> {
     if view.providers.contains_key(name) {
@@ -1706,7 +1515,7 @@ fn split_provider_endpoint_ref(name: &str) -> Option<(&str, &str)> {
     Some((provider_id, endpoint_id))
 }
 
-fn provider_endpoint_exists(provider: &ProviderConfigV4, endpoint_id: &str) -> bool {
+fn provider_endpoint_exists(provider: &ProviderConfig, endpoint_id: &str) -> bool {
     if endpoint_id == "default" {
         return provider
             .base_url
@@ -1718,7 +1527,7 @@ fn provider_endpoint_exists(provider: &ProviderConfigV4, endpoint_id: &str) -> b
     provider.endpoints.contains_key(endpoint_id)
 }
 
-fn provider_endpoint_enabled(provider: &ProviderConfigV4, endpoint_id: &str) -> bool {
+fn provider_endpoint_enabled(provider: &ProviderConfig, endpoint_id: &str) -> bool {
     if endpoint_id == "default"
         && provider
             .base_url
@@ -1734,10 +1543,10 @@ fn provider_endpoint_enabled(provider: &ProviderConfigV4, endpoint_id: &str) -> 
         .is_some_and(|endpoint| endpoint.enabled)
 }
 
-fn expand_v4_route_leaves(
+fn expand_route_leaves(
     service_name: &str,
-    view: &ServiceViewV4,
-    routing: &RoutingConfigV4,
+    view: &ServiceRouteConfig,
+    routing: &RouteGraphConfig,
     expansion: &RouteExpansionContext<'_>,
 ) -> Result<Vec<RouteLeaf>> {
     if view.providers.is_empty() && routing.routes.is_empty() {
@@ -1770,8 +1579,8 @@ fn expand_v4_route_leaves(
 
 fn expand_route_ref(
     service_name: &str,
-    view: &ServiceViewV4,
-    routing: &RoutingConfigV4,
+    view: &ServiceRouteConfig,
+    routing: &RouteGraphConfig,
     child_name: &str,
     parent_path: &[String],
     expansion: &RouteExpansionContext<'_>,
@@ -1827,8 +1636,8 @@ fn expand_route_ref(
 
 fn expand_route_node(
     service_name: &str,
-    view: &ServiceViewV4,
-    routing: &RoutingConfigV4,
+    view: &ServiceRouteConfig,
+    routing: &RouteGraphConfig,
     route_name: &str,
     parent_path: &[String],
     expansion: &RouteExpansionContext<'_>,
@@ -1858,16 +1667,16 @@ fn expand_route_node(
         node_path: &node_path,
     };
     let result = match node.strategy {
-        RoutingPolicyV4::OrderedFailover => {
+        RouteStrategy::OrderedFailover => {
             expand_ordered_route_children(service_name, view, routing, &frame, expansion, stack)
         }
-        RoutingPolicyV4::ManualSticky => {
+        RouteStrategy::ManualSticky => {
             expand_manual_sticky_route(service_name, view, routing, &frame, expansion, stack)
         }
-        RoutingPolicyV4::TagPreferred => {
+        RouteStrategy::TagPreferred => {
             expand_tag_preferred_route(service_name, view, routing, &frame, expansion, stack)
         }
-        RoutingPolicyV4::Conditional => {
+        RouteStrategy::Conditional => {
             expand_conditional_route(service_name, view, routing, &frame, expansion, stack)
         }
     };
@@ -1877,8 +1686,8 @@ fn expand_route_node(
 
 fn expand_ordered_route_children(
     service_name: &str,
-    view: &ServiceViewV4,
-    routing: &RoutingConfigV4,
+    view: &ServiceRouteConfig,
+    routing: &RouteGraphConfig,
     frame: &RouteExpansionFrame<'_>,
     expansion: &RouteExpansionContext<'_>,
     stack: &mut Vec<String>,
@@ -1909,8 +1718,8 @@ fn expand_ordered_route_children(
 
 fn expand_manual_sticky_route(
     service_name: &str,
-    view: &ServiceViewV4,
-    routing: &RoutingConfigV4,
+    view: &ServiceRouteConfig,
+    routing: &RouteGraphConfig,
     frame: &RouteExpansionFrame<'_>,
     expansion: &RouteExpansionContext<'_>,
     stack: &mut Vec<String>,
@@ -1958,8 +1767,8 @@ fn expand_manual_sticky_route(
 
 fn expand_tag_preferred_route(
     service_name: &str,
-    view: &ServiceViewV4,
-    routing: &RoutingConfigV4,
+    view: &ServiceRouteConfig,
+    routing: &RouteGraphConfig,
     frame: &RouteExpansionFrame<'_>,
     expansion: &RouteExpansionContext<'_>,
     stack: &mut Vec<String>,
@@ -2006,7 +1815,7 @@ fn expand_tag_preferred_route(
         }
     }
 
-    if matches!(frame.node.on_exhausted, RoutingExhaustedActionV4::Stop) {
+    if matches!(frame.node.on_exhausted, RouteExhaustedAction::Stop) {
         if preferred.is_empty() {
             anyhow::bail!(
                 "[{service_name}] tag-preferred route '{}' with on_exhausted = 'stop' matched no providers",
@@ -2052,8 +1861,8 @@ fn offset_preference_groups(leaves: &mut [RouteLeaf], offset: u32) {
 
 fn expand_conditional_route(
     service_name: &str,
-    view: &ServiceViewV4,
-    routing: &RoutingConfigV4,
+    view: &ServiceRouteConfig,
+    routing: &RouteGraphConfig,
     frame: &RouteExpansionFrame<'_>,
     expansion: &RouteExpansionContext<'_>,
     stack: &mut Vec<String>,
@@ -2100,9 +1909,8 @@ fn expand_conditional_route(
                 stack,
             )
         }
-        ConditionalExpansion::AllBranchesForCompatibility => {
-            let mut leaves = Vec::new();
-            leaves.extend(expand_route_ref(
+        ConditionalExpansion::AllConditionalBranches => {
+            let then_leaves = expand_route_ref(
                 service_name,
                 view,
                 routing,
@@ -2110,8 +1918,9 @@ fn expand_conditional_route(
                 frame.node_path,
                 expansion,
                 stack,
-            )?);
-            leaves.extend(expand_route_ref(
+            )?;
+            ensure_unique_route_leaves(service_name, &then_leaves)?;
+            let default_leaves = expand_route_ref(
                 service_name,
                 view,
                 routing,
@@ -2119,7 +1928,11 @@ fn expand_conditional_route(
                 frame.node_path,
                 expansion,
                 stack,
-            )?);
+            )?;
+            ensure_unique_route_leaves(service_name, &default_leaves)?;
+
+            let mut leaves = then_leaves;
+            leaves.extend(default_leaves);
             dedupe_route_leaves_by_target(&mut leaves);
             Ok(leaves)
         }
@@ -2133,7 +1946,7 @@ fn dedupe_route_leaves_by_target(leaves: &mut Vec<RouteLeaf>) {
 
 pub(crate) fn request_matches_condition(
     request: &RouteRequestContext,
-    condition: &RoutingConditionV4,
+    condition: &RouteCondition,
 ) -> bool {
     optional_field_matches(request.model.as_deref(), condition.model.as_deref(), false)
         && optional_field_matches(
@@ -2176,7 +1989,7 @@ fn optional_field_matches(
 }
 
 fn child_route_matches_any_filter(
-    view: &ServiceViewV4,
+    view: &ServiceRouteConfig,
     leaves: &[RouteLeaf],
     filters: &[BTreeMap<String, String>],
 ) -> bool {
@@ -2232,9 +2045,250 @@ fn ensure_unique_route_leaves(service_name: &str, leaves: &[RouteLeaf]) -> Resul
     Ok(())
 }
 
+struct StableRouteDigest {
+    hasher: Sha256,
+}
+
+impl StableRouteDigest {
+    fn new() -> Self {
+        let mut digest = Self {
+            hasher: Sha256::new(),
+        };
+        digest.text("codex-helper:compiled-route-graph");
+        digest
+    }
+
+    fn text(&mut self, value: &str) {
+        self.length(value.len());
+        self.hasher.update(value.as_bytes());
+    }
+
+    fn length(&mut self, value: usize) {
+        self.u64(u64::try_from(value).unwrap_or(u64::MAX));
+    }
+
+    fn bool(&mut self, value: bool) {
+        self.hasher.update([u8::from(value)]);
+    }
+
+    fn u32(&mut self, value: u32) {
+        self.hasher.update(value.to_be_bytes());
+    }
+
+    fn u64(&mut self, value: u64) {
+        self.hasher.update(value.to_be_bytes());
+    }
+
+    fn optional_text(&mut self, value: Option<&str>) {
+        self.bool(value.is_some());
+        if let Some(value) = value {
+            self.text(value);
+        }
+    }
+
+    fn optional_u32(&mut self, value: Option<u32>) {
+        self.bool(value.is_some());
+        if let Some(value) = value {
+            self.u32(value);
+        }
+    }
+
+    fn optional_u64(&mut self, value: Option<u64>) {
+        self.bool(value.is_some());
+        if let Some(value) = value {
+            self.u64(value);
+        }
+    }
+
+    fn string_map(&mut self, values: &BTreeMap<String, String>) {
+        self.length(values.len());
+        for (key, value) in values {
+            self.text(key);
+            self.text(value);
+        }
+    }
+
+    fn bool_map(&mut self, values: &BTreeMap<String, bool>) {
+        self.length(values.len());
+        for (key, value) in values {
+            self.text(key);
+            self.bool(*value);
+        }
+    }
+
+    fn finish(self) -> String {
+        format!("sha256:{:x}", self.hasher.finalize())
+    }
+}
+
+fn static_route_graph_digest(
+    service_name: &str,
+    routing: &RouteGraphConfig,
+    nodes: &BTreeMap<String, RouteNodePlan>,
+    candidates: &[RouteCandidate],
+) -> String {
+    let mut digest = StableRouteDigest::new();
+    digest.text("service_name");
+    digest.text(service_name);
+    digest.text("entry");
+    digest.text(routing.entry.as_str());
+    digest.text("affinity_policy");
+    digest.text(affinity_policy_name(routing.affinity_policy));
+    digest.text("fallback_ttl_ms");
+    digest.optional_u64(routing.fallback_ttl_ms);
+    digest.text("reprobe_preferred_after_ms");
+    digest.optional_u64(routing.reprobe_preferred_after_ms);
+    digest.text("nodes");
+    digest.length(nodes.len());
+    for (name, node) in nodes {
+        digest.text(name);
+        encode_route_node(&mut digest, node);
+    }
+    digest.text("candidates");
+    digest.length(candidates.len());
+    for candidate in candidates {
+        encode_route_candidate(&mut digest, candidate);
+    }
+    digest.finish()
+}
+
+fn encode_route_node(digest: &mut StableRouteDigest, node: &RouteNodePlan) {
+    digest.text("name");
+    digest.text(node.name.as_str());
+    digest.text("strategy");
+    digest.text(routing_policy_name(node.strategy));
+    digest.text("children");
+    digest.length(node.children.len());
+    for child in &node.children {
+        encode_route_ref(digest, child);
+    }
+    digest.text("target");
+    encode_optional_route_ref(digest, node.target.as_ref());
+    digest.text("prefer_tags");
+    digest.length(node.prefer_tags.len());
+    for filter in &node.prefer_tags {
+        digest.string_map(filter);
+    }
+    digest.text("on_exhausted");
+    digest.text(exhausted_action_name(node.on_exhausted));
+    digest.text("metadata");
+    digest.string_map(&node.metadata);
+    digest.text("when");
+    encode_optional_condition(digest, node.when.as_ref());
+    digest.text("then");
+    encode_optional_route_ref(digest, node.then.as_ref());
+    digest.text("default");
+    encode_optional_route_ref(digest, node.default_route.as_ref());
+}
+
+fn encode_route_ref(digest: &mut StableRouteDigest, route_ref: &RouteRef) {
+    match route_ref {
+        RouteRef::Route(name) => {
+            digest.text("route");
+            digest.text(name);
+        }
+        RouteRef::Provider(provider_id) => {
+            digest.text("provider");
+            digest.text(provider_id);
+        }
+        RouteRef::ProviderEndpoint {
+            provider_id,
+            endpoint_id,
+        } => {
+            digest.text("provider_endpoint");
+            digest.text(provider_id);
+            digest.text(endpoint_id);
+        }
+    }
+}
+
+fn encode_optional_route_ref(digest: &mut StableRouteDigest, route_ref: Option<&RouteRef>) {
+    digest.bool(route_ref.is_some());
+    if let Some(route_ref) = route_ref {
+        encode_route_ref(digest, route_ref);
+    }
+}
+
+fn encode_optional_condition(digest: &mut StableRouteDigest, condition: Option<&RouteCondition>) {
+    digest.bool(condition.is_some());
+    if let Some(condition) = condition {
+        digest.optional_text(condition.model.as_deref());
+        digest.optional_text(condition.service_tier.as_deref());
+        digest.optional_text(condition.reasoning_effort.as_deref());
+        digest.optional_text(condition.path.as_deref());
+        digest.optional_text(condition.method.as_deref());
+        digest.string_map(&condition.headers);
+    }
+}
+
+fn encode_route_candidate(digest: &mut StableRouteDigest, candidate: &RouteCandidate) {
+    digest.text("provider_id");
+    digest.text(candidate.provider_id.as_str());
+    digest.text("provider_alias");
+    digest.optional_text(candidate.provider_alias.as_deref());
+    digest.text("endpoint_id");
+    digest.text(candidate.endpoint_id.as_str());
+    digest.text("base_url");
+    digest.text(candidate.base_url.as_str());
+    digest.text("continuity_domain");
+    digest.optional_text(candidate.continuity_domain.as_deref());
+    digest.text("auth_shape");
+    encode_auth_shape(digest, &candidate.auth);
+    digest.text("tags");
+    digest.string_map(&candidate.tags);
+    digest.text("supported_models");
+    digest.bool_map(&candidate.supported_models);
+    digest.text("model_mapping");
+    digest.string_map(&candidate.model_mapping);
+    digest.text("route_path");
+    digest.length(candidate.route_path.len());
+    for segment in &candidate.route_path {
+        digest.text(segment);
+    }
+    digest.text("preference_group");
+    digest.u32(candidate.preference_group);
+    digest.text("stable_index");
+    digest.length(candidate.stable_index);
+    digest.text("concurrency");
+    digest.optional_u32(candidate.concurrency.max_concurrent_requests);
+    digest.optional_text(candidate.concurrency.limit_group.as_deref());
+}
+
+fn encode_auth_shape(digest: &mut StableRouteDigest, auth: &UpstreamAuth) {
+    digest.bool(auth.auth_token.is_some());
+    digest.bool(auth.auth_token_env.is_some());
+    digest.bool(auth.api_key.is_some());
+    digest.bool(auth.api_key_env.is_some());
+}
+
+fn affinity_policy_name(policy: RouteAffinityPolicy) -> &'static str {
+    match policy {
+        RouteAffinityPolicy::Off => "off",
+        RouteAffinityPolicy::PreferredGroup => "preferred-group",
+        RouteAffinityPolicy::FallbackSticky => "fallback-sticky",
+        RouteAffinityPolicy::Hard => "hard",
+    }
+}
+
+fn routing_policy_name(policy: RouteStrategy) -> &'static str {
+    match policy {
+        RouteStrategy::ManualSticky => "manual-sticky",
+        RouteStrategy::OrderedFailover => "ordered-failover",
+        RouteStrategy::TagPreferred => "tag-preferred",
+        RouteStrategy::Conditional => "conditional",
+    }
+}
+
+fn exhausted_action_name(action: RouteExhaustedAction) -> &'static str {
+    match action {
+        RouteExhaustedAction::Continue => "continue",
+        RouteExhaustedAction::Stop => "stop",
+    }
+}
+
 fn route_candidates_from_leaves(
     service_name: &str,
-    view: &ServiceViewV4,
+    view: &ServiceRouteConfig,
     leaves: &[RouteLeaf],
 ) -> Result<Vec<RouteCandidate>> {
     let mut candidates = Vec::new();
@@ -2249,7 +2303,7 @@ fn route_candidates_from_leaves(
             continue;
         }
 
-        let auth = merge_auth(&provider.auth, &provider.inline_auth);
+        let auth = provider.effective_auth();
         for endpoint in
             ordered_provider_endpoints(service_name, leaf.provider_id.as_str(), provider)?
         {
@@ -2264,6 +2318,25 @@ fn route_candidates_from_leaves(
                 continue;
             }
             let stable_index = candidates.len();
+            let supported_models =
+                merge_bool_maps(&provider.supported_models, &endpoint.supported_models);
+            let model_mapping = merge_string_maps(&provider.model_mapping, &endpoint.model_mapping);
+            let model_rules = Arc::new(
+                model_routing::CompiledModelRules::compile(
+                    supported_models
+                        .iter()
+                        .map(|(pattern, supported)| (pattern.clone(), *supported)),
+                    model_mapping
+                        .iter()
+                        .map(|(pattern, replacement)| (pattern.clone(), replacement.clone())),
+                )
+                .with_context(|| {
+                    format!(
+                        "[{service_name}] provider endpoint '{}.{}' has invalid model rules",
+                        leaf.provider_id, endpoint.endpoint_id
+                    )
+                })?,
+            );
             candidates.push(RouteCandidate {
                 provider_id: leaf.provider_id.clone(),
                 provider_alias: provider.alias.clone(),
@@ -2276,17 +2349,13 @@ fn route_candidates_from_leaves(
                     &provider.tags,
                     &endpoint.tags,
                 ),
-                supported_models: merge_bool_maps(
-                    &provider.supported_models,
-                    &endpoint.supported_models,
-                ),
-                model_mapping: merge_string_maps(&provider.model_mapping, &endpoint.model_mapping),
+                supported_models,
+                model_mapping,
+                model_rules,
                 route_path: leaf.route_path.clone(),
                 preference_group: leaf.preference_group,
                 stable_index,
                 concurrency: effective_candidate_concurrency(&provider.limits, &endpoint.limits),
-                compatibility_station_name: None,
-                compatibility_upstream_index: None,
             });
         }
     }
@@ -2311,10 +2380,35 @@ fn effective_candidate_concurrency(
     }
 }
 
+fn validate_candidate_concurrency_groups(
+    service_name: &str,
+    candidates: &[RouteCandidate],
+) -> Result<()> {
+    let mut limits_by_group = BTreeMap::new();
+    for candidate in candidates {
+        let Some(group) = candidate.concurrency.limit_group.as_deref() else {
+            continue;
+        };
+        let Some(limit) = candidate.concurrency.max_concurrent_requests else {
+            continue;
+        };
+        if let Some(existing_limit) = limits_by_group.get(group)
+            && *existing_limit != limit
+        {
+            anyhow::bail!(
+                "[{service_name}] concurrency limit group '{group}' has conflicting limits \
+                 {existing_limit} and {limit}"
+            );
+        }
+        limits_by_group.insert(group, limit);
+    }
+    Ok(())
+}
+
 fn ordered_provider_endpoints(
     service_name: &str,
     provider_name: &str,
-    provider: &ProviderConfigV4,
+    provider: &ProviderConfig,
 ) -> Result<Vec<EndpointParts>> {
     let mut endpoints = Vec::new();
     if let Some(base_url) = provider
@@ -2382,24 +2476,6 @@ fn ordered_provider_endpoints(
     Ok(endpoints)
 }
 
-fn merge_auth(block: &UpstreamAuth, inline: &UpstreamAuth) -> UpstreamAuth {
-    UpstreamAuth {
-        auth_token: inline
-            .auth_token
-            .clone()
-            .or_else(|| block.auth_token.clone()),
-        auth_token_env: inline
-            .auth_token_env
-            .clone()
-            .or_else(|| block.auth_token_env.clone()),
-        api_key: inline.api_key.clone().or_else(|| block.api_key.clone()),
-        api_key_env: inline
-            .api_key_env
-            .clone()
-            .or_else(|| block.api_key_env.clone()),
-    }
-}
-
 fn merge_string_maps(
     provider_values: &BTreeMap<String, String>,
     endpoint_values: &BTreeMap<String, String>,
@@ -2432,94 +2508,54 @@ fn merge_bool_maps(
     merged
 }
 
-fn candidate_compatibility_upstream_index(candidate: &RouteCandidate) -> usize {
-    candidate
-        .compatibility_upstream_index
-        .unwrap_or(candidate.stable_index)
-}
-
-fn candidate_compatibility_station_name(
-    template: &RoutePlanTemplate,
-    candidate: &RouteCandidate,
-) -> String {
-    candidate
-        .compatibility_station_name
-        .clone()
-        .or_else(|| template.compatibility_station_name.clone())
-        .unwrap_or_else(|| V4_COMPATIBILITY_STATION_NAME.to_string())
-}
-
 fn candidate_supports_model(candidate: &RouteCandidate, requested_model: &str) -> bool {
-    model_routing::is_model_supported(
-        &btree_bool_map_to_hash_map(&candidate.supported_models),
-        &btree_string_map_to_hash_map(&candidate.model_mapping),
-        requested_model,
-    )
-}
-
-fn hash_string_map_to_btree(values: &HashMap<String, String>) -> BTreeMap<String, String> {
-    values
-        .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect()
-}
-
-fn hash_bool_map_to_btree(values: &HashMap<String, bool>) -> BTreeMap<String, bool> {
-    values
-        .iter()
-        .map(|(key, value)| (key.clone(), *value))
-        .collect()
-}
-
-fn btree_string_map_to_hash_map(values: &BTreeMap<String, String>) -> HashMap<String, String> {
-    values
-        .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect()
-}
-
-fn btree_bool_map_to_hash_map(values: &BTreeMap<String, bool>) -> HashMap<String, bool> {
-    values
-        .iter()
-        .map(|(key, value)| (key.clone(), *value))
-        .collect()
+    candidate.is_model_supported(requested_model)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{
-        ProviderConcurrencyLimits, ProviderEndpointV4, ProxyConfigV4, RoutingAffinityPolicyV5,
-        RoutingConditionV4, RoutingConfigV4, RoutingExhaustedActionV4, RoutingNodeV4,
-        RoutingPolicyV4, compile_v4_to_runtime, resolved_v4_provider_order,
+        ProviderConcurrencyLimits, ProviderEndpointConfig, RouteAffinityPolicy, RouteCondition,
+        RouteExhaustedAction, RouteGraphConfig, RouteNodeConfig, RouteStrategy,
+        resolved_provider_order,
     };
-    use crate::lb::{LbState, LoadBalancer, SelectedUpstream};
-    use std::collections::{HashMap, HashSet};
-    use std::sync::{Arc, Mutex};
-
-    fn provider(base_url: &str) -> ProviderConfigV4 {
-        ProviderConfigV4 {
+    fn provider(base_url: &str) -> ProviderConfig {
+        ProviderConfig {
             base_url: Some(base_url.to_string()),
-            ..ProviderConfigV4::default()
+            ..ProviderConfig::default()
         }
     }
 
-    fn tagged_provider(base_url: &str, key: &str, value: &str) -> ProviderConfigV4 {
-        ProviderConfigV4 {
+    fn endpoint(base_url: &str, priority: u32) -> ProviderEndpointConfig {
+        ProviderEndpointConfig {
+            base_url: base_url.to_string(),
+            enabled: true,
+            priority,
+            continuity_domain: None,
+            tags: BTreeMap::new(),
+            supported_models: BTreeMap::new(),
+            model_mapping: BTreeMap::new(),
+            limits: ProviderConcurrencyLimits::default(),
+        }
+    }
+
+    fn tagged_provider(base_url: &str, key: &str, value: &str) -> ProviderConfig {
+        ProviderConfig {
             base_url: Some(base_url.to_string()),
             tags: BTreeMap::from([(key.to_string(), value.to_string())]),
-            ..ProviderConfigV4::default()
+            ..ProviderConfig::default()
         }
     }
 
-    fn limited_provider(base_url: &str, max_concurrent_requests: u32) -> ProviderConfigV4 {
-        ProviderConfigV4 {
+    fn limited_provider(base_url: &str, max_concurrent_requests: u32) -> ProviderConfig {
+        ProviderConfig {
             base_url: Some(base_url.to_string()),
             limits: ProviderConcurrencyLimits {
                 max_concurrent_requests: Some(max_concurrent_requests),
                 limit_group: None,
             },
-            ..ProviderConfigV4::default()
+            ..ProviderConfig::default()
         }
     }
 
@@ -2555,21 +2591,8 @@ mod tests {
             .collect()
     }
 
-    fn legacy_upstream_keys(template: &RoutePlanTemplate) -> Vec<String> {
-        template
-            .candidate_identities()
-            .into_iter()
-            .filter_map(|identity| {
-                identity
-                    .compatibility
-                    .as_ref()
-                    .map(LegacyUpstreamKey::stable_key)
-            })
-            .collect()
-    }
-
-    fn assert_provider_order_parity(view: &ServiceViewV4, template: &RoutePlanTemplate) {
-        let resolved = resolved_v4_provider_order("routing-ir-test", view).expect("resolved order");
+    fn assert_provider_order_parity(view: &ServiceRouteConfig, template: &RoutePlanTemplate) {
+        let resolved = resolved_provider_order("routing-ir-test", view).expect("resolved order");
         assert_eq!(template.expanded_provider_order, resolved);
         assert_eq!(provider_ids(template), resolved);
     }
@@ -2579,69 +2602,66 @@ mod tests {
         let providers = BTreeMap::from([
             (
                 "a".to_string(),
-                ProviderConfigV4 {
+                ProviderConfig {
                     base_url: Some("http://a.example/v1".to_string()),
                     tags: BTreeMap::from([("billing".to_string(), "monthly".to_string())]),
-                    ..ProviderConfigV4::default()
+                    ..ProviderConfig::default()
                 },
             ),
             (
                 "b".to_string(),
-                ProviderConfigV4 {
+                ProviderConfig {
                     base_url: Some("http://b.example/v1".to_string()),
                     tags: BTreeMap::from([("billing".to_string(), "monthly".to_string())]),
-                    ..ProviderConfigV4::default()
+                    ..ProviderConfig::default()
                 },
             ),
         ]);
         let request = RouteRequestContext::default();
-        let ordered = ServiceViewV4 {
+        let ordered = ServiceRouteConfig {
             providers: providers.clone(),
-            routing: Some(RoutingConfigV4 {
+            routing: Some(RouteGraphConfig {
                 entry: "root".to_string(),
                 routes: BTreeMap::from([(
                     "root".to_string(),
-                    RoutingNodeV4 {
-                        strategy: RoutingPolicyV4::OrderedFailover,
+                    RouteNodeConfig {
+                        strategy: RouteStrategy::OrderedFailover,
                         children: vec!["a".to_string(), "b".to_string()],
-                        ..RoutingNodeV4::default()
+                        ..RouteNodeConfig::default()
                     },
                 )]),
-                ..RoutingConfigV4::default()
+                ..RouteGraphConfig::default()
             }),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
-        let tag_preferred = ServiceViewV4 {
+        let tag_preferred = ServiceRouteConfig {
             providers,
-            routing: Some(RoutingConfigV4 {
+            routing: Some(RouteGraphConfig {
                 entry: "root".to_string(),
                 routes: BTreeMap::from([(
                     "root".to_string(),
-                    RoutingNodeV4 {
-                        strategy: RoutingPolicyV4::TagPreferred,
+                    RouteNodeConfig {
+                        strategy: RouteStrategy::TagPreferred,
                         children: vec!["a".to_string(), "b".to_string()],
                         prefer_tags: vec![BTreeMap::from([(
                             "billing".to_string(),
                             "monthly".to_string(),
                         )])],
-                        on_exhausted: RoutingExhaustedActionV4::Continue,
-                        ..RoutingNodeV4::default()
+                        on_exhausted: RouteExhaustedAction::Continue,
+                        ..RouteNodeConfig::default()
                     },
                 )]),
-                ..RoutingConfigV4::default()
+                ..RouteGraphConfig::default()
             }),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
 
         let ordered_template =
-            compile_v4_route_plan_template_with_request("routing-ir-test", &ordered, &request)
+            compile_route_plan_template_with_request("routing-ir-test", &ordered, &request)
                 .expect("ordered template");
-        let tag_preferred_template = compile_v4_route_plan_template_with_request(
-            "routing-ir-test",
-            &tag_preferred,
-            &request,
-        )
-        .expect("tag-preferred template");
+        let tag_preferred_template =
+            compile_route_plan_template_with_request("routing-ir-test", &tag_preferred, &request)
+                .expect("tag-preferred template");
 
         assert_eq!(
             provider_ids(&ordered_template),
@@ -2653,255 +2673,278 @@ mod tests {
         );
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    struct UpstreamSignature {
-        station_name: String,
-        index: usize,
-        base_url: String,
-        tags: BTreeMap<String, String>,
-        supported_models: BTreeMap<String, bool>,
-        model_mapping: BTreeMap<String, String>,
-    }
-
-    #[derive(Debug, PartialEq, Eq)]
-    struct AttemptOrderEvent {
-        decision: &'static str,
-        upstream: UpstreamSignature,
-        avoid_for_station: Vec<usize>,
-        avoided_total: usize,
-        total_upstreams: usize,
-        reason: Option<&'static str>,
-    }
-
-    fn hash_string_map_to_btree(values: &HashMap<String, String>) -> BTreeMap<String, String> {
-        values
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect()
-    }
-
-    fn legacy_parity_tags(values: &HashMap<String, String>) -> BTreeMap<String, String> {
-        values
-            .iter()
-            .filter(|(key, _)| {
-                !matches!(
-                    key.as_str(),
-                    "endpoint_id" | "provider_endpoint_key" | "route_path" | "preference_group"
-                )
-            })
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect()
-    }
-
-    fn hash_bool_map_to_btree(values: &HashMap<String, bool>) -> BTreeMap<String, bool> {
-        values
-            .iter()
-            .map(|(key, value)| (key.clone(), *value))
-            .collect()
-    }
-
-    fn upstream_signature(selected: &SelectedUpstream) -> UpstreamSignature {
-        UpstreamSignature {
-            station_name: selected.station_name.clone(),
-            index: selected.index,
-            base_url: selected.upstream.base_url.clone(),
-            tags: legacy_parity_tags(&selected.upstream.tags),
-            supported_models: hash_bool_map_to_btree(&selected.upstream.supported_models),
-            model_mapping: hash_string_map_to_btree(&selected.upstream.model_mapping),
-        }
-    }
-
-    fn provider_ids_from_attempt_events(events: &[AttemptOrderEvent]) -> Vec<String> {
-        events
-            .iter()
-            .map(|event| {
-                event
-                    .upstream
-                    .tags
-                    .get("provider_id")
-                    .expect("provider_id tag")
-                    .clone()
-            })
-            .collect()
-    }
-
-    fn skip_reason(reason: &RoutePlanSkipReason) -> &'static str {
-        reason.code()
-    }
-
-    fn sorted_hash_set(values: &HashSet<usize>) -> Vec<usize> {
-        let mut sorted = values.iter().copied().collect::<Vec<_>>();
-        sorted.sort_unstable();
-        sorted
-    }
-
-    fn station_exhausted(upstream_total: usize, avoid: &HashSet<usize>) -> bool {
-        upstream_total > 0
-            && avoid.iter().filter(|&&idx| idx < upstream_total).count() >= upstream_total
-    }
-
-    fn executor_selected_upstream_signatures(
-        template: &RoutePlanTemplate,
-    ) -> Vec<UpstreamSignature> {
-        RoutePlanExecutor::new(template)
-            .iter_selected_upstreams()
-            .map(|selected| upstream_signature(&selected.selected_upstream))
-            .collect()
-    }
-
-    fn legacy_routing_load_balancer(view: ServiceViewV4) -> LoadBalancer {
-        let runtime = compile_v4_to_runtime(&ProxyConfigV4 {
-            codex: view,
-            ..ProxyConfigV4::default()
-        })
-        .expect("compile v4 runtime");
-        let service = runtime
-            .codex
-            .station("routing")
-            .expect("routing station")
-            .clone();
-        LoadBalancer::new(
-            Arc::new(service),
-            Arc::new(Mutex::new(HashMap::<String, LbState>::new())),
-        )
-    }
-
-    fn legacy_load_balancer_selected_upstream_signatures(
-        view: ServiceViewV4,
-    ) -> Vec<UpstreamSignature> {
-        let lb = legacy_routing_load_balancer(view);
-        let upstream_count = lb.service.upstreams.len();
-        let mut avoid = HashSet::new();
-        let mut selected = Vec::new();
-        while selected.len() < upstream_count {
-            let next = lb
-                .select_upstream_avoiding_strict(&avoid)
-                .expect("legacy selected upstream");
-            avoid.insert(next.index);
-            selected.push(upstream_signature(&next));
-        }
-        selected
-    }
-
-    fn legacy_attempt_order_signatures(
-        view: ServiceViewV4,
-        request_model: Option<&str>,
-    ) -> Vec<AttemptOrderEvent> {
-        let lb = legacy_routing_load_balancer(view);
-        let total_upstreams = lb.service.upstreams.len();
-        let mut avoid = HashSet::new();
-        let mut avoided_total = 0usize;
-        let mut events = Vec::new();
-
-        while !station_exhausted(total_upstreams, &avoid) {
-            let Some(selected) = lb.select_upstream_avoiding_strict(&avoid) else {
-                break;
+    #[test]
+    fn compiled_route_graph_digest_is_static_canonical_and_child_order_sensitive() {
+        fn graph(children: Vec<&str>, reverse_provider_insertion: bool) -> CompiledRouteGraph {
+            let mut providers = BTreeMap::new();
+            let provider_entries = if reverse_provider_insertion {
+                vec![
+                    ("beta", "https://beta.example/v1"),
+                    ("alpha", "https://alpha.example/v1"),
+                ]
+            } else {
+                vec![
+                    ("alpha", "https://alpha.example/v1"),
+                    ("beta", "https://beta.example/v1"),
+                ]
             };
-
-            if let Some(requested_model) = request_model {
-                let supported = model_routing::is_model_supported(
-                    &selected.upstream.supported_models,
-                    &selected.upstream.model_mapping,
-                    requested_model,
-                );
-                if !supported {
-                    if avoid.insert(selected.index) {
-                        avoided_total = avoided_total.saturating_add(1);
-                    }
-                    events.push(AttemptOrderEvent {
-                        decision: "skipped_capability_mismatch",
-                        upstream: upstream_signature(&selected),
-                        avoid_for_station: sorted_hash_set(&avoid),
-                        avoided_total,
-                        total_upstreams,
-                        reason: Some("unsupported_model"),
-                    });
-                    continue;
-                }
+            for (name, base_url) in provider_entries {
+                providers.insert(name.to_string(), provider(base_url));
             }
 
-            events.push(AttemptOrderEvent {
-                decision: "selected",
-                upstream: upstream_signature(&selected),
-                avoid_for_station: sorted_hash_set(&avoid),
-                avoided_total,
-                total_upstreams,
-                reason: None,
-            });
-
-            if avoid.insert(selected.index) {
-                avoided_total = avoided_total.saturating_add(1);
-            }
-        }
-
-        events
-    }
-
-    fn executor_attempt_order_signatures(
-        view: &ServiceViewV4,
-        request_model: Option<&str>,
-    ) -> Vec<AttemptOrderEvent> {
-        let template = compile_v4_route_plan_template("codex", view).expect("route template");
-        let executor = RoutePlanExecutor::new(&template);
-        let mut state = RoutePlanAttemptState::default();
-        let mut events = Vec::new();
-
-        loop {
-            let selection = executor.select_supported_candidate(&mut state, request_model);
-            events.extend(
-                selection
-                    .skipped
-                    .into_iter()
-                    .map(|skipped| AttemptOrderEvent {
-                        decision: "skipped_capability_mismatch",
-                        upstream: upstream_signature(
-                            &executor.legacy_selected_upstream_for_candidate(skipped.candidate),
-                        ),
-                        avoid_for_station: skipped.avoided_candidate_indices,
-                        avoided_total: skipped.avoided_total,
-                        total_upstreams: skipped.total_upstreams,
-                        reason: Some(skip_reason(&skipped.reason)),
+            CompiledRouteGraph::compile(
+                "codex",
+                &ServiceRouteConfig {
+                    providers,
+                    routing: Some(RouteGraphConfig {
+                        entry: "root".to_string(),
+                        routes: BTreeMap::from([(
+                            "root".to_string(),
+                            RouteNodeConfig {
+                                strategy: RouteStrategy::OrderedFailover,
+                                children: children.into_iter().map(str::to_string).collect(),
+                                ..RouteNodeConfig::default()
+                            },
+                        )]),
+                        ..RouteGraphConfig::default()
                     }),
-            );
-
-            let Some(selected) = selection.selected else {
-                break;
-            };
-            events.push(AttemptOrderEvent {
-                decision: "selected",
-                upstream: upstream_signature(
-                    &executor.legacy_selected_upstream_for_candidate(selected.candidate),
-                ),
-                avoid_for_station: selection.avoided_candidate_indices,
-                avoided_total: selection.avoided_total,
-                total_upstreams: selection.total_upstreams,
-                reason: None,
-            });
-            state.avoid_selected(&selected);
+                    ..ServiceRouteConfig::default()
+                },
+            )
+            .expect("compile route graph")
         }
 
-        events
+        let first = graph(vec!["alpha", "beta"], false);
+        let reordered_maps = graph(vec!["alpha", "beta"], true);
+        let reordered_children = graph(vec!["beta", "alpha"], true);
+
+        assert_eq!(first.digest(), reordered_maps.digest());
+        assert_ne!(first.digest(), reordered_children.digest());
+        assert!(first.digest().starts_with("sha256:"));
+        assert!(!first.digest().contains("source:"));
     }
 
-    fn assert_executor_matches_legacy_load_balancer(view: ServiceViewV4) {
-        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+    #[test]
+    fn compiled_route_graph_digest_is_shared_by_all_conditional_requests() {
+        let view = ServiceRouteConfig {
+            providers: BTreeMap::from([
+                ("small".to_string(), provider("https://small.example/v1")),
+                ("large".to_string(), provider("https://large.example/v1")),
+            ]),
+            routing: Some(RouteGraphConfig {
+                entry: "root".to_string(),
+                routes: BTreeMap::from([(
+                    "root".to_string(),
+                    RouteNodeConfig {
+                        strategy: RouteStrategy::Conditional,
+                        when: Some(RouteCondition {
+                            model: Some("gpt-5".to_string()),
+                            ..RouteCondition::default()
+                        }),
+                        then: Some("large".to_string()),
+                        default_route: Some("small".to_string()),
+                        ..RouteNodeConfig::default()
+                    },
+                )]),
+                ..RouteGraphConfig::default()
+            }),
+            ..ServiceRouteConfig::default()
+        };
+        let graph = CompiledRouteGraph::compile("codex", &view).expect("compile route graph");
+        let digest = graph.digest().to_string();
+
+        let matching = graph
+            .route_plan(&RouteRequestContext {
+                model: Some("gpt-5".to_string()),
+                ..RouteRequestContext::default()
+            })
+            .expect("compile matching request plan");
+        let defaulted = graph
+            .route_plan(&RouteRequestContext {
+                model: Some("gpt-4.1".to_string()),
+                ..RouteRequestContext::default()
+            })
+            .expect("compile default request plan");
+
+        assert_eq!(provider_ids(&matching), vec!["large"]);
+        assert_eq!(provider_ids(&defaulted), vec!["small"]);
+        assert_eq!(graph.digest(), digest);
+    }
+
+    #[test]
+    fn compiled_route_graph_rejects_duplicate_endpoint_inside_unselected_conditional_branch() {
+        let view = ServiceRouteConfig {
+            providers: BTreeMap::from([(
+                "input".to_string(),
+                ProviderConfig {
+                    endpoints: BTreeMap::from([
+                        ("fast".to_string(), endpoint("https://fast.example/v1", 0)),
+                        ("slow".to_string(), endpoint("https://slow.example/v1", 1)),
+                    ]),
+                    ..ProviderConfig::default()
+                },
+            )]),
+            routing: Some(RouteGraphConfig {
+                entry: "root".to_string(),
+                routes: BTreeMap::from([
+                    (
+                        "bad".to_string(),
+                        RouteNodeConfig {
+                            strategy: RouteStrategy::OrderedFailover,
+                            children: vec!["input.fast".to_string(), "input.fast".to_string()],
+                            ..RouteNodeConfig::default()
+                        },
+                    ),
+                    (
+                        "root".to_string(),
+                        RouteNodeConfig {
+                            strategy: RouteStrategy::Conditional,
+                            when: Some(RouteCondition {
+                                model: Some("gpt-5".to_string()),
+                                ..RouteCondition::default()
+                            }),
+                            then: Some("bad".to_string()),
+                            default_route: Some("input.slow".to_string()),
+                            ..RouteNodeConfig::default()
+                        },
+                    ),
+                ]),
+                ..RouteGraphConfig::default()
+            }),
+            ..ServiceRouteConfig::default()
+        };
+
+        let compile_error = CompiledRouteGraph::compile("codex", &view)
+            .expect_err("static graph must reject duplicate endpoint");
+        assert!(compile_error.to_string().contains("input.fast"));
+
+        let request_error = compile_route_plan_template_with_request(
+            "codex",
+            &view,
+            &RouteRequestContext {
+                model: Some("gpt-4.1".to_string()),
+                ..RouteRequestContext::default()
+            },
+        )
+        .expect_err("request compile must validate the unselected branch");
+        assert!(request_error.to_string().contains("input.fast"));
+
+        let handshake_error = compile_route_handshake_plan("codex", &view)
+            .expect_err("handshake compile must not hide the duplicate endpoint");
+        assert!(handshake_error.to_string().contains("input.fast"));
+    }
+
+    #[test]
+    fn compiled_route_graph_allows_same_endpoint_in_mutually_exclusive_branches() {
+        let view = ServiceRouteConfig {
+            providers: BTreeMap::from([(
+                "input".to_string(),
+                ProviderConfig {
+                    endpoints: BTreeMap::from([(
+                        "fast".to_string(),
+                        endpoint("https://fast.example/v1", 0),
+                    )]),
+                    ..ProviderConfig::default()
+                },
+            )]),
+            routing: Some(RouteGraphConfig {
+                entry: "root".to_string(),
+                routes: BTreeMap::from([(
+                    "root".to_string(),
+                    RouteNodeConfig {
+                        strategy: RouteStrategy::Conditional,
+                        when: Some(RouteCondition {
+                            model: Some("gpt-5".to_string()),
+                            ..RouteCondition::default()
+                        }),
+                        then: Some("input.fast".to_string()),
+                        default_route: Some("input.fast".to_string()),
+                        ..RouteNodeConfig::default()
+                    },
+                )]),
+                ..RouteGraphConfig::default()
+            }),
+            ..ServiceRouteConfig::default()
+        };
+
+        let graph = CompiledRouteGraph::compile("codex", &view)
+            .expect("mutually exclusive branches may share an endpoint");
+
+        assert_eq!(graph.candidates().len(), 1);
+        assert_eq!(graph.candidates()[0].endpoint_id, "fast");
+    }
+
+    #[test]
+    fn compiled_route_graph_rejects_ambiguous_candidate_model_rules() {
+        let view = ServiceRouteConfig {
+            providers: BTreeMap::from([(
+                "input".to_string(),
+                ProviderConfig {
+                    base_url: Some("https://input.example/v1".to_string()),
+                    model_mapping: BTreeMap::from([
+                        ("ab*cd".to_string(), "first-*".to_string()),
+                        ("abc*d".to_string(), "second-*".to_string()),
+                    ]),
+                    ..ProviderConfig::default()
+                },
+            )]),
+            ..ServiceRouteConfig::default()
+        };
+
+        let error = CompiledRouteGraph::compile("codex", &view)
+            .expect_err("candidate wildcard tie must fail graph compilation");
+        let message = format!("{error:#}");
+        assert!(message.contains("input.default"), "unexpected: {message}");
+        assert!(message.contains("ab*cd"), "unexpected: {message}");
+        assert!(message.contains("abc*d"), "unexpected: {message}");
+    }
+
+    #[test]
+    fn compiled_route_graph_preserves_provider_endpoint_leaf() {
+        let view = ServiceRouteConfig {
+            providers: BTreeMap::from([(
+                "input".to_string(),
+                ProviderConfig {
+                    endpoints: BTreeMap::from([
+                        ("fast".to_string(), endpoint("https://fast.example/v1", 0)),
+                        ("slow".to_string(), endpoint("https://slow.example/v1", 1)),
+                    ]),
+                    ..ProviderConfig::default()
+                },
+            )]),
+            routing: Some(RouteGraphConfig::ordered_failover(vec![
+                "input.fast".to_string(),
+                "input.slow".to_string(),
+            ])),
+            ..ServiceRouteConfig::default()
+        };
+
+        let graph = CompiledRouteGraph::compile("codex", &view).expect("compile endpoint leaf");
+        let plan = graph
+            .route_plan(&RouteRequestContext::default())
+            .expect("compile request plan");
+
         assert_eq!(
-            executor_selected_upstream_signatures(&template),
-            legacy_load_balancer_selected_upstream_signatures(view)
+            provider_endpoint_keys(&plan),
+            vec!["codex/input/fast", "codex/input/slow"]
+        );
+        assert_eq!(
+            resolved_provider_order("codex", &view).expect("resolve provider order"),
+            vec!["input"]
         );
     }
 
     #[test]
     fn routing_ir_one_provider_matches_resolved_order() {
-        let view = ServiceViewV4 {
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([(
                 "input".to_string(),
                 provider("https://input.example/v1"),
             )]),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
 
-        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let template = compile_route_plan_template("codex", &view).expect("route template");
 
         assert_provider_order_parity(&view, &template);
         assert_eq!(template.entry, "main");
@@ -2918,16 +2961,16 @@ mod tests {
     }
 
     #[test]
-    fn routing_ir_v4_candidate_identity_retains_provider_endpoint_without_synthetic_legacy_key() {
-        let view = ServiceViewV4 {
+    fn routing_ir_candidate_identity_is_provider_endpoint_scoped() {
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([(
                 "input".to_string(),
                 provider("https://input.example/v1"),
             )]),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
 
-        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let template = compile_route_plan_template("codex", &view).expect("route template");
         let identities = template.candidate_identities();
 
         assert_eq!(identities.len(), 1);
@@ -2935,13 +2978,12 @@ mod tests {
             identities[0].provider_endpoint.stable_key(),
             "codex/input/default"
         );
-        assert!(identities[0].compatibility.is_none());
         assert_eq!(identities[0].base_url, "https://input.example/v1");
     }
 
     #[test]
     fn routing_ir_ordered_failover_matches_resolved_order() {
-        let view = ServiceViewV4 {
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([
                 (
                     "primary".to_string(),
@@ -2949,14 +2991,14 @@ mod tests {
                 ),
                 ("backup".to_string(), provider("https://backup.example/v1")),
             ]),
-            routing: Some(RoutingConfigV4::ordered_failover(vec![
+            routing: Some(RouteGraphConfig::ordered_failover(vec![
                 "backup".to_string(),
                 "primary".to_string(),
             ])),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
 
-        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let template = compile_route_plan_template("codex", &view).expect("route template");
 
         assert_provider_order_parity(&view, &template);
         assert_eq!(provider_ids(&template), vec!["backup", "primary"]);
@@ -2964,7 +3006,7 @@ mod tests {
 
     #[test]
     fn routing_ir_nested_route_graph_preserves_candidate_order_and_path() {
-        let view = ServiceViewV4 {
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([
                 (
                     "input".to_string(),
@@ -2979,32 +3021,32 @@ mod tests {
                     tagged_provider("https://paygo.example/v1", "billing", "paygo"),
                 ),
             ]),
-            routing: Some(RoutingConfigV4 {
+            routing: Some(RouteGraphConfig {
                 entry: "monthly_first".to_string(),
                 routes: BTreeMap::from([
                     (
                         "monthly_pool".to_string(),
-                        RoutingNodeV4 {
-                            strategy: RoutingPolicyV4::OrderedFailover,
+                        RouteNodeConfig {
+                            strategy: RouteStrategy::OrderedFailover,
                             children: vec!["input".to_string(), "input1".to_string()],
-                            ..RoutingNodeV4::default()
+                            ..RouteNodeConfig::default()
                         },
                     ),
                     (
                         "monthly_first".to_string(),
-                        RoutingNodeV4 {
-                            strategy: RoutingPolicyV4::OrderedFailover,
+                        RouteNodeConfig {
+                            strategy: RouteStrategy::OrderedFailover,
                             children: vec!["monthly_pool".to_string(), "paygo".to_string()],
-                            ..RoutingNodeV4::default()
+                            ..RouteNodeConfig::default()
                         },
                     ),
                 ]),
-                ..RoutingConfigV4::default()
+                ..RouteGraphConfig::default()
             }),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
 
-        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let template = compile_route_plan_template("codex", &view).expect("route template");
 
         assert_provider_order_parity(&view, &template);
         assert_eq!(provider_ids(&template), vec!["input", "input1", "paygo"]);
@@ -3028,7 +3070,7 @@ mod tests {
 
     #[test]
     fn routing_ir_manual_sticky_matches_resolved_order() {
-        let view = ServiceViewV4 {
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([
                 (
                     "primary".to_string(),
@@ -3036,14 +3078,14 @@ mod tests {
                 ),
                 ("backup".to_string(), provider("https://backup.example/v1")),
             ]),
-            routing: Some(RoutingConfigV4::manual_sticky(
+            routing: Some(RouteGraphConfig::manual_sticky(
                 "backup".to_string(),
                 vec!["backup".to_string(), "primary".to_string()],
             )),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
 
-        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let template = compile_route_plan_template("codex", &view).expect("route template");
 
         assert_provider_order_parity(&view, &template);
         assert_eq!(provider_ids(&template), vec!["backup"]);
@@ -3052,7 +3094,7 @@ mod tests {
 
     #[test]
     fn routing_ir_tag_preferred_continue_matches_resolved_order() {
-        let view = ServiceViewV4 {
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([
                 (
                     "monthly".to_string(),
@@ -3063,18 +3105,18 @@ mod tests {
                     tagged_provider("https://paygo.example/v1", "billing", "paygo"),
                 ),
             ]),
-            routing: Some(RoutingConfigV4::tag_preferred(
+            routing: Some(RouteGraphConfig::tag_preferred(
                 vec!["paygo".to_string(), "monthly".to_string()],
                 vec![BTreeMap::from([(
                     "billing".to_string(),
                     "monthly".to_string(),
                 )])],
-                RoutingExhaustedActionV4::Continue,
+                RouteExhaustedAction::Continue,
             )),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
 
-        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let template = compile_route_plan_template("codex", &view).expect("route template");
 
         assert_provider_order_parity(&view, &template);
         assert_eq!(provider_ids(&template), vec!["monthly", "paygo"]);
@@ -3082,27 +3124,13 @@ mod tests {
             provider_preference_groups(&template),
             vec![("monthly".to_string(), 0), ("paygo".to_string(), 1)]
         );
-        assert_eq!(
-            template.candidates[0]
-                .to_upstream_config()
-                .tags
-                .get("preference_group")
-                .map(String::as_str),
-            Some("0")
-        );
-        assert_eq!(
-            template.candidates[1]
-                .to_upstream_config()
-                .tags
-                .get("preference_group")
-                .map(String::as_str),
-            Some("1")
-        );
+        assert_eq!(template.candidates[0].preference_group, 0);
+        assert_eq!(template.candidates[1].preference_group, 1);
     }
 
     #[test]
     fn routing_ir_tag_preferred_stop_matches_resolved_order() {
-        let view = ServiceViewV4 {
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([
                 (
                     "monthly".to_string(),
@@ -3113,18 +3141,18 @@ mod tests {
                     tagged_provider("https://paygo.example/v1", "billing", "paygo"),
                 ),
             ]),
-            routing: Some(RoutingConfigV4::tag_preferred(
+            routing: Some(RouteGraphConfig::tag_preferred(
                 vec!["paygo".to_string(), "monthly".to_string()],
                 vec![BTreeMap::from([(
                     "billing".to_string(),
                     "monthly".to_string(),
                 )])],
-                RoutingExhaustedActionV4::Stop,
+                RouteExhaustedAction::Stop,
             )),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
 
-        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let template = compile_route_plan_template("codex", &view).expect("route template");
 
         assert_provider_order_parity(&view, &template);
         assert_eq!(provider_ids(&template), vec!["monthly"]);
@@ -3132,7 +3160,7 @@ mod tests {
 
     #[test]
     fn routing_ir_tag_preferred_marks_nested_preference_groups() {
-        let view = ServiceViewV4 {
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([
                 (
                     "monthly-a".to_string(),
@@ -3147,37 +3175,37 @@ mod tests {
                     tagged_provider("https://chili.example/v1", "billing", "paygo"),
                 ),
             ]),
-            routing: Some(RoutingConfigV4 {
+            routing: Some(RouteGraphConfig {
                 entry: "monthly_first".to_string(),
                 routes: BTreeMap::from([
                     (
                         "monthly_pool".to_string(),
-                        RoutingNodeV4 {
-                            strategy: RoutingPolicyV4::OrderedFailover,
+                        RouteNodeConfig {
+                            strategy: RouteStrategy::OrderedFailover,
                             children: vec!["monthly-a".to_string(), "monthly-b".to_string()],
-                            ..RoutingNodeV4::default()
+                            ..RouteNodeConfig::default()
                         },
                     ),
                     (
                         "monthly_first".to_string(),
-                        RoutingNodeV4 {
-                            strategy: RoutingPolicyV4::TagPreferred,
+                        RouteNodeConfig {
+                            strategy: RouteStrategy::TagPreferred,
                             children: vec!["chili".to_string(), "monthly_pool".to_string()],
                             prefer_tags: vec![BTreeMap::from([(
                                 "billing".to_string(),
                                 "monthly".to_string(),
                             )])],
-                            on_exhausted: RoutingExhaustedActionV4::Continue,
-                            ..RoutingNodeV4::default()
+                            on_exhausted: RouteExhaustedAction::Continue,
+                            ..RouteNodeConfig::default()
                         },
                     ),
                 ]),
-                ..RoutingConfigV4::default()
+                ..RouteGraphConfig::default()
             }),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
 
-        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let template = compile_route_plan_template("codex", &view).expect("route template");
 
         assert_provider_order_parity(&view, &template);
         assert_eq!(
@@ -3196,32 +3224,32 @@ mod tests {
 
     #[test]
     fn routing_ir_conditional_route_selects_then_branch_for_matching_request() {
-        let view = ServiceViewV4 {
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([
                 ("small".to_string(), provider("https://small.example/v1")),
                 ("large".to_string(), provider("https://large.example/v1")),
             ]),
-            routing: Some(RoutingConfigV4 {
+            routing: Some(RouteGraphConfig {
                 entry: "root".to_string(),
                 routes: BTreeMap::from([(
                     "root".to_string(),
-                    RoutingNodeV4 {
-                        strategy: RoutingPolicyV4::Conditional,
-                        when: Some(RoutingConditionV4 {
+                    RouteNodeConfig {
+                        strategy: RouteStrategy::Conditional,
+                        when: Some(RouteCondition {
                             model: Some("gpt-5".to_string()),
-                            ..RoutingConditionV4::default()
+                            ..RouteCondition::default()
                         }),
                         then: Some("large".to_string()),
                         default_route: Some("small".to_string()),
-                        ..RoutingNodeV4::default()
+                        ..RouteNodeConfig::default()
                     },
                 )]),
-                ..RoutingConfigV4::default()
+                ..RouteGraphConfig::default()
             }),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
 
-        let template = compile_v4_route_plan_template_with_request(
+        let template = compile_route_plan_template_with_request(
             "codex",
             &view,
             &RouteRequestContext {
@@ -3237,32 +3265,32 @@ mod tests {
 
     #[test]
     fn routing_ir_conditional_route_uses_default_branch_for_no_match() {
-        let view = ServiceViewV4 {
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([
                 ("small".to_string(), provider("https://small.example/v1")),
                 ("large".to_string(), provider("https://large.example/v1")),
             ]),
-            routing: Some(RoutingConfigV4 {
+            routing: Some(RouteGraphConfig {
                 entry: "root".to_string(),
                 routes: BTreeMap::from([(
                     "root".to_string(),
-                    RoutingNodeV4 {
-                        strategy: RoutingPolicyV4::Conditional,
-                        when: Some(RoutingConditionV4 {
+                    RouteNodeConfig {
+                        strategy: RouteStrategy::Conditional,
+                        when: Some(RouteCondition {
                             service_tier: Some("priority".to_string()),
-                            ..RoutingConditionV4::default()
+                            ..RouteCondition::default()
                         }),
                         then: Some("large".to_string()),
                         default_route: Some("small".to_string()),
-                        ..RoutingNodeV4::default()
+                        ..RouteNodeConfig::default()
                     },
                 )]),
-                ..RoutingConfigV4::default()
+                ..RouteGraphConfig::default()
             }),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
 
-        let template = compile_v4_route_plan_template_with_request(
+        let template = compile_route_plan_template_with_request(
             "codex",
             &view,
             &RouteRequestContext {
@@ -3278,7 +3306,7 @@ mod tests {
 
     #[test]
     fn routing_ir_conditional_route_composes_with_ordered_fallback_branch() {
-        let view = ServiceViewV4 {
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([
                 (
                     "large-primary".to_string(),
@@ -3290,37 +3318,37 @@ mod tests {
                 ),
                 ("small".to_string(), provider("https://small.example/v1")),
             ]),
-            routing: Some(RoutingConfigV4 {
+            routing: Some(RouteGraphConfig {
                 entry: "root".to_string(),
                 routes: BTreeMap::from([
                     (
                         "root".to_string(),
-                        RoutingNodeV4 {
-                            strategy: RoutingPolicyV4::Conditional,
-                            when: Some(RoutingConditionV4 {
+                        RouteNodeConfig {
+                            strategy: RouteStrategy::Conditional,
+                            when: Some(RouteCondition {
                                 model: Some("gpt-5".to_string()),
-                                ..RoutingConditionV4::default()
+                                ..RouteCondition::default()
                             }),
                             then: Some("large_pool".to_string()),
                             default_route: Some("small".to_string()),
-                            ..RoutingNodeV4::default()
+                            ..RouteNodeConfig::default()
                         },
                     ),
                     (
                         "large_pool".to_string(),
-                        RoutingNodeV4 {
-                            strategy: RoutingPolicyV4::OrderedFailover,
+                        RouteNodeConfig {
+                            strategy: RouteStrategy::OrderedFailover,
                             children: vec!["large-primary".to_string(), "large-backup".to_string()],
-                            ..RoutingNodeV4::default()
+                            ..RouteNodeConfig::default()
                         },
                     ),
                 ]),
-                ..RoutingConfigV4::default()
+                ..RouteGraphConfig::default()
             }),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
 
-        let template = compile_v4_route_plan_template_with_request(
+        let template = compile_route_plan_template_with_request(
             "codex",
             &view,
             &RouteRequestContext {
@@ -3342,31 +3370,31 @@ mod tests {
 
     #[test]
     fn routing_ir_conditional_route_rejects_missing_default() {
-        let view = ServiceViewV4 {
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([
                 ("small".to_string(), provider("https://small.example/v1")),
                 ("large".to_string(), provider("https://large.example/v1")),
             ]),
-            routing: Some(RoutingConfigV4 {
+            routing: Some(RouteGraphConfig {
                 entry: "root".to_string(),
                 routes: BTreeMap::from([(
                     "root".to_string(),
-                    RoutingNodeV4 {
-                        strategy: RoutingPolicyV4::Conditional,
-                        when: Some(RoutingConditionV4 {
+                    RouteNodeConfig {
+                        strategy: RouteStrategy::Conditional,
+                        when: Some(RouteCondition {
                             model: Some("gpt-5".to_string()),
-                            ..RoutingConditionV4::default()
+                            ..RouteCondition::default()
                         }),
                         then: Some("large".to_string()),
-                        ..RoutingNodeV4::default()
+                        ..RouteNodeConfig::default()
                     },
                 )]),
-                ..RoutingConfigV4::default()
+                ..RouteGraphConfig::default()
             }),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
 
-        let err = compile_v4_route_plan_template_with_request(
+        let err = compile_route_plan_template_with_request(
             "codex",
             &view,
             &RouteRequestContext {
@@ -3381,29 +3409,29 @@ mod tests {
 
     #[test]
     fn routing_ir_conditional_route_rejects_empty_condition() {
-        let view = ServiceViewV4 {
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([
                 ("small".to_string(), provider("https://small.example/v1")),
                 ("large".to_string(), provider("https://large.example/v1")),
             ]),
-            routing: Some(RoutingConfigV4 {
+            routing: Some(RouteGraphConfig {
                 entry: "root".to_string(),
                 routes: BTreeMap::from([(
                     "root".to_string(),
-                    RoutingNodeV4 {
-                        strategy: RoutingPolicyV4::Conditional,
-                        when: Some(RoutingConditionV4::default()),
+                    RouteNodeConfig {
+                        strategy: RouteStrategy::Conditional,
+                        when: Some(RouteCondition::default()),
                         then: Some("large".to_string()),
                         default_route: Some("small".to_string()),
-                        ..RoutingNodeV4::default()
+                        ..RouteNodeConfig::default()
                     },
                 )]),
-                ..RoutingConfigV4::default()
+                ..RouteGraphConfig::default()
             }),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
 
-        let err = compile_v4_route_plan_template_with_request(
+        let err = compile_route_plan_template_with_request(
             "codex",
             &view,
             &RouteRequestContext::default(),
@@ -3417,52 +3445,37 @@ mod tests {
     }
 
     #[test]
-    fn routing_ir_conditional_route_flattens_only_for_compat_runtime_path() {
-        let view = ServiceViewV4 {
+    fn routing_ir_handshake_plan_contains_all_conditional_branches() {
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([
                 ("small".to_string(), provider("https://small.example/v1")),
                 ("large".to_string(), provider("https://large.example/v1")),
             ]),
-            routing: Some(RoutingConfigV4 {
+            routing: Some(RouteGraphConfig {
                 entry: "root".to_string(),
                 routes: BTreeMap::from([(
                     "root".to_string(),
-                    RoutingNodeV4 {
-                        strategy: RoutingPolicyV4::Conditional,
-                        when: Some(RoutingConditionV4 {
+                    RouteNodeConfig {
+                        strategy: RouteStrategy::Conditional,
+                        when: Some(RouteCondition {
                             model: Some("gpt-5".to_string()),
-                            ..RoutingConditionV4::default()
+                            ..RouteCondition::default()
                         }),
                         then: Some("large".to_string()),
                         default_route: Some("small".to_string()),
-                        ..RoutingNodeV4::default()
+                        ..RouteNodeConfig::default()
                     },
                 )]),
-                ..RoutingConfigV4::default()
+                ..RouteGraphConfig::default()
             }),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
-        let cfg = ProxyConfigV4 {
-            version: 4,
-            codex: view,
-            ..ProxyConfigV4::default()
-        };
-
-        let runtime = compile_v4_to_runtime(&cfg).expect("compat runtime");
-        let routing = runtime
-            .codex
-            .station("routing")
-            .expect("compat routing station");
+        let plan = compile_route_handshake_plan("codex", &view).expect("handshake plan");
 
         assert_eq!(
-            routing
-                .upstreams
+            plan.candidates
                 .iter()
-                .map(|upstream| upstream
-                    .tags
-                    .get("provider_id")
-                    .map(String::as_str)
-                    .unwrap_or(""))
+                .map(|candidate| candidate.provider_id.as_str())
                 .collect::<Vec<_>>(),
             vec!["large", "small"]
         );
@@ -3473,7 +3486,7 @@ mod tests {
         let mut endpoints = BTreeMap::new();
         endpoints.insert(
             "slow".to_string(),
-            ProviderEndpointV4 {
+            ProviderEndpointConfig {
                 base_url: "https://slow.example/v1".to_string(),
                 continuity_domain: None,
                 enabled: true,
@@ -3486,7 +3499,7 @@ mod tests {
         );
         endpoints.insert(
             "fast".to_string(),
-            ProviderEndpointV4 {
+            ProviderEndpointConfig {
                 base_url: "https://fast.example/v1".to_string(),
                 continuity_domain: None,
                 enabled: true,
@@ -3500,20 +3513,20 @@ mod tests {
                 limits: ProviderConcurrencyLimits::default(),
             },
         );
-        let view = ServiceViewV4 {
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([(
                 "input".to_string(),
-                ProviderConfigV4 {
+                ProviderConfig {
                     tags: BTreeMap::from([("billing".to_string(), "monthly".to_string())]),
                     supported_models: BTreeMap::from([("gpt-5".to_string(), true)]),
                     endpoints,
-                    ..ProviderConfigV4::default()
+                    ..ProviderConfig::default()
                 },
             )]),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
 
-        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let template = compile_route_plan_template("codex", &view).expect("route template");
 
         assert_eq!(provider_ids(&template), vec!["input", "input"]);
         assert_eq!(template.candidates[0].endpoint_id, "fast");
@@ -3522,7 +3535,6 @@ mod tests {
             provider_endpoint_keys(&template),
             vec!["codex/input/fast", "codex/input/slow"]
         );
-        assert!(legacy_upstream_keys(&template).is_empty());
         assert_eq!(
             template.candidates[0]
                 .tags
@@ -3556,22 +3568,22 @@ mod tests {
 
     #[test]
     fn routing_ir_provider_concurrency_limit_compiles_to_default_endpoint() {
-        let view = ServiceViewV4 {
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([(
                 "relay".to_string(),
-                ProviderConfigV4 {
+                ProviderConfig {
                     base_url: Some("https://relay.example/v1".to_string()),
                     limits: ProviderConcurrencyLimits {
                         max_concurrent_requests: Some(5),
                         limit_group: Some(" relay-account ".to_string()),
                     },
-                    ..ProviderConfigV4::default()
+                    ..ProviderConfig::default()
                 },
             )]),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
 
-        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let template = compile_route_plan_template("codex", &view).expect("route template");
         let concurrency = &template.candidates[0].concurrency;
 
         assert_eq!(concurrency.max_concurrent_requests, Some(5));
@@ -3581,29 +3593,29 @@ mod tests {
                 "codex",
                 &template.candidate_provider_endpoint_key(&template.candidates[0])
             ),
-            Some("codex/relay-account".to_string())
+            Some("group:codex/relay-account".to_string())
         );
     }
 
     #[test]
     fn routing_ir_continuity_domain_defaults_to_endpoint_and_supports_explicit_overrides() {
-        let view = ServiceViewV4 {
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([
                 (
                     "opaque".to_string(),
-                    ProviderConfigV4 {
+                    ProviderConfig {
                         base_url: Some("https://same.example/v1".to_string()),
-                        ..ProviderConfigV4::default()
+                        ..ProviderConfig::default()
                     },
                 ),
                 (
                     "shared".to_string(),
-                    ProviderConfigV4 {
+                    ProviderConfig {
                         continuity_domain: Some(" shared-cluster ".to_string()),
                         endpoints: BTreeMap::from([
                             (
                                 "default".to_string(),
-                                ProviderEndpointV4 {
+                                ProviderEndpointConfig {
                                     base_url: "https://shared-default.example/v1".to_string(),
                                     continuity_domain: None,
                                     enabled: true,
@@ -3616,7 +3628,7 @@ mod tests {
                             ),
                             (
                                 "isolated".to_string(),
-                                ProviderEndpointV4 {
+                                ProviderEndpointConfig {
                                     base_url: "https://shared-isolated.example/v1".to_string(),
                                     continuity_domain: Some("isolated-cluster".to_string()),
                                     enabled: true,
@@ -3628,17 +3640,17 @@ mod tests {
                                 },
                             ),
                         ]),
-                        ..ProviderConfigV4::default()
+                        ..ProviderConfig::default()
                     },
                 ),
             ]),
-            routing: Some(RoutingConfigV4::ordered_failover(vec![
+            routing: Some(RouteGraphConfig::ordered_failover(vec![
                 "opaque".to_string(),
                 "shared".to_string(),
             ])),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
-        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let template = compile_route_plan_template("codex", &view).expect("route template");
         let domains = template
             .candidates
             .iter()
@@ -3677,16 +3689,16 @@ mod tests {
 
     #[test]
     fn routing_ir_continuity_topology_summarizes_endpoint_and_domain_counts() {
-        let view = ServiceViewV4 {
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([
                 (
                     "alpha".to_string(),
-                    ProviderConfigV4 {
+                    ProviderConfig {
                         continuity_domain: Some("shared-relay".to_string()),
                         endpoints: BTreeMap::from([
                             (
                                 "one".to_string(),
-                                ProviderEndpointV4 {
+                                ProviderEndpointConfig {
                                     base_url: "https://alpha-one.example/v1".to_string(),
                                     continuity_domain: None,
                                     enabled: true,
@@ -3699,7 +3711,7 @@ mod tests {
                             ),
                             (
                                 "two".to_string(),
-                                ProviderEndpointV4 {
+                                ProviderEndpointConfig {
                                     base_url: "https://alpha-two.example/v1".to_string(),
                                     continuity_domain: None,
                                     enabled: true,
@@ -3711,24 +3723,24 @@ mod tests {
                                 },
                             ),
                         ]),
-                        ..ProviderConfigV4::default()
+                        ..ProviderConfig::default()
                     },
                 ),
                 (
                     "beta".to_string(),
-                    ProviderConfigV4 {
+                    ProviderConfig {
                         base_url: Some("https://beta.example/v1".to_string()),
-                        ..ProviderConfigV4::default()
+                        ..ProviderConfig::default()
                     },
                 ),
             ]),
-            routing: Some(RoutingConfigV4::ordered_failover(vec![
+            routing: Some(RouteGraphConfig::ordered_failover(vec![
                 "alpha".to_string(),
                 "beta".to_string(),
             ])),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
-        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let template = compile_route_plan_template("codex", &view).expect("route template");
         let topology = template.continuity_topology();
 
         assert_eq!(topology.configured_provider_endpoint_count(), 3);
@@ -3762,12 +3774,12 @@ mod tests {
         let template = RoutePlanTemplate {
             service_name: "codex".to_string(),
             entry: "main".to_string(),
-            affinity_policy: RoutingAffinityPolicyV5::FallbackSticky,
+            affinity_policy: RouteAffinityPolicy::FallbackSticky,
+            scheduling_preset: SchedulingPreset::Balanced,
             fallback_ttl_ms: None,
             reprobe_preferred_after_ms: None,
             nodes: BTreeMap::new(),
             expanded_provider_order: vec!["relay".to_string()],
-            compatibility_station_name: None,
             candidates: vec![
                 RouteCandidate {
                     provider_id: "relay".to_string(),
@@ -3779,12 +3791,11 @@ mod tests {
                     tags: BTreeMap::new(),
                     supported_models: BTreeMap::new(),
                     model_mapping: BTreeMap::new(),
+                    model_rules: Arc::default(),
                     route_path: vec!["main".to_string(), "preferred".to_string()],
                     preference_group: 0,
                     stable_index: 0,
                     concurrency: RouteCandidateConcurrency::default(),
-                    compatibility_station_name: None,
-                    compatibility_upstream_index: None,
                 },
                 RouteCandidate {
                     provider_id: "relay".to_string(),
@@ -3796,12 +3807,11 @@ mod tests {
                     tags: BTreeMap::new(),
                     supported_models: BTreeMap::new(),
                     model_mapping: BTreeMap::new(),
+                    model_rules: Arc::default(),
                     route_path: vec!["main".to_string(), "fallback".to_string()],
                     preference_group: 1,
                     stable_index: 1,
                     concurrency: RouteCandidateConcurrency::default(),
-                    compatibility_station_name: None,
-                    compatibility_upstream_index: None,
                 },
             ],
         };
@@ -3826,17 +3836,17 @@ mod tests {
 
     #[test]
     fn routing_ir_endpoint_concurrency_limit_overrides_provider_limit() {
-        let view = ServiceViewV4 {
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([(
                 "relay".to_string(),
-                ProviderConfigV4 {
+                ProviderConfig {
                     limits: ProviderConcurrencyLimits {
                         max_concurrent_requests: Some(5),
                         limit_group: Some("relay-account".to_string()),
                     },
                     endpoints: BTreeMap::from([(
                         "hk".to_string(),
-                        ProviderEndpointV4 {
+                        ProviderEndpointConfig {
                             base_url: "https://hk.relay.example/v1".to_string(),
                             continuity_domain: None,
                             enabled: true,
@@ -3850,13 +3860,13 @@ mod tests {
                             },
                         },
                     )]),
-                    ..ProviderConfigV4::default()
+                    ..ProviderConfig::default()
                 },
             )]),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
 
-        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let template = compile_route_plan_template("codex", &view).expect("route template");
         let concurrency = &template.candidates[0].concurrency;
 
         assert_eq!(concurrency.max_concurrent_requests, Some(2));
@@ -3866,24 +3876,24 @@ mod tests {
                 "codex",
                 &template.candidate_provider_endpoint_key(&template.candidates[0])
             ),
-            Some("codex/relay-hk".to_string())
+            Some("group:codex/relay-hk".to_string())
         );
     }
 
     #[test]
     fn routing_ir_default_concurrency_is_unlimited_and_keyed_by_provider_endpoint_without_group() {
-        let view = ServiceViewV4 {
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([(
                 "relay".to_string(),
-                ProviderConfigV4 {
+                ProviderConfig {
                     base_url: Some("https://relay.example/v1".to_string()),
-                    ..ProviderConfigV4::default()
+                    ..ProviderConfig::default()
                 },
             )]),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
 
-        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let template = compile_route_plan_template("codex", &view).expect("route template");
         let concurrency = &template.candidates[0].concurrency;
         let provider_endpoint = template.candidate_provider_endpoint_key(&template.candidates[0]);
 
@@ -3897,20 +3907,58 @@ mod tests {
         };
         assert_eq!(
             grouped.limit_key("codex", &provider_endpoint),
-            Some("codex/relay/default".to_string())
+            Some("endpoint:codex/relay/default".to_string())
         );
     }
 
     #[test]
+    fn routing_ir_rejects_different_limits_for_the_same_explicit_group() {
+        let view = ServiceRouteConfig {
+            providers: BTreeMap::from([
+                (
+                    "primary".to_string(),
+                    ProviderConfig {
+                        base_url: Some("https://primary.example/v1".to_string()),
+                        limits: ProviderConcurrencyLimits {
+                            max_concurrent_requests: Some(1),
+                            limit_group: Some("shared-account".to_string()),
+                        },
+                        ..ProviderConfig::default()
+                    },
+                ),
+                (
+                    "backup".to_string(),
+                    ProviderConfig {
+                        base_url: Some("https://backup.example/v1".to_string()),
+                        limits: ProviderConcurrencyLimits {
+                            max_concurrent_requests: Some(2),
+                            limit_group: Some("shared-account".to_string()),
+                        },
+                        ..ProviderConfig::default()
+                    },
+                ),
+            ]),
+            ..ServiceRouteConfig::default()
+        };
+
+        let error = CompiledRouteGraph::compile("codex", &view)
+            .expect_err("one capacity group cannot have two limits");
+        let message = error.to_string();
+        assert!(message.contains("shared-account"), "unexpected: {message}");
+        assert!(message.contains("1"), "unexpected: {message}");
+        assert!(message.contains("2"), "unexpected: {message}");
+    }
+
+    #[test]
     fn routing_ir_manual_sticky_can_target_provider_endpoint() {
-        let view = ServiceViewV4 {
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([(
                 "input".to_string(),
-                ProviderConfigV4 {
+                ProviderConfig {
                     endpoints: BTreeMap::from([
                         (
                             "fast".to_string(),
-                            ProviderEndpointV4 {
+                            ProviderEndpointConfig {
                                 base_url: "https://fast.example/v1".to_string(),
                                 continuity_domain: None,
                                 enabled: true,
@@ -3923,7 +3971,7 @@ mod tests {
                         ),
                         (
                             "slow".to_string(),
-                            ProviderEndpointV4 {
+                            ProviderEndpointConfig {
                                 base_url: "https://slow.example/v1".to_string(),
                                 continuity_domain: None,
                                 enabled: true,
@@ -3935,26 +3983,26 @@ mod tests {
                             },
                         ),
                     ]),
-                    ..ProviderConfigV4::default()
+                    ..ProviderConfig::default()
                 },
             )]),
-            routing: Some(RoutingConfigV4 {
+            routing: Some(RouteGraphConfig {
                 entry: "root".to_string(),
                 routes: BTreeMap::from([(
                     "root".to_string(),
-                    RoutingNodeV4 {
-                        strategy: RoutingPolicyV4::ManualSticky,
+                    RouteNodeConfig {
+                        strategy: RouteStrategy::ManualSticky,
                         target: Some("input.slow".to_string()),
                         children: vec!["input".to_string()],
-                        ..RoutingNodeV4::default()
+                        ..RouteNodeConfig::default()
                     },
                 )]),
-                ..RoutingConfigV4::default()
+                ..RouteGraphConfig::default()
             }),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
 
-        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let template = compile_route_plan_template("codex", &view).expect("route template");
 
         assert_eq!(provider_ids(&template), vec!["input"]);
         assert_eq!(template.candidates[0].endpoint_id, "slow");
@@ -3968,13 +4016,13 @@ mod tests {
 
     #[test]
     fn routing_ir_manual_sticky_rejects_disabled_provider_endpoint_target() {
-        let view = ServiceViewV4 {
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([(
                 "input".to_string(),
-                ProviderConfigV4 {
+                ProviderConfig {
                     endpoints: BTreeMap::from([(
                         "fast".to_string(),
-                        ProviderEndpointV4 {
+                        ProviderEndpointConfig {
                             base_url: "https://fast.example/v1".to_string(),
                             continuity_domain: None,
                             enabled: false,
@@ -3985,26 +4033,26 @@ mod tests {
                             limits: ProviderConcurrencyLimits::default(),
                         },
                     )]),
-                    ..ProviderConfigV4::default()
+                    ..ProviderConfig::default()
                 },
             )]),
-            routing: Some(RoutingConfigV4 {
+            routing: Some(RouteGraphConfig {
                 entry: "root".to_string(),
                 routes: BTreeMap::from([(
                     "root".to_string(),
-                    RoutingNodeV4 {
-                        strategy: RoutingPolicyV4::ManualSticky,
+                    RouteNodeConfig {
+                        strategy: RouteStrategy::ManualSticky,
                         target: Some("input.fast".to_string()),
                         children: vec!["input".to_string()],
-                        ..RoutingNodeV4::default()
+                        ..RouteNodeConfig::default()
                     },
                 )]),
-                ..RoutingConfigV4::default()
+                ..RouteGraphConfig::default()
             }),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
 
-        let error = compile_v4_route_plan_template("codex", &view).expect_err("disabled endpoint");
+        let error = compile_route_plan_template("codex", &view).expect_err("disabled endpoint");
 
         assert!(
             error
@@ -4014,305 +4062,15 @@ mod tests {
     }
 
     #[test]
-    fn routing_ir_legacy_template_identity_uses_tagged_provider_and_station_index() {
-        let service = ServiceConfig {
-            name: "legacy-station".to_string(),
-            alias: None,
-            enabled: true,
-            level: 1,
-            upstreams: vec![UpstreamConfig {
-                base_url: "https://legacy.example/v1".to_string(),
-                auth: UpstreamAuth::default(),
-                tags: HashMap::from([("provider_id".to_string(), "tagged".to_string())]),
-                supported_models: HashMap::new(),
-                model_mapping: HashMap::new(),
-            }],
-        };
-
-        let template = compile_legacy_route_plan_template("codex", [&service]);
-        let identities = template.candidate_identities();
-
-        assert_eq!(identities.len(), 1);
-        assert_eq!(
-            identities[0].provider_endpoint.stable_key(),
-            "codex/tagged/0"
-        );
-        assert_eq!(
-            identities[0]
-                .compatibility
-                .as_ref()
-                .map(LegacyUpstreamKey::stable_key)
-                .as_deref(),
-            Some("codex/legacy-station/0")
-        );
-        assert_eq!(identities[0].base_url, "https://legacy.example/v1");
-    }
-
-    #[test]
-    fn route_plan_executor_matches_legacy_load_balancer_for_nested_route() {
-        assert_executor_matches_legacy_load_balancer(ServiceViewV4 {
-            providers: BTreeMap::from([
-                (
-                    "input".to_string(),
-                    tagged_provider("https://input.example/v1", "billing", "monthly"),
-                ),
-                (
-                    "input1".to_string(),
-                    tagged_provider("https://input1.example/v1", "billing", "monthly"),
-                ),
-                (
-                    "paygo".to_string(),
-                    tagged_provider("https://paygo.example/v1", "billing", "paygo"),
-                ),
-            ]),
-            routing: Some(RoutingConfigV4 {
-                entry: "monthly_first".to_string(),
-                routes: BTreeMap::from([
-                    (
-                        "monthly_pool".to_string(),
-                        RoutingNodeV4 {
-                            strategy: RoutingPolicyV4::OrderedFailover,
-                            children: vec!["input".to_string(), "input1".to_string()],
-                            ..RoutingNodeV4::default()
-                        },
-                    ),
-                    (
-                        "monthly_first".to_string(),
-                        RoutingNodeV4 {
-                            strategy: RoutingPolicyV4::OrderedFailover,
-                            children: vec!["monthly_pool".to_string(), "paygo".to_string()],
-                            ..RoutingNodeV4::default()
-                        },
-                    ),
-                ]),
-                ..RoutingConfigV4::default()
-            }),
-            ..ServiceViewV4::default()
-        });
-    }
-
-    #[test]
-    fn route_plan_executor_matches_legacy_load_balancer_for_tag_preferred() {
-        assert_executor_matches_legacy_load_balancer(ServiceViewV4 {
-            providers: BTreeMap::from([
-                (
-                    "monthly".to_string(),
-                    tagged_provider("https://monthly.example/v1", "billing", "monthly"),
-                ),
-                (
-                    "paygo".to_string(),
-                    tagged_provider("https://paygo.example/v1", "billing", "paygo"),
-                ),
-            ]),
-            routing: Some(RoutingConfigV4::tag_preferred(
-                vec!["paygo".to_string(), "monthly".to_string()],
-                vec![BTreeMap::from([(
-                    "billing".to_string(),
-                    "monthly".to_string(),
-                )])],
-                RoutingExhaustedActionV4::Continue,
-            )),
-            ..ServiceViewV4::default()
-        });
-    }
-
-    #[test]
-    fn route_plan_executor_matches_legacy_load_balancer_for_multi_endpoint_provider() {
-        let mut endpoints = BTreeMap::new();
-        endpoints.insert(
-            "slow".to_string(),
-            ProviderEndpointV4 {
-                base_url: "https://slow.example/v1".to_string(),
-                continuity_domain: None,
-                enabled: true,
-                priority: 10,
-                tags: BTreeMap::from([("region".to_string(), "us".to_string())]),
-                supported_models: BTreeMap::from([("gpt-4.1".to_string(), true)]),
-                model_mapping: BTreeMap::new(),
-                limits: ProviderConcurrencyLimits::default(),
-            },
-        );
-        endpoints.insert(
-            "fast".to_string(),
-            ProviderEndpointV4 {
-                base_url: "https://fast.example/v1".to_string(),
-                continuity_domain: None,
-                enabled: true,
-                priority: 0,
-                tags: BTreeMap::from([("region".to_string(), "hk".to_string())]),
-                supported_models: BTreeMap::new(),
-                model_mapping: BTreeMap::from([(
-                    "gpt-5".to_string(),
-                    "provider-gpt-5".to_string(),
-                )]),
-                limits: ProviderConcurrencyLimits::default(),
-            },
-        );
-
-        assert_executor_matches_legacy_load_balancer(ServiceViewV4 {
-            providers: BTreeMap::from([(
-                "input".to_string(),
-                ProviderConfigV4 {
-                    tags: BTreeMap::from([("billing".to_string(), "monthly".to_string())]),
-                    supported_models: BTreeMap::from([("gpt-5".to_string(), true)]),
-                    endpoints,
-                    ..ProviderConfigV4::default()
-                },
-            )]),
-            ..ServiceViewV4::default()
-        });
-    }
-
-    #[test]
-    fn route_plan_executor_attempt_order_matches_legacy_failover_avoidance() {
-        let view = ServiceViewV4 {
-            providers: BTreeMap::from([
-                (
-                    "primary".to_string(),
-                    provider("https://primary.example/v1"),
-                ),
-                ("backup".to_string(), provider("https://backup.example/v1")),
-                ("paygo".to_string(), provider("https://paygo.example/v1")),
-            ]),
-            routing: Some(RoutingConfigV4::ordered_failover(vec![
-                "backup".to_string(),
-                "primary".to_string(),
-                "paygo".to_string(),
-            ])),
-            ..ServiceViewV4::default()
-        };
-
-        let executor_events = executor_attempt_order_signatures(&view, None);
-        let legacy_events = legacy_attempt_order_signatures(view, None);
-
-        assert_eq!(executor_events, legacy_events);
-        assert_eq!(
-            provider_ids_from_attempt_events(&executor_events),
-            vec!["backup", "primary", "paygo"]
-        );
-        assert_eq!(executor_events[0].avoid_for_station, Vec::<usize>::new());
-        assert_eq!(executor_events[1].avoid_for_station, vec![0]);
-        assert_eq!(executor_events[2].avoid_for_station, vec![0, 1]);
-    }
-
-    #[test]
-    fn route_plan_executor_attempt_order_matches_legacy_unsupported_model_skip() {
-        let view = ServiceViewV4 {
-            providers: BTreeMap::from([
-                (
-                    "legacy".to_string(),
-                    ProviderConfigV4 {
-                        base_url: Some("https://legacy.example/v1".to_string()),
-                        supported_models: BTreeMap::from([("gpt-4.1".to_string(), true)]),
-                        ..ProviderConfigV4::default()
-                    },
-                ),
-                (
-                    "mapped".to_string(),
-                    ProviderConfigV4 {
-                        base_url: Some("https://mapped.example/v1".to_string()),
-                        model_mapping: BTreeMap::from([(
-                            "gpt-5".to_string(),
-                            "provider-gpt-5".to_string(),
-                        )]),
-                        ..ProviderConfigV4::default()
-                    },
-                ),
-                (
-                    "fallback".to_string(),
-                    provider("https://fallback.example/v1"),
-                ),
-            ]),
-            routing: Some(RoutingConfigV4::ordered_failover(vec![
-                "legacy".to_string(),
-                "mapped".to_string(),
-                "fallback".to_string(),
-            ])),
-            ..ServiceViewV4::default()
-        };
-
-        let executor_events = executor_attempt_order_signatures(&view, Some("gpt-5"));
-        let legacy_events = legacy_attempt_order_signatures(view, Some("gpt-5"));
-
-        assert_eq!(executor_events, legacy_events);
-        assert_eq!(
-            executor_events
-                .iter()
-                .map(|event| event.decision)
-                .collect::<Vec<_>>(),
-            vec!["skipped_capability_mismatch", "selected", "selected"]
-        );
-        assert_eq!(
-            provider_ids_from_attempt_events(&executor_events),
-            vec!["legacy", "mapped", "fallback"]
-        );
-        assert_eq!(executor_events[0].reason, Some("unsupported_model"));
-        assert_eq!(executor_events[0].avoid_for_station, vec![0]);
-        assert_eq!(executor_events[1].avoid_for_station, vec![0]);
-        assert_eq!(executor_events[2].avoid_for_station, vec![0, 1]);
-    }
-
-    #[test]
-    fn route_plan_executor_attempt_order_matches_legacy_all_unsupported_exhaustion() {
-        let view = ServiceViewV4 {
-            providers: BTreeMap::from([
-                (
-                    "old".to_string(),
-                    ProviderConfigV4 {
-                        base_url: Some("https://old.example/v1".to_string()),
-                        supported_models: BTreeMap::from([("gpt-4.1".to_string(), true)]),
-                        ..ProviderConfigV4::default()
-                    },
-                ),
-                (
-                    "older".to_string(),
-                    ProviderConfigV4 {
-                        base_url: Some("https://older.example/v1".to_string()),
-                        supported_models: BTreeMap::from([("gpt-4o".to_string(), true)]),
-                        ..ProviderConfigV4::default()
-                    },
-                ),
-            ]),
-            routing: Some(RoutingConfigV4::ordered_failover(vec![
-                "old".to_string(),
-                "older".to_string(),
-            ])),
-            ..ServiceViewV4::default()
-        };
-
-        let executor_events = executor_attempt_order_signatures(&view, Some("gpt-5"));
-        let legacy_events = legacy_attempt_order_signatures(view.clone(), Some("gpt-5"));
-
-        assert_eq!(executor_events, legacy_events);
-        assert_eq!(
-            executor_events
-                .iter()
-                .map(|event| event.decision)
-                .collect::<Vec<_>>(),
-            vec!["skipped_capability_mismatch", "skipped_capability_mismatch"]
-        );
-
-        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
-        let executor = RoutePlanExecutor::new(&template);
-        let mut state = RoutePlanAttemptState::default();
-        let selection = executor.select_supported_candidate(&mut state, Some("gpt-5"));
-
-        assert!(selection.selected.is_none());
-        assert_eq!(selection.skipped.len(), 2);
-        assert_eq!(selection.avoided_candidate_indices, vec![0, 1]);
-        assert!(state.route_candidates_exhausted(&template));
-    }
-
-    #[test]
     fn route_plan_executor_explains_structured_skip_reasons() {
-        let view = ServiceViewV4 {
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([
                 (
                     "unsupported".to_string(),
-                    ProviderConfigV4 {
+                    ProviderConfig {
                         base_url: Some("https://unsupported.example/v1".to_string()),
                         supported_models: BTreeMap::from([("gpt-4.1".to_string(), true)]),
-                        ..ProviderConfigV4::default()
+                        ..ProviderConfig::default()
                     },
                 ),
                 (
@@ -4337,7 +4095,7 @@ mod tests {
                     provider("https://healthy.example/v1"),
                 ),
             ]),
-            routing: Some(RoutingConfigV4::ordered_failover(vec![
+            routing: Some(RouteGraphConfig::ordered_failover(vec![
                 "unsupported".to_string(),
                 "disabled".to_string(),
                 "cooldown".to_string(),
@@ -4346,9 +4104,9 @@ mod tests {
                 "missing-auth".to_string(),
                 "healthy".to_string(),
             ])),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
-        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let template = compile_route_plan_template("codex", &view).expect("route template");
         let executor = RoutePlanExecutor::new(&template);
         let mut runtime = RoutePlanRuntimeState::default();
         runtime.set_provider_endpoint(
@@ -4441,7 +4199,7 @@ mod tests {
 
     #[test]
     fn route_plan_executor_skips_saturated_candidate_without_failure_penalty() {
-        let view = ServiceViewV4 {
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([
                 (
                     "primary".to_string(),
@@ -4449,13 +4207,13 @@ mod tests {
                 ),
                 ("backup".to_string(), provider("https://backup.example/v1")),
             ]),
-            routing: Some(RoutingConfigV4::ordered_failover(vec![
+            routing: Some(RouteGraphConfig::ordered_failover(vec![
                 "primary".to_string(),
                 "backup".to_string(),
             ])),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
-        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let template = compile_route_plan_template("codex", &view).expect("route template");
         assert_eq!(
             template.candidates[0].concurrency.max_concurrent_requests,
             Some(5)
@@ -4497,25 +4255,25 @@ mod tests {
 
     #[test]
     fn route_plan_candidate_runtime_snapshot_reports_structured_availability() {
-        let view = ServiceViewV4 {
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([(
                 "primary".to_string(),
-                ProviderConfigV4 {
+                ProviderConfig {
                     base_url: Some("https://primary.example/v1".to_string()),
                     supported_models: BTreeMap::from([("gpt-4.1".to_string(), true)]),
                     limits: ProviderConcurrencyLimits {
                         max_concurrent_requests: Some(2),
                         limit_group: Some("shared".to_string()),
                     },
-                    ..ProviderConfigV4::default()
+                    ..ProviderConfig::default()
                 },
             )]),
-            routing: Some(RoutingConfigV4::ordered_failover(vec![
+            routing: Some(RouteGraphConfig::ordered_failover(vec![
                 "primary".to_string(),
             ])),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
-        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let template = compile_route_plan_template("codex", &view).expect("route template");
         let candidate = &template.candidates[0];
         let mut runtime = RoutePlanRuntimeState::default();
         runtime.set_provider_endpoint(
@@ -4572,7 +4330,7 @@ mod tests {
 
     #[test]
     fn route_plan_executor_default_fallback_sticky_keeps_lower_preference_affinity() {
-        let view = ServiceViewV4 {
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([
                 (
                     "monthly".to_string(),
@@ -4583,17 +4341,17 @@ mod tests {
                     tagged_provider("https://chili.example/v1", "billing", "paygo"),
                 ),
             ]),
-            routing: Some(RoutingConfigV4::tag_preferred(
+            routing: Some(RouteGraphConfig::tag_preferred(
                 vec!["chili".to_string(), "monthly".to_string()],
                 vec![BTreeMap::from([(
                     "billing".to_string(),
                     "monthly".to_string(),
                 )])],
-                RoutingExhaustedActionV4::Continue,
+                RouteExhaustedAction::Continue,
             )),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
-        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let template = compile_route_plan_template("codex", &view).expect("route template");
         let executor = RoutePlanExecutor::new(&template);
         let mut runtime = RoutePlanRuntimeState::default();
         runtime.set_affinity_provider_endpoint(Some(endpoint_key("codex", "chili", "default")));
@@ -4607,7 +4365,7 @@ mod tests {
 
         assert_eq!(
             template.affinity_policy,
-            RoutingAffinityPolicyV5::FallbackSticky
+            RouteAffinityPolicy::FallbackSticky
         );
         assert_eq!(
             provider_preference_groups(&template),
@@ -4622,7 +4380,7 @@ mod tests {
 
     #[test]
     fn route_plan_executor_default_fallback_sticky_keeps_lower_order_affinity() {
-        let view = ServiceViewV4 {
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([
                 (
                     "monthly".to_string(),
@@ -4633,13 +4391,13 @@ mod tests {
                     tagged_provider("https://chili.example/v1", "billing", "paygo"),
                 ),
             ]),
-            routing: Some(RoutingConfigV4::ordered_failover(vec![
+            routing: Some(RouteGraphConfig::ordered_failover(vec![
                 "monthly".to_string(),
                 "chili".to_string(),
             ])),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
-        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let template = compile_route_plan_template("codex", &view).expect("route template");
         let executor = RoutePlanExecutor::new(&template);
         let mut runtime = RoutePlanRuntimeState::default();
         runtime.set_affinity_provider_endpoint(Some(endpoint_key("codex", "chili", "default")));
@@ -4653,7 +4411,7 @@ mod tests {
 
         assert_eq!(
             template.affinity_policy,
-            RoutingAffinityPolicyV5::FallbackSticky
+            RouteAffinityPolicy::FallbackSticky
         );
         assert_eq!(
             provider_preference_groups(&template),
@@ -4669,9 +4427,9 @@ mod tests {
     #[test]
     fn route_plan_executor_preferred_group_opt_in_prefers_primary() {
         let mut routing =
-            RoutingConfigV4::ordered_failover(vec!["monthly".to_string(), "chili".to_string()]);
-        routing.affinity_policy = RoutingAffinityPolicyV5::PreferredGroup;
-        let view = ServiceViewV4 {
+            RouteGraphConfig::ordered_failover(vec!["monthly".to_string(), "chili".to_string()]);
+        routing.affinity_policy = RouteAffinityPolicy::PreferredGroup;
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([
                 (
                     "monthly".to_string(),
@@ -4683,9 +4441,9 @@ mod tests {
                 ),
             ]),
             routing: Some(routing),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
-        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let template = compile_route_plan_template("codex", &view).expect("route template");
         let executor = RoutePlanExecutor::new(&template);
         let mut runtime = RoutePlanRuntimeState::default();
         runtime.set_affinity_provider_endpoint(Some(endpoint_key("codex", "chili", "default")));
@@ -4697,7 +4455,7 @@ mod tests {
 
         assert_eq!(
             template.affinity_policy,
-            RoutingAffinityPolicyV5::PreferredGroup
+            RouteAffinityPolicy::PreferredGroup
         );
         assert_eq!(selected.candidate.provider_id, "monthly");
         assert_eq!(
@@ -4709,9 +4467,9 @@ mod tests {
     #[test]
     fn route_plan_executor_affinity_selection_ignores_preferred_group_primary() {
         let mut routing =
-            RoutingConfigV4::ordered_failover(vec!["monthly".to_string(), "chili".to_string()]);
-        routing.affinity_policy = RoutingAffinityPolicyV5::PreferredGroup;
-        let view = ServiceViewV4 {
+            RouteGraphConfig::ordered_failover(vec!["monthly".to_string(), "chili".to_string()]);
+        routing.affinity_policy = RouteAffinityPolicy::PreferredGroup;
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([
                 (
                     "monthly".to_string(),
@@ -4723,9 +4481,9 @@ mod tests {
                 ),
             ]),
             routing: Some(routing),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
-        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let template = compile_route_plan_template("codex", &view).expect("route template");
         let executor = RoutePlanExecutor::new(&template);
         let mut runtime = RoutePlanRuntimeState::default();
         runtime.set_affinity_provider_endpoint(Some(endpoint_key("codex", "chili", "default")));
@@ -4754,9 +4512,9 @@ mod tests {
     #[test]
     fn route_plan_executor_affinity_selection_stops_when_affinity_is_unavailable() {
         let mut routing =
-            RoutingConfigV4::ordered_failover(vec!["monthly".to_string(), "chili".to_string()]);
-        routing.affinity_policy = RoutingAffinityPolicyV5::PreferredGroup;
-        let view = ServiceViewV4 {
+            RouteGraphConfig::ordered_failover(vec!["monthly".to_string(), "chili".to_string()]);
+        routing.affinity_policy = RouteAffinityPolicy::PreferredGroup;
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([
                 (
                     "monthly".to_string(),
@@ -4768,9 +4526,9 @@ mod tests {
                 ),
             ]),
             routing: Some(routing),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
-        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let template = compile_route_plan_template("codex", &view).expect("route template");
         let executor = RoutePlanExecutor::new(&template);
         let mut runtime = RoutePlanRuntimeState::default();
         runtime.set_affinity_provider_endpoint(Some(endpoint_key("codex", "chili", "default")));
@@ -4801,7 +4559,7 @@ mod tests {
 
     #[test]
     fn route_plan_executor_uses_fallback_group_only_when_preferred_usage_exhausted() {
-        let view = ServiceViewV4 {
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([
                 (
                     "monthly".to_string(),
@@ -4812,17 +4570,17 @@ mod tests {
                     tagged_provider("https://chili.example/v1", "billing", "paygo"),
                 ),
             ]),
-            routing: Some(RoutingConfigV4::tag_preferred(
+            routing: Some(RouteGraphConfig::tag_preferred(
                 vec!["chili".to_string(), "monthly".to_string()],
                 vec![BTreeMap::from([(
                     "billing".to_string(),
                     "monthly".to_string(),
                 )])],
-                RoutingExhaustedActionV4::Continue,
+                RouteExhaustedAction::Continue,
             )),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
-        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let template = compile_route_plan_template("codex", &view).expect("route template");
         let executor = RoutePlanExecutor::new(&template);
         let mut runtime = RoutePlanRuntimeState::default();
         runtime.set_affinity_provider_endpoint(Some(endpoint_key("codex", "chili", "default")));
@@ -4848,7 +4606,7 @@ mod tests {
 
     #[test]
     fn route_plan_executor_stops_when_all_candidates_usage_exhausted() {
-        let view = ServiceViewV4 {
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([
                 (
                     "monthly".to_string(),
@@ -4859,13 +4617,13 @@ mod tests {
                     tagged_provider("https://chili.example/v1", "billing", "paygo"),
                 ),
             ]),
-            routing: Some(RoutingConfigV4::ordered_failover(vec![
+            routing: Some(RouteGraphConfig::ordered_failover(vec![
                 "monthly".to_string(),
                 "chili".to_string(),
             ])),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
-        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let template = compile_route_plan_template("codex", &view).expect("route template");
         let executor = RoutePlanExecutor::new(&template);
         let mut runtime = RoutePlanRuntimeState::default();
         runtime.set_provider_endpoint(
@@ -4914,7 +4672,7 @@ mod tests {
 
     #[test]
     fn route_plan_executor_uses_fallback_group_when_preferred_is_hard_unavailable() {
-        let view = ServiceViewV4 {
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([
                 (
                     "monthly".to_string(),
@@ -4925,17 +4683,17 @@ mod tests {
                     tagged_provider("https://chili.example/v1", "billing", "paygo"),
                 ),
             ]),
-            routing: Some(RoutingConfigV4::tag_preferred(
+            routing: Some(RouteGraphConfig::tag_preferred(
                 vec!["chili".to_string(), "monthly".to_string()],
                 vec![BTreeMap::from([(
                     "billing".to_string(),
                     "monthly".to_string(),
                 )])],
-                RoutingExhaustedActionV4::Continue,
+                RouteExhaustedAction::Continue,
             )),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
-        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let template = compile_route_plan_template("codex", &view).expect("route template");
         let executor = RoutePlanExecutor::new(&template);
         let mut runtime = RoutePlanRuntimeState::default();
         runtime.set_affinity_provider_endpoint(Some(endpoint_key("codex", "chili", "default")));
@@ -4961,16 +4719,16 @@ mod tests {
 
     #[test]
     fn route_plan_executor_fallback_sticky_policy_can_keep_lower_preference_affinity() {
-        let mut routing = RoutingConfigV4::tag_preferred(
+        let mut routing = RouteGraphConfig::tag_preferred(
             vec!["chili".to_string(), "monthly".to_string()],
             vec![BTreeMap::from([(
                 "billing".to_string(),
                 "monthly".to_string(),
             )])],
-            RoutingExhaustedActionV4::Continue,
+            RouteExhaustedAction::Continue,
         );
-        routing.affinity_policy = RoutingAffinityPolicyV5::FallbackSticky;
-        let view = ServiceViewV4 {
+        routing.affinity_policy = RouteAffinityPolicy::FallbackSticky;
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([
                 (
                     "monthly".to_string(),
@@ -4982,9 +4740,9 @@ mod tests {
                 ),
             ]),
             routing: Some(routing),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
-        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let template = compile_route_plan_template("codex", &view).expect("route template");
         let executor = RoutePlanExecutor::new(&template);
         let mut runtime = RoutePlanRuntimeState::default();
         runtime.set_affinity_provider_endpoint(Some(endpoint_key("codex", "chili", "default")));
@@ -4998,7 +4756,7 @@ mod tests {
 
         assert_eq!(
             template.affinity_policy,
-            RoutingAffinityPolicyV5::FallbackSticky
+            RouteAffinityPolicy::FallbackSticky
         );
         assert_eq!(selected.candidate.provider_id, "chili");
         assert_eq!(
@@ -5009,17 +4767,17 @@ mod tests {
 
     #[test]
     fn route_plan_executor_fallback_sticky_reprobes_preferred_after_window() {
-        let mut routing = RoutingConfigV4::tag_preferred(
+        let mut routing = RouteGraphConfig::tag_preferred(
             vec!["chili".to_string(), "monthly".to_string()],
             vec![BTreeMap::from([(
                 "billing".to_string(),
                 "monthly".to_string(),
             )])],
-            RoutingExhaustedActionV4::Continue,
+            RouteExhaustedAction::Continue,
         );
-        routing.affinity_policy = RoutingAffinityPolicyV5::FallbackSticky;
+        routing.affinity_policy = RouteAffinityPolicy::FallbackSticky;
         routing.reprobe_preferred_after_ms = Some(1);
-        let view = ServiceViewV4 {
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([
                 (
                     "monthly".to_string(),
@@ -5031,9 +4789,9 @@ mod tests {
                 ),
             ]),
             routing: Some(routing),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
-        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let template = compile_route_plan_template("codex", &view).expect("route template");
         let executor = RoutePlanExecutor::new(&template);
         let now = crate::logging::now_ms();
         let mut runtime = RoutePlanRuntimeState::default();
@@ -5055,17 +4813,17 @@ mod tests {
 
     #[test]
     fn route_plan_executor_fallback_sticky_reprobes_preferred_after_fallback_ttl() {
-        let mut routing = RoutingConfigV4::tag_preferred(
+        let mut routing = RouteGraphConfig::tag_preferred(
             vec!["chili".to_string(), "monthly".to_string()],
             vec![BTreeMap::from([(
                 "billing".to_string(),
                 "monthly".to_string(),
             )])],
-            RoutingExhaustedActionV4::Continue,
+            RouteExhaustedAction::Continue,
         );
-        routing.affinity_policy = RoutingAffinityPolicyV5::FallbackSticky;
+        routing.affinity_policy = RouteAffinityPolicy::FallbackSticky;
         routing.fallback_ttl_ms = Some(1);
-        let view = ServiceViewV4 {
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([
                 (
                     "monthly".to_string(),
@@ -5077,9 +4835,9 @@ mod tests {
                 ),
             ]),
             routing: Some(routing),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
-        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let template = compile_route_plan_template("codex", &view).expect("route template");
         let executor = RoutePlanExecutor::new(&template);
         let now = crate::logging::now_ms();
         let mut runtime = RoutePlanRuntimeState::default();
@@ -5101,16 +4859,16 @@ mod tests {
 
     #[test]
     fn route_plan_executor_off_policy_ignores_affinity_inside_best_group() {
-        let mut routing = RoutingConfigV4::tag_preferred(
+        let mut routing = RouteGraphConfig::tag_preferred(
             vec!["monthly-a".to_string(), "monthly-b".to_string()],
             vec![BTreeMap::from([(
                 "billing".to_string(),
                 "monthly".to_string(),
             )])],
-            RoutingExhaustedActionV4::Continue,
+            RouteExhaustedAction::Continue,
         );
-        routing.affinity_policy = RoutingAffinityPolicyV5::Off;
-        let view = ServiceViewV4 {
+        routing.affinity_policy = RouteAffinityPolicy::Off;
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([
                 (
                     "monthly-a".to_string(),
@@ -5122,9 +4880,9 @@ mod tests {
                 ),
             ]),
             routing: Some(routing),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
-        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let template = compile_route_plan_template("codex", &view).expect("route template");
         let executor = RoutePlanExecutor::new(&template);
         let mut runtime = RoutePlanRuntimeState::default();
         runtime.set_affinity_provider_endpoint(Some(endpoint_key("codex", "monthly-b", "default")));
@@ -5134,7 +4892,7 @@ mod tests {
             executor.select_supported_candidate_with_runtime_state(&mut state, &runtime, None);
         let selected = selection.selected.expect("first candidate selected");
 
-        assert_eq!(template.affinity_policy, RoutingAffinityPolicyV5::Off);
+        assert_eq!(template.affinity_policy, RouteAffinityPolicy::Off);
         assert_eq!(selected.candidate.provider_id, "monthly-a");
         assert_eq!(
             selected.provider_endpoint,
@@ -5144,16 +4902,16 @@ mod tests {
 
     #[test]
     fn route_plan_executor_hard_policy_stops_when_affinity_is_unavailable() {
-        let mut routing = RoutingConfigV4::tag_preferred(
+        let mut routing = RouteGraphConfig::tag_preferred(
             vec!["monthly".to_string(), "chili".to_string()],
             vec![BTreeMap::from([(
                 "billing".to_string(),
                 "monthly".to_string(),
             )])],
-            RoutingExhaustedActionV4::Continue,
+            RouteExhaustedAction::Continue,
         );
-        routing.affinity_policy = RoutingAffinityPolicyV5::Hard;
-        let view = ServiceViewV4 {
+        routing.affinity_policy = RouteAffinityPolicy::Hard;
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([
                 (
                     "monthly".to_string(),
@@ -5165,9 +4923,9 @@ mod tests {
                 ),
             ]),
             routing: Some(routing),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
-        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let template = compile_route_plan_template("codex", &view).expect("route template");
         let executor = RoutePlanExecutor::new(&template);
         let mut runtime = RoutePlanRuntimeState::default();
         runtime.set_affinity_provider_endpoint(Some(endpoint_key("codex", "chili", "default")));
@@ -5183,22 +4941,22 @@ mod tests {
         let selection =
             executor.select_supported_candidate_with_runtime_state(&mut state, &runtime, None);
 
-        assert_eq!(template.affinity_policy, RoutingAffinityPolicyV5::Hard);
+        assert_eq!(template.affinity_policy, RouteAffinityPolicy::Hard);
         assert!(selection.selected.is_none());
     }
 
     #[test]
     fn route_plan_executor_soft_affinity_escapes_unavailable_hard_affinity() {
-        let mut routing = RoutingConfigV4::tag_preferred(
+        let mut routing = RouteGraphConfig::tag_preferred(
             vec!["monthly".to_string(), "chili".to_string()],
             vec![BTreeMap::from([(
                 "billing".to_string(),
                 "monthly".to_string(),
             )])],
-            RoutingExhaustedActionV4::Continue,
+            RouteExhaustedAction::Continue,
         );
-        routing.affinity_policy = RoutingAffinityPolicyV5::Hard;
-        let view = ServiceViewV4 {
+        routing.affinity_policy = RouteAffinityPolicy::Hard;
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([
                 (
                     "monthly".to_string(),
@@ -5210,9 +4968,9 @@ mod tests {
                 ),
             ]),
             routing: Some(routing),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
-        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let template = compile_route_plan_template("codex", &view).expect("route template");
         let executor = RoutePlanExecutor::new(&template);
         let mut runtime = RoutePlanRuntimeState::default();
         runtime.set_affinity_provider_endpoint(Some(endpoint_key("codex", "chili", "default")));
@@ -5230,7 +4988,7 @@ mod tests {
         );
         let selected = selection.selected.expect("soft fallback selected");
 
-        assert_eq!(template.affinity_policy, RoutingAffinityPolicyV5::Hard);
+        assert_eq!(template.affinity_policy, RouteAffinityPolicy::Hard);
         assert_eq!(selected.candidate.provider_id, "monthly");
         assert_eq!(
             selected.provider_endpoint,
@@ -5240,18 +4998,18 @@ mod tests {
 
     #[test]
     fn route_plan_executor_keeps_same_candidate_until_caller_marks_avoidance() {
-        let view = ServiceViewV4 {
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([
                 ("first".to_string(), provider("https://first.example/v1")),
                 ("second".to_string(), provider("https://second.example/v1")),
             ]),
-            routing: Some(RoutingConfigV4::ordered_failover(vec![
+            routing: Some(RouteGraphConfig::ordered_failover(vec![
                 "first".to_string(),
                 "second".to_string(),
             ])),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
-        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let template = compile_route_plan_template("codex", &view).expect("route template");
         let executor = RoutePlanExecutor::new(&template);
         let mut state = RoutePlanAttemptState::default();
 

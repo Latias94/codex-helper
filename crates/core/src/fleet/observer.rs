@@ -1,8 +1,6 @@
-use std::collections::HashMap;
-
-use crate::dashboard_core::build_dashboard_snapshot;
-use crate::dashboard_core::snapshot::DashboardSnapshot;
-use crate::state::{ActiveRequest, FinishedRequest, ProxyState, SessionIdentityCard};
+use crate::dashboard_core::{
+    OperatorReadData, OperatorReadModel, OperatorReadStatus, OperatorSessionSummary,
+};
 
 use super::model::{
     FleetConfidence, FleetEvidence, FleetEvidenceSource, FleetGraphStatus, FleetNodeHealth,
@@ -11,298 +9,231 @@ use super::model::{
 };
 use super::process_scan::scan_codex_processes;
 
-pub async fn build_local_fleet_snapshot(
-    state: &ProxyState,
-    service_name: &str,
+pub fn build_local_fleet_snapshot_from_operator_read_model(
+    model: &OperatorReadModel,
     node_id: impl Into<String>,
     label: impl Into<String>,
 ) -> FleetSnapshot {
-    let refreshed_at_ms = now_ms();
-    let dashboard = build_dashboard_snapshot(
-        state,
-        service_name,
-        crate::state::recent_finished_max(),
-        7,
-        None,
-        None,
-    )
-    .await;
-    let process_scan = scan_codex_processes();
-    let node = build_local_fleet_node_from_parts(LocalFleetNodeParts {
-        node_id: node_id.into(),
-        label: label.into(),
-        refreshed_at_ms,
-        processes: process_scan.summary(),
-        session_cards: &dashboard.session_cards,
-        active: &dashboard.active,
-        recent: &dashboard.recent,
-    });
-
-    FleetSnapshot {
-        api_version: 1,
-        service_name: service_name.to_string(),
-        refreshed_at_ms,
-        nodes: vec![node],
-    }
-}
-
-pub fn build_local_fleet_snapshot_from_parts(
-    service_name: &str,
-    node_id: impl Into<String>,
-    label: impl Into<String>,
-    refreshed_at_ms: u64,
-    session_cards: &[SessionIdentityCard],
-    active: &[ActiveRequest],
-    recent: &[FinishedRequest],
-) -> FleetSnapshot {
-    let node = build_local_fleet_node_from_parts(LocalFleetNodeParts {
-        node_id: node_id.into(),
-        label: label.into(),
-        refreshed_at_ms,
-        processes: FleetProcessSummary::default(),
-        session_cards,
-        active,
-        recent,
-    });
-
-    FleetSnapshot {
-        api_version: 1,
-        service_name: service_name.to_string(),
-        refreshed_at_ms,
-        nodes: vec![node],
-    }
-}
-
-pub fn build_local_fleet_snapshot_from_dashboard(
-    service_name: &str,
-    node_id: impl Into<String>,
-    label: impl Into<String>,
-    dashboard: &DashboardSnapshot,
-) -> FleetSnapshot {
-    let node = build_local_fleet_node_from_parts(LocalFleetNodeParts {
-        node_id: node_id.into(),
-        label: label.into(),
-        refreshed_at_ms: dashboard.refreshed_at_ms,
-        processes: scan_codex_processes().summary(),
-        session_cards: &dashboard.session_cards,
-        active: &dashboard.active,
-        recent: &dashboard.recent,
-    });
-
-    FleetSnapshot {
-        api_version: 1,
-        service_name: service_name.to_string(),
-        refreshed_at_ms: dashboard.refreshed_at_ms,
-        nodes: vec![node],
-    }
-}
-
-struct LocalFleetNodeParts<'a> {
-    node_id: String,
-    label: String,
-    refreshed_at_ms: u64,
-    processes: FleetProcessSummary,
-    session_cards: &'a [SessionIdentityCard],
-    active: &'a [ActiveRequest],
-    recent: &'a [FinishedRequest],
-}
-
-fn build_local_fleet_node_from_parts(parts: LocalFleetNodeParts<'_>) -> FleetNodeSnapshot {
-    let LocalFleetNodeParts {
+    let mut snapshot = build_fleet_snapshot_from_operator_read_model(
+        model,
         node_id,
         label,
-        refreshed_at_ms,
-        processes,
-        session_cards,
-        active,
-        recent,
-    } = parts;
+        FleetNodeKind::Local,
+        None,
+    );
+    if let Some(node) = snapshot.nodes.first_mut() {
+        node.processes = scan_codex_processes().summary();
+    }
+    snapshot
+}
 
-    let active_by_session = active
-        .iter()
-        .filter_map(|request| request.session_id.as_deref().map(|sid| (sid, request)))
-        .fold(
-            HashMap::<&str, Vec<&ActiveRequest>>::new(),
-            |mut acc, (sid, request)| {
-                acc.entry(sid).or_default().push(request);
-                acc
-            },
-        );
-    let recent_by_session = recent
-        .iter()
-        .filter_map(|request| request.session_id.as_deref().map(|sid| (sid, request)))
-        .fold(
-            HashMap::<&str, Vec<&FinishedRequest>>::new(),
-            |mut acc, (sid, request)| {
-                acc.entry(sid).or_default().push(request);
-                acc
-            },
-        );
+pub fn build_fleet_snapshot_from_operator_read_model(
+    model: &OperatorReadModel,
+    node_id: impl Into<String>,
+    label: impl Into<String>,
+    kind: FleetNodeKind,
+    active_endpoint: Option<String>,
+) -> FleetSnapshot {
+    let node_id = node_id.into();
+    let label = label.into();
+    let now = now_ms();
+    let validation_error = model.validate().err();
+    let (health, last_error) = if let Some(error) = validation_error {
+        (
+            FleetNodeHealth::ParseFailed,
+            Some(format!("invalid operator read-model: {error}")),
+        )
+    } else {
+        match model.status {
+            OperatorReadStatus::Ready => (FleetNodeHealth::Fresh, None),
+            OperatorReadStatus::Stale => (
+                FleetNodeHealth::Stale,
+                Some("operator read-model refresh failed".to_string()),
+            ),
+            OperatorReadStatus::Disconnected => (
+                FleetNodeHealth::Unreachable,
+                Some("operator read-model is disconnected".to_string()),
+            ),
+            OperatorReadStatus::AuthRequired => (
+                FleetNodeHealth::AuthFailed,
+                Some("operator read-model authentication is required".to_string()),
+            ),
+        }
+    };
 
-    let mut work_units = session_cards
-        .iter()
-        .enumerate()
-        .map(|(idx, card)| {
-            work_unit_from_session_card(
-                &node_id,
-                idx,
-                card,
-                card.session_id
-                    .as_deref()
-                    .and_then(|sid| active_by_session.get(sid).map(Vec::as_slice)),
-                card.session_id
-                    .as_deref()
-                    .and_then(|sid| recent_by_session.get(sid).map(Vec::as_slice)),
-            )
+    let retained_data = matches!(
+        model.status,
+        OperatorReadStatus::Ready | OperatorReadStatus::Stale
+    ) && validation_error.is_none();
+    let refreshed_at_ms = if retained_data {
+        model.captured_at_ms
+    } else {
+        now
+    };
+    let node = if retained_data {
+        build_operator_fleet_node(OperatorFleetNodeParts {
+            data: model.data.as_ref().expect("validated operator data"),
+            node_id,
+            label,
+            kind,
+            health,
+            refreshed_at_ms,
+            active_endpoint,
+            last_error,
+            stale_since_ms: (health == FleetNodeHealth::Stale).then_some(now),
+            snapshot_age_ms: Some(now.saturating_sub(refreshed_at_ms)),
         })
-        .collect::<Vec<_>>();
+    } else {
+        FleetNodeSnapshot {
+            node_id,
+            label,
+            kind,
+            health,
+            refreshed_at_ms,
+            stale_since_ms: None,
+            snapshot_age_ms: None,
+            active_endpoint: None,
+            last_error,
+            processes: FleetProcessSummary::default(),
+            topology: FleetTopology::default(),
+            work_units: Vec::new(),
+        }
+    };
 
+    FleetSnapshot {
+        api_version: 1,
+        service_name: model.service_name.clone(),
+        refreshed_at_ms,
+        nodes: vec![node],
+    }
+}
+
+struct OperatorFleetNodeParts<'a> {
+    data: &'a OperatorReadData,
+    node_id: String,
+    label: String,
+    kind: FleetNodeKind,
+    health: FleetNodeHealth,
+    refreshed_at_ms: u64,
+    active_endpoint: Option<String>,
+    last_error: Option<String>,
+    stale_since_ms: Option<u64>,
+    snapshot_age_ms: Option<u64>,
+}
+
+fn build_operator_fleet_node(parts: OperatorFleetNodeParts<'_>) -> FleetNodeSnapshot {
+    let OperatorFleetNodeParts {
+        data,
+        node_id,
+        label,
+        kind,
+        health,
+        refreshed_at_ms,
+        active_endpoint,
+        last_error,
+        stale_since_ms,
+        snapshot_age_ms,
+    } = parts;
+    let mut work_units = data
+        .summary
+        .sessions
+        .iter()
+        .map(|session| work_unit_from_operator_session(&node_id, session))
+        .collect::<Vec<_>>();
     work_units.sort_by_key(|unit| std::cmp::Reverse(unit.last_activity_ms.unwrap_or(0)));
 
     FleetNodeSnapshot {
         node_id,
         label,
-        kind: FleetNodeKind::Local,
-        health: FleetNodeHealth::Fresh,
+        kind,
+        health,
         refreshed_at_ms,
-        stale_since_ms: None,
-        snapshot_age_ms: Some(0),
-        active_endpoint: None,
-        last_error: None,
-        processes,
+        stale_since_ms,
+        snapshot_age_ms,
+        active_endpoint,
+        last_error,
+        processes: FleetProcessSummary::default(),
         topology: FleetTopology {
             status: FleetGraphStatus::Unavailable,
             edges: Vec::new(),
-            note: Some(
-                "subagent graph source unavailable; node-local session rows preserved".into(),
-            ),
+            note: Some("subagent graph source unavailable; operator session rows preserved".into()),
         },
         work_units,
     }
 }
 
-fn work_unit_from_session_card(
+fn work_unit_from_operator_session(
     node_id: &str,
-    idx: usize,
-    card: &SessionIdentityCard,
-    active: Option<&[&ActiveRequest]>,
-    recent: Option<&[&FinishedRequest]>,
+    session: &OperatorSessionSummary,
 ) -> FleetWorkUnit {
-    let id = card
-        .session_id
-        .as_ref()
-        .map(|sid| format!("session:{sid}"))
-        .unwrap_or_else(|| format!("unknown-session:{idx}"));
-    let active_started_at_ms = active
-        .and_then(|requests| requests.iter().map(|r| r.started_at_ms).min())
-        .or(card.active_started_at_ms_min);
-    let last_recent = recent.and_then(|requests| {
-        requests
-            .iter()
-            .max_by_key(|request| request.ended_at_ms)
-            .copied()
-    });
-    let last_activity_ms = active_started_at_ms
-        .max(card.last_ended_at_ms)
-        .or(card.last_ended_at_ms)
-        .or(active_started_at_ms);
-    let state = infer_work_unit_state(card, last_recent);
-    let evidence = infer_work_unit_evidence(card, active, recent);
-    let last_error = last_recent
-        .filter(|request| request.status_code >= 400)
-        .map(|request| format!("last status {}", request.status_code));
+    let last_activity_ms = session
+        .active_started_at_ms_min
+        .max(session.last_ended_at_ms)
+        .or(session.last_ended_at_ms)
+        .or(session.active_started_at_ms_min);
+    let state = if session.active_count > 0 {
+        FleetWorkUnitState::Running
+    } else if session.last_status.is_some_and(|status| status >= 400) {
+        FleetWorkUnitState::Errored
+    } else if session.last_ended_at_ms.is_some() || session.turns_total.unwrap_or(0) > 0 {
+        FleetWorkUnitState::Completed
+    } else {
+        FleetWorkUnitState::Unknown
+    };
+    let evidence = if session.active_count > 0 || session.active_started_at_ms_min.is_some() {
+        FleetEvidence::high(FleetEvidenceSource::RuntimeStatus)
+    } else if session.last_ended_at_ms.is_some() {
+        FleetEvidence::with_detail(
+            FleetEvidenceSource::RuntimeStatus,
+            FleetConfidence::Medium,
+            "derived from operator request/session history",
+        )
+    } else {
+        FleetEvidence::default()
+    };
 
     FleetWorkUnit {
         node_id: node_id.to_string(),
-        id,
+        id: session.session_key.clone(),
         parent_id: None,
         kind: FleetWorkUnitKind::Root,
         state,
         evidence,
-        session_id: card.session_id.clone(),
-        local_thread_id: card.session_id.clone(),
+        session_id: Some(session.session_key.clone()),
+        local_thread_id: Some(session.session_key.clone()),
         task_name: None,
-        cwd: card.cwd.clone(),
-        model: card
+        cwd: None,
+        model: session
             .effective_model
             .as_ref()
             .map(|value| value.value.clone())
-            .or_else(|| card.last_model.clone()),
-        station_name: card
-            .effective_station
-            .as_ref()
-            .map(|value| value.value.clone())
-            .or_else(|| card.last_station_name.clone()),
-        provider_id: card.last_provider_id.clone(),
-        last_status: card.last_status,
-        active_started_at_ms,
+            .or_else(|| session.last_model.clone()),
+        provider_id: session.last_provider_id.clone(),
+        last_status: session.last_status,
+        active_started_at_ms: session.active_started_at_ms_min,
         last_activity_ms,
-        last_error,
+        last_error: session
+            .last_status
+            .filter(|status| *status >= 400)
+            .map(|status| format!("last status {status}")),
         usage: FleetUsageSummary {
-            last_usage: card.last_usage.clone(),
-            total_usage: card.total_usage.clone(),
-            turns_total: card.turns_total,
-            turns_with_usage: card.turns_with_usage,
-            last_output_tokens_per_second: card.last_output_tokens_per_second,
-            avg_output_tokens_per_second: card.avg_output_tokens_per_second,
+            last_usage: session.last_usage.clone(),
+            total_usage: session.total_usage.clone(),
+            turns_total: session.turns_total,
+            turns_with_usage: session.turns_with_usage,
+            last_output_tokens_per_second: session.last_output_tokens_per_second,
+            avg_output_tokens_per_second: session.avg_output_tokens_per_second,
         },
     }
 }
 
-fn infer_work_unit_state(
-    card: &SessionIdentityCard,
-    last_recent: Option<&FinishedRequest>,
-) -> FleetWorkUnitState {
-    if card.active_count > 0 {
-        return FleetWorkUnitState::Running;
-    }
-    if let Some(status) = card.last_status
-        && status >= 400
-    {
-        return FleetWorkUnitState::Errored;
-    }
-    if let Some(request) = last_recent
-        && request.status_code >= 400
-    {
-        return FleetWorkUnitState::Errored;
-    }
-    if card.last_ended_at_ms.is_some() || card.turns_total.unwrap_or(0) > 0 {
-        return FleetWorkUnitState::Completed;
-    }
-    FleetWorkUnitState::Unknown
-}
-
-fn infer_work_unit_evidence(
-    card: &SessionIdentityCard,
-    active: Option<&[&ActiveRequest]>,
-    recent: Option<&[&FinishedRequest]>,
-) -> FleetEvidence {
-    if card.active_count > 0 || card.active_started_at_ms_min.is_some() {
-        return FleetEvidence::high(FleetEvidenceSource::RuntimeStatus);
-    }
-    if active.is_some_and(|requests| !requests.is_empty()) {
-        return FleetEvidence::high(FleetEvidenceSource::RuntimeStatus);
-    }
-    if recent.is_some_and(|requests| !requests.is_empty()) || card.last_ended_at_ms.is_some() {
-        return FleetEvidence::with_detail(
-            FleetEvidenceSource::RuntimeStatus,
-            FleetConfidence::Medium,
-            "derived from request/session runtime history",
-        );
-    }
-    if card.host_local_transcript_path.is_some() {
-        return FleetEvidence::with_detail(
-            FleetEvidenceSource::SessionLog,
-            FleetConfidence::Medium,
-            "derived from local Codex transcript path",
-        );
-    }
-    FleetEvidence::default()
-}
-
 #[cfg(test)]
 mod tests {
-    use crate::state::{FinishedRequest, RequestObservability, SessionIdentityCard};
+    use crate::dashboard_core::{
+        ApiV1OperatorSummary, OperatorReadData, OperatorReadModel, OperatorRevisionBundle,
+        OperatorSessionSummary,
+    };
+    use crate::state::SessionIdentityCard;
     use crate::usage::UsageMetrics;
 
     use super::*;
@@ -322,86 +253,95 @@ mod tests {
         }
     }
 
-    fn finished(id: u64, session_id: &str, status_code: u16) -> FinishedRequest {
-        FinishedRequest {
-            id,
-            trace_id: None,
-            session_id: Some(session_id.to_string()),
-            session_identity_source: None,
-            client_name: None,
-            client_addr: None,
-            cwd: None,
-            model: None,
-            reasoning_effort: None,
-            service_tier: None,
-            station_name: None,
-            provider_id: None,
-            upstream_base_url: None,
-            route_decision: None,
-            usage: None,
-            cost: crate::pricing::CostBreakdown::default(),
-            retry: None,
-            provider_signals: Vec::new(),
-            policy_actions: Vec::new(),
-            observability: RequestObservability::default(),
-            service: "codex".to_string(),
-            method: "POST".to_string(),
-            path: "/v1/responses".to_string(),
-            status_code,
-            duration_ms: 10,
-            ttfb_ms: None,
-            streaming: false,
-            ended_at_ms: id,
-        }
-    }
-
-    #[test]
-    fn local_snapshot_preserves_source_confidence_and_usage() {
-        let mut c = card("sid-1");
-        c.active_count = 1;
-        c.active_started_at_ms_min = Some(100);
-
-        let snapshot =
-            build_local_fleet_snapshot_from_parts("codex", "local", "Local", 200, &[c], &[], &[]);
-
-        let node = snapshot.nodes.first().expect("node");
-        let unit = node.work_units.first().expect("unit");
-        assert_eq!(unit.node_id, "local");
-        assert_eq!(unit.state, FleetWorkUnitState::Running);
-        assert_eq!(unit.evidence.source, FleetEvidenceSource::RuntimeStatus);
-        assert_eq!(unit.evidence.confidence, FleetConfidence::High);
-        assert_eq!(unit.usage.avg_output_tokens_per_second, Some(42.0));
-        assert_eq!(
-            unit.usage
-                .total_usage
-                .as_ref()
-                .map(|usage| usage.total_tokens),
-            Some(12)
-        );
-        assert_eq!(node.topology.status, FleetGraphStatus::Unavailable);
-    }
-
-    #[test]
-    fn local_snapshot_marks_recent_error_without_active_request() {
-        let mut c = card("sid-err");
-        c.active_count = 0;
-        c.last_status = Some(500);
-        c.last_ended_at_ms = Some(300);
-        let recent = vec![finished(300, "sid-err", 500)];
-
-        let snapshot = build_local_fleet_snapshot_from_parts(
+    fn ready_operator_model() -> OperatorReadModel {
+        let mut session = card("sid-operator");
+        session.active_count = 1;
+        session.active_started_at_ms_min = Some(100);
+        OperatorReadModel::ready(
             "codex",
-            "local",
-            "Local",
-            400,
-            &[c],
-            &[],
-            &recent,
+            200,
+            OperatorRevisionBundle {
+                runtime_revision: 7,
+                runtime_digest: "runtime-7".to_string(),
+                route_digest: "route-7".to_string(),
+                catalog_revision: "catalog-7".to_string(),
+                pricing_revision: "pricing-7".to_string(),
+                operator_pricing_revision: "operator-pricing-7".to_string(),
+                policy_revision: 8,
+                ledger_revision: "ledger-9".to_string(),
+            },
+            OperatorReadData {
+                summary: ApiV1OperatorSummary {
+                    api_version: 1,
+                    service_name: "codex".to_string(),
+                    runtime: Default::default(),
+                    counts: Default::default(),
+                    retry: Default::default(),
+                    sessions: vec![OperatorSessionSummary::from_session_card(&session, 0)],
+                    profiles: Vec::new(),
+                    providers: Vec::new(),
+                },
+                active_requests: Vec::new(),
+                recent_requests: Vec::new(),
+                usage_summaries: Vec::new(),
+                usage_day: Default::default(),
+                usage_rollup: Default::default(),
+                stats_5m: Default::default(),
+                stats_1h: Default::default(),
+                pricing_catalog: Default::default(),
+                provider_balances: Vec::new(),
+            },
+        )
+    }
+
+    #[test]
+    fn operator_read_model_projection_enforces_four_state_fact_retention() {
+        let ready = ready_operator_model();
+        let ready_snapshot = build_fleet_snapshot_from_operator_read_model(
+            &ready,
+            "remote-a",
+            "Remote A",
+            FleetNodeKind::Remote,
+            Some("https://admin.example".to_string()),
+        );
+        let ready_node = &ready_snapshot.nodes[0];
+        assert_eq!(ready_node.health, FleetNodeHealth::Fresh);
+        assert_eq!(ready_node.work_units.len(), 1);
+        assert_eq!(
+            ready_node.active_endpoint.as_deref(),
+            Some("https://admin.example")
         );
 
-        let unit = &snapshot.nodes[0].work_units[0];
-        assert_eq!(unit.state, FleetWorkUnitState::Errored);
-        assert_eq!(unit.last_error.as_deref(), Some("last status 500"));
-        assert_eq!(unit.evidence.confidence, FleetConfidence::Medium);
+        let stale = OperatorReadModel::stale_from(&ready);
+        let stale_snapshot = build_fleet_snapshot_from_operator_read_model(
+            &stale,
+            "remote-a",
+            "Remote A",
+            FleetNodeKind::Remote,
+            None,
+        );
+        assert_eq!(stale_snapshot.nodes[0].health, FleetNodeHealth::Stale);
+        assert_eq!(stale_snapshot.nodes[0].work_units.len(), 1);
+
+        for (model, expected_health) in [
+            (
+                OperatorReadModel::auth_required("codex"),
+                FleetNodeHealth::AuthFailed,
+            ),
+            (
+                OperatorReadModel::disconnected("codex"),
+                FleetNodeHealth::Unreachable,
+            ),
+        ] {
+            let snapshot = build_fleet_snapshot_from_operator_read_model(
+                &model,
+                "remote-a",
+                "Remote A",
+                FleetNodeKind::Remote,
+                None,
+            );
+            assert_eq!(snapshot.nodes[0].health, expected_health);
+            assert!(snapshot.nodes[0].work_units.is_empty());
+        }
     }
 }

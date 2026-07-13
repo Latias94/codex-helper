@@ -1,187 +1,149 @@
-import type { DataSource, RuntimeDataState, RuntimeOwnerMode } from "@/lib/api/types";
+import type { ApiOperatorReadModel } from "@/lib/api/admin-types";
+import type { RuntimeDataState, RuntimeOwnerMode } from "@/lib/api/types";
 
-type BuildRuntimeDataStateInput = {
-  hasLiveData: boolean;
+type BuildOperatorReadModelDataStateInput = {
+  model?: ApiOperatorReadModel;
   isLoading: boolean;
   isFetching: boolean;
   error?: unknown;
-  isEmpty?: boolean;
   ownerMode?: RuntimeOwnerMode;
-  lastUpdatedAt?: number;
 };
 
-type RuntimeIssueKind = "auth-required" | "unavailable" | "disconnected" | "unknown";
+type RuntimeIssueKind = "auth-required" | "unavailable" | "disconnected";
 
-const LIVE_STATE: RuntimeDataState = {
-  status: "live",
-  source: "live",
-  severity: "success",
-  title: "实时数据已连接",
-  description: "正在读取本机 codex-helper admin API。",
-  badge: "Live",
-  canUseLiveActions: true,
-  canStartProxy: false,
-  canAttachProxy: false,
-  canStopProxy: false,
-  isFallback: false,
-  isStale: false,
-  ownerMode: "unknown",
-};
-
-export function buildRuntimeDataState(input: BuildRuntimeDataStateInput): RuntimeDataState {
-  const errorMessage = errorToMessage(input.error);
-  const errorCode = errorToCode(input.error);
+export function buildOperatorReadModelDataState(
+  input: BuildOperatorReadModelDataStateInput,
+): RuntimeDataState {
   const ownerMode = input.ownerMode ?? "unknown";
-  const base = {
+  const common = {
     ownerMode,
-    lastUpdatedAt: input.lastUpdatedAt,
-    errorCode,
-    errorMessage,
+    canStartProxy: false,
+    canAttachProxy: false,
   };
 
-  if (input.hasLiveData && errorMessage) {
+  if (input.model?.status === "ready") {
     return {
-      ...base,
+      ...common,
+      status: input.isFetching ? "refreshing" : "live",
+      source: "live",
+      severity: input.isFetching ? "info" : "success",
+      title: input.isFetching ? "正在刷新本地 admin API 数据" : "实时数据已连接",
+      description: input.isFetching
+        ? "当前继续显示最近一次 coherent read model。"
+        : "正在读取本机 codex-helper operator read model。",
+      badge: input.isFetching ? "Refreshing" : "Live",
+      canUseLiveActions: true,
+      isStale: false,
+      lastUpdatedAt: input.model.captured_at_ms,
+    };
+  }
+
+  if (input.model?.status === "stale") {
+    return {
+      ...common,
       status: "stale",
       source: "live",
       severity: "warning",
       title: "实时数据刷新失败，正在显示上一次成功数据",
-      description: "可以先继续查看当前数据；如果需要执行控制动作，请重试刷新或检查本地代理运行时。",
+      description: "读取操作仍可继续；provider 和配置写入已禁用，直到下一次 ready 刷新。",
       badge: "Stale data",
       canUseLiveActions: false,
-      canStartProxy: false,
       canAttachProxy: true,
-      canStopProxy: false,
-      isFallback: false,
       isStale: true,
+      lastUpdatedAt: input.model.captured_at_ms,
+      errorCode: input.model.issue,
     };
   }
 
-  if (input.hasLiveData && input.isFetching) {
-    return {
-      ...LIVE_STATE,
-      ...base,
-      status: "refreshing",
-      severity: "info",
-      title: "正在刷新本地 admin API 数据",
-      description: "当前仍显示实时数据；刷新失败时会保留上一份可用数据并标记为 stale。",
-      badge: "Refreshing",
-    };
-  }
-
-  if (input.hasLiveData && input.isEmpty) {
-    return {
-      ...LIVE_STATE,
-      ...base,
-      status: "empty",
-      severity: "neutral",
-      title: "实时数据已连接，但当前没有业务记录",
-      description: "先让 Codex 通过本地代理发起一次请求，或在 Providers 中配置可路由供应商。",
-      badge: "Empty",
-    };
-  }
-
-  if (input.hasLiveData) {
-    return {
-      ...LIVE_STATE,
-      ...base,
-    };
-  }
-
-  if (input.isLoading && !errorMessage) {
-    return {
-      ...base,
-      status: "loading",
-      source: "mock",
-      severity: "info",
-      title: "正在连接本地 admin API",
-      description: "正在尝试读取 127.0.0.1 的 codex-helper 运行时；连接完成后会自动切换为实时数据。",
-      badge: "Connecting",
-      canUseLiveActions: false,
-      canStartProxy: false,
-      canAttachProxy: false,
-      canStopProxy: false,
-      isFallback: true,
-      isStale: false,
-    };
-  }
-
-  const issue = classifyRuntimeIssue(errorMessage, errorCode);
-
-  if (issue === "auth-required") {
-    return {
-      ...base,
+  if (input.model?.status === "auth_required") {
+    return unavailableState({
+      ...common,
       status: "auth-required",
-      source: "mock",
       severity: "danger",
       title: "需要 admin token",
-      description:
-        "本地 admin API 要求携带 token。请确认桌面端已读取 CODEX_HELPER_ADMIN_TOKEN，并在 Tauri 命令中注入 x-codex-helper-admin-token。",
+      description: "本地 admin API 拒绝了当前凭证。请确认桌面进程已读取 CODEX_HELPER_ADMIN_TOKEN。",
       badge: "Admin token",
-      canUseLiveActions: false,
-      canStartProxy: false,
       canAttachProxy: true,
-      canStopProxy: false,
-      isFallback: true,
-      isStale: false,
-    };
+      errorCode: input.model.issue,
+    });
   }
 
-  if (issue === "unavailable") {
-    return {
-      ...base,
-      status: "unavailable",
-      source: "mock",
-      severity: "warning",
-      title: "桌面运行时不可用，当前展示离线示例数据",
-      description: "当前可能在浏览器或 Vitest 中预览，无法调用 Tauri 命令；请在 Tauri 窗口中启动或附加本地代理。",
-      badge: "Desktop unavailable",
-      canUseLiveActions: false,
-      canStartProxy: false,
-      canAttachProxy: false,
-      canStopProxy: false,
-      isFallback: true,
-      isStale: false,
-    };
-  }
-
-  if (issue === "disconnected") {
-    return {
-      ...base,
+  if (input.model?.status === "disconnected") {
+    return unavailableState({
+      ...common,
       status: "disconnected",
-      source: "mock",
       severity: "warning",
-      title: "本地代理未连接，当前展示离线示例数据",
-      description: "没有连到 127.0.0.1:4211。可以先启动代理，或在下一阶段使用 Attach Existing 附加已有运行时。",
+      title: "本地代理未连接",
+      description: "当前没有可展示的运行时事实。请启动代理或附加已有的本地运行时。",
       badge: "Disconnected",
-      canUseLiveActions: false,
       canStartProxy: true,
       canAttachProxy: true,
-      canStopProxy: false,
-      isFallback: true,
-      isStale: false,
-    };
+      errorCode: input.model.issue,
+    });
   }
 
-  return {
-    ...base,
-    status: "mock",
-    source: "mock",
-    severity: "neutral",
-    title: "当前展示离线示例数据",
-    description: "启动或附加 codex-helper 本地代理后会自动切换为实时数据。",
-    badge: "Mock fallback",
-    canUseLiveActions: false,
+  if (input.isLoading && !input.error) {
+    return unavailableState({
+      ...common,
+      status: "loading",
+      severity: "info",
+      title: "正在连接本地 admin API",
+      description: "正在读取 coherent operator read model。",
+      badge: "Connecting",
+    });
+  }
+
+  const errorMessage = errorToMessage(input.error);
+  const errorCode = errorToCode(input.error);
+  const issue = classifyRuntimeIssue(errorMessage, errorCode);
+  if (issue === "auth-required") {
+    return unavailableState({
+      ...common,
+      status: "auth-required",
+      severity: "danger",
+      title: "需要 admin token",
+      description: "本地 admin API 拒绝了当前凭证。请确认桌面进程已读取 CODEX_HELPER_ADMIN_TOKEN。",
+      badge: "Admin token",
+      canAttachProxy: true,
+      errorCode,
+      errorMessage,
+    });
+  }
+  if (issue === "unavailable") {
+    return unavailableState({
+      ...common,
+      status: "unavailable",
+      severity: "warning",
+      title: "桌面运行时不可用",
+      description: "当前环境无法调用 Tauri 命令，因此没有可展示的运行时事实。",
+      badge: "Desktop unavailable",
+      errorCode,
+      errorMessage,
+    });
+  }
+  return unavailableState({
+    ...common,
+    status: "disconnected",
+    severity: "warning",
+    title: "本地代理未连接",
+    description: "当前没有可展示的运行时事实。请启动代理或附加已有的本地运行时。",
+    badge: "Disconnected",
     canStartProxy: true,
     canAttachProxy: true,
-    canStopProxy: false,
-    isFallback: true,
-    isStale: false,
-  };
+    errorCode,
+    errorMessage,
+  });
 }
 
-export function deriveDataSource(state: RuntimeDataState): DataSource {
-  return state.source;
+function unavailableState(
+  state: Omit<RuntimeDataState, "source" | "canUseLiveActions" | "isStale">,
+): RuntimeDataState {
+  return {
+    ...state,
+    source: "none",
+    canUseLiveActions: false,
+    isStale: false,
+  };
 }
 
 export function errorToMessage(error: unknown): string | undefined {
@@ -194,10 +156,10 @@ export function errorToMessage(error: unknown): string | undefined {
   if (typeof error === "string") {
     return error;
   }
-  if (typeof error === "object" && error !== null) {
-    const maybeMessage = (error as { message?: unknown }).message;
-    if (typeof maybeMessage === "string") {
-      return maybeMessage;
+  if (typeof error === "object") {
+    const message = Reflect.get(error, "message");
+    if (typeof message === "string") {
+      return message;
     }
     try {
       return JSON.stringify(error);
@@ -212,34 +174,16 @@ export function errorToCode(error: unknown): string | undefined {
   if (!error || typeof error !== "object") {
     return undefined;
   }
-  const maybeCode = (error as { code?: unknown }).code;
-  return typeof maybeCode === "string" && maybeCode.length > 0 ? maybeCode : undefined;
+  const code = Reflect.get(error, "code");
+  return typeof code === "string" && code.length > 0 ? code : undefined;
 }
 
-function classifyRuntimeIssue(message: string | undefined, code?: string): RuntimeIssueKind {
+function classifyRuntimeIssue(message?: string, code?: string): RuntimeIssueKind {
   if (code === "desktop_admin_http_401" || code === "desktop_admin_http_403") {
     return "auth-required";
   }
+  const text = message?.toLowerCase() ?? "";
   if (
-    code === "desktop_admin_connection_failed" ||
-    code === "desktop_admin_timeout" ||
-    code === "desktop_admin_request_failed"
-  ) {
-    return "disconnected";
-  }
-  if (code === "desktop_admin_decode_error" || code === "desktop_admin_http_status") {
-    return "disconnected";
-  }
-
-  if (!message) {
-    return "unknown";
-  }
-
-  const text = message.toLowerCase();
-
-  if (
-    text.includes("x-codex-helper-admin-token") ||
-    text.includes("codex_helper_admin_token") ||
     text.includes("admin token") ||
     text.includes("unauthorized") ||
     text.includes("forbidden") ||
@@ -248,7 +192,6 @@ function classifyRuntimeIssue(message: string | undefined, code?: string): Runti
   ) {
     return "auth-required";
   }
-
   if (
     text.includes("tauri runtime unavailable") ||
     text.includes("__tauri") ||
@@ -256,20 +199,5 @@ function classifyRuntimeIssue(message: string | undefined, code?: string): Runti
   ) {
     return "unavailable";
   }
-
-  if (
-    text.includes("connection refused") ||
-    text.includes("econnrefused") ||
-    text.includes("not reachable") ||
-    text.includes("failed to fetch") ||
-    text.includes("networkerror") ||
-    text.includes("timed out") ||
-    text.includes("timeout") ||
-    text.includes("127.0.0.1") ||
-    text.includes("4211")
-  ) {
-    return "disconnected";
-  }
-
   return "disconnected";
 }

@@ -1,5 +1,7 @@
 # Gap Matrix: Codex Operator Experience
 
+> Historical note (superseded 2026-07-13): this document records the original gap analysis. References below to JSONL accounting authority, forecast, or versioned config/runtime types are not current architecture; the canonical runtime uses the helper-owned SQLite store, semantic unversioned types, and the typed `OperatorReadModel`.
+
 > 中文速览：这份矩阵把当前项目、`cc-switch`、`aio-coding-hub`、Codex 源码语义放在一起看。结论是：我们不需要复制它们的全产品，但需要补齐“请求可观测 + 成本/余额 + 策略解释 + TUI 稳定性”这条链路。
 
 ## Reference Summary

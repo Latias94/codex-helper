@@ -25,6 +25,7 @@ members = [
     "crates/tui",
     "crates/server",
     "apps/desktop/src-tauri",
+    "tools/desktop-contract-schema",
 ]
 default-members = ["."]
 
@@ -64,6 +65,7 @@ humantime = "2.4.0"
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56.0"
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Security"] }
+windows-service = "0.8.1"
 
 [dev-dependencies]
 pretty_assertions = "1.4.1"

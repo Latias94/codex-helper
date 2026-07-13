@@ -1,267 +1,35 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::Arc;
+#[cfg(test)]
+use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::time::Instant;
 
 use ratatui::prelude::{Color, Style};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::config::ProxyConfig;
-pub(in crate::tui) use crate::dashboard_core::window_stats::compute_window_stats;
-use crate::dashboard_core::{ApiV1Snapshot, WindowStats};
-use crate::policy_actions::PolicyActionProjection;
-use crate::pricing::{ModelPriceCatalogSnapshot, UsdAmount};
+use crate::dashboard_core::{
+    OperatorProviderBalanceSummary, OperatorProviderEndpointSummary, OperatorProviderSummary,
+    OperatorReadData, OperatorRequestSummary, OperatorSessionSummary, WindowStats,
+};
+use crate::pricing::UsdAmount;
 use crate::runtime_identity::ProviderEndpointKey;
+#[cfg(test)]
+use crate::state::SessionIdentityCard;
 use crate::state::{
-    BalanceSnapshotStatus, FinishedRequest, HealthCheckStatus, LbConfigView,
-    ProviderBalanceSnapshot, ProxyState, ResolvedRouteValue, RouteDecisionProvenance,
-    SessionIdentityCard, SessionObservationScope, SessionRouteAffinity, StationHealth,
-    UsageDayView, UsageRollupView,
+    BalanceSnapshotStatus, ProviderBalanceSnapshot, ResolvedRouteValue, RouteDecisionProvenance,
+    SessionObservationScope, UsageDayView, UsageRollupView,
 };
 use crate::tui::Language;
 use crate::tui::i18n;
 use crate::tui::state::RequestControlFilter;
 use crate::usage::UsageMetrics;
-use crate::usage_forecast::UsageForecastBalanceHistoryLike;
 
-pub type UpstreamSummary = crate::dashboard_core::RuntimeUpstreamOption;
-pub type ProviderOption = crate::dashboard_core::RuntimeProviderOption;
-
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq, Default)]
-pub(in crate::tui) struct RoutingProviderRef {
-    pub(in crate::tui) name: String,
-    #[serde(default)]
-    pub(in crate::tui) alias: Option<String>,
-    #[serde(default)]
-    pub(in crate::tui) enabled: bool,
-    #[serde(default)]
-    pub(in crate::tui) tags: BTreeMap<String, String>,
-}
-
-fn default_tui_routing_policy() -> crate::config::RoutingPolicyV4 {
-    crate::config::RoutingPolicyV4::OrderedFailover
-}
-
-fn default_tui_routing_on_exhausted() -> crate::config::RoutingExhaustedActionV4 {
-    crate::config::RoutingExhaustedActionV4::Continue
-}
-
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
-pub(in crate::tui) struct RoutingSpecView {
-    #[serde(default = "default_tui_routing_entry")]
-    pub(in crate::tui) entry: String,
-    #[serde(default)]
-    pub(in crate::tui) routes: BTreeMap<String, crate::config::RoutingNodeV4>,
-    #[serde(default = "default_tui_routing_policy")]
-    pub(in crate::tui) policy: crate::config::RoutingPolicyV4,
-    #[serde(default)]
-    pub(in crate::tui) order: Vec<String>,
-    #[serde(default)]
-    pub(in crate::tui) target: Option<String>,
-    #[serde(default)]
-    pub(in crate::tui) prefer_tags: Vec<BTreeMap<String, String>>,
-    #[serde(default)]
-    pub(in crate::tui) chain: Vec<String>,
-    #[serde(default)]
-    pub(in crate::tui) pools: BTreeMap<String, crate::config::RoutingPoolV4>,
-    #[serde(default = "default_tui_routing_on_exhausted")]
-    pub(in crate::tui) on_exhausted: crate::config::RoutingExhaustedActionV4,
-    #[serde(default = "default_tui_routing_policy")]
-    pub(in crate::tui) entry_strategy: crate::config::RoutingPolicyV4,
-    #[serde(default)]
-    pub(in crate::tui) expanded_order: Vec<String>,
-    #[serde(default)]
-    pub(in crate::tui) entry_target: Option<String>,
-    #[serde(default)]
-    pub(in crate::tui) providers: Vec<RoutingProviderRef>,
-}
-
-impl From<crate::config::PersistedRoutingProviderRef> for RoutingProviderRef {
-    fn from(provider: crate::config::PersistedRoutingProviderRef) -> Self {
-        Self {
-            name: provider.name,
-            alias: provider.alias,
-            enabled: provider.enabled,
-            tags: provider.tags,
-        }
-    }
-}
-
-impl From<crate::config::PersistedRoutingSpec> for RoutingSpecView {
-    fn from(spec: crate::config::PersistedRoutingSpec) -> Self {
-        Self {
-            entry: spec.entry,
-            routes: spec.routes,
-            policy: spec.policy,
-            order: spec.order,
-            target: spec.target,
-            prefer_tags: spec.prefer_tags,
-            chain: Vec::new(),
-            pools: BTreeMap::new(),
-            on_exhausted: spec.on_exhausted,
-            entry_strategy: spec.entry_strategy,
-            expanded_order: spec.expanded_order,
-            entry_target: spec.entry_target,
-            providers: spec.providers.into_iter().map(Into::into).collect(),
-        }
-    }
-}
-
-fn default_tui_routing_entry() -> String {
-    "main".to_string()
-}
-
-pub(in crate::tui) fn routing_provider_names(spec: &RoutingSpecView) -> Vec<String> {
-    let mut names = if spec.expanded_order.is_empty() {
-        spec.graph_provider_names()
-    } else {
-        spec.expanded_order.clone()
-    };
-    for provider in &spec.providers {
-        if !names.iter().any(|name| name == &provider.name) {
-            names.push(provider.name.clone());
-        }
-    }
-    names
-}
-
-impl RoutingSpecView {
-    pub(in crate::tui) fn entry_node(&self) -> Option<&crate::config::RoutingNodeV4> {
-        self.routes.get(self.entry.as_str())
-    }
-
-    pub(in crate::tui) fn entry_node_mut(&mut self) -> &mut crate::config::RoutingNodeV4 {
-        self.routes.entry(self.entry.clone()).or_default()
-    }
-
-    pub(in crate::tui) fn sync_entry_compat_from_graph(&mut self) {
-        if let Some(node) = self.entry_node().cloned() {
-            self.policy = node.strategy;
-            self.order = node.children;
-            self.target = node.target;
-            self.prefer_tags = node.prefer_tags;
-            self.on_exhausted = node.on_exhausted;
-        }
-    }
-
-    pub(in crate::tui) fn graph_provider_names(&self) -> Vec<String> {
-        let mut names = Vec::new();
-        let mut seen = BTreeSet::new();
-        self.push_route_leaves(self.entry.as_str(), &mut seen, &mut names);
-        if names.is_empty() {
-            names = routing_leaf_provider_names(self);
-        }
-        names
-    }
-
-    fn push_route_leaves(
-        &self,
-        route_or_provider: &str,
-        seen_routes: &mut BTreeSet<String>,
-        out: &mut Vec<String>,
-    ) {
-        if self
-            .providers
-            .iter()
-            .any(|provider| provider.name == route_or_provider)
-        {
-            if !out.iter().any(|name| name == route_or_provider) {
-                out.push(route_or_provider.to_string());
-            }
-            return;
-        }
-        let Some(node) = self.routes.get(route_or_provider) else {
-            return;
-        };
-        if !seen_routes.insert(route_or_provider.to_string()) {
-            return;
-        }
-        if matches!(node.strategy, crate::config::RoutingPolicyV4::ManualSticky) {
-            if let Some(target) = node
-                .target
-                .as_deref()
-                .or_else(|| node.children.first().map(String::as_str))
-            {
-                self.push_route_leaves(target, seen_routes, out);
-            }
-        } else {
-            for child in &node.children {
-                self.push_route_leaves(child, seen_routes, out);
-            }
-        }
-        seen_routes.remove(route_or_provider);
-    }
-}
-
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
-pub(in crate::tui) struct RoutingSpecUpsertView {
-    pub(in crate::tui) entry: String,
-    #[serde(default)]
-    pub(in crate::tui) routes: BTreeMap<String, crate::config::RoutingNodeV4>,
-    #[serde(default = "default_tui_routing_policy")]
-    pub(in crate::tui) policy: crate::config::RoutingPolicyV4,
-    #[serde(default)]
-    pub(in crate::tui) order: Vec<String>,
-    #[serde(default)]
-    pub(in crate::tui) target: Option<String>,
-    #[serde(default)]
-    pub(in crate::tui) prefer_tags: Vec<BTreeMap<String, String>>,
-    #[serde(default = "default_tui_routing_on_exhausted")]
-    pub(in crate::tui) on_exhausted: crate::config::RoutingExhaustedActionV4,
-}
-
-impl From<&RoutingSpecView> for RoutingSpecUpsertView {
-    fn from(spec: &RoutingSpecView) -> Self {
-        Self {
-            entry: spec.entry.clone(),
-            routes: spec.routes.clone(),
-            policy: spec.policy,
-            order: spec.order.clone(),
-            target: spec.target.clone(),
-            prefer_tags: spec.prefer_tags.clone(),
-            on_exhausted: spec.on_exhausted,
-        }
-    }
-}
-
-impl From<RoutingSpecUpsertView> for crate::proxy::PersistedRoutingUpsertRequest {
-    fn from(spec: RoutingSpecUpsertView) -> Self {
-        Self {
-            entry: Some(spec.entry),
-            affinity_policy: None,
-            fallback_ttl_ms: None,
-            reprobe_preferred_after_ms: None,
-            routes: Some(spec.routes),
-            policy: Some(spec.policy),
-            order: spec.order,
-            target: spec.target,
-            prefer_tags: Some(spec.prefer_tags),
-            chain: Vec::new(),
-            pools: BTreeMap::new(),
-            on_exhausted: spec.on_exhausted,
-        }
-    }
-}
-
-pub(in crate::tui) fn routing_leaf_provider_names(spec: &RoutingSpecView) -> Vec<String> {
-    let mut names = if spec.order.is_empty() {
-        spec.providers
-            .iter()
-            .map(|provider| provider.name.clone())
-            .collect::<Vec<_>>()
-    } else {
-        spec.order.clone()
-    };
-    for provider in &spec.providers {
-        if !names.iter().any(|name| name == &provider.name) {
-            names.push(provider.name.clone());
-        }
-    }
-    names
-}
+pub type UpstreamSummary = OperatorProviderEndpointSummary;
+pub type ProviderOption = OperatorProviderSummary;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(in crate::tui) struct SessionRow {
     pub(in crate::tui) session_id: Option<String>,
+    pub(in crate::tui) local_session_id: Option<String>,
     pub(in crate::tui) observation_scope: SessionObservationScope,
     pub(in crate::tui) host_local_transcript_path: Option<String>,
     pub(in crate::tui) last_client_name: Option<String>,
@@ -278,8 +46,6 @@ pub(in crate::tui) struct SessionRow {
     pub(in crate::tui) last_reasoning_effort: Option<String>,
     pub(in crate::tui) last_service_tier: Option<String>,
     pub(in crate::tui) last_provider_id: Option<String>,
-    pub(in crate::tui) last_station_name: Option<String>,
-    pub(in crate::tui) last_upstream_base_url: Option<String>,
     pub(in crate::tui) last_usage: Option<UsageMetrics>,
     pub(in crate::tui) total_usage: Option<UsageMetrics>,
     pub(in crate::tui) turns_total: Option<u64>,
@@ -289,114 +55,162 @@ pub(in crate::tui) struct SessionRow {
     pub(in crate::tui) binding_profile_name: Option<String>,
     pub(in crate::tui) binding_continuity_mode: Option<crate::state::SessionContinuityMode>,
     pub(in crate::tui) last_route_decision: Option<RouteDecisionProvenance>,
-    pub(in crate::tui) route_affinity: Option<SessionRouteAffinity>,
+    pub(in crate::tui) route_affinity: Option<SessionRouteAffinityView>,
     pub(in crate::tui) effective_model: Option<ResolvedRouteValue>,
     pub(in crate::tui) effective_reasoning_effort: Option<ResolvedRouteValue>,
     pub(in crate::tui) effective_service_tier: Option<ResolvedRouteValue>,
-    pub(in crate::tui) effective_station: Option<ResolvedRouteValue>,
-    pub(in crate::tui) effective_upstream_base_url: Option<ResolvedRouteValue>,
-    pub(in crate::tui) override_model: Option<String>,
-    pub(in crate::tui) override_effort: Option<String>,
-    pub(in crate::tui) override_station_name: Option<String>,
-    pub(in crate::tui) override_route_target: Option<String>,
-    pub(in crate::tui) override_service_tier: Option<String>,
+}
+
+impl SessionRow {
+    pub(in crate::tui) fn local_command_session_id(&self) -> Option<&str> {
+        self.local_session_id.as_deref()
+    }
+
+    pub(in crate::tui) fn observed_provider_id(&self) -> Option<&str> {
+        self.last_route_decision
+            .as_ref()
+            .and_then(|decision| non_empty(decision.provider_id.as_deref()?))
+            .or_else(|| non_empty(self.last_provider_id.as_deref()?))
+    }
+
+    pub(in crate::tui) fn observed_endpoint_id(&self) -> Option<&str> {
+        self.last_route_decision
+            .as_ref()
+            .and_then(|decision| non_empty(decision.endpoint_id.as_deref()?))
+    }
+
+    pub(in crate::tui) fn observed_upstream_origin(&self) -> Option<String> {
+        self.last_route_decision
+            .as_ref()
+            .and_then(|decision| decision.effective_upstream_base_url.as_ref())
+            .and_then(|value| sanitize_upstream_origin(&value.value))
+            .or_else(|| {
+                self.route_affinity
+                    .as_ref()
+                    .and_then(|affinity| sanitize_upstream_origin(&affinity.upstream_origin))
+            })
+    }
+}
+
+fn non_empty(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty()).then_some(value)
+}
+
+pub(in crate::tui) fn sanitize_upstream_origin(value: &str) -> Option<String> {
+    let url = reqwest::Url::parse(value.trim()).ok()?;
+    let origin = url.origin().ascii_serialization();
+    (origin != "null").then_some(origin)
+}
+
+fn sanitize_route_decision(decision: &RouteDecisionProvenance) -> RouteDecisionProvenance {
+    let mut decision = decision.clone();
+    decision.effective_upstream_base_url =
+        decision
+            .effective_upstream_base_url
+            .as_ref()
+            .and_then(|value| {
+                Some(ResolvedRouteValue {
+                    value: sanitize_upstream_origin(&value.value)?,
+                    source: value.source,
+                })
+            });
+    decision
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::tui) struct ForecastBalanceSample {
-    pub(in crate::tui) fetched_at_ms: u64,
+pub(in crate::tui) struct SessionRouteAffinityView {
     pub(in crate::tui) provider_id: String,
-    pub(in crate::tui) station_name: Option<String>,
-    pub(in crate::tui) upstream_index: Option<usize>,
-    pub(in crate::tui) quota_remaining_usd: Option<String>,
-    pub(in crate::tui) subscription_balance_usd: Option<String>,
-    pub(in crate::tui) total_balance_usd: Option<String>,
-    pub(in crate::tui) error: Option<String>,
-    pub(in crate::tui) unlimited_quota: bool,
+    pub(in crate::tui) endpoint_id: String,
+    pub(in crate::tui) upstream_origin: String,
+    pub(in crate::tui) route_path: Vec<String>,
+    pub(in crate::tui) last_selected_at_ms: u64,
+    pub(in crate::tui) last_changed_at_ms: u64,
+    pub(in crate::tui) change_reason: String,
 }
 
-impl ForecastBalanceSample {
-    pub(in crate::tui) fn from_snapshot(snapshot: &ProviderBalanceSnapshot) -> Self {
-        Self {
-            fetched_at_ms: snapshot.fetched_at_ms,
-            provider_id: snapshot.provider_id.clone(),
-            station_name: snapshot.station_name.clone(),
-            upstream_index: snapshot.upstream_index,
-            quota_remaining_usd: snapshot.quota_remaining_usd.clone(),
-            subscription_balance_usd: snapshot.subscription_balance_usd.clone(),
-            total_balance_usd: snapshot.total_balance_usd.clone(),
-            error: snapshot.error.clone(),
-            unlimited_quota: snapshot.unlimited_quota == Some(true),
-        }
-    }
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(in crate::tui) struct RequestAttemptControlEvidence {
+    pub(in crate::tui) provider_signal_codes: Vec<String>,
+    pub(in crate::tui) policy_action_codes: Vec<String>,
 }
 
-impl UsageForecastBalanceHistoryLike for ForecastBalanceSample {
-    fn fetched_at_ms(&self) -> u64 {
-        self.fetched_at_ms
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(in crate::tui) struct RequestControlEvidence {
+    pub(in crate::tui) provider_signal_codes: Vec<String>,
+    pub(in crate::tui) policy_action_codes: Vec<String>,
+    pub(in crate::tui) route_attempts: HashMap<u32, RequestAttemptControlEvidence>,
+}
+
+impl RequestControlEvidence {
+    fn has_provider_signals(&self) -> bool {
+        !self.provider_signal_codes.is_empty()
+            || self
+                .route_attempts
+                .values()
+                .any(|attempt| !attempt.provider_signal_codes.is_empty())
     }
 
-    fn provider_id(&self) -> &str {
-        self.provider_id.as_str()
-    }
-
-    fn station_name(&self) -> Option<&str> {
-        self.station_name.as_deref()
-    }
-
-    fn upstream_index(&self) -> Option<usize> {
-        self.upstream_index
-    }
-
-    fn quota_remaining_usd(&self) -> Option<&str> {
-        self.quota_remaining_usd.as_deref()
-    }
-
-    fn subscription_balance_usd(&self) -> Option<&str> {
-        self.subscription_balance_usd.as_deref()
-    }
-
-    fn total_balance_usd(&self) -> Option<&str> {
-        self.total_balance_usd.as_deref()
-    }
-
-    fn error(&self) -> Option<&str> {
-        self.error.as_deref()
-    }
-
-    fn unlimited_quota(&self) -> bool {
-        self.unlimited_quota
+    fn has_policy_actions(&self) -> bool {
+        !self.policy_action_codes.is_empty()
+            || self
+                .route_attempts
+                .values()
+                .any(|attempt| !attempt.policy_action_codes.is_empty())
     }
 }
 
 #[derive(Debug, Clone)]
 pub(in crate::tui) struct Snapshot {
     pub(in crate::tui) rows: Vec<SessionRow>,
-    pub(in crate::tui) recent: Vec<FinishedRequest>,
-    pub(in crate::tui) model_overrides: HashMap<String, String>,
-    pub(in crate::tui) overrides: HashMap<String, String>,
-    pub(in crate::tui) station_overrides: HashMap<String, String>,
-    pub(in crate::tui) route_target_overrides: HashMap<String, String>,
-    pub(in crate::tui) service_tier_overrides: HashMap<String, String>,
-    pub(in crate::tui) global_station_override: Option<String>,
-    pub(in crate::tui) global_route_target_override: Option<String>,
-    pub(in crate::tui) station_meta_overrides: HashMap<String, (Option<bool>, Option<u8>)>,
+    pub(in crate::tui) recent: Vec<OperatorRequestSummary>,
+    pub(in crate::tui) request_control_evidence: HashMap<u64, RequestControlEvidence>,
     pub(in crate::tui) usage_day: UsageDayView,
     #[allow(dead_code)]
     pub(in crate::tui) usage_rollup: UsageRollupView,
     pub(in crate::tui) provider_balances: HashMap<String, Vec<ProviderBalanceSnapshot>>,
-    #[allow(dead_code)]
-    pub(in crate::tui) provider_balance_history: HashMap<String, Vec<ForecastBalanceSample>>,
-    pub(in crate::tui) station_health: HashMap<String, StationHealth>,
-    pub(in crate::tui) health_checks: HashMap<String, HealthCheckStatus>,
-    pub(in crate::tui) lb_view: HashMap<String, LbConfigView>,
-    pub(in crate::tui) provider_endpoint_policy_actions:
-        HashMap<String, Vec<PolicyActionProjection>>,
     pub(in crate::tui) stats_5m: WindowStats,
     pub(in crate::tui) stats_1h: WindowStats,
     pub(in crate::tui) service_status: Option<crate::service_status::ServiceStatusSnapshot>,
-    pub(in crate::tui) pricing_catalog: ModelPriceCatalogSnapshot,
     pub(in crate::tui) refreshed_at: Instant,
+}
+
+impl Default for Snapshot {
+    fn default() -> Self {
+        Self {
+            rows: Vec::new(),
+            recent: Vec::new(),
+            request_control_evidence: HashMap::new(),
+            usage_day: UsageDayView::default(),
+            usage_rollup: UsageRollupView::default(),
+            provider_balances: HashMap::new(),
+            stats_5m: WindowStats::default(),
+            stats_1h: WindowStats::default(),
+            service_status: None,
+            refreshed_at: Instant::now(),
+        }
+    }
+}
+
+pub(in crate::tui) fn request_attempt_count(request: &OperatorRequestSummary) -> u32 {
+    let retry_attempts = request
+        .retry
+        .as_ref()
+        .map(|retry| retry.attempts)
+        .unwrap_or(0);
+    retry_attempts
+        .max(request.observability.attempt_count)
+        .max(1)
+}
+
+pub(in crate::tui) fn request_provider_endpoint(
+    request: &OperatorRequestSummary,
+) -> Option<ProviderEndpointKey> {
+    Some(ProviderEndpointKey::new(
+        non_empty(&request.service)?,
+        non_empty(request.provider_id.as_deref()?)?,
+        non_empty(request.endpoint_id.as_deref()?)?,
+    ))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -552,85 +366,11 @@ pub(in crate::tui) fn short_sid(sid: &str, max: usize) -> String {
     shorten_head(sid, max)
 }
 
-pub fn build_provider_options(
-    cfg: &crate::config::ProxyConfig,
-    service_name: &str,
-) -> Vec<ProviderOption> {
-    let mgr = match service_name {
-        "claude" => &cfg.claude,
-        _ => &cfg.codex,
-    };
-    crate::dashboard_core::build_runtime_provider_options_from_mgr(mgr)
-}
-
-fn indexed_policy_actions(
-    actions: Vec<PolicyActionProjection>,
-) -> HashMap<String, Vec<PolicyActionProjection>> {
-    let mut indexed: HashMap<String, Vec<PolicyActionProjection>> = HashMap::new();
-    for action in actions {
-        indexed
-            .entry(action.provider_endpoint_key.stable_key())
-            .or_default()
-            .push(action);
-    }
-    indexed
-}
-
-pub(in crate::tui) fn runtime_upstream_provider_endpoint_key(
-    service_name: &str,
-    station_name: &str,
-    upstream_index: usize,
-    upstream: &UpstreamSummary,
-) -> ProviderEndpointKey {
-    let tag = |name: &str| {
-        upstream
-            .tags
-            .iter()
-            .find(|(key, _)| key == name)
-            .map(|(_, value)| value.trim())
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-    };
-    let provider_id =
-        tag("provider_id").unwrap_or_else(|| format!("{station_name}#{upstream_index}"));
-    let endpoint_id = tag("endpoint_id").unwrap_or_else(|| upstream_index.to_string());
-
-    ProviderEndpointKey::new(service_name, provider_id, endpoint_id)
-}
-
-pub(in crate::tui) fn runtime_upstream_policy_actions<'a>(
-    snapshot: &'a Snapshot,
-    service_name: &str,
-    station_name: &str,
-    upstream_index: usize,
-    upstream: &UpstreamSummary,
-) -> &'a [PolicyActionProjection] {
-    let endpoint_key = runtime_upstream_provider_endpoint_key(
-        service_name,
-        station_name,
-        upstream_index,
-        upstream,
-    );
-    snapshot
-        .provider_endpoint_policy_actions
-        .get(endpoint_key.stable_key().as_str())
-        .map(Vec::as_slice)
-        .unwrap_or(&[])
-}
-
-pub(in crate::tui) fn runtime_provider_policy_action_count(
-    snapshot: &Snapshot,
-    service_name: &str,
-    provider: &ProviderOption,
-) -> usize {
+pub(in crate::tui) fn operator_provider_policy_action_count(provider: &ProviderOption) -> usize {
     provider
-        .upstreams
+        .endpoints
         .iter()
-        .enumerate()
-        .map(|(idx, upstream)| {
-            runtime_upstream_policy_actions(snapshot, service_name, &provider.name, idx, upstream)
-                .len()
-        })
+        .map(|endpoint| endpoint.policy_actions.len())
         .sum()
 }
 
@@ -1176,7 +916,7 @@ fn push_balance_candidate(candidates: &mut Vec<String>, candidate: String) {
     }
 }
 
-fn balance_snapshot_rank(snapshot: &ProviderBalanceSnapshot) -> u8 {
+pub(in crate::tui) fn balance_snapshot_rank(snapshot: &ProviderBalanceSnapshot) -> u8 {
     match snapshot.status {
         BalanceSnapshotStatus::Ok => 0,
         BalanceSnapshotStatus::Stale => 1,
@@ -1186,58 +926,41 @@ fn balance_snapshot_rank(snapshot: &ProviderBalanceSnapshot) -> u8 {
     }
 }
 
-pub(in crate::tui) fn routing_context_balance_rank(
-    station_key: &str,
-    snapshot: &ProviderBalanceSnapshot,
-    provider_name: &str,
-) -> u8 {
-    let station_name = snapshot.station_name.as_deref().unwrap_or(station_key);
-    if station_name == "routing" || station_key == "routing" {
-        0
-    } else if station_name == provider_name || station_key == provider_name {
-        1
-    } else {
-        2
-    }
-}
-
 fn primary_balance_snapshot(
     balances: &[ProviderBalanceSnapshot],
 ) -> Option<&ProviderBalanceSnapshot> {
     balances.iter().min_by(|left, right| {
         balance_snapshot_rank(left)
             .cmp(&balance_snapshot_rank(right))
-            .then_with(|| left.upstream_index.cmp(&right.upstream_index))
-            .then_with(|| left.provider_id.cmp(&right.provider_id))
+            .then_with(|| {
+                left.provider_endpoint
+                    .endpoint_id
+                    .cmp(&right.provider_endpoint.endpoint_id)
+            })
+            .then_with(|| {
+                left.observation_provider_id
+                    .cmp(&right.observation_provider_id)
+            })
             .then_with(|| right.fetched_at_ms.cmp(&left.fetched_at_ms))
     })
 }
 
-pub(in crate::tui) fn station_primary_balance_snapshot<'a>(
-    provider_balances: &'a HashMap<String, Vec<ProviderBalanceSnapshot>>,
-    station_name: &str,
-) -> Option<&'a ProviderBalanceSnapshot> {
-    provider_balances
-        .get(station_name)
-        .and_then(|balances| primary_balance_snapshot(balances))
-}
-
 #[cfg(test)]
-pub(in crate::tui) fn station_balance_brief(
+pub(in crate::tui) fn provider_balance_brief(
     provider_balances: &HashMap<String, Vec<ProviderBalanceSnapshot>>,
-    station_name: &str,
+    provider_id: &str,
     max_width: usize,
 ) -> String {
-    station_balance_brief_lang(provider_balances, station_name, max_width, Language::En)
+    provider_balance_brief_lang(provider_balances, provider_id, max_width, Language::En)
 }
 
-pub(in crate::tui) fn station_balance_brief_lang(
+pub(in crate::tui) fn provider_balance_brief_lang(
     provider_balances: &HashMap<String, Vec<ProviderBalanceSnapshot>>,
-    station_name: &str,
+    provider_id: &str,
     max_width: usize,
     lang: Language,
 ) -> String {
-    let Some(balances) = provider_balances.get(station_name) else {
+    let Some(balances) = provider_balances.get(provider_id) else {
         return "-".to_string();
     };
     if balances.is_empty() {
@@ -1425,92 +1148,33 @@ fn compact_balance_parts(
     shorten_middle(fallback_label, max_width)
 }
 
-#[cfg(test)]
-fn row_station_candidates(row: &SessionRow) -> impl Iterator<Item = &str> {
-    [
-        row.last_station_name.as_deref(),
-        row.effective_station
-            .as_ref()
-            .map(|value| value.value.as_str()),
-        row.override_station_name.as_deref(),
-        row.override_route_target.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .map(str::trim)
-    .filter(|value| !value.is_empty() && *value != "-")
-}
-
 fn balance_by_provider_id<'a>(
     provider_balances: &'a HashMap<String, Vec<ProviderBalanceSnapshot>>,
     provider_id: &str,
-) -> Option<(&'a str, &'a ProviderBalanceSnapshot)> {
-    let mut matches = provider_balances
+) -> Option<&'a ProviderBalanceSnapshot> {
+    let balances = provider_balances.get(provider_id)?;
+    let mut matches = balances
         .iter()
-        .flat_map(|(station_name, balances)| {
-            balances
-                .iter()
-                .filter(move |snapshot| {
-                    snapshot.provider_id == provider_id
-                        || (snapshot.provider_id.trim().is_empty() && station_name == provider_id)
-                })
-                .map(move |snapshot| (station_name.as_str(), snapshot))
-        })
+        .filter(|snapshot| snapshot.provider_endpoint.provider_id == provider_id)
         .collect::<Vec<_>>();
     if matches.is_empty() {
         return None;
     }
-    matches.sort_by(|(_, left), (_, right)| {
+    matches.sort_by(|left, right| {
         balance_snapshot_rank(left)
             .cmp(&balance_snapshot_rank(right))
-            .then_with(|| left.upstream_index.cmp(&right.upstream_index))
+            .then_with(|| {
+                left.provider_endpoint
+                    .endpoint_id
+                    .cmp(&right.provider_endpoint.endpoint_id)
+            })
+            .then_with(|| {
+                left.observation_provider_id
+                    .cmp(&right.observation_provider_id)
+            })
             .then_with(|| right.fetched_at_ms.cmp(&left.fetched_at_ms))
     });
     matches.into_iter().next()
-}
-
-#[cfg(test)]
-pub(in crate::tui) fn session_balance_brief(
-    row: &SessionRow,
-    provider_balances: &HashMap<String, Vec<ProviderBalanceSnapshot>>,
-    max_width: usize,
-) -> Option<String> {
-    session_balance_brief_lang(row, provider_balances, max_width, Language::En)
-}
-
-#[cfg(test)]
-fn session_balance_brief_lang(
-    row: &SessionRow,
-    provider_balances: &HashMap<String, Vec<ProviderBalanceSnapshot>>,
-    max_width: usize,
-    lang: Language,
-) -> Option<String> {
-    for station_name in row_station_candidates(row) {
-        if provider_balances.contains_key(station_name) {
-            return Some(station_balance_brief_lang(
-                provider_balances,
-                station_name,
-                max_width,
-                lang,
-            ));
-        }
-    }
-
-    row.last_provider_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|provider_id| !provider_id.is_empty())
-        .and_then(|provider_id| balance_by_provider_id(provider_balances, provider_id))
-        .map(|(station_name, snapshot)| {
-            shorten_middle(
-                &format!(
-                    "{} {}",
-                    shorten_middle(station_name, 18),
-                    provider_balance_compact_lang(snapshot, max_width, lang)
-                ),
-                max_width,
-            )
-        })
 }
 
 pub(in crate::tui) fn session_observed_provider_balance_brief_lang(
@@ -1519,66 +1183,29 @@ pub(in crate::tui) fn session_observed_provider_balance_brief_lang(
     max_width: usize,
     lang: Language,
 ) -> Option<String> {
-    let provider_id = row
-        .last_provider_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|provider_id| !provider_id.is_empty() && *provider_id != "-")?;
-    balance_by_provider_id(provider_balances, provider_id)
-        .map(|(_, snapshot)| provider_balance_compact_lang(snapshot, max_width, lang))
+    session_observed_provider_balance_snapshot(row, provider_balances)
+        .map(|snapshot| provider_balance_compact_lang(snapshot, max_width, lang))
 }
 
 pub(in crate::tui) fn session_observed_provider_balance_snapshot<'a>(
     row: &SessionRow,
     provider_balances: &'a HashMap<String, Vec<ProviderBalanceSnapshot>>,
 ) -> Option<&'a ProviderBalanceSnapshot> {
-    let provider_id = row
-        .last_provider_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|provider_id| !provider_id.is_empty() && *provider_id != "-")?;
-    balance_by_provider_id(provider_balances, provider_id).map(|(_, snapshot)| snapshot)
-}
-
-pub(in crate::tui) fn provider_tags_brief(
-    provider: &ProviderOption,
-    max_width: usize,
-) -> Option<String> {
-    let mut tags = provider
-        .upstreams
-        .iter()
-        .flat_map(|upstream| upstream.tags.iter())
-        .filter(|(key, value)| {
-            !value.trim().is_empty()
-                && key.as_str() != "provider_id"
-                && key.as_str() != "source"
-                && key.as_str() != "requires_openai_auth"
-                && key.as_str() != "continuity_domain"
-                && key.as_str() != "provider_continuity_domain"
+    let provider_id = row.observed_provider_id()?;
+    if let Some(endpoint_id) = row.observed_endpoint_id()
+        && let Some(snapshot) = provider_balances.get(provider_id).and_then(|snapshots| {
+            snapshots.iter().find(|snapshot| {
+                snapshot.provider_endpoint.provider_id == provider_id
+                    && snapshot.provider_endpoint.endpoint_id == endpoint_id
+            })
         })
-        .map(|(key, value)| format!("{key}={value}"))
-        .collect::<Vec<_>>();
-    tags.sort();
-    tags.dedup();
-
-    if tags.is_empty() {
-        tags = provider
-            .upstreams
-            .iter()
-            .filter_map(|upstream| upstream.provider_id.as_deref())
-            .map(|provider_id| format!("provider_id={provider_id}"))
-            .collect::<Vec<_>>();
-        tags.sort();
-        tags.dedup();
+    {
+        return Some(snapshot);
     }
-
-    if tags.is_empty() {
-        None
-    } else {
-        Some(shorten_middle(&tags.join(" "), max_width))
-    }
+    balance_by_provider_id(provider_balances, provider_id)
 }
 
+#[cfg(test)]
 fn session_sort_key(row: &SessionRow) -> u64 {
     row.last_ended_at_ms
         .unwrap_or(0)
@@ -1640,18 +1267,14 @@ pub(in crate::tui) fn format_tok_per_second(value: Option<f64>) -> String {
 }
 
 pub(in crate::tui) fn usage_line_lang(usage: &UsageMetrics, lang: Language) -> String {
-    crate::usage_format::usage_line_with_labels(
-        usage,
+    format!(
+        "{}: {}/{}/{}/{}",
         i18n::label(lang, "tok in/out/rsn/ttl"),
-        i18n::label(lang, "cache read/create"),
+        tokens_short(usage.input_tokens),
+        tokens_short(usage.output_tokens),
+        tokens_short(usage.reasoning_output_tokens),
+        tokens_short(usage.total_tokens),
     )
-}
-
-pub(in crate::tui) fn request_cache_hit_rate_label(request: &FinishedRequest) -> String {
-    request
-        .cache_hit_rate()
-        .map(|rate| format!("{:.1}%", rate * 100.0))
-        .unwrap_or_else(|| "-".to_string())
 }
 
 pub(in crate::tui) fn status_style(p: Palette, status: Option<u16>) -> Style {
@@ -1664,6 +1287,7 @@ pub(in crate::tui) fn status_style(p: Palette, status: Option<u16>) -> Style {
     }
 }
 
+#[cfg(test)]
 fn build_session_rows_from_cards(cards: &[SessionIdentityCard]) -> Vec<SessionRow> {
     let mut rows = cards
         .iter()
@@ -1671,6 +1295,7 @@ fn build_session_rows_from_cards(cards: &[SessionIdentityCard]) -> Vec<SessionRo
             let session_id = card.session_id.clone()?;
             Some(SessionRow {
                 session_id: Some(session_id),
+                local_session_id: card.session_id.clone(),
                 observation_scope: card.observation_scope,
                 host_local_transcript_path: card.host_local_transcript_path.clone(),
                 last_client_name: card.last_client_name.clone(),
@@ -1687,8 +1312,6 @@ fn build_session_rows_from_cards(cards: &[SessionIdentityCard]) -> Vec<SessionRo
                 last_reasoning_effort: card.last_reasoning_effort.clone(),
                 last_service_tier: card.last_service_tier.clone(),
                 last_provider_id: card.last_provider_id.clone(),
-                last_station_name: card.last_station_name.clone(),
-                last_upstream_base_url: card.last_upstream_base_url.clone(),
                 last_usage: card.last_usage.clone(),
                 total_usage: card.total_usage.clone(),
                 turns_total: card.turns_total,
@@ -1697,31 +1320,29 @@ fn build_session_rows_from_cards(cards: &[SessionIdentityCard]) -> Vec<SessionRo
                 avg_output_tokens_per_second: card.avg_output_tokens_per_second,
                 binding_profile_name: card.binding_profile_name.clone(),
                 binding_continuity_mode: card.binding_continuity_mode,
-                last_route_decision: card.last_route_decision.clone(),
-                route_affinity: card.route_affinity.clone(),
+                last_route_decision: card
+                    .last_route_decision
+                    .as_ref()
+                    .map(sanitize_route_decision),
+                route_affinity: card.route_affinity.as_ref().and_then(|affinity| {
+                    Some(SessionRouteAffinityView {
+                        provider_id: affinity.provider_endpoint.provider_id.clone(),
+                        endpoint_id: affinity.provider_endpoint.endpoint_id.clone(),
+                        upstream_origin: sanitize_upstream_origin(&affinity.upstream_base_url)?,
+                        route_path: affinity.route_path.clone(),
+                        last_selected_at_ms: affinity.last_selected_at_ms,
+                        last_changed_at_ms: affinity.last_changed_at_ms,
+                        change_reason: affinity.change_reason.clone(),
+                    })
+                }),
                 effective_model: card.effective_model.clone(),
                 effective_reasoning_effort: card.effective_reasoning_effort.clone(),
                 effective_service_tier: card.effective_service_tier.clone(),
-                effective_station: card.effective_station.clone(),
-                effective_upstream_base_url: card.effective_upstream_base_url.clone(),
-                override_model: card.override_model.clone(),
-                override_effort: card.override_effort.clone(),
-                override_station_name: card.override_station_name.clone(),
-                override_route_target: None,
-                override_service_tier: card.override_service_tier.clone(),
             })
         })
         .collect::<Vec<_>>();
     rows.sort_by_key(|r| std::cmp::Reverse(session_sort_key(r)));
     rows
-}
-
-pub(in crate::tui) fn session_row_has_any_override(row: &SessionRow) -> bool {
-    row.override_model.is_some()
-        || row.override_effort.is_some()
-        || row.override_station_name.is_some()
-        || row.override_route_target.is_some()
-        || row.override_service_tier.is_some()
 }
 
 pub(in crate::tui) fn format_observed_client_identity(
@@ -1767,152 +1388,46 @@ pub(in crate::tui) struct SessionControlPosture {
     pub(in crate::tui) color: Color,
 }
 
-pub(in crate::tui) fn session_override_fields(row: &SessionRow) -> Vec<&'static str> {
-    let mut fields = Vec::new();
-    if row.override_model.is_some() {
-        fields.push("model");
-    }
-    if row.override_effort.is_some() {
-        fields.push("effort");
-    }
-    if row.override_station_name.is_some() {
-        fields.push("station");
-    }
-    if row.override_route_target.is_some() {
-        fields.push("route target");
-    }
-    if row.override_service_tier.is_some() {
-        fields.push("service_tier");
-    }
-    fields
-}
-
 #[cfg(test)]
 pub(in crate::tui) fn session_control_posture(
     row: &SessionRow,
-    global_station: Option<&str>,
-    global_route_target: Option<&str>,
     route_graph_routing: bool,
 ) -> SessionControlPosture {
-    session_control_posture_lang(
-        row,
-        global_station,
-        global_route_target,
-        route_graph_routing,
-        Language::En,
-    )
+    session_control_posture_lang(row, route_graph_routing, Language::En)
 }
 
 pub(in crate::tui) fn session_control_posture_lang(
     row: &SessionRow,
-    global_station: Option<&str>,
-    global_route_target: Option<&str>,
     route_graph_routing: bool,
     lang: Language,
 ) -> SessionControlPosture {
-    let override_fields = session_override_fields(row);
-    let override_fields_label = || {
-        override_fields
-            .iter()
-            .map(|field| i18n::label(lang, field))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
     if let Some(profile_name) = row.binding_profile_name.as_deref() {
-        if override_fields.is_empty() {
-            let mode = row
-                .binding_continuity_mode
-                .map(|mode| format!("{mode:?}").to_ascii_lowercase())
-                .unwrap_or_else(|| "default_profile".to_string());
-            return SessionControlPosture {
-                headline: match lang {
-                    Language::Zh => format!("绑定到 profile {profile_name}（{mode}）"),
-                    Language::En => format!("bound to profile {profile_name} ({mode})"),
-                },
-                detail: i18n::label(
-                    lang,
-                    "This session keeps its stored binding until another profile or override rewrites it.",
-                )
-                .to_string(),
-                color: Color::Rgb(63, 185, 80),
-            };
-        }
-
+        let mode = row
+            .binding_continuity_mode
+            .map(|mode| format!("{mode:?}").to_ascii_lowercase())
+            .unwrap_or_else(|| "default_profile".to_string());
         return SessionControlPosture {
             headline: match lang {
-                Language::Zh => format!("profile {profile_name} 存在会话覆盖"),
-                Language::En => format!("profile {profile_name} with session overrides"),
-            },
-            detail: format!(
-                "{} {}",
-                i18n::label(
-                    lang,
-                    "Session overrides currently take priority over the bound profile:",
-                ),
-                override_fields_label()
-            ),
-            color: Color::Rgb(88, 166, 255),
-        };
-    }
-
-    if !override_fields.is_empty() {
-        return SessionControlPosture {
-            headline: i18n::label(lang, "session-controlled route").to_string(),
-            detail: format!(
-                "{} {}",
-                i18n::label(lang, "This session is currently pinned by overrides on:"),
-                override_fields_label()
-            ),
-            color: Color::Rgb(88, 166, 255),
-        };
-    }
-
-    if route_graph_routing
-        && let Some(route_target) = global_route_target.filter(|target| !target.trim().is_empty())
-    {
-        return SessionControlPosture {
-            headline: match lang {
-                Language::Zh => format!("无绑定；全局路由目标 {route_target} 仍会影响路由"),
-                Language::En => {
-                    format!(
-                        "no binding; global route target {route_target} may still influence routing"
-                    )
-                }
+                Language::Zh => format!("绑定到 profile {profile_name}（{mode}）"),
+                Language::En => format!("bound to profile {profile_name} ({mode})"),
             },
             detail: i18n::label(
                 lang,
-                "Without a stored profile or session override, route graph defaults and runtime/global routing explain the effective route.",
+                "This session keeps its stored profile binding while runtime observations explain the effective route.",
             )
             .to_string(),
-            color: Color::Rgb(210, 153, 34),
-        };
-    }
-
-    if let Some(station) = global_station.filter(|station| !station.trim().is_empty()) {
-        return SessionControlPosture {
-            headline: match lang {
-                Language::Zh => format!("无绑定；全局站点 {station} 仍可能影响回退"),
-                Language::En => {
-                    format!("no binding; global station {station} may still influence fallback")
-                }
-            },
-            detail: i18n::label(
-                lang,
-                "Without a stored profile or session override, runtime/global routing explains the effective route.",
-            )
-            .to_string(),
-            color: Color::Rgb(210, 153, 34),
+            color: Color::Rgb(63, 185, 80),
         };
     }
 
     SessionControlPosture {
-        headline: i18n::label(lang, "no stored binding or session override").to_string(),
+        headline: i18n::label(lang, "no stored profile binding").to_string(),
         detail: i18n::label(
             lang,
             if route_graph_routing {
-                "Effective route comes from request payloads, route graph defaults, route target overrides, and runtime fallback."
+                "Effective route comes from request payloads, route graph defaults, and runtime fallback."
             } else {
-                "Effective route comes from request payloads, station defaults, and runtime fallback."
+                "Effective route comes from request payloads, profile defaults, and runtime fallback."
             },
         )
         .to_string(),
@@ -1920,131 +1435,173 @@ pub(in crate::tui) fn session_control_posture_lang(
     }
 }
 
-pub(in crate::tui) async fn refresh_snapshot(
-    state: &ProxyState,
-    cfg: Arc<ProxyConfig>,
-    service_name: &str,
-    stats_days: usize,
+pub(in crate::tui) fn snapshot_from_operator_data(
+    data: &OperatorReadData,
+    local_session_ids: &HashMap<String, String>,
 ) -> Snapshot {
-    let (mut snap, config_meta) = tokio::join!(
-        crate::dashboard_core::build_dashboard_snapshot(
-            state,
-            service_name,
-            crate::state::recent_finished_max(),
-            stats_days,
-            Some(&cfg.ui.service_status),
-            Some(cfg.as_ref()),
-        ),
-        state.get_station_meta_overrides(service_name),
-    );
-    let mgr = match service_name {
-        "claude" => &cfg.claude,
-        _ => &cfg.codex,
-    };
-    crate::state::enrich_session_identity_cards_with_runtime(&mut snap.session_cards, mgr);
-
-    let global_station_override = snap.effective_global_station_override().map(str::to_owned);
-    let global_route_target_override = snap
-        .effective_global_route_target_override()
-        .map(str::to_owned);
-    let station_health = snap.effective_station_health().clone();
-    let mut rows = build_session_rows_from_cards(&snap.session_cards);
-    for row in &mut rows {
-        if let Some(session_id) = row.session_id.as_deref() {
-            row.override_route_target =
-                snap.session_route_target_overrides.get(session_id).cloned();
-        }
-    }
+    let sessions = &data.summary.sessions;
     Snapshot {
-        rows,
-        recent: snap.recent,
-        model_overrides: snap.session_model_overrides,
-        overrides: snap.session_effort_overrides,
-        station_overrides: snap.session_station_overrides,
-        route_target_overrides: snap.session_route_target_overrides,
-        service_tier_overrides: snap.session_service_tier_overrides,
-        global_station_override,
-        global_route_target_override,
-        station_meta_overrides: config_meta,
-        usage_day: snap.usage_day,
-        usage_rollup: snap.usage_rollup,
-        provider_balances: snap.provider_balances,
-        provider_balance_history: snap
-            .provider_balance_history
-            .into_iter()
-            .map(|(station, snapshots)| {
-                (
-                    station,
-                    snapshots
-                        .into_iter()
-                        .map(|snapshot| ForecastBalanceSample::from_snapshot(&snapshot))
-                        .collect(),
-                )
-            })
+        rows: sessions
+            .iter()
+            .map(|session| session_row_from_operator(session, local_session_ids))
             .collect(),
-        station_health,
-        health_checks: snap.health_checks,
-        lb_view: snap.lb_view,
-        provider_endpoint_policy_actions: indexed_policy_actions(snap.policy_actions),
-        stats_5m: snap.stats_5m,
-        stats_1h: snap.stats_1h,
-        service_status: snap.service_status,
-        pricing_catalog: crate::pricing::operator_model_price_catalog_snapshot(),
+        recent: data.recent_requests.clone(),
+        request_control_evidence: data
+            .recent_requests
+            .iter()
+            .map(|request| (request.id, request_control_evidence_from_operator(request)))
+            .collect(),
+        usage_day: data.usage_day.clone(),
+        usage_rollup: data.usage_rollup.clone(),
+        provider_balances: operator_provider_balances(
+            &data.summary.service_name,
+            &data.provider_balances,
+        ),
+        stats_5m: data.stats_5m.clone(),
+        stats_1h: data.stats_1h.clone(),
+        service_status: None,
         refreshed_at: Instant::now(),
     }
 }
 
-pub(in crate::tui) async fn snapshot_from_api_v1(api: ApiV1Snapshot) -> Snapshot {
-    let snap = api.snapshot;
-    let global_station_override = snap.effective_global_station_override().map(str::to_owned);
-    let global_route_target_override = snap
-        .effective_global_route_target_override()
-        .map(str::to_owned);
-    let station_health = snap.effective_station_health().clone();
-    let mut rows = build_session_rows_from_cards(&snap.session_cards);
-    for row in &mut rows {
-        if let Some(session_id) = row.session_id.as_deref() {
-            row.override_route_target =
-                snap.session_route_target_overrides.get(session_id).cloned();
-        }
+pub(in crate::tui) fn provider_options_from_operator_data(
+    data: &OperatorReadData,
+) -> Vec<ProviderOption> {
+    data.summary.providers.clone()
+}
+
+fn session_row_from_operator(
+    session: &OperatorSessionSummary,
+    local_session_ids: &HashMap<String, String>,
+) -> SessionRow {
+    SessionRow {
+        session_id: Some(session.session_key.clone()),
+        local_session_id: local_session_ids.get(&session.session_key).cloned(),
+        observation_scope: SessionObservationScope::ObservedOnly,
+        host_local_transcript_path: None,
+        last_client_name: None,
+        last_client_addr: None,
+        cwd: None,
+        active_count: usize::try_from(session.active_count).unwrap_or(usize::MAX),
+        active_started_at_ms_min: session.active_started_at_ms_min,
+        active_last_method: None,
+        active_last_path: None,
+        last_status: session.last_status,
+        last_duration_ms: session.last_duration_ms,
+        last_ended_at_ms: session.last_ended_at_ms,
+        last_model: session.last_model.clone(),
+        last_reasoning_effort: session.last_reasoning_effort.clone(),
+        last_service_tier: session.last_service_tier.clone(),
+        last_provider_id: session.last_provider_id.clone(),
+        last_usage: session.last_usage.clone(),
+        total_usage: session.total_usage.clone(),
+        turns_total: session.turns_total,
+        turns_with_usage: session.turns_with_usage,
+        last_output_tokens_per_second: session.last_output_tokens_per_second,
+        avg_output_tokens_per_second: session.avg_output_tokens_per_second,
+        binding_profile_name: session.binding_profile_name.clone(),
+        binding_continuity_mode: session.binding_continuity_mode,
+        last_route_decision: session
+            .last_route_decision
+            .as_ref()
+            .map(sanitize_route_decision),
+        route_affinity: session.route_affinity.as_ref().and_then(|affinity| {
+            Some(SessionRouteAffinityView {
+                provider_id: affinity.provider_id.clone(),
+                endpoint_id: affinity.endpoint_id.clone(),
+                upstream_origin: sanitize_upstream_origin(&affinity.upstream_origin)?,
+                route_path: affinity.route_path.clone(),
+                last_selected_at_ms: affinity.last_selected_at_ms,
+                last_changed_at_ms: affinity.last_changed_at_ms,
+                change_reason: affinity.change_reason.clone(),
+            })
+        }),
+        effective_model: session.effective_model.clone(),
+        effective_reasoning_effort: session.effective_reasoning_effort.clone(),
+        effective_service_tier: session.effective_service_tier.clone(),
     }
-    Snapshot {
-        rows,
-        recent: snap.recent,
-        model_overrides: snap.session_model_overrides,
-        overrides: snap.session_effort_overrides,
-        station_overrides: snap.session_station_overrides,
-        route_target_overrides: snap.session_route_target_overrides,
-        service_tier_overrides: snap.session_service_tier_overrides,
-        global_station_override,
-        global_route_target_override,
-        station_meta_overrides: HashMap::new(),
-        usage_day: snap.usage_day,
-        usage_rollup: snap.usage_rollup,
-        provider_balances: snap.provider_balances,
-        provider_balance_history: snap
-            .provider_balance_history
-            .into_iter()
-            .map(|(station, snapshots)| {
+}
+
+fn request_control_evidence_from_operator(
+    request: &OperatorRequestSummary,
+) -> RequestControlEvidence {
+    RequestControlEvidence {
+        provider_signal_codes: request.provider_signal_codes.clone(),
+        policy_action_codes: request.policy_action_codes.clone(),
+        route_attempts: request
+            .retry
+            .iter()
+            .flat_map(|retry| retry.route_attempts.iter())
+            .map(|attempt| {
                 (
-                    station,
-                    snapshots
-                        .into_iter()
-                        .map(|snapshot| ForecastBalanceSample::from_snapshot(&snapshot))
-                        .collect(),
+                    attempt.attempt_index,
+                    RequestAttemptControlEvidence {
+                        provider_signal_codes: attempt.provider_signal_codes.clone(),
+                        policy_action_codes: attempt.policy_action_codes.clone(),
+                    },
                 )
             })
             .collect(),
-        station_health,
-        health_checks: snap.health_checks,
-        lb_view: snap.lb_view,
-        provider_endpoint_policy_actions: indexed_policy_actions(snap.policy_actions),
-        stats_5m: snap.stats_5m,
-        stats_1h: snap.stats_1h,
-        service_status: snap.service_status,
-        pricing_catalog: crate::pricing::operator_model_price_catalog_snapshot(),
-        refreshed_at: Instant::now(),
     }
+}
+
+fn operator_provider_balances(
+    service_name: &str,
+    balances: &[OperatorProviderBalanceSummary],
+) -> HashMap<String, Vec<ProviderBalanceSnapshot>> {
+    let mut grouped = HashMap::<String, Vec<ProviderBalanceSnapshot>>::new();
+    for balance in balances {
+        grouped
+            .entry(balance.provider_id.clone())
+            .or_default()
+            .push(ProviderBalanceSnapshot {
+                observation_provider_id: balance.observation_provider_id.clone(),
+                provider_endpoint: ProviderEndpointKey::new(
+                    service_name,
+                    &balance.provider_id,
+                    &balance.endpoint_id,
+                ),
+                source: "operator_read_model".to_string(),
+                fetched_at_ms: balance.fetched_at_ms,
+                stale_after_ms: balance.stale_after_ms,
+                stale: balance.stale,
+                status: balance.status,
+                exhausted: balance.exhausted,
+                exhaustion_affects_routing: balance.exhaustion_affects_routing,
+                plan_name: balance.plan_name.clone(),
+                total_balance_usd: balance.total_balance_usd.clone(),
+                subscription_balance_usd: balance.subscription_balance_usd.clone(),
+                paygo_balance_usd: balance.paygo_balance_usd.clone(),
+                monthly_budget_usd: balance.monthly_budget_usd.clone(),
+                monthly_spent_usd: balance.monthly_spent_usd.clone(),
+                quota_period: balance.quota_period.clone(),
+                quota_remaining_usd: balance.quota_remaining_usd.clone(),
+                quota_limit_usd: balance.quota_limit_usd.clone(),
+                quota_used_usd: balance.quota_used_usd.clone(),
+                quota_resets_at_ms: balance.quota_resets_at_ms,
+                unlimited_quota: balance.unlimited_quota,
+                total_used_usd: balance.total_used_usd.clone(),
+                today_used_usd: balance.today_used_usd.clone(),
+                total_requests: balance.total_requests,
+                today_requests: balance.today_requests,
+                total_tokens: balance.total_tokens,
+                today_tokens: balance.today_tokens,
+                subscription_expires_at: balance.subscription_expires_at.clone(),
+                usage_windows: balance.usage_windows.clone(),
+                usage_rate: balance.usage_rate.clone(),
+                usage_model_stats: balance.usage_model_stats.clone(),
+                usage_alerts: balance
+                    .alert_codes
+                    .iter()
+                    .map(|kind| codex_helper_core::balance::ProviderUsageAlert {
+                        kind: *kind,
+                        message: kind.as_str().to_string(),
+                    })
+                    .collect(),
+                ..Default::default()
+            });
+    }
+    grouped
 }
 
 pub(in crate::tui) fn filtered_requests_len(
@@ -2058,7 +1615,7 @@ pub(in crate::tui) fn filtered_requests_len(
         .recent
         .iter()
         .filter(
-            |r| match (selected_row.session_id.as_deref(), r.session_id.as_deref()) {
+            |r| match (selected_row.session_id.as_deref(), r.session_key.as_deref()) {
                 (Some(sid), Some(rid)) => sid == rid,
                 (Some(_), None) => false,
                 (None, Some(_)) => false,
@@ -2103,7 +1660,8 @@ pub(in crate::tui) fn request_page_focus_is_runtime_observed(
 }
 
 pub(in crate::tui) fn request_matches_page_filters(
-    request: &FinishedRequest,
+    request: &OperatorRequestSummary,
+    control_evidence: Option<&RequestControlEvidence>,
     errors_only: bool,
     scope_session: bool,
     focused_sid: Option<&str>,
@@ -2112,51 +1670,35 @@ pub(in crate::tui) fn request_matches_page_filters(
     if errors_only && request.status_code < 400 {
         return false;
     }
-    if !request_matches_control_filter(request, control_filter) {
+    if !request_matches_control_filter(control_evidence, control_filter) {
         return false;
     }
     if !scope_session {
         return true;
     }
 
-    match (focused_sid, request.session_id.as_deref()) {
+    match (focused_sid, request.session_key.as_deref()) {
         (Some(sid), Some(request_sid)) => sid == request_sid,
         (Some(_), None) => false,
         (None, _) => true,
     }
 }
 
-pub(in crate::tui) fn request_has_provider_signals(request: &FinishedRequest) -> bool {
-    !request.provider_signals.is_empty()
-        || request.retry.as_ref().is_some_and(|retry| {
-            retry
-                .route_attempts
-                .iter()
-                .any(|attempt| !attempt.provider_signals.is_empty())
-        })
-}
-
-pub(in crate::tui) fn request_has_policy_actions(request: &FinishedRequest) -> bool {
-    !request.policy_actions.is_empty()
-        || request.retry.as_ref().is_some_and(|retry| {
-            retry
-                .route_attempts
-                .iter()
-                .any(|attempt| !attempt.policy_actions.is_empty())
-        })
-}
-
 pub(in crate::tui) fn request_matches_control_filter(
-    request: &FinishedRequest,
+    control_evidence: Option<&RequestControlEvidence>,
     control_filter: RequestControlFilter,
 ) -> bool {
     match control_filter {
         RequestControlFilter::All => true,
-        RequestControlFilter::AnyEvidence => {
-            request_has_provider_signals(request) || request_has_policy_actions(request)
+        RequestControlFilter::AnyEvidence => control_evidence.is_some_and(|evidence| {
+            evidence.has_provider_signals() || evidence.has_policy_actions()
+        }),
+        RequestControlFilter::Signals => {
+            control_evidence.is_some_and(RequestControlEvidence::has_provider_signals)
         }
-        RequestControlFilter::Signals => request_has_provider_signals(request),
-        RequestControlFilter::Actions => request_has_policy_actions(request),
+        RequestControlFilter::Actions => {
+            control_evidence.is_some_and(RequestControlEvidence::has_policy_actions)
+        }
     }
 }
 
@@ -2175,6 +1717,7 @@ pub(in crate::tui) fn filtered_request_page_len(
         .filter(|request| {
             request_matches_page_filters(
                 request,
+                snapshot.request_control_evidence.get(&request.id),
                 errors_only,
                 scope_session,
                 focused_sid.as_deref(),
@@ -2188,12 +1731,96 @@ pub(in crate::tui) fn filtered_request_page_len(
 mod tests {
     use super::*;
 
-    use crate::state::FinishedRequest;
     use unicode_width::UnicodeWidthStr;
+
+    fn balance_identity(
+        observation_provider_id: &str,
+        provider_id: &str,
+        endpoint_id: &str,
+    ) -> ProviderBalanceSnapshot {
+        ProviderBalanceSnapshot {
+            observation_provider_id: observation_provider_id.to_string(),
+            provider_endpoint: ProviderEndpointKey::new("codex", provider_id, endpoint_id),
+            ..ProviderBalanceSnapshot::default()
+        }
+    }
+
+    fn operator_balance(
+        observation_provider_id: &str,
+        provider_id: &str,
+        endpoint_id: &str,
+        provider_endpoint_key: &str,
+    ) -> OperatorProviderBalanceSummary {
+        serde_json::from_value(serde_json::json!({
+            "observation_provider_id": observation_provider_id,
+            "provider_id": provider_id,
+            "endpoint_id": endpoint_id,
+            "provider_endpoint_key": provider_endpoint_key,
+            "fetched_at_ms": 100,
+            "stale": false,
+            "status": "ok",
+            "exhaustion_affects_routing": true
+        }))
+        .expect("operator balance summary")
+    }
+
+    #[test]
+    fn operator_provider_balances_reconstructs_canonical_identity_without_parsing_opaque_key() {
+        let grouped = operator_provider_balances(
+            "codex",
+            &[operator_balance(
+                "quota-observer",
+                "input",
+                "responses",
+                "opaque:wrong-service/wrong-provider/wrong-endpoint",
+            )],
+        );
+
+        let snapshot = grouped
+            .get("input")
+            .and_then(|balances| balances.first())
+            .expect("canonical provider balance");
+        assert_eq!(snapshot.observation_provider_id, "quota-observer");
+        assert_eq!(
+            snapshot.provider_endpoint,
+            ProviderEndpointKey::new("codex", "input", "responses")
+        );
+    }
+
+    #[test]
+    fn operator_provider_balances_keeps_same_observer_across_endpoints() {
+        let grouped = operator_provider_balances(
+            "codex",
+            &[
+                operator_balance("quota-observer", "input", "chat", "opaque:chat"),
+                operator_balance("quota-observer", "input", "responses", "opaque:responses"),
+            ],
+        );
+
+        let balances = grouped.get("input").expect("input balances");
+        assert_eq!(balances.len(), 2);
+        assert_eq!(
+            balances
+                .iter()
+                .map(|snapshot| snapshot.provider_endpoint.endpoint_id.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["chat", "responses"])
+        );
+    }
+
+    #[test]
+    fn sanitize_upstream_origin_drops_path_query_and_credentials() {
+        assert_eq!(
+            sanitize_upstream_origin("https://user:secret@relay.example.test:8443/v1?q=token")
+                .as_deref(),
+            Some("https://relay.example.test:8443")
+        );
+    }
 
     fn empty_session_row() -> SessionRow {
         SessionRow {
             session_id: Some("sid".to_string()),
+            local_session_id: None,
             observation_scope: SessionObservationScope::ObservedOnly,
             host_local_transcript_path: None,
             last_client_name: None,
@@ -2210,8 +1837,6 @@ mod tests {
             last_reasoning_effort: None,
             last_service_tier: None,
             last_provider_id: None,
-            last_station_name: None,
-            last_upstream_base_url: None,
             last_usage: None,
             total_usage: None,
             turns_total: None,
@@ -2225,38 +1850,39 @@ mod tests {
             effective_model: None,
             effective_reasoning_effort: None,
             effective_service_tier: None,
-            effective_station: None,
-            effective_upstream_base_url: None,
-            override_model: None,
-            override_effort: None,
-            override_station_name: None,
-            override_route_target: None,
-            override_service_tier: None,
         }
     }
 
-    fn finished_request(id: u64, session_id: Option<&str>) -> FinishedRequest {
-        FinishedRequest {
+    fn operator_request(id: u64, session_id: Option<&str>) -> OperatorRequestSummary {
+        OperatorRequestSummary {
             id,
-            trace_id: None,
-            session_id: session_id.map(ToOwned::to_owned),
-            session_identity_source: None,
-            client_name: None,
-            client_addr: None,
-            cwd: None,
+            session_key: session_id.map(ToOwned::to_owned),
             model: None,
             reasoning_effort: None,
             service_tier: None,
-            station_name: None,
             provider_id: None,
-            upstream_base_url: None,
-            route_decision: None,
+            endpoint_id: None,
+            provider_endpoint_key: None,
+            route_path: Vec::new(),
+            upstream_origin: None,
             usage: None,
             cost: crate::pricing::CostBreakdown::default(),
             retry: None,
-            provider_signals: Vec::new(),
-            policy_actions: Vec::new(),
-            observability: crate::state::RequestObservability::default(),
+            provider_signal_codes: Vec::new(),
+            policy_action_codes: Vec::new(),
+            observability: crate::dashboard_core::OperatorRequestObservability {
+                duration_ms: Some(120),
+                ttfb_ms: None,
+                generation_ms: None,
+                output_tokens_per_second: None,
+                attempt_count: 1,
+                route_attempt_count: 0,
+                retried: false,
+                cross_provider_failover: false,
+                same_provider_retry: false,
+                fast_mode: false,
+                streaming: false,
+            },
             service: "codex".to_string(),
             method: "POST".to_string(),
             path: "/v1/responses".to_string(),
@@ -2268,42 +1894,201 @@ mod tests {
         }
     }
 
-    fn provider_signal(
-        provider_id: &str,
-        endpoint_id: &str,
-    ) -> crate::provider_signals::ProviderSignal {
-        let mut signal = crate::provider_signals::ProviderSignal::high_confidence_route_facing(
-            crate::provider_signals::ProviderSignalKind::RateLimit,
-            crate::provider_signals::ProviderSignalSource::UpstreamResponse,
-            crate::provider_signals::ProviderSignalTarget::ProviderEndpoint {
-                provider_endpoint_key: ProviderEndpointKey::new("codex", provider_id, endpoint_id),
+    #[test]
+    fn operator_projection_preserves_local_handle_route_provenance_and_control_codes() {
+        use crate::dashboard_core::{
+            ApiV1OperatorSummary, OperatorRequestObservability, OperatorRetrySummary,
+            OperatorRetrySummaryView, OperatorRouteAttemptSummary, OperatorRuntimeSummary,
+            OperatorSessionRouteAffinitySummary, OperatorSummaryCounts,
+        };
+        use crate::state::RouteValueSource;
+
+        let session_key = "session:sha256:opaque";
+        let route_decision = RouteDecisionProvenance {
+            effective_model: Some(ResolvedRouteValue {
+                value: "gpt-5.6".to_string(),
+                source: RouteValueSource::SessionOverride,
+            }),
+            provider_id: Some("provider-a".to_string()),
+            endpoint_id: Some("responses".to_string()),
+            route_path: vec!["main".to_string(), "provider-a".to_string()],
+            effective_upstream_base_url: Some(ResolvedRouteValue {
+                value: "https://relay.example.test/v1/responses?token=secret".to_string(),
+                source: RouteValueSource::ProviderMapping,
+            }),
+            ..RouteDecisionProvenance::default()
+        };
+        let session = OperatorSessionSummary {
+            session_key: session_key.to_string(),
+            active_count: 1,
+            active_started_at_ms_min: Some(10),
+            last_status: Some(200),
+            last_duration_ms: Some(20),
+            last_ended_at_ms: Some(30),
+            last_model: Some("gpt-5.6".to_string()),
+            last_reasoning_effort: Some("high".to_string()),
+            last_service_tier: Some("priority".to_string()),
+            last_provider_id: Some("provider-a".to_string()),
+            last_usage: None,
+            total_usage: None,
+            turns_total: Some(1),
+            turns_with_usage: Some(1),
+            last_output_tokens_per_second: Some(12.5),
+            avg_output_tokens_per_second: Some(10.0),
+            binding_profile_name: Some("fast".to_string()),
+            binding_continuity_mode: None,
+            last_route_decision: Some(route_decision.clone()),
+            route_affinity: Some(OperatorSessionRouteAffinitySummary {
+                provider_id: "provider-a".to_string(),
+                endpoint_id: "responses".to_string(),
+                upstream_origin: "https://relay.example.test".to_string(),
+                route_path: vec!["main".to_string(), "provider-a".to_string()],
+                last_selected_at_ms: 10,
+                last_changed_at_ms: 11,
+                change_reason: "selected".to_string(),
+            }),
+            effective_model: Some(ResolvedRouteValue {
+                value: "gpt-5.6".to_string(),
+                source: RouteValueSource::SessionOverride,
+            }),
+            effective_reasoning_effort: Some(ResolvedRouteValue {
+                value: "high".to_string(),
+                source: RouteValueSource::SessionOverride,
+            }),
+            effective_service_tier: Some(ResolvedRouteValue {
+                value: "priority".to_string(),
+                source: RouteValueSource::SessionOverride,
+            }),
+        };
+        let request = OperatorRequestSummary {
+            id: 7,
+            session_key: Some(session_key.to_string()),
+            model: Some("gpt-5.6".to_string()),
+            reasoning_effort: Some("high".to_string()),
+            service_tier: Some("priority".to_string()),
+            provider_id: Some("provider-a".to_string()),
+            endpoint_id: Some("responses".to_string()),
+            provider_endpoint_key: Some("endpoint:sha256:opaque".to_string()),
+            route_path: vec!["main".to_string(), "provider-a".to_string()],
+            upstream_origin: Some("https://relay.example.test".to_string()),
+            usage: None,
+            cost: crate::pricing::CostBreakdown::default(),
+            retry: Some(OperatorRetrySummaryView {
+                attempts: 2,
+                route_attempts: vec![OperatorRouteAttemptSummary {
+                    attempt_index: 0,
+                    provider_id: Some("provider-a".to_string()),
+                    endpoint_id: Some("responses".to_string()),
+                    provider_endpoint_key: Some("endpoint:sha256:opaque".to_string()),
+                    preference_group: Some(0),
+                    provider_attempt: Some(1),
+                    upstream_attempt: Some(1),
+                    provider_max_attempts: Some(2),
+                    upstream_max_attempts: Some(2),
+                    avoided_total: Some(0),
+                    total_upstreams: Some(1),
+                    code: "failed_status".to_string(),
+                    status_code: Some(429),
+                    model: Some("gpt-5.6".to_string()),
+                    upstream_headers_ms: Some(5),
+                    duration_ms: Some(10),
+                    cooldown_secs: Some(30),
+                    skipped: false,
+                    provider_signal_codes: vec!["rate_limit".to_string()],
+                    policy_action_codes: vec!["cooldown".to_string()],
+                }],
+            }),
+            provider_signal_codes: vec!["rate_limit".to_string()],
+            policy_action_codes: vec!["cooldown".to_string()],
+            observability: OperatorRequestObservability {
+                duration_ms: Some(20),
+                ttfb_ms: Some(5),
+                generation_ms: Some(15),
+                output_tokens_per_second: Some(12.5),
+                attempt_count: 2,
+                route_attempt_count: 1,
+                retried: true,
+                cross_provider_failover: false,
+                same_provider_retry: true,
+                fast_mode: true,
+                streaming: false,
             },
-            1_000,
+            service: "codex".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/responses".to_string(),
+            status_code: 200,
+            duration_ms: 20,
+            ttfb_ms: Some(5),
+            streaming: false,
+            ended_at_ms: 30,
+        };
+        let data = OperatorReadData {
+            summary: ApiV1OperatorSummary {
+                api_version: 1,
+                service_name: "codex".to_string(),
+                runtime: OperatorRuntimeSummary::default(),
+                counts: OperatorSummaryCounts::default(),
+                retry: OperatorRetrySummary::default(),
+                sessions: vec![session],
+                profiles: Vec::new(),
+                providers: Vec::new(),
+            },
+            active_requests: Vec::new(),
+            recent_requests: vec![request],
+            usage_summaries: Vec::new(),
+            usage_day: UsageDayView::default(),
+            usage_rollup: UsageRollupView::default(),
+            stats_5m: WindowStats::default(),
+            stats_1h: WindowStats::default(),
+            pricing_catalog: crate::pricing::bundled_model_price_catalog_snapshot(),
+            provider_balances: Vec::new(),
+        };
+        let local_session_ids =
+            HashMap::from([(session_key.to_string(), "raw-session-id".to_string())]);
+
+        let snapshot = snapshot_from_operator_data(&data, &local_session_ids);
+
+        let row = snapshot.rows.first().expect("operator session row");
+        assert_eq!(row.session_id.as_deref(), Some(session_key));
+        assert_eq!(row.local_session_id.as_deref(), Some("raw-session-id"));
+        assert_eq!(
+            row.observed_upstream_origin().as_deref(),
+            Some("https://relay.example.test")
         );
-        signal.reset_after_secs = Some(60);
-        signal.reason = Some("upstream_rate_limited".to_string());
-        signal
-    }
-
-    fn policy_action(provider_id: &str, endpoint_id: &str) -> crate::policy_actions::PolicyAction {
-        crate::policy_actions::PolicyAction::cooldown_from_signal(
-            provider_signal(provider_id, endpoint_id),
-            1_000,
-            30,
-            1,
-        )
-        .expect("cooldown policy action")
-    }
-
-    fn policy_action_projection(provider_id: &str, endpoint_id: &str) -> PolicyActionProjection {
-        PolicyActionProjection {
-            provider_endpoint_key: ProviderEndpointKey::new("codex", provider_id, endpoint_id),
-            active_cooldown: true,
-            code: Some("cooldown".to_string()),
-            cooldown_remaining_secs: Some(42),
-            reason: Some("upstream_rate_limited".to_string()),
-            action_id: Some(format!("codex-helper:codex/{provider_id}/{endpoint_id}:1")),
-        }
+        assert_eq!(
+            row.route_affinity
+                .as_ref()
+                .map(|affinity| affinity.endpoint_id.as_str()),
+            Some("responses")
+        );
+        assert_eq!(
+            row.effective_model
+                .as_ref()
+                .map(|value| value.value.as_str()),
+            Some("gpt-5.6")
+        );
+        assert_eq!(
+            row.effective_model.as_ref().map(|value| value.source),
+            Some(RouteValueSource::SessionOverride)
+        );
+        let evidence = snapshot
+            .request_control_evidence
+            .get(&7)
+            .expect("operator request control evidence");
+        assert_eq!(evidence.provider_signal_codes, ["rate_limit"]);
+        assert_eq!(evidence.policy_action_codes, ["cooldown"]);
+        assert_eq!(
+            evidence
+                .route_attempts
+                .get(&0)
+                .map(|attempt| attempt.provider_signal_codes.as_slice()),
+            Some(["rate_limit".to_string()].as_slice())
+        );
+        assert_eq!(row.local_command_session_id(), Some("raw-session-id"));
+        assert_eq!(
+            snapshot.recent[0].provider_endpoint_key.as_deref(),
+            Some("endpoint:sha256:opaque")
+        );
     }
 
     #[test]
@@ -2363,15 +2148,6 @@ mod tests {
             provider_balance_compact(&snapshot, 18),
             "daily $7.50/$20.00"
         );
-    }
-
-    #[test]
-    fn session_route_target_counts_as_manual_override() {
-        let mut row = empty_session_row();
-        row.override_route_target = Some("monthly.default".to_string());
-
-        assert!(session_row_has_any_override(&row));
-        assert_eq!(session_override_fields(&row), vec!["route target"]);
     }
 
     #[test]
@@ -2450,7 +2226,7 @@ mod tests {
     }
 
     #[test]
-    fn station_balance_brief_prefers_usable_snapshot_and_keeps_warnings() {
+    fn provider_balance_brief_prefers_usable_snapshot_and_keeps_warnings() {
         let balances = HashMap::from([(
             "input".to_string(),
             vec![
@@ -2467,17 +2243,20 @@ mod tests {
         )]);
 
         assert_eq!(
-            station_balance_brief(&balances, "input", 24),
+            provider_balance_brief(&balances, "input", 24),
             "left $12.50 exh 1"
         );
         assert_eq!(
-            station_primary_balance_snapshot(&balances, "input").map(|snapshot| snapshot.status),
+            balances
+                .get("input")
+                .and_then(|values| primary_balance_snapshot(values))
+                .map(|snapshot| snapshot.status),
             Some(BalanceSnapshotStatus::Ok)
         );
     }
 
     #[test]
-    fn station_balance_brief_marks_ignored_exhaustion_as_lazy() {
+    fn provider_balance_brief_marks_ignored_exhaustion_as_lazy() {
         let balances = HashMap::from([(
             "input".to_string(),
             vec![ProviderBalanceSnapshot {
@@ -2492,101 +2271,69 @@ mod tests {
         )]);
 
         assert_eq!(
-            station_balance_brief(&balances, "input", 80),
+            provider_balance_brief(&balances, "input", 80),
             "lazy daily left $0 / $100.00"
         );
     }
 
     #[test]
-    fn station_balance_brief_keeps_quota_amount_complete_when_counts_overflow() {
+    fn provider_balance_brief_keeps_quota_amount_complete_when_counts_overflow() {
         let mut snapshots = vec![ProviderBalanceSnapshot {
-            provider_id: "routing".to_string(),
             status: BalanceSnapshotStatus::Ok,
             quota_period: Some("daily".to_string()),
             quota_remaining_usd: Some("93.83".to_string()),
             quota_limit_usd: Some("100".to_string()),
-            ..ProviderBalanceSnapshot::default()
+            ..balance_identity("routing-observer", "routing", "default")
         }];
         snapshots.extend((0..4).map(|_| ProviderBalanceSnapshot {
-            provider_id: "routing".to_string(),
             status: BalanceSnapshotStatus::Exhausted,
             exhausted: Some(true),
             exhaustion_affects_routing: false,
-            ..ProviderBalanceSnapshot::default()
+            ..balance_identity("routing-observer", "routing", "default")
         }));
         snapshots.push(ProviderBalanceSnapshot {
-            provider_id: "routing".to_string(),
             status: BalanceSnapshotStatus::Error,
-            ..ProviderBalanceSnapshot::default()
+            ..balance_identity("routing-observer", "routing", "default")
         });
         let balances = HashMap::from([("routing".to_string(), snapshots)]);
 
-        let brief = station_balance_brief_lang(&balances, "routing", 42, Language::Zh);
+        let brief = provider_balance_brief_lang(&balances, "routing", 42, Language::Zh);
 
         assert_eq!(brief, "daily 剩余 $93.83 / $100.00 不降级 4");
         assert!(!brief.contains('…'), "{brief}");
         assert!(brief.contains("$100.00"), "{brief}");
         assert!(UnicodeWidthStr::width(brief.as_str()) <= 42, "{brief}");
 
-        let narrow = station_balance_brief_lang(&balances, "routing", 14, Language::Zh);
+        let narrow = provider_balance_brief_lang(&balances, "routing", 14, Language::Zh);
         assert_eq!(narrow, "$93.83/$100.00");
         assert!(UnicodeWidthStr::width(narrow.as_str()) <= 14, "{narrow}");
     }
 
     #[test]
-    fn session_balance_brief_uses_observed_station_then_provider_fallback() {
-        let balances = HashMap::from([(
-            "input".to_string(),
-            vec![ProviderBalanceSnapshot {
-                provider_id: "input-provider".to_string(),
-                status: BalanceSnapshotStatus::Ok,
-                plan_name: Some("Monthly".to_string()),
-                total_balance_usd: Some("8.00".to_string()),
-                ..ProviderBalanceSnapshot::default()
-            }],
-        )]);
-        let mut row = empty_session_row();
-        row.last_station_name = Some("input".to_string());
-
-        assert_eq!(
-            session_balance_brief(&row, &balances, 80).as_deref(),
-            Some("Monthly left $8.00")
-        );
-
-        row.last_station_name = None;
-        row.last_provider_id = Some("input-provider".to_string());
-
-        assert_eq!(
-            session_balance_brief(&row, &balances, 80).as_deref(),
-            Some("input Monthly left $8.00")
-        );
-    }
-
-    #[test]
-    fn session_observed_provider_balance_follows_provider_not_station_summary() {
-        let balances = HashMap::from([(
-            "input".to_string(),
-            vec![
-                ProviderBalanceSnapshot {
-                    provider_id: "input".to_string(),
+    fn session_observed_provider_balance_follows_canonical_provider() {
+        let balances = HashMap::from([
+            (
+                "input".to_string(),
+                vec![ProviderBalanceSnapshot {
                     status: BalanceSnapshotStatus::Ok,
                     unlimited_quota: Some(true),
-                    ..ProviderBalanceSnapshot::default()
-                },
-                ProviderBalanceSnapshot {
-                    provider_id: "centos".to_string(),
+                    ..balance_identity("input-observer", "input", "default")
+                }],
+            ),
+            (
+                "centos".to_string(),
+                vec![ProviderBalanceSnapshot {
                     status: BalanceSnapshotStatus::Exhausted,
                     exhausted: Some(true),
                     exhaustion_affects_routing: false,
                     quota_period: Some("daily".to_string()),
                     quota_remaining_usd: Some("0".to_string()),
                     quota_limit_usd: Some("100".to_string()),
-                    ..ProviderBalanceSnapshot::default()
-                },
-            ],
-        )]);
+                    ..balance_identity("centos-observer", "centos", "default")
+                }],
+            ),
+        ]);
         let mut row = empty_session_row();
-        row.last_station_name = Some("input".to_string());
         row.last_provider_id = Some("centos".to_string());
 
         let brief = session_observed_provider_balance_brief_lang(&row, &balances, 80, Language::En);
@@ -2594,7 +2341,7 @@ mod tests {
         assert_eq!(brief.as_deref(), Some("lazy daily left $0 / $100.00"));
         assert_eq!(
             session_observed_provider_balance_snapshot(&row, &balances)
-                .map(|snapshot| snapshot.provider_id.as_str()),
+                .map(|snapshot| snapshot.provider_endpoint.provider_id.as_str()),
             Some("centos")
         );
     }
@@ -2608,177 +2355,152 @@ mod tests {
     }
 
     #[test]
-    fn provider_tags_brief_filters_internal_tags() {
-        let provider = ProviderOption {
-            name: "input".to_string(),
-            upstreams: vec![UpstreamSummary {
-                provider_id: Some("input".to_string()),
-                tags: vec![
-                    ("provider_id".to_string(), "input".to_string()),
-                    ("source".to_string(), "codex-config".to_string()),
-                    ("billing".to_string(), "monthly".to_string()),
-                    ("region".to_string(), "hk".to_string()),
-                ],
-                ..UpstreamSummary::default()
-            }],
-            ..ProviderOption::default()
+    fn operator_projection_preserves_canonical_provider_inventory_without_auth_fields() {
+        use crate::dashboard_core::{
+            ApiV1OperatorSummary, OperatorPolicyActionSummary, OperatorProviderCapacity,
+            OperatorProviderEndpointSummary, OperatorProviderSummary, OperatorRetrySummary,
+            OperatorRuntimeSummary, OperatorSummaryCounts,
         };
 
-        assert_eq!(
-            provider_tags_brief(&provider, 80).as_deref(),
-            Some("billing=monthly region=hk")
-        );
-    }
-
-    #[tokio::test]
-    async fn snapshot_from_api_v1_indexes_policy_actions_by_stable_key() {
-        let projection = policy_action_projection("alpha", "default");
-        let api = ApiV1Snapshot {
-            api_version: 1,
-            service_name: "codex".to_string(),
-            runtime_loaded_at_ms: None,
-            runtime_source_mtime_ms: None,
-            stations: Vec::new(),
-            configured_active_station: None,
-            effective_active_station: None,
-            default_profile: None,
-            profiles: Vec::new(),
-            snapshot: crate::dashboard_core::snapshot::DashboardSnapshot {
-                refreshed_at_ms: 1,
-                active: Vec::new(),
-                recent: Vec::new(),
-                session_cards: Vec::new(),
-                global_station_override: None,
-                global_route_target_override: None,
-                session_model_overrides: HashMap::new(),
-                session_station_overrides: HashMap::new(),
-                session_route_target_overrides: HashMap::new(),
-                session_effort_overrides: HashMap::new(),
-                session_service_tier_overrides: HashMap::new(),
-                session_stats: HashMap::new(),
-                station_health: HashMap::new(),
-                provider_balances: HashMap::new(),
-                provider_balance_history: HashMap::new(),
-                health_checks: HashMap::new(),
-                lb_view: HashMap::new(),
-                policy_actions: vec![projection.clone()],
-                usage_day: UsageDayView::default(),
-                usage_rollup: UsageRollupView::default(),
-                stats_5m: WindowStats::default(),
-                stats_1h: WindowStats::default(),
-                service_status: None,
+        let data = OperatorReadData {
+            summary: ApiV1OperatorSummary {
+                api_version: 1,
+                service_name: "codex".to_string(),
+                runtime: OperatorRuntimeSummary::default(),
+                counts: OperatorSummaryCounts::default(),
+                retry: OperatorRetrySummary::default(),
+                sessions: Vec::new(),
+                profiles: Vec::new(),
+                providers: vec![OperatorProviderSummary {
+                    name: "alpha".to_string(),
+                    alias: None,
+                    configured_enabled: true,
+                    effective_enabled: true,
+                    routable_endpoints: 1,
+                    endpoints: vec![OperatorProviderEndpointSummary {
+                        provider_name: "alpha".to_string(),
+                        name: "default".to_string(),
+                        provider_endpoint_key: "endpoint:sha256:opaque".to_string(),
+                        origin: Some("https://alpha.example".to_string()),
+                        priority: 2,
+                        configured_enabled: true,
+                        effective_enabled: true,
+                        routable: true,
+                        runtime_enabled_override: None,
+                        runtime_state: Default::default(),
+                        runtime_state_override: None,
+                        capacity: OperatorProviderCapacity::default(),
+                        policy_actions: vec![OperatorPolicyActionSummary {
+                            active_cooldown: true,
+                            code: "cooldown".to_string(),
+                            cooldown_remaining_secs: Some(42),
+                        }],
+                    }],
+                    capacity: OperatorProviderCapacity::default(),
+                }],
             },
+            active_requests: Vec::new(),
+            recent_requests: Vec::new(),
+            usage_summaries: Vec::new(),
+            usage_day: UsageDayView::default(),
+            usage_rollup: UsageRollupView::default(),
+            stats_5m: WindowStats::default(),
+            stats_1h: WindowStats::default(),
+            pricing_catalog: Default::default(),
+            provider_balances: Vec::new(),
         };
 
-        let mut legacy_value = serde_json::to_value(&api).expect("api json");
-        legacy_value
-            .get_mut("snapshot")
-            .and_then(|snapshot| snapshot.as_object_mut())
-            .expect("snapshot object")
-            .remove("usage_day");
-        let legacy_api: ApiV1Snapshot =
-            serde_json::from_value(legacy_value).expect("legacy api snapshot");
-        assert_eq!(legacy_api.snapshot.usage_day, UsageDayView::default());
-
-        let snapshot = snapshot_from_api_v1(api).await;
-
-        assert_eq!(
-            snapshot
-                .provider_endpoint_policy_actions
-                .get("codex/alpha/default")
-                .map(Vec::as_slice),
-            Some(std::slice::from_ref(&projection))
-        );
+        let providers = provider_options_from_operator_data(&data);
+        assert_eq!(providers, data.summary.providers);
+        assert_eq!(providers[0].endpoints[0].priority, 2);
+        assert!(providers[0].endpoints[0].routable);
+        let serialized = serde_json::to_string(&providers).expect("serialize providers");
+        assert!(!serialized.contains("\"auth\""));
     }
 
     #[test]
     fn request_control_filter_matches_top_level_and_retry_evidence() {
-        let plain = finished_request(1, Some("plain"));
-        let mut top_signal = finished_request(2, Some("top-signal"));
-        top_signal
-            .provider_signals
-            .push(provider_signal("signal-provider", "default"));
-        let mut top_action = finished_request(3, Some("top-action"));
-        top_action
-            .policy_actions
-            .push(policy_action("action-provider", "default"));
-        let mut retry_signal = finished_request(4, Some("retry-signal"));
-        retry_signal.retry = Some(crate::logging::RetryInfo {
-            attempts: 1,
-            upstream_chain: Vec::new(),
-            route_attempts: vec![crate::logging::RouteAttemptLog {
-                attempt_index: 0,
-                decision: "failed".to_string(),
-                provider_signals: vec![provider_signal("retry-signal-provider", "default")],
-                raw: "retry-signal".to_string(),
-                ..crate::logging::RouteAttemptLog::default()
-            }],
-        });
-        let mut retry_action = finished_request(5, Some("retry-action"));
-        retry_action.retry = Some(crate::logging::RetryInfo {
-            attempts: 1,
-            upstream_chain: Vec::new(),
-            route_attempts: vec![crate::logging::RouteAttemptLog {
-                attempt_index: 0,
-                decision: "failed".to_string(),
-                policy_actions: vec![policy_action("retry-action-provider", "default")],
-                raw: "retry-action".to_string(),
-                ..crate::logging::RouteAttemptLog::default()
-            }],
-        });
+        let top_signal = RequestControlEvidence {
+            provider_signal_codes: vec!["rate_limit".to_string()],
+            ..Default::default()
+        };
+        let top_action = RequestControlEvidence {
+            policy_action_codes: vec!["cooldown".to_string()],
+            ..Default::default()
+        };
+        let retry_signal = RequestControlEvidence {
+            route_attempts: HashMap::from([(
+                0,
+                RequestAttemptControlEvidence {
+                    provider_signal_codes: vec!["rate_limit".to_string()],
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let retry_action = RequestControlEvidence {
+            route_attempts: HashMap::from([(
+                0,
+                RequestAttemptControlEvidence {
+                    policy_action_codes: vec!["cooldown".to_string()],
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
 
-        for request in [
-            &plain,
-            &top_signal,
-            &top_action,
-            &retry_signal,
-            &retry_action,
+        for evidence in [
+            None,
+            Some(&top_signal),
+            Some(&top_action),
+            Some(&retry_signal),
+            Some(&retry_action),
         ] {
             assert!(request_matches_control_filter(
-                request,
+                evidence,
                 RequestControlFilter::All
             ));
         }
         assert!(!request_matches_control_filter(
-            &plain,
+            None,
             RequestControlFilter::AnyEvidence
         ));
-        for request in [&top_signal, &top_action, &retry_signal, &retry_action] {
+        for evidence in [&top_signal, &top_action, &retry_signal, &retry_action] {
             assert!(request_matches_control_filter(
-                request,
+                Some(evidence),
                 RequestControlFilter::AnyEvidence
             ));
         }
         assert!(request_matches_control_filter(
-            &top_signal,
+            Some(&top_signal),
             RequestControlFilter::Signals
         ));
         assert!(request_matches_control_filter(
-            &retry_signal,
+            Some(&retry_signal),
             RequestControlFilter::Signals
         ));
         assert!(!request_matches_control_filter(
-            &top_action,
+            Some(&top_action),
             RequestControlFilter::Signals
         ));
         assert!(!request_matches_control_filter(
-            &retry_action,
+            Some(&retry_action),
             RequestControlFilter::Signals
         ));
         assert!(request_matches_control_filter(
-            &top_action,
+            Some(&top_action),
             RequestControlFilter::Actions
         ));
         assert!(request_matches_control_filter(
-            &retry_action,
+            Some(&retry_action),
             RequestControlFilter::Actions
         ));
         assert!(!request_matches_control_filter(
-            &top_signal,
+            Some(&top_signal),
             RequestControlFilter::Actions
         ));
         assert!(!request_matches_control_filter(
-            &retry_signal,
+            Some(&retry_signal),
             RequestControlFilter::Actions
         ));
     }
@@ -2788,6 +2510,7 @@ mod tests {
         let snapshot = Snapshot {
             rows: vec![SessionRow {
                 session_id: Some("sid-selected".to_string()),
+                local_session_id: None,
                 observation_scope: SessionObservationScope::ObservedOnly,
                 host_local_transcript_path: None,
                 last_client_name: None,
@@ -2804,8 +2527,6 @@ mod tests {
                 last_reasoning_effort: None,
                 last_service_tier: None,
                 last_provider_id: None,
-                last_station_name: None,
-                last_upstream_base_url: None,
                 last_usage: None,
                 total_usage: None,
                 turns_total: None,
@@ -2819,35 +2540,15 @@ mod tests {
                 effective_model: None,
                 effective_reasoning_effort: None,
                 effective_service_tier: None,
-                effective_station: None,
-                effective_upstream_base_url: None,
-                override_model: None,
-                override_effort: None,
-                override_station_name: None,
-                override_route_target: None,
-                override_service_tier: None,
             }],
             recent: Vec::new(),
-            model_overrides: HashMap::new(),
-            overrides: HashMap::new(),
-            station_overrides: HashMap::new(),
-            route_target_overrides: HashMap::new(),
-            service_tier_overrides: HashMap::new(),
-            global_station_override: None,
-            global_route_target_override: None,
-            station_meta_overrides: HashMap::new(),
+            request_control_evidence: HashMap::new(),
             usage_day: UsageDayView::default(),
             usage_rollup: UsageRollupView::default(),
             provider_balances: HashMap::new(),
-            provider_balance_history: HashMap::new(),
-            station_health: HashMap::new(),
-            health_checks: HashMap::new(),
-            lb_view: HashMap::new(),
-            provider_endpoint_policy_actions: HashMap::new(),
             stats_5m: WindowStats::default(),
             stats_1h: WindowStats::default(),
             service_status: None,
-            pricing_catalog: crate::pricing::bundled_model_price_catalog_snapshot(),
             refreshed_at: Instant::now(),
         };
 
@@ -2861,6 +2562,7 @@ mod tests {
         let snapshot = Snapshot {
             rows: vec![SessionRow {
                 session_id: Some("sid-selected".to_string()),
+                local_session_id: None,
                 observation_scope: SessionObservationScope::ObservedOnly,
                 host_local_transcript_path: None,
                 last_client_name: None,
@@ -2877,8 +2579,6 @@ mod tests {
                 last_reasoning_effort: None,
                 last_service_tier: None,
                 last_provider_id: None,
-                last_station_name: None,
-                last_upstream_base_url: None,
                 last_usage: None,
                 total_usage: None,
                 turns_total: None,
@@ -2892,38 +2592,18 @@ mod tests {
                 effective_model: None,
                 effective_reasoning_effort: None,
                 effective_service_tier: None,
-                effective_station: None,
-                effective_upstream_base_url: None,
-                override_model: None,
-                override_effort: None,
-                override_station_name: None,
-                override_route_target: None,
-                override_service_tier: None,
             }],
             recent: vec![
-                finished_request(1, Some("sid-selected")),
-                finished_request(2, Some("sid-explicit")),
+                operator_request(1, Some("sid-selected")),
+                operator_request(2, Some("sid-explicit")),
             ],
-            model_overrides: HashMap::new(),
-            overrides: HashMap::new(),
-            station_overrides: HashMap::new(),
-            route_target_overrides: HashMap::new(),
-            service_tier_overrides: HashMap::new(),
-            global_station_override: None,
-            global_route_target_override: None,
-            station_meta_overrides: HashMap::new(),
+            request_control_evidence: HashMap::new(),
             usage_day: UsageDayView::default(),
             usage_rollup: UsageRollupView::default(),
             provider_balances: HashMap::new(),
-            provider_balance_history: HashMap::new(),
-            station_health: HashMap::new(),
-            health_checks: HashMap::new(),
-            lb_view: HashMap::new(),
-            provider_endpoint_policy_actions: HashMap::new(),
             stats_5m: WindowStats::default(),
             stats_1h: WindowStats::default(),
             service_status: None,
-            pricing_catalog: crate::pricing::bundled_model_price_catalog_snapshot(),
             refreshed_at: Instant::now(),
         };
 
@@ -2946,29 +2626,16 @@ mod tests {
         let snapshot = Snapshot {
             rows: vec![unknown_row],
             recent: vec![
-                finished_request(1, None),
-                finished_request(2, Some("sid-known")),
+                operator_request(1, None),
+                operator_request(2, Some("sid-known")),
             ],
-            model_overrides: HashMap::new(),
-            overrides: HashMap::new(),
-            station_overrides: HashMap::new(),
-            route_target_overrides: HashMap::new(),
-            service_tier_overrides: HashMap::new(),
-            global_station_override: None,
-            global_route_target_override: None,
-            station_meta_overrides: HashMap::new(),
+            request_control_evidence: HashMap::new(),
             usage_day: UsageDayView::default(),
             usage_rollup: UsageRollupView::default(),
             provider_balances: HashMap::new(),
-            provider_balance_history: HashMap::new(),
-            station_health: HashMap::new(),
-            health_checks: HashMap::new(),
-            lb_view: HashMap::new(),
-            provider_endpoint_policy_actions: HashMap::new(),
             stats_5m: WindowStats::default(),
             stats_1h: WindowStats::default(),
             service_status: None,
-            pricing_catalog: crate::pricing::bundled_model_price_catalog_snapshot(),
             refreshed_at: Instant::now(),
         };
 
@@ -2980,26 +2647,13 @@ mod tests {
         let snapshot = Snapshot {
             rows: vec![empty_session_row()],
             recent: Vec::new(),
-            model_overrides: HashMap::new(),
-            overrides: HashMap::new(),
-            station_overrides: HashMap::new(),
-            route_target_overrides: HashMap::new(),
-            service_tier_overrides: HashMap::new(),
-            global_station_override: None,
-            global_route_target_override: None,
-            station_meta_overrides: HashMap::new(),
+            request_control_evidence: HashMap::new(),
             usage_day: UsageDayView::default(),
             usage_rollup: UsageRollupView::default(),
             provider_balances: HashMap::new(),
-            provider_balance_history: HashMap::new(),
-            station_health: HashMap::new(),
-            health_checks: HashMap::new(),
-            lb_view: HashMap::new(),
-            provider_endpoint_policy_actions: HashMap::new(),
             stats_5m: WindowStats::default(),
             stats_1h: WindowStats::default(),
             service_status: None,
-            pricing_catalog: crate::pricing::bundled_model_price_catalog_snapshot(),
             refreshed_at: Instant::now(),
         };
 
@@ -3040,8 +2694,8 @@ mod tests {
             session_id: Some("sid-1".to_string()),
             last_output_tokens_per_second: Some(123.4),
             avg_output_tokens_per_second: Some(98.7),
-            route_affinity: Some(SessionRouteAffinity {
-                route_graph_key: "v4:deadbeef".to_string(),
+            route_affinity: Some(crate::state::SessionRouteAffinity {
+                route_graph_key: "route:deadbeef".to_string(),
                 session_identity_source: None,
                 provider_endpoint: codex_helper_core::runtime_identity::ProviderEndpointKey::new(
                     "codex", "right", "default",
@@ -3062,7 +2716,7 @@ mod tests {
             rows[0]
                 .route_affinity
                 .as_ref()
-                .map(|affinity| affinity.provider_endpoint.provider_id.as_str()),
+                .map(|affinity| affinity.provider_id.as_str()),
             Some("right")
         );
         assert_eq!(
@@ -3075,73 +2729,23 @@ mod tests {
     }
 
     #[test]
-    fn session_control_posture_reports_profile_overrides() {
-        let row = SessionRow {
-            session_id: Some("sid-1".to_string()),
-            observation_scope: SessionObservationScope::ObservedOnly,
-            host_local_transcript_path: None,
-            last_client_name: None,
-            last_client_addr: None,
-            cwd: None,
-            active_count: 0,
-            active_started_at_ms_min: None,
-            active_last_method: None,
-            active_last_path: None,
-            last_status: None,
-            last_duration_ms: None,
-            last_ended_at_ms: None,
-            last_model: None,
-            last_reasoning_effort: None,
-            last_service_tier: None,
-            last_provider_id: None,
-            last_station_name: None,
-            last_upstream_base_url: None,
-            last_usage: None,
-            total_usage: None,
-            turns_total: None,
-            turns_with_usage: None,
-            last_output_tokens_per_second: None,
-            avg_output_tokens_per_second: None,
-            binding_profile_name: Some("fast".to_string()),
-            binding_continuity_mode: None,
-            last_route_decision: None,
-            route_affinity: None,
-            effective_model: None,
-            effective_reasoning_effort: None,
-            effective_service_tier: None,
-            effective_station: None,
-            effective_upstream_base_url: None,
-            override_model: Some("gpt-5.4".to_string()),
-            override_effort: None,
-            override_station_name: None,
-            override_route_target: None,
-            override_service_tier: None,
-        };
+    fn session_control_posture_reports_profile_binding() {
+        let mut row = empty_session_row();
+        row.binding_profile_name = Some("fast".to_string());
 
-        let posture = session_control_posture(&row, None, None, false);
+        let posture = session_control_posture(&row, false);
 
         assert!(posture.headline.contains("profile fast"));
-        assert!(posture.detail.contains("model"));
+        assert!(posture.detail.contains("stored profile binding"));
     }
 
     #[test]
-    fn session_control_posture_reports_route_graph_override_context() {
-        let mut row = empty_session_row();
-        row.override_route_target = Some("monthly.default".to_string());
-
-        let posture = session_control_posture(&row, None, Some("input.fast"), true);
-
-        assert!(posture.headline.contains("session-controlled route"));
-        assert!(posture.detail.contains("route target"));
-    }
-
-    #[test]
-    fn session_control_posture_reports_global_route_target_context() {
+    fn session_control_posture_reports_route_graph_fallback_context() {
         let row = empty_session_row();
 
-        let posture = session_control_posture(&row, None, Some("input.fast"), true);
+        let posture = session_control_posture(&row, true);
 
-        assert!(posture.headline.contains("global route target input.fast"));
+        assert!(posture.headline.contains("no stored profile binding"));
         assert!(posture.detail.contains("route graph defaults"));
     }
 }

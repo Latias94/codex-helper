@@ -1,13 +1,9 @@
 use serde::Serialize;
-use serde_json::Value as JsonValue;
 use std::env;
-use std::fs::File;
-use std::io::BufReader;
 use std::path::PathBuf;
 
-use crate::config::{
-    codex_auth_path, codex_config_path, load_config, probe_codex_bootstrap_from_cli, proxy_home_dir,
-};
+use crate::codex_switch::{CodexSwitchPhase, inspect as inspect_codex_switch};
+use crate::config::{load_config, proxy_home_dir};
 use crate::logging::request_log_path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,15 +46,15 @@ pub async fn run_doctor(lang: DoctorLang) -> DoctorReport {
     // 1) codex-helper main config
     match load_config().await {
         Ok(cfg) => {
-            let codex_count = cfg.codex.station_count();
+            let codex_count = cfg.codex.providers.len();
             if codex_count == 0 {
                 checks.push(DoctorCheck {
                     id: "proxy_config.codex",
                     status: DoctorStatus::Warn,
                     message: pick(
                         lang,
-                        "检测到 ~/.codex-helper/config.toml/json 中尚无 Codex provider；建议先运行 `codex-helper config init`，再用 `codex-helper provider add` 手动添加，或运行 `codex-helper config import-from-codex` 从 Codex CLI 配置导入。",
-                        "No Codex providers found in ~/.codex-helper/config.toml/json; run `codex-helper config init`, then use `codex-helper provider add`, or run `codex-helper config import-from-codex` to import from Codex CLI.",
+                        "检测到 canonical ~/.codex-helper/config.toml 中尚无 Codex provider；请用 `codex-helper provider add` 显式添加。",
+                        "No Codex providers found in canonical ~/.codex-helper/config.toml; add one explicitly with `codex-helper provider add`.",
                     )
                     .to_string(),
                 });
@@ -68,12 +64,12 @@ pub async fn run_doctor(lang: DoctorLang) -> DoctorReport {
                     status: DoctorStatus::Ok,
                     message: match lang {
                         DoctorLang::Zh => format!(
-                            "已从 ~/.codex-helper/config.toml/json 读取到 {} 条 Codex 路由候选（runtime default station = {:?}）",
-                            codex_count, cfg.codex.active
+                            "已从 canonical ~/.codex-helper/config.toml 读取到 {} 个 Codex provider",
+                            codex_count
                         ),
                         DoctorLang::En => format!(
-                            "Loaded {} Codex routing candidates from ~/.codex-helper/config.toml/json (runtime default station = {:?})",
-                            codex_count, cfg.codex.active
+                            "Loaded {} Codex providers from canonical ~/.codex-helper/config.toml",
+                            codex_count
                         ),
                     },
                 });
@@ -83,15 +79,10 @@ pub async fn run_doctor(lang: DoctorLang) -> DoctorReport {
                 env::var(key).ok().is_some_and(|v| !v.trim().is_empty())
             }
 
-            for (svc_label, mgr) in [("Codex", &cfg.codex), ("Claude", &cfg.claude)] {
-                let Some(active_name) = mgr.active.as_deref() else {
-                    continue;
-                };
-                let Some(active_cfg) = mgr.active_station() else {
-                    continue;
-                };
-                for (idx, up) in active_cfg.upstreams.iter().enumerate() {
-                    if let Some(env_name) = up.auth.auth_token_env.as_deref()
+            for (svc_label, view) in [("Codex", &cfg.codex), ("Claude", &cfg.claude)] {
+                for (provider_id, provider) in &view.providers {
+                    let auth = provider.effective_auth();
+                    if let Some(env_name) = auth.auth_token_env.as_deref()
                         && !env_is_set(env_name)
                     {
                         checks.push(DoctorCheck {
@@ -99,17 +90,17 @@ pub async fn run_doctor(lang: DoctorLang) -> DoctorReport {
                             status: DoctorStatus::Warn,
                             message: match lang {
                                 DoctorLang::Zh => format!(
-                                    "{} active station '{}' upstream[{}] 缺少环境变量 {}（Bearer token）；请在运行 codex-helper 前设置该变量",
-                                    svc_label, active_name, idx, env_name
+                                    "{} provider '{}' 缺少环境变量 {}（Bearer token）；请在运行 codex-helper 前设置该变量",
+                                    svc_label, provider_id, env_name
                                 ),
                                 DoctorLang::En => format!(
-                                    "{} active station '{}' upstream[{}] is missing env var {} (Bearer token); set it before running codex-helper",
-                                    svc_label, active_name, idx, env_name
+                                    "{} provider '{}' is missing env var {} (Bearer token); set it before running codex-helper",
+                                    svc_label, provider_id, env_name
                                 ),
                             },
                         });
                     }
-                    if let Some(env_name) = up.auth.api_key_env.as_deref()
+                    if let Some(env_name) = auth.api_key_env.as_deref()
                         && !env_is_set(env_name)
                     {
                         checks.push(DoctorCheck {
@@ -117,38 +108,40 @@ pub async fn run_doctor(lang: DoctorLang) -> DoctorReport {
                             status: DoctorStatus::Warn,
                             message: match lang {
                                 DoctorLang::Zh => format!(
-                                    "{} active station '{}' upstream[{}] 缺少环境变量 {}（X-API-Key）；请在运行 codex-helper 前设置该变量",
-                                    svc_label, active_name, idx, env_name
+                                    "{} provider '{}' 缺少环境变量 {}（X-API-Key）；请在运行 codex-helper 前设置该变量",
+                                    svc_label, provider_id, env_name
                                 ),
                                 DoctorLang::En => format!(
-                                    "{} active station '{}' upstream[{}] is missing env var {} (X-API-Key); set it before running codex-helper",
-                                    svc_label, active_name, idx, env_name
+                                    "{} provider '{}' is missing env var {} (X-API-Key); set it before running codex-helper",
+                                    svc_label, provider_id, env_name
                                 ),
                             },
                         });
                     }
-                    let has_plaintext = up
-                        .auth
-                        .auth_token
-                        .as_deref()
-                        .is_some_and(|s| !s.trim().is_empty())
-                        || up
-                            .auth
-                            .api_key
-                            .as_deref()
-                            .is_some_and(|s| !s.trim().is_empty());
+                    let has_plaintext =
+                        [&provider.auth, &provider.inline_auth]
+                            .into_iter()
+                            .any(|auth| {
+                                auth.auth_token
+                                    .as_deref()
+                                    .is_some_and(|value| !value.trim().is_empty())
+                                    || auth
+                                        .api_key
+                                        .as_deref()
+                                        .is_some_and(|value| !value.trim().is_empty())
+                            });
                     if has_plaintext {
                         checks.push(DoctorCheck {
                             id: "proxy_config.auth.plaintext",
                             status: DoctorStatus::Warn,
                             message: match lang {
                                 DoctorLang::Zh => format!(
-                                    "{} active station '{}' upstream[{}] 在 ~/.codex-helper/config.toml/json 中检测到明文密钥字段（建议改用 auth_token_env/api_key_env 以避免落盘泄露）",
-                                    svc_label, active_name, idx
+                                    "{} provider '{}' 在 ~/.codex-helper/config.toml 中检测到明文密钥字段（建议改用 auth_token_env/api_key_env 以避免落盘泄露）",
+                                    svc_label, provider_id
                                 ),
                                 DoctorLang::En => format!(
-                                    "{} active station '{}' upstream[{}] contains plaintext secrets in ~/.codex-helper/config.toml/json (prefer auth_token_env/api_key_env)",
-                                    svc_label, active_name, idx
+                                    "{} provider '{}' contains plaintext secrets in ~/.codex-helper/config.toml (prefer auth_token_env/api_key_env)",
+                                    svc_label, provider_id
                                 ),
                             },
                         });
@@ -162,228 +155,72 @@ pub async fn run_doctor(lang: DoctorLang) -> DoctorReport {
                 status: DoctorStatus::Fail,
                 message: match lang {
                     DoctorLang::Zh => format!(
-                        "无法读取 ~/.codex-helper/config.toml/json：{}；请检查该文件是否为有效 TOML/JSON，或尝试备份后重新初始化。",
+                        "无法读取 canonical ~/.codex-helper/config.toml：{}；请确认它是有效的 version = 5 TOML。",
                         err
                     ),
                     DoctorLang::En => format!(
-                        "Failed to read ~/.codex-helper/config.toml/json: {err}; ensure it is valid TOML/JSON, or back it up and reinitialize.",
+                        "Failed to read canonical ~/.codex-helper/config.toml: {err}; ensure it is valid version = 5 TOML.",
                     ),
                 },
             });
         }
     }
 
-    // 2) Codex CLI config/auth
-    let codex_cfg_path = codex_config_path();
-    let codex_auth_path = codex_auth_path();
-
-    if codex_cfg_path.exists() {
-        checks.push(DoctorCheck {
-            id: "codex.config.toml",
-            status: DoctorStatus::Ok,
-            message: match lang {
-                DoctorLang::Zh => format!("检测到 Codex 配置文件：{:?}", codex_cfg_path),
-                DoctorLang::En => format!("Found Codex config file: {:?}", codex_cfg_path),
-            },
-        });
-
-        match std::fs::read_to_string(&codex_cfg_path)
-            .ok()
-            .and_then(|s| toml::from_str::<toml::Value>(&s).ok())
-        {
-            Some(value) => {
-                let provider = value
-                    .get("model_provider")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("openai");
-                checks.push(DoctorCheck {
-                    id: "codex.config.model_provider",
-                    status: DoctorStatus::Info,
-                    message: match lang {
-                        DoctorLang::Zh => format!(
-                            "当前 Codex model_provider = \"{}\"（doctor 仅做读取，不会修改该文件）",
-                            provider
-                        ),
-                        DoctorLang::En => format!(
-                            "Current Codex model_provider = \"{}\" (doctor is read-only)",
-                            provider
-                        ),
-                    },
-                });
-            }
-            None => checks.push(DoctorCheck {
-                id: "codex.config.toml",
-                status: DoctorStatus::Warn,
-                message: match lang {
-                    DoctorLang::Zh => format!(
-                        "无法解析 {:?} 为有效 TOML，codex-helper 将无法自动推导上游配置",
-                        codex_cfg_path
-                    ),
-                    DoctorLang::En => format!(
-                        "Failed to parse {:?} as TOML; codex-helper cannot infer upstreams from Codex CLI",
-                        codex_cfg_path
-                    ),
-                },
-            }),
-        }
-    } else {
-        checks.push(DoctorCheck {
-            id: "codex.config.toml",
-            status: DoctorStatus::Warn,
-            message: match lang {
-                DoctorLang::Zh => format!(
-                    "未找到 Codex 配置文件：{:?}；建议先安装并运行 Codex CLI，完成登录和基础配置。",
-                    codex_cfg_path
-                ),
-                DoctorLang::En => format!(
-                    "Codex config file not found: {:?}; install/run Codex CLI and complete initial setup.",
-                    codex_cfg_path
-                ),
-            },
-        });
-    }
-
-    if codex_auth_path.exists() {
-        checks.push(DoctorCheck {
-            id: "codex.auth.json",
-            status: DoctorStatus::Ok,
-            message: match lang {
-                DoctorLang::Zh => format!("检测到 Codex 认证文件：{:?}", codex_auth_path),
-                DoctorLang::En => format!("Found Codex auth file: {:?}", codex_auth_path),
-            },
-        });
-
-        match File::open(&codex_auth_path).ok().and_then(|f| {
-            let reader = BufReader::new(f);
-            serde_json::from_reader::<_, JsonValue>(reader).ok()
-        }) {
-            Some(json_val) => {
-                if let Some(obj) = json_val.as_object() {
-                    let api_keys: Vec<_> = obj
-                        .iter()
-                        .filter_map(|(k, v)| {
-                            if k.ends_with("_API_KEY")
-                                && v.as_str().is_some_and(|s| !s.trim().is_empty())
-                            {
-                                Some(k.clone())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    if api_keys.is_empty() {
-                        checks.push(DoctorCheck {
-                            id: "codex.auth.api_key",
-                            status: DoctorStatus::Warn,
-                            message: pick(
-                                lang,
-                                "`~/.codex/auth.json` 中未找到任何 `*_API_KEY` 字段，可能尚未通过 API Key 方式配置 Codex",
-                                "No `*_API_KEY` fields found in ~/.codex/auth.json; Codex may not be configured via API key.",
-                            )
-                            .to_string(),
-                        });
-                    } else if api_keys.len() == 1 {
-                        checks.push(DoctorCheck {
-                            id: "codex.auth.api_key",
-                            status: DoctorStatus::Ok,
-                            message: match lang {
-                                DoctorLang::Zh => {
-                                    format!("检测到 Codex API key 字段：{:?}", api_keys)
-                                }
-                                DoctorLang::En => {
-                                    format!("Found Codex API key field: {:?}", api_keys)
-                                }
-                            },
-                        });
-                    } else {
-                        checks.push(DoctorCheck {
-                            id: "codex.auth.api_key",
-                            status: DoctorStatus::Warn,
-                            message: match lang {
-                                DoctorLang::Zh => format!(
-                                    "检测到多个 `*_API_KEY` 字段：{:?}，自动推断 token 时可能需要手动指定 env_key",
-                                    api_keys
-                                ),
-                                DoctorLang::En => format!(
-                                    "Multiple `*_API_KEY` fields detected: {:?}; inference may require manual env_key selection",
-                                    api_keys
-                                ),
-                            },
-                        });
-                    }
-                } else {
-                    checks.push(DoctorCheck {
-                        id: "codex.auth.json",
-                        status: DoctorStatus::Warn,
-                        message: pick(
-                            lang,
-                            "`~/.codex/auth.json` 根节点不是 JSON 对象，可能不是 Codex CLI 生成的标准格式",
-                            "~/.codex/auth.json root is not a JSON object; it may not be in Codex CLI's standard format.",
-                        )
-                        .to_string(),
-                    });
-                }
-            }
-            None => checks.push(DoctorCheck {
-                id: "codex.auth.json",
-                status: DoctorStatus::Warn,
-                message: match lang {
-                    DoctorLang::Zh => format!(
-                        "无法解析 {:?} 为 JSON，codex-helper 将无法从中读取 token",
-                        codex_auth_path
-                    ),
-                    DoctorLang::En => format!(
-                        "Failed to parse {:?} as JSON; codex-helper cannot read tokens from it.",
-                        codex_auth_path
-                    ),
-                },
-            }),
-        }
-    } else {
-        checks.push(DoctorCheck {
-            id: "codex.auth.json",
-            status: DoctorStatus::Warn,
-            message: match lang {
-                DoctorLang::Zh => format!(
-                    "未找到 Codex 认证文件：{:?}；建议运行 `codex login` 完成登录，或按照 Codex 文档手动创建 auth.json。",
-                    codex_auth_path
-                ),
-                DoctorLang::En => format!(
-                    "Codex auth file not found: {:?}; run `codex login` or create auth.json per Codex docs.",
-                    codex_auth_path
-                ),
-            },
-        });
-    }
-
-    // 3) bootstrap probe (no disk write)
-    match probe_codex_bootstrap_from_cli().await {
-        Ok(()) => checks.push(DoctorCheck {
-            id: "bootstrap.codex",
-            status: DoctorStatus::Ok,
+    // 2) Helper-owned explicit Codex switch state. This path never reads auth.json.
+    match inspect_codex_switch() {
+        Ok(status) if status.phase == CodexSwitchPhase::Off => checks.push(DoctorCheck {
+            id: "codex.switch_state",
+            status: DoctorStatus::Info,
             message: pick(
                 lang,
-                "成功从 ~/.codex/config.toml 与 ~/.codex/auth.json 模拟推导 Codex 上游；如需导入，可运行 `codex-helper config import-from-codex`",
-                "Successfully inferred Codex upstreams from ~/.codex/config.toml and ~/.codex/auth.json; to import, run `codex-helper config import-from-codex`",
+                "未检测到 codex-helper 显式 switch state；doctor 不推断或导入 Codex CLI 配置。",
+                "No explicit codex-helper switch state found; doctor does not infer or import Codex CLI configuration.",
             )
             .to_string(),
         }),
-        Err(err) => checks.push(DoctorCheck {
-            id: "bootstrap.codex",
-            status: DoctorStatus::Warn,
+        Ok(status) if status.phase == CodexSwitchPhase::Applied && status.enabled => checks.push(DoctorCheck {
+            id: "codex.switch_state",
+            status: DoctorStatus::Ok,
             message: match lang {
                 DoctorLang::Zh => format!(
-                    "无法从 ~/.codex 自动推导 Codex 上游：{}；这不会影响手动在 ~/.codex-helper/config.toml 中配置 provider/routing，但自动导入功能将不可用。",
-                    err
+                    "显式 switch state 与当前 Codex helper stanza 一致（base_url = {}）。",
+                    status.base_url.as_deref().unwrap_or("<missing>")
                 ),
                 DoctorLang::En => format!(
-                    "Failed to infer Codex upstreams from ~/.codex: {err}; manual ~/.codex-helper config.toml provider/routing config still works but auto-import won't.",
+                    "Explicit switch state matches the current Codex helper stanza (base_url = {}).",
+                    status.base_url.as_deref().unwrap_or("<missing>")
                 ),
+            },
+        }),
+        Ok(status) => checks.push(DoctorCheck {
+            id: "codex.switch_state",
+            status: DoctorStatus::Warn,
+            message: pick(
+                lang,
+                "Codex switch 状态需要核对；请运行 `codex-helper switch status`，不要直接覆盖 config.toml。",
+                "The Codex switch state needs reconciliation; run `codex-helper switch status` and do not overwrite config.toml.",
+            )
+            .to_string()
+                + status
+                    .recovery_reason
+                    .as_deref()
+                    .map(|reason| format!(" {reason}"))
+                    .as_deref()
+                    .unwrap_or(""),
+        }),
+        Err(err) => checks.push(DoctorCheck {
+            id: "codex.switch_state",
+            status: DoctorStatus::Warn,
+            message: match lang {
+                DoctorLang::Zh => format!("无法验证 codex-helper 显式 switch state：{err}"),
+                DoctorLang::En => {
+                    format!("Failed to validate explicit codex-helper switch state: {err}")
+                }
             },
         }),
     }
 
-    // 4) logs and usage_providers
+    // 3) logs and usage_providers
     let log_path = request_log_path();
     if log_path.exists() {
         checks.push(DoctorCheck {
@@ -458,4 +295,96 @@ pub async fn run_doctor(lang: DoctorLang) -> DoctorReport {
     }
 
     DoctorReport { checks }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use std::sync::{Mutex, OnceLock};
+
+    struct ScopedEnv {
+        saved: Vec<(String, Option<String>)>,
+    }
+
+    impl ScopedEnv {
+        fn new() -> Self {
+            Self { saved: Vec::new() }
+        }
+
+        unsafe fn set(&mut self, key: &str, value: &Path) {
+            self.saved.push((key.to_string(), std::env::var(key).ok()));
+            unsafe { std::env::set_var(key, value) };
+        }
+    }
+
+    impl Drop for ScopedEnv {
+        fn drop(&mut self) {
+            for (key, previous) in self.saved.drain(..).rev() {
+                unsafe {
+                    match previous {
+                        Some(value) => std::env::set_var(&key, value),
+                        None => std::env::remove_var(&key),
+                    }
+                }
+            }
+        }
+    }
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        match LOCK.get_or_init(|| Mutex::new(())).lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    #[test]
+    fn doctor_ignores_codex_auth_and_import_feasibility() {
+        let _lock = env_lock();
+        let home =
+            std::env::temp_dir().join(format!("codex-helper-doctor-test-{}", uuid::Uuid::new_v4()));
+        let helper_home = home.join(".codex-helper");
+        let codex_home = home.join(".codex");
+        std::fs::create_dir_all(&helper_home).expect("create helper home");
+        std::fs::create_dir_all(&codex_home).expect("create Codex home");
+
+        let mut env = ScopedEnv::new();
+        unsafe {
+            env.set("HOME", &home);
+            env.set("USERPROFILE", &home);
+            env.set("CODEX_HELPER_HOME", &helper_home);
+            env.set("CODEX_HOME", &codex_home);
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        let report = runtime.block_on(async {
+            crate::config::init_config_toml(true)
+                .await
+                .expect("write canonical config");
+            std::fs::write(codex_home.join("auth.json"), "not-json")
+                .expect("write invalid auth file");
+            run_doctor(DoctorLang::En).await
+        });
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.id == "proxy_config.codex")
+        );
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.id == "codex.switch_state")
+        );
+        assert!(report.checks.iter().all(|check| {
+            !check.id.starts_with("codex.auth")
+                && check.id != "bootstrap.codex"
+                && !check.message.contains("import-from-codex")
+        }));
+    }
 }

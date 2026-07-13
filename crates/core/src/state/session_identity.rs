@@ -2,14 +2,14 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::ServiceConfigManager;
 use crate::logging::RetryInfo;
 use crate::policy_actions::PolicyAction;
 use crate::pricing::CostBreakdown;
 use crate::provider_signals::ProviderSignal;
 use crate::runtime_identity::ProviderEndpointKey;
+use crate::runtime_store::AttemptHandle;
 use crate::sessions;
-use crate::usage::{CacheInputAccounting, UsageMetrics};
+use crate::usage::{CacheAccountingConvention, UsageMetrics};
 
 fn bool_is_false(value: &bool) -> bool {
     !*value
@@ -52,8 +52,7 @@ fn effective_ttfb_ms_for_request(
         return Some(raw_ttfb);
     }
 
-    let attempts = retry.route_attempts_or_derived();
-    let Some(final_attempt) = attempts.iter().rev().find(|attempt| {
+    let Some(final_attempt) = retry.route_attempts.iter().rev().find(|attempt| {
         !attempt.skipped
             && (attempt.decision == "completed"
                 || attempt
@@ -136,9 +135,9 @@ pub struct RequestObservability {
     #[serde(default, skip_serializing_if = "bool_is_false")]
     pub retried: bool,
     #[serde(default, skip_serializing_if = "bool_is_false")]
-    pub cross_station_failover: bool,
+    pub cross_provider_failover: bool,
     #[serde(default, skip_serializing_if = "bool_is_false")]
-    pub same_station_retry: bool,
+    pub same_provider_retry: bool,
     #[serde(default, skip_serializing_if = "bool_is_false")]
     pub fast_mode: bool,
     #[serde(default, skip_serializing_if = "bool_is_false")]
@@ -156,8 +155,8 @@ impl Default for RequestObservability {
             attempt_count: 1,
             route_attempt_count: 0,
             retried: false,
-            cross_station_failover: false,
-            same_station_retry: false,
+            cross_provider_failover: false,
+            same_provider_retry: false,
             fast_mode: false,
             streaming: false,
         }
@@ -167,6 +166,12 @@ impl Default for RequestObservability {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ActiveRequest {
     pub id: u64,
+    #[serde(default)]
+    pub runtime_revision: u64,
+    #[serde(default)]
+    pub runtime_digest: String,
+    #[serde(default)]
+    pub policy_revision: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -181,16 +186,16 @@ pub struct ActiveRequest {
     pub cwd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub station_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_service_tier: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub upstream_base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub route_decision: Option<RouteDecisionProvenance>,
     pub service: String,
@@ -221,11 +226,7 @@ pub struct FinishedRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub station_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub upstream_base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub route_decision: Option<RouteDecisionProvenance>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -253,14 +254,17 @@ pub struct FinishedRequest {
 }
 
 impl FinishedRequest {
-    pub fn cache_input_accounting(&self) -> CacheInputAccounting {
-        CacheInputAccounting::for_service(&self.service)
+    pub fn provider_endpoint(&self) -> Option<ProviderEndpointKey> {
+        provider_endpoint_from_route_decision(&self.service, self.route_decision.as_ref())
     }
 
-    pub fn cache_hit_rate(&self) -> Option<f64> {
+    pub fn cache_hit_rate_with_convention(
+        &self,
+        convention: CacheAccountingConvention,
+    ) -> Option<f64> {
         self.usage
             .as_ref()
-            .and_then(|usage| usage.cache_hit_rate_with_accounting(self.cache_input_accounting()))
+            .and_then(|usage| usage.cache_hit_rate_with_convention(convention))
     }
 
     pub fn observability_view(&self) -> RequestObservability {
@@ -286,10 +290,26 @@ impl FinishedRequest {
     pub fn is_fast_mode(&self) -> bool {
         self.observability_view().fast_mode
     }
+}
 
-    pub fn crossed_station_boundary(&self) -> bool {
-        self.observability_view().cross_station_failover
+impl ActiveRequest {
+    pub fn provider_endpoint(&self) -> Option<ProviderEndpointKey> {
+        provider_endpoint_from_route_decision(&self.service, self.route_decision.as_ref())
     }
+}
+
+fn provider_endpoint_from_route_decision(
+    service: &str,
+    route_decision: Option<&RouteDecisionProvenance>,
+) -> Option<ProviderEndpointKey> {
+    let decision = route_decision?;
+    let service = service.trim();
+    let provider_id = decision.provider_id.as_deref()?.trim();
+    let endpoint_id = decision.endpoint_id.as_deref()?.trim();
+    if service.is_empty() || provider_id.is_empty() || endpoint_id.is_empty() {
+        return None;
+    }
+    Some(ProviderEndpointKey::new(service, provider_id, endpoint_id))
 }
 
 impl RequestObservability {
@@ -297,26 +317,26 @@ impl RequestObservability {
         let retry = request.retry.as_ref();
         let attempt_count = retry.map(|retry| retry.attempts.max(1)).unwrap_or(1);
         let route_attempts = retry
-            .map(|retry| retry.route_attempts_or_derived())
+            .map(|retry| retry.route_attempts.as_slice())
             .unwrap_or_default();
         let route_attempt_count = route_attempts.len();
-        let final_station = request
-            .station_name
+        let final_provider = request
+            .provider_id
             .as_deref()
             .map(str::trim)
-            .filter(|station| !station.is_empty());
-        let has_station_context = final_station.is_some()
+            .filter(|provider| !provider.is_empty());
+        let has_provider_context = final_provider.is_some()
             && route_attempts
                 .iter()
-                .any(|attempt| attempt.station_name.as_deref().is_some());
-        let cross_station_failover = final_station.is_some_and(|final_station| {
+                .any(|attempt| attempt.provider_id.as_deref().is_some());
+        let cross_provider_failover = final_provider.is_some_and(|final_provider| {
             route_attempts
                 .iter()
-                .filter_map(|attempt| attempt.station_name.as_deref())
-                .any(|station| station != final_station)
+                .filter_map(|attempt| attempt.provider_id.as_deref())
+                .any(|provider| provider != final_provider)
         });
         let retried = attempt_count > 1;
-        let same_station_retry = retried && has_station_context && !cross_station_failover;
+        let same_provider_retry = retried && has_provider_context && !cross_provider_failover;
         let ttfb_ms = effective_ttfb_ms_for_request(
             request.duration_ms,
             request.ttfb_ms,
@@ -351,8 +371,8 @@ impl RequestObservability {
             attempt_count,
             route_attempt_count,
             retried,
-            cross_station_failover,
-            same_station_retry,
+            cross_provider_failover,
+            same_provider_retry,
             fast_mode: decided_fast || service_tier_is_fast(request.service_tier.as_deref()),
             streaming: request.streaming || request.observability.streaming,
         }
@@ -362,10 +382,12 @@ impl RequestObservability {
 #[derive(Debug, Clone)]
 pub struct FinishRequestParams {
     pub id: u64,
+    pub winning_attempt: Option<AttemptHandle>,
     pub status_code: u16,
     pub duration_ms: u64,
     pub ended_at_ms: u64,
     pub observed_service_tier: Option<String>,
+    pub reported_model: Option<String>,
     pub usage: Option<UsageMetrics>,
     pub retry: Option<crate::logging::RetryInfo>,
     pub ttfb_ms: Option<u64>,
@@ -389,8 +411,6 @@ pub struct SessionStats {
     pub last_service_tier: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_provider_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_station_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_route_decision: Option<RouteDecisionProvenance>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -444,8 +464,6 @@ pub struct SessionBinding {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub station_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
@@ -464,7 +482,7 @@ pub enum RouteValueSource {
     SessionOverride,
     GlobalOverride,
     ProfileDefault,
-    StationMapping,
+    ProviderMapping,
     RuntimeFallback,
 }
 
@@ -496,8 +514,6 @@ pub struct RouteDecisionProvenance {
     pub effective_reasoning_effort: Option<ResolvedRouteValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effective_service_tier: Option<ResolvedRouteValue>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub effective_station: Option<ResolvedRouteValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effective_upstream_base_url: Option<ResolvedRouteValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -573,10 +589,6 @@ pub struct SessionIdentityCard {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_provider_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_station_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_upstream_base_url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_usage: Option<UsageMetrics>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_usage: Option<UsageMetrics>,
@@ -602,93 +614,11 @@ pub struct SessionIdentityCard {
     pub effective_reasoning_effort: Option<ResolvedRouteValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effective_service_tier: Option<ResolvedRouteValue>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub effective_station: Option<ResolvedRouteValue>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub effective_upstream_base_url: Option<ResolvedRouteValue>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub override_effort: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub override_station_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub override_model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub override_service_tier: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct SessionManualOverrides {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning_effort: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub station_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub route_target: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub service_tier: Option<String>,
-}
-
-impl SessionManualOverrides {
-    pub fn is_empty(&self) -> bool {
-        self.reasoning_effort.is_none()
-            && self.station_name.is_none()
-            && self.route_target.is_none()
-            && self.model.is_none()
-            && self.service_tier.is_none()
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct SessionEffortOverride {
-    pub(super) effort: String,
-    #[allow(dead_code)]
-    pub(super) updated_at_ms: u64,
-    pub(super) last_seen_ms: u64,
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct SessionStationOverride {
-    pub(super) station_name: String,
-    #[allow(dead_code)]
-    pub(super) updated_at_ms: u64,
-    pub(super) last_seen_ms: u64,
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct SessionRouteTargetOverride {
-    pub(super) target: String,
-    #[allow(dead_code)]
-    pub(super) updated_at_ms: u64,
-    pub(super) last_seen_ms: u64,
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct SessionModelOverride {
-    pub(super) model: String,
-    #[allow(dead_code)]
-    pub(super) updated_at_ms: u64,
-    pub(super) last_seen_ms: u64,
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct SessionServiceTierOverride {
-    pub(super) service_tier: String,
-    #[allow(dead_code)]
-    pub(super) updated_at_ms: u64,
-    pub(super) last_seen_ms: u64,
 }
 
 #[derive(Debug, Clone)]
 pub(super) struct SessionBindingEntry {
     pub(super) binding: SessionBinding,
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct SessionCwdCacheEntry {
-    pub(super) cwd: Option<String>,
-    pub(super) last_seen_ms: u64,
 }
 
 fn empty_session_identity_card(session_id: Option<String>) -> SessionIdentityCard {
@@ -709,8 +639,6 @@ fn empty_session_identity_card(session_id: Option<String>) -> SessionIdentityCar
         last_reasoning_effort: None,
         last_service_tier: None,
         last_provider_id: None,
-        last_station_name: None,
-        last_upstream_base_url: None,
         last_usage: None,
         total_usage: None,
         turns_total: None,
@@ -724,12 +652,6 @@ fn empty_session_identity_card(session_id: Option<String>) -> SessionIdentityCar
         effective_model: None,
         effective_reasoning_effort: None,
         effective_service_tier: None,
-        effective_station: None,
-        effective_upstream_base_url: None,
-        override_effort: None,
-        override_station_name: None,
-        override_model: None,
-        override_service_tier: None,
     }
 }
 
@@ -741,16 +663,9 @@ fn non_empty_trimmed(value: Option<&str>) -> Option<String> {
 }
 
 fn resolve_effective_observed_value(
-    override_value: Option<&str>,
     observed_value: Option<&str>,
     binding_value: Option<&str>,
 ) -> Option<ResolvedRouteValue> {
-    if let Some(value) = non_empty_trimmed(override_value) {
-        return Some(ResolvedRouteValue::new(
-            value,
-            RouteValueSource::SessionOverride,
-        ));
-    }
     let binding_value = non_empty_trimmed(binding_value);
     if let Some(binding) = binding_value {
         return Some(ResolvedRouteValue::new(
@@ -781,143 +696,21 @@ fn classify_session_observation_scope(card: &SessionIdentityCard) -> SessionObse
     }
 }
 
-fn resolve_effective_station_value(
-    card: &SessionIdentityCard,
-    global_station_override: Option<&str>,
-    binding_station_name: Option<&str>,
-) -> Option<ResolvedRouteValue> {
-    if let Some(value) = non_empty_trimmed(card.override_station_name.as_deref()) {
-        return Some(ResolvedRouteValue::new(
-            value,
-            RouteValueSource::SessionOverride,
-        ));
-    }
-    if let Some(value) = non_empty_trimmed(global_station_override) {
-        return Some(ResolvedRouteValue::new(
-            value,
-            RouteValueSource::GlobalOverride,
-        ));
-    }
-    let binding = non_empty_trimmed(binding_station_name);
-    if let Some(binding) = binding {
-        return Some(ResolvedRouteValue::new(
-            binding,
-            RouteValueSource::ProfileDefault,
-        ));
-    }
-    non_empty_trimmed(card.last_station_name.as_deref())
-        .map(|observed| ResolvedRouteValue::new(observed, RouteValueSource::RuntimeFallback))
-}
-
-fn apply_basic_effective_route(
-    card: &mut SessionIdentityCard,
-    global_station_override: Option<&str>,
-    binding: Option<&SessionBinding>,
-) {
+fn apply_basic_effective_route(card: &mut SessionIdentityCard, binding: Option<&SessionBinding>) {
     card.effective_model = resolve_effective_observed_value(
-        card.override_model.as_deref(),
         card.last_model.as_deref(),
         binding_request_field_value(binding, |binding| binding.model.as_deref()),
     );
     card.effective_reasoning_effort = resolve_effective_observed_value(
-        card.override_effort.as_deref(),
         card.last_reasoning_effort.as_deref(),
         binding_request_field_value(binding, |binding| binding.reasoning_effort.as_deref()),
     );
     card.effective_service_tier = resolve_effective_observed_value(
-        card.override_service_tier.as_deref(),
         card.last_service_tier.as_deref(),
         binding_request_field_value(binding, |binding| binding.service_tier.as_deref()),
     );
     card.binding_profile_name = binding.and_then(|binding| binding.profile_name.clone());
     card.binding_continuity_mode = binding.map(|binding| binding.continuity_mode);
-    card.effective_station = resolve_effective_station_value(
-        card,
-        global_station_override,
-        binding.and_then(|binding| binding.station_name.as_deref()),
-    );
-    card.effective_upstream_base_url = match (
-        card.effective_station.as_ref(),
-        non_empty_trimmed(card.last_station_name.as_deref()),
-        non_empty_trimmed(card.last_upstream_base_url.as_deref()),
-    ) {
-        (Some(station), Some(last_station), Some(upstream)) if station.value == last_station => {
-            Some(ResolvedRouteValue::new(
-                upstream,
-                RouteValueSource::RuntimeFallback,
-            ))
-        }
-        _ => None,
-    };
-}
-
-pub fn enrich_session_identity_cards_with_runtime(
-    cards: &mut [SessionIdentityCard],
-    mgr: &ServiceConfigManager,
-) {
-    for card in cards {
-        if card.effective_station.is_none()
-            && let Some(active) = mgr.active_station()
-        {
-            card.effective_station = Some(ResolvedRouteValue::new(
-                active.name.clone(),
-                RouteValueSource::RuntimeFallback,
-            ));
-        }
-
-        let effective_station_name = card
-            .effective_station
-            .as_ref()
-            .map(|value| value.value.as_str());
-        if card.effective_upstream_base_url.is_none()
-            && let Some(station_name) = effective_station_name
-            && let Some(station) = mgr.station(station_name)
-            && station.upstreams.len() == 1
-        {
-            card.effective_upstream_base_url = Some(ResolvedRouteValue::new(
-                station.upstreams[0].base_url.clone(),
-                RouteValueSource::RuntimeFallback,
-            ));
-        }
-
-        let Some(model) = card
-            .effective_model
-            .as_ref()
-            .map(|value| value.value.clone())
-        else {
-            continue;
-        };
-        let Some(station_name) = effective_station_name else {
-            continue;
-        };
-        let Some(last_station_name) = card.last_station_name.as_deref() else {
-            continue;
-        };
-        if last_station_name != station_name {
-            continue;
-        }
-        let Some(last_upstream_base_url) = card.last_upstream_base_url.as_deref() else {
-            continue;
-        };
-        let Some(station) = mgr.station(station_name) else {
-            continue;
-        };
-        let Some(upstream) = station
-            .upstreams
-            .iter()
-            .find(|upstream| upstream.base_url == last_upstream_base_url)
-        else {
-            continue;
-        };
-
-        let mapped = crate::model_routing::effective_model(&upstream.model_mapping, model.as_str());
-        if mapped != model {
-            card.effective_model = Some(ResolvedRouteValue::new(
-                mapped,
-                RouteValueSource::StationMapping,
-            ));
-        }
-    }
 }
 
 fn session_identity_sort_key(card: &SessionIdentityCard) -> u64 {
@@ -957,13 +750,8 @@ fn merge_session_identity_source(
 pub struct SessionIdentityCardBuildInputs<'a> {
     pub active: &'a [ActiveRequest],
     pub recent: &'a [FinishedRequest],
-    pub overrides: &'a HashMap<String, String>,
-    pub station_overrides: &'a HashMap<String, String>,
-    pub model_overrides: &'a HashMap<String, String>,
-    pub service_tier_overrides: &'a HashMap<String, String>,
     pub bindings: &'a HashMap<String, SessionBinding>,
     pub route_affinities: &'a HashMap<String, SessionRouteAffinity>,
-    pub global_station_override: Option<&'a str>,
     pub stats: &'a HashMap<String, SessionStats>,
 }
 
@@ -973,13 +761,8 @@ pub fn build_session_identity_cards_from_parts(
     let SessionIdentityCardBuildInputs {
         active,
         recent,
-        overrides,
-        station_overrides,
-        model_overrides,
-        service_tier_overrides,
         bindings,
         route_affinities,
-        global_station_override,
         stats,
     } = inputs;
 
@@ -1025,12 +808,6 @@ pub fn build_session_identity_cards_from_parts(
         if entry.last_provider_id.is_none() {
             entry.last_provider_id = req.provider_id.clone();
         }
-        if entry.last_station_name.is_none() {
-            entry.last_station_name = req.station_name.clone();
-        }
-        if entry.last_upstream_base_url.is_none() {
-            entry.last_upstream_base_url = req.upstream_base_url.clone();
-        }
         update_card_route_decision(entry, req.route_decision.as_ref());
     }
 
@@ -1060,11 +837,6 @@ pub fn build_session_identity_cards_from_parts(
                 .or(entry.last_reasoning_effort.clone());
             entry.last_service_tier = r.service_tier.clone().or(entry.last_service_tier.clone());
             entry.last_provider_id = r.provider_id.clone().or(entry.last_provider_id.clone());
-            entry.last_station_name = r.station_name.clone().or(entry.last_station_name.clone());
-            entry.last_upstream_base_url = r
-                .upstream_base_url
-                .clone()
-                .or(entry.last_upstream_base_url.clone());
             entry.last_usage = r.usage.clone().or(entry.last_usage.clone());
             entry.last_output_tokens_per_second = r
                 .observability_view()
@@ -1117,9 +889,6 @@ pub fn build_session_identity_cards_from_parts(
         if entry.last_provider_id.is_none() {
             entry.last_provider_id = st.last_provider_id.clone();
         }
-        if entry.last_station_name.is_none() {
-            entry.last_station_name = st.last_station_name.clone();
-        }
         if entry.last_usage.is_none() {
             entry.last_usage = st.last_usage.clone();
         }
@@ -1136,38 +905,6 @@ pub fn build_session_identity_cards_from_parts(
             entry.avg_output_tokens_per_second = st.avg_output_tokens_per_second;
         }
         update_card_route_decision(entry, st.last_route_decision.as_ref());
-    }
-
-    for (sid, eff) in overrides {
-        let key = Some(sid.clone());
-        let entry = map
-            .entry(key.clone())
-            .or_insert_with(|| empty_session_identity_card(key));
-        entry.override_effort = Some(eff.clone());
-    }
-
-    for (sid, station_name) in station_overrides {
-        let key = Some(sid.clone());
-        let entry = map
-            .entry(key.clone())
-            .or_insert_with(|| empty_session_identity_card(key));
-        entry.override_station_name = Some(station_name.clone());
-    }
-
-    for (sid, model) in model_overrides {
-        let key = Some(sid.clone());
-        let entry = map
-            .entry(key.clone())
-            .or_insert_with(|| empty_session_identity_card(key));
-        entry.override_model = Some(model.clone());
-    }
-
-    for (sid, service_tier) in service_tier_overrides {
-        let key = Some(sid.clone());
-        let entry = map
-            .entry(key.clone())
-            .or_insert_with(|| empty_session_identity_card(key));
-        entry.override_service_tier = Some(service_tier.clone());
     }
 
     for (sid, affinity) in route_affinities {
@@ -1187,7 +924,7 @@ pub fn build_session_identity_cards_from_parts(
             .session_id
             .as_deref()
             .and_then(|session_id| bindings.get(session_id));
-        apply_basic_effective_route(card, global_station_override, binding);
+        apply_basic_effective_route(card, binding);
         card.observation_scope = classify_session_observation_scope(card);
     }
     cards.sort_by_key(|card| std::cmp::Reverse(session_identity_sort_key(card)));
@@ -1229,13 +966,23 @@ mod tests {
     use crate::usage::UsageMetrics;
 
     #[test]
+    fn historical_override_provenance_values_remain_decodable() {
+        assert_eq!(
+            serde_json::from_str::<RouteValueSource>(r#""session_override""#)
+                .expect("session override provenance"),
+            RouteValueSource::SessionOverride
+        );
+        assert_eq!(
+            serde_json::from_str::<RouteValueSource>(r#""global_override""#)
+                .expect("global override provenance"),
+            RouteValueSource::GlobalOverride
+        );
+    }
+
+    #[test]
     fn session_identity_cards_do_not_surface_affinity_only_sessions() {
         let active = Vec::<ActiveRequest>::new();
         let recent = Vec::<FinishedRequest>::new();
-        let overrides = HashMap::<String, String>::new();
-        let station_overrides = HashMap::<String, String>::new();
-        let model_overrides = HashMap::<String, String>::new();
-        let service_tier_overrides = HashMap::<String, String>::new();
         let bindings = HashMap::<String, SessionBinding>::new();
         let stats = HashMap::<String, SessionStats>::new();
         let mut route_affinities = HashMap::<String, SessionRouteAffinity>::new();
@@ -1256,13 +1003,8 @@ mod tests {
         let cards = build_session_identity_cards_from_parts(SessionIdentityCardBuildInputs {
             active: &active,
             recent: &recent,
-            overrides: &overrides,
-            station_overrides: &station_overrides,
-            model_overrides: &model_overrides,
-            service_tier_overrides: &service_tier_overrides,
             bindings: &bindings,
             route_affinities: &route_affinities,
-            global_station_override: None,
             stats: &stats,
         });
 
@@ -1284,9 +1026,7 @@ mod tests {
             model: Some("gpt-5".to_string()),
             reasoning_effort: None,
             service_tier: Some("default".to_string()),
-            station_name: Some("primary".to_string()),
             provider_id: Some("primary-provider".to_string()),
-            upstream_base_url: Some("https://primary.example/v1".to_string()),
             route_decision: Some(RouteDecisionProvenance {
                 effective_service_tier: Some(ResolvedRouteValue {
                     value: "priority".to_string(),
@@ -1302,11 +1042,24 @@ mod tests {
             cost: CostBreakdown::default(),
             retry: Some(RetryInfo {
                 attempts: 2,
-                upstream_chain: vec![
-                    "backup:https://backup.example/v1 (idx=0) transport_error=timeout".to_string(),
-                    "primary:https://primary.example/v1 (idx=0) status=200 class=-".to_string(),
+                route_attempts: vec![
+                    RouteAttemptLog {
+                        attempt_index: 0,
+                        provider_id: Some("backup-provider".to_string()),
+                        decision: "failed_transport".to_string(),
+                        code: Some("failed_transport".to_string()),
+                        error_class: Some("upstream_transport_error".to_string()),
+                        ..RouteAttemptLog::default()
+                    },
+                    RouteAttemptLog {
+                        attempt_index: 1,
+                        provider_id: Some("primary-provider".to_string()),
+                        decision: "completed".to_string(),
+                        code: Some("completed".to_string()),
+                        status_code: Some(200),
+                        ..RouteAttemptLog::default()
+                    },
                 ],
-                route_attempts: Vec::new(),
             }),
             provider_signals: Vec::new(),
             policy_actions: Vec::new(),
@@ -1335,10 +1088,27 @@ mod tests {
         assert_eq!(observability.attempt_count, 2);
         assert_eq!(observability.route_attempt_count, 2);
         assert!(observability.retried);
-        assert!(observability.cross_station_failover);
+        assert!(observability.cross_provider_failover);
         assert!(observability.fast_mode);
         assert!(observability.streaming);
         assert_eq!(observability.output_tokens_per_second, Some(200.0));
+    }
+
+    #[test]
+    fn finished_request_observability_classifies_same_provider_retry() {
+        let mut request = sample_finished_request();
+        request
+            .retry
+            .as_mut()
+            .expect("retry fixture")
+            .route_attempts[0]
+            .provider_id = Some("primary-provider".to_string());
+
+        let observability = request.observability_view();
+
+        assert!(observability.retried);
+        assert!(!observability.cross_provider_failover);
+        assert!(observability.same_provider_retry);
     }
 
     #[test]
@@ -1359,6 +1129,8 @@ mod tests {
         );
         assert_eq!(value["observability"]["attempt_count"].as_u64(), Some(2));
         assert_eq!(value["observability"]["streaming"].as_bool(), Some(true));
+        assert!(value.get("station_name").is_none());
+        assert!(value.get("upstream_base_url").is_none());
     }
 
     #[test]
@@ -1403,7 +1175,6 @@ mod tests {
         });
         request.retry = Some(RetryInfo {
             attempts: 2,
-            upstream_chain: Vec::new(),
             route_attempts: vec![
                 RouteAttemptLog {
                     attempt_index: 0,
@@ -1411,7 +1182,6 @@ mod tests {
                     status_code: Some(429),
                     upstream_headers_ms: Some(50),
                     duration_ms: Some(500),
-                    raw: "failed".to_string(),
                     ..RouteAttemptLog::default()
                 },
                 RouteAttemptLog {
@@ -1420,7 +1190,6 @@ mod tests {
                     status_code: Some(200),
                     upstream_headers_ms: Some(1_200),
                     duration_ms: Some(2_200),
-                    raw: "completed".to_string(),
                     ..RouteAttemptLog::default()
                 },
             ],
@@ -1441,14 +1210,12 @@ mod tests {
         request.ttfb_ms = Some(2_210);
         request.retry = Some(RetryInfo {
             attempts: 2,
-            upstream_chain: Vec::new(),
             route_attempts: vec![RouteAttemptLog {
                 attempt_index: 1,
                 decision: "completed".to_string(),
                 status_code: Some(200),
                 upstream_headers_ms: Some(1_200),
                 duration_ms: Some(2_200),
-                raw: "completed".to_string(),
                 ..RouteAttemptLog::default()
             }],
         });

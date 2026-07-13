@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
+use crate::dashboard_core::OperatorRequestSummary;
 use crate::sessions::{SessionSummary, SessionSummarySource};
-use crate::state::FinishedRequest;
 use crate::tui::model::{SessionRow, Snapshot, format_age, now_ms};
 use crate::tui::state::{CodexHistoryExternalFocusOrigin, RecentCodexRow, UiState};
 use crate::tui::types::{Focus, Page};
@@ -9,7 +9,7 @@ use crate::tui::types::{Focus, Page};
 pub(super) fn selected_request_page_request<'a>(
     snapshot: &'a Snapshot,
     ui: &UiState,
-) -> Option<&'a FinishedRequest> {
+) -> Option<&'a OperatorRequestSummary> {
     ui.request_page_filtered_indices(snapshot)
         .get(ui.selected_request_page_idx)
         .and_then(|idx| snapshot.recent.get(*idx))
@@ -18,7 +18,7 @@ pub(super) fn selected_request_page_request<'a>(
 pub(super) fn selected_dashboard_request<'a>(
     snapshot: &'a Snapshot,
     ui: &UiState,
-) -> Option<&'a FinishedRequest> {
+) -> Option<&'a OperatorRequestSummary> {
     let selected_sid = snapshot
         .rows
         .get(ui.selected_session_idx)
@@ -28,7 +28,7 @@ pub(super) fn selected_dashboard_request<'a>(
         .recent
         .iter()
         .filter(
-            |request| match (selected_sid, request.session_id.as_deref()) {
+            |request| match (selected_sid, request.session_key.as_deref()) {
                 (Some(sid), Some(request_sid)) => sid == request_sid,
                 (Some(_), None) => false,
                 (None, _) => true,
@@ -36,6 +36,17 @@ pub(super) fn selected_dashboard_request<'a>(
         )
         .take(60)
         .nth(ui.selected_request_idx)
+}
+
+pub(super) fn local_session_id_for_opaque_key<'a>(
+    snapshot: &'a Snapshot,
+    opaque_session_key: &str,
+) -> Option<&'a str> {
+    snapshot
+        .rows
+        .iter()
+        .find(|row| row.session_id.as_deref() == Some(opaque_session_key))
+        .and_then(SessionRow::local_command_session_id)
 }
 
 pub(super) fn selected_recent_row(ui: &UiState) -> Option<RecentCodexRow> {
@@ -48,14 +59,6 @@ pub(super) fn selected_recent_row(ui: &UiState) -> Option<RecentCodexRow> {
 
 fn session_history_bridge_summary(row: &SessionRow) -> String {
     let mut parts = vec![
-        format!(
-            "station={}",
-            row.effective_station
-                .as_ref()
-                .map(|value| value.value.as_str())
-                .or(row.last_station_name.as_deref())
-                .unwrap_or("auto")
-        ),
         format!(
             "model={}",
             row.effective_model
@@ -73,8 +76,11 @@ fn session_history_bridge_summary(row: &SessionRow) -> String {
                 .unwrap_or("auto")
         ),
     ];
-    if let Some(provider) = row.last_provider_id.as_deref() {
+    if let Some(provider) = row.observed_provider_id() {
         parts.push(format!("provider={provider}"));
+    }
+    if let Some(endpoint) = row.observed_endpoint_id() {
+        parts.push(format!("endpoint={endpoint}"));
     }
     if let Some(status) = row.last_status {
         parts.push(format!("status={status}"));
@@ -82,17 +88,16 @@ fn session_history_bridge_summary(row: &SessionRow) -> String {
     format!("From Sessions: {}", parts.join(", "))
 }
 
-fn request_history_bridge_summary(request: &FinishedRequest) -> String {
+fn request_history_bridge_summary(request: &OperatorRequestSummary) -> String {
     let mut parts = vec![
-        format!(
-            "station={}",
-            request.station_name.as_deref().unwrap_or("auto")
-        ),
         format!("model={}", request.model.as_deref().unwrap_or("auto")),
         format!("tier={}", request.service_tier.as_deref().unwrap_or("auto")),
     ];
     if let Some(provider) = request.provider_id.as_deref() {
         parts.push(format!("provider={provider}"));
+    }
+    if let Some(endpoint) = request.endpoint_id.as_deref() {
+        parts.push(format!("endpoint={endpoint}"));
     }
     parts.push(format!("status={}", request.status_code));
     parts.push(format!("path={}", request.path));
@@ -103,7 +108,7 @@ pub(super) fn session_history_summary_from_row(
     row: &SessionRow,
     path: Option<PathBuf>,
 ) -> Option<SessionSummary> {
-    let sid = row.session_id.clone()?;
+    let sid = row.local_command_session_id()?.to_string();
     let sort_hint_ms = row.last_ended_at_ms.or(row.active_started_at_ms_min);
     let updated_at = sort_hint_ms.map(|ms| format_age(now_ms(), Some(ms)));
     let turns = row.turns_total.unwrap_or(0).min(usize::MAX as u64) as usize;
@@ -170,20 +175,20 @@ pub(super) fn recent_history_summary_from_row(
 }
 
 pub(super) fn request_history_summary_from_request(
-    request: &FinishedRequest,
+    request: &OperatorRequestSummary,
+    local_session_id: &str,
     path: Option<PathBuf>,
-) -> Option<SessionSummary> {
-    let sid = request.session_id.clone()?;
+) -> SessionSummary {
     let updated_at = Some(format_age(now_ms(), Some(request.ended_at_ms)));
     let source = if path.is_some() {
         SessionSummarySource::LocalFile
     } else {
         SessionSummarySource::ObservedOnly
     };
-    Some(SessionSummary {
-        id: sid,
+    SessionSummary {
+        id: local_session_id.to_string(),
         path: path.unwrap_or_default(),
-        cwd: request.cwd.clone(),
+        cwd: None,
         created_at: None,
         updated_at: updated_at.clone(),
         last_response_at: updated_at,
@@ -193,7 +198,7 @@ pub(super) fn request_history_summary_from_request(
         first_user_message: Some(request_history_bridge_summary(request)),
         source,
         sort_hint_ms: Some(request.ended_at_ms),
-    })
+    }
 }
 
 pub(super) fn prepare_select_history_from_external(

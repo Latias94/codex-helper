@@ -1,50 +1,20 @@
-use ratatui::widgets::{ListState, TableState};
+use ratatui::widgets::TableState;
 
 use crate::codex_integration::CodexStartupReadiness;
-use crate::config::{
-    FleetRegistryConfig, ResolvedRetryConfig, UsageForecastConfig,
-    is_supported_route_graph_config_version,
-};
-use crate::dashboard_core::ControlProfileOption;
-use crate::routing_explain::RoutingExplainResponse;
+use crate::config::CURRENT_CONFIG_VERSION;
+use crate::dashboard_core::{ControlProfileOption, OperatorReadModel, OperatorRetrySummary};
 use crate::sessions::{
     SessionMeta, SessionSummary, SessionSummarySource, SessionTranscriptMessage,
 };
-#[cfg(test)]
-use crate::usage_balance::{
-    UsageBalanceBuildInput, UsageBalanceEndpointRow, UsageBalanceProviderRow,
-    UsageBalanceRefreshInput, UsageBalanceView,
-};
-use crate::usage_providers::UsageProviderRefreshSummary;
 use codex_helper_core::fleet::FleetSnapshot;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use super::Language;
 use super::model::{
-    RoutingSpecView, Snapshot, codex_recent_window_threshold_ms, filtered_requests_len, now_ms,
-    request_matches_page_filters, request_page_focus_session_id, routing_provider_names,
-    session_row_has_any_override,
+    Snapshot, codex_recent_window_threshold_ms, filtered_requests_len, now_ms,
+    request_matches_page_filters, request_page_focus_session_id,
 };
 use super::types::{Focus, Overlay, Page, StatsFocus};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::tui) struct RoutingProviderRow {
-    pub(in crate::tui) name: String,
-    pub(in crate::tui) alias: Option<String>,
-    pub(in crate::tui) enabled: bool,
-    pub(in crate::tui) tags: BTreeMap<String, String>,
-    pub(in crate::tui) in_catalog: bool,
-}
-
-impl RoutingProviderRow {
-    pub(in crate::tui) fn display_label(&self) -> String {
-        self.alias
-            .as_deref()
-            .filter(|alias| !alias.trim().is_empty() && *alias != self.name)
-            .map(|alias| format!("{} ({alias})", self.name))
-            .unwrap_or_else(|| self.name.clone())
-    }
-}
 
 #[derive(Debug, Clone)]
 pub(in crate::tui) struct RecentCodexRow {
@@ -73,30 +43,6 @@ pub(in crate::tui) enum CodexHistoryExternalFocusOrigin {
 pub(in crate::tui) struct CodexHistoryExternalFocus {
     pub(in crate::tui) summary: SessionSummary,
     pub(in crate::tui) origin: CodexHistoryExternalFocusOrigin,
-}
-
-#[derive(Debug, Clone, Default)]
-pub(in crate::tui) struct CodexRelayDiagnosticsState {
-    pub(in crate::tui) loading: bool,
-    pub(in crate::tui) generation: u64,
-    pub(in crate::tui) last_started_at: Option<std::time::Instant>,
-    pub(in crate::tui) last_finished_at: Option<std::time::Instant>,
-    pub(in crate::tui) last_result: Option<crate::proxy::CodexRelayCapabilitiesResponse>,
-    pub(in crate::tui) last_error: Option<String>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub(in crate::tui) struct CodexRelayLiveSmokeState {
-    pub(in crate::tui) loading: bool,
-    pub(in crate::tui) generation: u64,
-    pub(in crate::tui) mode: Option<crate::tui::codex_relay_live_smoke::CodexRelayLiveSmokeMode>,
-    pub(in crate::tui) pending_confirm:
-        Option<crate::tui::codex_relay_live_smoke::CodexRelayLiveSmokeMode>,
-    pub(in crate::tui) pending_confirm_at: Option<std::time::Instant>,
-    pub(in crate::tui) last_started_at: Option<std::time::Instant>,
-    pub(in crate::tui) last_finished_at: Option<std::time::Instant>,
-    pub(in crate::tui) last_result: Option<crate::proxy::CodexRelayLiveSmokeResponse>,
-    pub(in crate::tui) last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,11 +103,9 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) service_name: &'static str,
     pub(in crate::tui) proxy_port: u16,
     pub(in crate::tui) language: Language,
-    pub(in crate::tui) usage_forecast: UsageForecastConfig,
-    pub(in crate::tui) refresh_ms: u64,
     pub(in crate::tui) config_version: Option<u32>,
     pub(in crate::tui) runtime_connection: RuntimeConnectionKind,
-    pub(in crate::tui) runtime_shutdown_available: Option<bool>,
+    pub(in crate::tui) operator_read_model: Option<OperatorReadModel>,
     pub(in crate::tui) runtime_status_error: Option<String>,
     pub(in crate::tui) page: Page,
     pub(in crate::tui) focus: Focus,
@@ -179,17 +123,6 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) selected_sessions_page_idx: usize,
     pub(in crate::tui) sessions_page_active_only: bool,
     pub(in crate::tui) sessions_page_errors_only: bool,
-    pub(in crate::tui) sessions_page_overrides_only: bool,
-    pub(in crate::tui) effort_menu_idx: usize,
-    pub(in crate::tui) model_menu_idx: usize,
-    pub(in crate::tui) service_tier_menu_idx: usize,
-    pub(in crate::tui) profile_menu_idx: usize,
-    pub(in crate::tui) provider_menu_idx: usize,
-    pub(in crate::tui) routing_menu_idx: usize,
-    pub(in crate::tui) routing_spec: Option<RoutingSpecView>,
-    pub(in crate::tui) routing_explain: Option<RoutingExplainResponse>,
-    pub(in crate::tui) last_routing_control_refresh_at: Option<std::time::Instant>,
-    pub(in crate::tui) fleet_registry: FleetRegistryConfig,
     pub(in crate::tui) fleet_snapshot: Option<FleetSnapshot>,
     pub(in crate::tui) fleet_loading: bool,
     pub(in crate::tui) fleet_refresh_generation: u64,
@@ -202,24 +135,16 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) selected_fleet_node_id: Option<String>,
     pub(in crate::tui) selected_fleet_unit_id: Option<String>,
     pub(in crate::tui) fleet_view_mode: FleetViewMode,
-    pub(in crate::tui) session_model_options: Vec<String>,
-    pub(in crate::tui) session_model_input: String,
-    pub(in crate::tui) session_model_input_hint: Option<String>,
-    pub(in crate::tui) session_service_tier_input: String,
-    pub(in crate::tui) session_service_tier_input_hint: Option<String>,
     pub(in crate::tui) profile_options: Vec<ControlProfileOption>,
     pub(in crate::tui) configured_default_profile: Option<String>,
     pub(in crate::tui) effective_default_profile: Option<String>,
-    pub(in crate::tui) runtime_default_profile_override: Option<String>,
     pub(in crate::tui) stats_focus: StatsFocus,
-    pub(in crate::tui) stats_days: usize,
     pub(in crate::tui) stats_errors_only: bool,
     pub(in crate::tui) stats_attention_only: bool,
-    pub(in crate::tui) selected_stats_station_idx: usize,
+    pub(in crate::tui) selected_stats_provider_endpoint_idx: usize,
     pub(in crate::tui) selected_stats_provider_idx: usize,
     pub(in crate::tui) stats_provider_detail_scroll: u16,
     pub(in crate::tui) needs_snapshot_refresh: bool,
-    pub(in crate::tui) needs_config_refresh: bool,
     pub(in crate::tui) toast: Option<(String, std::time::Instant)>,
     pub(in crate::tui) codex_history_sessions: Vec<SessionSummary>,
     pub(in crate::tui) codex_history_error: Option<String>,
@@ -248,19 +173,10 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) session_transcript_messages: Vec<SessionTranscriptMessage>,
     pub(in crate::tui) session_transcript_scroll: u16,
     pub(in crate::tui) session_transcript_error: Option<String>,
-    pub(in crate::tui) pending_overwrite_from_codex_confirm_at: Option<std::time::Instant>,
     pub(in crate::tui) last_runtime_config_loaded_at_ms: Option<u64>,
     pub(in crate::tui) last_runtime_config_source_mtime_ms: Option<u64>,
-    pub(in crate::tui) last_runtime_retry: Option<ResolvedRetryConfig>,
+    pub(in crate::tui) last_retry_summary: Option<OperatorRetrySummary>,
     pub(in crate::tui) last_runtime_config_refresh_at: Option<std::time::Instant>,
-    pub(in crate::tui) last_balance_refresh_requested_at: Option<std::time::Instant>,
-    pub(in crate::tui) balance_refresh_in_flight: bool,
-    pub(in crate::tui) last_balance_refresh_finished_at: Option<std::time::Instant>,
-    pub(in crate::tui) last_balance_refresh_message: Option<String>,
-    pub(in crate::tui) last_balance_refresh_error: Option<String>,
-    pub(in crate::tui) last_balance_refresh_summary: Option<UsageProviderRefreshSummary>,
-    pub(in crate::tui) codex_relay_diagnostics: CodexRelayDiagnosticsState,
-    pub(in crate::tui) codex_relay_live_smoke: CodexRelayLiveSmokeState,
     pub(in crate::tui) should_exit: bool,
     pub(in crate::tui) stations_table: TableState,
     pub(in crate::tui) sessions_table: TableState,
@@ -271,9 +187,8 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) codex_recent_table: TableState,
     pub(in crate::tui) fleet_nodes_table: TableState,
     pub(in crate::tui) fleet_units_table: TableState,
-    pub(in crate::tui) stats_stations_table: TableState,
+    pub(in crate::tui) stats_provider_endpoints_table: TableState,
     pub(in crate::tui) stats_providers_table: TableState,
-    pub(in crate::tui) menu_list: ListState,
     pub(in crate::tui) station_info_scroll: u16,
 }
 
@@ -315,11 +230,9 @@ impl Default for UiState {
             service_name: "codex",
             proxy_port: 3211,
             language: Language::En,
-            usage_forecast: UsageForecastConfig::default(),
-            refresh_ms: 500,
             config_version: None,
             runtime_connection: RuntimeConnectionKind::Integrated,
-            runtime_shutdown_available: None,
+            operator_read_model: None,
             runtime_status_error: None,
             page: Page::Dashboard,
             focus: Focus::Sessions,
@@ -337,17 +250,6 @@ impl Default for UiState {
             selected_sessions_page_idx: 0,
             sessions_page_active_only: false,
             sessions_page_errors_only: false,
-            sessions_page_overrides_only: false,
-            effort_menu_idx: 0,
-            model_menu_idx: 0,
-            service_tier_menu_idx: 0,
-            profile_menu_idx: 0,
-            provider_menu_idx: 0,
-            routing_menu_idx: 0,
-            routing_spec: None,
-            routing_explain: None,
-            last_routing_control_refresh_at: None,
-            fleet_registry: FleetRegistryConfig::default(),
             fleet_snapshot: None,
             fleet_loading: false,
             fleet_refresh_generation: 0,
@@ -360,24 +262,16 @@ impl Default for UiState {
             selected_fleet_node_id: None,
             selected_fleet_unit_id: None,
             fleet_view_mode: FleetViewMode::default(),
-            session_model_options: Vec::new(),
-            session_model_input: String::new(),
-            session_model_input_hint: None,
-            session_service_tier_input: String::new(),
-            session_service_tier_input_hint: None,
             profile_options: Vec::new(),
             configured_default_profile: None,
             effective_default_profile: None,
-            runtime_default_profile_override: None,
             stats_focus: StatsFocus::Providers,
-            stats_days: 7,
             stats_errors_only: false,
             stats_attention_only: false,
-            selected_stats_station_idx: 0,
+            selected_stats_provider_endpoint_idx: 0,
             selected_stats_provider_idx: 0,
             stats_provider_detail_scroll: 0,
             needs_snapshot_refresh: false,
-            needs_config_refresh: false,
             toast: None,
             codex_history_sessions: Vec::new(),
             codex_history_error: None,
@@ -406,19 +300,10 @@ impl Default for UiState {
             session_transcript_messages: Vec::new(),
             session_transcript_scroll: 0,
             session_transcript_error: None,
-            pending_overwrite_from_codex_confirm_at: None,
             last_runtime_config_loaded_at_ms: None,
             last_runtime_config_source_mtime_ms: None,
-            last_runtime_retry: None,
+            last_retry_summary: None,
             last_runtime_config_refresh_at: None,
-            last_balance_refresh_requested_at: None,
-            balance_refresh_in_flight: false,
-            last_balance_refresh_finished_at: None,
-            last_balance_refresh_message: None,
-            last_balance_refresh_error: None,
-            last_balance_refresh_summary: None,
-            codex_relay_diagnostics: CodexRelayDiagnosticsState::default(),
-            codex_relay_live_smoke: CodexRelayLiveSmokeState::default(),
             should_exit: false,
             stations_table: TableState::default(),
             sessions_table: TableState::default(),
@@ -429,9 +314,8 @@ impl Default for UiState {
             codex_recent_table: TableState::default(),
             fleet_nodes_table: TableState::default(),
             fleet_units_table: TableState::default(),
-            stats_stations_table: TableState::default(),
+            stats_provider_endpoints_table: TableState::default(),
             stats_providers_table: TableState::default(),
-            menu_list: ListState::default(),
             station_info_scroll: 0,
         }
     }
@@ -439,23 +323,14 @@ impl Default for UiState {
 
 impl UiState {
     pub(in crate::tui) fn uses_route_graph_routing(&self) -> bool {
-        self.config_version
-            .is_some_and(|version| version == 3 || is_supported_route_graph_config_version(version))
-    }
-
-    pub(in crate::tui) fn station_page_rows_len(&self, legacy_len: usize) -> usize {
-        if self.uses_route_graph_routing() {
-            return self.routing_provider_count().unwrap_or(legacy_len);
-        }
-        legacy_len
+        self.config_version == Some(CURRENT_CONFIG_VERSION)
     }
 
     pub(in crate::tui) fn clamp_selection(&mut self, snapshot: &Snapshot, providers_len: usize) {
-        let station_page_rows_len = self.station_page_rows_len(providers_len);
         self.selected_station_idx = clamp_table_selection(
             &mut self.stations_table,
             Some(self.selected_station_idx),
-            station_page_rows_len,
+            providers_len,
         )
         .unwrap_or(0);
 
@@ -495,11 +370,11 @@ impl UiState {
         )
         .unwrap_or(0);
 
-        let stats_stations_len = snapshot.usage_day.station_rows.len();
-        self.selected_stats_station_idx = clamp_table_selection(
-            &mut self.stats_stations_table,
-            Some(self.selected_stats_station_idx),
-            stats_stations_len,
+        let stats_provider_endpoints_len = snapshot.usage_day.provider_endpoint_rows.len();
+        self.selected_stats_provider_endpoint_idx = clamp_table_selection(
+            &mut self.stats_provider_endpoints_table,
+            Some(self.selected_stats_provider_endpoint_idx),
+            stats_provider_endpoints_len,
         )
         .unwrap_or(0);
 
@@ -526,7 +401,7 @@ impl UiState {
             &mut self.codex_recent_table,
             &mut self.fleet_nodes_table,
             &mut self.fleet_units_table,
-            &mut self.stats_stations_table,
+            &mut self.stats_provider_endpoints_table,
             &mut self.stats_providers_table,
         ] {
             *table.offset_mut() = 0;
@@ -543,108 +418,6 @@ impl UiState {
             &mut self.stations_table,
             Some(self.selected_station_idx),
             providers_len,
-            visible_rows,
-        )
-        .unwrap_or(0);
-    }
-
-    pub(in crate::tui) fn routing_provider_order(&self) -> Option<Vec<String>> {
-        self.routing_provider_rows()
-            .map(|rows| rows.into_iter().map(|row| row.name).collect())
-    }
-
-    pub(in crate::tui) fn routing_provider_count(&self) -> Option<usize> {
-        self.routing_provider_rows().map(|rows| rows.len())
-    }
-
-    pub(in crate::tui) fn routing_provider_rows(&self) -> Option<Vec<RoutingProviderRow>> {
-        let spec = self.routing_spec.as_ref()?;
-        let catalog = spec
-            .providers
-            .iter()
-            .map(|provider| (provider.name.as_str(), provider))
-            .collect::<HashMap<_, _>>();
-        Some(
-            routing_provider_names(spec)
-                .into_iter()
-                .map(|name| {
-                    let provider = catalog.get(name.as_str()).copied();
-                    RoutingProviderRow {
-                        name,
-                        alias: provider.and_then(|provider| provider.alias.clone()),
-                        enabled: provider.map(|provider| provider.enabled).unwrap_or(false),
-                        tags: provider
-                            .map(|provider| provider.tags.clone())
-                            .unwrap_or_default(),
-                        in_catalog: provider.is_some(),
-                    }
-                })
-                .collect(),
-        )
-    }
-
-    pub(in crate::tui) fn selected_route_graph_provider_name(&self) -> Option<String> {
-        self.selected_route_graph_provider_row()
-            .map(|row| row.name.clone())
-    }
-
-    pub(in crate::tui) fn selected_route_graph_provider_row(&self) -> Option<RoutingProviderRow> {
-        self.routing_provider_rows()?
-            .get(self.selected_station_idx)
-            .cloned()
-    }
-
-    pub(in crate::tui) fn selected_routing_menu_provider_row(&self) -> Option<RoutingProviderRow> {
-        self.routing_provider_rows()?
-            .get(self.routing_menu_idx)
-            .cloned()
-    }
-
-    pub(in crate::tui) fn reordered_routing_provider_order(
-        &self,
-        direction: isize,
-    ) -> Option<(Vec<String>, usize)> {
-        let mut order = self.routing_provider_order()?;
-        if order.is_empty() {
-            return None;
-        }
-        let current_idx = self.routing_menu_idx.min(order.len().saturating_sub(1));
-        let next_idx = current_idx.checked_add_signed(direction)?;
-        if next_idx >= order.len() {
-            return None;
-        }
-        order.swap(current_idx, next_idx);
-        Some((order, next_idx))
-    }
-
-    pub(in crate::tui) fn clamp_routing_menu_selection(&mut self) {
-        self.routing_menu_idx = self
-            .routing_provider_count()
-            .map(|len| self.routing_menu_idx.min(len.saturating_sub(1)))
-            .unwrap_or(0);
-    }
-
-    pub(in crate::tui) fn sync_routing_menu_with_station_selection(&mut self) {
-        self.routing_menu_idx = self.selected_station_idx;
-        if self.routing_provider_count().is_some() {
-            self.clamp_routing_menu_selection();
-        }
-    }
-
-    pub(in crate::tui) fn sync_station_selection_with_routing_menu(&mut self) {
-        self.selected_station_idx = self.routing_menu_idx;
-        self.selected_station_idx = self
-            .routing_provider_count()
-            .map(|len| self.selected_station_idx.min(len.saturating_sub(1)))
-            .unwrap_or(0);
-    }
-
-    pub(in crate::tui) fn sync_route_graph_table_viewport(&mut self, visible_rows: usize) {
-        let len = self.routing_provider_count().unwrap_or(0);
-        self.selected_station_idx = clamp_table_viewport(
-            &mut self.stations_table,
-            Some(self.selected_station_idx),
-            len,
             visible_rows,
         )
         .unwrap_or(0);
@@ -738,9 +511,6 @@ impl UiState {
                 if self.sessions_page_errors_only && row.last_status.is_some_and(|s| s < 400) {
                     return false;
                 }
-                if self.sessions_page_overrides_only && !session_row_has_any_override(row) {
-                    return false;
-                }
                 true
             })
             .take(200)
@@ -796,6 +566,7 @@ impl UiState {
             .filter(|(_, request)| {
                 request_matches_page_filters(
                     request,
+                    snapshot.request_control_evidence.get(&request.id),
                     self.request_page_errors_only,
                     self.request_page_scope_session,
                     focused_sid.as_deref(),
@@ -897,75 +668,6 @@ impl UiState {
         self.selected_codex_history_id = Some(sid);
         self.sync_codex_history_selection();
     }
-
-    #[cfg(test)]
-    pub(in crate::tui) fn usage_balance_provider_rows_len(&self, snapshot: &Snapshot) -> usize {
-        let view = self.usage_balance_view_for_selection(snapshot);
-        self.filtered_usage_balance_provider_rows(&view).len()
-    }
-
-    #[cfg(test)]
-    pub(in crate::tui) fn usage_balance_view_for_selection(
-        &self,
-        snapshot: &Snapshot,
-    ) -> UsageBalanceView {
-        self.usage_balance_view_with_refresh(snapshot, crate::tui::model::now_ms(), {
-            UsageBalanceRefreshInput {
-                refreshing: self.balance_refresh_in_flight,
-                last_message: self.last_balance_refresh_message.clone(),
-                last_error: self.last_balance_refresh_error.clone(),
-                last_provider_refresh: self.last_balance_refresh_summary.clone(),
-            }
-        })
-    }
-
-    #[cfg(test)]
-    pub(in crate::tui) fn usage_balance_view_for_report(
-        &self,
-        snapshot: &Snapshot,
-        generated_at_ms: u64,
-    ) -> UsageBalanceView {
-        self.usage_balance_view_with_refresh(
-            snapshot,
-            generated_at_ms,
-            UsageBalanceRefreshInput::default(),
-        )
-    }
-
-    #[cfg(test)]
-    pub(in crate::tui) fn filtered_usage_balance_provider_rows<'a>(
-        &self,
-        view: &'a UsageBalanceView,
-    ) -> Vec<&'a UsageBalanceProviderRow> {
-        view.provider_rows
-            .iter()
-            .filter(|row| !self.stats_attention_only || row.needs_attention())
-            .collect()
-    }
-
-    #[cfg(test)]
-    pub(in crate::tui) fn selected_usage_balance_provider_row<'a>(
-        &self,
-        view: &'a UsageBalanceView,
-    ) -> Option<&'a UsageBalanceProviderRow> {
-        self.filtered_usage_balance_provider_rows(view)
-            .into_iter()
-            .nth(self.selected_stats_provider_idx)
-    }
-
-    #[cfg(test)]
-    pub(in crate::tui) fn selected_usage_balance_provider_endpoints<'a>(
-        &self,
-        view: &'a UsageBalanceView,
-    ) -> Vec<&'a UsageBalanceEndpointRow> {
-        let Some(provider) = self.selected_usage_balance_provider_row(view) else {
-            return Vec::new();
-        };
-        view.endpoint_rows
-            .iter()
-            .filter(|row| row.provider_id == provider.provider_id)
-            .collect()
-    }
 }
 
 fn clamp_table_selection(
@@ -1050,40 +752,17 @@ pub(in crate::tui) fn adjust_table_selection(
 }
 
 #[cfg(test)]
-impl UiState {
-    fn usage_balance_view_with_refresh(
-        &self,
-        snapshot: &Snapshot,
-        generated_at_ms: u64,
-        refresh: UsageBalanceRefreshInput,
-    ) -> UsageBalanceView {
-        UsageBalanceView::build(UsageBalanceBuildInput {
-            service_name: self.service_name,
-            window_days: self.stats_days,
-            generated_at_ms,
-            usage_rollup: &snapshot.usage_rollup,
-            provider_balances: &snapshot.provider_balances,
-            recent: &snapshot.recent,
-            routing_explain: self.routing_explain.as_ref(),
-            refresh,
-        })
-    }
-}
-
-#[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::collections::HashMap;
     use std::path::PathBuf;
 
     use super::*;
+    use crate::dashboard_core::{OperatorRequestObservability, OperatorRequestSummary};
     use crate::state::{
-        BalanceSnapshotStatus, FinishedRequest, ProviderBalanceSnapshot, SessionObservationScope,
-        UsageBucket, UsageRollupView,
+        BalanceSnapshotStatus, ProviderBalanceSnapshot, SessionObservationScope, UsageBucket,
+        UsageRollupView,
     };
-    use crate::tui::model::RoutingProviderRef;
     use crate::tui::model::SessionRow;
-    use crate::tui::types::StatsFocus;
 
     fn sample_summary(id: &str, path: &str, source: SessionSummarySource) -> SessionSummary {
         SessionSummary {
@@ -1106,14 +785,7 @@ mod tests {
         Snapshot {
             rows: Vec::new(),
             recent: Vec::new(),
-            model_overrides: HashMap::new(),
-            overrides: HashMap::new(),
-            station_overrides: HashMap::new(),
-            route_target_overrides: HashMap::new(),
-            service_tier_overrides: HashMap::new(),
-            global_station_override: None,
-            global_route_target_override: None,
-            station_meta_overrides: HashMap::new(),
+            request_control_evidence: HashMap::new(),
             usage_day: crate::state::UsageDayView::default(),
             usage_rollup: UsageRollupView {
                 by_provider: vec![(
@@ -1128,22 +800,20 @@ mod tests {
             provider_balances: HashMap::from([(
                 "stale-provider".to_string(),
                 vec![ProviderBalanceSnapshot {
-                    provider_id: "stale-provider".to_string(),
-                    upstream_index: Some(7),
+                    observation_provider_id: "stale-observer".to_string(),
+                    provider_endpoint: crate::runtime_identity::ProviderEndpointKey::new(
+                        "codex",
+                        "stale-provider",
+                        "endpoint-7",
+                    ),
                     status: BalanceSnapshotStatus::Stale,
                     error: Some("refresh failed".to_string()),
                     ..ProviderBalanceSnapshot::default()
                 }],
             )]),
-            provider_balance_history: HashMap::new(),
-            station_health: HashMap::new(),
-            health_checks: HashMap::new(),
-            lb_view: HashMap::new(),
-            provider_endpoint_policy_actions: HashMap::new(),
             stats_5m: crate::dashboard_core::WindowStats::default(),
             stats_1h: crate::dashboard_core::WindowStats::default(),
             service_status: None,
-            pricing_catalog: crate::pricing::ModelPriceCatalogSnapshot::default(),
             refreshed_at: std::time::Instant::now(),
         }
     }
@@ -1151,6 +821,7 @@ mod tests {
     fn empty_session_row(id: &str) -> SessionRow {
         SessionRow {
             session_id: Some(id.to_string()),
+            local_session_id: None,
             observation_scope: SessionObservationScope::ObservedOnly,
             host_local_transcript_path: None,
             last_client_name: None,
@@ -1167,8 +838,6 @@ mod tests {
             last_reasoning_effort: None,
             last_service_tier: None,
             last_provider_id: None,
-            last_station_name: None,
-            last_upstream_base_url: None,
             last_usage: None,
             total_usage: None,
             turns_total: None,
@@ -1182,36 +851,43 @@ mod tests {
             effective_model: None,
             effective_reasoning_effort: None,
             effective_service_tier: None,
-            effective_station: None,
-            effective_upstream_base_url: None,
-            override_model: None,
-            override_effort: None,
-            override_station_name: None,
-            override_route_target: None,
-            override_service_tier: None,
         }
     }
 
-    fn finished_request(id: u64, session_id: Option<&str>, status_code: u16) -> FinishedRequest {
-        FinishedRequest {
+    fn operator_request(
+        id: u64,
+        session_id: Option<&str>,
+        status_code: u16,
+    ) -> OperatorRequestSummary {
+        OperatorRequestSummary {
             id,
-            trace_id: None,
-            session_id: session_id.map(ToOwned::to_owned),
-            session_identity_source: None,
-            client_name: None,
-            client_addr: None,
-            cwd: None,
+            session_key: session_id.map(ToOwned::to_owned),
             model: None,
             reasoning_effort: None,
             service_tier: None,
-            upstream_base_url: None,
-            route_decision: None,
+            provider_id: None,
+            endpoint_id: None,
+            provider_endpoint_key: None,
+            route_path: Vec::new(),
+            upstream_origin: None,
             usage: None,
             cost: crate::pricing::CostBreakdown::default(),
             retry: None,
-            provider_signals: Vec::new(),
-            policy_actions: Vec::new(),
-            observability: crate::state::RequestObservability::default(),
+            provider_signal_codes: Vec::new(),
+            policy_action_codes: Vec::new(),
+            observability: OperatorRequestObservability {
+                duration_ms: Some(10),
+                ttfb_ms: None,
+                generation_ms: None,
+                output_tokens_per_second: None,
+                attempt_count: 1,
+                route_attempt_count: 0,
+                retried: false,
+                cross_provider_failover: false,
+                same_provider_retry: false,
+                fast_mode: false,
+                streaming: false,
+            },
             service: "codex".to_string(),
             method: "POST".to_string(),
             path: "/v1/responses".to_string(),
@@ -1220,8 +896,6 @@ mod tests {
             ttfb_ms: None,
             streaming: false,
             ended_at_ms: id,
-            provider_id: None,
-            station_name: None,
         }
     }
 
@@ -1327,8 +1001,8 @@ mod tests {
     fn sync_request_page_selection_clamps_filtered_selection() {
         let snapshot = Snapshot {
             recent: vec![
-                finished_request(1, Some("sid"), 200),
-                finished_request(2, Some("sid"), 500),
+                operator_request(1, Some("sid"), 200),
+                operator_request(2, Some("sid"), 500),
             ],
             ..sample_usage_snapshot()
         };
@@ -1401,160 +1075,18 @@ mod tests {
     }
 
     #[test]
-    fn route_graph_routing_detection_includes_current_v5_schema() {
+    fn route_graph_routing_detection_only_accepts_current_v5_schema() {
         let mut ui = UiState {
-            config_version: Some(crate::config::CURRENT_ROUTE_GRAPH_CONFIG_VERSION),
+            config_version: Some(crate::config::CURRENT_CONFIG_VERSION),
             ..UiState::default()
         };
         assert!(ui.uses_route_graph_routing());
 
+        ui.config_version = Some(3);
+        assert!(!ui.uses_route_graph_routing());
+
         ui.config_version = Some(2);
         assert!(!ui.uses_route_graph_routing());
-    }
-
-    fn sample_route_graph_spec() -> RoutingSpecView {
-        RoutingSpecView {
-            entry: "main".to_string(),
-            routes: BTreeMap::new(),
-            policy: crate::config::RoutingPolicyV4::OrderedFailover,
-            order: vec!["backup".to_string()],
-            target: None,
-            prefer_tags: Vec::new(),
-            chain: Vec::new(),
-            pools: BTreeMap::new(),
-            on_exhausted: crate::config::RoutingExhaustedActionV4::Continue,
-            entry_strategy: crate::config::RoutingPolicyV4::OrderedFailover,
-            expanded_order: vec!["backup".to_string(), "input".to_string()],
-            entry_target: None,
-            providers: vec![
-                RoutingProviderRef {
-                    name: "input".to_string(),
-                    alias: None,
-                    enabled: true,
-                    tags: BTreeMap::new(),
-                },
-                RoutingProviderRef {
-                    name: "backup".to_string(),
-                    alias: None,
-                    enabled: true,
-                    tags: BTreeMap::new(),
-                },
-            ],
-        }
-    }
-
-    #[test]
-    fn route_graph_selection_tracks_provider_order_and_menu_sync() {
-        let spec = sample_route_graph_spec();
-        let mut ui = UiState {
-            config_version: Some(crate::config::CURRENT_ROUTE_GRAPH_CONFIG_VERSION),
-            routing_spec: Some(spec),
-            selected_station_idx: 1,
-            routing_menu_idx: 0,
-            ..UiState::default()
-        };
-
-        assert_eq!(
-            ui.routing_provider_order(),
-            Some(vec!["backup".to_string(), "input".to_string()])
-        );
-        let rows = ui.routing_provider_rows().expect("routing rows");
-        assert_eq!(
-            rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
-            vec!["backup", "input"]
-        );
-        assert_eq!(rows[1].display_label(), "input");
-        assert_eq!(
-            ui.selected_route_graph_provider_name().as_deref(),
-            Some("input")
-        );
-
-        ui.sync_routing_menu_with_station_selection();
-        assert_eq!(ui.routing_menu_idx, 1);
-        assert_eq!(
-            ui.selected_routing_menu_provider_row().map(|row| row.name),
-            Some("input".to_string())
-        );
-
-        ui.routing_menu_idx = 0;
-        ui.sync_station_selection_with_routing_menu();
-        assert_eq!(ui.selected_station_idx, 0);
-        assert_eq!(
-            ui.selected_route_graph_provider_name().as_deref(),
-            Some("backup")
-        );
-    }
-
-    #[test]
-    fn route_graph_selection_clamps_after_refresh_and_stays_on_row_model() {
-        let mut spec = sample_route_graph_spec();
-        spec.expanded_order = vec!["backup".to_string()];
-        spec.providers
-            .retain(|provider| provider.name.as_str() == "backup");
-        let mut ui = UiState {
-            config_version: Some(crate::config::CURRENT_ROUTE_GRAPH_CONFIG_VERSION),
-            routing_spec: Some(spec),
-            selected_station_idx: 9,
-            routing_menu_idx: 9,
-            ..UiState::default()
-        };
-        let snapshot = sample_usage_snapshot();
-
-        ui.clamp_selection(&snapshot, 2);
-        ui.clamp_routing_menu_selection();
-
-        assert_eq!(ui.selected_station_idx, 0);
-        assert_eq!(ui.routing_menu_idx, 0);
-        assert_eq!(
-            ui.selected_route_graph_provider_row()
-                .map(|row| (row.name, row.in_catalog)),
-            Some(("backup".to_string(), true))
-        );
-        assert_eq!(
-            ui.selected_routing_menu_provider_row()
-                .map(|row| (row.name, row.in_catalog)),
-            Some(("backup".to_string(), true))
-        );
-    }
-
-    #[test]
-    fn route_graph_reorder_helper_returns_order_and_new_menu_selection() {
-        let spec = sample_route_graph_spec();
-        let ui = UiState {
-            config_version: Some(crate::config::CURRENT_ROUTE_GRAPH_CONFIG_VERSION),
-            routing_spec: Some(spec),
-            routing_menu_idx: 1,
-            ..UiState::default()
-        };
-
-        let (order, next_idx) = ui
-            .reordered_routing_provider_order(-1)
-            .expect("selected row can move up");
-
-        assert_eq!(order, vec!["input".to_string(), "backup".to_string()]);
-        assert_eq!(next_idx, 0);
-        assert!(ui.reordered_routing_provider_order(1).is_none());
-    }
-
-    #[test]
-    fn route_graph_viewport_clamp_keeps_selected_detail_row_aligned() {
-        let spec = sample_route_graph_spec();
-        let mut ui = UiState {
-            config_version: Some(crate::config::CURRENT_ROUTE_GRAPH_CONFIG_VERSION),
-            routing_spec: Some(spec),
-            selected_station_idx: 8,
-            stations_table: TableState::default().with_offset(8).with_selected(Some(8)),
-            ..UiState::default()
-        };
-
-        ui.sync_route_graph_table_viewport(1);
-
-        assert_eq!(ui.selected_station_idx, 1);
-        assert_eq!(ui.stations_table.selected(), Some(1));
-        assert_eq!(
-            ui.selected_route_graph_provider_row().map(|row| row.name),
-            Some("input".to_string())
-        );
     }
 
     #[test]
@@ -1571,45 +1103,5 @@ mod tests {
         assert_eq!(ui.stations_table.offset(), 0);
         assert_eq!(ui.sessions_table.selected(), Some(4));
         assert_eq!(ui.sessions_table.offset(), 0);
-    }
-
-    #[test]
-    fn usage_balance_selection_uses_same_filtered_provider_rows_as_table() {
-        let snapshot = sample_usage_snapshot();
-        let ui = UiState {
-            stats_focus: StatsFocus::Providers,
-            stats_attention_only: true,
-            selected_stats_provider_idx: 0,
-            ..UiState::default()
-        };
-
-        let view = ui.usage_balance_view_for_report(&snapshot, 123);
-        let rows = ui.filtered_usage_balance_provider_rows(&view);
-        let selected = ui
-            .selected_usage_balance_provider_row(&view)
-            .expect("selected provider");
-
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].provider_id, "stale-provider");
-        assert_eq!(selected.provider_id, "stale-provider");
-        assert_eq!(ui.usage_balance_provider_rows_len(&snapshot), 1);
-    }
-
-    #[test]
-    fn usage_balance_selected_endpoints_follow_filtered_provider_selection() {
-        let snapshot = sample_usage_snapshot();
-        let ui = UiState {
-            stats_focus: StatsFocus::Providers,
-            stats_attention_only: true,
-            selected_stats_provider_idx: 0,
-            ..UiState::default()
-        };
-
-        let view = ui.usage_balance_view_for_report(&snapshot, 123);
-        let endpoints = ui.selected_usage_balance_provider_endpoints(&view);
-
-        assert_eq!(endpoints.len(), 1);
-        assert_eq!(endpoints[0].provider_id, "stale-provider");
-        assert_eq!(endpoints[0].endpoint_id, "upstream#7");
     }
 }

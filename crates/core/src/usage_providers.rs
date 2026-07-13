@@ -6,22 +6,24 @@ use anyhow::{Context, Result};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
 use crate::balance::{
     BalanceSnapshotStatus, ProviderBalanceSnapshot, ProviderUsageAlert, ProviderUsageAlertKind,
     ProviderUsageModelStat, ProviderUsageRateSnapshot, ProviderUsageWindow,
 };
-use crate::config::{ProxyConfig, ServiceConfigManager, proxy_home_dir};
-use crate::lb::LbState;
-use crate::policy_actions::{PolicyAction, PolicyActionKind};
-use crate::pricing::UsdAmount;
-use crate::provider_signals::{
-    ProviderSignal, ProviderSignalKind, ProviderSignalSource, ProviderSignalTarget,
+use crate::config::{
+    HelperConfig, ProviderConfig, ProviderEndpointConfig, ServiceRouteConfig, UpstreamAuth,
+    proxy_home_dir,
 };
-use crate::runtime_identity::ProviderEndpointKey;
+use crate::pricing::UsdAmount;
+use crate::runtime_identity::{ProviderEndpointKey, RuntimeUpstreamIdentity};
+use crate::runtime_store::{
+    ProviderObservation, ProviderObservationAuthority, ProviderObservationReservation,
+    ProviderObservationScope, ProviderPolicyEffect,
+};
 use crate::state::ProxyState;
-use crate::usage_forecast::next_reset_at_ms;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -84,17 +86,15 @@ impl ProviderKind {
 
     fn default_endpoint(&self) -> Option<&'static str> {
         match self {
-            ProviderKind::OpenAiBalanceHttpJson => Some("{{base_url}}/user/balance"),
-            ProviderKind::Sub2ApiUsage => Some("{{base_url}}/v1/usage"),
-            ProviderKind::Sub2ApiAuthMe => Some("{{base_url}}/api/v1/auth/me"),
-            ProviderKind::NewApiTokenUsage => Some("{{base_url}}/api/usage/token/"),
-            ProviderKind::NewApiUserSelf => Some("{{base_url}}/api/user/self"),
+            ProviderKind::OpenAiBalanceHttpJson => Some("/user/balance"),
+            ProviderKind::Sub2ApiUsage => Some("/v1/usage"),
+            ProviderKind::Sub2ApiAuthMe => Some("/api/v1/auth/me"),
+            ProviderKind::NewApiTokenUsage => Some("/api/usage/token/"),
+            ProviderKind::NewApiUserSelf => Some("/api/user/self"),
             ProviderKind::RightCodeAccountSummary => {
                 Some("https://www.right.codes/account/summary")
             }
-            ProviderKind::OpenAiOrganizationCosts => {
-                Some("{{base_url}}/v1/organization/costs?start_time={{unix_days_ago:30}}&limit=30")
-            }
+            ProviderKind::OpenAiOrganizationCosts => Some("/v1/organization/costs"),
             _ => None,
         }
     }
@@ -144,6 +144,7 @@ impl UsageProviderExtractConfig {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct UsageProviderConfig {
     id: String,
     kind: ProviderKind,
@@ -154,6 +155,8 @@ struct UsageProviderConfig {
     token_env: Option<String>,
     #[serde(default, skip_serializing_if = "bool_is_false")]
     require_token_env: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    new_api_user_id_env: Option<String>,
     #[serde(default)]
     poll_interval_secs: Option<u64>,
     #[serde(
@@ -166,38 +169,42 @@ struct UsageProviderConfig {
         skip_serializing_if = "bool_is_true"
     )]
     trust_exhaustion_for_routing: bool,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    headers: BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    variables: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "UsageProviderExtractConfig::is_empty")]
     extract: UsageProviderExtractConfig,
 }
 
 #[derive(Debug, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
 struct UsageProvidersFile {
     #[serde(default)]
     providers: Vec<UsageProviderConfig>,
 }
 
 #[derive(Debug, Clone)]
-struct UpstreamRef {
-    station_name: String,
-    index: usize,
-    provider_endpoint: Option<ProviderEndpointKey>,
+struct UsageProviderEndpointRef {
+    provider_endpoint: ProviderEndpointKey,
+    catalog_index: usize,
 }
 
 #[derive(Debug, Clone)]
 struct UsageProviderTarget {
-    upstream: UpstreamRef,
+    endpoint: UsageProviderEndpointRef,
     base_url: String,
-    provider_id: Option<String>,
+    auth: UpstreamAuth,
+    tags: BTreeMap<String, String>,
+    supported_models: BTreeMap<String, bool>,
+    model_mapping: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-struct UsageProviderTargetKey {
-    station_name: String,
-    upstream_index: usize,
+impl UsageProviderTarget {
+    fn runtime_identity(&self) -> RuntimeUpstreamIdentity {
+        RuntimeUpstreamIdentity::new_with_auth(
+            self.endpoint.provider_endpoint.clone(),
+            self.base_url.clone(),
+            self.tags.get("continuity_domain").cloned(),
+            &self.auth,
+        )
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -230,8 +237,6 @@ struct RefreshProviderTargetParams<'a> {
     client: &'a Client,
     provider: &'a UsageProviderConfig,
     target: &'a UsageProviderTarget,
-    cfg: &'a ProxyConfig,
-    lb_states: &'a Arc<Mutex<HashMap<String, LbState>>>,
     state: &'a Arc<ProxyState>,
     service_name: &'a str,
     interval_secs: u64,
@@ -260,9 +265,13 @@ const AUTO_PROBE_KIND_FAILURE_TTL: Duration = Duration::from_secs(10 * 60);
 const USAGE_PROVIDER_TERMINAL_FAILURE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const USAGE_PROVIDER_EXHAUSTED_SUPPRESSION_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const USAGE_PROVIDER_DAILY_RESET_SUPPRESSION_GRACE: Duration = Duration::from_secs(5 * 60);
+const DAILY_QUOTA_RESET_TIME: &str = "00:00";
+const DAILY_QUOTA_RESET_UTC_OFFSET: &str = "+08:00";
+const MINUTE_MS: u64 = 60_000;
+const HOUR_MS: u64 = 60 * MINUTE_MS;
+const DAY_MS: u64 = 24 * HOUR_MS;
 const LOW_BALANCE_ALERT_THRESHOLD_USD: &str = "10";
 const EXPIRING_SOON_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
-const AUTO_PROVIDER_ID_PREFIX: &str = "auto:balance:";
 const AUTO_PROBE_KINDS: [ProviderKind; 5] = [
     ProviderKind::RightCodeAccountSummary,
     ProviderKind::Sub2ApiUsage,
@@ -288,21 +297,17 @@ struct ProviderTargetSuppressionKey {
 struct ProviderTargetSuppression {
     until: Instant,
     reason: String,
-    routing_exhausted: bool,
 }
 
 #[derive(Debug, Clone)]
 struct ProviderTargetSuppressionDecision {
     reason: String,
-    routing_exhausted: bool,
     ttl: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct AutoProbeTargetKey {
-    station_name: String,
-    upstream_index: usize,
-    provider_endpoint_key: Option<String>,
+    provider_endpoint: ProviderEndpointKey,
     base_url: String,
 }
 
@@ -393,10 +398,110 @@ fn usage_providers_path() -> std::path::PathBuf {
     proxy_home_dir().join("usage_providers.json")
 }
 
-fn service_manager<'a>(cfg: &'a ProxyConfig, service_name: &str) -> &'a ServiceConfigManager {
+fn service_route_config<'a>(cfg: &'a HelperConfig, service_name: &str) -> &'a ServiceRouteConfig {
     match service_name {
         "claude" => &cfg.claude,
         _ => &cfg.codex,
+    }
+}
+
+#[derive(Debug)]
+struct ProviderEndpointCatalogEntry<'a> {
+    endpoint_id: String,
+    base_url: String,
+    priority: u32,
+    endpoint: Option<&'a ProviderEndpointConfig>,
+}
+
+fn provider_endpoint_catalog(provider: &ProviderConfig) -> Vec<ProviderEndpointCatalogEntry<'_>> {
+    let mut endpoints = Vec::new();
+    if let Some(base_url) = provider
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|base_url| !base_url.is_empty())
+    {
+        endpoints.push(ProviderEndpointCatalogEntry {
+            endpoint_id: "default".to_string(),
+            base_url: base_url.to_string(),
+            priority: 0,
+            endpoint: None,
+        });
+    }
+    endpoints.extend(
+        provider
+            .endpoints
+            .iter()
+            .filter(|(_, endpoint)| endpoint.enabled && !endpoint.base_url.trim().is_empty())
+            .map(|(endpoint_id, endpoint)| ProviderEndpointCatalogEntry {
+                endpoint_id: endpoint_id.clone(),
+                base_url: endpoint.base_url.trim().to_string(),
+                priority: endpoint.priority,
+                endpoint: Some(endpoint),
+            }),
+    );
+    endpoints.sort_by(|left, right| {
+        left.priority
+            .cmp(&right.priority)
+            .then_with(|| left.endpoint_id.cmp(&right.endpoint_id))
+            .then_with(|| left.base_url.cmp(&right.base_url))
+    });
+    endpoints
+}
+
+fn usage_provider_target(
+    service_name: &str,
+    provider_id: &str,
+    provider: &ProviderConfig,
+    catalog_index: usize,
+    endpoint: ProviderEndpointCatalogEntry<'_>,
+) -> UsageProviderTarget {
+    let mut tags = provider.tags.clone();
+    if let Some(endpoint) = endpoint.endpoint {
+        tags.extend(endpoint.tags.clone());
+    }
+    tags.insert("provider_id".to_string(), provider_id.to_string());
+    tags.insert("endpoint_id".to_string(), endpoint.endpoint_id.clone());
+
+    let endpoint_continuity_domain = endpoint
+        .endpoint
+        .and_then(|endpoint| endpoint.continuity_domain.as_ref())
+        .or(provider.continuity_domain.as_ref())
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty());
+    if let Some(value) = endpoint_continuity_domain {
+        tags.insert("continuity_domain".to_string(), value.to_string());
+    }
+    if let Some(value) = provider
+        .continuity_domain
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        tags.insert("provider_continuity_domain".to_string(), value.to_string());
+    }
+
+    let mut supported_models = provider.supported_models.clone();
+    let mut model_mapping = provider.model_mapping.clone();
+    if let Some(endpoint) = endpoint.endpoint {
+        supported_models.extend(endpoint.supported_models.clone());
+        model_mapping.extend(endpoint.model_mapping.clone());
+    }
+
+    UsageProviderTarget {
+        endpoint: UsageProviderEndpointRef {
+            provider_endpoint: ProviderEndpointKey::new(
+                service_name,
+                provider_id,
+                endpoint.endpoint_id,
+            ),
+            catalog_index,
+        },
+        base_url: endpoint.base_url,
+        auth: provider.effective_auth(),
+        tags,
+        supported_models,
+        model_mapping,
     }
 }
 
@@ -414,11 +519,10 @@ fn default_provider_config(
         endpoint: endpoint.to_string(),
         token_env: None,
         require_token_env: false,
+        new_api_user_id_env: None,
         poll_interval_secs: Some(DEFAULT_POLL_INTERVAL_SECS),
         refresh_on_request: true,
         trust_exhaustion_for_routing: true,
-        headers: BTreeMap::new(),
-        variables: BTreeMap::new(),
         extract,
     }
 }
@@ -455,41 +559,8 @@ fn is_rightcode_base_url(base_url: &str) -> bool {
     )
 }
 
-fn provider_id_component(value: &str) -> String {
-    let component = value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
-                ch
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string();
-    if component.is_empty() {
-        "station".to_string()
-    } else {
-        component
-    }
-}
-
 fn auto_provider_id(target: &UsageProviderTarget) -> String {
-    if let Some(provider_id) = target
-        .provider_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return provider_id.to_string();
-    }
-    format!(
-        "{}{}:{}",
-        AUTO_PROVIDER_ID_PREFIX,
-        provider_id_component(&target.upstream.station_name),
-        target.upstream.index
-    )
+    target.endpoint.provider_endpoint.provider_id.clone()
 }
 
 fn auto_usage_provider(target: &UsageProviderTarget, kind: ProviderKind) -> UsageProviderConfig {
@@ -502,11 +573,10 @@ fn auto_usage_provider(target: &UsageProviderTarget, kind: ProviderKind) -> Usag
         endpoint: String::new(),
         token_env: None,
         require_token_env: false,
+        new_api_user_id_env: None,
         poll_interval_secs: Some(DEFAULT_POLL_INTERVAL_SECS),
         refresh_on_request: true,
         trust_exhaustion_for_routing: true,
-        headers: BTreeMap::new(),
-        variables: BTreeMap::new(),
         extract: UsageProviderExtractConfig::default(),
     };
     if matches!(kind, ProviderKind::RightCodeAccountSummary) {
@@ -535,13 +605,7 @@ fn first_auto_probe_kind(target: &UsageProviderTarget) -> ProviderKind {
 
 fn auto_probe_target_key(target: &UsageProviderTarget) -> AutoProbeTargetKey {
     AutoProbeTargetKey {
-        station_name: target.upstream.station_name.clone(),
-        upstream_index: target.upstream.index,
-        provider_endpoint_key: target
-            .upstream
-            .provider_endpoint
-            .as_ref()
-            .map(ProviderEndpointKey::stable_key),
+        provider_endpoint: target.endpoint.provider_endpoint.clone(),
         base_url: normalized_balance_base_url(&target.base_url)
             .unwrap_or_else(|| target.base_url.clone()),
     }
@@ -672,7 +736,6 @@ fn remember_usage_provider_target_suppression(
     target: &UsageProviderTarget,
     ttl: Duration,
     reason: impl Into<String>,
-    routing_exhausted: bool,
     now: Instant,
 ) {
     if let Ok(mut suppressions) = USAGE_PROVIDER_TARGET_SUPPRESSIONS
@@ -684,7 +747,6 @@ fn remember_usage_provider_target_suppression(
             ProviderTargetSuppression {
                 until: now + ttl,
                 reason: reason.into(),
-                routing_exhausted,
             },
         );
     }
@@ -727,16 +789,6 @@ fn usage_provider_target_suppression_active(
         suppressions.remove(&key);
         None
     }
-}
-
-fn usage_provider_target_suppression_remaining_ttl(
-    suppression: &ProviderTargetSuppression,
-    now: Instant,
-) -> Option<Duration> {
-    suppression
-        .until
-        .checked_duration_since(now)
-        .filter(|ttl| !ttl.is_zero())
 }
 
 fn usage_provider_suppression_reason_is_refreshable_window(reason: &str) -> bool {
@@ -791,7 +843,7 @@ fn default_providers() -> UsageProvidersFile {
         "openai-official-costs",
         ProviderKind::OpenAiOrganizationCosts,
         vec!["api.openai.com"],
-        "https://api.openai.com/v1/organization/costs?start_time={{unix_days_ago:30}}&limit=30",
+        "https://api.openai.com/v1/organization/costs",
         UsageProviderExtractConfig::default(),
     );
     openai_official.token_env = Some("OPENAI_ADMIN_KEY".to_string());
@@ -835,7 +887,7 @@ fn default_providers() -> UsageProvidersFile {
                 "siliconflow",
                 ProviderKind::OpenAiBalanceHttpJson,
                 vec!["api.siliconflow.cn", "api.siliconflow.com"],
-                "{{base_url}}/v1/user/info",
+                "/v1/user/info",
                 UsageProviderExtractConfig::default(),
             ),
             default_provider_config(
@@ -857,23 +909,42 @@ fn default_providers() -> UsageProvidersFile {
     }
 }
 
-fn load_providers() -> UsageProvidersFile {
-    let path = usage_providers_path();
-    if let Ok(text) = std::fs::read_to_string(&path)
-        && let Ok(file) = serde_json::from_str::<UsageProvidersFile>(&text)
-    {
-        return file;
-    }
-
-    // 写入默认配置，方便用户查看/修改。
-    let default = default_providers();
-    if let Ok(text) = serde_json::to_string_pretty(&default) {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+fn load_providers_from_path(path: &std::path::Path) -> Result<UsageProvidersFile> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(default_providers());
         }
-        let _ = std::fs::write(&path, text);
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to read usage provider configuration {}",
+                    path.display()
+                )
+            });
+        }
+    };
+
+    let file: UsageProvidersFile = serde_json::from_str(&text).with_context(|| {
+        format!(
+            "failed to parse usage provider configuration {}",
+            path.display()
+        )
+    })?;
+    for provider in &file.providers {
+        validate_usage_provider_config(provider).with_context(|| {
+            format!(
+                "invalid usage provider '{}' in {}",
+                provider.id,
+                path.display()
+            )
+        })?;
     }
-    default
+    Ok(file)
+}
+
+fn load_providers() -> Result<UsageProvidersFile> {
+    load_providers_from_path(&usage_providers_path())
 }
 
 fn domain_matches(base_url: &str, domains: &[String]) -> bool {
@@ -896,77 +967,46 @@ fn domain_matches(base_url: &str, domains: &[String]) -> bool {
 }
 
 fn matching_provider_targets(
-    cfg: &ProxyConfig,
+    cfg: &HelperConfig,
     service_name: &str,
     provider: &UsageProviderConfig,
-    station_name_filter: Option<&str>,
+    route_provider_id_filter: Option<&str>,
 ) -> Vec<UsageProviderTarget> {
-    let mut stations: Vec<_> = service_manager(cfg, service_name)
-        .stations()
-        .iter()
-        .collect();
-    stations.sort_by_key(|(name, _)| name.as_str());
-
-    let mut targets = Vec::new();
-    for (station_name, service) in stations {
-        if station_name_filter.is_some_and(|filter| filter != station_name.as_str()) {
-            continue;
-        }
-        for (index, upstream) in service.upstreams.iter().enumerate() {
-            if domain_matches(&upstream.base_url, &provider.domains) {
-                targets.push(UsageProviderTarget {
-                    upstream: UpstreamRef {
-                        station_name: station_name.clone(),
-                        index,
-                        provider_endpoint: upstream.provider_endpoint_key(service_name),
-                    },
-                    base_url: upstream.base_url.clone(),
-                    provider_id: upstream.tags.get("provider_id").cloned(),
-                });
-            }
-        }
-    }
-
-    targets
+    usage_provider_targets(cfg, service_name, route_provider_id_filter)
+        .into_iter()
+        .filter(|target| domain_matches(&target.base_url, &provider.domains))
+        .collect()
 }
 
 fn usage_provider_targets(
-    cfg: &ProxyConfig,
+    cfg: &HelperConfig,
     service_name: &str,
-    station_name_filter: Option<&str>,
+    route_provider_id_filter: Option<&str>,
 ) -> Vec<UsageProviderTarget> {
-    let mut stations: Vec<_> = service_manager(cfg, service_name)
-        .stations()
-        .iter()
-        .collect();
-    stations.sort_by_key(|(name, _)| name.as_str());
-
     let mut targets = Vec::new();
-    for (station_name, service) in stations {
-        if station_name_filter.is_some_and(|filter| filter != station_name.as_str()) {
+    for (provider_id, provider) in &service_route_config(cfg, service_name).providers {
+        if !provider.enabled
+            || route_provider_id_filter.is_some_and(|filter| filter != provider_id.as_str())
+        {
             continue;
         }
-        for (index, upstream) in service.upstreams.iter().enumerate() {
-            targets.push(UsageProviderTarget {
-                upstream: UpstreamRef {
-                    station_name: station_name.clone(),
-                    index,
-                    provider_endpoint: upstream.provider_endpoint_key(service_name),
-                },
-                base_url: upstream.base_url.clone(),
-                provider_id: upstream.tags.get("provider_id").cloned(),
-            });
+        for (catalog_index, endpoint) in provider_endpoint_catalog(provider).into_iter().enumerate()
+        {
+            targets.push(usage_provider_target(
+                service_name,
+                provider_id,
+                provider,
+                catalog_index,
+                endpoint,
+            ));
         }
     }
 
     targets
 }
 
-fn target_key(target: &UsageProviderTarget) -> UsageProviderTargetKey {
-    UsageProviderTargetKey {
-        station_name: target.upstream.station_name.clone(),
-        upstream_index: target.upstream.index,
-    }
+fn target_key(target: &UsageProviderTarget) -> ProviderEndpointKey {
+    target.endpoint.provider_endpoint.clone()
 }
 
 fn enqueue_request_balance_refresh(key: ProviderEndpointKey) -> Option<Duration> {
@@ -1026,78 +1066,32 @@ pub fn request_balance_refresh_queued_for_provider_endpoint(
 }
 
 fn usage_provider_target_for_provider_endpoint(
-    cfg: &ProxyConfig,
+    cfg: &HelperConfig,
     service_name: &str,
     provider_endpoint: &ProviderEndpointKey,
 ) -> Option<UsageProviderTarget> {
-    service_manager(cfg, service_name)
-        .stations()
-        .iter()
-        .filter_map(|(station_name, service)| {
-            service
-                .upstreams
-                .iter()
-                .enumerate()
-                .find_map(|(index, upstream)| {
-                    let upstream_endpoint = upstream.provider_endpoint_key(service_name)?;
-                    if upstream_endpoint != *provider_endpoint {
-                        return None;
-                    }
-                    Some(UsageProviderTarget {
-                        upstream: UpstreamRef {
-                            station_name: station_name.clone(),
-                            index,
-                            provider_endpoint: Some(upstream_endpoint),
-                        },
-                        base_url: upstream.base_url.clone(),
-                        provider_id: upstream.tags.get("provider_id").cloned(),
-                    })
-                })
-        })
-        .next()
-}
-
-trait UsageProviderUpstreamIdentityExt {
-    fn provider_endpoint_key(&self, service_name: &str) -> Option<ProviderEndpointKey>;
-}
-
-impl UsageProviderUpstreamIdentityExt for crate::config::UpstreamConfig {
-    fn provider_endpoint_key(&self, service_name: &str) -> Option<ProviderEndpointKey> {
-        let provider_id = self.tags.get("provider_id")?.trim();
-        let endpoint_id = self.tags.get("endpoint_id")?.trim();
-        if provider_id.is_empty() || endpoint_id.is_empty() {
-            return None;
-        }
-        Some(ProviderEndpointKey::new(
-            service_name.to_string(),
-            provider_id.to_string(),
-            endpoint_id.to_string(),
-        ))
-    }
+    usage_provider_targets(cfg, service_name, Some(&provider_endpoint.provider_id))
+        .into_iter()
+        .find(|target| target.endpoint.provider_endpoint == *provider_endpoint)
 }
 
 #[cfg(test)]
 fn configured_target_keys(
-    cfg: &ProxyConfig,
+    cfg: &HelperConfig,
     service_name: &str,
     providers: &[UsageProviderConfig],
-    station_name_filter: Option<&str>,
-) -> HashSet<UsageProviderTargetKey> {
+    route_provider_id_filter: Option<&str>,
+) -> HashSet<ProviderEndpointKey> {
     providers
         .iter()
         .flat_map(|provider| {
-            matching_provider_targets(cfg, service_name, provider, station_name_filter)
+            matching_provider_targets(cfg, service_name, provider, route_provider_id_filter)
         })
         .map(|target| target_key(&target))
         .collect()
 }
 
-fn resolve_token(
-    provider: &UsageProviderConfig,
-    upstreams: &[UpstreamRef],
-    cfg: &ProxyConfig,
-    service_name: &str,
-) -> Option<String> {
+fn resolve_token(provider: &UsageProviderConfig, target: &UsageProviderTarget) -> Option<String> {
     // 优先: token_env 环境变量
     if let Some(env_name) = &provider.token_env
         && let Ok(v) = std::env::var(env_name)
@@ -1110,20 +1104,59 @@ fn resolve_token(
         return None;
     }
 
-    // 否则: 使用绑定 upstream 的 auth_token（当前 Codex 正在使用的 token）
-    for uref in upstreams {
-        if let Some(service) = service_manager(cfg, service_name).station(&uref.station_name)
-            && let Some(up) = service.upstreams.get(uref.index)
-        {
-            if let Some(token) = up.auth.resolve_auth_token() {
-                return Some(token);
-            }
-            if let Some(token) = up.auth.resolve_api_key() {
-                return Some(token);
-            }
-        }
+    if let Some(token) = target.auth.resolve_auth_token() {
+        return Some(token);
     }
-    None
+    target.auth.resolve_api_key()
+}
+
+fn new_api_user_id_env_name(provider: &UsageProviderConfig) -> Result<Option<&str>> {
+    let Some(env_name) = provider.new_api_user_id_env.as_deref() else {
+        return Ok(None);
+    };
+    if !matches!(provider.kind, ProviderKind::NewApiUserSelf) {
+        anyhow::bail!(
+            "usage provider '{}' may set new_api_user_id_env only for kind new_api_user_self",
+            provider.id
+        );
+    }
+    let env_name = env_name.trim();
+    if env_name.is_empty() {
+        anyhow::bail!(
+            "usage provider '{}' new_api_user_id_env must name an environment variable",
+            provider.id
+        );
+    }
+    Ok(Some(env_name))
+}
+
+fn validate_usage_provider_config(provider: &UsageProviderConfig) -> Result<()> {
+    new_api_user_id_env_name(provider)?;
+    Ok(())
+}
+
+fn resolve_new_api_user_id_with(
+    provider: &UsageProviderConfig,
+    read_env: impl FnOnce(&str) -> Option<String>,
+) -> Result<Option<String>> {
+    let Some(env_name) = new_api_user_id_env_name(provider)? else {
+        return Ok(None);
+    };
+    let user_id = read_env(env_name)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "usage provider '{}' requires New-Api-User from environment variable '{}'",
+                provider.id,
+                env_name
+            )
+        })?;
+    Ok(Some(user_id))
+}
+
+fn resolve_new_api_user_id(provider: &UsageProviderConfig) -> Result<Option<String>> {
+    resolve_new_api_user_id_with(provider, |env_name| std::env::var(env_name).ok())
 }
 
 fn normalized_balance_base_url(base_url: &str) -> Option<String> {
@@ -1179,63 +1212,95 @@ fn path_prefixes_match(provider_prefixes: &[String], available_prefixes: &[Strin
     })
 }
 
-fn render_provider_template(
-    template: &str,
-    base_url: &str,
-    upstream_base_url: &str,
+fn provider_endpoint_is_loopback(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+fn provider_query_name_is_credential(name: &str) -> bool {
+    let normalized = name
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect::<String>();
+    matches!(
+        normalized.as_str(),
+        "accesskey"
+            | "apikey"
+            | "apitoken"
+            | "key"
+            | "token"
+            | "accesstoken"
+            | "authtoken"
+            | "xapikey"
+            | "authorization"
+            | "bearer"
+            | "bearertoken"
+            | "password"
+            | "passwd"
+            | "secret"
+            | "clientsecret"
+            | "secretkey"
+            | "privatekey"
+            | "credential"
+    )
+}
+
+fn validate_provider_endpoint(
+    provider: &UsageProviderConfig,
+    endpoint: &str,
     token: &str,
-    variables: &BTreeMap<String, String>,
-) -> String {
-    let mut out = template
-        .replace("{{baseUrl}}", base_url)
-        .replace("{{base_url}}", base_url)
-        .replace("{{upstreamBaseUrl}}", upstream_base_url)
-        .replace("{{upstream_base_url}}", upstream_base_url)
-        .replace("{{apiKey}}", token)
-        .replace("{{accessToken}}", token)
-        .replace("{{token}}", token);
-
-    out = out
-        .replace("{{unix_now}}", &unix_now_secs().to_string())
-        .replace("{{unix_now_ms}}", &unix_now_ms().to_string());
-
-    while let Some(start) = out.find("{{unix_days_ago:") {
-        let Some(end_offset) = out[start..].find("}}") else {
-            break;
-        };
-        let end = start + end_offset + 2;
-        let days_str = out[start + "{{unix_days_ago:".len()..end - 2].trim();
-        let replacement = days_str
-            .parse::<u64>()
-            .ok()
-            .map(|days| unix_now_secs().saturating_sub(days.saturating_mul(24 * 60 * 60)))
-            .map(|secs| secs.to_string())
-            .unwrap_or_default();
-        out.replace_range(start..end, &replacement);
-    }
-
-    while let Some(start) = out.find("{{env:") {
-        let Some(end_offset) = out[start..].find("}}") else {
-            break;
-        };
-        let end = start + end_offset + 2;
-        let env_name = out[start + 6..end - 2].trim();
-        let value = std::env::var(env_name).unwrap_or_default();
-        out.replace_range(start..end, &value);
-    }
-
-    for (name, value_template) in variables {
-        let value = render_provider_template(
-            value_template,
-            base_url,
-            upstream_base_url,
-            token,
-            &BTreeMap::new(),
+) -> Result<String> {
+    let url = reqwest::Url::parse(endpoint).with_context(|| {
+        format!(
+            "usage provider '{}' endpoint is not a valid URL",
+            provider.id
+        )
+    })?;
+    if !matches!(url.scheme(), "http" | "https") {
+        anyhow::bail!(
+            "usage provider '{}' endpoint scheme must be HTTP or HTTPS",
+            provider.id
         );
-        out = out.replace(&format!("{{{{{name}}}}}"), &value);
     }
-
-    out
+    if url.scheme() != "https" && !provider_endpoint_is_loopback(&url) {
+        anyhow::bail!(
+            "usage provider '{}' endpoint must use HTTPS outside loopback",
+            provider.id
+        );
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        anyhow::bail!(
+            "usage provider '{}' endpoint must not contain userinfo",
+            provider.id
+        );
+    }
+    if url.fragment().is_some() {
+        anyhow::bail!(
+            "usage provider '{}' endpoint must not contain a fragment",
+            provider.id
+        );
+    }
+    if !domain_matches(url.as_str(), &provider.domains) {
+        anyhow::bail!(
+            "usage provider '{}' endpoint host is outside its matched domains",
+            provider.id
+        );
+    }
+    if url.query_pairs().any(|(name, value)| {
+        provider_query_name_is_credential(&name) || (!token.is_empty() && value == token)
+    }) {
+        anyhow::bail!(
+            "usage provider '{}' endpoint must not contain query credentials",
+            provider.id
+        );
+    }
+    Ok(url.into())
 }
 
 fn resolve_endpoint(
@@ -1261,24 +1326,228 @@ fn resolve_endpoint(
             provider.kind
         );
     }
-
-    let rendered = render_provider_template(
-        &endpoint,
-        &base_url,
-        upstream_base_url,
-        token,
-        &provider.variables,
-    );
-    if rendered.starts_with("http://") || rendered.starts_with("https://") {
-        return Ok(rendered);
+    if endpoint.contains("{{") || endpoint.contains("}}") {
+        anyhow::bail!(
+            "usage provider '{}' endpoint templates are not supported; use an absolute URL or relative path",
+            provider.id
+        );
     }
 
-    let path = if rendered.starts_with('/') {
-        rendered
+    let resolved = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        endpoint
     } else {
-        format!("/{rendered}")
+        let path = if endpoint.starts_with('/') {
+            endpoint
+        } else {
+            format!("/{endpoint}")
+        };
+        format!("{base_url}{path}")
     };
-    Ok(format!("{base_url}{path}"))
+    let resolved = if matches!(provider.kind, ProviderKind::OpenAiOrganizationCosts) {
+        let mut url = reqwest::Url::parse(&resolved).with_context(|| {
+            format!(
+                "usage provider '{}' endpoint is not a valid URL",
+                provider.id
+            )
+        })?;
+        let retained_query = url
+            .query_pairs()
+            .filter(|(name, _)| name != "start_time" && name != "limit")
+            .map(|(name, value)| (name.into_owned(), value.into_owned()))
+            .collect::<Vec<_>>();
+        url.set_query(None);
+        {
+            let mut query = url.query_pairs_mut();
+            query.extend_pairs(retained_query);
+            query.append_pair(
+                "start_time",
+                &unix_now_secs()
+                    .saturating_sub(30 * 24 * 60 * 60)
+                    .to_string(),
+            );
+            query.append_pair("limit", "30");
+        }
+        url.into()
+    } else {
+        resolved
+    };
+    validate_provider_endpoint(provider, &resolved, token)
+}
+
+struct PreparedProviderPoll {
+    endpoint: String,
+    new_api_user_id: Option<String>,
+    reservation: Option<ProviderObservationReservation>,
+}
+
+fn credential_safe_digest(domain: &[u8], values: &[&[u8]]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    for value in values {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value);
+    }
+    format!("sha256:{:x}", digest.finalize())
+}
+
+fn usage_provider_account_fingerprint(token: &str, new_api_user_id: Option<&str>) -> String {
+    match new_api_user_id {
+        Some(user_id) => credential_safe_digest(
+            b"codex-helper:usage-provider-account:v1\0",
+            &[token.as_bytes(), user_id.as_bytes()],
+        ),
+        None => credential_safe_digest(
+            b"codex-helper:usage-provider-account:v1\0",
+            &[token.as_bytes()],
+        ),
+    }
+}
+
+fn usage_provider_config_revision(
+    provider: &UsageProviderConfig,
+    target: &UsageProviderTarget,
+) -> String {
+    let provider_json = serde_json::to_vec(provider).unwrap_or_default();
+    let endpoint_key = target.endpoint.provider_endpoint.stable_key();
+    let endpoint_metadata = serde_json::to_vec(&(
+        &target.tags,
+        &target.supported_models,
+        &target.model_mapping,
+    ))
+    .unwrap_or_default();
+    credential_safe_digest(
+        b"codex-helper:usage-provider-config:v1\0",
+        &[
+            provider_json.as_slice(),
+            target.base_url.as_bytes(),
+            endpoint_key.as_bytes(),
+            endpoint_metadata.as_slice(),
+        ],
+    )
+}
+
+fn auto_usage_provider_config_revision(target: &UsageProviderTarget) -> String {
+    let endpoint_key = target.endpoint.provider_endpoint.stable_key();
+    credential_safe_digest(
+        b"codex-helper:auto-usage-provider-config:v1\0",
+        &[target.base_url.as_bytes(), endpoint_key.as_bytes()],
+    )
+}
+
+async fn prepare_provider_poll(
+    state: &ProxyState,
+    provider: &UsageProviderConfig,
+    target: &UsageProviderTarget,
+    token: &str,
+    adapter_code: &str,
+    config_revision_override: Option<&str>,
+    observed_at_ms: u64,
+) -> Result<PreparedProviderPoll> {
+    let endpoint = resolve_endpoint(provider, &target.base_url, token)?;
+    let new_api_user_id = resolve_new_api_user_id(provider)?;
+    let provider_endpoint = target.endpoint.provider_endpoint.clone();
+    let account_fingerprint = usage_provider_account_fingerprint(token, new_api_user_id.as_deref());
+    let route_scope = target.runtime_identity().policy_route_scope();
+    let scope = match ProviderObservationScope::new(
+        provider_endpoint,
+        &target.base_url,
+        route_scope,
+        adapter_code,
+        &endpoint,
+        account_fingerprint,
+        config_revision_override
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| usage_provider_config_revision(provider, target)),
+    ) {
+        Ok(scope) => scope,
+        Err(error) => {
+            warn!(error = %error, "failed to build provider observation scope");
+            return Ok(PreparedProviderPoll {
+                endpoint,
+                new_api_user_id,
+                reservation: None,
+            });
+        }
+    };
+    let reservation = match state
+        .reserve_provider_observation(scope, observed_at_ms)
+        .await
+    {
+        Ok(reservation) => Some(reservation),
+        Err(error) => {
+            warn!(error = %error, "failed to reserve provider observation");
+            None
+        }
+    };
+    Ok(PreparedProviderPoll {
+        endpoint,
+        new_api_user_id,
+        reservation,
+    })
+}
+
+async fn commit_provider_poll_observation(
+    state: &ProxyState,
+    reservation: Option<ProviderObservationReservation>,
+    snapshot: &ProviderBalanceSnapshot,
+    suppression: Option<&ProviderTargetSuppressionDecision>,
+    completed_at_ms: u64,
+) -> bool {
+    let Some(reservation) = reservation else {
+        return true;
+    };
+    let status = snapshot.status_at(completed_at_ms);
+    let (authority, effect) = match status {
+        BalanceSnapshotStatus::Exhausted if snapshot.exhaustion_affects_routing => {
+            let reason = suppression
+                .map(|decision| decision.reason.clone())
+                .unwrap_or_else(|| "balance exhausted".to_string());
+            let expires_at_unix_ms = suppression
+                .map(|decision| completed_at_ms.saturating_add(duration_millis_u64(decision.ttl)));
+            (
+                ProviderObservationAuthority::Authoritative,
+                ProviderPolicyEffect::Block {
+                    action_kind: "balance_exhausted".to_string(),
+                    code: Some("balance_exhausted".to_string()),
+                    reason,
+                    expires_at_unix_ms,
+                },
+            )
+        }
+        BalanceSnapshotStatus::Ok if snapshot.exhaustion_affects_routing => (
+            ProviderObservationAuthority::Authoritative,
+            ProviderPolicyEffect::Recover {
+                reason: "authoritative balance available".to_string(),
+            },
+        ),
+        _ => (
+            ProviderObservationAuthority::Informational,
+            ProviderPolicyEffect::ObserveOnly {
+                reason: format!("balance snapshot status {status:?}"),
+            },
+        ),
+    };
+    let observation = ProviderObservation {
+        observed_at_unix_ms: snapshot.fetched_at_ms,
+        completed_at_unix_ms: completed_at_ms.max(snapshot.fetched_at_ms),
+        authority,
+        evidence: serde_json::to_value(snapshot).unwrap_or_else(|error| {
+            serde_json::json!({
+                "source": snapshot.source,
+                "status": format!("{status:?}"),
+                "serialization_error": error.to_string(),
+            })
+        }),
+        effect,
+    };
+    if let Err(error) = state
+        .commit_provider_observation(reservation, observation)
+        .await
+    {
+        warn!(error = %error, "failed to commit provider balance observation");
+        return false;
+    }
+    true
 }
 
 fn endpoint_origin(endpoint: &str) -> String {
@@ -1295,15 +1564,58 @@ fn endpoint_origin(endpoint: &str) -> String {
         .unwrap_or_else(|| "unknown-origin".to_string())
 }
 
+fn provider_request_headers(
+    provider: &UsageProviderConfig,
+    token: &str,
+    new_api_user_id: Option<&str>,
+) -> Result<reqwest::header::HeaderMap> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    match provider.kind {
+        ProviderKind::YescodeProfile => {
+            let value = reqwest::header::HeaderValue::from_str(token).with_context(|| {
+                format!("usage provider '{}' has an invalid API key", provider.id)
+            })?;
+            headers.insert("X-API-Key", value);
+        }
+        _ => {
+            let value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                .with_context(|| {
+                    format!(
+                        "usage provider '{}' has an invalid bearer token",
+                        provider.id
+                    )
+                })?;
+            headers.insert(reqwest::header::AUTHORIZATION, value);
+        }
+    }
+
+    if let Some(user_id) = new_api_user_id {
+        if !matches!(provider.kind, ProviderKind::NewApiUserSelf) {
+            anyhow::bail!(
+                "usage provider '{}' cannot send New-Api-User for kind {:?}",
+                provider.id,
+                provider.kind
+            );
+        }
+        let value = reqwest::header::HeaderValue::from_str(user_id).with_context(|| {
+            format!(
+                "usage provider '{}' has an invalid New-Api-User value",
+                provider.id
+            )
+        })?;
+        headers.insert("New-Api-User", value);
+    }
+    Ok(headers)
+}
+
 async fn poll_provider_http_json(
     client: &Client,
     provider: &UsageProviderConfig,
-    upstream_base_url: &str,
+    endpoint: &str,
+    new_api_user_id: Option<&str>,
     token: &str,
 ) -> Result<serde_json::Value> {
-    let endpoint = resolve_endpoint(provider, upstream_base_url, token)?;
-    let origin = endpoint_origin(&endpoint);
-    let base_url = normalized_balance_base_url(upstream_base_url).unwrap_or_default();
+    let origin = endpoint_origin(endpoint);
     let mut req = client
         .get(endpoint)
         .timeout(BALANCE_HTTP_REQUEST_TIMEOUT)
@@ -1313,27 +1625,7 @@ async fn poll_provider_http_json(
             concat!("codex-helper/", env!("CARGO_PKG_VERSION")),
         );
 
-    match provider.kind {
-        ProviderKind::YescodeProfile => {
-            req = req.header("X-API-Key", token);
-        }
-        _ => {
-            req = req.header("Authorization", format!("Bearer {}", token));
-        }
-    }
-
-    for (name, template) in &provider.headers {
-        let value = render_provider_template(
-            template,
-            &base_url,
-            upstream_base_url,
-            token,
-            &provider.variables,
-        );
-        if !value.trim().is_empty() {
-            req = req.header(name.as_str(), value);
-        }
-    }
+    req = req.headers(provider_request_headers(provider, token, new_api_user_id)?);
 
     let resp = req.send().await.with_context(|| {
         format!(
@@ -1744,28 +2036,24 @@ struct RateLimitWindowSnapshot {
 
 fn base_snapshot(
     provider: &UsageProviderConfig,
-    upstream: &UpstreamRef,
+    upstream: &UsageProviderEndpointRef,
     fetched_at_ms: u64,
     stale_after_ms: Option<u64>,
 ) -> ProviderBalanceSnapshot {
     let mut snapshot = ProviderBalanceSnapshot::new(
         provider.id.clone(),
-        upstream.station_name.clone(),
-        upstream.index,
+        upstream.provider_endpoint.clone(),
         provider.kind.source_name(),
         fetched_at_ms,
         stale_after_ms,
     );
-    if let Some(provider_endpoint) = &upstream.provider_endpoint {
-        snapshot.provider_endpoint_key = Some(provider_endpoint.stable_key());
-    }
     snapshot.exhaustion_affects_routing = provider.trust_exhaustion_for_routing;
     snapshot
 }
 
 fn snapshot_error(
     provider: &UsageProviderConfig,
-    upstream: &UpstreamRef,
+    upstream: &UsageProviderEndpointRef,
     fetched_at_ms: u64,
     stale_after_ms: Option<u64>,
     message: impl Into<String>,
@@ -1775,7 +2063,7 @@ fn snapshot_error(
 
 fn budget_snapshot_from_json(
     provider: &UsageProviderConfig,
-    upstream: &UpstreamRef,
+    upstream: &UsageProviderEndpointRef,
     value: &serde_json::Value,
     fetched_at_ms: u64,
     stale_after_ms: Option<u64>,
@@ -1808,7 +2096,7 @@ fn budget_snapshot_from_json(
 
 fn yescode_snapshot_from_json(
     provider: &UsageProviderConfig,
-    upstream: &UpstreamRef,
+    upstream: &UsageProviderEndpointRef,
     value: &serde_json::Value,
     fetched_at_ms: u64,
     stale_after_ms: Option<u64>,
@@ -1848,7 +2136,7 @@ fn yescode_snapshot_from_json(
 
 fn balance_http_snapshot_from_json(
     provider: &UsageProviderConfig,
-    upstream: &UpstreamRef,
+    upstream: &UsageProviderEndpointRef,
     value: &serde_json::Value,
     fetched_at_ms: u64,
     stale_after_ms: Option<u64>,
@@ -2554,7 +2842,7 @@ fn sub2api_limiting_subscription_window(value: &serde_json::Value) -> Option<Quo
 
 fn sub2api_usage_snapshot_from_json(
     provider: &UsageProviderConfig,
-    upstream: &UpstreamRef,
+    upstream: &UsageProviderEndpointRef,
     value: &serde_json::Value,
     fetched_at_ms: u64,
     stale_after_ms: Option<u64>,
@@ -2665,7 +2953,7 @@ fn sub2api_usage_snapshot_from_json(
 
 fn sub2api_auth_me_snapshot_from_json(
     provider: &UsageProviderConfig,
-    upstream: &UpstreamRef,
+    upstream: &UsageProviderEndpointRef,
     value: &serde_json::Value,
     fetched_at_ms: u64,
     stale_after_ms: Option<u64>,
@@ -2718,7 +3006,7 @@ fn rightcode_subscription_window(value: &serde_json::Value) -> Option<QuotaWindo
 
 fn rightcode_account_summary_snapshot_from_json(
     provider: &UsageProviderConfig,
-    upstream: &UpstreamRef,
+    upstream: &UsageProviderEndpointRef,
     value: &serde_json::Value,
     upstream_base_url: &str,
     fetched_at_ms: u64,
@@ -2788,7 +3076,7 @@ fn rightcode_account_summary_snapshot_from_json(
 
 fn new_api_token_usage_snapshot_from_json(
     provider: &UsageProviderConfig,
-    upstream: &UpstreamRef,
+    upstream: &UsageProviderEndpointRef,
     value: &serde_json::Value,
     fetched_at_ms: u64,
     stale_after_ms: Option<u64>,
@@ -2886,7 +3174,7 @@ fn new_api_token_usage_snapshot_from_json(
 
 fn new_api_snapshot_from_json(
     provider: &UsageProviderConfig,
-    upstream: &UpstreamRef,
+    upstream: &UsageProviderEndpointRef,
     value: &serde_json::Value,
     fetched_at_ms: u64,
     stale_after_ms: Option<u64>,
@@ -2996,7 +3284,7 @@ fn openai_organization_costs_total(value: &serde_json::Value) -> Option<UsdAmoun
 
 fn openai_organization_costs_snapshot_from_json(
     provider: &UsageProviderConfig,
-    upstream: &UpstreamRef,
+    upstream: &UsageProviderEndpointRef,
     value: &serde_json::Value,
     fetched_at_ms: u64,
     stale_after_ms: Option<u64>,
@@ -3017,113 +3305,18 @@ fn openai_organization_costs_snapshot_from_json(
     snapshot
 }
 
-fn balance_exhaustion_policy_action(
-    endpoint_key: ProviderEndpointKey,
-    observed_at_ms: u64,
-    cooldown: Duration,
-) -> Option<PolicyAction> {
-    let cooldown_ms = duration_millis_u64(cooldown);
-    if cooldown_ms == 0 {
-        return None;
-    }
-    let cooldown_secs = cooldown_ms.div_ceil(1000);
-    let mut signal = ProviderSignal::high_confidence_route_facing(
-        ProviderSignalKind::Balance,
-        ProviderSignalSource::BalanceSnapshot,
-        ProviderSignalTarget::ProviderEndpoint {
-            provider_endpoint_key: endpoint_key,
-        },
-        observed_at_ms,
-    );
-    signal.reset_after_secs = Some(cooldown_secs);
-    signal.reason = Some("balance_exhausted".to_string());
-    PolicyAction::cooldown_from_signal(signal, observed_at_ms, 0, observed_at_ms)
-}
-
-async fn sync_balance_policy_action_for_endpoint(
-    state: &Arc<ProxyState>,
-    service_name: &str,
-    endpoint_key: ProviderEndpointKey,
-    exhausted: bool,
-    ttl: Option<Duration>,
-) {
-    if exhausted {
-        let cooldown = ttl.unwrap_or(USAGE_PROVIDER_EXHAUSTED_SUPPRESSION_TTL);
-        if let Some(action) =
-            balance_exhaustion_policy_action(endpoint_key, crate::logging::now_ms(), cooldown)
-        {
-            state.upsert_owned_policy_action(service_name, action).await;
-        }
-    } else {
-        state
-            .clear_owned_policy_action(
-                service_name,
-                &endpoint_key,
-                PolicyActionKind::Cooldown,
-                ProviderSignalKind::Balance,
-                ProviderSignalSource::BalanceSnapshot,
-            )
-            .await;
-    }
-}
-
-async fn update_usage_exhausted(
-    lb_states: &Arc<Mutex<HashMap<String, LbState>>>,
-    state: &Arc<ProxyState>,
-    cfg: &ProxyConfig,
-    service_name: &str,
-    upstreams: &[UpstreamRef],
-    exhausted: bool,
-    ttl: Option<Duration>,
-) {
-    if let Ok(mut map) = lb_states.lock() {
-        for uref in upstreams {
-            let service = match service_manager(cfg, service_name).station(&uref.station_name) {
-                Some(s) => s,
-                None => continue,
-            };
-
-            let entry = map
-                .entry(uref.station_name.clone())
-                .or_insert_with(LbState::default);
-            entry.ensure_layout(service.name.as_str(), &service.upstreams);
-            if uref.index < entry.usage_exhausted.len() {
-                entry.usage_exhausted[uref.index] = exhausted;
-            }
-        }
-    }
-
-    for uref in upstreams {
-        if let Some(endpoint_key) = uref.provider_endpoint.clone() {
-            sync_balance_policy_action_for_endpoint(
-                state,
-                service_name,
-                endpoint_key.clone(),
-                exhausted,
-                ttl,
-            )
-            .await;
-            state
-                .set_provider_endpoint_usage_exhausted(service_name, endpoint_key, exhausted)
-                .await;
-        }
-    }
-}
-
 fn provider_hosts_for_diagnostics(
-    cfg: &ProxyConfig,
+    cfg: &HelperConfig,
     service_name: &str,
     provider: &UsageProviderConfig,
 ) -> Vec<String> {
     let mut hosts: Vec<String> = Vec::new();
-    for service in service_manager(cfg, service_name).stations().values() {
-        for upstream in &service.upstreams {
-            if domain_matches(&upstream.base_url, &provider.domains)
-                && let Ok(url) = reqwest::Url::parse(&upstream.base_url)
-                && let Some(host) = url.host_str()
-            {
-                hosts.push(host.to_string());
-            }
+    for target in usage_provider_targets(cfg, service_name, None) {
+        if domain_matches(&target.base_url, &provider.domains)
+            && let Ok(url) = reqwest::Url::parse(&target.base_url)
+            && let Some(host) = url.host_str()
+        {
+            hosts.push(host.to_string());
         }
     }
     hosts.sort();
@@ -3132,7 +3325,7 @@ fn provider_hosts_for_diagnostics(
 }
 
 fn warn_if_provider_spans_hosts(
-    cfg: &ProxyConfig,
+    cfg: &HelperConfig,
     service_name: &str,
     provider: &UsageProviderConfig,
 ) {
@@ -3148,7 +3341,7 @@ fn warn_if_provider_spans_hosts(
 
 fn snapshot_from_provider_json(
     provider: &UsageProviderConfig,
-    upstream: &UpstreamRef,
+    upstream: &UsageProviderEndpointRef,
     value: &serde_json::Value,
     upstream_base_url: &str,
     fetched_at_ms: u64,
@@ -3217,20 +3410,16 @@ async fn refresh_provider_target(
         client,
         provider,
         target,
-        cfg,
-        lb_states,
         state,
         service_name,
         interval_secs,
         force,
     } = params;
 
-    let upstreams = vec![target.upstream.clone()];
     let fetched_at_ms = unix_now_ms();
     let stale_after_ms = stale_after_ms(fetched_at_ms, interval_secs);
     let snapshot_decision = existing_usage_provider_target_suppression_decision(
         state,
-        cfg,
         service_name,
         &provider.id,
         target,
@@ -3241,20 +3430,12 @@ async fn refresh_provider_target(
     if let Some(suppression) = active_usage_provider_target_suppression(&provider.id, target, now)
         && !force_can_bypass_active_suppression(force, &suppression, snapshot_decision.as_ref())
     {
-        let ttl = usage_provider_target_suppression_remaining_ttl(&suppression, now);
-        update_usage_exhausted(
-            lb_states,
-            state,
-            cfg,
-            service_name,
-            &upstreams,
-            suppression.routing_exhausted,
-            ttl,
-        )
-        .await;
         warn!(
             "usage provider '{}' skipped {}[{}]: balance refresh suppressed: {}",
-            provider.id, target.upstream.station_name, target.upstream.index, suppression.reason
+            provider.id,
+            target.endpoint.provider_endpoint.provider_id,
+            target.endpoint.catalog_index,
+            suppression.reason
         );
         return UsageProviderRefreshOutcome::Failed;
     }
@@ -3264,37 +3445,26 @@ async fn refresh_provider_target(
             target,
             decision.ttl,
             decision.reason.clone(),
-            decision.routing_exhausted,
             Instant::now(),
         );
-        update_usage_exhausted(
-            lb_states,
-            state,
-            cfg,
-            service_name,
-            &upstreams,
-            decision.routing_exhausted,
-            Some(decision.ttl),
-        )
-        .await;
         warn!(
             "usage provider '{}' skipped {}[{}]: existing balance snapshot suppresses refresh: {}",
-            provider.id, target.upstream.station_name, target.upstream.index, decision.reason
+            provider.id,
+            target.endpoint.provider_endpoint.provider_id,
+            target.endpoint.catalog_index,
+            decision.reason
         );
         return UsageProviderRefreshOutcome::Failed;
     }
 
-    let Some(token) = resolve_token(provider, &upstreams, cfg, service_name) else {
+    let Some(token) = resolve_token(provider, target) else {
         let snapshot = if provider.kind == ProviderKind::OpenAiOrganizationCosts {
-            base_snapshot(provider, &upstreams[0], fetched_at_ms, stale_after_ms)
+            base_snapshot(provider, &target.endpoint, fetched_at_ms, stale_after_ms)
         } else {
-            base_snapshot(provider, &upstreams[0], fetched_at_ms, stale_after_ms)
+            base_snapshot(provider, &target.endpoint, fetched_at_ms, stale_after_ms)
                 .with_error("no usable token; checked provider token_env and upstream auth")
         };
-        state
-            .record_provider_balance_snapshot(service_name, snapshot)
-            .await;
-        update_usage_exhausted(lb_states, state, cfg, service_name, &upstreams, false, None).await;
+        state.record_provider_balance_snapshot(snapshot).await;
         if provider.kind == ProviderKind::OpenAiOrganizationCosts {
             warn!(
                 "usage provider '{}' is missing OPENAI_ADMIN_KEY; OpenAI official costs stay unknown",
@@ -3303,18 +3473,53 @@ async fn refresh_provider_target(
         } else {
             warn!(
                 "usage provider '{}' has no usable token (checked token_env and associated upstream auth_token); \
-跳过本次用量查询，请检查 usage_providers.json 和 ~/.codex-helper/config.json",
+跳过本次用量查询，请检查 usage_providers.json 和 ~/.codex-helper/config.toml",
                 provider.id
             );
         }
         return UsageProviderRefreshOutcome::MissingToken;
     };
 
-    match poll_provider_http_json(client, provider, &target.base_url, &token).await {
+    let prepared_poll = match prepare_provider_poll(
+        state.as_ref(),
+        provider,
+        target,
+        &token,
+        provider.kind.source_name(),
+        None,
+        fetched_at_ms,
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let snapshot = base_snapshot(provider, &target.endpoint, fetched_at_ms, stale_after_ms)
+                .with_error(error.to_string());
+            state.record_provider_balance_snapshot(snapshot).await;
+            warn!(
+                "usage provider '{}' could not prepare poll for {}[{}]: {}",
+                provider.id,
+                target.endpoint.provider_endpoint.provider_id,
+                target.endpoint.catalog_index,
+                error
+            );
+            return UsageProviderRefreshOutcome::Failed;
+        }
+    };
+
+    match poll_provider_http_json(
+        client,
+        provider,
+        &prepared_poll.endpoint,
+        prepared_poll.new_api_user_id.as_deref(),
+        &token,
+    )
+    .await
+    {
         Ok(value) => {
             let snapshot = snapshot_from_provider_json(
                 provider,
-                &upstreams[0],
+                &target.endpoint,
                 &value,
                 &target.base_url,
                 fetched_at_ms,
@@ -3322,48 +3527,57 @@ async fn refresh_provider_target(
             );
             let snapshot_error = usage_provider_snapshot_error(&snapshot).map(str::to_string);
             let suppression_decision =
-                usage_provider_suppression_decision_from_snapshot(&snapshot, cfg, fetched_at_ms);
-            let exhausted_for_lb = suppression_decision
-                .as_ref()
-                .is_some_and(|decision| decision.routing_exhausted);
-            if let Some(decision) = suppression_decision.as_ref() {
+                usage_provider_suppression_decision_from_snapshot(&snapshot, fetched_at_ms);
+            let exhausted_for_routing = suppression_decision.is_some();
+            let terminal_snapshot_error = snapshot_error
+                .as_deref()
+                .is_some_and(usage_provider_error_is_terminal);
+            let observation_committed = commit_provider_poll_observation(
+                state.as_ref(),
+                prepared_poll.reservation,
+                &snapshot,
+                suppression_decision.as_ref(),
+                unix_now_ms(),
+            )
+            .await;
+            if observation_committed && let Some(decision) = suppression_decision.as_ref() {
                 remember_usage_provider_target_suppression(
                     &provider.id,
                     target,
                     decision.ttl,
                     decision.reason.as_str(),
-                    decision.routing_exhausted,
                     Instant::now(),
                 );
-            } else {
+            } else if observation_committed && terminal_snapshot_error {
+                remember_usage_provider_target_suppression(
+                    &provider.id,
+                    target,
+                    USAGE_PROVIDER_TERMINAL_FAILURE_TTL,
+                    snapshot_error
+                        .as_deref()
+                        .unwrap_or("terminal provider error"),
+                    Instant::now(),
+                );
+            } else if observation_committed {
                 clear_usage_provider_target_suppression(&provider.id, target);
             }
-            update_usage_exhausted(
-                lb_states,
-                state,
-                cfg,
-                service_name,
-                &upstreams,
-                exhausted_for_lb,
-                suppression_decision.as_ref().map(|decision| decision.ttl),
-            )
-            .await;
-            state
-                .record_provider_balance_snapshot(service_name, snapshot)
-                .await;
+            state.record_provider_balance_snapshot(snapshot).await;
             if let Some(error) = snapshot_error {
                 warn!(
                     "usage provider '{}' returned error snapshot for {}[{}]: {}",
-                    provider.id, target.upstream.station_name, target.upstream.index, error
+                    provider.id,
+                    target.endpoint.provider_endpoint.provider_id,
+                    target.endpoint.catalog_index,
+                    error
                 );
                 return UsageProviderRefreshOutcome::Failed;
             }
             info!(
                 "usage provider '{}' refreshed {}[{}], exhausted = {}, routing_trusted = {}",
                 provider.id,
-                target.upstream.station_name,
-                target.upstream.index,
-                exhausted_for_lb,
+                target.endpoint.provider_endpoint.provider_id,
+                target.endpoint.catalog_index,
+                exhausted_for_routing,
                 provider.trust_exhaustion_for_routing
             );
             UsageProviderRefreshOutcome::Refreshed
@@ -3377,30 +3591,26 @@ async fn refresh_provider_target(
                     target,
                     USAGE_PROVIDER_TERMINAL_FAILURE_TTL,
                     error.clone(),
-                    true,
                     Instant::now(),
                 );
             }
-            state
-                .record_provider_balance_snapshot(
-                    service_name,
-                    base_snapshot(provider, &upstreams[0], fetched_at_ms, stale_after_ms)
-                        .with_error(error.clone()),
-                )
-                .await;
-            update_usage_exhausted(
-                lb_states,
-                state,
-                cfg,
-                service_name,
-                &upstreams,
-                terminal_failure,
-                terminal_failure.then_some(USAGE_PROVIDER_TERMINAL_FAILURE_TTL),
+            let snapshot = base_snapshot(provider, &target.endpoint, fetched_at_ms, stale_after_ms)
+                .with_error(error.clone());
+            commit_provider_poll_observation(
+                state.as_ref(),
+                prepared_poll.reservation,
+                &snapshot,
+                None,
+                unix_now_ms(),
             )
             .await;
+            state.record_provider_balance_snapshot(snapshot).await;
             warn!(
                 "usage provider '{}' poll failed for {}[{}]: {}",
-                provider.id, target.upstream.station_name, target.upstream.index, error
+                provider.id,
+                target.endpoint.provider_endpoint.provider_id,
+                target.endpoint.catalog_index,
+                error
             );
             UsageProviderRefreshOutcome::Failed
         }
@@ -3421,7 +3631,7 @@ struct AutoRefreshJob {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct UsageProviderRefreshOptions<'a> {
-    pub station_name_filter: Option<&'a str>,
+    pub route_provider_id_filter: Option<&'a str>,
     pub provider_id_filter: Option<&'a str>,
     pub force: bool,
 }
@@ -3429,8 +3639,6 @@ pub struct UsageProviderRefreshOptions<'a> {
 async fn run_configured_refresh_job<'a>(
     client: &'a Client,
     job: ConfiguredRefreshJob<'a>,
-    cfg: &'a ProxyConfig,
-    lb_states: &'a Arc<Mutex<HashMap<String, LbState>>>,
     state: &'a Arc<ProxyState>,
     service_name: &'a str,
 ) -> (String, UsageProviderRefreshOutcome) {
@@ -3439,8 +3647,6 @@ async fn run_configured_refresh_job<'a>(
         client,
         provider: job.provider,
         target: &job.target,
-        cfg,
-        lb_states,
         state,
         service_name,
         interval_secs: job.interval_secs,
@@ -3453,28 +3659,15 @@ async fn run_configured_refresh_job<'a>(
 async fn run_auto_refresh_job(
     client: &Client,
     job: AutoRefreshJob,
-    cfg: &ProxyConfig,
-    lb_states: &Arc<Mutex<HashMap<String, LbState>>>,
     state: &Arc<ProxyState>,
     service_name: &str,
 ) -> UsageProviderRefreshOutcome {
-    auto_probe_provider_target(
-        client,
-        &job.target,
-        cfg,
-        lb_states,
-        state,
-        service_name,
-        job.force,
-    )
-    .await
+    auto_probe_provider_target(client, &job.target, state, service_name, job.force).await
 }
 
 async fn run_configured_refresh_jobs<'a>(
     client: &'a Client,
     jobs: Vec<ConfiguredRefreshJob<'a>>,
-    cfg: &'a ProxyConfig,
-    lb_states: &'a Arc<Mutex<HashMap<String, LbState>>>,
     state: &'a Arc<ProxyState>,
     service_name: &'a str,
 ) -> Vec<(String, UsageProviderRefreshOutcome)> {
@@ -3487,27 +3680,13 @@ async fn run_configured_refresh_jobs<'a>(
         let Some(job) = pending.next() else {
             break;
         };
-        running.push(run_configured_refresh_job(
-            client,
-            job,
-            cfg,
-            lb_states,
-            state,
-            service_name,
-        ));
+        running.push(run_configured_refresh_job(client, job, state, service_name));
     }
 
     while let Some(result) = running.next().await {
         results.push(result);
         if let Some(job) = pending.next() {
-            running.push(run_configured_refresh_job(
-                client,
-                job,
-                cfg,
-                lb_states,
-                state,
-                service_name,
-            ));
+            running.push(run_configured_refresh_job(client, job, state, service_name));
         }
     }
 
@@ -3517,8 +3696,6 @@ async fn run_configured_refresh_jobs<'a>(
 async fn run_auto_refresh_jobs(
     client: &Client,
     jobs: Vec<AutoRefreshJob>,
-    cfg: &ProxyConfig,
-    lb_states: &Arc<Mutex<HashMap<String, LbState>>>,
     state: &Arc<ProxyState>,
     service_name: &str,
 ) -> Vec<UsageProviderRefreshOutcome> {
@@ -3531,27 +3708,13 @@ async fn run_auto_refresh_jobs(
         let Some(job) = pending.next() else {
             break;
         };
-        running.push(run_auto_refresh_job(
-            client,
-            job,
-            cfg,
-            lb_states,
-            state,
-            service_name,
-        ));
+        running.push(run_auto_refresh_job(client, job, state, service_name));
     }
 
     while let Some(result) = running.next().await {
         results.push(result);
         if let Some(job) = pending.next() {
-            running.push(run_auto_refresh_job(
-                client,
-                job,
-                cfg,
-                lb_states,
-                state,
-                service_name,
-            ));
+            running.push(run_auto_refresh_job(client, job, state, service_name));
         }
     }
 
@@ -3664,6 +3827,65 @@ fn duration_until_ms(deadline_ms: u64, now_ms: u64) -> Option<Duration> {
         .map(Duration::from_millis)
 }
 
+fn next_daily_quota_reset_at_ms(now_ms: u64) -> Option<u64> {
+    next_fixed_offset_reset_at_ms(now_ms, DAILY_QUOTA_RESET_UTC_OFFSET, DAILY_QUOTA_RESET_TIME)
+}
+
+fn next_fixed_offset_reset_at_ms(now_ms: u64, utc_offset: &str, reset_time: &str) -> Option<u64> {
+    let offset_ms = parse_utc_offset_ms(utc_offset)?;
+    let reset_ms = parse_hh_mm_ms(reset_time)?;
+    let local_ms = i128::from(now_ms) + offset_ms;
+    let local_day_start = div_floor(local_ms, i128::from(DAY_MS)) * i128::from(DAY_MS);
+    let mut reset_local = local_day_start + i128::from(reset_ms);
+    if reset_local <= local_ms {
+        reset_local += i128::from(DAY_MS);
+    }
+    let reset_utc = reset_local - offset_ms;
+    u64::try_from(reset_utc).ok()
+}
+
+fn parse_hh_mm_ms(value: &str) -> Option<u64> {
+    let (hour, minute) = value.trim().split_once(':')?;
+    let hour = hour.parse::<u64>().ok()?;
+    let minute = minute.parse::<u64>().ok()?;
+    if hour >= 24 || minute >= 60 {
+        return None;
+    }
+    Some(
+        hour.saturating_mul(HOUR_MS)
+            .saturating_add(minute.saturating_mul(MINUTE_MS)),
+    )
+}
+
+fn parse_utc_offset_ms(value: &str) -> Option<i128> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("z") || value == "+00:00" || value == "-00:00" {
+        return Some(0);
+    }
+    let sign = match value.as_bytes().first().copied()? {
+        b'+' => 1_i128,
+        b'-' => -1_i128,
+        _ => return None,
+    };
+    let (hour, minute) = value[1..].split_once(':')?;
+    let hour = hour.parse::<i128>().ok()?;
+    let minute = minute.parse::<i128>().ok()?;
+    if hour > 23 || minute > 59 {
+        return None;
+    }
+    Some(sign * (hour * i128::from(HOUR_MS) + minute * i128::from(MINUTE_MS)))
+}
+
+fn div_floor(dividend: i128, divisor: i128) -> i128 {
+    let quotient = dividend / divisor;
+    let remainder = dividend % divisor;
+    if remainder != 0 && ((remainder > 0) != (divisor > 0)) {
+        quotient - 1
+    } else {
+        quotient
+    }
+}
+
 fn snapshot_freshness_ttl(snapshot: &ProviderBalanceSnapshot, now_ms: u64) -> Option<Duration> {
     snapshot
         .stale_after_ms
@@ -3672,20 +3894,14 @@ fn snapshot_freshness_ttl(snapshot: &ProviderBalanceSnapshot, now_ms: u64) -> Op
 
 fn current_day_quota_suppression_ttl(
     snapshot: &ProviderBalanceSnapshot,
-    cfg: &ProxyConfig,
     now_ms: u64,
 ) -> Option<Duration> {
-    let reset_at_ms = next_reset_at_ms(
-        snapshot.fetched_at_ms,
-        cfg.ui.usage_forecast.reset_utc_offset.as_str(),
-        cfg.ui.usage_forecast.reset_time.as_str(),
-    )?;
+    let reset_at_ms = next_daily_quota_reset_at_ms(snapshot.fetched_at_ms)?;
     duration_until_ms(reset_at_ms, now_ms)
 }
 
 fn usage_provider_snapshot_suppression_ttl(
     snapshot: &ProviderBalanceSnapshot,
-    cfg: &ProxyConfig,
     now_ms: u64,
 ) -> Option<Duration> {
     if let Some(reset_at_ms) = snapshot.quota_resets_at_ms {
@@ -3696,7 +3912,7 @@ fn usage_provider_snapshot_suppression_ttl(
     }
 
     if snapshot_has_current_day_quota_exhaustion(snapshot) {
-        return current_day_quota_suppression_ttl(snapshot, cfg, now_ms);
+        return current_day_quota_suppression_ttl(snapshot, now_ms);
     }
 
     if snapshot_has_refreshable_window_exhaustion(snapshot) {
@@ -3746,34 +3962,13 @@ fn usage_provider_snapshot_error(snapshot: &ProviderBalanceSnapshot) -> Option<&
         .filter(|value| !value.is_empty())
 }
 
-fn usage_provider_snapshot_terminal_error(snapshot: &ProviderBalanceSnapshot) -> Option<&str> {
-    usage_provider_snapshot_error(snapshot).filter(|error| usage_provider_error_is_terminal(error))
-}
-
 fn usage_provider_suppression_decision_from_snapshot(
     snapshot: &ProviderBalanceSnapshot,
-    cfg: &ProxyConfig,
     now_ms: u64,
 ) -> Option<ProviderTargetSuppressionDecision> {
-    if let Some(error) = usage_provider_snapshot_terminal_error(snapshot) {
-        if snapshot.stale_at(now_ms) {
-            return None;
-        }
-        return Some(ProviderTargetSuppressionDecision {
-            reason: error.to_string(),
-            routing_exhausted: true,
-            ttl: USAGE_PROVIDER_TERMINAL_FAILURE_TTL,
-        });
-    }
-
     let reason = usage_provider_snapshot_suppression_reason(snapshot)?;
-    usage_provider_snapshot_suppression_ttl(snapshot, cfg, now_ms).map(|ttl| {
-        ProviderTargetSuppressionDecision {
-            reason,
-            routing_exhausted: true,
-            ttl,
-        }
-    })
+    usage_provider_snapshot_suppression_ttl(snapshot, now_ms)
+        .map(|ttl| ProviderTargetSuppressionDecision { reason, ttl })
 }
 
 fn provider_balance_snapshot_matches_target(
@@ -3781,50 +3976,24 @@ fn provider_balance_snapshot_matches_target(
     provider_id: &str,
     target: &UsageProviderTarget,
 ) -> bool {
-    if snapshot.provider_id != provider_id {
+    if snapshot.observation_provider_id != provider_id {
         return false;
     }
-    if snapshot.station_name.as_deref() != Some(target.upstream.station_name.as_str()) {
-        return false;
-    }
-    if snapshot.upstream_index != Some(target.upstream.index) {
-        return false;
-    }
-
-    match (
-        snapshot.provider_endpoint_key.as_deref(),
-        target
-            .upstream
-            .provider_endpoint
-            .as_ref()
-            .map(ProviderEndpointKey::stable_key),
-    ) {
-        (Some(snapshot_key), Some(target_key)) => snapshot_key == target_key,
-        _ => true,
-    }
+    snapshot.provider_endpoint == target.endpoint.provider_endpoint
 }
 
 async fn existing_usage_provider_target_suppression_decision(
     state: &Arc<ProxyState>,
-    cfg: &ProxyConfig,
     service_name: &str,
     provider_id: &str,
     target: &UsageProviderTarget,
     now_ms: u64,
 ) -> Option<ProviderTargetSuppressionDecision> {
     let view = state.get_provider_balance_view(service_name).await;
-    view.get(&target.upstream.station_name)
-        .and_then(|snapshots| {
-            snapshots
-                .iter()
-                .filter(|snapshot| {
-                    provider_balance_snapshot_matches_target(snapshot, provider_id, target)
-                })
-                .max_by_key(|snapshot| snapshot.fetched_at_ms)
-                .and_then(|snapshot| {
-                    usage_provider_suppression_decision_from_snapshot(snapshot, cfg, now_ms)
-                })
-        })
+    view.iter()
+        .filter(|snapshot| provider_balance_snapshot_matches_target(snapshot, provider_id, target))
+        .max_by_key(|snapshot| snapshot.fetched_at_ms)
+        .and_then(|snapshot| usage_provider_suppression_decision_from_snapshot(snapshot, now_ms))
 }
 
 fn auto_probe_error_summary(probe_errors: &[String]) -> Option<String> {
@@ -3834,81 +4003,100 @@ fn auto_probe_error_summary(probe_errors: &[String]) -> Option<String> {
 async fn auto_probe_provider_target(
     client: &Client,
     target: &UsageProviderTarget,
-    cfg: &ProxyConfig,
-    lb_states: &Arc<Mutex<HashMap<String, LbState>>>,
     state: &Arc<ProxyState>,
     service_name: &str,
     force: bool,
 ) -> UsageProviderRefreshOutcome {
-    let upstreams = vec![target.upstream.clone()];
     let fetched_at_ms = unix_now_ms();
     let interval_secs = DEFAULT_POLL_INTERVAL_SECS;
     let stale_after_ms = stale_after_ms(fetched_at_ms, interval_secs);
 
     if is_official_openai_base_url(&target.base_url) {
         let provider = auto_openai_official_provider(target);
-        let Some(token) = resolve_token(&provider, &upstreams, cfg, service_name) else {
+        let Some(token) = resolve_token(&provider, target) else {
             state
-                .record_provider_balance_snapshot(
-                    service_name,
-                    base_snapshot(&provider, &target.upstream, fetched_at_ms, stale_after_ms),
-                )
-                .await;
-            update_usage_exhausted(lb_states, state, cfg, service_name, &upstreams, false, None)
+                .record_provider_balance_snapshot(base_snapshot(
+                    &provider,
+                    &target.endpoint,
+                    fetched_at_ms,
+                    stale_after_ms,
+                ))
                 .await;
             warn!(
                 "OpenAI organization costs require OPENAI_ADMIN_KEY; balance stays unknown for {}[{}]",
-                target.upstream.station_name, target.upstream.index
+                target.endpoint.provider_endpoint.provider_id, target.endpoint.catalog_index
             );
             return UsageProviderRefreshOutcome::MissingToken;
         };
 
-        return match poll_provider_http_json(client, &provider, &target.base_url, &token).await {
+        let prepared_poll = match prepare_provider_poll(
+            state.as_ref(),
+            &provider,
+            target,
+            &token,
+            provider.kind.source_name(),
+            None,
+            fetched_at_ms,
+        )
+        .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let snapshot =
+                    base_snapshot(&provider, &target.endpoint, fetched_at_ms, stale_after_ms)
+                        .with_error(error.to_string());
+                state.record_provider_balance_snapshot(snapshot).await;
+                return UsageProviderRefreshOutcome::Failed;
+            }
+        };
+
+        return match poll_provider_http_json(
+            client,
+            &provider,
+            &prepared_poll.endpoint,
+            prepared_poll.new_api_user_id.as_deref(),
+            &token,
+        )
+        .await
+        {
             Ok(value) => {
                 let snapshot = snapshot_from_provider_json(
                     &provider,
-                    &upstreams[0],
+                    &target.endpoint,
                     &value,
                     &target.base_url,
                     fetched_at_ms,
                     stale_after_ms,
                 );
-                update_usage_exhausted(
-                    lb_states,
-                    state,
-                    cfg,
-                    service_name,
-                    &upstreams,
-                    false,
+                commit_provider_poll_observation(
+                    state.as_ref(),
+                    prepared_poll.reservation,
+                    &snapshot,
                     None,
+                    unix_now_ms(),
                 )
                 .await;
-                state
-                    .record_provider_balance_snapshot(service_name, snapshot)
-                    .await;
+                state.record_provider_balance_snapshot(snapshot).await;
                 UsageProviderRefreshOutcome::Refreshed
             }
             Err(err) => {
-                state
-                    .record_provider_balance_snapshot(
-                        service_name,
-                        base_snapshot(&provider, &upstreams[0], fetched_at_ms, stale_after_ms)
-                            .with_error(err.to_string()),
-                    )
-                    .await;
-                update_usage_exhausted(
-                    lb_states,
-                    state,
-                    cfg,
-                    service_name,
-                    &upstreams,
-                    false,
+                let snapshot =
+                    base_snapshot(&provider, &target.endpoint, fetched_at_ms, stale_after_ms)
+                        .with_error(err.to_string());
+                commit_provider_poll_observation(
+                    state.as_ref(),
+                    prepared_poll.reservation,
+                    &snapshot,
                     None,
+                    unix_now_ms(),
                 )
                 .await;
+                state.record_provider_balance_snapshot(snapshot).await;
                 warn!(
                     "OpenAI organization costs poll failed for {}[{}]: {}",
-                    target.upstream.station_name, target.upstream.index, err
+                    target.endpoint.provider_endpoint.provider_id,
+                    target.endpoint.catalog_index,
+                    err
                 );
                 UsageProviderRefreshOutcome::Failed
             }
@@ -3919,7 +4107,6 @@ async fn auto_probe_provider_target(
     let provider_id = first_provider.id.clone();
     let snapshot_decision = existing_usage_provider_target_suppression_decision(
         state,
-        cfg,
         service_name,
         &provider_id,
         target,
@@ -3930,22 +4117,11 @@ async fn auto_probe_provider_target(
     if let Some(suppression) = active_usage_provider_target_suppression(&provider_id, target, now)
         && !force_can_bypass_active_suppression(force, &suppression, snapshot_decision.as_ref())
     {
-        let ttl = usage_provider_target_suppression_remaining_ttl(&suppression, now);
-        update_usage_exhausted(
-            lb_states,
-            state,
-            cfg,
-            service_name,
-            &upstreams,
-            suppression.routing_exhausted,
-            ttl,
-        )
-        .await;
         warn!(
             "auto usage provider '{}' skipped {}[{}]: balance refresh suppressed: {}",
             first_provider.id,
-            target.upstream.station_name,
-            target.upstream.index,
+            target.endpoint.provider_endpoint.provider_id,
+            target.endpoint.catalog_index,
             suppression.reason
         );
         return UsageProviderRefreshOutcome::Failed;
@@ -3956,40 +4132,30 @@ async fn auto_probe_provider_target(
             target,
             decision.ttl,
             decision.reason.clone(),
-            decision.routing_exhausted,
             Instant::now(),
         );
-        update_usage_exhausted(
-            lb_states,
-            state,
-            cfg,
-            service_name,
-            &upstreams,
-            decision.routing_exhausted,
-            Some(decision.ttl),
-        )
-        .await;
         warn!(
             "auto usage provider '{}' skipped {}[{}]: existing balance snapshot suppresses refresh: {}",
-            first_provider.id, target.upstream.station_name, target.upstream.index, decision.reason
+            first_provider.id,
+            target.endpoint.provider_endpoint.provider_id,
+            target.endpoint.catalog_index,
+            decision.reason
         );
         return UsageProviderRefreshOutcome::Failed;
     }
 
-    let Some(token) = resolve_token(&first_provider, &upstreams, cfg, service_name) else {
+    let Some(token) = resolve_token(&first_provider, target) else {
         state
             .record_provider_balance_snapshot(
-                service_name,
                 base_snapshot(
                     &first_provider,
-                    &target.upstream,
+                    &target.endpoint,
                     fetched_at_ms,
                     stale_after_ms,
                 )
                 .with_error("no usable token; checked upstream auth"),
             )
             .await;
-        update_usage_exhausted(lb_states, state, cfg, service_name, &upstreams, false, None).await;
         return UsageProviderRefreshOutcome::MissingToken;
     };
 
@@ -3998,32 +4164,60 @@ async fn auto_probe_provider_target(
         let error = "all balance probe kinds are temporarily suppressed";
         warn!(
             "auto usage provider '{}' skipped {}[{}]: {}",
-            first_provider.id, target.upstream.station_name, target.upstream.index, error
+            first_provider.id,
+            target.endpoint.provider_endpoint.provider_id,
+            target.endpoint.catalog_index,
+            error
         );
         state
             .record_provider_balance_snapshot(
-                service_name,
                 base_snapshot(
                     &first_provider,
-                    &target.upstream,
+                    &target.endpoint,
                     fetched_at_ms,
                     stale_after_ms,
                 )
                 .with_error(error),
             )
             .await;
-        update_usage_exhausted(lb_states, state, cfg, service_name, &upstreams, false, None).await;
         return UsageProviderRefreshOutcome::Failed;
     }
 
+    let auto_config_revision = auto_usage_provider_config_revision(target);
     let mut probe_errors = Vec::new();
     for kind in probe_order {
         let provider = auto_usage_provider(target, kind);
-        match poll_provider_http_json(client, &provider, &target.base_url, &token).await {
+        let prepared_poll = match prepare_provider_poll(
+            state.as_ref(),
+            &provider,
+            target,
+            &token,
+            "usage_provider:auto_balance",
+            Some(auto_config_revision.as_str()),
+            fetched_at_ms,
+        )
+        .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                remember_auto_probe_kind_failure(&provider_id, target, kind, Instant::now());
+                probe_errors.push(format!("{kind:?}: {error}"));
+                continue;
+            }
+        };
+        match poll_provider_http_json(
+            client,
+            &provider,
+            &prepared_poll.endpoint,
+            prepared_poll.new_api_user_id.as_deref(),
+            &token,
+        )
+        .await
+        {
             Ok(value) => {
                 let snapshot = snapshot_from_provider_json(
                     &provider,
-                    &upstreams[0],
+                    &target.endpoint,
                     &value,
                     &target.base_url,
                     fetched_at_ms,
@@ -4031,49 +4225,47 @@ async fn auto_probe_provider_target(
                 );
                 if auto_snapshot_is_usable(&snapshot) {
                     remember_auto_probe_kind_success(&provider_id, target, kind);
-                    let suppression_decision = usage_provider_suppression_decision_from_snapshot(
+                    let suppression_decision =
+                        usage_provider_suppression_decision_from_snapshot(&snapshot, fetched_at_ms);
+                    let exhausted_for_routing = suppression_decision.is_some();
+                    let observation_committed = commit_provider_poll_observation(
+                        state.as_ref(),
+                        prepared_poll.reservation,
                         &snapshot,
-                        cfg,
-                        fetched_at_ms,
-                    );
-                    let exhausted_for_lb = suppression_decision
-                        .as_ref()
-                        .is_some_and(|decision| decision.routing_exhausted);
-                    if let Some(decision) = suppression_decision.as_ref() {
+                        suppression_decision.as_ref(),
+                        unix_now_ms(),
+                    )
+                    .await;
+                    if observation_committed && let Some(decision) = suppression_decision.as_ref() {
                         remember_usage_provider_target_suppression(
                             &provider_id,
                             target,
                             decision.ttl,
                             decision.reason.as_str(),
-                            decision.routing_exhausted,
                             Instant::now(),
                         );
-                    } else {
+                    } else if observation_committed {
                         clear_usage_provider_target_suppression(&provider_id, target);
                     }
-                    update_usage_exhausted(
-                        lb_states,
-                        state,
-                        cfg,
-                        service_name,
-                        &upstreams,
-                        exhausted_for_lb,
-                        suppression_decision.as_ref().map(|decision| decision.ttl),
-                    )
-                    .await;
-                    state
-                        .record_provider_balance_snapshot(service_name, snapshot)
-                        .await;
+                    state.record_provider_balance_snapshot(snapshot).await;
                     info!(
                         "auto usage provider '{}' refreshed {}[{}] via {:?}, exhausted = {}",
                         provider.id,
-                        target.upstream.station_name,
-                        target.upstream.index,
+                        target.endpoint.provider_endpoint.provider_id,
+                        target.endpoint.catalog_index,
                         kind,
-                        exhausted_for_lb
+                        exhausted_for_routing
                     );
                     return UsageProviderRefreshOutcome::Refreshed;
                 }
+                commit_provider_poll_observation(
+                    state.as_ref(),
+                    prepared_poll.reservation,
+                    &snapshot,
+                    None,
+                    unix_now_ms(),
+                )
+                .await;
                 remember_auto_probe_kind_failure(&provider_id, target, kind, Instant::now());
                 let error = snapshot.error.unwrap_or_else(|| {
                     format!("auto probe {:?} returned no usable balance fields", kind)
@@ -4081,6 +4273,17 @@ async fn auto_probe_provider_target(
                 probe_errors.push(format!("{:?}: {}", kind, error));
             }
             Err(err) => {
+                let snapshot =
+                    base_snapshot(&provider, &target.endpoint, fetched_at_ms, stale_after_ms)
+                        .with_error(err.to_string());
+                commit_provider_poll_observation(
+                    state.as_ref(),
+                    prepared_poll.reservation,
+                    &snapshot,
+                    None,
+                    unix_now_ms(),
+                )
+                .await;
                 remember_auto_probe_kind_failure(&provider_id, target, kind, Instant::now());
                 probe_errors.push(format!("{:?}: {}", kind, err));
             }
@@ -4090,14 +4293,16 @@ async fn auto_probe_provider_target(
     if let Some(error) = auto_probe_error_summary(&probe_errors) {
         warn!(
             "auto usage provider '{}' found no usable balance endpoint for {}[{}]: {}",
-            first_provider.id, target.upstream.station_name, target.upstream.index, error
+            first_provider.id,
+            target.endpoint.provider_endpoint.provider_id,
+            target.endpoint.catalog_index,
+            error
         );
         state
             .record_provider_balance_snapshot(
-                service_name,
                 base_snapshot(
                     &first_provider,
-                    &target.upstream,
+                    &target.endpoint,
                     fetched_at_ms,
                     stale_after_ms,
                 )
@@ -4111,49 +4316,37 @@ async fn auto_probe_provider_target(
                 target,
                 USAGE_PROVIDER_TERMINAL_FAILURE_TTL,
                 error.clone(),
-                true,
                 Instant::now(),
             );
         }
-        update_usage_exhausted(
-            lb_states,
-            state,
-            cfg,
-            service_name,
-            &upstreams,
-            terminal_failure,
-            terminal_failure.then_some(USAGE_PROVIDER_TERMINAL_FAILURE_TTL),
-        )
-        .await;
     }
     UsageProviderRefreshOutcome::Failed
 }
 
 pub async fn refresh_balances_for_service(
     client: &Client,
-    cfg: Arc<ProxyConfig>,
-    lb_states: Arc<Mutex<HashMap<String, LbState>>>,
+    cfg: Arc<HelperConfig>,
     state: Arc<ProxyState>,
     service_name: &str,
     options: UsageProviderRefreshOptions<'_>,
-) -> UsageProviderRefreshSummary {
+) -> Result<UsageProviderRefreshSummary> {
     // Tests should be hermetic and must not depend on real user `usage_providers.json`.
     if cfg!(test) {
-        return UsageProviderRefreshSummary::default();
+        return Ok(UsageProviderRefreshSummary::default());
     }
 
     let UsageProviderRefreshOptions {
-        station_name_filter,
+        route_provider_id_filter,
         provider_id_filter,
         force,
     } = options;
-    let station_name_filter = station_name_filter
+    let route_provider_id_filter = route_provider_id_filter
         .map(str::trim)
         .filter(|value| !value.is_empty());
     let provider_id_filter = provider_id_filter
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let providers_file = load_providers();
+    let providers_file = load_providers()?;
     let mut summary = UsageProviderRefreshSummary {
         providers_configured: providers_file.providers.len(),
         ..UsageProviderRefreshSummary::default()
@@ -4167,7 +4360,8 @@ pub async fn refresh_balances_for_service(
             continue;
         }
 
-        let targets = matching_provider_targets(&cfg, service_name, provider, station_name_filter);
+        let targets =
+            matching_provider_targets(&cfg, service_name, provider, route_provider_id_filter);
         if targets.is_empty() {
             continue;
         }
@@ -4191,15 +4385,8 @@ pub async fn refresh_balances_for_service(
 
     let mut refreshed_provider_ids = HashSet::new();
     if !configured_jobs.is_empty() {
-        for (provider_id, outcome) in run_configured_refresh_jobs(
-            client,
-            configured_jobs,
-            &cfg,
-            &lb_states,
-            &state,
-            service_name,
-        )
-        .await
+        for (provider_id, outcome) in
+            run_configured_refresh_jobs(client, configured_jobs, &state, service_name).await
         {
             match outcome {
                 UsageProviderRefreshOutcome::Refreshed => {
@@ -4213,7 +4400,7 @@ pub async fn refresh_balances_for_service(
     }
 
     let mut auto_jobs = Vec::new();
-    for target in usage_provider_targets(&cfg, service_name, station_name_filter) {
+    for target in usage_provider_targets(&cfg, service_name, route_provider_id_filter) {
         if configured_job_keys.contains(&target_key(&target)) {
             continue;
         }
@@ -4227,9 +4414,7 @@ pub async fn refresh_balances_for_service(
     }
 
     if !auto_jobs.is_empty() {
-        for outcome in
-            run_auto_refresh_jobs(client, auto_jobs, &cfg, &lb_states, &state, service_name).await
-        {
+        for outcome in run_auto_refresh_jobs(client, auto_jobs, &state, service_name).await {
             match outcome {
                 UsageProviderRefreshOutcome::Refreshed => {
                     summary.refreshed += 1;
@@ -4255,16 +4440,13 @@ pub async fn refresh_balances_for_service(
         }
     }
 
-    summary
+    Ok(summary)
 }
 
-/// Provider-endpoint keyed variant used by the route graph executor.
-/// Station/upstream are still updated inside the usage provider as a compatibility projection
-/// when the current runtime config can map the endpoint back to one legacy upstream.
+/// Queues an identity-scoped provider observation refresh for the route graph executor.
 pub fn enqueue_poll_for_codex_provider_endpoint(
     client: Client,
-    cfg: Arc<ProxyConfig>,
-    lb_states: Arc<Mutex<HashMap<String, LbState>>>,
+    cfg: Arc<HelperConfig>,
     state: Arc<ProxyState>,
     service_name: &str,
     provider_endpoint: ProviderEndpointKey,
@@ -4296,7 +4478,6 @@ pub fn enqueue_poll_for_codex_provider_endpoint(
             match poll_for_codex_target(
                 client.clone(),
                 cfg.clone(),
-                lb_states.clone(),
                 state.clone(),
                 service_name.as_str(),
                 current_target,
@@ -4317,8 +4498,7 @@ pub fn enqueue_poll_for_codex_provider_endpoint(
 
 async fn poll_for_codex_target(
     client: Client,
-    cfg: Arc<ProxyConfig>,
-    lb_states: Arc<Mutex<HashMap<String, LbState>>>,
+    cfg: Arc<HelperConfig>,
     state: Arc<ProxyState>,
     service_name: &str,
     current_target: Option<UsageProviderTarget>,
@@ -4329,7 +4509,15 @@ async fn poll_for_codex_target(
         return RequestBalancePollOutcome::Skipped;
     }
 
-    let providers_file = load_providers();
+    let providers_file = match load_providers() {
+        Ok(providers_file) => providers_file,
+        Err(error) => {
+            warn!(
+                "skipping request-driven usage provider poll because configuration could not be loaded: {error:#}"
+            );
+            return RequestBalancePollOutcome::Skipped;
+        }
+    };
     let Some(current_target) = current_target else {
         return RequestBalancePollOutcome::Skipped;
     };
@@ -4375,15 +4563,7 @@ async fn poll_for_codex_target(
     }
 
     if !configured_jobs.is_empty() {
-        let _ = run_configured_refresh_jobs(
-            &client,
-            configured_jobs,
-            &cfg,
-            &lb_states,
-            &state,
-            service_name,
-        )
-        .await;
+        let _ = run_configured_refresh_jobs(&client, configured_jobs, &state, service_name).await;
         return RequestBalancePollOutcome::Attempted;
     }
 
@@ -4415,16 +4595,7 @@ async fn poll_for_codex_target(
         map.insert(auto_provider.id.clone(), now);
     }
 
-    let _ = auto_probe_provider_target(
-        &client,
-        &current_target,
-        &cfg,
-        &lb_states,
-        &state,
-        service_name,
-        false,
-    )
-    .await;
+    let _ = auto_probe_provider_target(&client, &current_target, &state, service_name, false).await;
     RequestBalancePollOutcome::Attempted
 }
 
@@ -4433,7 +4604,7 @@ mod tests {
     use super::*;
 
     use crate::balance::BalanceSnapshotStatus;
-    use crate::config::{ServiceConfig, UpstreamAuth, UpstreamConfig};
+    use crate::config::{ProviderConfig, ProviderEndpointConfig, UpstreamAuth};
     use axum::routing::get;
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4456,102 +4627,100 @@ mod tests {
             endpoint: "https://example.com/usage".to_string(),
             token_env: None,
             require_token_env: false,
+            new_api_user_id_env: None,
             poll_interval_secs: Some(60),
             refresh_on_request: true,
             trust_exhaustion_for_routing: true,
-            headers: BTreeMap::new(),
-            variables: BTreeMap::new(),
             extract: UsageProviderExtractConfig::default(),
         }
     }
 
-    fn upstream() -> UpstreamRef {
-        UpstreamRef {
-            station_name: "right".to_string(),
-            index: 1,
-            provider_endpoint: None,
+    fn upstream() -> UsageProviderEndpointRef {
+        UsageProviderEndpointRef {
+            provider_endpoint: ProviderEndpointKey::new("codex", "right", "default"),
+            catalog_index: 1,
         }
     }
 
-    fn endpoint_upstream() -> UpstreamRef {
-        UpstreamRef {
-            station_name: "right".to_string(),
-            index: 1,
-            provider_endpoint: Some(ProviderEndpointKey::new("codex", "right", "default")),
+    fn provider_config(base_url: &str) -> ProviderConfig {
+        ProviderConfig {
+            base_url: Some(base_url.to_string()),
+            ..ProviderConfig::default()
         }
     }
 
-    fn upstream_config(base_url: &str) -> UpstreamConfig {
-        UpstreamConfig {
+    fn provider_endpoint_config(base_url: &str, endpoint_id: &str) -> ProviderConfig {
+        ProviderConfig {
+            endpoints: BTreeMap::from([(endpoint_id.to_string(), endpoint_config(base_url))]),
+            ..ProviderConfig::default()
+        }
+    }
+
+    fn endpoint_config(base_url: &str) -> ProviderEndpointConfig {
+        ProviderEndpointConfig {
             base_url: base_url.to_string(),
-            auth: UpstreamAuth::default(),
-            tags: HashMap::new(),
-            supported_models: HashMap::new(),
-            model_mapping: HashMap::new(),
-        }
-    }
-
-    fn endpoint_upstream_config(
-        base_url: &str,
-        provider_id: &str,
-        endpoint_id: &str,
-    ) -> UpstreamConfig {
-        let mut upstream = upstream_config(base_url);
-        upstream
-            .tags
-            .insert("provider_id".to_string(), provider_id.to_string());
-        upstream
-            .tags
-            .insert("endpoint_id".to_string(), endpoint_id.to_string());
-        upstream
-    }
-
-    fn service_config(name: &str, upstreams: Vec<UpstreamConfig>) -> ServiceConfig {
-        ServiceConfig {
-            name: name.to_string(),
-            alias: None,
+            continuity_domain: None,
             enabled: true,
-            level: 1,
-            upstreams,
+            priority: 0,
+            tags: BTreeMap::new(),
+            supported_models: BTreeMap::new(),
+            model_mapping: BTreeMap::new(),
+            limits: crate::config::ProviderConcurrencyLimits::default(),
         }
     }
 
-    fn proxy_config(stations: Vec<ServiceConfig>) -> ProxyConfig {
-        let mut cfg = ProxyConfig::default();
-        cfg.codex.configs = stations
+    fn helper_config(providers: Vec<(&str, ProviderConfig)>) -> HelperConfig {
+        let mut cfg = HelperConfig::default();
+        cfg.codex.providers = providers
             .into_iter()
-            .map(|station| (station.name.clone(), station))
+            .map(|(provider_id, provider)| (provider_id.to_string(), provider))
             .collect();
         cfg
     }
 
     fn usage_provider_target(base_url: &str, provider_id: &str) -> UsageProviderTarget {
         UsageProviderTarget {
-            upstream: UpstreamRef {
-                station_name: "routing".to_string(),
-                index: 0,
-                provider_endpoint: Some(ProviderEndpointKey::new("codex", provider_id, "default")),
+            endpoint: UsageProviderEndpointRef {
+                provider_endpoint: ProviderEndpointKey::new("codex", provider_id, "default"),
+                catalog_index: 0,
             },
             base_url: base_url.to_string(),
-            provider_id: Some(provider_id.to_string()),
+            auth: UpstreamAuth::default(),
+            tags: BTreeMap::new(),
+            supported_models: BTreeMap::new(),
+            model_mapping: BTreeMap::new(),
         }
     }
 
     fn usage_provider_target_at(
-        station_name: &str,
-        upstream_index: usize,
+        endpoint_id: &str,
+        catalog_index: usize,
         base_url: &str,
         provider_id: &str,
     ) -> UsageProviderTarget {
         UsageProviderTarget {
-            upstream: UpstreamRef {
-                station_name: station_name.to_string(),
-                index: upstream_index,
-                provider_endpoint: Some(ProviderEndpointKey::new("codex", provider_id, "default")),
+            endpoint: UsageProviderEndpointRef {
+                provider_endpoint: ProviderEndpointKey::new("codex", provider_id, endpoint_id),
+                catalog_index,
             },
             base_url: base_url.to_string(),
-            provider_id: Some(provider_id.to_string()),
+            auth: UpstreamAuth::default(),
+            tags: BTreeMap::new(),
+            supported_models: BTreeMap::new(),
+            model_mapping: BTreeMap::new(),
         }
+    }
+
+    fn isolated_usage_provider_path(test_name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "codex-helper-usage-provider-{test_name}-{}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&directory).expect("create isolated test directory");
+        let path = directory.join("usage_providers.json");
+        (directory, path)
     }
 
     fn clear_auto_probe_kind_state(provider_id: &str) {
@@ -4566,6 +4735,105 @@ mod tests {
             failures.retain(|key, _| key.provider_id != provider_id);
         }
         clear_usage_provider_target_suppressions_for_provider(provider_id);
+    }
+
+    async fn target_automatic_eligibility(
+        state: &ProxyState,
+        target: &UsageProviderTarget,
+    ) -> Option<crate::runtime_store::ProviderAutomaticEligibility> {
+        let endpoint = &target.endpoint.provider_endpoint;
+        state
+            .capture_provider_policy_snapshot()
+            .await
+            .projections
+            .iter()
+            .find(|projection| &projection.provider_endpoint == endpoint)
+            .map(|projection| projection.automatic)
+    }
+
+    #[test]
+    fn missing_usage_provider_file_uses_builtins_without_creating_a_file() {
+        let (directory, path) = isolated_usage_provider_path("missing");
+
+        let providers = load_providers_from_path(&path).expect("load in-memory built-ins");
+
+        assert!(!providers.providers.is_empty());
+        assert!(!path.exists(), "missing operator config must stay missing");
+        std::fs::remove_dir_all(directory).expect("remove isolated test directory");
+    }
+
+    #[test]
+    fn invalid_usage_provider_file_returns_error_without_rewriting_input() {
+        let (directory, path) = isolated_usage_provider_path("invalid");
+        let original = br#"{
+  "providers": [{
+    "id": "legacy-template",
+    "kind": "new_api_user_self",
+    "domains": ["example.com"],
+    "headers": {"New-Api-User": "42"}
+  }]
+}"#;
+        std::fs::write(&path, original).expect("write invalid operator config");
+
+        let error = load_providers_from_path(&path).expect_err("invalid config must fail");
+
+        let detail = format!("{error:#}");
+        assert!(detail.contains("failed to parse usage provider configuration"));
+        assert!(detail.contains("unknown field `headers`"));
+        assert_eq!(
+            std::fs::read(&path)
+                .expect("read preserved operator config")
+                .as_slice(),
+            original
+        );
+        std::fs::remove_dir_all(directory).expect("remove isolated test directory");
+    }
+
+    #[test]
+    fn unreadable_usage_provider_path_returns_contextual_error_without_replacement() {
+        let (directory, path) = isolated_usage_provider_path("unreadable");
+        std::fs::create_dir(&path).expect("create directory at config path");
+
+        let error = load_providers_from_path(&path).expect_err("directory is not a readable file");
+
+        assert!(
+            format!("{error:#}").contains("failed to read usage provider configuration"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            path.is_dir(),
+            "loader must not replace operator-owned input"
+        );
+        std::fs::remove_dir_all(directory).expect("remove isolated test directory");
+    }
+
+    #[test]
+    fn valid_usage_provider_file_is_loaded_without_rewriting_it() {
+        let (directory, path) = isolated_usage_provider_path("valid");
+        let original = br#"{
+  "providers": [{
+    "id": "newapi-dashboard",
+    "kind": "new_api_user_self",
+    "domains": ["example.com"],
+    "new_api_user_id_env": "NEW_API_USER_ID"
+  }]
+}"#;
+        std::fs::write(&path, original).expect("write operator config");
+
+        let providers = load_providers_from_path(&path).expect("load operator config");
+
+        assert_eq!(providers.providers.len(), 1);
+        assert_eq!(
+            providers.providers[0].new_api_user_id_env.as_deref(),
+            Some("NEW_API_USER_ID")
+        );
+        assert_eq!(
+            std::fs::read(&path)
+                .expect("read preserved operator config")
+                .as_slice(),
+            original
+        );
+        std::fs::remove_dir_all(directory).expect("remove isolated test directory");
     }
 
     #[test]
@@ -4655,12 +4923,9 @@ mod tests {
     }
 
     #[test]
-    fn provider_templates_support_variables_for_custom_headers_or_queries() {
+    fn provider_relative_endpoint_resolves_against_normalized_base_url() {
         let mut provider = provider("newapi", ProviderKind::NewApiUserSelf);
-        provider.endpoint = "{{base_url}}/api/user/self?user={{userId}}".to_string();
-        provider
-            .variables
-            .insert("userId".to_string(), "42".to_string());
+        provider.endpoint = "/api/user/self?user=42".to_string();
 
         let endpoint = resolve_endpoint(&provider, "https://newapi.example.com/v1", "token")
             .expect("endpoint");
@@ -4683,6 +4948,7 @@ mod tests {
     fn openai_organization_costs_endpoint_defaults_to_official_v1_costs_window() {
         let mut provider = provider("openai", ProviderKind::OpenAiOrganizationCosts);
         provider.endpoint.clear();
+        provider.domains = vec!["api.openai.com".to_string()];
 
         let endpoint =
             resolve_endpoint(&provider, "https://api.openai.com/v1", "token").expect("endpoint");
@@ -4699,33 +4965,260 @@ mod tests {
     }
 
     #[test]
+    fn openai_organization_costs_adapter_owns_its_query_window() {
+        let mut provider = provider("openai", ProviderKind::OpenAiOrganizationCosts);
+        provider.domains = vec!["api.openai.com".to_string()];
+        provider.endpoint =
+            "https://api.openai.com/v1/organization/costs?bucket=day&start_time=1&limit=1"
+                .to_string();
+
+        let endpoint =
+            resolve_endpoint(&provider, "https://api.openai.com/v1", "token").expect("endpoint");
+        let url = reqwest::Url::parse(&endpoint).expect("resolved endpoint URL");
+        let query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
+
+        assert_eq!(query.get("bucket").map(String::as_str), Some("day"));
+        assert_eq!(query.get("limit").map(String::as_str), Some("30"));
+        assert!(
+            query
+                .get("start_time")
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some_and(|value| value > 1)
+        );
+    }
+
+    #[test]
+    fn provider_endpoint_rejects_untrusted_or_credential_bearing_urls() {
+        let cases = [
+            (
+                "http://example.com/usage",
+                "must use HTTPS outside loopback",
+            ),
+            (
+                "https://user:password@example.com/usage",
+                "must not contain userinfo",
+            ),
+            (
+                "https://example.com/usage#private",
+                "must not contain a fragment",
+            ),
+            (
+                "https://untrusted.example.net/usage",
+                "outside its matched domains",
+            ),
+            (
+                "{{unsupported}}/usage",
+                "endpoint templates are not supported",
+            ),
+            (
+                "https://example.com/usage?api_key=literal-secret",
+                "must not contain query credentials",
+            ),
+            (
+                "https://example.com/usage?access_key=independent-secret",
+                "must not contain query credentials",
+            ),
+            (
+                "https://example.com/usage?api_token=independent-secret",
+                "must not contain query credentials",
+            ),
+            (
+                "https://example.com/usage?x-api-key=independent-secret",
+                "must not contain query credentials",
+            ),
+            (
+                "https://example.com/usage?secret_key=independent-secret",
+                "must not contain query credentials",
+            ),
+            (
+                "https://example.com/usage?private_key=independent-secret",
+                "must not contain query credentials",
+            ),
+            (
+                "https://example.com/usage?user=model-secret-token",
+                "must not contain query credentials",
+            ),
+        ];
+
+        for (endpoint, expected) in cases {
+            let mut provider = provider("credential-boundary", ProviderKind::NewApiUserSelf);
+            provider.endpoint = endpoint.to_string();
+            let error = resolve_endpoint(&provider, "https://example.com/v1", "model-secret-token")
+                .expect_err(endpoint);
+            assert!(
+                error.to_string().contains(expected),
+                "unexpected error for {endpoint}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_endpoint_allows_plain_http_only_for_loopback() {
+        let mut provider = provider("loopback", ProviderKind::NewApiUserSelf);
+        provider.domains = vec!["127.0.0.1".to_string()];
+        provider.endpoint = "http://127.0.0.1:8080/usage?user=42".to_string();
+
+        let endpoint = resolve_endpoint(&provider, "http://127.0.0.1:8080/v1", "model-secret")
+            .expect("loopback endpoint");
+
+        assert_eq!(endpoint, "http://127.0.0.1:8080/usage?user=42");
+    }
+
+    #[test]
+    fn usage_provider_config_rejects_generic_headers_and_variables() {
+        for field in ["headers", "variables"] {
+            let mut input = serde_json::json!({
+                "id": "closed-config",
+                "kind": "new_api_user_self",
+                "domains": ["example.com"]
+            });
+            input
+                .as_object_mut()
+                .expect("provider config object")
+                .insert(field.to_string(), serde_json::json!({"arbitrary": "value"}));
+
+            let error = serde_json::from_value::<UsageProviderConfig>(input)
+                .expect_err("generic request customization must be rejected");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("unknown field `{field}`")),
+                "unexpected error for {field}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn new_api_user_self_uses_typed_user_id_and_fixed_headers() {
+        let mut provider = provider("newapi", ProviderKind::NewApiUserSelf);
+        provider.new_api_user_id_env = Some("NEW_API_USER_ID".to_string());
+
+        let user_id = resolve_new_api_user_id_with(&provider, |name| {
+            (name == "NEW_API_USER_ID").then(|| "42".to_string())
+        })
+        .expect("typed user id")
+        .expect("configured user id");
+        let headers = provider_request_headers(&provider, "dashboard-token", Some(&user_id))
+            .expect("fixed provider headers");
+
+        assert_eq!(
+            headers
+                .get(reqwest::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer dashboard-token")
+        );
+        assert_eq!(
+            headers
+                .get("New-Api-User")
+                .and_then(|value| value.to_str().ok()),
+            Some("42")
+        );
+    }
+
+    #[test]
+    fn new_api_user_id_field_is_kind_scoped_and_required_when_configured() {
+        let mut provider = provider("wrong-kind", ProviderKind::OpenAiBalanceHttpJson);
+        provider.new_api_user_id_env = Some("NEW_API_USER_ID".to_string());
+        let error = resolve_new_api_user_id_with(&provider, |_| Some("42".to_string()))
+            .expect_err("field must be kind scoped");
+        assert!(
+            error
+                .to_string()
+                .contains("only for kind new_api_user_self")
+        );
+
+        provider.kind = ProviderKind::NewApiUserSelf;
+        let error = resolve_new_api_user_id_with(&provider, |_| None)
+            .expect_err("configured user id must be available");
+        assert!(
+            error
+                .to_string()
+                .contains("requires New-Api-User from environment variable 'NEW_API_USER_ID'")
+        );
+    }
+
+    #[test]
+    fn new_api_user_id_partitions_the_account_fingerprint() {
+        let first = usage_provider_account_fingerprint("shared-token", Some("42"));
+        let second = usage_provider_account_fingerprint("shared-token", Some("43"));
+        let token_only = usage_provider_account_fingerprint("shared-token", None);
+
+        assert_ne!(first, second);
+        assert_ne!(first, token_only);
+        assert!(first.starts_with("sha256:"));
+    }
+
+    #[tokio::test]
+    async fn upstream_client_refuses_cross_origin_usage_provider_redirects() {
+        let target_headers = Arc::new(Mutex::new(Vec::<axum::http::HeaderMap>::new()));
+        let target_headers_for_route = target_headers.clone();
+        let target = axum::Router::new().fallback(get(move |headers: axum::http::HeaderMap| {
+            let target_headers = target_headers_for_route.clone();
+            async move {
+                target_headers.lock().expect("target headers").push(headers);
+                axum::Json(serde_json::json!({"balance": 1}))
+            }
+        }));
+        let (target_addr, target_handle) = spawn_axum_server(target).await;
+
+        let source_hits = Arc::new(AtomicUsize::new(0));
+        let source_hits_for_route = source_hits.clone();
+        let redirect_location = format!("http://{target_addr}/capture");
+        let source = axum::Router::new().fallback(get(move || {
+            let source_hits = source_hits_for_route.clone();
+            let redirect_location = redirect_location.clone();
+            async move {
+                source_hits.fetch_add(1, Ordering::SeqCst);
+                (
+                    axum::http::StatusCode::FOUND,
+                    [(axum::http::header::LOCATION, redirect_location)],
+                )
+            }
+        }));
+        let (source_addr, source_handle) = spawn_axum_server(source).await;
+        let endpoint = format!("http://{source_addr}/usage");
+        let client = crate::proxy::upstream_http_client_builder()
+            .build()
+            .expect("build production upstream client");
+
+        for kind in [
+            ProviderKind::OpenAiBalanceHttpJson,
+            ProviderKind::YescodeProfile,
+        ] {
+            let provider = provider("redirect-boundary", kind);
+            let error =
+                poll_provider_http_json(&client, &provider, &endpoint, None, "model-secret")
+                    .await
+                    .expect_err("redirect must remain an upstream response");
+            assert!(
+                error.to_string().contains("HTTP 302"),
+                "unexpected redirect error: {error:#}"
+            );
+        }
+
+        assert_eq!(source_hits.load(Ordering::SeqCst), 2);
+        assert!(
+            target_headers.lock().expect("target headers").is_empty(),
+            "redirect target received provider credentials or metadata"
+        );
+        source_handle.abort();
+        target_handle.abort();
+    }
+
+    #[test]
     fn require_token_env_prevents_upstream_model_key_fallback() {
-        let mut cfg = proxy_config(vec![service_config(
-            "right",
-            vec![upstream_config("https://api.openai.com/v1")],
-        )]);
-        cfg.codex
-            .configs
-            .get_mut("right")
-            .expect("station")
-            .upstreams[0]
-            .auth
-            .auth_token = Some("model-key".to_string());
+        let mut target = usage_provider_target("https://api.openai.com/v1", "right");
+        target.auth.auth_token = Some("model-key".to_string());
 
         let mut provider = provider("openai", ProviderKind::OpenAiOrganizationCosts);
         provider.token_env = Some("__CODEX_HELPER_TEST_MISSING_TOKEN_ENV__".to_string());
         provider.require_token_env = true;
-        let upstreams = [UpstreamRef {
-            station_name: "right".to_string(),
-            index: 0,
-            provider_endpoint: None,
-        }];
 
-        assert_eq!(resolve_token(&provider, &upstreams, &cfg, "codex"), None);
+        assert_eq!(resolve_token(&provider, &target), None);
 
         provider.require_token_env = false;
         assert_eq!(
-            resolve_token(&provider, &upstreams, &cfg, "codex").as_deref(),
+            resolve_token(&provider, &target).as_deref(),
             Some("model-key")
         );
     }
@@ -4765,6 +5258,21 @@ mod tests {
     }
 
     #[test]
+    fn terminal_provider_error_does_not_become_routing_exhaustion() {
+        let snapshot = ProviderBalanceSnapshot {
+            fetched_at_ms: 1_000,
+            stale_after_ms: Some(2_000),
+            error: Some("USER_INACTIVE: User account is not active".to_string()),
+            ..ProviderBalanceSnapshot::default()
+        };
+
+        assert!(
+            usage_provider_suppression_decision_from_snapshot(&snapshot, 1_500).is_none(),
+            "poll failures may back off polling but must not create route eligibility effects"
+        );
+    }
+
+    #[test]
     fn current_day_quota_exhaustion_blocks_followup_usage_even_when_display_only() {
         let mut snapshot = ProviderBalanceSnapshot {
             status: BalanceSnapshotStatus::Exhausted,
@@ -4778,12 +5286,8 @@ mod tests {
 
         assert!(!snapshot.routing_exhausted());
         assert!(
-            usage_provider_suppression_decision_from_snapshot(
-                &snapshot,
-                &ProxyConfig::default(),
-                snapshot.fetched_at_ms,
-            )
-            .is_some()
+            usage_provider_suppression_decision_from_snapshot(&snapshot, snapshot.fetched_at_ms)
+                .is_some()
         );
         assert_eq!(
             usage_provider_snapshot_suppression_reason(&snapshot).as_deref(),
@@ -4792,15 +5296,29 @@ mod tests {
     }
 
     #[test]
-    fn current_day_quota_suppression_expires_after_configured_reset() {
-        let cfg = ProxyConfig::default();
+    fn daily_quota_reset_uses_default_fixed_offset_midnight() {
+        let now_ms = 10 * HOUR_MS;
+
+        let reset_at_ms = next_daily_quota_reset_at_ms(now_ms).expect("default reset");
+
+        assert_eq!(reset_at_ms, 16 * HOUR_MS);
+    }
+
+    #[test]
+    fn fixed_offset_reset_uses_configured_clock_and_timezone() {
+        let now_ms = 10 * HOUR_MS;
+
+        let reset_at_ms =
+            next_fixed_offset_reset_at_ms(now_ms, "-05:00", "06:30").expect("fixed reset");
+
+        assert_eq!(reset_at_ms, 11 * HOUR_MS + 30 * MINUTE_MS);
+    }
+
+    #[test]
+    fn current_day_quota_suppression_expires_after_default_reset() {
         let fetched_at_ms = 1_700_000_000_000;
-        let reset_at_ms = next_reset_at_ms(
-            fetched_at_ms,
-            cfg.ui.usage_forecast.reset_utc_offset.as_str(),
-            cfg.ui.usage_forecast.reset_time.as_str(),
-        )
-        .expect("default reset config is valid");
+        let reset_at_ms =
+            next_daily_quota_reset_at_ms(fetched_at_ms).expect("default reset is valid");
         let suppress_until_ms = reset_at_ms;
 
         let mut snapshot = ProviderBalanceSnapshot {
@@ -4815,17 +5333,13 @@ mod tests {
         };
         snapshot.refresh_status(fetched_at_ms);
 
-        let decision = usage_provider_suppression_decision_from_snapshot(
-            &snapshot,
-            &cfg,
-            suppress_until_ms - 1,
-        )
-        .expect("daily exhaustion should suppress until configured reset");
+        let decision =
+            usage_provider_suppression_decision_from_snapshot(&snapshot, suppress_until_ms - 1)
+                .expect("daily exhaustion should suppress until default reset");
         assert_eq!(decision.ttl, Duration::from_millis(1));
-        assert!(decision.routing_exhausted);
 
         assert!(
-            usage_provider_suppression_decision_from_snapshot(&snapshot, &cfg, suppress_until_ms)
+            usage_provider_suppression_decision_from_snapshot(&snapshot, suppress_until_ms)
                 .is_none(),
             "a fresh-looking daily exhaustion snapshot must not suppress refresh after reset"
         );
@@ -4833,7 +5347,6 @@ mod tests {
 
     #[test]
     fn stale_non_daily_exhaustion_snapshot_does_not_renew_suppression() {
-        let cfg = ProxyConfig::default();
         let mut snapshot = ProviderBalanceSnapshot {
             fetched_at_ms: 1_000,
             stale_after_ms: Some(2_000),
@@ -4845,20 +5358,18 @@ mod tests {
         };
         snapshot.refresh_status(1_000);
 
-        let fresh_decision =
-            usage_provider_suppression_decision_from_snapshot(&snapshot, &cfg, 1_500)
-                .expect("fresh exhausted quota should suppress follow-up polling");
+        let fresh_decision = usage_provider_suppression_decision_from_snapshot(&snapshot, 1_500)
+            .expect("fresh exhausted quota should suppress follow-up polling");
         assert_eq!(fresh_decision.ttl, USAGE_PROVIDER_EXHAUSTED_SUPPRESSION_TTL);
 
         assert!(
-            usage_provider_suppression_decision_from_snapshot(&snapshot, &cfg, 2_001).is_none(),
+            usage_provider_suppression_decision_from_snapshot(&snapshot, 2_001).is_none(),
             "stale exhausted quota snapshots must not be used to renew suppression forever"
         );
     }
 
     #[test]
     fn refreshable_weekly_window_exhaustion_suppresses_only_while_snapshot_is_fresh() {
-        let cfg = ProxyConfig::default();
         let mut snapshot = ProviderBalanceSnapshot {
             fetched_at_ms: 1_000,
             stale_after_ms: Some(10_000),
@@ -4871,20 +5382,18 @@ mod tests {
         };
         snapshot.refresh_status(1_000);
 
-        let decision = usage_provider_suppression_decision_from_snapshot(&snapshot, &cfg, 4_000)
+        let decision = usage_provider_suppression_decision_from_snapshot(&snapshot, 4_000)
             .expect("fresh weekly window exhaustion should block follow-up usage");
         assert_eq!(decision.ttl, Duration::from_millis(6_000));
-        assert!(decision.routing_exhausted);
 
         assert!(
-            usage_provider_suppression_decision_from_snapshot(&snapshot, &cfg, 10_001).is_none(),
+            usage_provider_suppression_decision_from_snapshot(&snapshot, 10_001).is_none(),
             "weekly/monthly windows without explicit reset_at should be re-queried after staleness"
         );
     }
 
     #[test]
     fn rate_limit_reset_at_drives_suppression_ttl() {
-        let cfg = ProxyConfig::default();
         let reset_at_ms = 120_000;
         let suppress_until_ms =
             reset_at_ms + duration_millis_u64(USAGE_PROVIDER_DAILY_RESET_SUPPRESSION_GRACE);
@@ -4899,37 +5408,27 @@ mod tests {
         };
         snapshot.refresh_status(1_000);
 
-        let decision = usage_provider_suppression_decision_from_snapshot(
-            &snapshot,
-            &cfg,
-            suppress_until_ms - 1,
-        )
-        .expect("rate limit should suppress until reset grace expires");
+        let decision =
+            usage_provider_suppression_decision_from_snapshot(&snapshot, suppress_until_ms - 1)
+                .expect("rate limit should suppress until reset grace expires");
         assert_eq!(decision.ttl, Duration::from_millis(1));
 
         assert!(
-            usage_provider_suppression_decision_from_snapshot(&snapshot, &cfg, suppress_until_ms)
+            usage_provider_suppression_decision_from_snapshot(&snapshot, suppress_until_ms)
                 .is_none()
         );
     }
 
     #[test]
-    fn auto_provider_uses_stable_target_id_across_probe_kinds() {
-        let target = UsageProviderTarget {
-            upstream: UpstreamRef {
-                station_name: "input/sub".to_string(),
-                index: 2,
-                provider_endpoint: None,
-            },
-            base_url: "https://ai.input.im/v1".to_string(),
-            provider_id: None,
-        };
+    fn auto_provider_uses_canonical_provider_id_across_probe_kinds() {
+        let target =
+            usage_provider_target_at("secondary", 2, "https://ai.input.im/v1", "input/sub");
 
         let sub2api = auto_usage_provider(&target, ProviderKind::Sub2ApiUsage);
         let newapi_token = auto_usage_provider(&target, ProviderKind::NewApiTokenUsage);
         let newapi = auto_usage_provider(&target, ProviderKind::NewApiUserSelf);
 
-        assert_eq!(sub2api.id, "auto:balance:input-sub:2");
+        assert_eq!(sub2api.id, "input/sub");
         assert_eq!(sub2api.id, newapi_token.id);
         assert_eq!(sub2api.id, newapi.id);
         assert_eq!(sub2api.domains, vec!["ai.input.im".to_string()]);
@@ -4945,15 +5444,7 @@ mod tests {
 
     #[test]
     fn auto_probe_prefers_rightcode_adapter_for_rightcode_hosts() {
-        let target = UsageProviderTarget {
-            upstream: UpstreamRef {
-                station_name: "right".to_string(),
-                index: 0,
-                provider_endpoint: None,
-            },
-            base_url: "https://www.right.codes/codex/v1".to_string(),
-            provider_id: Some("right".to_string()),
-        };
+        let target = usage_provider_target("https://www.right.codes/codex/v1", "right");
 
         assert_eq!(
             first_auto_probe_kind(&target),
@@ -4977,16 +5468,8 @@ mod tests {
     }
 
     #[test]
-    fn auto_provider_id_prefers_runtime_provider_tag() {
-        let target = UsageProviderTarget {
-            upstream: UpstreamRef {
-                station_name: "routing".to_string(),
-                index: 0,
-                provider_endpoint: Some(ProviderEndpointKey::new("codex", "input", "default")),
-            },
-            base_url: "https://ai.input.im/v1".to_string(),
-            provider_id: Some("input".to_string()),
-        };
+    fn auto_provider_id_uses_canonical_endpoint_identity() {
+        let target = usage_provider_target("https://ai.input.im/v1", "input");
 
         let provider = auto_usage_provider(&target, ProviderKind::Sub2ApiUsage);
 
@@ -4994,16 +5477,8 @@ mod tests {
     }
 
     #[test]
-    fn auto_target_provider_id_filter_matches_runtime_provider_tag() {
-        let target = UsageProviderTarget {
-            upstream: UpstreamRef {
-                station_name: "routing".to_string(),
-                index: 6,
-                provider_endpoint: Some(ProviderEndpointKey::new("codex", "input6", "default")),
-            },
-            base_url: "https://input.9z1.me/v1".to_string(),
-            provider_id: Some("input6".to_string()),
-        };
+    fn auto_target_provider_id_filter_matches_canonical_provider_id() {
+        let target = usage_provider_target_at("default", 6, "https://input.9z1.me/v1", "input6");
 
         assert!(auto_target_matches_provider_id_filter(&target, None));
         assert!(auto_target_matches_provider_id_filter(
@@ -5017,36 +5492,25 @@ mod tests {
     }
 
     #[test]
-    fn auto_target_provider_id_filter_matches_generated_auto_id() {
-        let target = UsageProviderTarget {
-            upstream: UpstreamRef {
-                station_name: "routing".to_string(),
-                index: 6,
-                provider_endpoint: None,
-            },
-            base_url: "https://input.9z1.me/v1".to_string(),
-            provider_id: None,
-        };
+    fn auto_target_provider_id_filter_does_not_generate_compatibility_id() {
+        let target = usage_provider_target_at("default", 6, "https://input.9z1.me/v1", "input6");
 
         assert!(auto_target_matches_provider_id_filter(
             &target,
-            Some("auto:balance:routing:6")
+            Some("input6")
         ));
         assert!(!auto_target_matches_provider_id_filter(
             &target,
-            Some("input6")
+            Some("auto:balance:routing:6")
         ));
     }
 
     #[test]
     fn provider_endpoint_target_lookup_uses_endpoint_identity() {
-        let cfg = proxy_config(vec![service_config(
-            "routing",
-            vec![
-                endpoint_upstream_config("https://input.example/v1", "input", "default"),
-                endpoint_upstream_config("https://right.example/v1", "right", "default"),
-            ],
-        )]);
+        let cfg = helper_config(vec![
+            ("input", provider_config("https://input.example/v1")),
+            ("right", provider_config("https://right.example/v1")),
+        ]);
 
         let target = usage_provider_target_for_provider_endpoint(
             &cfg,
@@ -5055,19 +5519,82 @@ mod tests {
         )
         .expect("provider endpoint target");
 
-        assert_eq!(target.upstream.station_name, "routing");
-        assert_eq!(target.upstream.index, 1);
+        assert_eq!(target.endpoint.provider_endpoint.provider_id, "right");
+        assert_eq!(target.endpoint.catalog_index, 0);
         assert_eq!(
-            target
-                .upstream
-                .provider_endpoint
-                .as_ref()
-                .map(ProviderEndpointKey::stable_key)
-                .as_deref(),
-            Some("codex/right/default")
+            target.endpoint.provider_endpoint.stable_key(),
+            "codex/right/default"
         );
         assert_eq!(target.base_url, "https://right.example/v1");
-        assert_eq!(target.provider_id.as_deref(), Some("right"));
+    }
+
+    #[test]
+    fn canonical_targets_preserve_auth_endpoint_overrides_and_priority_order() {
+        let mut provider = provider_endpoint_config("https://slow.example/v1", "slow");
+        provider.auth.auth_token = Some("block-token".to_string());
+        provider.inline_auth.auth_token = Some("inline-token".to_string());
+        provider
+            .tags
+            .insert("region".to_string(), "provider".to_string());
+        provider
+            .tags
+            .insert("tier".to_string(), "provider".to_string());
+        provider.supported_models.insert("gpt-*".to_string(), true);
+        provider
+            .model_mapping
+            .insert("gpt-external".to_string(), "gpt-provider".to_string());
+        let slow = provider.endpoints.get_mut("slow").expect("slow endpoint");
+        slow.priority = 20;
+        slow.tags.insert("tier".to_string(), "slow".to_string());
+        slow.supported_models.insert("gpt-*".to_string(), false);
+        slow.model_mapping
+            .insert("gpt-external".to_string(), "gpt-slow".to_string());
+        provider.endpoints.insert(
+            "fast".to_string(),
+            ProviderEndpointConfig {
+                priority: 10,
+                tags: BTreeMap::from([("tier".to_string(), "fast".to_string())]),
+                ..endpoint_config("https://fast.example/v1")
+            },
+        );
+        provider.endpoints.insert(
+            "disabled".to_string(),
+            ProviderEndpointConfig {
+                enabled: false,
+                ..endpoint_config("https://disabled.example/v1")
+            },
+        );
+        let cfg = helper_config(vec![("relay", provider)]);
+
+        let targets = usage_provider_targets(&cfg, "codex", Some("relay"));
+
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| target.endpoint.provider_endpoint.endpoint_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fast", "slow"]
+        );
+        assert_eq!(
+            targets[0].auth.resolve_auth_token().as_deref(),
+            Some("inline-token")
+        );
+        assert_eq!(
+            targets[0].tags.get("region").map(String::as_str),
+            Some("provider")
+        );
+        assert_eq!(
+            targets[0].tags.get("tier").map(String::as_str),
+            Some("fast")
+        );
+        assert_eq!(targets[1].supported_models.get("gpt-*"), Some(&false));
+        assert_eq!(
+            targets[1]
+                .model_mapping
+                .get("gpt-external")
+                .map(String::as_str),
+            Some("gpt-slow")
+        );
     }
 
     #[test]
@@ -5154,9 +5681,9 @@ mod tests {
 
     #[test]
     fn configured_target_keys_prevent_auto_probe_for_explicit_balance_domains() {
-        let cfg = proxy_config(vec![
-            service_config("explicit", vec![upstream_config("https://example.com/v1")]),
-            service_config("auto", vec![upstream_config("https://ai.input.im/v1")]),
+        let cfg = helper_config(vec![
+            ("explicit", provider_config("https://example.com/v1")),
+            ("auto", provider_config("https://ai.input.im/v1")),
         ]);
         let configured = configured_target_keys(
             &cfg,
@@ -5167,7 +5694,7 @@ mod tests {
         let auto_targets = usage_provider_targets(&cfg, "codex", None)
             .into_iter()
             .filter(|target| !configured.contains(&target_key(target)))
-            .map(|target| target.upstream.station_name)
+            .map(|target| target.endpoint.provider_endpoint.provider_id)
             .collect::<Vec<_>>();
 
         assert_eq!(auto_targets, vec!["auto".to_string()]);
@@ -5316,13 +5843,9 @@ mod tests {
     async fn auto_probe_suppressed_order_records_error_snapshot() {
         let provider_id = "input-suppressed-snapshot";
         clear_auto_probe_kind_state(provider_id);
-        let mut upstream =
-            endpoint_upstream_config("https://relay.example.com/v1", provider_id, "default");
-        upstream.auth.auth_token = Some("model-key".to_string());
-        let cfg = proxy_config(vec![service_config("routing", vec![upstream])]);
-        let lb_states = Arc::new(Mutex::new(HashMap::new()));
         let state = ProxyState::new();
-        let target = usage_provider_target("https://relay.example.com/v1", provider_id);
+        let mut target = usage_provider_target("https://relay.example.com/v1", provider_id);
+        target.auth.auth_token = Some("model-key".to_string());
         let now = Instant::now();
 
         for kind in AUTO_PROBE_KINDS {
@@ -5332,25 +5855,15 @@ mod tests {
             remember_auto_probe_kind_failure(provider_id, &target, kind, now);
         }
 
-        let outcome = auto_probe_provider_target(
-            &Client::new(),
-            &target,
-            &cfg,
-            &lb_states,
-            &state,
-            "codex",
-            false,
-        )
-        .await;
+        let outcome =
+            auto_probe_provider_target(&Client::new(), &target, &state, "codex", false).await;
 
         assert_eq!(outcome, UsageProviderRefreshOutcome::Failed);
         let view = state.get_provider_balance_view("codex").await;
         let snapshot = view
-            .get("routing")
-            .and_then(|snapshots| {
-                snapshots
-                    .iter()
-                    .find(|snapshot| snapshot.provider_id == provider_id)
+            .iter()
+            .find(|snapshot| {
+                provider_balance_snapshot_matches_target(snapshot, provider_id, &target)
             })
             .expect("suppressed auto probe snapshot");
         assert_eq!(snapshot.status, BalanceSnapshotStatus::Error);
@@ -5358,20 +5871,16 @@ mod tests {
             snapshot.error.as_deref(),
             Some("all balance probe kinds are temporarily suppressed")
         );
-        assert_eq!(snapshot.upstream_index, Some(0));
-        let guard = lb_states.lock().expect("lb states");
-        assert!(
-            !guard
-                .get("routing")
-                .and_then(|entry| entry.usage_exhausted.first())
-                .copied()
-                .unwrap_or(true)
+        assert_eq!(snapshot.provider_endpoint.endpoint_id, "default");
+        assert_eq!(
+            target_automatic_eligibility(state.as_ref(), &target).await,
+            None
         );
         clear_auto_probe_kind_state(provider_id);
     }
 
     #[tokio::test]
-    async fn auto_probe_terminal_auth_failure_keeps_route_exhausted_during_suppression() {
+    async fn auto_probe_terminal_auth_failure_does_not_change_eligibility_during_backoff() {
         let provider_id = "input-terminal-auth";
         clear_auto_probe_kind_state(provider_id);
         let request_count = Arc::new(AtomicUsize::new(0));
@@ -5391,43 +5900,24 @@ mod tests {
         }));
         let (addr, handle) = spawn_axum_server(app).await;
         let base_url = format!("http://{addr}/v1");
-        let mut upstream = endpoint_upstream_config(&base_url, provider_id, "default");
-        upstream.auth.auth_token = Some("model-key".to_string());
-        let cfg = proxy_config(vec![service_config("routing", vec![upstream])]);
-        let lb_states = Arc::new(Mutex::new(HashMap::new()));
         let state = ProxyState::new();
-        let target = usage_provider_target(&base_url, provider_id);
+        let mut target = usage_provider_target(&base_url, provider_id);
+        target.auth.auth_token = Some("model-key".to_string());
 
-        let outcome = auto_probe_provider_target(
-            &Client::new(),
-            &target,
-            &cfg,
-            &lb_states,
-            &state,
-            "codex",
-            false,
-        )
-        .await;
+        let outcome =
+            auto_probe_provider_target(&Client::new(), &target, &state, "codex", false).await;
 
         assert_eq!(outcome, UsageProviderRefreshOutcome::Failed);
         assert!(request_count.load(Ordering::SeqCst) > 0);
-        {
-            let guard = lb_states.lock().expect("lb states");
-            assert!(
-                guard
-                    .get("routing")
-                    .and_then(|entry| entry.usage_exhausted.first())
-                    .copied()
-                    .unwrap_or(false)
-            );
-        }
+        assert_eq!(
+            target_automatic_eligibility(state.as_ref(), &target).await,
+            Some(crate::runtime_store::ProviderAutomaticEligibility::Eligible)
+        );
         let view = state.get_provider_balance_view("codex").await;
         let snapshot = view
-            .get("routing")
-            .and_then(|snapshots| {
-                snapshots
-                    .iter()
-                    .find(|snapshot| snapshot.provider_id == provider_id)
+            .iter()
+            .find(|snapshot| {
+                provider_balance_snapshot_matches_target(snapshot, provider_id, &target)
             })
             .expect("terminal auth failure snapshot");
         assert!(
@@ -5439,43 +5929,21 @@ mod tests {
         );
 
         let requests_after_first_probe = request_count.load(Ordering::SeqCst);
-        let suppressed_outcome = auto_probe_provider_target(
-            &Client::new(),
-            &target,
-            &cfg,
-            &lb_states,
-            &state,
-            "codex",
-            false,
-        )
-        .await;
+        let suppressed_outcome =
+            auto_probe_provider_target(&Client::new(), &target, &state, "codex", false).await;
 
         assert_eq!(suppressed_outcome, UsageProviderRefreshOutcome::Failed);
         assert_eq!(
             request_count.load(Ordering::SeqCst),
             requests_after_first_probe
         );
-        {
-            let guard = lb_states.lock().expect("lb states");
-            assert!(
-                guard
-                    .get("routing")
-                    .and_then(|entry| entry.usage_exhausted.first())
-                    .copied()
-                    .unwrap_or(false)
-            );
-        }
+        assert_eq!(
+            target_automatic_eligibility(state.as_ref(), &target).await,
+            Some(crate::runtime_store::ProviderAutomaticEligibility::Eligible)
+        );
 
-        let forced_outcome = auto_probe_provider_target(
-            &Client::new(),
-            &target,
-            &cfg,
-            &lb_states,
-            &state,
-            "codex",
-            true,
-        )
-        .await;
+        let forced_outcome =
+            auto_probe_provider_target(&Client::new(), &target, &state, "codex", true).await;
 
         assert_eq!(forced_outcome, UsageProviderRefreshOutcome::Failed);
         assert_eq!(
@@ -5488,7 +5956,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_probe_daily_package_exhaustion_suppresses_followup_refresh() {
+    async fn auto_probe_daily_package_exhaustion_suppresses_poll_without_blocking_route() {
         let provider_id = "input-daily-exhausted";
         clear_auto_probe_kind_state(provider_id);
         let request_count = Arc::new(AtomicUsize::new(0));
@@ -5514,83 +5982,42 @@ mod tests {
         }));
         let (addr, handle) = spawn_axum_server(app).await;
         let base_url = format!("http://{addr}/v1");
-        let mut upstream = endpoint_upstream_config(&base_url, provider_id, "default");
-        upstream.auth.auth_token = Some("model-key".to_string());
-        let cfg = proxy_config(vec![service_config("routing", vec![upstream])]);
-        let lb_states = Arc::new(Mutex::new(HashMap::new()));
         let state = ProxyState::new();
-        let target = usage_provider_target(&base_url, provider_id);
+        let mut target = usage_provider_target(&base_url, provider_id);
+        target.auth.auth_token = Some("model-key".to_string());
 
-        let outcome = auto_probe_provider_target(
-            &Client::new(),
-            &target,
-            &cfg,
-            &lb_states,
-            &state,
-            "codex",
-            false,
-        )
-        .await;
+        let outcome =
+            auto_probe_provider_target(&Client::new(), &target, &state, "codex", false).await;
 
         assert_eq!(outcome, UsageProviderRefreshOutcome::Refreshed);
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
-        {
-            let guard = lb_states.lock().expect("lb states");
-            assert!(
-                guard
-                    .get("routing")
-                    .and_then(|entry| entry.usage_exhausted.first())
-                    .copied()
-                    .unwrap_or(false)
-            );
-        }
+        assert_eq!(
+            target_automatic_eligibility(state.as_ref(), &target).await,
+            Some(crate::runtime_store::ProviderAutomaticEligibility::Eligible)
+        );
         let view = state.get_provider_balance_view("codex").await;
         let snapshot = view
-            .get("routing")
-            .and_then(|snapshots| {
-                snapshots
-                    .iter()
-                    .find(|snapshot| snapshot.provider_id == provider_id)
+            .iter()
+            .find(|snapshot| {
+                provider_balance_snapshot_matches_target(snapshot, provider_id, &target)
             })
             .expect("daily exhausted snapshot");
         assert_eq!(snapshot.status, BalanceSnapshotStatus::Exhausted);
         assert_eq!(snapshot.quota_period.as_deref(), Some("daily"));
         assert!(snapshot.routing_ignored_exhaustion());
 
-        let suppressed_outcome = auto_probe_provider_target(
-            &Client::new(),
-            &target,
-            &cfg,
-            &lb_states,
-            &state,
-            "codex",
-            false,
-        )
-        .await;
+        let suppressed_outcome =
+            auto_probe_provider_target(&Client::new(), &target, &state, "codex", false).await;
 
         assert_eq!(suppressed_outcome, UsageProviderRefreshOutcome::Failed);
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
-        {
-            let guard = lb_states.lock().expect("lb states");
-            assert!(
-                guard
-                    .get("routing")
-                    .and_then(|entry| entry.usage_exhausted.first())
-                    .copied()
-                    .unwrap_or(false)
-            );
-        }
+        assert_eq!(
+            target_automatic_eligibility(state.as_ref(), &target).await,
+            Some(crate::runtime_store::ProviderAutomaticEligibility::Eligible)
+        );
 
-        let forced_outcome = auto_probe_provider_target(
-            &Client::new(),
-            &target,
-            &cfg,
-            &lb_states,
-            &state,
-            "codex",
-            true,
-        )
-        .await;
+        let forced_outcome =
+            auto_probe_provider_target(&Client::new(), &target, &state, "codex", true).await;
 
         assert_eq!(forced_outcome, UsageProviderRefreshOutcome::Failed);
         assert_eq!(
@@ -5630,56 +6057,32 @@ mod tests {
         }));
         let (addr, handle) = spawn_axum_server(app).await;
         let base_url = format!("http://{addr}/v1");
-        let mut upstream = endpoint_upstream_config(&base_url, provider_id, "default");
-        upstream.auth.auth_token = Some("model-key".to_string());
-        let cfg = proxy_config(vec![service_config("routing", vec![upstream])]);
-        let lb_states = Arc::new(Mutex::new(HashMap::new()));
         let state = ProxyState::new();
-        let target = usage_provider_target(&base_url, provider_id);
+        let mut target = usage_provider_target(&base_url, provider_id);
+        target.auth.auth_token = Some("model-key".to_string());
 
         remember_usage_provider_target_suppression(
             provider_id,
             &target,
             Duration::from_secs(60),
             "daily package quota exhausted for current period",
-            true,
             Instant::now(),
         );
 
-        let suppressed_outcome = auto_probe_provider_target(
-            &Client::new(),
-            &target,
-            &cfg,
-            &lb_states,
-            &state,
-            "codex",
-            false,
-        )
-        .await;
+        let suppressed_outcome =
+            auto_probe_provider_target(&Client::new(), &target, &state, "codex", false).await;
 
         assert_eq!(suppressed_outcome, UsageProviderRefreshOutcome::Failed);
         assert_eq!(request_count.load(Ordering::SeqCst), 0);
 
-        let forced_outcome = auto_probe_provider_target(
-            &Client::new(),
-            &target,
-            &cfg,
-            &lb_states,
-            &state,
-            "codex",
-            true,
-        )
-        .await;
+        let forced_outcome =
+            auto_probe_provider_target(&Client::new(), &target, &state, "codex", true).await;
 
         assert_eq!(forced_outcome, UsageProviderRefreshOutcome::Refreshed);
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
-        let guard = lb_states.lock().expect("lb states");
-        assert!(
-            !guard
-                .get("routing")
-                .and_then(|entry| entry.usage_exhausted.first())
-                .copied()
-                .unwrap_or(true)
+        assert_eq!(
+            target_automatic_eligibility(state.as_ref(), &target).await,
+            Some(crate::runtime_store::ProviderAutomaticEligibility::Eligible)
         );
         clear_auto_probe_kind_state(provider_id);
         handle.abort();
@@ -6170,6 +6573,7 @@ mod tests {
     fn rightcode_endpoint_defaults_to_account_summary() {
         let mut provider = provider("rightcode", ProviderKind::RightCodeAccountSummary);
         provider.endpoint.clear();
+        provider.domains = vec!["right.codes".to_string()];
 
         let endpoint = resolve_endpoint(&provider, "https://www.right.codes/codex/v1", "token")
             .expect("endpoint");
@@ -6341,40 +6745,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_missing_token_clears_stale_lb_exhaustion_marker() {
-        let cfg = proxy_config(vec![service_config(
-            "right",
-            vec![
-                upstream_config("https://primary.example/v1"),
-                upstream_config("https://backup.example/v1"),
-            ],
-        )]);
-        let lb_states = Arc::new(Mutex::new(HashMap::new()));
-        let target = UsageProviderTarget {
-            upstream: upstream(),
-            base_url: "https://backup.example/v1".to_string(),
-            provider_id: Some("right".to_string()),
-        };
-        let upstreams = vec![target.upstream.clone()];
+    async fn provider_missing_token_does_not_recover_committed_eligibility() {
+        let target = usage_provider_target_at("backup", 1, "https://backup.example/v1", "right");
         let state = ProxyState::new();
-        update_usage_exhausted(&lb_states, &state, &cfg, "codex", &upstreams, true, None).await;
-        {
-            let guard = lb_states.lock().expect("lb states");
-            assert!(
-                guard
-                    .get("right")
-                    .and_then(|entry| entry.usage_exhausted.get(1))
-                    .copied()
-                    .unwrap_or(false)
-            );
-        }
+        let endpoint = target.endpoint.provider_endpoint.clone();
+        state
+            .set_provider_automatic_block_for_runtime_identity_for_test(
+                target.runtime_identity(),
+                true,
+                1_000,
+            )
+            .await;
 
         let outcome = refresh_provider_target(RefreshProviderTargetParams {
             client: &Client::new(),
             provider: &provider("sub2api", ProviderKind::OpenAiBalanceHttpJson),
             target: &target,
-            cfg: &cfg,
-            lb_states: &lb_states,
             state: &state,
             service_name: "codex",
             interval_secs: 60,
@@ -6383,47 +6769,103 @@ mod tests {
         .await;
 
         assert_eq!(outcome, UsageProviderRefreshOutcome::MissingToken);
-        let guard = lb_states.lock().expect("lb states");
-        assert!(
-            !guard
-                .get("right")
-                .and_then(|entry| entry.usage_exhausted.get(1))
-                .copied()
-                .unwrap_or(true)
-        );
+        let runtime = state
+            .route_plan_runtime_state_for_provider_endpoints("codex")
+            .await;
+        assert!(runtime.provider_endpoint(&endpoint).usage_exhausted);
     }
 
     #[tokio::test]
-    async fn usage_exhaustion_syncs_owned_balance_policy_action() {
-        let cfg = proxy_config(vec![service_config(
-            "right",
-            vec![
-                upstream_config("https://primary.example/v1"),
-                upstream_config("https://backup.example/v1"),
-            ],
-        )]);
-        let lb_states = Arc::new(Mutex::new(HashMap::new()));
-        let upstreams = vec![endpoint_upstream()];
+    async fn authoritative_balance_poll_blocks_and_recovers_durable_policy() {
+        let provider = provider("sub2api", ProviderKind::OpenAiBalanceHttpJson);
+        let target =
+            usage_provider_target_at("default", 1, "https://relay.example.com/v1", "right");
         let state = ProxyState::new();
-
-        update_usage_exhausted(
-            &lb_states,
-            &state,
-            &cfg,
-            "codex",
-            &upstreams,
-            true,
-            Some(Duration::from_secs(30)),
+        let prepared = prepare_provider_poll(
+            state.as_ref(),
+            &provider,
+            &target,
+            "model-key",
+            provider.kind.source_name(),
+            None,
+            1_000,
         )
-        .await;
-        let actions = state.list_policy_actions("codex").await;
-        assert_eq!(actions.len(), 1);
-        assert_eq!(actions[0].source_signal.kind, ProviderSignalKind::Balance);
-        assert_eq!(actions[0].source_signal.reset_after_secs, Some(30));
-        assert_eq!(actions[0].reason, "balance_exhausted");
+        .await
+        .expect("prepare exhausted observation");
+        let exhausted = ProviderBalanceSnapshot {
+            observation_provider_id: provider.id.clone(),
+            provider_endpoint: target.endpoint.provider_endpoint.clone(),
+            source: provider.kind.source_name().to_string(),
+            fetched_at_ms: 1_000,
+            stale_after_ms: Some(60_000),
+            status: BalanceSnapshotStatus::Exhausted,
+            exhausted: Some(true),
+            exhaustion_affects_routing: true,
+            ..ProviderBalanceSnapshot::default()
+        };
+        let suppression = ProviderTargetSuppressionDecision {
+            reason: "balance exhausted".to_string(),
+            ttl: Duration::from_secs(30),
+        };
 
-        update_usage_exhausted(&lb_states, &state, &cfg, "codex", &upstreams, false, None).await;
-        assert!(state.list_policy_actions("codex").await.is_empty());
+        assert!(
+            commit_provider_poll_observation(
+                state.as_ref(),
+                prepared.reservation,
+                &exhausted,
+                Some(&suppression),
+                1_001,
+            )
+            .await
+        );
+        let blocked = state.capture_provider_policy_snapshot().await;
+        let projection = blocked
+            .projections
+            .first()
+            .expect("blocked provider projection");
+        let action = projection.active_action.as_ref().expect("active action");
+        assert_eq!(action.action_kind, "balance_exhausted");
+        assert_eq!(action.expires_at_unix_ms, Some(31_001));
+
+        let prepared = prepare_provider_poll(
+            state.as_ref(),
+            &provider,
+            &target,
+            "model-key",
+            provider.kind.source_name(),
+            None,
+            2_000,
+        )
+        .await
+        .expect("prepare recovery observation");
+        let recovered = ProviderBalanceSnapshot {
+            status: BalanceSnapshotStatus::Ok,
+            exhausted: Some(false),
+            exhaustion_affects_routing: true,
+            fetched_at_ms: 2_000,
+            ..exhausted
+        };
+
+        assert!(
+            commit_provider_poll_observation(
+                state.as_ref(),
+                prepared.reservation,
+                &recovered,
+                None,
+                2_001,
+            )
+            .await
+        );
+        let recovered = state.capture_provider_policy_snapshot().await;
+        let projection = recovered
+            .projections
+            .first()
+            .expect("recovered provider projection");
+        assert!(projection.active_action.is_none());
+        assert_eq!(
+            projection.automatic,
+            crate::runtime_store::ProviderAutomaticEligibility::Eligible
+        );
     }
 
     #[test]

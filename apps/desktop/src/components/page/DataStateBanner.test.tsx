@@ -42,7 +42,6 @@ describe("DataStateBanner", () => {
           title: "实时数据刷新失败，正在显示上一次成功数据",
           description: "重试刷新或检查本地代理运行时。",
           badge: "Stale data",
-          isFallback: false,
           isStale: true,
         })}
       />,
@@ -56,17 +55,15 @@ describe("DataStateBanner", () => {
 
 function state(overrides: Partial<RuntimeDataState>): RuntimeDataState {
   return {
-    status: "mock",
-    source: "mock",
+    status: "disconnected",
+    source: "none",
     severity: "warning",
-    title: "当前展示离线示例数据",
-    description: "启动或附加 codex-helper 本地代理后会自动切换为实时数据。",
-    badge: "Mock fallback",
+    title: "本地代理未连接",
+    description: "当前没有可展示的运行时事实。",
+    badge: "Disconnected",
     canUseLiveActions: false,
     canStartProxy: true,
     canAttachProxy: true,
-    canStopProxy: false,
-    isFallback: true,
     isStale: false,
     ownerMode: "unknown",
     ...overrides,

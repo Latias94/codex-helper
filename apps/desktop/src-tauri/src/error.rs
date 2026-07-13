@@ -50,11 +50,6 @@ impl CommandError {
             hint: None,
         }
     }
-
-    pub(crate) fn with_hint(mut self, hint: impl Into<String>) -> Self {
-        self.hint = Some(hint.into());
-        self
-    }
 }
 
 impl From<DesktopError> for CommandError {
@@ -87,13 +82,12 @@ mod tests {
 
     #[test]
     fn command_error_builder_keeps_message_compatibility() {
-        let err = CommandError::new("desktop_admin_http_403", "HTTP 403 forbidden", false)
-            .with_hint("set CODEX_HELPER_ADMIN_TOKEN");
+        let err = CommandError::new("desktop_admin_http_403", "HTTP 403 forbidden", false);
         let value = serde_json::to_value(&err).expect("serialize command error");
 
         assert_eq!(value["code"].as_str(), Some("desktop_admin_http_403"));
         assert_eq!(value["message"].as_str(), Some("HTTP 403 forbidden"));
         assert_eq!(value["retryable"].as_bool(), Some(false));
-        assert_eq!(value["hint"].as_str(), Some("set CODEX_HELPER_ADMIN_TOKEN"));
+        assert!(value.get("hint").is_none());
     }
 }

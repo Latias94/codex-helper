@@ -8,7 +8,7 @@ use serde_json::Value;
 use crate::config::UpstreamConfig;
 
 use super::classify::{ROUTING_MISMATCH_CAPABILITY_CLASS, classify_upstream_response};
-use super::models_compat::maybe_decode_models_response_body_without_translation;
+use super::models_compat::maybe_decode_models_response_body;
 
 const MAX_PROBE_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 
@@ -216,12 +216,7 @@ pub fn classify_codex_relay_probe_response(
     body: &[u8],
 ) -> CodexRelayProbeResult {
     let body = if spec.kind == CodexRelayProbeKind::Models && status.is_success() {
-        maybe_decode_models_response_body_without_translation(
-            "codex",
-            "/models",
-            headers,
-            Bytes::copy_from_slice(body),
-        )
+        maybe_decode_models_response_body("codex", "/models", headers, Bytes::copy_from_slice(body))
     } else {
         Bytes::copy_from_slice(body)
     };

@@ -1,18 +1,14 @@
+import { emptyProvidersData } from "@/lib/api/empty-data";
 import { mapProvidersData } from "@/lib/api/mappers";
-import { mockProvidersData } from "@/lib/api/mock-data";
-import type { QueryBackedData } from "@/lib/api/types";
+import type { ProvidersData, QueryBackedData } from "@/lib/api/types";
 import { useAdminReadModelState } from "@/lib/api/use-admin-read-model";
 
-export function useProvidersData(): QueryBackedData<typeof mockProvidersData> {
+export function useProvidersData(): QueryBackedData<ProvidersData> {
   const query = useAdminReadModelState();
-  const { readModel, state } = query;
-  const data = readModel.data
-    ? mapProvidersData(
-        readModel.data.operatorSummary,
-        readModel.data.providers,
-        readModel.data.recentRequests,
-      )
-    : mockProvidersData;
+  const { facts, state } = query;
+  const data = facts
+    ? mapProvidersData(facts.summary)
+    : emptyProvidersData;
 
   return {
     data,
@@ -24,7 +20,7 @@ export function useProvidersData(): QueryBackedData<typeof mockProvidersData> {
             status: "empty",
             severity: "neutral",
             title: "实时数据已连接，但当前没有供应商",
-            description: "先在配置中添加 provider，或检查 /operator/summary 是否加载了 providers。",
+            description: "先在配置中添加 provider，或检查 canonical operator read model 是否包含 providers。",
             badge: "Empty",
           }
         : state,

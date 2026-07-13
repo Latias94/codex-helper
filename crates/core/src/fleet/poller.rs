@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::control_plane_client::{ControlPlaneClient, ControlPlaneEndpoint, ControlPlaneError};
 
 use super::model::{FleetNodeHealth, FleetNodeSnapshot, FleetSnapshot, now_ms};
+use super::observer::build_fleet_snapshot_from_operator_read_model;
 use super::registry::FleetNodeConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -18,7 +19,11 @@ pub struct FleetPollResult {
     pub error: Option<String>,
 }
 
-pub async fn poll_fleet_node(node_id: &str, node: &FleetNodeConfig) -> FleetPollResult {
+pub async fn poll_fleet_node(
+    service_name: &str,
+    node_id: &str,
+    node: &FleetNodeConfig,
+) -> FleetPollResult {
     let label = node.display_label(node_id);
     let mut last_failure: Option<(FleetNodeHealth, String)> = None;
 
@@ -47,21 +52,19 @@ pub async fn poll_fleet_node(node_id: &str, node: &FleetNodeConfig) -> FleetPoll
             }
         };
 
-        match client.fleet_snapshot().await {
-            Ok(snapshot) => {
-                let mut node_snapshot = snapshot.nodes.into_iter().next().unwrap_or_else(|| {
-                    empty_remote_node(
-                        node_id,
-                        &label,
-                        FleetNodeHealth::Unsupported,
-                        Some("remote fleet snapshot contained no nodes".to_string()),
-                    )
-                });
-                node_snapshot.node_id = node_id.to_string();
-                node_snapshot.label = label.clone();
-                node_snapshot.kind = super::model::FleetNodeKind::Remote;
-                node_snapshot.health = FleetNodeHealth::Fresh;
-                node_snapshot.active_endpoint = Some(client.endpoint().admin_base_url.clone());
+        match client.operator_read_model().await {
+            Ok(model) if model.service_name == service_name => {
+                let node_snapshot = build_fleet_snapshot_from_operator_read_model(
+                    &model,
+                    node_id,
+                    &label,
+                    super::model::FleetNodeKind::Remote,
+                    Some(client.endpoint().admin_base_url().to_string()),
+                )
+                .nodes
+                .into_iter()
+                .next()
+                .expect("operator fleet projection always contains one node");
                 return FleetPollResult {
                     node_id: node_id.to_string(),
                     label,
@@ -69,6 +72,17 @@ pub async fn poll_fleet_node(node_id: &str, node: &FleetNodeConfig) -> FleetPoll
                     snapshot: Some(node_snapshot),
                     error: None,
                 };
+            }
+            Ok(model) => {
+                record_fallback_failure(
+                    &mut last_failure,
+                    FleetNodeHealth::ParseFailed,
+                    format!(
+                        "operator read-model service mismatch: expected {service_name}, got {}",
+                        model.service_name
+                    ),
+                );
+                continue;
             }
             Err(err) => {
                 record_fallback_failure(
@@ -130,8 +144,16 @@ pub fn node_snapshot_from_poll_result(
         });
     }
 
+    let can_retain_previous = matches!(
+        result.health,
+        FleetNodeHealth::Stale
+            | FleetNodeHealth::RateLimited
+            | FleetNodeHealth::Unsupported
+            | FleetNodeHealth::Unreachable
+    );
     previous
-        .map(|previous| stale_node_from_previous(previous, result.health, error.clone()))
+        .filter(|_| can_retain_previous)
+        .map(|previous| stale_node_from_previous(previous, FleetNodeHealth::Stale, error.clone()))
         .or(result.snapshot)
         .unwrap_or_else(|| {
             empty_remote_node(node_id, result.label.as_str(), result.health, Some(error))
@@ -140,6 +162,7 @@ pub fn node_snapshot_from_poll_result(
 
 pub fn health_from_control_plane_error(err: &ControlPlaneError) -> FleetNodeHealth {
     match err {
+        ControlPlaneError::UntrustedRequestPath { .. } => FleetNodeHealth::Unreachable,
         ControlPlaneError::HttpStatus { status, .. } if *status == 401 || *status == 403 => {
             FleetNodeHealth::AuthFailed
         }
@@ -151,6 +174,7 @@ pub fn health_from_control_plane_error(err: &ControlPlaneError) -> FleetNodeHeal
         }
         ControlPlaneError::HttpStatus { .. } => FleetNodeHealth::Unreachable,
         ControlPlaneError::Decode { .. } => FleetNodeHealth::ParseFailed,
+        ControlPlaneError::InvalidPayload { .. } => FleetNodeHealth::ParseFailed,
         ControlPlaneError::Transport { .. } => FleetNodeHealth::Unreachable,
     }
 }
@@ -193,10 +217,11 @@ fn record_fallback_failure(
 
 fn health_priority(health: FleetNodeHealth) -> u8 {
     match health {
-        FleetNodeHealth::Fresh => 5,
-        FleetNodeHealth::AuthFailed | FleetNodeHealth::RateLimited => 4,
-        FleetNodeHealth::Unsupported => 3,
-        FleetNodeHealth::ParseFailed => 2,
+        FleetNodeHealth::Fresh => 6,
+        FleetNodeHealth::AuthFailed => 5,
+        FleetNodeHealth::ParseFailed => 4,
+        FleetNodeHealth::RateLimited => 3,
+        FleetNodeHealth::Unsupported => 2,
         FleetNodeHealth::Stale => 1,
         FleetNodeHealth::Unreachable => 0,
     }
@@ -216,7 +241,7 @@ pub async fn poll_fleet_registry_with_previous(
 ) -> FleetSnapshot {
     let mut nodes = Vec::new();
     for (node_id, node) in registry.enabled_nodes() {
-        let result = poll_fleet_node(node_id, node).await;
+        let result = poll_fleet_node(service_name, node_id, node).await;
         let previous_node = previous.and_then(|snapshot| {
             snapshot
                 .nodes
@@ -239,6 +264,9 @@ pub fn default_poll_interval() -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dashboard_core::{
+        ApiV1OperatorSummary, OperatorReadData, OperatorReadModel, OperatorRevisionBundle,
+    };
     use crate::fleet::{FleetNodeKind, FleetProcessSummary, FleetTopology};
     use axum::{Json, http::StatusCode, routing::get};
     use std::collections::BTreeMap;
@@ -256,11 +284,49 @@ mod tests {
         (addr, handle)
     }
 
+    fn ready_operator_model() -> OperatorReadModel {
+        OperatorReadModel::ready(
+            "codex",
+            42,
+            OperatorRevisionBundle {
+                runtime_revision: 7,
+                runtime_digest: "runtime-7".to_string(),
+                route_digest: "route-7".to_string(),
+                catalog_revision: "catalog-7".to_string(),
+                pricing_revision: "pricing-7".to_string(),
+                operator_pricing_revision: "operator-pricing-7".to_string(),
+                policy_revision: 8,
+                ledger_revision: "ledger-9".to_string(),
+            },
+            OperatorReadData {
+                summary: ApiV1OperatorSummary {
+                    api_version: 1,
+                    service_name: "codex".to_string(),
+                    runtime: Default::default(),
+                    counts: Default::default(),
+                    retry: Default::default(),
+                    sessions: Vec::new(),
+                    profiles: Vec::new(),
+                    providers: Vec::new(),
+                },
+                active_requests: Vec::new(),
+                recent_requests: Vec::new(),
+                usage_summaries: Vec::new(),
+                usage_day: Default::default(),
+                usage_rollup: Default::default(),
+                stats_5m: Default::default(),
+                stats_1h: Default::default(),
+                pricing_catalog: Default::default(),
+                provider_balances: Vec::new(),
+            },
+        )
+    }
+
     #[test]
     fn classifies_http_errors_for_fleet_degradation() {
         let err = |status| ControlPlaneError::HttpStatus {
             status,
-            body: String::new(),
+            body_excerpt: String::new(),
         };
 
         assert_eq!(
@@ -277,6 +343,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn invalid_payload_failure_outranks_reconnectable_endpoint_failures() {
+        let mut failure = None;
+        record_fallback_failure(
+            &mut failure,
+            FleetNodeHealth::ParseFailed,
+            "invalid payload".to_string(),
+        );
+        record_fallback_failure(
+            &mut failure,
+            FleetNodeHealth::RateLimited,
+            "rate limited".to_string(),
+        );
+        record_fallback_failure(
+            &mut failure,
+            FleetNodeHealth::Unsupported,
+            "unsupported".to_string(),
+        );
+
+        assert_eq!(
+            failure,
+            Some((FleetNodeHealth::ParseFailed, "invalid payload".to_string()))
+        );
+    }
+
     #[tokio::test]
     async fn poll_fleet_node_falls_back_to_second_endpoint_after_http_failure() {
         let first_hits = Arc::new(AtomicUsize::new(0));
@@ -284,7 +375,7 @@ mod tests {
 
         let first_count = first_hits.clone();
         let first_app = axum::Router::new().route(
-            "/__codex_helper/api/v1/fleet/snapshot",
+            "/__codex_helper/api/v1/operator/read-model",
             get(move || {
                 let first_count = first_count.clone();
                 async move {
@@ -296,34 +387,15 @@ mod tests {
         let (first_addr, first_handle) = spawn_axum_server(first_app).await;
 
         let second_count = second_hits.clone();
-        let success_snapshot = FleetSnapshot {
-            api_version: 1,
-            service_name: "codex".to_string(),
-            refreshed_at_ms: 42,
-            nodes: vec![FleetNodeSnapshot {
-                node_id: "placeholder".to_string(),
-                label: "placeholder".to_string(),
-                kind: FleetNodeKind::Remote,
-                health: FleetNodeHealth::Fresh,
-                refreshed_at_ms: 42,
-                stale_since_ms: None,
-                snapshot_age_ms: None,
-                active_endpoint: None,
-                last_error: None,
-                processes: FleetProcessSummary::default(),
-                topology: FleetTopology::default(),
-                work_units: Vec::new(),
-            }],
-        };
-        let second_snapshot = success_snapshot.clone();
+        let second_model = ready_operator_model();
         let second_app = axum::Router::new().route(
-            "/__codex_helper/api/v1/fleet/snapshot",
+            "/__codex_helper/api/v1/operator/read-model",
             get(move || {
                 let second_count = second_count.clone();
-                let second_snapshot = second_snapshot.clone();
+                let second_model = second_model.clone();
                 async move {
                     second_count.fetch_add(1, Ordering::SeqCst);
-                    Json(second_snapshot)
+                    Json(second_model)
                 }
             }),
         );
@@ -339,7 +411,7 @@ mod tests {
             enabled: true,
         };
 
-        let result = poll_fleet_node("node-a", &node).await;
+        let result = poll_fleet_node("codex", "node-a", &node).await;
         assert_eq!(result.health, FleetNodeHealth::Fresh);
         assert!(result.error.is_none());
 
@@ -363,7 +435,7 @@ mod tests {
         let hits = Arc::new(AtomicUsize::new(0));
         let hit_count = hits.clone();
         let app = axum::Router::new().route(
-            "/__codex_helper/api/v1/fleet/snapshot",
+            "/__codex_helper/api/v1/operator/read-model",
             get(move || {
                 let hit_count = hit_count.clone();
                 async move {
@@ -408,7 +480,6 @@ mod tests {
                     task_name: Some("preserved".to_string()),
                     cwd: None,
                     model: None,
-                    station_name: None,
                     provider_id: None,
                     last_status: None,
                     active_started_at_ms: None,
@@ -438,14 +509,10 @@ mod tests {
         let node = &snapshot.nodes[0];
         assert_eq!(node.node_id, "node-a");
         assert_eq!(node.health, FleetNodeHealth::AuthFailed);
-        assert_eq!(node.work_units.len(), 1);
-        assert_eq!(node.work_units[0].task_name.as_deref(), Some("preserved"));
-        assert_eq!(
-            node.active_endpoint.as_deref(),
-            Some("http://previous.example")
-        );
-        assert!(node.snapshot_age_ms.is_some());
-        assert!(node.stale_since_ms.is_some());
+        assert!(node.work_units.is_empty());
+        assert!(node.active_endpoint.is_none());
+        assert!(node.snapshot_age_ms.is_none());
+        assert!(node.stale_since_ms.is_none());
         assert!(
             node.last_error
                 .as_deref()
@@ -453,5 +520,86 @@ mod tests {
         );
 
         handle.abort();
+    }
+
+    #[test]
+    fn reconnectable_failure_retains_previous_facts_as_stale() {
+        let previous = FleetNodeSnapshot {
+            node_id: "node-a".to_string(),
+            label: "remote-node".to_string(),
+            kind: FleetNodeKind::Remote,
+            health: FleetNodeHealth::Fresh,
+            refreshed_at_ms: 100,
+            stale_since_ms: None,
+            snapshot_age_ms: None,
+            active_endpoint: Some("http://previous.example".to_string()),
+            last_error: None,
+            processes: FleetProcessSummary::default(),
+            topology: FleetTopology::default(),
+            work_units: Vec::new(),
+        };
+        let result = FleetPollResult {
+            node_id: "node-a".to_string(),
+            label: "remote-node".to_string(),
+            health: FleetNodeHealth::Unreachable,
+            snapshot: Some(empty_remote_node(
+                "node-a",
+                "remote-node",
+                FleetNodeHealth::Unreachable,
+                Some("transport failed".to_string()),
+            )),
+            error: Some("transport failed".to_string()),
+        };
+
+        let node = node_snapshot_from_poll_result("node-a", result, Some(&previous));
+
+        assert_eq!(node.health, FleetNodeHealth::Stale);
+        assert_eq!(
+            node.active_endpoint.as_deref(),
+            Some("http://previous.example")
+        );
+        assert_eq!(node.last_error.as_deref(), Some("transport failed"));
+        assert!(node.stale_since_ms.is_some());
+    }
+
+    #[test]
+    fn parse_failure_drops_previous_runtime_facts() {
+        let previous = FleetNodeSnapshot {
+            node_id: "node-a".to_string(),
+            label: "remote-node".to_string(),
+            kind: FleetNodeKind::Remote,
+            health: FleetNodeHealth::Fresh,
+            refreshed_at_ms: 100,
+            stale_since_ms: None,
+            snapshot_age_ms: None,
+            active_endpoint: Some("http://previous.example".to_string()),
+            last_error: None,
+            processes: FleetProcessSummary {
+                scan_available: true,
+                codex_like_processes: 2,
+                error: None,
+            },
+            topology: FleetTopology::default(),
+            work_units: Vec::new(),
+        };
+        let result = FleetPollResult {
+            node_id: "node-a".to_string(),
+            label: "remote-node".to_string(),
+            health: FleetNodeHealth::ParseFailed,
+            snapshot: Some(empty_remote_node(
+                "node-a",
+                "remote-node",
+                FleetNodeHealth::ParseFailed,
+                Some("invalid payload".to_string()),
+            )),
+            error: Some("invalid payload".to_string()),
+        };
+
+        let node = node_snapshot_from_poll_result("node-a", result, Some(&previous));
+
+        assert_eq!(node.health, FleetNodeHealth::ParseFailed);
+        assert!(node.active_endpoint.is_none());
+        assert_eq!(node.processes, FleetProcessSummary::default());
+        assert!(node.stale_since_ms.is_none());
     }
 }

@@ -1,11 +1,9 @@
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use owo_colors::OwoColorize;
-use reqwest::Client;
 
-use crate::cli_types::{CodexCommand, reject_legacy_mode};
-use crate::config::{ServiceKind, load_or_bootstrap_for_service_with_v4_source};
+use crate::cli_types::CodexCommand;
+use crate::config::load_config_with_source;
 use crate::proxy::{
     CODEX_RELAY_LIVE_SMOKE_ACK, CodexRelayCapabilitiesRequest, CodexRelayCapabilitiesResponse,
     CodexRelayEvidenceFilters, CodexRelayEvidenceKind, CodexRelayLiveSmokeCase,
@@ -13,33 +11,24 @@ use crate::proxy::{
     codex_relay_evidence_path, read_recent_codex_relay_evidence,
 };
 use crate::{CliError, CliResult};
-use codex_helper_core::codex_capability_profile::CodexCapabilitySupport;
+use codex_helper_core::codex_capability_profile::{
+    CodexCapabilityDecision, CodexCapabilitySupport,
+};
 
 pub(crate) async fn handle_codex_cmd(cmd: CodexCommand) -> CliResult<()> {
     match cmd {
         CodexCommand::Capabilities {
-            station,
             provider,
             endpoint,
-            upstream_index,
             model,
-            preset,
-            legacy_mode,
-            compaction,
             json,
         } => {
-            reject_legacy_mode(legacy_mode)?;
             let proxy = build_codex_proxy_for_cli().await?;
             let response = proxy
                 .codex_relay_capabilities(CodexRelayCapabilitiesRequest {
-                    station_name: station,
                     provider_id: provider,
                     endpoint_id: endpoint,
-                    upstream_index,
                     model,
-                    patch_mode: preset.map(Into::into),
-                    compaction: compaction.map(Into::into),
-                    responses_websocket: None,
                 })
                 .await
                 .map_err(|err| CliError::Other(err.to_string()))?;
@@ -51,10 +40,8 @@ pub(crate) async fn handle_codex_cmd(cmd: CodexCommand) -> CliResult<()> {
         }
         CodexCommand::LiveSmoke {
             acknowledgement,
-            station,
             provider,
             endpoint,
-            upstream_index,
             model,
             image,
             compact_v2,
@@ -67,10 +54,8 @@ pub(crate) async fn handle_codex_cmd(cmd: CodexCommand) -> CliResult<()> {
             let response = proxy
                 .codex_relay_live_smoke(CodexRelayLiveSmokeRequest {
                     acknowledgement: Some(acknowledgement),
-                    station_name: station,
                     provider_id: provider,
                     endpoint_id: endpoint,
-                    upstream_index,
                     model: Some(model),
                     cases,
                     service_tier,
@@ -86,13 +71,13 @@ pub(crate) async fn handle_codex_cmd(cmd: CodexCommand) -> CliResult<()> {
         CodexCommand::Evidence {
             limit,
             kind,
-            station,
+            provider,
             model,
             json,
         } => {
             let filters = CodexRelayEvidenceFilters {
                 kind: kind.map(Into::into),
-                station_name: station,
+                provider_id: provider,
                 model,
             };
             let entries = read_recent_codex_relay_evidence(limit, &filters)
@@ -129,28 +114,13 @@ fn live_smoke_cases(
 }
 
 async fn build_codex_proxy_for_cli() -> CliResult<ProxyService> {
-    let loaded = load_or_bootstrap_for_service_with_v4_source(ServiceKind::Codex)
+    let loaded = load_config_with_source()
         .await
-        .map_err(|err| CliError::ProxyConfig(err.to_string()))?;
-    let cfg = Arc::new(loaded.runtime);
-    if cfg.codex.configs.is_empty() || cfg.codex.active_station().is_none() {
-        return Err(CliError::ProxyConfig(
-            "未找到任何可用的 Codex 上游配置，请先运行 `codex-helper config init` 或 `codex-helper provider add`".to_string(),
-        ));
-    }
-    let client = Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .tcp_keepalive(std::time::Duration::from_secs(30))
-        .pool_idle_timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|err| CliError::Other(err.to_string()))?;
-    Ok(ProxyService::new_with_v4_source(
-        client,
-        cfg,
-        loaded.v4.map(Arc::new),
-        "codex",
-        Arc::new(Mutex::new(HashMap::new())),
-    ))
+        .map_err(|err| CliError::Configuration(err.to_string()))?;
+    crate::runtime_host::validate_service_has_upstream("codex", &loaded.source)
+        .map_err(|err| CliError::Configuration(err.to_string()))?;
+    ProxyService::new_ephemeral_diagnostic(Arc::new(loaded.source), "codex")
+        .map_err(|err| CliError::Other(err.to_string()))
 }
 
 fn print_json<T: serde::Serialize>(value: &T) -> CliResult<()> {
@@ -163,34 +133,51 @@ fn print_json<T: serde::Serialize>(value: &T) -> CliResult<()> {
 fn print_capabilities_text(response: &CodexRelayCapabilitiesResponse) {
     println!("{}", "Codex relay capability diagnostics".bold());
     println!(
-        "Target: {} {}",
-        format_target_identity(
-            &response.station_name,
-            response.upstream_index,
-            response.provider_endpoint_key.as_deref()
-        ),
-        response.upstream_base_url
+        "Target: provider={} endpoint={} key={}",
+        response.provider_id, response.endpoint_id, response.provider_endpoint_key
     );
     println!(
-        "Preset: {}; compaction: {}; Responses WebSocket: {}; model: {}",
-        response.patch_mode.as_preset_str(),
-        response.compaction,
-        response.responses_websocket,
-        response.model.as_deref().unwrap_or("<none>")
+        "Provider contract: adapter={:?}; catalog_revision={}; model={}; request_dialects={}",
+        response.expected.provider_adapter,
+        response
+            .expected
+            .catalog_revision
+            .as_deref()
+            .unwrap_or("<none>"),
+        response.model.as_deref().unwrap_or("<none>"),
+        if response.expected.request_dialects.is_empty() {
+            "<none>".to_string()
+        } else {
+            response.expected.request_dialects.join(", ")
+        }
     );
     println!(
-        "Expected: compact={} ({:?}); continuity identity={} state_sharing={} ({:?})",
-        support_label(response.expected.remote_compaction_v1.support),
-        response.expected.provider_identity,
-        support_label(
-            response
-                .expected
-                .continuity
-                .identity_sets_compact_path
-                .support
-        ),
-        support_label(response.expected.continuity.state_sharing.support),
-        response.expected.continuity.state_sharing.support
+        "Model catalog: shape={:?}; selection={:?}; translation_required={}; reason={}",
+        response.expected.model_catalog.shape,
+        response.expected.model_catalog.selection,
+        response.expected.model_catalog.translation_required,
+        response.expected.model_catalog.reason
+    );
+    println!("Expected capabilities:");
+    print_capability_decision("responses", &response.expected.responses);
+    print_capability_decision(
+        "remote_compaction_v1",
+        &response.expected.remote_compaction_v1,
+    );
+    print_capability_decision(
+        "hosted_image_generation",
+        &response.expected.hosted_image_generation,
+    );
+    print_capability_decision(
+        "responses_websocket",
+        &response.expected.responses_websocket,
+    );
+    print_capability_decision("ultra_maps_to_max", &response.expected.ultra_maps_to_max);
+    print_capability_decision("web_search", &response.expected.web_search);
+    print_capability_decision("apply_patch", &response.expected.apply_patch);
+    print_capability_decision(
+        "reasoning_summaries",
+        &response.expected.reasoning_summaries,
     );
     println!(
         "Observed: models={:?}/{:?}, responses={:?}/{:?}, compact={:?}/{:?}",
@@ -217,14 +204,14 @@ fn print_capabilities_text(response: &CodexRelayCapabilitiesResponse) {
     for warning in &response.continuity.warnings {
         println!("{} {}", "Continuity warning:".yellow(), warning);
     }
-    println!(
-        "Recommendation: {} ({:?})",
-        response
-            .recommendation
-            .recommended_patch_mode
-            .as_preset_str(),
-        response.recommendation.confidence
-    );
+    for recommendation in &response.continuity.recommendations {
+        println!("Continuity recommendation: {recommendation}");
+    }
+    if response.mismatches.is_empty() {
+        println!("Mismatches: none");
+    } else {
+        println!("Mismatches: {}", response.mismatches.len());
+    }
     for mismatch in &response.mismatches {
         println!(
             "{} {}: expected={}, observed={}, reason={}",
@@ -238,6 +225,14 @@ fn print_capabilities_text(response: &CodexRelayCapabilitiesResponse) {
     println!("Evidence: {:?}", codex_relay_evidence_path());
 }
 
+fn print_capability_decision(label: &str, decision: &CodexCapabilityDecision) {
+    println!(
+        "  {label}: {} ({})",
+        support_label(decision.support),
+        decision.reason
+    );
+}
+
 fn support_label(support: CodexCapabilitySupport) -> &'static str {
     match support {
         CodexCapabilitySupport::Unknown => "unknown",
@@ -249,13 +244,8 @@ fn support_label(support: CodexCapabilitySupport) -> &'static str {
 fn print_live_smoke_text(response: &CodexRelayLiveSmokeResponse) {
     println!("{}", "Codex relay live smoke".bold());
     println!(
-        "Target: {} {}",
-        format_target_identity(
-            &response.station_name,
-            response.upstream_index,
-            response.provider_endpoint_key.as_deref()
-        ),
-        response.upstream_base_url
+        "Target: provider={} endpoint={} key={}",
+        response.provider_id, response.endpoint_id, response.provider_endpoint_key
     );
     println!(
         "Model: requested={}, upstream={}",
@@ -286,19 +276,6 @@ fn print_live_smoke_text(response: &CodexRelayLiveSmokeResponse) {
     );
 }
 
-fn format_target_identity(
-    station_name: &str,
-    upstream_index: usize,
-    provider_endpoint_key: Option<&str>,
-) -> String {
-    match provider_endpoint_key {
-        Some(provider_endpoint_key) => {
-            format!("{provider_endpoint_key} via {station_name}[{upstream_index}]")
-        }
-        None => format!("{station_name}[{upstream_index}]"),
-    }
-}
-
 fn print_evidence_text(entries: &[crate::proxy::CodexRelayEvidenceEntry]) {
     let path = codex_relay_evidence_path();
     println!("{}", format!("Codex relay evidence from {:?}", path).bold());
@@ -308,27 +285,35 @@ fn print_evidence_text(entries: &[crate::proxy::CodexRelayEvidenceEntry]) {
     }
     for entry in entries {
         println!(
-            "{} {} {:?} station={} upstream={} model={} source={}",
+            "{} {} {:?} provider={} endpoint={} key={} model={} source={}",
             entry.timestamp_ms,
             entry.evidence_id,
             entry.kind,
-            entry
-                .provider_endpoint_key
-                .as_deref()
-                .unwrap_or(entry.station_name.as_str()),
-            entry.upstream_index,
+            entry.provider_id,
+            entry.endpoint_id,
+            entry.provider_endpoint_key,
             entry.model.as_deref().unwrap_or("-"),
             entry.source
         );
         match entry.kind {
             CodexRelayEvidenceKind::CapabilityDiagnostics => {
-                if let Some(recommended) = entry
+                let provider_adapter = entry
                     .payload
-                    .get("recommendation")
-                    .and_then(|value| value.get("recommended_patch_mode"))
-                    .and_then(|value| value.as_str())
-                {
-                    println!("  recommendation={recommended}");
+                    .pointer("/expected/provider_adapter")
+                    .and_then(|value| value.as_str());
+                let mismatch_count = entry
+                    .payload
+                    .get("mismatches")
+                    .and_then(|value| value.as_array())
+                    .map(Vec::len);
+                if provider_adapter.is_some() || mismatch_count.is_some() {
+                    println!(
+                        "  provider_adapter={} mismatches={}",
+                        provider_adapter.unwrap_or("unknown"),
+                        mismatch_count
+                            .map(|count| count.to_string())
+                            .unwrap_or_else(|| "unknown".to_string())
+                    );
                 }
             }
             CodexRelayEvidenceKind::LiveSmoke => {
@@ -401,14 +386,5 @@ mod tests {
                 CodexRelayLiveSmokeCase::ResponsesWebSocket,
             ]
         );
-    }
-
-    #[test]
-    fn format_target_identity_includes_provider_endpoint_when_available() {
-        assert_eq!(
-            format_target_identity("routing", 9, Some("codex/ciii/default")),
-            "codex/ciii/default via routing[9]"
-        );
-        assert_eq!(format_target_identity("input", 0, None), "input[0]");
     }
 }

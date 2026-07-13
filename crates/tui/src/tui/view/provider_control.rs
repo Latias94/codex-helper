@@ -1,11 +1,11 @@
-use crate::policy_actions::PolicyActionProjection;
+use crate::dashboard_core::{OperatorPolicyActionSummary, OperatorProviderEndpointSummary};
 use crate::tui::model::shorten_middle;
 
 fn append_policy_action_control_parts(
-    action: &PolicyActionProjection,
-    reason_width: usize,
+    action: &OperatorPolicyActionSummary,
     parts: &mut Vec<String>,
 ) {
+    parts.push(action.code.clone());
     if action.active_cooldown {
         let cooldown = action
             .cooldown_remaining_secs
@@ -13,48 +13,24 @@ fn append_policy_action_control_parts(
             .unwrap_or_else(|| "?".to_string());
         parts.push(format!("cooldown={cooldown}"));
     }
-
-    if let Some(reason) = action
-        .reason
-        .as_deref()
-        .filter(|reason| !reason.trim().is_empty())
-    {
-        parts.push(format!("reason={}", shorten_middle(reason, reason_width)));
-    }
 }
 
 pub(in crate::tui::view) fn policy_action_control_details(
-    action: &PolicyActionProjection,
-    reason_width: usize,
+    action: &OperatorPolicyActionSummary,
 ) -> String {
     let mut parts = Vec::new();
-    append_policy_action_control_parts(action, reason_width, &mut parts);
-    if parts.is_empty() {
-        parts.push("action".to_string());
-    }
+    append_policy_action_control_parts(action, &mut parts);
     parts.join(" ")
 }
 
 pub(in crate::tui::view) fn policy_action_control_summary(
-    action: &PolicyActionProjection,
+    endpoint: &OperatorProviderEndpointSummary,
+    action: &OperatorPolicyActionSummary,
     endpoint_width: usize,
-    reason_width: usize,
 ) -> String {
     format!(
         "{} {}",
-        shorten_middle(&action.provider_endpoint_key.stable_key(), endpoint_width),
-        policy_action_control_details(action, reason_width)
+        shorten_middle(&endpoint.name, endpoint_width),
+        policy_action_control_details(action)
     )
-}
-
-pub(in crate::tui::view) fn routing_policy_action_control_details(
-    action: &PolicyActionProjection,
-    reason_width: usize,
-) -> String {
-    let mut parts = vec![format!(
-        "endpoint={}",
-        action.provider_endpoint_key.endpoint_id.as_str()
-    )];
-    append_policy_action_control_parts(action, reason_width, &mut parts);
-    parts.join(" ")
 }

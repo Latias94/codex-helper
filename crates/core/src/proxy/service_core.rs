@@ -1,123 +1,99 @@
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::time::Duration;
 
+use anyhow::Context;
 use reqwest::Client;
 use tokio::sync::watch;
 
 use crate::config::{
-    PersistedProviderSpec, PersistedProvidersCatalog, PersistedRoutingSpec, ProxyConfig,
-    ProxyConfigV4, ServiceConfigManager,
+    HelperConfig, PersistedProviderSpec, PersistedProvidersCatalog, PersistedRoutingSpec,
 };
 use crate::filter::RequestFilter;
-use crate::lb::LbState;
 use crate::routing_explain::RoutingExplainResponse;
 use crate::routing_ir::RouteRequestContext;
+use crate::runtime_store::RuntimeStore;
 use crate::state::{ProxyState, SessionBinding, SessionContinuityMode};
 
 use super::profile_defaults::effective_default_profile_name;
 use super::{
     CodexRelayCapabilitiesRequest, CodexRelayCapabilitiesResponse, CodexRelayLiveSmokeRequest,
-    CodexRelayLiveSmokeResponse, PersistedRoutingUpsertRequest, ProfilesResponse,
-    ProviderBalanceRefreshResponse, ProxyControlError, ProxyService, ReloadResult, RuntimeConfig,
-    RuntimeStatusResponse,
+    CodexRelayLiveSmokeResponse, ProfilesResponse, ProviderBalanceRefreshResponse,
+    ProxyControlError, ProxyService, RuntimeConfig,
 };
 
 impl ProxyService {
-    pub fn new(
+    #[cfg(test)]
+    pub(crate) fn new(
         client: Client,
-        config: Arc<ProxyConfig>,
+        config: Arc<HelperConfig>,
         service_name: &'static str,
-        lb_states: Arc<Mutex<HashMap<String, LbState>>>,
     ) -> Self {
-        Self::new_with_v4_source(client, config, None, service_name, lb_states)
+        let runtime_store = Arc::new(
+            RuntimeStore::open_in_memory()
+                .expect("an isolated in-memory runtime store should open"),
+        );
+        Self::new_with_runtime_store_inner(client, config, service_name, runtime_store, false)
+            .expect("test proxy route graph must compile")
     }
 
-    pub fn new_with_v4_source(
+    pub(crate) fn new_with_runtime_store(
         client: Client,
-        config: Arc<ProxyConfig>,
-        v4_source: Option<Arc<ProxyConfigV4>>,
+        config: Arc<HelperConfig>,
         service_name: &'static str,
-        lb_states: Arc<Mutex<HashMap<String, LbState>>>,
-    ) -> Self {
-        Self::new_with_v4_source_and_shutdown(
-            client,
+        runtime_store: Arc<RuntimeStore>,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_runtime_store_inner(client, config, service_name, runtime_store, true)
+    }
+
+    fn new_with_runtime_store_inner(
+        client: Client,
+        config: Arc<HelperConfig>,
+        service_name: &'static str,
+        runtime_store: Arc<RuntimeStore>,
+        spawn_cleanup_task: bool,
+    ) -> anyhow::Result<Self> {
+        let provider_policy = RuntimeConfig::reconcile_initial_provider_policy(
+            config.as_ref(),
+            runtime_store.as_ref(),
+        )?;
+        let state = ProxyState::new_with_runtime_store(runtime_store)?;
+        let runtime_config = Arc::new(RuntimeConfig::new_with_policy_state(
             config,
-            v4_source,
-            service_name,
-            lb_states,
-            None,
-        )
-    }
-
-    pub fn new_with_v4_source_and_shutdown(
-        client: Client,
-        config: Arc<ProxyConfig>,
-        v4_source: Option<Arc<ProxyConfigV4>>,
-        service_name: &'static str,
-        lb_states: Arc<Mutex<HashMap<String, LbState>>>,
-        shutdown_tx: Option<watch::Sender<bool>>,
-    ) -> Self {
-        let state = ProxyState::new_with_lb_states(Some(lb_states.clone()));
-        ProxyState::spawn_cleanup_task(state.clone());
-        if !cfg!(test) {
-            let state = state.clone();
-            let log_path = crate::logging::request_log_path();
-            let mut base_url_to_provider_id = HashMap::new();
-            let mgr = match service_name {
-                "claude" => &config.claude,
-                _ => &config.codex,
-            };
-            for svc in mgr.stations().values() {
-                for up in &svc.upstreams {
-                    if let Some(pid) = up.tags.get("provider_id") {
-                        base_url_to_provider_id.insert(up.base_url.clone(), pid.clone());
-                    }
-                }
-            }
-            tokio::spawn(async move {
-                let _ = state
-                    .replay_usage_from_requests_log(service_name, log_path, base_url_to_provider_id)
-                    .await;
-            });
+            provider_policy,
+            Arc::clone(&state),
+        )?);
+        if spawn_cleanup_task {
+            ProxyState::spawn_cleanup_task(&state);
         }
-        Self {
+        Ok(Self {
             client,
-            config: Arc::new(RuntimeConfig::new_with_v4(config, v4_source)),
+            config: runtime_config,
             service_name,
-            lb_states,
             concurrency_limiter: Arc::new(super::concurrency_limits::ConcurrencyLimiter::default()),
             filter: RequestFilter::new(),
             state,
-            shutdown_tx,
-            host_local_session_history_mode: crate::host_local::HostLocalSessionHistoryMode::Auto,
-        }
+        })
     }
 
-    pub fn with_host_local_session_history_mode(
-        mut self,
-        mode: crate::host_local::HostLocalSessionHistoryMode,
-    ) -> Self {
-        self.host_local_session_history_mode = mode;
-        self
-    }
-
-    pub(crate) fn host_local_session_history_available(&self) -> bool {
-        crate::host_local::host_local_session_history_available_for_mode(
-            self.host_local_session_history_mode,
-        )
-    }
-
-    pub(super) fn service_manager<'a>(&self, cfg: &'a ProxyConfig) -> &'a ServiceConfigManager {
-        match self.service_name {
-            "codex" => &cfg.codex,
-            "claude" => &cfg.claude,
-            _ => &cfg.codex,
-        }
+    pub fn new_ephemeral_diagnostic(
+        config: Arc<HelperConfig>,
+        service_name: &'static str,
+    ) -> anyhow::Result<Self> {
+        let client = super::upstream_http_client_builder()
+            .connect_timeout(Duration::from_secs(10))
+            .tcp_keepalive(Duration::from_secs(30))
+            .pool_idle_timeout(Duration::from_secs(30))
+            .build()
+            .context("build ephemeral diagnostic upstream client")?;
+        let runtime_store = Arc::new(
+            RuntimeStore::open_in_memory().context("open ephemeral diagnostic runtime store")?,
+        );
+        Self::new_with_runtime_store(client, config, service_name, runtime_store)
     }
 
     pub(super) async fn ensure_default_session_binding(
         &self,
-        mgr: &ServiceConfigManager,
+        view: &crate::config::ServiceRouteConfig,
         session_id: &str,
         now_ms: u64,
     ) -> Option<SessionBinding> {
@@ -126,13 +102,15 @@ impl ProxyService {
             return Some(binding);
         }
 
-        let profile_name =
-            effective_default_profile_name(self.state.as_ref(), self.service_name, mgr).await?;
-        let profile = crate::config::resolve_service_profile(mgr, profile_name.as_str()).ok()?;
+        let profile_name = effective_default_profile_name(view)?;
+        let profile = crate::config::resolve_service_profile_from_catalog(
+            &view.profiles,
+            profile_name.as_str(),
+        )
+        .ok()?;
         let binding = SessionBinding {
             session_id: session_id.to_string(),
             profile_name: Some(profile_name),
-            station_name: profile.station.clone(),
             model: profile.model.clone(),
             reasoning_effort: profile.reasoning_effort.clone(),
             service_tier: profile.service_tier.clone(),
@@ -149,58 +127,78 @@ impl ProxyService {
         self.state.clone()
     }
 
-    pub fn shutdown_available(&self) -> bool {
-        self.shutdown_tx.is_some()
-    }
-
-    pub fn request_shutdown(&self) -> bool {
-        self.shutdown_tx
-            .as_ref()
-            .is_some_and(|shutdown_tx| shutdown_tx.send(true).is_ok())
-    }
-
-    pub fn spawn_initial_balance_refresh(&self) {
-        if cfg!(test) {
-            return;
-        }
-
-        let proxy = self.clone();
-        tokio::spawn(async move {
-            match super::providers_api::refresh_provider_balances_for_proxy(
-                &proxy, None, None, false,
+    #[cfg(test)]
+    pub(crate) async fn set_provider_automatic_block_for_test(
+        &self,
+        provider_endpoint: crate::runtime_identity::ProviderEndpointKey,
+        blocked: bool,
+        observed_at_ms: u64,
+    ) -> crate::runtime_store::ProviderObservationCommit {
+        let snapshot = self.config.capture().await;
+        let identity = snapshot
+            .route_graph(self.service_name)
+            .into_iter()
+            .flat_map(|graph| graph.candidate_identities())
+            .find(|identity| identity.provider_endpoint == provider_endpoint)
+            .unwrap_or_else(|| {
+                panic!(
+                    "provider endpoint {provider_endpoint} is not active in the current runtime snapshot"
+                )
+            });
+        self.state
+            .set_provider_automatic_block_for_runtime_identity_for_test(
+                identity,
+                blocked,
+                observed_at_ms,
             )
             .await
-            {
-                Ok(summary) => {
-                    tracing::info!(
-                        "initial provider balance refresh finished: attempted={}, refreshed={}, failed={}, missing_token={}, auto_refreshed={}",
-                        summary.attempted,
-                        summary.refreshed,
-                        summary.failed,
-                        summary.missing_token,
-                        summary.auto_refreshed
-                    );
-                }
-                Err((status, message)) => {
-                    tracing::warn!(
-                        "initial provider balance refresh failed before polling: status={}, {}",
-                        status,
-                        message
-                    );
+    }
+
+    pub(crate) fn spawn_initial_balance_refresh(
+        &self,
+        mut shutdown_rx: watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
+        let proxy = self.clone();
+        tokio::spawn(async move {
+            let refresh = async {
+                super::providers_api::refresh_provider_balances_for_proxy(&proxy, None, None, false)
+                    .await
+            };
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(&mut shutdown_rx) => {}
+                result = refresh => match result {
+                    Ok(summary) => {
+                        tracing::info!(
+                            "initial provider balance refresh finished: attempted={}, refreshed={}, failed={}, missing_token={}, auto_refreshed={}",
+                            summary.attempted,
+                            summary.refreshed,
+                            summary.failed,
+                            summary.missing_token,
+                            summary.auto_refreshed
+                        );
+                    }
+                    Err((status, message)) => {
+                        tracing::warn!(
+                            "initial provider balance refresh failed before polling: status={}, {}",
+                            status,
+                            message
+                        );
+                    }
                 }
             }
-        });
+        })
     }
 
     pub async fn refresh_provider_balances(
         &self,
-        station_name_filter: Option<&str>,
+        route_provider_id_filter: Option<&str>,
         provider_id_filter: Option<&str>,
         force: bool,
     ) -> Result<ProviderBalanceRefreshResponse, ProxyControlError> {
         let refresh = super::providers_api::refresh_provider_balances_for_proxy(
             self,
-            station_name_filter,
+            route_provider_id_filter,
             provider_id_filter,
             force,
         )
@@ -218,8 +216,26 @@ impl ProxyService {
         })
     }
 
-    pub async fn runtime_status(&self) -> RuntimeStatusResponse {
-        super::api_responses::build_runtime_status_response(self).await
+    pub async fn operator_read_capture(
+        &self,
+    ) -> Result<crate::dashboard_core::OperatorReadCapture, ProxyControlError> {
+        super::api_responses::build_operator_read_capture(self)
+            .await
+            .map_err(|error| {
+                tracing::error!(error = %error, "failed to build operator read model");
+                ProxyControlError::new(
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "operator read model unavailable",
+                )
+            })
+    }
+
+    pub async fn operator_read_model(
+        &self,
+    ) -> Result<crate::dashboard_core::OperatorReadModel, ProxyControlError> {
+        self.operator_read_capture()
+            .await
+            .map(|capture| capture.model)
     }
 
     pub async fn codex_relay_capabilities(
@@ -236,7 +252,7 @@ impl ProxyService {
         super::codex_relay_live_smoke::codex_relay_live_smoke_for_proxy(self, request).await
     }
 
-    pub async fn reload_runtime_config(&self) -> Result<ReloadResult, ProxyControlError> {
+    pub async fn reload_runtime_config(&self) -> Result<bool, ProxyControlError> {
         let changed = self.config.force_reload_from_disk().await.map_err(|err| {
             ProxyControlError::new(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -246,214 +262,37 @@ impl ProxyService {
         if changed {
             super::control_plane_service::prune_runtime_observability_after_reload(self).await;
         }
-        let status = self.runtime_status().await;
-        Ok(super::api_responses::build_reload_result(changed, status))
+        Ok(changed)
     }
 
     pub async fn profiles(&self) -> ProfilesResponse {
         super::api_responses::make_profiles_response(self).await
     }
 
-    pub async fn set_runtime_default_profile(
-        &self,
-        profile_name: Option<String>,
-    ) -> Result<(), ProxyControlError> {
-        let profile_name = normalize_optional_control_name(profile_name);
-
-        if let Some(profile_name) = profile_name {
-            let cfg = self.config.snapshot().await;
-            let mgr = self.service_manager(cfg.as_ref());
-            if mgr.profile(profile_name.as_str()).is_none() {
-                return Err(ProxyControlError::new(
-                    axum::http::StatusCode::NOT_FOUND,
-                    format!("profile '{}' not found", profile_name),
-                ));
-            }
-            let resolved = crate::config::resolve_service_profile(mgr, profile_name.as_str())
-                .map_err(|err| {
-                    ProxyControlError::new(axum::http::StatusCode::BAD_REQUEST, err.to_string())
-                })?;
-            crate::config::validate_profile_station_compatibility(
-                self.service_name,
-                mgr,
-                profile_name.as_str(),
-                &resolved,
-            )
-            .map_err(|err| {
-                ProxyControlError::new(axum::http::StatusCode::BAD_REQUEST, err.to_string())
-            })?;
-            self.state
-                .set_runtime_default_profile_override(
-                    self.service_name.to_string(),
-                    profile_name,
-                    crate::logging::now_ms(),
-                )
-                .await;
-        } else {
-            self.state
-                .clear_runtime_default_profile_override(self.service_name)
-                .await;
-        }
-
-        Ok(())
-    }
-
-    pub async fn set_persisted_default_profile(
-        &self,
-        profile_name: Option<String>,
-    ) -> Result<ProfilesResponse, ProxyControlError> {
-        let profile_name = normalize_optional_control_name(profile_name);
-
-        if let super::control_plane_service::PersistedProxySettingsDocument::V4(mut document) =
-            super::control_plane_service::load_persisted_proxy_settings_document()
-                .await
-                .map_err(ProxyControlError::from)?
-        {
-            if let Some(profile_name) = profile_name.as_deref() {
-                let view =
-                    super::control_plane_service::service_view_v4(&document, self.service_name);
-                if !view.profiles.contains_key(profile_name) {
-                    return Err(ProxyControlError::new(
-                        axum::http::StatusCode::NOT_FOUND,
-                        format!("profile '{}' not found", profile_name),
-                    ));
-                }
-                let runtime = crate::config::compile_v4_to_runtime(&document).map_err(|err| {
-                    ProxyControlError::new(axum::http::StatusCode::BAD_REQUEST, err.to_string())
-                })?;
-                let mgr = super::persisted_registry_api::runtime_service_manager_for_document(
-                    &runtime,
-                    self.service_name,
-                );
-                let resolved =
-                    crate::config::resolve_service_profile(mgr, profile_name).map_err(|err| {
-                        ProxyControlError::new(axum::http::StatusCode::BAD_REQUEST, err.to_string())
-                    })?;
-                crate::config::validate_profile_station_compatibility(
-                    self.service_name,
-                    mgr,
-                    profile_name,
-                    &resolved,
-                )
-                .map_err(|err| {
-                    ProxyControlError::new(axum::http::StatusCode::BAD_REQUEST, err.to_string())
-                })?;
-            }
-            let view =
-                super::control_plane_service::service_view_v4_mut(&mut document, self.service_name);
-            view.default_profile = profile_name;
-            super::control_plane_service::save_persisted_proxy_settings_document_and_reload(
-                self,
-                super::control_plane_service::PersistedProxySettingsDocument::V4(document),
-            )
-            .await
-            .map_err(ProxyControlError::from)?;
-            return Ok(self.profiles().await);
-        }
-
-        let cfg_snapshot = self.config.snapshot().await;
-        let mut cfg = cfg_snapshot.as_ref().clone();
-        let mgr =
-            super::control_plane_service::runtime_service_manager_mut(&mut cfg, self.service_name);
-
-        if let Some(profile_name) = profile_name.as_deref() {
-            if mgr.profile(profile_name).is_none() {
-                return Err(ProxyControlError::new(
-                    axum::http::StatusCode::NOT_FOUND,
-                    format!("profile '{}' not found", profile_name),
-                ));
-            }
-            let resolved =
-                crate::config::resolve_service_profile(mgr, profile_name).map_err(|err| {
-                    ProxyControlError::new(axum::http::StatusCode::BAD_REQUEST, err.to_string())
-                })?;
-            crate::config::validate_profile_station_compatibility(
-                self.service_name,
-                mgr,
-                profile_name,
-                &resolved,
-            )
-            .map_err(|err| {
-                ProxyControlError::new(axum::http::StatusCode::BAD_REQUEST, err.to_string())
-            })?;
-        }
-        mgr.default_profile = profile_name;
-
-        super::control_plane_service::save_runtime_profile_settings_and_reload(self, cfg)
-            .await
-            .map_err(ProxyControlError::from)
-    }
-
     pub async fn persisted_provider_specs(
         &self,
     ) -> Result<PersistedProvidersCatalog, ProxyControlError> {
-        let catalog = match super::control_plane_service::load_persisted_proxy_settings_document()
-            .await
-            .map_err(ProxyControlError::from)?
-        {
-            super::control_plane_service::PersistedProxySettingsDocument::V2(cfg) => {
-                crate::config::build_persisted_provider_catalog(
-                    super::control_plane_service::service_view_v2(&cfg, self.service_name),
-                )
-            }
-            super::control_plane_service::PersistedProxySettingsDocument::V4(cfg) => {
-                PersistedProvidersCatalog {
-                    providers: super::control_plane_service::service_view_v4(
-                        &cfg,
-                        self.service_name,
-                    )
-                    .providers
-                    .iter()
-                    .map(|(name, provider)| {
-                        persisted_provider_spec_from_v4_for_service(name, provider)
-                    })
-                    .collect(),
-                }
-            }
-        };
-        Ok(catalog)
-    }
-
-    pub async fn upsert_persisted_provider_spec(
-        &self,
-        provider_name: String,
-        provider: PersistedProviderSpec,
-    ) -> Result<(), ProxyControlError> {
-        super::persisted_registry_api::upsert_persisted_provider_spec_for_proxy(
-            self,
-            provider_name,
-            provider.into(),
-        )
-        .await
-        .map(|_| ())
-        .map_err(ProxyControlError::from)
+        let snapshot = self.config.capture().await;
+        let source = snapshot.config();
+        let view =
+            super::control_plane_service::service_route_config(source.as_ref(), self.service_name);
+        Ok(PersistedProvidersCatalog {
+            providers: view
+                .providers
+                .iter()
+                .map(|(name, provider)| {
+                    persisted_provider_spec_from_config_for_service(name, provider)
+                })
+                .collect(),
+        })
     }
 
     pub async fn persisted_routing_spec(&self) -> Result<PersistedRoutingSpec, ProxyControlError> {
-        match super::control_plane_service::load_persisted_proxy_settings_document()
-            .await
-            .map_err(ProxyControlError::from)?
-        {
-            super::control_plane_service::PersistedProxySettingsDocument::V4(cfg) => {
-                let view = super::control_plane_service::service_view_v4(&cfg, self.service_name);
-                Ok(persisted_routing_spec_from_v4_for_service(view))
-            }
-            super::control_plane_service::PersistedProxySettingsDocument::V2(_) => {
-                Err(ProxyControlError::new(
-                    axum::http::StatusCode::BAD_REQUEST,
-                    "routing API requires a version = 5 route graph config",
-                ))
-            }
-        }
-    }
-
-    pub async fn upsert_persisted_routing_spec(
-        &self,
-        payload: PersistedRoutingUpsertRequest,
-    ) -> Result<PersistedRoutingSpec, ProxyControlError> {
-        super::persisted_registry_api::upsert_persisted_routing_spec_for_proxy(self, payload)
-            .await
-            .map_err(ProxyControlError::from)
+        let snapshot = self.config.capture().await;
+        let source = snapshot.config();
+        let view =
+            super::control_plane_service::service_route_config(source.as_ref(), self.service_name);
+        Ok(persisted_routing_spec_from_config_for_service(view))
     }
 
     pub async fn routing_explain(
@@ -467,17 +306,9 @@ impl ProxyService {
     }
 }
 
-fn normalize_optional_control_name(value: Option<String>) -> Option<String> {
-    value
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-}
-
-fn persisted_provider_spec_from_v4_for_service(
+fn persisted_provider_spec_from_config_for_service(
     name: &str,
-    provider: &crate::config::ProviderConfigV4,
+    provider: &crate::config::ProviderConfig,
 ) -> PersistedProviderSpec {
     let mut endpoints = Vec::new();
     if let Some(base_url) = provider
@@ -518,22 +349,23 @@ fn persisted_provider_spec_from_v4_for_service(
     }
 }
 
-fn persisted_routing_spec_from_v4_for_service(
-    view: &crate::config::ServiceViewV4,
+fn persisted_routing_spec_from_config_for_service(
+    view: &crate::config::ServiceRouteConfig,
 ) -> PersistedRoutingSpec {
-    let routing = crate::config::effective_v4_routing(view);
-    let order = crate::config::resolved_v4_provider_order("persisted-routing", view)
+    let routing = crate::config::effective_routing(view);
+    let order = crate::config::resolved_provider_order("persisted-routing", view)
         .unwrap_or_else(|_| view.providers.keys().cloned().collect::<Vec<_>>());
     let entry_node = routing.entry_node();
     PersistedRoutingSpec {
         entry: routing.entry.clone(),
         affinity_policy: routing.affinity_policy,
+        scheduling_preset: routing.scheduling_preset,
         fallback_ttl_ms: routing.fallback_ttl_ms,
         reprobe_preferred_after_ms: routing.reprobe_preferred_after_ms,
         routes: routing.routes.clone(),
         policy: entry_node
             .map(|node| node.strategy)
-            .unwrap_or(crate::config::RoutingPolicyV4::OrderedFailover),
+            .unwrap_or(crate::config::RouteStrategy::OrderedFailover),
         order: order.clone(),
         target: entry_node.and_then(|node| node.target.clone()),
         prefer_tags: entry_node
@@ -541,10 +373,10 @@ fn persisted_routing_spec_from_v4_for_service(
             .unwrap_or_default(),
         on_exhausted: entry_node
             .map(|node| node.on_exhausted)
-            .unwrap_or(crate::config::RoutingExhaustedActionV4::Continue),
+            .unwrap_or(crate::config::RouteExhaustedAction::Continue),
         entry_strategy: entry_node
             .map(|node| node.strategy)
-            .unwrap_or(crate::config::RoutingPolicyV4::OrderedFailover),
+            .unwrap_or(crate::config::RouteStrategy::OrderedFailover),
         expanded_order: order,
         entry_target: entry_node.and_then(|node| node.target.clone()),
         providers: view
@@ -559,5 +391,30 @@ fn persisted_routing_spec_from_v4_for_service(
                 },
             )
             .collect(),
+    }
+}
+
+async fn wait_for_shutdown(shutdown_rx: &mut watch::Receiver<bool>) {
+    if *shutdown_rx.borrow() {
+        return;
+    }
+    while shutdown_rx.changed().await.is_ok() {
+        if *shutdown_rx.borrow() {
+            return;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ephemeral_diagnostic_factory_is_explicit_and_isolated() {
+        let proxy =
+            ProxyService::new_ephemeral_diagnostic(Arc::new(HelperConfig::default()), "codex")
+                .expect("build ephemeral diagnostic proxy");
+
+        assert_eq!(proxy.state_handle().runtime_store_handle().path(), None);
     }
 }

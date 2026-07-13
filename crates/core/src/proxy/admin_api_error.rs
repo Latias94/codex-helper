@@ -52,10 +52,6 @@ impl AdminApiHttpError {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, code, message)
     }
 
-    pub(super) fn service_unavailable(code: impl Into<String>, message: impl Into<String>) -> Self {
-        Self::new(StatusCode::SERVICE_UNAVAILABLE, code, message)
-    }
-
     fn code_for_status(status: StatusCode) -> &'static str {
         match status {
             StatusCode::BAD_REQUEST => "admin_bad_request",

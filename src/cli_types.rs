@@ -1,5 +1,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
+use codex_helper_core::runtime_identity::ProviderEndpointKey;
 use std::net::IpAddr;
+use std::str::FromStr;
 
 #[derive(Parser, Debug)]
 #[command(name = "codex-helper", version)]
@@ -13,9 +15,9 @@ pub type CliResult<T> = Result<T, CliError>;
 
 #[derive(Debug)]
 pub enum CliError {
-    /// Errors related to codex-helper's config (config.json/config.toml)
-    ProxyConfig(String),
-    /// Errors while reading or interpreting Codex CLI config/auth files
+    /// Errors related to the canonical codex-helper config.toml
+    Configuration(String),
+    /// Errors while inspecting or explicitly patching Codex config.toml
     CodexConfig(String),
     /// Errors while working with usage logs / usage_providers.json
     Usage(String),
@@ -28,7 +30,7 @@ pub enum CliError {
 impl std::fmt::Display for CliError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CliError::ProxyConfig(msg) => write!(f, "Proxy config error: {}", msg),
+            CliError::Configuration(msg) => write!(f, "Configuration error: {}", msg),
             CliError::CodexConfig(msg) => write!(f, "Codex config error: {}", msg),
             CliError::Usage(msg) => write!(f, "Usage error: {}", msg),
             CliError::Pricing(msg) => write!(f, "Pricing error: {}", msg),
@@ -64,7 +66,7 @@ pub(crate) enum Command {
         /// Disable built-in TUI dashboard (enabled by default when running in an interactive terminal)
         #[arg(long)]
         no_tui: bool,
-        /// Keep the proxy resident when the operator console exits; client patch is not auto-restored
+        /// Keep the proxy resident when the operator console exits
         #[arg(long)]
         resident: bool,
         /// Mark the resident child as supervisor-owned; internal use by `daemon supervise`
@@ -73,11 +75,19 @@ pub(crate) enum Command {
         /// Mark a resident proxy as desktop/tray-owned; intended for future desktop shells
         #[arg(long, hide = true)]
         desktop_managed: bool,
+        /// Mark a resident proxy as system-service-owned; internal use by `service`
+        #[arg(long, hide = true)]
+        service_managed: bool,
     },
     /// Inspect or control a resident codex-helper proxy
     Daemon {
         #[command(subcommand)]
         cmd: DaemonCommand,
+    },
+    /// Install and control the resident operating-system service
+    Service {
+        #[command(subcommand)]
+        cmd: ServiceCommand,
     },
     /// Attach a read-only TUI dashboard to an already-running local resident proxy
     Tui {
@@ -96,12 +106,12 @@ pub(crate) enum Command {
         #[command(subcommand)]
         cmd: RelayCommand,
     },
-    /// Manage Codex/Claude switch on/off state
+    /// Manage explicit Codex switch state
     Switch {
         #[command(subcommand)]
         cmd: SwitchCommand,
     },
-    /// Manage codex-helper config files and schema migration
+    /// Manage codex-helper configuration
     Config {
         #[command(subcommand)]
         cmd: ConfigCommand,
@@ -111,7 +121,7 @@ pub(crate) enum Command {
         #[command(subcommand)]
         cmd: RoutingCommand,
     },
-    /// Manage route graph provider catalog for v4 configs
+    /// Manage the canonical route graph provider catalog
     Provider {
         #[command(subcommand)]
         cmd: ProviderCommand,
@@ -138,8 +148,17 @@ pub(crate) enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Inspect usage logs written by codex-helper
+    /// Inspect the runtime's read-only operator usage projection
     Usage {
+        /// Target Codex runtime (default if neither service flag is set)
+        #[arg(long)]
+        codex: bool,
+        /// Target Claude runtime
+        #[arg(long)]
+        claude: bool,
+        /// Proxy port; defaults to 3211 for Codex and 3210 for Claude
+        #[arg(long)]
+        port: Option<u16>,
         #[command(subcommand)]
         cmd: UsageCommand,
     },
@@ -181,18 +200,6 @@ pub(crate) enum DaemonCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Ask a resident proxy to gracefully stop
-    Stop {
-        /// Target Codex proxy (default if neither flag is set)
-        #[arg(long)]
-        codex: bool,
-        /// Target Claude proxy
-        #[arg(long)]
-        claude: bool,
-        /// Proxy port; defaults to 3211 for Codex and 3210 for Claude
-        #[arg(long)]
-        port: Option<u16>,
-    },
     /// Run a foreground watchdog that restarts a resident proxy child after crashes
     Supervise {
         /// Target Codex proxy (default if neither flag is set)
@@ -214,6 +221,64 @@ pub(crate) enum DaemonCommand {
 }
 
 #[derive(Subcommand, Debug)]
+pub(crate) enum ServiceCommand {
+    /// Install or update the operating-system service
+    Install {
+        /// Target Codex service (default if neither flag is set)
+        #[arg(long)]
+        codex: bool,
+        /// Target Claude service
+        #[arg(long)]
+        claude: bool,
+        /// Listen host for the resident proxy
+        #[arg(long, default_value = "127.0.0.1")]
+        host: IpAddr,
+        /// Proxy port; defaults to 3211 for Codex and 3210 for Claude
+        #[arg(long)]
+        port: Option<u16>,
+        /// Install without starting immediately
+        #[arg(long)]
+        no_start: bool,
+    },
+    /// Uninstall the operating-system service
+    Uninstall {
+        /// Leave a currently running service alive until it exits
+        #[arg(long)]
+        keep_running: bool,
+    },
+    /// Start the installed service
+    Start,
+    /// Stop the installed service
+    Stop,
+    /// Restart the installed service
+    Restart,
+    /// Show installation and runtime status
+    Status {
+        /// Output status as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show service log locations
+    Logs,
+    /// Enter the Windows Service Control Manager dispatcher
+    #[command(hide = true)]
+    Run {
+        /// Target service name
+        #[arg(long, default_value = "codex")]
+        service_name: String,
+        /// Listen host for the resident proxy
+        #[arg(long, default_value = "127.0.0.1")]
+        host: IpAddr,
+        /// Proxy port
+        #[arg(long)]
+        port: Option<u16>,
+        /// Helper home captured at installation time
+        #[arg(long)]
+        helper_home: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 pub(crate) enum RelayCommand {
     /// Add or update a named remote relay target
     Add {
@@ -222,7 +287,7 @@ pub(crate) enum RelayCommand {
         /// Proxy base URL, for example http://nas.local:3211
         #[arg(long)]
         proxy_url: String,
-        /// Admin API base URL. If omitted, derived from proxy URL or discovered later.
+        /// Admin API base URL. Required for remote targets; loopback targets derive it.
         #[arg(long)]
         admin_url: Option<String>,
         /// Environment variable that stores the admin token for this target
@@ -234,15 +299,6 @@ pub(crate) enum RelayCommand {
         /// Target Claude service
         #[arg(long)]
         claude: bool,
-        /// Codex client preset used when switching to this target
-        #[arg(long = "preset", value_enum)]
-        preset: Option<CodexClientPatchPresetArg>,
-        /// Removed legacy spelling; use --preset instead.
-        #[arg(long = "mode", hide = true)]
-        legacy_mode: Option<String>,
-        /// Enable Responses WebSocket transport advertising for official bridge presets
-        #[arg(long)]
-        responses_websocket: bool,
     },
     /// List configured relay targets
     List,
@@ -254,23 +310,16 @@ pub(crate) enum RelayCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Restore Codex/Claude away from the active relay patch
-    Off {
-        /// Target Codex config (default if neither flag is set)
-        #[arg(long)]
-        codex: bool,
-        /// Target Claude settings (experimental)
-        #[arg(long)]
-        claude: bool,
-    },
-    /// Use a relay target; switches the client and opens TUI unless flags say otherwise
+    /// Explain how to disable an explicit Codex switch without changing client config
+    Off,
+    /// Use a relay target; starts local or attaches remote without changing client config
     Use {
         /// Target name, for example "local" or "nas"
         target: String,
-        /// Switch client only; do not open TUI
+        /// Do not open TUI when starting the built-in local target
         #[arg(long)]
         no_tui: bool,
-        /// Attach TUI only; do not switch client config
+        /// Attach to an existing runtime instead of starting a local proxy
         #[arg(long)]
         attach_only: bool,
     },
@@ -284,30 +333,15 @@ pub(crate) enum CodexCommand {
     /// Run validation-only Codex relay capability diagnostics
     #[command(name = "relay-capabilities")]
     Capabilities {
-        /// Target station/provider name; defaults to the current Codex routing target
-        #[arg(long)]
-        station: Option<String>,
-        /// Target route-graph provider id; mutually exclusive with --station
+        /// Target canonical provider id; defaults to the current runtime target when omitted
         #[arg(long)]
         provider: Option<String>,
-        /// Target route-graph endpoint id; requires --provider
+        /// Target canonical endpoint id; requires --provider
         #[arg(long)]
         endpoint: Option<String>,
-        /// Target upstream index inside a legacy station/provider
-        #[arg(long = "upstream-index")]
-        upstream_index: Option<usize>,
         /// Requested model used for model-catalog capability interpretation
         #[arg(long)]
         model: Option<String>,
-        /// Preset to evaluate; defaults to current switch/config preset
-        #[arg(long = "preset", value_enum)]
-        preset: Option<CodexClientPatchPresetArg>,
-        /// Removed legacy spelling; use --preset instead.
-        #[arg(long = "mode", hide = true)]
-        legacy_mode: Option<String>,
-        /// Compaction strategy to evaluate; defaults to current switch/config compaction
-        #[arg(long, value_enum)]
-        compaction: Option<CodexCompactionStrategyArg>,
         /// Output JSON instead of text
         #[arg(long)]
         json: bool,
@@ -318,18 +352,12 @@ pub(crate) enum CodexCommand {
         /// Required exact acknowledgement before any upstream live-smoke request is sent
         #[arg(long = "acknowledgement", value_name = "ACK")]
         acknowledgement: String,
-        /// Target station/provider name; defaults to the current Codex routing target
-        #[arg(long)]
-        station: Option<String>,
-        /// Target route-graph provider id; mutually exclusive with --station
+        /// Target canonical provider id; defaults to the current runtime target when omitted
         #[arg(long)]
         provider: Option<String>,
-        /// Target route-graph endpoint id; requires --provider
+        /// Target canonical endpoint id; requires --provider
         #[arg(long)]
         endpoint: Option<String>,
-        /// Target upstream index inside a legacy station/provider
-        #[arg(long = "upstream-index")]
-        upstream_index: Option<usize>,
         /// Requested model; required for live smoke
         #[arg(long)]
         model: String,
@@ -358,9 +386,9 @@ pub(crate) enum CodexCommand {
         /// Filter by evidence kind
         #[arg(long, value_enum)]
         kind: Option<CodexRelayEvidenceKindArg>,
-        /// Match station/provider name substring
+        /// Match canonical provider id substring
         #[arg(long)]
-        station: Option<String>,
+        provider: Option<String>,
         /// Match requested model substring
         #[arg(long)]
         model: Option<String>,
@@ -391,131 +419,19 @@ pub(crate) enum NotifyCommand {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum SwitchCommand {
-    /// Switch Codex/Claude config to use local proxy
+    /// Switch Codex config to a helper proxy
     On {
         /// Listen port for local proxy; defaults to 3211
-        #[arg(long, default_value_t = 3211)]
-        port: u16,
-        /// Codex client preset; if omitted, use the preset from ~/.codex-helper/config.toml
-        #[arg(long = "preset", value_enum)]
-        preset: Option<CodexClientPatchPresetArg>,
-        /// Removed legacy spelling; use --preset instead.
-        #[arg(long = "mode", hide = true)]
-        legacy_mode: Option<String>,
-        /// Enable Responses WebSocket transport advertising for official bridge presets
-        #[arg(long)]
-        responses_websocket: bool,
-        /// Override Codex client compaction strategy without adding another preset
-        #[arg(long, value_enum)]
-        compaction: Option<CodexCompactionStrategyArg>,
-        /// Target Codex config (default if neither flag is set)
-        #[arg(long)]
-        codex: bool,
-        /// Target Claude settings (experimental)
-        #[arg(long)]
-        claude: bool,
+        #[arg(long, conflicts_with = "base_url")]
+        port: Option<u16>,
+        /// Explicit helper proxy base URL
+        #[arg(long, conflicts_with = "port")]
+        base_url: Option<String>,
     },
-    /// Disable local proxy integration (Codex is patched in place; Claude restores backup)
-    Off {
-        /// Target Codex config (default if neither flag is set)
-        #[arg(long)]
-        codex: bool,
-        /// Target Claude settings (experimental)
-        #[arg(long)]
-        claude: bool,
-    },
-    /// Show current switch status for Codex/Claude
-    Status {
-        /// Show Codex switch status
-        #[arg(long)]
-        codex: bool,
-        /// Show Claude switch status
-        #[arg(long)]
-        claude: bool,
-    },
-    /// Manage Codex App mobile remote-control enablement
-    RemoteControl {
-        #[command(subcommand)]
-        cmd: RemoteControlCommand,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-pub(crate) enum RemoteControlCommand {
-    /// Enable Codex App mobile remote control on this machine
-    Enable,
-    /// Show Codex App mobile remote-control status
+    /// Restore the selector and helper stanza recorded by the explicit switch operation
+    Off,
+    /// Show the helper-owned Codex switch status
     Status,
-    /// Check Codex logs for a successful experimentalFeature/enablement/set response
-    CheckLogs,
-}
-
-#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CodexClientPatchPresetArg {
-    /// Historical codex-helper patch behavior
-    Default,
-    /// Keep ChatGPT account auth while routing model traffic through codex-helper
-    ChatgptBridge,
-    /// Experimental image generation bridge using a minimal ChatGPT auth facade
-    ImagegenBridge,
-    /// Experimental official relay preset for HTTP OpenAI Responses features
-    #[value(name = "official-relay")]
-    OfficialRelayBridge,
-    /// Experimental official imagegen preset plus minimal image generation auth facade
-    #[value(name = "official-imagegen")]
-    OfficialImagegenBridge,
-}
-
-pub(crate) fn legacy_mode_replacement_hint(value: &str) -> String {
-    let trimmed = value.trim();
-    let replacement = match trimmed {
-        "official-relay-bridge" | "official_relay_bridge" => "official-relay",
-        "official-imagegen-bridge" | "official_imagegen_bridge" => "official-imagegen",
-        "" => "<preset>",
-        other => other,
-    };
-    format!("`--mode {trimmed}` has been removed; use `--preset {replacement}` instead")
-}
-
-pub(crate) fn reject_legacy_mode(value: Option<String>) -> CliResult<()> {
-    if let Some(value) = value {
-        return Err(CliError::Other(legacy_mode_replacement_hint(&value)));
-    }
-    Ok(())
-}
-
-impl From<CodexClientPatchPresetArg> for codex_helper_core::codex_integration::CodexPatchMode {
-    fn from(value: CodexClientPatchPresetArg) -> Self {
-        match value {
-            CodexClientPatchPresetArg::Default => Self::Default,
-            CodexClientPatchPresetArg::ChatgptBridge => Self::ChatGptBridge,
-            CodexClientPatchPresetArg::ImagegenBridge => Self::ImagegenBridge,
-            CodexClientPatchPresetArg::OfficialRelayBridge => Self::OfficialRelayBridge,
-            CodexClientPatchPresetArg::OfficialImagegenBridge => Self::OfficialImagegenBridge,
-        }
-    }
-}
-
-#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
-#[value(rename_all = "kebab-case")]
-pub(crate) enum CodexCompactionStrategyArg {
-    Auto,
-    Local,
-    RemoteV1,
-    RemoteV2,
-}
-
-impl From<CodexCompactionStrategyArg>
-    for codex_helper_core::codex_integration::CodexCompactionStrategy
-{
-    fn from(value: CodexCompactionStrategyArg) -> Self {
-        match value {
-            CodexCompactionStrategyArg::Auto => Self::Auto,
-            CodexCompactionStrategyArg::Local => Self::Local,
-            CodexCompactionStrategyArg::RemoteV1 => Self::RemoteV1,
-            CodexCompactionStrategyArg::RemoteV2 => Self::RemoteV2,
-        }
-    }
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -541,46 +457,12 @@ pub enum ConfigCommand {
         /// Overwrite existing config.toml (backing up to config.toml.bak)
         #[arg(long)]
         force: bool,
-        /// Do not auto-import Codex providers from ~/.codex/config.toml (template only)
-        #[arg(long)]
-        no_import: bool,
     },
     /// Set retry policy to a curated profile (writes to ~/.codex-helper/config.*)
     #[command(name = "set-retry-profile")]
     SetRetryProfile {
         #[arg(value_enum)]
         profile: RetryProfile,
-    },
-    /// Import Codex providers from ~/.codex/config.toml + auth.json into codex-helper config
-    ImportFromCodex {
-        /// Overwrite existing Codex providers in codex-helper config
-        #[arg(long)]
-        force: bool,
-    },
-    /// Overwrite Codex providers from ~/.codex/config.toml + auth.json
-    ///
-    /// This resets Codex providers in codex-helper back to Codex CLI defaults.
-    #[command(name = "overwrite-from-codex")]
-    OverwriteFromCodex {
-        /// Preview changes without writing ~/.codex-helper/config (toml/json)
-        #[arg(long)]
-        dry_run: bool,
-        /// Confirm overwriting providers (required unless --dry-run)
-        #[arg(long)]
-        yes: bool,
-    },
-
-    /// Preview or write migration output for the current route graph schema
-    Migrate {
-        /// Preview only; print migrated TOML to stdout
-        #[arg(long, conflicts_with = "write")]
-        dry_run: bool,
-        /// Write migrated TOML to ~/.codex-helper/config.toml
-        #[arg(long, conflicts_with = "dry_run")]
-        write: bool,
-        /// Confirm writing migrated config to disk
-        #[arg(long, requires = "write")]
-        yes: bool,
     },
 }
 
@@ -598,7 +480,7 @@ pub enum RoutingCommand {
         #[arg(long)]
         json: bool,
     },
-    /// List the current runtime routing candidates
+    /// List providers in the canonical configuration
     List {
         /// Target Codex routing (default if neither flag is set)
         #[arg(long)]
@@ -607,7 +489,7 @@ pub enum RoutingCommand {
         #[arg(long)]
         claude: bool,
     },
-    /// Explain the current runtime routing order
+    /// Preview routing from configuration only; runtime health is not queried
     Explain {
         /// Target Codex routing (default if neither flag is set)
         #[arg(long)]
@@ -732,7 +614,7 @@ pub enum RoutingCommand {
 #[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 pub enum ProviderCommand {
-    /// Show providers in the v4 catalog
+    /// Show providers in the source catalog
     List {
         /// Target Codex provider catalog (default if neither flag is set)
         #[arg(long)]
@@ -828,7 +710,7 @@ pub enum RoutingPolicy {
     TagPreferred,
 }
 
-impl From<RoutingPolicy> for codex_helper_core::config::RoutingPolicyV4 {
+impl From<RoutingPolicy> for codex_helper_core::config::RouteStrategy {
     fn from(value: RoutingPolicy) -> Self {
         match value {
             RoutingPolicy::ManualSticky => Self::ManualSticky,
@@ -845,7 +727,7 @@ pub enum RoutingExhaustedAction {
     Stop,
 }
 
-impl From<RoutingExhaustedAction> for codex_helper_core::config::RoutingExhaustedActionV4 {
+impl From<RoutingExhaustedAction> for codex_helper_core::config::RouteExhaustedAction {
     fn from(value: RoutingExhaustedAction) -> Self {
         match value {
             RoutingExhaustedAction::Continue => Self::Continue,
@@ -992,7 +874,7 @@ pub enum RecentTerminal {
 
 #[derive(Subcommand, Debug)]
 pub enum UsageCommand {
-    /// Show recent requests with basic usage info from ~/.codex-helper/logs/requests.jsonl
+    /// Show recent requests from the runtime operator read model
     Tail {
         /// Maximum number of recent entries to print
         #[arg(long, default_value_t = 20)]
@@ -1001,29 +883,29 @@ pub enum UsageCommand {
         #[arg(long)]
         raw: bool,
     },
-    /// Summarize total token usage from ~/.codex-helper/logs/requests.jsonl
+    /// Summarize token usage from the runtime operator read model
     Summary {
         /// Maximum number of summary rows to show (sorted by total_tokens desc)
         #[arg(long, default_value_t = 20)]
         limit: usize,
-        /// Group summary rows by routing target, provider, model, or session
-        #[arg(long, value_enum, default_value_t = UsageSummaryBy::Station)]
+        /// Group summary rows by provider endpoint, provider, model, or session
+        #[arg(long, value_enum, default_value_t = UsageSummaryBy::ProviderEndpoint)]
         by: UsageSummaryBy,
     },
-    /// Find matching request records in ~/.codex-helper/logs/requests.jsonl
+    /// Find matching requests in the runtime operator read model
     Find {
         /// Maximum number of matching entries to print, newest first
         #[arg(long, default_value_t = 20)]
         limit: usize,
-        /// Match session id substring
+        /// Match a redacted operator session key substring
         #[arg(long)]
         session: Option<String>,
         /// Match model id substring
         #[arg(long)]
         model: Option<String>,
-        /// Match routing target/config name substring
+        /// Match an exact canonical service/provider/endpoint key
         #[arg(long)]
-        station: Option<String>,
+        provider_endpoint: Option<ProviderEndpointArg>,
         /// Match provider id substring
         #[arg(long)]
         provider: Option<String>,
@@ -1072,10 +954,49 @@ pub enum UsageCommand {
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 #[value(rename_all = "kebab-case")]
 pub enum UsageSummaryBy {
-    Station,
+    ProviderEndpoint,
     Provider,
     Model,
     Session,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderEndpointArg(ProviderEndpointKey);
+
+impl ProviderEndpointArg {
+    pub fn into_key(self) -> ProviderEndpointKey {
+        self.0
+    }
+
+    #[cfg(test)]
+    fn stable_key(&self) -> String {
+        self.0.stable_key()
+    }
+}
+
+impl FromStr for ProviderEndpointArg {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let mut parts = value.split('/');
+        let service_name = parts.next().unwrap_or_default().trim();
+        let provider_id = parts.next().unwrap_or_default().trim();
+        let endpoint_id = parts.next().unwrap_or_default().trim();
+        if service_name.is_empty()
+            || provider_id.is_empty()
+            || endpoint_id.is_empty()
+            || parts.next().is_some()
+        {
+            return Err(
+                "provider endpoint must use the exact service/provider/endpoint form".to_string(),
+            );
+        }
+        Ok(Self(ProviderEndpointKey::new(
+            service_name,
+            provider_id,
+            endpoint_id,
+        )))
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -1154,59 +1075,83 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn switch_on_without_preset_leaves_preset_unset_for_config_fallback() {
-        let cli = Cli::try_parse_from(["codex-helper", "switch", "on"])
-            .expect("parse switch on without explicit preset");
-
-        let Some(Command::Switch {
-            cmd:
-                SwitchCommand::On {
-                    preset,
-                    responses_websocket,
-                    compaction,
-                    ..
-                },
-        }) = cli.command
-        else {
-            panic!("expected switch on command");
-        };
-        assert_eq!(preset, None);
-        assert!(!responses_websocket);
-        assert_eq!(compaction, None);
+    fn config_init_rejects_removed_no_import_flag() {
+        assert!(Cli::try_parse_from(["codex-helper", "config", "init", "--no-import"]).is_err());
     }
 
     #[test]
-    fn switch_on_with_explicit_preset_keeps_requested_preset_and_compaction() {
+    fn config_rejects_removed_codex_import_commands() {
+        for command in ["import-from-codex", "overwrite-from-codex"] {
+            assert!(Cli::try_parse_from(["codex-helper", "config", command]).is_err());
+        }
+    }
+
+    #[test]
+    fn config_rejects_removed_migrate_command() {
+        assert!(Cli::try_parse_from(["codex-helper", "config", "migrate"]).is_err());
+    }
+
+    #[test]
+    fn switch_on_accepts_explicit_base_url() {
         let cli = Cli::try_parse_from([
             "codex-helper",
             "switch",
             "on",
-            "--preset",
-            "official-imagegen",
-            "--responses-websocket",
-            "--compaction",
-            "local",
+            "--base-url",
+            "https://relay.example/v1",
         ])
-        .expect("parse switch on with explicit preset");
-
+        .expect("parse explicit base URL");
         let Some(Command::Switch {
             cmd:
                 SwitchCommand::On {
-                    preset,
-                    responses_websocket,
-                    compaction,
-                    ..
+                    port: None,
+                    base_url: Some(base_url),
                 },
         }) = cli.command
         else {
-            panic!("expected switch on command");
+            panic!("expected explicit switch-on base URL");
         };
-        assert_eq!(
-            preset,
-            Some(CodexClientPatchPresetArg::OfficialImagegenBridge)
+        assert_eq!(base_url, "https://relay.example/v1");
+    }
+
+    #[test]
+    fn switch_rejects_removed_mutation_surfaces() {
+        for args in [
+            vec!["codex-helper", "switch", "on", "--preset", "default"],
+            vec!["codex-helper", "switch", "on", "--mode", "official-relay"],
+            vec!["codex-helper", "switch", "on", "--compaction", "local"],
+            vec!["codex-helper", "switch", "on", "--responses-websocket"],
+            vec!["codex-helper", "switch", "on", "--claude"],
+            vec!["codex-helper", "switch", "on", "--codex"],
+            vec!["codex-helper", "switch", "off", "--claude"],
+            vec!["codex-helper", "switch", "off", "--codex"],
+            vec!["codex-helper", "switch", "status", "--codex"],
+            vec!["codex-helper", "switch", "status", "--claude"],
+            vec!["codex-helper", "switch", "remote-control", "enable"],
+            vec!["codex-helper", "switch", "remote-control", "status"],
+            vec!["codex-helper", "switch", "remote-control", "check-logs"],
+        ] {
+            assert!(
+                Cli::try_parse_from(args.clone()).is_err(),
+                "removed switch surface should be rejected: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn switch_rejects_port_and_base_url_together() {
+        assert!(
+            Cli::try_parse_from([
+                "codex-helper",
+                "switch",
+                "on",
+                "--port",
+                "4321",
+                "--base-url",
+                "https://relay.example/v1",
+            ])
+            .is_err()
         );
-        assert!(responses_websocket);
-        assert_eq!(compaction, Some(CodexCompactionStrategyArg::Local));
     }
 
     #[test]
@@ -1217,10 +1162,6 @@ mod tests {
             "relay-capabilities",
             "--model",
             "gpt-5.5",
-            "--preset",
-            "official-imagegen",
-            "--compaction",
-            "local",
             "--provider",
             "ciii",
             "--endpoint",
@@ -1233,8 +1174,6 @@ mod tests {
             cmd:
                 CodexCommand::Capabilities {
                     model,
-                    preset,
-                    compaction,
                     provider,
                     endpoint,
                     json,
@@ -1245,60 +1184,126 @@ mod tests {
             panic!("expected codex relay capabilities command");
         };
         assert_eq!(model.as_deref(), Some("gpt-5.5"));
-        assert_eq!(
-            preset,
-            Some(CodexClientPatchPresetArg::OfficialImagegenBridge)
-        );
-        assert_eq!(compaction, Some(CodexCompactionStrategyArg::Local));
         assert_eq!(provider.as_deref(), Some("ciii"));
         assert_eq!(endpoint.as_deref(), Some("default"));
         assert!(json);
     }
 
     #[test]
-    fn codex_relay_cli_captures_removed_mode_for_replacement_hint() {
-        let cli = Cli::try_parse_from([
-            "codex-helper",
-            "codex",
-            "relay-capabilities",
-            "--mode",
-            "official-imagegen-bridge",
-        ])
-        .expect("capture removed codex relay capabilities mode option");
+    fn codex_relay_cli_rejects_removed_capability_assumptions() {
+        for removed in [
+            vec!["--preset", "official-imagegen"],
+            vec!["--mode", "official-imagegen-bridge"],
+            vec!["--compaction", "local"],
+        ] {
+            let mut args = vec!["codex-helper", "codex", "relay-capabilities"];
+            args.extend(removed);
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
 
-        let Some(Command::Codex {
-            cmd:
-                CodexCommand::Capabilities {
-                    preset,
-                    legacy_mode,
-                    ..
-                },
-        }) = cli.command
+    #[test]
+    fn codex_relay_cli_rejects_legacy_target_flags() {
+        for args in [
+            vec![
+                "codex-helper",
+                "codex",
+                "relay-capabilities",
+                "--station",
+                "legacy-station",
+            ],
+            vec![
+                "codex-helper",
+                "codex",
+                "relay-live-smoke",
+                "--acknowledgement",
+                "run-live-codex-relay-smoke",
+                "--model",
+                "gpt-5.5",
+                "--upstream-index",
+                "1",
+            ],
+            vec![
+                "codex-helper",
+                "codex",
+                "relay-evidence",
+                "--station",
+                "legacy-station",
+            ],
+        ] {
+            let error = Cli::try_parse_from(args).expect_err("legacy target flag should fail");
+            assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        }
+    }
+
+    #[test]
+    fn usage_cli_uses_canonical_provider_endpoint_identity() {
+        let summary = Cli::try_parse_from([
+            "codex-helper",
+            "usage",
+            "--claude",
+            "--port",
+            "4210",
+            "summary",
+            "--by",
+            "provider-endpoint",
+        ])
+        .expect("parse provider-endpoint summary");
+        let Some(Command::Usage {
+            claude, port, cmd, ..
+        }) = summary.command
         else {
-            panic!("expected codex relay capabilities command");
+            panic!("expected usage summary command");
         };
-        assert_eq!(preset, None);
-        assert_eq!(legacy_mode.as_deref(), Some("official-imagegen-bridge"));
+        assert!(claude);
+        assert_eq!(port, Some(4210));
+        assert!(matches!(
+            cmd,
+            UsageCommand::Summary {
+                by: UsageSummaryBy::ProviderEndpoint,
+                ..
+            }
+        ));
+
+        let find = Cli::try_parse_from([
+            "codex-helper",
+            "usage",
+            "find",
+            "--provider-endpoint",
+            "codex/sol/responses",
+        ])
+        .expect("parse provider endpoint filter");
+        let Some(Command::Usage {
+            cmd: UsageCommand::Find {
+                provider_endpoint, ..
+            },
+            ..
+        }) = find.command
+        else {
+            panic!("expected usage find command");
+        };
         assert_eq!(
-            legacy_mode_replacement_hint(legacy_mode.as_deref().unwrap()),
-            "`--mode official-imagegen-bridge` has been removed; use `--preset official-imagegen` instead"
+            provider_endpoint
+                .as_ref()
+                .map(ProviderEndpointArg::stable_key),
+            Some("codex/sol/responses".to_string())
         );
     }
 
     #[test]
-    fn codex_relay_cli_rejects_legacy_bridge_preset_value() {
-        let error = Cli::try_parse_from([
-            "codex-helper",
-            "codex",
-            "relay-capabilities",
-            "--preset",
-            "official-imagegen-bridge",
-        ])
-        .expect_err("legacy bridge preset value should fail clap parse");
-
-        let message = error.to_string();
-        assert!(message.contains("invalid value"));
-        assert!(message.contains("official-imagegen"));
+    fn usage_cli_rejects_removed_station_identity() {
+        for args in [
+            vec!["codex-helper", "usage", "summary", "--by", "station"],
+            vec![
+                "codex-helper",
+                "usage",
+                "find",
+                "--station",
+                "legacy-station",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
     }
 
     #[test]
@@ -1419,7 +1424,7 @@ mod tests {
             "relay-evidence",
             "--kind",
             "live-smoke",
-            "--station",
+            "--provider",
             "input",
             "--limit",
             "5",
@@ -1430,7 +1435,7 @@ mod tests {
             cmd:
                 CodexCommand::Evidence {
                     kind,
-                    station,
+                    provider,
                     limit,
                     ..
                 },
@@ -1439,7 +1444,7 @@ mod tests {
             panic!("expected codex relay evidence command");
         };
         assert_eq!(kind, Some(CodexRelayEvidenceKindArg::LiveSmoke));
-        assert_eq!(station.as_deref(), Some("input"));
+        assert_eq!(provider.as_deref(), Some("input"));
         assert_eq!(limit, 5);
     }
 
@@ -1503,6 +1508,107 @@ mod tests {
     }
 
     #[test]
+    fn serve_cli_parses_hidden_service_managed_flag() {
+        let cli = Cli::try_parse_from(["codex-helper", "serve", "--codex", "--service-managed"])
+            .expect("parse service-managed serve command");
+
+        let Some(Command::Serve {
+            codex,
+            resident,
+            service_managed,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected serve command");
+        };
+        assert!(codex);
+        assert!(!resident);
+        assert!(service_managed);
+    }
+
+    #[test]
+    fn service_cli_parses_install_and_status_contract() {
+        let cli = Cli::try_parse_from([
+            "codex-helper",
+            "service",
+            "install",
+            "--claude",
+            "--host",
+            "127.0.0.2",
+            "--port",
+            "4210",
+            "--no-start",
+        ])
+        .expect("parse service install command");
+
+        let Some(Command::Service {
+            cmd:
+                ServiceCommand::Install {
+                    codex,
+                    claude,
+                    host,
+                    port,
+                    no_start,
+                },
+        }) = cli.command
+        else {
+            panic!("expected service install command");
+        };
+        assert!(!codex);
+        assert!(claude);
+        assert_eq!(host, IpAddr::from([127, 0, 0, 2]));
+        assert_eq!(port, Some(4210));
+        assert!(no_start);
+
+        let status = Cli::try_parse_from(["codex-helper", "service", "status", "--json"])
+            .expect("parse service status command");
+        assert!(matches!(
+            status.command,
+            Some(Command::Service {
+                cmd: ServiceCommand::Status { json: true }
+            })
+        ));
+    }
+
+    #[test]
+    fn service_cli_internal_run_carries_installed_runtime_identity() {
+        let cli = Cli::try_parse_from([
+            "codex-helper",
+            "service",
+            "run",
+            "--service-name",
+            "claude",
+            "--host",
+            "127.0.0.3",
+            "--port",
+            "4210",
+            "--helper-home",
+            "/tmp/helper-home",
+        ])
+        .expect("parse internal service run command");
+
+        let Some(Command::Service {
+            cmd:
+                ServiceCommand::Run {
+                    service_name,
+                    host,
+                    port,
+                    helper_home,
+                },
+        }) = cli.command
+        else {
+            panic!("expected internal service run command");
+        };
+        assert_eq!(service_name, "claude");
+        assert_eq!(host, IpAddr::from([127, 0, 0, 3]));
+        assert_eq!(port, Some(4210));
+        assert_eq!(
+            helper_home,
+            Some(std::path::PathBuf::from("/tmp/helper-home"))
+        );
+    }
+
+    #[test]
     fn daemon_cli_parses_status_json() {
         let cli = Cli::try_parse_from([
             "codex-helper",
@@ -1529,24 +1635,17 @@ mod tests {
     }
 
     #[test]
-    fn daemon_cli_parses_stop() {
-        let cli = Cli::try_parse_from(["codex-helper", "daemon", "stop", "--codex"])
-            .expect("parse daemon stop command");
+    fn daemon_cli_rejects_http_stop_but_service_stop_remains_explicit() {
+        assert!(Cli::try_parse_from(["codex-helper", "daemon", "stop", "--codex"]).is_err());
 
-        let Some(Command::Daemon {
-            cmd:
-                DaemonCommand::Stop {
-                    codex,
-                    claude,
-                    port,
-                },
-        }) = cli.command
-        else {
-            panic!("expected daemon stop command");
-        };
-        assert!(codex);
-        assert!(!claude);
-        assert_eq!(port, None);
+        let service_stop = Cli::try_parse_from(["codex-helper", "service", "stop"])
+            .expect("parse local service stop command");
+        assert!(matches!(
+            service_stop.command,
+            Some(Command::Service {
+                cmd: ServiceCommand::Stop
+            })
+        ));
     }
 
     #[test]
@@ -1603,38 +1702,38 @@ mod tests {
     }
 
     #[test]
-    fn relay_cli_parses_add_target() {
-        let cli = Cli::try_parse_from([
-            "ch",
-            "relay",
-            "add",
-            "nas",
-            "--proxy-url",
-            "http://nas.local:3211",
-            "--admin-token-env",
-            "NAS_ADMIN_TOKEN",
-            "--preset",
-            "chatgpt-bridge",
-        ])
-        .expect("parse relay add command");
+    fn relay_cli_rejects_removed_client_preset() {
+        for removed in [
+            vec!["--preset", "chatgpt-bridge"],
+            vec!["--mode", "official-relay"],
+            vec!["--responses-websocket"],
+        ] {
+            let mut args = vec![
+                "ch",
+                "relay",
+                "add",
+                "nas",
+                "--proxy-url",
+                "http://nas.local:3211",
+                "--admin-token-env",
+                "NAS_ADMIN_TOKEN",
+            ];
+            args.extend(removed);
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
 
-        let Some(Command::Relay {
-            cmd:
-                RelayCommand::Add {
-                    name,
-                    proxy_url,
-                    admin_token_env,
-                    preset,
-                    ..
-                },
-        }) = cli.command
-        else {
-            panic!("expected relay add command");
-        };
-        assert_eq!(name, "nas");
-        assert_eq!(proxy_url, "http://nas.local:3211");
-        assert_eq!(admin_token_env.as_deref(), Some("NAS_ADMIN_TOKEN"));
-        assert_eq!(preset, Some(CodexClientPatchPresetArg::ChatgptBridge));
+    #[test]
+    fn relay_cli_off_is_read_only_and_rejects_old_client_flags() {
+        let cli = Cli::try_parse_from(["ch", "relay", "off"]).expect("parse relay off");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Relay {
+                cmd: RelayCommand::Off
+            })
+        ));
+        assert!(Cli::try_parse_from(["ch", "relay", "off", "--codex"]).is_err());
+        assert!(Cli::try_parse_from(["ch", "relay", "off", "--claude"]).is_err());
     }
 
     #[test]

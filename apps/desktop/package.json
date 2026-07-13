@@ -9,7 +9,7 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview --host 127.0.0.1",
     "test": "vitest run",
-    "check:contracts": "node ./scripts/check-admin-read-model-contract.mjs",
+    "check:contracts": "node --test ./scripts/desktop-contracts.node-test.mjs && node ./scripts/check-admin-read-model-contract.mjs && node ./scripts/check-read-only-control-plane-surface.mjs",
     "generate:contracts": "node ./scripts/generate-desktop-contracts.mjs",
     "check:versions": "node ./scripts/check-version-sync.mjs",
     "prepare:sidecar": "node ./scripts/prepare-sidecar.mjs",

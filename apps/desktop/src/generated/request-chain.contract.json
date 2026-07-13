@@ -9,6 +9,23 @@
         "trace_id",
         "request_id",
         "session_id"
+      ],
+      "shape": [
+        {
+          "name": "trace_id",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "request_id",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "session_id",
+          "optional": true,
+          "type": "string"
+        }
       ]
     },
     {
@@ -20,6 +37,33 @@
         "limit",
         "truncated",
         "requests"
+      ],
+      "shape": [
+        {
+          "name": "api_version",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "selector",
+          "optional": false,
+          "type": "ApiRequestChainSelector"
+        },
+        {
+          "name": "limit",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "truncated",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "requests",
+          "optional": false,
+          "type": "ApiRequestChainRequest[]"
+        }
       ]
     },
     {
@@ -34,8 +78,10 @@
         "model",
         "reasoning_effort",
         "service_tier",
-        "station_name",
         "provider_id",
+        "endpoint_id",
+        "provider_endpoint_key",
+        "route_path",
         "usage",
         "cost",
         "observability",
@@ -54,6 +100,158 @@
         "provider_signals",
         "policy_actions",
         "timeline"
+      ],
+      "shape": [
+        {
+          "name": "request_id",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "trace_id",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "session_id",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "session_identity_source",
+          "optional": true,
+          "type": "ApiSessionIdentitySource"
+        },
+        {
+          "name": "client_name",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "model",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "reasoning_effort",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "service_tier",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "provider_id",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "endpoint_id",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "provider_endpoint_key",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "route_path",
+          "optional": true,
+          "type": "string[]"
+        },
+        {
+          "name": "usage",
+          "optional": true,
+          "type": "ApiUsageMetrics"
+        },
+        {
+          "name": "cost",
+          "optional": true,
+          "type": "ApiCostBreakdown"
+        },
+        {
+          "name": "observability",
+          "optional": false,
+          "type": "ApiRequestObservability"
+        },
+        {
+          "name": "service",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "method",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "path",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "status_code",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "duration_ms",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "ttfb_ms",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "streaming",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "ended_at_ms",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "attempts_truncated",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "provider_signals_truncated",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "policy_actions_truncated",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "route_attempts",
+          "optional": false,
+          "type": "ApiRequestChainRouteAttempt[]"
+        },
+        {
+          "name": "provider_signals",
+          "optional": false,
+          "type": "ApiRequestChainProviderSignal[]"
+        },
+        {
+          "name": "policy_actions",
+          "optional": false,
+          "type": "ApiRequestChainPolicyAction[]"
+        },
+        {
+          "name": "timeline",
+          "optional": false,
+          "type": "ApiRequestChainTimelineEvent[]"
+        }
       ]
     },
     {
@@ -64,7 +262,6 @@
         "provider_id",
         "endpoint_id",
         "provider_endpoint_key",
-        "station_name",
         "preference_group",
         "route_path",
         "provider_attempt",
@@ -84,6 +281,123 @@
         "skipped",
         "provider_signals",
         "policy_actions"
+      ],
+      "shape": [
+        {
+          "name": "attempt_index",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "provider_id",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "endpoint_id",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "provider_endpoint_key",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "preference_group",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "route_path",
+          "optional": true,
+          "type": "string[]"
+        },
+        {
+          "name": "provider_attempt",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "upstream_attempt",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "provider_max_attempts",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "upstream_max_attempts",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "avoided_total",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "total_upstreams",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "decision",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "code",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "status_code",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "error_class",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "model",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "upstream_headers_ms",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "duration_ms",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "cooldown_secs",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "skipped",
+          "optional": true,
+          "type": "boolean"
+        },
+        {
+          "name": "provider_signals",
+          "optional": false,
+          "type": "ApiRequestChainProviderSignal[]"
+        },
+        {
+          "name": "policy_actions",
+          "optional": false,
+          "type": "ApiRequestChainPolicyAction[]"
+        }
       ]
     },
     {
@@ -101,6 +415,63 @@
         "reset_after_secs",
         "error_class",
         "trace_id"
+      ],
+      "shape": [
+        {
+          "name": "kind",
+          "optional": false,
+          "type": "ApiProviderSignalKind"
+        },
+        {
+          "name": "code",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "source",
+          "optional": false,
+          "type": "ApiProviderSignalSource"
+        },
+        {
+          "name": "target",
+          "optional": false,
+          "type": "ApiProviderSignalTarget"
+        },
+        {
+          "name": "confidence",
+          "optional": false,
+          "type": "ApiProviderSignalConfidence"
+        },
+        {
+          "name": "observed_at_ms",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "route_facing",
+          "optional": true,
+          "type": "boolean"
+        },
+        {
+          "name": "retry_after_secs",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "reset_after_secs",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "error_class",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "trace_id",
+          "optional": true,
+          "type": "string"
+        }
       ]
     },
     {
@@ -118,6 +489,63 @@
         "expires_at_ms",
         "recovery_state",
         "generation"
+      ],
+      "shape": [
+        {
+          "name": "id",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "kind",
+          "optional": false,
+          "type": "ApiPolicyActionKind"
+        },
+        {
+          "name": "code",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "owner",
+          "optional": false,
+          "type": "ApiPolicyActionOwner"
+        },
+        {
+          "name": "provider_endpoint_key",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "source_signal",
+          "optional": false,
+          "type": "ApiRequestChainProviderSignal"
+        },
+        {
+          "name": "confidence",
+          "optional": false,
+          "type": "ApiProviderSignalConfidence"
+        },
+        {
+          "name": "created_at_ms",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "expires_at_ms",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "recovery_state",
+          "optional": false,
+          "type": "ApiPolicyActionRecoveryState"
+        },
+        {
+          "name": "generation",
+          "optional": false,
+          "type": "number"
+        }
       ]
     },
     {
@@ -134,16 +562,196 @@
         "provider_endpoint_key",
         "status_code",
         "model"
+      ],
+      "shape": [
+        {
+          "name": "order",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "at_ms",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "kind",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "code",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "attempt_index",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "provider_id",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "endpoint_id",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "provider_endpoint_key",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "status_code",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "model",
+          "optional": true,
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/state/session_identity.rs",
+      "struct": "RequestObservability",
+      "fields": [
+        "trace_id",
+        "duration_ms",
+        "ttfb_ms",
+        "generation_ms",
+        "output_tokens_per_second",
+        "attempt_count",
+        "route_attempt_count",
+        "retried",
+        "cross_provider_failover",
+        "same_provider_retry",
+        "fast_mode",
+        "streaming"
+      ],
+      "shape": [
+        {
+          "name": "trace_id",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "duration_ms",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "ttfb_ms",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "generation_ms",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "output_tokens_per_second",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "attempt_count",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "route_attempt_count",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "retried",
+          "optional": true,
+          "type": "boolean"
+        },
+        {
+          "name": "cross_provider_failover",
+          "optional": true,
+          "type": "boolean"
+        },
+        {
+          "name": "same_provider_retry",
+          "optional": true,
+          "type": "boolean"
+        },
+        {
+          "name": "fast_mode",
+          "optional": true,
+          "type": "boolean"
+        },
+        {
+          "name": "streaming",
+          "optional": true,
+          "type": "boolean"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/runtime_identity.rs",
+      "struct": "ProviderEndpointKey",
+      "fields": [
+        "service_name",
+        "provider_id",
+        "endpoint_id"
+      ],
+      "shape": [
+        {
+          "name": "service_name",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "provider_id",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "endpoint_id",
+          "optional": false,
+          "type": "string"
+        }
       ]
     },
     {
       "file": "src-tauri/src/commands/admin_api.rs",
       "struct": "RequestChainPayload",
       "fields": [
-        "trace_id",
-        "request_id",
+        "traceId",
+        "requestId",
         "session",
         "limit"
+      ],
+      "shape": [
+        {
+          "name": "traceId",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "requestId",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "session",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "limit",
+          "optional": true,
+          "type": "number"
+        }
       ]
     }
   ],
@@ -155,6 +763,23 @@
         "trace_id",
         "request_id",
         "session_id"
+      ],
+      "shape": [
+        {
+          "name": "trace_id",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "request_id",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "session_id",
+          "optional": true,
+          "type": "string"
+        }
       ]
     },
     {
@@ -166,6 +791,33 @@
         "limit",
         "truncated",
         "requests"
+      ],
+      "shape": [
+        {
+          "name": "api_version",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "selector",
+          "optional": false,
+          "type": "ApiRequestChainSelector"
+        },
+        {
+          "name": "limit",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "truncated",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "requests",
+          "optional": false,
+          "type": "ApiRequestChainRequest[]"
+        }
       ]
     },
     {
@@ -180,8 +832,10 @@
         "model",
         "reasoning_effort",
         "service_tier",
-        "station_name",
         "provider_id",
+        "endpoint_id",
+        "provider_endpoint_key",
+        "route_path",
         "usage",
         "cost",
         "observability",
@@ -200,6 +854,158 @@
         "provider_signals",
         "policy_actions",
         "timeline"
+      ],
+      "shape": [
+        {
+          "name": "request_id",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "trace_id",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "session_id",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "session_identity_source",
+          "optional": true,
+          "type": "ApiSessionIdentitySource"
+        },
+        {
+          "name": "client_name",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "model",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "reasoning_effort",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "service_tier",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "provider_id",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "endpoint_id",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "provider_endpoint_key",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "route_path",
+          "optional": true,
+          "type": "string[]"
+        },
+        {
+          "name": "usage",
+          "optional": true,
+          "type": "ApiUsageMetrics"
+        },
+        {
+          "name": "cost",
+          "optional": true,
+          "type": "ApiCostBreakdown"
+        },
+        {
+          "name": "observability",
+          "optional": false,
+          "type": "ApiRequestObservability"
+        },
+        {
+          "name": "service",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "method",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "path",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "status_code",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "duration_ms",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "ttfb_ms",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "streaming",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "ended_at_ms",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "attempts_truncated",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "provider_signals_truncated",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "policy_actions_truncated",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "route_attempts",
+          "optional": false,
+          "type": "ApiRequestChainRouteAttempt[]"
+        },
+        {
+          "name": "provider_signals",
+          "optional": false,
+          "type": "ApiRequestChainProviderSignal[]"
+        },
+        {
+          "name": "policy_actions",
+          "optional": false,
+          "type": "ApiRequestChainPolicyAction[]"
+        },
+        {
+          "name": "timeline",
+          "optional": false,
+          "type": "ApiRequestChainTimelineEvent[]"
+        }
       ]
     },
     {
@@ -210,7 +1016,6 @@
         "provider_id",
         "endpoint_id",
         "provider_endpoint_key",
-        "station_name",
         "preference_group",
         "route_path",
         "provider_attempt",
@@ -230,6 +1035,123 @@
         "skipped",
         "provider_signals",
         "policy_actions"
+      ],
+      "shape": [
+        {
+          "name": "attempt_index",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "provider_id",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "endpoint_id",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "provider_endpoint_key",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "preference_group",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "route_path",
+          "optional": true,
+          "type": "string[]"
+        },
+        {
+          "name": "provider_attempt",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "upstream_attempt",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "provider_max_attempts",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "upstream_max_attempts",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "avoided_total",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "total_upstreams",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "decision",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "code",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "status_code",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "error_class",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "model",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "upstream_headers_ms",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "duration_ms",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "cooldown_secs",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "skipped",
+          "optional": true,
+          "type": "boolean"
+        },
+        {
+          "name": "provider_signals",
+          "optional": false,
+          "type": "ApiRequestChainProviderSignal[]"
+        },
+        {
+          "name": "policy_actions",
+          "optional": false,
+          "type": "ApiRequestChainPolicyAction[]"
+        }
       ]
     },
     {
@@ -247,6 +1169,63 @@
         "reset_after_secs",
         "error_class",
         "trace_id"
+      ],
+      "shape": [
+        {
+          "name": "kind",
+          "optional": false,
+          "type": "ApiProviderSignalKind"
+        },
+        {
+          "name": "code",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "source",
+          "optional": false,
+          "type": "ApiProviderSignalSource"
+        },
+        {
+          "name": "target",
+          "optional": false,
+          "type": "ApiProviderSignalTarget"
+        },
+        {
+          "name": "confidence",
+          "optional": false,
+          "type": "ApiProviderSignalConfidence"
+        },
+        {
+          "name": "observed_at_ms",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "route_facing",
+          "optional": true,
+          "type": "boolean"
+        },
+        {
+          "name": "retry_after_secs",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "reset_after_secs",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "error_class",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "trace_id",
+          "optional": true,
+          "type": "string"
+        }
       ]
     },
     {
@@ -264,6 +1243,63 @@
         "expires_at_ms",
         "recovery_state",
         "generation"
+      ],
+      "shape": [
+        {
+          "name": "id",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "kind",
+          "optional": false,
+          "type": "ApiPolicyActionKind"
+        },
+        {
+          "name": "code",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "owner",
+          "optional": false,
+          "type": "ApiPolicyActionOwner"
+        },
+        {
+          "name": "provider_endpoint_key",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "source_signal",
+          "optional": false,
+          "type": "ApiRequestChainProviderSignal"
+        },
+        {
+          "name": "confidence",
+          "optional": false,
+          "type": "ApiProviderSignalConfidence"
+        },
+        {
+          "name": "created_at_ms",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "expires_at_ms",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "recovery_state",
+          "optional": false,
+          "type": "ApiPolicyActionRecoveryState"
+        },
+        {
+          "name": "generation",
+          "optional": false,
+          "type": "number"
+        }
       ]
     },
     {
@@ -280,6 +1316,164 @@
         "provider_endpoint_key",
         "status_code",
         "model"
+      ],
+      "shape": [
+        {
+          "name": "order",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "at_ms",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "kind",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "code",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "attempt_index",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "provider_id",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "endpoint_id",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "provider_endpoint_key",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "status_code",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "model",
+          "optional": true,
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiRequestObservability",
+      "fields": [
+        "trace_id",
+        "duration_ms",
+        "ttfb_ms",
+        "generation_ms",
+        "output_tokens_per_second",
+        "attempt_count",
+        "route_attempt_count",
+        "retried",
+        "cross_provider_failover",
+        "same_provider_retry",
+        "fast_mode",
+        "streaming"
+      ],
+      "shape": [
+        {
+          "name": "trace_id",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "duration_ms",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "ttfb_ms",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "generation_ms",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "output_tokens_per_second",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "attempt_count",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "route_attempt_count",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "retried",
+          "optional": true,
+          "type": "boolean"
+        },
+        {
+          "name": "cross_provider_failover",
+          "optional": true,
+          "type": "boolean"
+        },
+        {
+          "name": "same_provider_retry",
+          "optional": true,
+          "type": "boolean"
+        },
+        {
+          "name": "fast_mode",
+          "optional": true,
+          "type": "boolean"
+        },
+        {
+          "name": "streaming",
+          "optional": true,
+          "type": "boolean"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiProviderEndpointKey",
+      "fields": [
+        "service_name",
+        "provider_id",
+        "endpoint_id"
+      ],
+      "shape": [
+        {
+          "name": "service_name",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "provider_id",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "endpoint_id",
+          "optional": false,
+          "type": "string"
+        }
       ]
     },
     {
@@ -290,24 +1484,115 @@
         "requestId",
         "session",
         "limit"
+      ],
+      "shape": [
+        {
+          "name": "traceId",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "requestId",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "session",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "limit",
+          "optional": true,
+          "type": "number"
+        }
       ]
     }
   ],
-  "requiredText": [
+  "enums": [
     {
-      "file": "../../crates/core/src/proxy/control_plane_manifest.rs",
-      "text": "API_V1_REQUEST_LEDGER_CHAIN",
-      "reason": "request-chain endpoint is discoverable"
+      "file": "../../crates/core/src/state/session_identity.rs",
+      "rust": "SessionIdentitySource",
+      "typescriptFile": "src/lib/api/admin-types.ts",
+      "typescript": "ApiSessionIdentitySource",
+      "values": [
+        "header",
+        "body_session_id",
+        "prompt_cache_key",
+        "metadata_session_id",
+        "previous_response_id"
+      ]
     },
     {
-      "file": "../../crates/core/src/proxy/control_plane_manifest.rs",
-      "text": "request_ledger_chain",
-      "reason": "request-chain capability and operator link are discoverable"
+      "file": "../../crates/core/src/provider_signals/model.rs",
+      "rust": "ProviderSignalKind",
+      "typescriptFile": "src/lib/api/admin-types.ts",
+      "typescript": "ApiProviderSignalKind",
+      "values": [
+        "quota",
+        "rate_limit",
+        "capacity",
+        "transport",
+        "balance",
+        "service_status",
+        "capability",
+        "local_concurrency",
+        "unknown"
+      ]
     },
     {
-      "file": "src-tauri/src/lib.rs",
-      "text": "commands::admin_api::get_request_chain",
-      "reason": "desktop command is registered"
+      "file": "../../crates/core/src/provider_signals/model.rs",
+      "rust": "ProviderSignalSource",
+      "typescriptFile": "src/lib/api/admin-types.ts",
+      "typescript": "ApiProviderSignalSource",
+      "values": [
+        "upstream_response",
+        "response_headers",
+        "balance_snapshot",
+        "service_status",
+        "capability_probe",
+        "local_scheduler",
+        "route_attempt"
+      ]
+    },
+    {
+      "file": "../../crates/core/src/provider_signals/model.rs",
+      "rust": "ProviderSignalConfidence",
+      "typescriptFile": "src/lib/api/admin-types.ts",
+      "typescript": "ApiProviderSignalConfidence",
+      "values": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    {
+      "file": "../../crates/core/src/policy_actions/model.rs",
+      "rust": "PolicyActionKind",
+      "typescriptFile": "src/lib/api/admin-types.ts",
+      "typescript": "ApiPolicyActionKind",
+      "values": [
+        "cooldown",
+        "unknown"
+      ]
+    },
+    {
+      "file": "../../crates/core/src/policy_actions/model.rs",
+      "rust": "PolicyActionOwner",
+      "typescriptFile": "src/lib/api/admin-types.ts",
+      "typescript": "ApiPolicyActionOwner",
+      "values": [
+        "codex_helper"
+      ]
+    },
+    {
+      "file": "../../crates/core/src/policy_actions/model.rs",
+      "rust": "PolicyActionRecoveryState",
+      "typescriptFile": "src/lib/api/admin-types.ts",
+      "typescript": "ApiPolicyActionRecoveryState",
+      "values": [
+        "active"
+      ]
     }
   ],
   "notes": [

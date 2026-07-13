@@ -4,10 +4,6 @@ use super::*;
 pub struct ServiceControlProfile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extends: Option<String>,
-    /// Retained for legacy/v2 profiles. V4 route graph configs should express provider
-    /// selection in the service routing block instead of profile-level station bindings.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub station: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -21,9 +17,6 @@ fn merge_service_control_profile(
     overlay: &ServiceControlProfile,
 ) -> ServiceControlProfile {
     base.extends = overlay.extends.clone();
-    if overlay.station.is_some() {
-        base.station = overlay.station.clone();
-    }
     if overlay.model.is_some() {
         base.model = overlay.model.clone();
     }
@@ -83,154 +76,13 @@ pub fn resolve_service_profile_from_catalog(
     resolve_inner(profiles, profile_name, &mut stack, &mut cache)
 }
 
-pub fn resolve_service_profile(
-    mgr: &ServiceConfigManager,
-    profile_name: &str,
-) -> Result<ServiceControlProfile> {
-    resolve_service_profile_from_catalog(&mgr.profiles, profile_name)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExplicitCapabilitySupport {
-    Unknown,
-    Supported,
-    Unsupported,
-}
-
-fn parse_boolish_capability_tag(value: &str) -> Option<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "y" | "on" | "supported" => Some(true),
-        "0" | "false" | "no" | "n" | "off" | "unsupported" => Some(false),
-        _ => None,
-    }
-}
-
-fn explicit_capability_support_for_upstreams(
-    upstreams: &[UpstreamConfig],
-    tag_keys: &[&str],
-) -> ExplicitCapabilitySupport {
-    let mut saw_supported = false;
-    let mut saw_explicit_unsupported = false;
-    let mut saw_unknown = false;
-
-    for upstream in upstreams {
-        match tag_keys
-            .iter()
-            .find_map(|key| upstream.tags.get(*key))
-            .and_then(|value| parse_boolish_capability_tag(value))
-        {
-            Some(true) => saw_supported = true,
-            Some(false) => saw_explicit_unsupported = true,
-            None => saw_unknown = true,
-        }
-    }
-
-    if saw_supported {
-        ExplicitCapabilitySupport::Supported
-    } else if saw_explicit_unsupported && !saw_unknown {
-        ExplicitCapabilitySupport::Unsupported
-    } else {
-        ExplicitCapabilitySupport::Unknown
-    }
-}
-
-pub fn validate_profile_station_compatibility(
+pub(crate) fn validate_service_profile_catalog(
     service_name: &str,
-    mgr: &ServiceConfigManager,
-    profile_name: &str,
-    profile: &ServiceControlProfile,
+    default_profile: Option<&str>,
+    profiles: &BTreeMap<String, ServiceControlProfile>,
 ) -> Result<()> {
-    let Some(station) = profile
-        .station
-        .as_deref()
-        .map(str::trim)
-        .filter(|station| !station.is_empty())
-    else {
-        return Ok(());
-    };
-
-    let Some(config) = mgr.station(station) else {
-        anyhow::bail!(
-            "[{service_name}] profile '{}' references missing station '{}'",
-            profile_name,
-            station
-        );
-    };
-
-    if let Some(model) = profile
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-    {
-        let supported = config.upstreams.is_empty()
-            || config.upstreams.iter().any(|upstream| {
-                crate::model_routing::is_model_supported(
-                    &upstream.supported_models,
-                    &upstream.model_mapping,
-                    model,
-                )
-            });
-        if !supported {
-            anyhow::bail!(
-                "[{service_name}] profile '{}' model '{}' is not supported by station '{}'",
-                profile_name,
-                model,
-                station
-            );
-        }
-    }
-
-    if let Some(service_tier) = profile
-        .service_tier
-        .as_deref()
-        .map(str::trim)
-        .filter(|service_tier| !service_tier.is_empty())
-        && explicit_capability_support_for_upstreams(
-            &config.upstreams,
-            &[
-                "supports_service_tier",
-                "supports_service_tiers",
-                "supports_fast_mode",
-                "supports_fast",
-            ],
-        ) == ExplicitCapabilitySupport::Unsupported
-    {
-        anyhow::bail!(
-            "[{service_name}] profile '{}' requires service_tier '{}' but station '{}' explicitly disables fast/service-tier support",
-            profile_name,
-            service_tier,
-            station
-        );
-    }
-
-    if let Some(reasoning_effort) = profile
-        .reasoning_effort
-        .as_deref()
-        .map(str::trim)
-        .filter(|reasoning_effort| !reasoning_effort.is_empty())
-        && explicit_capability_support_for_upstreams(
-            &config.upstreams,
-            &["supports_reasoning_effort", "supports_reasoning"],
-        ) == ExplicitCapabilitySupport::Unsupported
-    {
-        anyhow::bail!(
-            "[{service_name}] profile '{}' requires reasoning_effort '{}' but station '{}' explicitly disables reasoning support",
-            profile_name,
-            reasoning_effort,
-            station
-        );
-    }
-
-    Ok(())
-}
-
-pub(crate) fn validate_service_profiles(
-    service_name: &str,
-    mgr: &ServiceConfigManager,
-) -> Result<()> {
-    if let Some(default_profile) = mgr.default_profile.as_deref()
-        && !mgr.profiles.contains_key(default_profile)
+    if let Some(default_profile) = default_profile
+        && !profiles.contains_key(default_profile)
     {
         anyhow::bail!(
             "[{service_name}] default_profile '{}' does not exist in profiles",
@@ -238,10 +90,35 @@ pub(crate) fn validate_service_profiles(
         );
     }
 
-    for profile_name in mgr.profiles.keys() {
-        let resolved = resolve_service_profile(mgr, profile_name)?;
-        validate_profile_station_compatibility(service_name, mgr, profile_name, &resolved)?;
+    for profile_name in profiles.keys() {
+        resolve_service_profile_from_catalog(profiles, profile_name)?;
     }
-
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_five_profile_ignores_removed_station_projection() {
+        let config = toml::from_str::<HelperConfig>(
+            r#"
+version = 5
+
+[codex.profiles.daily]
+station = "legacy-route-label"
+model = "gpt-5"
+"#,
+        )
+        .expect("version 5 config with a removed profile key should remain readable");
+
+        assert_eq!(
+            config.codex.profiles["daily"].model.as_deref(),
+            Some("gpt-5")
+        );
+        let serialized = toml::to_string(&config).expect("serialize canonical config");
+        assert!(!serialized.contains("station"));
+        assert!(!serialized.contains("legacy-route-label"));
+    }
 }

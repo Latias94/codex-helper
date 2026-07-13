@@ -33,15 +33,9 @@ pub struct CodexRelayEvidenceEntry {
     pub source: String,
     pub kind: CodexRelayEvidenceKind,
     pub service_name: String,
-    pub station_name: String,
-    pub upstream_index: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub endpoint_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider_endpoint_key: Option<String>,
-    pub upstream_base_url: String,
+    pub provider_id: String,
+    pub endpoint_id: String,
+    pub provider_endpoint_key: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     pub payload: Value,
@@ -50,7 +44,7 @@ pub struct CodexRelayEvidenceEntry {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CodexRelayEvidenceFilters {
     pub kind: Option<CodexRelayEvidenceKind>,
-    pub station_name: Option<String>,
+    pub provider_id: Option<String>,
     pub model: Option<String>,
 }
 
@@ -61,8 +55,8 @@ impl CodexRelayEvidenceFilters {
         {
             return false;
         }
-        if let Some(station_name) = self.station_name.as_deref()
-            && !contains_ignore_ascii_case(entry.station_name.as_str(), station_name)
+        if let Some(provider_id) = self.provider_id.as_deref()
+            && !contains_ignore_ascii_case(entry.provider_id.as_str(), provider_id)
         {
             return false;
         }
@@ -120,12 +114,9 @@ fn capability_evidence_entry(
         source: normalize_source(source),
         kind: CodexRelayEvidenceKind::CapabilityDiagnostics,
         service_name: response.service_name.clone(),
-        station_name: response.station_name.clone(),
-        upstream_index: response.upstream_index,
         provider_id: response.provider_id.clone(),
         endpoint_id: response.endpoint_id.clone(),
         provider_endpoint_key: response.provider_endpoint_key.clone(),
-        upstream_base_url: response.upstream_base_url.clone(),
         model: response.model.clone(),
         payload: serde_json::to_value(response).map_err(std::io::Error::other)?,
     })
@@ -142,12 +133,9 @@ fn live_smoke_evidence_entry(
         source: normalize_source(source),
         kind: CodexRelayEvidenceKind::LiveSmoke,
         service_name: response.service_name.clone(),
-        station_name: response.station_name.clone(),
-        upstream_index: response.upstream_index,
         provider_id: response.provider_id.clone(),
         endpoint_id: response.endpoint_id.clone(),
         provider_endpoint_key: response.provider_endpoint_key.clone(),
-        upstream_base_url: response.upstream_base_url.clone(),
         model: Some(response.requested_model.clone()),
         payload: serde_json::to_value(response).map_err(std::io::Error::other)?,
     })
@@ -237,17 +225,14 @@ fn contains_ignore_ascii_case(value: &str, needle: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codex_capability_profile::{
-        CodexCapabilityProfile, CodexCapabilityProfileInput, CodexCapabilitySupport,
-        CodexModelCatalogProfile, CodexPatchModeRecommendation, CodexPatchModeRecommendationInput,
-    };
-    use crate::codex_integration::CodexPatchMode;
+    use crate::codex_capability_profile::{CodexCapabilityDecision, CodexModelCatalogProfile};
+    use crate::provider_catalog::ProviderAdapter;
     use crate::proxy::{
         CodexRelayCapabilitiesObserved, CodexRelayContinuityDiagnostics,
         CodexRelayContinuityDomainSummary, CodexRelayLiveSmokeCase, CodexRelayLiveSmokeConfidence,
         CodexRelayLiveSmokeOutcome, CodexRelayLiveSmokeResult, CodexRelayLiveSmokeSideEffect,
         CodexRelayProbeConfidence, CodexRelayProbeKind, CodexRelayProbeResult,
-        CodexRelayProbeSupport,
+        CodexRelayProbeSupport, CodexRelayProviderContract,
     };
 
     fn temp_evidence_path() -> PathBuf {
@@ -277,30 +262,30 @@ mod tests {
 
     fn capabilities_response() -> CodexRelayCapabilitiesResponse {
         let model_catalog = CodexModelCatalogProfile::unknown("test");
-        let expected =
-            CodexCapabilityProfile::for_input(CodexCapabilityProfileInput::from_patch_mode(
-                CodexPatchMode::OfficialImagegenBridge,
-                model_catalog.clone(),
-            ));
-        let recommendation =
-            CodexPatchModeRecommendation::for_input(CodexPatchModeRecommendationInput {
-                current_patch_mode: CodexPatchMode::OfficialImagegenBridge,
-                model_catalog,
-                responses: CodexCapabilitySupport::Supported,
-                responses_compact: CodexCapabilitySupport::Supported,
-            });
+        let expected = CodexRelayProviderContract {
+            provider_adapter: ProviderAdapter::OpenAiCompatible,
+            catalog_revision: None,
+            request_dialects: vec![
+                "responses_http".to_string(),
+                "responses_compact".to_string(),
+                "responses_websocket".to_string(),
+            ],
+            model_catalog,
+            responses: CodexCapabilityDecision::supported("test"),
+            remote_compaction_v1: CodexCapabilityDecision::supported("test"),
+            hosted_image_generation: CodexCapabilityDecision::unknown("test"),
+            responses_websocket: CodexCapabilityDecision::unknown("test"),
+            ultra_maps_to_max: CodexCapabilityDecision::unknown("test"),
+            web_search: CodexCapabilityDecision::unknown("test"),
+            apply_patch: CodexCapabilityDecision::unknown("test"),
+            reasoning_summaries: CodexCapabilityDecision::unknown("test"),
+        };
         CodexRelayCapabilitiesResponse {
             api_version: 1,
             service_name: "codex".to_string(),
-            station_name: "input".to_string(),
-            upstream_index: 0,
-            provider_id: None,
-            endpoint_id: None,
-            provider_endpoint_key: None,
-            upstream_base_url: "https://relay.example/v1".to_string(),
-            patch_mode: CodexPatchMode::OfficialImagegenBridge,
-            compaction: crate::codex_integration::CodexCompactionStrategy::Auto,
-            responses_websocket: false,
+            provider_id: "input".to_string(),
+            endpoint_id: "default".to_string(),
+            provider_endpoint_key: "codex/input/default".to_string(),
             model: Some("gpt-5.5".to_string()),
             expected,
             observed: CodexRelayCapabilitiesObserved {
@@ -317,7 +302,6 @@ mod tests {
                     CodexRelayProbeSupport::Supported,
                 ),
             },
-            recommendation,
             continuity: CodexRelayContinuityDiagnostics {
                 selected_domain: CodexRelayContinuityDomainSummary {
                     key: "provider_endpoint:codex/input/default".to_string(),
@@ -338,12 +322,9 @@ mod tests {
         CodexRelayLiveSmokeResponse {
             api_version: 1,
             service_name: "codex".to_string(),
-            station_name: "input".to_string(),
-            upstream_index: 0,
-            provider_id: None,
-            endpoint_id: None,
-            provider_endpoint_key: None,
-            upstream_base_url: "https://relay.example/v1".to_string(),
+            provider_id: "input".to_string(),
+            endpoint_id: "default".to_string(),
+            provider_endpoint_key: "codex/input/default".to_string(),
             requested_model: model.to_string(),
             upstream_model: model.to_string(),
             cases: vec![CodexRelayLiveSmokeCase::ResponsesCompact],
@@ -387,10 +368,17 @@ mod tests {
         );
         assert_eq!(entries[0].model.as_deref(), Some("gpt-5.5"));
         assert!(entries[0].payload.get("results").is_some());
+        let serialized = serde_json::to_value(&entries[0]).expect("serialize evidence");
+        assert!(serialized.get("station_name").is_none());
+        assert!(serialized.get("upstream_index").is_none());
+        assert!(serialized.get("upstream_base_url").is_none());
+        assert_eq!(serialized["provider_id"], "input");
+        assert_eq!(serialized["endpoint_id"], "default");
+        assert_eq!(serialized["provider_endpoint_key"], "codex/input/default");
     }
 
     #[test]
-    fn codex_relay_evidence_filters_by_kind_station_and_model() {
+    fn codex_relay_evidence_filters_by_kind_provider_and_model() {
         let path = temp_evidence_path();
         append_codex_relay_evidence_entry(
             &path,
@@ -413,7 +401,7 @@ mod tests {
             10,
             &CodexRelayEvidenceFilters {
                 kind: Some(CodexRelayEvidenceKind::LiveSmoke),
-                station_name: Some("inp".to_string()),
+                provider_id: Some("inp".to_string()),
                 model: Some("gpt".to_string()),
             },
         )

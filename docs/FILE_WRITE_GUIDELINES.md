@@ -22,10 +22,12 @@ For config/state files, this can break repeated saves, backup refresh, or restor
 These rules apply to local files whose path stays stable across writes, for example:
 
 - `~/.codex-helper/config.toml`
-- `~/.codex-helper/config.json`
+- `~/.codex-helper/pricing_overrides.toml`
 - `notify_state.json`
-- session/stat cache files
-- Codex / Claude client config files patched by `switch on/off`
+- helper-owned recovery and advisory metadata under `~/.codex-helper/state/` and `run/`
+- `~/.codex/config.toml`, only for an explicit local Codex `switch on/off` operation and only for the helper-owned provider selector/stanza
+
+Codex `auth.json`, model cache, and SQLite files are outside codex-helper ownership and must never be handled through these write helpers.
 
 ## Non-goals
 

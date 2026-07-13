@@ -4,7 +4,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use codex_helper_core::config::ServiceKind;
-use codex_helper_core::host_local::HostLocalSessionHistoryMode;
+use codex_helper_core::control_plane_client::validate_admin_token_header_value;
 use codex_helper_core::proxy::{ADMIN_TOKEN_ENV_VAR, admin_port_for_proxy_port};
 use codex_helper_core::runtime_host::ProxyRuntimeOptions;
 use serde::Deserialize;
@@ -24,8 +24,6 @@ pub struct ServerConfigSection {
     pub port: Option<u16>,
     pub admin_host: Option<IpAddr>,
     pub admin_port: Option<u16>,
-    pub advertised_admin_base_url: Option<String>,
-    pub host_local_session_history: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -35,8 +33,6 @@ pub struct ServerConfigOverrides {
     pub port: Option<u16>,
     pub admin_host: Option<IpAddr>,
     pub admin_port: Option<u16>,
-    pub advertised_admin_base_url: Option<String>,
-    pub host_local_session_history: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -46,8 +42,6 @@ pub struct EffectiveServerConfig {
     pub port: u16,
     pub admin_host: IpAddr,
     pub admin_port: u16,
-    pub advertised_admin_base_url: Option<String>,
-    pub host_local_session_history: bool,
 }
 
 impl EffectiveServerConfig {
@@ -76,24 +70,12 @@ impl EffectiveServerConfig {
             .admin_port
             .or(file.admin_port)
             .unwrap_or_else(|| admin_port_for_proxy_port(port));
-        let advertised_admin_base_url = normalize_optional_url(
-            overrides
-                .advertised_admin_base_url
-                .or(file.advertised_admin_base_url),
-        );
-        let host_local_session_history = overrides
-            .host_local_session_history
-            .or(file.host_local_session_history)
-            .unwrap_or(false);
-
         let effective = Self {
             service,
             host,
             port,
             admin_host,
             admin_port,
-            advertised_admin_base_url,
-            host_local_session_history,
         };
         effective.validate()?;
         Ok(effective)
@@ -108,28 +90,17 @@ impl EffectiveServerConfig {
     }
 
     pub fn runtime_options(&self) -> ProxyRuntimeOptions {
-        ProxyRuntimeOptions::for_proxy_port(self.port)
-            .with_admin_addr(self.admin_addr())
-            .with_advertised_admin_base_url(self.advertised_admin_base_url.clone())
-            .with_host_local_session_history_mode(if self.host_local_session_history {
-                HostLocalSessionHistoryMode::Enabled
-            } else {
-                HostLocalSessionHistoryMode::Disabled
-            })
+        ProxyRuntimeOptions::for_proxy_port(self.port).with_admin_addr(self.admin_addr())
     }
 
     fn validate(&self) -> Result<()> {
-        if !self.admin_host.is_loopback() && !admin_token_configured() {
-            bail!(
-                "admin host {} is not loopback; set {} before exposing the admin API",
-                self.admin_host,
-                ADMIN_TOKEN_ENV_VAR
-            );
-        }
-        if let Some(url) = self.advertised_admin_base_url.as_deref()
-            && !(url.starts_with("http://") || url.starts_with("https://"))
-        {
-            bail!("advertised-admin-base-url must start with http:// or https://");
+        if !self.admin_host.is_loopback() {
+            validate_configured_admin_token().with_context(|| {
+                format!(
+                    "admin host {} is not loopback; configure {} before exposing the admin API",
+                    self.admin_host, ADMIN_TOKEN_ENV_VAR
+                )
+            })?;
         }
         Ok(())
     }
@@ -174,21 +145,70 @@ fn default_proxy_port_for_service(service_kind: ServiceKind) -> u16 {
     }
 }
 
-fn normalize_optional_url(url: Option<String>) -> Option<String> {
-    url.map(|url| url.trim().trim_end_matches('/').to_string())
-        .filter(|url| !url.is_empty())
-}
-
-fn admin_token_configured() -> bool {
-    std::env::var(ADMIN_TOKEN_ENV_VAR)
-        .ok()
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false)
+fn validate_configured_admin_token() -> Result<()> {
+    let value = std::env::var(ADMIN_TOKEN_ENV_VAR)
+        .with_context(|| format!("{ADMIN_TOKEN_ENV_VAR} is missing or not valid Unicode"))?;
+    let value = value.trim();
+    if value.is_empty() {
+        bail!("{ADMIN_TOKEN_ENV_VAR} is empty");
+    }
+    validate_admin_token_header_value(value)
+        .with_context(|| format!("{ADMIN_TOKEN_ENV_VAR} is not a valid HTTP header value"))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+    use std::sync::{Mutex, MutexGuard};
+
     use super::*;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct ScopedEnv {
+        _lock: MutexGuard<'static, ()>,
+        previous: Option<OsString>,
+    }
+
+    impl ScopedEnv {
+        fn set(value: &str) -> Self {
+            let lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let previous = std::env::var_os(ADMIN_TOKEN_ENV_VAR);
+            // SAFETY: this guard serializes this module's test-only environment mutations.
+            unsafe { std::env::set_var(ADMIN_TOKEN_ENV_VAR, value) };
+            Self {
+                _lock: lock,
+                previous,
+            }
+        }
+
+        fn remove() -> Self {
+            let lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let previous = std::env::var_os(ADMIN_TOKEN_ENV_VAR);
+            // SAFETY: this guard serializes this module's test-only environment mutations.
+            unsafe { std::env::remove_var(ADMIN_TOKEN_ENV_VAR) };
+            Self {
+                _lock: lock,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for ScopedEnv {
+        fn drop(&mut self) {
+            // SAFETY: the environment lock remains held while restoring the prior value.
+            unsafe {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var(ADMIN_TOKEN_ENV_VAR, value),
+                    None => std::env::remove_var(ADMIN_TOKEN_ENV_VAR),
+                }
+            }
+        }
+    }
 
     #[test]
     fn parses_server_section() {
@@ -200,8 +220,6 @@ mod tests {
             port = 3211
             admin-host = "127.0.0.1"
             admin-port = 4211
-            advertised-admin-base-url = "http://nas.local:4211/"
-            host-local-session-history = false
             "#,
         )
         .expect("parse server config");
@@ -211,19 +229,13 @@ mod tests {
         assert_eq!(config.port, Some(3211));
         assert_eq!(config.admin_host, Some("127.0.0.1".parse().unwrap()));
         assert_eq!(config.admin_port, Some(4211));
-        assert_eq!(
-            config.advertised_admin_base_url.as_deref(),
-            Some("http://nas.local:4211/")
-        );
-        assert_eq!(config.host_local_session_history, Some(false));
     }
 
     #[test]
-    fn effective_config_merges_cli_overrides_and_normalizes_admin_url() {
+    fn effective_config_merges_cli_overrides() {
         let config = EffectiveServerConfig::from_sources(
             ServerConfigSection {
                 service: Some(ServerService::Claude),
-                advertised_admin_base_url: Some("http://nas.local:4211/".to_string()),
                 ..ServerConfigSection::default()
             },
             ServerConfigOverrides {
@@ -236,18 +248,11 @@ mod tests {
 
         assert_eq!(config.service, ServerService::Codex);
         assert_eq!(config.port, 3211);
-        assert_eq!(
-            config.advertised_admin_base_url.as_deref(),
-            Some("http://nas.local:4211")
-        );
     }
 
     #[test]
     fn effective_config_rejects_remote_admin_without_token() {
-        let old = std::env::var(ADMIN_TOKEN_ENV_VAR).ok();
-        unsafe {
-            std::env::remove_var(ADMIN_TOKEN_ENV_VAR);
-        }
+        let _token = ScopedEnv::remove();
 
         let result = EffectiveServerConfig::from_sources(
             ServerConfigSection::default(),
@@ -257,11 +262,23 @@ mod tests {
             },
         );
 
-        if let Some(old) = old {
-            unsafe {
-                std::env::set_var(ADMIN_TOKEN_ENV_VAR, old);
-            }
-        }
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn effective_config_rejects_remote_admin_with_invalid_header_token() {
+        let _token = ScopedEnv::set("invalid\nheader");
+
+        let result = EffectiveServerConfig::from_sources(
+            ServerConfigSection::default(),
+            ServerConfigOverrides {
+                admin_host: Some("0.0.0.0".parse().unwrap()),
+                ..ServerConfigOverrides::default()
+            },
+        );
+
+        let error = result.expect_err("invalid HTTP header token must fail before bind");
+        assert!(error.to_string().contains(ADMIN_TOKEN_ENV_VAR));
+        assert!(!error.to_string().contains("invalid\nheader"));
     }
 }

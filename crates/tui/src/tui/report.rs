@@ -7,7 +7,7 @@ use crate::state::{UsageBucket, UsageDayDimensionRow, UsageDayView};
 
 #[derive(Debug, Clone)]
 pub(in crate::tui) enum StatsTarget {
-    Station(String, UsageBucket),
+    ProviderEndpoint(String, UsageBucket),
     Provider(String, UsageBucket),
 }
 
@@ -27,10 +27,10 @@ fn fmt_avg_ms(total_ms: u64, n: u64) -> String {
 
 fn selected_stats_target_from_view(ui: &UiState, usage: &UsageDayView) -> Option<StatsTarget> {
     match ui.stats_focus {
-        StatsFocus::Stations => usage
-            .station_rows
-            .get(ui.selected_stats_station_idx)
-            .map(|row| StatsTarget::Station(row.name.clone(), row.bucket.clone())),
+        StatsFocus::ProviderEndpoints => usage
+            .provider_endpoint_rows
+            .get(ui.selected_stats_provider_endpoint_idx)
+            .map(|row| StatsTarget::ProviderEndpoint(row.name.clone(), row.bucket.clone())),
         StatsFocus::Providers => usage
             .provider_rows
             .get(ui.selected_stats_provider_idx)
@@ -46,7 +46,9 @@ pub(in crate::tui) fn build_stats_report(
     let usage = &snapshot.usage_day;
     let target = selected_stats_target_from_view(ui, usage)?;
     let (kind, name, target_bucket) = match &target {
-        StatsTarget::Station(name, bucket) => (i18n::label(ui.language, "station"), name, bucket),
+        StatsTarget::ProviderEndpoint(name, bucket) => {
+            (i18n::label(ui.language, "provider endpoint"), name, bucket)
+        }
         StatsTarget::Provider(name, bucket) => (i18n::label(ui.language, "provider"), name, bucket),
     };
     let l = |text| i18n::label(ui.language, text);
@@ -94,16 +96,6 @@ pub(in crate::tui) fn build_stats_report(
         usage.coverage.day_may_be_partial,
         usage.coverage.partial_reason.as_deref().unwrap_or("-")
     ));
-    if usage.coverage.scanned_lines > 0 {
-        out.push_str(&format!(
-            "scan_lines={} max_lines={} max_bytes={} bytes_truncated={} lines_truncated={}\n",
-            usage.coverage.scanned_lines,
-            usage.coverage.max_lines,
-            usage.coverage.max_bytes,
-            usage.coverage.bytes_truncated,
-            usage.coverage.lines_truncated
-        ));
-    }
     out.push('\n');
 
     out.push_str(match ui.language {
@@ -126,7 +118,12 @@ pub(in crate::tui) fn build_stats_report(
     out.push('\n');
 
     append_dimension(&mut out, ui.language, "providers", &usage.provider_rows);
-    append_dimension(&mut out, ui.language, "stations", &usage.station_rows);
+    append_dimension(
+        &mut out,
+        ui.language,
+        "provider endpoints",
+        &usage.provider_endpoint_rows,
+    );
     append_dimension(&mut out, ui.language, "models", &usage.model_rows);
     append_dimension(&mut out, ui.language, "sessions", &usage.session_rows);
     append_dimension(&mut out, ui.language, "projects", &usage.project_rows);
@@ -169,7 +166,7 @@ fn append_dimension(
 ) {
     let display_title = match (lang, title) {
         (Language::Zh, "providers") => "providers",
-        (Language::Zh, "stations") => "stations",
+        (Language::Zh, "provider endpoints") => "provider endpoints",
         (Language::Zh, "models") => "models",
         (Language::Zh, "sessions") => "sessions",
         (Language::Zh, "projects") => "projects",

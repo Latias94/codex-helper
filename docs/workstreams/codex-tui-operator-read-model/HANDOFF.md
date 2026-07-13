@@ -1,7 +1,9 @@
 # Codex TUI Operator Read Model Refactor - Handoff
 
-Status: Active
+Status: Historical (superseded 2026-07-12)
 Last updated: 2026-05-28
+
+> Historical status (superseded 2026-07-12): the transitional raw-config/compatibility-alias lane is no longer active. TUI, desktop, CLI, and fleet now consume one typed, redacted operator read model with explicit ready/stale/disconnected/unauthorized states, and attached clients are query-only.
 
 ## Current State
 

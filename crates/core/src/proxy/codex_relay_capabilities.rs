@@ -3,14 +3,13 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::codex_capability_profile::{
-    CodexCapabilityDecision, CodexCapabilityProfile, CodexCapabilityProfileInput,
-    CodexCapabilitySupport, CodexModelCatalogProfile, CodexPatchModeRecommendation,
-    CodexPatchModeRecommendationInput,
+use crate::codex_capability_profile::{CodexCapabilityDecision, CodexModelCatalogProfile};
+use crate::config::{ServiceRouteConfig, effective_routing};
+use crate::provider_catalog::{
+    AccountFingerprint, CatalogReasoningEffort, ProviderAdapter, ProviderCatalogEpoch,
+    ProviderCatalogScope,
 };
-use crate::codex_integration::{CodexCompactionStrategy, CodexPatchMode, CodexSwitchOptions};
-use crate::config::{ServiceViewV4, effective_v4_routing};
-use crate::routing_ir::compile_v4_route_plan_template_for_compat_runtime;
+use crate::routing_ir::compile_route_handshake_plan;
 use crate::runtime_identity::ContinuityDomainKey;
 
 use super::codex_relay_probe::CodexRelayProbeObservation;
@@ -25,87 +24,46 @@ use super::{
 };
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CodexRelayCapabilitiesRequest {
-    #[serde(default)]
-    pub station_name: Option<String>,
     #[serde(default)]
     pub provider_id: Option<String>,
     #[serde(default)]
     pub endpoint_id: Option<String>,
     #[serde(default)]
-    pub upstream_index: Option<usize>,
-    #[serde(default)]
     pub model: Option<String>,
-    #[serde(
-        default,
-        alias = "patch_preset",
-        deserialize_with = "deserialize_patch_preset_input"
-    )]
-    pub patch_mode: Option<CodexPatchMode>,
-    #[serde(default)]
-    pub compaction: Option<CodexCompactionStrategy>,
-    #[serde(default)]
-    pub responses_websocket: Option<bool>,
-}
-
-fn deserialize_patch_preset_input<'de, D>(
-    deserializer: D,
-) -> Result<Option<CodexPatchMode>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = Option::<String>::deserialize(deserializer)?;
-    value
-        .as_deref()
-        .map(parse_patch_preset_input)
-        .transpose()
-        .map_err(serde::de::Error::custom)
-}
-
-fn parse_patch_preset_input(value: &str) -> Result<CodexPatchMode, String> {
-    match value.trim() {
-        "default" => Ok(CodexPatchMode::Default),
-        "chatgpt-bridge" => Ok(CodexPatchMode::ChatGptBridge),
-        "imagegen-bridge" => Ok(CodexPatchMode::ImagegenBridge),
-        "official-relay" => Ok(CodexPatchMode::OfficialRelayBridge),
-        "official-imagegen" => Ok(CodexPatchMode::OfficialImagegenBridge),
-        "official-relay-bridge" | "official_relay_bridge" => Err(
-            "legacy patch preset 'official-relay-bridge' has been removed; use 'official-relay'"
-                .to_string(),
-        ),
-        "official-imagegen-bridge" | "official_imagegen_bridge" => Err(
-            "legacy patch preset 'official-imagegen-bridge' has been removed; use 'official-imagegen'"
-                .to_string(),
-        ),
-        other => Err(format!(
-            "unsupported patch_preset '{other}'; expected 'default', 'chatgpt-bridge', 'imagegen-bridge', 'official-relay', or 'official-imagegen'"
-        )),
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodexRelayCapabilitiesResponse {
     pub api_version: u32,
     pub service_name: String,
-    pub station_name: String,
-    pub upstream_index: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub endpoint_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider_endpoint_key: Option<String>,
-    pub upstream_base_url: String,
-    pub patch_mode: CodexPatchMode,
-    pub compaction: CodexCompactionStrategy,
-    pub responses_websocket: bool,
+    pub provider_id: String,
+    pub endpoint_id: String,
+    pub provider_endpoint_key: String,
     pub model: Option<String>,
-    pub expected: CodexCapabilityProfile,
+    pub expected: CodexRelayProviderContract,
     pub observed: CodexRelayCapabilitiesObserved,
-    pub recommendation: CodexPatchModeRecommendation,
     #[serde(default)]
     pub continuity: CodexRelayContinuityDiagnostics,
     pub mismatches: Vec<CodexRelayCapabilityMismatch>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexRelayProviderContract {
+    pub provider_adapter: ProviderAdapter,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub catalog_revision: Option<String>,
+    pub request_dialects: Vec<String>,
+    pub model_catalog: CodexModelCatalogProfile,
+    pub responses: CodexCapabilityDecision,
+    pub remote_compaction_v1: CodexCapabilityDecision,
+    pub hosted_image_generation: CodexCapabilityDecision,
+    pub responses_websocket: CodexCapabilityDecision,
+    pub ultra_maps_to_max: CodexCapabilityDecision,
+    pub web_search: CodexCapabilityDecision,
+    pub apply_patch: CodexCapabilityDecision,
+    pub reasoning_summaries: CodexCapabilityDecision,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,55 +132,19 @@ pub(super) async fn codex_relay_capabilities_for_proxy(
         ));
     }
 
-    let cfg = proxy.config.snapshot().await;
-    let mgr = proxy.service_manager(cfg.as_ref());
+    let runtime_snapshot = proxy.config.capture().await;
+    let graph = runtime_snapshot
+        .route_graph(proxy.service_name)
+        .ok_or_else(|| {
+            ProxyControlError::new(StatusCode::BAD_REQUEST, "no codex route graph is available")
+        })?;
     let target = select_codex_relay_target(
-        mgr,
+        graph.as_ref(),
         CodexRelayTargetSelection {
-            station_name: payload.station_name.as_deref(),
-            upstream_index: payload.upstream_index,
             provider_id: payload.provider_id.as_deref(),
             endpoint_id: payload.endpoint_id.as_deref(),
         },
     )?;
-    let patch_mode = payload
-        .patch_mode
-        .or_else(current_codex_switch_patch_mode)
-        .or_else(|| {
-            crate::config::codex_client_patch_config_from_config_file()
-                .ok()
-                .map(|cfg| cfg.preset)
-        })
-        .unwrap_or_default();
-    let responses_websocket = payload
-        .responses_websocket
-        .or_else(current_codex_switch_responses_websocket)
-        .or_else(|| {
-            crate::config::codex_client_patch_config_from_config_file()
-                .ok()
-                .map(|cfg| cfg.options.responses_websocket)
-        })
-        .unwrap_or(false);
-    let compaction = payload
-        .compaction
-        .or_else(current_codex_switch_compaction_strategy)
-        .or_else(|| {
-            crate::config::codex_client_patch_config_from_config_file()
-                .ok()
-                .map(|cfg| cfg.options.compaction)
-        })
-        .unwrap_or_default();
-    if let Err(err) = (CodexSwitchOptions {
-        responses_websocket,
-        compaction,
-    })
-    .validate_for_mode(patch_mode)
-    {
-        return Err(ProxyControlError::new(
-            StatusCode::BAD_REQUEST,
-            err.to_string(),
-        ));
-    }
     let model = payload
         .model
         .as_deref()
@@ -234,42 +156,35 @@ pub(super) async fn codex_relay_capabilities_for_proxy(
     let observations = run_capability_probe_cases(&probe_client, &target.upstream).await;
     let models_observation = observation_for_kind(&observations, CodexRelayProbeKind::Models);
 
-    let expected = build_expected_profile(
-        patch_mode,
-        compaction,
-        responses_websocket,
+    let expected = build_expected_provider_contract(
+        runtime_snapshot.as_ref(),
+        &target,
         model.as_deref(),
         models_observation,
-    );
+    )?;
     let observed = build_observed_from_probe_observations(&observations);
-    let recommendation = build_recommendation(patch_mode, &expected, &observed);
     let mismatches = build_mismatches(&expected, &observed);
-    let v4_source = proxy.config.v4_snapshot().await;
+    let config_source = runtime_snapshot.config();
     let continuity = build_continuity_diagnostics(
         proxy.service_name,
-        v4_source.as_deref().map(|cfg| &cfg.codex),
+        Some(&config_source.codex),
         &target,
-        patch_mode,
-        compaction,
-        responses_websocket,
+        &expected,
+        &observed,
     );
+    let provider_endpoint_key = target.provider_endpoint.stable_key();
+    let provider_id = target.provider_endpoint.provider_id;
+    let endpoint_id = target.provider_endpoint.endpoint_id;
 
     let response = CodexRelayCapabilitiesResponse {
         api_version: 1,
         service_name: proxy.service_name.to_string(),
-        station_name: target.station_name,
-        upstream_index: target.upstream_index,
-        provider_id: target.provider_id,
-        endpoint_id: target.endpoint_id,
-        provider_endpoint_key: target.provider_endpoint_key,
-        upstream_base_url: target.upstream.base_url,
-        patch_mode,
-        compaction,
-        responses_websocket,
+        provider_id,
+        endpoint_id,
+        provider_endpoint_key,
         model,
         expected,
         observed,
-        recommendation,
         continuity,
         mismatches,
     };
@@ -326,43 +241,156 @@ fn observation_for_kind(
         .expect("Codex relay probe registry must include all observed response fields")
 }
 
-fn current_codex_switch_patch_mode() -> Option<CodexPatchMode> {
-    crate::codex_integration::codex_switch_status()
-        .ok()
-        .and_then(|status| status.patch_mode)
-}
-
-fn current_codex_switch_responses_websocket() -> Option<bool> {
-    crate::codex_integration::codex_switch_status()
-        .ok()
-        .and_then(|status| status.supports_websockets)
-}
-
-fn current_codex_switch_compaction_strategy() -> Option<CodexCompactionStrategy> {
-    crate::codex_integration::codex_switch_status()
-        .ok()
-        .filter(|status| status.enabled)
-        .map(|status| status.compaction_strategy)
-}
-
-fn build_expected_profile(
-    patch_mode: CodexPatchMode,
-    compaction: CodexCompactionStrategy,
-    responses_websocket: bool,
+fn build_expected_provider_contract(
+    runtime_snapshot: &super::runtime_config::RuntimeSnapshot,
+    target: &SelectedCodexRelayTarget,
     model: Option<&str>,
     models_observation: &CodexRelayProbeObservation,
-) -> CodexCapabilityProfile {
+) -> Result<CodexRelayProviderContract, ProxyControlError> {
+    let endpoint = reqwest::Url::parse(&target.upstream.base_url).map_err(|error| {
+        ProxyControlError::new(
+            StatusCode::BAD_REQUEST,
+            format!("selected Codex relay upstream base URL is invalid: {error}"),
+        )
+    })?;
+    let provider_adapter = ProviderAdapter::for_endpoint(&endpoint);
+    let catalog_epoch =
+        capture_provider_catalog_epoch(runtime_snapshot, target, provider_adapter, &endpoint);
+    let catalog_model =
+        model.and_then(|model| catalog_epoch.as_ref().and_then(|epoch| epoch.model(model)));
     let model_catalog = translated_models_catalog(models_observation, model).unwrap_or_else(|| {
         CodexModelCatalogProfile::unknown(models_observation.result.reason.clone())
     });
-    CodexCapabilityProfile::for_input(CodexCapabilityProfileInput::from_patch_config(
-        patch_mode,
-        CodexSwitchOptions {
-            responses_websocket,
-            compaction,
-        },
+    let web_search = model_catalog.selected_web_search_support();
+    let apply_patch = model_catalog.selected_apply_patch_support();
+    let reasoning_summaries = model_catalog.selected_reasoning_summary_support();
+
+    Ok(CodexRelayProviderContract {
+        provider_adapter,
+        catalog_revision: catalog_epoch
+            .as_ref()
+            .map(|epoch| epoch.revision().as_str().to_string()),
+        request_dialects: vec![
+            "responses_http".to_string(),
+            "responses_compact".to_string(),
+            "responses_websocket".to_string(),
+        ],
         model_catalog,
-    ))
+        responses: adapter_responses_support(provider_adapter),
+        remote_compaction_v1: adapter_remote_compaction_support(provider_adapter),
+        hosted_image_generation: CodexCapabilityDecision::unknown(
+            "hosted image generation is not inferred from Codex-owned auth or client presets; request tools are preserved for the selected provider",
+        ),
+        responses_websocket: catalog_websocket_support(model, catalog_model),
+        ultra_maps_to_max: catalog_ultra_mapping_support(model, catalog_model),
+        web_search,
+        apply_patch,
+        reasoning_summaries,
+    })
+}
+
+fn capture_provider_catalog_epoch(
+    runtime_snapshot: &super::runtime_config::RuntimeSnapshot,
+    target: &SelectedCodexRelayTarget,
+    adapter: ProviderAdapter,
+    endpoint: &reqwest::Url,
+) -> Option<ProviderCatalogEpoch> {
+    if adapter != ProviderAdapter::OpenAiCodex {
+        return None;
+    }
+
+    let mut final_headers = axum::http::HeaderMap::new();
+    super::attempt_request::inject_auth_headers(
+        "codex",
+        &target.upstream.auth,
+        endpoint.as_str(),
+        &mut final_headers,
+    );
+    let route_scope = target.provider_endpoint.stable_key();
+    let scope = ProviderCatalogScope::new(
+        adapter,
+        endpoint.as_str(),
+        route_scope,
+        AccountFingerprint::from_final_headers(&final_headers),
+        runtime_snapshot.digest(),
+    )
+    .ok()?;
+    runtime_snapshot
+        .provider_catalog()
+        .capture_epoch(scope)
+        .ok()
+}
+
+fn adapter_responses_support(adapter: ProviderAdapter) -> CodexCapabilityDecision {
+    match adapter {
+        ProviderAdapter::OpenAiCodex => CodexCapabilityDecision::supported(
+            "captured provider endpoint uses the official OpenAI Codex adapter",
+        ),
+        ProviderAdapter::AwsBedrock | ProviderAdapter::OpenAiCompatible => {
+            CodexCapabilityDecision::unknown(
+                "the selected adapter does not provide an authoritative Responses contract; inspect the endpoint probe",
+            )
+        }
+    }
+}
+
+fn adapter_remote_compaction_support(adapter: ProviderAdapter) -> CodexCapabilityDecision {
+    match adapter {
+        ProviderAdapter::OpenAiCodex => CodexCapabilityDecision::supported(
+            "the captured official OpenAI Codex contract supports Responses compact",
+        ),
+        ProviderAdapter::AwsBedrock | ProviderAdapter::OpenAiCompatible => {
+            CodexCapabilityDecision::unknown(
+                "Responses compact is not inferred for a compatible relay; inspect the endpoint probe",
+            )
+        }
+    }
+}
+
+fn catalog_websocket_support(
+    requested_model: Option<&str>,
+    model: Option<&crate::provider_catalog::ProviderModelCapabilities>,
+) -> CodexCapabilityDecision {
+    match (requested_model, model) {
+        (_, Some(model)) if model.prefers_websockets() => CodexCapabilityDecision::supported(
+            "the captured provider catalog model prefers Responses WebSocket transport",
+        ),
+        (_, Some(_)) => CodexCapabilityDecision::unsupported(
+            "the captured provider catalog model does not advertise Responses WebSocket transport",
+        ),
+        (Some(model), None) => CodexCapabilityDecision::unknown(format!(
+            "model {model:?} has no authoritative contract in the captured provider catalog"
+        )),
+        (None, None) => CodexCapabilityDecision::unknown(
+            "no model was selected, so WebSocket support cannot be read from the provider catalog",
+        ),
+    }
+}
+
+fn catalog_ultra_mapping_support(
+    requested_model: Option<&str>,
+    model: Option<&crate::provider_catalog::ProviderModelCapabilities>,
+) -> CodexCapabilityDecision {
+    let Some(model) = model else {
+        return CodexCapabilityDecision::unknown(match requested_model {
+            Some(model) => format!(
+                "model {model:?} has no authoritative ultra mapping in the captured provider catalog"
+            ),
+            None => "no model was selected, so ultra mapping cannot be resolved".to_string(),
+        });
+    };
+    let efforts = model.supported_reasoning_efforts();
+    if efforts.contains(&CatalogReasoningEffort::Ultra)
+        && efforts.contains(&CatalogReasoningEffort::Max)
+    {
+        CodexCapabilityDecision::supported(
+            "the captured provider model contract maps Codex ultra intent to upstream max effort",
+        )
+    } else {
+        CodexCapabilityDecision::unsupported(
+            "the captured provider model contract does not authorize the ultra-to-max mapping",
+        )
+    }
 }
 
 fn translated_models_catalog(
@@ -386,14 +414,14 @@ fn translated_models_catalog(
 }
 
 fn build_mismatches(
-    expected: &CodexCapabilityProfile,
+    expected: &CodexRelayProviderContract,
     observed: &CodexRelayCapabilitiesObserved,
 ) -> Vec<CodexRelayCapabilityMismatch> {
     let mut out = Vec::new();
     push_endpoint_mismatch(
         &mut out,
         "responses",
-        &CodexCapabilityDecision::supported("Codex model requests require a /responses endpoint"),
+        &expected.responses,
         &observed.responses,
     );
     push_endpoint_mismatch(
@@ -407,7 +435,7 @@ fn build_mismatches(
             capability: "model_catalog".to_string(),
             expected: "codex_models".to_string(),
             observed: "openai_data_list".to_string(),
-            reason: "relay returned an OpenAI models list; helper model translation is disabled by default so Codex can keep using its bundled model metadata. Enable codex.client_patch.translate_models only if you intentionally want helper-synthesized model metadata.".to_string(),
+            reason: "relay returned an OpenAI models list; the captured provider catalog remains authoritative and request-time client preset translation is not available".to_string(),
         });
     }
     out
@@ -415,22 +443,13 @@ fn build_mismatches(
 
 fn build_continuity_diagnostics(
     service_name: &str,
-    view: Option<&ServiceViewV4>,
+    view: Option<&ServiceRouteConfig>,
     target: &SelectedCodexRelayTarget,
-    patch_mode: CodexPatchMode,
-    compaction: CodexCompactionStrategy,
-    responses_websocket: bool,
+    expected: &CodexRelayProviderContract,
+    observed: &CodexRelayCapabilitiesObserved,
 ) -> CodexRelayContinuityDiagnostics {
-    let fallback_domain = target
-        .provider_endpoint_key
-        .as_deref()
-        .map(|key| format!("provider_endpoint:{key}"))
-        .unwrap_or_else(|| {
-            format!(
-                "legacy:{}/{}/{}",
-                service_name, target.station_name, target.upstream_index
-            )
-        });
+    let provider_endpoint_key = target.provider_endpoint.stable_key();
+    let fallback_domain = format!("provider_endpoint:{provider_endpoint_key}");
     let mut selected_domain = CodexRelayContinuityDomainSummary {
         key: fallback_domain,
         explicit: false,
@@ -440,14 +459,12 @@ fn build_continuity_diagnostics(
     let mut affinity_policy = None;
 
     if let Some(view) = view {
-        let routing = effective_v4_routing(view);
+        let routing = effective_routing(view);
         affinity_policy = Some(routing_affinity_policy_label(routing.affinity_policy).to_string());
-        if let Ok(template) = compile_v4_route_plan_template_for_compat_runtime(service_name, view)
-        {
+        if let Ok(template) = compile_route_handshake_plan(service_name, view) {
             let topology = template.continuity_topology();
             configured_endpoint_count = topology.configured_provider_endpoint_count().max(1);
-            if let Some(provider_endpoint_key) = target.provider_endpoint_key.as_deref()
-                && let Some(summary) = topology.selected_domain_summary(provider_endpoint_key)
+            if let Some(summary) = topology.selected_domain_summary(provider_endpoint_key.as_str())
             {
                 selected_domain = domain_summary(&summary.domain);
                 same_domain_endpoint_count = summary.same_domain_endpoint_count;
@@ -455,18 +472,17 @@ fn build_continuity_diagnostics(
         }
     }
 
-    let remote_compaction_identity = compaction
-        .provider_identity_for_mode(patch_mode)
-        .provider_name()
-        == "OpenAI";
+    let remote_compaction_available = expected.remote_compaction_v1.is_supported()
+        || observed.responses_compact.support == super::CodexRelayProbeSupport::Supported;
+    let responses_websocket_available = expected.responses_websocket.is_supported();
     let can_state_bound_failover_within_domain =
         selected_domain.explicit && same_domain_endpoint_count > 1;
     let mut warnings = Vec::new();
     let mut recommendations = Vec::new();
 
-    if remote_compaction_identity && !selected_domain.explicit && configured_endpoint_count > 1 {
+    if remote_compaction_available && !selected_domain.explicit && configured_endpoint_count > 1 {
         warnings.push(
-            "remote compaction identity is active with multiple configured provider endpoints, but the selected endpoint has no explicit continuity_domain".to_string(),
+            "Responses compact is available with multiple configured provider endpoints, but the selected endpoint has no explicit continuity_domain".to_string(),
         );
         recommendations.push(
             "Set the same continuity_domain only on provider endpoints that intentionally share encrypted response state; otherwise keep provider-endpoint isolation.".to_string(),
@@ -487,7 +503,7 @@ fn build_continuity_diagnostics(
     if matches!(
         affinity_policy.as_deref(),
         Some("preferred-group") | Some("off")
-    ) && remote_compaction_identity
+    ) && remote_compaction_available
         && configured_endpoint_count > 1
     {
         warnings.push(
@@ -495,7 +511,7 @@ fn build_continuity_diagnostics(
         );
     }
 
-    if responses_websocket && !selected_domain.explicit && configured_endpoint_count > 1 {
+    if responses_websocket_available && !selected_domain.explicit && configured_endpoint_count > 1 {
         warnings.push(
             "Responses WebSocket compact uses the same state-bound continuity rules; do not enable cross-provider continuity without explicit continuity_domain".to_string(),
         );
@@ -519,37 +535,12 @@ fn domain_summary(domain: &ContinuityDomainKey) -> CodexRelayContinuityDomainSum
     }
 }
 
-fn routing_affinity_policy_label(policy: crate::config::RoutingAffinityPolicyV5) -> &'static str {
+fn routing_affinity_policy_label(policy: crate::config::RouteAffinityPolicy) -> &'static str {
     match policy {
-        crate::config::RoutingAffinityPolicyV5::Off => "off",
-        crate::config::RoutingAffinityPolicyV5::PreferredGroup => "preferred-group",
-        crate::config::RoutingAffinityPolicyV5::FallbackSticky => "fallback-sticky",
-        crate::config::RoutingAffinityPolicyV5::Hard => "hard",
-    }
-}
-
-fn build_recommendation(
-    current_patch_mode: CodexPatchMode,
-    expected: &CodexCapabilityProfile,
-    observed: &CodexRelayCapabilitiesObserved,
-) -> CodexPatchModeRecommendation {
-    CodexPatchModeRecommendation::for_input(CodexPatchModeRecommendationInput {
-        current_patch_mode,
-        model_catalog: expected.model_catalog.clone(),
-        responses: observed_support_to_capability_support(observed.responses.support),
-        responses_compact: observed_support_to_capability_support(
-            observed.responses_compact.support,
-        ),
-    })
-}
-
-fn observed_support_to_capability_support(
-    support: super::CodexRelayProbeSupport,
-) -> CodexCapabilitySupport {
-    match support {
-        super::CodexRelayProbeSupport::Supported => CodexCapabilitySupport::Supported,
-        super::CodexRelayProbeSupport::Unsupported => CodexCapabilitySupport::Unsupported,
-        super::CodexRelayProbeSupport::Unknown => CodexCapabilitySupport::Unknown,
+        crate::config::RouteAffinityPolicy::Off => "off",
+        crate::config::RouteAffinityPolicy::PreferredGroup => "preferred-group",
+        crate::config::RouteAffinityPolicy::FallbackSticky => "fallback-sticky",
+        crate::config::RouteAffinityPolicy::Hard => "hard",
     }
 }
 
@@ -605,17 +596,16 @@ fn probe_confidence_label(confidence: super::CodexRelayProbeConfidence) -> &'sta
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap};
-    use std::sync::{Arc, Mutex};
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     use reqwest::Client;
 
     use super::*;
-    use crate::codex_capability_profile::{CodexCapabilitySupport, CodexProviderIdentity};
+    use crate::codex_capability_profile::CodexCapabilitySupport;
     use crate::config::{
-        ProviderConfigV4, ProxyConfigV4, RoutingConfigV4, ServiceViewV4, UpstreamAuth,
+        HelperConfig, ProviderConfig, RouteGraphConfig, ServiceRouteConfig, UpstreamAuth,
     };
-    use crate::lb::LbState;
 
     fn probe_result(
         kind: CodexRelayProbeKind,
@@ -643,26 +633,42 @@ mod tests {
     }
 
     #[test]
-    fn codex_relay_capabilities_request_accepts_patch_preset_names() {
-        let request = serde_json::from_value::<CodexRelayCapabilitiesRequest>(
-            serde_json::json!({ "patch_preset": "official-imagegen" }),
-        )
-        .expect("current patch preset should deserialize");
+    fn codex_relay_capabilities_request_accepts_provider_target_fields() {
+        let request = serde_json::from_value::<CodexRelayCapabilitiesRequest>(serde_json::json!({
+            "provider_id": "relay",
+            "endpoint_id": "primary",
+            "model": "gpt-5.6-sol"
+        }))
+        .expect("provider target should deserialize");
 
-        assert_eq!(
-            request.patch_mode,
-            Some(CodexPatchMode::OfficialImagegenBridge)
-        );
+        assert_eq!(request.provider_id.as_deref(), Some("relay"));
+        assert_eq!(request.endpoint_id.as_deref(), Some("primary"));
+        assert_eq!(request.model.as_deref(), Some("gpt-5.6-sol"));
     }
 
     #[test]
-    fn codex_relay_capabilities_request_rejects_legacy_bridge_preset_names() {
-        let error = serde_json::from_value::<CodexRelayCapabilitiesRequest>(
-            serde_json::json!({ "patch_preset": "official-imagegen-bridge" }),
-        )
-        .expect_err("legacy bridge preset should be rejected for new API requests");
+    fn codex_relay_capabilities_request_rejects_removed_fields() {
+        for field in [
+            ("station_name", serde_json::json!("legacy-station")),
+            ("upstream_index", serde_json::json!(1)),
+            ("patch_preset", serde_json::json!("official-relay")),
+            ("patch_mode", serde_json::json!("official_relay_bridge")),
+            ("compaction", serde_json::json!("remote_v1")),
+            ("responses_websocket", serde_json::json!(true)),
+        ] {
+            let payload = serde_json::Value::Object(serde_json::Map::from_iter([(
+                field.0.to_string(),
+                field.1,
+            )]));
+            let error = serde_json::from_value::<CodexRelayCapabilitiesRequest>(payload)
+                .expect_err("removed client preset field should be rejected");
 
-        assert!(error.to_string().contains("use 'official-imagegen'"));
+            assert!(
+                error.to_string().contains("unknown field"),
+                "unexpected error for {}: {error}",
+                field.0
+            );
+        }
     }
 
     #[test]
@@ -684,42 +690,35 @@ mod tests {
 
     #[tokio::test]
     async fn codex_relay_capabilities_targets_route_graph_provider_id() {
-        let v4 = ProxyConfigV4 {
-            codex: ServiceViewV4 {
+        let source = HelperConfig {
+            codex: ServiceRouteConfig {
                 providers: BTreeMap::from([
                     (
                         "input8".to_string(),
-                        ProviderConfigV4 {
+                        ProviderConfig {
                             base_url: Some("http://127.0.0.1:9/v1".to_string()),
                             inline_auth: UpstreamAuth::default(),
-                            ..ProviderConfigV4::default()
+                            ..ProviderConfig::default()
                         },
                     ),
                     (
                         "ciii".to_string(),
-                        ProviderConfigV4 {
+                        ProviderConfig {
                             base_url: Some("http://127.0.0.1:10/v1".to_string()),
                             inline_auth: UpstreamAuth::default(),
-                            ..ProviderConfigV4::default()
+                            ..ProviderConfig::default()
                         },
                     ),
                 ]),
-                routing: Some(RoutingConfigV4::ordered_failover(vec![
+                routing: Some(RouteGraphConfig::ordered_failover(vec![
                     "input8".to_string(),
                     "ciii".to_string(),
                 ])),
-                ..ServiceViewV4::default()
+                ..ServiceRouteConfig::default()
             },
-            ..ProxyConfigV4::default()
+            ..HelperConfig::default()
         };
-        let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compile v4 runtime");
-        let proxy = ProxyService::new_with_v4_source(
-            Client::new(),
-            Arc::new(runtime),
-            Some(Arc::new(v4)),
-            "codex",
-            Arc::new(Mutex::new(HashMap::<String, LbState>::new())),
-        );
+        let proxy = ProxyService::new(Client::new(), Arc::new(source), "codex");
 
         let response = codex_relay_capabilities_for_proxy(
             &proxy,
@@ -732,61 +731,62 @@ mod tests {
         .await
         .expect("capabilities response");
 
-        assert_eq!(response.station_name, "routing");
-        assert_eq!(response.upstream_index, 1);
-        assert_eq!(response.provider_id.as_deref(), Some("ciii"));
-        assert_eq!(response.endpoint_id.as_deref(), Some("default"));
-        assert_eq!(
-            response.provider_endpoint_key.as_deref(),
-            Some("codex/ciii/default")
-        );
-        assert_eq!(response.upstream_base_url, "http://127.0.0.1:10/v1");
+        assert_eq!(response.provider_id, "ciii");
+        assert_eq!(response.endpoint_id, "default");
+        assert_eq!(response.provider_endpoint_key, "codex/ciii/default");
+        let serialized = serde_json::to_value(&response).expect("serialize response");
+        assert!(serialized.get("station_name").is_none());
+        assert!(serialized.get("upstream_index").is_none());
+        assert!(serialized.get("upstream_base_url").is_none());
+        for field in ["provider_id", "endpoint_id", "provider_endpoint_key"] {
+            let mut missing = serialized.clone();
+            missing
+                .as_object_mut()
+                .expect("response object")
+                .remove(field);
+            assert!(
+                serde_json::from_value::<CodexRelayCapabilitiesResponse>(missing).is_err(),
+                "missing canonical field {field} should fail"
+            );
+        }
     }
 
     #[tokio::test]
-    async fn codex_relay_capabilities_recommends_explicit_continuity_domain_for_multi_relay() {
-        let v4 = ProxyConfigV4 {
-            codex: ServiceViewV4 {
+    async fn compatible_relay_without_probe_does_not_infer_continuity_risk() {
+        let source = HelperConfig {
+            codex: ServiceRouteConfig {
                 providers: BTreeMap::from([
                     (
                         "relay-a".to_string(),
-                        ProviderConfigV4 {
+                        ProviderConfig {
                             base_url: Some("http://127.0.0.1:9/v1".to_string()),
                             inline_auth: UpstreamAuth::default(),
-                            ..ProviderConfigV4::default()
+                            ..ProviderConfig::default()
                         },
                     ),
                     (
                         "relay-b".to_string(),
-                        ProviderConfigV4 {
+                        ProviderConfig {
                             base_url: Some("http://127.0.0.1:10/v1".to_string()),
                             inline_auth: UpstreamAuth::default(),
-                            ..ProviderConfigV4::default()
+                            ..ProviderConfig::default()
                         },
                     ),
                 ]),
-                routing: Some(RoutingConfigV4::ordered_failover(vec![
+                routing: Some(RouteGraphConfig::ordered_failover(vec![
                     "relay-a".to_string(),
                     "relay-b".to_string(),
                 ])),
-                ..ServiceViewV4::default()
+                ..ServiceRouteConfig::default()
             },
-            ..ProxyConfigV4::default()
+            ..HelperConfig::default()
         };
-        let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compile v4 runtime");
-        let proxy = ProxyService::new_with_v4_source(
-            Client::new(),
-            Arc::new(runtime),
-            Some(Arc::new(v4)),
-            "codex",
-            Arc::new(Mutex::new(HashMap::<String, LbState>::new())),
-        );
+        let proxy = ProxyService::new(Client::new(), Arc::new(source), "codex");
 
         let response = codex_relay_capabilities_for_proxy(
             &proxy,
             CodexRelayCapabilitiesRequest {
                 provider_id: Some("relay-a".to_string()),
-                patch_mode: Some(CodexPatchMode::OfficialRelayBridge),
                 ..Default::default()
             },
         )
@@ -801,179 +801,171 @@ mod tests {
         assert_eq!(response.continuity.configured_endpoint_count, 2);
         assert_eq!(response.continuity.same_domain_endpoint_count, 1);
         assert!(!response.continuity.can_state_bound_failover_within_domain);
-        assert!(
-            response
-                .continuity
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("no explicit continuity_domain"))
-        );
+        assert!(response.continuity.warnings.is_empty());
     }
 
     #[tokio::test]
-    async fn codex_relay_capabilities_uses_compaction_strategy_for_expected_profile() {
-        let v4 = ProxyConfigV4 {
-            codex: ServiceViewV4 {
+    async fn codex_relay_capabilities_reports_compatible_provider_contract() {
+        let source = HelperConfig {
+            codex: ServiceRouteConfig {
                 providers: BTreeMap::from([
                     (
                         "relay-a".to_string(),
-                        ProviderConfigV4 {
+                        ProviderConfig {
                             base_url: Some("http://127.0.0.1:9/v1".to_string()),
                             inline_auth: UpstreamAuth::default(),
-                            ..ProviderConfigV4::default()
+                            ..ProviderConfig::default()
                         },
                     ),
                     (
                         "relay-b".to_string(),
-                        ProviderConfigV4 {
+                        ProviderConfig {
                             base_url: Some("http://127.0.0.1:10/v1".to_string()),
                             inline_auth: UpstreamAuth::default(),
-                            ..ProviderConfigV4::default()
+                            ..ProviderConfig::default()
                         },
                     ),
                 ]),
-                routing: Some(RoutingConfigV4::ordered_failover(vec![
+                routing: Some(RouteGraphConfig::ordered_failover(vec![
                     "relay-a".to_string(),
                     "relay-b".to_string(),
                 ])),
-                ..ServiceViewV4::default()
+                ..ServiceRouteConfig::default()
             },
-            ..ProxyConfigV4::default()
+            ..HelperConfig::default()
         };
-        let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compile v4 runtime");
-        let proxy = ProxyService::new_with_v4_source(
-            Client::new(),
-            Arc::new(runtime),
-            Some(Arc::new(v4)),
-            "codex",
-            Arc::new(Mutex::new(HashMap::<String, LbState>::new())),
-        );
+        let proxy = ProxyService::new(Client::new(), Arc::new(source), "codex");
 
         let response = codex_relay_capabilities_for_proxy(
             &proxy,
             CodexRelayCapabilitiesRequest {
                 provider_id: Some("relay-a".to_string()),
-                patch_mode: Some(CodexPatchMode::OfficialImagegenBridge),
-                compaction: Some(CodexCompactionStrategy::Local),
                 ..Default::default()
             },
         )
         .await
         .expect("capabilities response");
 
-        assert_eq!(response.compaction, CodexCompactionStrategy::Local);
         assert_eq!(
-            response.expected.provider_identity,
-            CodexProviderIdentity::HelperRelay
+            response.expected.provider_adapter,
+            ProviderAdapter::OpenAiCompatible
         );
+        assert_eq!(response.expected.catalog_revision, None);
         assert_eq!(
             response.expected.remote_compaction_v1.support,
-            CodexCapabilitySupport::Unsupported
+            CodexCapabilitySupport::Unknown
         );
         assert!(
             response.continuity.warnings.is_empty(),
-            "local compaction should not warn about remote compact continuity domains"
+            "compatible relays without a successful probe must not imply compact continuity"
         );
         assert!(
             !response
                 .mismatches
                 .iter()
                 .any(|mismatch| mismatch.capability == "remote_compaction_v1"),
-            "local compaction should not require /responses/compact support"
+            "an unknown provider contract must not claim a compact mismatch"
         );
     }
 
     #[tokio::test]
-    async fn codex_relay_capabilities_rejects_invalid_compaction_combination() {
-        let v4 = ProxyConfigV4 {
-            codex: ServiceViewV4 {
+    async fn official_provider_contract_uses_captured_catalog() {
+        let source = HelperConfig {
+            codex: ServiceRouteConfig {
                 providers: BTreeMap::from([(
-                    "relay-a".to_string(),
-                    ProviderConfigV4 {
-                        base_url: Some("http://127.0.0.1:9/v1".to_string()),
+                    "openai".to_string(),
+                    ProviderConfig {
+                        base_url: Some("https://api.openai.com/v1".to_string()),
                         inline_auth: UpstreamAuth::default(),
-                        ..ProviderConfigV4::default()
+                        ..ProviderConfig::default()
                     },
                 )]),
-                routing: Some(RoutingConfigV4::ordered_failover(vec![
-                    "relay-a".to_string(),
+                routing: Some(RouteGraphConfig::ordered_failover(vec![
+                    "openai".to_string(),
                 ])),
-                ..ServiceViewV4::default()
+                ..ServiceRouteConfig::default()
             },
-            ..ProxyConfigV4::default()
+            ..HelperConfig::default()
         };
-        let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compile v4 runtime");
-        let proxy = ProxyService::new_with_v4_source(
-            Client::new(),
-            Arc::new(runtime),
-            Some(Arc::new(v4)),
-            "codex",
-            Arc::new(Mutex::new(HashMap::<String, LbState>::new())),
-        );
-
-        let err = codex_relay_capabilities_for_proxy(
-            &proxy,
-            CodexRelayCapabilitiesRequest {
-                provider_id: Some("relay-a".to_string()),
-                patch_mode: Some(CodexPatchMode::Default),
-                compaction: Some(CodexCompactionStrategy::RemoteV1),
-                ..Default::default()
+        let proxy = ProxyService::new(Client::new(), Arc::new(source), "codex");
+        let runtime_snapshot = proxy.config.capture().await;
+        let graph = runtime_snapshot
+            .route_graph("codex")
+            .expect("compiled codex graph");
+        let target = select_codex_relay_target(
+            graph.as_ref(),
+            CodexRelayTargetSelection {
+                provider_id: Some("openai"),
+                endpoint_id: None,
             },
         )
-        .await
-        .expect_err("remote compaction should require official preset");
+        .expect("select official provider target");
+        let models_observation = observation(CodexRelayProbeKind::Models);
 
-        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
-        assert!(
-            err.message()
-                .contains("remote compaction strategies require --preset official-relay")
+        let contract = build_expected_provider_contract(
+            runtime_snapshot.as_ref(),
+            &target,
+            Some("gpt-5.6-sol"),
+            &models_observation,
+        )
+        .expect("build official provider contract");
+
+        assert_eq!(contract.provider_adapter, ProviderAdapter::OpenAiCodex);
+        assert!(contract.catalog_revision.is_some());
+        assert_eq!(
+            contract.responses.support,
+            CodexCapabilitySupport::Supported
+        );
+        assert_eq!(
+            contract.remote_compaction_v1.support,
+            CodexCapabilitySupport::Supported
+        );
+        assert_eq!(
+            contract.responses_websocket.support,
+            CodexCapabilitySupport::Supported
+        );
+        assert_eq!(
+            contract.ultra_maps_to_max.support,
+            CodexCapabilitySupport::Supported
         );
     }
 
     #[tokio::test]
     async fn codex_relay_capabilities_does_not_infer_official_openai_domain_from_same_host() {
-        let v4 = ProxyConfigV4 {
-            codex: ServiceViewV4 {
+        let source = HelperConfig {
+            codex: ServiceRouteConfig {
                 providers: BTreeMap::from([
                     (
                         "openai-a".to_string(),
-                        ProviderConfigV4 {
+                        ProviderConfig {
                             base_url: Some("https://api.openai.com/v1".to_string()),
                             inline_auth: UpstreamAuth::default(),
-                            ..ProviderConfigV4::default()
+                            ..ProviderConfig::default()
                         },
                     ),
                     (
                         "openai-b".to_string(),
-                        ProviderConfigV4 {
+                        ProviderConfig {
                             base_url: Some("https://api.openai.com/v1".to_string()),
                             inline_auth: UpstreamAuth::default(),
-                            ..ProviderConfigV4::default()
+                            ..ProviderConfig::default()
                         },
                     ),
                 ]),
-                routing: Some(RoutingConfigV4::ordered_failover(vec![
+                routing: Some(RouteGraphConfig::ordered_failover(vec![
                     "openai-a".to_string(),
                     "openai-b".to_string(),
                 ])),
-                ..ServiceViewV4::default()
+                ..ServiceRouteConfig::default()
             },
-            ..ProxyConfigV4::default()
+            ..HelperConfig::default()
         };
-        let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compile v4 runtime");
-        let proxy = ProxyService::new_with_v4_source(
-            Client::new(),
-            Arc::new(runtime),
-            Some(Arc::new(v4)),
-            "codex",
-            Arc::new(Mutex::new(HashMap::<String, LbState>::new())),
-        );
+        let proxy = ProxyService::new(Client::new(), Arc::new(source), "codex");
 
         let response = codex_relay_capabilities_for_proxy(
             &proxy,
             CodexRelayCapabilitiesRequest {
                 provider_id: Some("openai-a".to_string()),
-                patch_mode: Some(CodexPatchMode::OfficialRelayBridge),
                 ..Default::default()
             },
         )
@@ -998,50 +990,42 @@ mod tests {
 
     #[tokio::test]
     async fn codex_relay_capabilities_reports_shared_explicit_continuity_domain() {
-        let v4 = ProxyConfigV4 {
-            codex: ServiceViewV4 {
+        let source = HelperConfig {
+            codex: ServiceRouteConfig {
                 providers: BTreeMap::from([
                     (
                         "relay-a".to_string(),
-                        ProviderConfigV4 {
+                        ProviderConfig {
                             base_url: Some("http://127.0.0.1:9/v1".to_string()),
                             continuity_domain: Some("relay-cluster".to_string()),
                             inline_auth: UpstreamAuth::default(),
-                            ..ProviderConfigV4::default()
+                            ..ProviderConfig::default()
                         },
                     ),
                     (
                         "relay-b".to_string(),
-                        ProviderConfigV4 {
+                        ProviderConfig {
                             base_url: Some("http://127.0.0.1:10/v1".to_string()),
                             continuity_domain: Some("relay-cluster".to_string()),
                             inline_auth: UpstreamAuth::default(),
-                            ..ProviderConfigV4::default()
+                            ..ProviderConfig::default()
                         },
                     ),
                 ]),
-                routing: Some(RoutingConfigV4::ordered_failover(vec![
+                routing: Some(RouteGraphConfig::ordered_failover(vec![
                     "relay-a".to_string(),
                     "relay-b".to_string(),
                 ])),
-                ..ServiceViewV4::default()
+                ..ServiceRouteConfig::default()
             },
-            ..ProxyConfigV4::default()
+            ..HelperConfig::default()
         };
-        let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compile v4 runtime");
-        let proxy = ProxyService::new_with_v4_source(
-            Client::new(),
-            Arc::new(runtime),
-            Some(Arc::new(v4)),
-            "codex",
-            Arc::new(Mutex::new(HashMap::<String, LbState>::new())),
-        );
+        let proxy = ProxyService::new(Client::new(), Arc::new(source), "codex");
 
         let response = codex_relay_capabilities_for_proxy(
             &proxy,
             CodexRelayCapabilitiesRequest {
                 provider_id: Some("relay-a".to_string()),
-                patch_mode: Some(CodexPatchMode::OfficialRelayBridge),
                 ..Default::default()
             },
         )

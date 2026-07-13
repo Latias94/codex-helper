@@ -3,6 +3,8 @@
 Status: Complete
 Last updated: 2026-05-18
 
+> Historical status (superseded 2026-07-12): `official-relay-bridge` and all client patch presets/auth-facade behavior were removed. The local switch now changes only the helper selector/stanza in Codex `config.toml`; Responses and compact support are determined by the selected provider contract and bounded observations.
+
 ## Current State
 
 The workstream is complete. CORB-020, CORB-030, CORB-040, and CORB-050 are implemented and verified:

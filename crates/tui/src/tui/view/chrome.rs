@@ -7,7 +7,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::tui::i18n::{self, msg};
-use crate::tui::model::{Palette, Snapshot, shorten_middle};
+use crate::tui::model::{Palette, Snapshot, request_attempt_count, shorten_middle};
 use crate::tui::state::UiState;
 use crate::tui::types::{Focus, Overlay, Page, page_index, page_titles};
 
@@ -26,20 +26,24 @@ fn push_header_metric(
     spans.push(Span::styled(value.into(), value_style));
 }
 
-fn route_summary_full(provider: &str, station: &str, attempts: impl std::fmt::Display) -> String {
-    format!("{provider} -> {station} x{attempts}")
+fn route_summary_full(provider: &str, endpoint: &str, attempts: impl std::fmt::Display) -> String {
+    format!("{provider} -> {endpoint} x{attempts}")
 }
 
-fn route_summary_medium(provider: &str, station: &str, attempts: impl std::fmt::Display) -> String {
+fn route_summary_medium(
+    provider: &str,
+    endpoint: &str,
+    attempts: impl std::fmt::Display,
+) -> String {
     format!(
         "{} -> {} x{attempts}",
         shorten_middle(provider, 18),
-        shorten_middle(station, 18)
+        shorten_middle(endpoint, 18)
     )
 }
 
-fn route_summary_compact(station: &str, attempts: impl std::fmt::Display) -> String {
-    format!("{} x{attempts}", shorten_middle(station, 18))
+fn route_summary_compact(endpoint: &str, attempts: impl std::fmt::Display) -> String {
+    format!("{} x{attempts}", shorten_middle(endpoint, 18))
 }
 
 fn text_prefix_by_width(text: &str, max_width: usize) -> String {
@@ -208,20 +212,6 @@ fn footer_help_text(ui: &UiState) -> &'static str {
             Page::ServiceStatus => i18n::text(ui.language, msg::FOOTER_SERVICE_STATUS),
         },
         Overlay::Help => i18n::text(ui.language, msg::FOOTER_HELP),
-        Overlay::EffortMenu => i18n::text(ui.language, msg::FOOTER_SELECT_APPLY),
-        Overlay::ModelMenuSession => i18n::text(ui.language, msg::FOOTER_MODEL_MENU),
-        Overlay::ModelInputSession => i18n::text(ui.language, msg::FOOTER_MODEL_INPUT),
-        Overlay::ServiceTierMenuSession => i18n::text(ui.language, msg::FOOTER_SERVICE_TIER_MENU),
-        Overlay::ServiceTierInputSession => i18n::text(ui.language, msg::FOOTER_SERVICE_TIER_INPUT),
-        Overlay::ProfileMenuSession => i18n::text(ui.language, msg::FOOTER_PROFILE_SESSION),
-        Overlay::ProfileMenuDefaultRuntime => i18n::text(ui.language, msg::FOOTER_PROFILE_RUNTIME),
-        Overlay::ProfileMenuDefaultPersisted => {
-            i18n::text(ui.language, msg::FOOTER_PROFILE_CONFIGURED)
-        }
-        Overlay::ProviderMenuSession | Overlay::ProviderMenuGlobal => {
-            i18n::text(ui.language, msg::FOOTER_SELECT_APPLY)
-        }
-        Overlay::RoutingMenu => i18n::text(ui.language, msg::FOOTER_ROUTING_MENU),
         Overlay::StationInfo => i18n::text(ui.language, msg::FOOTER_STATION_INFO),
         Overlay::SessionTranscript => i18n::text(ui.language, msg::FOOTER_SESSION_TRANSCRIPT),
         Overlay::StartupAlert => i18n::text(ui.language, msg::FOOTER_STARTUP_GUARDRAIL),
@@ -334,44 +324,6 @@ pub(super) fn render_header(
         .filter(|r| r.status_code >= 400)
         .count();
     let updated = snapshot.refreshed_at.elapsed().as_millis();
-    let overrides_model = snapshot.model_overrides.len();
-    let overrides_effort = snapshot.overrides.len();
-    let uses_route_graph = ui.uses_route_graph_routing();
-    let overrides_route = if uses_route_graph {
-        snapshot.route_target_overrides.len()
-    } else {
-        snapshot.station_overrides.len()
-    };
-    let overrides_tier = snapshot.service_tier_overrides.len();
-    let (hc_running, hc_canceling) = {
-        let mut running = 0usize;
-        let mut canceling = 0usize;
-        for st in snapshot.health_checks.values() {
-            if !st.done {
-                running += 1;
-                if st.cancel_requested {
-                    canceling += 1;
-                }
-            }
-        }
-        (running, canceling)
-    };
-
-    let global_station = snapshot
-        .global_station_override
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or("-");
-    let global_route_target = snapshot
-        .global_route_target_override
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or("-");
-    let global_route_control = if uses_route_graph {
-        global_route_target
-    } else {
-        global_station
-    };
     let focus = match ui.page {
         Page::Fleet => i18n::label(ui.language, "fleet view"),
         Page::ServiceStatus => i18n::label(ui.language, "service status"),
@@ -436,11 +388,11 @@ pub(super) fn render_header(
         .and_then(|r| r.provider_id.as_deref())
         .filter(|s| !s.trim().is_empty())
         .unwrap_or("-");
-    let last_station = last_req
-        .and_then(|r| r.station_name.as_deref())
+    let last_endpoint = last_req
+        .and_then(|r| r.endpoint_id.as_deref())
         .filter(|s| !s.trim().is_empty())
         .unwrap_or("-");
-    let last_attempts = last_req.map(|r| r.attempt_count()).unwrap_or(1);
+    let last_attempts = last_req.map(request_attempt_count).unwrap_or(1);
 
     let fmt_ok_pct = |ok: usize, total: usize| -> String {
         if total == 0 {
@@ -461,23 +413,9 @@ pub(super) fn render_header(
     let s5 = &snapshot.stats_5m;
     let s1 = &snapshot.stats_1h;
 
-    let hc_text = if hc_running > 0 {
-        if ui.language == crate::tui::Language::Zh {
-            format!("运行:{hc_running} 取消:{hc_canceling}")
-        } else {
-            format!("run:{hc_running} cancel:{hc_canceling}")
-        }
-    } else {
-        "-".to_string()
-    };
-    let route_full = route_summary_full(last_provider, last_station, last_attempts);
-    let route_medium = route_summary_medium(last_provider, last_station, last_attempts);
-    let route_compact = route_summary_compact(last_station, last_attempts);
-    let overrides_total = overrides_model
-        .saturating_add(overrides_effort)
-        .saturating_add(overrides_route)
-        .saturating_add(overrides_tier);
-
+    let route_full = route_summary_full(last_provider, last_endpoint, last_attempts);
+    let route_medium = route_summary_medium(last_provider, last_endpoint, last_attempts);
+    let route_compact = route_summary_compact(last_endpoint, last_attempts);
     let mut subtitle_spans = Vec::new();
     if inner.width >= 150 {
         push_header_metric(
@@ -574,44 +512,6 @@ pub(super) fn render_header(
         push_header_sep(&mut subtitle_spans, false);
         push_header_metric(
             &mut subtitle_spans,
-            i18n::text(ui.language, msg::STATUS_HEALTH_CHECK_SHORT),
-            hc_text,
-            Style::default().fg(p.muted),
-            Style::default().fg(if hc_running > 0 { p.accent } else { p.muted }),
-        );
-        push_header_sep(&mut subtitle_spans, false);
-        push_header_metric(
-            &mut subtitle_spans,
-            i18n::text(
-                ui.language,
-                if uses_route_graph {
-                    msg::STATUS_OVERRIDES_ROUTE_SHORT
-                } else {
-                    msg::STATUS_OVERRIDES_SHORT
-                },
-            ),
-            format!("{overrides_model}/{overrides_effort}/{overrides_route}/{overrides_tier}"),
-            Style::default().fg(p.muted),
-            Style::default().fg(p.muted),
-        );
-        push_header_sep(&mut subtitle_spans, false);
-        push_header_metric(
-            &mut subtitle_spans,
-            i18n::text(
-                ui.language,
-                if uses_route_graph {
-                    msg::STATUS_GLOBAL_ROUTE_TARGET_SHORT
-                } else {
-                    msg::STATUS_GLOBAL_STATION_OVERRIDE_SHORT
-                },
-            ),
-            global_route_control.to_string(),
-            Style::default().fg(p.muted),
-            Style::default().fg(p.accent),
-        );
-        push_header_sep(&mut subtitle_spans, false);
-        push_header_metric(
-            &mut subtitle_spans,
             i18n::text(ui.language, msg::STATUS_UPDATED_SHORT),
             format!("{updated}ms"),
             Style::default().fg(p.muted),
@@ -649,40 +549,6 @@ pub(super) fn render_header(
             Style::default().fg(p.muted),
             Style::default().fg(p.accent),
         );
-        if hc_running > 0 {
-            push_header_sep(&mut subtitle_spans, true);
-            push_header_metric(
-                &mut subtitle_spans,
-                "hc ",
-                hc_text,
-                Style::default().fg(p.muted),
-                Style::default().fg(p.accent),
-            );
-        }
-        if overrides_total > 0 {
-            push_header_sep(&mut subtitle_spans, true);
-            push_header_metric(
-                &mut subtitle_spans,
-                "ovr ",
-                overrides_total.to_string(),
-                Style::default().fg(p.muted),
-                Style::default().fg(p.muted),
-            );
-        }
-        if global_route_control != "-" {
-            push_header_sep(&mut subtitle_spans, true);
-            push_header_metric(
-                &mut subtitle_spans,
-                if uses_route_graph {
-                    "route "
-                } else {
-                    "global "
-                },
-                shorten_middle(global_route_control, 24),
-                Style::default().fg(p.muted),
-                Style::default().fg(p.accent),
-            );
-        }
         push_header_sep(&mut subtitle_spans, true);
         push_header_metric(
             &mut subtitle_spans,
@@ -852,7 +718,7 @@ mod tests {
     }
 
     #[test]
-    fn footer_help_text_uses_page_specific_routing_copy() {
+    fn footer_help_text_uses_query_only_routing_copy() {
         let ui = UiState {
             page: Page::Stations,
             language: crate::tui::Language::En,
@@ -862,15 +728,16 @@ mod tests {
 
         let text = footer_help_text(&ui);
 
-        assert!(text.contains("r/Enter edit"), "{text}");
-        assert!(text.contains("g refresh balances"), "{text}");
+        assert!(text.contains("provider"), "{text}");
+        assert!(text.contains("i details"), "{text}");
+        assert!(!text.contains("refresh"), "{text}");
     }
 
     #[test]
     fn route_summary_full_uses_directional_separator() {
         assert_eq!(
-            route_summary_full("provider-a", "station-b", 3),
-            "provider-a -> station-b x3"
+            route_summary_full("provider-a", "endpoint-b", 3),
+            "provider-a -> endpoint-b x3"
         );
     }
 
@@ -905,7 +772,7 @@ mod tests {
         let ui = UiState {
             page: Page::Stations,
             language: crate::tui::Language::En,
-            config_version: Some(4),
+            config_version: Some(crate::config::CURRENT_CONFIG_VERSION),
             ..Default::default()
         };
 

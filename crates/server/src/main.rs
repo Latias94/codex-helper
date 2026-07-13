@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use codex_helper_core::config::load_or_bootstrap_for_service_with_v4_source;
+use codex_helper_core::config::load_config_with_source;
 use codex_helper_core::runtime_host::{
     build_proxy_runtime_from_loaded_with_options, service_name_for_kind,
 };
@@ -34,12 +34,6 @@ struct Cli {
     /// Admin listen port. Defaults to proxy port + 1000.
     #[arg(long)]
     admin_port: Option<u16>,
-    /// Admin API base URL advertised to proxy clients.
-    #[arg(long)]
-    advertised_admin_base_url: Option<String>,
-    /// Enable host-local Codex session history enrichment for this server process.
-    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
-    host_local_session_history: Option<bool>,
 }
 
 #[tokio::main]
@@ -55,15 +49,13 @@ async fn main() -> Result<()> {
             port: cli.port,
             admin_host: cli.admin_host,
             admin_port: cli.admin_port,
-            advertised_admin_base_url: cli.advertised_admin_base_url,
-            host_local_session_history: cli.host_local_session_history,
         },
     )?;
     let service_kind = effective.service_kind();
     let service_name = service_name_for_kind(service_kind);
     let admin_addr = effective.admin_addr();
 
-    let loaded = load_or_bootstrap_for_service_with_v4_source(service_kind)
+    let loaded = load_config_with_source()
         .await
         .with_context(|| format!("load {service_name} proxy config"))?;
     let runtime = build_proxy_runtime_from_loaded_with_options(
@@ -81,7 +73,6 @@ async fn main() -> Result<()> {
         )
     })?;
 
-    runtime.proxy.spawn_initial_balance_refresh();
     let shutdown_tx = runtime.shutdown_tx.clone();
     tokio::spawn(async move {
         wait_for_shutdown_signal().await;
@@ -100,7 +91,8 @@ async fn main() -> Result<()> {
         service_name
     );
 
-    runtime.start().wait().await
+    let mut running_runtime = runtime.start();
+    running_runtime.wait().await
 }
 
 fn init_tracing() {

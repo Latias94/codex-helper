@@ -3,6 +3,8 @@
 Status: Complete
 Last updated: 2026-05-19
 
+> Historical API status (updated 2026-07-12): the explicit, acknowledged core/CLI/TUI live-smoke behavior remains, but the remote admin POST endpoint described below was removed when the control plane became GET/HEAD-only. Historical task and verification records are retained as implementation evidence, not as the current API contract.
+
 ## Current State
 
 The workstream is closed. Core live smoke, the admin API surface, the TUI Settings operator flow, and user-facing docs are implemented and validated. Capability diagnostics remain validation-only and should not be changed into live checks.

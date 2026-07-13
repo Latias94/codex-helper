@@ -1,6 +1,8 @@
 # Handoff
 
-Current state: the startup guardrail implementation and documented smoke checklist are in place.
+> Historical ownership note (updated 2026-07-12): startup readiness no longer reads Codex auth, model cache, SQLite, or remote-control state. The retained guardrail reports helper config/runtime readiness and explicit local switch-journal conflicts; the implementation inventory below records the earlier broader probe.
+
+Historical state: the startup guardrail implementation and documented smoke checklist were in place for this workstream.
 
 Implemented:
 

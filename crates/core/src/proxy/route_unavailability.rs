@@ -1,7 +1,8 @@
 use axum::body::Body;
 use axum::http::{Response, StatusCode};
+use std::collections::BTreeMap;
 
-use crate::logging::{RouteAttemptLog, log_retry_trace};
+use crate::logging::{RouteAttemptLog, log_control_trace_event};
 use crate::routing_ir::{
     RouteCandidate, RoutePlanAttemptState, RoutePlanExecutor, RoutePlanRuntimeState,
     RoutePlanSkipReason,
@@ -19,6 +20,7 @@ pub(super) struct RouteUnavailableReport {
     pub(super) route_attempts: Vec<RouteAttemptLog>,
     pub(super) provider_endpoints_to_probe: Vec<ProviderEndpointKey>,
     pub(super) message: String,
+    short_cooldown_remaining_secs: Option<u64>,
 }
 
 impl RouteUnavailableReport {
@@ -27,18 +29,7 @@ impl RouteUnavailableReport {
     }
 
     pub(super) fn short_cooldown_wait_secs(&self, max_secs: u64) -> Option<u64> {
-        let wait_secs = self
-            .route_attempts
-            .iter()
-            .filter(|attempt| attempt.decision == "route_unavailable")
-            .filter(|attempt| {
-                attempt
-                    .reason
-                    .as_deref()
-                    .is_some_and(|reason| reason.split(',').any(|part| part == "cooldown"))
-            })
-            .filter_map(|attempt| attempt.cooldown_secs)
-            .min()?;
+        let wait_secs = self.short_cooldown_remaining_secs?;
         (wait_secs <= max_secs).then_some(wait_secs.saturating_add(1).max(1))
     }
 }
@@ -62,6 +53,8 @@ pub(super) fn route_unavailable_report(
     let mut provider_endpoints_to_probe = Vec::new();
     let mut retry_after_secs = None::<u64>;
     let mut has_runtime_unavailable_reason = false;
+    let mut has_short_cooldown_reason = false;
+    let mut reason_counts = BTreeMap::<String, usize>::new();
 
     for candidate in &template.candidates {
         let provider_endpoint = template.candidate_provider_endpoint_key(candidate);
@@ -90,6 +83,25 @@ pub(super) fn route_unavailable_report(
         }) {
             provider_endpoints_to_probe.push(provider_endpoint.clone());
         }
+        has_short_cooldown_reason |= reasons
+            .iter()
+            .any(|reason| matches!(reason, RoutePlanSkipReason::Cooldown));
+
+        let mut reason_codes = reasons
+            .iter()
+            .map(RoutePlanSkipReason::code)
+            .collect::<Vec<_>>();
+        if avoided {
+            reason_codes.push("attempt_avoided");
+        }
+        if reason_codes.is_empty() {
+            reason_codes.push("not_selected");
+        }
+        reason_codes.sort_unstable();
+        reason_codes.dedup();
+        for code in reason_codes {
+            *reason_counts.entry(code.to_string()).or_default() += 1;
+        }
         if let Some(secs) = runtime_state.cooldown_remaining_secs {
             retry_after_secs = Some(retry_after_secs.map_or(secs, |current| current.min(secs)));
         }
@@ -98,8 +110,6 @@ pub(super) fn route_unavailable_report(
             template,
             candidate,
             &provider_endpoint,
-            reasons,
-            avoided,
             route_state,
             request_model,
         ));
@@ -121,11 +131,10 @@ pub(super) fn route_unavailable_report(
             attempt.cooldown_reason = Some("route_unavailable".to_string());
         }
     }
-    let reason_counts = reason_counts_for_log(&route_attempts);
     let message =
         format!("No upstreams are currently routable; try again in {retry_after_secs} seconds");
 
-    log_retry_trace(serde_json::json!({
+    log_control_trace_event(serde_json::json!({
         "event": "route_graph_unavailable",
         "service": service_name,
         "request_id": request_id,
@@ -142,6 +151,7 @@ pub(super) fn route_unavailable_report(
         route_attempts,
         provider_endpoints_to_probe,
         message,
+        short_cooldown_remaining_secs: has_short_cooldown_reason.then_some(retry_after_secs),
     })
 }
 
@@ -181,32 +191,9 @@ fn route_unavailable_attempt(
     template: &crate::routing_ir::RoutePlanTemplate,
     candidate: &RouteCandidate,
     provider_endpoint: &ProviderEndpointKey,
-    reasons: Vec<RoutePlanSkipReason>,
-    avoided: bool,
     route_state: &RoutePlanAttemptState,
     request_model: Option<&str>,
 ) -> RouteAttemptLog {
-    let mut reason_codes = reasons
-        .iter()
-        .map(RoutePlanSkipReason::code)
-        .collect::<Vec<_>>();
-    if avoided {
-        reason_codes.push("attempt_avoided");
-    }
-    if reason_codes.is_empty() {
-        reason_codes.push("not_selected");
-    }
-    reason_codes.sort_unstable();
-    reason_codes.dedup();
-
-    let reason = reason_codes.join(",");
-    let raw = format!(
-        "endpoint={} unavailable reason={} model={}",
-        provider_endpoint.stable_key(),
-        reason,
-        request_model.unwrap_or("-")
-    );
-
     let mut attempt = RouteAttemptLog {
         attempt_index: 0,
         provider_id: Some(candidate.provider_id.clone()),
@@ -214,38 +201,17 @@ fn route_unavailable_attempt(
         provider_endpoint_key: Some(provider_endpoint.stable_key()),
         preference_group: Some(candidate.preference_group),
         route_path: candidate.route_path.clone(),
-        station_name: candidate
-            .compatibility_station_name
-            .as_ref()
-            .or(template.compatibility_station_name.as_ref())
-            .cloned(),
-        upstream_base_url: Some(candidate.base_url.clone()),
-        upstream_index: candidate.compatibility_upstream_index,
         avoided_candidate_indices: route_state.route_avoid_candidate_indices(template),
         avoided_total: Some(route_state.avoided_total()),
         total_upstreams: Some(template.candidates.len()),
         decision: "route_unavailable".to_string(),
-        reason: Some(reason),
         error_class: Some("route_unavailable".to_string()),
         model: request_model.map(ToOwned::to_owned),
         skipped: true,
-        raw,
         ..Default::default()
     };
     attempt.refresh_code();
     attempt
-}
-
-fn reason_counts_for_log(route_attempts: &[RouteAttemptLog]) -> serde_json::Value {
-    let mut counts = std::collections::BTreeMap::<String, usize>::new();
-    for attempt in route_attempts {
-        if let Some(reason) = attempt.reason.as_deref() {
-            for code in reason.split(',').filter(|code| !code.is_empty()) {
-                *counts.entry(code.to_string()).or_default() += 1;
-            }
-        }
-    }
-    serde_json::to_value(counts).unwrap_or(serde_json::Value::Null)
 }
 
 fn codex_stream_response(

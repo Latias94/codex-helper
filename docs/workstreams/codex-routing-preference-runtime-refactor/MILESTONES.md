@@ -1,5 +1,11 @@
 # Milestones: Codex Routing Preference Runtime
 
+> Historical status (superseded 2026-07-13): these milestones describe the
+> intermediate route-preference and schema-migration workstream, not the current
+> compatibility or runtime contract. See
+> [Configuration](../../CONFIGURATION.md) and the
+> [canonical relay/runtime modernization plan](../../plans/2026-07-10-002-refactor-canonical-relay-runtime-modernization-plan.md).
+
 ## P0 - Workstream Shape
 
 - [x] Define the runtime preference problem.

@@ -10,11 +10,10 @@ use crate::tui::ProviderOption;
 use crate::tui::i18n;
 use crate::tui::model::{
     Palette, Snapshot, balance_snapshot_status_style, basename, duration_short, format_age,
-    format_observed_client_identity, format_tok_per_second, now_ms, request_cache_hit_rate_label,
-    session_control_posture_lang, session_observation_scope_label_lang,
-    session_observed_provider_balance_brief_lang, session_observed_provider_balance_snapshot,
-    session_row_has_any_override, session_transcript_host_status_lang, short_sid, shorten,
-    shorten_middle, status_style, tokens_short, usage_line_lang,
+    format_observed_client_identity, format_tok_per_second, now_ms, session_control_posture_lang,
+    session_observation_scope_label_lang, session_observed_provider_balance_brief_lang,
+    session_observed_provider_balance_snapshot, session_transcript_host_status_lang, short_sid,
+    shorten, shorten_middle, status_style, tokens_short, usage_line_lang,
 };
 use crate::tui::state::UiState;
 use crate::tui::types::{Focus, Overlay};
@@ -123,33 +122,12 @@ fn render_sessions_panel(
                     Style::default().fg(p.good).add_modifier(Modifier::BOLD),
                 ));
             }
-            if r.override_effort.is_some() {
-                badges.push(Span::styled("E", Style::default().fg(p.accent)));
-            }
-            if r.override_station_name.is_some() {
-                badges.push(Span::styled("C", Style::default().fg(p.accent)));
-            }
-            if r.override_route_target.is_some() {
-                badges.push(Span::styled("R", Style::default().fg(p.accent)));
-            }
-            if r.override_model.is_some() {
-                badges.push(Span::styled("M", Style::default().fg(p.accent)));
-            }
-            if r.override_service_tier.is_some() {
-                badges.push(Span::styled("T", Style::default().fg(p.accent)));
-            }
-
             let mut session_spans = vec![Span::styled(sid, Style::default().fg(p.text))];
             for b in badges {
                 session_spans.push(Span::raw(" "));
                 session_spans.push(Span::raw("["));
                 session_spans.push(b);
                 session_spans.push(Span::raw("]"));
-            }
-
-            let mut row_style = Style::default().fg(p.text).bg(p.panel);
-            if session_row_has_any_override(r) {
-                row_style = row_style.add_modifier(Modifier::ITALIC);
             }
 
             Row::new(vec![
@@ -161,7 +139,7 @@ fn render_sessions_panel(
                 Cell::from(Line::from(vec![tok])),
                 Cell::from(Line::from(vec![tok_per_second])),
             ])
-            .style(row_style)
+            .style(Style::default().fg(p.text).bg(p.panel))
         })
         .collect::<Vec<_>>();
 
@@ -247,21 +225,6 @@ fn render_session_details(
         })
         .unwrap_or_else(|| "-".to_string());
 
-    let override_effort = selected
-        .and_then(|r| r.override_effort.as_deref())
-        .unwrap_or("-");
-    let override_station = selected
-        .and_then(|r| r.override_station_name.as_deref())
-        .unwrap_or("-");
-    let override_route_target = selected
-        .and_then(|r| r.override_route_target.as_deref())
-        .unwrap_or("-");
-    let override_model = selected
-        .and_then(|r| r.override_model.as_deref())
-        .unwrap_or("-");
-    let override_service_tier = selected
-        .and_then(|r| r.override_service_tier.as_deref())
-        .unwrap_or("-");
     let binding = selected
         .and_then(|r| r.binding_profile_name.as_deref())
         .unwrap_or("-");
@@ -269,7 +232,7 @@ fn render_session_details(
         .and_then(|r| r.last_model.as_deref())
         .unwrap_or("-");
     let provider = selected
-        .and_then(|r| r.last_provider_id.as_deref())
+        .and_then(|r| r.observed_provider_id())
         .unwrap_or("-");
     let balance = selected.and_then(|r| {
         session_observed_provider_balance_brief_lang(r, &snapshot.provider_balances, 56, lang)
@@ -281,21 +244,22 @@ fn render_session_details(
         Some(balance) => balance.to_string(),
         None => provider.to_string(),
     };
-    let station = selected
-        .and_then(|r| r.last_station_name.as_deref())
+    let endpoint = selected
+        .and_then(|r| r.observed_endpoint_id())
         .unwrap_or("-");
     let effort = selected
-        .and_then(|r| r.override_effort.as_deref())
-        .or_else(|| selected.and_then(|r| r.last_reasoning_effort.as_deref()))
+        .and_then(|r| {
+            r.effective_reasoning_effort
+                .as_ref()
+                .map(|value| value.value.as_str())
+                .or(r.last_reasoning_effort.as_deref())
+        })
         .unwrap_or("-");
     let service_tier = selected
         .and_then(|r| {
-            r.override_service_tier
-                .as_deref()
-                .or(r
-                    .effective_service_tier
-                    .as_ref()
-                    .map(|value| value.value.as_str()))
+            r.effective_service_tier
+                .as_ref()
+                .map(|value| value.value.as_str())
                 .or(r.last_service_tier.as_deref())
         })
         .unwrap_or("-");
@@ -326,15 +290,8 @@ fn render_session_details(
         .filter(|u| u.total_tokens > 0)
         .map(|usage| usage_line_lang(usage, lang))
         .unwrap_or_else(|| format!("{}: -", l("tok in/out/rsn/ttl")));
-    let posture = selected.map(|row| {
-        session_control_posture_lang(
-            row,
-            snapshot.global_station_override.as_deref(),
-            snapshot.global_route_target_override.as_deref(),
-            ui.uses_route_graph_routing(),
-            lang,
-        )
-    });
+    let posture =
+        selected.map(|row| session_control_posture_lang(row, ui.uses_route_graph_routing(), lang));
 
     let lines = vec![
         kv_line(
@@ -395,48 +352,21 @@ fn render_session_details(
         ),
         kv_line(
             p,
-            l("station"),
-            station.to_string(),
+            l("endpoint"),
+            endpoint.to_string(),
             Style::default().fg(p.text),
         ),
         kv_line(
             p,
             l("effort"),
             effort.to_string(),
-            Style::default().fg(if override_effort != "-" {
-                p.accent
-            } else {
-                p.text
-            }),
+            Style::default().fg(p.text),
         ),
         kv_line(
             p,
             l("service_tier"),
             service_tier.to_string(),
-            Style::default().fg(if override_service_tier != "-" {
-                p.accent
-            } else {
-                p.text
-            }),
-        ),
-        kv_line(
-            p,
-            l("override"),
-            format!(
-                "model={override_model}, effort={override_effort}, station={override_station}, route_target={override_route_target}, tier={override_service_tier}"
-            ),
-            Style::default().fg(
-                if override_model != "-"
-                    || override_effort != "-"
-                    || override_station != "-"
-                    || override_route_target != "-"
-                    || override_service_tier != "-"
-                {
-                    p.accent
-                } else {
-                    p.muted
-                },
-            ),
+            Style::default().fg(p.text),
         ),
         kv_line(
             p,
@@ -509,7 +439,7 @@ fn render_requests_panel(
             let Some(selected_row) = selected_row else {
                 return true;
             };
-            match (&selected_row.session_id, &r.session_id) {
+            match (&selected_row.session_id, &r.session_key) {
                 (Some(sid), Some(rid)) => sid == rid,
                 (Some(_), None) => false,
                 (None, Some(_)) => false,
@@ -550,7 +480,7 @@ fn render_requests_panel(
                 r.status_code.to_string(),
                 status_style(p, Some(r.status_code)),
             );
-            let observability = r.observability_view();
+            let observability = &r.observability;
             let ttfb = observability
                 .ttfb_ms
                 .map(duration_short)
@@ -563,13 +493,9 @@ fn render_requests_panel(
             let output = usage
                 .map(|u| tokens_short(u.output_tokens))
                 .unwrap_or_else(|| "-".to_string());
-            let cache_read = usage
-                .map(|u| tokens_short(u.cache_read_tokens_total()))
-                .unwrap_or_else(|| "-".to_string());
-            let cache_new = usage
-                .map(|u| tokens_short(u.cache_creation_tokens_total()))
-                .unwrap_or_else(|| "-".to_string());
-            let cache_hit = request_cache_hit_rate_label(r);
+            let cache_read = "-";
+            let cache_new = "-";
+            let cache_hit = "-";
             let total_tokens = usage
                 .map(|u| tokens_short(u.total_tokens))
                 .unwrap_or_else(|| "-".to_string());
@@ -585,11 +511,7 @@ fn render_requests_panel(
             if show_cache_hit {
                 cells.push(Cell::from(Span::styled(
                     cache_hit,
-                    Style::default().fg(if r.cache_hit_rate().is_some() {
-                        p.accent
-                    } else {
-                        p.muted
-                    }),
+                    Style::default().fg(p.muted),
                 )));
             }
             cells.extend([

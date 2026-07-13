@@ -18,10 +18,15 @@ fn is_hop_by_hop_header(name_lower: &str) -> bool {
 }
 
 fn is_request_header_to_strip(name_lower: &str) -> bool {
-    name_lower == "host"
-        || name_lower == "content-length"
-        || name_lower == "user-agent"
-        || is_hop_by_hop_header(name_lower)
+    matches!(
+        name_lower,
+        "host"
+            | "content-length"
+            | "user-agent"
+            | "cookie"
+            | "x-forwarded-api-key"
+            | "x-codex-helper-admin-token"
+    ) || is_hop_by_hop_header(name_lower)
 }
 
 fn hop_by_hop_connection_tokens(headers: &HeaderMap) -> Vec<String> {
@@ -64,7 +69,7 @@ pub(super) fn filter_response_headers(src: &HeaderMap) -> HeaderMap {
         let name_lower = name.as_str().to_ascii_lowercase();
         if is_hop_by_hop_header(&name_lower)
             || name_lower == "content-length"
-            || name_lower == "content-encoding"
+            || name_lower == "set-cookie"
         {
             continue;
         }
@@ -85,6 +90,7 @@ pub(super) fn header_map_to_entries(headers: &HeaderMap) -> Vec<HeaderEntry> {
                 | "cookie"
                 | "set-cookie"
                 | "x-api-key"
+                | "x-codex-helper-admin-token"
                 | "x-forwarded-api-key"
                 | "x-goog-api-key"
         )
@@ -125,6 +131,15 @@ mod tests {
         headers.insert("keep-alive", HeaderValue::from_static("timeout=5"));
         headers.insert("x-remove-me", HeaderValue::from_static("drop"));
         headers.insert("authorization", HeaderValue::from_static("Bearer secret"));
+        headers.insert("cookie", HeaderValue::from_static("session=secret"));
+        headers.insert(
+            "x-forwarded-api-key",
+            HeaderValue::from_static("forwarded-secret"),
+        );
+        headers.insert(
+            "x-codex-helper-admin-token",
+            HeaderValue::from_static("admin-secret"),
+        );
         headers.insert("x-keep-me", HeaderValue::from_static("ok"));
 
         let filtered = filter_request_headers(&headers);
@@ -135,6 +150,9 @@ mod tests {
         assert!(!filtered.contains_key("connection"));
         assert!(!filtered.contains_key("keep-alive"));
         assert!(!filtered.contains_key("x-remove-me"));
+        assert!(!filtered.contains_key("cookie"));
+        assert!(!filtered.contains_key("x-forwarded-api-key"));
+        assert!(!filtered.contains_key("x-codex-helper-admin-token"));
         assert_eq!(
             filtered.get("authorization"),
             Some(&HeaderValue::from_static("Bearer secret"))
@@ -146,22 +164,30 @@ mod tests {
     }
 
     #[test]
-    fn response_header_filter_removes_encoding_length_and_connection_targets() {
+    fn response_header_filter_preserves_encoding_and_removes_framing_headers() {
         let mut headers = HeaderMap::new();
         headers.insert("content-length", HeaderValue::from_static("321"));
         headers.insert("content-encoding", HeaderValue::from_static("gzip"));
         headers.insert("connection", HeaderValue::from_static("x-remove-me"));
         headers.insert("x-remove-me", HeaderValue::from_static("drop"));
         headers.insert("transfer-encoding", HeaderValue::from_static("chunked"));
+        headers.insert(
+            "set-cookie",
+            HeaderValue::from_static("session=upstream-secret"),
+        );
         headers.insert("content-type", HeaderValue::from_static("application/json"));
 
         let filtered = filter_response_headers(&headers);
 
         assert!(!filtered.contains_key("content-length"));
-        assert!(!filtered.contains_key("content-encoding"));
+        assert_eq!(
+            filtered.get("content-encoding"),
+            Some(&HeaderValue::from_static("gzip"))
+        );
         assert!(!filtered.contains_key("connection"));
         assert!(!filtered.contains_key("transfer-encoding"));
         assert!(!filtered.contains_key("x-remove-me"));
+        assert!(!filtered.contains_key("set-cookie"));
         assert_eq!(
             filtered.get("content-type"),
             Some(&HeaderValue::from_static("application/json"))
@@ -173,6 +199,10 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", HeaderValue::from_static("Bearer secret"));
         headers.insert("x-api-key", HeaderValue::from_static("secret-key"));
+        headers.insert(
+            "x-codex-helper-admin-token",
+            HeaderValue::from_static("admin-secret"),
+        );
         headers.insert("content-type", HeaderValue::from_static("application/json"));
 
         let entries = header_map_to_entries(&headers);
@@ -182,6 +212,12 @@ mod tests {
         }));
         assert!(entries.iter().any(|entry| {
             entry.name.eq_ignore_ascii_case("x-api-key") && entry.value == "[REDACTED]"
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry
+                .name
+                .eq_ignore_ascii_case("x-codex-helper-admin-token")
+                && entry.value == "[REDACTED]"
         }));
         assert!(entries.iter().any(|entry| {
             entry.name.eq_ignore_ascii_case("content-type") && entry.value == "application/json"

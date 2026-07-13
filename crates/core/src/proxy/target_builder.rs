@@ -1,23 +1,21 @@
 use anyhow::{Result, anyhow};
-use axum::http::{HeaderMap, Uri};
-
-use crate::config::UpstreamConfig;
+use axum::http::Uri;
 
 use super::ProxyService;
-use super::attempt_target::AttemptTarget;
+use crate::routing_ir::CapturedRouteCandidate;
 
 impl ProxyService {
     pub(super) fn build_target(
         &self,
-        target: &AttemptTarget,
+        target: &CapturedRouteCandidate,
         uri: &Uri,
-    ) -> Result<(reqwest::Url, HeaderMap)> {
-        build_target_impl(target.upstream(), uri)
+    ) -> Result<reqwest::Url> {
+        build_target_impl(target.base_url(), uri)
     }
 }
 
-fn build_target_impl(upstream: &UpstreamConfig, uri: &Uri) -> Result<(reqwest::Url, HeaderMap)> {
-    let base = upstream.base_url.trim_end_matches('/').to_string();
+fn build_target_impl(base_url: &str, uri: &Uri) -> Result<reqwest::Url> {
+    let base = base_url.trim_end_matches('/').to_string();
 
     let base_url =
         reqwest::Url::parse(&base).map_err(|e| anyhow!("invalid upstream base_url {base}: {e}"))?;
@@ -47,49 +45,27 @@ fn build_target_impl(upstream: &UpstreamConfig, uri: &Uri) -> Result<(reqwest::U
     };
 
     let full = format!("{base}{path_and_query}");
-    let url =
-        reqwest::Url::parse(&full).map_err(|e| anyhow!("invalid upstream url {full}: {e}"))?;
-
-    // ensure query preserved (Url::parse already includes it)
-    let headers = HeaderMap::new();
-    Ok((url, headers))
+    reqwest::Url::parse(&full).map_err(|e| anyhow!("invalid upstream url {full}: {e}"))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
-    use crate::config::{UpstreamAuth, UpstreamConfig};
-
     use super::*;
-
-    fn upstream(base_url: &str) -> UpstreamConfig {
-        UpstreamConfig {
-            base_url: base_url.to_string(),
-            auth: UpstreamAuth::default(),
-            tags: HashMap::new(),
-            supported_models: HashMap::new(),
-            model_mapping: HashMap::new(),
-        }
-    }
 
     #[test]
     fn build_target_strips_duplicate_base_path_prefix() {
-        let upstream = upstream("https://api.example.com/v1");
         let uri: Uri = "/v1/responses".parse().expect("uri");
 
-        let (url, headers) = build_target_impl(&upstream, &uri).expect("target");
+        let url = build_target_impl("https://api.example.com/v1", &uri).expect("target");
 
         assert_eq!(url.as_str(), "https://api.example.com/v1/responses");
-        assert!(headers.is_empty());
     }
 
     #[test]
     fn build_target_preserves_query_string() {
-        let upstream = upstream("https://api.example.com/v1/");
         let uri: Uri = "/responses?stream=true".parse().expect("uri");
 
-        let (url, _) = build_target_impl(&upstream, &uri).expect("target");
+        let url = build_target_impl("https://api.example.com/v1/", &uri).expect("target");
 
         assert_eq!(
             url.as_str(),
@@ -99,10 +75,9 @@ mod tests {
 
     #[test]
     fn build_target_does_not_strip_partial_prefix_match() {
-        let upstream = upstream("https://api.example.com/v1");
         let uri: Uri = "/v12/responses".parse().expect("uri");
 
-        let (url, _) = build_target_impl(&upstream, &uri).expect("target");
+        let url = build_target_impl("https://api.example.com/v1", &uri).expect("target");
 
         assert_eq!(url.as_str(), "https://api.example.com/v1/v12/responses");
     }

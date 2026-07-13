@@ -3,9 +3,11 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::file_replace::write_text_file;
-use crate::usage::{CacheInputAccounting, UsageMetrics};
+use crate::provider_catalog::{ProviderCatalogEpoch, ProviderPriceKey, ProviderPricingTier};
+use crate::usage::{CacheAccountingConvention, EconomicsStatus, UsageMetrics};
 
 const BASELLM_ALL_JSON_URL: &str = "https://basellm.github.io/llm-metadata/api/all.json";
 const FEMTO_USD_PER_USD: i128 = 1_000_000_000_000_000;
@@ -154,7 +156,7 @@ impl CostAdjustments {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CostBreakdown {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_cost_usd: Option<String>,
@@ -177,6 +179,69 @@ pub struct CostBreakdown {
     #[serde(skip)]
     total_cost_femto_usd: Option<i128>,
 }
+
+#[derive(Deserialize)]
+struct CostBreakdownWire {
+    #[serde(default)]
+    input_cost_usd: Option<String>,
+    #[serde(default)]
+    output_cost_usd: Option<String>,
+    #[serde(default)]
+    cache_read_cost_usd: Option<String>,
+    #[serde(default)]
+    cache_creation_cost_usd: Option<String>,
+    #[serde(default)]
+    service_tier_multiplier: Option<String>,
+    #[serde(default)]
+    provider_cost_multiplier: Option<String>,
+    #[serde(default)]
+    total_cost_usd: Option<String>,
+    #[serde(default)]
+    confidence: CostConfidence,
+    #[serde(default)]
+    pricing_source: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for CostBreakdown {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = CostBreakdownWire::deserialize(deserializer)?;
+        let total_cost_femto_usd = wire
+            .total_cost_usd
+            .as_deref()
+            .and_then(parse_decimal_usd_to_femto);
+        Ok(Self {
+            input_cost_usd: wire.input_cost_usd,
+            output_cost_usd: wire.output_cost_usd,
+            cache_read_cost_usd: wire.cache_read_cost_usd,
+            cache_creation_cost_usd: wire.cache_creation_cost_usd,
+            service_tier_multiplier: wire.service_tier_multiplier,
+            provider_cost_multiplier: wire.provider_cost_multiplier,
+            total_cost_usd: wire.total_cost_usd,
+            confidence: wire.confidence,
+            pricing_source: wire.pricing_source,
+            total_cost_femto_usd,
+        })
+    }
+}
+
+impl PartialEq for CostBreakdown {
+    fn eq(&self, other: &Self) -> bool {
+        self.input_cost_usd == other.input_cost_usd
+            && self.output_cost_usd == other.output_cost_usd
+            && self.cache_read_cost_usd == other.cache_read_cost_usd
+            && self.cache_creation_cost_usd == other.cache_creation_cost_usd
+            && self.service_tier_multiplier == other.service_tier_multiplier
+            && self.provider_cost_multiplier == other.provider_cost_multiplier
+            && self.total_cost_usd == other.total_cost_usd
+            && self.confidence == other.confidence
+            && self.pricing_source == other.pricing_source
+    }
+}
+
+impl Eq for CostBreakdown {}
 
 impl Default for CostBreakdown {
     fn default() -> Self {
@@ -313,24 +378,26 @@ pub struct BillableTokenUsage {
     pub output_tokens: i64,
     pub cache_read_input_tokens: i64,
     pub cache_creation_input_tokens: i64,
+    pub economics_status: EconomicsStatus,
 }
 
 impl BillableTokenUsage {
     pub fn from_usage(usage: &UsageMetrics) -> Self {
-        Self::from_usage_with_accounting(usage, CacheInputAccounting::default())
+        Self::from_usage_with_convention(usage, CacheAccountingConvention::UNKNOWN)
     }
 
-    pub fn from_usage_with_accounting(
+    pub fn from_usage_with_convention(
         usage: &UsageMetrics,
-        accounting: CacheInputAccounting,
+        convention: CacheAccountingConvention,
     ) -> Self {
-        let breakdown = usage.cache_usage_breakdown(accounting);
+        let buckets = usage.canonical_usage_buckets(convention);
 
         Self {
-            input_tokens: breakdown.effective_input_tokens,
+            input_tokens: buckets.ordinary_input_tokens,
             output_tokens: usage.output_tokens.max(0),
-            cache_read_input_tokens: breakdown.cache_read_input_tokens,
-            cache_creation_input_tokens: breakdown.cache_creation_input_tokens,
+            cache_read_input_tokens: buckets.cache_read_input_tokens,
+            cache_creation_input_tokens: buckets.cache_write_input_tokens,
+            economics_status: buckets.status,
         }
     }
 }
@@ -603,6 +670,39 @@ pub struct ModelPriceCatalog {
     aliases: BTreeMap<String, String>,
 }
 
+/// Immutable operator pricing facts captured for one logical request.
+#[derive(Debug, Clone)]
+pub struct CapturedModelPriceCatalog {
+    catalog: ModelPriceCatalog,
+    source: String,
+    revision: String,
+}
+
+impl CapturedModelPriceCatalog {
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    pub fn revision(&self) -> &str {
+        &self.revision
+    }
+
+    pub fn snapshot(&self) -> ModelPriceCatalogSnapshot {
+        self.catalog.snapshot(self.source.clone())
+    }
+
+    pub fn estimate_usage_cost_with_convention(
+        &self,
+        model: &str,
+        usage: &UsageMetrics,
+        adjustments: CostAdjustments,
+        convention: CacheAccountingConvention,
+    ) -> CostBreakdown {
+        self.catalog
+            .estimate_usage_cost_with_convention(model, usage, adjustments, convention)
+    }
+}
+
 impl ModelPriceCatalog {
     pub fn new() -> Self {
         Self::default()
@@ -644,25 +744,23 @@ impl ModelPriceCatalog {
         usage: &UsageMetrics,
         adjustments: CostAdjustments,
     ) -> CostBreakdown {
-        self.estimate_usage_cost_with_accounting(
-            model,
-            usage,
-            adjustments,
-            CacheInputAccounting::default(),
-        )
+        let Some(price) = self.price_for_model(model) else {
+            return CostBreakdown::unknown();
+        };
+        estimate_usage_cost(usage, price, adjustments)
     }
 
-    pub fn estimate_usage_cost_with_accounting(
+    pub fn estimate_usage_cost_with_convention(
         &self,
         model: &str,
         usage: &UsageMetrics,
         adjustments: CostAdjustments,
-        accounting: CacheInputAccounting,
+        convention: CacheAccountingConvention,
     ) -> CostBreakdown {
         let Some(price) = self.price_for_model(model) else {
             return CostBreakdown::unknown();
         };
-        estimate_usage_cost_with_accounting(usage, price, adjustments, accounting)
+        estimate_usage_cost_with_convention(usage, price, adjustments, convention)
     }
 
     pub fn len(&self) -> usize {
@@ -959,14 +1057,50 @@ pub fn validate_model_price_overrides_document(
 }
 
 fn build_operator_model_price_catalog() -> (ModelPriceCatalog, String) {
-    match load_model_price_overrides_from_disk() {
-        Ok(overrides) => build_operator_model_price_catalog_with_overrides(overrides),
+    match try_capture_operator_model_price_catalog() {
+        Ok(captured) => return (captured.catalog, captured.source),
         Err(err) => {
             static WARNED: OnceLock<()> = OnceLock::new();
             WARNED.get_or_init(|| {
                 tracing::warn!("failed to load model price overrides: {err}");
             });
-            (bundled_model_price_catalog().clone(), "bundled".to_string())
+        }
+    }
+    (bundled_model_price_catalog().clone(), "bundled".to_string())
+}
+
+pub fn try_capture_operator_model_price_catalog() -> Result<CapturedModelPriceCatalog, String> {
+    let overrides = load_model_price_overrides_from_disk()?;
+    let (catalog, source) = build_operator_model_price_catalog_with_overrides(overrides);
+    let snapshot = catalog.snapshot(source.clone());
+    let encoded = serde_json::to_vec(&snapshot)
+        .map_err(|error| format!("failed to encode operator pricing catalog: {error}"))?;
+    let revision = format!("sha256:{:x}", Sha256::digest(encoded));
+    Ok(CapturedModelPriceCatalog {
+        catalog,
+        source,
+        revision,
+    })
+}
+
+pub fn capture_operator_model_price_catalog() -> CapturedModelPriceCatalog {
+    match try_capture_operator_model_price_catalog() {
+        Ok(captured) => captured,
+        Err(err) => {
+            static WARNED: OnceLock<()> = OnceLock::new();
+            WARNED.get_or_init(|| {
+                tracing::warn!("failed to load model price overrides: {err}");
+            });
+            let (catalog, source) = (bundled_model_price_catalog().clone(), "bundled".to_string());
+            let snapshot = catalog.snapshot(source.clone());
+            let encoded =
+                serde_json::to_vec(&snapshot).unwrap_or_else(|_| source.as_bytes().to_vec());
+            let revision = format!("sha256:{:x}", Sha256::digest(encoded));
+            CapturedModelPriceCatalog {
+                catalog,
+                source,
+                revision,
+            }
         }
     }
 }
@@ -981,39 +1115,24 @@ pub fn estimate_request_cost_from_operator_catalog(
     usage: Option<&UsageMetrics>,
     adjustments: CostAdjustments,
 ) -> CostBreakdown {
-    estimate_request_cost_from_operator_catalog_with_accounting(
-        model,
-        usage,
-        adjustments,
-        CacheInputAccounting::default(),
-    )
+    let (Some(model), Some(usage)) = (model, usage) else {
+        return CostBreakdown::unknown();
+    };
+    let (catalog, _) = build_operator_model_price_catalog();
+    catalog.estimate_usage_cost(model, usage, adjustments)
 }
 
-pub fn estimate_request_cost_from_operator_catalog_for_service(
+pub fn estimate_request_cost_from_operator_catalog_with_convention(
     model: Option<&str>,
     usage: Option<&UsageMetrics>,
     adjustments: CostAdjustments,
-    service: &str,
-) -> CostBreakdown {
-    estimate_request_cost_from_operator_catalog_with_accounting(
-        model,
-        usage,
-        adjustments,
-        CacheInputAccounting::for_service(service),
-    )
-}
-
-pub fn estimate_request_cost_from_operator_catalog_with_accounting(
-    model: Option<&str>,
-    usage: Option<&UsageMetrics>,
-    adjustments: CostAdjustments,
-    accounting: CacheInputAccounting,
+    convention: CacheAccountingConvention,
 ) -> CostBreakdown {
     let (Some(model), Some(usage)) = (model, usage) else {
         return CostBreakdown::unknown();
     };
     let (catalog, _) = build_operator_model_price_catalog();
-    catalog.estimate_usage_cost_with_accounting(model, usage, adjustments, accounting)
+    catalog.estimate_usage_cost_with_convention(model, usage, adjustments, convention)
 }
 
 pub fn estimate_request_cost_from_bundled_catalog(
@@ -1021,28 +1140,76 @@ pub fn estimate_request_cost_from_bundled_catalog(
     usage: Option<&UsageMetrics>,
     adjustments: CostAdjustments,
 ) -> CostBreakdown {
-    estimate_request_cost_from_bundled_catalog_with_accounting(
-        model,
-        usage,
-        adjustments,
-        CacheInputAccounting::default(),
-    )
+    let (Some(model), Some(usage)) = (model, usage) else {
+        return CostBreakdown::unknown();
+    };
+    bundled_model_price_catalog().estimate_usage_cost(model, usage, adjustments)
 }
 
-pub fn estimate_request_cost_from_bundled_catalog_with_accounting(
+pub fn estimate_request_cost_from_bundled_catalog_with_convention(
     model: Option<&str>,
     usage: Option<&UsageMetrics>,
     adjustments: CostAdjustments,
-    accounting: CacheInputAccounting,
+    convention: CacheAccountingConvention,
 ) -> CostBreakdown {
     let (Some(model), Some(usage)) = (model, usage) else {
         return CostBreakdown::unknown();
     };
-    bundled_model_price_catalog().estimate_usage_cost_with_accounting(
+    bundled_model_price_catalog().estimate_usage_cost_with_convention(
         model,
         usage,
         adjustments,
-        accounting,
+        convention,
+    )
+}
+
+pub fn estimate_usage_cost_from_provider_epoch(
+    epoch: &ProviderCatalogEpoch,
+    model: &str,
+    tier: ProviderPricingTier,
+    usage: &UsageMetrics,
+) -> CostBreakdown {
+    let key = epoch.capture_price_key(model, tier);
+    estimate_usage_cost_from_captured_provider_price(epoch, &key, usage)
+}
+
+pub fn estimate_usage_cost_from_captured_provider_price(
+    epoch: &ProviderCatalogEpoch,
+    key: &ProviderPriceKey,
+    usage: &UsageMetrics,
+) -> CostBreakdown {
+    let Some(quote) = epoch.price_quote(key) else {
+        return CostBreakdown::unknown();
+    };
+    let prices = quote.prices_per_million();
+    let (Some(input), Some(cache_read), Some(cache_write), Some(output)) = (
+        prices.input_usd(),
+        prices.cache_read_usd(),
+        prices.cache_write_usd(),
+        prices.output_usd(),
+    ) else {
+        return unknown_with_source(&quote.source_label());
+    };
+    let Some(mut price) = ModelPrice::from_per_million_usd(
+        key.model(),
+        epoch
+            .model(key.model())
+            .map(|model| model.display_name().to_string()),
+        input,
+        output,
+        Some(cache_read),
+        Some(cache_write),
+        quote.source_label(),
+    ) else {
+        return unknown_with_source(&quote.source_label());
+    };
+    price.confidence = CostConfidence::Exact;
+
+    estimate_usage_cost_with_convention(
+        usage,
+        &price,
+        CostAdjustments::default(),
+        quote.cache_accounting_convention(),
     )
 }
 
@@ -1051,16 +1218,30 @@ pub fn estimate_usage_cost(
     price: &ModelPrice,
     adjustments: CostAdjustments,
 ) -> CostBreakdown {
-    estimate_usage_cost_with_accounting(usage, price, adjustments, CacheInputAccounting::default())
+    estimate_billable_usage_cost(BillableTokenUsage::from_usage(usage), price, adjustments)
 }
 
-pub fn estimate_usage_cost_with_accounting(
+pub fn estimate_usage_cost_with_convention(
     usage: &UsageMetrics,
     price: &ModelPrice,
     adjustments: CostAdjustments,
-    accounting: CacheInputAccounting,
+    convention: CacheAccountingConvention,
 ) -> CostBreakdown {
-    let billable = BillableTokenUsage::from_usage_with_accounting(usage, accounting);
+    estimate_billable_usage_cost(
+        BillableTokenUsage::from_usage_with_convention(usage, convention),
+        price,
+        adjustments,
+    )
+}
+
+fn estimate_billable_usage_cost(
+    billable: BillableTokenUsage,
+    price: &ModelPrice,
+    adjustments: CostAdjustments,
+) -> CostBreakdown {
+    if billable.economics_status != EconomicsStatus::Complete {
+        return unknown_with_source(&price.source);
+    }
 
     let Some(cache_read_price) = required_price(
         billable.cache_read_input_tokens,
@@ -1306,6 +1487,170 @@ fn format_femto_usd(value: i128) -> String {
 mod tests {
     use super::*;
 
+    use crate::provider_catalog::{
+        AccountFingerprint, OPENAI_GPT_5_6_PRICING_REVISION, ProviderAdapter, ProviderCatalogEpoch,
+        ProviderCatalogScope, ProviderPricingTier,
+    };
+
+    fn openai_codex_epoch(seed: u8, endpoint: &str) -> ProviderCatalogEpoch {
+        let scope = ProviderCatalogScope::new(
+            ProviderAdapter::OpenAiCodex,
+            endpoint,
+            "route:codex",
+            AccountFingerprint::from_digest([seed; 32]),
+            "sha256:test-config",
+        )
+        .expect("valid OpenAI Codex scope");
+        ProviderCatalogEpoch::bundled_openai_codex(scope).expect("OpenAI Codex epoch")
+    }
+
+    #[test]
+    fn provider_epoch_standard_price_bills_exclusive_gpt_5_6_cache_buckets_once() {
+        let epoch = openai_codex_epoch(1, "https://api.openai.com/v1");
+        let usage = crate::usage::extract_usage_from_bytes(
+            br#"{"usage":{"input_tokens":1000,"output_tokens":50,"input_tokens_details":{"cached_tokens":100,"cache_write_tokens":200}}}"#,
+        )
+        .expect("usage");
+
+        let cost = estimate_usage_cost_from_provider_epoch(
+            &epoch,
+            "gpt-5.6-sol",
+            ProviderPricingTier::Standard,
+            &usage,
+        );
+
+        assert_eq!(cost.input_cost_usd.as_deref(), Some("0.0035"));
+        assert_eq!(cost.cache_read_cost_usd.as_deref(), Some("0.00005"));
+        assert_eq!(cost.cache_creation_cost_usd.as_deref(), Some("0.00125"));
+        assert_eq!(cost.output_cost_usd.as_deref(), Some("0.0015"));
+        assert_eq!(cost.total_cost_usd.as_deref(), Some("0.0063"));
+        assert_eq!(cost.confidence, CostConfidence::Exact);
+        assert!(
+            cost.pricing_source
+                .as_deref()
+                .is_some_and(|source| source.contains(OPENAI_GPT_5_6_PRICING_REVISION))
+        );
+    }
+
+    #[test]
+    fn provider_epoch_explicit_zero_cache_write_is_known_zero_not_missing() {
+        let epoch = openai_codex_epoch(1, "https://api.openai.com/v1");
+        let usage = crate::usage::extract_usage_from_bytes(
+            br#"{"usage":{"input_tokens":1000,"output_tokens":50,"input_tokens_details":{"cached_tokens":100,"cache_write_tokens":0}}}"#,
+        )
+        .expect("usage");
+
+        let cost = estimate_usage_cost_from_provider_epoch(
+            &epoch,
+            "gpt-5.6-sol",
+            ProviderPricingTier::Standard,
+            &usage,
+        );
+
+        assert_eq!(cost.input_cost_usd.as_deref(), Some("0.0045"));
+        assert_eq!(cost.cache_read_cost_usd.as_deref(), Some("0.00005"));
+        assert_eq!(cost.cache_creation_cost_usd, None);
+        assert_eq!(cost.output_cost_usd.as_deref(), Some("0.0015"));
+        assert_eq!(cost.total_cost_usd.as_deref(), Some("0.00605"));
+        assert_eq!(cost.confidence, CostConfidence::Exact);
+    }
+
+    #[test]
+    fn provider_epoch_rejects_sse_usage_with_prior_cache_conflict() {
+        let epoch = openai_codex_epoch(1, "https://api.openai.com/v1");
+        let sse = concat!(
+            "data: {\"usage\":{\"input_tokens\":1000,\"output_tokens\":50,\"input_tokens_details\":{\"cached_tokens\":100,\"cache_write_tokens\":0},\"cache_write_tokens\":200}}\n\n",
+            "data: {\"usage\":{\"input_tokens\":1000,\"output_tokens\":50,\"input_tokens_details\":{\"cached_tokens\":100,\"cache_write_tokens\":0}}}\n\n"
+        );
+        let usage = crate::usage::extract_usage_from_sse_bytes(sse.as_bytes()).expect("usage");
+
+        let cost = estimate_usage_cost_from_provider_epoch(
+            &epoch,
+            "gpt-5.6-sol",
+            ProviderPricingTier::Standard,
+            &usage,
+        );
+
+        assert!(cost.is_unknown());
+        assert_eq!(cost.confidence, CostConfidence::Unknown);
+        assert_eq!(cost.total_cost_usd, None);
+    }
+
+    #[test]
+    fn provider_epoch_priority_price_uses_priority_row_without_multiplier_fallback() {
+        let epoch = openai_codex_epoch(1, "https://api.openai.com/v1");
+        let usage = crate::usage::extract_usage_from_bytes(
+            br#"{"usage":{"input_tokens":1000,"output_tokens":50,"input_tokens_details":{"cached_tokens":100,"cache_write_tokens":200}}}"#,
+        )
+        .expect("usage");
+
+        let cost = estimate_usage_cost_from_provider_epoch(
+            &epoch,
+            "gpt-5.6-sol",
+            ProviderPricingTier::Priority,
+            &usage,
+        );
+
+        assert_eq!(cost.input_cost_usd.as_deref(), Some("0.007"));
+        assert_eq!(cost.cache_read_cost_usd.as_deref(), Some("0.0001"));
+        assert_eq!(cost.cache_creation_cost_usd.as_deref(), Some("0.0025"));
+        assert_eq!(cost.output_cost_usd.as_deref(), Some("0.003"));
+        assert_eq!(cost.total_cost_usd.as_deref(), Some("0.0126"));
+        assert_eq!(cost.service_tier_multiplier, None);
+    }
+
+    #[test]
+    fn provider_epoch_rejects_foreign_scope_and_unsupported_tiers_as_unknown() {
+        let epoch = openai_codex_epoch(1, "https://api.openai.com/v1");
+        let foreign = openai_codex_epoch(2, "https://relay.example/v1");
+        let usage = UsageMetrics {
+            input_tokens: 1_000,
+            output_tokens: 50,
+            ..UsageMetrics::default()
+        };
+        let foreign_key = foreign.capture_price_key("gpt-5.6-sol", ProviderPricingTier::Standard);
+
+        assert!(
+            estimate_usage_cost_from_captured_provider_price(&epoch, &foreign_key, &usage)
+                .is_unknown()
+        );
+        for tier in [
+            ProviderPricingTier::Flex,
+            ProviderPricingTier::Batch,
+            ProviderPricingTier::Regional,
+            ProviderPricingTier::Unknown,
+        ] {
+            assert!(
+                estimate_usage_cost_from_provider_epoch(&epoch, "gpt-5.6-sol", tier, &usage)
+                    .is_unknown(),
+                "tier: {tier:?}"
+            );
+        }
+        assert!(
+            estimate_usage_cost_from_provider_epoch(
+                &epoch,
+                "openai.gpt-5.6-sol",
+                ProviderPricingTier::Standard,
+                &usage,
+            )
+            .is_unknown()
+        );
+        assert!(
+            estimate_usage_cost_from_provider_epoch(
+                &epoch,
+                "gpt-5.6-missing",
+                ProviderPricingTier::Standard,
+                &usage,
+            )
+            .is_unknown()
+        );
+        assert!(
+            bundled_model_price_catalog()
+                .price_for_model("gpt-5.6-sol")
+                .is_none()
+        );
+    }
+
     #[test]
     fn parses_and_formats_precise_usd_amounts() {
         assert_eq!(
@@ -1345,7 +1690,15 @@ mod tests {
             ..UsageMetrics::default()
         };
 
-        let cost = estimate_usage_cost(&usage, &price, CostAdjustments::default());
+        let cost = estimate_usage_cost_with_convention(
+            &usage,
+            &price,
+            CostAdjustments::default(),
+            CacheAccountingConvention {
+                cache_read: crate::usage::CacheTokenInclusion::IncludedInInput,
+                cache_write: crate::usage::CacheTokenInclusion::Separate,
+            },
+        );
 
         assert_eq!(cost.input_cost_usd.as_deref(), Some("0.0009"));
         assert_eq!(cost.cache_read_cost_usd.as_deref(), Some("0.00001"));
@@ -1374,7 +1727,7 @@ mod tests {
     }
 
     #[test]
-    fn subtracts_direct_cache_read_for_codex_style_accounting() {
+    fn subtracts_cache_read_and_write_for_codex_style_accounting() {
         let usage = UsageMetrics {
             input_tokens: 100,
             output_tokens: 5,
@@ -1383,14 +1736,120 @@ mod tests {
             ..UsageMetrics::default()
         };
 
-        let billable = BillableTokenUsage::from_usage_with_accounting(
+        let billable = BillableTokenUsage::from_usage_with_convention(
             &usage,
-            CacheInputAccounting::DirectReadIncludedInInput,
+            CacheAccountingConvention::INCLUDED_IN_INPUT,
         );
 
-        assert_eq!(billable.input_tokens, 70);
+        assert_eq!(billable.input_tokens, 60);
         assert_eq!(billable.cache_read_input_tokens, 30);
         assert_eq!(billable.cache_creation_input_tokens, 10);
+        assert_eq!(billable.economics_status, EconomicsStatus::Complete);
+    }
+
+    #[test]
+    fn codex_cache_buckets_are_mutually_exclusive() {
+        let usage = UsageMetrics {
+            input_tokens: 1_000,
+            cache_read_input_tokens: 100,
+            cache_creation_input_tokens: 200,
+            ..UsageMetrics::default()
+        };
+
+        let billable = BillableTokenUsage::from_usage_with_convention(
+            &usage,
+            CacheAccountingConvention::INCLUDED_IN_INPUT,
+        );
+
+        assert_eq!(billable.input_tokens, 700);
+        assert_eq!(billable.cache_read_input_tokens, 100);
+        assert_eq!(billable.cache_creation_input_tokens, 200);
+        assert_eq!(billable.economics_status, EconomicsStatus::Complete);
+    }
+
+    #[test]
+    fn contradictory_included_cache_totals_make_cost_unknown() {
+        let price = ModelPrice::from_per_million_usd(
+            "test-model",
+            None,
+            "1",
+            "2",
+            Some("0.1"),
+            Some("1.25"),
+            "test",
+        )
+        .expect("price");
+        let usage = UsageMetrics {
+            input_tokens: 100,
+            output_tokens: 5,
+            cache_read_input_tokens: 80,
+            cache_creation_input_tokens: 40,
+            ..UsageMetrics::default()
+        };
+
+        let cost = estimate_usage_cost_with_convention(
+            &usage,
+            &price,
+            CostAdjustments::default(),
+            CacheAccountingConvention::INCLUDED_IN_INPUT,
+        );
+
+        assert_eq!(cost.confidence, CostConfidence::Unknown);
+        assert_eq!(cost.total_cost_usd, None);
+        assert_eq!(cost.pricing_source.as_deref(), Some("test"));
+    }
+
+    #[test]
+    fn conflicting_cache_evidence_makes_cost_unknown() {
+        let price = ModelPrice::from_per_million_usd(
+            "test-model",
+            None,
+            "1",
+            "2",
+            Some("0.1"),
+            Some("1.25"),
+            "test",
+        )
+        .expect("price");
+        let usage = crate::usage::extract_usage_from_bytes(
+            br#"{"usage":{"input_tokens":1000,"output_tokens":5,"input_tokens_details":{"cache_write_tokens":0},"cache_write_tokens":200}}"#,
+        )
+        .expect("usage");
+
+        let cost = estimate_usage_cost_with_convention(
+            &usage,
+            &price,
+            CostAdjustments::default(),
+            CacheAccountingConvention::INCLUDED_IN_INPUT,
+        );
+
+        assert_eq!(cost.confidence, CostConfidence::Unknown);
+        assert_eq!(cost.total_cost_usd, None);
+        assert_eq!(cost.pricing_source.as_deref(), Some("test"));
+    }
+
+    #[test]
+    fn default_cost_is_unknown_when_cache_accounting_convention_is_ambiguous() {
+        let price = ModelPrice::from_per_million_usd(
+            "test-model",
+            None,
+            "1",
+            "2",
+            Some("0.1"),
+            Some("1.25"),
+            "test",
+        )
+        .expect("price");
+        let usage = crate::usage::extract_usage_from_bytes(
+            br#"{"usage":{"input_tokens":1000,"output_tokens":5,"input_tokens_details":{"cached_tokens":100,"cache_write_tokens":200}}}"#,
+        )
+        .expect("usage");
+
+        let cost = estimate_usage_cost(&usage, &price, CostAdjustments::default());
+
+        assert_eq!(cost.confidence, CostConfidence::Unknown);
+        assert_eq!(cost.total_cost_usd, None);
+        assert_eq!(cost.pricing_source.as_deref(), Some("test"));
     }
 
     #[test]
@@ -1418,6 +1877,55 @@ mod tests {
         assert_eq!(cost.confidence, CostConfidence::Unknown);
         assert_eq!(cost.total_cost_usd, None);
         assert_eq!(cost.pricing_source.as_deref(), Some("test"));
+    }
+
+    #[test]
+    fn contradictory_main_token_economics_never_produce_exact_cost() {
+        let price = ModelPrice::from_per_million_usd(
+            "test-model",
+            None,
+            "1",
+            "2",
+            Some("0.1"),
+            Some("1.25"),
+            "test",
+        )
+        .expect("price");
+        let invalid_output = crate::usage::extract_usage_from_bytes(
+            br#"{"usage":{"input_tokens":10,"output_tokens":"1.5"}}"#,
+        )
+        .expect("recognized usage");
+        let negative_output = UsageMetrics {
+            input_tokens: 10,
+            output_tokens: -1,
+            ..UsageMetrics::default()
+        };
+        let overflowing = UsageMetrics {
+            input_tokens: i64::MAX,
+            output_tokens: 1,
+            ..UsageMetrics::default()
+        };
+        let contradictory_total = crate::usage::extract_usage_from_bytes(
+            br#"{"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":16}}"#,
+        )
+        .expect("recognized usage");
+
+        for usage in [
+            invalid_output,
+            negative_output,
+            overflowing,
+            contradictory_total,
+        ] {
+            let cost = estimate_usage_cost_with_convention(
+                &usage,
+                &price,
+                CostAdjustments::default(),
+                CacheAccountingConvention::SEPARATE,
+            );
+
+            assert!(cost.is_unknown(), "usage: {usage:?}");
+            assert_ne!(cost.confidence, CostConfidence::Exact);
+        }
     }
 
     #[test]

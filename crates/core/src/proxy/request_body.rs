@@ -1,11 +1,102 @@
 use axum::body::Bytes;
 use axum::http::{HeaderMap, HeaderValue};
 
-pub(super) fn extract_reasoning_effort_from_value(value: &serde_json::Value) -> Option<String> {
-    value
-        .get("reasoning")
-        .and_then(|reasoning| reasoning.get("effort"))
-        .and_then(|effort| effort.as_str())
+use crate::provider_catalog::ProviderModelRequestContract;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RequestDialect {
+    ResponsesHttp,
+    ResponsesCompact,
+    ChatCompletions,
+    ResponsesWebSocket,
+    Passthrough,
+}
+
+impl RequestDialect {
+    pub(super) fn from_http_path(path: &str) -> Self {
+        let path = path.trim_end_matches('/');
+        if path.ends_with("/responses/compact") {
+            Self::ResponsesCompact
+        } else if path.ends_with("/chat/completions") {
+            Self::ChatCompletions
+        } else if path.ends_with("/responses") {
+            Self::ResponsesHttp
+        } else {
+            Self::Passthrough
+        }
+    }
+
+    fn uses_responses_reasoning(self) -> bool {
+        matches!(
+            self,
+            Self::ResponsesHttp | Self::ResponsesCompact | Self::ResponsesWebSocket
+        )
+    }
+
+    pub(super) fn supports_reasoning_effort(self) -> bool {
+        self.uses_responses_reasoning() || self == Self::ChatCompletions
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReasoningOrchestrationIntent {
+    Ultra,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(super) enum DeferredReasoningIntentError {
+    #[error("reasoning intent requires a captured provider request contract")]
+    MissingCapturedContract,
+    #[error("selected provider request contract does not support the ultra intent")]
+    UnsupportedUltra,
+    #[error("selected request dialect cannot carry a reasoning effort")]
+    UnsupportedDialect,
+    #[error("request body must be a JSON object to resolve a reasoning intent")]
+    InvalidRequestBody,
+}
+
+pub(super) fn apply_deferred_reasoning_intent(
+    body: &Bytes,
+    dialect: RequestDialect,
+    intent: ReasoningOrchestrationIntent,
+    contract: Option<&ProviderModelRequestContract>,
+) -> Result<Bytes, DeferredReasoningIntentError> {
+    let contract = contract.ok_or(DeferredReasoningIntentError::MissingCapturedContract)?;
+    match intent {
+        ReasoningOrchestrationIntent::Ultra if !contract.ultra_maps_to_max() => {
+            return Err(DeferredReasoningIntentError::UnsupportedUltra);
+        }
+        ReasoningOrchestrationIntent::Ultra => {}
+    }
+    if !dialect.supports_reasoning_effort() {
+        return Err(DeferredReasoningIntentError::UnsupportedDialect);
+    }
+
+    let mut value = serde_json::from_slice::<serde_json::Value>(body.as_ref())
+        .map_err(|_| DeferredReasoningIntentError::InvalidRequestBody)?;
+    if !apply_reasoning_effort_override_value(&mut value, dialect, "max") {
+        return Err(DeferredReasoningIntentError::InvalidRequestBody);
+    }
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .map_err(|_| DeferredReasoningIntentError::InvalidRequestBody)
+}
+
+pub(super) fn extract_reasoning_effort_from_value(
+    value: &serde_json::Value,
+    dialect: RequestDialect,
+) -> Option<String> {
+    let effort = if dialect.uses_responses_reasoning() {
+        value
+            .get("reasoning")
+            .and_then(|reasoning| reasoning.get("effort"))
+    } else if dialect == RequestDialect::ChatCompletions {
+        value.get("reasoning_effort")
+    } else {
+        None
+    };
+    effort
+        .and_then(serde_json::Value::as_str)
         .map(ToOwned::to_owned)
 }
 
@@ -63,7 +154,50 @@ fn extract_service_tier_from_response_value(value: &serde_json::Value) -> Option
                 .and_then(|response| response.get("service_tier"))
                 .and_then(|service_tier| service_tier.as_str())
         })
+        .or_else(|| {
+            value
+                .get("message")
+                .and_then(|message| message.get("service_tier"))
+                .and_then(|service_tier| service_tier.as_str())
+        })
         .map(ToOwned::to_owned)
+}
+
+fn extract_model_from_response_value(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("model")
+        .and_then(|model| model.as_str())
+        .or_else(|| {
+            value
+                .get("response")
+                .and_then(|response| response.get("model"))
+                .and_then(|model| model.as_str())
+        })
+        .or_else(|| {
+            value
+                .get("message")
+                .and_then(|message| message.get("model"))
+                .and_then(|model| model.as_str())
+        })
+        .map(ToOwned::to_owned)
+}
+
+pub(super) fn merge_response_metadata_from_value(
+    value: &serde_json::Value,
+    last_model: &mut Option<String>,
+    last_service_tier: &mut Option<String>,
+) {
+    if let Some(model) = extract_model_from_response_value(value) {
+        *last_model = Some(model);
+    }
+    if let Some(service_tier) = extract_service_tier_from_response_value(value) {
+        *last_service_tier = Some(service_tier);
+    }
+}
+
+pub(super) fn extract_model_from_response_body(body: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    extract_model_from_response_value(&value)
 }
 
 pub(super) fn extract_service_tier_from_response_body(body: &[u8]) -> Option<String> {
@@ -71,25 +205,62 @@ pub(super) fn extract_service_tier_from_response_body(body: &[u8]) -> Option<Str
     extract_service_tier_from_response_value(&value)
 }
 
-pub(super) fn apply_reasoning_effort_override_value(value: &mut serde_json::Value, effort: &str) {
+pub(super) fn apply_reasoning_effort_override_value(
+    value: &mut serde_json::Value,
+    dialect: RequestDialect,
+    effort: &str,
+) -> bool {
     let Some(object) = value.as_object_mut() else {
-        return;
+        return false;
     };
-    let reasoning = object
-        .entry("reasoning")
-        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-    if let Some(reasoning_object) = reasoning.as_object_mut() {
-        reasoning_object.insert(
-            "effort".to_string(),
+
+    if dialect.uses_responses_reasoning() {
+        let reasoning = object
+            .entry("reasoning")
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        if let Some(reasoning_object) = reasoning.as_object_mut() {
+            reasoning_object.insert(
+                "effort".to_string(),
+                serde_json::Value::String(effort.to_string()),
+            );
+        } else {
+            let mut new_reasoning = serde_json::Map::new();
+            new_reasoning.insert(
+                "effort".to_string(),
+                serde_json::Value::String(effort.to_string()),
+            );
+            *reasoning = serde_json::Value::Object(new_reasoning);
+        }
+        true
+    } else if dialect == RequestDialect::ChatCompletions {
+        object.insert(
+            "reasoning_effort".to_string(),
             serde_json::Value::String(effort.to_string()),
         );
+        true
     } else {
-        let mut new_reasoning = serde_json::Map::new();
-        new_reasoning.insert(
-            "effort".to_string(),
-            serde_json::Value::String(effort.to_string()),
-        );
-        *reasoning = serde_json::Value::Object(new_reasoning);
+        false
+    }
+}
+
+pub(super) fn remove_reasoning_effort_value(
+    value: &mut serde_json::Value,
+    dialect: RequestDialect,
+) -> bool {
+    let Some(object) = value.as_object_mut() else {
+        return false;
+    };
+
+    if dialect.uses_responses_reasoning() {
+        object
+            .get_mut("reasoning")
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|reasoning| reasoning.remove("effort"))
+            .is_some()
+    } else if dialect == RequestDialect::ChatCompletions {
+        object.remove("reasoning_effort").is_some()
+    } else {
+        false
     }
 }
 
@@ -118,97 +289,8 @@ pub(super) fn normalize_codex_compact_request_value(value: &mut serde_json::Valu
         return;
     };
 
-    let mut normalized = serde_json::Map::new();
-    for field in [
-        "model",
-        "input",
-        "instructions",
-        "tools",
-        "parallel_tool_calls",
-        "reasoning",
-        "service_tier",
-        "prompt_cache_key",
-        "text",
-    ] {
-        if let Some(value) = object.get(field) {
-            normalized.insert(field.to_string(), value.clone());
-        }
-    }
-
-    *object = normalized;
-}
-
-pub(super) fn remove_hosted_image_generation_tools_value(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::Object(object) => {
-            if let Some(tools) = object
-                .get_mut("tools")
-                .and_then(serde_json::Value::as_array_mut)
-            {
-                tools.retain(|tool| !tool_is_hosted_image_generation(tool));
-            }
-
-            let forces_hosted_image_generation = object
-                .get("tool_choice")
-                .is_some_and(tool_choice_forces_hosted_image_generation);
-            if forces_hosted_image_generation {
-                object.insert(
-                    "tool_choice".to_string(),
-                    serde_json::Value::String("auto".to_string()),
-                );
-            }
-
-            for value in object.values_mut() {
-                remove_hosted_image_generation_tools_value(value);
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                remove_hosted_image_generation_tools_value(item);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn tool_is_hosted_image_generation(tool: &serde_json::Value) -> bool {
-    tool.get("type")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|tool_type| tool_type == "image_generation")
-}
-
-fn tool_choice_forces_hosted_image_generation(tool_choice: &serde_json::Value) -> bool {
-    tool_choice
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|tool_type| tool_type == "image_generation")
-}
-
-pub(super) fn build_codex_remote_compaction_v2_downgrade_body(body: &[u8]) -> Option<Bytes> {
-    let mut value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
-    remove_compaction_trigger_items(&mut value);
-    normalize_codex_compact_request_value(&mut value);
-    serde_json::to_vec(&value).ok().map(Bytes::from)
-}
-
-fn remove_compaction_trigger_items(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::Array(items) => {
-            items.retain(|item| {
-                item.get("type")
-                    .and_then(serde_json::Value::as_str)
-                    .is_none_or(|item_type| item_type != "compaction_trigger")
-            });
-            for item in items {
-                remove_compaction_trigger_items(item);
-            }
-        }
-        serde_json::Value::Object(object) => {
-            for value in object.values_mut() {
-                remove_compaction_trigger_items(value);
-            }
-        }
-        _ => {}
+    for field in ["previous_response_id", "store", "stream", "include"] {
+        object.remove(field);
     }
 }
 
@@ -399,10 +481,22 @@ fn normalize_session_completion_value(value: String) -> Option<String> {
         .then(|| value.to_string())
 }
 
+#[cfg(test)]
 pub(super) fn scan_service_tier_from_sse_bytes_incremental(
     data: &[u8],
     scan_pos: &mut usize,
     last: &mut Option<String>,
+) {
+    let mut ignored_model = None;
+    scan_response_metadata_from_sse_bytes_incremental(data, scan_pos, &mut ignored_model, last);
+}
+
+#[cfg(test)]
+pub(super) fn scan_response_metadata_from_sse_bytes_incremental(
+    data: &[u8],
+    scan_pos: &mut usize,
+    last_model: &mut Option<String>,
+    last_service_tier: &mut Option<String>,
 ) {
     let mut i = (*scan_pos).min(data.len());
 
@@ -433,10 +527,8 @@ pub(super) fn scan_service_tier_from_sse_bytes_incremental(
             continue;
         }
 
-        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload)
-            && let Some(service_tier) = extract_service_tier_from_response_value(&value)
-        {
-            *last = Some(service_tier);
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) {
+            merge_response_metadata_from_value(&value, last_model, last_service_tier);
         }
     }
 
@@ -446,17 +538,39 @@ pub(super) fn scan_service_tier_from_sse_bytes_incremental(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_model_override_value, apply_reasoning_effort_override_value,
-        apply_service_tier_override_value, codex_compact_request_requires_affinity,
-        codex_responses_body_has_compaction_trigger, codex_responses_body_requests_stream,
-        complete_codex_session_fields, extract_model_from_value,
+        DeferredReasoningIntentError, ReasoningOrchestrationIntent, RequestDialect,
+        apply_deferred_reasoning_intent, apply_model_override_value,
+        apply_reasoning_effort_override_value, apply_service_tier_override_value,
+        codex_compact_request_requires_affinity, codex_responses_body_has_compaction_trigger,
+        codex_responses_body_requests_stream, complete_codex_session_fields,
+        extract_model_from_response_body, extract_model_from_value,
         extract_reasoning_effort_from_value, extract_service_tier_from_response_body,
         extract_service_tier_from_value, is_stale_previous_response_error,
         normalize_codex_compact_request_value, remove_previous_response_id_from_body,
+        scan_response_metadata_from_sse_bytes_incremental,
         scan_service_tier_from_sse_bytes_incremental,
+    };
+    use crate::provider_catalog::{
+        AccountFingerprint, ProviderAdapter, ProviderCatalogEpoch, ProviderCatalogScope,
+        ProviderModelRequestContract,
     };
     use axum::body::Bytes;
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
+
+    fn request_contract(model: &str) -> ProviderModelRequestContract {
+        let scope = ProviderCatalogScope::new(
+            ProviderAdapter::OpenAiCodex,
+            "https://api.openai.com/v1",
+            "codex/provider/default",
+            AccountFingerprint::from_digest([7; 32]),
+            "test-runtime",
+        )
+        .expect("provider scope");
+        ProviderCatalogEpoch::bundled_openai_codex(scope)
+            .expect("provider epoch")
+            .capture_model_request_contract(model)
+            .expect("provider request contract")
+    }
 
     #[test]
     fn extracts_request_fields() {
@@ -468,7 +582,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(body).expect("request json");
 
         assert_eq!(
-            extract_reasoning_effort_from_value(&value).as_deref(),
+            extract_reasoning_effort_from_value(&value, RequestDialect::ResponsesHttp).as_deref(),
             Some("high")
         );
         assert_eq!(extract_model_from_value(&value).as_deref(), Some("gpt-5"));
@@ -482,12 +596,12 @@ mod tests {
     fn applies_request_overrides() {
         let body = br#"{"input":"hello"}"#;
         let mut value: serde_json::Value = serde_json::from_slice(body).expect("request json");
-        apply_reasoning_effort_override_value(&mut value, "medium");
+        apply_reasoning_effort_override_value(&mut value, RequestDialect::ResponsesHttp, "medium");
         apply_model_override_value(&mut value, "gpt-5.4");
         apply_service_tier_override_value(&mut value, "flex");
 
         assert_eq!(
-            extract_reasoning_effort_from_value(&value).as_deref(),
+            extract_reasoning_effort_from_value(&value, RequestDialect::ResponsesHttp).as_deref(),
             Some("medium")
         );
         assert_eq!(extract_model_from_value(&value).as_deref(), Some("gpt-5.4"));
@@ -495,6 +609,72 @@ mod tests {
             extract_service_tier_from_value(&value).as_deref(),
             Some("flex")
         );
+    }
+
+    #[test]
+    fn deferred_ultra_maps_to_max_only_with_captured_provider_support() {
+        let responses = Bytes::from_static(
+            br#"{"reasoning":{"mode":"pro","future_mode":"deliberate"},"future_request_field":true}"#,
+        );
+        let supported = request_contract("gpt-5.6-sol");
+
+        let resolved = apply_deferred_reasoning_intent(
+            &responses,
+            RequestDialect::ResponsesHttp,
+            ReasoningOrchestrationIntent::Ultra,
+            Some(&supported),
+        )
+        .expect("supported ultra mapping");
+        let value: serde_json::Value =
+            serde_json::from_slice(resolved.as_ref()).expect("json body");
+        assert_eq!(value["reasoning"]["effort"].as_str(), Some("max"));
+        assert_eq!(value["reasoning"]["mode"].as_str(), Some("pro"));
+        assert_eq!(
+            value["reasoning"]["future_mode"].as_str(),
+            Some("deliberate")
+        );
+        assert_eq!(value["future_request_field"].as_bool(), Some(true));
+
+        assert_eq!(
+            apply_deferred_reasoning_intent(
+                &responses,
+                RequestDialect::ResponsesHttp,
+                ReasoningOrchestrationIntent::Ultra,
+                None,
+            ),
+            Err(DeferredReasoningIntentError::MissingCapturedContract)
+        );
+        assert_eq!(
+            apply_deferred_reasoning_intent(
+                &responses,
+                RequestDialect::ResponsesHttp,
+                ReasoningOrchestrationIntent::Ultra,
+                Some(&request_contract("gpt-5.6-luna")),
+            ),
+            Err(DeferredReasoningIntentError::UnsupportedUltra)
+        );
+    }
+
+    #[test]
+    fn deferred_ultra_uses_chat_reasoning_effort_without_responses_reasoning() {
+        let chat = Bytes::from_static(
+            br#"{"messages":[],"parallel_tool_calls":false,"future_request_field":true}"#,
+        );
+        let supported = request_contract("gpt-5.6-terra");
+
+        let resolved = apply_deferred_reasoning_intent(
+            &chat,
+            RequestDialect::ChatCompletions,
+            ReasoningOrchestrationIntent::Ultra,
+            Some(&supported),
+        )
+        .expect("supported chat ultra mapping");
+        let value: serde_json::Value =
+            serde_json::from_slice(resolved.as_ref()).expect("json body");
+        assert_eq!(value["reasoning_effort"].as_str(), Some("max"));
+        assert!(value.get("reasoning").is_none());
+        assert_eq!(value["parallel_tool_calls"].as_bool(), Some(false));
+        assert_eq!(value["future_request_field"].as_bool(), Some(true));
     }
 
     #[test]
@@ -569,37 +749,69 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_codex_compact_body_to_supported_payload_fields() {
+    fn normalizes_codex_compact_body_by_removing_only_known_incompatible_fields() {
         let mut value: serde_json::Value = serde_json::json!({
             "model": "gpt-5.5",
             "input": [{"type": "message", "role": "user", "content": "compact me"}],
             "instructions": "compact-test",
             "tools": [{"type": "function", "name": "shell"}],
-            "parallel_tool_calls": true,
-            "reasoning": {"effort": "high"},
+            "parallel_tool_calls": false,
+            "reasoning": {"effort": "high", "future_mode": "deliberate"},
             "text": {"verbosity": "low"},
             "previous_response_id": "resp_123",
             "store": true,
             "stream": true,
             "prompt_cache_key": "cache_123",
             "service_tier": "flex",
-            "include": ["reasoning.encrypted_content"]
+            "include": ["reasoning.encrypted_content"],
+            "future_request_field": {"enabled": true}
         });
 
         normalize_codex_compact_request_value(&mut value);
 
         assert_eq!(value["model"].as_str(), Some("gpt-5.5"));
         assert!(value.get("tools").is_some());
-        assert_eq!(value["parallel_tool_calls"].as_bool(), Some(true));
+        assert_eq!(value["parallel_tool_calls"].as_bool(), Some(false));
         assert_eq!(value["reasoning"]["effort"].as_str(), Some("high"));
+        assert_eq!(
+            value["reasoning"]["future_mode"].as_str(),
+            Some("deliberate")
+        );
         assert_eq!(value["text"]["verbosity"].as_str(), Some("low"));
         assert!(value.get("previous_response_id").is_none());
         assert!(value.get("store").is_none());
         assert!(value.get("stream").is_none());
         assert_eq!(value["prompt_cache_key"].as_str(), Some("cache_123"));
         assert_eq!(value["service_tier"].as_str(), Some("flex"));
-        assert!(value.get("previous_response_id").is_none());
         assert!(value.get("include").is_none());
+        assert_eq!(
+            value["future_request_field"]["enabled"].as_bool(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn request_dialect_is_selected_from_the_concrete_http_path() {
+        assert_eq!(
+            RequestDialect::from_http_path("/v1/responses"),
+            RequestDialect::ResponsesHttp
+        );
+        assert_eq!(
+            RequestDialect::from_http_path("/backend-api/codex/responses/"),
+            RequestDialect::ResponsesHttp
+        );
+        assert_eq!(
+            RequestDialect::from_http_path("/v1/responses/compact/"),
+            RequestDialect::ResponsesCompact
+        );
+        assert_eq!(
+            RequestDialect::from_http_path("/v1/chat/completions"),
+            RequestDialect::ChatCompletions
+        );
+        assert_eq!(
+            RequestDialect::from_http_path("/v1/messages"),
+            RequestDialect::Passthrough
+        );
     }
 
     #[test]
@@ -696,6 +908,51 @@ mod tests {
                 .as_deref(),
             Some("flex")
         );
+    }
+
+    #[test]
+    fn extracts_reported_model_from_response_shapes() {
+        assert_eq!(
+            extract_model_from_response_body(br#"{"model":"gpt-5.6-sol"}"#).as_deref(),
+            Some("gpt-5.6-sol")
+        );
+        assert_eq!(
+            extract_model_from_response_body(br#"{"response":{"model":"gpt-5.6-terra"}}"#)
+                .as_deref(),
+            Some("gpt-5.6-terra")
+        );
+    }
+
+    #[test]
+    fn scans_reported_model_and_tier_from_sse_incrementally() {
+        let chunk1 =
+            b"data: {\"response\":{\"model\":\"gpt-5.6-sol\",\"service_tier\":\"priority\"}}\n";
+        let chunk2 =
+            b"data: {\"model\":\"gpt-5.6-terra\",\"service_tier\":\"flex\"}\n\ndata: [DONE]\n";
+        let mut scan_pos = 0;
+        let mut model = None;
+        let mut tier = None;
+        let mut data = Vec::new();
+
+        data.extend_from_slice(chunk1);
+        scan_response_metadata_from_sse_bytes_incremental(
+            &data,
+            &mut scan_pos,
+            &mut model,
+            &mut tier,
+        );
+        assert_eq!(model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(tier.as_deref(), Some("priority"));
+
+        data.extend_from_slice(chunk2);
+        scan_response_metadata_from_sse_bytes_incremental(
+            &data,
+            &mut scan_pos,
+            &mut model,
+            &mut tier,
+        );
+        assert_eq!(model.as_deref(), Some("gpt-5.6-terra"));
+        assert_eq!(tier.as_deref(), Some("flex"));
     }
 
     #[test]

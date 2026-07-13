@@ -1,5 +1,7 @@
 # Milestones: Codex Routing Runtime IR
 
+> Historical status (superseded 2026-07-12): this document records a pre-version-5 design and migration phase. The current helper accepts only `~/.codex-helper/config.toml` with `version = 5`; `codex-helper config migrate` and v2/v3/v4 compatibility readers do not exist. See [current configuration](../../CONFIGURATION.md) and the [canonical modernization plan](../../plans/2026-07-10-002-refactor-canonical-relay-runtime-modernization-plan.md). The remaining content is archival.
+
 ## P0 - Workstream Shape
 
 - [x] Define the runtime IR refactor goal.

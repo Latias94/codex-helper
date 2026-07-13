@@ -9,7 +9,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    ProxyConfig, ServiceConfigManager, ServiceStatusConfig, ServiceStatusProbeConfig, UpstreamAuth,
+    HelperConfig, ServiceRouteConfig, ServiceStatusConfig, ServiceStatusProbeConfig, UpstreamAuth,
 };
 
 static SERVICE_STATUS_CACHE: OnceLock<Mutex<ServiceStatusCache>> = OnceLock::new();
@@ -182,14 +182,16 @@ struct ProviderProbeTarget {
     provider_id: String,
     endpoint_id: String,
     base_url: String,
+    priority: u32,
     auth: UpstreamAuth,
+    tags: HashMap<String, String>,
     supported_models: HashMap<String, bool>,
     model_mapping: HashMap<String, String>,
 }
 
 pub async fn refresh_service_status_snapshot(
     config: &ServiceStatusConfig,
-    runtime_config: Option<&ProxyConfig>,
+    runtime_config: Option<&HelperConfig>,
     service_name: &str,
 ) -> ServiceStatusSnapshot {
     if !config.is_active() {
@@ -234,7 +236,7 @@ fn store_service_status_snapshot(config_key: u64, snapshot: ServiceStatusSnapsho
 
 fn service_status_cache_key(
     config: &ServiceStatusConfig,
-    runtime_config: Option<&ProxyConfig>,
+    runtime_config: Option<&HelperConfig>,
     service_name: &str,
 ) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -255,50 +257,39 @@ fn service_status_cache_key(
         probe.headers.hash(&mut hasher);
     }
     if let Some(runtime_config) = runtime_config
-        && let Some(mgr) = service_manager(runtime_config, service_name)
+        && let Some(service) = service_route_config(runtime_config, service_name)
     {
-        let mut providers = mgr
-            .stations()
-            .values()
-            .flat_map(|station| station.upstreams.iter())
-            .filter_map(|upstream| {
-                let provider_id = upstream.tags.get("provider_id")?;
-                let endpoint_id = upstream
-                    .tags
-                    .get("endpoint_id")
-                    .map(String::as_str)
-                    .unwrap_or("default");
-                Some((provider_id, endpoint_id, upstream))
-            })
-            .collect::<Vec<_>>();
-        providers.sort_by(|left, right| {
-            left.0
-                .cmp(right.0)
-                .then_with(|| left.1.cmp(right.1))
-                .then_with(|| left.2.base_url.cmp(&right.2.base_url))
-        });
-        for (provider_id, endpoint_id, upstream) in providers {
-            provider_id.hash(&mut hasher);
-            endpoint_id.hash(&mut hasher);
-            upstream.base_url.hash(&mut hasher);
-            let mut supported_models = upstream.supported_models.iter().collect::<Vec<_>>();
-            supported_models.sort_by(|left, right| left.0.cmp(right.0));
-            supported_models.hash(&mut hasher);
-            let mut model_mapping = upstream.model_mapping.iter().collect::<Vec<_>>();
-            model_mapping.sort_by(|left, right| left.0.cmp(right.0));
-            model_mapping.hash(&mut hasher);
-            upstream.auth.auth_token.hash(&mut hasher);
-            upstream.auth.auth_token_env.hash(&mut hasher);
-            upstream.auth.api_key.hash(&mut hasher);
-            upstream.auth.api_key_env.hash(&mut hasher);
+        for target in provider_probe_targets(service, None, None) {
+            hash_provider_probe_target(&target, &mut hasher);
         }
     }
     hasher.finish()
 }
 
+fn hash_provider_probe_target(target: &ProviderProbeTarget, hasher: &mut impl Hasher) {
+    target.provider_id.hash(hasher);
+    target.endpoint_id.hash(hasher);
+    target.base_url.hash(hasher);
+    target.priority.hash(hasher);
+
+    let mut tags = target.tags.iter().collect::<Vec<_>>();
+    tags.sort_by(|left, right| left.0.cmp(right.0));
+    tags.hash(hasher);
+    let mut supported_models = target.supported_models.iter().collect::<Vec<_>>();
+    supported_models.sort_by(|left, right| left.0.cmp(right.0));
+    supported_models.hash(hasher);
+    let mut model_mapping = target.model_mapping.iter().collect::<Vec<_>>();
+    model_mapping.sort_by(|left, right| left.0.cmp(right.0));
+    model_mapping.hash(hasher);
+    target.auth.auth_token.hash(hasher);
+    target.auth.auth_token_env.hash(hasher);
+    target.auth.api_key.hash(hasher);
+    target.auth.api_key_env.hash(hasher);
+}
+
 async fn fetch_service_status_snapshot(
     config: &ServiceStatusConfig,
-    runtime_config: Option<&ProxyConfig>,
+    runtime_config: Option<&HelperConfig>,
     service_name: &str,
 ) -> ServiceStatusSnapshot {
     let client = match Client::builder()
@@ -347,7 +338,7 @@ async fn fetch_service_status_snapshot(
 async fn fetch_probe(
     client: &Client,
     config: &ServiceStatusConfig,
-    runtime_config: Option<&ProxyConfig>,
+    runtime_config: Option<&HelperConfig>,
     service_name: &str,
     probe: &ServiceStatusProbeConfig,
 ) -> ServiceStatusProbeSnapshot {
@@ -379,7 +370,7 @@ async fn fetch_probe(
 async fn fetch_probe_inner(
     client: &Client,
     config: &ServiceStatusConfig,
-    runtime_config: Option<&ProxyConfig>,
+    runtime_config: Option<&HelperConfig>,
     service_name: &str,
     probe: &ServiceStatusProbeConfig,
 ) -> Result<ServiceStatusProbeSnapshot> {
@@ -423,7 +414,7 @@ async fn fetch_probe_inner(
 async fn fetch_provider_probe(
     client: &Client,
     config: &ServiceStatusConfig,
-    runtime_config: Option<&ProxyConfig>,
+    runtime_config: Option<&HelperConfig>,
     service_name: &str,
     probe: &ServiceStatusProbeConfig,
 ) -> Result<ServiceStatusProbeSnapshot> {
@@ -562,7 +553,7 @@ async fn send_provider_probe_request(
 }
 
 fn provider_probe_target(
-    runtime_config: Option<&ProxyConfig>,
+    runtime_config: Option<&HelperConfig>,
     service_name: &str,
     probe: &ServiceStatusProbeConfig,
 ) -> Result<ProviderProbeTarget> {
@@ -577,11 +568,11 @@ fn provider_probe_target(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let cfg = runtime_config.context("provider probes require runtime config")?;
-    let mgr = service_manager(cfg, service_name)
+    let config = runtime_config.context("provider probes require runtime config")?;
+    let service = service_route_config(config, service_name)
         .with_context(|| format!("unknown service for provider probe: {service_name}"))?;
 
-    provider_probe_targets(mgr, provider, endpoint)
+    provider_probe_targets(service, Some(provider), endpoint)
         .into_iter()
         .next()
         .with_context(|| {
@@ -596,46 +587,97 @@ fn provider_probe_target(
 }
 
 fn provider_probe_targets(
-    mgr: &ServiceConfigManager,
-    provider: &str,
+    service: &ServiceRouteConfig,
+    provider_filter: Option<&str>,
     endpoint: Option<&str>,
 ) -> Vec<ProviderProbeTarget> {
     let mut targets = Vec::new();
-    for station in mgr.stations().values() {
-        for upstream in &station.upstreams {
-            let upstream_provider = upstream
-                .tags
-                .get("provider_id")
-                .map(String::as_str)
-                .unwrap_or(station.name.as_str());
-            if upstream_provider != provider {
+    for (provider_id, provider) in &service.providers {
+        if !provider.enabled || provider_filter.is_some_and(|filter| filter != provider_id.as_str())
+        {
+            continue;
+        }
+
+        let auth = merge_auth(&provider.auth, &provider.inline_auth);
+        if endpoint.is_none_or(|endpoint| endpoint == "default")
+            && let Some(base_url) = provider
+                .base_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        {
+            targets.push(ProviderProbeTarget {
+                provider_id: provider_id.clone(),
+                endpoint_id: "default".to_string(),
+                base_url: base_url.to_string(),
+                priority: 0,
+                auth: auth.clone(),
+                tags: provider.tags.clone().into_iter().collect(),
+                supported_models: provider.supported_models.clone().into_iter().collect(),
+                model_mapping: provider.model_mapping.clone().into_iter().collect(),
+            });
+        }
+
+        for (endpoint_id, endpoint_config) in &provider.endpoints {
+            if !endpoint_config.enabled
+                || endpoint.is_some_and(|filter| filter != endpoint_id.as_str())
+            {
                 continue;
             }
-            let upstream_endpoint = upstream
-                .tags
-                .get("endpoint_id")
-                .map(String::as_str)
-                .unwrap_or("default");
-            if endpoint.is_some_and(|endpoint| endpoint != upstream_endpoint) {
+            let base_url = endpoint_config.base_url.trim();
+            if base_url.is_empty() {
                 continue;
             }
             targets.push(ProviderProbeTarget {
-                provider_id: upstream_provider.to_string(),
-                endpoint_id: upstream_endpoint.to_string(),
-                base_url: upstream.base_url.clone(),
-                auth: upstream.auth.clone(),
-                supported_models: upstream.supported_models.clone(),
-                model_mapping: upstream.model_mapping.clone(),
+                provider_id: provider_id.clone(),
+                endpoint_id: endpoint_id.clone(),
+                base_url: base_url.to_string(),
+                priority: endpoint_config.priority,
+                auth: auth.clone(),
+                tags: merge_maps(&provider.tags, &endpoint_config.tags),
+                supported_models: merge_maps(
+                    &provider.supported_models,
+                    &endpoint_config.supported_models,
+                ),
+                model_mapping: merge_maps(&provider.model_mapping, &endpoint_config.model_mapping),
             });
         }
     }
     targets.sort_by(|left, right| {
         left.provider_id
             .cmp(&right.provider_id)
+            .then_with(|| left.priority.cmp(&right.priority))
             .then_with(|| left.endpoint_id.cmp(&right.endpoint_id))
             .then_with(|| left.base_url.cmp(&right.base_url))
     });
     targets
+}
+
+fn merge_auth(block: &UpstreamAuth, inline: &UpstreamAuth) -> UpstreamAuth {
+    UpstreamAuth {
+        auth_token: inline
+            .auth_token
+            .clone()
+            .or_else(|| block.auth_token.clone()),
+        auth_token_env: inline
+            .auth_token_env
+            .clone()
+            .or_else(|| block.auth_token_env.clone()),
+        api_key: inline.api_key.clone().or_else(|| block.api_key.clone()),
+        api_key_env: inline
+            .api_key_env
+            .clone()
+            .or_else(|| block.api_key_env.clone()),
+    }
+}
+
+fn merge_maps<T: Clone>(
+    provider_values: &std::collections::BTreeMap<String, T>,
+    endpoint_values: &std::collections::BTreeMap<String, T>,
+) -> HashMap<String, T> {
+    let mut merged = provider_values.clone();
+    merged.extend(endpoint_values.clone());
+    merged.into_iter().collect()
 }
 
 fn provider_probe_models(
@@ -666,13 +708,13 @@ fn provider_probe_models(
     models
 }
 
-fn service_manager<'a>(
-    cfg: &'a ProxyConfig,
+fn service_route_config<'a>(
+    config: &'a HelperConfig,
     service_name: &str,
-) -> Option<&'a ServiceConfigManager> {
+) -> Option<&'a ServiceRouteConfig> {
     match service_name {
-        "claude" => Some(&cfg.claude),
-        "codex" => Some(&cfg.codex),
+        "claude" => Some(&config.claude),
+        "codex" => Some(&config.codex),
         _ => None,
     }
 }
@@ -936,7 +978,9 @@ mod tests {
     use axum::routing::post;
     use axum::{Json, Router};
 
-    use crate::config::{ServiceConfig, UpstreamConfig};
+    use crate::config::{
+        ProviderConcurrencyLimits, ProviderConfig, ProviderEndpointConfig, ServiceRouteConfig,
+    };
 
     #[derive(Debug, Clone, Default)]
     struct CapturedProviderProbeRequest {
@@ -955,6 +999,64 @@ mod tests {
             timeout_ms: None,
             high_latency_ms: None,
             headers: Default::default(),
+        }
+    }
+
+    fn canonical_runtime_with_endpoint(base_url: String) -> HelperConfig {
+        HelperConfig {
+            codex: ServiceRouteConfig {
+                providers: std::collections::BTreeMap::from([(
+                    "relay".to_string(),
+                    ProviderConfig {
+                        auth: UpstreamAuth {
+                            auth_token: Some("test-token".to_string()),
+                            api_key: Some("provider-api-key".to_string()),
+                            ..UpstreamAuth::default()
+                        },
+                        inline_auth: UpstreamAuth {
+                            api_key: Some("endpoint-api-key".to_string()),
+                            ..UpstreamAuth::default()
+                        },
+                        tags: std::collections::BTreeMap::from([
+                            ("region".to_string(), "provider-region".to_string()),
+                            ("shared".to_string(), "provider".to_string()),
+                        ]),
+                        supported_models: std::collections::BTreeMap::from([
+                            ("gpt-5.5".to_string(), true),
+                            ("legacy".to_string(), true),
+                        ]),
+                        model_mapping: std::collections::BTreeMap::from([
+                            ("gpt-5.5".to_string(), "provider-gpt-5.5".to_string()),
+                            ("legacy".to_string(), "provider-legacy".to_string()),
+                        ]),
+                        endpoints: std::collections::BTreeMap::from([(
+                            "fast".to_string(),
+                            ProviderEndpointConfig {
+                                base_url,
+                                continuity_domain: None,
+                                enabled: true,
+                                priority: 3,
+                                tags: std::collections::BTreeMap::from([
+                                    ("shared".to_string(), "endpoint".to_string()),
+                                    ("zone".to_string(), "edge".to_string()),
+                                ]),
+                                supported_models: std::collections::BTreeMap::from([
+                                    ("legacy".to_string(), false),
+                                    ("endpoint-only".to_string(), true),
+                                ]),
+                                model_mapping: std::collections::BTreeMap::from([(
+                                    "gpt-5.5".to_string(),
+                                    "upstream-gpt-5.5".to_string(),
+                                )]),
+                                limits: ProviderConcurrencyLimits::default(),
+                            },
+                        )]),
+                        ..ProviderConfig::default()
+                    },
+                )]),
+                ..ServiceRouteConfig::default()
+            },
+            ..HelperConfig::default()
         }
     }
 
@@ -1013,6 +1115,71 @@ mod tests {
         assert_eq!(snapshot.services[2].latest_kind, ServiceStatusKind::Slow);
     }
 
+    #[test]
+    fn canonical_provider_probe_target_merges_provider_and_endpoint_fields() {
+        let runtime = canonical_runtime_with_endpoint("https://relay.example/v1".to_string());
+
+        let targets = provider_probe_targets(&runtime.codex, Some("relay"), Some("fast"));
+
+        assert_eq!(targets.len(), 1);
+        let target = &targets[0];
+        assert_eq!(target.provider_id, "relay");
+        assert_eq!(target.endpoint_id, "fast");
+        assert_eq!(target.base_url, "https://relay.example/v1");
+        assert_eq!(target.priority, 3);
+        assert_eq!(target.auth.auth_token.as_deref(), Some("test-token"));
+        assert_eq!(target.auth.api_key.as_deref(), Some("endpoint-api-key"));
+        assert_eq!(
+            target.tags.get("region").map(String::as_str),
+            Some("provider-region")
+        );
+        assert_eq!(
+            target.tags.get("shared").map(String::as_str),
+            Some("endpoint")
+        );
+        assert_eq!(target.tags.get("zone").map(String::as_str), Some("edge"));
+        assert_eq!(target.supported_models.get("gpt-5.5"), Some(&true));
+        assert_eq!(target.supported_models.get("legacy"), Some(&false));
+        assert_eq!(target.supported_models.get("endpoint-only"), Some(&true));
+        assert_eq!(
+            target.model_mapping.get("gpt-5.5").map(String::as_str),
+            Some("upstream-gpt-5.5")
+        );
+        assert_eq!(
+            target.model_mapping.get("legacy").map(String::as_str),
+            Some("provider-legacy")
+        );
+    }
+
+    #[test]
+    fn service_status_cache_key_tracks_canonical_endpoint_fields() {
+        let config = ServiceStatusConfig {
+            enabled: true,
+            probes: vec![ServiceStatusProbeConfig {
+                provider: Some("relay".to_string()),
+                endpoint: Some("fast".to_string()),
+                ..ServiceStatusProbeConfig::default()
+            }],
+            ..ServiceStatusConfig::default()
+        };
+        let mut runtime = canonical_runtime_with_endpoint("https://relay.example/v1".to_string());
+        let initial_key = service_status_cache_key(&config, Some(&runtime), "codex");
+
+        runtime
+            .codex
+            .providers
+            .get_mut("relay")
+            .and_then(|provider| provider.endpoints.get_mut("fast"))
+            .expect("canonical endpoint")
+            .tags
+            .insert("region".to_string(), "endpoint-region".to_string());
+
+        assert_ne!(
+            initial_key,
+            service_status_cache_key(&config, Some(&runtime), "codex")
+        );
+    }
+
     #[tokio::test]
     async fn provider_probe_sends_minimal_chat_completion_request() {
         async fn handler(
@@ -1056,34 +1223,7 @@ mod tests {
                 .expect("serve provider probe test");
         });
 
-        let mut runtime = ProxyConfig::default();
-        runtime.codex.configs.insert(
-            "relay".to_string(),
-            ServiceConfig {
-                name: "relay".to_string(),
-                alias: None,
-                enabled: true,
-                level: 1,
-                upstreams: vec![UpstreamConfig {
-                    base_url: format!("http://{addr}/v1"),
-                    auth: UpstreamAuth {
-                        auth_token: Some("secret-token".to_string()),
-                        auth_token_env: None,
-                        api_key: Some("api-key".to_string()),
-                        api_key_env: None,
-                    },
-                    tags: HashMap::from([
-                        ("provider_id".to_string(), "relay".to_string()),
-                        ("endpoint_id".to_string(), "default".to_string()),
-                    ]),
-                    supported_models: HashMap::from([("gpt-5.5".to_string(), true)]),
-                    model_mapping: HashMap::from([(
-                        "gpt-5.5".to_string(),
-                        "upstream-gpt-5.5".to_string(),
-                    )]),
-                }],
-            },
-        );
+        let runtime = canonical_runtime_with_endpoint(format!("http://{addr}/v1"));
         let config = ServiceStatusConfig {
             enabled: true,
             refresh_interval_secs: 60,
@@ -1093,7 +1233,7 @@ mod tests {
             probes: vec![ServiceStatusProbeConfig {
                 id: Some("relay".to_string()),
                 provider: Some("relay".to_string()),
-                endpoint: Some("default".to_string()),
+                endpoint: Some("fast".to_string()),
                 url: None,
                 models: vec!["gpt-5.5".to_string()],
                 timeout_ms: None,
@@ -1119,11 +1259,8 @@ mod tests {
             .expect("captured request lock")
             .clone()
             .expect("captured provider probe request");
-        assert_eq!(
-            captured.authorization.as_deref(),
-            Some("Bearer secret-token")
-        );
-        assert_eq!(captured.api_key.as_deref(), Some("api-key"));
+        assert_eq!(captured.authorization.as_deref(), Some("Bearer test-token"));
+        assert_eq!(captured.api_key.as_deref(), Some("endpoint-api-key"));
         assert_eq!(captured.body["model"], "upstream-gpt-5.5");
         assert_eq!(captured.body["max_tokens"], 1);
         assert_eq!(captured.body["temperature"], 0);

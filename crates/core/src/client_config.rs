@@ -22,26 +22,6 @@ pub fn codex_config_path() -> PathBuf {
     codex_home().join("config.toml")
 }
 
-pub fn codex_sqlite_dir() -> PathBuf {
-    codex_home().join("sqlite")
-}
-
-pub fn codex_app_db_path() -> PathBuf {
-    codex_sqlite_dir().join("codex-dev.db")
-}
-
-pub fn codex_switch_state_path() -> PathBuf {
-    codex_home().join("codex-helper-switch-state.json")
-}
-
-pub fn codex_auth_path() -> PathBuf {
-    codex_home().join("auth.json")
-}
-
-pub fn codex_models_cache_path() -> PathBuf {
-    codex_home().join("models_cache.json")
-}
-
 pub fn claude_home() -> PathBuf {
     resolve_home_dir("CLAUDE_HOME", ".claude")
 }
@@ -71,8 +51,4 @@ pub fn claude_settings_backup_path_for(path: &Path) -> PathBuf {
 
 pub fn claude_settings_backup_path() -> PathBuf {
     claude_settings_backup_path_for(&claude_settings_path())
-}
-
-pub fn is_claude_absent_backup_sentinel(text: &str) -> bool {
-    text.trim() == CLAUDE_ABSENT_BACKUP_SENTINEL
 }

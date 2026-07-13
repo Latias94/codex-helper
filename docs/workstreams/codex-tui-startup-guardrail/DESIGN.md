@@ -1,5 +1,11 @@
 # Design: Codex TUI Startup Guardrail
 
+> Historical artifact (superseded 2026-07-12): startup readiness no longer reads
+> Codex auth, model cache, SQLite, or remote-control state. The retained guardrail
+> reports helper config/runtime readiness and explicit local switch-journal
+> conflicts. The remote control plane is GET/HEAD-only, and the
+> `switch remote-control` commands referenced below no longer exist.
+
 ## Problem Statement
 
 Many operators start the Codex TUI directly and do not run a separate verification command first.
@@ -72,4 +78,3 @@ guardrail that answers:
 - `codex-provider-concurrency-limits` already covers provider hard-stop semantics.
 
 This workstream stays narrow: one startup guardrail for the direct TUI entry path.
-

@@ -9,6 +9,7 @@ use crate::provider_signals::{
     ProviderSignal, ProviderSignalConfidence, ProviderSignalKind, ProviderSignalSource,
     ProviderSignalTarget,
 };
+use crate::runtime_identity::ProviderEndpointKey;
 use crate::state::{FinishedRequest, RequestObservability, SessionIdentitySource};
 use crate::usage::UsageMetrics;
 
@@ -75,9 +76,13 @@ pub struct RequestChainRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub station_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_endpoint_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub route_path: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageMetrics>,
     #[serde(default, skip_serializing_if = "CostBreakdown::is_unknown")]
@@ -110,8 +115,6 @@ pub struct RequestChainRouteAttempt {
     pub endpoint_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_endpoint_key: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub station_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preference_group: Option<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -204,6 +207,14 @@ pub struct RequestChainTimelineEvent {
     pub model: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct FinalRouteIdentity {
+    provider_id: Option<String>,
+    endpoint_id: Option<String>,
+    provider_endpoint_key: Option<String>,
+    route_path: Vec<String>,
+}
+
 impl RequestChainExport {
     pub fn from_finished_requests(
         selector: RequestChainSelector,
@@ -227,10 +238,11 @@ impl RequestChainExport {
 
 impl RequestChainRequest {
     pub fn from_finished_request(request: &FinishedRequest) -> Self {
+        let final_route_identity = FinalRouteIdentity::from_finished_request(request);
         let route_attempts = request
             .retry
             .as_ref()
-            .map(|retry| retry.route_attempts_or_derived())
+            .map(|retry| retry.route_attempts.as_slice())
             .unwrap_or_default();
         let attempts_truncated = route_attempts.len() > REQUEST_CHAIN_ATTEMPT_MAX;
         let route_attempts = route_attempts
@@ -255,8 +267,13 @@ impl RequestChainRequest {
             .map(RequestChainPolicyAction::from_action)
             .collect::<Vec<_>>();
 
-        let timeline =
-            request_chain_timeline(request, &route_attempts, &provider_signals, &policy_actions);
+        let timeline = request_chain_timeline(
+            request,
+            &final_route_identity,
+            &route_attempts,
+            &provider_signals,
+            &policy_actions,
+        );
 
         Self {
             request_id: request.id,
@@ -267,8 +284,10 @@ impl RequestChainRequest {
             model: request.model.clone(),
             reasoning_effort: request.reasoning_effort.clone(),
             service_tier: request.service_tier.clone(),
-            station_name: request.station_name.clone(),
-            provider_id: request.provider_id.clone(),
+            provider_id: final_route_identity.provider_id,
+            endpoint_id: final_route_identity.endpoint_id,
+            provider_endpoint_key: final_route_identity.provider_endpoint_key,
+            route_path: final_route_identity.route_path,
             usage: request.usage.clone(),
             cost: request.cost.clone(),
             observability: request.observability_view(),
@@ -287,6 +306,35 @@ impl RequestChainRequest {
             provider_signals,
             policy_actions,
             timeline,
+        }
+    }
+}
+
+impl FinalRouteIdentity {
+    fn from_finished_request(request: &FinishedRequest) -> Self {
+        let route_decision = request.route_decision.as_ref();
+        let provider_id =
+            clean_identity(route_decision.and_then(|decision| decision.provider_id.clone()))
+                .or_else(|| clean_identity(request.provider_id.clone()));
+        let endpoint_id =
+            clean_identity(route_decision.and_then(|decision| decision.endpoint_id.clone()));
+        let provider_endpoint_key =
+            provider_id
+                .as_deref()
+                .zip(endpoint_id.as_deref())
+                .map(|(provider_id, endpoint_id)| {
+                    ProviderEndpointKey::new(request.service.as_str(), provider_id, endpoint_id)
+                        .stable_key()
+                });
+        let route_path = route_decision
+            .map(|decision| decision.route_path.clone())
+            .unwrap_or_default();
+
+        Self {
+            provider_id,
+            endpoint_id,
+            provider_endpoint_key,
+            route_path,
         }
     }
 }
@@ -310,7 +358,6 @@ impl RequestChainRouteAttempt {
             provider_id: attempt.provider_id.clone(),
             endpoint_id: attempt.endpoint_id.clone(),
             provider_endpoint_key: attempt.provider_endpoint_key.clone(),
-            station_name: attempt.station_name.clone(),
             preference_group: attempt.preference_group,
             route_path: attempt.route_path.clone(),
             provider_attempt: attempt.provider_attempt,
@@ -372,6 +419,7 @@ impl RequestChainPolicyAction {
 
 fn request_chain_timeline(
     request: &FinishedRequest,
+    final_route_identity: &FinalRouteIdentity,
     route_attempts: &[RequestChainRouteAttempt],
     provider_signals: &[RequestChainProviderSignal],
     policy_actions: &[RequestChainPolicyAction],
@@ -386,9 +434,9 @@ fn request_chain_timeline(
             "request_completed".to_string()
         },
         attempt_index: None,
-        provider_id: request.provider_id.clone(),
-        endpoint_id: None,
-        provider_endpoint_key: None,
+        provider_id: final_route_identity.provider_id.clone(),
+        endpoint_id: final_route_identity.endpoint_id.clone(),
+        provider_endpoint_key: final_route_identity.provider_endpoint_key.clone(),
         status_code: Some(request.status_code),
         model: request.model.clone(),
     }];
@@ -548,10 +596,17 @@ mod tests {
             model: Some("gpt-5.6".to_string()),
             reasoning_effort: Some("high".to_string()),
             service_tier: Some("priority".to_string()),
-            station_name: Some("primary".to_string()),
-            provider_id: Some("relay".to_string()),
-            upstream_base_url: Some("https://relay.example/v1?token=secret".to_string()),
-            route_decision: None,
+            provider_id: Some("legacy-provider".to_string()),
+            route_decision: Some(crate::state::RouteDecisionProvenance {
+                effective_upstream_base_url: Some(crate::state::ResolvedRouteValue::new(
+                    "https://raw-upstream.invalid/v1?credential=url-secret",
+                    crate::state::RouteValueSource::RuntimeFallback,
+                )),
+                provider_id: Some("relay".to_string()),
+                endpoint_id: Some("default".to_string()),
+                route_path: vec!["root".to_string(), "relay".to_string()],
+                ..crate::state::RouteDecisionProvenance::default()
+            }),
             usage: Some(UsageMetrics {
                 input_tokens: 10,
                 output_tokens: 20,
@@ -561,7 +616,6 @@ mod tests {
             cost: CostBreakdown::unknown(),
             retry: Some(RetryInfo {
                 attempts: 1,
-                upstream_chain: vec!["raw upstream chain secret-token".to_string()],
                 route_attempts: vec![RouteAttemptLog {
                     attempt_index: 0,
                     provider_id: Some("relay".to_string()),
@@ -572,7 +626,6 @@ mod tests {
                     status_code: Some(429),
                     error_class: Some("http_429".to_string()),
                     model: Some("gpt-5.6".to_string()),
-                    raw: "raw route attempt secret-token".to_string(),
                     provider_signals: vec![provider_signal.clone()],
                     policy_actions: vec![policy_action.clone()],
                     ..RouteAttemptLog::default()
@@ -613,11 +666,82 @@ mod tests {
         assert!(text.contains("\"code\":\"failed_status\""));
         assert!(!text.contains("client_addr"));
         assert!(!text.contains("cwd"));
+        assert!(!text.contains("station_name"));
+        assert!(!text.contains("legacy-station-secret"));
         assert!(!text.contains("upstream_base_url"));
+        assert!(!text.contains("raw-upstream.invalid"));
+        assert!(!text.contains("url-secret"));
         assert!(!text.contains("raw"));
         assert!(!text.contains("secret-token"));
         assert!(!text.contains("cf-ray-secret"));
         assert!(!text.contains("upstream-secret"));
+    }
+
+    #[test]
+    fn request_chain_export_uses_final_route_decision_endpoint_identity() {
+        let export = RequestChainExport::from_finished_requests(
+            RequestChainSelector {
+                request_id: Some(42),
+                ..RequestChainSelector::default()
+            },
+            20,
+            false,
+            vec![finished_request()],
+        );
+        let value = serde_json::to_value(&export).expect("serialize request chain export");
+        let request = &value["requests"][0];
+
+        assert_eq!(request["provider_id"].as_str(), Some("relay"));
+        assert_eq!(request["endpoint_id"].as_str(), Some("default"));
+        assert_eq!(
+            request["provider_endpoint_key"].as_str(),
+            Some("codex/relay/default")
+        );
+        assert_eq!(request["route_path"], serde_json::json!(["root", "relay"]));
+
+        let terminal = export.requests[0]
+            .timeline
+            .iter()
+            .find(|event| event.kind == "request")
+            .expect("terminal request timeline event");
+        assert_eq!(terminal.provider_id.as_deref(), Some("relay"));
+        assert_eq!(terminal.endpoint_id.as_deref(), Some("default"));
+        assert_eq!(
+            terminal.provider_endpoint_key.as_deref(),
+            Some("codex/relay/default")
+        );
+    }
+
+    #[test]
+    fn request_chain_export_falls_back_to_top_level_provider_without_endpoint_identity() {
+        let mut finished = finished_request();
+        finished.provider_id = Some("fallback-provider".to_string());
+        finished.route_decision = None;
+
+        let export = RequestChainExport::from_finished_requests(
+            RequestChainSelector {
+                request_id: Some(42),
+                ..RequestChainSelector::default()
+            },
+            20,
+            false,
+            vec![finished],
+        );
+        let request = &export.requests[0];
+
+        assert_eq!(request.provider_id.as_deref(), Some("fallback-provider"));
+        assert!(request.endpoint_id.is_none());
+        assert!(request.provider_endpoint_key.is_none());
+        assert!(request.route_path.is_empty());
+
+        let terminal = request
+            .timeline
+            .iter()
+            .find(|event| event.kind == "request")
+            .expect("terminal request timeline event");
+        assert_eq!(terminal.provider_id.as_deref(), Some("fallback-provider"));
+        assert!(terminal.endpoint_id.is_none());
+        assert!(terminal.provider_endpoint_key.is_none());
     }
 
     #[test]

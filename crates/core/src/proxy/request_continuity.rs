@@ -1,4 +1,4 @@
-use crate::config::RoutingAffinityPolicyV5;
+use crate::config::RouteAffinityPolicy;
 
 use super::request_body::{
     codex_compact_request_requires_affinity, codex_responses_body_has_compaction_trigger,
@@ -31,12 +31,6 @@ pub(super) struct RequestContinuityClassification {
     pub(super) is_remote_compaction_v1_request: bool,
     pub(super) is_remote_compaction_v2_request: bool,
     pub(super) remote_compaction_requires_affinity: bool,
-}
-
-impl RequestContinuityClassification {
-    pub(super) fn is_remote_compaction_request(self) -> bool {
-        self.is_remote_compaction_v1_request || self.is_remote_compaction_v2_request
-    }
 }
 
 pub(super) struct RequestContinuityClassificationInput<'a> {
@@ -98,7 +92,7 @@ impl RequestContinuityDecision {
 pub(super) struct RouteContinuityDecisionInput {
     pub(super) is_remote_compaction_request: bool,
     pub(super) remote_compaction_requires_affinity: bool,
-    pub(super) affinity_policy: Option<RoutingAffinityPolicyV5>,
+    pub(super) affinity_policy: Option<RouteAffinityPolicy>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,7 +106,7 @@ impl RequestContinuityContract {
     pub(super) fn from_route(input: RouteContinuityDecisionInput) -> Self {
         let decision = route_continuity_decision(input);
         let strict_affinity = input.is_remote_compaction_request
-            && matches!(input.affinity_policy, Some(RoutingAffinityPolicyV5::Hard));
+            && matches!(input.affinity_policy, Some(RouteAffinityPolicy::Hard));
         Self {
             decision,
             strict_affinity,
@@ -181,7 +175,7 @@ impl RequestContinuityContract {
 }
 
 fn route_continuity_decision(input: RouteContinuityDecisionInput) -> RequestContinuityDecision {
-    let hard_affinity = matches!(input.affinity_policy, Some(RoutingAffinityPolicyV5::Hard));
+    let hard_affinity = matches!(input.affinity_policy, Some(RouteAffinityPolicy::Hard));
     if input.is_remote_compaction_request
         && (input.remote_compaction_requires_affinity || hard_affinity)
     {
@@ -278,7 +272,7 @@ mod tests {
         let contract = RequestContinuityContract::from_route(RouteContinuityDecisionInput {
             is_remote_compaction_request: true,
             remote_compaction_requires_affinity: false,
-            affinity_policy: Some(RoutingAffinityPolicyV5::Hard),
+            affinity_policy: Some(RouteAffinityPolicy::Hard),
         });
 
         assert_eq!(contract.continuity_class(), "provider_state_bound");
@@ -293,7 +287,7 @@ mod tests {
         let contract = RequestContinuityContract::from_route(RouteContinuityDecisionInput {
             is_remote_compaction_request: true,
             remote_compaction_requires_affinity: true,
-            affinity_policy: Some(RoutingAffinityPolicyV5::FallbackSticky),
+            affinity_policy: Some(RouteAffinityPolicy::FallbackSticky),
         });
 
         assert_eq!(contract.continuity_class(), "provider_state_bound");
@@ -308,7 +302,7 @@ mod tests {
         let contract = RequestContinuityContract::from_route(RouteContinuityDecisionInput {
             is_remote_compaction_request: true,
             remote_compaction_requires_affinity: true,
-            affinity_policy: Some(RoutingAffinityPolicyV5::Hard),
+            affinity_policy: Some(RouteAffinityPolicy::Hard),
         });
 
         assert_eq!(contract.continuity_class(), "provider_state_bound");

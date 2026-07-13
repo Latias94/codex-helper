@@ -4,19 +4,17 @@ use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
-use crate::config::storage::load_config;
 use crate::control_plane_client::{ControlPlaneClient, ControlPlaneEndpoint};
-use crate::dashboard_core::ApiV1Snapshot;
-use crate::proxy::RuntimeStatusResponse;
+use crate::dashboard_core::OperatorReadModel;
 
 use super::fleet_refresh::{
     FleetRefreshResult, FleetRefreshSource, apply_fleet_refresh_result, start_fleet_refresh,
 };
 use super::i18n;
 use super::model::{
-    Palette, ProviderOption, Snapshot, build_provider_options, filtered_request_page_len,
-    filtered_requests_len, snapshot_from_api_v1,
+    Palette, ProviderOption, Snapshot, filtered_request_page_len, filtered_requests_len,
 };
+use super::operator_projection::apply_operator_read_model;
 use super::runtime_refresh::DashboardTiming;
 use super::state::{FleetViewMode, RuntimeConnectionKind, UiState, adjust_table_selection};
 use super::types::{Focus, Overlay, Page, StatsFocus};
@@ -41,24 +39,16 @@ impl AttachedDashboardRuntime {
     }
 
     fn admin_base_url(&self) -> &str {
-        &self.client.endpoint().admin_base_url
+        self.client.endpoint().admin_base_url()
     }
 
-    async fn fetch_json<T>(&self, path: &str) -> anyhow::Result<T>
-    where
-        T: serde::de::DeserializeOwned,
-    {
-        self.client.fetch_json(path).await
-    }
-
-    async fn runtime_status(&self) -> anyhow::Result<RuntimeStatusResponse> {
-        self.fetch_json("/__codex_helper/api/v1/runtime/status")
-            .await
-    }
-
-    async fn snapshot(&self, stats_days: usize) -> anyhow::Result<ApiV1Snapshot> {
+    async fn operator_read_model(
+        &self,
+        service_name: &str,
+        previous: Option<&OperatorReadModel>,
+    ) -> OperatorReadModel {
         self.client
-            .snapshot(crate::state::recent_finished_max(), stats_days.min(365))
+            .refresh_operator_read_model(service_name, previous)
             .await
     }
 }
@@ -88,44 +78,24 @@ async fn run_attached_dashboard_runtime(
     port: u16,
     runtime: AttachedDashboardRuntime,
 ) -> anyhow::Result<()> {
-    let cfg = load_config().await.unwrap_or_default();
-    let language = resolve_attached_language(&cfg);
+    let language = resolve_attached_language();
     let timing = DashboardTiming::from_env();
 
-    let status = runtime.runtime_status().await?;
-    let api_snapshot = runtime.snapshot(7).await?;
-    if api_snapshot.service_name.as_str() != service_name {
-        anyhow::bail!(
-            "attached proxy on port {port} is service '{}', expected '{service_name}'",
-            api_snapshot.service_name
-        );
-    }
-
-    let mut providers = build_provider_options(&cfg, service_name);
+    let mut providers = Vec::new();
     let mut ui = UiState {
         service_name,
         proxy_port: port,
         language,
-        usage_forecast: cfg.ui.usage_forecast.clone(),
-        fleet_registry: cfg.fleet.clone(),
-        refresh_ms: timing.refresh_ms,
-        config_version: cfg.version,
+        config_version: None,
         runtime_connection: RuntimeConnectionKind::Attached,
-        runtime_shutdown_available: Some(status.shutdown_available),
-        last_runtime_config_loaded_at_ms: Some(status.loaded_at_ms),
-        last_runtime_config_source_mtime_ms: status.source_mtime_ms,
-        last_runtime_retry: Some(status.retry),
-        last_runtime_config_refresh_at: Some(Instant::now()),
         toast: Some((
             attached_start_toast(language, runtime.admin_base_url()),
             Instant::now(),
         )),
         ..Default::default()
     };
-    let mut snapshot = snapshot_from_api_v1(api_snapshot).await;
-    hydrate_attached_profile_state(&mut ui, &runtime).await;
-    hydrate_attached_routing_state(&mut ui, &runtime).await;
-    ui.clamp_selection(&snapshot, ui.station_page_rows_len(providers.len()));
+    let mut snapshot = Snapshot::default();
+    refresh_attached_snapshot(&runtime, &mut ui, &mut snapshot, &mut providers).await;
 
     let (term_guard, mut terminal) = enter_dashboard_terminal()?;
     let mut events = EventStream::new();
@@ -154,7 +124,7 @@ async fn run_attached_dashboard_runtime(
 
         tokio::select! {
             _ = ticker.tick() => {
-                refresh_attached_snapshot(&runtime, &mut ui, &mut snapshot, providers.len()).await;
+                refresh_attached_snapshot(&runtime, &mut ui, &mut snapshot, &mut providers).await;
                 if ui.page == Page::Fleet
                     && !ui.fleet_loading
                     && ui
@@ -190,7 +160,7 @@ async fn run_attached_dashboard_runtime(
                             start_attached_fleet_refresh(&mut ui, &runtime, fleet_refresh_tx.clone());
                         }
                         if ui.needs_snapshot_refresh {
-                            refresh_attached_snapshot(&runtime, &mut ui, &mut snapshot, providers.len()).await;
+                            refresh_attached_snapshot(&runtime, &mut ui, &mut snapshot, &mut providers).await;
                             ui.needs_snapshot_refresh = false;
                         }
                         render_invalidation = RenderInvalidation::FullClear;
@@ -213,21 +183,24 @@ fn start_attached_fleet_refresh(
     runtime: &AttachedDashboardRuntime,
     tx: mpsc::UnboundedSender<FleetRefreshResult>,
 ) {
+    let model = ui
+        .operator_read_model
+        .clone()
+        .unwrap_or_else(|| OperatorReadModel::disconnected(ui.service_name));
     start_fleet_refresh(
         ui,
         FleetRefreshSource::Attached {
-            client: runtime.client.clone(),
+            model: Box::new(model),
+            admin_base_url: runtime.admin_base_url().to_string(),
         },
         tx,
     );
     ui.needs_fleet_refresh = false;
 }
 
-fn resolve_attached_language(cfg: &crate::config::ProxyConfig) -> super::Language {
+fn resolve_attached_language() -> super::Language {
     if let Ok(s) = std::env::var("CODEX_HELPER_TUI_LANG") {
         super::resolve_language_preference(Some(&s))
-    } else if let Some(s) = cfg.ui.language.as_deref() {
-        super::resolve_language_preference(Some(s))
     } else {
         super::detect_system_language()
     }
@@ -274,66 +247,18 @@ async fn refresh_attached_snapshot(
     runtime: &AttachedDashboardRuntime,
     ui: &mut UiState,
     snapshot: &mut Snapshot,
-    providers_len: usize,
+    providers: &mut Vec<ProviderOption>,
 ) {
-    match runtime.runtime_status().await {
-        Ok(status) => {
-            ui.runtime_status_error = None;
-            ui.runtime_shutdown_available = Some(status.shutdown_available);
-            ui.last_runtime_config_loaded_at_ms = Some(status.loaded_at_ms);
-            ui.last_runtime_config_source_mtime_ms = status.source_mtime_ms;
-            ui.last_runtime_retry = Some(status.retry);
-            ui.last_runtime_config_refresh_at = Some(Instant::now());
-        }
-        Err(err) => {
-            ui.runtime_status_error = Some(err.to_string());
-            ui.last_runtime_config_refresh_at = Some(Instant::now());
-        }
-    }
-
-    match runtime.snapshot(ui.stats_days).await {
-        Ok(api_snapshot) => {
-            *snapshot = snapshot_from_api_v1(api_snapshot).await;
-            ui.clamp_selection(snapshot, ui.station_page_rows_len(providers_len));
-        }
-        Err(err) => {
-            ui.runtime_status_error = Some(err.to_string());
-        }
-    }
-}
-
-async fn hydrate_attached_profile_state(ui: &mut UiState, runtime: &AttachedDashboardRuntime) {
-    let Ok(response) = runtime
-        .fetch_json::<crate::proxy::ProfilesResponse>("/__codex_helper/api/v1/profiles")
-        .await
-    else {
-        return;
-    };
-
-    ui.configured_default_profile = response.configured_default_profile.clone();
-    ui.effective_default_profile = response.default_profile.clone();
-    ui.runtime_default_profile_override =
-        if response.default_profile != response.configured_default_profile {
-            response.default_profile.clone()
-        } else {
-            None
-        };
-    ui.profile_options = response.profiles;
-}
-
-async fn hydrate_attached_routing_state(ui: &mut UiState, runtime: &AttachedDashboardRuntime) {
-    if !ui.uses_route_graph_routing() {
-        return;
-    }
-    let Ok(spec) = runtime
-        .fetch_json::<crate::config::PersistedRoutingSpec>("/__codex_helper/api/v1/routing")
-        .await
-    else {
-        return;
-    };
-    ui.routing_spec = Some(super::model::RoutingSpecView::from(spec));
-    ui.clamp_routing_menu_selection();
-    ui.last_routing_control_refresh_at = Some(Instant::now());
+    let model = runtime
+        .operator_read_model(ui.service_name, ui.operator_read_model.as_ref())
+        .await;
+    apply_operator_read_model(
+        ui,
+        snapshot,
+        providers,
+        model,
+        &std::collections::HashMap::new(),
+    );
 }
 
 fn handle_attached_key(
@@ -359,6 +284,14 @@ fn handle_attached_key(
             }
             _ => false,
         };
+    }
+
+    if ui.page == Page::Settings
+        && ui.service_name == "codex"
+        && let Some(intent) = input::codex_switch_intent_for_key(key.code, ui.proxy_port)
+    {
+        input::apply_codex_switch(ui, intent);
+        return true;
     }
 
     match key.code {
@@ -450,8 +383,8 @@ fn cycle_attached_focus(ui: &mut UiState) {
         Page::Stations => ui.focus = Focus::Stations,
         Page::Stats => {
             ui.stats_focus = match ui.stats_focus {
-                StatsFocus::Stations => StatsFocus::Providers,
-                StatsFocus::Providers => StatsFocus::Stations,
+                StatsFocus::ProviderEndpoints => StatsFocus::Providers,
+                StatsFocus::Providers => StatsFocus::ProviderEndpoints,
             };
             ui.stats_provider_detail_scroll = 0;
         }
@@ -474,19 +407,20 @@ fn move_attached_selection(
 ) -> bool {
     match ui.page {
         Page::Stations => {
-            let len = ui.station_page_rows_len(providers_len);
-            if let Some(next) = adjust_table_selection(&mut ui.stations_table, delta, len) {
+            if let Some(next) = adjust_table_selection(&mut ui.stations_table, delta, providers_len)
+            {
                 ui.selected_station_idx = next;
                 return true;
             }
             false
         }
         Page::Stats => match ui.stats_focus {
-            StatsFocus::Stations => {
-                let len = snapshot.usage_day.station_rows.len();
-                if let Some(next) = adjust_table_selection(&mut ui.stats_stations_table, delta, len)
+            StatsFocus::ProviderEndpoints => {
+                let len = snapshot.usage_day.provider_endpoint_rows.len();
+                if let Some(next) =
+                    adjust_table_selection(&mut ui.stats_provider_endpoints_table, delta, len)
                 {
-                    ui.selected_stats_station_idx = next;
+                    ui.selected_stats_provider_endpoint_idx = next;
                     return true;
                 }
                 false
@@ -626,6 +560,205 @@ fn toggle_attached_language(ui: &mut UiState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Json, Router, extract::State, http::Uri, routing::get};
+    use std::sync::{Arc, Mutex};
+
+    use crate::dashboard_core::{
+        ApiV1OperatorSummary, OperatorReadData, OperatorReadModel, OperatorReadStatus,
+        OperatorRevisionBundle, OperatorRuntimeSummary, OperatorSummaryCounts,
+    };
+
+    #[derive(Clone)]
+    struct RequestLog {
+        paths: Arc<Mutex<Vec<String>>>,
+        model: OperatorReadModel,
+    }
+
+    async fn operator_read_model_response(
+        State(state): State<RequestLog>,
+        uri: Uri,
+    ) -> Json<OperatorReadModel> {
+        state
+            .paths
+            .lock()
+            .expect("request log lock")
+            .push(uri.path().to_string());
+        Json(state.model)
+    }
+
+    async fn unexpected_attached_request(State(state): State<RequestLog>, uri: Uri) {
+        state
+            .paths
+            .lock()
+            .expect("request log lock")
+            .push(uri.path().to_string());
+    }
+
+    async fn spawn_operator_server(
+        model: OperatorReadModel,
+    ) -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let state = RequestLog {
+            paths: paths.clone(),
+            model,
+        };
+        let app = Router::new()
+            .route(
+                "/__codex_helper/api/v1/operator/read-model",
+                get(operator_read_model_response),
+            )
+            .fallback(get(unexpected_attached_request))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind operator server");
+        let address = listener.local_addr().expect("operator server address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve operator model");
+        });
+        (format!("http://{address}"), paths, server)
+    }
+
+    fn ready_operator_model() -> OperatorReadModel {
+        let mut model = OperatorReadModel::ready(
+            "codex",
+            42,
+            OperatorRevisionBundle {
+                runtime_revision: 7,
+                runtime_digest: "runtime-7".to_string(),
+                route_digest: "route-7".to_string(),
+                catalog_revision: "catalog-7".to_string(),
+                pricing_revision: "pricing-7".to_string(),
+                operator_pricing_revision: "operator-pricing-7".to_string(),
+                policy_revision: 8,
+                ledger_revision: "ledger-9".to_string(),
+            },
+            OperatorReadData {
+                summary: ApiV1OperatorSummary {
+                    api_version: 1,
+                    service_name: "codex".to_string(),
+                    runtime: OperatorRuntimeSummary::default(),
+                    counts: OperatorSummaryCounts::default(),
+                    retry: Default::default(),
+                    sessions: Vec::new(),
+                    profiles: Vec::new(),
+                    providers: Vec::new(),
+                },
+                active_requests: Vec::new(),
+                recent_requests: Vec::new(),
+                usage_summaries: Vec::new(),
+                usage_day: Default::default(),
+                usage_rollup: Default::default(),
+                stats_5m: Default::default(),
+                stats_1h: Default::default(),
+                pricing_catalog: Default::default(),
+                provider_balances: Vec::new(),
+            },
+        );
+        let data = model.data.as_mut().expect("ready operator data");
+        data.summary.runtime.runtime_loaded_at_ms = Some(77);
+        data.stats_5m.total = 3;
+        model
+    }
+
+    #[tokio::test]
+    async fn attached_refresh_reads_exactly_one_operator_bundle() {
+        let (base_url, paths, server) = spawn_operator_server(ready_operator_model()).await;
+        let runtime = AttachedDashboardRuntime::new_with_admin_base_url(base_url, None)
+            .expect("attached runtime");
+        let mut ui = UiState {
+            service_name: "codex",
+            runtime_connection: RuntimeConnectionKind::Attached,
+            ..Default::default()
+        };
+        let mut snapshot = empty_snapshot();
+        let mut providers = Vec::new();
+
+        refresh_attached_snapshot(&runtime, &mut ui, &mut snapshot, &mut providers).await;
+
+        assert_eq!(
+            *paths.lock().expect("request log lock"),
+            vec!["/__codex_helper/api/v1/operator/read-model"],
+        );
+        assert_eq!(
+            ui.operator_read_model.as_ref().map(|model| model.status),
+            Some(OperatorReadStatus::Ready)
+        );
+        assert_eq!(snapshot.stats_5m.total, 3);
+        server.abort();
+    }
+
+    #[test]
+    fn stale_attached_bundle_keeps_facts_but_disables_runtime_actions() {
+        let ready = ready_operator_model();
+        let stale = OperatorReadModel::stale_from(&ready);
+        let mut ui = UiState {
+            service_name: "codex",
+            runtime_connection: RuntimeConnectionKind::Attached,
+            ..Default::default()
+        };
+        let mut snapshot = Snapshot::default();
+        let mut providers = Vec::new();
+
+        apply_operator_read_model(
+            &mut ui,
+            &mut snapshot,
+            &mut providers,
+            stale,
+            &std::collections::HashMap::new(),
+        );
+
+        let model = ui.operator_read_model.as_ref().expect("stale model");
+        assert_eq!(model.status, OperatorReadStatus::Stale);
+        assert!(!model.can_use_runtime_actions());
+        assert_eq!(snapshot.stats_5m.total, 3);
+        assert_eq!(ui.last_runtime_config_loaded_at_ms, Some(77));
+        assert!(
+            ui.runtime_status_error
+                .as_deref()
+                .is_some_and(|error| error.contains("stale"))
+        );
+    }
+
+    #[test]
+    fn unavailable_attached_states_drop_previous_runtime_facts() {
+        for unavailable in [
+            OperatorReadModel::auth_required("codex"),
+            OperatorReadModel::disconnected("codex"),
+        ] {
+            let mut ui = UiState {
+                service_name: "codex",
+                runtime_connection: RuntimeConnectionKind::Attached,
+                ..Default::default()
+            };
+            let mut snapshot = Snapshot::default();
+            let mut providers = Vec::new();
+            apply_operator_read_model(
+                &mut ui,
+                &mut snapshot,
+                &mut providers,
+                ready_operator_model(),
+                &std::collections::HashMap::new(),
+            );
+
+            apply_operator_read_model(
+                &mut ui,
+                &mut snapshot,
+                &mut providers,
+                unavailable,
+                &std::collections::HashMap::new(),
+            );
+
+            let model = ui.operator_read_model.as_ref().expect("unavailable model");
+            assert!(!model.can_use_runtime_actions());
+            assert!(model.data.is_none());
+            assert_eq!(snapshot.stats_5m.total, 0);
+            assert!(providers.is_empty());
+            assert_eq!(ui.last_runtime_config_loaded_at_ms, None);
+        }
+    }
 
     #[test]
     fn attached_page_switch_keeps_exit_semantics_read_only() {
@@ -696,26 +829,13 @@ mod tests {
         Snapshot {
             rows: Vec::new(),
             recent: Vec::new(),
-            model_overrides: std::collections::HashMap::new(),
-            overrides: std::collections::HashMap::new(),
-            station_overrides: std::collections::HashMap::new(),
-            route_target_overrides: std::collections::HashMap::new(),
-            service_tier_overrides: std::collections::HashMap::new(),
-            global_station_override: None,
-            global_route_target_override: None,
-            station_meta_overrides: std::collections::HashMap::new(),
+            request_control_evidence: std::collections::HashMap::new(),
             usage_day: crate::state::UsageDayView::default(),
             usage_rollup: crate::state::UsageRollupView::default(),
             provider_balances: std::collections::HashMap::new(),
-            provider_balance_history: std::collections::HashMap::new(),
-            station_health: std::collections::HashMap::new(),
-            health_checks: std::collections::HashMap::new(),
-            lb_view: std::collections::HashMap::new(),
-            provider_endpoint_policy_actions: std::collections::HashMap::new(),
             stats_5m: crate::dashboard_core::WindowStats::default(),
             stats_1h: crate::dashboard_core::WindowStats::default(),
             service_status: None,
-            pricing_catalog: crate::pricing::ModelPriceCatalogSnapshot::default(),
             refreshed_at: Instant::now(),
         }
     }

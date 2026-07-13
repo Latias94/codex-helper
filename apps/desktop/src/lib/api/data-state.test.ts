@@ -1,94 +1,107 @@
 import { describe, expect, it } from "vitest";
 
-import { buildRuntimeDataState, errorToCode, errorToMessage } from "@/lib/api/data-state";
+import type { ApiOperatorReadModel } from "@/lib/api/admin-types";
+import {
+  buildOperatorReadModelDataState,
+  errorToCode,
+  errorToMessage,
+} from "@/lib/api/data-state";
 
-describe("runtime data state", () => {
-  it("shows a loading connection state before the first read model resolves", () => {
-    const state = buildRuntimeDataState({
-      hasLiveData: false,
-      isLoading: true,
-      isFetching: true,
-    });
+describe("operator read-model data state", () => {
+  it.each([
+    ["ready", "live", true, false],
+    ["stale", "stale", false, true],
+    ["disconnected", "disconnected", false, false],
+    ["auth_required", "auth-required", false, false],
+  ] as const)(
+    "derives %s from the server status",
+    (operatorStatus, expectedStatus, canUseLiveActions, isStale) => {
+      const state = buildOperatorReadModelDataState({
+        model: operatorModel(operatorStatus),
+        isFetching: false,
+        isLoading: false,
+      });
 
-    expect(state.status).toBe("loading");
-    expect(state.title).toContain("正在连接本地 admin API");
-    expect(state.isFallback).toBe(true);
-  });
+      expect(state.status).toBe(expectedStatus);
+      expect(state.canUseLiveActions).toBe(canUseLiveActions);
+      expect(state.isStale).toBe(isStale);
+      expect(state.lastUpdatedAt).toBe(
+        operatorStatus === "disconnected" || operatorStatus === "auth_required" ? undefined : 1234,
+      );
+    },
+  );
 
-  it("classifies browser or Vitest previews as desktop-runtime unavailable mock fallback", () => {
-    const state = buildRuntimeDataState({
-      hasLiveData: false,
-      isLoading: false,
+  it("does not promote disconnected data to ready because the query succeeded", () => {
+    const state = buildOperatorReadModelDataState({
+      model: operatorModel("disconnected"),
       isFetching: false,
-      error: new Error("tauri runtime unavailable in unit tests"),
-    });
-
-    expect(state.status).toBe("unavailable");
-    expect(state.title).toContain("当前展示离线示例数据");
-    expect(state.badge).toBe("Desktop unavailable");
-  });
-
-  it("classifies missing admin token separately from network disconnects", () => {
-    const state = buildRuntimeDataState({
-      hasLiveData: false,
       isLoading: false,
-      isFetching: false,
-      error: "HTTP 403 forbidden: missing x-codex-helper-admin-token",
-    });
-
-    expect(state.status).toBe("auth-required");
-    expect(state.title).toBe("需要 admin token");
-    expect(state.canAttachProxy).toBe(true);
-    expect(state.canStartProxy).toBe(false);
-  });
-
-  it("classifies structured admin error codes before message text", () => {
-    const state = buildRuntimeDataState({
-      hasLiveData: false,
-      isLoading: false,
-      isFetching: false,
-      error: {
-        code: "desktop_admin_http_403",
-        message: "admin API returned a forbidden response",
-      },
-    });
-
-    expect(state.status).toBe("auth-required");
-    expect(state.errorCode).toBe("desktop_admin_http_403");
-  });
-
-  it("teaches the user what to do when the local proxy is disconnected", () => {
-    const state = buildRuntimeDataState({
-      hasLiveData: false,
-      isLoading: false,
-      isFetching: false,
-      error: new Error("admin API http://127.0.0.1:4211 is not reachable: connection refused"),
     });
 
     expect(state.status).toBe("disconnected");
-    expect(state.description).toContain("启动代理");
-    expect(state.canStartProxy).toBe(true);
-    expect(state.canAttachProxy).toBe(true);
-  });
-
-  it("keeps previous live data visible but disables live actions after a failed refresh", () => {
-    const state = buildRuntimeDataState({
-      hasLiveData: true,
-      isLoading: false,
-      isFetching: false,
-      error: new Error("refresh timed out"),
-    });
-
-    expect(state.status).toBe("stale");
-    expect(state.source).toBe("live");
-    expect(state.isFallback).toBe(false);
-    expect(state.isStale).toBe(true);
+    expect(state.source).toBe("none");
     expect(state.canUseLiveActions).toBe(false);
   });
 
-  it("normalizes non-Error command failures into readable messages", () => {
-    expect(errorToMessage({ message: "command failed" })).toBe("command failed");
-    expect(errorToCode({ code: "desktop_admin_timeout", message: "timed out" })).toBe("desktop_admin_timeout");
-    expect(errorToMessage("plain failure")).toBe("plain failure");
+  it("keeps server-retained stale data visible while disabling writes", () => {
+    const model = operatorModel("stale");
+    const state = buildOperatorReadModelDataState({
+      model,
+      isFetching: false,
+      isLoading: false,
+    });
+
+    expect(model.data).toBeDefined();
+    expect(model.revisions).toBeDefined();
+    expect(state.status).toBe("stale");
+    expect(state.canUseLiveActions).toBe(false);
+  });
+
+  it("keeps a Tauri runtime failure fact-free", () => {
+    const state = buildOperatorReadModelDataState({
+      error: new Error("tauri runtime unavailable in unit tests"),
+      isFetching: false,
+      isLoading: false,
+    });
+
+    expect(state.status).toBe("unavailable");
+    expect(state.source).toBe("none");
+    expect(state.title).not.toContain("示例数据");
+  });
+
+  it("normalizes structured command failures", () => {
+    const error = { code: "desktop_admin_http_403", message: "forbidden" };
+    expect(errorToCode(error)).toBe("desktop_admin_http_403");
+    expect(errorToMessage(error)).toBe("forbidden");
   });
 });
+
+function operatorModel(status: ApiOperatorReadModel["status"]): ApiOperatorReadModel {
+  const base = {
+    api_version: 1 as const,
+    service_name: "codex",
+    captured_at_ms: status === "disconnected" || status === "auth_required" ? 0 : 1234,
+  };
+  if (status === "disconnected") {
+    return { ...base, status, issue: "disconnected" };
+  }
+  if (status === "auth_required") {
+    return { ...base, status, issue: "auth_required" };
+  }
+  const facts = {
+    revisions: {
+      runtime_revision: 1,
+      runtime_digest: "runtime",
+      route_digest: "route",
+      catalog_revision: "catalog",
+      pricing_revision: "pricing",
+      operator_pricing_revision: "operator-pricing",
+      policy_revision: 2,
+      ledger_revision: "operator-ledger-v1:test",
+    },
+    data: {} as never,
+  };
+  return status === "ready"
+    ? { ...base, ...facts, status }
+    : { ...base, ...facts, status, issue: "refresh_failed" };
+}

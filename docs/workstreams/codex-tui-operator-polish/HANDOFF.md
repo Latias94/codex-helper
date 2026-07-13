@@ -1,7 +1,9 @@
 # Codex TUI Operator Polish - Handoff
 
-Status: Active
+Status: Historical (superseded 2026-07-12)
 Last updated: 2026-05-28
+
+> Historical status (superseded 2026-07-12): the forecast provenance and mutable operator assumptions in this handoff no longer describe the product. Forecasting was removed, and TUI/desktop now consume the same typed, redacted, query-only operator read model. The narrow-width polish evidence remains historical UI evidence.
 
 ## Current State
 

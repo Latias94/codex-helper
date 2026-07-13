@@ -1,19 +1,16 @@
 export type RuntimeMode = "running" | "attached" | "stopped" | "unavailable";
 
-export type ProviderHealth = "healthy" | "warning" | "error" | "unknown";
-
 export type CostEstimate = {
   amount: string;
   disclaimer: string;
 };
 
-export type DataSource = "live" | "mock";
+export type DataSource = "live" | "none";
 
 export type RuntimeDataStatus =
   | "loading"
   | "live"
   | "refreshing"
-  | "mock"
   | "unavailable"
   | "disconnected"
   | "auth-required"
@@ -24,17 +21,14 @@ export type RuntimeOwnerMode = "desktop-owned" | "attached" | "unknown";
 export type RuntimeDataSeverity = "neutral" | "info" | "success" | "warning" | "danger";
 
 export type DesktopRuntimeConnectionMode = "desktop-owned" | "attached" | "stopped" | "unknown";
+export type CodexSwitchPhase = "off" | "prepared" | "applied" | "recovery_required";
 
 export type CodexSwitchSnapshot = {
+  phase?: CodexSwitchPhase | null;
   enabled: boolean;
-  modelProvider?: string | null;
-  providerName?: string | null;
+  managed: boolean;
   baseUrl?: string | null;
-  preset?: string | null;
-  requiresOpenaiAuth?: boolean | null;
-  supportsWebsockets?: boolean | null;
-  remoteCompactionV2Enabled: boolean;
-  hasSwitchState: boolean;
+  recoveryReason?: string | null;
   errorMessage?: string | null;
 };
 
@@ -45,13 +39,10 @@ export type DesktopControlState = {
   proxyBaseUrl: string;
   adminBaseUrl: string;
   reachable: boolean;
-  shutdownAvailable: boolean;
   owner?: unknown;
   codexSwitch: CodexSwitchSnapshot;
   canStart: boolean;
   canAttach: boolean;
-  canStopOwned: boolean;
-  canRemoteStop: boolean;
   canSwitchOn: boolean;
   canSwitchOff: boolean;
 };
@@ -61,7 +52,6 @@ export type DesktopActionResult = {
   action: string;
   message: string;
   state?: DesktopControlState;
-  payload?: unknown;
 };
 
 export type RuntimeDataState = {
@@ -74,8 +64,6 @@ export type RuntimeDataState = {
   canUseLiveActions: boolean;
   canStartProxy: boolean;
   canAttachProxy: boolean;
-  canStopProxy: boolean;
-  isFallback: boolean;
   isStale: boolean;
   ownerMode: RuntimeOwnerMode;
   lastUpdatedAt?: number;
@@ -120,27 +108,29 @@ export type RecentRequestView = {
 };
 
 export type ProviderCardView = {
-  id?: string;
   name: string;
-  alias?: string | null;
-  baseUrl: string;
-  continuityDomain?: string | null;
-  host: string;
-  enabled: boolean;
+  alias?: string;
+  configuredEnabled: boolean;
+  effectiveEnabled: boolean;
+  routableEndpoints: number;
   endpointCount: number;
-  endpointName?: string;
-  editable: boolean;
-  editBlockedReason?: string;
-  auth: string;
-  balance: string;
-  health: "Healthy" | "Warning" | "Error" | "Unknown";
-  latency: string;
-  capabilities: string[];
-  usage: string;
-  lastUsed: string;
+  capacity?: string;
+  endpoints: ProviderEndpointInventoryView[];
   controlSummary: string;
   controlBadges: ProviderControlBadgeView[];
-  active: boolean;
+};
+
+export type ProviderEndpointInventoryView = {
+  key: string;
+  name: string;
+  origin: string;
+  priority: number;
+  configuredEnabled: boolean;
+  effectiveEnabled: boolean;
+  routable: boolean;
+  runtimeState: string;
+  capacity?: string;
+  policyActionCount: number;
 };
 
 export type ProviderControlBadgeView = {
@@ -218,8 +208,6 @@ export type UsageCoverageView = {
   isPartial: boolean;
   reason?: string;
   loadedRequests: number;
-  scannedLines: number;
-  truncated: boolean;
 };
 
 export type UsageRetryGateView = {
@@ -239,14 +227,13 @@ export type DashboardData = {
 
 export type ProvidersData = {
   providers: ProviderCardView[];
-  routeOrder: ProviderCardView[];
 };
 
 export type UsageData = {
   summary: UsageSummaryView;
   hourly: UsageHourView[];
   providerRows: UsageDimensionRowView[];
-  stationRows: UsageDimensionRowView[];
+  providerEndpointRows: UsageDimensionRowView[];
   modelRows: UsageDimensionRowView[];
   sessionRows: UsageDimensionRowView[];
   projectRows: UsageDimensionRowView[];

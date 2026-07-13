@@ -1,19 +1,24 @@
-use crate::config::{ProxyConfig, resolve_service_profile};
+use anyhow::{Result, anyhow};
+
+use crate::config::resolve_service_profile_from_catalog;
+use crate::dashboard_core::window_stats::compute_window_stats;
 use crate::dashboard_core::{
-    ApiV1OperatorSummary, ControlPlaneSurfaceCapabilities, ControlProfileOption,
-    HostLocalControlPlaneCapabilities, OperatorProfileSummary, OperatorRetrySummary,
-    OperatorRuntimeSummary, OperatorSummaryCounts, RemoteAdminAccessCapabilities,
-    SharedControlPlaneCapabilities, build_operator_health_summary, build_profile_options_from_mgr,
-    build_station_options_from_mgr, summarize_recent_retry_observations,
+    ApiV1OperatorSummary, ControlProfileOption, OperatorActiveRequestSummary,
+    OperatorProfileSummary, OperatorProviderBalanceSummary, OperatorProviderSummary,
+    OperatorReadCapture, OperatorReadData, OperatorReadModel, OperatorRequestSummary,
+    OperatorRetrySummary, OperatorRevisionBundle, OperatorRuntimeSummary, OperatorSessionSummary,
+    OperatorSummaryCounts, build_operator_session_stats, build_profile_options_from_route_view,
+    redact_operator_pricing_catalog, redact_operator_usage_day, redact_operator_usage_summaries,
+    summarize_recent_retry_observations,
 };
-use crate::state::{SessionIdentityCardBuildInputs, build_session_identity_cards_from_parts};
+use crate::state::{
+    OperatorLifecycleSnapshot, SessionIdentityCardBuildInputs,
+    build_session_identity_cards_from_parts,
+};
 
 use super::ProxyService;
-use super::control_plane_manifest::api_v1_operator_summary_links;
-use super::profile_defaults::{
-    configured_active_station_name, effective_active_station_name, effective_default_profile_name,
-};
-use super::providers_api::build_provider_options_for_proxy;
+use super::profile_defaults::effective_default_profile_name;
+use super::providers_api::build_provider_options_for_runtime_snapshot;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProfilesResponse {
@@ -22,128 +27,129 @@ pub struct ProfilesResponse {
     pub profiles: Vec<ControlProfileOption>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct RuntimeStatusResponse {
-    pub runtime_source_path: String,
-    pub config_path: String,
-    pub loaded_at_ms: u64,
-    pub source_mtime_ms: Option<u64>,
-    pub retry: crate::config::ResolvedRetryConfig,
-    #[serde(default)]
-    pub shutdown_available: bool,
-}
-
-#[derive(serde::Serialize)]
-pub(super) struct RetryConfigResponse {
-    configured: crate::config::RetryConfig,
-    resolved: crate::config::ResolvedRetryConfig,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ReloadResult {
-    pub reloaded: bool,
-    pub status: RuntimeStatusResponse,
-}
-
-pub(super) async fn build_operator_summary(
+pub(super) async fn build_operator_read_capture(
     proxy: &ProxyService,
-    surface_capabilities: ControlPlaneSurfaceCapabilities,
-    shared_capabilities: SharedControlPlaneCapabilities,
-    host_local_capabilities: HostLocalControlPlaneCapabilities,
-    remote_admin_access: RemoteAdminAccessCapabilities,
-) -> ApiV1OperatorSummary {
-    let cfg = proxy.config.snapshot().await;
-    let mgr = proxy.service_manager(cfg.as_ref());
-    let configured_active_station = configured_active_station_name(mgr);
-    let effective_active_station = effective_active_station_name(mgr);
-    let configured_default_profile = mgr.default_profile.clone();
-    let configured_retry = cfg.retry.clone();
-    let resolved_retry = configured_retry.resolve();
-    let loaded_at_ms = proxy.config.last_loaded_at_ms();
-    let source_mtime_ms = proxy.config.last_mtime_ms().await;
-    let (
-        active,
-        recent,
-        global_station_override,
-        global_route_target_override,
-        session_model,
-        session_station,
-        session_effort,
-        session_service_tier,
-        session_bindings,
-        session_route_affinities,
-        session_stats,
-        default_profile,
-        station_meta_overrides,
-        station_state_overrides,
-        station_health,
-        health_checks,
-        lb_view,
-    ) = tokio::join!(
-        proxy.state.list_active_requests(),
-        proxy.state.list_recent_finished(200),
-        proxy.state.get_global_station_override(),
-        proxy.state.get_global_route_target_override(),
-        proxy.state.list_session_model_overrides(),
-        proxy.state.list_session_station_overrides(),
-        proxy.state.list_session_effort_overrides(),
-        proxy.state.list_session_service_tier_overrides(),
-        proxy.state.list_session_bindings(),
-        proxy.state.list_session_route_affinities(),
-        proxy.state.list_session_stats(),
-        effective_default_profile_name(proxy.state.as_ref(), proxy.service_name, mgr),
-        proxy.state.get_station_meta_overrides(proxy.service_name),
+) -> Result<OperatorReadCapture> {
+    const MAX_CAPTURE_ATTEMPTS: usize = 3;
+
+    for _ in 0..MAX_CAPTURE_ATTEMPTS {
+        let lifecycle_snapshot = proxy
+            .state
+            .capture_operator_lifecycle_snapshot(proxy.service_name, 200)
+            .await;
+        let state_revision = lifecycle_snapshot.state_revision;
+        #[cfg(test)]
         proxy
             .state
-            .get_station_runtime_state_overrides(proxy.service_name),
-        proxy.state.get_station_health(proxy.service_name),
-        proxy.state.list_health_checks(proxy.service_name),
-        proxy.state.get_lb_view(),
+            .pause_operator_aggregation_after_snapshot_for_test()
+            .await;
+        let capture = build_operator_read_model_once(proxy, lifecycle_snapshot).await?;
+        if proxy.state.operator_revision() == state_revision {
+            return Ok(capture);
+        }
+    }
+
+    Err(anyhow!(
+        "operator state changed during each coherent capture attempt"
+    ))
+}
+
+async fn build_operator_read_model_once(
+    proxy: &ProxyService,
+    lifecycle_snapshot: OperatorLifecycleSnapshot,
+) -> Result<OperatorReadCapture> {
+    let runtime_snapshot = proxy.config.capture().await;
+    let config = runtime_snapshot.config();
+    let view =
+        super::control_plane_service::service_route_config(config.as_ref(), proxy.service_name);
+    let configured_default_profile = view.default_profile.clone();
+    let configured_retry = config.retry.clone();
+    let resolved_retry = configured_retry.resolve();
+    let loaded_at_ms = runtime_snapshot.loaded_at_ms();
+    let source_mtime_ms = runtime_snapshot.source_mtime_ms();
+    let captured_at_ms = crate::logging::now_ms();
+    let route_graph = runtime_snapshot
+        .route_graph(proxy.service_name)
+        .ok_or_else(|| {
+            anyhow!(
+                "runtime snapshot has no '{}' route graph",
+                proxy.service_name
+            )
+        })?;
+    let provider_catalog = runtime_snapshot.provider_catalog();
+    let operator_pricing_catalog = runtime_snapshot.operator_pricing_catalog();
+    let provider_policy = runtime_snapshot.provider_policy();
+    let usage_summaries = lifecycle_snapshot.usage_summaries(100);
+    let mut usage_day = lifecycle_snapshot.usage_day_view(12, captured_at_ms);
+    let usage_rollup = lifecycle_snapshot.usage_rollup_view(12, 7);
+    let ledger_revision = lifecycle_snapshot.ledger_revision.to_string();
+    let active = lifecycle_snapshot.active_requests;
+    let recent = lifecycle_snapshot.recent_finished;
+    let (session_bindings, session_route_affinities, provider_balances) = tokio::join!(
+        proxy.state.list_session_bindings(),
+        proxy.state.list_session_route_affinities(),
+        proxy.state.get_provider_balance_view(proxy.service_name),
     );
+    let default_profile = effective_default_profile_name(view);
+    let session_stats = build_operator_session_stats(&recent);
+    let policy_actions = proxy.state.policy_action_projections_for_snapshot(
+        proxy.service_name,
+        captured_at_ms,
+        provider_policy.as_ref(),
+    );
+    usage_day.retry_gate =
+        crate::state::UsageRetryGateSummary::from_policy_actions(&policy_actions);
     let session_cards = build_session_identity_cards_from_parts(SessionIdentityCardBuildInputs {
         active: &active,
         recent: &recent,
-        overrides: &session_effort,
-        station_overrides: &session_station,
-        model_overrides: &session_model,
-        service_tier_overrides: &session_service_tier,
         bindings: &session_bindings,
         route_affinities: &session_route_affinities,
-        global_station_override: global_station_override.as_deref(),
         stats: &session_stats,
     });
     let default_profile_summary = default_profile.as_deref().and_then(|profile_name| {
-        resolve_service_profile(mgr, profile_name)
+        resolve_service_profile_from_catalog(&view.profiles, profile_name)
             .ok()
             .map(|profile| OperatorProfileSummary {
                 name: profile_name.to_string(),
-                station: profile.station,
                 model: profile.model,
                 reasoning_effort: profile.reasoning_effort,
                 service_tier: profile.service_tier.clone(),
                 fast_mode: profile.service_tier.as_deref() == Some("priority"),
             })
     });
-    let stations =
-        build_station_options_from_mgr(mgr, &station_meta_overrides, &station_state_overrides);
-    let profiles = build_profile_options_from_mgr(mgr, default_profile.as_deref());
-    let health =
-        build_operator_health_summary(&stations, &station_health, &health_checks, &lb_view);
-    let providers = build_provider_options_for_proxy(proxy)
+    let profiles = build_profile_options_from_route_view(view, default_profile.as_deref());
+    let providers = build_provider_options_for_runtime_snapshot(proxy, runtime_snapshot.as_ref())
         .await
-        .unwrap_or_default();
+        .map_err(|(status, message)| {
+            anyhow!("build operator providers failed with {status}: {message}")
+        })?;
+    let operator_providers = providers
+        .iter()
+        .map(OperatorProviderSummary::from)
+        .collect::<Vec<_>>();
     let retry_observations = summarize_recent_retry_observations(&recent);
-
-    ApiV1OperatorSummary {
+    let local_session_ids = session_cards
+        .iter()
+        .filter_map(|card| {
+            card.session_id.as_ref().map(|session_id| {
+                (
+                    crate::dashboard_core::operator_summary::operator_session_key(session_id),
+                    session_id.clone(),
+                )
+            })
+        })
+        .collect();
+    let sessions = session_cards
+        .iter()
+        .enumerate()
+        .map(|(index, card)| OperatorSessionSummary::from_session_card(card, index))
+        .collect::<Vec<_>>();
+    let summary = ApiV1OperatorSummary {
         api_version: 1,
         service_name: proxy.service_name.to_string(),
         runtime: OperatorRuntimeSummary {
             runtime_loaded_at_ms: Some(loaded_at_ms),
             runtime_source_mtime_ms: source_mtime_ms,
-            configured_active_station,
-            effective_active_station,
-            global_station_override,
-            global_route_target_override,
             configured_default_profile,
             default_profile,
             default_profile_summary,
@@ -151,68 +157,89 @@ pub(super) async fn build_operator_summary(
         counts: OperatorSummaryCounts {
             active_requests: active.len(),
             recent_requests: recent.len(),
-            sessions: session_cards.len(),
-            stations: mgr.stations().len(),
-            profiles: mgr.profiles.len(),
+            sessions: sessions.len(),
+            profiles: view.profiles.len(),
             providers: providers.len(),
         },
         retry: OperatorRetrySummary {
             configured_profile: configured_retry.profile,
-            supports_write: surface_capabilities.retry_config,
             upstream_max_attempts: resolved_retry.upstream.max_attempts,
             provider_max_attempts: resolved_retry.route.max_attempts,
-            allow_cross_station_before_first_output: resolved_retry
-                .allow_cross_station_before_first_output,
             recent_retried_requests: retry_observations.recent_retried_requests,
-            recent_cross_station_failovers: retry_observations.recent_cross_station_failovers,
-            recent_same_station_retries: retry_observations.recent_same_station_retries,
+            recent_cross_provider_failovers: retry_observations.recent_cross_provider_failovers,
+            recent_same_provider_retries: retry_observations.recent_same_provider_retries,
             recent_fast_mode_requests: retry_observations.recent_fast_mode_requests,
         },
-        health: Some(health),
-        session_cards,
-        stations: stations.clone(),
+        sessions,
         profiles,
-        providers,
-        links: Some(api_v1_operator_summary_links()),
-        surface_capabilities,
-        shared_capabilities,
-        host_local_capabilities,
-        remote_admin_access,
-    }
+        providers: operator_providers,
+    };
+    let stats_5m = compute_window_stats(&recent, captured_at_ms, 5 * 60_000, |_| true);
+    let stats_1h = compute_window_stats(&recent, captured_at_ms, 60 * 60_000, |_| true);
+    let mut operator_balances = provider_balances
+        .iter()
+        .map(OperatorProviderBalanceSummary::from)
+        .collect::<Vec<_>>();
+    operator_balances.sort_by(|left, right| {
+        left.provider_id
+            .cmp(&right.provider_id)
+            .then_with(|| left.endpoint_id.cmp(&right.endpoint_id))
+            .then_with(|| {
+                left.observation_provider_id
+                    .cmp(&right.observation_provider_id)
+            })
+            .then_with(|| left.provider_endpoint_key.cmp(&right.provider_endpoint_key))
+    });
+    let revisions = OperatorRevisionBundle {
+        runtime_revision: runtime_snapshot.revision(),
+        runtime_digest: runtime_snapshot.digest().to_string(),
+        route_digest: route_graph.digest().to_string(),
+        catalog_revision: provider_catalog.catalog_revision().as_str().to_string(),
+        pricing_revision: provider_catalog.pricing_revision().as_str().to_string(),
+        operator_pricing_revision: operator_pricing_catalog.revision().to_string(),
+        policy_revision: provider_policy.policy_revision,
+        ledger_revision,
+    };
+    let model = OperatorReadModel::ready(
+        proxy.service_name,
+        captured_at_ms,
+        revisions,
+        OperatorReadData {
+            summary,
+            active_requests: active
+                .iter()
+                .map(OperatorActiveRequestSummary::from_active_request)
+                .collect(),
+            recent_requests: recent
+                .iter()
+                .map(OperatorRequestSummary::from_finished_request)
+                .collect(),
+            usage_summaries: redact_operator_usage_summaries(usage_summaries),
+            usage_day: redact_operator_usage_day(usage_day),
+            usage_rollup,
+            stats_5m,
+            stats_1h,
+            pricing_catalog: redact_operator_pricing_catalog(operator_pricing_catalog.snapshot()),
+            provider_balances: operator_balances,
+        },
+    );
+    model
+        .validate()
+        .map_err(|message| anyhow!("invalid operator read model: {message}"))?;
+    Ok(OperatorReadCapture {
+        model,
+        local_session_ids,
+    })
 }
 
 pub(super) async fn make_profiles_response(proxy: &ProxyService) -> ProfilesResponse {
-    let cfg = proxy.config.snapshot().await;
-    let mgr = proxy.service_manager(cfg.as_ref());
-    let default_profile =
-        effective_default_profile_name(proxy.state.as_ref(), proxy.service_name, mgr).await;
+    let config = proxy.config.capture().await.config();
+    let view =
+        super::control_plane_service::service_route_config(config.as_ref(), proxy.service_name);
+    let default_profile = effective_default_profile_name(view);
     ProfilesResponse {
         default_profile: default_profile.clone(),
-        configured_default_profile: mgr.default_profile.clone(),
-        profiles: build_profile_options_from_mgr(mgr, default_profile.as_deref()),
+        configured_default_profile: view.default_profile.clone(),
+        profiles: build_profile_options_from_route_view(view, default_profile.as_deref()),
     }
-}
-
-pub(super) async fn build_runtime_status_response(proxy: &ProxyService) -> RuntimeStatusResponse {
-    let cfg = proxy.config.snapshot().await;
-    let runtime_source_path = crate::config::config_file_path().display().to_string();
-    RuntimeStatusResponse {
-        runtime_source_path: runtime_source_path.clone(),
-        config_path: runtime_source_path,
-        loaded_at_ms: proxy.config.last_loaded_at_ms(),
-        source_mtime_ms: proxy.config.last_mtime_ms().await,
-        retry: cfg.retry.resolve(),
-        shutdown_available: proxy.shutdown_available(),
-    }
-}
-
-pub(super) fn build_retry_config_response(cfg: &ProxyConfig) -> RetryConfigResponse {
-    RetryConfigResponse {
-        configured: cfg.retry.clone(),
-        resolved: cfg.retry.resolve(),
-    }
-}
-
-pub(super) fn build_reload_result(reloaded: bool, status: RuntimeStatusResponse) -> ReloadResult {
-    ReloadResult { reloaded, status }
 }

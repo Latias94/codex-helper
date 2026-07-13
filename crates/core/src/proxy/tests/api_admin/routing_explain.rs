@@ -1,7 +1,21 @@
 use super::*;
+use crate::config::ProviderEndpointConfig;
+
+fn provider_endpoint(base_url: String, supported_model: &str) -> ProviderEndpointConfig {
+    ProviderEndpointConfig {
+        base_url,
+        continuity_domain: None,
+        enabled: true,
+        priority: 0,
+        tags: std::collections::BTreeMap::new(),
+        supported_models: std::collections::BTreeMap::from([(supported_model.to_string(), true)]),
+        model_mapping: std::collections::BTreeMap::new(),
+        limits: ProviderConcurrencyLimits::default(),
+    }
+}
 
 #[tokio::test]
-async fn proxy_api_v1_routing_explain_returns_selected_route_and_structured_skip_reasons() {
+async fn proxy_routing_explain_returns_selected_route_and_structured_skip_reasons() {
     let _env_lock = env_lock().await;
     let temp_dir = make_temp_test_dir();
     let mut scoped = ScopedEnv::default();
@@ -11,70 +25,71 @@ async fn proxy_api_v1_routing_explain_returns_selected_route_and_structured_skip
 
     let old_url = "http://127.0.0.1:9/v1".to_string();
     let new_url = "http://127.0.0.1:10/v1".to_string();
-    let cfg = make_proxy_config(
-        vec![
-            UpstreamConfig {
-                base_url: old_url.clone(),
-                auth: UpstreamAuth::default(),
-                tags: HashMap::from([
-                    ("provider_id".to_string(), "old".to_string()),
-                    ("endpoint_id".to_string(), "legacy".to_string()),
-                ]),
-                supported_models: HashMap::from([("gpt-4.1".to_string(), true)]),
-                model_mapping: HashMap::new(),
-            },
-            UpstreamConfig {
-                base_url: new_url.clone(),
-                auth: UpstreamAuth::default(),
-                tags: HashMap::from([
-                    ("provider_id".to_string(), "new".to_string()),
-                    ("endpoint_id".to_string(), "modern".to_string()),
-                ]),
-                supported_models: HashMap::from([("gpt-5".to_string(), true)]),
-                model_mapping: HashMap::new(),
-            },
-        ],
-        RetryConfig::default(),
-    );
+    let cfg = HelperConfig {
+        codex: ServiceRouteConfig {
+            providers: std::collections::BTreeMap::from([
+                (
+                    "old".to_string(),
+                    ProviderConfig {
+                        endpoints: std::collections::BTreeMap::from([(
+                            "legacy".to_string(),
+                            provider_endpoint(old_url.clone(), "gpt-4.1"),
+                        )]),
+                        ..ProviderConfig::default()
+                    },
+                ),
+                (
+                    "new".to_string(),
+                    ProviderConfig {
+                        endpoints: std::collections::BTreeMap::from([(
+                            "modern".to_string(),
+                            provider_endpoint(new_url.clone(), "gpt-5"),
+                        )]),
+                        ..ProviderConfig::default()
+                    },
+                ),
+            ]),
+            routing: Some(RouteGraphConfig::ordered_failover(vec![
+                "old".to_string(),
+                "new".to_string(),
+            ])),
+            ..ServiceRouteConfig::default()
+        },
+        ..HelperConfig::default()
+    };
 
-    let proxy = ProxyService::new(
-        Client::new(),
-        Arc::new(cfg),
-        "codex",
-        Arc::new(std::sync::Mutex::new(HashMap::new())),
-    );
-    {
-        let mut guard = proxy.lb_states.lock().expect("lb state lock");
-        guard.insert(
-            "test".to_string(),
-            crate::lb::LbState {
-                failure_counts: vec![crate::lb::FAILURE_THRESHOLD, 0],
-                cooldown_until: vec![None, None],
-                usage_exhausted: vec![false, false],
-                last_good_index: None,
-                penalty_streak: vec![0, 0],
-                upstream_signature: vec![old_url, new_url],
+    let proxy = ProxyService::new(Client::new(), Arc::new(cfg), "codex");
+    proxy
+        .state
+        .penalize_provider_endpoint_attempt(
+            "codex",
+            crate::runtime_identity::ProviderEndpointKey::new("codex", "old", "legacy"),
+            30,
+            crate::endpoint_health::CooldownBackoff {
+                factor: 1,
+                max_secs: 0,
             },
-        );
-    }
+        )
+        .await;
 
-    let app = crate::proxy::router(proxy);
-    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
-    let client = reqwest::Client::new();
-
-    let explain = client
-        .get(format!(
-            "http://{}/__codex_helper/api/v1/routing/explain?model=gpt-5&session=sid-route&service_tier=priority&reasoning_effort=high&path=/v1/chat/completions&method=POST&header=X-Plan%3Dgold",
-            proxy_addr
-        ))
-        .send()
+    let explain = proxy
+        .routing_explain(
+            crate::routing_ir::RouteRequestContext {
+                model: Some("gpt-5".to_string()),
+                service_tier: Some("priority".to_string()),
+                reasoning_effort: Some("high".to_string()),
+                path: Some("/v1/chat/completions".to_string()),
+                method: Some("POST".to_string()),
+                headers: std::collections::BTreeMap::from([(
+                    "X-Plan".to_string(),
+                    "gold".to_string(),
+                )]),
+            },
+            Some("sid-route".to_string()),
+        )
         .await
-        .expect("routing explain send")
-        .error_for_status()
-        .expect("routing explain status")
-        .json::<serde_json::Value>()
-        .await
-        .expect("routing explain json");
+        .expect("build routing explain");
+    let explain = serde_json::to_value(explain).expect("serialize routing explain");
 
     assert_eq!(explain["api_version"].as_u64(), Some(1));
     assert_eq!(explain["service_name"].as_str(), Some("codex"));
@@ -118,7 +133,7 @@ async fn proxy_api_v1_routing_explain_returns_selected_route_and_structured_skip
     assert_eq!(explain["affinity_policy"].as_str(), Some("fallback_sticky"));
     assert_eq!(
         explain["selected_route"]["preference_group"].as_u64(),
-        Some(0)
+        Some(1)
     );
     assert_eq!(
         explain["selected_route"]["route_path"]
@@ -127,11 +142,8 @@ async fn proxy_api_v1_routing_explain_returns_selected_route_and_structured_skip
                 .iter()
                 .filter_map(|item| item.as_str())
                 .collect::<Vec<_>>()),
-        Some(vec!["legacy", "test", "new"])
+        Some(vec!["main", "new"])
     );
-    assert!(explain["selected_route"]["compatibility"].is_null());
-    assert!(explain["selected_route"]["station_name"].is_null());
-    assert!(explain["selected_route"]["upstream_index"].is_null());
 
     let first = &explain["candidates"][0];
     assert_eq!(first["provider_id"].as_str(), Some("old"));
@@ -141,21 +153,24 @@ async fn proxy_api_v1_routing_explain_returns_selected_route_and_structured_skip
     );
     assert_eq!(first["preference_group"].as_u64(), Some(0));
     assert_eq!(first["selected"].as_bool(), Some(false));
-    assert!(first["compatibility"].is_null());
     assert_eq!(
         first["skip_reasons"].as_array().map(|reasons| reasons
             .iter()
             .filter_map(|reason| reason.get("code").and_then(|value| value.as_str()))
             .collect::<Vec<_>>()),
-        Some(vec!["unsupported_model", "breaker_open"])
+        Some(vec!["unsupported_model", "cooldown"])
     );
     assert_eq!(
         first["skip_reasons"][0]["requested_model"].as_str(),
         Some("gpt-5")
     );
     assert_eq!(
-        first["skip_reasons"][1]["failure_count"].as_u64(),
-        Some(crate::lb::FAILURE_THRESHOLD as u64)
+        first["availability"]["failure_count"].as_u64(),
+        Some(crate::endpoint_health::FAILURE_THRESHOLD as u64)
+    );
+    assert_eq!(
+        first["availability"]["cooldown_active"].as_bool(),
+        Some(true)
     );
     assert_eq!(explain["candidates"][1]["selected"].as_bool(), Some(true));
     assert_eq!(
@@ -164,12 +179,10 @@ async fn proxy_api_v1_routing_explain_returns_selected_route_and_structured_skip
             .map(Vec::len),
         Some(0)
     );
-
-    proxy_handle.abort();
 }
 
 #[tokio::test]
-async fn proxy_api_v1_routing_explain_uses_legacy_session_affinity() {
+async fn proxy_routing_explain_uses_session_affinity() {
     let _env_lock = env_lock().await;
     let temp_dir = make_temp_test_dir();
     let mut scoped = ScopedEnv::default();
@@ -179,38 +192,39 @@ async fn proxy_api_v1_routing_explain_uses_legacy_session_affinity() {
 
     let old_url = "http://127.0.0.1:9/v1".to_string();
     let new_url = "http://127.0.0.1:10/v1".to_string();
-    let cfg = make_proxy_config(
-        vec![
-            UpstreamConfig {
-                base_url: old_url.clone(),
-                auth: UpstreamAuth::default(),
-                tags: HashMap::from([
-                    ("provider_id".to_string(), "old".to_string()),
-                    ("endpoint_id".to_string(), "legacy".to_string()),
-                ]),
-                supported_models: HashMap::from([("gpt-5".to_string(), true)]),
-                model_mapping: HashMap::new(),
-            },
-            UpstreamConfig {
-                base_url: new_url.clone(),
-                auth: UpstreamAuth::default(),
-                tags: HashMap::from([
-                    ("provider_id".to_string(), "new".to_string()),
-                    ("endpoint_id".to_string(), "modern".to_string()),
-                ]),
-                supported_models: HashMap::from([("gpt-5".to_string(), true)]),
-                model_mapping: HashMap::new(),
-            },
-        ],
-        RetryConfig::default(),
-    );
-
-    let proxy = ProxyService::new(
-        Client::new(),
-        Arc::new(cfg.clone()),
-        "codex",
-        Arc::new(std::sync::Mutex::new(HashMap::new())),
-    );
+    let source = HelperConfig {
+        codex: ServiceRouteConfig {
+            providers: std::collections::BTreeMap::from([
+                (
+                    "old".to_string(),
+                    ProviderConfig {
+                        endpoints: std::collections::BTreeMap::from([(
+                            "legacy".to_string(),
+                            provider_endpoint(old_url.clone(), "gpt-5"),
+                        )]),
+                        ..ProviderConfig::default()
+                    },
+                ),
+                (
+                    "new".to_string(),
+                    ProviderConfig {
+                        endpoints: std::collections::BTreeMap::from([(
+                            "modern".to_string(),
+                            provider_endpoint(new_url.clone(), "gpt-5"),
+                        )]),
+                        ..ProviderConfig::default()
+                    },
+                ),
+            ]),
+            routing: Some(RouteGraphConfig::ordered_failover(vec![
+                "old".to_string(),
+                "new".to_string(),
+            ])),
+            ..ServiceRouteConfig::default()
+        },
+        ..HelperConfig::default()
+    };
+    let proxy = ProxyService::new(Client::new(), Arc::new(source.clone()), "codex");
     let request = crate::routing_ir::RouteRequestContext {
         model: Some("gpt-5".to_string()),
         service_tier: None,
@@ -219,30 +233,23 @@ async fn proxy_api_v1_routing_explain_uses_legacy_session_affinity() {
         method: Some("POST".to_string()),
         headers: Default::default(),
     };
-    let selection = proxy
-        .lbs_for_request(&cfg, None, &request, Some("sid-route"))
-        .await;
-    let lbs = match selection {
-        crate::proxy::request_routing::RequestRouteSelection::Legacy { lbs } => lbs,
-        crate::proxy::request_routing::RequestRouteSelection::RouteGraph { .. } => {
-            panic!("expected legacy route selection")
-        }
-    };
-    let legacy_template = crate::routing_ir::compile_legacy_route_plan_template(
+    let template = crate::routing_ir::compile_route_plan_template_with_request(
         "codex",
-        lbs.iter().map(|lb| lb.service.as_ref()),
-    );
-    let target_candidate = legacy_template
+        &source.codex,
+        &request,
+    )
+    .expect("compile route plan");
+    let target_candidate = template
         .candidates
         .iter()
         .find(|candidate| candidate.provider_id == "new")
-        .expect("legacy candidate for new provider");
+        .expect("candidate for new provider");
     proxy
         .state
         .record_session_route_affinity_success(
             "sid-route",
             crate::state::SessionRouteAffinityTarget {
-                route_graph_key: legacy_template.route_graph_key().to_string(),
+                route_graph_key: template.route_graph_key(),
                 session_identity_source: Some(crate::state::SessionIdentitySource::Header),
                 provider_endpoint: crate::runtime_identity::ProviderEndpointKey::new(
                     "codex", "new", "modern",
@@ -253,25 +260,14 @@ async fn proxy_api_v1_routing_explain_uses_legacy_session_affinity() {
             Some("test".to_string()),
             crate::logging::now_ms(),
         )
-        .await;
-
-    let app = crate::proxy::router(proxy);
-    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
-    let client = reqwest::Client::new();
-
-    let explain = client
-        .get(format!(
-            "http://{}/__codex_helper/api/v1/routing/explain?model=gpt-5&session=sid-route&path=/v1/chat/completions&method=POST",
-            proxy_addr
-        ))
-        .send()
         .await
-        .expect("routing explain send")
-        .error_for_status()
-        .expect("routing explain status")
-        .json::<serde_json::Value>()
+        .expect("persist route affinity");
+
+    let explain = proxy
+        .routing_explain(request, Some("sid-route".to_string()))
         .await
-        .expect("routing explain json");
+        .expect("build routing explain");
+    let explain = serde_json::to_value(explain).expect("serialize routing explain");
 
     assert_eq!(
         explain["selected_route"]["provider_endpoint_key"].as_str(),
@@ -285,12 +281,10 @@ async fn proxy_api_v1_routing_explain_uses_legacy_session_affinity() {
         explain["selected_route"]["endpoint_id"].as_str(),
         Some("modern")
     );
-
-    proxy_handle.abort();
 }
 
 #[tokio::test]
-async fn proxy_api_v1_routing_explain_uses_provider_endpoint_runtime_health_for_v4_routes() {
+async fn proxy_routing_explain_uses_provider_endpoint_runtime_health_for_routes() {
     let _env_lock = env_lock().await;
     let temp_dir = make_temp_test_dir();
     let mut scoped = ScopedEnv::default();
@@ -298,75 +292,63 @@ async fn proxy_api_v1_routing_explain_uses_provider_endpoint_runtime_health_for_
         scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
     }
 
-    let v4 = ProxyConfigV4 {
-        codex: ServiceViewV4 {
+    let source = HelperConfig {
+        codex: ServiceRouteConfig {
             providers: std::collections::BTreeMap::from([
                 (
                     "monthly".to_string(),
-                    ProviderConfigV4 {
+                    ProviderConfig {
                         base_url: Some("http://127.0.0.1:9/v1".to_string()),
                         inline_auth: UpstreamAuth::default(),
-                        ..ProviderConfigV4::default()
+                        ..ProviderConfig::default()
                     },
                 ),
                 (
                     "chili".to_string(),
-                    ProviderConfigV4 {
+                    ProviderConfig {
                         base_url: Some("http://127.0.0.1:10/v1".to_string()),
                         inline_auth: UpstreamAuth::default(),
-                        ..ProviderConfigV4::default()
+                        ..ProviderConfig::default()
                     },
                 ),
             ]),
-            routing: Some(RoutingConfigV4 {
+            routing: Some(RouteGraphConfig {
                 entry: "monthly_first".to_string(),
                 routes: std::collections::BTreeMap::from([(
                     "monthly_first".to_string(),
-                    RoutingNodeV4 {
-                        strategy: RoutingPolicyV4::OrderedFailover,
+                    RouteNodeConfig {
+                        strategy: RouteStrategy::OrderedFailover,
                         children: vec!["monthly".to_string(), "chili".to_string()],
-                        ..RoutingNodeV4::default()
+                        ..RouteNodeConfig::default()
                     },
                 )]),
-                ..RoutingConfigV4::default()
+                ..RouteGraphConfig::default()
             }),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         },
-        ..ProxyConfigV4::default()
+        ..HelperConfig::default()
     };
-    let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compat runtime");
-    let proxy = ProxyService::new_with_v4_source(
-        Client::new(),
-        Arc::new(runtime),
-        Some(Arc::new(v4)),
-        "codex",
-        Arc::new(std::sync::Mutex::new(HashMap::new())),
-    );
+    let proxy = ProxyService::new(Client::new(), Arc::new(source), "codex");
     proxy
-        .state
-        .set_provider_endpoint_usage_exhausted(
-            "codex",
+        .set_provider_automatic_block_for_test(
             crate::runtime_identity::ProviderEndpointKey::new("codex", "monthly", "default"),
             true,
+            1,
         )
         .await;
-    let app = crate::proxy::router(proxy);
-    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
-    let client = reqwest::Client::new();
-
-    let explain = client
-        .get(format!(
-            "http://{}/__codex_helper/api/v1/routing/explain?session=sid-route",
-            proxy_addr
-        ))
-        .send()
+    proxy
+        .config
+        .publish_provider_policy(proxy.state.capture_provider_policy_snapshot().await)
         .await
-        .expect("routing explain send")
-        .error_for_status()
-        .expect("routing explain status")
-        .json::<serde_json::Value>()
+        .expect("publish provider policy snapshot");
+    let explain = proxy
+        .routing_explain(
+            crate::routing_ir::RouteRequestContext::default(),
+            Some("sid-route".to_string()),
+        )
         .await
-        .expect("routing explain json");
+        .expect("build routing explain");
+    let explain = serde_json::to_value(explain).expect("serialize routing explain");
 
     assert_eq!(
         explain["selected_route"]["provider_endpoint_key"].as_str(),
@@ -395,7 +377,7 @@ async fn proxy_api_v1_routing_explain_uses_provider_endpoint_runtime_health_for_
                 .iter()
                 .filter_map(|reason| reason.get("code").and_then(|value| value.as_str()))
                 .collect::<Vec<_>>()),
-        Some(vec!["usage_exhausted"])
+        Some(vec!["cooldown", "usage_exhausted"])
     );
     assert_eq!(
         explain["candidates"][0]["availability"]["available"].as_bool(),
@@ -407,7 +389,7 @@ async fn proxy_api_v1_routing_explain_uses_provider_endpoint_runtime_health_for_
     );
     assert_eq!(
         explain["candidates"][0]["availability"]["routable_except_usage"].as_bool(),
-        Some(true)
+        Some(false)
     );
     assert_eq!(
         explain["candidates"][0]["availability"]["usage_exhausted"].as_bool(),
@@ -415,8 +397,6 @@ async fn proxy_api_v1_routing_explain_uses_provider_endpoint_runtime_health_for_
     );
     assert_eq!(
         explain["candidates"][0]["availability"]["dominant_reason"]["code"].as_str(),
-        Some("usage_exhausted")
+        Some("cooldown")
     );
-
-    proxy_handle.abort();
 }

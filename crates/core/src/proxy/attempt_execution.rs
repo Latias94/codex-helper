@@ -3,36 +3,36 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use axum::body::{Body, Bytes};
-use axum::http::{HeaderMap, HeaderValue, Method, Response, StatusCode, Uri, header};
+use axum::http::{HeaderMap, Method, Response, StatusCode, Uri};
 
-use crate::lb::{CooldownBackoff, LoadBalancer};
+use crate::endpoint_health::CooldownBackoff;
 use crate::logging::{
-    BodyPreview, CodexBridgeLog, HeaderEntry, RouteAttemptLog, ServiceTierLog, log_retry_trace,
+    BodyPreview, HeaderEntry, RouteAttemptLog, ServiceTierLog, log_control_trace_event,
+    upstream_origin,
 };
-use crate::state::{SessionBinding, SessionIdentitySource};
+use crate::runtime_store::{AttemptOutcome, AttemptRouteEvidence, EconomicsState};
+use crate::state::{AttemptProviderScopeCapture, SessionBinding, SessionIdentitySource};
 
 use super::ProxyService;
+use super::attempt_request::{AttemptRequestIdentityParams, prepare_attempt_request_identity};
 use super::attempt_response::{
     AttemptResponseOutcome, AttemptResponseParams, StreamingAttemptResponseParams,
     handle_attempt_response, handle_streaming_attempt_success,
 };
-use super::attempt_target::AttemptTarget;
 use super::attempt_transport::{
-    AttemptReadBodyOutcome, AttemptReadBodyParams, AttemptTransportOutcome, AttemptTransportParams,
+    AttemptReadBodyOutcome, AttemptReadBodyParams, AttemptTargetBuildFailureParams,
+    AttemptTransportOutcome, AttemptTransportParams, handle_attempt_target_build_failure,
     handle_attempt_transport, read_attempt_response_body,
 };
 use super::concurrency_limits::ConcurrencyPermit;
 use super::headers::filter_response_headers;
 use super::reasoning_guard::should_strict_buffer_reasoning_guard;
 use super::request_body::{
-    build_codex_remote_compaction_v2_downgrade_body, is_stale_previous_response_error,
+    ReasoningOrchestrationIntent, RequestDialect, is_stale_previous_response_error,
     remove_previous_response_id_from_body,
 };
 use super::request_preparation::RequestFlavor;
-use super::response_fixer::{
-    classify_remote_compaction_v2_response,
-    synthesize_remote_compaction_v2_sse_from_compact_response,
-};
+use super::response_entity::UpstreamResponseEntity;
 use super::response_semantics::ResponseSemanticContract;
 use super::retry::{RetryLayerOptions, RetryPlan};
 use super::route_attempts::{
@@ -40,11 +40,13 @@ use super::route_attempts::{
     start_selected_route_attempt,
 };
 use super::selected_upstream_request::{
-    SelectedUpstreamRequestSetupParams, prepare_selected_upstream_request,
+    SelectedUpstreamRequestSetupParams, apply_selected_model_mapping,
+    prepare_selected_upstream_request,
 };
+use crate::routing_ir::CapturedRouteCandidate;
 
 pub(super) enum SelectedUpstreamExecutionOutcome {
-    ContinueStation,
+    ContinueProviderChain,
     StopProviderChain,
     Return(Response<Body>),
 }
@@ -57,7 +59,7 @@ struct AttemptSelectLogParams<'a> {
     upstream_attempt: u32,
     provider_opt: &'a RetryLayerOptions,
     upstream_opt: &'a RetryLayerOptions,
-    target: &'a AttemptTarget,
+    target: &'a CapturedRouteCandidate,
     provider_id: Option<&'a str>,
     avoid_set: &'a HashSet<usize>,
     avoided_total: usize,
@@ -67,8 +69,7 @@ struct AttemptSelectLogParams<'a> {
 
 pub(super) struct ExecuteSelectedUpstreamParams<'a> {
     pub(super) proxy: &'a ProxyService,
-    pub(super) legacy_lb: Option<&'a LoadBalancer>,
-    pub(super) target: &'a AttemptTarget,
+    pub(super) target: &'a CapturedRouteCandidate,
     pub(super) method: &'a Method,
     pub(super) uri: &'a Uri,
     pub(super) client_headers: &'a HeaderMap,
@@ -79,14 +80,11 @@ pub(super) struct ExecuteSelectedUpstreamParams<'a> {
     pub(super) request_id: u64,
     pub(super) request_body_len: usize,
     pub(super) body_for_upstream: &'a Bytes,
+    pub(super) request_dialect: RequestDialect,
     pub(super) request_model: Option<&'a str>,
     pub(super) session_binding: Option<&'a SessionBinding>,
-    pub(super) session_override_config: Option<&'a str>,
-    pub(super) global_station_override: Option<&'a str>,
-    pub(super) override_model: Option<&'a str>,
-    pub(super) override_effort: Option<&'a str>,
-    pub(super) override_service_tier: Option<&'a str>,
     pub(super) effective_effort: Option<&'a str>,
+    pub(super) deferred_reasoning_intent: Option<ReasoningOrchestrationIntent>,
     pub(super) effective_service_tier: Option<&'a str>,
     pub(super) base_service_tier: &'a ServiceTierLog,
     pub(super) session_id: Option<&'a str>,
@@ -111,7 +109,6 @@ pub(super) struct ExecuteSelectedUpstreamParams<'a> {
     pub(super) avoid_set: &'a mut HashSet<usize>,
     pub(super) avoided_total: &'a mut usize,
     pub(super) last_err: &'a mut Option<(StatusCode, String)>,
-    pub(super) upstream_chain: &'a mut Vec<String>,
     pub(super) route_attempts: &'a mut Vec<RouteAttemptLog>,
     pub(super) concurrency_permit: Option<ConcurrencyPermit>,
 }
@@ -121,7 +118,6 @@ pub(super) async fn execute_selected_upstream(
 ) -> SelectedUpstreamExecutionOutcome {
     let ExecuteSelectedUpstreamParams {
         proxy,
-        legacy_lb,
         target,
         method,
         uri,
@@ -133,14 +129,11 @@ pub(super) async fn execute_selected_upstream(
         request_id,
         request_body_len,
         body_for_upstream,
+        request_dialect,
         request_model,
         session_binding,
-        session_override_config,
-        global_station_override,
-        override_model,
-        override_effort,
-        override_service_tier,
         effective_effort,
+        deferred_reasoning_intent,
         effective_service_tier,
         base_service_tier,
         session_id,
@@ -165,33 +158,150 @@ pub(super) async fn execute_selected_upstream(
         avoid_set,
         avoided_total,
         last_err,
-        upstream_chain,
         route_attempts,
         mut concurrency_permit,
     } = params;
 
-    let selected_setup = prepare_selected_upstream_request(SelectedUpstreamRequestSetupParams {
+    let model_mapping = apply_selected_model_mapping(target, body_for_upstream, request_model);
+    let target_url = match proxy.build_target(target, uri) {
+        Ok(url) => url,
+        Err(error) => {
+            *global_attempt = global_attempt.saturating_add(1);
+            log_attempt_select(AttemptSelectLogParams {
+                service_name: proxy.service_name,
+                request_id,
+                global_attempt: *global_attempt,
+                provider_attempt,
+                upstream_attempt: 0,
+                provider_opt,
+                upstream_opt,
+                target,
+                provider_id: Some(target.provider_id()),
+                avoid_set,
+                avoided_total: *avoided_total,
+                total_upstreams,
+                model_note: model_mapping.model_note.as_str(),
+            });
+            let route_attempt_index = start_selected_route_attempt(
+                route_attempts,
+                StartRouteAttemptParams {
+                    target,
+                    provider_id: Some(target.provider_id()),
+                    provider_attempt,
+                    upstream_attempt: 0,
+                    provider_max_attempts: provider_opt.max_attempts,
+                    upstream_max_attempts: upstream_opt.max_attempts,
+                    model_note: model_mapping.model_note.as_str(),
+                    avoid_set,
+                    avoided_total: *avoided_total,
+                    total_upstreams,
+                },
+            );
+            return match handle_attempt_target_build_failure(AttemptTargetBuildFailureParams {
+                proxy,
+                target,
+                error_message: error.to_string(),
+                transport_cooldown_secs: plan.transport_cooldown_secs,
+                cooldown_backoff,
+                avoid_set,
+                avoided_total,
+                last_err,
+                route_attempts,
+                route_attempt_index,
+                model_note: model_mapping.model_note.as_str(),
+                allow_provider_failover,
+            })
+            .await
+            {
+                AttemptTransportOutcome::TryNextUpstream => {
+                    SelectedUpstreamExecutionOutcome::ContinueProviderChain
+                }
+                AttemptTransportOutcome::StopProviderChain => {
+                    SelectedUpstreamExecutionOutcome::StopProviderChain
+                }
+                AttemptTransportOutcome::RetrySameUpstream
+                | AttemptTransportOutcome::Continue(_) => {
+                    unreachable!("target build failure cannot continue transport")
+                }
+            };
+        }
+    };
+    let request_identity = prepare_attempt_request_identity(AttemptRequestIdentityParams {
         proxy,
-        target,
-        body_for_upstream,
-        request_model,
-        session_binding,
-        session_override_config,
-        global_station_override,
-        override_model,
-        override_effort,
-        override_service_tier,
-        effective_effort,
-        effective_service_tier,
-        client_content_type: request_flavor.client_content_type.as_deref(),
-        request_body_previews,
-        debug_max,
-        warn_max,
+        auth: target.auth(),
+        client_headers,
+        client_uri,
+        target_url: target_url.as_str(),
     });
+    let attempt_context = match proxy
+        .state
+        .capture_upstream_attempt_context(
+            request_id,
+            AttemptRouteEvidence {
+                provider_endpoint_key: Some(target.provider_endpoint_key()),
+                provider_id: Some(target.provider_id().to_owned()),
+                endpoint_id: Some(target.endpoint_id().to_owned()),
+                route_path: target.route_path().to_vec(),
+                upstream_base_url: Some(target.base_url().to_owned()),
+                mapped_model: model_mapping.effective_model.clone(),
+            },
+            AttemptProviderScopeCapture {
+                endpoint: target_url.clone(),
+                route_scope: target.provider_endpoint_key(),
+                account_fingerprint: request_identity.account_fingerprint,
+            },
+        )
+        .await
+    {
+        Ok(context) => context,
+        Err(error) => {
+            tracing::error!(
+                request_id,
+                provider_id = target.provider_id(),
+                error = %error,
+                "failed to capture durable upstream attempt context"
+            );
+            *last_err = Some((StatusCode::INTERNAL_SERVER_ERROR, error.to_string()));
+            return SelectedUpstreamExecutionOutcome::StopProviderChain;
+        }
+    };
+
+    let selected_setup =
+        match prepare_selected_upstream_request(SelectedUpstreamRequestSetupParams {
+            proxy,
+            target,
+            model_mapping,
+            request_contract: attempt_context.request_contract(),
+            request_dialect,
+            request_model,
+            session_binding,
+            effective_effort,
+            deferred_reasoning_intent,
+            effective_service_tier,
+            client_content_type: request_flavor.client_content_type.as_deref(),
+            request_body_previews,
+            debug_max,
+            warn_max,
+        }) {
+            Ok(setup) => setup,
+            Err(error) => {
+                let message = error.to_string();
+                tracing::warn!(
+                    request_id,
+                    provider_id = target.provider_id(),
+                    error = %error,
+                    "selected provider cannot resolve deferred reasoning intent"
+                );
+                *last_err = Some((StatusCode::BAD_REQUEST, message));
+                return SelectedUpstreamExecutionOutcome::StopProviderChain;
+            }
+        };
     let model_note = selected_setup.model_note;
     let provider_id = selected_setup.provider_id;
     let route_decision = selected_setup.route_decision;
     let selected_filtered_body = selected_setup.filtered_body;
+    let selected_effective_effort = selected_setup.effective_effort;
+    let effective_effort = selected_effective_effort.as_deref();
     let selected_upstream_request_body_len = selected_setup.upstream_request_body_len;
     let selected_upstream_request_body_debug = selected_setup.upstream_request_body_debug;
     let selected_upstream_request_body_warn = selected_setup.upstream_request_body_warn;
@@ -240,12 +350,12 @@ pub(super) async fn execute_selected_upstream(
 
             let transport = handle_attempt_transport(AttemptTransportParams {
                 proxy,
-                legacy_lb,
                 target,
                 method,
-                uri,
+                target_url: &target_url,
+                request_identity: &request_identity,
+                attempt_context: &attempt_context,
                 client_headers,
-                codex_client_patch_mode: request_flavor.codex_client_patch_mode,
                 client_headers_entries_cache,
                 request_body_len,
                 upstream_request_body_len: current_upstream_request_body_len,
@@ -257,7 +367,6 @@ pub(super) async fn execute_selected_upstream(
                 client_body_warn,
                 upstream_request_body_warn: current_upstream_request_body_warn.as_ref(),
                 request_id,
-                provider_id: provider_id.as_deref(),
                 route_decision: &route_decision,
                 filtered_body: &current_filtered_body,
                 upstream_opt,
@@ -267,34 +376,33 @@ pub(super) async fn execute_selected_upstream(
                 avoid_set,
                 avoided_total,
                 last_err,
-                upstream_chain,
                 route_attempts,
                 route_attempt_index,
                 model_note: model_note.as_str(),
                 allow_provider_failover,
             })
             .await;
-            let (resp, upstream_start, upstream_headers_ms, debug_base) = match transport {
-                AttemptTransportOutcome::RetrySameUpstream => break,
-                AttemptTransportOutcome::TryNextUpstream => {
-                    return SelectedUpstreamExecutionOutcome::ContinueStation;
-                }
-                AttemptTransportOutcome::StopProviderChain => {
-                    return SelectedUpstreamExecutionOutcome::StopProviderChain;
-                }
-                AttemptTransportOutcome::Continue(success) => (
-                    success.response,
-                    success.upstream_start,
-                    success.upstream_headers_ms,
-                    success.debug_base,
-                ),
-            };
+            let (resp, upstream_start, upstream_headers_ms, debug_base, attempt_handle) =
+                match transport {
+                    AttemptTransportOutcome::RetrySameUpstream => break,
+                    AttemptTransportOutcome::TryNextUpstream => {
+                        return SelectedUpstreamExecutionOutcome::ContinueProviderChain;
+                    }
+                    AttemptTransportOutcome::StopProviderChain => {
+                        return SelectedUpstreamExecutionOutcome::StopProviderChain;
+                    }
+                    AttemptTransportOutcome::Continue(success) => (
+                        success.response,
+                        success.upstream_start,
+                        success.upstream_headers_ms,
+                        success.debug_base,
+                        success.attempt_handle,
+                    ),
+                };
             let status = resp.status();
             let success = status.is_success();
             let resp_headers = resp.headers().clone();
             let resp_headers_filtered = filter_response_headers(&resp_headers);
-            let remote_v2_downgrade_enabled = request_flavor.is_remote_compaction_v2_request
-                && codex_remote_v2_downgrade_enabled(proxy).await;
             let strict_buffer_reasoning_guard = request_flavor.is_stream
                 && success
                 && should_strict_buffer_reasoning_guard(
@@ -303,15 +411,10 @@ pub(super) async fn execute_selected_upstream(
                     uri.path(),
                 );
 
-            if request_flavor.is_stream
-                && success
-                && !remote_v2_downgrade_enabled
-                && !strict_buffer_reasoning_guard
-            {
+            if request_flavor.is_stream && success && !strict_buffer_reasoning_guard {
                 return SelectedUpstreamExecutionOutcome::Return(
                     handle_streaming_attempt_success(StreamingAttemptResponseParams {
                         proxy,
-                        legacy_lb,
                         target,
                         response: resp,
                         status,
@@ -324,7 +427,6 @@ pub(super) async fn execute_selected_upstream(
                         request_body_len,
                         upstream_request_body_len: current_upstream_request_body_len,
                         debug_base,
-                        upstream_chain,
                         route_attempts,
                         route_attempt_index,
                         model_note: model_note.as_str(),
@@ -345,6 +447,7 @@ pub(super) async fn execute_selected_upstream(
                         method,
                         path: uri.path(),
                         concurrency_permit: concurrency_permit.take(),
+                        attempt_handle,
                     })
                     .await,
                 );
@@ -352,7 +455,6 @@ pub(super) async fn execute_selected_upstream(
 
             let bytes = match read_attempt_response_body(AttemptReadBodyParams {
                 proxy,
-                legacy_lb,
                 target,
                 response: resp,
                 upstream_opt,
@@ -362,429 +464,45 @@ pub(super) async fn execute_selected_upstream(
                 avoid_set,
                 avoided_total,
                 last_err,
-                upstream_chain,
                 route_attempts,
                 route_attempt_index,
                 model_note: model_note.as_str(),
                 allow_provider_failover,
+                attempt_handle,
             })
             .await
             {
                 AttemptReadBodyOutcome::RetrySameUpstream => break,
                 AttemptReadBodyOutcome::TryNextUpstream => {
-                    return SelectedUpstreamExecutionOutcome::ContinueStation;
+                    return SelectedUpstreamExecutionOutcome::ContinueProviderChain;
                 }
                 AttemptReadBodyOutcome::StopProviderChain => {
                     return SelectedUpstreamExecutionOutcome::StopProviderChain;
                 }
                 AttemptReadBodyOutcome::Continue(bytes) => bytes,
             };
-
-            if remote_v2_downgrade_enabled {
-                let classification =
-                    classify_remote_compaction_v2_response(status, &resp_headers, &bytes);
-                if classification.valid_v2_stream {
-                    let dur = start.elapsed().as_millis() as u64;
-                    match handle_attempt_response(AttemptResponseParams {
-                        proxy,
-                        legacy_lb,
-                        target,
-                        method,
-                        path: uri.path(),
-                        status,
-                        response_headers: resp_headers,
-                        response_headers_filtered: resp_headers_filtered,
-                        response_body: bytes,
-                        request_id,
-                        duration_ms: dur,
-                        started_at_ms,
-                        upstream_headers_ms,
-                        provider_id: provider_id.as_deref(),
-                        session_id,
-                        session_identity_source,
-                        cwd,
-                        effective_effort,
-                        base_service_tier,
-                        codex_bridge: request_flavor.codex_bridge_log.clone(),
-                        response_semantic_contract,
-                        upstream_chain,
-                        route_attempts,
-                        route_attempt_index,
-                        model_note: model_note.as_str(),
-                        route_graph_key,
-                        plan,
-                        upstream_opt,
-                        provider_opt,
-                        upstream_attempt,
-                        avoid_set,
-                        avoided_total,
-                        last_err,
-                        cooldown_backoff,
-                        is_user_turn: request_flavor.is_user_turn,
-                        allow_provider_failover,
-                        is_codex_service: request_flavor.is_codex_service,
-                    })
-                    .await
-                    {
-                        AttemptResponseOutcome::RetrySameUpstream => break,
-                        AttemptResponseOutcome::TryNextUpstream => {
-                            return SelectedUpstreamExecutionOutcome::ContinueStation;
-                        }
-                        AttemptResponseOutcome::Return(response) => {
-                            return SelectedUpstreamExecutionOutcome::Return(response);
-                        }
-                    }
-                }
-
-                if !classification.downgrade_recommended {
-                    let dur = start.elapsed().as_millis() as u64;
-                    match handle_attempt_response(AttemptResponseParams {
-                        proxy,
-                        legacy_lb,
-                        target,
-                        method,
-                        path: uri.path(),
-                        status,
-                        response_headers: resp_headers,
-                        response_headers_filtered: resp_headers_filtered,
-                        response_body: bytes,
-                        request_id,
-                        duration_ms: dur,
-                        started_at_ms,
-                        upstream_headers_ms,
-                        provider_id: provider_id.as_deref(),
-                        session_id,
-                        session_identity_source,
-                        cwd,
-                        effective_effort,
-                        base_service_tier,
-                        codex_bridge: request_flavor.codex_bridge_log.clone(),
-                        response_semantic_contract,
-                        upstream_chain,
-                        route_attempts,
-                        route_attempt_index,
-                        model_note: model_note.as_str(),
-                        route_graph_key,
-                        plan,
-                        upstream_opt,
-                        provider_opt,
-                        upstream_attempt,
-                        avoid_set,
-                        avoided_total,
-                        last_err,
-                        cooldown_backoff,
-                        is_user_turn: request_flavor.is_user_turn,
-                        allow_provider_failover,
-                        is_codex_service: request_flavor.is_codex_service,
-                    })
-                    .await
-                    {
-                        AttemptResponseOutcome::RetrySameUpstream => break,
-                        AttemptResponseOutcome::TryNextUpstream => {
-                            return SelectedUpstreamExecutionOutcome::ContinueStation;
-                        }
-                        AttemptResponseOutcome::Return(response) => {
-                            return SelectedUpstreamExecutionOutcome::Return(response);
-                        }
-                    }
-                }
-
-                record_status_route_attempt(
-                    upstream_chain,
-                    route_attempts,
-                    StatusRouteAttemptParams {
-                        target,
-                        route_attempt_index,
-                        status_code: status.as_u16(),
-                        error_class: Some(classification.response_shape),
-                        reason: None,
-                        model_note: model_note.as_str(),
-                        upstream_headers_ms,
-                        duration_ms: start.elapsed().as_millis() as u64,
-                        cooldown_secs: None,
-                        cooldown_reason: None,
-                        provider_signals: Vec::new(),
-                        policy_actions: Vec::new(),
-                    },
-                );
-
-                if let (Some(compact_body), Some(compact_uri), Some(compact_client_uri)) = (
-                    build_codex_remote_compaction_v2_downgrade_body(current_filtered_body.as_ref()),
-                    compact_uri_for_remote_v2(uri),
-                    compact_client_uri_for_remote_v2(client_uri),
-                ) {
-                    tracing::info!(
-                        request_id,
-                        response_shape = classification.response_shape,
-                        downgraded_to_responses_compact = true,
-                        "downgrading Codex remote_compaction_v2 request to /responses/compact"
-                    );
-                    let compact_previews = super::request_preparation::build_body_previews(
-                        compact_body.as_ref(),
-                        request_flavor.client_content_type.as_deref(),
-                        request_body_previews,
-                        debug_max,
-                        warn_max,
-                    );
-                    *global_attempt = global_attempt.saturating_add(1);
-                    log_attempt_select(AttemptSelectLogParams {
-                        service_name: proxy.service_name,
-                        request_id,
-                        global_attempt: *global_attempt,
-                        provider_attempt,
-                        upstream_attempt,
-                        provider_opt,
-                        upstream_opt,
-                        target,
-                        provider_id: provider_id.as_deref(),
-                        avoid_set,
-                        avoided_total: *avoided_total,
-                        total_upstreams,
-                        model_note: model_note.as_str(),
-                    });
-                    let compact_route_attempt_index = start_selected_route_attempt(
-                        route_attempts,
-                        StartRouteAttemptParams {
-                            target,
-                            provider_id: provider_id.as_deref(),
-                            provider_attempt,
-                            upstream_attempt,
-                            provider_max_attempts: provider_opt.max_attempts,
-                            upstream_max_attempts: upstream_opt.max_attempts,
-                            model_note: model_note.as_str(),
-                            avoid_set,
-                            avoided_total: *avoided_total,
-                            total_upstreams,
-                        },
-                    );
-                    let transport = handle_attempt_transport(AttemptTransportParams {
-                        proxy,
-                        legacy_lb,
-                        target,
-                        method,
-                        uri: &compact_uri,
-                        client_headers,
-                        codex_client_patch_mode: request_flavor.codex_client_patch_mode,
-                        client_headers_entries_cache,
-                        request_body_len,
-                        upstream_request_body_len: compact_body.len(),
-                        debug_max,
-                        warn_max,
-                        client_uri: compact_client_uri.as_str(),
-                        client_body_debug,
-                        upstream_request_body_debug: compact_previews.debug.as_ref(),
-                        client_body_warn,
-                        upstream_request_body_warn: compact_previews.warn.as_ref(),
-                        request_id,
-                        provider_id: provider_id.as_deref(),
-                        route_decision: &route_decision,
-                        filtered_body: &compact_body,
-                        upstream_opt,
-                        upstream_attempt,
-                        transport_cooldown_secs: plan.transport_cooldown_secs,
-                        cooldown_backoff,
-                        avoid_set,
-                        avoided_total,
-                        last_err,
-                        upstream_chain,
-                        route_attempts,
-                        route_attempt_index: compact_route_attempt_index,
-                        model_note: model_note.as_str(),
-                        allow_provider_failover,
-                    })
-                    .await;
-                    let (
-                        compact_resp,
-                        _compact_upstream_start,
-                        compact_upstream_headers_ms,
-                        _debug_base,
-                    ) = match transport {
-                        AttemptTransportOutcome::RetrySameUpstream => break,
-                        AttemptTransportOutcome::TryNextUpstream => {
-                            return SelectedUpstreamExecutionOutcome::ContinueStation;
-                        }
-                        AttemptTransportOutcome::StopProviderChain => {
-                            return SelectedUpstreamExecutionOutcome::StopProviderChain;
-                        }
-                        AttemptTransportOutcome::Continue(success) => (
-                            success.response,
-                            success.upstream_start,
-                            success.upstream_headers_ms,
-                            success.debug_base,
-                        ),
-                    };
-                    let compact_status = compact_resp.status();
-                    let compact_success = compact_status.is_success();
-                    let compact_headers = compact_resp.headers().clone();
-                    let compact_headers_filtered = filter_response_headers(&compact_headers);
-                    let compact_bytes = match read_attempt_response_body(AttemptReadBodyParams {
-                        proxy,
-                        legacy_lb,
-                        target,
-                        response: compact_resp,
-                        upstream_opt,
-                        upstream_attempt,
-                        transport_cooldown_secs: plan.transport_cooldown_secs,
-                        cooldown_backoff,
-                        avoid_set,
-                        avoided_total,
-                        last_err,
-                        upstream_chain,
-                        route_attempts,
-                        route_attempt_index: compact_route_attempt_index,
-                        model_note: model_note.as_str(),
-                        allow_provider_failover,
-                    })
-                    .await
-                    {
-                        AttemptReadBodyOutcome::RetrySameUpstream => break,
-                        AttemptReadBodyOutcome::TryNextUpstream => {
-                            return SelectedUpstreamExecutionOutcome::ContinueStation;
-                        }
-                        AttemptReadBodyOutcome::StopProviderChain => {
-                            return SelectedUpstreamExecutionOutcome::StopProviderChain;
-                        }
-                        AttemptReadBodyOutcome::Continue(bytes) => bytes,
-                    };
-
-                    if compact_success
-                        && let Some(sse_body) =
-                            synthesize_remote_compaction_v2_sse_from_compact_response(
-                                proxy.service_name,
-                                compact_uri.path(),
-                                &compact_headers,
-                                &compact_bytes,
-                            )
-                    {
-                        let mut sse_headers = compact_headers_filtered.clone();
-                        sse_headers.insert(
-                            header::CONTENT_TYPE,
-                            HeaderValue::from_static("text/event-stream"),
-                        );
-                        let dur = start.elapsed().as_millis() as u64;
-                        match handle_attempt_response(AttemptResponseParams {
-                            proxy,
-                            legacy_lb,
-                            target,
-                            method,
-                            path: uri.path(),
-                            status: StatusCode::OK,
-                            response_headers: sse_headers.clone(),
-                            response_headers_filtered: sse_headers,
-                            response_body: sse_body,
-                            request_id,
-                            duration_ms: dur,
-                            started_at_ms,
-                            upstream_headers_ms: compact_upstream_headers_ms,
-                            provider_id: provider_id.as_deref(),
-                            session_id,
-                            session_identity_source,
-                            cwd,
-                            effective_effort,
-                            base_service_tier,
-                            codex_bridge: codex_bridge_with_remote_v2_downgrade(
-                                request_flavor.codex_bridge_log.clone(),
-                            ),
-                            response_semantic_contract,
-                            upstream_chain,
-                            route_attempts,
-                            route_attempt_index: compact_route_attempt_index,
-                            model_note: model_note.as_str(),
-                            route_graph_key,
-                            plan,
-                            upstream_opt,
-                            provider_opt,
-                            upstream_attempt,
-                            avoid_set,
-                            avoided_total,
-                            last_err,
-                            cooldown_backoff,
-                            is_user_turn: request_flavor.is_user_turn,
-                            allow_provider_failover,
-                            is_codex_service: request_flavor.is_codex_service,
-                        })
-                        .await
-                        {
-                            AttemptResponseOutcome::RetrySameUpstream => break,
-                            AttemptResponseOutcome::TryNextUpstream => {
-                                return SelectedUpstreamExecutionOutcome::ContinueStation;
-                            }
-                            AttemptResponseOutcome::Return(response) => {
-                                return SelectedUpstreamExecutionOutcome::Return(response);
-                            }
-                        }
-                    }
-
-                    let dur = start.elapsed().as_millis() as u64;
-                    match handle_attempt_response(AttemptResponseParams {
-                        proxy,
-                        legacy_lb,
-                        target,
-                        method,
-                        path: compact_uri.path(),
-                        status: compact_status,
-                        response_headers: compact_headers,
-                        response_headers_filtered: compact_headers_filtered,
-                        response_body: compact_bytes,
-                        request_id,
-                        duration_ms: dur,
-                        started_at_ms,
-                        upstream_headers_ms: compact_upstream_headers_ms,
-                        provider_id: provider_id.as_deref(),
-                        session_id,
-                        session_identity_source,
-                        cwd,
-                        effective_effort,
-                        base_service_tier,
-                        codex_bridge: codex_bridge_with_remote_v2_downgrade(
-                            request_flavor.codex_bridge_log.clone(),
-                        ),
-                        response_semantic_contract,
-                        upstream_chain,
-                        route_attempts,
-                        route_attempt_index: compact_route_attempt_index,
-                        model_note: model_note.as_str(),
-                        route_graph_key,
-                        plan,
-                        upstream_opt,
-                        provider_opt,
-                        upstream_attempt,
-                        avoid_set,
-                        avoided_total,
-                        last_err,
-                        cooldown_backoff,
-                        is_user_turn: request_flavor.is_user_turn,
-                        allow_provider_failover,
-                        is_codex_service: request_flavor.is_codex_service,
-                    })
-                    .await
-                    {
-                        AttemptResponseOutcome::RetrySameUpstream => break,
-                        AttemptResponseOutcome::TryNextUpstream => {
-                            return SelectedUpstreamExecutionOutcome::ContinueStation;
-                        }
-                        AttemptResponseOutcome::Return(response) => {
-                            return SelectedUpstreamExecutionOutcome::Return(response);
-                        }
-                    }
-                }
-            }
-
             if request_flavor.is_codex_service
                 && !previous_response_rectified
                 && !success
                 && is_stale_previous_response_error(status, bytes.as_ref())
                 && let Some(rectified_body) = rectified_previous_response_body.as_ref()
             {
+                if let Err(error) = proxy.state.finish_upstream_attempt(
+                    attempt_handle,
+                    AttemptOutcome::Failed,
+                    crate::logging::now_ms(),
+                    EconomicsState::Unknown,
+                ) {
+                    *last_err = Some((StatusCode::INTERNAL_SERVER_ERROR, error.to_string()));
+                    return SelectedUpstreamExecutionOutcome::StopProviderChain;
+                }
                 record_status_route_attempt(
-                    upstream_chain,
                     route_attempts,
                     StatusRouteAttemptParams {
                         target,
                         route_attempt_index,
                         status_code: status.as_u16(),
                         error_class: Some("codex_stale_previous_response_id"),
-                        reason: None,
                         model_note: model_note.as_str(),
                         upstream_headers_ms,
                         duration_ms: start.elapsed().as_millis() as u64,
@@ -818,14 +536,15 @@ pub(super) async fn execute_selected_upstream(
             let dur = start.elapsed().as_millis() as u64;
             match handle_attempt_response(AttemptResponseParams {
                 proxy,
-                legacy_lb,
                 target,
                 method,
                 path: uri.path(),
                 status,
+                upstream_entity: UpstreamResponseEntity::capture(status, &bytes),
                 response_headers: resp_headers,
                 response_headers_filtered: resp_headers_filtered,
                 response_body: bytes,
+                attempt_handle,
                 request_id,
                 duration_ms: dur,
                 started_at_ms,
@@ -838,7 +557,6 @@ pub(super) async fn execute_selected_upstream(
                 base_service_tier,
                 codex_bridge: request_flavor.codex_bridge_log.clone(),
                 response_semantic_contract,
-                upstream_chain,
                 route_attempts,
                 route_attempt_index,
                 model_note: model_note.as_str(),
@@ -859,7 +577,10 @@ pub(super) async fn execute_selected_upstream(
             {
                 AttemptResponseOutcome::RetrySameUpstream => break,
                 AttemptResponseOutcome::TryNextUpstream => {
-                    return SelectedUpstreamExecutionOutcome::ContinueStation;
+                    return SelectedUpstreamExecutionOutcome::ContinueProviderChain;
+                }
+                AttemptResponseOutcome::StopProviderChain => {
+                    return SelectedUpstreamExecutionOutcome::StopProviderChain;
                 }
                 AttemptResponseOutcome::Return(response) => {
                     return SelectedUpstreamExecutionOutcome::Return(response);
@@ -868,58 +589,7 @@ pub(super) async fn execute_selected_upstream(
         }
     }
 
-    SelectedUpstreamExecutionOutcome::ContinueStation
-}
-
-async fn codex_remote_v2_downgrade_enabled(proxy: &ProxyService) -> bool {
-    if proxy.service_name != "codex" {
-        return false;
-    }
-    proxy
-        .config
-        .v4_snapshot()
-        .await
-        .map(|config| config.codex.compaction.remote_v2_downgrade)
-        .unwrap_or(true)
-}
-
-fn codex_bridge_with_remote_v2_downgrade(
-    codex_bridge: Option<CodexBridgeLog>,
-) -> Option<CodexBridgeLog> {
-    codex_bridge.map(|mut bridge| {
-        bridge.remote_compaction_v1_request = true;
-        bridge.downgraded_to_responses_compact = true;
-        bridge
-    })
-}
-
-fn compact_uri_for_remote_v2(uri: &Uri) -> Option<Uri> {
-    let path = uri.path().trim_end_matches('/');
-    if !path.ends_with("/responses") {
-        return None;
-    }
-    let compact_path = format!("{path}/compact");
-    let path_and_query = match uri.query() {
-        Some(query) => format!("{compact_path}?{query}"),
-        None => compact_path,
-    };
-    path_and_query.parse().ok()
-}
-
-fn compact_client_uri_for_remote_v2(client_uri: &str) -> Option<String> {
-    let (path, query) = client_uri
-        .split_once('?')
-        .map(|(path, query)| (path, Some(query)))
-        .unwrap_or((client_uri, None));
-    let path = path.trim_end_matches('/');
-    if !path.ends_with("/responses") {
-        return None;
-    }
-    let compact_path = format!("{path}/compact");
-    Some(match query {
-        Some(query) => format!("{compact_path}?{query}"),
-        None => compact_path,
-    })
+    SelectedUpstreamExecutionOutcome::ContinueProviderChain
 }
 
 fn log_attempt_select(params: AttemptSelectLogParams<'_>) {
@@ -941,21 +611,11 @@ fn log_attempt_select(params: AttemptSelectLogParams<'_>) {
 
     let mut avoided_indices = avoid_set.iter().copied().collect::<Vec<_>>();
     avoided_indices.sort_unstable();
-    let avoid_for_station = if target.uses_provider_endpoint_attempt_index() {
-        Vec::new()
-    } else {
-        avoided_indices.clone()
-    };
-    let avoided_candidate_indices = if target.uses_provider_endpoint_attempt_index() {
-        avoided_indices
-    } else {
-        Vec::new()
-    };
     let endpoint_id = target.endpoint_id();
     let provider_endpoint_key = target.provider_endpoint_key();
     let preference_group = target.preference_group();
 
-    log_retry_trace(serde_json::json!({
+    log_control_trace_event(serde_json::json!({
         "event": "attempt_select",
         "service": service_name,
         "request_id": request_id,
@@ -964,17 +624,12 @@ fn log_attempt_select(params: AttemptSelectLogParams<'_>) {
         "upstream_attempt": upstream_attempt + 1,
         "provider_max_attempts": provider_opt.max_attempts,
         "upstream_max_attempts": upstream_opt.max_attempts,
-        "upstream_base_url": target.upstream().base_url.as_str(),
-        "provider_id": provider_id.or_else(|| target.provider_id()),
+        "upstream_origin": upstream_origin(target.base_url()),
+        "provider_id": provider_id.unwrap_or_else(|| target.provider_id()),
         "endpoint_id": endpoint_id,
         "provider_endpoint_key": provider_endpoint_key,
         "preference_group": preference_group,
-        "compatibility": {
-            "station_name": target.compatibility_station_name(),
-            "upstream_index": target.compatibility_upstream_index(),
-        },
-        "avoid_for_station": avoid_for_station,
-        "avoided_candidate_indices": avoided_candidate_indices,
+        "avoided_candidate_indices": avoided_indices,
         "avoided_total": avoided_total,
         "total_upstreams": total_upstreams,
         "model": model_note,

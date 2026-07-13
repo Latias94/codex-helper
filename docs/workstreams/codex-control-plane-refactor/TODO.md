@@ -1,5 +1,10 @@
 # Fearless Refactor TODO: Codex Control Plane
 
+> Historical status (superseded 2026-07-13): this checklist records the earlier
+> station-first mutable control-plane workstream, not the current remote API or
+> operator-read contract. See [Configuration](../../CONFIGURATION.md) and the
+> [canonical relay/runtime modernization plan](../../plans/2026-07-10-002-refactor-canonical-relay-runtime-modernization-plan.md).
+
 > 中文速览：这份清单按“先语义、后界面；先会话、后平台；先可解释、后自动化”的原则拆解。第一阶段不是做炫 UI，而是把 session identity、effective route、scope-aware override 和 profile/station 关系建稳。
 
 ## Status Legend

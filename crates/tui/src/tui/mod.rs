@@ -1,10 +1,9 @@
 mod attached;
-mod codex_relay_diagnostics;
-mod codex_relay_live_smoke;
 mod fleet_refresh;
 mod i18n;
 mod input;
 mod model;
+mod operator_projection;
 mod report;
 mod runtime_refresh;
 mod session_refresh;
@@ -18,7 +17,7 @@ pub use attached::{run_attached_dashboard, run_attached_dashboard_with_admin_bas
 pub use i18n::Language;
 pub use i18n::{detect_system_language, parse_language, resolve_language_preference};
 #[allow(unused_imports)]
-pub use model::{ProviderOption, UpstreamSummary, build_provider_options};
+pub use model::{ProviderOption, UpstreamSummary};
 
 use std::io;
 use std::sync::Arc;
@@ -33,23 +32,17 @@ use ratatui::backend::CrosstermBackend;
 use tokio::sync::{mpsc, watch};
 
 use crate::codex_integration::CodexStartupReadiness;
-use crate::config::ProxyConfig;
+use crate::config::HelperConfig;
 use crate::proxy::ProxyService;
 use crate::state::ProxyState;
 
-use self::codex_relay_diagnostics::{
-    CodexRelayDiagnosticsResult, apply_codex_relay_diagnostics_result,
-};
-use self::codex_relay_live_smoke::{
-    CodexRelayLiveSmokeResult, apply_codex_relay_live_smoke_result,
-};
 use self::fleet_refresh::{
     FleetRefreshResult, FleetRefreshSource, apply_fleet_refresh_result, start_fleet_refresh,
 };
-use self::model::{Palette, Snapshot, refresh_snapshot};
+use self::model::{Palette, Snapshot};
+use self::operator_projection::apply_operator_read_model;
 use self::runtime_refresh::{
-    DashboardTiming, apply_pending_refresh_requests, handle_balance_refresh_result,
-    handle_ticker_refreshes,
+    DashboardTiming, apply_pending_refresh_requests, handle_ticker_refreshes,
 };
 use self::session_refresh::{
     CodexHistoryRefreshResult, CodexRecentRefreshResult, apply_codex_history_refresh_result,
@@ -76,6 +69,26 @@ fn request_full_clear(invalidation: &mut RenderInvalidation) {
     *invalidation = RenderInvalidation::FullClear;
 }
 
+fn start_integrated_fleet_refresh(
+    ui: &mut UiState,
+    cfg: &Arc<HelperConfig>,
+    tx: mpsc::UnboundedSender<FleetRefreshResult>,
+) {
+    let model = ui
+        .operator_read_model
+        .clone()
+        .unwrap_or_else(|| crate::dashboard_core::OperatorReadModel::disconnected(ui.service_name));
+    start_fleet_refresh(
+        ui,
+        FleetRefreshSource::Integrated {
+            model: Box::new(model),
+            cfg: cfg.clone(),
+        },
+        tx,
+    );
+    ui.needs_fleet_refresh = false;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RenderSurfaceKey {
     page: types::Page,
@@ -96,14 +109,9 @@ struct RenderSurfaceKey {
     fleet_loading: bool,
     fleet_refresh_generation: u64,
     fleet_view_mode: state::FleetViewMode,
-    selected_stats_station_idx: usize,
+    selected_stats_provider_endpoint_idx: usize,
     selected_stats_provider_idx: usize,
     stats_provider_detail_scroll: u16,
-    effort_menu_idx: usize,
-    model_menu_idx: usize,
-    service_tier_menu_idx: usize,
-    profile_menu_idx: usize,
-    provider_menu_idx: usize,
     station_info_scroll: u16,
     session_transcript_scroll: u16,
 }
@@ -131,14 +139,9 @@ impl RenderSurfaceKey {
             fleet_loading: ui.fleet_loading,
             fleet_refresh_generation: ui.fleet_refresh_generation,
             fleet_view_mode: ui.fleet_view_mode,
-            selected_stats_station_idx: ui.selected_stats_station_idx,
+            selected_stats_provider_endpoint_idx: ui.selected_stats_provider_endpoint_idx,
             selected_stats_provider_idx: ui.selected_stats_provider_idx,
             stats_provider_detail_scroll: ui.stats_provider_detail_scroll,
-            effort_menu_idx: ui.effort_menu_idx,
-            model_menu_idx: ui.model_menu_idx,
-            service_tier_menu_idx: ui.service_tier_menu_idx,
-            profile_menu_idx: ui.profile_menu_idx,
-            provider_menu_idx: ui.provider_menu_idx,
             station_info_scroll: ui.station_info_scroll,
             session_transcript_scroll: ui.session_transcript_scroll,
         }
@@ -152,8 +155,6 @@ fn render_dashboard_if_needed(
     last_drawn_page: &mut types::Page,
     ui: &mut UiState,
     snapshot: &Snapshot,
-    proxy: &ProxyService,
-    balance_refresh_tx: &input::BalanceRefreshSender,
     palette: Palette,
     service_name: &'static str,
     port: u16,
@@ -170,15 +171,6 @@ fn render_dashboard_if_needed(
         request_full_clear(render_invalidation);
         ui.reset_table_viewports();
         *last_drawn_page = ui.page;
-        if ui.uses_route_graph_routing() && ui.page == types::Page::Stations {
-            let _ = input::request_provider_balance_refresh(
-                ui,
-                snapshot,
-                proxy,
-                input::BalanceRefreshMode::Auto,
-                balance_refresh_tx,
-            );
-        }
     }
     if matches!(render_invalidation, RenderInvalidation::FullClear) {
         terminal.clear()?;
@@ -214,14 +206,13 @@ fn leave_dashboard_terminal(
 pub async fn run_dashboard(
     proxy: ProxyService,
     state: Arc<ProxyState>,
-    cfg: Arc<ProxyConfig>,
+    cfg: Arc<HelperConfig>,
     service_name: &'static str,
     port: u16,
     _admin_port: u16,
-    providers: Vec<ProviderOption>,
     startup_readiness: Option<CodexStartupReadiness>,
     language: Language,
-    shutdown: watch::Sender<bool>,
+    _shutdown: watch::Sender<bool>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let timing = DashboardTiming::from_env();
@@ -234,10 +225,7 @@ pub async fn run_dashboard(
         service_name,
         proxy_port: port,
         language,
-        usage_forecast: cfg.ui.usage_forecast.clone(),
-        fleet_registry: cfg.fleet.clone(),
-        refresh_ms: timing.refresh_ms,
-        config_version: cfg.version,
+        config_version: Some(cfg.version),
         overlay: if show_startup_alert {
             types::Overlay::StartupAlert
         } else {
@@ -246,7 +234,6 @@ pub async fn run_dashboard(
         startup_readiness,
         ..Default::default()
     };
-    let _ = input::refresh_profile_control_state(&mut ui, &proxy).await;
     let palette = Palette::default();
 
     let mut events = EventStream::new();
@@ -256,12 +243,23 @@ pub async fn run_dashboard(
 
     let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
 
-    let mut cfg = cfg;
-    let mut snapshot = refresh_snapshot(&state, cfg.clone(), service_name, ui.stats_days).await;
-    let mut providers = providers;
-    ui.clamp_selection(&snapshot, ui.station_page_rows_len(providers.len()));
-    let (balance_refresh_tx, mut balance_refresh_rx) =
-        mpsc::unbounded_channel::<input::BalanceRefreshOutcome>();
+    let mut snapshot = Snapshot::default();
+    let mut providers = Vec::new();
+    let mut local_session_ids = std::collections::HashMap::new();
+    let initial_model = match proxy.operator_read_capture().await {
+        Ok(capture) => {
+            local_session_ids = capture.local_session_ids;
+            capture.model
+        }
+        Err(_) => crate::dashboard_core::OperatorReadModel::disconnected(service_name),
+    };
+    apply_operator_read_model(
+        &mut ui,
+        &mut snapshot,
+        &mut providers,
+        initial_model,
+        &local_session_ids,
+    );
     let (snapshot_refresh_tx, mut snapshot_refresh_rx) =
         mpsc::unbounded_channel::<SnapshotRefreshResult>();
     let (history_refresh_tx, mut history_refresh_rx) =
@@ -269,10 +267,6 @@ pub async fn run_dashboard(
     let (recent_refresh_tx, mut recent_refresh_rx) =
         mpsc::unbounded_channel::<CodexRecentRefreshResult>();
     let (fleet_refresh_tx, mut fleet_refresh_rx) = mpsc::unbounded_channel::<FleetRefreshResult>();
-    let (codex_relay_diagnostics_tx, mut codex_relay_diagnostics_rx) =
-        mpsc::unbounded_channel::<CodexRelayDiagnosticsResult>();
-    let (codex_relay_live_smoke_tx, mut codex_relay_live_smoke_rx) =
-        mpsc::unbounded_channel::<CodexRelayLiveSmokeResult>();
     let mut snapshot_refresh = SnapshotRefreshController::new(snapshot_refresh_tx);
 
     let mut render_invalidation = RenderInvalidation::FullClear;
@@ -284,8 +278,6 @@ pub async fn run_dashboard(
             &mut last_drawn_page,
             &mut ui,
             &snapshot,
-            &proxy,
-            &balance_refresh_tx,
             palette,
             service_name,
             port,
@@ -293,24 +285,17 @@ pub async fn run_dashboard(
         )?;
 
         if ui.should_exit || *shutdown_rx.borrow() {
-            let _ = shutdown.send(true);
             break;
         }
 
         tokio::select! {
             _ = ticker.tick() => {
                 handle_ticker_refreshes(
-                    &mut ui,
                     &proxy,
-                    state.clone(),
-                    cfg.clone(),
-                    service_name,
-                    &snapshot,
-                    providers.len(),
-                    timing.io_timeout,
                     timing.snapshot_fallback_interval,
+                    &snapshot,
                     &mut snapshot_refresh,
-                ).await;
+                );
                 if ui.page == types::Page::Fleet
                     && !ui.fleet_loading
                     && ui
@@ -320,64 +305,49 @@ pub async fn run_dashboard(
                     ui.needs_fleet_refresh = true;
                 }
                 if ui.needs_fleet_refresh && !ui.fleet_loading {
-                    start_fleet_refresh(
+                    start_integrated_fleet_refresh(
                         &mut ui,
-                        FleetRefreshSource::Integrated {
-                            state: state.clone(),
-                            cfg: cfg.clone(),
-                            service_name,
-                        },
+                        &cfg,
                         fleet_refresh_tx.clone(),
                     );
-                    ui.needs_fleet_refresh = false;
                 }
                 request_redraw(&mut render_invalidation);
             }
             changed = state_changes.changed() => {
                 if changed.is_ok() {
-                    snapshot_refresh.request(
-                        state.clone(),
-                        cfg.clone(),
-                        service_name,
-                        ui.stats_days,
-                    );
+                    snapshot_refresh.request(proxy.clone());
                 }
             }
             maybe_snapshot_refresh = snapshot_refresh_rx.recv() => {
                 if let Some(result) = maybe_snapshot_refresh {
                     snapshot_refresh.finish(result.generation);
-                    if snapshot_refresh.result_is_current(
-                        &result,
-                        cfg.version,
-                        ui.stats_days,
-                    ) {
-                        snapshot = result.snapshot;
-                        ui.clamp_selection(&snapshot, ui.station_page_rows_len(providers.len()));
+                    if snapshot_refresh.result_is_current(&result) {
+                        let model = match result.capture {
+                            Ok(capture) => {
+                                local_session_ids = capture.local_session_ids;
+                                capture.model
+                            }
+                            Err(_error) => {
+                                ui.operator_read_model
+                                    .as_ref()
+                                    .map(crate::dashboard_core::OperatorReadModel::stale_from)
+                                    .unwrap_or_else(|| {
+                                        crate::dashboard_core::OperatorReadModel::disconnected(
+                                            service_name,
+                                        )
+                                    })
+                            }
+                        };
+                        apply_operator_read_model(
+                            &mut ui,
+                            &mut snapshot,
+                            &mut providers,
+                            model,
+                            &local_session_ids,
+                        );
                         request_redraw(&mut render_invalidation);
                     }
-                    snapshot_refresh.request_pending_if_idle(
-                        state.clone(),
-                        cfg.clone(),
-                        service_name,
-                        ui.stats_days,
-                    );
-                }
-            }
-            maybe_balance_refresh = balance_refresh_rx.recv() => {
-                if let Some(result) = maybe_balance_refresh {
-                    handle_balance_refresh_result(
-                        &mut ui,
-                        &proxy,
-                        state.clone(),
-                        cfg.clone(),
-                        service_name,
-                        &snapshot,
-                        providers.len(),
-                        timing.io_timeout,
-                        &mut snapshot_refresh,
-                        result,
-                    ).await;
-                    request_redraw(&mut render_invalidation);
+                    snapshot_refresh.request_pending_if_idle(proxy.clone());
                 }
             }
             maybe_history_refresh = history_refresh_rx.recv() => {
@@ -401,29 +371,13 @@ pub async fn run_dashboard(
                     request_redraw(&mut render_invalidation);
                 }
             }
-            maybe_codex_relay_diagnostics = codex_relay_diagnostics_rx.recv() => {
-                if let Some(result) = maybe_codex_relay_diagnostics
-                    && apply_codex_relay_diagnostics_result(&mut ui, result)
-                {
-                    request_redraw(&mut render_invalidation);
-                }
-            }
-            maybe_codex_relay_live_smoke = codex_relay_live_smoke_rx.recv() => {
-                if let Some(result) = maybe_codex_relay_live_smoke
-                    && apply_codex_relay_live_smoke_result(&mut ui, result)
-                {
-                    request_redraw(&mut render_invalidation);
-                }
-            }
             changed = shutdown_rx.changed() => {
                 let _ = changed;
                 ui.should_exit = true;
-                let _ = shutdown.send(true);
                 break;
             }
             _ = &mut ctrl_c => {
                 ui.should_exit = true;
-                let _ = shutdown.send(true);
                 break;
             }
             maybe_event = events.next() => {
@@ -433,14 +387,9 @@ pub async fn run_dashboard(
                         let before_surface = RenderSurfaceKey::capture(&ui);
                         if input::handle_key_event(
                             input::KeyEventContext {
-                                state: &state,
                                 providers: &mut providers,
                                 ui: &mut ui,
                                 snapshot: &snapshot,
-                                proxy: &proxy,
-                                balance_refresh_tx: &balance_refresh_tx,
-                                codex_relay_diagnostics_tx: &codex_relay_diagnostics_tx,
-                                codex_relay_live_smoke_tx: &codex_relay_live_smoke_tx,
                             },
                             key,
                         )
@@ -448,26 +397,17 @@ pub async fn run_dashboard(
                         {
                             apply_pending_refresh_requests(
                                 &mut ui,
-                                state.clone(),
-                                &mut cfg,
-                                service_name,
-                                &snapshot,
-                                &mut providers,
+                                &proxy,
                                 &mut snapshot_refresh,
                                 history_refresh_tx.clone(),
                                 recent_refresh_tx.clone(),
                             ).await;
                             if ui.needs_fleet_refresh && !ui.fleet_loading {
-                                start_fleet_refresh(
+                                start_integrated_fleet_refresh(
                                     &mut ui,
-                                    FleetRefreshSource::Integrated {
-                                        state: state.clone(),
-                                        cfg: cfg.clone(),
-                                        service_name,
-                                    },
+                                    &cfg,
                                     fleet_refresh_tx.clone(),
                                 );
-                                ui.needs_fleet_refresh = false;
                             }
                             let after_surface = RenderSurfaceKey::capture(&ui);
                             if before_surface != after_surface {

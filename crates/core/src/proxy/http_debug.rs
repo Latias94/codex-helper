@@ -9,7 +9,7 @@ pub(super) struct HttpDebugBase {
     #[allow(dead_code)]
     pub(super) upstream_request_body_len: usize,
     pub(super) client_uri: String,
-    pub(super) target_url: String,
+    pub(super) upstream_origin: Option<String>,
     pub(super) client_headers: Vec<HeaderEntry>,
     pub(super) upstream_request_headers: Vec<HeaderEntry>,
     pub(super) auth_resolution: Option<AuthResolutionLog>,
@@ -20,24 +20,6 @@ pub(super) struct HttpDebugBase {
 }
 
 pub(super) fn format_reqwest_error_for_retry_chain(error: &reqwest::Error) -> String {
-    use std::error::Error as _;
-
-    let mut parts: Vec<String> = Vec::new();
-    let first = error.to_string();
-    if !first.trim().is_empty() {
-        parts.push(first);
-    }
-
-    let mut current = error.source();
-    for _ in 0..4 {
-        let Some(source) = current else { break };
-        let message = source.to_string();
-        if !message.trim().is_empty() && !parts.iter().any(|part| part == &message) {
-            parts.push(message);
-        }
-        current = source.source();
-    }
-
     let mut flags: Vec<&'static str> = Vec::new();
     if error.is_timeout() {
         flags.push("timeout");
@@ -46,21 +28,11 @@ pub(super) fn format_reqwest_error_for_retry_chain(error: &reqwest::Error) -> St
         flags.push("connect");
     }
 
-    let mut out = if parts.is_empty() {
-        "reqwest error".to_string()
-    } else {
-        parts.join(" | caused_by: ")
-    };
+    let mut out = "upstream HTTP transport failed".to_string();
     if !flags.is_empty() {
         out.push_str(" (flags: ");
         out.push_str(&flags.join(","));
         out.push(')');
-    }
-    out = out.replace(['\r', '\n'], " ");
-    const MAX_LEN: usize = 360;
-    if out.len() > MAX_LEN {
-        out.truncate(MAX_LEN);
-        out.push('…');
     }
     out
 }
@@ -98,7 +70,7 @@ mod tests {
             upstream_error_hint: Some(value.to_string()),
             upstream_cf_ray: None,
             client_uri: "/v1/responses".to_string(),
-            target_url: "https://example.com/v1/responses".to_string(),
+            upstream_origin: Some("https://example.com".to_string()),
             client_headers: vec![HeaderEntry {
                 name: "content-type".to_string(),
                 value: "application/json".to_string(),
@@ -138,16 +110,17 @@ mod tests {
 
     #[test]
     fn format_reqwest_error_for_retry_chain_sanitizes_output() {
+        let poisoned = "https://user:secret@example.test:99999/private/secret-path?token=hidden";
         let error = reqwest::Client::new()
-            .get("http://[::1")
+            .get(poisoned)
             .build()
             .expect_err("invalid url should fail");
 
         let formatted = format_reqwest_error_for_retry_chain(&error);
 
         assert!(!formatted.is_empty());
-        assert!(!formatted.contains('\n'));
-        assert!(!formatted.contains('\r'));
-        assert!(formatted.len() <= 361);
+        for secret in ["user:secret", "secret-path", "token=hidden", "example.test"] {
+            assert!(!formatted.contains(secret));
+        }
     }
 }

@@ -1,11 +1,8 @@
 # Routing-First Configuration Guide
 
-> Historical note: this v3 routing-first workstream is superseded by
-> `docs/workstreams/codex-routing-graph-refactor/`. Use the v4 route graph docs
-> for current authoring and implementation decisions.
+> Historical status (superseded 2026-07-12): this document records a pre-version-5 design and migration phase. The current helper accepts only `~/.codex-helper/config.toml` with `version = 5`; `codex-helper config migrate` and v2/v3/v4 compatibility readers do not exist. See [current configuration](../../CONFIGURATION.md) and the [canonical modernization plan](../../plans/2026-07-10-002-refactor-canonical-relay-runtime-modernization-plan.md). The remaining content is archival.
 
-> This document describes the target authoring model for the routing refactor.
-> The current branch can load and write `version = 3` routing-first config, `config init` emits a v3 template, and legacy station-first config remains readable for migration.
+> Historical context: this document described the target authoring model for the routing refactor. At that time, the branch could load and write `version = 3` routing-first config, `config init` emitted a v3 template, and legacy station-first config remained readable for migration.
 > The goal is simple: keep providers thin, make routing explicit, and let most users configure the system without learning internal station/group mechanics.
 
 ## Mental Model

@@ -31,17 +31,14 @@ use cases::{
 };
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CodexRelayLiveSmokeRequest {
     #[serde(default)]
     pub acknowledgement: Option<String>,
     #[serde(default)]
-    pub station_name: Option<String>,
-    #[serde(default)]
     pub provider_id: Option<String>,
     #[serde(default)]
     pub endpoint_id: Option<String>,
-    #[serde(default)]
-    pub upstream_index: Option<usize>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
@@ -112,15 +109,9 @@ pub struct CodexRelayLiveSmokeResult {
 pub struct CodexRelayLiveSmokeResponse {
     pub api_version: u32,
     pub service_name: String,
-    pub station_name: String,
-    pub upstream_index: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub endpoint_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider_endpoint_key: Option<String>,
-    pub upstream_base_url: String,
+    pub provider_id: String,
+    pub endpoint_id: String,
+    pub provider_endpoint_key: String,
     pub requested_model: String,
     pub upstream_model: String,
     pub cases: Vec<CodexRelayLiveSmokeCase>,
@@ -330,13 +321,15 @@ pub(super) async fn codex_relay_live_smoke_for_proxy(
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
 
-    let cfg = proxy.config.snapshot().await;
-    let mgr = proxy.service_manager(cfg.as_ref());
+    let runtime_snapshot = proxy.config.capture().await;
+    let graph = runtime_snapshot
+        .route_graph(proxy.service_name)
+        .ok_or_else(|| {
+            ProxyControlError::new(StatusCode::BAD_REQUEST, "no codex route graph is available")
+        })?;
     let target = select_codex_relay_target(
-        mgr,
+        graph.as_ref(),
         CodexRelayTargetSelection {
-            station_name: payload.station_name.as_deref(),
-            upstream_index: payload.upstream_index,
             provider_id: payload.provider_id.as_deref(),
             endpoint_id: payload.endpoint_id.as_deref(),
         },
@@ -360,16 +353,16 @@ pub(super) async fn codex_relay_live_smoke_for_proxy(
     }
 
     let warnings = live_smoke_warnings(&cases);
+    let provider_endpoint_key = target.provider_endpoint.stable_key();
+    let provider_id = target.provider_endpoint.provider_id;
+    let endpoint_id = target.provider_endpoint.endpoint_id;
 
     let response = CodexRelayLiveSmokeResponse {
         api_version: LIVE_SMOKE_API_VERSION,
         service_name: proxy.service_name.to_string(),
-        station_name: target.station_name,
-        upstream_index: target.upstream_index,
-        provider_id: target.provider_id,
-        endpoint_id: target.endpoint_id,
-        provider_endpoint_key: target.provider_endpoint_key,
-        upstream_base_url: target.upstream.base_url,
+        provider_id,
+        endpoint_id,
+        provider_endpoint_key,
         requested_model,
         upstream_model,
         cases,
@@ -1283,10 +1276,9 @@ mod tests {
     use super::cases::REMOTE_COMPACTION_V2_BETA_FEATURE;
     use super::*;
     use crate::config::{
-        ProviderConfigV4, ProxyConfig, ProxyConfigV4, RetryConfig, RoutingConfigV4, ServiceConfig,
-        ServiceConfigManager, ServiceViewV4, UiConfig, UpstreamAuth, UpstreamConfig,
+        HelperConfig, ProviderConfig, RouteGraphConfig, ServiceRouteConfig, UpstreamAuth,
+        UpstreamConfig,
     };
-    use crate::lb::LbState;
 
     fn spawn_axum_server(app: axum::Router) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -1409,73 +1401,65 @@ mod tests {
     }
 
     fn proxy_for_upstreams(upstreams: Vec<UpstreamConfig>) -> ProxyService {
-        let mut mgr = ServiceConfigManager {
-            active: Some("test".to_string()),
-            ..Default::default()
-        };
-        mgr.configs.insert(
-            "test".to_string(),
-            ServiceConfig {
-                name: "test".to_string(),
-                alias: None,
-                enabled: true,
-                level: 1,
-                upstreams,
+        let mut providers = std::collections::BTreeMap::new();
+        let mut route_order = Vec::with_capacity(upstreams.len());
+        for (index, upstream) in upstreams.into_iter().enumerate() {
+            let provider_id = if index == 0 {
+                "test".to_string()
+            } else {
+                format!("test-{}", index + 1)
+            };
+            providers.insert(
+                provider_id.clone(),
+                ProviderConfig {
+                    base_url: Some(upstream.base_url),
+                    auth: upstream.auth,
+                    tags: upstream.tags.into_iter().collect(),
+                    supported_models: upstream.supported_models.into_iter().collect(),
+                    model_mapping: upstream.model_mapping.into_iter().collect(),
+                    ..ProviderConfig::default()
+                },
+            );
+            route_order.push(provider_id);
+        }
+        let cfg = HelperConfig {
+            codex: ServiceRouteConfig {
+                providers,
+                routing: Some(RouteGraphConfig::ordered_failover(route_order)),
+                ..ServiceRouteConfig::default()
             },
-        );
-        let cfg = ProxyConfig {
-            version: Some(1),
-            codex: mgr,
-            claude: ServiceConfigManager::default(),
-            retry: RetryConfig::default(),
-            notify: Default::default(),
-            default_service: None,
-            relay_targets: std::collections::BTreeMap::new(),
-            fleet: Default::default(),
-            ui: UiConfig::default(),
+            ..HelperConfig::default()
         };
-        ProxyService::new(
-            reqwest::Client::new(),
-            Arc::new(cfg),
-            "codex",
-            Arc::new(Mutex::new(HashMap::<String, LbState>::new())),
-        )
+        ProxyService::new(reqwest::Client::new(), Arc::new(cfg), "codex")
     }
 
-    fn proxy_for_v4_providers(providers: Vec<(&str, String)>) -> ProxyService {
-        let v4 = ProxyConfigV4 {
-            codex: ServiceViewV4 {
+    fn proxy_for_providers(providers: Vec<(&str, String)>) -> ProxyService {
+        let source = HelperConfig {
+            codex: ServiceRouteConfig {
                 providers: providers
                     .iter()
                     .map(|(provider_id, base_url)| {
                         (
                             (*provider_id).to_string(),
-                            ProviderConfigV4 {
+                            ProviderConfig {
                                 base_url: Some(base_url.clone()),
                                 inline_auth: UpstreamAuth::default(),
-                                ..ProviderConfigV4::default()
+                                ..ProviderConfig::default()
                             },
                         )
                     })
                     .collect(),
-                routing: Some(RoutingConfigV4::ordered_failover(
+                routing: Some(RouteGraphConfig::ordered_failover(
                     providers
                         .iter()
                         .map(|(provider_id, _)| (*provider_id).to_string())
                         .collect(),
                 )),
-                ..ServiceViewV4::default()
+                ..ServiceRouteConfig::default()
             },
-            ..ProxyConfigV4::default()
+            ..HelperConfig::default()
         };
-        let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compile v4 runtime");
-        ProxyService::new_with_v4_source(
-            reqwest::Client::new(),
-            Arc::new(runtime),
-            Some(Arc::new(v4)),
-            "codex",
-            Arc::new(Mutex::new(HashMap::<String, LbState>::new())),
-        )
+        ProxyService::new(reqwest::Client::new(), Arc::new(source), "codex")
     }
 
     fn request(model: &str, cases: Vec<CodexRelayLiveSmokeCase>) -> CodexRelayLiveSmokeRequest {
@@ -1522,6 +1506,27 @@ mod tests {
                 "Responses WebSocket was not tested because websocket smoke is explicit-only",
             ]
         );
+    }
+
+    #[test]
+    fn codex_relay_live_smoke_request_rejects_legacy_target_fields() {
+        for field in [
+            ("station_name", serde_json::json!("legacy-station")),
+            ("upstream_index", serde_json::json!(1)),
+        ] {
+            let payload = serde_json::Value::Object(serde_json::Map::from_iter([(
+                field.0.to_string(),
+                field.1,
+            )]));
+            let error = serde_json::from_value::<CodexRelayLiveSmokeRequest>(payload)
+                .expect_err("legacy target field should be rejected");
+
+            assert!(
+                error.to_string().contains("unknown field"),
+                "unexpected error for {}: {error}",
+                field.0
+            );
+        }
     }
 
     #[test]
@@ -2224,7 +2229,7 @@ mod tests {
         );
         let (input8_addr, input8_handle) = spawn_axum_server(input8_app);
         let (ciii_addr, ciii_handle) = spawn_axum_server(ciii_app);
-        let proxy = proxy_for_v4_providers(vec![
+        let proxy = proxy_for_providers(vec![
             ("input8", format!("http://{input8_addr}/v1")),
             ("ciii", format!("http://{ciii_addr}/v1")),
         ]);
@@ -2237,14 +2242,24 @@ mod tests {
 
         assert_eq!(input8_hits.load(Ordering::SeqCst), 0);
         assert_eq!(ciii_hits.load(Ordering::SeqCst), 1);
-        assert_eq!(response.station_name, "routing");
-        assert_eq!(response.upstream_index, 1);
-        assert_eq!(response.provider_id.as_deref(), Some("ciii"));
-        assert_eq!(response.endpoint_id.as_deref(), Some("default"));
-        assert_eq!(
-            response.provider_endpoint_key.as_deref(),
-            Some("codex/ciii/default")
-        );
+        assert_eq!(response.provider_id, "ciii");
+        assert_eq!(response.endpoint_id, "default");
+        assert_eq!(response.provider_endpoint_key, "codex/ciii/default");
+        let serialized = serde_json::to_value(&response).expect("serialize response");
+        assert!(serialized.get("station_name").is_none());
+        assert!(serialized.get("upstream_index").is_none());
+        assert!(serialized.get("upstream_base_url").is_none());
+        for field in ["provider_id", "endpoint_id", "provider_endpoint_key"] {
+            let mut missing = serialized.clone();
+            missing
+                .as_object_mut()
+                .expect("response object")
+                .remove(field);
+            assert!(
+                serde_json::from_value::<CodexRelayLiveSmokeResponse>(missing).is_err(),
+                "missing canonical field {field} should fail"
+            );
+        }
         assert_eq!(
             response.results[0].outcome,
             CodexRelayLiveSmokeOutcome::Passed

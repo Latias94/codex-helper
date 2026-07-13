@@ -1,20 +1,19 @@
-use axum::Json;
 use axum::Router;
 use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::http::{HeaderMap, Uri};
 use axum::middleware;
 use axum::routing::MethodFilter;
-use axum::routing::{any, get, on};
+use axum::routing::{any, on};
 
 use super::ProxyService;
-use super::admin::{ProxyAdminDiscovery, reject_admin_paths_from_proxy, require_admin_path_only};
+use super::admin::{reject_admin_paths_from_proxy, require_admin_path_only};
 use super::control_plane_routes::control_plane_routes;
 use super::handle_proxy;
 use super::openai_images::{handle_openai_images_edits, handle_openai_images_generations};
 use super::responses_websocket::handle_responses_websocket;
 
-pub fn router(proxy: ProxyService) -> Router {
+pub(crate) fn router(proxy: ProxyService) -> Router {
     // In axum 0.8, wildcard segments use `/{*path}` (equivalent to `/*path` from axum 0.7).
     let proxy_routes = proxy_only_router(proxy.clone());
 
@@ -23,36 +22,9 @@ pub fn router(proxy: ProxyService) -> Router {
         .merge(proxy_routes)
 }
 
-pub fn proxy_only_router(proxy: ProxyService) -> Router {
-    proxy_only_router_with_admin_base_url(proxy, None)
-}
-
-pub fn proxy_only_router_with_admin_base_url(
-    proxy: ProxyService,
-    admin_base_url: Option<String>,
-) -> Router {
-    let service_name = proxy.service_name;
-    let discovery = admin_base_url.map(|admin_base_url| {
-        Json(ProxyAdminDiscovery {
-            api_version: 1,
-            service_name,
-            admin_base_url,
-        })
-    });
-
-    let mut router = Router::new();
-    if let Some(discovery) = discovery {
-        router = router.route(
-            "/.well-known/codex-helper-admin",
-            get(move || {
-                let discovery = discovery.clone();
-                async move { discovery }
-            }),
-        );
-    }
-
+pub(crate) fn proxy_only_router(proxy: ProxyService) -> Router {
     let proxy_for_fallback = proxy.clone();
-    router
+    Router::new()
         .route(
             "/images/generations",
             on(MethodFilter::POST, {
@@ -108,6 +80,87 @@ fn responses_websocket_route(proxy: ProxyService) -> axum::routing::MethodRouter
     .fallback(move |req| handle_proxy(proxy_for_fallback.clone(), req))
 }
 
-pub fn admin_listener_router(proxy: ProxyService) -> Router {
+pub(crate) fn admin_listener_router(proxy: ProxyService) -> Router {
     router(proxy).layer(middleware::from_fn(require_admin_path_only))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::Json;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use reqwest::Client;
+    use tower::ServiceExt;
+
+    use super::*;
+    use crate::config::{HelperConfig, ProviderConfig, RouteGraphConfig, ServiceRouteConfig};
+
+    fn proxy_with_upstream(base_url: String) -> ProxyService {
+        let config = HelperConfig {
+            codex: ServiceRouteConfig {
+                providers: std::collections::BTreeMap::from([(
+                    "test".to_string(),
+                    ProviderConfig {
+                        base_url: Some(base_url),
+                        ..ProviderConfig::default()
+                    },
+                )]),
+                routing: Some(RouteGraphConfig::ordered_failover(vec!["test".to_string()])),
+                ..ServiceRouteConfig::default()
+            },
+            ..HelperConfig::default()
+        };
+        ProxyService::new(
+            Client::builder()
+                .no_proxy()
+                .build()
+                .expect("build upstream client"),
+            Arc::new(config),
+            "codex",
+        )
+    }
+
+    #[tokio::test]
+    async fn missing_admin_discovery_is_not_forwarded_upstream() {
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let hits = upstream_hits.clone();
+        let upstream = Router::new().fallback(move || {
+            let hits = hits.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                Json(serde_json::json!({
+                    "api_version": 1,
+                    "service_name": "codex",
+                    "admin_base_url": "http://127.0.0.1:65535"
+                }))
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind hostile upstream");
+        let upstream_addr = listener.local_addr().expect("hostile upstream address");
+        let upstream_handle = tokio::spawn(async move {
+            axum::serve(listener, upstream)
+                .await
+                .expect("serve hostile upstream");
+        });
+        let app = proxy_only_router(proxy_with_upstream(format!("http://{upstream_addr}")));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/.well-known/codex-helper-admin")
+                    .body(Body::empty())
+                    .expect("build discovery request"),
+            )
+            .await
+            .expect("discovery response");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+        upstream_handle.abort();
+    }
 }

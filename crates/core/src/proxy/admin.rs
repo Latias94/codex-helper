@@ -5,8 +5,6 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::{Request, Response, StatusCode};
 use axum::middleware::Next;
 
-use crate::dashboard_core::RemoteAdminAccessCapabilities;
-
 use super::{ADMIN_PORT_OFFSET, ADMIN_TOKEN_ENV_VAR, ADMIN_TOKEN_HEADER};
 
 #[derive(Clone)]
@@ -21,17 +19,6 @@ impl AdminAccessConfig {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
         Self { token }
-    }
-}
-
-pub(super) fn admin_access_capabilities() -> RemoteAdminAccessCapabilities {
-    let access = AdminAccessConfig::from_env();
-    RemoteAdminAccessCapabilities {
-        loopback_without_token: true,
-        remote_requires_token: true,
-        remote_enabled: access.token.is_some(),
-        token_header: ADMIN_TOKEN_HEADER.to_string(),
-        token_env_var: ADMIN_TOKEN_ENV_VAR.to_string(),
     }
 }
 
@@ -57,6 +44,9 @@ pub fn admin_base_url_from_proxy_base_url(proxy_base_url: &str) -> Option<String
     let mut url = reqwest::Url::parse(proxy_base_url).ok()?;
     let port = url.port_or_known_default()?;
     url.set_port(Some(admin_port_for_proxy_port(port))).ok()?;
+    url.set_path("/");
+    url.set_query(None);
+    url.set_fragment(None);
     Some(url.to_string().trim_end_matches('/').to_string())
 }
 
@@ -68,11 +58,8 @@ fn is_admin_path(path: &str) -> bool {
     path == "/__codex_helper" || path.starts_with("/__codex_helper/")
 }
 
-#[derive(Clone, serde::Serialize)]
-pub(super) struct ProxyAdminDiscovery {
-    pub(super) api_version: u32,
-    pub(super) service_name: &'static str,
-    pub(super) admin_base_url: String,
+fn is_proxy_reserved_path(path: &str) -> bool {
+    is_admin_path(path) || path == "/.well-known/codex-helper-admin"
 }
 
 pub(super) async fn require_admin_access(
@@ -81,21 +68,25 @@ pub(super) async fn require_admin_access(
     req: Request<Body>,
     next: Next,
 ) -> Result<Response<Body>, (StatusCode, String)> {
-    if peer_addr.ip().is_loopback() {
-        return Ok(next.run(req).await);
-    }
-
     let provided = req
         .headers()
         .get(ADMIN_TOKEN_HEADER)
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let remote_allowed = access
-        .token
-        .as_deref()
-        .is_some_and(|expected| Some(expected) == provided);
-    if remote_allowed {
+    if let Some(expected) = access.token.as_deref() {
+        if Some(expected) == provided {
+            return Ok(next.run(req).await);
+        }
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "admin routes require {ADMIN_TOKEN_HEADER} when {ADMIN_TOKEN_ENV_VAR} is configured"
+            ),
+        ));
+    }
+
+    if peer_addr.ip().is_loopback() {
         return Ok(next.run(req).await);
     }
 
@@ -121,8 +112,25 @@ pub(super) async fn reject_admin_paths_from_proxy(
     req: Request<Body>,
     next: Next,
 ) -> Result<Response<Body>, StatusCode> {
-    if is_admin_path(req.uri().path()) {
+    if is_proxy_reserved_path(req.uri().path()) {
         return Err(StatusCode::NOT_FOUND);
     }
     Ok(next.run(req).await)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derived_admin_base_url_discards_proxy_request_path() {
+        assert_eq!(
+            admin_base_url_from_proxy_base_url("http://127.0.0.1:3211/v1"),
+            Some("http://127.0.0.1:4211".to_string())
+        );
+        assert_eq!(
+            admin_base_url_from_proxy_base_url("http://127.0.0.1:3211/backend-api/codex/responses"),
+            Some("http://127.0.0.1:4211".to_string())
+        );
+    }
 }

@@ -1,28 +1,16 @@
 use axum::http::{Method, StatusCode};
 
-use crate::logging::{
-    CodexBridgeLog, HeaderEntry, HttpDebugLog, RetryInfo, RouteAttemptLog, ServiceTierLog,
-    log_request_with_debug, should_include_http_warn,
-};
+use crate::logging::{CodexBridgeLog, RetryInfo, RouteAttemptLog, ServiceTierLog};
 use crate::state::SessionIdentitySource;
 
 use super::ProxyService;
 use super::failure_summary::failed_proxy_client_message;
 use super::request_observer::{RequestObserver, RequestPublication};
 
-const EMPTY_TARGET_URL: &str = "-";
-const CLIENT_BODY_READ_ERROR_HINT: &str =
-    "读取客户端请求 body 失败（可能超过大小限制或连接中断）。";
-
 pub(super) struct ClientBodyReadErrorParams<'a> {
     pub(super) proxy: &'a ProxyService,
     pub(super) method: &'a Method,
     pub(super) path: &'a str,
-    pub(super) client_uri: &'a str,
-    pub(super) session_id: Option<String>,
-    pub(super) session_identity_source: Option<SessionIdentitySource>,
-    pub(super) cwd: Option<String>,
-    pub(super) client_headers: Vec<HeaderEntry>,
     pub(super) duration_ms: u64,
     pub(super) error_message: String,
 }
@@ -46,64 +34,58 @@ pub(super) struct FailedProxyRequestParams<'a> {
     pub(super) failure_route_attempts: Vec<RouteAttemptLog>,
 }
 
-pub(super) fn log_client_body_read_error(
+pub(super) fn client_body_read_error(
     params: ClientBodyReadErrorParams<'_>,
 ) -> (StatusCode, String) {
     let ClientBodyReadErrorParams {
         proxy,
         method,
         path,
-        client_uri,
-        session_id,
-        session_identity_source,
-        cwd,
-        client_headers,
         duration_ms,
         error_message,
     } = params;
 
-    let status = StatusCode::BAD_REQUEST;
-    let http_debug = build_early_error_http_debug(
-        status,
-        client_uri,
-        client_headers,
-        "client_body_read_error",
-        CLIENT_BODY_READ_ERROR_HINT,
-        error_message.as_str(),
-    );
-
-    log_request_with_debug(
-        None,
-        proxy.service_name,
-        method.as_str(),
+    tracing::warn!(
+        service = proxy.service_name,
+        method = method.as_str(),
         path,
-        status.as_u16(),
         duration_ms,
-        None,
-        None,
-        None,
-        None,
-        None,
-        EMPTY_TARGET_URL,
-        session_id,
-        session_identity_source,
-        cwd,
-        None,
-        None,
-        ServiceTierLog::default(),
-        None,
-        None,
-        None,
-        None,
-        http_debug,
+        error = %error_message,
+        "client request body read failed before durable lifecycle creation"
     );
-
-    (status, error_message)
+    (StatusCode::BAD_REQUEST, error_message)
 }
 
 pub(super) async fn finish_failed_proxy_request(
     params: FailedProxyRequestParams<'_>,
 ) -> (StatusCode, String) {
+    let (status, message, _) = finish_failed_proxy_request_inner(params, true).await;
+    (status, message)
+}
+
+pub(super) async fn finish_non_economic_failed_proxy_request(
+    params: FailedProxyRequestParams<'_>,
+) -> (StatusCode, String) {
+    let (status, message, _) = finish_failed_proxy_request_inner(params, false).await;
+    (status, message)
+}
+
+pub(super) async fn finish_failed_proxy_request_with_publication_result(
+    params: FailedProxyRequestParams<'_>,
+) -> (StatusCode, String, bool) {
+    finish_failed_proxy_request_inner(params, true).await
+}
+
+pub(super) async fn finish_non_economic_failed_proxy_request_with_publication_result(
+    params: FailedProxyRequestParams<'_>,
+) -> (StatusCode, String, bool) {
+    finish_failed_proxy_request_inner(params, false).await
+}
+
+async fn finish_failed_proxy_request_inner(
+    params: FailedProxyRequestParams<'_>,
+    include_in_economics: bool,
+) -> (StatusCode, String, bool) {
     let FailedProxyRequestParams {
         proxy,
         method,
@@ -136,7 +118,6 @@ pub(super) async fn finish_failed_proxy_request(
         duration_ms,
         started_at_ms,
     );
-    publication.upstream_base_url = EMPTY_TARGET_URL.to_string();
     publication.session_id = session_id;
     publication.session_identity_source = session_identity_source;
     publication.cwd = cwd;
@@ -144,39 +125,14 @@ pub(super) async fn finish_failed_proxy_request(
     publication.service_tier = service_tier;
     publication.codex_bridge = codex_bridge;
     publication.retry = retry;
-    RequestObserver::new(proxy, method, path)
-        .publish_terminal_once(publication)
-        .await;
+    let observer = RequestObserver::new(proxy, method, path);
+    let published = if include_in_economics {
+        observer.publish_terminal_once(publication).await
+    } else {
+        observer
+            .publish_non_economic_terminal_once(publication)
+            .await
+    };
 
-    (status, client_message)
-}
-
-fn build_early_error_http_debug(
-    status: StatusCode,
-    client_uri: &str,
-    client_headers: Vec<HeaderEntry>,
-    error_class: &str,
-    error_hint: &str,
-    error_message: &str,
-) -> Option<HttpDebugLog> {
-    should_include_http_warn(status.as_u16()).then(|| HttpDebugLog {
-        request_body_len: None,
-        upstream_request_body_len: None,
-        upstream_headers_ms: None,
-        upstream_first_chunk_ms: None,
-        upstream_body_read_ms: None,
-        upstream_error_class: Some(error_class.to_string()),
-        upstream_error_hint: Some(error_hint.to_string()),
-        upstream_cf_ray: None,
-        client_uri: client_uri.to_string(),
-        target_url: EMPTY_TARGET_URL.to_string(),
-        client_headers,
-        upstream_request_headers: Vec::new(),
-        auth_resolution: None,
-        client_body: None,
-        upstream_request_body: None,
-        upstream_response_headers: None,
-        upstream_response_body: None,
-        upstream_error: Some(error_message.to_string()),
-    })
+    (status, client_message, published)
 }

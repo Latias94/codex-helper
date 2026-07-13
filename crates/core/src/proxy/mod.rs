@@ -1,9 +1,7 @@
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::Client;
-use tokio::sync::watch;
 
 mod admin;
 mod admin_api_error;
@@ -13,8 +11,6 @@ mod attempt_failures;
 mod attempt_health;
 mod attempt_request;
 mod attempt_response;
-mod attempt_selection;
-mod attempt_target;
 mod attempt_transport;
 mod auth_resolution;
 mod classify;
@@ -33,16 +29,12 @@ mod control_plane_service;
 mod entrypoint;
 mod failure_summary;
 mod headers;
-mod healthcheck_api;
 mod http_debug;
 mod models_compat;
 mod openai_images;
-mod passive_health;
-mod persisted_registry_api;
 mod profile_defaults;
 mod provider_evidence;
 mod provider_execution;
-mod provider_orchestration;
 mod providers_api;
 mod reasoning_guard;
 mod request_body;
@@ -52,7 +44,7 @@ mod request_encoding;
 mod request_failures;
 mod request_observer;
 mod request_preparation;
-mod request_routing;
+mod response_entity;
 mod response_finalization;
 mod response_fixer;
 mod response_semantics;
@@ -60,27 +52,20 @@ mod responses_websocket;
 mod retry;
 mod route_affinity;
 mod route_attempts;
-mod route_executor_runtime;
-mod route_metadata;
 mod route_provenance;
 mod route_target_selection;
 mod route_unavailability;
 mod router_setup;
-mod routing_plan;
 mod runtime_admin_api;
 mod runtime_config;
 mod selected_upstream_request;
 mod service_core;
-mod session_overrides;
-mod stations_api;
 mod stream;
 mod target_builder;
 #[cfg(test)]
 mod tests;
 
 use crate::filter::RequestFilter;
-use crate::host_local::HostLocalSessionHistoryMode;
-use crate::lb::LbState;
 use crate::state::{ProviderBalanceSnapshot, ProxyState};
 use crate::usage_providers::UsageProviderRefreshSummary;
 
@@ -88,11 +73,11 @@ pub use self::admin::{
     admin_base_url_from_proxy_base_url, admin_loopback_addr_for_proxy_port,
     admin_port_for_proxy_port, local_admin_base_url_for_proxy_port, local_proxy_base_url,
 };
-pub use self::api_responses::{ProfilesResponse, ReloadResult, RuntimeStatusResponse};
+pub use self::api_responses::ProfilesResponse;
 pub use self::codex_relay_capabilities::{
     CodexRelayCapabilitiesObserved, CodexRelayCapabilitiesRequest, CodexRelayCapabilitiesResponse,
     CodexRelayCapabilityMismatch, CodexRelayContinuityDiagnostics,
-    CodexRelayContinuityDomainSummary,
+    CodexRelayContinuityDomainSummary, CodexRelayProviderContract,
 };
 pub use self::codex_relay_evidence::{
     CodexRelayEvidenceEntry, CodexRelayEvidenceFilters, CodexRelayEvidenceKind,
@@ -109,11 +94,11 @@ pub use self::codex_relay_probe::{
     classify_codex_relay_probe_response,
 };
 use self::concurrency_limits::ConcurrencyLimiter;
-pub use self::entrypoint::handle_proxy;
-pub use self::persisted_registry_api::PersistedRoutingUpsertRequest;
-pub use self::router_setup::{
-    admin_listener_router, proxy_only_router, proxy_only_router_with_admin_base_url, router,
-};
+pub(crate) use self::entrypoint::handle_proxy;
+pub use self::response_entity::upstream_http_client_builder;
+#[cfg(test)]
+pub(crate) use self::router_setup::router;
+pub(crate) use self::router_setup::{admin_listener_router, proxy_only_router};
 use self::runtime_config::RuntimeConfig;
 
 pub const ADMIN_TOKEN_ENV_VAR: &str = "CODEX_HELPER_ADMIN_TOKEN";
@@ -127,11 +112,6 @@ const AUTH_FILE_CACHE_MIN_CHECK_INTERVAL: Duration = Duration::from_millis(20);
 const AUTH_FILE_CACHE_MIN_CHECK_INTERVAL: Duration = Duration::from_millis(800);
 
 #[cfg(test)]
-fn codex_auth_json_value(key: &str) -> Option<String> {
-    auth_resolution::codex_auth_json_value(key)
-}
-
-#[cfg(test)]
 fn claude_settings_env_value(key: &str) -> Option<String> {
     auth_resolution::claude_settings_env_value(key)
 }
@@ -139,22 +119,19 @@ fn claude_settings_env_value(key: &str) -> Option<String> {
 /// Generic proxy service; currently used by both Codex and Claude.
 #[derive(Clone)]
 pub struct ProxyService {
-    pub client: Client,
+    pub(crate) client: Client,
     config: Arc<RuntimeConfig>,
     pub service_name: &'static str,
-    lb_states: Arc<Mutex<HashMap<String, LbState>>>,
     concurrency_limiter: Arc<ConcurrencyLimiter>,
     filter: RequestFilter,
     state: Arc<ProxyState>,
-    shutdown_tx: Option<watch::Sender<bool>>,
-    host_local_session_history_mode: HostLocalSessionHistoryMode,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProviderBalanceRefreshResponse {
     pub service_name: String,
     pub refresh: UsageProviderRefreshSummary,
-    pub provider_balances: HashMap<String, Vec<ProviderBalanceSnapshot>>,
+    pub provider_balances: Vec<ProviderBalanceSnapshot>,
 }
 
 #[derive(Debug, Clone)]

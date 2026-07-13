@@ -1,16 +1,15 @@
 import { Clock3, Database, Link2, RefreshCw, Server } from "lucide-react";
 
 import { Button, Card } from "@/components/ui";
-import { mockRuntime } from "@/lib/api/mock-data";
 import type { RuntimeSummary } from "@/lib/api/types";
 import { cn } from "@/lib/utils";
 
 export function StatusStrip({
-  runtime = mockRuntime,
+  runtime,
   onRefresh,
   healthy = true,
 }: {
-  runtime?: RuntimeSummary;
+  runtime: RuntimeSummary;
   onRefresh?: () => void;
   healthy?: boolean;
 }) {
@@ -30,7 +29,7 @@ export function StatusStrip({
         </span>
         <span className="flex items-center gap-2 text-slate-700">
           <Database className="h-4 w-4 text-slate-400" />
-          当前供应商 <b className="text-teal-700">{runtime.provider}</b>
+          最近供应商 <b className="text-teal-700">{runtime.provider}</b>
         </span>
         <span className="flex items-center gap-2 text-slate-500">
           <Clock3 className="h-4 w-4" />

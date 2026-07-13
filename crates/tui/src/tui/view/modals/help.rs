@@ -8,15 +8,16 @@ use crate::tui::model::Palette;
 use crate::tui::state::UiState;
 use crate::tui::types::Page;
 use crate::tui::view::widgets::centered_rect;
+
 fn help_heading(text: impl Into<String>, p: Palette) -> Line<'static> {
-    Line::from(vec![Span::styled(
+    Line::from(Span::styled(
         text.into(),
         Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-    )])
+    ))
 }
 
-fn help_current_page_title(lang: Language, page: Page, is_route_graph: bool) -> &'static str {
-    match (lang, page, is_route_graph) {
+fn help_current_page_title(lang: Language, page: Page, routing: bool) -> &'static str {
+    match (lang, page, routing) {
         (Language::Zh, Page::Dashboard, _) => "当前页面：总览",
         (Language::Zh, Page::Stations, true) => "当前页面：路由",
         (Language::Zh, Page::Stations, false) => "当前页面：站点",
@@ -45,176 +46,110 @@ fn help_current_page_title(lang: Language, page: Page, is_route_graph: bool) -> 
 pub(super) fn current_page_help_lines(
     lang: Language,
     page: Page,
-    is_route_graph: bool,
-    is_codex_service: bool,
+    routing: bool,
+    codex: bool,
     p: Palette,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![help_heading(
-        help_current_page_title(lang, page, is_route_graph),
+        help_current_page_title(lang, page, routing),
         p,
     )];
-
-    let entries = match (lang, page, is_route_graph, is_codex_service) {
-        (Language::Zh, Page::Dashboard, true, _) => vec![
+    let entries = match (lang, page, codex) {
+        (Language::Zh, Page::Dashboard, _) => vec![
             "  Tab        切换会话/请求焦点",
-            "  b/M/f      会话 profile、model、fast/service tier 覆盖",
-            "  Enter      打开 effort 菜单；l/m/h/X 快速设置；x 清除",
-            "  p/P        打开会话/全局 route target 编辑",
-            "  O/H o/h    从会话或请求面板跳到关联页面",
+            "  ↑/↓        移动当前选择",
+            "  O/H o/h    跳到关联请求、会话或历史",
         ],
-        (Language::Zh, Page::Dashboard, false, _) => vec![
-            "  Tab        切换会话/请求焦点",
-            "  b/M/f      会话 profile、model、fast/service tier 覆盖",
-            "  Enter      打开 effort 菜单；l/m/h/X 快速设置；x 清除",
-            "  p/P        设置会话站点覆盖 / 全局站点 pin",
-            "  O/H o/h    从会话或请求面板跳到关联页面",
+        (Language::Zh, Page::Stations, _) => vec![
+            "  ↑/↓        移动 provider 选择",
+            "  i          查看只读 provider 详情",
         ],
-        (Language::Zh, Page::Stations, true, _) => vec![
-            "  r/Enter    打开 routing 编辑器",
-            "  g          刷新路由预览与余额",
-            "  e/f/s      启停、包月优先、耗尽策略",
-            "  1/2/0      设置 monthly/paygo/unknown billing tag",
-            "  Backspace  清除全局 route target；o/O 设置或清除会话 route target",
-            "  []/u/d     调整 provider 顺序",
-        ],
-        (Language::Zh, Page::Stations, false, _) => vec![
-            "  Enter      设置全局站点 pin；Backspace 清除",
-            "  o/O        设置或清除当前会话站点覆盖",
-            "  i          查看站点详情",
-            "  h/H        检查当前/全部站点；c/C 取消检查",
-        ],
-        (Language::Zh, Page::Sessions, _, _) => vec![
-            "  b/M/f      会话 profile、model、fast/service tier 覆盖",
-            "  R          重置当前会话 manual overrides",
-            "  a/e/v      活跃、错误、覆盖筛选；r 重置筛选",
+        (Language::Zh, Page::Sessions, _) => vec![
+            "  a/e        活跃、错误筛选；r 重置筛选",
             "  t          打开全屏对话记录",
             "  o/H        跳到 Requests / History",
         ],
-        (Language::Zh, Page::Requests, _, _) => vec![
-            "  e          仅看错误",
-            "  c          循环控制证据过滤",
-            "  s          切换当前会话 / 全部请求",
+        (Language::Zh, Page::Requests, _) => vec![
+            "  e/c/s      错误、控制证据与会话范围筛选",
             "  x          清除显式 session 聚焦",
             "  o/h        跳到 Sessions / History",
         ],
-        (Language::Zh, Page::Stats, _, _) => vec![
-            "  Tab        切换站点 / provider 今日排行",
+        (Language::Zh, Page::Stats, _) => vec![
+            "  Tab        切换 endpoint / provider 今日排行",
             "  ↑/↓        移动当前排行选择",
-            "  面板       显示今日请求、token、覆盖范围和全局 retry gate 数量",
+            "  y          导出并复制选中报告",
         ],
-        (Language::Zh, Page::Settings, _, true) => vec![
-            "  p/P        管理配置默认 profile / 运行时默认 profile",
-            "  R          重载运行时配置",
-            "  O          从 ~/.codex 覆盖导入站点，需要二次确认",
-            "  B/I/F/V/D  启用 ChatGPT / Imagegen / Official relay / Official imagegen / 默认 patch",
+        (Language::Zh, Page::Settings, true) => vec![
+            "  n/o        显式开启/关闭 Codex 本地 switch",
+            "  页面       展示 operator bundle、重试和 profile 只读事实",
         ],
-        (Language::Zh, Page::Settings, _, false) => vec![
-            "  p/P        管理配置默认 profile / 运行时默认 profile",
-            "  R          重载运行时配置",
-        ],
-        (Language::Zh, Page::History, _, _) => vec![
+        (Language::Zh, Page::Settings, false) => {
+            vec!["  页面       展示 operator bundle、重试和 profile 只读事实"]
+        }
+        (Language::Zh, Page::History, _) => vec![
             "  r          刷新历史会话列表",
             "  t/Enter    打开全屏对话记录",
             "  s/f        跳到 Sessions / Requests",
         ],
-        (Language::Zh, Page::Recent, _, _) => vec![
+        (Language::Zh, Page::Recent, _) => vec![
             "  [ / ]      切换时间窗口",
             "  Enter/y    复制选中项 / 复制可见列表",
-            "  t          打开全屏对话记录",
-            "  s/f/h      跳到 Sessions / Requests / History",
+            "  t/s/f/h    打开记录或跳到关联页面",
         ],
-        (Language::Zh, Page::Fleet, _, _) => vec![
-            "  Tab        切换节点列表 / 工作单元视图",
-            "  ↑/↓        移动当前列表选择",
-            "  r          立即刷新 Fleet 快照",
-            "  t          切换 Tree / Flat 展示",
+        (Language::Zh, Page::Fleet, _) => vec![
+            "  Tab        切换节点 / 工作单元焦点",
+            "  r          刷新快照；t 切换 Tree / Flat",
         ],
-        (Language::Zh, Page::ServiceStatus, _, _) => vec![
-            "  r          刷新服务状态快照",
-            "  5          返回本页",
-            "  表格       展示每个探针、模型、最新状态、延迟和历史格子",
-        ],
-        (Language::En, Page::Dashboard, true, _) => vec![
+        (Language::Zh, Page::ServiceStatus, _) => vec!["  r          刷新只读服务状态快照"],
+        (Language::En, Page::Dashboard, _) => vec![
             "  Tab        switch Sessions / Requests focus",
-            "  b/M/f      session profile, model, fast/service tier overrides",
-            "  Enter      open effort menu; l/m/h/X quick set; x clear",
-            "  p/P        open session/global route target editor",
-            "  O/H o/h    jump from session or request panels",
+            "  ↑/↓        move the active selection",
+            "  O/H o/h    jump to related requests, sessions, or history",
         ],
-        (Language::En, Page::Dashboard, false, _) => vec![
-            "  Tab        switch Sessions / Requests focus",
-            "  b/M/f      session profile, model, fast/service tier overrides",
-            "  Enter      open effort menu; l/m/h/X quick set; x clear",
-            "  p/P        set session station override / global station pin",
-            "  O/H o/h    jump from session or request panels",
+        (Language::En, Page::Stations, _) => vec![
+            "  ↑/↓        move the provider selection",
+            "  i          inspect read-only provider details",
         ],
-        (Language::En, Page::Stations, true, _) => vec![
-            "  r/Enter    open routing editor",
-            "  g          refresh routing preview and balances",
-            "  e/f/s      enable, monthly-first, exhausted action",
-            "  1/2/0      set monthly/paygo/unknown billing tag",
-            "  Backspace  clear global route target; o/O set or clear session route target",
-            "  []/u/d     reorder providers",
-        ],
-        (Language::En, Page::Stations, false, _) => vec![
-            "  Enter      set global station pin; Backspace clears it",
-            "  o/O        set or clear current session station override",
-            "  i          open station details",
-            "  h/H        check selected/all stations; c/C cancel checks",
-        ],
-        (Language::En, Page::Sessions, _, _) => vec![
-            "  b/M/f      session profile, model, fast/service tier overrides",
-            "  R          reset current session manual overrides",
-            "  a/e/v      active, error, override filters; r resets filters",
-            "  t          open full-screen transcript",
+        (Language::En, Page::Sessions, _) => vec![
+            "  a/e        active and error filters; r resets",
+            "  t          open the full-screen transcript",
             "  o/H        jump to Requests / History",
         ],
-        (Language::En, Page::Requests, _, _) => vec![
-            "  e          toggle errors-only",
-            "  c          cycle provider-control filter",
-            "  s          switch current session / all requests",
+        (Language::En, Page::Requests, _) => vec![
+            "  e/c/s      error, control-evidence, and session-scope filters",
             "  x          clear explicit session focus",
             "  o/h        jump to Sessions / History",
         ],
-        (Language::En, Page::Stats, _, _) => vec![
-            "  Tab        switch station / provider day ranking",
+        (Language::En, Page::Stats, _) => vec![
+            "  Tab        switch endpoint / provider day ranking",
             "  ↑/↓        move the active ranking selection",
-            "  Panels     show today's requests, tokens, coverage, and global retry gate count",
+            "  y          export and copy the selected report",
         ],
-        (Language::En, Page::Settings, _, true) => vec![
-            "  p/P        manage configured default profile / runtime default profile",
-            "  R          reload runtime config",
-            "  O          overwrite-import stations from ~/.codex, with confirmation",
-            "  B/I/F/V/D  enable ChatGPT / Imagegen / Official relay / Official imagegen / default preset",
+        (Language::En, Page::Settings, true) => vec![
+            "  n/o        explicitly switch the local Codex target on/off",
+            "  page       shows read-only operator bundle, retry, and profile facts",
         ],
-        (Language::En, Page::Settings, _, false) => vec![
-            "  p/P        manage configured default profile / runtime default profile",
-            "  R          reload runtime config",
-        ],
-        (Language::En, Page::History, _, _) => vec![
-            "  r          refresh history session list",
-            "  t/Enter    open full-screen transcript",
+        (Language::En, Page::Settings, false) => {
+            vec!["  page       shows read-only operator bundle, retry, and profile facts"]
+        }
+        (Language::En, Page::History, _) => vec![
+            "  r          refresh the history session list",
+            "  t/Enter    open the full-screen transcript",
             "  s/f        jump to Sessions / Requests",
         ],
-        (Language::En, Page::Recent, _, _) => vec![
-            "  [ / ]      switch time window",
-            "  Enter/y    copy selected item / visible list",
-            "  t          open full-screen transcript",
-            "  s/f/h      jump to Sessions / Requests / History",
+        (Language::En, Page::Recent, _) => vec![
+            "  [ / ]      switch the time window",
+            "  Enter/y    copy the selected item / visible list",
+            "  t/s/f/h    open a transcript or jump to a related page",
         ],
-        (Language::En, Page::Fleet, _, _) => vec![
+        (Language::En, Page::Fleet, _) => vec![
             "  Tab        switch nodes / work units focus",
-            "  ↑/↓        move the current list selection",
-            "  r          refresh the Fleet snapshot now",
-            "  t          toggle Tree / Flat layout",
+            "  r          refresh the snapshot; t toggles Tree / Flat",
         ],
-        (Language::En, Page::ServiceStatus, _, _) => vec![
-            "  r          refresh the service status snapshot",
-            "  5          return to this page",
-            "  table      shows each probe, model, latest state, latency, and history cells",
-        ],
+        (Language::En, Page::ServiceStatus, _) => {
+            vec!["  r          refresh the read-only service status snapshot"]
+        }
     };
-
     lines.extend(entries.into_iter().map(Line::from));
     lines.push(Line::from(""));
     lines
@@ -237,11 +172,11 @@ pub(super) fn help_text_for_tests(lines: &[Line<'_>]) -> String {
 fn help_quit_line(lang: Language, attached: bool) -> &'static str {
     match (lang, attached) {
         (Language::Zh, true) => "  q          只退出附着控制台；不停止 resident proxy",
-        (Language::Zh, false) => "  q          退出并触发 shutdown",
+        (Language::Zh, false) => "  q          退出控制台；不请求停止 runtime",
         (Language::En, true) => {
             "  q          exit attached console only; keep resident proxy running"
         }
-        (Language::En, false) => "  q          quit and request shutdown",
+        (Language::En, false) => "  q          exit console and keep the runtime running",
     }
 }
 
@@ -251,380 +186,44 @@ pub(super) fn help_quit_line_for_tests(lang: Language, attached: bool) -> &'stat
 }
 
 pub(in crate::tui::view) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui: &UiState) {
-    let lang = ui.language;
-    let is_route_graph = ui.uses_route_graph_routing();
-    let area = centered_rect(70, 70, f.area());
+    let area = centered_rect(72, 72, f.area());
     f.render_widget(Clear, area);
     let block = Block::default()
         .title(Span::styled(
-            i18n::text(lang, msg::OVERLAY_HELP_TITLE),
+            i18n::text(ui.language, msg::OVERLAY_HELP_TITLE),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(p.focus))
         .style(Style::default().bg(p.panel));
-
-    let mut lines =
-        current_page_help_lines(lang, ui.page, is_route_graph, ui.service_name == "codex", p);
-    lines.extend(if lang == crate::tui::Language::Zh {
-        vec![
-            Line::from(vec![Span::styled(
-                "导航",
-                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-            )]),
-            Line::from("  ↑/↓, j/k   移动选中项"),
-            Line::from("  1-9/0      切换页面"),
-            Line::from(
-                "            1 总览  2 站点/路由  3 会话  4 请求  5 用量  6 状态  7 设置  8 历史  9 最近  0 Fleet",
-            ),
-            Line::from("  L          切换语言（中/英，自动落盘）"),
-            Line::from("  7 设置     查看运行态与关键配置入口"),
-            Line::from(
-                "  设置页      p 管理配置默认 profile；P 管理运行时默认 profile；R 重载配置；O 覆盖导入 ~/.codex（仅 codex）",
-            ),
-            Line::from("  Tab        切换焦点（总览页）"),
-            Line::from(
-                "  总览页     b 打开 profile 菜单；M 打开 model 菜单；f 打开 fast / service tier 菜单；R 重置当前会话 manual overrides；O/H 从会话面板跳到 Requests/History；o/h 从请求面板跳到 Sessions/History",
-            ),
-            Line::from(""),
-            Line::from(vec![Span::styled(
-                "推理强度",
-                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-            )]),
-            Line::from("  Enter      打开 effort 菜单（会话列表）"),
-            Line::from("  l/m/h/X    设置 low/medium/high/xhigh"),
-            Line::from("  x          清除 effort 覆盖"),
-            Line::from(if is_route_graph {
-                "  R          重置当前会话 model/route_target/effort/service_tier 覆盖"
-            } else {
-                "  R          重置当前会话 model/station/effort/service_tier 覆盖"
-            }),
-            Line::from(""),
-            Line::from(vec![Span::styled(
-                "模型覆盖",
-                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-            )]),
-            Line::from("  M          打开 model 菜单（Dashboard/Sessions）"),
-            Line::from("  clear      清除当前会话 model 覆盖"),
-            Line::from("  Custom...  输入任意 model 名称"),
-            Line::from(""),
-            Line::from(vec![Span::styled(
-                "Fast / Service Tier",
-                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-            )]),
-            Line::from("  f          打开 fast / service tier 菜单（Dashboard/Sessions）"),
-            Line::from("  priority   通常对应 fast mode"),
-            Line::from("  Custom...  输入任意 service_tier"),
-            Line::from(""),
-            Line::from(vec![Span::styled(
-                if is_route_graph {
-                    "Route target 覆盖"
-                } else {
-                    "Provider 覆盖"
-                },
-                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-            )]),
-            Line::from(if is_route_graph {
-                "  p/P        打开 route graph 编辑器（provider 选择由 routing policy 管理）"
-            } else {
-                "  p          会话级 provider 覆盖（固定）"
-            }),
-            Line::from(if is_route_graph {
-                "  r          在 Routing 页打开 routing 编辑器"
-            } else {
-                "  P          全局站点 pin（运行时）"
-            }),
-            Line::from("  b          打开 session profile 菜单（Dashboard/Sessions）"),
-            Line::from("  Clear binding  清除当前会话已存储的 profile 绑定（保留其他会话覆盖）"),
-            Line::from(""),
-            Line::from(vec![Span::styled(
-                if is_route_graph {
-                    "路由页（Routing）"
-                } else {
-                    "站点页（Stations）"
-                },
-                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-            )]),
-            Line::from(if is_route_graph {
-                "  Enter/r    打开 routing 编辑器（策略/顺序/tags/启停）"
-            } else {
-                "  Enter      设置为全局 pin"
-            }),
-            Line::from(if is_route_graph {
-                "  Backspace  清除全局 route target"
-            } else {
-                "  Backspace  清除全局 pin（自动）"
-            }),
-            Line::from(if is_route_graph {
-                "  o          设置会话 route target 为选中 provider"
-            } else {
-                "  o          设置会话 override 为当前站点"
-            }),
-            Line::from(if is_route_graph {
-                "  O          清除会话 route target"
-            } else {
-                "  O          清除会话 override"
-            }),
-            Line::from("  i          查看 Provider 详情（可滚动）"),
-            Line::from("  h/H        运行健康检查（当前/全部）"),
-            Line::from("  c/C        取消健康检查（当前/全部）"),
-            Line::from(""),
-            Line::from(vec![Span::styled(
-                "请求页（Requests）",
-                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-            )]),
-            Line::from("  e          仅看错误（errors-only）"),
-            Line::from("  s          scope：全部 vs 当前会话"),
-            Line::from("  x          清除显式 session 聚焦"),
-            Line::from("  o/h        打开到 Sessions / History"),
-            Line::from(""),
-            Line::from(vec![Span::styled(
-                "会话页（Sessions）",
-                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-            )]),
-            Line::from("  a          仅看活跃（active-only）"),
-            Line::from("  e          仅看错误（errors-only）"),
-            Line::from("  v          仅看覆盖（overrides-only）"),
-            Line::from("  r          重置筛选"),
-            Line::from("  M          打开 model 菜单"),
-            Line::from("  f          打开 fast / service tier 菜单"),
-            Line::from("  R          重置当前会话 manual overrides"),
-            Line::from("  t          对话记录（全屏）"),
-            Line::from("  o/H        打开到 Requests / History"),
-            Line::from(""),
-            Line::from(vec![Span::styled(
-                "历史页（History）",
-                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-            )]),
-            Line::from("  r          刷新历史会话列表"),
-            Line::from("  t/Enter    打开对话记录（全屏）"),
-            Line::from("  s/f        打开到 Sessions / Requests"),
-            Line::from(""),
-            Line::from(vec![Span::styled(
-                "最近页（Recent）",
-                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-            )]),
-            Line::from("  [ / ]      切换时间窗口"),
-            Line::from("  Enter / y  复制选中 / 复制可见列表"),
-            Line::from("  t          打开对话记录（全屏）"),
-            Line::from("  s/f/h      打开到 Sessions / Requests / History"),
-            Line::from(""),
-            Line::from(vec![Span::styled(
-                "Fleet 页",
-                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-            )]),
-            Line::from("  r          刷新 Fleet 快照"),
-            Line::from("  Tab        切换节点 / 工作单元焦点"),
-            Line::from("  t          切换 Tree / Flat 展示"),
-            Line::from(""),
-            Line::from(vec![Span::styled(
-                "服务状态页",
-                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-            )]),
-            Line::from("  r          刷新服务状态快照"),
-            Line::from("  配置入口    [ui.service_status]"),
-            Line::from(""),
-            Line::from(vec![Span::styled(
-                "今日用量页",
-                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-            )]),
-            Line::from("  Tab        切换焦点（station vs provider）"),
-            Line::from("  ↑/↓        移动当前排行选择"),
-            Line::from("  面板       今日 totals、覆盖范围、retry gate 和维度排行"),
-            Line::from(""),
-            Line::from(vec![Span::styled(
-                "退出",
-                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-            )]),
-            Line::from(help_quit_line(
-                lang,
-                ui.runtime_connection.is_attached(),
-            )),
-            Line::from("  Esc/?      关闭帮助"),
-        ]
-    } else {
-        vec![
-            Line::from(vec![Span::styled(
-                "Navigation",
-                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-            )]),
-            Line::from("  Tab        switch focus (Dashboard)"),
-            Line::from("  ↑/↓, j/k   move selection"),
-            Line::from("  1-9/0      switch page"),
-            Line::from(
-                "            1 Dashboard  2 Stations/Routing  3 Sessions  4 Requests  5 Usage  6 Status  7 Settings  8 History  9 Recent  0 Fleet",
-            ),
-            Line::from("  L          toggle language (zh/en, persisted)"),
-            Line::from("  7 Settings show runtime + station overview"),
-            Line::from(
-                "  Settings   p manage configured default profile; P manage runtime default profile; R reload settings; O overwrite-import ~/.codex (codex only)",
-            ),
-            Line::from(
-                "  Dashboard  b opens profile menu; M opens model menu; f opens fast / service tier menu; R resets current session manual overrides; O/H jump from Sessions panel to Requests/History; o/h jump from Requests panel to Sessions/History",
-            ),
-            Line::from(""),
-            Line::from(vec![Span::styled(
-                "Effort",
-                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-            )]),
-            Line::from("  Enter      open effort menu (on Sessions)"),
-            Line::from("  l/m/h/X    set low/medium/high/xhigh"),
-            Line::from("  x          clear effort override"),
-            Line::from(if is_route_graph {
-                "  R          reset session model/route_target/effort/service_tier overrides"
-            } else {
-                "  R          reset session model/station/effort/service_tier overrides"
-            }),
-            Line::from(""),
-            Line::from(vec![Span::styled(
-                "Model override",
-                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-            )]),
-            Line::from("  M          open model menu (Dashboard/Sessions)"),
-            Line::from("  clear      clear the session model override"),
-            Line::from("  Custom...  enter any model name"),
-            Line::from(""),
-            Line::from(vec![Span::styled(
-                "Fast / Service tier",
-                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-            )]),
-            Line::from("  f          open fast / service tier menu (Dashboard/Sessions)"),
-            Line::from("  priority   usually maps to fast mode"),
-            Line::from("  Custom...  enter any service_tier"),
-            Line::from(""),
-            Line::from(vec![Span::styled(
-                if is_route_graph {
-                    "Route target override"
-                } else {
-                    "Provider override"
-                },
-                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-            )]),
-            Line::from(if is_route_graph {
-                "  p/P        open route graph editor (provider choice is routing policy)"
-            } else {
-                "  p          session provider override (pinned)"
-            }),
-            Line::from(if is_route_graph {
-                "  r          open routing editor on the Routing page"
-            } else {
-                "  P          global station pin (runtime)"
-            }),
-            Line::from("  b          open session profile menu (Dashboard/Sessions)"),
-            Line::from(
-                "  Clear binding  clear the stored session profile binding and keep other session overrides",
-            ),
-            Line::from(""),
-            Line::from(vec![Span::styled(
-                if is_route_graph {
-                    "Routing page"
-                } else {
-                    "Stations page"
-                },
-                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-            )]),
-            Line::from(if is_route_graph {
-                "  Enter/r    open routing editor (policy/order/tags/enable)"
-            } else {
-                "  Enter      set global pin"
-            }),
-            Line::from(if is_route_graph {
-                "  Backspace  clear global route target"
-            } else {
-                "  Backspace  clear global pin (auto)"
-            }),
-            Line::from(if is_route_graph {
-                "  o          set session route target to selected provider"
-            } else {
-                "  o          set session override to selected station"
-            }),
-            Line::from(if is_route_graph {
-                "  O          clear session route target"
-            } else {
-                "  O          clear session override"
-            }),
-            Line::from("  i          open provider details (scrollable)"),
-            Line::from("  h/H        run health checks (selected/all)"),
-            Line::from("  c/C        cancel health checks (selected/all)"),
-            Line::from(""),
-            Line::from(vec![Span::styled(
-                "Requests page",
-                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-            )]),
-            Line::from("  e          toggle errors-only filter"),
-            Line::from("  s          toggle scope (all vs selected session)"),
-            Line::from("  x          clear explicit session focus"),
-            Line::from("  o/h        open in Sessions / History"),
-            Line::from(""),
-            Line::from(vec![Span::styled(
-                "Sessions page",
-                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-            )]),
-            Line::from("  a          toggle active-only"),
-            Line::from("  e          toggle errors-only"),
-            Line::from("  v          toggle overrides-only"),
-            Line::from("  r          reset filters"),
-            Line::from("  M          open model menu"),
-            Line::from("  f          open fast / service tier menu"),
-            Line::from("  R          reset current session manual overrides"),
-            Line::from("  t          transcript (full-screen)"),
-            Line::from("  o/H        open in Requests / History"),
-            Line::from(""),
-            Line::from(vec![Span::styled(
-                "History page",
-                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-            )]),
-            Line::from("  r          refresh history session list"),
-            Line::from("  t/Enter    open transcript (full-screen)"),
-            Line::from("  s/f        open in Sessions / Requests"),
-            Line::from(""),
-            Line::from(vec![Span::styled(
-                "Recent page",
-                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-            )]),
-            Line::from("  [ / ]      switch time window"),
-            Line::from("  Enter / y  copy selected / copy visible list"),
-            Line::from("  t          open transcript (full-screen)"),
-            Line::from("  s/f/h      open in Sessions / Requests / History"),
-            Line::from(""),
-            Line::from(vec![Span::styled(
-                "Fleet page",
-                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-            )]),
-            Line::from("  r          refresh Fleet snapshot"),
-            Line::from("  Tab        switch nodes / work units focus"),
-            Line::from("  t          toggle Tree / Flat layout"),
-            Line::from(""),
-            Line::from(vec![Span::styled(
-                "Service Status page",
-                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-            )]),
-            Line::from("  r          refresh service status snapshot"),
-            Line::from("  config     [ui.service_status]"),
-            Line::from(""),
-            Line::from(vec![Span::styled(
-                "Today Usage page",
-                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-            )]),
-            Line::from("  Tab        switch focus (station vs provider)"),
-            Line::from("  ↑/↓        move selected ranking row"),
-            Line::from("  panels     today totals, coverage, retry gate, and dimensions"),
-            Line::from(""),
-            Line::from(vec![Span::styled(
-                "Quit",
-                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-            )]),
-            Line::from(help_quit_line(
-                lang,
-                ui.runtime_connection.is_attached(),
-            )),
-            Line::from("  Esc/?      close this modal"),
-        ]
-    });
-
-    let content = Paragraph::new(Text::from(lines))
-        .block(block)
-        .style(Style::default().fg(p.muted))
-        .wrap(Wrap { trim: false });
-    f.render_widget(content, area);
+    let mut lines = current_page_help_lines(
+        ui.language,
+        ui.page,
+        ui.uses_route_graph_routing(),
+        ui.service_name == "codex",
+        p,
+    );
+    lines.push(help_heading(
+        match ui.language {
+            Language::Zh => "通用",
+            Language::En => "General",
+        },
+        p,
+    ));
+    lines.extend([
+        Line::from("  1-9/0      pages"),
+        Line::from("  L          language (current TUI session only)"),
+        Line::from("  ? / Esc    open / close help"),
+        Line::from(help_quit_line(
+            ui.language,
+            ui.runtime_connection.is_attached(),
+        )),
+    ]);
+    f.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(block)
+            .style(Style::default().fg(p.text))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }

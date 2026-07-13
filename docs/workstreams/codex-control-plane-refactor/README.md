@@ -1,5 +1,12 @@
 # Fearless Refactor Workstream: Codex Control Plane
 
+> Historical status (superseded 2026-07-13): this document describes the
+> earlier station-first mutable control-plane design. It is not the current
+> remote API or operator-read contract. See
+> [Configuration](../../CONFIGURATION.md) and the
+> [canonical relay/runtime modernization plan](../../plans/2026-07-10-002-refactor-canonical-relay-runtime-modernization-plan.md)
+> for the query-only GET/HEAD surface and canonical provider/endpoint model.
+
 > 中文速览：本目录用于跟踪 `codex-helper` 从“本地代理 + 观察面板”演进到“Codex-first 本地控制平面”的无畏重构。重点不是照搬 `CLIProxyAPI`，而是先把会话身份、会话级控制、配置模板、提供商管理与高可用语义做清楚，再决定后续 GUI / WebUI / LAN 共享能力如何承接。
 
 ## Purpose

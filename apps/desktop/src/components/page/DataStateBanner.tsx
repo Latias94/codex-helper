@@ -1,7 +1,7 @@
 import { AlertTriangle, KeyRound, Loader2, PlugZap, RotateCw, Wifi, WifiOff } from "lucide-react";
 
 import { Badge, Button } from "@/components/ui";
-import type { DataSource, RuntimeDataState } from "@/lib/api/types";
+import type { RuntimeDataState } from "@/lib/api/types";
 import { cn } from "@/lib/utils";
 
 const bannerTone = {
@@ -22,27 +22,12 @@ const descriptionTone = {
 
 export function DataStateBanner({
   state,
-  source,
-  isLoading,
-  isRefreshing,
-  errorMessage,
   onRefresh,
 }: {
-  state?: RuntimeDataState;
-  source?: DataSource;
-  isLoading?: boolean;
-  isRefreshing?: boolean;
-  errorMessage?: string;
+  state: RuntimeDataState;
   onRefresh?: () => void;
 }) {
-  const bannerState =
-    state ??
-    legacyState({
-      source: source ?? "mock",
-      isLoading: Boolean(isLoading),
-      isRefreshing: Boolean(isRefreshing),
-      errorMessage,
-    });
+  const bannerState = state;
 
   if (bannerState.status === "live") {
     return null;
@@ -113,39 +98,8 @@ function badgeVariantForState(state: RuntimeDataState) {
   if (state.source === "live") {
     return "success" as const;
   }
-  if (state.status === "mock" || state.status === "empty") {
+  if (state.status === "empty") {
     return "muted" as const;
   }
   return "warning" as const;
-}
-
-function legacyState({
-  source,
-  isLoading,
-  isRefreshing,
-  errorMessage,
-}: {
-  source: DataSource;
-  isLoading: boolean;
-  isRefreshing: boolean;
-  errorMessage?: string;
-}): RuntimeDataState {
-  return {
-    status: source === "live" ? (isRefreshing ? "refreshing" : "live") : isLoading ? "loading" : "mock",
-    source,
-    severity: source === "live" ? "info" : "warning",
-    title: source === "live" ? "正在刷新本地 admin API 数据" : "当前展示离线示例数据",
-    description: errorMessage
-      ? `无法连接本地 admin API：${errorMessage}`
-      : "启动或附加 codex-helper 本地代理后会自动切换为实时数据。",
-    badge: source === "live" ? "Live" : "Mock fallback",
-    canUseLiveActions: source === "live",
-    canStartProxy: source !== "live",
-    canAttachProxy: source !== "live",
-    canStopProxy: false,
-    isFallback: source !== "live",
-    isStale: false,
-    ownerMode: "unknown",
-    errorMessage,
-  };
 }

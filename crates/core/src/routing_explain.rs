@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::config::{RoutingAffinityPolicyV5, RoutingConditionV4};
+use crate::config::{RouteAffinityPolicy, RouteCondition};
 use crate::dashboard_core::ProviderCapacity;
 use crate::routing_ir::{
     RouteCandidate, RoutePlanAttemptState, RoutePlanCandidateRuntimeSnapshot, RoutePlanExecutor,
@@ -292,12 +292,12 @@ pub fn build_routing_explain_response_with_request(
     }
 }
 
-fn routing_affinity_policy_label(policy: RoutingAffinityPolicyV5) -> &'static str {
+fn routing_affinity_policy_label(policy: RouteAffinityPolicy) -> &'static str {
     match policy {
-        RoutingAffinityPolicyV5::Off => "off",
-        RoutingAffinityPolicyV5::PreferredGroup => "preferred_group",
-        RoutingAffinityPolicyV5::FallbackSticky => "fallback_sticky",
-        RoutingAffinityPolicyV5::Hard => "hard",
+        RouteAffinityPolicy::Off => "off",
+        RouteAffinityPolicy::PreferredGroup => "preferred_group",
+        RouteAffinityPolicy::FallbackSticky => "fallback_sticky",
+        RouteAffinityPolicy::Hard => "hard",
     }
 }
 
@@ -559,8 +559,8 @@ impl From<&RouteRequestContext> for RoutingExplainRequestContext {
     }
 }
 
-impl From<&RoutingConditionV4> for RoutingExplainCondition {
-    fn from(condition: &RoutingConditionV4) -> Self {
+impl From<&RouteCondition> for RoutingExplainCondition {
+    fn from(condition: &RouteCondition) -> Self {
         Self {
             model: condition.model.clone(),
             service_tier: condition.service_tier.clone(),
@@ -602,17 +602,17 @@ mod tests {
 
     use super::*;
     use crate::config::{
-        ProviderConfigV4, RoutingConditionV4, RoutingConfigV4, RoutingExhaustedActionV4,
-        RoutingNodeV4, RoutingPolicyV4, ServiceViewV4, UpstreamAuth,
+        ProviderConfig, RouteCondition, RouteExhaustedAction, RouteGraphConfig, RouteNodeConfig,
+        RouteStrategy, ServiceRouteConfig, UpstreamAuth,
     };
-    use crate::routing_ir::compile_v4_route_plan_template_with_request;
+    use crate::routing_ir::compile_route_plan_template_with_request;
     use crate::runtime_identity::ProviderEndpointKey;
 
-    fn provider(base_url: &str) -> ProviderConfigV4 {
-        ProviderConfigV4 {
+    fn provider(base_url: &str) -> ProviderConfig {
+        ProviderConfig {
             base_url: Some(base_url.to_string()),
             inline_auth: UpstreamAuth::default(),
-            ..ProviderConfigV4::default()
+            ..ProviderConfig::default()
         }
     }
 
@@ -714,35 +714,35 @@ mod tests {
             headers: BTreeMap::from([("Authorization".to_string(), "secret-token".to_string())]),
             ..RouteRequestContext::default()
         };
-        let view = ServiceViewV4 {
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([
                 ("small".to_string(), provider("https://small.example/v1")),
                 ("large".to_string(), provider("https://large.example/v1")),
             ]),
-            routing: Some(RoutingConfigV4 {
+            routing: Some(RouteGraphConfig {
                 entry: "root".to_string(),
                 routes: BTreeMap::from([(
                     "root".to_string(),
-                    RoutingNodeV4 {
-                        strategy: RoutingPolicyV4::Conditional,
-                        when: Some(RoutingConditionV4 {
+                    RouteNodeConfig {
+                        strategy: RouteStrategy::Conditional,
+                        when: Some(RouteCondition {
                             model: Some("gpt-5".to_string()),
                             headers: BTreeMap::from([(
                                 "Authorization".to_string(),
                                 "secret-token".to_string(),
                             )]),
-                            ..RoutingConditionV4::default()
+                            ..RouteCondition::default()
                         }),
                         then: Some("large".to_string()),
                         default_route: Some("small".to_string()),
-                        ..RoutingNodeV4::default()
+                        ..RouteNodeConfig::default()
                     },
                 )]),
-                ..RoutingConfigV4::default()
+                ..RouteGraphConfig::default()
             }),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
-        let template = compile_v4_route_plan_template_with_request("codex", &view, &request)
+        let template = compile_route_plan_template_with_request("codex", &view, &request)
             .expect("conditional route template");
 
         let explain = build_routing_explain_response_with_request(
@@ -787,36 +787,36 @@ mod tests {
     #[test]
     fn routing_explain_reports_affinity_and_preference_group() {
         let request = RouteRequestContext::default();
-        let view = ServiceViewV4 {
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([
                 (
                     "monthly".to_string(),
-                    ProviderConfigV4 {
+                    ProviderConfig {
                         base_url: Some("https://monthly.example/v1".to_string()),
                         tags: BTreeMap::from([("billing".to_string(), "monthly".to_string())]),
-                        ..ProviderConfigV4::default()
+                        ..ProviderConfig::default()
                     },
                 ),
                 (
                     "chili".to_string(),
-                    ProviderConfigV4 {
+                    ProviderConfig {
                         base_url: Some("https://chili.example/v1".to_string()),
                         tags: BTreeMap::from([("billing".to_string(), "paygo".to_string())]),
-                        ..ProviderConfigV4::default()
+                        ..ProviderConfig::default()
                     },
                 ),
             ]),
-            routing: Some(RoutingConfigV4::tag_preferred(
+            routing: Some(RouteGraphConfig::tag_preferred(
                 vec!["chili".to_string(), "monthly".to_string()],
                 vec![BTreeMap::from([(
                     "billing".to_string(),
                     "monthly".to_string(),
                 )])],
-                RoutingExhaustedActionV4::Continue,
+                RouteExhaustedAction::Continue,
             )),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
-        let template = compile_v4_route_plan_template_with_request("codex", &view, &request)
+        let template = compile_route_plan_template_with_request("codex", &view, &request)
             .expect("route template");
         let mut runtime = RoutePlanRuntimeState::default();
         runtime.set_affinity_provider_endpoint(Some(ProviderEndpointKey::new(

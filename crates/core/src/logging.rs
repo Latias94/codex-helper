@@ -12,7 +12,9 @@ use crate::config::proxy_home_dir;
 use crate::local_log_store::{LogRetention, append_line};
 use crate::policy_actions::PolicyAction;
 use crate::provider_signals::ProviderSignal;
-use crate::state::{RouteDecisionProvenance, SessionIdentitySource};
+use crate::state::{
+    RouteDecisionProvenance, SessionIdentitySource, is_logical_request_success_status,
+};
 use crate::usage::UsageMetrics;
 
 #[path = "logging/control_trace.rs"]
@@ -20,7 +22,7 @@ mod control_trace_impl;
 
 use control_trace_impl::append_control_trace_payload;
 pub use control_trace_impl::{
-    ControlTraceDetail, ControlTraceLogEntry, control_trace_path, log_retry_trace,
+    ControlTraceDetail, ControlTraceLogEntry, control_trace_path, log_control_trace_event,
     read_recent_control_trace_entries,
 };
 
@@ -58,6 +60,31 @@ pub fn request_trace_id(service: &str, request_id: u64) -> String {
     } else {
         format!("{service}-{request_id}")
     }
+}
+
+pub(crate) fn upstream_origin(value: &str) -> Option<String> {
+    let url = reqwest::Url::parse(value.trim()).ok()?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return None;
+    }
+    let origin = url.origin().ascii_serialization();
+    (origin != "null").then_some(origin)
+}
+
+fn route_decision_for_request_log(
+    mut route_decision: Option<RouteDecisionProvenance>,
+) -> Option<RouteDecisionProvenance> {
+    if let Some(route_decision) = route_decision.as_mut() {
+        route_decision.effective_upstream_base_url = None;
+    }
+    route_decision
+}
+
+fn http_debug_for_request_log(mut http_debug: HttpDebugLog) -> HttpDebugLog {
+    http_debug.upstream_origin = http_debug
+        .upstream_origin
+        .and_then(|value| upstream_origin(value.as_str()));
+    http_debug
 }
 
 fn env_bool(key: &str) -> bool {
@@ -126,7 +153,7 @@ pub fn should_include_http_debug(status_code: u16) -> bool {
     if opt.all {
         return true;
     }
-    !(200..300).contains(&status_code)
+    !is_logical_request_success_status(status_code)
 }
 
 pub fn should_include_http_warn(status_code: u16) -> bool {
@@ -137,7 +164,7 @@ pub fn should_include_http_warn(status_code: u16) -> bool {
     if opt.all {
         return true;
     }
-    !(200..300).contains(&status_code)
+    !is_logical_request_success_status(status_code)
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -238,7 +265,8 @@ pub struct HttpDebugLog {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_cf_ray: Option<String>,
     pub client_uri: String,
-    pub target_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_origin: Option<String>,
     pub client_headers: Vec<HeaderEntry>,
     pub upstream_request_headers: Vec<HeaderEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -277,8 +305,6 @@ pub struct CodexBridgeLog {
     #[serde(default, skip_serializing_if = "bool_is_false")]
     pub remote_compaction_v2_request: bool,
     #[serde(default, skip_serializing_if = "bool_is_false")]
-    pub downgraded_to_responses_compact: bool,
-    #[serde(default, skip_serializing_if = "bool_is_false")]
     pub responses_websocket_request: bool,
     #[serde(default, skip_serializing_if = "bool_is_false")]
     pub strips_client_auth: bool,
@@ -302,14 +328,13 @@ pub struct RequestLog<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ttfb_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub station_name: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_endpoint_key: Option<String>,
-    pub upstream_base_url: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_origin: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -347,10 +372,6 @@ pub struct HttpDebugRef {
 }
 
 fn route_attempts_is_empty(value: &[RouteAttemptLog]) -> bool {
-    value.is_empty()
-}
-
-fn route_attempt_avoid_for_station_is_empty(value: &[usize]) -> bool {
     value.is_empty()
 }
 
@@ -411,17 +432,6 @@ pub struct RouteAttemptLog {
     pub provider_max_attempts: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_max_attempts: Option<u32>,
-    #[serde(default, skip_serializing)]
-    pub station_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub upstream_base_url: Option<String>,
-    #[serde(default, skip_serializing)]
-    pub upstream_index: Option<usize>,
-    #[serde(
-        default,
-        skip_serializing_if = "route_attempt_avoid_for_station_is_empty"
-    )]
-    pub avoid_for_station: Vec<usize>,
     #[serde(
         default,
         skip_serializing_if = "route_attempt_avoided_candidate_indices_is_empty"
@@ -434,8 +444,6 @@ pub struct RouteAttemptLog {
     pub decision: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status_code: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -456,13 +464,11 @@ pub struct RouteAttemptLog {
     pub policy_actions: Vec<PolicyAction>,
     #[serde(default, skip_serializing_if = "bool_is_false")]
     pub skipped: bool,
-    pub raw: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct RetryInfo {
     pub attempts: u32,
-    pub upstream_chain: Vec<String>,
     #[serde(default, skip_serializing_if = "route_attempts_is_empty")]
     pub route_attempts: Vec<RouteAttemptLog>,
 }
@@ -470,173 +476,23 @@ pub struct RetryInfo {
 impl RouteAttemptLog {
     pub fn stable_code(&self) -> &str {
         self.code.as_deref().unwrap_or_else(|| {
-            route_attempt_code(
-                self.decision.as_str(),
-                self.error_class.as_deref(),
-                self.reason.as_deref(),
-                self.skipped,
-            )
+            route_attempt_code(self.decision.as_str(), self.error_class.as_deref())
         })
     }
 
     pub fn refresh_code(&mut self) {
         self.code = Some(
-            route_attempt_code(
-                self.decision.as_str(),
-                self.error_class.as_deref(),
-                self.reason.as_deref(),
-                self.skipped,
-            )
-            .to_string(),
+            route_attempt_code(self.decision.as_str(), self.error_class.as_deref()).to_string(),
         );
     }
 }
 
-impl RetryInfo {
-    pub fn route_attempts_or_derived(&self) -> Vec<RouteAttemptLog> {
-        if self.route_attempts.is_empty() {
-            parse_route_attempts_from_chain(&self.upstream_chain)
-        } else {
-            self.route_attempts.clone()
-        }
-    }
-
-    pub fn touches_station(&self, station_name: &str) -> bool {
-        let station_name = station_name.trim();
-        if station_name.is_empty() {
-            return false;
-        }
-        self.route_attempts_or_derived()
-            .iter()
-            .any(|attempt| attempt.station_name.as_deref() == Some(station_name))
-    }
-
-    pub fn touched_other_station(&self, final_station: Option<&str>) -> bool {
-        let Some(final_station) = final_station
-            .map(str::trim)
-            .filter(|station| !station.is_empty())
-        else {
-            return false;
-        };
-
-        self.route_attempts_or_derived()
-            .iter()
-            .filter_map(|attempt| attempt.station_name.as_deref())
-            .any(|station| station != final_station)
-    }
-}
-
-pub(crate) fn parse_route_attempts_from_chain(chain: &[String]) -> Vec<RouteAttemptLog> {
-    chain
-        .iter()
-        .enumerate()
-        .map(|(idx, raw)| parse_route_attempt_from_chain_entry(raw, idx as u32))
-        .collect()
-}
-
-fn parse_route_attempt_from_chain_entry(raw: &str, attempt_index: u32) -> RouteAttemptLog {
-    let raw = raw.trim();
-    let mut attempt = RouteAttemptLog {
-        attempt_index,
-        decision: "observed".to_string(),
-        raw: raw.to_string(),
-        ..Default::default()
-    };
-
-    if raw.starts_with("all_upstreams_avoided") {
-        attempt.decision = "all_upstreams_avoided".to_string();
-        attempt.reason = route_chain_value(raw, "total").map(|total| format!("total={total}"));
-        attempt.skipped = true;
-        attempt.refresh_code();
-        return attempt;
-    }
-
-    let (target, metadata, upstream_index) = split_route_chain_entry(raw);
-    attempt.upstream_index = upstream_index;
-    if let Some(target) = target {
-        let (station_name, upstream_base_url) = parse_route_chain_target(target);
-        attempt.station_name = station_name;
-        attempt.upstream_base_url = upstream_base_url;
-    }
-    apply_route_chain_identity_metadata(&mut attempt, raw);
-
-    if let Some(status_code) =
-        route_chain_value(metadata, "status").and_then(|value| value.parse::<u16>().ok())
-    {
-        attempt.status_code = Some(status_code);
-        attempt.decision = if (200..300).contains(&status_code) {
-            "completed".to_string()
-        } else {
-            "failed_status".to_string()
-        };
-    }
-
-    if let Some(error_class) =
-        route_chain_value(metadata, "class").filter(|value| !value.eq_ignore_ascii_case("-"))
-    {
-        if matches!(
-            error_class.as_str(),
-            "reasoning_guard_triggered" | "reasoning_guard_blocked"
-        ) {
-            attempt.decision = "failed_reasoning_guard".to_string();
-        }
-        attempt.error_class = Some(error_class);
-    }
-    if let Some(reason) = route_chain_value(metadata, "reason") {
-        attempt.reason = Some(reason);
-    }
-    if let Some(model) = route_chain_value(metadata, "model") {
-        attempt.model = Some(model);
-    }
-
-    if let Some(model) = route_chain_value(metadata, "skipped_unsupported_model") {
-        attempt.decision = "skipped_capability_mismatch".to_string();
-        attempt.reason = Some("unsupported_model".to_string());
-        attempt.model = Some(model);
-        attempt.skipped = true;
-    }
-
-    if let Some(error) = route_chain_value(metadata, "transport_error") {
-        attempt.decision = "failed_transport".to_string();
-        attempt.reason = Some(error);
-        attempt.error_class = Some("upstream_transport_error".to_string());
-    }
-
-    if let Some(error) = route_chain_value(metadata, "target_build_error") {
-        attempt.decision = "failed_target_build".to_string();
-        attempt.reason = Some(error);
-        attempt.error_class = Some("target_build_error".to_string());
-    }
-
-    if let Some(error) = route_chain_value(metadata, "body_read_error") {
-        attempt.decision = "failed_body_read".to_string();
-        attempt.reason = Some(error);
-        attempt.error_class = Some("upstream_body_read_error".to_string());
-    }
-    if let Some(error) = route_chain_value(metadata, "body_too_large") {
-        attempt.decision = "failed_body_too_large".to_string();
-        attempt.reason = Some(error);
-        attempt.error_class = Some("upstream_response_body_too_large".to_string());
-    }
-
-    attempt.refresh_code();
-    attempt
-}
-
-fn route_attempt_code(
-    decision: &str,
-    error_class: Option<&str>,
-    reason: Option<&str>,
-    skipped: bool,
-) -> &'static str {
+fn route_attempt_code(decision: &str, error_class: Option<&str>) -> &'static str {
     if matches!(
         error_class,
         Some("reasoning_guard_triggered" | "reasoning_guard_blocked")
     ) {
         return "failed_reasoning_guard";
-    }
-    if skipped && reason == Some("unsupported_model") {
-        return "skipped_capability_mismatch";
     }
     match decision {
         "selected" => "selected",
@@ -645,6 +501,7 @@ fn route_attempt_code(
         "failed_status" => "failed_status",
         "failed_client_request" => "failed_client_request",
         "failed_reasoning_guard" => "failed_reasoning_guard",
+        "failed_lifecycle_store" => "failed_lifecycle_store",
         "failed_transport" => "failed_transport",
         "failed_target_build" => "failed_target_build",
         "failed_body_read" => "failed_body_read",
@@ -652,156 +509,9 @@ fn route_attempt_code(
         "skipped_capability_mismatch" => "skipped_capability_mismatch",
         "all_upstreams_avoided" => "all_upstreams_avoided",
         "route_unavailable" => "route_unavailable",
-        _ => "legacy_route_attempt",
+        _ => "unknown",
     }
 }
-
-fn apply_route_chain_identity_metadata(attempt: &mut RouteAttemptLog, raw: &str) {
-    if let Some(station) = route_chain_value(raw, "station") {
-        attempt.station_name = non_empty_str(station.as_str()).map(ToOwned::to_owned);
-    }
-    if let Some(provider_endpoint_key) = route_chain_value(raw, "endpoint") {
-        let provider_endpoint_key = provider_endpoint_key.trim().to_string();
-        if !provider_endpoint_key.is_empty() && provider_endpoint_key != "-" {
-            let parts = provider_endpoint_key.split('/').collect::<Vec<_>>();
-            if parts.len() >= 3 {
-                attempt.provider_id = non_empty_str(parts[1]).map(ToOwned::to_owned);
-                attempt.endpoint_id = non_empty_str(parts[2]).map(ToOwned::to_owned);
-            }
-            attempt.provider_endpoint_key = Some(provider_endpoint_key);
-        }
-    }
-    if let Some(group) = route_chain_value(raw, "group").and_then(|value| value.parse::<u32>().ok())
-    {
-        attempt.preference_group = Some(group);
-    }
-    if let Some(station) = route_chain_value(raw, "compat_station") {
-        attempt.station_name = non_empty_str(station.as_str()).map(ToOwned::to_owned);
-    }
-    if let Some(index) =
-        route_chain_value(raw, "upstream_index").and_then(|value| value.parse::<usize>().ok())
-    {
-        attempt.upstream_index = Some(index);
-    }
-    if let Some(url) = route_chain_value(raw, "url") {
-        attempt.upstream_base_url = non_empty_str(url.as_str()).map(ToOwned::to_owned);
-    }
-    if let Some(indices) = route_chain_value(raw, "avoid_candidates") {
-        attempt.avoided_candidate_indices = parse_usize_list(indices.as_str());
-    }
-    if let Some(indices) = route_chain_value(raw, "avoid") {
-        attempt.avoid_for_station = parse_usize_list(indices.as_str());
-    }
-}
-
-fn parse_usize_list(raw: &str) -> Vec<usize> {
-    raw.split(',')
-        .filter_map(|part| part.trim().parse::<usize>().ok())
-        .collect()
-}
-
-fn split_route_chain_entry(raw: &str) -> (Option<&str>, &str, Option<usize>) {
-    if let Some(idx_start) = raw.find(" (idx=") {
-        let target = raw[..idx_start].trim();
-        let after_idx = &raw[idx_start + " (idx=".len()..];
-        if let Some(idx_end) = after_idx.find(')') {
-            let upstream_index = after_idx[..idx_end].trim().parse::<usize>().ok();
-            let metadata = after_idx[idx_end + 1..].trim();
-            return (non_empty_str(target), metadata, upstream_index);
-        }
-        return (non_empty_str(target), after_idx.trim(), None);
-    }
-
-    if let Some(metadata_start) = first_route_chain_key_start(raw) {
-        let target = raw[..metadata_start].trim();
-        let metadata = raw[metadata_start..].trim();
-        return (non_empty_str(target), metadata, None);
-    }
-
-    (non_empty_str(raw), "", None)
-}
-
-fn parse_route_chain_target(target: &str) -> (Option<String>, Option<String>) {
-    let target = target.trim();
-    if target.is_empty() {
-        return (None, None);
-    }
-    if target.starts_with("http://") || target.starts_with("https://") {
-        return (None, Some(target.to_string()));
-    }
-
-    if let Some(pos) = target.find(":http://").or_else(|| target.find(":https://")) {
-        let station = target[..pos].trim();
-        let base_url = target[pos + 1..].trim();
-        return (
-            non_empty_str(station).map(ToOwned::to_owned),
-            non_empty_str(base_url).map(ToOwned::to_owned),
-        );
-    }
-
-    (None, Some(target.to_string()))
-}
-
-fn first_route_chain_key_start(raw: &str) -> Option<usize> {
-    ROUTE_CHAIN_KEYS
-        .iter()
-        .filter_map(|key| find_route_chain_key(raw, format!("{key}=").as_str()))
-        .min()
-}
-
-fn route_chain_value(raw: &str, key: &str) -> Option<String> {
-    let needle = format!("{key}=");
-    let start = find_route_chain_key(raw, needle.as_str())?;
-    let value_start = start + needle.len();
-    let value_end = ROUTE_CHAIN_KEYS
-        .iter()
-        .filter(|candidate| **candidate != key)
-        .filter_map(|candidate| {
-            raw[value_start..]
-                .find(&format!(" {candidate}="))
-                .map(|offset| value_start + offset)
-        })
-        .min()
-        .unwrap_or(raw.len());
-    non_empty_str(raw[value_start..value_end].trim()).map(ToOwned::to_owned)
-}
-
-fn find_route_chain_key(raw: &str, needle: &str) -> Option<usize> {
-    let mut offset = 0usize;
-    while let Some(pos) = raw[offset..].find(needle) {
-        let absolute = offset + pos;
-        if absolute == 0 || raw[..absolute].ends_with(' ') {
-            return Some(absolute);
-        }
-        offset = absolute + needle.len();
-    }
-    None
-}
-
-fn non_empty_str(value: &str) -> Option<&str> {
-    let value = value.trim();
-    if value.is_empty() { None } else { Some(value) }
-}
-
-const ROUTE_CHAIN_KEYS: &[&str] = &[
-    "status",
-    "class",
-    "model",
-    "transport_error",
-    "target_build_error",
-    "body_read_error",
-    "body_too_large",
-    "skipped_unsupported_model",
-    "total",
-    "station",
-    "endpoint",
-    "group",
-    "compat_station",
-    "upstream_index",
-    "url",
-    "avoid_candidates",
-    "avoid",
-];
 
 #[derive(Debug, Serialize)]
 struct HttpDebugLogEntry<'a> {
@@ -819,14 +529,13 @@ struct HttpDebugLogEntry<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ttfb_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub station_name: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_endpoint_key: Option<String>,
-    pub upstream_base_url: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_origin: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -901,7 +610,7 @@ fn append_json_line(path: &PathBuf, opt: RequestLogOptions, line: &str) -> bool 
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn log_request_with_debug(
+pub(crate) fn log_committed_request_with_debug(
     request_id: Option<u64>,
     service: &str,
     method: &str,
@@ -909,11 +618,10 @@ pub fn log_request_with_debug(
     status_code: u16,
     duration_ms: u64,
     ttfb_ms: Option<u64>,
-    station_name: Option<&str>,
     provider_id: Option<String>,
     endpoint_id: Option<String>,
     provider_endpoint_key: Option<String>,
-    upstream_base_url: &str,
+    upstream_origin: Option<String>,
     session_id: Option<String>,
     session_identity_source: Option<SessionIdentitySource>,
     cwd: Option<String>,
@@ -927,12 +635,15 @@ pub fn log_request_with_debug(
     http_debug: Option<HttpDebugLog>,
 ) {
     let opt = request_log_options();
-    if opt.only_errors && (200..300).contains(&status_code) {
+    if opt.only_errors && is_logical_request_success_status(status_code) {
         return;
     }
 
     let ts = now_ms();
     let trace_id = request_id.map(|id| request_trace_id(service, id));
+    let upstream_origin = upstream_origin.and_then(|value| self::upstream_origin(value.as_str()));
+    let route_decision = route_decision_for_request_log(route_decision);
+    let http_debug = http_debug.map(http_debug_for_request_log);
 
     static DEBUG_SEQ: AtomicU64 = AtomicU64::new(0);
     let mut http_debug_for_main = http_debug;
@@ -962,11 +673,10 @@ pub fn log_request_with_debug(
             status_code,
             duration_ms,
             ttfb_ms,
-            station_name,
             provider_id: provider_id.clone(),
             endpoint_id: endpoint_id.clone(),
             provider_endpoint_key: provider_endpoint_key.clone(),
-            upstream_base_url,
+            upstream_origin: upstream_origin.clone(),
             session_id: session_id.clone(),
             session_identity_source,
             cwd: cwd.clone(),
@@ -1011,11 +721,10 @@ pub fn log_request_with_debug(
         status_code,
         duration_ms,
         ttfb_ms,
-        station_name,
         provider_id,
         endpoint_id,
         provider_endpoint_key,
-        upstream_base_url,
+        upstream_origin,
         session_id,
         session_identity_source,
         cwd,

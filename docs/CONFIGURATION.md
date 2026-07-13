@@ -14,7 +14,7 @@ The short version: define providers once, then point `routing.entry` at a named 
 - `profiles` are request defaults such as model and reasoning effort. They should not pick providers.
 - `retry` controls how hard the proxy retries before returning an error.
 
-Legacy `station` data is migration input. Hand-written config should think in `provider`, `endpoint`, and `route graph`.
+The public config is expressed in `provider`, `endpoint`, and `route graph` terms. Runtime routing uses those identities directly.
 
 ## Local Proxy Vs Outbound Proxy
 
@@ -28,9 +28,10 @@ Current outbound proxy support comes from the underlying HTTP client's system/en
 ## File Locations
 
 - Main config: `~/.codex-helper/config.toml`
+- Runtime state: `~/.codex-helper/state/state.sqlite`
 - Balance adapters: `~/.codex-helper/usage_providers.json`
 - Pricing overrides: `~/.codex-helper/pricing_overrides.toml`
-- Request log: `~/.codex-helper/logs/requests.jsonl`
+- Post-commit request debug log: `~/.codex-helper/logs/requests.jsonl`
 - Routing/control trace: `~/.codex-helper/logs/control_trace.jsonl`
 - Codex relay diagnostic evidence: `~/.codex-helper/logs/codex_relay_evidence.jsonl`
 
@@ -39,7 +40,7 @@ Codex-owned files remain owned by Codex:
 - `~/.codex/auth.json`
 - `~/.codex/config.toml`
 
-`switch on/off` and one-command startup only patch the local Codex proxy section. They do not overwrite unrelated Codex config changes.
+Only an explicit local `switch on/off` action may patch `~/.codex/config.toml`, and it is limited to the helper-owned provider selector and `model_providers.codex_proxy` stanza. codex-helper never reads or writes Codex `auth.json`, model cache, or SQLite files.
 
 ## Relay Targets
 
@@ -49,10 +50,8 @@ Relay targets are client-side bookmarks for local or remote codex-helper runtime
 [relay_targets.nas]
 service = "codex"
 proxy_url = "http://nas.local:3211"
-admin_url = "http://nas.local:4211"
+admin_url = "https://nas.example.com:4211"
 admin_token_env = "CODEX_HELPER_NAS_ADMIN_TOKEN"
-client_preset = "official-relay"
-responses_websocket = false
 ```
 
 Equivalent CLI:
@@ -60,14 +59,13 @@ Equivalent CLI:
 ```bash
 ch relay add nas \
   --proxy-url http://nas.local:3211 \
-  --admin-url http://nas.local:4211 \
-  --admin-token-env CODEX_HELPER_NAS_ADMIN_TOKEN \
-  --preset official-relay
+  --admin-url https://nas.example.com:4211 \
+  --admin-token-env CODEX_HELPER_NAS_ADMIN_TOKEN
 ```
 
-`local` is built in and resolves to the normal loopback ports for the current `default_service`, so `ch relay local` preserves the normal local foreground flow. Named targets are remote by default: `ch relay nas` patches this machine's Codex config to the target proxy and opens an attached TUI against the target admin API. `--no-tui` switches only; `--attach-only` observes only.
+`local` is built in and resolves to the normal loopback ports for the current `default_service`. `ch relay local` starts the normal local foreground flow. Named targets are remote by default: `ch relay nas` starts or attaches to the selected runtime and opens its read-only TUI; it never changes Codex client configuration. `--no-tui` omits the console, while `--attach-only` requires an already-running runtime. To point Codex at a target, run `codex-helper switch on --base-url <PROXY_URL>` as a separate explicit action.
 
-`admin_token_env` stores the environment variable name, not the token value. For Docker/NAS targets, prefer setting `advertised-admin-base-url` on the server so `relay add` can discover a reachable admin URL; otherwise pass `--admin-url` explicitly.
+`admin_token_env` stores the environment variable name, not the token value. A remote admin URL must use HTTPS; HTTP is accepted only for loopback. A trusted SSH/Tailscale tunnel can expose the remote admin listener on a client loopback URL. Remote targets must set `admin_url` explicitly; runtime responses and redirects cannot replace that configured authority. URLs containing userinfo, query credentials, fragments, or paths are rejected.
 
 ## Fleet Observer Registry
 
@@ -84,77 +82,36 @@ enabled = true
 
 [fleet.nodes.mini]
 label = "Mac mini"
-admin_url = "http://mac-mini.tailnet.example.ts.net:4211"
+admin_url = "https://mac-mini.tailnet.example.ts.net:4211"
 admin_token_env = "CODEX_HELPER_MAC_MINI_ADMIN_TOKEN"
 enabled = true
 ```
 
-`admin_token_env` names the environment variable that holds the admin token. Do not put a raw token string there. For non-loopback nodes, use HTTPS or a trusted encrypted tunnel plus `admin_token_env`.
+`admin_token_env` names the environment variable that holds the admin token. Do not put a raw token string there. Non-loopback nodes require HTTPS and `admin_token_env`; when using a trusted encrypted tunnel, terminate it on a client loopback URL.
 
 `ch tui` renders the Fleet page at `9`, with `r` for refresh, `Tab` to switch between nodes and work units, and `t` to switch between tree and flat work-unit views.
 
-## Codex Client Preset
+## Explicit Codex Client Switch
 
-The default preset only points `~/.codex/config.toml` `model_provider` at the local `codex_proxy`. To keep ChatGPT account auth and mobile/desktop account features while routing model requests through codex-helper, enable ChatGPT bridge:
-
-```toml
-version = 5
-
-[codex.client_patch]
-preset = "chatgpt-bridge"
-# Optional transport switch. Only valid with official relay presets.
-responses_websocket = false
-# Optional compaction strategy: auto | local | remote-v1 | remote-v2.
-compaction = "auto"
-```
-
-Legacy `mode = "..."` config is still accepted for existing users, but codex-helper rewrites saved/generated config as `preset = "..."`.
-
-You can also switch it temporarily from the CLI:
+Client switching is a separate local action from starting, selecting, or diagnosing a runtime. No server, relay bookmark, TUI refresh, desktop action, or capability result changes Codex configuration implicitly.
 
 ```bash
-codex-helper switch on --preset chatgpt-bridge
-codex-helper switch on --preset imagegen-bridge
-codex-helper switch on --preset official-relay
-codex-helper switch on --preset official-relay --responses-websocket
-codex-helper switch on --preset official-imagegen --compaction local
-codex-helper switch on --preset official-imagegen
-codex-helper switch on --preset default
+codex-helper switch on                         # http://127.0.0.1:3211
+codex-helper switch on --port 4321
+codex-helper switch on --base-url https://relay.example/v1
+codex-helper switch status
+codex-helper switch off
 ```
 
-The legacy CLI spelling `--mode ...` has been removed. Use `--preset ...` for new commands. On startup, `codex-helper serve` uses `[codex.client_patch]` when Codex is not already switched to codex-helper. If Codex is already switched, the existing client preset is preserved; use `switch on --preset ...` or the TUI Settings `B`/`I`/`F`/`D` keys to change it explicitly.
+`switch on` records the original selector and helper stanza, then writes only the helper-owned `model_providers.codex_proxy` stanza and selects it. `switch off` restores only the recorded selector/stanza. The recovery journal lives under `~/.codex-helper/state/`; an external edit that makes the current file match neither the original nor helper-applied fingerprint moves the switch to `recovery_required` and leaves the file untouched for human reconciliation.
 
-By default, the console owns the proxy lifecycle: `codex-helper serve` stops its proxy and restores the local client patch when the built-in TUI exits. For long-running local proxy use, start `codex-helper serve --resident`. Resident mode keeps the client patch active when the console exits, exposes `/__codex_helper/api/v1/runtime/shutdown`, and can be inspected with `codex-helper daemon status` or stopped with `codex-helper daemon stop`. Use `codex-helper tui --codex` or `codex-helper tui --claude` to attach a read-only terminal dashboard to an existing resident proxy; quitting that dashboard exits only the console. If you want a foreground watchdog, `codex-helper daemon supervise --codex` starts a resident child, restarts it with bounded backoff after crashes, and records crash markers in `~/.codex-helper/run/`.
+The switch never changes `~/.codex/auth.json`, `models_cache.json`, Codex SQLite, unrelated providers, feature flags, compaction settings, WebSocket settings, or hosted-tool settings. Provider capabilities come from the selected provider contract and live observations, not from switch configuration.
 
-Resident runtimes write a best-effort owner marker under `~/.codex-helper/run/` so `daemon status` can distinguish manual CLI, supervisor, and future desktop/tray-owned sidecars. These marker files are advisory metadata only: stale, corrupt, or missing markers should not stop a proxy from starting, exiting, or being stopped explicitly. The desktop-managed sidecar mode is intentionally hidden until a visible desktop/tray shell exists; normal `serve` startup remains non-resident by default.
+Proxy lifecycle is independent. `codex-helper serve` is foreground by default, `--resident` keeps it running after the console exits, and `codex-helper tui` attaches a read-only console. None of these commands run `switch on` or `switch off`. Resident runtimes write advisory owner markers under `~/.codex-helper/run/`; inspect them with the read-only `codex-helper daemon status`. Manage an installed local runtime with `codex-helper service start/stop/restart`; there is no remote HTTP shutdown command.
 
-`chatgpt-bridge` writes `requires_openai_auth = true` and `supports_websockets = false` into `~/.codex/config.toml`, and changes only two `~/.codex/auth.json` fields: `auth_mode` becomes `"chatgpt"` and `OPENAI_API_KEY` becomes `null`. It requires an existing official Codex ChatGPT login state; if `auth.json` has no complete token/email/account metadata, codex-helper refuses the patch before writing `config.toml` or `auth.json`. Existing Codex apps usually need a restart before they read the changed client config.
+codex-helper normalizes HTTP request `Content-Encoding` before inspection and forwarding. Supported encodings are `zstd`, `gzip` / `x-gzip`, `br`, and `deflate`; after decoding, helper forwards ordinary JSON and removes stale `Content-Encoding` / `Content-Length`. Set `CODEX_HELPER_REQUEST_BODY_ENCODING=passthrough` only when an upstream requires the exact compressed body.
 
-`imagegen-bridge` is an explicit experimental hack preset. It writes an empty `{}` `~/.codex/auth.json` facade so Codex's default auth resolution still treats the session as ChatGPT-backed and exposes the hosted `image_generation` tool, while actual upstream credentials still come from codex-helper routing (`auth_token_env`, `auth_token`, `api_key_env`, or `api_key`). It does not require an official ChatGPT login and does not write an explicit `auth_mode`. Before enabling it, codex-helper verifies that the Codex service has at least one enabled upstream and that at least one upstream credential is actually available to the current process. For env-based credentials, setting only the env var name in config is not enough; the env var value must also be present when you run `switch on` or start `serve`. codex-helper stores the previous `auth.json` in its switch state and restores it when switching back to `default` or running `switch off`, but only if the current `auth.json` still matches the helper-written facade. If the user or Codex changed `auth.json` meanwhile, codex-helper leaves it untouched.
-
-`official-relay` is an experimental official-relay preset for relays that forward OpenAI Responses semantics, especially sub2api-style relays that support `/responses/compact`. It writes `name = "OpenAI"` into `~/.codex/config.toml` so Codex chooses the remote compaction path by default. It keeps `supports_websockets = false` unless the separate WebSocket switch is enabled. It does not write `requires_openai_auth` and does not patch `auth.json`; upstream credentials still must come from codex-helper routing. If the relay rejects `/responses/compact` with 404/405/501 or an unsupported-compact error, explicitly set `compaction = "local"` to make the Codex client return to local compaction, or use a relay account that advertises compact support.
-
-For all presets, codex-helper normalizes HTTP request `Content-Encoding` by default before it inspects or forwards a request. Supported request encodings are `zstd`, `gzip` / `x-gzip`, `br`, and `deflate`; after a successful decode, helper forwards ordinary JSON and removes stale `Content-Encoding` / `Content-Length`. This is a transport compatibility layer, not a compact fallback: the upstream relay must still implement `/responses/compact`, hosted tools, or WebSocket support itself. If you hit a rare relay that requires the exact compressed Codex request body, start helper with `CODEX_HELPER_REQUEST_BODY_ENCODING=passthrough` to preserve the original body and header.
-
-When Codex does not send stronger session headers (`session_id`, `session-id`, `conversation_id`, or `thread-id`), codex-helper also uses decoded JSON `prompt_cache_key` as the session-affinity key. This mirrors sub2api-style stickiness so normal `/responses` traffic and later `/responses/compact` requests stay on the same selected route without asking users to classify the relay implementation.
-
-`official-imagegen` is the hybrid experimental preset for relays backed by official OpenAI subscriptions. It writes the same OpenAI provider identity as `official-relay` so Codex uses the remote compaction path by default, and writes the same empty `{}` auth facade as `imagegen-bridge` so Codex exposes hosted `image_generation`. By default it keeps `supports_websockets = false`, does not write `requires_openai_auth`, and still strips Codex client auth before forwarding unless the selected upstream has its own helper-side credential. This preset only makes Codex expose and send the official hosted tool; the relay account still has to support both `/responses/compact` and hosted image generation calls.
-
-`compaction` is a separate compaction strategy, not another preset. `auto` keeps the preset default: `default` / `imagegen-bridge` lean toward Codex local compaction, while `official-relay` / `official-imagegen` use the remote compaction path by default. `local` forces the provider identity back to `codex-helper` so the Codex client performs local compaction; `remote-v1` forces OpenAI provider identity and disables `remote_compaction_v2`, making Codex use `/responses/compact`; `remote-v2` writes `[features].remote_compaction_v2 = true`, while helper still uses `[codex.compaction].remote_v2_downgrade = true` to fall back to v1 when the upstream cannot produce a valid v2 stream.
-
-`responses_websocket = true` is a transport switch, not a separate preset. It is only valid with `official-relay` and `official-imagegen`. When enabled, codex-helper writes `supports_websockets = true` into Codex's provider config and handles the WebSocket upgrade itself on `/responses`, `/v1/responses`, and `/backend-api/codex/responses`. The relay path reads the first `response.create` frame, applies the same model override, model mapping, request filter, routing selection, session affinity, concurrency snapshot, and auth injection as normal helper traffic, injects `OpenAI-Beta: responses_websockets=2026-02-06`, then bridges frames bidirectionally to the selected upstream. Keep it disabled unless your upstream relay also supports Responses WebSocket v2.
-
-Assuming the relay supports the required endpoints, the capability ladder is:
-
-```text
-default
-< chatgpt-bridge / imagegen-bridge
-< official-relay
-< official-imagegen
-< official-imagegen + responses_websocket
-```
-
-`official-imagegen` is the most complete preset, but it is also the most demanding: the relay must support `/responses`, `/responses/compact`, and hosted `image_generation`. Only enable `responses_websocket` after a WebSocket live smoke passes for the selected upstream.
+When Codex sends no stronger session header (`session_id`, `session-id`, `conversation_id`, or `thread-id`), decoded JSON `prompt_cache_key` is used as the session-affinity key so normal Responses and compact requests can remain on the same selected provider endpoint.
 
 ## OpenAI Images-Compatible Endpoints
 
@@ -210,72 +167,44 @@ curl 'http://127.0.0.1:3211/v1/images/edits' \
 Both generation and JSON edits support one generated result (`n` absent or `1`). JSON edits do not
 parse masks; JSON requests with `mask` and multipart edits pass through as ordinary proxy requests.
 
-You can actively inspect a relay's Codex capability profile through the local admin API:
-
-In the built-in TUI, open Settings (`6`) and press `C` to run the same bounded relay diagnostic
-against the current Codex runtime. The Settings page shows the selected target, expected
-capabilities, observed `/models` / `/responses` / `/responses/compact` support, mismatches,
-warnings, and the recommended preset. The TUI action is diagnostic-only; it never changes the
-preset automatically.
+The CLI capability diagnostic is an explicit, manual, process-local operator action. Run it from a shell:
 
 ```bash
-curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-capabilities \
-  -H 'content-type: application/json' \
-  -d '{"patch_preset":"official-imagegen","compaction":"local","model":"gpt-5.5"}'
+codex-helper codex relay-capabilities \
+  --model gpt-5.5 \
+  --provider ciii \
+  --endpoint default
 ```
 
-For API compatibility the response JSON field is still named `patch_mode`; new requests should send `patch_preset`, and the temporary `patch_mode` request field only accepts current preset names such as `official-imagegen`. Legacy bridge-mode values such as `official-imagegen-bridge` are rejected with a replacement hint. Requests and responses also include `compaction` so diagnostics evaluate the same `auto` / `local` / `remote-v1` / `remote-v2` strategy that `switch on` would apply.
-
-Use the admin port for your Codex proxy port (`proxy_port + 1000`; the default Codex proxy is
-`3211`, so the default admin port is `4211`). The endpoint is `POST` on purpose: it sends one
-bounded active probe to the selected upstream's `/models`, `/responses`, and `/responses/compact`
-endpoints. `/models` is read-only; the two Responses probes send `{}` and classify validation
-errors as endpoint support. The endpoint does not use normal routing, retry, request ledger,
-session affinity, passive health, or runtime health state, so it is a diagnostic action rather than
-a request storm amplifier.
+The command accepts only the optional canonical provider-endpoint selector (`--provider` with optional `--endpoint`) and an optional model. With no selector, it uses the current runtime target. Legacy station names and positional upstream indexes are rejected. Client assumptions such as `--preset`, `--mode`, and `--compaction` are also rejected. The bounded diagnostic probes the selected endpoint's `/models`, `/responses`, and `/responses/compact` endpoints without using normal retry/failover, request accounting, affinity, passive health, or policy state.
 
 The response includes:
 
-- `expected`: what Codex should expose for the requested preset and model metadata.
-- `compaction`: the compaction strategy used when computing the expected Codex client profile.
-- `observed`: what the relay actually returned for `/models`, `/responses`, and
-  `/responses/compact`, including confidence and whether helper translation is required.
-- `mismatches`: places where Codex will try a capability that the relay did not prove.
-- `recommendation`: the conservative preset recommendation for the observed relay.
-- `continuity`: the selected provider endpoint's state-continuity domain, whether that domain was
-  explicit, and warnings for official relay presets that may carry encrypted compact state.
+- required `provider_id`, `endpoint_id`, and `provider_endpoint_key` identity, plus provider adapter, captured catalog revision, request dialects, and selected model;
+- `expected`, the provider-owned capability decisions for Responses, compact, hosted image generation, WebSocket, ultra mapping, web search, apply patch, and reasoning summaries;
+- `observed`, the validation-only `/models`, `/responses`, and `/responses/compact` results, confidence, and translation evidence;
+- `continuity`, including the selected continuity domain, endpoint counts, affinity policy, warnings, and recommendations;
+- `mismatches`, where observed endpoint behavior disagrees with the captured provider contract.
 
-Recommendation rules are intentionally conservative:
-
-| Observed relay state | Recommended preset |
-| --- | --- |
-| `/responses` works, `/responses/compact` works, selected model is image-capable | `official-imagegen` |
-| `/responses` works, `/responses/compact` works, selected model is not image-capable | `official-relay` |
-| `/responses` works, `/responses/compact` is unsupported, selected model is image-capable | `imagegen-bridge` |
-| `/responses` works, `/responses/compact` is unsupported, no image capability is proven | `default` |
-| `/responses/compact` is unknown | avoid official relay presets until compact is proven |
-| `/responses` is unavailable | `default`; no preset can compensate for a missing Responses endpoint |
+Capability results never change client configuration, provider configuration, routing, or policy state. JSON output is available with `--json`.
 
 For sub2api-style relays, a raw OpenAI `/models` response (`data: [...]`) is fine only if
 codex-helper translates it into the Codex `models: [...]` catalog before Codex sees it. The
 diagnostic response reports this as `observed.models.translation_required = true`. For non-sub2api
 relays, the same rules apply: the relay can either return Codex-shaped model metadata directly or
 return an OpenAI model list that codex-helper can translate. If the selected model is absent or its
-metadata does not prove image input, the recommendation will not assume hosted image generation.
+metadata is not authoritative, model-scoped capability decisions remain `unknown`.
 
 Hosted `image_generation` is not actively probed by this diagnostic endpoint because that can spend
-quota or create image artifacts. Responses WebSocket support is opt-in through
-`responses_websocket = true` / `--responses-websocket`; bridge presets keep it disabled by default.
-Remote compaction v2 is not enabled by default. If you set `compaction = "remote-v2"` or enable Codex
-`[features].remote_compaction_v2 = true` yourself, helper recognizes the
-`compaction_trigger` request shape for logging and route-continuity protection,
-but the upstream relay must still support v2 compaction response items or rely on helper's v2-to-v1 downgrade fallback.
+quota or create image artifacts, so the contract reports it without fabricating live evidence.
+Responses WebSocket support comes from the captured provider/model catalog. If Codex sends a
+`compaction_trigger`, helper recognizes the remote-compaction-v2 request shape for lifecycle and
+route-continuity protection, but the upstream still has to return valid v2 compaction items.
 
-Official relay presets deliberately separate two ideas:
+The provider contract and continuity model deliberately separate two ideas:
 
-- `name = "OpenAI"` tells Codex to use the official Responses protocol surface, including
-  `/responses/compact` for remote compaction v1.
-- It does not prove that two helper provider endpoints share upstream encrypted response state.
+- Endpoint capability may prove the Responses and `/responses/compact` protocol surfaces.
+- Protocol support does not prove that two provider endpoints share upstream encrypted response state.
 
 By default, each provider endpoint is its own continuity domain. For relay chains such as sub2api,
 New API, or another OpenAI-compatible gateway, do not use host name, base URL, provider brand, or
@@ -306,124 +235,78 @@ a real upstream request, not a background health check. It is manual, cost-beari
 literal acknowledgement string before codex-helper sends any upstream traffic:
 
 ```bash
-curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-live-smoke \
-  -H 'content-type: application/json' \
-  -d '{
-    "acknowledgement": "run-live-codex-relay-smoke",
-    "model": "gpt-5.5"
-  }'
+codex-helper codex relay-live-smoke \
+  --acknowledgement run-live-codex-relay-smoke \
+  --model gpt-5.5
 ```
 
-With no `cases` field, live smoke only checks remote compaction v1 through `/responses/compact`.
+With no optional case flag, live smoke only checks remote compaction v1 through `/responses/compact`.
 Remote compaction v2, hosted image generation, and Responses WebSocket are never part of the default
 case set. To explicitly test Codex remote compaction v2 compatibility for the selected
-relay/provider chain, include `remote_compaction_v2`. The smoke sends `POST /responses` with
+relay/provider chain, pass `--compact-v2`. The smoke sends `POST /responses` with
 `stream: true`, one `compaction_trigger` input item, and `x-codex-beta-features:
 remote_compaction_v2`; it passes only when the stream contains exactly one compaction output item
 and `response.completed`:
 
 ```bash
-curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-live-smoke \
-  -H 'content-type: application/json' \
-  -d '{
-    "acknowledgement": "run-live-codex-relay-smoke",
-    "model": "gpt-5.5",
-    "provider_id": "ciii",
-    "endpoint_id": "default",
-    "cases": ["remote_compaction_v2"]
-  }'
+codex-helper codex relay-live-smoke \
+  --acknowledgement run-live-codex-relay-smoke \
+  --model gpt-5.5 \
+  --provider ciii \
+  --endpoint default \
+  --compact-v2
 ```
 
 To explicitly test the hosted tool request path:
 
 ```bash
-curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-live-smoke \
-  -H 'content-type: application/json' \
-  -d '{
-    "acknowledgement": "run-live-codex-relay-smoke",
-    "model": "gpt-5.5",
-    "cases": ["responses_compact", "hosted_image_generation"]
-  }'
+codex-helper codex relay-live-smoke \
+  --acknowledgement run-live-codex-relay-smoke \
+  --model gpt-5.5 \
+  --image
 ```
 
-To explicitly test the selected upstream's Responses WebSocket v2 path, include
-`responses_websocket`. The smoke opens `GET /responses` as a WebSocket, injects
+To explicitly test the selected upstream's Responses WebSocket v2 path, pass
+`--websocket`. The smoke opens `GET /responses` as a WebSocket, injects
 `OpenAI-Beta: responses_websockets=2026-02-06`, sends one minimal `response.create` frame, and
 passes when the relay returns a `response.*` event or a Codex WebSocket protocol event such as
 `codex.rate_limits`:
 
 ```bash
-curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-live-smoke \
-  -H 'content-type: application/json' \
-  -d '{
-    "acknowledgement": "run-live-codex-relay-smoke",
-    "model": "gpt-5.5",
-    "provider_id": "ciii",
-    "endpoint_id": "default",
-    "cases": ["responses_websocket"]
-  }'
-```
-
-In the TUI Settings page, press `X` twice within the confirmation window for compact-only live
-smoke, or `Y` twice for compact plus hosted image-generation live smoke. Both actions use the
-currently selected Codex runtime target and inferred model unless the API request supplies explicit
-fields.
-
-The same diagnostics are available without starting the TUI or admin listener:
-
-```bash
-codex-helper codex relay-capabilities \
-  --preset official-imagegen \
-  --compaction local \
-  --model gpt-5.5 \
-  --provider ciii \
-  --endpoint default
-
-codex-helper codex relay-live-smoke \
-  --acknowledgement run-live-codex-relay-smoke \
-  --model gpt-5.5
-
 codex-helper codex relay-live-smoke \
   --acknowledgement run-live-codex-relay-smoke \
   --model gpt-5.5 \
   --provider ciii \
-  --compact-v2
-
-codex-helper codex relay-live-smoke \
-  --acknowledgement run-live-codex-relay-smoke \
-  --model gpt-5.5 \
-  --image
-
-codex-helper codex relay-live-smoke \
-  --acknowledgement run-live-codex-relay-smoke \
-  --model gpt-5.5 \
-  --provider ciii \
+  --endpoint default \
   --websocket
-
-codex-helper codex relay-evidence --limit 20
 ```
+
+Use `codex-helper codex relay-evidence --limit 20` to inspect local sanitized summaries.
 
 For the CLI, omitting optional case flags runs the default compact smoke. Supplying `--compact-v2`,
 `--image`, `--websocket`, or any combination runs only those explicit optional cases, so an optional smoke does not
 accidentally spend an additional compact request.
 
-Targeting uses the normal selected runtime target by default. For route-graph configs, diagnostics
-can target a provider endpoint directly with `provider_id` / `endpoint_id` in the API body or
-`--provider` / `--endpoint` in the CLI. Legacy `--station` / `--upstream-index` is still available
-for station-shaped configs, but provider targeting cannot be combined with station targeting.
+Targeting uses the current runtime target by default. Diagnostics may target one canonical provider
+endpoint with `--provider` and optional `--endpoint`; legacy `--station` and `--upstream-index`
+selectors are not accepted.
 
-Live smoke is intentionally isolated from normal routing behavior. It selects one upstream, sends at
+Live smoke is intentionally isolated from normal routing behavior. It selects one provider endpoint, sends at
 most one request/connection per selected case, bypasses route retry/failover, and does not write
 request ledger entries, route affinity, passive health, runtime health, balance state, or
-patch-preset changes. Image responses are summarized only: codex-helper reports whether an
+client/config changes. Image responses are summarized only: codex-helper reports whether an
 `image_generation_call` appeared, but does not store raw image bytes or base64 payloads.
 
 Capability diagnostics and live smoke append sanitized summaries to
 `~/.codex-helper/logs/codex_relay_evidence.jsonl`. This evidence store is local operator memory,
 not routing truth. It does not feed request ledger summaries, load balancing, session affinity,
-passive health, balance exhaustion, retry policy, or automatic patch-preset changes. Use
+passive health, balance exhaustion, retry policy, or client switching. Use
 `codex-helper codex relay-evidence --json` when you want machine-readable records for bug reports or
 relay comparisons.
+
+Stored and printed evidence identifies the target only by `provider_id`, `endpoint_id`, and
+`provider_endpoint_key`; configured upstream base URLs and raw upstream payloads are neither stored
+nor printed. Evidence can be filtered by canonical provider ID with `relay-evidence --provider`.
 
 To diagnose whether remote compaction v1 is active, inspect the codex-helper request ledger after a Codex compaction happens:
 
@@ -432,11 +315,9 @@ codex-helper usage find --path responses/compact --limit 20
 codex-helper usage find --path responses --limit 20
 ```
 
-An official compact hit normally appears as `POST /responses/compact` in codex-helper logs. Ordinary local fallback compaction appears as a normal `POST /responses` request. Remote compaction v2, when Codex enables it, also travels through ordinary `/responses` with a structured `compaction_trigger` input item rather than `/responses/compact`; helper logs it with `codex_bridge.remote_compaction_v2_request = true` and applies state-bound route-continuity rules. `compaction = "remote-v2"` explicitly enables v2; default `auto` does not write that feature flag. When `responses_websocket` is enabled, normal turn streaming uses a WebSocket `GET /responses`-style upgrade rather than an HTTP `POST /responses`.
+An HTTP compact request appears as `POST /responses/compact`; remote compaction v2 travels through ordinary `/responses` with a structured `compaction_trigger` item. A WebSocket turn uses a `GET /responses`-style upgrade. The request ledger records the path and captured provider endpoint without inferring client-side capability settings.
 
-Switching back to `default` removes the bridge-only fields from `codex_proxy` and restores helper-managed auth patches when it is safe to do so.
-
-Safety rule: in bridge presets, upstream providers should configure their own `auth_token_env` / `auth_token` or API key equivalent. If an upstream has no helper-side secret, codex-helper strips Codex client auth headers to avoid forwarding ChatGPT/facade auth to third-party relays.
+Authentication is origin-scoped. Client authentication may pass only to the official OpenAI origin; third-party relays must configure helper-side `auth_token_env`, `auth_token`, or equivalent API-key credentials, and Codex client account headers are stripped before forwarding.
 
 ## Recommended Start
 
@@ -510,7 +391,7 @@ max_guard_retries = 1
 on_retry_exhausted = "pass"
 # Limit the guard to Codex/Responses-compatible paths.
 paths = ["/v1/responses", "/responses", "/v1/chat/completions", "/chat/completions"]
-# Emit retry trace entries for matches so TUI Requests and logs can explain the decision.
+# Emit control-trace events for matches so TUI Requests and logs can explain the decision.
 log_matches = true
 ```
 
@@ -531,11 +412,10 @@ log_matches = true
   `reasoning_tokens`, at the cost of losing live streaming for those guarded requests.
 - Runtime config reload applies to this guard: every new request checks for config file changes
   before building its retry plan; in-flight requests keep the config snapshot they started with.
-  Press `R` on the TUI Settings page to force an immediate reload.
 - The TUI Requests page shows hits in the `RG` column. The details pane's `Retry / route chain`
   shows `decision=failed_reasoning_guard`, `class=reasoning_guard_triggered`, and
   `reason=reasoning_tokens=<matched value>`. A final response passed after retry exhaustion is
-  recorded as a normal completion, with retry trace `action=exhausted-pass`.
+  recorded as a normal completion, with control-trace event `action=exhausted-pass`.
 
 ## Route Graph Shape
 
@@ -579,22 +459,22 @@ Most users should prefer `ordered-failover` for fixed priority and `tag-preferre
 
 Route graph session affinity is runtime state with a small durable ledger for Codex route continuity. The TOML config chooses the affinity policy and can optionally bound fallback stickiness:
 
-- `fallback-sticky` is the default used by the generated config template and Codex bootstrap import. It keeps a session on the last successful fallback provider while that provider remains viable, which is safer for official relay features such as remote compaction that may carry upstream-account-bound encrypted state. Set `fallback_ttl_ms` to cap how long a lower-priority fallback affinity can be reused, or `reprobe_preferred_after_ms` to force a preferred-group reprobe after a fallback target change.
+- `fallback-sticky` is the default used by the canonical version 5 config template. It keeps a session on the last successful fallback provider while that provider remains viable, which is safer for official relay features such as remote compaction that may carry upstream-account-bound encrypted state. Set `fallback_ttl_ms` to cap how long a lower-priority fallback affinity can be reused, or `reprobe_preferred_after_ms` to force a preferred-group reprobe after a fallback target change.
 - `preferred-group` applies session affinity only inside the currently best available preference group, so a session that temporarily falls back to paygo returns to monthly as soon as a monthly provider is viable again.
 - `off` ignores automatic route affinity.
 - `hard` treats an existing affinity target as strict for that route graph; if the target is unavailable, no alternate candidate is selected.
 
 For each request with a session id, codex-helper keys affinity by `session_id + service + route_graph_key`. While the route graph is unchanged, the same session can keep using the previously selected provider/endpoint according to the policy. This improves upstream prompt-cache locality for relay providers that cache by account or upstream target without letting automatic stickiness override user preference by default.
 
-Successful route affinity is also persisted to:
+Successful route affinity is committed to the helper-owned runtime database:
 
 ```text
-~/.codex-helper/state/session-route-affinities.json
+~/.codex-helper/state/state.sqlite
 ```
 
-The ledger stores helper-owned provider endpoint identity only; it does not store or infer upstream relay implementation details. Set `CODEX_HELPER_SESSION_ROUTE_AFFINITY_LEDGER=off` to disable this persistence, or set it to a path to use a custom ledger file.
+The runtime store records helper-owned provider endpoint identity only; it does not store or infer upstream relay implementation details. Affinity persistence shares the runtime store ownership and durability settings and cannot be redirected to a separate JSON ledger.
 
-For Codex remote compaction, helper treats compact v1 requests that mention state-bound fields such as `encrypted_content`, `previous_response_id`, or `compaction_summary`, and compact v2 requests with a structured `compaction_trigger`, as provider-state-bound. Under the default `fallback-sticky` route affinity policy, a state-bound compact request without existing route affinity is still tryable: helper follows the configured route graph, records the successful provider endpoint as the session affinity, and lets upstream decide whether the compact state is valid. Under `hard` affinity, or on the legacy multi-upstream path, missing affinity remains fail-closed with an explicit continuity error. If a known affinity endpoint itself fails, `fallback-sticky` may continue along the route graph and update affinity, while `hard` blocks cross-endpoint movement unless an explicit shared `continuity_domain` permits it. Non-state-bound compact can still use normal provider fallback according to the route policy.
+For Codex remote compaction, helper treats compact v1 requests that mention state-bound fields such as `encrypted_content`, `previous_response_id`, or `compaction_summary`, and compact v2 requests with a structured `compaction_trigger`, as provider-state-bound. Under the default `fallback-sticky` route affinity policy, a state-bound compact request without existing route affinity is still tryable: helper follows the configured route graph, records the successful provider endpoint as the session affinity, and lets upstream decide whether the compact state is valid. Under `hard` affinity, missing affinity remains fail-closed with an explicit continuity error. If a known affinity endpoint itself fails, `fallback-sticky` may continue along the route graph and update affinity, while `hard` blocks cross-endpoint movement unless an explicit shared `continuity_domain` permits it. Non-state-bound compact can still use normal provider fallback according to the route policy.
 
 Affinity is not a hard pin:
 
@@ -602,7 +482,7 @@ Affinity is not a hard pin:
 - if the sticky provider fails, ordinary and non-state-bound requests continue through the current route graph and then stick to the next successful provider;
 - provider-state-bound compact honors the route affinity policy: `fallback-sticky` stays tryable and updates affinity after a successful fallback, while `hard` stays within the affinity continuity domain unless an explicit shared `continuity_domain` permits movement;
 - if provider tags, route node strategy, children, entry, or provider endpoint identity change, the route graph key changes and old affinity no longer matches;
-- legacy station overrides are disabled for route graph configs; use route/provider/endpoint controls instead.
+- route graph decisions use route/provider/endpoint controls rather than a second station-shaped override path.
 
 This means monthly pools such as `monthly_pool -> paygo` normally keep a conversation on one monthly provider until that provider stops being viable, instead of round-robining every request and reducing upstream cache hit rate.
 
@@ -621,7 +501,7 @@ Pick one recipe first. You can refine fields later. For Claude, replace `codex` 
 | I need to force one provider temporarily | [Manual Pin](#manual-pin) | Explicit and easy to undo |
 | One provider account has multiple upstream endpoints | [Multiple Endpoints For One Provider](#multiple-endpoints-for-one-provider) | Keeps one provider identity with endpoint-level routing |
 
-Routing decisions use runtime provider endpoints. New diagnostics and balance DTOs expose `provider_endpoint_key`, `provider_id`, and `endpoint_id`; station/upstream fields are only read from legacy logs and snapshots.
+Routing decisions use runtime provider endpoints. Diagnostics and balance DTOs expose `provider_endpoint_key`, `provider_id`, and `endpoint_id` directly.
 
 ### One Provider
 
@@ -1089,22 +969,22 @@ extends = "daily"
 reasoning_effort = "high"
 ```
 
-Legacy profile station bindings are migration-only. New v5 configs should use `[codex.routing]`.
+Profiles define request defaults only; provider selection belongs in `[codex.routing]`.
 
 ## Balance Adapters
 
-Most relay users do not need to write `usage_providers.json` just to see balances. If no explicit adapter matches an upstream, codex-helper tries common relay probes:
+Most relay users do not need to write `usage_providers.json` just to see balances. The file is optional and operator-owned: when it is absent, codex-helper uses in-memory built-ins without creating it. An unreadable or invalid file produces an explicit load error and is never replaced or rewritten. If no explicit adapter matches an upstream, codex-helper tries common relay probes:
 
-1. `sub2api_usage`: `GET {{base_url}}/v1/usage` with the model API key.
-2. `new_api_token_usage`: `GET {{base_url}}/api/usage/token/` with the model API key.
-3. `new_api_user_self`: `GET {{base_url}}/api/user/self` with dashboard-style auth.
-4. `openai_balance_http_json`: `GET {{base_url}}/user/balance` with the model API key.
+1. `sub2api_usage`: `GET /v1/usage` on the normalized provider origin with the model API key.
+2. `new_api_token_usage`: `GET /api/usage/token/` on the normalized provider origin with the model API key.
+3. `new_api_user_self`: `GET /api/user/self` on the normalized provider origin with dashboard-style auth.
+4. `openai_balance_http_json`: `GET /user/balance` on the normalized provider origin with the model API key.
 
 RightCode hosts (`www.right.codes` / `right.codes`) are special-cased before the generic relay probes. The built-in `rightcode_account_summary` adapter calls `GET https://www.right.codes/account/summary`, uses bearer auth, reads wallet `balance`, and matches subscription daily quota by the upstream path prefix such as `/codex`.
 
-Explicit adapters are still useful when a relay needs dashboard credentials, custom headers, a custom endpoint, or safer exhaustion handling.
+Explicit adapters are still useful when a relay needs independent dashboard credentials, a provider-kind-specific field, a custom endpoint, or safer exhaustion handling.
 
-Request-driven balance refreshes are coalesced with a 60-second delay by default, and the same provider is auto-polled at most once every 600 seconds. Explicit `poll_interval_secs` values below 120 seconds are raised to 120 seconds. Manual refresh can still query proactively, but it respects confirmed terminal errors and current-period exhaustion safeguards.
+Request-driven balance observations are coalesced with a 60-second delay by default, and the same provider is auto-polled at most once every 600 seconds. Explicit `poll_interval_secs` values below 120 seconds are raised to 120 seconds. Operator clients read the last committed observation; they do not trigger a remote refresh.
 
 For `api.openai.com`, codex-helper skips relay-style `/user/balance` probing. If `OPENAI_ADMIN_KEY` is set, it can auto-read `openai_organization_costs`; otherwise the official OpenAI provider remains unknown instead of being treated as exhausted.
 
@@ -1119,7 +999,7 @@ OpenAI's public platform surface is not a wallet-balance API. It exposes organiz
       "domains": ["api.openai.com"],
       "token_env": "OPENAI_ADMIN_KEY",
       "require_token_env": true,
-      "endpoint": "https://api.openai.com/v1/organization/costs?start_time={{unix_days_ago:30}}&limit=30",
+      "endpoint": "https://api.openai.com/v1/organization/costs",
       "poll_interval_secs": 600,
       "refresh_on_request": false,
       "trust_exhaustion_for_routing": false
@@ -1128,9 +1008,9 @@ OpenAI's public platform surface is not a wallet-balance API. It exposes organiz
 }
 ```
 
-`OPENAI_ADMIN_KEY` must be an organization-level admin key; a normal model API key is not a stable substitute.
+`OPENAI_ADMIN_KEY` must be an organization-level admin key; a normal model API key is not a stable substitute. The `openai_organization_costs` adapter adds its rolling 30-day `start_time` and `limit=30` query parameters itself.
 
-In balance adapter templates, `{{base_url}}` is normalized without a trailing `/v1`. Use `{{upstream_base_url}}` only when a balance endpoint really lives under the same `/v1` prefix as model requests. Time helpers such as `{{unix_now}}`, `{{unix_now_ms}}`, and `{{unix_days_ago:30}}` are available for official usage/cost APIs that require query windows.
+`endpoint` accepts an absolute URL or a relative path. Relative paths resolve against the provider base URL normalized without a trailing `/v1`. Endpoint templates, credential interpolation, environment interpolation, arbitrary headers, and arbitrary variables are not supported. Each closed adapter kind owns its authentication headers and required query construction.
 
 Sub2API API-key telemetry:
 
@@ -1179,11 +1059,10 @@ New API dashboard-style quota:
       "id": "right-newapi",
       "kind": "new_api_user_self",
       "domains": ["www.right.codes"],
-      "endpoint": "{{base_url}}/api/user/self",
+      "endpoint": "/api/user/self",
       "token_env": "RIGHTCODE_NEWAPI_ACCESS_TOKEN",
-      "headers": {
-        "New-Api-User": "{{env:RIGHTCODE_NEWAPI_USER_ID}}"
-      },
+      "require_token_env": true,
+      "new_api_user_id_env": "RIGHTCODE_NEWAPI_USER_ID",
       "poll_interval_secs": 600,
       "refresh_on_request": true,
       "trust_exhaustion_for_routing": true
@@ -1202,7 +1081,7 @@ Important balance behavior:
 - New API quota values are quota units converted with `QuotaPerUnit = 500000`; token usage snapshots with `unlimited_quota = true` are never treated as exhausted.
 - RightCode `balance` is shown as wallet balance. Matched `subscriptions[*].total_quota` and `remaining_quota` are shown as daily quota; `reset_today = false` means codex-helper includes today's fresh daily quota before displaying remaining quota.
 - If a provider reports misleading zero balances for active subscriptions, set `trust_exhaustion_for_routing = false`.
-- UI surfaces cached balance snapshots; manual refresh uses `POST /__codex_helper/api/v1/providers/balances/refresh` and also avoids targets with confirmed terminal errors or current-period exhaustion.
+- UI surfaces expose the last committed balance observation and its freshness; they do not mutate or refresh provider state.
 - Balance HTTP calls are bounded and reuse the same outbound client as proxy runtime calls. A failed lookup should surface the probed origin and adapter kind in logs, for example whether `sub2api_usage` or `openai_balance_http_json` returned non-JSON.
 
 ## Usage Page
@@ -1213,17 +1092,16 @@ The Tauri desktop `Usage` page consumes the same local-day read model; its recen
 How to read it:
 
 - The summary band shows today's request count, tokens, estimated cost, success rate, token mix, and the global retry gate count.
-- The 24h activity band shows local-day request distribution and whether the loaded request log may be partial.
+- The 24h activity band shows local-day request distribution from committed request events.
 - Provider and station rows show today's request volume, error count, tokens, estimated cost, and average latency.
 - Model, session, and project panels highlight the main local-day usage drivers.
-- Coverage warnings mean codex-helper only loaded the bounded local request log window. They are not a claim that no earlier usage exists.
+- Coverage status distinguishes complete, partial, and unknown economics in the committed read model.
 - `unknown` means there is no trusted balance data or the lookup failed. Do not treat it as healthy balance.
 - `stale` means the snapshot expired; it is distinct from `exhausted`, `error`, and `unlimited`.
 - `unlimited` is a known unlimited quota state, not unknown.
-- Balance refresh remains on the routing/provider diagnostics surfaces; use Routing/Stations `g` in TUI or the `Refresh balances` button on the Tauri desktop Providers page.
-- A single provider balance refresh failure only updates that provider's error/unknown state. It does not interrupt other provider refreshes, TUI redraw, or snapshot refresh.
+- Provider observation failures appear as `unknown` or `stale` facts without interrupting TUI redraw or read-model refresh.
 - In the desktop Usage table, the per-row `Chain` action loads the sanitized request chain only on demand. Use it for single-request diagnosis after the totals show an unusual pattern.
-- The `Routing` page keeps compact balance context and refresh controls. Use TUI `Usage` to answer what was used today; use Routing/Stations to answer balance and route eligibility questions.
+- The `Routing` page keeps compact read-only balance context. Use TUI `Usage` to answer what was used today; use Routing/Stations to inspect balance and route eligibility.
 
 ## Runtime Safeguards
 
@@ -1269,10 +1147,10 @@ Useful adapter fields:
 | Field | Meaning |
 | --- | --- |
 | `domains` | Relay hosts this adapter applies to |
-| `endpoint` | Balance endpoint URL, with optional `{{base_url}}` templating |
+| `endpoint` | Absolute balance URL or path relative to the normalized provider base URL |
 | `token_env` | Environment variable used for adapter auth |
 | `require_token_env` | Require `token_env` instead of falling back to the model API key |
-| `headers` / `variables` | Request templating |
+| `new_api_user_id_env` | `new_api_user_self` only: environment variable used for the fixed `New-Api-User` header |
 | `poll_interval_secs` | Refresh throttle / cache window |
 | `refresh_on_request` | Whether routed requests may trigger balance refresh |
 | `trust_exhaustion_for_routing` | Whether exhausted snapshots may demote routing |
@@ -1295,14 +1173,13 @@ Use pricing overrides for local corrections or relay-specific multipliers. Do no
 
 ## CLI Editing
 
-Initialize or inspect migration:
+Initialize the canonical config:
 
-Normal startup, including the default TUI path, requires a current `version = 5` `config.toml`. If an older TOML or `config.json` is present, startup stops with a migration-required error; use the migration commands below to preview and then explicitly write the new file.
+Normal startup, including the default TUI path, requires `~/.codex-helper/config.toml` with `version = 5`. `config init` creates a current template; `--force` replaces an existing canonical file only after writing `config.toml.bak`. Historical schemas and `config.json` are unsupported and are never imported, migrated, rewritten, or deleted automatically.
 
 ```bash
 codex-helper config init
-codex-helper config migrate --dry-run
-codex-helper config migrate --write --yes
+codex-helper config init --force
 ```
 
 Manage providers:
@@ -1334,7 +1211,7 @@ Use `--claude` on provider/routing commands when editing the Claude service inst
 
 `routing show` reads persisted config. `routing list` and `routing explain` read the compiled runtime candidate view.
 Use `routing explain --model <MODEL> --json` to inspect the same selected route, candidate order, route paths, and structured skip reasons exposed by the runtime admin explain API.
-In that response, `provider_endpoint_key`, `provider_id`, `endpoint_id`, `route_path`, and `preference_group` are the primary v5 routing identity. New routing explain responses no longer emit legacy station/upstream compatibility objects; old logs and balance snapshots can still be read for migration.
+In that response, `provider_endpoint_key`, `provider_id`, `endpoint_id`, `route_path`, and `preference_group` are the canonical routing identity.
 
 ## Inspect Routing And Logs
 
@@ -1348,21 +1225,21 @@ codex-helper routing explain --model <MODEL> --json
 
 `routing show` answers "what is saved in config". `routing explain` answers "what the runtime would try now", including candidate order, route paths, and skip reasons such as disabled provider, unsupported model, cooldown, or trusted balance exhaustion.
 
-Provider runtime facts flow through provider signals and owned policy actions:
+Provider eligibility is derived from committed provider observations:
 
-- Upstream responses, route attempts, and trusted balance snapshots are normalized into provider signals.
-- Only high-confidence route-facing quota, rate-limit, capacity, transport, or balance evidence can create an automatic policy action.
-- Automatic actions are owned by codex-helper, persisted under `~/.codex-helper/state/policy-actions.json`, and projected into routing runtime state and `/__codex_helper/api/v1/providers`.
-- Manual runtime overrides remain higher priority than automatic action recovery.
+- Closed provider adapters normalize observations by endpoint origin, route scope, account fingerprint, config revision, incarnation, and generation.
+- Only an authoritative, identity-matched exhausted observation can create an automatic block. HTTP errors, transport failures, parse failures, and passive request health never create or clear quota eligibility.
+- Observation history, automatic actions, and the eligibility projection commit atomically to `~/.codex-helper/state/state.sqlite` before the new policy revision appears in routing and `GET /__codex_helper/api/v1/operator/read-model`.
+- Manual eligibility remains higher priority than automatic block or recovery.
 - codex-helper does not mutate Codex auth files, ChatGPT login state, relay account files, or provider dashboards as an automatic quota response.
 
-Every completed request is written to:
+The authoritative request and attempt lifecycle is committed to:
 
 ```text
-~/.codex-helper/logs/requests.jsonl
+~/.codex-helper/state/state.sqlite
 ```
 
-When a request retries or switches provider, the request log stores `retry.route_attempts[]`. The most useful fields are `provider_id`, `endpoint_id`, `route_path`, `decision`, `status_code`, and `error_class`. Newer records may also include `provider_signals[]` and `policy_actions[]` at the route-attempt and top levels, so request-ledger APIs can filter by `signal_kind` or `policy_action_kind` while old JSONL records still read with empty evidence.
+When a request retries or switches provider, committed attempts retain `provider_id`, `endpoint_id`, `route_path`, `decision`, `status_code`, and `error_class`. Request-ledger reads and usage rollups query those committed facts. `logs/requests.jsonl` is optional post-commit debug output only; failure or rotation cannot affect accounting, and production readers never replay it.
 
 For compact diagnostics, filter by request path:
 
@@ -1370,7 +1247,7 @@ For compact diagnostics, filter by request path:
 codex-helper usage find --path responses/compact --limit 20
 ```
 
-The same filter is available through the local admin API as `GET /__codex_helper/api/v1/request-ledger/recent?path=responses/compact`.
+The read-only operator bundle publishes recent committed requests in `data.recent_requests`. Use `codex-helper usage find` for local filtered searches; the remote control plane does not expose a general ledger-query endpoint.
 
 To inspect one request or session as a route-control timeline, use the request-chain export:
 
@@ -1396,9 +1273,9 @@ The control trace is enabled by default and is written to:
 ~/.codex-helper/logs/control_trace.jsonl
 ```
 
-It records routing selection events such as the compiled route plan, provider endpoint, preference group, skipped higher-priority groups, pinned-route decisions, retry options, and failover reasons. When a lower-priority preference group is selected, the `route_graph_selection_explain` event lists each higher-priority provider endpoint that was skipped and the structured reasons such as `unsupported_model`, `cooldown`, `usage_exhausted`, `runtime_disabled`, or `attempt_avoided`. Set `CODEX_HELPER_CONTROL_TRACE=0` to turn it off, or `CODEX_HELPER_CONTROL_TRACE_PATH` to write it somewhere else. The older `retry_trace.jsonl` file is only written when `CODEX_HELPER_RETRY_TRACE=1`.
+It records routing selection events such as the compiled route plan, provider endpoint, preference group, skipped higher-priority groups, pinned-route decisions, retry options, and failover reasons. When a lower-priority preference group is selected, the `route_graph_selection_explain` event lists each higher-priority provider endpoint that was skipped and the structured reasons such as `unsupported_model`, `cooldown`, `usage_exhausted`, `runtime_disabled`, or `attempt_avoided`. Set `CODEX_HELPER_CONTROL_TRACE=0` to turn it off, or `CODEX_HELPER_CONTROL_TRACE_PATH` to write it somewhere else.
 
-Request/debug logs, `control_trace.jsonl`, and the optional `retry_trace.jsonl` share the bounded JSONL retention controlled by `CODEX_HELPER_REQUEST_LOG_MAX_BYTES` and `CODEX_HELPER_REQUEST_LOG_MAX_FILES` (defaults: 50 MiB per active file and 10 rotated files). Oversized active JSONL files rotate on first write, and rotated files are pruned by count and total budget.
+Request/debug logs and `control_trace.jsonl` share the bounded JSONL retention controlled by `CODEX_HELPER_REQUEST_LOG_MAX_BYTES` and `CODEX_HELPER_REQUEST_LOG_MAX_FILES` (defaults: 50 MiB per active file and 10 rotated files). Oversized active JSONL files rotate on first write, and rotated files are pruned by count and total budget.
 
 Other local helper logs use the same bounded storage primitive with separate knobs:
 
@@ -1428,18 +1305,17 @@ Check these fields first:
 - `selected_route.provider_endpoint_key` and `selected_route.preference_group` show what the runtime would try now. Group `0` is the most preferred group.
 - `candidates[].skip_reasons` explains why a preferred candidate was skipped, for example `unsupported_model`, `cooldown`, `usage_exhausted`, `runtime_disabled`, or `attempt_avoided`.
 - `affinity.policy` / `affinity_policy` tells whether automatic affinity is `preferred-group`, `off`, `fallback-sticky`, or `hard`.
-- Route graph decisions use `provider_endpoint_key`, `provider_id`, `endpoint_id`, and `route_path`; legacy station/upstream context is not emitted by new routing explain responses.
+- Route graph decisions use `provider_endpoint_key`, `provider_id`, `endpoint_id`, and `route_path` as their canonical identity.
 
 For a monthly-first setup, the generated default is `affinity_policy = "fallback-sticky"`, because relay providers often bind cache and encrypted response state to an upstream account. If you prefer automatic return to the best monthly group after an outage, explicitly set `affinity_policy = "preferred-group"`. If the route keeps using paygo unexpectedly, look for one of these causes:
 
-- an explicit session/global route target override is set;
 - the monthly provider is disabled or missing auth;
 - the requested model is unsupported by the monthly provider;
 - the monthly endpoint is cooling down after retryable failures;
 - trusted balance data marks the endpoint `usage_exhausted`;
 - the config uses `affinity_policy = "fallback-sticky"` or `hard`.
 
-Trusted balance exhaustion is a provider-endpoint runtime signal. It creates an owned balance policy action for the canonical provider endpoint and can demote a monthly endpoint for the current request/refresh window, but it is not a permanent session preference. A fresh non-exhausted balance snapshot clears only the balance action owned by codex-helper; it does not clear manual overrides or unrelated response-based cooldowns. If every candidate is currently blocked by trusted exhaustion or cooldown, Codex streaming turns receive a retryable `response.failed` SSE with a bounded delay instead of repeatedly hitting depleted upstreams; the helper also queues a throttled balance refresh so recovered relays can re-enter routing. If a provider reports misleading zero balances for an active subscription, set `trust_exhaustion_for_routing = false` for that usage provider or fix the balance extractor.
+Trusted balance exhaustion is a provider-endpoint runtime signal. It creates an owned balance policy action for the canonical provider endpoint and can demote a monthly endpoint for the current request/refresh window, but it is not a permanent session preference. A fresh non-exhausted balance snapshot clears only the balance action owned by codex-helper; it does not clear manual eligibility or unrelated response-based cooldowns. If every candidate is currently blocked by trusted exhaustion or cooldown, Codex streaming turns receive a retryable `response.failed` SSE with a bounded delay instead of repeatedly hitting depleted upstreams; the helper also queues a throttled balance refresh so recovered relays can re-enter routing. If a provider reports misleading zero balances for an active subscription, set `trust_exhaustion_for_routing = false` for that usage provider or fix the balance extractor.
 
 Use the control trace when a lower-priority group is selected:
 
@@ -1447,57 +1323,24 @@ Use the control trace when a lower-priority group is selected:
 ~/.codex-helper/logs/control_trace.jsonl
 ```
 
-Look for `route_graph_selection_explain`. It records the selected provider endpoint, selected preference group, skipped higher-priority groups, and per-candidate skip reasons. Use route/provider/endpoint controls for temporary steering; legacy station overrides are rejected for route graph configs.
+Look for `route_graph_selection_explain`. It records the selected provider endpoint, selected preference group, skipped higher-priority groups, and per-candidate skip reasons. Route/provider/endpoint identifiers are the only routing control vocabulary.
 
-## UI Editing
+## Operator UI
 
-TUI and desktop surfaces should keep the same mental model as the config file:
+TUI and desktop consume the same typed, redacted `OperatorReadModel`. They use only `GET` / `HEAD` against a remote runtime control plane:
 
-- Provider list: names, aliases, enabled state, tags, balance, expanded fallback order, canonical provider endpoint keys, and active automatic policy actions.
-- Routing editor: entry strategy, target, children/order, preferred tags, exhaustion behavior, and route graph tree preview.
-- Desktop provider and routing forms: expose common edits while preserving advanced route graph fields for CLI or raw TOML.
-- Requests and sessions: provider choice, route affinity, retry chain, token/cache token usage, cache hit rate, and estimated cost.
-- Runtime steering: useful for temporary choices, but durable provider intent belongs in `[service.providers]` and `[service.routing]`.
+- Provider views show names, aliases, enabled state, tags, committed balance/eligibility facts, expanded fallback order, canonical endpoint keys, and policy provenance.
+- Routing views show the compiled entry, candidate order, route paths, skip reasons, continuity, and captured revisions.
+- Requests and sessions show provider choice, route affinity, retry chain, token/cache evidence, and committed economics.
+- `ready`, `stale`, `disconnected`, and `auth_required` states remain explicit; clients never fabricate a local fallback view.
 
-TUI routing editor shortcuts:
+These operator clients are query-only. Edit durable provider and routing intent through local CLI commands or `config.toml`. Within the TUI, `n` / `o` is the only local exception and patches only the helper provider selector/stanza in this machine's Codex config; it never mutates a remote runtime. The separate explicit local `switch on/off` action is the only client-config mutation described by this guide.
 
-- `Enter`: pin selected provider with `manual-sticky`.
-- `a`: switch the entry route to `ordered-failover` using the visible order.
-- `[` / `]` or `u` / `d`: move selected provider in the entry route's expanded order.
-- `f`: enable monthly-first tag preference with `prefer_tags = [{ billing = "monthly" }]`.
-- `e`: enable or disable the selected provider.
-- `s`: toggle `on_exhausted` between `continue` and `stop`.
-- `1` / `2` / `0`: set `billing=monthly`, set `billing=paygo`, or clear `billing`.
+## Configuration Compatibility
 
-Advanced multi-endpoint providers, model mappings, custom balance extraction rules, and deeply nested graphs are still best edited with CLI or raw TOML/JSON.
+`version = 5` in `~/.codex-helper/config.toml` is the only public helper configuration contract. Older versioned or unversioned TOML and `config.json` are unsupported inputs. Startup reports the unsupported file/schema without importing, converting, deleting, or treating it as generated state; there is no migration command or compatibility runtime reader.
 
-## Migration
-
-The current route graph schema writes `version = 5`. Normal startup only accepts a current `config.toml` with `version = 5`.
-
-Legacy `version = 4`, `version = 3`, `version = 2`, unversioned TOML, and legacy `config.json` files are migration input only. Starting codex-helper, including the default TUI startup path, now stops with a migration-required error instead of rewriting old files implicitly. Preview the generated v5 TOML first, then opt in to writing it:
-
-```bash
-codex-helper config migrate --dry-run
-codex-helper config migrate --write --yes
-```
-
-When `--write --yes` writes the new file, the previous file is copied to `config.toml.bak` or `config.json.bak` first.
-
-During migration, codex-helper writes missing route-graph affinity as `affinity_policy = "fallback-sticky"` so the on-disk config is explicit. Existing configs can still set either policy depending on whether official relay continuity or fastest return to the preferred group matters more; configs that explicitly keep `preferred-group` may be called out in migration previews so operators notice the trade-off. The command is intentionally explicit so automated restarts and foreground TUI sessions cannot silently change persistent config.
-
-Migration rules:
-
-- old `active_station` becomes part of the initial route entry;
-- old `level` becomes ordering input only;
-- old station/group members flatten into provider entries and an entry route's `children`;
-- legacy v3 `policy/order/target/prefer_tags` becomes a v5 entry route node;
-- legacy v3 `pool-fallback` becomes nested route nodes;
-- existing provider tags are preserved;
-- business tags such as `billing=monthly` are never guessed;
-- endpoint-scoped station groups may warn because provider routing is provider-level by default.
-
-After migration, treat provider and routing graph as the public write surface. Station-shaped inputs are compatibility readers and migration diagnostics, not the runtime routing identity.
+Create a separate version 5 file with `config init`, then express provider and routing intent directly through `[service.providers]`, `[service.routing]`, and route nodes. Keep any historical file outside the canonical path if it is needed for manual reference.
 
 ## Design Boundaries
 
@@ -1508,5 +1351,5 @@ codex-helper intentionally avoids:
 - pretending speed-first or cost-first routing is reliable before real measurements exist;
 - keeping `level` as the main user-facing priority control;
 - treating balance lookup failure as provider exhaustion;
-- silently writing legacy station schema from TUI or desktop forms;
+- silently writing an alternate station-shaped schema from TUI or desktop forms;
 - using a special `pool-fallback` syntax when nested route nodes express the same intent more cleanly.

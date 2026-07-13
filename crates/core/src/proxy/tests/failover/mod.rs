@@ -3,6 +3,9 @@ use super::*;
 mod config_failover;
 mod response_semantics;
 
+const UPSTREAM_TWO_SUCCESS_SSE: &[u8] = b"data: {\"ok\":true,\"upstream\":2}\n\ndata: {\"type\":\"response.completed\"}\n\ndata: [DONE]\n\n";
+const BACKUP_SUCCESS_SSE: &[u8] = b"data: {\"ok\":true,\"upstream\":\"backup\"}\n\ndata: {\"type\":\"response.completed\"}\n\ndata: [DONE]\n\n";
+
 fn retry_layer_config(
     max_attempts: u32,
     on_status: &str,
@@ -54,6 +57,80 @@ fn retry_config_with_cooldowns(
     }
 }
 
+fn capacity_wait_config(primary_base_url: String, backup_base_url: Option<String>) -> HelperConfig {
+    let mut providers = std::collections::BTreeMap::from([(
+        "primary".to_string(),
+        ProviderConfig {
+            base_url: Some(primary_base_url),
+            inline_auth: UpstreamAuth::default(),
+            limits: ProviderConcurrencyLimits {
+                max_concurrent_requests: Some(1),
+                limit_group: None,
+            },
+            ..ProviderConfig::default()
+        },
+    )]);
+    let mut children = vec!["primary".to_string()];
+    if let Some(backup_base_url) = backup_base_url {
+        providers.insert(
+            "backup".to_string(),
+            ProviderConfig {
+                base_url: Some(backup_base_url),
+                inline_auth: UpstreamAuth::default(),
+                ..ProviderConfig::default()
+            },
+        );
+        children.push("backup".to_string());
+    }
+    let mut routing = RouteGraphConfig::ordered_failover(children);
+    routing.scheduling_preset = SchedulingPreset::ContinuityFirst;
+
+    HelperConfig {
+        codex: ServiceRouteConfig {
+            providers,
+            routing: Some(routing),
+            ..ServiceRouteConfig::default()
+        },
+        ..HelperConfig::default()
+    }
+}
+
+async fn wait_for_provider_pending(
+    proxy: &ProxyService,
+    provider_id: &str,
+    max_concurrent_requests: u32,
+    expected: u32,
+) {
+    let runtime_revision = proxy.config.capture().await.revision();
+    let limit = crate::proxy::concurrency_limits::ConcurrencyLimit::new(
+        max_concurrent_requests,
+        runtime_revision,
+    )
+    .expect("test provider concurrency limit must be non-zero");
+    let provider_endpoint = crate::runtime_identity::ProviderEndpointKey::new(
+        proxy.service_name,
+        provider_id,
+        "default",
+    );
+    let key = format!("endpoint:{}", provider_endpoint.stable_key());
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if proxy
+                .concurrency_limiter
+                .snapshot(key.as_str(), limit)
+                .pending
+                == expected
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("provider pending waiter count should converge");
+}
+
 #[tokio::test]
 async fn proxy_failover_retries_502_then_uses_second_upstream() {
     run_failover_retries_502_then_uses_second_upstream().await;
@@ -101,7 +178,7 @@ async fn run_failover_retries_502_then_uses_second_upstream() {
 
     let proxy_client = Client::new();
     let retry = retry_config(2, "502", Vec::new(), RetryStrategy::Failover);
-    let cfg = make_proxy_config(
+    let cfg = make_helper_config(
         vec![
             UpstreamConfig {
                 base_url: format!("http://{}/v1", u1_addr),
@@ -139,23 +216,8 @@ async fn run_failover_retries_502_then_uses_second_upstream() {
         retry,
     );
 
-    let proxy = ProxyService::new(
-        proxy_client,
-        Arc::new(cfg),
-        "codex",
-        Arc::new(std::sync::Mutex::new(HashMap::new())),
-    );
+    let proxy = ProxyService::new(proxy_client, Arc::new(cfg), "codex");
     let state = proxy.state.clone();
-    state
-        .set_global_station_override("stale-station-pin".to_string(), 1)
-        .await;
-    state
-        .set_session_station_override(
-            "sid-input".to_string(),
-            "stale-session-station-pin".to_string(),
-            1,
-        )
-        .await;
     let app = crate::proxy::router(proxy);
     let (proxy_addr, proxy_handle) = spawn_axum_server(app);
 
@@ -185,7 +247,7 @@ async fn run_failover_retries_502_then_uses_second_upstream() {
             .iter()
             .map(|attempt| attempt.endpoint_id.as_deref())
             .collect::<Vec<_>>(),
-        vec![Some("0"), Some("0"), Some("1")]
+        vec![Some("default"), Some("default"), Some("default")]
     );
     assert_eq!(
         retry
@@ -193,7 +255,11 @@ async fn run_failover_retries_502_then_uses_second_upstream() {
             .iter()
             .map(|attempt| attempt.provider_endpoint_key.as_deref())
             .collect::<Vec<_>>(),
-        vec![Some("codex/u1/0"), Some("codex/u1/0"), Some("codex/u2/1")]
+        vec![
+            Some("codex/u1/default"),
+            Some("codex/u1/default"),
+            Some("codex/u2/default")
+        ]
     );
     assert_eq!(
         retry
@@ -201,7 +267,7 @@ async fn run_failover_retries_502_then_uses_second_upstream() {
             .iter()
             .map(|attempt| attempt.preference_group)
             .collect::<Vec<_>>(),
-        vec![Some(0), Some(0), Some(0)]
+        vec![Some(0), Some(0), Some(1)]
     );
     assert_eq!(
         retry
@@ -210,17 +276,17 @@ async fn run_failover_retries_502_then_uses_second_upstream() {
             .map(|attempt| attempt.route_path.clone())
             .collect::<Vec<_>>(),
         vec![
-            vec!["legacy".to_string(), "test".to_string(), "u1".to_string()],
-            vec!["legacy".to_string(), "test".to_string(), "u1".to_string()],
-            vec!["legacy".to_string(), "test".to_string(), "u2".to_string()],
+            vec!["main".to_string(), "u1".to_string()],
+            vec!["main".to_string(), "u1".to_string()],
+            vec!["main".to_string(), "u2".to_string()],
         ]
     );
     let route_decision = request
         .route_decision
         .as_ref()
         .expect("finished route decision");
-    assert_eq!(route_decision.endpoint_id.as_deref(), Some("1"));
-    assert_eq!(route_decision.route_path, vec!["legacy", "test", "u2"]);
+    assert_eq!(route_decision.endpoint_id.as_deref(), Some("default"));
+    assert_eq!(route_decision.route_path, vec!["main", "u2"]);
     // Two-layer model: retry current upstream first, then fail over.
     assert_eq!(upstream1_hits.load(Ordering::SeqCst), 2);
     assert_eq!(upstream2_hits.load(Ordering::SeqCst), 1);
@@ -231,7 +297,7 @@ async fn run_failover_retries_502_then_uses_second_upstream() {
 }
 
 #[tokio::test]
-async fn proxy_v4_route_graph_affinity_is_session_scoped() {
+async fn proxy_route_graph_route_graph_affinity_is_session_scoped() {
     let input_hits = Arc::new(AtomicUsize::new(0));
     let input1_hits = Arc::new(AtomicUsize::new(0));
     let right_hits = Arc::new(AtomicUsize::new(0));
@@ -312,7 +378,6 @@ async fn proxy_v4_route_graph_affinity_is_session_scoped() {
             Vec::new(),
             RetryStrategy::Failover,
         )),
-        allow_cross_station_before_first_output: Some(true),
         transport_cooldown_secs: Some(0),
         cooldown_backoff_factor: Some(1),
         cooldown_backoff_max_secs: Some(0),
@@ -320,77 +385,70 @@ async fn proxy_v4_route_graph_affinity_is_session_scoped() {
     };
     let monthly_tags =
         std::collections::BTreeMap::from([("billing".to_string(), "monthly".to_string())]);
-    let v4 = ProxyConfigV4 {
+    let source = HelperConfig {
         retry,
-        codex: ServiceViewV4 {
+        codex: ServiceRouteConfig {
             providers: std::collections::BTreeMap::from([
                 (
                     "input".to_string(),
-                    ProviderConfigV4 {
+                    ProviderConfig {
                         base_url: Some(format!("http://{input_addr}/v1")),
                         inline_auth: UpstreamAuth::default(),
                         tags: monthly_tags.clone(),
-                        ..ProviderConfigV4::default()
+                        ..ProviderConfig::default()
                     },
                 ),
                 (
                     "input1".to_string(),
-                    ProviderConfigV4 {
+                    ProviderConfig {
                         base_url: Some(format!("http://{input1_addr}/v1")),
                         inline_auth: UpstreamAuth::default(),
                         tags: monthly_tags,
-                        ..ProviderConfigV4::default()
+                        ..ProviderConfig::default()
                     },
                 ),
                 (
                     "right".to_string(),
-                    ProviderConfigV4 {
+                    ProviderConfig {
                         base_url: Some(format!("http://{right_addr}/v1")),
                         inline_auth: UpstreamAuth::default(),
-                        ..ProviderConfigV4::default()
+                        ..ProviderConfig::default()
                     },
                 ),
             ]),
-            routing: Some(RoutingConfigV4 {
+            routing: Some(RouteGraphConfig {
                 entry: "monthly_first".to_string(),
                 routes: std::collections::BTreeMap::from([
                     (
                         "monthly_first".to_string(),
-                        RoutingNodeV4 {
-                            strategy: RoutingPolicyV4::TagPreferred,
+                        RouteNodeConfig {
+                            strategy: RouteStrategy::TagPreferred,
                             children: vec!["monthly_pool".to_string(), "right".to_string()],
                             prefer_tags: vec![std::collections::BTreeMap::from([(
                                 "billing".to_string(),
                                 "monthly".to_string(),
                             )])],
-                            on_exhausted: crate::config::RoutingExhaustedActionV4::Continue,
-                            ..RoutingNodeV4::default()
+                            on_exhausted: crate::config::RouteExhaustedAction::Continue,
+                            ..RouteNodeConfig::default()
                         },
                     ),
                     (
                         "monthly_pool".to_string(),
-                        RoutingNodeV4 {
-                            strategy: RoutingPolicyV4::OrderedFailover,
+                        RouteNodeConfig {
+                            strategy: RouteStrategy::OrderedFailover,
                             children: vec!["input".to_string(), "input1".to_string()],
-                            on_exhausted: crate::config::RoutingExhaustedActionV4::Continue,
-                            ..RoutingNodeV4::default()
+                            on_exhausted: crate::config::RouteExhaustedAction::Continue,
+                            ..RouteNodeConfig::default()
                         },
                     ),
                 ]),
-                ..RoutingConfigV4::default()
+                ..RouteGraphConfig::default()
             }),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         },
-        ..ProxyConfigV4::default()
+        ..HelperConfig::default()
     };
-    let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compat runtime");
-    let proxy = ProxyService::new_with_v4_source(
-        Client::new(),
-        Arc::new(runtime),
-        Some(Arc::new(v4)),
-        "codex",
-        Arc::new(std::sync::Mutex::new(HashMap::new())),
-    );
+    let proxy = ProxyService::new(Client::new(), Arc::new(source), "codex");
     let state = proxy.state.clone();
     let app = crate::proxy::router(proxy);
     let (proxy_addr, proxy_handle) = spawn_axum_server(app);
@@ -412,19 +470,6 @@ async fn proxy_v4_route_graph_affinity_is_session_scoped() {
                 && request.provider_id.as_deref() == Some("right")
         })
         .expect("fallback finished request");
-    assert_eq!(fallback_request.station_name, None);
-    assert_eq!(
-        fallback_request
-            .route_decision
-            .as_ref()
-            .and_then(|decision| {
-                decision
-                    .effective_station
-                    .as_ref()
-                    .map(|station| station.value.as_str())
-            }),
-        None
-    );
     assert_eq!(
         fallback_request
             .route_decision
@@ -471,20 +516,6 @@ async fn proxy_v4_route_graph_affinity_is_session_scoped() {
             .map(|attempt| attempt.avoided_candidate_indices.clone())
             .collect::<Vec<_>>(),
         vec![Vec::<usize>::new(), vec![0], vec![0, 1]]
-    );
-    assert!(
-        fallback_retry
-            .route_attempts
-            .iter()
-            .all(|attempt| attempt.avoid_for_station.is_empty()),
-        "route graph attempts should track candidate avoids, not station upstream avoids"
-    );
-    assert!(
-        fallback_retry
-            .route_attempts
-            .iter()
-            .all(|attempt| attempt.station_name.is_none() && attempt.upstream_index.is_none()),
-        "route graph attempts should not serialize compatibility station/index as primary identity"
     );
     let fallback_affinity_snapshot = state
         .get_session_route_affinity("sid-right")
@@ -556,7 +587,7 @@ async fn proxy_v4_route_graph_affinity_is_session_scoped() {
 }
 
 #[tokio::test]
-async fn proxy_v4_route_graph_health_does_not_write_synthetic_routing_lb_state() {
+async fn proxy_route_graph_route_graph_health_does_not_write_synthetic_routing_lb_state() {
     let primary_hits = Arc::new(AtomicUsize::new(0));
     let backup_hits = Arc::new(AtomicUsize::new(0));
 
@@ -612,58 +643,49 @@ async fn proxy_v4_route_graph_health_does_not_write_synthetic_routing_lb_state()
             Vec::new(),
             RetryStrategy::Failover,
         )),
-        allow_cross_station_before_first_output: Some(true),
         transport_cooldown_secs: Some(0),
         cooldown_backoff_factor: Some(1),
         cooldown_backoff_max_secs: Some(0),
         ..RetryConfig::default()
     };
-    let v4 = ProxyConfigV4 {
+    let source = HelperConfig {
         retry,
-        codex: ServiceViewV4 {
+        codex: ServiceRouteConfig {
             providers: std::collections::BTreeMap::from([
                 (
                     "primary".to_string(),
-                    ProviderConfigV4 {
+                    ProviderConfig {
                         base_url: Some(format!("http://{primary_addr}/v1")),
                         inline_auth: UpstreamAuth::default(),
-                        ..ProviderConfigV4::default()
+                        ..ProviderConfig::default()
                     },
                 ),
                 (
                     "backup".to_string(),
-                    ProviderConfigV4 {
+                    ProviderConfig {
                         base_url: Some(format!("http://{backup_addr}/v1")),
                         inline_auth: UpstreamAuth::default(),
-                        ..ProviderConfigV4::default()
+                        ..ProviderConfig::default()
                     },
                 ),
             ]),
-            routing: Some(RoutingConfigV4 {
+            routing: Some(RouteGraphConfig {
                 entry: "monthly_first".to_string(),
                 routes: std::collections::BTreeMap::from([(
                     "monthly_first".to_string(),
-                    RoutingNodeV4 {
-                        strategy: RoutingPolicyV4::OrderedFailover,
+                    RouteNodeConfig {
+                        strategy: RouteStrategy::OrderedFailover,
                         children: vec!["primary".to_string(), "backup".to_string()],
-                        ..RoutingNodeV4::default()
+                        ..RouteNodeConfig::default()
                     },
                 )]),
-                ..RoutingConfigV4::default()
+                ..RouteGraphConfig::default()
             }),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         },
-        ..ProxyConfigV4::default()
+        ..HelperConfig::default()
     };
-    let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compat runtime");
-    let lb_states = Arc::new(std::sync::Mutex::new(HashMap::new()));
-    let proxy = ProxyService::new_with_v4_source(
-        Client::new(),
-        Arc::new(runtime),
-        Some(Arc::new(v4)),
-        "codex",
-        lb_states.clone(),
-    );
+    let proxy = ProxyService::new(Client::new(), Arc::new(source), "codex");
     let app = crate::proxy::router(proxy);
     let (proxy_addr, proxy_handle) = spawn_axum_server(app);
     let client = reqwest::Client::new();
@@ -672,16 +694,6 @@ async fn proxy_v4_route_graph_health_does_not_write_synthetic_routing_lb_state()
     assert_eq!(fallback["provider"].as_str(), Some("backup"));
     assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
     assert_eq!(backup_hits.load(Ordering::SeqCst), 1);
-    {
-        let guard = lb_states.lock().expect("lb states");
-        assert!(
-            guard
-                .get("routing")
-                .is_none_or(|entry| entry.failure_counts.iter().all(|count| *count == 0)),
-            "route graph branch should not write provider health into synthetic routing LB state"
-        );
-    }
-
     let sticky = send_responses_json(&client, proxy_addr, Some("sid-failover")).await;
     assert_eq!(sticky["provider"].as_str(), Some("backup"));
     assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
@@ -693,7 +705,367 @@ async fn proxy_v4_route_graph_health_does_not_write_synthetic_routing_lb_state()
 }
 
 #[tokio::test]
-async fn proxy_v4_route_graph_skips_provider_when_local_concurrency_limit_is_saturated() {
+async fn proxy_route_graph_balanced_scheduling_waits_for_preferred_capacity() {
+    let primary_hits = Arc::new(AtomicUsize::new(0));
+    let backup_hits = Arc::new(AtomicUsize::new(0));
+    let primary_started = Arc::new(tokio::sync::Notify::new());
+    let release_primary = Arc::new(tokio::sync::Notify::new());
+
+    let primary_counter = primary_hits.clone();
+    let primary_started_for_route = primary_started.clone();
+    let release_primary_for_route = release_primary.clone();
+    let primary = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let primary_counter = primary_counter.clone();
+            let primary_started = primary_started_for_route.clone();
+            let release_primary = release_primary_for_route.clone();
+            async move {
+                let hit = primary_counter.fetch_add(1, Ordering::SeqCst);
+                if hit == 0 {
+                    primary_started.notify_one();
+                    release_primary.notified().await;
+                }
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "provider": "primary" })),
+                )
+            }
+        }),
+    );
+    let (primary_addr, primary_handle) = spawn_axum_server(primary);
+
+    let backup_counter = backup_hits.clone();
+    let backup = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let backup_counter = backup_counter.clone();
+            async move {
+                backup_counter.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "provider": "backup" })),
+                )
+            }
+        }),
+    );
+    let (backup_addr, backup_handle) = spawn_axum_server(backup);
+
+    let source = HelperConfig {
+        codex: ServiceRouteConfig {
+            providers: std::collections::BTreeMap::from([
+                (
+                    "primary".to_string(),
+                    ProviderConfig {
+                        base_url: Some(format!("http://{primary_addr}/v1")),
+                        inline_auth: UpstreamAuth::default(),
+                        limits: ProviderConcurrencyLimits {
+                            max_concurrent_requests: Some(1),
+                            limit_group: None,
+                        },
+                        ..ProviderConfig::default()
+                    },
+                ),
+                (
+                    "backup".to_string(),
+                    ProviderConfig {
+                        base_url: Some(format!("http://{backup_addr}/v1")),
+                        inline_auth: UpstreamAuth::default(),
+                        ..ProviderConfig::default()
+                    },
+                ),
+            ]),
+            routing: Some(RouteGraphConfig {
+                entry: "main".to_string(),
+                routes: std::collections::BTreeMap::from([(
+                    "main".to_string(),
+                    RouteNodeConfig {
+                        strategy: RouteStrategy::OrderedFailover,
+                        children: vec!["primary".to_string(), "backup".to_string()],
+                        ..RouteNodeConfig::default()
+                    },
+                )]),
+                ..RouteGraphConfig::default()
+            }),
+            ..ServiceRouteConfig::default()
+        },
+        ..HelperConfig::default()
+    };
+    let proxy = ProxyService::new(Client::new(), Arc::new(source), "codex");
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let client = reqwest::Client::new();
+
+    let first_request = tokio::spawn({
+        let client = client.clone();
+        async move { send_responses_json(&client, proxy_addr, Some("sid-primary")).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), primary_started.notified())
+        .await
+        .expect("primary request should acquire the only local concurrency permit");
+
+    let second_request = tokio::spawn({
+        let client = client.clone();
+        async move { send_responses_json(&client, proxy_addr, Some("sid-second")).await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let second_finished_early = second_request.is_finished();
+    let backup_hits_before_release = backup_hits.load(Ordering::SeqCst);
+
+    release_primary.notify_one();
+    let first = tokio::time::timeout(Duration::from_secs(2), first_request)
+        .await
+        .expect("first request should finish after release")
+        .expect("first request task should join");
+    let second = tokio::time::timeout(Duration::from_secs(2), second_request)
+        .await
+        .expect("second request should acquire released preferred capacity")
+        .expect("second request task should join");
+
+    assert!(
+        !second_finished_early,
+        "balanced request must wait for capacity"
+    );
+    assert_eq!(backup_hits_before_release, 0);
+    assert_eq!(first["provider"].as_str(), Some("primary"));
+    assert_eq!(second["provider"].as_str(), Some("primary"));
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 2);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
+
+    proxy_handle.abort();
+    primary_handle.abort();
+    backup_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_http_capacity_wait_keeps_captured_runtime_snapshot_across_reload() {
+    let _env_guard = env_lock().await;
+    let codex_home = make_temp_test_dir();
+    let helper_home = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HOME", &codex_home);
+        scoped.set_path("CODEX_HELPER_HOME", &helper_home);
+    }
+
+    let old_hits = Arc::new(AtomicUsize::new(0));
+    let first_started = Arc::new(tokio::sync::Notify::new());
+    let release_first = Arc::new(tokio::sync::Notify::new());
+    let old_counter = old_hits.clone();
+    let first_started_for_route = first_started.clone();
+    let release_first_for_route = release_first.clone();
+    let old_upstream = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let old_counter = old_counter.clone();
+            let first_started = first_started_for_route.clone();
+            let release_first = release_first_for_route.clone();
+            async move {
+                let hit = old_counter.fetch_add(1, Ordering::SeqCst) + 1;
+                if hit == 1 {
+                    first_started.notify_one();
+                    release_first.notified().await;
+                }
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "runtime": "old", "hit": hit })),
+                )
+            }
+        }),
+    );
+    let (old_addr, old_handle) = spawn_axum_server(old_upstream);
+
+    let new_hits = Arc::new(AtomicUsize::new(0));
+    let new_counter = new_hits.clone();
+    let new_upstream = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let new_counter = new_counter.clone();
+            async move {
+                let hit = new_counter.fetch_add(1, Ordering::SeqCst) + 1;
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "runtime": "new", "hit": hit })),
+                )
+            }
+        }),
+    );
+    let (new_addr, new_handle) = spawn_axum_server(new_upstream);
+
+    let initial = capacity_wait_config(format!("http://{old_addr}/v1"), None);
+    crate::config::save_helper_config(&initial)
+        .await
+        .expect("save initial capacity route config");
+    let loaded = crate::config::load_config_with_source()
+        .await
+        .expect("load initial capacity route config");
+    let proxy = proxy_with_loaded_route_graph_config(loaded);
+    let retained = proxy.clone();
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let client = reqwest::Client::new();
+
+    let first_request = tokio::spawn({
+        let client = client.clone();
+        async move { send_responses_json(&client, proxy_addr, Some("sid-reload-first")).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), first_started.notified())
+        .await
+        .expect("first request should occupy the old primary capacity");
+
+    let queued_request = tokio::spawn({
+        let client = client.clone();
+        async move { send_responses_json(&client, proxy_addr, Some("sid-reload-queued")).await }
+    });
+    wait_for_provider_pending(&retained, "primary", 1, 1).await;
+
+    let reloaded = capacity_wait_config(format!("http://{new_addr}/v1"), None);
+    crate::config::save_helper_config(&reloaded)
+        .await
+        .expect("save reloaded capacity route config");
+    assert!(
+        retained
+            .config
+            .force_reload_from_disk()
+            .await
+            .expect("reload capacity route config"),
+        "changed primary origin should publish a new runtime snapshot"
+    );
+
+    release_first.notify_one();
+    let first = tokio::time::timeout(Duration::from_secs(2), first_request)
+        .await
+        .expect("first request should finish after release")
+        .expect("first request task should join");
+    let queued = tokio::time::timeout(Duration::from_secs(2), queued_request)
+        .await
+        .expect("queued request should acquire the released old capacity")
+        .expect("queued request task should join");
+    let next = send_responses_json(&client, proxy_addr, Some("sid-reload-next")).await;
+
+    assert_eq!(first["runtime"].as_str(), Some("old"));
+    assert_eq!(queued["runtime"].as_str(), Some("old"));
+    assert_eq!(next["runtime"].as_str(), Some("new"));
+    assert_eq!(old_hits.load(Ordering::SeqCst), 2);
+    assert_eq!(new_hits.load(Ordering::SeqCst), 1);
+
+    proxy_handle.abort();
+    old_handle.abort();
+    new_handle.abort();
+    let _ = std::fs::remove_dir_all(codex_home);
+    let _ = std::fs::remove_dir_all(helper_home);
+}
+
+#[tokio::test]
+async fn proxy_http_capacity_wait_keeps_captured_policy_until_next_request() {
+    let primary_hits = Arc::new(AtomicUsize::new(0));
+    let first_started = Arc::new(tokio::sync::Notify::new());
+    let release_first = Arc::new(tokio::sync::Notify::new());
+    let primary_counter = primary_hits.clone();
+    let first_started_for_route = first_started.clone();
+    let release_first_for_route = release_first.clone();
+    let primary = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let primary_counter = primary_counter.clone();
+            let first_started = first_started_for_route.clone();
+            let release_first = release_first_for_route.clone();
+            async move {
+                let hit = primary_counter.fetch_add(1, Ordering::SeqCst) + 1;
+                if hit == 1 {
+                    first_started.notify_one();
+                    release_first.notified().await;
+                }
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "provider": "primary", "hit": hit })),
+                )
+            }
+        }),
+    );
+    let (primary_addr, primary_handle) = spawn_axum_server(primary);
+
+    let backup_hits = Arc::new(AtomicUsize::new(0));
+    let backup_counter = backup_hits.clone();
+    let backup = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let backup_counter = backup_counter.clone();
+            async move {
+                let hit = backup_counter.fetch_add(1, Ordering::SeqCst) + 1;
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "provider": "backup", "hit": hit })),
+                )
+            }
+        }),
+    );
+    let (backup_addr, backup_handle) = spawn_axum_server(backup);
+
+    let source = capacity_wait_config(
+        format!("http://{primary_addr}/v1"),
+        Some(format!("http://{backup_addr}/v1")),
+    );
+    let proxy = ProxyService::new(Client::new(), Arc::new(source), "codex");
+    let retained = proxy.clone();
+    let state = proxy.state.clone();
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let client = reqwest::Client::new();
+
+    let first_request = tokio::spawn({
+        let client = client.clone();
+        async move { send_responses_json(&client, proxy_addr, Some("sid-policy-first")).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), first_started.notified())
+        .await
+        .expect("first request should occupy the primary capacity");
+
+    let queued_request = tokio::spawn({
+        let client = client.clone();
+        async move { send_responses_json(&client, proxy_addr, Some("sid-policy-queued")).await }
+    });
+    wait_for_provider_pending(&retained, "primary", 1, 1).await;
+
+    state
+        .set_provider_manual_eligibility(
+            crate::runtime_identity::ProviderEndpointKey::new("codex", "primary", "default"),
+            crate::runtime_store::ProviderManualEligibility::Disabled,
+            Some("test disables primary after the HTTP request is queued".to_string()),
+            crate::logging::now_ms(),
+        )
+        .await
+        .expect("commit manual primary eligibility");
+    retained
+        .config
+        .publish_provider_policy(state.capture_provider_policy_snapshot().await)
+        .await
+        .expect("publish disabled primary policy snapshot");
+
+    release_first.notify_one();
+    let first = tokio::time::timeout(Duration::from_secs(2), first_request)
+        .await
+        .expect("first request should finish after release")
+        .expect("first request task should join");
+    let queued = tokio::time::timeout(Duration::from_secs(2), queued_request)
+        .await
+        .expect("queued request should acquire capacity under its captured policy")
+        .expect("queued request task should join");
+    let next = send_responses_json(&client, proxy_addr, Some("sid-policy-next")).await;
+
+    assert_eq!(first["provider"].as_str(), Some("primary"));
+    assert_eq!(queued["provider"].as_str(), Some("primary"));
+    assert_eq!(next["provider"].as_str(), Some("backup"));
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 2);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 1);
+
+    proxy_handle.abort();
+    primary_handle.abort();
+    backup_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_route_graph_route_graph_skips_provider_when_local_concurrency_limit_is_saturated() {
     let primary_hits = Arc::new(AtomicUsize::new(0));
     let backup_hits = Arc::new(AtomicUsize::new(0));
     let primary_started = Arc::new(tokio::sync::Notify::new());
@@ -737,54 +1109,49 @@ async fn proxy_v4_route_graph_skips_provider_when_local_concurrency_limit_is_sat
     );
     let (backup_addr, backup_handle) = spawn_axum_server(backup);
 
-    let v4 = ProxyConfigV4 {
-        codex: ServiceViewV4 {
+    let source = HelperConfig {
+        codex: ServiceRouteConfig {
             providers: std::collections::BTreeMap::from([
                 (
                     "primary".to_string(),
-                    ProviderConfigV4 {
+                    ProviderConfig {
                         base_url: Some(format!("http://{primary_addr}/v1")),
                         inline_auth: UpstreamAuth::default(),
                         limits: ProviderConcurrencyLimits {
                             max_concurrent_requests: Some(1),
                             limit_group: None,
                         },
-                        ..ProviderConfigV4::default()
+                        ..ProviderConfig::default()
                     },
                 ),
                 (
                     "backup".to_string(),
-                    ProviderConfigV4 {
+                    ProviderConfig {
                         base_url: Some(format!("http://{backup_addr}/v1")),
                         inline_auth: UpstreamAuth::default(),
-                        ..ProviderConfigV4::default()
+                        ..ProviderConfig::default()
                     },
                 ),
             ]),
-            routing: Some(RoutingConfigV4 {
+            routing: Some(RouteGraphConfig {
                 entry: "main".to_string(),
+                scheduling_preset: SchedulingPreset::ThroughputFirst,
                 routes: std::collections::BTreeMap::from([(
                     "main".to_string(),
-                    RoutingNodeV4 {
-                        strategy: RoutingPolicyV4::OrderedFailover,
+                    RouteNodeConfig {
+                        strategy: RouteStrategy::OrderedFailover,
                         children: vec!["primary".to_string(), "backup".to_string()],
-                        ..RoutingNodeV4::default()
+                        ..RouteNodeConfig::default()
                     },
                 )]),
-                ..RoutingConfigV4::default()
+                ..RouteGraphConfig::default()
             }),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         },
-        ..ProxyConfigV4::default()
+        ..HelperConfig::default()
     };
-    let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compat runtime");
-    let proxy = ProxyService::new_with_v4_source(
-        Client::new(),
-        Arc::new(runtime),
-        Some(Arc::new(v4)),
-        "codex",
-        Arc::new(std::sync::Mutex::new(HashMap::new())),
-    );
+    let proxy = ProxyService::new(Client::new(), Arc::new(source), "codex");
+    let proxy_for_explain = proxy.clone();
     let app = crate::proxy::router(proxy);
     let (proxy_addr, proxy_handle) = spawn_axum_server(app);
     let client = reqwest::Client::new();
@@ -797,19 +1164,14 @@ async fn proxy_v4_route_graph_skips_provider_when_local_concurrency_limit_is_sat
         .await
         .expect("primary request should acquire the only local concurrency permit");
 
-    let explain = client
-        .get(format!(
-            "http://{}/__codex_helper/api/v1/routing/explain?session=sid-second",
-            proxy_addr
-        ))
-        .send()
+    let explain = proxy_for_explain
+        .routing_explain(
+            crate::routing_ir::RouteRequestContext::default(),
+            Some("sid-second".to_string()),
+        )
         .await
-        .expect("routing explain send")
-        .error_for_status()
-        .expect("routing explain status")
-        .json::<serde_json::Value>()
-        .await
-        .expect("routing explain json");
+        .expect("build routing explain");
+    let explain = serde_json::to_value(explain).expect("serialize routing explain");
     assert_eq!(
         explain["selected_route"]["provider_id"].as_str(),
         Some("backup")
@@ -898,7 +1260,7 @@ async fn proxy_v4_route_graph_skips_provider_when_local_concurrency_limit_is_sat
 }
 
 #[tokio::test]
-async fn proxy_v4_conditional_routing_selects_branch_by_request_model() {
+async fn proxy_route_graph_conditional_routing_selects_branch_by_request_model() {
     let small_hits = Arc::new(AtomicUsize::new(0));
     let large_hits = Arc::new(AtomicUsize::new(0));
 
@@ -928,55 +1290,48 @@ async fn proxy_v4_conditional_routing_selects_branch_by_request_model() {
     );
     let (large_addr, large_handle) = spawn_axum_server(large);
 
-    let v4 = ProxyConfigV4 {
-        codex: ServiceViewV4 {
+    let source = HelperConfig {
+        codex: ServiceRouteConfig {
             providers: std::collections::BTreeMap::from([
                 (
                     "small".to_string(),
-                    ProviderConfigV4 {
+                    ProviderConfig {
                         base_url: Some(format!("http://{}/v1", small_addr)),
                         inline_auth: UpstreamAuth::default(),
-                        ..ProviderConfigV4::default()
+                        ..ProviderConfig::default()
                     },
                 ),
                 (
                     "large".to_string(),
-                    ProviderConfigV4 {
+                    ProviderConfig {
                         base_url: Some(format!("http://{}/v1", large_addr)),
                         inline_auth: UpstreamAuth::default(),
-                        ..ProviderConfigV4::default()
+                        ..ProviderConfig::default()
                     },
                 ),
             ]),
-            routing: Some(RoutingConfigV4 {
+            routing: Some(RouteGraphConfig {
                 entry: "root".to_string(),
                 routes: std::collections::BTreeMap::from([(
                     "root".to_string(),
-                    RoutingNodeV4 {
-                        strategy: RoutingPolicyV4::Conditional,
-                        when: Some(RoutingConditionV4 {
+                    RouteNodeConfig {
+                        strategy: RouteStrategy::Conditional,
+                        when: Some(RouteCondition {
                             model: Some("gpt-5".to_string()),
-                            ..RoutingConditionV4::default()
+                            ..RouteCondition::default()
                         }),
                         then: Some("large".to_string()),
                         default_route: Some("small".to_string()),
-                        ..RoutingNodeV4::default()
+                        ..RouteNodeConfig::default()
                     },
                 )]),
-                ..RoutingConfigV4::default()
+                ..RouteGraphConfig::default()
             }),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         },
-        ..ProxyConfigV4::default()
+        ..HelperConfig::default()
     };
-    let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compat runtime");
-    let proxy = ProxyService::new_with_v4_source(
-        Client::new(),
-        Arc::new(runtime),
-        Some(Arc::new(v4)),
-        "codex",
-        Arc::new(std::sync::Mutex::new(HashMap::new())),
-    );
+    let proxy = ProxyService::new(Client::new(), Arc::new(source), "codex");
     let state = proxy.state.clone();
     let app = crate::proxy::router(proxy);
     let (proxy_addr, proxy_handle) = spawn_axum_server(app);
@@ -1075,7 +1430,7 @@ async fn proxy_same_upstream_retries_502_then_succeeds_without_failover() {
 
     let proxy_client = Client::new();
     let retry = retry_config(2, "502", Vec::new(), RetryStrategy::SameUpstream);
-    let cfg = make_proxy_config(
+    let cfg = make_helper_config(
         vec![
             UpstreamConfig {
                 base_url: format!("http://{}/v1", u1_addr),
@@ -1113,12 +1468,7 @@ async fn proxy_same_upstream_retries_502_then_succeeds_without_failover() {
         retry,
     );
 
-    let proxy = ProxyService::new(
-        proxy_client,
-        Arc::new(cfg),
-        "codex",
-        Arc::new(std::sync::Mutex::new(HashMap::new())),
-    );
+    let proxy = ProxyService::new(proxy_client, Arc::new(cfg), "codex");
     let app = crate::proxy::router(proxy);
     let (proxy_addr, proxy_handle) = spawn_axum_server(app);
 
@@ -1170,11 +1520,9 @@ async fn proxy_failover_across_requests_penalizes_502_when_no_internal_retry() {
             u2_hits.fetch_add(1, Ordering::SeqCst);
             async move {
                 let s = stream::iter(
-                    vec![Bytes::from_static(
-                        b"data: {\"ok\":true,\"upstream\":2}\n\n",
-                    )]
-                    .into_iter()
-                    .map(Ok::<Bytes, Infallible>),
+                    vec![Bytes::from_static(UPSTREAM_TWO_SUCCESS_SSE)]
+                        .into_iter()
+                        .map(Ok::<Bytes, Infallible>),
                 );
                 let mut resp = Response::new(Body::from_stream(s));
                 *resp.status_mut() = StatusCode::OK;
@@ -1208,7 +1556,6 @@ async fn proxy_failover_across_requests_penalizes_502_when_no_internal_retry() {
             on_class: Some(Vec::new()),
             strategy: Some(RetryStrategy::Failover),
         }),
-        allow_cross_station_before_first_output: Some(true),
         cloudflare_challenge_cooldown_secs: Some(0),
         cloudflare_timeout_cooldown_secs: Some(0),
         transport_cooldown_secs: Some(60),
@@ -1216,7 +1563,7 @@ async fn proxy_failover_across_requests_penalizes_502_when_no_internal_retry() {
         cooldown_backoff_max_secs: Some(0),
         ..Default::default()
     };
-    let cfg = make_proxy_config(
+    let cfg = make_helper_config(
         vec![
             UpstreamConfig {
                 base_url: format!("http://{}/v1", u1_addr),
@@ -1254,12 +1601,7 @@ async fn proxy_failover_across_requests_penalizes_502_when_no_internal_retry() {
         retry,
     );
 
-    let proxy = ProxyService::new(
-        proxy_client,
-        Arc::new(cfg),
-        "codex",
-        Arc::new(std::sync::Mutex::new(HashMap::new())),
-    );
+    let proxy = ProxyService::new(proxy_client, Arc::new(cfg), "codex");
     let state = proxy.state.clone();
     let app = crate::proxy::router(proxy);
     let (proxy_addr, proxy_handle) = spawn_axum_server(app);
@@ -1282,6 +1624,7 @@ async fn proxy_failover_across_requests_penalizes_502_when_no_internal_retry() {
         body1_s.contains(r#""upstream":2"#),
         "expected response from upstream2, got: {body1_s}"
     );
+    assert!(!body1_s.contains("response.failed"), "{body1_s}");
     let mut finished = Vec::new();
     for _ in 0..100 {
         finished = state.list_recent_finished(10).await;
@@ -1301,8 +1644,15 @@ async fn proxy_failover_across_requests_penalizes_502_when_no_internal_retry() {
     assert_eq!(retry.route_attempts[0].provider_attempt, Some(1));
     assert_eq!(retry.route_attempts[1].decision, "completed");
     assert_eq!(retry.route_attempts[1].provider_id.as_deref(), Some("u2"));
+    assert_eq!(
+        retry.route_attempts[1].endpoint_id.as_deref(),
+        Some("default")
+    );
+    assert_eq!(
+        retry.route_attempts[1].provider_endpoint_key.as_deref(),
+        Some("codex/u2/default")
+    );
     assert_eq!(retry.route_attempts[1].provider_attempt, Some(1));
-    assert_eq!(retry.route_attempts[1].upstream_index, Some(1));
     assert!(retry.route_attempts[1].upstream_headers_ms.is_some());
 
     // Second request should now go directly to upstream2 thanks to the cooldown on upstream1.
@@ -1335,6 +1685,7 @@ async fn proxy_failover_across_requests_penalizes_502_when_no_internal_retry() {
         body_s.contains(r#""upstream":2"#),
         "expected response from upstream2, got: {body_s}"
     );
+    assert!(!body_s.contains("response.failed"), "{body_s}");
 
     assert_eq!(upstream1_hits.load(Ordering::SeqCst), 1);
     assert_eq!(upstream2_hits.load(Ordering::SeqCst), 2);
@@ -1355,11 +1706,9 @@ async fn proxy_failover_across_requests_penalizes_transport_error_when_no_intern
             u2_hits.fetch_add(1, Ordering::SeqCst);
             async move {
                 let s = stream::iter(
-                    vec![Bytes::from_static(
-                        b"data: {\"ok\":true,\"upstream\":2}\n\n",
-                    )]
-                    .into_iter()
-                    .map(Ok::<Bytes, Infallible>),
+                    vec![Bytes::from_static(UPSTREAM_TWO_SUCCESS_SSE)]
+                        .into_iter()
+                        .map(Ok::<Bytes, Infallible>),
                 );
                 let mut resp = Response::new(Body::from_stream(s));
                 *resp.status_mut() = StatusCode::OK;
@@ -1385,7 +1734,7 @@ async fn proxy_failover_across_requests_penalizes_transport_error_when_no_intern
         0,
         60,
     );
-    let cfg = make_proxy_config(
+    let cfg = make_helper_config(
         vec![
             UpstreamConfig {
                 base_url: format!("http://{}/v1", unused),
@@ -1423,12 +1772,7 @@ async fn proxy_failover_across_requests_penalizes_transport_error_when_no_intern
         retry,
     );
 
-    let proxy = ProxyService::new(
-        proxy_client,
-        Arc::new(cfg),
-        "codex",
-        Arc::new(std::sync::Mutex::new(HashMap::new())),
-    );
+    let proxy = ProxyService::new(proxy_client, Arc::new(cfg), "codex");
     let app = crate::proxy::router(proxy);
     let (proxy_addr, proxy_handle) = spawn_axum_server(app);
 
@@ -1449,6 +1793,7 @@ async fn proxy_failover_across_requests_penalizes_transport_error_when_no_intern
         body1_s.contains(r#""upstream":2"#),
         "expected response from upstream2, got: {body1_s}"
     );
+    assert!(!body1_s.contains("response.failed"), "{body1_s}");
 
     let resp2 = client
         .post(format!("http://{}/v1/responses", proxy_addr))
@@ -1465,6 +1810,7 @@ async fn proxy_failover_across_requests_penalizes_transport_error_when_no_intern
         body_s.contains(r#""upstream":2"#),
         "expected response from upstream2, got: {body_s}"
     );
+    assert!(!body_s.contains("response.failed"), "{body_s}");
     assert_eq!(upstream2_hits.load(Ordering::SeqCst), 2);
 
     proxy_handle.abort();
@@ -1505,11 +1851,9 @@ async fn proxy_failover_across_requests_penalizes_cloudflare_challenge_when_no_i
             u2_hits.fetch_add(1, Ordering::SeqCst);
             async move {
                 let s = stream::iter(
-                    vec![Bytes::from_static(
-                        b"data: {\"ok\":true,\"upstream\":2}\n\n",
-                    )]
-                    .into_iter()
-                    .map(Ok::<Bytes, Infallible>),
+                    vec![Bytes::from_static(UPSTREAM_TWO_SUCCESS_SSE)]
+                        .into_iter()
+                        .map(Ok::<Bytes, Infallible>),
                 );
                 let mut resp = Response::new(Body::from_stream(s));
                 *resp.status_mut() = StatusCode::OK;
@@ -1533,7 +1877,7 @@ async fn proxy_failover_across_requests_penalizes_cloudflare_challenge_when_no_i
         0,
         0,
     );
-    let cfg = make_proxy_config(
+    let cfg = make_helper_config(
         vec![
             UpstreamConfig {
                 base_url: format!("http://{}/v1", u1_addr),
@@ -1571,12 +1915,7 @@ async fn proxy_failover_across_requests_penalizes_cloudflare_challenge_when_no_i
         retry,
     );
 
-    let proxy = ProxyService::new(
-        proxy_client,
-        Arc::new(cfg),
-        "codex",
-        Arc::new(std::sync::Mutex::new(HashMap::new())),
-    );
+    let proxy = ProxyService::new(proxy_client, Arc::new(cfg), "codex");
     let app = crate::proxy::router(proxy);
     let (proxy_addr, proxy_handle) = spawn_axum_server(app);
 
@@ -1647,11 +1986,9 @@ async fn proxy_multi_config_failover_across_requests_respects_cooldown() {
             b_hits.fetch_add(1, Ordering::SeqCst);
             async move {
                 let s = stream::iter(
-                    vec![Bytes::from_static(
-                        b"data: {\"ok\":true,\"upstream\":\"backup\"}\n\n",
-                    )]
-                    .into_iter()
-                    .map(Ok::<Bytes, Infallible>),
+                    vec![Bytes::from_static(BACKUP_SUCCESS_SSE)]
+                        .into_iter()
+                        .map(Ok::<Bytes, Infallible>),
                 );
                 let mut resp = Response::new(Body::from_stream(s));
                 *resp.status_mut() = StatusCode::OK;
@@ -1684,7 +2021,6 @@ async fn proxy_multi_config_failover_across_requests_respects_cooldown() {
             on_class: Some(Vec::new()),
             strategy: Some(RetryStrategy::Failover),
         }),
-        allow_cross_station_before_first_output: Some(true),
         cloudflare_challenge_cooldown_secs: Some(0),
         cloudflare_timeout_cooldown_secs: Some(0),
         transport_cooldown_secs: Some(60),
@@ -1693,79 +2029,35 @@ async fn proxy_multi_config_failover_across_requests_respects_cooldown() {
         ..Default::default()
     };
 
-    let mut mgr = ServiceConfigManager {
-        active: Some("primary".to_string()),
-        ..Default::default()
-    };
-    mgr.configs.insert(
-        "primary".to_string(),
-        ServiceConfig {
-            name: "primary".to_string(),
-            alias: None,
-            enabled: true,
-            level: 1,
-            upstreams: vec![UpstreamConfig {
-                base_url: format!("http://{}/v1", p_addr),
-                auth: UpstreamAuth {
-                    auth_token: None,
-                    auth_token_env: None,
-                    api_key: None,
-                    api_key_env: None,
-                },
-                tags: {
-                    let mut t = HashMap::new();
-                    t.insert("provider_id".to_string(), "primary".to_string());
-                    t
-                },
-                supported_models: HashMap::new(),
-                model_mapping: HashMap::new(),
-            }],
+    let cfg = HelperConfig {
+        codex: ServiceRouteConfig {
+            providers: std::collections::BTreeMap::from([
+                (
+                    "primary".to_string(),
+                    ProviderConfig {
+                        base_url: Some(format!("http://{p_addr}/v1")),
+                        ..ProviderConfig::default()
+                    },
+                ),
+                (
+                    "backup".to_string(),
+                    ProviderConfig {
+                        base_url: Some(format!("http://{b_addr}/v1")),
+                        ..ProviderConfig::default()
+                    },
+                ),
+            ]),
+            routing: Some(RouteGraphConfig::ordered_failover(vec![
+                "primary".to_string(),
+                "backup".to_string(),
+            ])),
+            ..ServiceRouteConfig::default()
         },
-    );
-    mgr.configs.insert(
-        "backup".to_string(),
-        ServiceConfig {
-            name: "backup".to_string(),
-            alias: None,
-            enabled: true,
-            level: 2,
-            upstreams: vec![UpstreamConfig {
-                base_url: format!("http://{}/v1", b_addr),
-                auth: UpstreamAuth {
-                    auth_token: None,
-                    auth_token_env: None,
-                    api_key: None,
-                    api_key_env: None,
-                },
-                tags: {
-                    let mut t = HashMap::new();
-                    t.insert("provider_id".to_string(), "backup".to_string());
-                    t
-                },
-                supported_models: HashMap::new(),
-                model_mapping: HashMap::new(),
-            }],
-        },
-    );
-
-    let cfg = ProxyConfig {
-        version: Some(1),
-        codex: mgr,
-        claude: ServiceConfigManager::default(),
         retry,
-        notify: Default::default(),
-        default_service: None,
-        relay_targets: std::collections::BTreeMap::new(),
-        fleet: Default::default(),
-        ui: UiConfig::default(),
+        ..HelperConfig::default()
     };
 
-    let proxy = ProxyService::new(
-        Client::new(),
-        Arc::new(cfg),
-        "codex",
-        Arc::new(std::sync::Mutex::new(HashMap::new())),
-    );
+    let proxy = ProxyService::new(Client::new(), Arc::new(cfg), "codex");
     let app = crate::proxy::router(proxy);
     let (proxy_addr, proxy_handle) = spawn_axum_server(app);
 
@@ -1786,6 +2078,7 @@ async fn proxy_multi_config_failover_across_requests_respects_cooldown() {
         body1_s.contains(r#""upstream":"backup""#),
         "expected response from backup, got: {body1_s}"
     );
+    assert!(!body1_s.contains("response.failed"), "{body1_s}");
 
     let resp2 = client
         .post(format!("http://{}/v1/responses", proxy_addr))
@@ -1802,182 +2095,10 @@ async fn proxy_multi_config_failover_across_requests_respects_cooldown() {
         body2_s.contains(r#""upstream":"backup""#),
         "expected response from backup, got: {body2_s}"
     );
+    assert!(!body2_s.contains("response.failed"), "{body2_s}");
 
     assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
     assert_eq!(backup_hits.load(Ordering::SeqCst), 2);
-
-    proxy_handle.abort();
-    p_handle.abort();
-    b_handle.abort();
-}
-
-#[tokio::test]
-async fn proxy_multi_config_does_not_cross_station_failover_when_pre_output_guard_disabled() {
-    let primary_hits = Arc::new(AtomicUsize::new(0));
-    let backup_hits = Arc::new(AtomicUsize::new(0));
-
-    let p_hits = primary_hits.clone();
-    let primary = axum::Router::new().route(
-        "/v1/responses",
-        post(move || async move {
-            p_hits.fetch_add(1, Ordering::SeqCst);
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({ "err": "primary 502" })),
-            )
-        }),
-    );
-    let (p_addr, p_handle) = spawn_axum_server(primary);
-
-    let b_hits = backup_hits.clone();
-    let backup = axum::Router::new().route(
-        "/v1/responses",
-        post(move || async move {
-            b_hits.fetch_add(1, Ordering::SeqCst);
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({ "ok": true, "upstream": "backup" })),
-            )
-        }),
-    );
-    let (b_addr, b_handle) = spawn_axum_server(backup);
-
-    let retry = RetryConfig {
-        upstream: Some(crate::config::RetryLayerConfig {
-            max_attempts: Some(1),
-            backoff_ms: Some(0),
-            backoff_max_ms: Some(0),
-            jitter_ms: Some(0),
-            on_status: Some("502".to_string()),
-            on_class: Some(Vec::new()),
-            strategy: Some(RetryStrategy::SameUpstream),
-        }),
-        provider: Some(crate::config::RetryLayerConfig {
-            max_attempts: Some(2),
-            backoff_ms: Some(0),
-            backoff_max_ms: Some(0),
-            jitter_ms: Some(0),
-            on_status: Some("502".to_string()),
-            on_class: Some(Vec::new()),
-            strategy: Some(RetryStrategy::Failover),
-        }),
-        allow_cross_station_before_first_output: Some(false),
-        cloudflare_challenge_cooldown_secs: Some(0),
-        cloudflare_timeout_cooldown_secs: Some(0),
-        transport_cooldown_secs: Some(60),
-        cooldown_backoff_factor: Some(1),
-        cooldown_backoff_max_secs: Some(0),
-        ..Default::default()
-    };
-
-    let mut mgr = ServiceConfigManager {
-        active: Some("primary".to_string()),
-        ..Default::default()
-    };
-    mgr.configs.insert(
-        "primary".to_string(),
-        ServiceConfig {
-            name: "primary".to_string(),
-            alias: None,
-            enabled: true,
-            level: 1,
-            upstreams: vec![UpstreamConfig {
-                base_url: format!("http://{}/v1", p_addr),
-                auth: UpstreamAuth {
-                    auth_token: None,
-                    auth_token_env: None,
-                    api_key: None,
-                    api_key_env: None,
-                },
-                tags: {
-                    let mut t = HashMap::new();
-                    t.insert("provider_id".to_string(), "primary".to_string());
-                    t
-                },
-                supported_models: HashMap::new(),
-                model_mapping: HashMap::new(),
-            }],
-        },
-    );
-    mgr.configs.insert(
-        "backup".to_string(),
-        ServiceConfig {
-            name: "backup".to_string(),
-            alias: None,
-            enabled: true,
-            level: 2,
-            upstreams: vec![UpstreamConfig {
-                base_url: format!("http://{}/v1", b_addr),
-                auth: UpstreamAuth {
-                    auth_token: None,
-                    auth_token_env: None,
-                    api_key: None,
-                    api_key_env: None,
-                },
-                tags: {
-                    let mut t = HashMap::new();
-                    t.insert("provider_id".to_string(), "backup".to_string());
-                    t
-                },
-                supported_models: HashMap::new(),
-                model_mapping: HashMap::new(),
-            }],
-        },
-    );
-
-    let cfg = ProxyConfig {
-        version: Some(1),
-        codex: mgr,
-        claude: ServiceConfigManager::default(),
-        retry,
-        notify: Default::default(),
-        default_service: None,
-        relay_targets: std::collections::BTreeMap::new(),
-        fleet: Default::default(),
-        ui: UiConfig::default(),
-    };
-
-    let proxy = ProxyService::new(
-        Client::new(),
-        Arc::new(cfg),
-        "codex",
-        Arc::new(std::sync::Mutex::new(HashMap::new())),
-    );
-    let app = crate::proxy::router(proxy);
-    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
-
-    let client = reqwest::Client::new();
-
-    let resp1 = client
-        .post(format!("http://{}/v1/responses", proxy_addr))
-        .header("content-type", "application/json")
-        .body(r#"{"model":"gpt","input":"hi"}"#)
-        .send()
-        .await
-        .expect("send");
-    assert_eq!(resp1.status(), StatusCode::BAD_GATEWAY);
-    let body1 = resp1.text().await.expect("read body");
-    assert!(
-        body1.contains("primary 502"),
-        "expected first request to fail at primary, got: {body1}"
-    );
-
-    let resp2 = client
-        .post(format!("http://{}/v1/responses", proxy_addr))
-        .header("content-type", "application/json")
-        .body(r#"{"model":"gpt","input":"hi"}"#)
-        .send()
-        .await
-        .expect("send");
-    assert_eq!(resp2.status(), StatusCode::BAD_GATEWAY);
-    let body2 = resp2.text().await.expect("read body");
-    assert!(
-        !body2.contains("backup"),
-        "expected second request to stay blocked instead of using backup, got: {body2}"
-    );
-
-    assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
-    assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
 
     proxy_handle.abort();
     p_handle.abort();
@@ -2009,11 +2130,9 @@ async fn proxy_does_not_failover_when_502_is_not_retryable_and_threshold_not_rea
             u2_hits.fetch_add(1, Ordering::SeqCst);
             async move {
                 let s = stream::iter(
-                    vec![Bytes::from_static(
-                        b"data: {\"ok\":true,\"upstream\":2}\n\n",
-                    )]
-                    .into_iter()
-                    .map(Ok::<Bytes, Infallible>),
+                    vec![Bytes::from_static(UPSTREAM_TWO_SUCCESS_SSE)]
+                        .into_iter()
+                        .map(Ok::<Bytes, Infallible>),
                 );
                 let mut resp = Response::new(Body::from_stream(s));
                 *resp.status_mut() = StatusCode::OK;
@@ -2054,7 +2173,7 @@ async fn proxy_does_not_failover_when_502_is_not_retryable_and_threshold_not_rea
         cooldown_backoff_max_secs: Some(0),
         ..Default::default()
     };
-    let cfg = make_proxy_config(
+    let cfg = make_helper_config(
         vec![
             UpstreamConfig {
                 base_url: format!("http://{}/v1", u1_addr),
@@ -2084,12 +2203,7 @@ async fn proxy_does_not_failover_when_502_is_not_retryable_and_threshold_not_rea
         retry,
     );
 
-    let proxy = ProxyService::new(
-        proxy_client,
-        Arc::new(cfg),
-        "codex",
-        Arc::new(std::sync::Mutex::new(HashMap::new())),
-    );
+    let proxy = ProxyService::new(proxy_client, Arc::new(cfg), "codex");
     let app = crate::proxy::router(proxy);
     let (proxy_addr, proxy_handle) = spawn_axum_server(app);
 
@@ -2181,7 +2295,7 @@ async fn proxy_retries_each_upstream_once_and_stops_when_all_avoided() {
         cooldown_backoff_max_secs: Some(0),
         ..Default::default()
     };
-    let cfg = make_proxy_config(
+    let cfg = make_helper_config(
         vec![
             UpstreamConfig {
                 base_url: format!("http://{}/v1", u1_addr),
@@ -2211,12 +2325,7 @@ async fn proxy_retries_each_upstream_once_and_stops_when_all_avoided() {
         retry,
     );
 
-    let proxy = ProxyService::new(
-        proxy_client,
-        Arc::new(cfg),
-        "codex",
-        Arc::new(std::sync::Mutex::new(HashMap::new())),
-    );
+    let proxy = ProxyService::new(proxy_client, Arc::new(cfg), "codex");
     let state = proxy.state.clone();
     let app = crate::proxy::router(proxy);
     let (proxy_addr, proxy_handle) = spawn_axum_server(app);
@@ -2240,10 +2349,8 @@ async fn proxy_retries_each_upstream_once_and_stops_when_all_avoided() {
         "{body}"
     );
     assert!(body.contains("all upstream attempts failed"), "{body}");
-    assert!(
-        body.contains("upstream[0]") && body.contains("upstream[1]"),
-        "{body}"
-    );
+    assert!(body.contains("endpoint=codex/test/default"), "{body}");
+    assert!(body.contains("endpoint=codex/test-2/default"), "{body}");
     assert_eq!(upstream1_hits.load(Ordering::SeqCst), 1);
     assert_eq!(upstream2_hits.load(Ordering::SeqCst), 1);
 
@@ -2306,7 +2413,7 @@ async fn failed_single_attempt_records_route_attempts_for_logs() {
         cooldown_backoff_max_secs: Some(0),
         ..Default::default()
     };
-    let cfg = make_proxy_config(
+    let cfg = make_helper_config(
         vec![UpstreamConfig {
             base_url: format!("http://{}/v1", upstream_addr),
             auth: UpstreamAuth {
@@ -2326,12 +2433,7 @@ async fn failed_single_attempt_records_route_attempts_for_logs() {
         retry,
     );
 
-    let proxy = ProxyService::new(
-        Client::new(),
-        Arc::new(cfg),
-        "codex",
-        Arc::new(std::sync::Mutex::new(HashMap::new())),
-    );
+    let proxy = ProxyService::new(Client::new(), Arc::new(cfg), "codex");
     let state = proxy.state.clone();
     let app = crate::proxy::router(proxy);
     let (proxy_addr, proxy_handle) = spawn_axum_server(app);

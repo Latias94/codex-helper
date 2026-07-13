@@ -4,29 +4,31 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use axum::body::Bytes;
-use axum::http::{HeaderMap, Method, StatusCode, Uri};
+use axum::http::{HeaderMap, Method, StatusCode};
 use futures_util::StreamExt;
 
-use crate::codex_integration::CodexPatchMode;
-use crate::lb::LoadBalancer;
 use crate::logging::{BodyPreview, HeaderEntry, RouteAttemptLog};
-use crate::state::RouteDecisionProvenance;
+use crate::runtime_store::{AttemptHandle, AttemptOutcome, EconomicsState};
+use crate::state::{CapturedUpstreamAttemptContext, RouteDecisionProvenance};
 
 use super::ProxyService;
 use super::attempt_failures::{TerminalUpstreamFailureParams, apply_terminal_upstream_failure};
-use super::attempt_request::{AttemptRequestSetupParams, prepare_attempt_request};
-use super::attempt_target::AttemptTarget;
+use super::attempt_request::{
+    AttemptRequestIdentity, FrozenAttemptRequestSetupParams, prepare_attempt_request_with_identity,
+};
 use super::http_debug::{HttpDebugBase, format_reqwest_error_for_retry_chain};
 use super::retry::{RetryLayerOptions, backoff_sleep, should_retry_class};
 use super::route_attempts::{
     ErrorRouteAttemptParams, RouteAttemptErrorKind, record_error_route_attempt,
 };
+use crate::routing_ir::CapturedRouteCandidate;
 
 pub(super) struct AttemptTransportSuccess {
     pub(super) response: reqwest::Response,
     pub(super) upstream_start: Instant,
     pub(super) upstream_headers_ms: u64,
     pub(super) debug_base: Option<HttpDebugBase>,
+    pub(super) attempt_handle: AttemptHandle,
 }
 
 pub(super) enum AttemptTransportOutcome {
@@ -125,12 +127,12 @@ async fn read_response_body_with_limit(
 
 pub(super) struct AttemptTransportParams<'a> {
     pub(super) proxy: &'a ProxyService,
-    pub(super) legacy_lb: Option<&'a LoadBalancer>,
-    pub(super) target: &'a AttemptTarget,
+    pub(super) target: &'a CapturedRouteCandidate,
     pub(super) method: &'a Method,
-    pub(super) uri: &'a Uri,
+    pub(super) target_url: &'a reqwest::Url,
+    pub(super) request_identity: &'a AttemptRequestIdentity,
+    pub(super) attempt_context: &'a CapturedUpstreamAttemptContext,
     pub(super) client_headers: &'a HeaderMap,
-    pub(super) codex_client_patch_mode: CodexPatchMode,
     pub(super) client_headers_entries_cache: &'a OnceLock<Vec<HeaderEntry>>,
     pub(super) request_body_len: usize,
     pub(super) upstream_request_body_len: usize,
@@ -142,17 +144,30 @@ pub(super) struct AttemptTransportParams<'a> {
     pub(super) client_body_warn: Option<&'a BodyPreview>,
     pub(super) upstream_request_body_warn: Option<&'a BodyPreview>,
     pub(super) request_id: u64,
-    pub(super) provider_id: Option<&'a str>,
     pub(super) route_decision: &'a RouteDecisionProvenance,
     pub(super) filtered_body: &'a Bytes,
     pub(super) upstream_opt: &'a RetryLayerOptions,
     pub(super) upstream_attempt: u32,
     pub(super) transport_cooldown_secs: u64,
-    pub(super) cooldown_backoff: crate::lb::CooldownBackoff,
+    pub(super) cooldown_backoff: crate::endpoint_health::CooldownBackoff,
     pub(super) avoid_set: &'a mut HashSet<usize>,
     pub(super) avoided_total: &'a mut usize,
     pub(super) last_err: &'a mut Option<(StatusCode, String)>,
-    pub(super) upstream_chain: &'a mut Vec<String>,
+    pub(super) route_attempts: &'a mut Vec<RouteAttemptLog>,
+    pub(super) route_attempt_index: usize,
+    pub(super) model_note: &'a str,
+    pub(super) allow_provider_failover: bool,
+}
+
+pub(super) struct AttemptTargetBuildFailureParams<'a> {
+    pub(super) proxy: &'a ProxyService,
+    pub(super) target: &'a CapturedRouteCandidate,
+    pub(super) error_message: String,
+    pub(super) transport_cooldown_secs: u64,
+    pub(super) cooldown_backoff: crate::endpoint_health::CooldownBackoff,
+    pub(super) avoid_set: &'a mut HashSet<usize>,
+    pub(super) avoided_total: &'a mut usize,
+    pub(super) last_err: &'a mut Option<(StatusCode, String)>,
     pub(super) route_attempts: &'a mut Vec<RouteAttemptLog>,
     pub(super) route_attempt_index: usize,
     pub(super) model_note: &'a str,
@@ -161,21 +176,68 @@ pub(super) struct AttemptTransportParams<'a> {
 
 pub(super) struct AttemptReadBodyParams<'a> {
     pub(super) proxy: &'a ProxyService,
-    pub(super) legacy_lb: Option<&'a LoadBalancer>,
-    pub(super) target: &'a AttemptTarget,
+    pub(super) target: &'a CapturedRouteCandidate,
     pub(super) response: reqwest::Response,
     pub(super) upstream_opt: &'a RetryLayerOptions,
     pub(super) upstream_attempt: u32,
     pub(super) transport_cooldown_secs: u64,
-    pub(super) cooldown_backoff: crate::lb::CooldownBackoff,
+    pub(super) cooldown_backoff: crate::endpoint_health::CooldownBackoff,
     pub(super) avoid_set: &'a mut HashSet<usize>,
     pub(super) avoided_total: &'a mut usize,
     pub(super) last_err: &'a mut Option<(StatusCode, String)>,
-    pub(super) upstream_chain: &'a mut Vec<String>,
     pub(super) route_attempts: &'a mut Vec<RouteAttemptLog>,
     pub(super) route_attempt_index: usize,
     pub(super) model_note: &'a str,
     pub(super) allow_provider_failover: bool,
+    pub(super) attempt_handle: AttemptHandle,
+}
+
+pub(super) async fn handle_attempt_target_build_failure(
+    params: AttemptTargetBuildFailureParams<'_>,
+) -> AttemptTransportOutcome {
+    let AttemptTargetBuildFailureParams {
+        proxy,
+        target,
+        error_message,
+        transport_cooldown_secs,
+        cooldown_backoff,
+        avoid_set,
+        avoided_total,
+        last_err,
+        route_attempts,
+        route_attempt_index,
+        model_note,
+        allow_provider_failover,
+    } = params;
+    apply_terminal_upstream_failure(TerminalUpstreamFailureParams {
+        proxy,
+        target,
+        penalize_endpoint: false,
+        cooldown_secs: transport_cooldown_secs,
+        cooldown_backoff,
+        error_message,
+        avoid_set,
+        avoided_total,
+        last_err,
+    })
+    .await;
+    record_error_route_attempt(
+        route_attempts,
+        ErrorRouteAttemptParams {
+            target,
+            route_attempt_index,
+            kind: RouteAttemptErrorKind::TargetBuild,
+            model_note,
+            duration_ms: None,
+            cooldown_secs: Some(transport_cooldown_secs),
+            cooldown_reason: Some("target_build_error"),
+        },
+    );
+    if allow_provider_failover {
+        AttemptTransportOutcome::TryNextUpstream
+    } else {
+        AttemptTransportOutcome::StopProviderChain
+    }
 }
 
 pub(super) async fn handle_attempt_transport(
@@ -183,12 +245,12 @@ pub(super) async fn handle_attempt_transport(
 ) -> AttemptTransportOutcome {
     let AttemptTransportParams {
         proxy,
-        legacy_lb,
         target,
         method,
-        uri,
+        target_url,
+        request_identity,
+        attempt_context,
         client_headers,
-        codex_client_patch_mode,
         client_headers_entries_cache,
         request_body_len,
         upstream_request_body_len,
@@ -200,7 +262,6 @@ pub(super) async fn handle_attempt_transport(
         client_body_warn,
         upstream_request_body_warn,
         request_id,
-        provider_id,
         route_decision,
         filtered_body,
         upstream_opt,
@@ -210,57 +271,14 @@ pub(super) async fn handle_attempt_transport(
         avoid_set,
         avoided_total,
         last_err,
-        upstream_chain,
         route_attempts,
         route_attempt_index,
         model_note,
         allow_provider_failover,
     } = params;
 
-    let target_url = match proxy.build_target(target, uri) {
-        Ok((url, _headers)) => url,
-        Err(error) => {
-            let err_str = error.to_string();
-            apply_terminal_upstream_failure(TerminalUpstreamFailureParams {
-                proxy,
-                lb: None,
-                target,
-                error_class: "target_build_error",
-                penalize_reason: None,
-                cooldown_secs: transport_cooldown_secs,
-                cooldown_backoff,
-                error_message: err_str.clone(),
-                avoid_set,
-                avoided_total,
-                last_err,
-            })
-            .await;
-            record_error_route_attempt(
-                upstream_chain,
-                route_attempts,
-                ErrorRouteAttemptParams {
-                    target,
-                    route_attempt_index,
-                    kind: RouteAttemptErrorKind::TargetBuild,
-                    reason: err_str.as_str(),
-                    model_note,
-                    duration_ms: None,
-                    cooldown_secs: Some(transport_cooldown_secs),
-                    cooldown_reason: Some("target_build_error"),
-                },
-            );
-            return if allow_provider_failover {
-                AttemptTransportOutcome::TryNextUpstream
-            } else {
-                AttemptTransportOutcome::StopProviderChain
-            };
-        }
-    };
-
-    let attempt_request = prepare_attempt_request(AttemptRequestSetupParams {
-        proxy,
-        auth: &target.upstream().auth,
-        codex_client_patch_mode,
+    let attempt_request = prepare_attempt_request_with_identity(FrozenAttemptRequestSetupParams {
+        identity: request_identity,
         client_headers,
         client_headers_entries_cache,
         request_body_len,
@@ -277,15 +295,7 @@ pub(super) async fn handle_attempt_transport(
     let headers = attempt_request.headers;
     proxy
         .state
-        .update_request_route(
-            request_id,
-            target.compatibility_station_name().map(ToOwned::to_owned),
-            provider_id
-                .map(ToOwned::to_owned)
-                .or_else(|| target.provider_id().map(ToOwned::to_owned)),
-            target.upstream().base_url.clone(),
-            Some(route_decision.clone()),
-        )
+        .update_request_route(request_id, route_decision.clone())
         .await;
     let debug_base = attempt_request.debug_base;
 
@@ -295,21 +305,66 @@ pub(super) async fn handle_attempt_transport(
         .headers(headers)
         .body(filtered_body.clone());
 
+    let attempt_handle = match proxy
+        .state
+        .begin_upstream_attempt(attempt_context, crate::logging::now_ms())
+        .await
+    {
+        Ok(handle) => handle,
+        Err(error) => {
+            let message = error.to_string();
+            record_error_route_attempt(
+                route_attempts,
+                ErrorRouteAttemptParams {
+                    target,
+                    route_attempt_index,
+                    kind: RouteAttemptErrorKind::Lifecycle,
+                    model_note,
+                    duration_ms: None,
+                    cooldown_secs: None,
+                    cooldown_reason: None,
+                },
+            );
+            *last_err = Some((StatusCode::INTERNAL_SERVER_ERROR, message));
+            return AttemptTransportOutcome::StopProviderChain;
+        }
+    };
+
     let upstream_start = Instant::now();
     let response = match builder.send().await {
         Ok(response) => response,
         Err(error) => {
             let err_str = format_reqwest_error_for_retry_chain(&error);
+            if let Err(commit_error) = proxy.state.finish_upstream_attempt(
+                attempt_handle,
+                AttemptOutcome::Failed,
+                crate::logging::now_ms(),
+                EconomicsState::Unknown,
+            ) {
+                let message = commit_error.to_string();
+                record_error_route_attempt(
+                    route_attempts,
+                    ErrorRouteAttemptParams {
+                        target,
+                        route_attempt_index,
+                        kind: RouteAttemptErrorKind::Lifecycle,
+                        model_note,
+                        duration_ms: Some(upstream_start.elapsed().as_millis() as u64),
+                        cooldown_secs: None,
+                        cooldown_reason: None,
+                    },
+                );
+                *last_err = Some((StatusCode::INTERNAL_SERVER_ERROR, message));
+                return AttemptTransportOutcome::StopProviderChain;
+            }
             let can_retry_upstream = upstream_attempt + 1 < upstream_opt.max_attempts
                 && should_retry_class(upstream_opt, Some("upstream_transport_error"));
             record_error_route_attempt(
-                upstream_chain,
                 route_attempts,
                 ErrorRouteAttemptParams {
                     target,
                     route_attempt_index,
                     kind: RouteAttemptErrorKind::Transport,
-                    reason: err_str.as_str(),
                     model_note,
                     duration_ms: Some(upstream_start.elapsed().as_millis() as u64),
                     cooldown_secs: (!can_retry_upstream).then_some(transport_cooldown_secs),
@@ -323,10 +378,8 @@ pub(super) async fn handle_attempt_transport(
 
             apply_terminal_upstream_failure(TerminalUpstreamFailureParams {
                 proxy,
-                lb: legacy_lb,
                 target,
-                error_class: "upstream_transport_error",
-                penalize_reason: Some("upstream_transport_error"),
+                penalize_endpoint: true,
                 cooldown_secs: transport_cooldown_secs,
                 cooldown_backoff,
                 error_message: err_str,
@@ -348,6 +401,7 @@ pub(super) async fn handle_attempt_transport(
         upstream_start,
         upstream_headers_ms: upstream_start.elapsed().as_millis() as u64,
         debug_base,
+        attempt_handle,
     }))
 }
 
@@ -356,7 +410,6 @@ pub(super) async fn read_attempt_response_body(
 ) -> AttemptReadBodyOutcome {
     let AttemptReadBodyParams {
         proxy,
-        legacy_lb,
         target,
         response,
         upstream_opt,
@@ -366,18 +419,40 @@ pub(super) async fn read_attempt_response_body(
         avoid_set,
         avoided_total,
         last_err,
-        upstream_chain,
         route_attempts,
         route_attempt_index,
         model_note,
         allow_provider_failover,
+        attempt_handle,
     } = params;
 
     match read_response_body_with_limit(response).await {
         Ok(bytes) => AttemptReadBodyOutcome::Continue(bytes),
         Err(error) => {
             let err_str = error.message();
-            let (route_kind, can_retry_upstream, error_class, cooldown_reason) = match &error {
+            if let Err(commit_error) = proxy.state.finish_upstream_attempt(
+                attempt_handle,
+                AttemptOutcome::Failed,
+                crate::logging::now_ms(),
+                EconomicsState::Unknown,
+            ) {
+                let message = commit_error.to_string();
+                record_error_route_attempt(
+                    route_attempts,
+                    ErrorRouteAttemptParams {
+                        target,
+                        route_attempt_index,
+                        kind: RouteAttemptErrorKind::Lifecycle,
+                        model_note,
+                        duration_ms: None,
+                        cooldown_secs: None,
+                        cooldown_reason: None,
+                    },
+                );
+                *last_err = Some((StatusCode::INTERNAL_SERVER_ERROR, message));
+                return AttemptReadBodyOutcome::StopProviderChain;
+            }
+            let (route_kind, can_retry_upstream, cooldown_reason) = match &error {
                 ResponseBodyReadError::Read(_) => {
                     let can_retry_upstream = upstream_attempt + 1 < upstream_opt.max_attempts
                         && should_retry_class(upstream_opt, Some("upstream_transport_error"));
@@ -385,24 +460,20 @@ pub(super) async fn read_attempt_response_body(
                         RouteAttemptErrorKind::BodyRead,
                         can_retry_upstream,
                         "upstream_body_read_error",
-                        "upstream_body_read_error",
                     )
                 }
                 ResponseBodyReadError::TooLarge { .. } => (
                     RouteAttemptErrorKind::BodyTooLarge,
                     false,
                     "upstream_response_body_too_large",
-                    "upstream_response_body_too_large",
                 ),
             };
             record_error_route_attempt(
-                upstream_chain,
                 route_attempts,
                 ErrorRouteAttemptParams {
                     target,
                     route_attempt_index,
                     kind: route_kind,
-                    reason: err_str.as_str(),
                     model_note,
                     duration_ms: None,
                     cooldown_secs: (!can_retry_upstream).then_some(transport_cooldown_secs),
@@ -416,10 +487,8 @@ pub(super) async fn read_attempt_response_body(
 
             apply_terminal_upstream_failure(TerminalUpstreamFailureParams {
                 proxy,
-                lb: legacy_lb,
                 target,
-                error_class,
-                penalize_reason: Some(error_class),
+                penalize_endpoint: true,
                 cooldown_secs: transport_cooldown_secs,
                 cooldown_backoff,
                 error_message: err_str,

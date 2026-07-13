@@ -4,19 +4,14 @@ import {
   contractOutputPath,
   formatContractJson,
   parseTypescriptObjectFields,
-  readDesktopFile,
+  parseTypescriptObjectShape,
+  parseTypescriptStringUnion,
+  typescriptObjectShapeFailures,
 } from "./desktop-contracts.mjs";
 
 const generatedContracts = buildDesktopContracts();
 
 const failures = [];
-
-function requireText(file, text, reason) {
-  const contents = readDesktopFile(file);
-  if (!contents.includes(text)) {
-    failures.push(`${file}: missing ${JSON.stringify(text)} (${reason})`);
-  }
-}
 
 function checkTypescriptTarget(target) {
   const actualFields = parseTypescriptObjectFields(target.file, target.type);
@@ -29,6 +24,17 @@ function checkTypescriptTarget(target) {
   const extraFields = actualFields.filter((field) => !target.fields.includes(field));
   for (const field of extraFields) {
     failures.push(`${target.file}: ${target.type} has extra field ${field}`);
+  }
+
+  if (target.shape) {
+    const actualShape = parseTypescriptObjectShape(target.file, target.type);
+    failures.push(
+      ...typescriptObjectShapeFailures(
+        actualShape,
+        target.shape,
+        `${target.file}: ${target.type}`,
+      ),
+    );
   }
 }
 
@@ -44,8 +50,13 @@ for (const { output, contract } of generatedContracts) {
     checkTypescriptTarget(target);
   }
 
-  for (const requirement of contract.requiredText ?? []) {
-    requireText(requirement.file, requirement.text, requirement.reason ?? contract.contract);
+  for (const enumTarget of contract.enums ?? []) {
+    const actual = parseTypescriptStringUnion(enumTarget.typescriptFile, enumTarget.typescript);
+    if (JSON.stringify(actual) !== JSON.stringify(enumTarget.values)) {
+      failures.push(
+        `${enumTarget.typescriptFile}: ${enumTarget.typescript} values ${JSON.stringify(actual)}, expected ${JSON.stringify(enumTarget.values)}`,
+      );
+    }
   }
 }
 

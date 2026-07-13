@@ -1,10 +1,10 @@
 # codex-helper
 
-Codex CLI 的本地中转代理与控制台，重点解决两个问题：多中转站管理，以及在走中转时尽量保留 Codex 原生 ChatGPT 使用体验。
+Codex CLI 的本地中转代理与控制台，重点解决多中转站路由、请求生命周期和可观测性问题。
 
-很多 Codex 能力不是简单转发 `/responses` 就会稳定出现。ChatGPT 登录态、OpenAI provider 身份、`/models` metadata、`/responses/compact`、hosted `image_generation` 都会影响 Codex 是否显示和调用对应能力；一些 sub2api 或其它 relay 在这些细节上返回的形态也不完全符合 Codex 预期。
+很多 Codex 能力不是简单转发 `/responses` 就会稳定出现。Provider adapter、`/models` metadata、`/responses/compact`、WebSocket 和 hosted `image_generation` 都属于选中 provider 的契约；一些 sub2api 或其它 relay 在这些细节上返回的形态也不完全符合 Codex 预期。
 
-codex-helper 把这些差异收在本地：Codex 连接本机代理，helper 再按 provider / routing 选择 OpenAI 官方或你的中转站，并补上模型列表翻译、client preset、能力诊断、余额观测和 fallback 策略。
+codex-helper 把这些差异收在本地：Codex 连接本机代理，helper 再按 provider / routing 选择 OpenAI 官方或你的中转站，并提供模型列表翻译、provider-owned 能力诊断、余额观测和 fallback 策略。
 
 当前发布版本：`v0.20.2`
 
@@ -29,7 +29,7 @@ English: [README_EN.md](README_EN.md)
 
 - 你有多个 Codex/OpenAI 兼容中转站，不想反复手改 `~/.codex/config.toml`。
 - 你希望“包月中转优先，用完或失败后再兜底到备用线路”。
-- 你想让 Codex 保留 ChatGPT 登录态、桌面端/手机端账号能力判定，但模型请求实际走自有 relay 或包月额度。
+- 你需要一个显式、可恢复且不会触碰 Codex auth/cache/SQLite 的本地代理开关。
 - 你的 sub2api 或其它中转普通对话能跑，但 `/models`、`/responses/compact`、hosted `image_generation`、模型名映射这类 Codex 细节不稳定。
 - 你想在 TUI 或桌面端里看到当前 provider、余额/套餐、请求 token、cache token、耗时、重试和成本估算。
 - 你需要长期运行的本地代理，并希望日志、状态、session 绑定和 dashboard 刷新保持可控。
@@ -40,10 +40,10 @@ English: [README_EN.md](README_EN.md)
 ## 核心能力
 
 - **本地代理**：默认监听 `127.0.0.1:3211`，Codex 继续按原方式使用。
-- **安全 Codex 局部修改**：只改本地代理片段，不影响 Codex 运行中写入的其他配置。
-- **Codex 原生体验预设**：`chatgpt-bridge` 保留 ChatGPT 登录态，`imagegen-bridge` 暴露 hosted image generation，`official-relay` / `official-imagegen` 默认让支持官方 Responses 语义的中转走远程压缩；`compaction` 和 `responses_websocket` 分别作为独立开关控制压缩策略与 Responses WebSocket v2。
+- **显式安全 Switch**：只在人工执行 `switch on/off` 时修改 `~/.codex/config.toml` 的 helper provider selector/stanza；外部编辑冲突会进入 `recovery_required`，Codex auth、模型缓存和 SQLite 永远不属于 helper 所有权。
+- **Provider-owned 能力契约**：Responses、compact、WebSocket、hosted tool 和模型能力来自捕获的 provider/catalog 事实，不由客户端 patch 假设。
 - **OpenAI Images 兼容入口**：本地代理额外暴露 `POST /v1/images/generations` 和 JSON `POST /v1/images/edits`，会转成 Responses hosted `image_generation` 请求并复用同一套 provider routing / fallback，方便本地 skill 或脚本稳定生图或带参考图生成。
-- **中转能力诊断**：TUI、CLI 和 admin API 都可以检查 `/models`、`/responses`、`/responses/compact`，并给出当前 relay 更适合哪种 preset。
+- **中转能力诊断**：显式、本进程的 CLI 动作可以有界检查 `/models`、`/responses`、`/responses/compact`，展示 provider contract、观测、continuity 和 mismatch，但不会修改配置或路由。
 - **provider / routing 配置**：`version = 5` route graph 格式，新增 provider 后用 routing entry/routes 决定顺序、固定、分组或标签优先。
 - **会话粘性与自动兜底**：同一 Codex 会话会尽量粘住已选 provider，请求失败、上游不可用或可信余额显示耗尽时再按策略切换候选 provider/upstream。
 - **provider 信号控制循环**：限流、配额、传输错误和余额耗尽会先记录为 provider signal，再生成 helper 拥有的临时 policy action 投影到路由；手动禁用优先级更高，自动 action 不会修改 Codex auth 或第三方账号文件。
@@ -99,10 +99,9 @@ ch
 默认行为：
 
 - 启动本地代理；
-- 初始化或迁移 `~/.codex-helper/config.toml`，旧文件会自动备份为 `.bak`；
-- 必要时把 Codex 的 `model_provider` 局部 patch 到 `codex_proxy`；
+- 读取唯一支持的 `version = 5` `~/.codex-helper/config.toml`；
 - 交互终端中打开 TUI；
-- 退出时撤销 codex-helper 的本地代理 patch。
+- 退出时停止当前前台控制台启动的代理。
 
 只启动代理、不打开 TUI：
 
@@ -110,29 +109,28 @@ ch
 codex-helper serve --no-tui
 ```
 
-高级：常驻/附着代理（只有显式使用 `--resident`/`daemon`/`tui` 子命令时才会让代理独立于当前控制台继续运行）：
+高级：系统服务/附着代理（只有显式安装服务或使用 `--resident`/`daemon`/`tui` 子命令时，代理才会独立于当前控制台继续运行）：
 
 ```bash
-codex-helper serve --resident
+codex-helper service install --codex
+codex-helper service status
 codex-helper daemon status
-codex-helper daemon stop
 codex-helper tui --codex
+codex-helper service stop
 ```
 
-默认 `codex-helper serve` 的内置 TUI 遵循“界面拥有代理”：退出界面会停止它自己启动的代理，并撤销本地客户端 patch。`daemon status/stop` 只用于查询或停止你显式启动的 resident proxy；`tui` 子命令只读附着到已有 resident proxy，退出这个 attached TUI 不会停止代理。需要自动拉起/崩溃重启时可用 `codex-helper daemon supervise --codex`，supervisor 会写入轻量 crash marker 到 `~/.codex-helper/run/` 便于排查。
+默认 `codex-helper serve` 的内置 TUI 遵循“界面拥有代理”：退出界面会停止它自己启动的代理，但不会执行 `switch on/off`。`daemon status` 只读查询 resident proxy；已安装的本地服务使用 `service start/stop/restart` 管理，不提供远程 HTTP shutdown 命令。`tui` 子命令只读附着到已有 resident proxy，退出这个 attached TUI 不会停止代理。需要自动拉起/崩溃重启时可用 `codex-helper daemon supervise --codex`，supervisor 会写入轻量 crash marker 到 `~/.codex-helper/run/` 便于排查。
 
 `daemon status` 会尽量显示当前 resident proxy 的 owner marker（manual CLI、supervisor 或未来桌面/托盘 owner）；marker 只用于可观测性，读取或清理失败不会阻断代理启动/退出。面向未来桌面端的 sidecar 语义已经预留为隐藏的 managed 启动模式，普通用户无需手动判断或使用。
 
-Tauri 桌面端采用更接近 Clash 的常驻客户端语义：关闭主窗口隐藏到托盘，`Quit App` 只退出桌面进程，真正停止代理必须走显式 `Stop Proxy`。Windows NSIS packaged 路径已通过隔离生命周期 smoke，但尚未进入公开发布；macOS/Linux packaged parity、签名发布链路和回滚流程仍需单独完成。
+Tauri 桌面端采用更接近 Clash 的常驻客户端语义：关闭主窗口隐藏到托盘，`Quit App` 只退出桌面进程，两者都不会停止 runtime。停止 runtime 属于显式的本地 CLI/service 操作，不在桌面端 query-only 控制面内。Windows NSIS packaged 路径已通过隔离生命周期 smoke，但尚未进入公开发布；macOS/Linux packaged parity、签名发布链路和回滚流程仍需单独完成。
 
-显式开关 Codex 代理 patch：
+显式切换 Codex 客户端到 helper：
 
 ```bash
 codex-helper switch on
-codex-helper switch on --preset chatgpt-bridge
-codex-helper switch on --preset official-relay
-codex-helper switch on --preset official-relay --responses-websocket
-codex-helper switch on --preset official-imagegen
+codex-helper switch on --port 4321
+codex-helper switch on --base-url https://relay.example/v1
 codex-helper switch status
 codex-helper switch off
 ```
@@ -142,35 +140,30 @@ NAS / 远端 relay target：
 ```bash
 ch relay add nas \
   --proxy-url http://nas.local:3211 \
-  --admin-url http://nas.local:4211 \
-  --admin-token-env CODEX_HELPER_NAS_ADMIN_TOKEN \
-  --preset official-relay
+  --admin-url https://nas.example.com:4211 \
+  --admin-token-env CODEX_HELPER_NAS_ADMIN_TOKEN
 
 ch relay list
 ch relay status nas
 ch relay nas
-ch relay nas --no-tui
+ch relay local --no-tui
 ch relay nas --attach-only
 ch relay off
 ```
 
-`ch` 仍然是本机前台启动入口；`ch relay local` 是同一行为的显式 target 写法。`ch relay <name>` 会把本机 Codex patch 到远端 proxy，并附着一个本地 TUI 去看远端 admin API；`--no-tui` 只切换客户端，`--attach-only` 只看远端 TUI 不改本机 Codex 配置。admin token 只从 `--admin-token-env` 指定的环境变量读取，值不会写进 `~/.codex-helper/config.toml`。容器/NAS 端应设置 `advertised-admin-base-url`，或在 `relay add` 时显式给 `--admin-url`。
+`ch` 仍然是本机前台启动入口；`ch relay local` 是同一行为的显式 target 写法。`ch relay <name>` 只启动或附着到目标 runtime，并打开只读 TUI，不会修改本机 Codex 配置；`--no-tui` 只适用于启动内置本地 target，`--attach-only` 要求 runtime 已运行。远端 target 始终通过只读 TUI 附着。要让 Codex 指向该目标，另行执行 `codex-helper switch on --base-url <PROXY_URL>`。admin token 只从 `--admin-token-env` 指定的环境变量读取，值不会写进 `~/.codex-helper/config.toml`。远程 admin URL 必须使用 HTTPS；HTTP 只允许 loopback，包括在客户端终止的可信隧道。远端 target 必须在 `relay add` 时显式提供可信的 `--admin-url`；proxy 响应和重定向不会替换该 authority。
 
-远端 target 不等于远端拥有本机 Codex 会话文件。容器默认不会声明 host-local transcript/session 访问能力，除非你明确挂载并启用对应 server policy。
+容器和服务器不提供客户端本地 transcript/session 能力。本地 `session` 命令只读取执行该命令机器上的 Codex 会话文件。
 
-预设怎么选：
+客户端 switch 只负责把 Codex 指向一个 helper URL。`switch on` 记录原 selector 和 helper stanza，只写入 `model_providers.codex_proxy`；`switch off` 只恢复记录过的内容。外部编辑发生冲突时，状态进入 `recovery_required` 并保持文件不动。Codex `auth.json`、`models_cache.json`、SQLite、feature flags、compaction 和 WebSocket 设置都不会被读取或修改。
 
-| 预设 | 适合什么情况 | 效果 |
-| --- | --- | --- |
-| `default` | 只需要本地代理、多 provider 和 fallback | Codex 把模型请求发到本地 helper，helper 再选上游 |
-| `chatgpt-bridge` | 你已经在官方 Codex 里登录 ChatGPT，希望保留桌面端/手机端账号体验，但模型流量走 relay | 写入 ChatGPT auth 形态，真实上游凭据仍来自 helper 配置 |
-| `imagegen-bridge` | relay 不支持 official provider 身份，但你想让 Codex 暴露 hosted `image_generation` | 写入 `{}` auth facade；不会要求官方登录 |
-| `official-relay` | relay 背后能转发官方 OpenAI Responses 语义，尤其支持 `/responses/compact` | 默认让 Codex 把本地 helper 当作 OpenAI provider，从而走远程压缩路径 |
-| `official-imagegen` | relay 背后是官方订阅账号，并且同时支持 `/responses/compact` 和 hosted image generation | 默认同时启用 OpenAI provider 身份、远程压缩路径和 `{}` imagegen facade |
+Relay 能力由选中 provider 的 adapter、catalog 和有界观测决定，不由 switch 配置推断。可用下面的本地命令查看 provider contract、实际 `/models` / `/responses` / `/responses/compact` 结果、continuity 和 mismatches：
 
-`chatgpt-bridge` 启用前必须先在官方 Codex 中完成 ChatGPT 登录。如果 `~/.codex/auth.json` 没有完整 token、email 和账号信息，codex-helper 会拒绝 patch，避免 Codex TUI 因半登录状态启动失败。
+```bash
+codex-helper codex relay-capabilities --model gpt-5.5 --provider ciii --endpoint default
+```
 
-`official-relay` 和 `official-imagegen` 都是实验预设。它们只负责让 Codex 使用更接近官方的客户端能力选择；中转站本身仍必须真正支持对应接口。默认情况下，`official-*` 会让 Codex 选择远程压缩路径；如果要保留 official preset 的其它行为但强制本地压缩，可额外设置 `[codex.client_patch].compaction = "local"` 或使用 `codex-helper switch on --preset official-imagegen --compaction local`。真实请求密钥来自 `~/.codex-helper/config.toml` 的 provider 配置，bridge 预设不会把 Codex 的 ChatGPT token 透传给没有 helper 侧密钥的第三方 relay。旧的 `official-relay-bridge` / `official-imagegen-bridge` 输入名已移除；新命令请使用 `official-relay` / `official-imagegen`。
+第三方 relay 应配置自己的 `auth_token_env`、`auth_token` 或等价 API key。Codex 客户端认证只允许透传给官方 OpenAI origin，避免把账号 header 泄露给中转。
 
 为了不拖能力较强的中转后腿，codex-helper 默认会在路由前归一化压缩 HTTP 请求体（`zstd`、`gzip` / `x-gzip`、`br`、`deflate`）。对 Codex `/responses`、`/responses/compact` 和 Responses WebSocket，helper 还会从已有请求证据补齐缺失的 `session_id`、`x-session-id`、官方 `session-id` / `thread-id` 和 `prompt_cache_key`，来源包括 header session、body `session_id`、`prompt_cache_key` 和 `metadata.session_id`。`previous_response_id` 只用于 stale-response 修复，不作为 session identity 来源；helper 不会凭空生成 session id，也不会覆盖用户已经带上的 session 字段。
 
@@ -178,19 +171,7 @@ ch relay off
 
 Codex 请求语义还有两个小修复：如果上游明确返回 `previous_response_id` 对应 response 不存在，helper 会移除该字段并对同一个上游重试一次；如果中转无视 `Accept-Encoding: identity` 返回 gzip JSON，helper 会先解压再转发普通 JSON。`service_tier` 只做观测和日志归因，日志会区分 requested / effective / actual，不会因为 helper 默认配置改写客户端请求里的 fast mode。
 
-在上游能力满足的前提下，能力最完整的是 `official-imagegen`；如果再确认上游支持 Responses WebSocket v2，可以额外开启 `responses_websocket`，这就是当前最接近官方体验的组合：
-
-```text
-default
-< chatgpt-bridge / imagegen-bridge
-< official-relay
-< official-imagegen
-< official-imagegen + responses_websocket
-```
-
-不要无脑开最强组合：`official-imagegen` 要求中转同时支持 `/responses`、`/responses/compact` 和 hosted `image_generation`；`responses_websocket` 还要求 WebSocket live smoke 通过。
-
-如果上游已确认支持 Responses WebSocket v2，再额外启用 `responses_websocket = true` 或 `--responses-websocket`；它是独立传输开关，不是新的 preset。压缩路径同样是独立开关：`compaction = "auto"` 保持 preset 默认，`local` 强制 Codex 客户端走本地压缩，`remote-v1` 强制 `/responses/compact`，`remote-v2` 强制 `remote_compaction_v2` 并继续使用 helper 的 v2 到 v1 降级兜底。
+Hosted image generation、remote compaction 和 Responses WebSocket 都要求上游真正支持对应协议。Live smoke 必须显式确认，且只用于诊断，不会开启客户端功能或修改路由。
 
 本地代理还提供 OpenAI Images 兼容的生图和参考图编辑入口，适合给 Codex skill 或脚本调用，而不是依赖 Codex 客户端是否成功暴露 hosted tool：
 
@@ -230,14 +211,13 @@ curl 'http://127.0.0.1:3211/v1/images/edits' \
 
 注意：任何对 `~/.codex/config.toml` 的修改都只会被新启动的 Codex 会话读取；修改后请完整重启 Codex App、TUI 或 `codex exec` 会话。
 
-如果你的目标是“还能登录 ChatGPT，但实际对话流量走中转”，推荐把账号层和路由层分开：
+要把模型流量交给 relay，请把客户端指向 helper，再由 helper 配置选择上游：
 
-1. 用 `chatgpt-bridge` 保留 Codex App 的 ChatGPT 登录态。
-2. `codex-helper switch on --preset chatgpt-bridge` 会把 Codex 自己的 `~/.codex/config.toml` 指向本地 `codex_proxy`。
-3. 在 `~/.codex-helper/config.toml` 配 `codex.providers.*` 和 `codex.routing`，让 codex-helper 最终选择你的 relay。
-4. 如果 relay 需要带前缀的模型名，就给 provider 配 `model_mapping`。
+1. 运行 `codex-helper switch on`，把 Codex 的 `~/.codex/config.toml` 指向本地 `codex_proxy`。
+2. 在 `~/.codex-helper/config.toml` 配置 `codex.providers.*` 和 `codex.routing`。
+3. 如果 relay 需要带前缀的模型名，给 provider 配置 `model_mapping`。
 
-这种拆法适合保留 Codex App、手机端和订阅账号能力判定，同时把日常对话、工具调用和 imagegen 等模型消耗放到自有中转或包月额度。
+这条链路不改变或代理 Codex 的登录状态；账号文件始终由 Codex 自己维护。
 
 Codex 侧的本地代理入口通常由 `switch on` 写入，不建议手写覆盖其它 Codex 配置：
 
@@ -249,8 +229,6 @@ model_provider = "codex_proxy"
 name = "codex-helper"
 base_url = "http://127.0.0.1:3211"
 wire_api = "responses"
-requires_openai_auth = true
-supports_websockets = false
 ```
 
 codex-helper 侧只负责上游和路由：
@@ -258,11 +236,6 @@ codex-helper 侧只负责上游和路由：
 ```toml
 # ~/.codex-helper/config.toml
 version = 5
-
-[codex.client_patch]
-preset = "chatgpt-bridge"
-responses_websocket = false
-compaction = "auto"
 
 [codex.providers.relay]
 base_url = "https://relay.example/v1"
@@ -275,16 +248,6 @@ entry = "relay_first"
 strategy = "ordered-failover"
 children = ["relay"]
 ```
-
-Codex App 手机远程控制走的是另一条路径，不要把它和 `chatgpt-bridge` 混在一起：
-
-```bash
-codex-helper switch remote-control enable
-codex-helper switch remote-control status
-codex-helper switch remote-control check-logs
-```
-
-这个命令会写 `~/.codex/config.toml` 的 `[features].remote_connections = true`，不会写 `remote_control = true`，然后备份并更新 `~/.codex/sqlite/codex-dev.db` 里的 `local_app_server_feature_enablement.remote_control`。执行后请完整重启 Codex App，再用 `check-logs` 验证 `experimentalFeature/enablement/set` 至少出现一次 `errorCode=null`。手机端连接时仍然需要 ChatGPT 账号完成 MFA / 多因素认证。
 
 如果中转站要求带 provider 前缀的模型名，可以用 provider 级 `model_mapping` 改写请求体里的 `model`：
 
@@ -359,7 +322,7 @@ profile = "balanced"
 
 codex-helper 有两层“代理”：
 
-- **本地代理**：Codex 连接 `127.0.0.1:3211`，请求先进入 codex-helper，再由 routing 选择 provider。只要启用了 codex-helper 的 Codex patch，即使没有配置外部网络代理，请求也会经过这个本地 proxy server。
+- **本地代理**：Codex 连接 `127.0.0.1:3211`，请求先进入 codex-helper，再由 routing 选择 provider。显式执行 `switch on` 让 Codex 指向 helper 后，即使没有配置出站网络代理，请求也会经过这个本地 proxy server。
 - **出站网络代理**：codex-helper 访问 provider、relay 或 balance API 时是否经过网络代理。当前版本还没有 `config.toml` 专用配置段，但底层 HTTP client 会受 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY` 等系统/环境变量影响。
 
 更详细的边界和未来配置方向见 [配置参考的本地代理和出站代理章节](docs/CONFIGURATION.zh.md#本地代理和出站代理)。
@@ -379,8 +342,8 @@ codex-helper routing explain --model gpt-5 --json
 # 会话
 codex-helper session list
 codex-helper session list --truncate 120
-codex-helper session search "remote_control"
-codex-helper session search "remote_control" --truncate 120
+codex-helper session search "rate limit"
+codex-helper session search "rate limit" --truncate 120
 codex-helper session recent
 codex-helper session last
 codex-helper session transcript <SESSION_ID> --tail 40
@@ -398,7 +361,7 @@ codex-helper pricing sync-basellm --model gpt-5 --dry-run
 # 诊断
 codex-helper status
 codex-helper doctor
-codex-helper codex relay-capabilities --preset official-imagegen --compaction local --model gpt-5.5
+codex-helper codex relay-capabilities --model gpt-5.5 --provider ciii --endpoint default
 codex-helper codex relay-live-smoke --acknowledgement run-live-codex-relay-smoke --model gpt-5.5
 codex-helper codex relay-live-smoke --acknowledgement run-live-codex-relay-smoke --model gpt-5.5 --provider ciii --compact-v2
 codex-helper codex relay-evidence --limit 20
@@ -415,24 +378,24 @@ codex-helper --version
 
 - `Overview`：代理状态、当前会话和最近请求。
 - `Routing` / `Stations`：route graph、provider 顺序、余额/套餐、tags、健康状态和 routing 预览。
-- `Sessions`：session identity、effective route、route affinity、单会话覆盖。
-- `Usage`：今日请求、token、估算成本、24 小时活跃度、provider/station/model/session/project 排行、日志覆盖提示和全局 retry gate 数量。
-- `Requests`：请求日志、endpoint 最近样本、token、cache token、耗时、重试、request chain 和成本。
+- `Sessions`：session identity、effective route 和 route affinity。
+- `Usage`：来自 committed request events 的今日请求、token、估算成本、provider/model/session 排行和 coverage state。
+- `Requests`：committed request/attempt 样本、token、cache evidence、耗时、重试、request chain 和成本。
 
-常用快捷键会显示在底部。TUI 的持久化 provider/routing 编辑优先使用 routing 页面，手动改配置后可用 `R` 重新加载运行态配置。
-余额刷新和余额诊断保留在 `Routing` / `Stations` 相关页面；单个 provider 查询失败只会显示为错误/未知状态，不会打断页面刷新或其他 provider 的刷新。
+TUI 和桌面端消费同一份 typed、redacted `OperatorReadModel`，对远程 runtime control plane 只使用 `GET` / `HEAD`。模型明确区分 `ready`、`stale`、`disconnected` 和 `auth_required`；连接或认证失败时不会用本机配置、SQLite 或空 runtime 伪造 fallback view。持久 provider/routing intent 通过本地 CLI 或 `config.toml` 修改。在 TUI 中，`n` / `o` 是唯一的局部例外：它们只显式 patch 本机 Codex 配置里的 helper provider selector/stanza，不是远程 runtime mutation。
 
 ### Desktop Preview
 
-新的 Tauri 桌面端位于 `apps/desktop`，技术栈是 React 19、Tailwind CSS 4、shadcn/ui 风格组件和 TanStack Router/Query/Table。它已经实现 Dashboard、Providers、Usage、Settings、只读 admin 数据、安全控制动作、关闭隐藏到托盘语义、单实例、开机启动设置、轻量单配置导入导出、打开配置/日志/缓存路径、Provider 常用编辑表单和 Windows NSIS packaged sidecar 构建。Windows packaged smoke 已覆盖安装包启动、托盘 Show/Hide/Quit、显式 Stop Proxy、Detach、第二次启动聚焦、开机启动注册、配置导入导出和 Provider 编辑；但当前公开 release 不发布桌面安装包，正式桌面 release 会等签名密钥、HTTPS 发布端点、artifact hosting 和回滚流程就绪后再启用。桌面端打包策略见 [docs/DESKTOP_RELEASE.md](docs/DESKTOP_RELEASE.md)。
+新的 Tauri 桌面端位于 `apps/desktop`，技术栈是 React 19、Tailwind CSS 4、shadcn/ui 风格组件和 TanStack Router/Query/Table。它展示 typed、redacted `OperatorReadModel`，并保留本地 proxy 生命周期、显式 Codex switch、关闭隐藏到托盘、单实例和开机启动设置；不导入配置、不编辑 provider，也不通过远程 control plane 修改 provider/routing/config。Windows NSIS packaged sidecar 已完成隔离 smoke，但当前公开 release 仍不发布桌面安装包，正式 release 会等签名密钥、HTTPS 发布端点、artifact hosting 和回滚流程就绪后再启用。桌面端打包策略见 [docs/DESKTOP_RELEASE.md](docs/DESKTOP_RELEASE.md)。
 
 ## 配置文件位置
 
 - 主配置：`~/.codex-helper/config.toml`
-- 余额适配：`~/.codex-helper/usage_providers.json`
+- 运行时状态：`~/.codex-helper/state/state.sqlite`
+- 余额适配（可选、operator-owned；缺失时只使用内存内置项，无效输入不会被覆盖）：`~/.codex-helper/usage_providers.json`
 - 价格覆盖：`~/.codex-helper/pricing_overrides.toml`
 - 请求过滤：`~/.codex-helper/filter.json`
-- 请求日志：`~/.codex-helper/logs/requests.jsonl`
+- 提交后的调试日志：`~/.codex-helper/logs/requests.jsonl`
 - Codex relay 诊断证据：`~/.codex-helper/logs/codex_relay_evidence.jsonl`
 
 Codex 自己的文件仍由 Codex 维护：
@@ -440,7 +403,7 @@ Codex 自己的文件仍由 Codex 维护：
 - `~/.codex/auth.json`
 - `~/.codex/config.toml`
 
-codex-helper 只会局部修改 `~/.codex/config.toml` 里的本地代理片段。
+只有显式本地 `switch on/off` 会修改 `~/.codex/config.toml` 里的 helper provider selector/stanza；Codex auth、模型缓存和 SQLite 始终保持不动。
 
 ## 设计边界
 
@@ -454,8 +417,8 @@ codex-helper 刻意避免这些做法：
 
 ## 更多文档
 
-- [docs/CONFIGURATION.zh.md](docs/CONFIGURATION.zh.md)：中文完整配置参考，包含 routing 模板、余额适配、代理说明和迁移。
-- [docs/CONFIGURATION.md](docs/CONFIGURATION.md)：English configuration reference, routing, balance adapters, pricing, migration.
+- [docs/CONFIGURATION.zh.md](docs/CONFIGURATION.zh.md)：中文完整配置参考，包含 routing 模板、余额适配、代理说明、配置兼容性和只读 operator 视图。
+- [docs/CONFIGURATION.md](docs/CONFIGURATION.md)：English configuration reference covering routing, balance adapters, pricing, configuration compatibility, and query-only operator views.
 - [CHANGELOG.md](CHANGELOG.md)：版本变更和升级注意事项。
 - [docs/DESKTOP_RELEASE.md](docs/DESKTOP_RELEASE.md)：Tauri 桌面端打包、sidecar 和 release gate 说明。
 - [docs/workstreams/codex-routing-scheduler-observability-refactor/README.md](docs/workstreams/codex-routing-scheduler-observability-refactor/README.md)：路由调度状态、限流/过载结果、并发上限和 TUI 指标的无畏重构设计。

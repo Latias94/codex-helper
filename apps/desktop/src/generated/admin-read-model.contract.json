@@ -7,23 +7,2749 @@
       "struct": "AdminReadModel",
       "fields": [
         "endpoint",
-        "operator_summary",
-        "runtime_status",
-        "providers",
-        "recent_requests",
-        "usage_summary",
-        "usage_day",
-        "section_statuses"
+        "operatorReadModel"
+      ],
+      "shape": [
+        {
+          "name": "endpoint",
+          "optional": false,
+          "type": "AdminEndpointConfig"
+        },
+        {
+          "name": "operatorReadModel",
+          "optional": false,
+          "type": "ApiOperatorReadModel"
+        }
       ]
     },
     {
-      "file": "src-tauri/src/commands/admin_api.rs",
-      "struct": "AdminReadModelSectionStatus",
+      "file": "../../crates/core/src/dashboard_core/operator_summary.rs",
+      "struct": "OperatorReadModel",
       "fields": [
-        "section",
-        "ok",
+        "api_version",
+        "service_name",
+        "status",
+        "captured_at_ms",
+        "revisions",
+        "data",
+        "issue"
+      ],
+      "shape": [
+        {
+          "name": "api_version",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "service_name",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "status",
+          "optional": false,
+          "type": "ApiOperatorReadStatus"
+        },
+        {
+          "name": "captured_at_ms",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "revisions",
+          "optional": true,
+          "type": "ApiOperatorRevisionBundle"
+        },
+        {
+          "name": "data",
+          "optional": true,
+          "type": "ApiOperatorReadData"
+        },
+        {
+          "name": "issue",
+          "optional": true,
+          "type": "ApiOperatorReadIssue"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/dashboard_core/operator_summary.rs",
+      "struct": "OperatorRevisionBundle",
+      "fields": [
+        "runtime_revision",
+        "runtime_digest",
+        "route_digest",
+        "catalog_revision",
+        "pricing_revision",
+        "operator_pricing_revision",
+        "policy_revision",
+        "ledger_revision"
+      ],
+      "shape": [
+        {
+          "name": "runtime_revision",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "runtime_digest",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "route_digest",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "catalog_revision",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "pricing_revision",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "operator_pricing_revision",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "policy_revision",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "ledger_revision",
+          "optional": false,
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/dashboard_core/operator_summary.rs",
+      "struct": "OperatorReadData",
+      "fields": [
+        "summary",
+        "active_requests",
+        "recent_requests",
+        "usage_summaries",
+        "usage_day",
+        "usage_rollup",
+        "stats_5m",
+        "stats_1h",
+        "pricing_catalog",
+        "provider_balances"
+      ],
+      "shape": [
+        {
+          "name": "summary",
+          "optional": false,
+          "type": "ApiOperatorSummary"
+        },
+        {
+          "name": "active_requests",
+          "optional": false,
+          "type": "ApiOperatorActiveRequestSummary[]"
+        },
+        {
+          "name": "recent_requests",
+          "optional": false,
+          "type": "ApiOperatorRequestSummary[]"
+        },
+        {
+          "name": "usage_summaries",
+          "optional": false,
+          "type": "ApiRequestUsageSummary[]"
+        },
+        {
+          "name": "usage_day",
+          "optional": false,
+          "type": "ApiUsageDayView"
+        },
+        {
+          "name": "usage_rollup",
+          "optional": false,
+          "type": "ApiUsageRollupView"
+        },
+        {
+          "name": "stats_5m",
+          "optional": false,
+          "type": "ApiWindowStats"
+        },
+        {
+          "name": "stats_1h",
+          "optional": false,
+          "type": "ApiWindowStats"
+        },
+        {
+          "name": "pricing_catalog",
+          "optional": false,
+          "type": "ApiModelPriceCatalogSnapshot"
+        },
+        {
+          "name": "provider_balances",
+          "optional": false,
+          "type": "ApiOperatorProviderBalanceSummary[]"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/dashboard_core/operator_summary.rs",
+      "struct": "ApiV1OperatorSummary",
+      "fields": [
+        "api_version",
+        "service_name",
+        "runtime",
+        "counts",
+        "retry",
+        "sessions",
+        "profiles",
+        "providers"
+      ],
+      "shape": [
+        {
+          "name": "api_version",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "service_name",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "runtime",
+          "optional": false,
+          "type": "ApiOperatorRuntimeSummary"
+        },
+        {
+          "name": "counts",
+          "optional": false,
+          "type": "ApiOperatorSummaryCounts"
+        },
+        {
+          "name": "retry",
+          "optional": false,
+          "type": "ApiOperatorRetrySummary"
+        },
+        {
+          "name": "sessions",
+          "optional": false,
+          "type": "ApiOperatorSessionSummary[]"
+        },
+        {
+          "name": "profiles",
+          "optional": false,
+          "type": "ApiControlProfileOption[]"
+        },
+        {
+          "name": "providers",
+          "optional": false,
+          "type": "ApiOperatorProviderSummary[]"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/dashboard_core/operator_summary.rs",
+      "struct": "OperatorSummaryCounts",
+      "fields": [
+        "active_requests",
+        "recent_requests",
+        "sessions",
+        "profiles",
+        "providers"
+      ],
+      "shape": [
+        {
+          "name": "active_requests",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "recent_requests",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "sessions",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "profiles",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "providers",
+          "optional": false,
+          "type": "number"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/dashboard_core/operator_summary.rs",
+      "struct": "OperatorRetrySummary",
+      "fields": [
+        "configured_profile",
+        "upstream_max_attempts",
+        "provider_max_attempts",
+        "recent_retried_requests",
+        "recent_cross_provider_failovers",
+        "recent_same_provider_retries",
+        "recent_fast_mode_requests"
+      ],
+      "shape": [
+        {
+          "name": "configured_profile",
+          "optional": false,
+          "type": "ApiRetryProfileName|null"
+        },
+        {
+          "name": "upstream_max_attempts",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "provider_max_attempts",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "recent_retried_requests",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "recent_cross_provider_failovers",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "recent_same_provider_retries",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "recent_fast_mode_requests",
+          "optional": false,
+          "type": "number"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/dashboard_core/types.rs",
+      "struct": "ControlProfileOption",
+      "fields": [
+        "name",
+        "extends",
+        "model",
+        "reasoning_effort",
+        "service_tier",
+        "fast_mode",
+        "is_default"
+      ],
+      "shape": [
+        {
+          "name": "name",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "extends",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "model",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "reasoning_effort",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "service_tier",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "fast_mode",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "is_default",
+          "optional": false,
+          "type": "boolean"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/dashboard_core/operator_summary.rs",
+      "struct": "OperatorProviderSummary",
+      "fields": [
+        "name",
+        "alias",
+        "configured_enabled",
+        "effective_enabled",
+        "routable_endpoints",
+        "endpoints",
+        "capacity"
+      ],
+      "shape": [
+        {
+          "name": "name",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "alias",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "configured_enabled",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "effective_enabled",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "routable_endpoints",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "endpoints",
+          "optional": false,
+          "type": "ApiOperatorProviderEndpointSummary[]"
+        },
+        {
+          "name": "capacity",
+          "optional": true,
+          "type": "ApiOperatorProviderCapacity"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/dashboard_core/operator_summary.rs",
+      "struct": "OperatorProviderEndpointSummary",
+      "fields": [
+        "provider_name",
+        "name",
+        "provider_endpoint_key",
+        "origin",
+        "priority",
+        "configured_enabled",
+        "effective_enabled",
+        "routable",
+        "runtime_enabled_override",
+        "runtime_state",
+        "runtime_state_override",
+        "capacity",
+        "policy_actions"
+      ],
+      "shape": [
+        {
+          "name": "provider_name",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "name",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "provider_endpoint_key",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "origin",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "priority",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "configured_enabled",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "effective_enabled",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "routable",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "runtime_enabled_override",
+          "optional": true,
+          "type": "boolean"
+        },
+        {
+          "name": "runtime_state",
+          "optional": false,
+          "type": "ApiRuntimeConfigState"
+        },
+        {
+          "name": "runtime_state_override",
+          "optional": true,
+          "type": "ApiRuntimeConfigState"
+        },
+        {
+          "name": "capacity",
+          "optional": true,
+          "type": "ApiOperatorProviderCapacity"
+        },
+        {
+          "name": "policy_actions",
+          "optional": true,
+          "type": "ApiOperatorPolicyActionSummary[]"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/dashboard_core/operator_summary.rs",
+      "struct": "OperatorProviderCapacity",
+      "fields": [
+        "configured_max_concurrent_requests",
+        "effective_max_concurrent_requests",
+        "active",
+        "limit",
+        "saturated",
+        "inherited_from_provider"
+      ],
+      "shape": [
+        {
+          "name": "configured_max_concurrent_requests",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "effective_max_concurrent_requests",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "active",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "limit",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "saturated",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "inherited_from_provider",
+          "optional": true,
+          "type": "boolean"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/dashboard_core/operator_summary.rs",
+      "struct": "OperatorPolicyActionSummary",
+      "fields": [
+        "active_cooldown",
         "code",
-        "error"
+        "cooldown_remaining_secs"
+      ],
+      "shape": [
+        {
+          "name": "active_cooldown",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "code",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "cooldown_remaining_secs",
+          "optional": true,
+          "type": "number"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/dashboard_core/operator_summary.rs",
+      "struct": "OperatorSessionSummary",
+      "fields": [
+        "session_key",
+        "active_count",
+        "active_started_at_ms_min",
+        "last_status",
+        "last_duration_ms",
+        "last_ended_at_ms",
+        "last_model",
+        "last_reasoning_effort",
+        "last_service_tier",
+        "last_provider_id",
+        "last_usage",
+        "total_usage",
+        "turns_total",
+        "turns_with_usage",
+        "last_output_tokens_per_second",
+        "avg_output_tokens_per_second",
+        "binding_profile_name",
+        "binding_continuity_mode",
+        "last_route_decision",
+        "route_affinity",
+        "effective_model",
+        "effective_reasoning_effort",
+        "effective_service_tier"
+      ],
+      "shape": [
+        {
+          "name": "session_key",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "active_count",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "active_started_at_ms_min",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "last_status",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "last_duration_ms",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "last_ended_at_ms",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "last_model",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "last_reasoning_effort",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "last_service_tier",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "last_provider_id",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "last_usage",
+          "optional": true,
+          "type": "ApiUsageMetrics"
+        },
+        {
+          "name": "total_usage",
+          "optional": true,
+          "type": "ApiUsageMetrics"
+        },
+        {
+          "name": "turns_total",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "turns_with_usage",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "last_output_tokens_per_second",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "avg_output_tokens_per_second",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "binding_profile_name",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "binding_continuity_mode",
+          "optional": true,
+          "type": "ApiSessionContinuityMode"
+        },
+        {
+          "name": "last_route_decision",
+          "optional": true,
+          "type": "ApiOperatorRouteDecision"
+        },
+        {
+          "name": "route_affinity",
+          "optional": true,
+          "type": "ApiOperatorSessionRouteAffinitySummary"
+        },
+        {
+          "name": "effective_model",
+          "optional": true,
+          "type": "ApiResolvedRouteValue"
+        },
+        {
+          "name": "effective_reasoning_effort",
+          "optional": true,
+          "type": "ApiResolvedRouteValue"
+        },
+        {
+          "name": "effective_service_tier",
+          "optional": true,
+          "type": "ApiResolvedRouteValue"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/dashboard_core/operator_summary.rs",
+      "struct": "OperatorSessionRouteAffinitySummary",
+      "fields": [
+        "provider_id",
+        "endpoint_id",
+        "upstream_origin",
+        "route_path",
+        "last_selected_at_ms",
+        "last_changed_at_ms",
+        "change_reason"
+      ],
+      "shape": [
+        {
+          "name": "provider_id",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "endpoint_id",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "upstream_origin",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "route_path",
+          "optional": true,
+          "type": "string[]"
+        },
+        {
+          "name": "last_selected_at_ms",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "last_changed_at_ms",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "change_reason",
+          "optional": false,
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/state/session_identity.rs",
+      "struct": "RouteDecisionProvenance",
+      "fields": [
+        "decided_at_ms",
+        "binding_profile_name",
+        "binding_continuity_mode",
+        "effective_model",
+        "effective_reasoning_effort",
+        "effective_service_tier",
+        "effective_upstream_base_url",
+        "provider_id",
+        "endpoint_id",
+        "route_path"
+      ],
+      "shape": [
+        {
+          "name": "decided_at_ms",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "binding_profile_name",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "binding_continuity_mode",
+          "optional": true,
+          "type": "ApiSessionContinuityMode"
+        },
+        {
+          "name": "effective_model",
+          "optional": true,
+          "type": "ApiResolvedRouteValue"
+        },
+        {
+          "name": "effective_reasoning_effort",
+          "optional": true,
+          "type": "ApiResolvedRouteValue"
+        },
+        {
+          "name": "effective_service_tier",
+          "optional": true,
+          "type": "ApiResolvedRouteValue"
+        },
+        {
+          "name": "effective_upstream_base_url",
+          "optional": true,
+          "type": "ApiResolvedRouteValue"
+        },
+        {
+          "name": "provider_id",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "endpoint_id",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "route_path",
+          "optional": true,
+          "type": "string[]"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/dashboard_core/operator_summary.rs",
+      "struct": "OperatorActiveRequestSummary",
+      "fields": [
+        "id",
+        "runtime_revision",
+        "policy_revision",
+        "session_key",
+        "model",
+        "requested_model",
+        "reasoning_effort",
+        "service_tier",
+        "requested_service_tier",
+        "provider_id",
+        "endpoint_id",
+        "provider_endpoint_key",
+        "route_path",
+        "upstream_origin",
+        "service",
+        "method",
+        "path",
+        "started_at_ms"
+      ],
+      "shape": [
+        {
+          "name": "id",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "runtime_revision",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "policy_revision",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "session_key",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "model",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "requested_model",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "reasoning_effort",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "service_tier",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "requested_service_tier",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "provider_id",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "endpoint_id",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "provider_endpoint_key",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "route_path",
+          "optional": true,
+          "type": "string[]"
+        },
+        {
+          "name": "upstream_origin",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "service",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "method",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "path",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "started_at_ms",
+          "optional": false,
+          "type": "number"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/dashboard_core/operator_summary.rs",
+      "struct": "OperatorRequestSummary",
+      "fields": [
+        "id",
+        "session_key",
+        "model",
+        "reasoning_effort",
+        "service_tier",
+        "provider_id",
+        "endpoint_id",
+        "provider_endpoint_key",
+        "route_path",
+        "upstream_origin",
+        "usage",
+        "cost",
+        "retry",
+        "provider_signal_codes",
+        "policy_action_codes",
+        "observability",
+        "service",
+        "method",
+        "path",
+        "status_code",
+        "duration_ms",
+        "ttfb_ms",
+        "streaming",
+        "ended_at_ms"
+      ],
+      "shape": [
+        {
+          "name": "id",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "session_key",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "model",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "reasoning_effort",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "service_tier",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "provider_id",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "endpoint_id",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "provider_endpoint_key",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "route_path",
+          "optional": true,
+          "type": "string[]"
+        },
+        {
+          "name": "upstream_origin",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "usage",
+          "optional": true,
+          "type": "ApiUsageMetrics"
+        },
+        {
+          "name": "cost",
+          "optional": true,
+          "type": "ApiCostBreakdown"
+        },
+        {
+          "name": "retry",
+          "optional": true,
+          "type": "ApiOperatorRetrySummaryView"
+        },
+        {
+          "name": "provider_signal_codes",
+          "optional": true,
+          "type": "string[]"
+        },
+        {
+          "name": "policy_action_codes",
+          "optional": true,
+          "type": "string[]"
+        },
+        {
+          "name": "observability",
+          "optional": false,
+          "type": "ApiOperatorRequestObservability"
+        },
+        {
+          "name": "service",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "method",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "path",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "status_code",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "duration_ms",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "ttfb_ms",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "streaming",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "ended_at_ms",
+          "optional": false,
+          "type": "number"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/dashboard_core/operator_summary.rs",
+      "struct": "OperatorRetrySummaryView",
+      "fields": [
+        "attempts",
+        "route_attempts"
+      ],
+      "shape": [
+        {
+          "name": "attempts",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "route_attempts",
+          "optional": true,
+          "type": "ApiOperatorRouteAttemptSummary[]"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/dashboard_core/operator_summary.rs",
+      "struct": "OperatorRouteAttemptSummary",
+      "fields": [
+        "attempt_index",
+        "provider_id",
+        "endpoint_id",
+        "provider_endpoint_key",
+        "preference_group",
+        "provider_attempt",
+        "upstream_attempt",
+        "provider_max_attempts",
+        "upstream_max_attempts",
+        "avoided_total",
+        "total_upstreams",
+        "code",
+        "status_code",
+        "model",
+        "upstream_headers_ms",
+        "duration_ms",
+        "cooldown_secs",
+        "skipped",
+        "provider_signal_codes",
+        "policy_action_codes"
+      ],
+      "shape": [
+        {
+          "name": "attempt_index",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "provider_id",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "endpoint_id",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "provider_endpoint_key",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "preference_group",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "provider_attempt",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "upstream_attempt",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "provider_max_attempts",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "upstream_max_attempts",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "avoided_total",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "total_upstreams",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "code",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "status_code",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "model",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "upstream_headers_ms",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "duration_ms",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "cooldown_secs",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "skipped",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "provider_signal_codes",
+          "optional": true,
+          "type": "string[]"
+        },
+        {
+          "name": "policy_action_codes",
+          "optional": true,
+          "type": "string[]"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/dashboard_core/operator_summary.rs",
+      "struct": "OperatorRequestObservability",
+      "fields": [
+        "duration_ms",
+        "ttfb_ms",
+        "generation_ms",
+        "output_tokens_per_second",
+        "attempt_count",
+        "route_attempt_count",
+        "retried",
+        "cross_provider_failover",
+        "same_provider_retry",
+        "fast_mode",
+        "streaming"
+      ],
+      "shape": [
+        {
+          "name": "duration_ms",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "ttfb_ms",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "generation_ms",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "output_tokens_per_second",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "attempt_count",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "route_attempt_count",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "retried",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "cross_provider_failover",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "same_provider_retry",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "fast_mode",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "streaming",
+          "optional": false,
+          "type": "boolean"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/dashboard_core/operator_summary.rs",
+      "struct": "OperatorProviderBalanceSummary",
+      "fields": [
+        "observation_provider_id",
+        "provider_id",
+        "endpoint_id",
+        "provider_endpoint_key",
+        "fetched_at_ms",
+        "stale_after_ms",
+        "stale",
+        "status",
+        "exhausted",
+        "exhaustion_affects_routing",
+        "plan_name",
+        "total_balance_usd",
+        "subscription_balance_usd",
+        "paygo_balance_usd",
+        "monthly_budget_usd",
+        "monthly_spent_usd",
+        "quota_period",
+        "quota_remaining_usd",
+        "quota_limit_usd",
+        "quota_used_usd",
+        "quota_resets_at_ms",
+        "unlimited_quota",
+        "total_used_usd",
+        "today_used_usd",
+        "total_requests",
+        "today_requests",
+        "total_tokens",
+        "today_tokens",
+        "subscription_expires_at",
+        "usage_windows",
+        "usage_rate",
+        "usage_model_stats",
+        "alert_codes"
+      ],
+      "shape": [
+        {
+          "name": "observation_provider_id",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "provider_id",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "endpoint_id",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "provider_endpoint_key",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "fetched_at_ms",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "stale_after_ms",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "stale",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "status",
+          "optional": false,
+          "type": "ApiBalanceSnapshotStatus"
+        },
+        {
+          "name": "exhausted",
+          "optional": true,
+          "type": "boolean"
+        },
+        {
+          "name": "exhaustion_affects_routing",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "plan_name",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "total_balance_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "subscription_balance_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "paygo_balance_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "monthly_budget_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "monthly_spent_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "quota_period",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "quota_remaining_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "quota_limit_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "quota_used_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "quota_resets_at_ms",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "unlimited_quota",
+          "optional": true,
+          "type": "boolean"
+        },
+        {
+          "name": "total_used_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "today_used_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "total_requests",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "today_requests",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "total_tokens",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "today_tokens",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "subscription_expires_at",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "usage_windows",
+          "optional": true,
+          "type": "ApiProviderUsageWindow[]"
+        },
+        {
+          "name": "usage_rate",
+          "optional": true,
+          "type": "ApiProviderUsageRateSnapshot"
+        },
+        {
+          "name": "usage_model_stats",
+          "optional": true,
+          "type": "ApiProviderUsageModelStat[]"
+        },
+        {
+          "name": "alert_codes",
+          "optional": true,
+          "type": "ApiProviderUsageAlertKind[]"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/balance.rs",
+      "struct": "ProviderUsageWindow",
+      "fields": [
+        "period",
+        "used_usd",
+        "limit_usd",
+        "remaining_usd",
+        "unlimited"
+      ],
+      "shape": [
+        {
+          "name": "period",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "used_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "limit_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "remaining_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "unlimited",
+          "optional": true,
+          "type": "boolean"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/balance.rs",
+      "struct": "ProviderUsageRateSnapshot",
+      "fields": [
+        "average_duration_ms",
+        "rpm",
+        "tpm"
+      ],
+      "shape": [
+        {
+          "name": "average_duration_ms",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "rpm",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "tpm",
+          "optional": true,
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/balance.rs",
+      "struct": "ProviderUsageModelStat",
+      "fields": [
+        "model",
+        "request_count",
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "input_cost_usd",
+        "output_cost_usd",
+        "total_cost_usd"
+      ],
+      "shape": [
+        {
+          "name": "model",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "request_count",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "input_tokens",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "output_tokens",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "total_tokens",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "input_cost_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "output_cost_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "total_cost_usd",
+          "optional": true,
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/dashboard_core/operator_summary.rs",
+      "struct": "OperatorRuntimeSummary",
+      "fields": [
+        "runtime_loaded_at_ms",
+        "runtime_source_mtime_ms",
+        "configured_default_profile",
+        "default_profile",
+        "default_profile_summary"
+      ],
+      "shape": [
+        {
+          "name": "runtime_loaded_at_ms",
+          "optional": false,
+          "type": "null|number"
+        },
+        {
+          "name": "runtime_source_mtime_ms",
+          "optional": false,
+          "type": "null|number"
+        },
+        {
+          "name": "configured_default_profile",
+          "optional": false,
+          "type": "null|string"
+        },
+        {
+          "name": "default_profile",
+          "optional": false,
+          "type": "null|string"
+        },
+        {
+          "name": "default_profile_summary",
+          "optional": false,
+          "type": "ApiOperatorProfileSummary|null"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/dashboard_core/operator_summary.rs",
+      "struct": "OperatorProfileSummary",
+      "fields": [
+        "name",
+        "model",
+        "reasoning_effort",
+        "service_tier",
+        "fast_mode"
+      ],
+      "shape": [
+        {
+          "name": "name",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "model",
+          "optional": false,
+          "type": "null|string"
+        },
+        {
+          "name": "reasoning_effort",
+          "optional": false,
+          "type": "null|string"
+        },
+        {
+          "name": "service_tier",
+          "optional": false,
+          "type": "null|string"
+        },
+        {
+          "name": "fast_mode",
+          "optional": false,
+          "type": "boolean"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/state/runtime_types.rs",
+      "struct": "UsageDayCoverage",
+      "fields": [
+        "source",
+        "loaded_first_ms",
+        "loaded_last_ms",
+        "loaded_requests",
+        "day_may_be_partial",
+        "partial_reason"
+      ],
+      "shape": [
+        {
+          "name": "source",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "loaded_first_ms",
+          "optional": false,
+          "type": "null|number"
+        },
+        {
+          "name": "loaded_last_ms",
+          "optional": false,
+          "type": "null|number"
+        },
+        {
+          "name": "loaded_requests",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "day_may_be_partial",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "partial_reason",
+          "optional": true,
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/request_ledger.rs",
+      "struct": "RequestUsageAggregate",
+      "fields": [
+        "requests",
+        "duration_ms_total",
+        "input_tokens",
+        "output_tokens",
+        "reasoning_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "total_tokens"
+      ],
+      "shape": [
+        {
+          "name": "requests",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "duration_ms_total",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "input_tokens",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "output_tokens",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "reasoning_tokens",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "cache_read_input_tokens",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "cache_creation_input_tokens",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "total_tokens",
+          "optional": false,
+          "type": "number"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/request_ledger.rs",
+      "struct": "RequestUsageSummaryRow",
+      "fields": [
+        "group_value",
+        "aggregate"
+      ],
+      "shape": [
+        {
+          "name": "group_value",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "aggregate",
+          "optional": false,
+          "type": "ApiRequestUsageAggregate"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/request_ledger.rs",
+      "struct": "RequestUsageSummaryCoverage",
+      "fields": [
+        "source",
+        "first_terminal_at_ms",
+        "last_terminal_at_ms",
+        "requests",
+        "all_history"
+      ],
+      "shape": [
+        {
+          "name": "source",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "first_terminal_at_ms",
+          "optional": false,
+          "type": "null|number"
+        },
+        {
+          "name": "last_terminal_at_ms",
+          "optional": false,
+          "type": "null|number"
+        },
+        {
+          "name": "requests",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "all_history",
+          "optional": false,
+          "type": "boolean"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/request_ledger.rs",
+      "struct": "RequestUsageSummary",
+      "fields": [
+        "group",
+        "coverage",
+        "rows"
+      ],
+      "shape": [
+        {
+          "name": "group",
+          "optional": false,
+          "type": "ApiRequestUsageSummaryGroup"
+        },
+        {
+          "name": "coverage",
+          "optional": false,
+          "type": "ApiRequestUsageSummaryCoverage"
+        },
+        {
+          "name": "rows",
+          "optional": false,
+          "type": "ApiRequestUsageSummaryRow[]"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/usage.rs",
+      "struct": "UsageMetrics",
+      "fields": [
+        "input_tokens",
+        "output_tokens",
+        "reasoning_tokens",
+        "reasoning_output_tokens",
+        "total_tokens",
+        "total_tokens_source",
+        "cached_input_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "cache_creation_5m_input_tokens",
+        "cache_creation_1h_input_tokens",
+        "evidence"
+      ],
+      "shape": [
+        {
+          "name": "input_tokens",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "output_tokens",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "reasoning_tokens",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "reasoning_output_tokens",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "total_tokens",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "total_tokens_source",
+          "optional": true,
+          "type": "ApiUsageTotalSource"
+        },
+        {
+          "name": "cached_input_tokens",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "cache_read_input_tokens",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "cache_creation_input_tokens",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "cache_creation_5m_input_tokens",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "cache_creation_1h_input_tokens",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "evidence",
+          "optional": true,
+          "type": "ApiUsageEvidence"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/usage.rs",
+      "struct": "UsageEvidence",
+      "fields": [
+        "cache_read_input_tokens",
+        "cache_write_input_tokens",
+        "aggregate_status"
+      ],
+      "shape": [
+        {
+          "name": "cache_read_input_tokens",
+          "optional": false,
+          "type": "ApiUsageTokenEvidence"
+        },
+        {
+          "name": "cache_write_input_tokens",
+          "optional": false,
+          "type": "ApiUsageTokenEvidence"
+        },
+        {
+          "name": "aggregate_status",
+          "optional": true,
+          "type": "ApiEconomicsStatus"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/usage.rs",
+      "struct": "UsageTokenEvidenceWire",
+      "fields": [
+        "state",
+        "selected",
+        "observations",
+        "invalid_sources"
+      ],
+      "shape": [
+        {
+          "name": "state",
+          "optional": false,
+          "type": "ApiUsageEvidenceState"
+        },
+        {
+          "name": "selected",
+          "optional": false,
+          "type": "ApiUsageTokenObservation|null"
+        },
+        {
+          "name": "observations",
+          "optional": false,
+          "type": "ApiUsageTokenObservation[]"
+        },
+        {
+          "name": "invalid_sources",
+          "optional": false,
+          "type": "ApiUsageEvidenceSource[]"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/usage.rs",
+      "struct": "UsageTokenObservation",
+      "fields": [
+        "source",
+        "value"
+      ],
+      "shape": [
+        {
+          "name": "source",
+          "optional": false,
+          "type": "ApiUsageEvidenceSource"
+        },
+        {
+          "name": "value",
+          "optional": false,
+          "type": "number"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/pricing.rs",
+      "struct": "CostBreakdown",
+      "fields": [
+        "input_cost_usd",
+        "output_cost_usd",
+        "cache_read_cost_usd",
+        "cache_creation_cost_usd",
+        "service_tier_multiplier",
+        "provider_cost_multiplier",
+        "total_cost_usd",
+        "confidence",
+        "pricing_source"
+      ],
+      "shape": [
+        {
+          "name": "input_cost_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "output_cost_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "cache_read_cost_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "cache_creation_cost_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "service_tier_multiplier",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "provider_cost_multiplier",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "total_cost_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "confidence",
+          "optional": false,
+          "type": "ApiCostConfidence"
+        },
+        {
+          "name": "pricing_source",
+          "optional": true,
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/state/session_identity.rs",
+      "struct": "ResolvedRouteValue",
+      "fields": [
+        "value",
+        "source"
+      ],
+      "shape": [
+        {
+          "name": "value",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "source",
+          "optional": false,
+          "type": "ApiRouteValueSource"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/state/runtime_types.rs",
+      "struct": "UsageBucket",
+      "fields": [
+        "requests_total",
+        "requests_error",
+        "duration_ms_total",
+        "requests_with_usage",
+        "duration_ms_with_usage_total",
+        "generation_ms_total",
+        "ttfb_ms_total",
+        "ttfb_samples",
+        "usage",
+        "cost"
+      ],
+      "shape": [
+        {
+          "name": "requests_total",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "requests_error",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "duration_ms_total",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "requests_with_usage",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "duration_ms_with_usage_total",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "generation_ms_total",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "ttfb_ms_total",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "ttfb_samples",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "usage",
+          "optional": false,
+          "type": "ApiUsageMetrics"
+        },
+        {
+          "name": "cost",
+          "optional": true,
+          "type": "ApiUsageCostSummary"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/pricing.rs",
+      "struct": "CostSummary",
+      "fields": [
+        "total_cost_usd",
+        "confidence",
+        "priced_requests",
+        "unpriced_requests"
+      ],
+      "shape": [
+        {
+          "name": "total_cost_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "confidence",
+          "optional": false,
+          "type": "ApiCostConfidence"
+        },
+        {
+          "name": "priced_requests",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "unpriced_requests",
+          "optional": true,
+          "type": "number"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/state/runtime_types.rs",
+      "struct": "UsageDayHourRow",
+      "fields": [
+        "hour",
+        "bucket"
+      ],
+      "shape": [
+        {
+          "name": "hour",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "bucket",
+          "optional": false,
+          "type": "ApiUsageBucket"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/state/runtime_types.rs",
+      "struct": "UsageDayDimensionRow",
+      "fields": [
+        "name",
+        "bucket"
+      ],
+      "shape": [
+        {
+          "name": "name",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "bucket",
+          "optional": false,
+          "type": "ApiUsageBucket"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/state/runtime_types.rs",
+      "struct": "UsageRetryGateReasonRow",
+      "fields": [
+        "reason",
+        "active"
+      ],
+      "shape": [
+        {
+          "name": "reason",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "active",
+          "optional": false,
+          "type": "number"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/state/runtime_types.rs",
+      "struct": "UsageRetryGateSummary",
+      "fields": [
+        "active",
+        "active_cooldowns",
+        "max_remaining_secs",
+        "reasons"
+      ],
+      "shape": [
+        {
+          "name": "active",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "active_cooldowns",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "max_remaining_secs",
+          "optional": false,
+          "type": "null|number"
+        },
+        {
+          "name": "reasons",
+          "optional": false,
+          "type": "ApiUsageRetryGateReasonRow[]"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/state/runtime_types.rs",
+      "struct": "UsageDayView",
+      "fields": [
+        "day",
+        "label",
+        "start_ms",
+        "end_ms",
+        "generated_at_ms",
+        "summary",
+        "hourly",
+        "provider_rows",
+        "provider_endpoint_rows",
+        "model_rows",
+        "session_rows",
+        "project_rows",
+        "retry_gate",
+        "coverage"
+      ],
+      "shape": [
+        {
+          "name": "day",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "label",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "start_ms",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "end_ms",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "generated_at_ms",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "summary",
+          "optional": false,
+          "type": "ApiUsageBucket"
+        },
+        {
+          "name": "hourly",
+          "optional": false,
+          "type": "ApiUsageDayHourRow[]"
+        },
+        {
+          "name": "provider_rows",
+          "optional": false,
+          "type": "ApiUsageDayDimensionRow[]"
+        },
+        {
+          "name": "provider_endpoint_rows",
+          "optional": false,
+          "type": "ApiUsageDayDimensionRow[]"
+        },
+        {
+          "name": "model_rows",
+          "optional": false,
+          "type": "ApiUsageDayDimensionRow[]"
+        },
+        {
+          "name": "session_rows",
+          "optional": false,
+          "type": "ApiUsageDayDimensionRow[]"
+        },
+        {
+          "name": "project_rows",
+          "optional": false,
+          "type": "ApiUsageDayDimensionRow[]"
+        },
+        {
+          "name": "retry_gate",
+          "optional": false,
+          "type": "ApiUsageRetryGateSummary"
+        },
+        {
+          "name": "coverage",
+          "optional": false,
+          "type": "ApiUsageDayCoverage"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/state/runtime_types.rs",
+      "struct": "UsageRollupCoverage",
+      "fields": [
+        "requested_days",
+        "all_loaded",
+        "loaded_first_day",
+        "loaded_last_day",
+        "loaded_days_with_data",
+        "loaded_requests",
+        "window_first_day",
+        "window_last_day",
+        "window_days_with_data",
+        "window_requests",
+        "window_exceeds_loaded_start"
+      ],
+      "shape": [
+        {
+          "name": "requested_days",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "all_loaded",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "loaded_first_day",
+          "optional": false,
+          "type": "null|number"
+        },
+        {
+          "name": "loaded_last_day",
+          "optional": false,
+          "type": "null|number"
+        },
+        {
+          "name": "loaded_days_with_data",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "loaded_requests",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "window_first_day",
+          "optional": false,
+          "type": "null|number"
+        },
+        {
+          "name": "window_last_day",
+          "optional": false,
+          "type": "null|number"
+        },
+        {
+          "name": "window_days_with_data",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "window_requests",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "window_exceeds_loaded_start",
+          "optional": false,
+          "type": "boolean"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/state/runtime_types.rs",
+      "struct": "UsageRollupView",
+      "fields": [
+        "loaded",
+        "window",
+        "coverage",
+        "by_day",
+        "by_provider_endpoint",
+        "by_provider_endpoint_day",
+        "by_provider",
+        "by_provider_day"
+      ],
+      "shape": [
+        {
+          "name": "loaded",
+          "optional": false,
+          "type": "ApiUsageBucket"
+        },
+        {
+          "name": "window",
+          "optional": false,
+          "type": "ApiUsageBucket"
+        },
+        {
+          "name": "coverage",
+          "optional": false,
+          "type": "ApiUsageRollupCoverage"
+        },
+        {
+          "name": "by_day",
+          "optional": false,
+          "type": "[number,ApiUsageBucket][]"
+        },
+        {
+          "name": "by_provider_endpoint",
+          "optional": false,
+          "type": "[string,ApiUsageBucket][]"
+        },
+        {
+          "name": "by_provider_endpoint_day",
+          "optional": false,
+          "type": "Record<string,[number,ApiUsageBucket][]>"
+        },
+        {
+          "name": "by_provider",
+          "optional": false,
+          "type": "[string,ApiUsageBucket][]"
+        },
+        {
+          "name": "by_provider_day",
+          "optional": false,
+          "type": "Record<string,[number,ApiUsageBucket][]>"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/dashboard_core/window_stats.rs",
+      "struct": "WindowStats",
+      "fields": [
+        "total",
+        "ok_2xx",
+        "err_429",
+        "err_4xx",
+        "err_5xx",
+        "p50_ms",
+        "p95_ms",
+        "avg_attempts",
+        "retry_rate",
+        "top_provider",
+        "top_provider_endpoint"
+      ],
+      "shape": [
+        {
+          "name": "total",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "ok_2xx",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "err_429",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "err_4xx",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "err_5xx",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "p50_ms",
+          "optional": false,
+          "type": "null|number"
+        },
+        {
+          "name": "p95_ms",
+          "optional": false,
+          "type": "null|number"
+        },
+        {
+          "name": "avg_attempts",
+          "optional": false,
+          "type": "null|number"
+        },
+        {
+          "name": "retry_rate",
+          "optional": false,
+          "type": "null|number"
+        },
+        {
+          "name": "top_provider",
+          "optional": false,
+          "type": "[string,number]|null"
+        },
+        {
+          "name": "top_provider_endpoint",
+          "optional": false,
+          "type": "[string,number]|null"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/pricing.rs",
+      "struct": "ModelPriceView",
+      "fields": [
+        "model_id",
+        "display_name",
+        "aliases",
+        "input_per_1m_usd",
+        "output_per_1m_usd",
+        "cache_read_input_per_1m_usd",
+        "cache_creation_input_per_1m_usd",
+        "source",
+        "confidence"
+      ],
+      "shape": [
+        {
+          "name": "model_id",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "display_name",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "aliases",
+          "optional": true,
+          "type": "string[]"
+        },
+        {
+          "name": "input_per_1m_usd",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "output_per_1m_usd",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "cache_read_input_per_1m_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "cache_creation_input_per_1m_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "source",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "confidence",
+          "optional": false,
+          "type": "ApiCostConfidence"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/pricing.rs",
+      "struct": "ModelPriceCatalogSnapshot",
+      "fields": [
+        "source",
+        "model_count",
+        "models"
+      ],
+      "shape": [
+        {
+          "name": "source",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "model_count",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "models",
+          "optional": false,
+          "type": "ApiModelPriceView[]"
+        }
       ]
     }
   ],
@@ -33,54 +2759,2937 @@
       "type": "AdminReadModel",
       "fields": [
         "endpoint",
-        "operatorSummary",
-        "runtimeStatus",
-        "providers",
-        "recentRequests",
-        "usageSummary",
-        "usageDay",
-        "sectionStatuses"
-      ]
-    },
-    {
-      "file": "src/lib/api/admin-read-model.ts",
-      "type": "AdminReadModelDto",
-      "fields": [
-        "endpoint",
-        "operatorSummary",
-        "runtimeStatus",
-        "providers",
-        "recentRequests",
-        "usageSummary",
-        "usageDay",
-        "sectionStatuses"
-      ]
-    },
-    {
-      "file": "src/lib/tauri/commands.ts",
-      "type": "AdminReadModelSectionStatus",
-      "fields": [
-        "section",
-        "ok",
-        "code",
-        "error"
+        "operatorReadModel"
+      ],
+      "shape": [
+        {
+          "name": "endpoint",
+          "optional": false,
+          "type": "AdminEndpointConfig"
+        },
+        {
+          "name": "operatorReadModel",
+          "optional": false,
+          "type": "ApiOperatorReadModel"
+        }
       ]
     },
     {
       "file": "src/lib/api/admin-types.ts",
-      "type": "ApiAdminReadModelSectionStatus",
+      "type": "ApiOperatorReadModelWire",
       "fields": [
-        "section",
-        "ok",
+        "api_version",
+        "service_name",
+        "status",
+        "captured_at_ms",
+        "revisions",
+        "data",
+        "issue"
+      ],
+      "shape": [
+        {
+          "name": "api_version",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "service_name",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "status",
+          "optional": false,
+          "type": "ApiOperatorReadStatus"
+        },
+        {
+          "name": "captured_at_ms",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "revisions",
+          "optional": true,
+          "type": "ApiOperatorRevisionBundle"
+        },
+        {
+          "name": "data",
+          "optional": true,
+          "type": "ApiOperatorReadData"
+        },
+        {
+          "name": "issue",
+          "optional": true,
+          "type": "ApiOperatorReadIssue"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiOperatorRevisionBundle",
+      "fields": [
+        "runtime_revision",
+        "runtime_digest",
+        "route_digest",
+        "catalog_revision",
+        "pricing_revision",
+        "operator_pricing_revision",
+        "policy_revision",
+        "ledger_revision"
+      ],
+      "shape": [
+        {
+          "name": "runtime_revision",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "runtime_digest",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "route_digest",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "catalog_revision",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "pricing_revision",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "operator_pricing_revision",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "policy_revision",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "ledger_revision",
+          "optional": false,
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiOperatorReadData",
+      "fields": [
+        "summary",
+        "active_requests",
+        "recent_requests",
+        "usage_summaries",
+        "usage_day",
+        "usage_rollup",
+        "stats_5m",
+        "stats_1h",
+        "pricing_catalog",
+        "provider_balances"
+      ],
+      "shape": [
+        {
+          "name": "summary",
+          "optional": false,
+          "type": "ApiOperatorSummary"
+        },
+        {
+          "name": "active_requests",
+          "optional": false,
+          "type": "ApiOperatorActiveRequestSummary[]"
+        },
+        {
+          "name": "recent_requests",
+          "optional": false,
+          "type": "ApiOperatorRequestSummary[]"
+        },
+        {
+          "name": "usage_summaries",
+          "optional": false,
+          "type": "ApiRequestUsageSummary[]"
+        },
+        {
+          "name": "usage_day",
+          "optional": false,
+          "type": "ApiUsageDayView"
+        },
+        {
+          "name": "usage_rollup",
+          "optional": false,
+          "type": "ApiUsageRollupView"
+        },
+        {
+          "name": "stats_5m",
+          "optional": false,
+          "type": "ApiWindowStats"
+        },
+        {
+          "name": "stats_1h",
+          "optional": false,
+          "type": "ApiWindowStats"
+        },
+        {
+          "name": "pricing_catalog",
+          "optional": false,
+          "type": "ApiModelPriceCatalogSnapshot"
+        },
+        {
+          "name": "provider_balances",
+          "optional": false,
+          "type": "ApiOperatorProviderBalanceSummary[]"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiOperatorSummary",
+      "fields": [
+        "api_version",
+        "service_name",
+        "runtime",
+        "counts",
+        "retry",
+        "sessions",
+        "profiles",
+        "providers"
+      ],
+      "shape": [
+        {
+          "name": "api_version",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "service_name",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "runtime",
+          "optional": false,
+          "type": "ApiOperatorRuntimeSummary"
+        },
+        {
+          "name": "counts",
+          "optional": false,
+          "type": "ApiOperatorSummaryCounts"
+        },
+        {
+          "name": "retry",
+          "optional": false,
+          "type": "ApiOperatorRetrySummary"
+        },
+        {
+          "name": "sessions",
+          "optional": false,
+          "type": "ApiOperatorSessionSummary[]"
+        },
+        {
+          "name": "profiles",
+          "optional": false,
+          "type": "ApiControlProfileOption[]"
+        },
+        {
+          "name": "providers",
+          "optional": false,
+          "type": "ApiOperatorProviderSummary[]"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiOperatorSummaryCounts",
+      "fields": [
+        "active_requests",
+        "recent_requests",
+        "sessions",
+        "profiles",
+        "providers"
+      ],
+      "shape": [
+        {
+          "name": "active_requests",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "recent_requests",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "sessions",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "profiles",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "providers",
+          "optional": false,
+          "type": "number"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiOperatorRetrySummary",
+      "fields": [
+        "configured_profile",
+        "upstream_max_attempts",
+        "provider_max_attempts",
+        "recent_retried_requests",
+        "recent_cross_provider_failovers",
+        "recent_same_provider_retries",
+        "recent_fast_mode_requests"
+      ],
+      "shape": [
+        {
+          "name": "configured_profile",
+          "optional": false,
+          "type": "ApiRetryProfileName|null"
+        },
+        {
+          "name": "upstream_max_attempts",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "provider_max_attempts",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "recent_retried_requests",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "recent_cross_provider_failovers",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "recent_same_provider_retries",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "recent_fast_mode_requests",
+          "optional": false,
+          "type": "number"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiControlProfileOption",
+      "fields": [
+        "name",
+        "extends",
+        "model",
+        "reasoning_effort",
+        "service_tier",
+        "fast_mode",
+        "is_default"
+      ],
+      "shape": [
+        {
+          "name": "name",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "extends",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "model",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "reasoning_effort",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "service_tier",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "fast_mode",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "is_default",
+          "optional": false,
+          "type": "boolean"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiOperatorProviderSummary",
+      "fields": [
+        "name",
+        "alias",
+        "configured_enabled",
+        "effective_enabled",
+        "routable_endpoints",
+        "endpoints",
+        "capacity"
+      ],
+      "shape": [
+        {
+          "name": "name",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "alias",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "configured_enabled",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "effective_enabled",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "routable_endpoints",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "endpoints",
+          "optional": false,
+          "type": "ApiOperatorProviderEndpointSummary[]"
+        },
+        {
+          "name": "capacity",
+          "optional": true,
+          "type": "ApiOperatorProviderCapacity"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiOperatorProviderEndpointSummary",
+      "fields": [
+        "provider_name",
+        "name",
+        "provider_endpoint_key",
+        "origin",
+        "priority",
+        "configured_enabled",
+        "effective_enabled",
+        "routable",
+        "runtime_enabled_override",
+        "runtime_state",
+        "runtime_state_override",
+        "capacity",
+        "policy_actions"
+      ],
+      "shape": [
+        {
+          "name": "provider_name",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "name",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "provider_endpoint_key",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "origin",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "priority",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "configured_enabled",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "effective_enabled",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "routable",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "runtime_enabled_override",
+          "optional": true,
+          "type": "boolean"
+        },
+        {
+          "name": "runtime_state",
+          "optional": false,
+          "type": "ApiRuntimeConfigState"
+        },
+        {
+          "name": "runtime_state_override",
+          "optional": true,
+          "type": "ApiRuntimeConfigState"
+        },
+        {
+          "name": "capacity",
+          "optional": true,
+          "type": "ApiOperatorProviderCapacity"
+        },
+        {
+          "name": "policy_actions",
+          "optional": true,
+          "type": "ApiOperatorPolicyActionSummary[]"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiOperatorProviderCapacity",
+      "fields": [
+        "configured_max_concurrent_requests",
+        "effective_max_concurrent_requests",
+        "active",
+        "limit",
+        "saturated",
+        "inherited_from_provider"
+      ],
+      "shape": [
+        {
+          "name": "configured_max_concurrent_requests",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "effective_max_concurrent_requests",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "active",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "limit",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "saturated",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "inherited_from_provider",
+          "optional": true,
+          "type": "boolean"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiOperatorPolicyActionSummary",
+      "fields": [
+        "active_cooldown",
         "code",
+        "cooldown_remaining_secs"
+      ],
+      "shape": [
+        {
+          "name": "active_cooldown",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "code",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "cooldown_remaining_secs",
+          "optional": true,
+          "type": "number"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiOperatorSessionSummary",
+      "fields": [
+        "session_key",
+        "active_count",
+        "active_started_at_ms_min",
+        "last_status",
+        "last_duration_ms",
+        "last_ended_at_ms",
+        "last_model",
+        "last_reasoning_effort",
+        "last_service_tier",
+        "last_provider_id",
+        "last_usage",
+        "total_usage",
+        "turns_total",
+        "turns_with_usage",
+        "last_output_tokens_per_second",
+        "avg_output_tokens_per_second",
+        "binding_profile_name",
+        "binding_continuity_mode",
+        "last_route_decision",
+        "route_affinity",
+        "effective_model",
+        "effective_reasoning_effort",
+        "effective_service_tier"
+      ],
+      "shape": [
+        {
+          "name": "session_key",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "active_count",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "active_started_at_ms_min",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "last_status",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "last_duration_ms",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "last_ended_at_ms",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "last_model",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "last_reasoning_effort",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "last_service_tier",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "last_provider_id",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "last_usage",
+          "optional": true,
+          "type": "ApiUsageMetrics"
+        },
+        {
+          "name": "total_usage",
+          "optional": true,
+          "type": "ApiUsageMetrics"
+        },
+        {
+          "name": "turns_total",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "turns_with_usage",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "last_output_tokens_per_second",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "avg_output_tokens_per_second",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "binding_profile_name",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "binding_continuity_mode",
+          "optional": true,
+          "type": "ApiSessionContinuityMode"
+        },
+        {
+          "name": "last_route_decision",
+          "optional": true,
+          "type": "ApiOperatorRouteDecision"
+        },
+        {
+          "name": "route_affinity",
+          "optional": true,
+          "type": "ApiOperatorSessionRouteAffinitySummary"
+        },
+        {
+          "name": "effective_model",
+          "optional": true,
+          "type": "ApiResolvedRouteValue"
+        },
+        {
+          "name": "effective_reasoning_effort",
+          "optional": true,
+          "type": "ApiResolvedRouteValue"
+        },
+        {
+          "name": "effective_service_tier",
+          "optional": true,
+          "type": "ApiResolvedRouteValue"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiOperatorSessionRouteAffinitySummary",
+      "fields": [
+        "provider_id",
+        "endpoint_id",
+        "upstream_origin",
+        "route_path",
+        "last_selected_at_ms",
+        "last_changed_at_ms",
+        "change_reason"
+      ],
+      "shape": [
+        {
+          "name": "provider_id",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "endpoint_id",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "upstream_origin",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "route_path",
+          "optional": true,
+          "type": "string[]"
+        },
+        {
+          "name": "last_selected_at_ms",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "last_changed_at_ms",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "change_reason",
+          "optional": false,
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiOperatorRouteDecision",
+      "fields": [
+        "decided_at_ms",
+        "binding_profile_name",
+        "binding_continuity_mode",
+        "effective_model",
+        "effective_reasoning_effort",
+        "effective_service_tier",
+        "effective_upstream_base_url",
+        "provider_id",
+        "endpoint_id",
+        "route_path"
+      ],
+      "shape": [
+        {
+          "name": "decided_at_ms",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "binding_profile_name",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "binding_continuity_mode",
+          "optional": true,
+          "type": "ApiSessionContinuityMode"
+        },
+        {
+          "name": "effective_model",
+          "optional": true,
+          "type": "ApiResolvedRouteValue"
+        },
+        {
+          "name": "effective_reasoning_effort",
+          "optional": true,
+          "type": "ApiResolvedRouteValue"
+        },
+        {
+          "name": "effective_service_tier",
+          "optional": true,
+          "type": "ApiResolvedRouteValue"
+        },
+        {
+          "name": "effective_upstream_base_url",
+          "optional": true,
+          "type": "ApiResolvedRouteValue"
+        },
+        {
+          "name": "provider_id",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "endpoint_id",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "route_path",
+          "optional": true,
+          "type": "string[]"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiOperatorActiveRequestSummary",
+      "fields": [
+        "id",
+        "runtime_revision",
+        "policy_revision",
+        "session_key",
+        "model",
+        "requested_model",
+        "reasoning_effort",
+        "service_tier",
+        "requested_service_tier",
+        "provider_id",
+        "endpoint_id",
+        "provider_endpoint_key",
+        "route_path",
+        "upstream_origin",
+        "service",
+        "method",
+        "path",
+        "started_at_ms"
+      ],
+      "shape": [
+        {
+          "name": "id",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "runtime_revision",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "policy_revision",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "session_key",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "model",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "requested_model",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "reasoning_effort",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "service_tier",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "requested_service_tier",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "provider_id",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "endpoint_id",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "provider_endpoint_key",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "route_path",
+          "optional": true,
+          "type": "string[]"
+        },
+        {
+          "name": "upstream_origin",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "service",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "method",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "path",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "started_at_ms",
+          "optional": false,
+          "type": "number"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiOperatorRequestSummary",
+      "fields": [
+        "id",
+        "session_key",
+        "model",
+        "reasoning_effort",
+        "service_tier",
+        "provider_id",
+        "endpoint_id",
+        "provider_endpoint_key",
+        "route_path",
+        "upstream_origin",
+        "usage",
+        "cost",
+        "retry",
+        "provider_signal_codes",
+        "policy_action_codes",
+        "observability",
+        "service",
+        "method",
+        "path",
+        "status_code",
+        "duration_ms",
+        "ttfb_ms",
+        "streaming",
+        "ended_at_ms"
+      ],
+      "shape": [
+        {
+          "name": "id",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "session_key",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "model",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "reasoning_effort",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "service_tier",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "provider_id",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "endpoint_id",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "provider_endpoint_key",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "route_path",
+          "optional": true,
+          "type": "string[]"
+        },
+        {
+          "name": "upstream_origin",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "usage",
+          "optional": true,
+          "type": "ApiUsageMetrics"
+        },
+        {
+          "name": "cost",
+          "optional": true,
+          "type": "ApiCostBreakdown"
+        },
+        {
+          "name": "retry",
+          "optional": true,
+          "type": "ApiOperatorRetrySummaryView"
+        },
+        {
+          "name": "provider_signal_codes",
+          "optional": true,
+          "type": "string[]"
+        },
+        {
+          "name": "policy_action_codes",
+          "optional": true,
+          "type": "string[]"
+        },
+        {
+          "name": "observability",
+          "optional": false,
+          "type": "ApiOperatorRequestObservability"
+        },
+        {
+          "name": "service",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "method",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "path",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "status_code",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "duration_ms",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "ttfb_ms",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "streaming",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "ended_at_ms",
+          "optional": false,
+          "type": "number"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiOperatorRetrySummaryView",
+      "fields": [
+        "attempts",
+        "route_attempts"
+      ],
+      "shape": [
+        {
+          "name": "attempts",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "route_attempts",
+          "optional": true,
+          "type": "ApiOperatorRouteAttemptSummary[]"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiOperatorRouteAttemptSummary",
+      "fields": [
+        "attempt_index",
+        "provider_id",
+        "endpoint_id",
+        "provider_endpoint_key",
+        "preference_group",
+        "provider_attempt",
+        "upstream_attempt",
+        "provider_max_attempts",
+        "upstream_max_attempts",
+        "avoided_total",
+        "total_upstreams",
+        "code",
+        "status_code",
+        "model",
+        "upstream_headers_ms",
+        "duration_ms",
+        "cooldown_secs",
+        "skipped",
+        "provider_signal_codes",
+        "policy_action_codes"
+      ],
+      "shape": [
+        {
+          "name": "attempt_index",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "provider_id",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "endpoint_id",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "provider_endpoint_key",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "preference_group",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "provider_attempt",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "upstream_attempt",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "provider_max_attempts",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "upstream_max_attempts",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "avoided_total",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "total_upstreams",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "code",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "status_code",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "model",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "upstream_headers_ms",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "duration_ms",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "cooldown_secs",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "skipped",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "provider_signal_codes",
+          "optional": true,
+          "type": "string[]"
+        },
+        {
+          "name": "policy_action_codes",
+          "optional": true,
+          "type": "string[]"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiOperatorRequestObservability",
+      "fields": [
+        "duration_ms",
+        "ttfb_ms",
+        "generation_ms",
+        "output_tokens_per_second",
+        "attempt_count",
+        "route_attempt_count",
+        "retried",
+        "cross_provider_failover",
+        "same_provider_retry",
+        "fast_mode",
+        "streaming"
+      ],
+      "shape": [
+        {
+          "name": "duration_ms",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "ttfb_ms",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "generation_ms",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "output_tokens_per_second",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "attempt_count",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "route_attempt_count",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "retried",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "cross_provider_failover",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "same_provider_retry",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "fast_mode",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "streaming",
+          "optional": false,
+          "type": "boolean"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiOperatorProviderBalanceSummary",
+      "fields": [
+        "observation_provider_id",
+        "provider_id",
+        "endpoint_id",
+        "provider_endpoint_key",
+        "fetched_at_ms",
+        "stale_after_ms",
+        "stale",
+        "status",
+        "exhausted",
+        "exhaustion_affects_routing",
+        "plan_name",
+        "total_balance_usd",
+        "subscription_balance_usd",
+        "paygo_balance_usd",
+        "monthly_budget_usd",
+        "monthly_spent_usd",
+        "quota_period",
+        "quota_remaining_usd",
+        "quota_limit_usd",
+        "quota_used_usd",
+        "quota_resets_at_ms",
+        "unlimited_quota",
+        "total_used_usd",
+        "today_used_usd",
+        "total_requests",
+        "today_requests",
+        "total_tokens",
+        "today_tokens",
+        "subscription_expires_at",
+        "usage_windows",
+        "usage_rate",
+        "usage_model_stats",
+        "alert_codes"
+      ],
+      "shape": [
+        {
+          "name": "observation_provider_id",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "provider_id",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "endpoint_id",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "provider_endpoint_key",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "fetched_at_ms",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "stale_after_ms",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "stale",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "status",
+          "optional": false,
+          "type": "ApiBalanceSnapshotStatus"
+        },
+        {
+          "name": "exhausted",
+          "optional": true,
+          "type": "boolean"
+        },
+        {
+          "name": "exhaustion_affects_routing",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "plan_name",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "total_balance_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "subscription_balance_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "paygo_balance_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "monthly_budget_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "monthly_spent_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "quota_period",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "quota_remaining_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "quota_limit_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "quota_used_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "quota_resets_at_ms",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "unlimited_quota",
+          "optional": true,
+          "type": "boolean"
+        },
+        {
+          "name": "total_used_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "today_used_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "total_requests",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "today_requests",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "total_tokens",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "today_tokens",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "subscription_expires_at",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "usage_windows",
+          "optional": true,
+          "type": "ApiProviderUsageWindow[]"
+        },
+        {
+          "name": "usage_rate",
+          "optional": true,
+          "type": "ApiProviderUsageRateSnapshot"
+        },
+        {
+          "name": "usage_model_stats",
+          "optional": true,
+          "type": "ApiProviderUsageModelStat[]"
+        },
+        {
+          "name": "alert_codes",
+          "optional": true,
+          "type": "ApiProviderUsageAlertKind[]"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiProviderUsageWindow",
+      "fields": [
+        "period",
+        "used_usd",
+        "limit_usd",
+        "remaining_usd",
+        "unlimited"
+      ],
+      "shape": [
+        {
+          "name": "period",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "used_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "limit_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "remaining_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "unlimited",
+          "optional": true,
+          "type": "boolean"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiProviderUsageRateSnapshot",
+      "fields": [
+        "average_duration_ms",
+        "rpm",
+        "tpm"
+      ],
+      "shape": [
+        {
+          "name": "average_duration_ms",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "rpm",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "tpm",
+          "optional": true,
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiProviderUsageModelStat",
+      "fields": [
+        "model",
+        "request_count",
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "input_cost_usd",
+        "output_cost_usd",
+        "total_cost_usd"
+      ],
+      "shape": [
+        {
+          "name": "model",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "request_count",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "input_tokens",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "output_tokens",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "total_tokens",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "input_cost_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "output_cost_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "total_cost_usd",
+          "optional": true,
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiOperatorRuntimeSummary",
+      "fields": [
+        "runtime_loaded_at_ms",
+        "runtime_source_mtime_ms",
+        "configured_default_profile",
+        "default_profile",
+        "default_profile_summary"
+      ],
+      "shape": [
+        {
+          "name": "runtime_loaded_at_ms",
+          "optional": false,
+          "type": "null|number"
+        },
+        {
+          "name": "runtime_source_mtime_ms",
+          "optional": false,
+          "type": "null|number"
+        },
+        {
+          "name": "configured_default_profile",
+          "optional": false,
+          "type": "null|string"
+        },
+        {
+          "name": "default_profile",
+          "optional": false,
+          "type": "null|string"
+        },
+        {
+          "name": "default_profile_summary",
+          "optional": false,
+          "type": "ApiOperatorProfileSummary|null"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiOperatorProfileSummary",
+      "fields": [
+        "name",
+        "model",
+        "reasoning_effort",
+        "service_tier",
+        "fast_mode"
+      ],
+      "shape": [
+        {
+          "name": "name",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "model",
+          "optional": false,
+          "type": "null|string"
+        },
+        {
+          "name": "reasoning_effort",
+          "optional": false,
+          "type": "null|string"
+        },
+        {
+          "name": "service_tier",
+          "optional": false,
+          "type": "null|string"
+        },
+        {
+          "name": "fast_mode",
+          "optional": false,
+          "type": "boolean"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiUsageDayCoverage",
+      "fields": [
+        "source",
+        "loaded_first_ms",
+        "loaded_last_ms",
+        "loaded_requests",
+        "day_may_be_partial",
+        "partial_reason"
+      ],
+      "shape": [
+        {
+          "name": "source",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "loaded_first_ms",
+          "optional": false,
+          "type": "null|number"
+        },
+        {
+          "name": "loaded_last_ms",
+          "optional": false,
+          "type": "null|number"
+        },
+        {
+          "name": "loaded_requests",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "day_may_be_partial",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "partial_reason",
+          "optional": true,
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiRequestUsageAggregate",
+      "fields": [
+        "requests",
+        "duration_ms_total",
+        "input_tokens",
+        "output_tokens",
+        "reasoning_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "total_tokens"
+      ],
+      "shape": [
+        {
+          "name": "requests",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "duration_ms_total",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "input_tokens",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "output_tokens",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "reasoning_tokens",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "cache_read_input_tokens",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "cache_creation_input_tokens",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "total_tokens",
+          "optional": false,
+          "type": "number"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiRequestUsageSummaryRow",
+      "fields": [
+        "group_value",
+        "aggregate"
+      ],
+      "shape": [
+        {
+          "name": "group_value",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "aggregate",
+          "optional": false,
+          "type": "ApiRequestUsageAggregate"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiRequestUsageSummaryCoverage",
+      "fields": [
+        "source",
+        "first_terminal_at_ms",
+        "last_terminal_at_ms",
+        "requests",
+        "all_history"
+      ],
+      "shape": [
+        {
+          "name": "source",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "first_terminal_at_ms",
+          "optional": false,
+          "type": "null|number"
+        },
+        {
+          "name": "last_terminal_at_ms",
+          "optional": false,
+          "type": "null|number"
+        },
+        {
+          "name": "requests",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "all_history",
+          "optional": false,
+          "type": "boolean"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiRequestUsageSummary",
+      "fields": [
+        "group",
+        "coverage",
+        "rows"
+      ],
+      "shape": [
+        {
+          "name": "group",
+          "optional": false,
+          "type": "ApiRequestUsageSummaryGroup"
+        },
+        {
+          "name": "coverage",
+          "optional": false,
+          "type": "ApiRequestUsageSummaryCoverage"
+        },
+        {
+          "name": "rows",
+          "optional": false,
+          "type": "ApiRequestUsageSummaryRow[]"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiUsageMetrics",
+      "fields": [
+        "input_tokens",
+        "output_tokens",
+        "reasoning_tokens",
+        "reasoning_output_tokens",
+        "total_tokens",
+        "total_tokens_source",
+        "cached_input_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "cache_creation_5m_input_tokens",
+        "cache_creation_1h_input_tokens",
+        "evidence"
+      ],
+      "shape": [
+        {
+          "name": "input_tokens",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "output_tokens",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "reasoning_tokens",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "reasoning_output_tokens",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "total_tokens",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "total_tokens_source",
+          "optional": true,
+          "type": "ApiUsageTotalSource"
+        },
+        {
+          "name": "cached_input_tokens",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "cache_read_input_tokens",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "cache_creation_input_tokens",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "cache_creation_5m_input_tokens",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "cache_creation_1h_input_tokens",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "evidence",
+          "optional": true,
+          "type": "ApiUsageEvidence"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiUsageEvidence",
+      "fields": [
+        "cache_read_input_tokens",
+        "cache_write_input_tokens",
+        "aggregate_status"
+      ],
+      "shape": [
+        {
+          "name": "cache_read_input_tokens",
+          "optional": false,
+          "type": "ApiUsageTokenEvidence"
+        },
+        {
+          "name": "cache_write_input_tokens",
+          "optional": false,
+          "type": "ApiUsageTokenEvidence"
+        },
+        {
+          "name": "aggregate_status",
+          "optional": true,
+          "type": "ApiEconomicsStatus"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiUsageTokenEvidence",
+      "fields": [
+        "state",
+        "selected",
+        "observations",
+        "invalid_sources"
+      ],
+      "shape": [
+        {
+          "name": "state",
+          "optional": false,
+          "type": "ApiUsageEvidenceState"
+        },
+        {
+          "name": "selected",
+          "optional": false,
+          "type": "ApiUsageTokenObservation|null"
+        },
+        {
+          "name": "observations",
+          "optional": false,
+          "type": "ApiUsageTokenObservation[]"
+        },
+        {
+          "name": "invalid_sources",
+          "optional": false,
+          "type": "ApiUsageEvidenceSource[]"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiUsageTokenObservation",
+      "fields": [
+        "source",
+        "value"
+      ],
+      "shape": [
+        {
+          "name": "source",
+          "optional": false,
+          "type": "ApiUsageEvidenceSource"
+        },
+        {
+          "name": "value",
+          "optional": false,
+          "type": "number"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiCostBreakdown",
+      "fields": [
+        "input_cost_usd",
+        "output_cost_usd",
+        "cache_read_cost_usd",
+        "cache_creation_cost_usd",
+        "service_tier_multiplier",
+        "provider_cost_multiplier",
+        "total_cost_usd",
+        "confidence",
+        "pricing_source"
+      ],
+      "shape": [
+        {
+          "name": "input_cost_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "output_cost_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "cache_read_cost_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "cache_creation_cost_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "service_tier_multiplier",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "provider_cost_multiplier",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "total_cost_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "confidence",
+          "optional": false,
+          "type": "ApiCostConfidence"
+        },
+        {
+          "name": "pricing_source",
+          "optional": true,
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiResolvedRouteValue",
+      "fields": [
+        "value",
+        "source"
+      ],
+      "shape": [
+        {
+          "name": "value",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "source",
+          "optional": false,
+          "type": "ApiRouteValueSource"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiUsageBucket",
+      "fields": [
+        "requests_total",
+        "requests_error",
+        "duration_ms_total",
+        "requests_with_usage",
+        "duration_ms_with_usage_total",
+        "generation_ms_total",
+        "ttfb_ms_total",
+        "ttfb_samples",
+        "usage",
+        "cost"
+      ],
+      "shape": [
+        {
+          "name": "requests_total",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "requests_error",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "duration_ms_total",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "requests_with_usage",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "duration_ms_with_usage_total",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "generation_ms_total",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "ttfb_ms_total",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "ttfb_samples",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "usage",
+          "optional": false,
+          "type": "ApiUsageMetrics"
+        },
+        {
+          "name": "cost",
+          "optional": true,
+          "type": "ApiUsageCostSummary"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiUsageCostSummary",
+      "fields": [
+        "total_cost_usd",
+        "confidence",
+        "priced_requests",
+        "unpriced_requests"
+      ],
+      "shape": [
+        {
+          "name": "total_cost_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "confidence",
+          "optional": false,
+          "type": "ApiCostConfidence"
+        },
+        {
+          "name": "priced_requests",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "unpriced_requests",
+          "optional": true,
+          "type": "number"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiUsageDayHourRow",
+      "fields": [
+        "hour",
+        "bucket"
+      ],
+      "shape": [
+        {
+          "name": "hour",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "bucket",
+          "optional": false,
+          "type": "ApiUsageBucket"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiUsageDayDimensionRow",
+      "fields": [
+        "name",
+        "bucket"
+      ],
+      "shape": [
+        {
+          "name": "name",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "bucket",
+          "optional": false,
+          "type": "ApiUsageBucket"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiUsageRetryGateReasonRow",
+      "fields": [
+        "reason",
+        "active"
+      ],
+      "shape": [
+        {
+          "name": "reason",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "active",
+          "optional": false,
+          "type": "number"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiUsageRetryGateSummary",
+      "fields": [
+        "active",
+        "active_cooldowns",
+        "max_remaining_secs",
+        "reasons"
+      ],
+      "shape": [
+        {
+          "name": "active",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "active_cooldowns",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "max_remaining_secs",
+          "optional": false,
+          "type": "null|number"
+        },
+        {
+          "name": "reasons",
+          "optional": false,
+          "type": "ApiUsageRetryGateReasonRow[]"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiUsageDayView",
+      "fields": [
+        "day",
+        "label",
+        "start_ms",
+        "end_ms",
+        "generated_at_ms",
+        "summary",
+        "hourly",
+        "provider_rows",
+        "provider_endpoint_rows",
+        "model_rows",
+        "session_rows",
+        "project_rows",
+        "retry_gate",
+        "coverage"
+      ],
+      "shape": [
+        {
+          "name": "day",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "label",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "start_ms",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "end_ms",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "generated_at_ms",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "summary",
+          "optional": false,
+          "type": "ApiUsageBucket"
+        },
+        {
+          "name": "hourly",
+          "optional": false,
+          "type": "ApiUsageDayHourRow[]"
+        },
+        {
+          "name": "provider_rows",
+          "optional": false,
+          "type": "ApiUsageDayDimensionRow[]"
+        },
+        {
+          "name": "provider_endpoint_rows",
+          "optional": false,
+          "type": "ApiUsageDayDimensionRow[]"
+        },
+        {
+          "name": "model_rows",
+          "optional": false,
+          "type": "ApiUsageDayDimensionRow[]"
+        },
+        {
+          "name": "session_rows",
+          "optional": false,
+          "type": "ApiUsageDayDimensionRow[]"
+        },
+        {
+          "name": "project_rows",
+          "optional": false,
+          "type": "ApiUsageDayDimensionRow[]"
+        },
+        {
+          "name": "retry_gate",
+          "optional": false,
+          "type": "ApiUsageRetryGateSummary"
+        },
+        {
+          "name": "coverage",
+          "optional": false,
+          "type": "ApiUsageDayCoverage"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiUsageRollupCoverage",
+      "fields": [
+        "requested_days",
+        "all_loaded",
+        "loaded_first_day",
+        "loaded_last_day",
+        "loaded_days_with_data",
+        "loaded_requests",
+        "window_first_day",
+        "window_last_day",
+        "window_days_with_data",
+        "window_requests",
+        "window_exceeds_loaded_start"
+      ],
+      "shape": [
+        {
+          "name": "requested_days",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "all_loaded",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "loaded_first_day",
+          "optional": false,
+          "type": "null|number"
+        },
+        {
+          "name": "loaded_last_day",
+          "optional": false,
+          "type": "null|number"
+        },
+        {
+          "name": "loaded_days_with_data",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "loaded_requests",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "window_first_day",
+          "optional": false,
+          "type": "null|number"
+        },
+        {
+          "name": "window_last_day",
+          "optional": false,
+          "type": "null|number"
+        },
+        {
+          "name": "window_days_with_data",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "window_requests",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "window_exceeds_loaded_start",
+          "optional": false,
+          "type": "boolean"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiUsageRollupView",
+      "fields": [
+        "loaded",
+        "window",
+        "coverage",
+        "by_day",
+        "by_provider_endpoint",
+        "by_provider_endpoint_day",
+        "by_provider",
+        "by_provider_day"
+      ],
+      "shape": [
+        {
+          "name": "loaded",
+          "optional": false,
+          "type": "ApiUsageBucket"
+        },
+        {
+          "name": "window",
+          "optional": false,
+          "type": "ApiUsageBucket"
+        },
+        {
+          "name": "coverage",
+          "optional": false,
+          "type": "ApiUsageRollupCoverage"
+        },
+        {
+          "name": "by_day",
+          "optional": false,
+          "type": "[number,ApiUsageBucket][]"
+        },
+        {
+          "name": "by_provider_endpoint",
+          "optional": false,
+          "type": "[string,ApiUsageBucket][]"
+        },
+        {
+          "name": "by_provider_endpoint_day",
+          "optional": false,
+          "type": "Record<string,[number,ApiUsageBucket][]>"
+        },
+        {
+          "name": "by_provider",
+          "optional": false,
+          "type": "[string,ApiUsageBucket][]"
+        },
+        {
+          "name": "by_provider_day",
+          "optional": false,
+          "type": "Record<string,[number,ApiUsageBucket][]>"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiWindowStats",
+      "fields": [
+        "total",
+        "ok_2xx",
+        "err_429",
+        "err_4xx",
+        "err_5xx",
+        "p50_ms",
+        "p95_ms",
+        "avg_attempts",
+        "retry_rate",
+        "top_provider",
+        "top_provider_endpoint"
+      ],
+      "shape": [
+        {
+          "name": "total",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "ok_2xx",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "err_429",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "err_4xx",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "err_5xx",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "p50_ms",
+          "optional": false,
+          "type": "null|number"
+        },
+        {
+          "name": "p95_ms",
+          "optional": false,
+          "type": "null|number"
+        },
+        {
+          "name": "avg_attempts",
+          "optional": false,
+          "type": "null|number"
+        },
+        {
+          "name": "retry_rate",
+          "optional": false,
+          "type": "null|number"
+        },
+        {
+          "name": "top_provider",
+          "optional": false,
+          "type": "[string,number]|null"
+        },
+        {
+          "name": "top_provider_endpoint",
+          "optional": false,
+          "type": "[string,number]|null"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiModelPriceView",
+      "fields": [
+        "model_id",
+        "display_name",
+        "aliases",
+        "input_per_1m_usd",
+        "output_per_1m_usd",
+        "cache_read_input_per_1m_usd",
+        "cache_creation_input_per_1m_usd",
+        "source",
+        "confidence"
+      ],
+      "shape": [
+        {
+          "name": "model_id",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "display_name",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "aliases",
+          "optional": true,
+          "type": "string[]"
+        },
+        {
+          "name": "input_per_1m_usd",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "output_per_1m_usd",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "cache_read_input_per_1m_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "cache_creation_input_per_1m_usd",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "source",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "confidence",
+          "optional": false,
+          "type": "ApiCostConfidence"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiModelPriceCatalogSnapshot",
+      "fields": [
+        "source",
+        "model_count",
+        "models"
+      ],
+      "shape": [
+        {
+          "name": "source",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "model_count",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "models",
+          "optional": false,
+          "type": "ApiModelPriceView[]"
+        }
+      ]
+    }
+  ],
+  "enums": [
+    {
+      "file": "../../crates/core/src/dashboard_core/operator_summary.rs",
+      "rust": "OperatorReadStatus",
+      "typescriptFile": "src/lib/api/admin-types.ts",
+      "typescript": "ApiOperatorReadStatus",
+      "values": [
+        "ready",
+        "stale",
+        "disconnected",
+        "auth_required"
+      ]
+    },
+    {
+      "file": "../../crates/core/src/dashboard_core/operator_summary.rs",
+      "rust": "OperatorReadIssue",
+      "typescriptFile": "src/lib/api/admin-types.ts",
+      "typescript": "ApiOperatorReadIssue",
+      "values": [
+        "refresh_failed",
+        "disconnected",
+        "auth_required"
+      ]
+    },
+    {
+      "file": "../../crates/core/src/state/session_identity.rs",
+      "rust": "SessionContinuityMode",
+      "typescriptFile": "src/lib/api/admin-types.ts",
+      "typescript": "ApiSessionContinuityMode",
+      "values": [
+        "default_profile",
+        "manual_profile"
+      ]
+    },
+    {
+      "file": "../../crates/core/src/balance.rs",
+      "rust": "BalanceSnapshotStatus",
+      "typescriptFile": "src/lib/api/admin-types.ts",
+      "typescript": "ApiBalanceSnapshotStatus",
+      "values": [
+        "unknown",
+        "ok",
+        "exhausted",
+        "stale",
         "error"
+      ]
+    },
+    {
+      "file": "../../crates/core/src/balance.rs",
+      "rust": "ProviderUsageAlertKind",
+      "typescriptFile": "src/lib/api/admin-types.ts",
+      "typescript": "ApiProviderUsageAlertKind",
+      "values": [
+        "daily_usage_80",
+        "daily_usage_95",
+        "low_balance",
+        "subscription_expiring_soon",
+        "subscription_expired"
+      ]
+    },
+    {
+      "file": "../../crates/core/src/config_retry.rs",
+      "rust": "RetryProfileName",
+      "typescriptFile": "src/lib/api/admin-types.ts",
+      "typescript": "ApiRetryProfileName",
+      "values": [
+        "balanced",
+        "same-upstream",
+        "aggressive-failover",
+        "cost-primary"
+      ]
+    },
+    {
+      "file": "../../crates/core/src/request_ledger.rs",
+      "rust": "RequestUsageSummaryGroup",
+      "typescriptFile": "src/lib/api/admin-types.ts",
+      "typescript": "ApiRequestUsageSummaryGroup",
+      "values": [
+        "provider_endpoint",
+        "provider",
+        "model",
+        "session"
+      ]
+    },
+    {
+      "file": "../../crates/core/src/usage.rs",
+      "rust": "UsageEvidenceSource",
+      "typescriptFile": "src/lib/api/admin-types.ts",
+      "typescript": "ApiUsageEvidenceSource",
+      "values": [
+        "responses_input_tokens_details_cached_tokens",
+        "chat_prompt_tokens_details_cached_tokens",
+        "cached_input_tokens_alias",
+        "cached_tokens_alias",
+        "cache_read_input_tokens_alias",
+        "cache_read_tokens_alias",
+        "responses_input_tokens_details_cache_write_tokens",
+        "chat_prompt_tokens_details_cache_write_tokens",
+        "responses_input_tokens_details_cache_creation_tokens",
+        "chat_prompt_tokens_details_cache_creation_tokens",
+        "cache_creation_input_tokens_alias",
+        "cache_write_input_tokens_alias",
+        "cache_creation_tokens_alias",
+        "cache_write_tokens_alias",
+        "anthropic_cache_creation_ttl"
+      ]
+    },
+    {
+      "file": "../../crates/core/src/usage.rs",
+      "rust": "UsageEvidenceState",
+      "typescriptFile": "src/lib/api/admin-types.ts",
+      "typescript": "ApiUsageEvidenceState",
+      "values": [
+        "missing",
+        "present_zero",
+        "present_value",
+        "invalid",
+        "conflict"
+      ]
+    },
+    {
+      "file": "../../crates/core/src/usage.rs",
+      "rust": "EconomicsStatus",
+      "typescriptFile": "src/lib/api/admin-types.ts",
+      "typescript": "ApiEconomicsStatus",
+      "values": [
+        "complete",
+        "partial",
+        "conflict"
+      ]
+    },
+    {
+      "file": "../../crates/core/src/usage.rs",
+      "rust": "UsageTotalSource",
+      "typescriptFile": "src/lib/api/admin-types.ts",
+      "typescript": "ApiUsageTotalSource",
+      "values": [
+        "derived",
+        "derived_without_convention",
+        "reported",
+        "aggregated"
+      ]
+    },
+    {
+      "file": "../../crates/core/src/pricing.rs",
+      "rust": "CostConfidence",
+      "typescriptFile": "src/lib/api/admin-types.ts",
+      "typescript": "ApiCostConfidence",
+      "values": [
+        "unknown",
+        "partial",
+        "estimated",
+        "exact"
+      ]
+    },
+    {
+      "file": "../../crates/core/src/state/runtime_types.rs",
+      "rust": "RuntimeConfigState",
+      "typescriptFile": "src/lib/api/admin-types.ts",
+      "typescript": "ApiRuntimeConfigState",
+      "values": [
+        "normal",
+        "draining",
+        "breaker_open",
+        "half_open"
+      ]
+    },
+    {
+      "file": "../../crates/core/src/state/session_identity.rs",
+      "rust": "RouteValueSource",
+      "typescriptFile": "src/lib/api/admin-types.ts",
+      "typescript": "ApiRouteValueSource",
+      "values": [
+        "request_payload",
+        "session_override",
+        "global_override",
+        "profile_default",
+        "provider_mapping",
+        "runtime_fallback"
       ]
     }
   ],
   "notes": [
-    "Generated by apps/desktop/scripts/generate-desktop-contracts.mjs from Rust DTO field declarations.",
-    "usageDay is sourced from operatorSummary.links.snapshot -> snapshot.usage_day.",
-    "sectionStatuses distinguishes empty sections from failed section loads.",
-    "This lightweight contract is intentionally narrow; request-chain diagnostics have a separate contract file."
+    "Generated from the desktop wrapper and the canonical core OperatorReadModel DTO.",
+    "Nested status enums, revision fields, read-data fields, requiredness, and scalar/reference types are checked.",
+    "Request-chain diagnostics retain a separate allowlisted contract."
   ]
 }

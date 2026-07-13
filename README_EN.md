@@ -1,10 +1,10 @@
 # codex-helper
 
-A local relay proxy and operator console for Codex CLI, focused on two jobs: managing multiple relays and keeping Codex as close as possible to the native ChatGPT-backed experience while those relays are in use.
+A local relay proxy and operator console for Codex CLI, focused on multi-relay routing, durable request lifecycle, and observability.
 
-Some Codex features do not appear just because `/responses` can be forwarded. ChatGPT auth shape, OpenAI provider identity, `/models` metadata, `/responses/compact`, and hosted `image_generation` all affect what Codex decides to expose. Some sub2api-style and other relays also return shapes that work for normal chat but are not quite what Codex expects.
+Some Codex features do not appear just because `/responses` can be forwarded. Provider adapter, `/models` metadata, `/responses/compact`, WebSocket, and hosted `image_generation` are facts of the selected provider contract. Some sub2api-style and other relays also return shapes that work for normal chat but are not quite what Codex expects.
 
-codex-helper keeps that compatibility layer local. Codex talks to the helper proxy, and the helper picks OpenAI or one of your relays through provider/routing config. It also handles model-list translation, client presets, capability diagnostics, balance visibility, and fallback policy.
+codex-helper keeps that compatibility layer local. Codex talks to the helper proxy, and the helper picks OpenAI or one of your relays through provider/routing config. It also handles model-list translation, provider-owned capability diagnostics, balance visibility, and fallback policy.
 
 Current release: `v0.20.2`
 
@@ -18,7 +18,7 @@ Use codex-helper if:
 
 - you use multiple Codex/OpenAI-compatible relays and do not want to keep editing `~/.codex/config.toml`;
 - you want monthly relays first, then pay-as-you-go or official providers as fallback;
-- you want Codex to keep ChatGPT login/account behavior for the app or mobile flow, while model traffic uses your own relay or monthly quota;
+- you need an explicit, recoverable local proxy switch that never touches Codex auth, cache, or SQLite;
 - your sub2api-style or other relay works for ordinary chat but is shaky around `/models`, `/responses/compact`, hosted `image_generation`, or provider-specific model names;
 - you want TUI or desktop visibility into provider choice, balance/plan, tokens, cache tokens, latency, retries, and estimated cost;
 - you run a local proxy for long periods and need bounded runtime state plus rotated logs;
@@ -29,10 +29,10 @@ It is probably unnecessary if you only use one official account and do not need 
 ## Main Features
 
 - **Local proxy**: listens on `127.0.0.1:3211` by default.
-- **Safe Codex patching**: only touches the local proxy fields in `~/.codex/config.toml`; unrelated Codex edits are preserved.
-- **Native Codex presets**: `chatgpt-bridge` keeps ChatGPT login shape, `imagegen-bridge` exposes hosted image generation, and `official-relay` / `official-imagegen` make relays that forward official Responses semantics use remote compaction by default; `compaction` and `responses_websocket` are separate switches for the compaction path and Responses WebSocket v2.
+- **Explicit safe switch**: only a local `switch on/off` action edits the helper provider selector/stanza in `~/.codex/config.toml`; conflicting external edits produce `recovery_required`, while Codex auth, model cache, and SQLite remain outside helper ownership.
+- **Provider-owned capability contract**: Responses, compact, WebSocket, hosted-tool, and model decisions come from captured provider/catalog facts rather than client patch assumptions.
 - **OpenAI Images-compatible entrypoint**: the local proxy also exposes `POST /v1/images/generations` and JSON `POST /v1/images/edits`, translates them into Responses hosted `image_generation` requests, and keeps using the same provider routing / fallback chain for local skills and scripts.
-- **Relay capability diagnostics**: TUI, CLI, and admin API checks for `/models`, `/responses`, and `/responses/compact`, then recommends the preset that matches the selected relay.
+- **Relay capability diagnostics**: explicit, process-local CLI actions perform bounded `/models`, `/responses`, and `/responses/compact` checks and show provider contract, observations, continuity, and mismatches without changing configuration or routing.
 - **Provider / routing config**: `version = 5` route graph schema. Define providers once, then use routing entry/routes for order, pinning, grouping, or tag preference.
 - **Session affinity and failover**: each Codex session tries to keep using the selected provider, then falls through to other route candidates when requests fail, upstreams are unavailable, or trusted balance snapshots are exhausted.
 - **Provider signal control loop**: rate limits, quota responses, transport failures, and exhausted balances are first recorded as provider signals, then converted into helper-owned temporary policy actions projected into routing. Manual disables have higher precedence, and automatic actions never mutate Codex auth or third-party account files.
@@ -87,10 +87,9 @@ ch
 By default this will:
 
 - start the local proxy;
-- initialize or migrate `~/.codex-helper/config.toml`, backing up the old file as `.bak` first;
-- patch Codex to use `model_providers.codex_proxy` when needed;
+- load the only supported `version = 5` `~/.codex-helper/config.toml`;
 - open the TUI in interactive terminals;
-- remove only the codex-helper proxy patch on exit.
+- stop the proxy started by the current foreground console on exit.
 
 Start the proxy without the TUI:
 
@@ -98,29 +97,28 @@ Start the proxy without the TUI:
 codex-helper serve --no-tui
 ```
 
-Advanced: run a resident/attached proxy. Only the explicit `--resident`/`daemon`/`tui` subcommands let the proxy outlive the current console:
+Advanced: run a system service or attached proxy. Only an explicitly installed service or the `--resident`/`daemon`/`tui` subcommands let the proxy outlive the current console:
 
 ```bash
-codex-helper serve --resident
+codex-helper service install --codex
+codex-helper service status
 codex-helper daemon status
-codex-helper daemon stop
 codex-helper tui --codex
+codex-helper service stop
 ```
 
-By default, the built-in `codex-helper serve` TUI follows “the console owns the proxy”: exiting the UI stops the proxy it started and restores the local client patch. `daemon status/stop` is only for resident proxies you explicitly started. The `tui` subcommand attaches read-only to an existing resident proxy, so exiting that attached TUI does not stop the proxy. For automatic restart after child crashes, run `codex-helper daemon supervise --codex`; the supervisor records lightweight crash markers under `~/.codex-helper/run/`.
+By default, the built-in `codex-helper serve` TUI follows “the console owns the proxy”: exiting the UI stops the proxy it started but never runs `switch on/off`. `daemon status` is read-only; manage an installed local service with `service start/stop/restart`. There is no remote HTTP shutdown command. The `tui` subcommand attaches read-only to an existing resident proxy, so exiting that attached TUI does not stop the proxy. For automatic restart after child crashes, run `codex-helper daemon supervise --codex`; the supervisor records lightweight crash markers under `~/.codex-helper/run/`.
 
 `daemon status` best-effort shows the resident proxy owner marker (manual CLI, supervisor, or a future desktop/tray owner). The marker is only observability metadata: read or cleanup failures never block proxy startup or shutdown. A hidden managed sidecar mode is reserved for the future desktop shell, so ordinary users do not need to choose it manually.
 
-The Tauri desktop client uses a more Clash-like resident-client lifecycle: closing the main window hides it to the tray, `Quit App` exits only the desktop process, and stopping the proxy remains an explicit `Stop Proxy` action. The Windows NSIS packaged path has passed isolated lifecycle smoke, but it is not part of the public release yet; macOS/Linux packaged parity, signing, and rollback operations still need separate follow-up work.
+The Tauri desktop client uses a more Clash-like resident-client lifecycle: closing the main window hides it to the tray, and `Quit App` exits only the desktop process; neither stops the runtime. Stopping the runtime remains an explicit local CLI/service operation outside the desktop query-only control plane. The Windows NSIS packaged path has passed isolated lifecycle smoke, but it is not part of the public release yet; macOS/Linux packaged parity, signing, and rollback operations still need separate follow-up work.
 
-Manage the Codex proxy patch explicitly:
+Switch the Codex client to helper explicitly:
 
 ```bash
 codex-helper switch on
-codex-helper switch on --preset chatgpt-bridge
-codex-helper switch on --preset official-relay
-codex-helper switch on --preset official-relay --responses-websocket
-codex-helper switch on --preset official-imagegen
+codex-helper switch on --port 4321
+codex-helper switch on --base-url https://relay.example/v1
 codex-helper switch status
 codex-helper switch off
 ```
@@ -130,35 +128,30 @@ NAS / remote relay targets:
 ```bash
 ch relay add nas \
   --proxy-url http://nas.local:3211 \
-  --admin-url http://nas.local:4211 \
-  --admin-token-env CODEX_HELPER_NAS_ADMIN_TOKEN \
-  --preset official-relay
+  --admin-url https://nas.example.com:4211 \
+  --admin-token-env CODEX_HELPER_NAS_ADMIN_TOKEN
 
 ch relay list
 ch relay status nas
 ch relay nas
-ch relay nas --no-tui
+ch relay local --no-tui
 ch relay nas --attach-only
 ch relay off
 ```
 
-Plain `ch` still starts the local foreground helper. `ch relay local` is the explicit target form for the same local flow. `ch relay <name>` patches the local Codex client to the remote proxy and attaches a local TUI to that target's admin API. Use `--no-tui` for switch-only and `--attach-only` for observe-only. Admin tokens are read from the environment variable named by `--admin-token-env`; token values are not written to `~/.codex-helper/config.toml`. The container/NAS side should set `advertised-admin-base-url`, or the client should pass `--admin-url` when adding the target.
+Plain `ch` still starts the local foreground helper. `ch relay local` is the explicit target form for the same local flow. `ch relay <name>` only starts or attaches to the target runtime and opens a read-only TUI; it never changes local Codex configuration. `--no-tui` is valid only when starting the built-in local target, while `--attach-only` requires an existing runtime. Remote targets always attach through the read-only TUI. Point Codex at that target separately with `codex-helper switch on --base-url <PROXY_URL>`. Admin tokens are read from the environment variable named by `--admin-token-env`; token values are not written to `~/.codex-helper/config.toml`. Remote admin URLs must use HTTPS; HTTP is accepted only for loopback, including a trusted tunnel terminated on the client. A remote target must provide its trusted `--admin-url` explicitly when it is added; proxy responses and redirects cannot replace that authority.
 
-A remote target does not give the server access to this client's local Codex transcript/session files. Container deployments keep host-local transcript/session capabilities disabled unless those paths are explicitly mounted and enabled by server policy.
+Container and server runtimes do not provide access to a client's local transcript/session files. Local `session` commands read only the Codex session files on the machine where the command runs.
 
-Preset choices:
+The client switch only points Codex at one helper URL. `switch on` records the original selector and helper stanza, then writes `model_providers.codex_proxy`; `switch off` restores only the recorded content. Conflicting external edits move the state to `recovery_required` and leave the file untouched. Codex `auth.json`, `models_cache.json`, SQLite, feature flags, compaction, and WebSocket settings are never read or changed.
 
-| Preset | Use it when | Effect |
-| --- | --- | --- |
-| `default` | You only need the local proxy, multiple providers, and fallback | Codex sends model requests to the local helper; helper picks the upstream |
-| `chatgpt-bridge` | You are already signed in to ChatGPT in official Codex and want app/mobile account behavior, but model traffic should use a relay | Keeps the ChatGPT auth shape while upstream credentials still come from helper config |
-| `imagegen-bridge` | The relay does not support official provider identity, but you want Codex to expose hosted `image_generation` | Writes the empty `{}` auth facade and does not require official login |
-| `official-relay` | The relay forwards official OpenAI Responses semantics, especially `/responses/compact` | Makes Codex treat the local helper as an OpenAI provider and use the remote compaction path by default |
-| `official-imagegen` | The relay is backed by an official subscription account and supports both `/responses/compact` and hosted image generation | Combines OpenAI provider identity, the default remote compaction path, and the imagegen auth facade |
+Relay capabilities come from the selected provider adapter, catalog, and bounded observations rather than switch configuration. Inspect the provider contract, live `/models` / `/responses` / `/responses/compact` results, continuity, and mismatches with:
 
-`chatgpt-bridge` requires a completed ChatGPT login in official Codex first. If `~/.codex/auth.json` lacks the full token, email, and account metadata, codex-helper refuses the patch instead of leaving Codex in a half-login state.
+```bash
+codex-helper codex relay-capabilities --model gpt-5.5 --provider ciii --endpoint default
+```
 
-`official-relay` and `official-imagegen` are experimental. They only change how Codex chooses client-side capabilities; the relay still has to support the underlying endpoints. By default, `official-*` makes Codex choose the remote compaction path. To keep other official preset behavior while forcing local compaction, set `[codex.client_patch].compaction = "local"` or run `codex-helper switch on --preset official-imagegen --compaction local`. Real request credentials come from `~/.codex-helper/config.toml`, and the bridge presets do not forward Codex ChatGPT tokens to third-party relays that do not have helper-side credentials. Legacy input names `official-relay-bridge` / `official-imagegen-bridge` have been removed; use `official-relay` / `official-imagegen` for new commands.
+Third-party relays should configure their own `auth_token_env`, `auth_token`, or equivalent API key. Codex client authentication may pass only to the official OpenAI origin, preventing account headers from leaking to a relay.
 
 To avoid degrading capable relays, codex-helper normalizes compressed HTTP request bodies before routing by default (`zstd`, `gzip` / `x-gzip`, `br`, and `deflate`). For Codex `/responses`, `/responses/compact`, and Responses WebSocket, helper also completes missing `session_id`, `x-session-id`, official `session-id` / `thread-id`, and `prompt_cache_key` fields from existing request evidence: header session ids, body `session_id`, `prompt_cache_key`, or `metadata.session_id`. `previous_response_id` is only used for stale-response repair, not as a session identity source. It does not invent a synthetic session id and does not overwrite session fields the client already sent.
 
@@ -166,19 +159,7 @@ Selected provider endpoint affinity is persisted under helper state so a helper 
 
 Codex request semantics also include two targeted repairs: if an upstream explicitly says a `previous_response_id` response no longer exists, helper removes that field and retries the same upstream once; if a relay ignores `Accept-Encoding: identity` and returns gzip JSON, helper decodes it before forwarding plain JSON. `service_tier` remains observational and attribution-only: logs distinguish requested / effective / actual values, but helper default config does not rewrite the client's fast-mode request tier.
 
-Assuming the upstream supports the required endpoints, `official-imagegen` is the most complete preset. If the upstream also passes Responses WebSocket v2 smoke, adding `responses_websocket` is the closest current setup to the official experience:
-
-```text
-default
-< chatgpt-bridge / imagegen-bridge
-< official-relay
-< official-imagegen
-< official-imagegen + responses_websocket
-```
-
-Do not enable the strongest combination blindly: `official-imagegen` requires the relay to support `/responses`, `/responses/compact`, and hosted `image_generation`; `responses_websocket` additionally requires a passing WebSocket live smoke.
-
-If the upstream is known to support Responses WebSocket v2, enable `responses_websocket = true` or `--responses-websocket` separately; it is a transport switch, not a preset. Compaction is also a separate switch: `compaction = "auto"` keeps the preset default, `local` forces Codex client-side local compaction, `remote-v1` forces `/responses/compact`, and `remote-v2` forces `remote_compaction_v2` while keeping helper's v2-to-v1 downgrade fallback available.
+Hosted image generation, remote compaction, and Responses WebSocket all require real upstream protocol support. Live smoke requires explicit acknowledgement and is diagnostic only; it never enables a client feature or changes routing.
 
 The proxy also exposes OpenAI Images-compatible generation and reference-image edit entrypoints for skills or scripts that should not depend on whether the Codex client exposed its hosted tool:
 
@@ -218,14 +199,13 @@ Internally both entrypoints still use `/v1/responses` plus hosted `image_generat
 
 Note: any change to `~/.codex/config.toml` is only picked up by newly started Codex sessions. After changing it, fully restart the Codex App, TUI, or `codex exec` session.
 
-If you want Codex to stay logged into ChatGPT while the actual conversation/model traffic goes through a relay, split the setup into two layers:
+To send model traffic through a relay, point the client at helper and let helper select the upstream:
 
-1. Use `chatgpt-bridge` to keep the Codex App on the ChatGPT auth path.
-2. `codex-helper switch on --preset chatgpt-bridge` points Codex's own `~/.codex/config.toml` at the local `codex_proxy`.
-3. Configure `codex.providers.*` and `codex.routing` in `~/.codex-helper/config.toml` so codex-helper selects your relay.
-4. If the relay expects prefixed model names, add `model_mapping` on the provider.
+1. Run `codex-helper switch on` to point Codex's `~/.codex/config.toml` at local `codex_proxy`.
+2. Configure `codex.providers.*` and `codex.routing` in `~/.codex-helper/config.toml`.
+3. Add provider-scoped `model_mapping` if the relay expects prefixed model names.
 
-This split is for setups where Codex App, mobile, and subscription-gated account checks should still see ChatGPT auth, while day-to-day conversation, tool, and imagegen model usage consumes your relay or monthly quota.
+This path neither changes nor proxies Codex login state; account files remain owned by Codex.
 
 The Codex-side local proxy entry is normally written by `switch on`; avoid hand-editing it over unrelated Codex settings:
 
@@ -237,8 +217,6 @@ model_provider = "codex_proxy"
 name = "codex-helper"
 base_url = "http://127.0.0.1:3211"
 wire_api = "responses"
-requires_openai_auth = true
-supports_websockets = false
 ```
 
 The codex-helper side only owns upstreams and routing:
@@ -246,11 +224,6 @@ The codex-helper side only owns upstreams and routing:
 ```toml
 # ~/.codex-helper/config.toml
 version = 5
-
-[codex.client_patch]
-preset = "chatgpt-bridge"
-responses_websocket = false
-compaction = "auto"
 
 [codex.providers.relay]
 base_url = "https://relay.example/v1"
@@ -263,16 +236,6 @@ entry = "relay_first"
 strategy = "ordered-failover"
 children = ["relay"]
 ```
-
-Codex App mobile remote control is a separate path, not the same as `chatgpt-bridge`:
-
-```bash
-codex-helper switch remote-control enable
-codex-helper switch remote-control status
-codex-helper switch remote-control check-logs
-```
-
-This writes `remote_connections = true` under `~/.codex/config.toml`'s `[features]` table, does not write `remote_control = true`, and then backs up and updates `local_app_server_feature_enablement.remote_control` inside `~/.codex/sqlite/codex-dev.db`. After that, fully restart the Codex app, then use `check-logs` to confirm `experimentalFeature/enablement/set` appeared at least once with `errorCode=null`. Mobile login still requires MFA on the ChatGPT account.
 
 If a relay expects provider-prefixed model names, add provider-scoped model mapping:
 
@@ -345,13 +308,13 @@ max_concurrent_requests = 5
 limit_group = "input-account"
 ```
 
-For complete config, migration, balance adapters, pricing, and TUI/desktop editing notes, see [docs/CONFIGURATION.md](docs/CONFIGURATION.md). The equivalent Chinese reference is [docs/CONFIGURATION.zh.md](docs/CONFIGURATION.zh.md).
+For complete config, compatibility behavior, balance adapters, pricing, and query-only TUI/desktop operator views, see [docs/CONFIGURATION.md](docs/CONFIGURATION.md). The equivalent Chinese reference is [docs/CONFIGURATION.zh.md](docs/CONFIGURATION.zh.md).
 
 ## Proxy Notes
 
 codex-helper has two proxy layers:
 
-- **Local proxy**: Codex connects to `127.0.0.1:3211`, then codex-helper chooses a provider through routing. When the Codex patch is enabled, requests still pass through this local proxy server even if you do not configure any outbound network proxy.
+- **Local proxy**: Codex connects to `127.0.0.1:3211`, then codex-helper chooses a provider through routing. After an explicit `switch on` points Codex at helper, requests still pass through this local proxy server even if you do not configure an outbound network proxy.
 - **Outbound network proxy**: codex-helper may use a network proxy when connecting to provider endpoints, relays, or balance APIs. There is not yet a dedicated `config.toml` section for this; the underlying HTTP client follows system/environment variables such as `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY`.
 
 See [Local Proxy Vs Outbound Proxy](docs/CONFIGURATION.md#local-proxy-vs-outbound-proxy) for details.
@@ -370,8 +333,8 @@ codex-helper routing explain
 # sessions
 codex-helper session list
 codex-helper session list --truncate 120
-codex-helper session search "remote_control"
-codex-helper session search "remote_control" --truncate 120
+codex-helper session search "rate limit"
+codex-helper session search "rate limit" --truncate 120
 codex-helper session recent
 codex-helper session last
 codex-helper session transcript <SESSION_ID> --tail 40
@@ -389,7 +352,7 @@ codex-helper pricing sync-basellm --model gpt-5 --dry-run
 # diagnostics
 codex-helper status
 codex-helper doctor
-codex-helper codex relay-capabilities --preset official-imagegen --compaction local --model gpt-5.5
+codex-helper codex relay-capabilities --model gpt-5.5 --provider ciii --endpoint default
 codex-helper codex relay-live-smoke --acknowledgement run-live-codex-relay-smoke --model gpt-5.5
 codex-helper codex relay-live-smoke --acknowledgement run-live-codex-relay-smoke --model gpt-5.5 --provider ciii --compact-v2
 codex-helper codex relay-evidence --limit 20
@@ -406,23 +369,24 @@ Useful pages:
 
 - `Overview`: proxy status, current sessions, and recent requests.
 - `Routing` / `Stations`: route graph, provider order, balance/plan, tags, health, and routing preview.
-- `Sessions`: session identity, effective route, route affinity, and per-session overrides.
-- `Usage`: local-day requests, tokens, estimated cost, 24h activity, provider/station/model/session/project rankings, coverage warnings, and the global retry-gate count.
-- `Requests`: request logs, recent endpoint samples, tokens, cache tokens, latency, retries, request chains, and cost.
+- `Sessions`: session identity, effective route, and route affinity.
+- `Usage`: local-day requests, tokens, estimated cost, provider/model/session rankings, and coverage state from committed request events.
+- `Requests`: committed request/attempt samples, token/cache evidence, latency, retries, request chains, and cost.
 
-Shortcut hints are shown at the bottom. Under v5 config, durable provider/routing edits should go through the routing page, provider/routing CLI commands, or raw TOML. Press `R` after manual config edits to reload runtime config.
+TUI and desktop consume the same typed, redacted `OperatorReadModel` and use only `GET` / `HEAD` against a remote runtime control plane. The model distinguishes `ready`, `stale`, `disconnected`, and `auth_required`; connection or authentication failures never synthesize a fallback view from local config, SQLite, or an empty runtime. Edit durable provider/routing intent with local CLI commands or `config.toml`. Within the TUI, `n` / `o` is the only local exception: it explicitly patches only the helper provider selector/stanza in this machine's Codex config and is not a remote runtime mutation.
 
 ### Desktop Preview
 
-The new Tauri desktop client lives under `apps/desktop` and uses React 19, Tailwind CSS 4, shadcn/ui-style components, and TanStack Router/Query/Table. It already implements Dashboard, Providers, Usage, Settings, read-only admin data, safe control actions, close-to-tray semantics, single instance, launch-at-login settings, lightweight single-config import/export, config/log/cache path openers, common provider edit forms, and a Windows NSIS packaged sidecar build. Windows packaged smoke now covers tray Show/Hide/Quit, Detach, Stop Proxy, second-launch focus, launch-at-login registration, config import/export, and provider editing. The current public release does not publish the desktop installer; the public desktop release remains gated on signing keys, HTTPS release endpoints, artifact hosting, and rollback operations. See [docs/DESKTOP_RELEASE.md](docs/DESKTOP_RELEASE.md) for the desktop packaging contract.
+The new Tauri desktop client lives under `apps/desktop` and uses React 19, Tailwind CSS 4, shadcn/ui-style components, and TanStack Router/Query/Table. It renders the typed, redacted `OperatorReadModel` and keeps local proxy lifecycle, explicit Codex switch, close-to-tray semantics, single instance, and launch-at-login settings; it does not import config, edit providers, or mutate provider/routing/config through the remote control plane. The Windows NSIS packaged sidecar has passed isolated smoke, but the public release still does not ship the desktop installer; signing keys, HTTPS release endpoints, artifact hosting, and rollback operations remain release gates. See [docs/DESKTOP_RELEASE.md](docs/DESKTOP_RELEASE.md) for the packaging contract.
 
 ## File Locations
 
 - Main config: `~/.codex-helper/config.toml`
-- Balance adapters: `~/.codex-helper/usage_providers.json`
+- Runtime state: `~/.codex-helper/state/state.sqlite`
+- Balance adapters (optional and operator-owned; missing files use in-memory built-ins, and invalid input is never overwritten): `~/.codex-helper/usage_providers.json`
 - Pricing overrides: `~/.codex-helper/pricing_overrides.toml`
 - Request filter: `~/.codex-helper/filter.json`
-- Request log: `~/.codex-helper/logs/requests.jsonl`
+- Post-commit debug log: `~/.codex-helper/logs/requests.jsonl`
 - Codex relay diagnostic evidence: `~/.codex-helper/logs/codex_relay_evidence.jsonl`
 
 Codex-owned files remain owned by Codex:
@@ -430,7 +394,7 @@ Codex-owned files remain owned by Codex:
 - `~/.codex/auth.json`
 - `~/.codex/config.toml`
 
-codex-helper only touches the local proxy fields in `~/.codex/config.toml`.
+Only an explicit local `switch on/off` action touches the helper provider selector/stanza in `~/.codex/config.toml`; Codex auth, model cache, and SQLite remain untouched.
 
 ## Design Boundaries
 
@@ -444,8 +408,8 @@ codex-helper intentionally avoids:
 
 ## More Docs
 
-- [docs/CONFIGURATION.md](docs/CONFIGURATION.md): English configuration reference, routing, balance adapters, pricing, migration.
-- [docs/CONFIGURATION.zh.md](docs/CONFIGURATION.zh.md): Chinese configuration reference with routing recipes, balance adapters, proxy notes, and migration.
+- [docs/CONFIGURATION.md](docs/CONFIGURATION.md): English configuration reference covering routing, balance adapters, pricing, configuration compatibility, and query-only operator views.
+- [docs/CONFIGURATION.zh.md](docs/CONFIGURATION.zh.md): Chinese configuration reference with routing recipes, balance adapters, proxy notes, configuration compatibility, and query-only operator views.
 - [CHANGELOG.md](CHANGELOG.md): release notes and upgrade notes.
 - [docs/DESKTOP_RELEASE.md](docs/DESKTOP_RELEASE.md): Tauri desktop packaging, sidecar, and release-gate notes.
 - [docs/workstreams/codex-routing-scheduler-observability-refactor/README.md](docs/workstreams/codex-routing-scheduler-observability-refactor/README.md): fearless refactor design for routing scheduler state, throttle/overload outcomes, concurrency limits, and TUI metrics.

@@ -1,18 +1,17 @@
+import { emptyUsageData } from "@/lib/api/empty-data";
 import { mapUsageData } from "@/lib/api/mappers";
-import { mockUsageData } from "@/lib/api/mock-data";
-import type { QueryBackedData } from "@/lib/api/types";
+import type { QueryBackedData, UsageData } from "@/lib/api/types";
 import { useAdminReadModelState } from "@/lib/api/use-admin-read-model";
 
-export function useUsageData(): QueryBackedData<typeof mockUsageData> {
+export function useUsageData(): QueryBackedData<UsageData> {
   const query = useAdminReadModelState();
-  const { readModel, state } = query;
-  const data = readModel.data
-    ? mapUsageData({
-        recentRequests: readModel.data.recentRequests,
-        usageSummary: readModel.data.usageSummary,
-        usageDay: readModel.data.usageDay,
-      })
-    : mockUsageData;
+  const { facts, state } = query;
+  const data = facts
+      ? mapUsageData({
+          recentRequests: facts.recent_requests,
+          usageDay: facts.usage_day,
+        })
+    : emptyUsageData;
 
   return {
     data,

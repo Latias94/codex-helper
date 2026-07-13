@@ -1,5 +1,7 @@
 # Handoff
 
+> Historical note (superseded 2026-07-13): this handoff records the first concurrency-limit implementation. References below to versioned config projections or the earlier non-blocking permit path are not current architecture; limits now execute through the canonical version 5 runtime snapshot and queued capacity gate.
+
 Current state: provider/endpoint local concurrency limits are implemented for v5 route graph execution.
 
 Implemented:

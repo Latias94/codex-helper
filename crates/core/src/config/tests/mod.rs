@@ -1,12 +1,12 @@
 use super::*;
+use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
-mod basic;
+mod canonical_schema;
+mod current_v5_contract;
 mod io_bootstrap;
 mod retry_profiles;
 mod route_graph_ops;
-mod v2_schema;
-mod v4_schema;
 
 struct ScopedEnv {
     saved: Vec<(String, Option<String>)>,
@@ -91,18 +91,18 @@ fn write_file(path: &Path, content: &str) {
     std::fs::write(path, content).expect("write test file");
 }
 
-fn assert_migration_required(error: &anyhow::Error, schema_label: &str) {
+fn assert_unsupported_config(error: &anyhow::Error, version_label: &str) {
     let message = error.to_string();
     assert!(
-        message.contains(schema_label),
-        "expected migration error to mention {schema_label:?}, got: {message}"
+        message.contains(version_label),
+        "expected rejection to mention {version_label:?}, got: {message}"
     );
     assert!(
         message.contains("normal startup only accepts version = 5"),
         "expected normal-startup v5 boundary, got: {message}"
     );
     assert!(
-        message.contains("config migrate"),
-        "expected explicit migrate guidance, got: {message}"
+        message.contains("Back up the file") && message.contains("replace it"),
+        "expected explicit replacement guidance, got: {message}"
     );
 }

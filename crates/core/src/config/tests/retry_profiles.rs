@@ -68,7 +68,6 @@ fn retry_profile_defaults_to_balanced_when_unset() {
     assert_eq!(resolved.transport_cooldown_secs, 30);
     assert_eq!(resolved.cooldown_backoff_factor, 1);
     assert_eq!(resolved.cooldown_backoff_max_secs, 600);
-    assert!(!resolved.allow_cross_station_before_first_output);
 }
 
 #[test]
@@ -82,7 +81,6 @@ fn retry_profile_cost_primary_sets_probe_back_defaults() {
     assert_eq!(resolved.cooldown_backoff_factor, 2);
     assert_eq!(resolved.cooldown_backoff_max_secs, 900);
     assert_eq!(resolved.transport_cooldown_secs, 30);
-    assert!(resolved.allow_cross_station_before_first_output);
 }
 
 #[test]
@@ -117,7 +115,6 @@ fn retry_profile_aggressive_failover_enables_broader_failover_with_guardrails() 
             .iter()
             .any(|c| c == "client_error_non_retryable")
     );
-    assert!(resolved.allow_cross_station_before_first_output);
 }
 
 #[test]
@@ -134,41 +131,45 @@ fn retry_profile_allows_explicit_overrides() {
     let resolved = cfg.resolve();
     assert_eq!(resolved.upstream.max_attempts, 5);
     assert_eq!(resolved.upstream.strategy, RetryStrategy::Failover);
-    assert!(!resolved.allow_cross_station_before_first_output);
 }
 
 #[test]
-fn retry_profile_allows_explicit_cross_station_override() {
-    let cfg = RetryConfig {
-        profile: Some(RetryProfileName::AggressiveFailover),
-        allow_cross_station_before_first_output: Some(false),
-        ..RetryConfig::default()
-    };
-    let resolved = cfg.resolve();
-    assert!(!resolved.allow_cross_station_before_first_output);
+fn retry_config_rejects_retired_cross_station_flag() {
+    let text = r#"
+version = 5
+
+[retry]
+allow_cross_station_before_first_output = true
+"#;
+    let err = toml::from_str::<HelperConfig>(text).expect_err("retired cross-station retry flag");
+
+    assert!(
+        err.to_string()
+            .contains("unknown field `allow_cross_station_before_first_output`")
+    );
 }
 
 #[test]
 fn retry_profile_parses_from_toml_kebab_case() {
     let text = r#"
-version = 1
+version = 5
 
 [retry]
 profile = "cost-primary"
 "#;
-    let cfg = toml::from_str::<ProxyConfig>(text).expect("toml parse");
+    let cfg = toml::from_str::<HelperConfig>(text).expect("toml parse");
     assert_eq!(cfg.retry.profile, Some(RetryProfileName::CostPrimary));
 }
 
 #[test]
 fn retry_config_rejects_retired_flat_fields() {
     let text = r#"
-version = 1
+version = 5
 
 [retry]
 max_attempts = 5
 "#;
-    let err = toml::from_str::<ProxyConfig>(text).expect_err("retired flat retry field");
+    let err = toml::from_str::<HelperConfig>(text).expect_err("retired flat retry field");
 
     assert!(err.to_string().contains("unknown field `max_attempts`"));
 }

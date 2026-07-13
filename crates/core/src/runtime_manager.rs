@@ -50,10 +50,6 @@ impl ProxyLifecycleMode {
     pub fn detach_on_normal_exit(self) -> bool {
         matches!(self, Self::AttachedObserver)
     }
-
-    pub fn keeps_client_patch_on_exit(self) -> bool {
-        matches!(self, Self::ResidentDaemon | Self::DesktopOwned)
-    }
 }
 
 impl fmt::Display for ProxyLifecycleMode {
@@ -75,6 +71,7 @@ impl std::str::FromStr for ProxyLifecycleMode {
 pub enum RuntimeOwnerKind {
     ManualCli,
     Supervisor,
+    SystemService,
     Desktop,
 }
 
@@ -83,6 +80,7 @@ impl RuntimeOwnerKind {
         match self {
             Self::ManualCli => "manual_cli",
             Self::Supervisor => "supervisor",
+            Self::SystemService => "system_service",
             Self::Desktop => "desktop",
         }
     }
@@ -91,6 +89,7 @@ impl RuntimeOwnerKind {
         match normalize_token(value).as_str() {
             "manual_cli" | "manual" | "cli" | "resident" => Some(Self::ManualCli),
             "supervisor" | "watchdog" => Some(Self::Supervisor),
+            "system_service" | "service" | "system" => Some(Self::SystemService),
             "desktop" | "desktop_owned" | "tray" | "tauri" => Some(Self::Desktop),
             _ => None,
         }
@@ -98,7 +97,9 @@ impl RuntimeOwnerKind {
 
     pub fn lifecycle_mode(self) -> ProxyLifecycleMode {
         match self {
-            Self::ManualCli | Self::Supervisor => ProxyLifecycleMode::ResidentDaemon,
+            Self::ManualCli | Self::Supervisor | Self::SystemService => {
+                ProxyLifecycleMode::ResidentDaemon
+            }
             Self::Desktop => ProxyLifecycleMode::DesktopOwned,
         }
     }
@@ -344,49 +345,6 @@ pub fn describe_normal_exit(mode: ProxyLifecycleMode) -> &'static str {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RuntimeConnectionMode {
-    Owned,
-    Attached,
-    Stopped,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RuntimeStopIntent {
-    OwnerExit,
-    ExplicitStop,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RuntimeStopAction {
-    StopOwnedRuntime,
-    ShutdownAttachedRuntime,
-    DetachOnly,
-    Noop,
-}
-
-pub fn decide_runtime_stop_action(
-    connection: RuntimeConnectionMode,
-    intent: RuntimeStopIntent,
-    attached_shutdown_available: bool,
-) -> RuntimeStopAction {
-    match (connection, intent) {
-        (RuntimeConnectionMode::Owned, _) => RuntimeStopAction::StopOwnedRuntime,
-        (RuntimeConnectionMode::Attached, RuntimeStopIntent::OwnerExit) => {
-            RuntimeStopAction::DetachOnly
-        }
-        (RuntimeConnectionMode::Attached, RuntimeStopIntent::ExplicitStop)
-            if attached_shutdown_available =>
-        {
-            RuntimeStopAction::ShutdownAttachedRuntime
-        }
-        (RuntimeConnectionMode::Attached, RuntimeStopIntent::ExplicitStop) => {
-            RuntimeStopAction::DetachOnly
-        }
-        (RuntimeConnectionMode::Stopped, _) => RuntimeStopAction::Noop,
-    }
-}
-
 fn normalize_token(value: &str) -> String {
     value.trim().to_ascii_lowercase().replace(['-', ' '], "_")
 }
@@ -432,8 +390,6 @@ mod tests {
         assert!(ProxyLifecycleMode::EphemeralConsole.owns_runtime());
         assert!(!ProxyLifecycleMode::AttachedObserver.owns_runtime());
         assert!(ProxyLifecycleMode::AttachedObserver.detach_on_normal_exit());
-        assert!(!ProxyLifecycleMode::EphemeralConsole.keeps_client_patch_on_exit());
-        assert!(ProxyLifecycleMode::ResidentDaemon.keeps_client_patch_on_exit());
         assert_eq!(
             describe_normal_exit(ProxyLifecycleMode::DesktopOwned),
             "keep_until_desktop_quit"
@@ -451,6 +407,10 @@ mod tests {
             Some(RuntimeOwnerKind::Supervisor)
         );
         assert_eq!(
+            RuntimeOwnerKind::parse("service"),
+            Some(RuntimeOwnerKind::SystemService)
+        );
+        assert_eq!(
             RuntimeOwnerKind::parse("tray"),
             Some(RuntimeOwnerKind::Desktop)
         );
@@ -461,6 +421,10 @@ mod tests {
         assert_eq!(
             RuntimeOwnerKind::Desktop.lifecycle_mode(),
             ProxyLifecycleMode::DesktopOwned
+        );
+        assert_eq!(
+            RuntimeOwnerKind::SystemService.lifecycle_mode(),
+            ProxyLifecycleMode::ResidentDaemon
         );
     }
 
@@ -530,50 +494,6 @@ mod tests {
             read_owner_marker_from(&run_dir, "codex", 3211)
                 .expect("read after guard drop")
                 .is_none()
-        );
-    }
-
-    #[test]
-    fn runtime_stop_decision_keeps_attached_exit_safe() {
-        assert_eq!(
-            decide_runtime_stop_action(
-                RuntimeConnectionMode::Owned,
-                RuntimeStopIntent::OwnerExit,
-                false
-            ),
-            RuntimeStopAction::StopOwnedRuntime
-        );
-        assert_eq!(
-            decide_runtime_stop_action(
-                RuntimeConnectionMode::Attached,
-                RuntimeStopIntent::OwnerExit,
-                true
-            ),
-            RuntimeStopAction::DetachOnly
-        );
-        assert_eq!(
-            decide_runtime_stop_action(
-                RuntimeConnectionMode::Attached,
-                RuntimeStopIntent::ExplicitStop,
-                true
-            ),
-            RuntimeStopAction::ShutdownAttachedRuntime
-        );
-        assert_eq!(
-            decide_runtime_stop_action(
-                RuntimeConnectionMode::Attached,
-                RuntimeStopIntent::ExplicitStop,
-                false
-            ),
-            RuntimeStopAction::DetachOnly
-        );
-        assert_eq!(
-            decide_runtime_stop_action(
-                RuntimeConnectionMode::Stopped,
-                RuntimeStopIntent::ExplicitStop,
-                true
-            ),
-            RuntimeStopAction::Noop
         );
     }
 }

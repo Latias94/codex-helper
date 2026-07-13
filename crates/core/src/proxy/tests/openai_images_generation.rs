@@ -35,7 +35,7 @@ async fn openai_images_generation_endpoint_translates_request_and_response() {
         }),
     );
     let upstream = spawn_test_upstream(upstream);
-    let cfg = make_proxy_config(vec![upstream.upstream_config()], RetryConfig::default());
+    let cfg = make_helper_config(vec![upstream.upstream_config()], RetryConfig::default());
     let proxy = spawn_test_proxy(cfg);
     let client = Client::new();
 
@@ -98,7 +98,7 @@ async fn openai_images_generation_endpoint_honors_explicit_responses_model() {
         }),
     );
     let upstream = spawn_test_upstream(upstream);
-    let cfg = make_proxy_config(vec![upstream.upstream_config()], RetryConfig::default());
+    let cfg = make_helper_config(vec![upstream.upstream_config()], RetryConfig::default());
     let proxy = spawn_test_proxy(cfg);
     let client = Client::new();
 
@@ -159,7 +159,7 @@ async fn openai_images_generation_endpoint_strips_client_user_agent_before_upstr
         }),
     );
     let upstream = spawn_test_upstream(upstream);
-    let cfg = make_proxy_config(vec![upstream.upstream_config()], RetryConfig::default());
+    let cfg = make_helper_config(vec![upstream.upstream_config()], RetryConfig::default());
     let proxy = spawn_test_proxy(cfg);
     let client = Client::new();
 
@@ -204,7 +204,7 @@ async fn openai_images_generation_endpoint_rejects_n_greater_than_one_before_ups
         }),
     );
     let upstream = spawn_test_upstream(upstream);
-    let cfg = make_proxy_config(vec![upstream.upstream_config()], RetryConfig::default());
+    let cfg = make_helper_config(vec![upstream.upstream_config()], RetryConfig::default());
     let proxy = spawn_test_proxy(cfg);
     let client = Client::new();
 
@@ -238,7 +238,7 @@ async fn openai_images_generation_endpoint_passes_upstream_errors_through() {
         }),
     );
     let upstream = spawn_test_upstream(upstream);
-    let cfg = make_proxy_config(vec![upstream.upstream_config()], RetryConfig::default());
+    let cfg = make_helper_config(vec![upstream.upstream_config()], RetryConfig::default());
     let proxy = spawn_test_proxy(cfg);
     let client = Client::new();
 
@@ -269,7 +269,7 @@ async fn openai_images_generation_endpoint_reports_missing_image_result() {
         }),
     );
     let upstream = spawn_test_upstream(upstream);
-    let cfg = make_proxy_config(vec![upstream.upstream_config()], RetryConfig::default());
+    let cfg = make_helper_config(vec![upstream.upstream_config()], RetryConfig::default());
     let proxy = spawn_test_proxy(cfg);
     let client = Client::new();
 
@@ -333,7 +333,7 @@ async fn openai_images_generation_missing_result_fails_over_to_next_upstream() {
     );
     let bad_upstream = spawn_test_upstream(bad_upstream);
     let good_upstream = spawn_test_upstream(good_upstream);
-    let cfg = make_proxy_config(
+    let cfg = make_helper_config(
         vec![
             bad_upstream.upstream_config(),
             good_upstream.upstream_config(),
@@ -361,7 +361,7 @@ async fn openai_images_generation_missing_result_fails_over_to_next_upstream() {
 #[tokio::test]
 async fn openai_images_generation_route_failure_returns_openai_error_json() {
     let unused_addr = reserve_unused_local_addr();
-    let cfg = make_proxy_config(
+    let cfg = make_helper_config(
         vec![upstream_config(format!("http://{unused_addr}/v1"))],
         RetryConfig::default(),
     );
@@ -431,7 +431,7 @@ async fn openai_images_edits_endpoint_translates_json_references_and_response() 
         }),
     );
     let upstream = spawn_test_upstream(upstream);
-    let cfg = make_proxy_config(vec![upstream.upstream_config()], RetryConfig::default());
+    let cfg = make_helper_config(vec![upstream.upstream_config()], RetryConfig::default());
     let proxy = spawn_test_proxy(cfg);
     let client = Client::new();
 
@@ -509,7 +509,7 @@ async fn openai_images_edits_endpoint_rejects_n_greater_than_one_before_upstream
         }),
     );
     let upstream = spawn_test_upstream(upstream);
-    let cfg = make_proxy_config(vec![upstream.upstream_config()], RetryConfig::default());
+    let cfg = make_helper_config(vec![upstream.upstream_config()], RetryConfig::default());
     let proxy = spawn_test_proxy(cfg);
     let client = Client::new();
 
@@ -565,7 +565,7 @@ async fn openai_images_edits_endpoint_passes_non_json_requests_through() {
         }),
     );
     let upstream = spawn_test_upstream(upstream);
-    let cfg = make_proxy_config(vec![upstream.upstream_config()], RetryConfig::default());
+    let cfg = make_helper_config(vec![upstream.upstream_config()], RetryConfig::default());
     let proxy = spawn_test_proxy(cfg);
     let client = Client::new();
 

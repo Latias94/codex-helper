@@ -1,12 +1,12 @@
 use super::config_doc::{
-    ensure_v4_routing, ensure_v4_routing_order_contains, load_v4_config, ordered_v4_provider_names,
-    parse_cli_string_map, parse_cli_tags, print_v4_provider_list, select_v4_service_view,
-    select_v4_service_view_mut,
+    ensure_routing, ensure_routing_order_contains, load_helper_config, ordered_provider_names,
+    parse_cli_string_map, parse_cli_tags, print_provider_list, select_service_route_config,
+    select_service_route_config_mut,
 };
 use crate::cli_types::ProviderCommand;
 use crate::config::{
-    CURRENT_ROUTE_GRAPH_CONFIG_VERSION, ProviderConfigV4, ProviderEndpointV4, ServiceViewV4,
-    UpstreamAuth, storage::save_config_v4,
+    CURRENT_CONFIG_VERSION, ProviderConfig, ProviderEndpointConfig, ServiceRouteConfig,
+    UpstreamAuth, storage::save_helper_config,
 };
 use crate::{CliError, CliResult};
 use serde::Serialize;
@@ -59,22 +59,22 @@ pub async fn handle_provider_cmd(cmd: ProviderCommand) -> CliResult<()> {
             claude,
             json,
         } => {
-            let (cfg, service, label) = load_v4_config(codex, claude, "provider")
+            let (cfg, service, label) = load_helper_config(codex, claude, "provider")
                 .await
-                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
-            let (view, _) = select_v4_service_view(&cfg, service);
+                .map_err(|e| CliError::Configuration(e.to_string()))?;
+            let (view, _) = select_service_route_config(&cfg, service);
 
             if json {
                 let payload = ProviderCatalogPayload {
-                    schema_version: CURRENT_ROUTE_GRAPH_CONFIG_VERSION,
+                    schema_version: CURRENT_CONFIG_VERSION,
                     service: service.to_string(),
                     providers: build_provider_views(view),
                 };
                 let text = serde_json::to_string_pretty(&payload)
-                    .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+                    .map_err(|e| CliError::Configuration(e.to_string()))?;
                 println!("{text}");
             } else {
-                print_v4_provider_list(label, view);
+                print_provider_list(label, view);
             }
         }
         ProviderCommand::Show {
@@ -83,22 +83,22 @@ pub async fn handle_provider_cmd(cmd: ProviderCommand) -> CliResult<()> {
             claude,
             json,
         } => {
-            let (cfg, service, label) = load_v4_config(codex, claude, "provider")
+            let (cfg, service, label) = load_helper_config(codex, claude, "provider")
                 .await
-                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
-            let (view, _) = select_v4_service_view(&cfg, service);
+                .map_err(|e| CliError::Configuration(e.to_string()))?;
+            let (view, _) = select_service_route_config(&cfg, service);
             let provider = build_provider_view(view, name.as_str()).ok_or_else(|| {
-                CliError::ProxyConfig(format!("provider '{}' not found in v4 config", name))
+                CliError::Configuration(format!("provider '{}' not found in source config", name))
             })?;
 
             if json {
                 let payload = ProviderShowPayload {
-                    schema_version: CURRENT_ROUTE_GRAPH_CONFIG_VERSION,
+                    schema_version: CURRENT_CONFIG_VERSION,
                     service: service.to_string(),
                     provider,
                 };
                 let text = serde_json::to_string_pretty(&payload)
-                    .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+                    .map_err(|e| CliError::Configuration(e.to_string()))?;
                 println!("{text}");
             } else {
                 print_provider_detail(label, &provider);
@@ -121,25 +121,25 @@ pub async fn handle_provider_cmd(cmd: ProviderCommand) -> CliResult<()> {
             claude,
         } => {
             let parsed_tags =
-                parse_cli_tags(&tags).map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+                parse_cli_tags(&tags).map_err(|e| CliError::Configuration(e.to_string()))?;
             let parsed_supported_models = parse_cli_supported_models(&supported_models)
-                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+                .map_err(|e| CliError::Configuration(e.to_string()))?;
             let parsed_model_mapping = parse_cli_string_map(&model_mapping, "model-map")
-                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
-            let (mut cfg, service, label) = load_v4_config(codex, claude, "provider")
+                .map_err(|e| CliError::Configuration(e.to_string()))?;
+            let (mut cfg, service, label) = load_helper_config(codex, claude, "provider")
                 .await
-                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+                .map_err(|e| CliError::Configuration(e.to_string()))?;
             {
-                let (view, _) = select_v4_service_view_mut(&mut cfg, service);
+                let (view, _) = select_service_route_config_mut(&mut cfg, service);
                 if view.providers.contains_key(name.as_str()) && !replace {
-                    return Err(CliError::ProxyConfig(format!(
+                    return Err(CliError::Configuration(format!(
                         "provider '{}' already exists; pass --replace to overwrite it",
                         name
                     )));
                 }
                 view.providers.insert(
                     name.clone(),
-                    ProviderConfigV4 {
+                    ProviderConfig {
                         alias,
                         enabled: !disabled,
                         base_url: Some(base_url),
@@ -152,18 +152,18 @@ pub async fn handle_provider_cmd(cmd: ProviderCommand) -> CliResult<()> {
                         tags: parsed_tags,
                         supported_models: parsed_supported_models,
                         model_mapping: parsed_model_mapping,
-                        ..ProviderConfigV4::default()
+                        ..ProviderConfig::default()
                     },
                 );
-                ensure_v4_routing_order_contains(view, name.as_str());
+                ensure_routing_order_contains(view, name.as_str());
                 if disabled {
                     clear_manual_target_for_provider(view, name.as_str());
                 }
             }
 
-            save_config_v4(&cfg)
+            save_helper_config(&cfg)
                 .await
-                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+                .map_err(|e| CliError::Configuration(e.to_string()))?;
             println!("Added {label} provider '{}'", name);
         }
         ProviderCommand::Enable {
@@ -171,24 +171,24 @@ pub async fn handle_provider_cmd(cmd: ProviderCommand) -> CliResult<()> {
             codex,
             claude,
         } => {
-            let (mut cfg, service, label) = load_v4_config(codex, claude, "provider")
+            let (mut cfg, service, label) = load_helper_config(codex, claude, "provider")
                 .await
-                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+                .map_err(|e| CliError::Configuration(e.to_string()))?;
             {
-                let (view, _) = select_v4_service_view_mut(&mut cfg, service);
+                let (view, _) = select_service_route_config_mut(&mut cfg, service);
                 let Some(provider) = view.providers.get_mut(name.as_str()) else {
-                    return Err(CliError::ProxyConfig(format!(
-                        "provider '{}' not found in v4 config",
+                    return Err(CliError::Configuration(format!(
+                        "provider '{}' not found in source config",
                         name
                     )));
                 };
                 provider.enabled = true;
-                ensure_v4_routing_order_contains(view, name.as_str());
+                ensure_routing_order_contains(view, name.as_str());
             }
 
-            save_config_v4(&cfg)
+            save_helper_config(&cfg)
                 .await
-                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+                .map_err(|e| CliError::Configuration(e.to_string()))?;
             println!("Enabled {label} provider '{}'", name);
         }
         ProviderCommand::Disable {
@@ -196,15 +196,15 @@ pub async fn handle_provider_cmd(cmd: ProviderCommand) -> CliResult<()> {
             codex,
             claude,
         } => {
-            let (mut cfg, service, label) = load_v4_config(codex, claude, "provider")
+            let (mut cfg, service, label) = load_helper_config(codex, claude, "provider")
                 .await
-                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+                .map_err(|e| CliError::Configuration(e.to_string()))?;
             let mut cleared_target = false;
             {
-                let (view, _) = select_v4_service_view_mut(&mut cfg, service);
+                let (view, _) = select_service_route_config_mut(&mut cfg, service);
                 let Some(provider) = view.providers.get_mut(name.as_str()) else {
-                    return Err(CliError::ProxyConfig(format!(
-                        "provider '{}' not found in v4 config",
+                    return Err(CliError::Configuration(format!(
+                        "provider '{}' not found in source config",
                         name
                     )));
                 };
@@ -215,9 +215,9 @@ pub async fn handle_provider_cmd(cmd: ProviderCommand) -> CliResult<()> {
                 }
             }
 
-            save_config_v4(&cfg)
+            save_helper_config(&cfg)
                 .await
-                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+                .map_err(|e| CliError::Configuration(e.to_string()))?;
             if cleared_target {
                 println!(
                     "Disabled {label} provider '{}' and cleared manual routing target",
@@ -232,25 +232,25 @@ pub async fn handle_provider_cmd(cmd: ProviderCommand) -> CliResult<()> {
     Ok(())
 }
 
-fn build_provider_views(view: &ServiceViewV4) -> Vec<ProviderView> {
-    ordered_v4_provider_names(view)
+fn build_provider_views(view: &ServiceRouteConfig) -> Vec<ProviderView> {
+    ordered_provider_names(view)
         .into_iter()
         .filter_map(|name| build_provider_view(view, name.as_str()))
         .collect()
 }
 
-fn build_provider_view(view: &ServiceViewV4, name: &str) -> Option<ProviderView> {
+fn build_provider_view(view: &ServiceRouteConfig, name: &str) -> Option<ProviderView> {
     let provider = view.providers.get(name)?;
-    let route_order = crate::config::resolved_v4_provider_order("provider-cli", view)
-        .unwrap_or_else(|_| ordered_v4_provider_names(view));
+    let route_order = crate::config::resolved_provider_order("provider-cli", view)
+        .unwrap_or_else(|_| ordered_provider_names(view));
     let routing_index = route_order
         .iter()
         .position(|candidate| candidate == name)
         .map(|idx| idx + 1);
-    let routing_target = crate::config::effective_v4_routing(view)
+    let routing_target = crate::config::effective_routing(view)
         .entry_node()
         .and_then(|node| {
-            matches!(node.strategy, crate::config::RoutingPolicyV4::ManualSticky)
+            matches!(node.strategy, crate::config::RouteStrategy::ManualSticky)
                 .then(|| node.target.as_deref())
                 .flatten()
         })
@@ -288,11 +288,11 @@ fn build_provider_view(view: &ServiceViewV4, name: &str) -> Option<ProviderView>
     })
 }
 
-fn clear_manual_target_for_provider(view: &mut ServiceViewV4, provider_name: &str) -> bool {
-    ensure_v4_routing(view).clear_manual_target_for(provider_name)
+fn clear_manual_target_for_provider(view: &mut ServiceRouteConfig, provider_name: &str) -> bool {
+    ensure_routing(view).clear_manual_target_for(provider_name)
 }
 
-fn provider_endpoints(provider: &ProviderConfigV4) -> Vec<ProviderEndpointView> {
+fn provider_endpoints(provider: &ProviderConfig) -> Vec<ProviderEndpointView> {
     let mut endpoints = Vec::new();
     if let Some(base_url) = provider
         .base_url
@@ -317,7 +317,10 @@ fn provider_endpoints(provider: &ProviderConfigV4) -> Vec<ProviderEndpointView> 
     endpoints
 }
 
-fn endpoint_view_from_config(name: &str, endpoint: &ProviderEndpointV4) -> ProviderEndpointView {
+fn endpoint_view_from_config(
+    name: &str,
+    endpoint: &ProviderEndpointConfig,
+) -> ProviderEndpointView {
     ProviderEndpointView {
         name: name.to_string(),
         base_url: endpoint.base_url.clone(),
@@ -328,7 +331,7 @@ fn endpoint_view_from_config(name: &str, endpoint: &ProviderEndpointV4) -> Provi
 }
 
 fn print_provider_detail(label: &str, provider: &ProviderView) {
-    println!("Schema version: v{CURRENT_ROUTE_GRAPH_CONFIG_VERSION}");
+    println!("Schema version: v{CURRENT_CONFIG_VERSION}");
     println!("Service: {label}");
     println!("Provider: {}", provider.name);
     if let Some(alias) = provider.alias.as_deref() {

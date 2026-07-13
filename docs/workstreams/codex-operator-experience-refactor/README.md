@@ -1,5 +1,10 @@
 # Fearless Refactor Workstream: Codex Operator Experience
 
+> Historical note: this workstream is superseded by the
+> [canonical relay/runtime modernization plan](../../plans/2026-07-10-002-refactor-canonical-relay-runtime-modernization-plan.md).
+> It remains as design history and evidence, not as the current operator read
+> model, routing, control-plane, or client-mutation contract.
+
 > 中文速览：本目录承接 `codex-control-plane-refactor` 之后的下一层产品化工作。控制平面已经把 `station / profile / session binding / effective route` 的语义打稳；本 workstream 关注操作者每天真正感知到的体验：TUI 稳定性、GUI 信息架构、请求级可观测、价格/余额、以及直观且安全的自动切换策略。
 
 ## Purpose

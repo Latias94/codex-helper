@@ -1,8 +1,11 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 
-use crate::codex_integration::{CodexCompactionStrategy, CodexPatchMode, CodexSwitchOptions};
-use crate::config::{ProxyConfig, RelayTargetConfig, ServiceKind};
-use crate::control_plane_client::normalize_base_url;
+use crate::config::{HelperConfig, RelayTargetConfig, ServiceKind};
+use crate::control_plane_client::{
+    configured_local_admin_token_env, is_loopback_control_plane_base_url,
+    normalize_admin_token_env, normalize_base_url, normalize_control_plane_base_url,
+    require_remote_admin_token,
+};
 use crate::proxy::{
     admin_base_url_from_proxy_base_url, local_admin_base_url_for_proxy_port, local_proxy_base_url,
 };
@@ -14,8 +17,6 @@ pub struct ResolvedRelayTarget {
     pub proxy_url: String,
     pub admin_url: Option<String>,
     pub admin_token_env: Option<String>,
-    pub client_preset: CodexPatchMode,
-    pub client_options: CodexSwitchOptions,
     pub built_in_local: bool,
 }
 
@@ -32,7 +33,7 @@ impl ResolvedRelayTarget {
     }
 }
 
-pub fn resolve_relay_target(cfg: &ProxyConfig, name: &str) -> Result<ResolvedRelayTarget> {
+pub fn resolve_relay_target(cfg: &HelperConfig, name: &str) -> Result<ResolvedRelayTarget> {
     let name = normalize_relay_target_name(name)?;
     if name == "local" {
         let service = cfg.default_service.unwrap_or(ServiceKind::Codex);
@@ -42,20 +43,7 @@ pub fn resolve_relay_target(cfg: &ProxyConfig, name: &str) -> Result<ResolvedRel
             service,
             proxy_url: local_proxy_base_url(port),
             admin_url: Some(local_admin_base_url_for_proxy_port(port)),
-            admin_token_env: None,
-            client_preset: cfg
-                .relay_targets
-                .get("local")
-                .and_then(|target| target.client_preset)
-                .unwrap_or(CodexPatchMode::Default),
-            client_options: CodexSwitchOptions {
-                responses_websocket: cfg
-                    .relay_targets
-                    .get("local")
-                    .and_then(|target| target.responses_websocket)
-                    .unwrap_or(false),
-                compaction: CodexCompactionStrategy::Auto,
-            },
+            admin_token_env: configured_local_admin_token_env().map(str::to_string),
             built_in_local: true,
         });
     }
@@ -67,7 +55,7 @@ pub fn resolve_relay_target(cfg: &ProxyConfig, name: &str) -> Result<ResolvedRel
     resolve_configured_relay_target(&name, target)
 }
 
-pub fn relay_target_names(cfg: &ProxyConfig) -> Vec<String> {
+pub fn relay_target_names(cfg: &HelperConfig) -> Vec<String> {
     let mut names = vec!["local".to_string()];
     for name in cfg.relay_targets.keys() {
         if name != "local" {
@@ -82,27 +70,27 @@ pub fn relay_target_config_from_args(
     proxy_url: String,
     admin_url: Option<String>,
     admin_token_env: Option<String>,
-    client_preset: Option<CodexPatchMode>,
-    responses_websocket: Option<bool>,
 ) -> Result<RelayTargetConfig> {
     let proxy_url = normalize_base_url(&proxy_url)
         .ok_or_else(|| anyhow!("relay proxy URL must start with http:// or https://"))?;
     let admin_url = match admin_url {
-        Some(url) => Some(
-            normalize_base_url(&url)
-                .ok_or_else(|| anyhow!("relay admin URL must start with http:// or https://"))?,
-        ),
-        None => admin_base_url_from_proxy_base_url(&proxy_url),
+        Some(url) => Some(normalize_control_plane_base_url(&url)?),
+        None if is_loopback_control_plane_base_url(&proxy_url) => {
+            admin_base_url_from_proxy_base_url(&proxy_url)
+                .map(|url| normalize_control_plane_base_url(&url))
+                .transpose()?
+        }
+        None => anyhow::bail!("remote relay proxy URL requires an explicit admin_url"),
     };
+    let admin_token_env = normalize_admin_token_env(admin_token_env.as_deref())?;
+    if let Some(admin_url) = admin_url.as_deref() {
+        require_remote_admin_token(admin_url, admin_token_env.as_deref())?;
+    }
     Ok(RelayTargetConfig {
         service,
         proxy_url,
         admin_url,
-        admin_token_env: admin_token_env
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty()),
-        client_preset,
-        responses_websocket,
+        admin_token_env,
     })
 }
 
@@ -114,22 +102,34 @@ fn resolve_configured_relay_target(
         .ok_or_else(|| anyhow!("relay target '{name}' has an invalid proxy_url"))?;
     let admin_url = match target.admin_url.as_deref() {
         Some(url) => Some(
-            normalize_base_url(url)
-                .ok_or_else(|| anyhow!("relay target '{name}' has an invalid admin_url"))?,
+            normalize_control_plane_base_url(url)
+                .with_context(|| format!("relay target '{name}' has an invalid admin_url"))?,
         ),
-        None => admin_base_url_from_proxy_base_url(&proxy_url),
+        None if is_loopback_control_plane_base_url(&proxy_url) => {
+            admin_base_url_from_proxy_base_url(&proxy_url)
+                .map(|url| {
+                    normalize_control_plane_base_url(&url).with_context(|| {
+                        format!("relay target '{name}' has an invalid derived admin_url")
+                    })
+                })
+                .transpose()?
+        }
+        None => {
+            anyhow::bail!("relay target '{name}' remote proxy URL requires an explicit admin_url")
+        }
     };
+    let admin_token_env = normalize_admin_token_env(target.admin_token_env.as_deref())
+        .with_context(|| format!("relay target '{name}' has an invalid admin_token_env"))?;
+    if let Some(admin_url) = admin_url.as_deref() {
+        require_remote_admin_token(admin_url, admin_token_env.as_deref())
+            .with_context(|| format!("relay target '{name}' requires a valid admin_token_env"))?;
+    }
     Ok(ResolvedRelayTarget {
         name: name.to_string(),
         service: target.service.unwrap_or(ServiceKind::Codex),
         proxy_url,
         admin_url,
-        admin_token_env: target.admin_token_env.clone(),
-        client_preset: target.client_preset.unwrap_or(CodexPatchMode::Default),
-        client_options: CodexSwitchOptions {
-            responses_websocket: target.responses_websocket.unwrap_or(false),
-            compaction: CodexCompactionStrategy::Auto,
-        },
+        admin_token_env,
         built_in_local: false,
     })
 }
@@ -158,9 +158,9 @@ mod tests {
 
     #[test]
     fn relay_target_resolves_builtin_local_from_default_service() {
-        let cfg = ProxyConfig {
+        let cfg = HelperConfig {
             default_service: Some(ServiceKind::Codex),
-            ..ProxyConfig::default()
+            ..HelperConfig::default()
         };
 
         let target = resolve_relay_target(&cfg, "local").expect("local target");
@@ -178,25 +178,183 @@ mod tests {
             RelayTargetConfig {
                 service: Some(ServiceKind::Codex),
                 proxy_url: "http://nas.local:3211/".to_string(),
-                admin_url: Some("http://nas.local:4211/".to_string()),
+                admin_url: Some("https://nas.example:4211/".to_string()),
                 admin_token_env: Some("NAS_TOKEN".to_string()),
-                client_preset: Some(CodexPatchMode::ChatGptBridge),
-                responses_websocket: Some(true),
             },
         );
-        let cfg = ProxyConfig {
+        let cfg = HelperConfig {
             relay_targets: targets,
-            ..ProxyConfig::default()
+            ..HelperConfig::default()
         };
 
         let target = resolve_relay_target(&cfg, "nas").expect("nas target");
 
         assert_eq!(target.proxy_url, "http://nas.local:3211");
-        assert_eq!(target.admin_url.as_deref(), Some("http://nas.local:4211"));
+        assert_eq!(
+            target.admin_url.as_deref(),
+            Some("https://nas.example:4211")
+        );
         assert_eq!(target.admin_token_env.as_deref(), Some("NAS_TOKEN"));
-        assert_eq!(target.client_preset, CodexPatchMode::ChatGptBridge);
-        assert!(target.client_options.responses_websocket);
         assert!(!target.is_local());
+    }
+
+    #[test]
+    fn relay_target_rejects_remote_http_admin_url() {
+        let err = relay_target_config_from_args(
+            Some(ServiceKind::Codex),
+            "http://nas.example:3211".to_string(),
+            Some("http://nas.example:4211".to_string()),
+            Some("NAS_TOKEN".to_string()),
+        )
+        .expect_err("remote admin HTTP must be rejected");
+
+        assert!(err.to_string().contains("HTTPS"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn relay_target_rejects_explicit_remote_admin_without_token() {
+        let err = relay_target_config_from_args(
+            Some(ServiceKind::Codex),
+            "http://127.0.0.1:3211".to_string(),
+            Some("https://relay.example:4211".to_string()),
+            None,
+        )
+        .expect_err("explicit remote admin URL must require a token environment variable");
+
+        assert!(
+            err.to_string().contains("admin_token_env"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn relay_target_rejects_remote_proxy_without_explicit_admin_url() {
+        let err = relay_target_config_from_args(
+            Some(ServiceKind::Codex),
+            "https://relay.example:3211".to_string(),
+            None,
+            Some("RELAY_ADMIN_TOKEN".to_string()),
+        )
+        .expect_err("remote proxy must require an explicit admin authority");
+
+        assert!(
+            err.to_string().contains("explicit admin_url"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn relay_target_resolution_rejects_remote_proxy_without_explicit_admin_url() {
+        let mut targets = BTreeMap::new();
+        targets.insert(
+            "nas".to_string(),
+            RelayTargetConfig {
+                proxy_url: "https://relay.example:3211".to_string(),
+                admin_token_env: Some("RELAY_ADMIN_TOKEN".to_string()),
+                ..RelayTargetConfig::default()
+            },
+        );
+        let cfg = HelperConfig {
+            relay_targets: targets,
+            ..HelperConfig::default()
+        };
+
+        let err = resolve_relay_target(&cfg, "nas")
+            .expect_err("loaded remote relay target must pin its admin authority");
+
+        assert!(
+            err.to_string().contains("explicit admin_url"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn relay_target_rejects_discovered_remote_admin_without_token() {
+        let discovered_admin_url = "https://relay.example:4211".to_string();
+        let err = relay_target_config_from_args(
+            Some(ServiceKind::Codex),
+            "https://relay.example:3211".to_string(),
+            Some(discovered_admin_url),
+            None,
+        )
+        .expect_err("discovered remote admin URL must require a token environment variable");
+
+        assert!(
+            err.to_string().contains("admin_token_env"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn relay_target_rejects_invalid_remote_admin_token_env() {
+        let err = relay_target_config_from_args(
+            Some(ServiceKind::Codex),
+            "https://relay.example:3211".to_string(),
+            Some("https://relay.example:4211".to_string()),
+            Some("Bearer token".to_string()),
+        )
+        .expect_err("remote admin token must name an environment variable");
+
+        assert!(
+            err.to_string().contains("valid environment variable name"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn relay_target_accepts_remote_admin_with_valid_token_env() {
+        let target = relay_target_config_from_args(
+            Some(ServiceKind::Codex),
+            "https://relay.example:3211".to_string(),
+            Some("https://relay.example:4211".to_string()),
+            Some(" RELAY_ADMIN_TOKEN ".to_string()),
+        )
+        .expect("remote HTTPS admin with a valid token environment variable");
+
+        assert_eq!(
+            target.admin_url.as_deref(),
+            Some("https://relay.example:4211")
+        );
+        assert_eq!(target.admin_token_env.as_deref(), Some("RELAY_ADMIN_TOKEN"));
+    }
+
+    #[test]
+    fn relay_target_resolution_revalidates_remote_admin_token() {
+        let mut targets = BTreeMap::new();
+        targets.insert(
+            "nas".to_string(),
+            RelayTargetConfig {
+                proxy_url: "https://relay.example:3211".to_string(),
+                admin_url: Some("https://relay.example:4211".to_string()),
+                ..RelayTargetConfig::default()
+            },
+        );
+        let cfg = HelperConfig {
+            relay_targets: targets,
+            ..HelperConfig::default()
+        };
+
+        let err = resolve_relay_target(&cfg, "nas")
+            .expect_err("loaded relay config must enforce the remote token boundary");
+
+        assert!(
+            err.to_string().contains("admin_token_env"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn relay_target_allows_loopback_admin_without_token() {
+        let target = relay_target_config_from_args(
+            Some(ServiceKind::Codex),
+            "http://127.0.0.1:3211".to_string(),
+            None,
+            None,
+        )
+        .expect("loopback relay admin must not require a token");
+
+        assert_eq!(target.admin_url.as_deref(), Some("http://127.0.0.1:4211"));
+        assert!(target.admin_token_env.is_none());
     }
 
     #[test]

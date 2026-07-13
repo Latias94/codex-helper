@@ -56,11 +56,31 @@ Environment escape hatches:
 1. packaged resource directory sidecar: `codex-helper(.exe)`;
 2. sibling binary next to the current desktop executable, including Cargo `deps`
    parent fallback for development builds;
-3. developer environment override: `CODEX_HELPER_CLI_PATH` or legacy
-   `CODEX_HELPER_CLI`.
+3. developer environment override: `CODEX_HELPER_CLI_PATH`.
 
 The environment override is only a development fallback. A packaged app should
 not require shell setup to start a desktop-managed proxy.
+
+## Operator boundary
+
+The desktop app is query-only with respect to runtime data. It renders the
+typed, redacted `OperatorReadModel`, uses only `GET` / `HEAD` against the remote
+runtime control plane, and preserves the model's `ready`, `stale`,
+`disconnected`, and `auth_required` states. When the runtime is unavailable or
+authentication fails, the app does not fabricate a fallback view from local
+config, SQLite, or an empty runtime.
+
+Desktop-local capabilities remain intentionally narrow:
+
+- start a desktop-managed local proxy or attach to an existing local runtime;
+- detach or quit the desktop app without stopping the runtime;
+- explicitly switch the local Codex helper provider selector/stanza;
+- export the current config and open known config, home, log, or cache paths;
+- manage window/tray, single-instance, and launch-at-login behavior.
+
+The desktop app does not import config, expose a Provider common-edit form, or
+mutate provider/routing/config state through a remote control plane. Durable
+provider and routing intent belongs to local CLI commands or `config.toml`.
 
 ## Signing and release-channel posture
 
@@ -113,8 +133,8 @@ Current policy:
 - Launch at login starts only the desktop companion.
 - It does not automatically stop, restart, or seize an existing local proxy.
 - Startup-time proxy auto-start remains explicit; the companion can start a
-  desktop-managed sidecar, but proxy shutdown still requires the user-facing
-  `Stop Proxy` action.
+  desktop-managed sidecar. Detach and app quit leave the runtime running; proxy
+  shutdown remains outside the desktop query-only surface.
 - The plugin supports Windows, macOS, and Linux desktop targets. Android/iOS are
   intentionally outside this desktop release target.
 
@@ -148,8 +168,9 @@ Verified on Windows:
   `CODEX_HELPER_CLI_PATH`.
 - Native close hides to tray, native tray menu Show Window / Hide to Tray / Quit
   App paths work, and Quit App exits only the desktop process.
-- Detach, explicit Stop Proxy, second-launch focus/restore, config
-  export/import, and Provider common edit UI pass in the packaged app.
+- Start Proxy, Attach Existing, Detach, app quit, second-launch focus/restore,
+  config export/open-path, and the explicit local Codex switch pass in the
+  packaged app. There is no config import or Provider common-edit command.
 - Launch-at-login enable/disable registers and unregisters the Windows HKCU Run
   entry during smoke cleanup.
 - Release posture is defined: manual GitHub Releases for the first replacement

@@ -2,6 +2,8 @@
 
 Status: complete
 
+> Historical status (superseded 2026-07-12): this closeout records a removed client patch preset and auth-facade design. Hosted image generation is now a provider/model capability decision, and the explicit local switch does not expose or enable it.
+
 ## Delivered
 
 - Added `official-imagegen-bridge` as an explicit Codex client patch mode.

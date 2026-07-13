@@ -59,16 +59,6 @@ fn read_json_file(path: &Path) -> Option<serde_json::Value> {
     serde_json::from_str(&text).ok()
 }
 
-pub(super) fn codex_auth_json_value(key: &str) -> Option<String> {
-    static CACHE: OnceLock<Mutex<JsonFileCache>> = OnceLock::new();
-    let value = cached_json_file_value(&CACHE, crate::config::codex_auth_path());
-    let object = value.as_ref()?.as_object()?;
-    object
-        .get(key)
-        .and_then(|value| value.as_str())
-        .map(str::to_owned)
-}
-
 pub(super) fn claude_settings_env_value(key: &str) -> Option<String> {
     static CACHE: OnceLock<Mutex<JsonFileCache>> = OnceLock::new();
     let value = cached_json_file_value(&CACHE, crate::config::claude_settings_path());
@@ -83,7 +73,6 @@ pub(super) fn claude_settings_env_value(key: &str) -> Option<String> {
 pub(super) fn resolve_auth_token_with_source(
     service_name: &str,
     auth: &UpstreamAuth,
-    client_has_auth: bool,
 ) -> (Option<String>, String) {
     if let Some(token) = auth.auth_token.as_deref()
         && !token.trim().is_empty()
@@ -100,39 +89,24 @@ pub(super) fn resolve_auth_token_with_source(
             return (Some(value), format!("env:{env_name}"));
         }
 
-        let file_value = match service_name {
-            "codex" => codex_auth_json_value(env_name),
-            "claude" => claude_settings_env_value(env_name),
-            _ => None,
-        };
+        let file_value = (service_name == "claude")
+            .then(|| claude_settings_env_value(env_name))
+            .flatten();
         if let Some(value) = file_value
             && !value.trim().is_empty()
         {
-            let source = match service_name {
-                "codex" => format!("codex_auth_json:{env_name}"),
-                "claude" => format!("claude_settings_env:{env_name}"),
-                _ => format!("file:{env_name}"),
-            };
-            return (Some(value), source);
+            return (Some(value), format!("claude_settings_env:{env_name}"));
         }
 
-        if client_has_auth {
-            return (None, format!("client_passthrough (missing_env:{env_name})"));
-        }
         return (None, format!("missing_env:{env_name}"));
     }
 
-    if client_has_auth {
-        (None, "client_passthrough".to_string())
-    } else {
-        (None, "none".to_string())
-    }
+    (None, "none".to_string())
 }
 
 pub(super) fn resolve_api_key_with_source(
     service_name: &str,
     auth: &UpstreamAuth,
-    client_has_x_api_key: bool,
 ) -> (Option<String>, String) {
     if let Some(key) = auth.api_key.as_deref()
         && !key.trim().is_empty()
@@ -149,33 +123,19 @@ pub(super) fn resolve_api_key_with_source(
             return (Some(value), format!("env:{env_name}"));
         }
 
-        let file_value = match service_name {
-            "codex" => codex_auth_json_value(env_name),
-            "claude" => claude_settings_env_value(env_name),
-            _ => None,
-        };
+        let file_value = (service_name == "claude")
+            .then(|| claude_settings_env_value(env_name))
+            .flatten();
         if let Some(value) = file_value
             && !value.trim().is_empty()
         {
-            let source = match service_name {
-                "codex" => format!("codex_auth_json:{env_name}"),
-                "claude" => format!("claude_settings_env:{env_name}"),
-                _ => format!("file:{env_name}"),
-            };
-            return (Some(value), source);
+            return (Some(value), format!("claude_settings_env:{env_name}"));
         }
 
-        if client_has_x_api_key {
-            return (None, format!("client_passthrough (missing_env:{env_name})"));
-        }
         return (None, format!("missing_env:{env_name}"));
     }
 
-    if client_has_x_api_key {
-        (None, "client_passthrough".to_string())
-    } else {
-        (None, "none".to_string())
-    }
+    (None, "none".to_string())
 }
 
 #[cfg(test)]
@@ -193,17 +153,17 @@ mod tests {
         };
 
         assert_eq!(
-            resolve_auth_token_with_source("codex", &auth, true),
+            resolve_auth_token_with_source("codex", &auth),
             (Some("token-1".to_string()), "inline".to_string())
         );
         assert_eq!(
-            resolve_api_key_with_source("codex", &auth, true),
+            resolve_api_key_with_source("codex", &auth),
             (Some("key-1".to_string()), "inline".to_string())
         );
     }
 
     #[test]
-    fn auth_resolution_falls_back_to_client_passthrough_when_env_missing() {
+    fn auth_resolution_reports_missing_env_without_client_policy() {
         let auth = UpstreamAuth {
             auth_token: None,
             auth_token_env: Some("CODEX_HELPER_TEST_MISSING_AUTH_ENV_09A1".to_string()),
@@ -212,33 +172,31 @@ mod tests {
         };
 
         assert_eq!(
-            resolve_auth_token_with_source("other", &auth, true),
+            resolve_auth_token_with_source("codex", &auth),
             (
                 None,
-                "client_passthrough (missing_env:CODEX_HELPER_TEST_MISSING_AUTH_ENV_09A1)"
-                    .to_string(),
+                "missing_env:CODEX_HELPER_TEST_MISSING_AUTH_ENV_09A1".to_string(),
             )
         );
         assert_eq!(
-            resolve_api_key_with_source("other", &auth, true),
+            resolve_api_key_with_source("codex", &auth),
             (
                 None,
-                "client_passthrough (missing_env:CODEX_HELPER_TEST_MISSING_API_ENV_09A1)"
-                    .to_string(),
+                "missing_env:CODEX_HELPER_TEST_MISSING_API_ENV_09A1".to_string(),
             )
         );
     }
 
     #[test]
-    fn auth_resolution_reports_none_without_client_headers_or_config() {
+    fn auth_resolution_reports_none_without_helper_config() {
         let auth = UpstreamAuth::default();
 
         assert_eq!(
-            resolve_auth_token_with_source("codex", &auth, false),
+            resolve_auth_token_with_source("codex", &auth),
             (None, "none".to_string())
         );
         assert_eq!(
-            resolve_api_key_with_source("codex", &auth, false),
+            resolve_api_key_with_source("codex", &auth),
             (None, "none".to_string())
         );
     }

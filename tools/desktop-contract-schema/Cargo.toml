@@ -1,0 +1,11 @@
+[package]
+name = "codex-helper-desktop-contract-schema"
+version = "0.20.3"
+edition = "2024"
+publish = false
+
+[dependencies]
+heck = "0.5.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+syn = { version = "2.0.118", features = ["full", "parsing"] }

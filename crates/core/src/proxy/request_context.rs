@@ -9,24 +9,24 @@ use crate::state::{SessionBinding, SessionIdentitySource};
 
 use super::ProxyService;
 use super::client_identity::{
-    extract_client_addr, extract_client_name, extract_session_identity,
-    extract_session_identity_with_body_fallback,
+    extract_client_addr, extract_client_name, extract_session_identity_with_body_fallback,
 };
-use super::headers::header_map_to_entries;
-use super::request_body::codex_session_identity_and_completed_body;
+use super::request_body::{
+    ReasoningOrchestrationIntent, RequestDialect, codex_session_identity_and_completed_body,
+};
 use super::request_encoding::normalize_request_content_encoding;
 use super::request_failures::{
-    FailedProxyRequestParams, finish_failed_proxy_request, log_client_body_read_error,
+    ClientBodyReadErrorParams, FailedProxyRequestParams, client_body_read_error,
+    finish_failed_proxy_request,
 };
 use super::request_preparation::{
     CommonRequestPreparationError, CommonRequestPreparationParams, RequestFlavor,
-    codex_path_is_responses_compact, codex_path_is_responses_or_compact, detect_request_flavor,
-    load_request_config_context, prepare_common_request, session_identity_source,
-    session_identity_value,
+    codex_path_is_responses_or_compact, detect_request_flavor, load_request_config_context,
+    prepare_common_request,
 };
-use super::request_routing::RequestRouteSelection;
 use super::response_semantics::ResponseSemanticContract;
 use super::retry::RetryPlan;
+use super::runtime_config::CapturedRoutePlan;
 
 const MAX_PROXY_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 
@@ -39,16 +39,13 @@ pub(super) struct PreparedProxyRequest {
     pub(super) session_id: Option<String>,
     pub(super) session_identity_source: Option<SessionIdentitySource>,
     pub(super) session_binding: Option<SessionBinding>,
-    pub(super) route_selection: RequestRouteSelection,
+    pub(super) route_plan: CapturedRoutePlan,
     pub(super) cwd: Option<String>,
-    pub(super) session_override_config: Option<String>,
-    pub(super) global_station_override: Option<String>,
-    pub(super) override_effort: Option<String>,
-    pub(super) override_model: Option<String>,
-    pub(super) override_service_tier: Option<String>,
     pub(super) body_for_upstream: Bytes,
+    pub(super) request_dialect: RequestDialect,
     pub(super) request_model: Option<String>,
     pub(super) effective_effort: Option<String>,
+    pub(super) deferred_reasoning_intent: Option<ReasoningOrchestrationIntent>,
     pub(super) effective_service_tier: Option<String>,
     pub(super) base_service_tier: ServiceTierLog,
     pub(super) request_body_len: usize,
@@ -61,7 +58,7 @@ pub(super) struct PreparedProxyRequest {
     pub(super) client_body_warn: Option<BodyPreview>,
     pub(super) request_id: u64,
     pub(super) plan: RetryPlan,
-    pub(super) cooldown_backoff: crate::lb::CooldownBackoff,
+    pub(super) cooldown_backoff: crate::endpoint_health::CooldownBackoff,
 }
 
 pub(super) async fn prepare_proxy_request(
@@ -79,65 +76,35 @@ pub(super) async fn prepare_proxy_request(
     let mut client_headers = parts.headers;
     let client_headers_entries_cache: OnceLock<Vec<HeaderEntry>> = OnceLock::new();
 
-    let header_session_identity = extract_session_identity(&client_headers);
     let client_name = extract_client_name(&client_headers);
 
     let config = load_request_config_context(proxy).await;
-    let request_flavor = detect_request_flavor(
-        proxy.service_name,
-        &method,
-        &client_headers,
-        uri.path(),
-        config.codex_patch_mode,
-    );
+    let request_flavor =
+        detect_request_flavor(proxy.service_name, &method, &client_headers, uri.path());
     let raw_body = match to_bytes(body, MAX_PROXY_REQUEST_BYTES).await {
         Ok(body) => body,
         Err(error) => {
             let dur = start.elapsed().as_millis() as u64;
-            let client_headers_entries = client_headers_entries_cache
-                .get_or_init(|| header_map_to_entries(&client_headers))
-                .clone();
-            return Err(log_client_body_read_error(
-                super::request_failures::ClientBodyReadErrorParams {
-                    proxy,
-                    method: &method,
-                    path: uri.path(),
-                    client_uri: client_uri.as_str(),
-                    session_id: session_identity_value(header_session_identity.as_ref()),
-                    session_identity_source: session_identity_source(
-                        header_session_identity.as_ref(),
-                    ),
-                    cwd: None,
-                    client_headers: client_headers_entries,
-                    duration_ms: dur,
-                    error_message: error.to_string(),
-                },
-            ));
+            return Err(client_body_read_error(ClientBodyReadErrorParams {
+                proxy,
+                method: &method,
+                path: uri.path(),
+                duration_ms: dur,
+                error_message: error.to_string(),
+            }));
         }
     };
     let raw_body = match normalize_request_content_encoding(&mut client_headers, raw_body) {
         Ok(body) => body,
         Err(error) => {
             let dur = start.elapsed().as_millis() as u64;
-            let client_headers_entries = client_headers_entries_cache
-                .get_or_init(|| header_map_to_entries(&client_headers))
-                .clone();
-            return Err(log_client_body_read_error(
-                super::request_failures::ClientBodyReadErrorParams {
-                    proxy,
-                    method: &method,
-                    path: uri.path(),
-                    client_uri: client_uri.as_str(),
-                    session_id: session_identity_value(header_session_identity.as_ref()),
-                    session_identity_source: session_identity_source(
-                        header_session_identity.as_ref(),
-                    ),
-                    cwd: None,
-                    client_headers: client_headers_entries,
-                    duration_ms: dur,
-                    error_message: error.to_string(),
-                },
-            ));
+            return Err(client_body_read_error(ClientBodyReadErrorParams {
+                proxy,
+                method: &method,
+                path: uri.path(),
+                duration_ms: dur,
+                error_message: error.to_string(),
+            }));
         }
     };
     let (session_identity_hint, raw_body) = if request_flavor.is_codex_service
@@ -162,19 +129,25 @@ pub(super) async fn prepare_proxy_request(
         uri: &uri,
         client_headers: &client_headers,
         raw_body: &raw_body,
-        compact_request: codex_path_is_responses_compact(uri.path()),
+        request_dialect: RequestDialect::from_http_path(uri.path()),
         session_identity_hint,
         client_name,
         client_addr,
         started_at_ms,
         client_content_type: request_flavor.client_content_type.as_deref(),
         request_body_previews,
-        preserve_hosted_image_generation_tools: response_semantic_contract.is_some(),
     })
     .await
     {
         Ok(prepared) => prepared,
-        Err(CommonRequestPreparationError::NoRoutableStation {
+        Err(CommonRequestPreparationError::LifecycleStoreUnavailable { message }) => {
+            tracing::error!(error = %message, "failed to begin durable logical request");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to begin durable request lifecycle".to_string(),
+            ));
+        }
+        Err(CommonRequestPreparationError::NoRoutableCandidate {
             request_id,
             session_id,
             session_identity_source,
@@ -189,7 +162,7 @@ pub(super) async fn prepare_proxy_request(
                 path: uri.path(),
                 request_id,
                 status: StatusCode::BAD_GATEWAY,
-                message: "no routable station".to_string(),
+                message: "no routable provider candidate".to_string(),
                 duration_ms: dur,
                 started_at_ms,
                 session_id: session_id.clone(),
@@ -205,6 +178,13 @@ pub(super) async fn prepare_proxy_request(
         }
     };
 
+    let Some(route_plan) = prepared.route_plan else {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "request route plan was not prepared".to_string(),
+        ));
+    };
+
     Ok(PreparedProxyRequest {
         method,
         uri,
@@ -214,16 +194,13 @@ pub(super) async fn prepare_proxy_request(
         session_id: prepared.session_id,
         session_identity_source: prepared.session_identity_source,
         session_binding: prepared.session_binding,
-        route_selection: prepared.route_selection,
+        route_plan,
         cwd: prepared.cwd,
-        session_override_config: prepared.session_override_config,
-        global_station_override: prepared.global_station_override,
-        override_effort: prepared.override_effort,
-        override_model: prepared.override_model,
-        override_service_tier: prepared.override_service_tier,
         body_for_upstream: prepared.body_for_upstream,
+        request_dialect: prepared.request_dialect,
         request_model: prepared.request_model,
         effective_effort: prepared.effective_effort,
+        deferred_reasoning_intent: prepared.deferred_reasoning_intent,
         effective_service_tier: prepared.effective_service_tier,
         base_service_tier: prepared.base_service_tier,
         request_body_len: prepared.request_body_len,

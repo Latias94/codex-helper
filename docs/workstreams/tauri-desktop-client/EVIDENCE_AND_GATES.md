@@ -3,6 +3,8 @@
 Status: Closed with follow-ups
 Last updated: 2026-05-22
 
+Historical note (superseded 2026-07-13): references below to `usage_balance` and pre-canonical desktop data paths are retained as implementation history. The desktop now consumes the typed `OperatorReadModel` and server-owned SQLite projections.
+
 ## Required Gates By Phase
 
 Planning:

@@ -1,7 +1,9 @@
 # Codex Responses WebSocket Relay — Evidence And Gates
 
-Status: Active
+Status: Historical (superseded by the canonical relay runtime on 2026-07-13)
 Last updated: 2026-05-19
+
+The commands and forecast/JSONL references below are retained as implementation history, not as current verification or accounting authority.
 
 ## Gate Set
 
@@ -313,4 +315,3 @@ cargo run -p codex-helper --bin codex-helper -- codex relay-live-smoke --acknowl
 cargo run -p codex-helper --bin codex-helper -- codex relay-live-smoke --acknowledgement run-live-codex-relay-smoke --model gpt-5.5 --provider ciii --websocket --json
 # unknown: target codex/ciii/default; WebSocket handshake HTTP 101 then close code 1011 "upstream websocket proxy failed"
 ```
-

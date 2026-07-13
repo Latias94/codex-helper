@@ -1,25 +1,18 @@
-use std::collections::HashMap;
-
 use serde::{Deserialize, Serialize};
 
-use crate::balance::{ProviderBalanceSnapshot, StationRoutingBalanceSummary};
+use crate::balance::{ProviderBalanceSnapshot, ProviderRoutingBalanceSummary};
 use crate::routing_ir::{RouteCandidate, RoutePlanTemplate};
 use crate::runtime_identity::RuntimeUpstreamIdentity;
-use crate::state::{LbConfigView, LbUpstreamView, PassiveUpstreamHealth, StationHealth};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RouteRuntimeSignalInputs<'a> {
-    pub station_health: Option<&'a HashMap<String, StationHealth>>,
-    pub load_balancers: Option<&'a HashMap<String, LbConfigView>>,
-    pub provider_balances: Option<&'a HashMap<String, Vec<ProviderBalanceSnapshot>>>,
+    pub provider_balances: Option<&'a [ProviderBalanceSnapshot]>,
     pub now_ms: u64,
 }
 
 impl<'a> RouteRuntimeSignalInputs<'a> {
     pub fn empty(now_ms: u64) -> Self {
         Self {
-            station_health: None,
-            load_balancers: None,
             provider_balances: None,
             now_ms,
         }
@@ -29,15 +22,11 @@ impl<'a> RouteRuntimeSignalInputs<'a> {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RouteCandidateRuntimeSignals {
     pub identity: RuntimeUpstreamIdentity,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub passive_health: Option<PassiveUpstreamHealth>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub load_balancer: Option<LbUpstreamView>,
     #[serde(
         default,
-        skip_serializing_if = "StationRoutingBalanceSummary::is_empty"
+        skip_serializing_if = "ProviderRoutingBalanceSummary::is_empty"
     )]
-    pub balance: StationRoutingBalanceSummary,
+    pub balance: ProviderRoutingBalanceSummary,
 }
 
 impl RoutePlanTemplate {
@@ -48,8 +37,6 @@ impl RoutePlanTemplate {
     ) -> RouteCandidateRuntimeSignals {
         let identity = self.candidate_identity(candidate);
         RouteCandidateRuntimeSignals {
-            passive_health: candidate_passive_health(&identity, inputs.station_health),
-            load_balancer: candidate_load_balancer_state(&identity, inputs.load_balancers),
             balance: candidate_balance_summary(&identity, inputs.provider_balances, inputs.now_ms),
             identity,
         }
@@ -66,74 +53,20 @@ impl RoutePlanTemplate {
     }
 }
 
-fn candidate_passive_health(
-    identity: &RuntimeUpstreamIdentity,
-    station_health: Option<&HashMap<String, StationHealth>>,
-) -> Option<PassiveUpstreamHealth> {
-    let compatibility = identity.compatibility.as_ref()?;
-    station_health?
-        .get(compatibility.station_name.as_str())?
-        .upstreams
-        .iter()
-        .find(|upstream| upstream.base_url == identity.base_url)
-        .and_then(|upstream| upstream.passive.clone())
-}
-
-fn candidate_load_balancer_state(
-    identity: &RuntimeUpstreamIdentity,
-    load_balancers: Option<&HashMap<String, LbConfigView>>,
-) -> Option<LbUpstreamView> {
-    let compatibility = identity.compatibility.as_ref()?;
-    load_balancers?
-        .get(compatibility.station_name.as_str())?
-        .upstreams
-        .get(compatibility.upstream_index)
-        .cloned()
-}
-
 fn candidate_balance_summary(
     identity: &RuntimeUpstreamIdentity,
-    provider_balances: Option<&HashMap<String, Vec<ProviderBalanceSnapshot>>>,
+    provider_balances: Option<&[ProviderBalanceSnapshot]>,
     now_ms: u64,
-) -> StationRoutingBalanceSummary {
+) -> ProviderRoutingBalanceSummary {
     let Some(provider_balances) = provider_balances else {
-        return StationRoutingBalanceSummary::default();
+        return ProviderRoutingBalanceSummary::default();
     };
 
-    let snapshots = if let Some(compatibility) = identity.compatibility.as_ref() {
-        provider_balances
-            .get(compatibility.station_name.as_str())
-            .into_iter()
-            .flat_map(|snapshots| snapshots.iter())
-            .filter(|snapshot| balance_snapshot_matches_candidate(snapshot, identity))
-            .collect::<Vec<_>>()
-    } else {
-        let provider_endpoint_key = identity.provider_endpoint.stable_key();
-        provider_balances
-            .values()
-            .flat_map(|snapshots| snapshots.iter())
-            .filter(|snapshot| {
-                snapshot
-                    .provider_endpoint_key
-                    .as_deref()
-                    .is_some_and(|key| key == provider_endpoint_key)
-            })
-            .collect::<Vec<_>>()
-    };
+    let snapshots = provider_balances
+        .iter()
+        .filter(|snapshot| snapshot.provider_endpoint == identity.provider_endpoint);
 
-    StationRoutingBalanceSummary::from_snapshot_iter_at(snapshots, now_ms)
-}
-
-fn balance_snapshot_matches_candidate(
-    snapshot: &ProviderBalanceSnapshot,
-    identity: &RuntimeUpstreamIdentity,
-) -> bool {
-    let Some(compatibility) = identity.compatibility.as_ref() else {
-        return false;
-    };
-    snapshot.provider_id == identity.provider_endpoint.provider_id
-        && snapshot.station_name.as_deref() == Some(compatibility.station_name.as_str())
-        && snapshot.upstream_index == Some(compatibility.upstream_index)
+    ProviderRoutingBalanceSummary::from_snapshot_iter_at(snapshots, now_ms)
 }
 
 #[cfg(test)]
@@ -141,41 +74,32 @@ mod tests {
     use super::*;
     use crate::balance::BalanceSnapshotStatus;
     use crate::config::{
-        ProviderConcurrencyLimits, ProviderConfigV4, ProviderEndpointV4, ServiceConfig,
-        ServiceViewV4, UpstreamAuth, UpstreamConfig,
+        ProviderConcurrencyLimits, ProviderConfig, ProviderEndpointConfig, ServiceRouteConfig,
+        UpstreamAuth,
     };
-    use crate::routing_ir::{compile_legacy_route_plan_template, compile_v4_route_plan_template};
-    use crate::state::{PassiveHealthState, UpstreamHealth};
+    use crate::routing_ir::compile_route_plan_template;
     use std::collections::BTreeMap;
 
-    fn provider(base_url: &str) -> ProviderConfigV4 {
-        ProviderConfigV4 {
+    fn provider(base_url: &str) -> ProviderConfig {
+        ProviderConfig {
             base_url: Some(base_url.to_string()),
-            ..ProviderConfigV4::default()
-        }
-    }
-
-    fn passive_health(state: PassiveHealthState, score: u8) -> PassiveUpstreamHealth {
-        PassiveUpstreamHealth {
-            score,
-            state,
-            observed_at_ms: 100,
-            last_failure_at_ms: Some(100),
-            consecutive_failures: 1,
-            ..PassiveUpstreamHealth::default()
+            ..ProviderConfig::default()
         }
     }
 
     fn balance_snapshot(
+        observation_provider_id: &str,
         provider_id: &str,
-        station_name: &str,
-        upstream_index: usize,
+        endpoint_id: &str,
         exhausted: bool,
     ) -> ProviderBalanceSnapshot {
         ProviderBalanceSnapshot {
-            provider_id: provider_id.to_string(),
-            station_name: Some(station_name.to_string()),
-            upstream_index: Some(upstream_index),
+            observation_provider_id: observation_provider_id.to_string(),
+            provider_endpoint: crate::runtime_identity::ProviderEndpointKey::new(
+                "codex",
+                provider_id,
+                endpoint_id,
+            ),
             source: "test".to_string(),
             fetched_at_ms: 100,
             stale_after_ms: Some(200),
@@ -190,45 +114,18 @@ mod tests {
     }
 
     #[test]
-    fn route_candidate_runtime_signals_attach_existing_legacy_state() {
-        let view = ServiceViewV4 {
+    fn route_candidate_runtime_signals_ignore_balance_for_another_endpoint() {
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([(
                 "input".to_string(),
                 provider("https://input.example/v1"),
             )]),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
-        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let template = compile_route_plan_template("codex", &view).expect("route template");
 
-        let station_health = HashMap::from([(
-            "routing".to_string(),
-            StationHealth {
-                checked_at_ms: 100,
-                upstreams: vec![UpstreamHealth {
-                    base_url: "https://input.example/v1".to_string(),
-                    passive: Some(passive_health(PassiveHealthState::Failing, 20)),
-                    ..UpstreamHealth::default()
-                }],
-            },
-        )]);
-        let load_balancers = HashMap::from([(
-            "routing".to_string(),
-            LbConfigView {
-                last_good_index: None,
-                upstreams: vec![LbUpstreamView {
-                    failure_count: 3,
-                    cooldown_remaining_secs: Some(11),
-                    usage_exhausted: true,
-                }],
-            },
-        )]);
-        let provider_balances = HashMap::from([(
-            "routing".to_string(),
-            vec![balance_snapshot("input", "routing", 0, true)],
-        )]);
+        let provider_balances = vec![balance_snapshot("source-a", "other", "default", true)];
         let inputs = RouteRuntimeSignalInputs {
-            station_health: Some(&station_health),
-            load_balancers: Some(&load_balancers),
             provider_balances: Some(&provider_balances),
             now_ms: 150,
         };
@@ -240,9 +137,8 @@ mod tests {
             signals[0].identity.provider_endpoint.stable_key(),
             "codex/input/default"
         );
-        assert!(signals[0].identity.compatibility.is_none());
-        assert!(signals[0].passive_health.is_none());
-        assert!(signals[0].load_balancer.is_none());
+        assert_eq!(signals[0].identity.base_url, "https://input.example/v1");
+        assert!(signals[0].identity.continuity_domain.is_none());
         assert!(signals[0].balance.is_empty());
     }
 
@@ -251,7 +147,7 @@ mod tests {
         let mut endpoints = BTreeMap::new();
         endpoints.insert(
             "slow".to_string(),
-            ProviderEndpointV4 {
+            ProviderEndpointConfig {
                 base_url: "https://slow.example/v1".to_string(),
                 continuity_domain: None,
                 enabled: true,
@@ -264,7 +160,7 @@ mod tests {
         );
         endpoints.insert(
             "fast".to_string(),
-            ProviderEndpointV4 {
+            ProviderEndpointConfig {
                 base_url: "https://fast.example/v1".to_string(),
                 continuity_domain: None,
                 enabled: true,
@@ -275,50 +171,25 @@ mod tests {
                 limits: ProviderConcurrencyLimits::default(),
             },
         );
-        let view = ServiceViewV4 {
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([(
                 "input".to_string(),
-                ProviderConfigV4 {
+                ProviderConfig {
                     endpoints,
                     auth: UpstreamAuth::default(),
-                    ..ProviderConfigV4::default()
+                    ..ProviderConfig::default()
                 },
             )]),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
-        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
-        let provider_balances = HashMap::from([(
-            "routing".to_string(),
-            vec![
-                balance_snapshot("input", "routing", 0, false)
-                    .with_provider_endpoint_key("codex/input/fast"),
-                balance_snapshot("input", "routing", 1, true)
-                    .with_provider_endpoint_key("codex/input/slow"),
-            ],
-        )]);
-        let load_balancers = HashMap::from([(
-            "routing".to_string(),
-            LbConfigView {
-                last_good_index: Some(0),
-                upstreams: vec![
-                    LbUpstreamView {
-                        failure_count: 0,
-                        cooldown_remaining_secs: None,
-                        usage_exhausted: false,
-                    },
-                    LbUpstreamView {
-                        failure_count: 3,
-                        cooldown_remaining_secs: Some(30),
-                        usage_exhausted: true,
-                    },
-                ],
-            },
-        )]);
+        let template = compile_route_plan_template("codex", &view).expect("route template");
+        let provider_balances = vec![
+            balance_snapshot("source-a", "input", "fast", false),
+            balance_snapshot("source-a", "input", "slow", true),
+        ];
         let inputs = RouteRuntimeSignalInputs {
-            load_balancers: Some(&load_balancers),
             provider_balances: Some(&provider_balances),
             now_ms: 150,
-            ..RouteRuntimeSignalInputs::default()
         };
 
         let signals = template.candidate_runtime_signal_view(&inputs);
@@ -330,65 +201,29 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["codex/input/fast", "codex/input/slow"]
         );
-        assert!(signals[0].identity.compatibility.is_none());
-        assert!(signals[1].identity.compatibility.is_none());
         assert_eq!(signals[0].balance.ok, 1);
         assert_eq!(signals[0].balance.routing_snapshots, 1);
         assert_eq!(signals[1].balance.exhausted, 1);
         assert_eq!(signals[1].balance.routing_exhausted, 1);
-        assert!(signals[0].load_balancer.is_none());
-        assert!(signals[1].load_balancer.is_none());
     }
 
     #[test]
-    fn route_candidate_runtime_signals_keep_legacy_station_compatibility_reads() {
-        let service = ServiceConfig {
-            name: "primary".to_string(),
-            alias: Some("Primary".to_string()),
-            enabled: true,
-            level: 1,
-            upstreams: vec![UpstreamConfig {
-                base_url: "https://legacy.example/v1".to_string(),
-                auth: UpstreamAuth::default(),
-                tags: HashMap::from([
-                    ("provider_id".to_string(), "legacy-provider".to_string()),
-                    ("endpoint_id".to_string(), "legacy-endpoint".to_string()),
-                ]),
-                supported_models: HashMap::new(),
-                model_mapping: HashMap::new(),
-            }],
+    fn route_candidate_runtime_signals_aggregate_matching_endpoint_across_source_buckets() {
+        let view = ServiceRouteConfig {
+            providers: BTreeMap::from([(
+                "input".to_string(),
+                provider("https://input.example/v1"),
+            )]),
+            ..ServiceRouteConfig::default()
         };
-        let template = compile_legacy_route_plan_template("codex", [&service]);
+        let template = compile_route_plan_template("codex", &view).expect("route template");
 
-        let station_health = HashMap::from([(
-            "primary".to_string(),
-            StationHealth {
-                checked_at_ms: 100,
-                upstreams: vec![UpstreamHealth {
-                    base_url: "https://legacy.example/v1".to_string(),
-                    passive: Some(passive_health(PassiveHealthState::Degraded, 60)),
-                    ..UpstreamHealth::default()
-                }],
-            },
-        )]);
-        let load_balancers = HashMap::from([(
-            "primary".to_string(),
-            LbConfigView {
-                last_good_index: Some(0),
-                upstreams: vec![LbUpstreamView {
-                    failure_count: 1,
-                    cooldown_remaining_secs: None,
-                    usage_exhausted: false,
-                }],
-            },
-        )]);
-        let provider_balances = HashMap::from([(
-            "primary".to_string(),
-            vec![balance_snapshot("legacy-provider", "primary", 0, false)],
-        )]);
+        let provider_balances = vec![
+            balance_snapshot("source-a", "input", "default", false),
+            balance_snapshot("source-b", "input", "default", true),
+            balance_snapshot("source-b", "other", "default", true),
+        ];
         let inputs = RouteRuntimeSignalInputs {
-            station_health: Some(&station_health),
-            load_balancers: Some(&load_balancers),
             provider_balances: Some(&provider_balances),
             now_ms: 150,
         };
@@ -396,34 +231,10 @@ mod tests {
         let signals = template.candidate_runtime_signal_view(&inputs);
 
         assert_eq!(signals.len(), 1);
-        assert_eq!(
-            signals[0].identity.provider_endpoint.stable_key(),
-            "codex/legacy-provider/legacy-endpoint"
-        );
-        assert_eq!(
-            signals[0]
-                .identity
-                .compatibility
-                .as_ref()
-                .map(crate::runtime_identity::LegacyUpstreamKey::stable_key)
-                .as_deref(),
-            Some("codex/primary/0")
-        );
-        assert_eq!(
-            signals[0]
-                .passive_health
-                .as_ref()
-                .map(|health| health.state),
-            Some(PassiveHealthState::Degraded)
-        );
-        assert_eq!(
-            signals[0]
-                .load_balancer
-                .as_ref()
-                .map(|view| view.failure_count),
-            Some(1)
-        );
+        assert_eq!(signals[0].balance.snapshots, 2);
         assert_eq!(signals[0].balance.ok, 1);
-        assert_eq!(signals[0].balance.routing_snapshots, 1);
+        assert_eq!(signals[0].balance.exhausted, 1);
+        assert_eq!(signals[0].balance.routing_snapshots, 2);
+        assert_eq!(signals[0].balance.routing_exhausted, 1);
     }
 }

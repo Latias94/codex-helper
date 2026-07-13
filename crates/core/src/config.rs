@@ -1,30 +1,21 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
-use std::fs as stdfs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use crate::client_config::{codex_home, is_claude_absent_backup_sentinel};
+use crate::client_config::codex_home;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::Value as JsonValue;
 use tokio::fs;
 use toml::Value as TomlValue;
-use tracing::{info, warn};
+use tracing::warn;
 
 pub use crate::client_config::{
-    claude_settings_backup_path, claude_settings_path, codex_auth_path, codex_config_path,
-    codex_models_cache_path, codex_switch_state_path,
+    claude_settings_backup_path, claude_settings_path, codex_config_path,
 };
 pub use crate::fleet::registry::{FleetNodeConfig, FleetRegistryConfig};
 
 #[path = "config_storage.rs"]
 mod storage_impl;
-
-#[path = "config_bootstrap.rs"]
-mod bootstrap_impl;
-
-#[path = "config_auth_sync.rs"]
-mod auth_sync_impl;
 
 #[path = "config_retry.rs"]
 mod retry_impl;
@@ -32,83 +23,26 @@ mod retry_impl;
 #[path = "config_profiles.rs"]
 mod profiles_impl;
 
-#[path = "config_routing.rs"]
-mod routing_impl;
+#[path = "helper_config.rs"]
+mod helper_config_impl;
 
-#[path = "config_v2.rs"]
-mod v2_impl;
-
-#[path = "config_v4.rs"]
-mod v4_impl;
-
-pub use auth_sync_impl::{
-    SyncCodexAuthFromCodexOptions, SyncCodexAuthFromCodexReport, sync_codex_auth_from_codex_cli,
-};
-pub(crate) use auth_sync_impl::{infer_env_key_from_auth_json, read_file_if_exists};
-pub use bootstrap_impl::{
-    import_codex_config_from_codex_cli, load_or_bootstrap_for_service,
-    load_or_bootstrap_for_service_with_v4_source, load_or_bootstrap_from_claude,
-    load_or_bootstrap_from_codex, overwrite_codex_config_from_codex_cli_in_place,
-    probe_codex_bootstrap_from_cli,
-};
-pub(crate) use profiles_impl::validate_service_profiles;
-pub use profiles_impl::{
-    ServiceControlProfile, resolve_service_profile, resolve_service_profile_from_catalog,
-    validate_profile_station_compatibility,
-};
+pub use helper_config_impl::{effective_routing, resolved_provider_order, validate_helper_config};
+pub(crate) use profiles_impl::validate_service_profile_catalog;
+pub use profiles_impl::{ServiceControlProfile, resolve_service_profile_from_catalog};
 pub use retry_impl::{
     ReasoningGuardAction, ReasoningGuardConfig, ReasoningGuardRetryExhaustedAction,
     ReasoningGuardStreamMode, ResolvedReasoningGuardConfig, ResolvedRetryConfig,
     ResolvedRetryLayerConfig, RetryConfig, RetryLayerConfig, RetryProfileName, RetryStrategy,
 };
-pub use routing_impl::{RoutingCandidate, ServiceRoutingExplanation, explain_service_routing};
 pub use storage_impl::{
-    CodexClientPatchConfig, LoadedProxyConfig, codex_client_patch_config_from_config_file,
-    codex_client_patch_mode_from_config_file, codex_client_patch_preset_from_config_file,
-    config_file_path, init_config_toml, load_config, load_config_with_v4_source,
-    normalize_config_toml_authoring, normalize_config_toml_client_patch, save_config,
-    save_config_v2, save_config_v4,
+    LoadedConfig, config_file_path, init_config_toml, load_config, load_config_with_source,
+    save_helper_config,
 };
-pub use v2_impl::{
-    build_persisted_provider_catalog, build_persisted_station_catalog, compact_v2_config,
-    compile_v2_to_runtime, migrate_legacy_to_v2,
-};
-pub(crate) use v4_impl::compact_v4_config_for_write;
-pub use v4_impl::{
-    ConfigV4MigrationReport, collect_route_graph_affinity_migration_warnings,
-    compile_v4_to_runtime, compile_v4_to_v2, effective_v4_routing, migrate_legacy_to_v4,
-    migrate_legacy_to_v4_with_report, migrate_v2_to_v4, migrate_v2_to_v4_with_report,
-    resolved_v4_provider_order,
-};
-
-pub mod legacy {
-    pub use super::v4_impl::legacy::*;
-}
-
-#[cfg(test)]
-use bootstrap_impl::bootstrap_from_codex;
 
 pub mod storage {
     pub use super::storage_impl::{
-        CodexClientPatchConfig, LoadedProxyConfig, codex_client_patch_config_from_config_file,
-        codex_client_patch_mode_from_config_file, codex_client_patch_preset_from_config_file,
-        config_file_path, init_config_toml, load_config, load_config_with_v4_source,
-        normalize_config_toml_authoring, normalize_config_toml_client_patch, save_config,
-        save_config_v2, save_config_v4,
-    };
-}
-
-pub mod bootstrap {
-    pub use super::bootstrap_impl::{
-        import_codex_config_from_codex_cli, load_or_bootstrap_for_service,
-        load_or_bootstrap_from_claude, load_or_bootstrap_from_codex,
-        overwrite_codex_config_from_codex_cli_in_place, probe_codex_bootstrap_from_cli,
-    };
-}
-
-pub mod auth_sync {
-    pub use super::auth_sync_impl::{
-        SyncCodexAuthFromCodexOptions, SyncCodexAuthFromCodexReport, sync_codex_auth_from_codex_cli,
+        LoadedConfig, config_file_path, init_config_toml, load_config, load_config_with_source,
+        save_helper_config,
     };
 }
 
@@ -129,6 +63,24 @@ pub struct UpstreamAuth {
 }
 
 impl UpstreamAuth {
+    pub fn with_overrides(&self, overrides: &Self) -> Self {
+        Self {
+            auth_token: overrides
+                .auth_token
+                .clone()
+                .or_else(|| self.auth_token.clone()),
+            auth_token_env: overrides
+                .auth_token_env
+                .clone()
+                .or_else(|| self.auth_token_env.clone()),
+            api_key: overrides.api_key.clone().or_else(|| self.api_key.clone()),
+            api_key_env: overrides
+                .api_key_env
+                .clone()
+                .or_else(|| self.api_key_env.clone()),
+        }
+    }
+
     pub fn resolve_auth_token(&self) -> Option<String> {
         if let Some(token) = self.auth_token.as_deref()
             && !token.trim().is_empty()
@@ -184,103 +136,12 @@ pub struct UpstreamConfig {
     pub model_mapping: HashMap<String, String>,
 }
 
-pub fn model_routing_warnings(cfg: &ProxyConfig, service_name: &str) -> Vec<String> {
-    use crate::model_routing::match_wildcard;
-
-    fn validate_upstream(name: &str, upstream: &UpstreamConfig) -> Vec<String> {
-        let mut out = Vec::new();
-
-        if upstream.supported_models.is_empty() && upstream.model_mapping.is_empty() {
-            out.push(format!(
-                "[{name}] 未配置 supported_models 或 model_mapping，将假设支持所有模型（可能导致降级失败）"
-            ));
-            return out;
-        }
-
-        if !upstream.model_mapping.is_empty() && upstream.supported_models.is_empty() {
-            out.push(format!(
-                "[{name}] 配置了 model_mapping 但未配置 supported_models，映射目标将不做校验，请确认目标模型在供应商处可用"
-            ));
-        }
-
-        if upstream.model_mapping.is_empty() || upstream.supported_models.is_empty() {
-            return out;
-        }
-
-        for (external_model, internal_model) in upstream.model_mapping.iter() {
-            if internal_model.contains('*') {
-                continue;
-            }
-            let supported = if upstream
-                .supported_models
-                .get(internal_model)
-                .copied()
-                .unwrap_or(false)
-            {
-                true
-            } else {
-                upstream
-                    .supported_models
-                    .keys()
-                    .any(|p| match_wildcard(p, internal_model))
-            };
-            if !supported {
-                out.push(format!(
-                    "[{name}] 模型映射无效：'{external_model}' -> '{internal_model}'，目标模型不在 supported_models 中"
-                ));
-            }
-        }
-        out
-    }
-
-    let mgr = match service_name {
-        "claude" => &cfg.claude,
-        "codex" => &cfg.codex,
-        _ => &cfg.codex,
-    };
-
-    let mut warnings = Vec::new();
-    for (cfg_name, svc) in mgr.stations() {
-        for (idx, upstream) in svc.upstreams.iter().enumerate() {
-            let name = format!(
-                "{service_name}:{cfg_name} upstream[{idx}] ({})",
-                upstream.base_url
-            );
-            warnings.extend(validate_upstream(&name, upstream));
-        }
-    }
-    warnings
-}
-
-/// A logical config entry (roughly corresponds to cli_proxy 的一个配置名)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ServiceConfig {
-    /// 配置标识（map key），保持稳定
-    #[serde(default)]
-    pub name: String,
-    /// 可选别名，便于展示/记忆
-    #[serde(default)]
-    pub alias: Option<String>,
-    /// Whether this config is eligible for automatic routing (defaults to true).
-    #[serde(default = "default_service_config_enabled")]
-    pub enabled: bool,
-    /// Priority group (1..=10, lower is higher priority). Default: 1.
-    #[serde(default = "default_service_config_level")]
-    pub level: u8,
-    #[serde(default)]
-    pub upstreams: Vec<UpstreamConfig>,
-}
-
 fn default_service_config_enabled() -> bool {
     true
 }
 
 fn is_default_service_config_enabled(value: &bool) -> bool {
     *value == default_service_config_enabled()
-}
-
-fn default_service_config_level() -> u8 {
-    1
 }
 
 fn default_provider_endpoint_priority() -> u32 {
@@ -303,74 +164,6 @@ fn is_default_provider_concurrency_limits(value: &ProviderConcurrencyLimits) -> 
     value == &ProviderConcurrencyLimits::default()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ServiceConfigManager {
-    /// 当前激活配置名
-    #[serde(default)]
-    pub active: Option<String>,
-    /// 新会话默认使用的控制模板名（Phase 1: 仅加载与展示，不自动绑定）。
-    #[serde(default)]
-    pub default_profile: Option<String>,
-    /// 可复用控制模板。
-    #[serde(default)]
-    pub profiles: BTreeMap<String, ServiceControlProfile>,
-    /// 站点集合。公共序列化使用 `stations`，仍兼容读取 legacy `configs`。
-    #[serde(default, rename = "stations", alias = "configs")]
-    pub configs: HashMap<String, ServiceConfig>,
-}
-
-impl ServiceConfigManager {
-    pub fn stations(&self) -> &HashMap<String, ServiceConfig> {
-        &self.configs
-    }
-
-    pub fn stations_mut(&mut self) -> &mut HashMap<String, ServiceConfig> {
-        &mut self.configs
-    }
-
-    pub fn station(&self, name: &str) -> Option<&ServiceConfig> {
-        self.stations().get(name)
-    }
-
-    pub fn station_mut(&mut self, name: &str) -> Option<&mut ServiceConfig> {
-        self.stations_mut().get_mut(name)
-    }
-
-    pub fn contains_station(&self, name: &str) -> bool {
-        self.station(name).is_some()
-    }
-
-    pub fn station_count(&self) -> usize {
-        self.stations().len()
-    }
-
-    pub fn has_stations(&self) -> bool {
-        !self.stations().is_empty()
-    }
-
-    pub fn active_station(&self) -> Option<&ServiceConfig> {
-        self.active
-            .as_ref()
-            .and_then(|name| self.station(name))
-            // HashMap 的 values().next() 是非确定性的；这里用 key 排序后的最小项作为稳定兜底。
-            .or_else(|| {
-                self.stations()
-                    .iter()
-                    .min_by_key(|(k, _)| *k)
-                    .map(|(_, v)| v)
-            })
-    }
-
-    pub fn profile(&self, name: &str) -> Option<&ServiceControlProfile> {
-        self.profiles.get(name)
-    }
-
-    pub fn default_profile_ref(&self) -> Option<(&str, &ServiceControlProfile)> {
-        let name = self.default_profile.as_deref()?;
-        self.profile(name).map(|profile| (name, profile))
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotifyPolicyConfig {
     /// Only notify when proxy duration_ms is >= this threshold.
@@ -381,9 +174,9 @@ pub struct NotifyPolicyConfig {
     pub merge_window_ms: u64,
     /// Suppress notifications for the same thread-id within this cooldown.
     pub per_thread_cooldown_ms: u64,
-    /// How far back to look in proxy recent-finished list when matching a thread-id.
+    /// How far back to search typed operator requests when matching a thread-id.
     pub recent_search_window_ms: u64,
-    /// Timeout for calling proxy `status/recent` endpoint.
+    /// Timeout for fetching the typed operator read model.
     pub recent_endpoint_timeout_ms: u64,
 }
 
@@ -426,96 +219,6 @@ pub struct NotifyConfig {
     pub system: NotifySystemConfig,
     #[serde(default)]
     pub exec: NotifyExecConfig,
-}
-
-fn default_usage_forecast_enabled() -> bool {
-    true
-}
-
-fn default_usage_forecast_rate_window_minutes() -> u64 {
-    60
-}
-
-fn default_usage_forecast_min_priced_requests() -> u64 {
-    2
-}
-
-fn default_usage_forecast_reset_time() -> String {
-    "00:00".to_string()
-}
-
-fn default_usage_forecast_reset_utc_offset() -> String {
-    "+08:00".to_string()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct UsageForecastConfig {
-    /// Whether spend forecast rendering is enabled.
-    #[serde(
-        default = "default_usage_forecast_enabled",
-        skip_serializing_if = "is_default_usage_forecast_enabled"
-    )]
-    pub enabled: bool,
-    /// Rolling spend-rate window used for projection.
-    #[serde(
-        default = "default_usage_forecast_rate_window_minutes",
-        skip_serializing_if = "is_default_usage_forecast_rate_window_minutes"
-    )]
-    pub rate_window_minutes: u64,
-    /// Minimum priced requests before the forecast is treated as confident enough to show.
-    #[serde(
-        default = "default_usage_forecast_min_priced_requests",
-        skip_serializing_if = "is_default_usage_forecast_min_priced_requests"
-    )]
-    pub min_priced_requests: u64,
-    /// Daily quota reset clock time in the reset timezone, formatted as HH:MM.
-    #[serde(
-        default = "default_usage_forecast_reset_time",
-        skip_serializing_if = "is_default_usage_forecast_reset_time"
-    )]
-    pub reset_time: String,
-    /// Reset timezone as a fixed UTC offset, for example +08:00.
-    #[serde(
-        default = "default_usage_forecast_reset_utc_offset",
-        skip_serializing_if = "is_default_usage_forecast_reset_utc_offset"
-    )]
-    pub reset_utc_offset: String,
-}
-
-impl Default for UsageForecastConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_usage_forecast_enabled(),
-            rate_window_minutes: default_usage_forecast_rate_window_minutes(),
-            min_priced_requests: default_usage_forecast_min_priced_requests(),
-            reset_time: default_usage_forecast_reset_time(),
-            reset_utc_offset: default_usage_forecast_reset_utc_offset(),
-        }
-    }
-}
-
-fn is_default_usage_forecast_enabled(value: &bool) -> bool {
-    *value == default_usage_forecast_enabled()
-}
-
-fn is_default_usage_forecast_rate_window_minutes(value: &u64) -> bool {
-    *value == default_usage_forecast_rate_window_minutes()
-}
-
-fn is_default_usage_forecast_min_priced_requests(value: &u64) -> bool {
-    *value == default_usage_forecast_min_priced_requests()
-}
-
-fn is_default_usage_forecast_reset_time(value: &String) -> bool {
-    value == &default_usage_forecast_reset_time()
-}
-
-fn is_default_usage_forecast_reset_utc_offset(value: &String) -> bool {
-    value == &default_usage_forecast_reset_utc_offset()
-}
-
-fn is_default_usage_forecast_config(value: &UsageForecastConfig) -> bool {
-    value == &UsageForecastConfig::default()
 }
 
 fn default_service_status_refresh_interval_secs() -> u64 {
@@ -650,69 +353,26 @@ pub struct RelayTargetConfig {
     pub admin_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub admin_token_env: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub client_preset: Option<crate::codex_integration::CodexPatchMode>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub responses_websocket: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ProxyConfig {
-    /// Optional config schema version for future migrations
-    #[serde(default)]
-    pub version: Option<u32>,
-    /// Codex 服务配置
-    #[serde(default)]
-    pub codex: ServiceConfigManager,
-    /// Claude Code 等其他服务配置，后续扩展
-    #[serde(default)]
-    pub claude: ServiceConfigManager,
-    /// Global retry policy (proxy-side).
-    #[serde(default)]
-    pub retry: RetryConfig,
-    /// Notify integration settings (used by `codex-helper notify ...`).
-    #[serde(default)]
-    pub notify: NotifyConfig,
-    /// 默认目标服务（用于 CLI 默认选择 codex/claude）
-    #[serde(default)]
-    pub default_service: Option<ServiceKind>,
-    /// Named local or remote relay targets used by daily CLI/TUI workflows.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub relay_targets: BTreeMap<String, RelayTargetConfig>,
-    /// Optional fleet observer targets used by the read-only Codex Fleet panel.
-    #[serde(default, skip_serializing_if = "FleetRegistryConfig::is_empty")]
-    pub fleet: FleetRegistryConfig,
-    /// UI settings (mainly for the built-in TUI).
-    #[serde(default)]
-    pub ui: UiConfig,
+pub const CURRENT_CONFIG_VERSION: u32 = 5;
+
+pub fn is_supported_config_version(version: u32) -> bool {
+    version == CURRENT_CONFIG_VERSION
 }
 
-fn default_proxy_config_v2_version() -> u32 {
-    2
-}
-
-pub const LEGACY_ROUTE_GRAPH_CONFIG_VERSION: u32 = 4;
-pub const CURRENT_ROUTE_GRAPH_CONFIG_VERSION: u32 = 5;
-
-pub fn is_supported_route_graph_config_version(version: u32) -> bool {
-    matches!(
-        version,
-        LEGACY_ROUTE_GRAPH_CONFIG_VERSION | CURRENT_ROUTE_GRAPH_CONFIG_VERSION
-    )
-}
-
-fn default_proxy_config_v4_version() -> u32 {
-    CURRENT_ROUTE_GRAPH_CONFIG_VERSION
+fn default_config_version() -> u32 {
+    CURRENT_CONFIG_VERSION
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProxyConfigV2 {
-    #[serde(default = "default_proxy_config_v2_version")]
+pub struct HelperConfig {
+    #[serde(default = "default_config_version")]
     pub version: u32,
     #[serde(default)]
-    pub codex: ServiceViewV2,
+    pub codex: ServiceRouteConfig,
     #[serde(default)]
-    pub claude: ServiceViewV2,
+    pub claude: ServiceRouteConfig,
     #[serde(default)]
     pub retry: RetryConfig,
     #[serde(default)]
@@ -727,50 +387,12 @@ pub struct ProxyConfigV2 {
     pub ui: UiConfig,
 }
 
-impl Default for ProxyConfigV2 {
+impl Default for HelperConfig {
     fn default() -> Self {
         Self {
-            version: default_proxy_config_v2_version(),
-            codex: ServiceViewV2::default(),
-            claude: ServiceViewV2::default(),
-            retry: RetryConfig::default(),
-            notify: NotifyConfig::default(),
-            default_service: None,
-            relay_targets: BTreeMap::new(),
-            fleet: FleetRegistryConfig::default(),
-            ui: UiConfig::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProxyConfigV4 {
-    #[serde(default = "default_proxy_config_v4_version")]
-    pub version: u32,
-    #[serde(default)]
-    pub codex: ServiceViewV4,
-    #[serde(default)]
-    pub claude: ServiceViewV4,
-    #[serde(default)]
-    pub retry: RetryConfig,
-    #[serde(default)]
-    pub notify: NotifyConfig,
-    #[serde(default)]
-    pub default_service: Option<ServiceKind>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub relay_targets: BTreeMap<String, RelayTargetConfig>,
-    #[serde(default, skip_serializing_if = "FleetRegistryConfig::is_empty")]
-    pub fleet: FleetRegistryConfig,
-    #[serde(default)]
-    pub ui: UiConfig,
-}
-
-impl Default for ProxyConfigV4 {
-    fn default() -> Self {
-        Self {
-            version: default_proxy_config_v4_version(),
-            codex: ServiceViewV4::default(),
-            claude: ServiceViewV4::default(),
+            version: default_config_version(),
+            codex: ServiceRouteConfig::default(),
+            claude: ServiceRouteConfig::default(),
             retry: RetryConfig::default(),
             notify: NotifyConfig::default(),
             default_service: None,
@@ -782,63 +404,25 @@ impl Default for ProxyConfigV4 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ServiceViewV4 {
+pub struct ServiceRouteConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_profile: Option<String>,
-    #[serde(default, skip_serializing_if = "is_default_codex_compaction_config")]
-    pub compaction: CodexCompactionConfig,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub profiles: BTreeMap<String, ServiceControlProfile>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub providers: BTreeMap<String, ProviderConfigV4>,
+    pub providers: BTreeMap<String, ProviderConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub routing: Option<RoutingConfigV4>,
+    pub routing: Option<RouteGraphConfig>,
 }
 
-impl ServiceViewV4 {
-    pub fn ensure_routing_mut(&mut self) -> &mut RoutingConfigV4 {
-        self.routing.get_or_insert_with(RoutingConfigV4::default)
+impl ServiceRouteConfig {
+    pub fn ensure_routing_mut(&mut self) -> &mut RouteGraphConfig {
+        self.routing.get_or_insert_with(RouteGraphConfig::default)
     }
-
-    pub fn normalize_routing_authoring(&mut self) {
-        if let Some(routing) = self.routing.as_mut() {
-            routing.normalize_authoring();
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
-pub struct CodexCompactionConfig {
-    #[serde(
-        default = "default_codex_remote_v2_downgrade",
-        skip_serializing_if = "is_default_codex_remote_v2_downgrade"
-    )]
-    pub remote_v2_downgrade: bool,
-}
-
-impl Default for CodexCompactionConfig {
-    fn default() -> Self {
-        Self {
-            remote_v2_downgrade: default_codex_remote_v2_downgrade(),
-        }
-    }
-}
-
-fn default_codex_remote_v2_downgrade() -> bool {
-    true
-}
-
-fn is_default_codex_remote_v2_downgrade(value: &bool) -> bool {
-    *value == default_codex_remote_v2_downgrade()
-}
-
-fn is_default_codex_compaction_config(value: &CodexCompactionConfig) -> bool {
-    value == &CodexCompactionConfig::default()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderConfigV4 {
+pub struct ProviderConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alias: Option<String>,
     #[serde(
@@ -874,10 +458,10 @@ pub struct ProviderConfigV4 {
     )]
     pub limits: ProviderConcurrencyLimits,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub endpoints: BTreeMap<String, ProviderEndpointV4>,
+    pub endpoints: BTreeMap<String, ProviderEndpointConfig>,
 }
 
-impl Default for ProviderConfigV4 {
+impl Default for ProviderConfig {
     fn default() -> Self {
         Self {
             alias: None,
@@ -895,8 +479,14 @@ impl Default for ProviderConfigV4 {
     }
 }
 
+impl ProviderConfig {
+    pub fn effective_auth(&self) -> UpstreamAuth {
+        self.auth.with_overrides(&self.inline_auth)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderEndpointV4 {
+pub struct ProviderEndpointConfig {
     pub base_url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuity_domain: Option<String>,
@@ -932,159 +522,98 @@ pub struct ProviderEndpointV4 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RoutingConfigV4 {
-    #[serde(default = "default_routing_entry_v4")]
+pub struct RouteGraphConfig {
+    #[serde(default = "default_route_entry")]
     pub entry: String,
-    #[serde(default = "default_routing_affinity_policy_v5")]
-    pub affinity_policy: RoutingAffinityPolicyV5,
+    #[serde(default = "default_route_affinity_policy")]
+    pub affinity_policy: RouteAffinityPolicy,
+    #[serde(default, skip_serializing_if = "SchedulingPreset::is_default")]
+    pub scheduling_preset: SchedulingPreset,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_ttl_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reprobe_preferred_after_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub routes: BTreeMap<String, RoutingNodeV4>,
-    #[serde(skip, default = "default_routing_policy_v4")]
-    pub policy: RoutingPolicyV4,
-    #[serde(skip)]
-    pub order: Vec<String>,
-    #[serde(skip)]
-    pub target: Option<String>,
-    #[serde(skip)]
-    pub prefer_tags: Vec<BTreeMap<String, String>>,
-    #[serde(skip)]
-    pub chain: Vec<String>,
-    #[serde(skip)]
-    pub pools: BTreeMap<String, RoutingPoolV4>,
-    #[serde(skip, default = "default_routing_on_exhausted_v4")]
-    pub on_exhausted: RoutingExhaustedActionV4,
+    pub routes: BTreeMap<String, RouteNodeConfig>,
 }
 
-impl Default for RoutingConfigV4 {
+impl Default for RouteGraphConfig {
     fn default() -> Self {
         Self {
-            entry: default_routing_entry_v4(),
-            affinity_policy: default_routing_affinity_policy_v5(),
+            entry: default_route_entry(),
+            affinity_policy: default_route_affinity_policy(),
+            scheduling_preset: SchedulingPreset::default(),
             fallback_ttl_ms: None,
             reprobe_preferred_after_ms: None,
             routes: BTreeMap::new(),
-            policy: default_routing_policy_v4(),
-            order: Vec::new(),
-            target: None,
-            prefer_tags: Vec::new(),
-            chain: Vec::new(),
-            pools: BTreeMap::new(),
-            on_exhausted: default_routing_on_exhausted_v4(),
         }
     }
 }
 
-impl ProxyConfigV4 {
-    pub fn normalize_routing_authoring(&mut self) {
-        self.codex.normalize_routing_authoring();
-        self.claude.normalize_routing_authoring();
-    }
-
-    pub fn sync_routing_compat_from_graph(&mut self) {
-        self.normalize_routing_authoring();
-    }
-}
-
-impl RoutingConfigV4 {
+impl RouteGraphConfig {
     pub fn ordered_failover(children: Vec<String>) -> Self {
-        Self::single_entry_node(RoutingNodeV4 {
-            strategy: RoutingPolicyV4::OrderedFailover,
+        Self::single_entry_node(RouteNodeConfig {
+            strategy: RouteStrategy::OrderedFailover,
             children,
-            ..RoutingNodeV4::default()
+            ..RouteNodeConfig::default()
         })
     }
 
     pub fn manual_sticky(target: String, children: Vec<String>) -> Self {
-        Self::single_entry_node(RoutingNodeV4 {
-            strategy: RoutingPolicyV4::ManualSticky,
+        Self::single_entry_node(RouteNodeConfig {
+            strategy: RouteStrategy::ManualSticky,
             target: Some(target),
             children,
-            ..RoutingNodeV4::default()
+            ..RouteNodeConfig::default()
         })
     }
 
     pub fn tag_preferred(
         children: Vec<String>,
         prefer_tags: Vec<BTreeMap<String, String>>,
-        on_exhausted: RoutingExhaustedActionV4,
+        on_exhausted: RouteExhaustedAction,
     ) -> Self {
-        Self::single_entry_node(RoutingNodeV4 {
-            strategy: RoutingPolicyV4::TagPreferred,
+        Self::single_entry_node(RouteNodeConfig {
+            strategy: RouteStrategy::TagPreferred,
             children,
             prefer_tags,
             on_exhausted,
-            ..RoutingNodeV4::default()
+            ..RouteNodeConfig::default()
         })
     }
 
-    pub fn single_entry_node(node: RoutingNodeV4) -> Self {
+    pub fn single_entry_node(node: RouteNodeConfig) -> Self {
         let entry = non_conflicting_default_route_entry(&node);
-        let mut out = Self {
+        Self {
             routes: BTreeMap::from([(entry.clone(), node)]),
             entry,
-            affinity_policy: default_routing_affinity_policy_v5(),
+            affinity_policy: default_route_affinity_policy(),
+            scheduling_preset: SchedulingPreset::default(),
             fallback_ttl_ms: None,
             reprobe_preferred_after_ms: None,
-            policy: default_routing_policy_v4(),
-            order: Vec::new(),
-            target: None,
-            prefer_tags: Vec::new(),
-            chain: Vec::new(),
-            pools: BTreeMap::new(),
-            on_exhausted: default_routing_on_exhausted_v4(),
-        };
-        out.sync_compat_from_graph();
-        out
+        }
     }
 
-    pub fn has_compat_authoring_fields(&self) -> bool {
-        self.policy != default_routing_policy_v4()
-            || !self.order.is_empty()
-            || self.target.is_some()
-            || !self.prefer_tags.is_empty()
-            || !self.chain.is_empty()
-            || !self.pools.is_empty()
-            || self.on_exhausted != default_routing_on_exhausted_v4()
-    }
-
-    pub fn entry_node(&self) -> Option<&RoutingNodeV4> {
+    pub fn entry_node(&self) -> Option<&RouteNodeConfig> {
         self.routes.get(self.entry.as_str())
     }
 
-    pub fn entry_node_mut(&mut self) -> Option<&mut RoutingNodeV4> {
+    pub fn entry_node_mut(&mut self) -> Option<&mut RouteNodeConfig> {
         self.routes.get_mut(self.entry.as_str())
     }
 
-    pub fn normalize_authoring(&mut self) {
-        if self.routes.is_empty() {
-            self.sync_graph_from_compat();
-        }
-        self.sync_compat_from_graph();
-    }
-
-    pub fn ensure_graph_from_compat(&mut self) {
-        if self.routes.is_empty() {
-            self.sync_graph_from_compat();
-        }
-    }
-
-    pub fn ensure_entry_node_mut(&mut self) -> &mut RoutingNodeV4 {
-        self.ensure_graph_from_compat();
+    pub fn ensure_entry_node_mut(&mut self) -> &mut RouteNodeConfig {
         let entry = self.entry.clone();
         self.routes.entry(entry).or_default()
     }
 
     pub fn set_entry_routing(
         &mut self,
-        policy: RoutingPolicyV4,
+        policy: RouteStrategy,
         target: Option<String>,
         children: Vec<String>,
         prefer_tags: Vec<BTreeMap<String, String>>,
-        on_exhausted: RoutingExhaustedActionV4,
+        on_exhausted: RouteExhaustedAction,
     ) {
         let node = self.ensure_entry_node_mut();
         node.strategy = policy;
@@ -1092,22 +621,21 @@ impl RoutingConfigV4 {
         node.target = target;
         node.prefer_tags = prefer_tags;
         node.on_exhausted = on_exhausted;
-        if !matches!(node.strategy, RoutingPolicyV4::ManualSticky) {
+        if !matches!(node.strategy, RouteStrategy::ManualSticky) {
             node.target = None;
         }
-        if !matches!(node.strategy, RoutingPolicyV4::TagPreferred) {
+        if !matches!(node.strategy, RouteStrategy::TagPreferred) {
             node.prefer_tags.clear();
         }
-        self.sync_compat_from_graph();
     }
 
     pub fn clear_entry_target(&mut self, children: Vec<String>) {
         self.set_entry_routing(
-            RoutingPolicyV4::OrderedFailover,
+            RouteStrategy::OrderedFailover,
             None,
             children,
             Vec::new(),
-            RoutingExhaustedActionV4::Continue,
+            RouteExhaustedAction::Continue,
         );
     }
 
@@ -1116,77 +644,31 @@ impl RoutingConfigV4 {
         if !node.children.iter().any(|name| name == provider_name) {
             node.children.push(provider_name.to_string());
         }
-        self.sync_compat_from_graph();
     }
 
     pub fn clear_manual_target_for(&mut self, provider_name: &str) -> bool {
         let node = self.ensure_entry_node_mut();
-        let should_clear = matches!(node.strategy, RoutingPolicyV4::ManualSticky)
+        let should_clear = matches!(node.strategy, RouteStrategy::ManualSticky)
             && node.target.as_deref() == Some(provider_name);
         if !should_clear {
             return false;
         }
-        node.strategy = RoutingPolicyV4::OrderedFailover;
+        node.strategy = RouteStrategy::OrderedFailover;
         node.target = None;
         node.prefer_tags.clear();
-        node.on_exhausted = RoutingExhaustedActionV4::Continue;
-        self.sync_compat_from_graph();
+        node.on_exhausted = RouteExhaustedAction::Continue;
         true
     }
 
     pub fn remove_provider_references(&mut self, provider_name: &str) {
-        self.ensure_graph_from_compat();
         for node in self.routes.values_mut() {
             node.children.retain(|name| name != provider_name);
             if node.target.as_deref() == Some(provider_name) {
                 node.target = None;
-                if matches!(node.strategy, RoutingPolicyV4::ManualSticky) {
-                    node.strategy = RoutingPolicyV4::OrderedFailover;
+                if matches!(node.strategy, RouteStrategy::ManualSticky) {
+                    node.strategy = RouteStrategy::OrderedFailover;
                 }
             }
-        }
-        self.sync_compat_from_graph();
-    }
-
-    pub fn sync_compat_from_graph(&mut self) {
-        let Some(node) = self.entry_node().cloned() else {
-            self.policy = default_routing_policy_v4();
-            self.order.clear();
-            self.target = None;
-            self.prefer_tags.clear();
-            self.chain.clear();
-            self.pools.clear();
-            self.on_exhausted = default_routing_on_exhausted_v4();
-            return;
-        };
-
-        self.policy = node.strategy;
-        self.target = node.target.clone();
-        self.prefer_tags = node.prefer_tags.clone();
-        self.on_exhausted = node.on_exhausted;
-        self.order = node.children.clone();
-    }
-
-    pub fn sync_graph_from_compat(&mut self) {
-        if !self.has_compat_authoring_fields() {
-            return;
-        }
-
-        if self.routes.is_empty() {
-            self.entry =
-                non_conflicting_default_route_entry_from_refs(&self.order, self.target.as_deref());
-            self.routes
-                .insert(self.entry.clone(), RoutingNodeV4::default());
-        }
-
-        let entry = self.entry.clone();
-        let node = self.routes.entry(entry).or_default();
-        node.strategy = self.policy;
-        node.target = self.target.clone();
-        node.prefer_tags = self.prefer_tags.clone();
-        node.on_exhausted = self.on_exhausted;
-        if !self.order.is_empty() {
-            node.children = self.order.clone();
         }
     }
 
@@ -1232,7 +714,6 @@ impl RoutingConfigV4 {
         for node in self.routes.values_mut() {
             rewrite_route_node_refs(node, old, new.as_str());
         }
-        self.sync_compat_from_graph();
         Ok(())
     }
 
@@ -1251,16 +732,15 @@ impl RoutingConfigV4 {
             );
         }
         self.routes.remove(name);
-        self.sync_compat_from_graph();
         Ok(())
     }
 }
 
-fn default_routing_entry_v4() -> String {
+fn default_route_entry() -> String {
     "main".to_string()
 }
 
-fn non_conflicting_default_route_entry(node: &RoutingNodeV4) -> String {
+fn non_conflicting_default_route_entry(node: &RouteNodeConfig) -> String {
     non_conflicting_default_route_entry_from_refs(&node.children, node.target.as_deref())
 }
 
@@ -1273,7 +753,7 @@ fn non_conflicting_default_route_entry_from_refs(
         .map(String::as_str)
         .chain(target)
         .collect::<BTreeSet<_>>();
-    let base = default_routing_entry_v4();
+    let base = default_route_entry();
     if !occupied.contains(base.as_str()) {
         return base;
     }
@@ -1287,7 +767,7 @@ fn non_conflicting_default_route_entry_from_refs(
     candidate
 }
 
-fn rewrite_route_node_refs(node: &mut RoutingNodeV4, old: &str, new: &str) {
+fn rewrite_route_node_refs(node: &mut RouteNodeConfig, old: &str, new: &str) {
     for child in &mut node.children {
         if child == old {
             *child = new.to_string();
@@ -1305,35 +785,35 @@ fn rewrite_route_node_refs(node: &mut RoutingNodeV4, old: &str, new: &str) {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RoutingNodeV4 {
-    #[serde(default = "default_routing_policy_v4")]
-    pub strategy: RoutingPolicyV4,
+pub struct RouteNodeConfig {
+    #[serde(default = "default_route_strategy")]
+    pub strategy: RouteStrategy,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prefer_tags: Vec<BTreeMap<String, String>>,
-    #[serde(default = "default_routing_on_exhausted_v4")]
-    pub on_exhausted: RoutingExhaustedActionV4,
+    #[serde(default = "default_route_exhausted_action")]
+    pub on_exhausted: RouteExhaustedAction,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub when: Option<RoutingConditionV4>,
+    pub when: Option<RouteCondition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub then: Option<String>,
     #[serde(default, rename = "default", skip_serializing_if = "Option::is_none")]
     pub default_route: Option<String>,
 }
 
-impl Default for RoutingNodeV4 {
+impl Default for RouteNodeConfig {
     fn default() -> Self {
         Self {
-            strategy: default_routing_policy_v4(),
+            strategy: default_route_strategy(),
             children: Vec::new(),
             target: None,
             prefer_tags: Vec::new(),
-            on_exhausted: default_routing_on_exhausted_v4(),
+            on_exhausted: default_route_exhausted_action(),
             metadata: BTreeMap::new(),
             when: None,
             then: None,
@@ -1343,7 +823,7 @@ impl Default for RoutingNodeV4 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq, Hash)]
-pub struct RoutingConditionV4 {
+pub struct RouteCondition {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1358,7 +838,7 @@ pub struct RoutingConditionV4 {
     pub headers: BTreeMap<String, String>,
 }
 
-impl RoutingConditionV4 {
+impl RouteCondition {
     pub fn is_empty(&self) -> bool {
         self.model.is_none()
             && self.service_tier.is_none()
@@ -1371,43 +851,66 @@ impl RoutingConditionV4 {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "kebab-case")]
-pub enum RoutingPolicyV4 {
+pub enum RouteStrategy {
     ManualSticky,
     OrderedFailover,
     TagPreferred,
     Conditional,
 }
 
-fn default_routing_policy_v4() -> RoutingPolicyV4 {
-    RoutingPolicyV4::OrderedFailover
+fn default_route_strategy() -> RouteStrategy {
+    RouteStrategy::OrderedFailover
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "kebab-case")]
-pub enum RoutingExhaustedActionV4 {
+pub enum RouteExhaustedAction {
     Continue,
     Stop,
 }
 
-fn default_routing_on_exhausted_v4() -> RoutingExhaustedActionV4 {
-    RoutingExhaustedActionV4::Continue
+fn default_route_exhausted_action() -> RouteExhaustedAction {
+    RouteExhaustedAction::Continue
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "kebab-case")]
-pub enum RoutingAffinityPolicyV5 {
+pub enum RouteAffinityPolicy {
     Off,
     PreferredGroup,
     FallbackSticky,
     Hard,
 }
 
-fn default_routing_affinity_policy_v5() -> RoutingAffinityPolicyV5 {
-    RoutingAffinityPolicyV5::FallbackSticky
+fn default_route_affinity_policy() -> RouteAffinityPolicy {
+    RouteAffinityPolicy::FallbackSticky
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "kebab-case")]
+pub enum SchedulingPreset {
+    ContinuityFirst,
+    #[default]
+    Balanced,
+    ThroughputFirst,
+}
+
+impl SchedulingPreset {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ContinuityFirst => "continuity-first",
+            Self::Balanced => "balanced",
+            Self::ThroughputFirst => "throughput-first",
+        }
+    }
+
+    fn is_default(value: &Self) -> bool {
+        *value == Self::default()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-pub struct RoutingPoolV4 {
+pub struct RoutePoolConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<String>,
 }
@@ -1426,26 +929,28 @@ pub struct PersistedRoutingProviderRef {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PersistedRoutingSpec {
     pub entry: String,
-    #[serde(default = "default_routing_affinity_policy_v5")]
-    pub affinity_policy: RoutingAffinityPolicyV5,
+    #[serde(default = "default_route_affinity_policy")]
+    pub affinity_policy: RouteAffinityPolicy,
+    #[serde(default, skip_serializing_if = "SchedulingPreset::is_default")]
+    pub scheduling_preset: SchedulingPreset,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_ttl_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reprobe_preferred_after_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub routes: BTreeMap<String, RoutingNodeV4>,
-    #[serde(default = "default_routing_policy_v4")]
-    pub policy: RoutingPolicyV4,
+    pub routes: BTreeMap<String, RouteNodeConfig>,
+    #[serde(default = "default_route_strategy")]
+    pub policy: RouteStrategy,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub order: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prefer_tags: Vec<BTreeMap<String, String>>,
-    #[serde(default = "default_routing_on_exhausted_v4")]
-    pub on_exhausted: RoutingExhaustedActionV4,
-    #[serde(default = "default_routing_policy_v4")]
-    pub entry_strategy: RoutingPolicyV4,
+    #[serde(default = "default_route_exhausted_action")]
+    pub on_exhausted: RouteExhaustedAction,
+    #[serde(default = "default_route_strategy")]
+    pub entry_strategy: RouteStrategy,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expanded_order: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1459,168 +964,6 @@ fn is_default_upstream_auth(auth: &UpstreamAuth) -> bool {
         && auth.auth_token_env.is_none()
         && auth.api_key.is_none()
         && auth.api_key_env.is_none()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ServiceViewV2 {
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        rename = "active_station",
-        alias = "active_group"
-    )]
-    pub active_group: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_profile: Option<String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub profiles: BTreeMap<String, ServiceControlProfile>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub providers: BTreeMap<String, ProviderConfigV2>,
-    #[serde(
-        default,
-        skip_serializing_if = "BTreeMap::is_empty",
-        rename = "stations",
-        alias = "groups"
-    )]
-    pub groups: BTreeMap<String, GroupConfigV2>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderConfigV2 {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub alias: Option<String>,
-    #[serde(default = "default_service_config_enabled")]
-    pub enabled: bool,
-    #[serde(default)]
-    pub auth: UpstreamAuth,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub tags: BTreeMap<String, String>,
-    #[serde(
-        default,
-        skip_serializing_if = "BTreeMap::is_empty",
-        alias = "supportedModels"
-    )]
-    pub supported_models: BTreeMap<String, bool>,
-    #[serde(
-        default,
-        skip_serializing_if = "BTreeMap::is_empty",
-        alias = "modelMapping"
-    )]
-    pub model_mapping: BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub endpoints: BTreeMap<String, ProviderEndpointV2>,
-}
-
-impl Default for ProviderConfigV2 {
-    fn default() -> Self {
-        Self {
-            alias: None,
-            enabled: default_service_config_enabled(),
-            auth: UpstreamAuth::default(),
-            tags: BTreeMap::new(),
-            supported_models: BTreeMap::new(),
-            model_mapping: BTreeMap::new(),
-            endpoints: BTreeMap::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderEndpointV2 {
-    pub base_url: String,
-    #[serde(default = "default_service_config_enabled")]
-    pub enabled: bool,
-    #[serde(
-        default = "default_provider_endpoint_priority",
-        skip_serializing_if = "is_default_provider_endpoint_priority"
-    )]
-    pub priority: u32,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub tags: BTreeMap<String, String>,
-    #[serde(
-        default,
-        skip_serializing_if = "BTreeMap::is_empty",
-        alias = "supportedModels"
-    )]
-    pub supported_models: BTreeMap<String, bool>,
-    #[serde(
-        default,
-        skip_serializing_if = "BTreeMap::is_empty",
-        alias = "modelMapping"
-    )]
-    pub model_mapping: BTreeMap<String, String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GroupConfigV2 {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub alias: Option<String>,
-    #[serde(default = "default_service_config_enabled")]
-    pub enabled: bool,
-    #[serde(default = "default_service_config_level")]
-    pub level: u8,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub members: Vec<GroupMemberRefV2>,
-}
-
-impl Default for GroupConfigV2 {
-    fn default() -> Self {
-        Self {
-            alias: None,
-            enabled: default_service_config_enabled(),
-            level: default_service_config_level(),
-            members: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-pub struct GroupMemberRefV2 {
-    pub provider: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty", alias = "endpoints")]
-    pub endpoint_names: Vec<String>,
-    #[serde(default)]
-    pub preferred: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-pub struct PersistedStationProviderEndpointRef {
-    pub name: String,
-    pub base_url: String,
-    #[serde(default = "default_service_config_enabled")]
-    pub enabled: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-pub struct PersistedStationProviderRef {
-    pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub alias: Option<String>,
-    #[serde(default = "default_service_config_enabled")]
-    pub enabled: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub endpoints: Vec<PersistedStationProviderEndpointRef>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-pub struct PersistedStationSpec {
-    pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub alias: Option<String>,
-    #[serde(default = "default_service_config_enabled")]
-    pub enabled: bool,
-    #[serde(default = "default_service_config_level")]
-    pub level: u8,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub members: Vec<GroupMemberRefV2>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-pub struct PersistedStationsCatalog {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub stations: Vec<PersistedStationSpec>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub providers: Vec<PersistedStationProviderRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -1678,9 +1021,6 @@ pub struct UiConfig {
     /// When unset, codex-helper will pick a default language based on system locale for the first run.
     #[serde(default)]
     pub language: Option<String>,
-    /// Spend-rate projection shown in operator UIs.
-    #[serde(default, skip_serializing_if = "is_default_usage_forecast_config")]
-    pub usage_forecast: UsageForecastConfig,
     /// Optional remote service status probes shown by operator UIs.
     #[serde(default, skip_serializing_if = "is_default_service_status_config")]
     pub service_status: ServiceStatusConfig,

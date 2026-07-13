@@ -17,10 +17,10 @@ pub(super) fn failed_proxy_client_message(
 ) -> String {
     let attempts = if route_attempts.is_empty() {
         retry
-            .map(RetryInfo::route_attempts_or_derived)
+            .map(|retry| retry.route_attempts.as_slice())
             .unwrap_or_default()
     } else {
-        route_attempts.to_vec()
+        route_attempts
     };
     let sanitized_message = sanitize_failure_text(message, MAX_FAILURE_DETAIL_CHARS);
 
@@ -64,9 +64,7 @@ pub(super) fn failed_proxy_client_message(
         .count()
         .saturating_sub(MAX_FAILURE_ATTEMPTS_IN_RESPONSE);
     if omitted > 0 {
-        lines.push(format!(
-            "... {omitted} more route decisions omitted; see requests.jsonl retry.route_attempts"
-        ));
+        lines.push(format!("... {omitted} more route decisions omitted"));
     }
 
     if !sanitized_message.is_empty() && sanitized_message != "no upstreams available" {
@@ -79,21 +77,17 @@ pub(super) fn failed_proxy_client_message(
 fn route_attempt_client_line(attempt: &RouteAttemptLog) -> String {
     let mut parts = Vec::new();
     if let Some(provider_endpoint_key) =
-        clean_optional_component(attempt.provider_endpoint_key.as_deref())
+        clean_route_identity_component(attempt.provider_endpoint_key.as_deref())
     {
         parts.push(format!("endpoint={provider_endpoint_key}"));
     }
-    if let Some(provider_id) = clean_optional_component(attempt.provider_id.as_deref()) {
+    if let Some(provider_id) = clean_route_identity_component(attempt.provider_id.as_deref()) {
         parts.push(format!("provider={provider_id}"));
     }
     if let Some(preference_group) = attempt.preference_group {
         parts.push(format!("group={preference_group}"));
     }
-    if let Some(station_name) = clean_optional_component(attempt.station_name.as_deref()) {
-        parts.push(format!("station={station_name}"));
-    }
-    parts.push(upstream_label(attempt));
-    parts.push(format!("decision={}", attempt.decision));
+    parts.push(format!("code={}", attempt.stable_code()));
 
     if let Some(provider_attempt) = attempt.provider_attempt
         && let Some(provider_max_attempts) = attempt.provider_max_attempts
@@ -115,12 +109,7 @@ fn route_attempt_client_line(attempt: &RouteAttemptLog) -> String {
     if let Some(error_class) = clean_optional_component(attempt.error_class.as_deref()) {
         parts.push(format!("class={error_class}"));
     }
-    if let Some(reason) = attempt.reason.as_deref() {
-        parts.push(format!(
-            "reason={}",
-            sanitize_failure_text(reason, MAX_FAILURE_DETAIL_CHARS)
-        ));
-    } else if let Some(cooldown_reason) = attempt.cooldown_reason.as_deref() {
+    if let Some(cooldown_reason) = attempt.cooldown_reason.as_deref() {
         parts.push(format!(
             "reason={}",
             sanitize_failure_text(cooldown_reason, MAX_FAILURE_DETAIL_CHARS)
@@ -139,27 +128,9 @@ fn route_attempt_client_line(attempt: &RouteAttemptLog) -> String {
     truncate_chars(&parts.join(" "), MAX_FAILURE_DETAIL_CHARS * 2)
 }
 
-fn upstream_label(attempt: &RouteAttemptLog) -> String {
-    let index = attempt
-        .upstream_index
-        .map(|idx| idx.to_string())
-        .unwrap_or_else(|| "?".to_string());
-    let Some(base_url) = attempt.upstream_base_url.as_deref() else {
-        return format!("upstream[{index}]=unknown");
-    };
-    let host = reqwest::Url::parse(base_url)
-        .ok()
-        .and_then(|url| {
-            let host = url.host_str()?.to_string();
-            let port = url
-                .port()
-                .map(|port| format!(":{port}"))
-                .unwrap_or_default();
-            Some(format!("{host}{port}"))
-        })
-        .unwrap_or_else(|| sanitize_failure_text(strip_url_query(base_url).as_str(), 80));
-
-    format!("upstream[{index}]={host}")
+fn clean_route_identity_component(value: Option<&str>) -> Option<String> {
+    let without_query = value.and_then(|value| value.split(['?', '#']).next());
+    clean_optional_component(without_query)
 }
 
 fn clean_optional_component(value: Option<&str>) -> Option<String> {
@@ -255,11 +226,7 @@ mod tests {
             upstream_attempt: Some(1),
             provider_max_attempts: Some(2),
             upstream_max_attempts: Some(1),
-            station_name: Some("primary".to_string()),
-            upstream_base_url: Some("https://api.example.com/v1?api_key=secret".to_string()),
-            upstream_index: Some(0),
             decision: decision.to_string(),
-            raw: String::new(),
             ..Default::default()
         }
     }
@@ -272,9 +239,6 @@ mod tests {
         first.duration_ms = Some(42);
         let mut second = attempt("failed_transport");
         second.provider_id = Some("beta".to_string());
-        second.station_name = Some("backup".to_string());
-        second.upstream_index = Some(1);
-        second.reason = Some("operation timed out".to_string());
         second.error_class = Some("upstream_transport_error".to_string());
 
         let message = failed_proxy_client_message(
@@ -288,8 +252,8 @@ mod tests {
         assert!(message.contains("all upstream attempts failed"));
         assert!(message.contains("request_id=12"));
         assert!(message.contains("provider=alpha"));
-        assert!(message.contains("station=backup"));
-        assert!(message.contains("upstream[1]=api.example.com"));
+        assert!(message.contains("provider=beta"));
+        assert!(message.contains("code=failed_transport"));
         assert!(message.contains("status=429"));
         assert!(message.contains("class=upstream_transport_error"));
         assert!(message.contains("last_error:"));
@@ -299,7 +263,6 @@ mod tests {
     fn failed_proxy_client_message_summarizes_unusable_upstreams() {
         let mut skipped = attempt("skipped_capability_mismatch");
         skipped.skipped = true;
-        skipped.reason = Some("unsupported_model".to_string());
         skipped.model = Some("gpt-5".to_string());
 
         let message = failed_proxy_client_message(
@@ -312,16 +275,15 @@ mod tests {
 
         assert!(message.contains("no usable upstream matched the request"));
         assert!(message.contains("attempts=0"));
-        assert!(message.contains("reason=unsupported_model"));
+        assert!(message.contains("code=skipped_capability_mismatch"));
         assert!(!message.contains("last_error:"));
     }
 
     #[test]
     fn failed_proxy_client_message_redacts_sensitive_values() {
         let mut failed = attempt("failed_transport");
-        failed.reason = Some(
-            r#"Authorization: Bearer sk-testsecret123 api_key=abc123 token:"hidden""#.to_string(),
-        );
+        failed.provider_endpoint_key =
+            Some("codex/provider?api_key=abc123/Bearer-sk-testsecret123".to_string());
 
         let message = failed_proxy_client_message(
             StatusCode::BAD_GATEWAY,
@@ -340,7 +302,7 @@ mod tests {
     #[test]
     fn failed_proxy_client_message_truncates_long_details() {
         let mut failed = attempt("failed_transport");
-        failed.reason = Some("x".repeat(1000));
+        failed.error_class = Some("x".repeat(1000));
 
         let message = failed_proxy_client_message(
             StatusCode::BAD_GATEWAY,
@@ -355,12 +317,16 @@ mod tests {
     }
 
     #[test]
-    fn failed_proxy_client_message_without_attempts_returns_sanitized_error() {
+    fn failed_proxy_client_message_requires_structured_retry_attempts() {
+        let retry = RetryInfo {
+            attempts: 1,
+            route_attempts: Vec::new(),
+        };
         let message = failed_proxy_client_message(
             StatusCode::BAD_GATEWAY,
             "plain error token=secret",
             1,
-            None,
+            Some(&retry),
             &[],
         );
 
@@ -368,11 +334,26 @@ mod tests {
     }
 
     #[test]
+    fn failed_proxy_client_message_does_not_claim_debug_log_authority() {
+        let attempts = (0..7)
+            .map(|attempt_index| RouteAttemptLog {
+                attempt_index,
+                ..attempt("failed_transport")
+            })
+            .collect::<Vec<_>>();
+
+        let message =
+            failed_proxy_client_message(StatusCode::BAD_GATEWAY, "bad gateway", 9, None, &attempts);
+
+        assert!(message.contains("... 1 more route decisions omitted"));
+        assert!(!message.contains("requests.jsonl"));
+    }
+
+    #[test]
     fn failed_proxy_client_message_prefers_provider_endpoint_identity() {
         let mut failed = attempt("failed_transport");
         failed.provider_endpoint_key = Some("codex/input/default".to_string());
         failed.preference_group = Some(0);
-        failed.reason = Some("operation timed out".to_string());
 
         let message =
             failed_proxy_client_message(StatusCode::BAD_GATEWAY, "bad gateway", 2, None, &[failed]);

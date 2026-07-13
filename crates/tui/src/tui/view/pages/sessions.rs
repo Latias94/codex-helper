@@ -9,9 +9,8 @@ use crate::tui::model::{
     Palette, Snapshot, balance_snapshot_status_style, basename, format_age,
     format_observed_client_identity, format_tok_per_second, now_ms, session_control_posture_lang,
     session_observation_scope_label_lang, session_observed_provider_balance_brief_lang,
-    session_observed_provider_balance_snapshot, session_row_has_any_override,
-    session_transcript_host_status_lang, short_sid, shorten, shorten_middle, status_style,
-    tokens_short, usage_line_lang,
+    session_observed_provider_balance_snapshot, session_transcript_host_status_lang, short_sid,
+    shorten, shorten_middle, status_style, tokens_short, usage_line_lang,
 };
 use crate::tui::state::UiState;
 use crate::tui::view::widgets::kv_line;
@@ -33,7 +32,7 @@ pub(super) fn render_sessions_page(
     let filtered = ui.filtered_sessions_page_indices(snapshot);
 
     let title = format!(
-        "{}  ({}: {}, {}: {}, {}: {})",
+        "{}  ({}: {}, {}: {})",
         l("Sessions"),
         l("active_only"),
         if ui.sessions_page_active_only {
@@ -43,12 +42,6 @@ pub(super) fn render_sessions_page(
         },
         l("errors_only"),
         if ui.sessions_page_errors_only {
-            l("on")
-        } else {
-            l("off")
-        },
-        l("overrides_only"),
-        if ui.sessions_page_overrides_only {
             l("on")
         } else {
             l("off")
@@ -72,7 +65,7 @@ pub(super) fn render_sessions_page(
         l("turns"),
         "Tok",
         "tok/s",
-        "Pin",
+        l("profile"),
     ])
     .style(Style::default().fg(p.muted))
     .height(1);
@@ -105,10 +98,9 @@ pub(super) fn render_sessions_page(
                 .map(|u| tokens_short(u.total_tokens))
                 .unwrap_or_else(|| "-".to_string());
             let tok_per_second = format_tok_per_second(row.last_output_tokens_per_second);
-            let pin = row
-                .override_route_target
+            let profile = row
+                .binding_profile_name
                 .as_deref()
-                .or(row.override_station_name.as_deref())
                 .map(|s| shorten(s, 12))
                 .unwrap_or_else(|| "-".to_string());
 
@@ -118,10 +110,6 @@ pub(super) fn render_sessions_page(
             } else if row.last_status.is_some_and(|s| s >= 400) {
                 style = style.fg(p.warn);
             }
-            if session_row_has_any_override(row) {
-                style = style.add_modifier(Modifier::BOLD);
-            }
-
             Row::new(vec![
                 Cell::from(sid),
                 Cell::from(Span::styled(cwd, Style::default().fg(p.muted))),
@@ -139,16 +127,12 @@ pub(super) fn render_sessions_page(
                 Cell::from(Span::styled(tok, Style::default().fg(p.muted))),
                 Cell::from(Span::styled(tok_per_second, Style::default().fg(p.accent))),
                 Cell::from(Span::styled(
-                    pin,
-                    Style::default().fg(
-                        if row.override_route_target.is_some()
-                            || row.override_station_name.is_some()
-                        {
-                            p.accent
-                        } else {
-                            p.muted
-                        },
-                    ),
+                    profile,
+                    Style::default().fg(if row.binding_profile_name.is_some() {
+                        p.accent
+                    } else {
+                        p.muted
+                    }),
                 )),
             ])
             .style(style)
@@ -199,16 +183,10 @@ pub(super) fn render_sessions_page(
         )
         .unwrap_or_else(|| "-".to_string());
         let observed_model = row.last_model.as_deref().unwrap_or("-");
-        let provider = row.last_provider_id.as_deref().unwrap_or("-");
+        let provider = row.observed_provider_id().unwrap_or("-");
         let observed_endpoint = row
-            .last_route_decision
-            .as_ref()
-            .and_then(|decision| {
-                decision
-                    .provider_id
-                    .as_ref()
-                    .zip(decision.endpoint_id.as_ref())
-            })
+            .observed_provider_id()
+            .zip(row.observed_endpoint_id())
             .map(|(provider_id, endpoint_id)| format!("{provider_id}/{endpoint_id}"))
             .unwrap_or_else(|| "-".to_string());
         let observed_route_path = row
@@ -228,8 +206,9 @@ pub(super) fn render_sessions_page(
             session_observed_provider_balance_snapshot(row, &snapshot.provider_balances)
                 .map(|snapshot| balance_snapshot_status_style(p, snapshot))
                 .unwrap_or_else(|| Style::default().fg(p.muted));
-        let observed_station = row.last_station_name.as_deref().unwrap_or("-");
-        let observed_upstream = row.last_upstream_base_url.as_deref().unwrap_or("-");
+        let observed_upstream = row
+            .observed_upstream_origin()
+            .unwrap_or_else(|| "-".to_string());
         let observed_effort = row.last_reasoning_effort.as_deref().unwrap_or("-");
         let observed_service_tier = row.last_service_tier.as_deref().unwrap_or("-");
         let binding_profile = row.binding_profile_name.as_deref().unwrap_or("-");
@@ -238,49 +217,19 @@ pub(super) fn render_sessions_page(
             .map(|mode| format!("{mode:?}").to_ascii_lowercase())
             .unwrap_or_else(|| "-".to_string());
         let effective_model = format_resolved_route_value(row.effective_model.as_ref(), lang);
-        let effective_station = format_resolved_route_value(row.effective_station.as_ref(), lang);
-        let effective_upstream =
-            format_resolved_route_value(row.effective_upstream_base_url.as_ref(), lang);
         let effective_effort =
             format_resolved_route_value(row.effective_reasoning_effort.as_ref(), lang);
         let effective_service_tier =
             format_resolved_route_value(row.effective_service_tier.as_ref(), lang);
-        let override_model = row.override_model.as_deref().unwrap_or("-");
-        let override_effort = row.override_effort.as_deref().unwrap_or("-");
-        let override_station = row.override_station_name.as_deref().unwrap_or("-");
-        let override_route_target = row.override_route_target.as_deref().unwrap_or("-");
-        let override_service_tier = row.override_service_tier.as_deref().unwrap_or("-");
-        let global_station = snapshot.global_station_override.as_deref().unwrap_or("-");
-        let global_route_target = snapshot
-            .global_route_target_override
-            .as_deref()
-            .unwrap_or("-");
-        let posture = session_control_posture_lang(
-            row,
-            snapshot.global_station_override.as_deref(),
-            snapshot.global_route_target_override.as_deref(),
-            ui.uses_route_graph_routing(),
-            lang,
-        );
-        let routing = if session_row_has_any_override(row) {
-            format!(
-                "session(model={override_model}, station={override_station}, route_target={override_route_target}, tier={override_service_tier})"
-            )
-        } else if global_route_target != "-" {
-            format!("global_route_target={global_route_target}")
-        } else if global_station != "-" {
-            format!("pinned(global-station)={global_station}")
-        } else {
-            "auto".to_string()
-        };
+        let posture = session_control_posture_lang(row, ui.uses_route_graph_routing(), lang);
         let route_affinity = row
             .route_affinity
             .as_ref()
             .map(|affinity| {
                 format!(
                     "endpoint={} upstream={} reason={}",
-                    affinity.provider_endpoint.stable_key(),
-                    shorten_middle(&affinity.upstream_base_url, 64),
+                    format_args!("{}/{}", affinity.provider_id, affinity.endpoint_id),
+                    shorten_middle(&affinity.upstream_origin, 64),
                     affinity.change_reason
                 )
             })
@@ -368,14 +317,8 @@ pub(super) fn render_sessions_page(
         lines.push(kv_line(p, "balance", balance, balance_style));
         lines.push(kv_line(
             p,
-            "station(last)",
-            observed_station.to_string(),
-            Style::default().fg(p.text),
-        ));
-        lines.push(kv_line(
-            p,
-            "upstream(last)",
-            observed_upstream.to_string(),
+            "upstream_origin",
+            observed_upstream,
             Style::default().fg(p.text),
         ));
         lines.push(kv_line(
@@ -403,18 +346,6 @@ pub(super) fn render_sessions_page(
         ));
         lines.push(kv_line(
             p,
-            "station",
-            effective_station,
-            Style::default().fg(p.text),
-        ));
-        lines.push(kv_line(
-            p,
-            "upstream",
-            effective_upstream,
-            Style::default().fg(p.text),
-        ));
-        lines.push(kv_line(
-            p,
             "effort",
             effective_effort,
             Style::default().fg(p.text),
@@ -424,27 +355,6 @@ pub(super) fn render_sessions_page(
             "service_tier",
             effective_service_tier,
             Style::default().fg(p.text),
-        ));
-        lines.push(kv_line(
-            p,
-            l("override"),
-            format!(
-                "model={override_model}, effort={override_effort}, station={override_station}, route_target={override_route_target}, tier={override_service_tier}, global_station={global_station}, global_route_target={global_route_target}"
-            ),
-            Style::default().fg(if session_row_has_any_override(row)
-                || global_station != "-"
-                || global_route_target != "-"
-            {
-                p.accent
-            } else {
-                p.muted
-            }),
-        ));
-        lines.push(kv_line(
-            p,
-            l("routing"),
-            routing,
-            Style::default().fg(p.muted),
         ));
         lines.push(kv_line(
             p,
@@ -514,28 +424,8 @@ pub(super) fn render_sessions_page(
             crate::tui::Language::En => "  e toggle errors-only",
         }));
         lines.push(Line::from(match lang {
-            crate::tui::Language::Zh => "  v 切换仅覆盖",
-            crate::tui::Language::En => "  v toggle overrides-only",
-        }));
-        lines.push(Line::from(match lang {
             crate::tui::Language::Zh => "  r 重置筛选",
             crate::tui::Language::En => "  r reset filters",
-        }));
-        lines.push(Line::from(match lang {
-            crate::tui::Language::Zh => "  b 管理 profile 绑定",
-            crate::tui::Language::En => "  b manage profile binding",
-        }));
-        lines.push(Line::from(match lang {
-            crate::tui::Language::Zh => "  M 打开 model 菜单",
-            crate::tui::Language::En => "  M open model menu",
-        }));
-        lines.push(Line::from(match lang {
-            crate::tui::Language::Zh => "  f 打开 fast / service tier 菜单",
-            crate::tui::Language::En => "  f open fast / service tier menu",
-        }));
-        lines.push(Line::from(match lang {
-            crate::tui::Language::Zh => "  R 重置当前会话 manual overrides",
-            crate::tui::Language::En => "  R reset current session manual overrides",
         }));
         lines.push(Line::from(match lang {
             crate::tui::Language::Zh => "  t 打开对话记录（全屏）",
@@ -548,10 +438,6 @@ pub(super) fn render_sessions_page(
         lines.push(Line::from(match lang {
             crate::tui::Language::Zh => "  H 在 History 中打开会话",
             crate::tui::Language::En => "  H open session in History",
-        }));
-        lines.push(Line::from(match lang {
-            crate::tui::Language::Zh => "  Enter effort 菜单  p/P provider 覆盖",
-            crate::tui::Language::En => "  Enter effort menu  p/P provider override",
         }));
     } else {
         lines.push(Line::from(Span::styled(
@@ -582,7 +468,7 @@ fn route_value_source_label(source: RouteValueSource, lang: crate::tui::Language
         RouteValueSource::SessionOverride => i18n::label(lang, "session override"),
         RouteValueSource::GlobalOverride => i18n::label(lang, "global override"),
         RouteValueSource::ProfileDefault => i18n::label(lang, "profile default"),
-        RouteValueSource::StationMapping => i18n::label(lang, "station mapping"),
+        RouteValueSource::ProviderMapping => i18n::label(lang, "provider mapping"),
         RouteValueSource::RuntimeFallback => i18n::label(lang, "runtime fallback"),
     }
 }

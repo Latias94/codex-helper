@@ -1,5 +1,10 @@
 # Workstream: Codex Usage / Balance
 
+> Historical note: this workstream is superseded by the
+> [canonical relay/runtime modernization plan](../../plans/2026-07-10-002-refactor-canonical-relay-runtime-modernization-plan.md).
+> It remains as design history and evidence, not as the current usage,
+> accounting, balance, or operator-client contract.
+
 > 中文速览：本目录定义一等 `Usage / Balance` 决策页面。目标不是再堆一个旧 `Stats` 页，而是把 provider 用量、成本、余额/配额、刷新状态、路由影响和导出报告统一成用户判断“现在该走谁、谁快耗尽、谁不稳定”的可信页面。
 
 ## Purpose
@@ -107,4 +112,3 @@ Usage and balance are decision data, not decoration.
 The page is successful when a user can look at it for a few seconds and decide
 whether to keep the current routing policy, refresh balances, pin a provider,
 change a route target, or investigate a failing relay.
-

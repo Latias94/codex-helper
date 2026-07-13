@@ -2,27 +2,27 @@ use super::*;
 
 #[test]
 fn rename_route_node_updates_references_and_entry_name() {
-    let mut routing = RoutingConfigV4 {
+    let mut routing = RouteGraphConfig {
         entry: "main".to_string(),
         routes: BTreeMap::from([
             (
                 "main".to_string(),
-                RoutingNodeV4 {
-                    strategy: RoutingPolicyV4::OrderedFailover,
+                RouteNodeConfig {
+                    strategy: RouteStrategy::OrderedFailover,
                     children: vec!["pool".to_string(), "paygo".to_string()],
-                    ..RoutingNodeV4::default()
+                    ..RouteNodeConfig::default()
                 },
             ),
             (
                 "pool".to_string(),
-                RoutingNodeV4 {
-                    strategy: RoutingPolicyV4::OrderedFailover,
+                RouteNodeConfig {
+                    strategy: RouteStrategy::OrderedFailover,
                     children: vec!["alpha".to_string()],
-                    ..RoutingNodeV4::default()
+                    ..RouteNodeConfig::default()
                 },
             ),
         ]),
-        ..RoutingConfigV4::default()
+        ..RouteGraphConfig::default()
     };
 
     routing
@@ -40,35 +40,35 @@ fn rename_route_node_updates_references_and_entry_name() {
 
 #[test]
 fn delete_route_node_rejects_entry_and_referenced_nodes() {
-    let mut routing = RoutingConfigV4 {
+    let mut routing = RouteGraphConfig {
         entry: "main".to_string(),
         routes: BTreeMap::from([
             (
                 "main".to_string(),
-                RoutingNodeV4 {
-                    strategy: RoutingPolicyV4::OrderedFailover,
+                RouteNodeConfig {
+                    strategy: RouteStrategy::OrderedFailover,
                     children: vec!["pool".to_string()],
-                    ..RoutingNodeV4::default()
+                    ..RouteNodeConfig::default()
                 },
             ),
             (
                 "pool".to_string(),
-                RoutingNodeV4 {
-                    strategy: RoutingPolicyV4::OrderedFailover,
+                RouteNodeConfig {
+                    strategy: RouteStrategy::OrderedFailover,
                     children: vec!["alpha".to_string()],
-                    ..RoutingNodeV4::default()
+                    ..RouteNodeConfig::default()
                 },
             ),
             (
                 "unused".to_string(),
-                RoutingNodeV4 {
-                    strategy: RoutingPolicyV4::OrderedFailover,
+                RouteNodeConfig {
+                    strategy: RouteStrategy::OrderedFailover,
                     children: vec!["alpha".to_string()],
-                    ..RoutingNodeV4::default()
+                    ..RouteNodeConfig::default()
                 },
             ),
         ]),
-        ..RoutingConfigV4::default()
+        ..RouteGraphConfig::default()
     };
 
     let err = routing
@@ -88,68 +88,29 @@ fn delete_route_node_rejects_entry_and_referenced_nodes() {
 }
 
 #[test]
-fn sync_graph_from_compat_ignores_default_compat_fields_for_existing_graph() {
-    let mut routing = RoutingConfigV4 {
-        entry: "main".to_string(),
-        routes: BTreeMap::from([(
-            "main".to_string(),
-            RoutingNodeV4 {
-                strategy: RoutingPolicyV4::TagPreferred,
-                children: vec!["monthly".to_string(), "paygo".to_string()],
-                prefer_tags: vec![BTreeMap::from([(
-                    "billing".to_string(),
-                    "monthly".to_string(),
-                )])],
-                on_exhausted: RoutingExhaustedActionV4::Stop,
-                ..RoutingNodeV4::default()
-            },
-        )]),
-        ..RoutingConfigV4::default()
-    };
+fn entry_routing_authoring_updates_entry_node() {
+    let mut routing = RouteGraphConfig::default();
 
-    routing.sync_graph_from_compat();
+    routing.set_entry_routing(
+        RouteStrategy::ManualSticky,
+        Some("monthly".to_string()),
+        vec!["monthly".to_string(), "paygo".to_string()],
+        Vec::new(),
+        RouteExhaustedAction::Continue,
+    );
 
-    let entry = routing.entry_node().expect("entry node should remain");
-    assert_eq!(entry.strategy, RoutingPolicyV4::TagPreferred);
+    let entry = routing.entry_node().expect("entry route should exist");
+    assert_eq!(entry.strategy, RouteStrategy::ManualSticky);
+    assert_eq!(entry.target.as_deref(), Some("monthly"));
     assert_eq!(
         entry.children,
         vec!["monthly".to_string(), "paygo".to_string()]
     );
-    assert_eq!(entry.on_exhausted, RoutingExhaustedActionV4::Stop);
-    assert_eq!(
-        entry.prefer_tags,
-        vec![BTreeMap::from([(
-            "billing".to_string(),
-            "monthly".to_string()
-        )])]
-    );
 }
 
 #[test]
-fn entry_routing_authoring_syncs_legacy_compat_fields() {
-    let mut routing = RoutingConfigV4::default();
-
-    routing.set_entry_routing(
-        RoutingPolicyV4::ManualSticky,
-        Some("monthly".to_string()),
-        vec!["monthly".to_string(), "paygo".to_string()],
-        Vec::new(),
-        RoutingExhaustedActionV4::Continue,
-    );
-
-    let entry = routing.entry_node().expect("entry route should exist");
-    assert_eq!(entry.strategy, RoutingPolicyV4::ManualSticky);
-    assert_eq!(entry.target.as_deref(), Some("monthly"));
-    assert_eq!(
-        routing.order,
-        vec!["monthly".to_string(), "paygo".to_string()]
-    );
-    assert_eq!(routing.target.as_deref(), Some("monthly"));
-}
-
-#[test]
-fn provider_reference_authoring_updates_entry_and_compat_fields() {
-    let mut routing = RoutingConfigV4::manual_sticky(
+fn provider_reference_authoring_updates_entry_node() {
+    let mut routing = RouteGraphConfig::manual_sticky(
         "monthly".to_string(),
         vec!["monthly".to_string(), "paygo".to_string()],
     );
@@ -158,9 +119,7 @@ fn provider_reference_authoring_updates_entry_and_compat_fields() {
     routing.remove_provider_references("monthly");
 
     let entry = routing.entry_node().expect("entry route should exist");
-    assert_eq!(entry.strategy, RoutingPolicyV4::OrderedFailover);
+    assert_eq!(entry.strategy, RouteStrategy::OrderedFailover);
     assert_eq!(entry.target, None);
     assert_eq!(entry.children, vec!["paygo".to_string()]);
-    assert_eq!(routing.target, None);
-    assert_eq!(routing.order, vec!["paygo".to_string()]);
 }

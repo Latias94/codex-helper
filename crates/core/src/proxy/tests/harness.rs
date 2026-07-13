@@ -60,13 +60,8 @@ pub(super) fn spawn_test_upstream(app: axum::Router) -> TestUpstreamServer {
     TestUpstreamServer { addr, handle }
 }
 
-pub(super) fn spawn_test_proxy(config: ProxyConfig) -> TestProxyServer {
-    let proxy = ProxyService::new(
-        Client::new(),
-        Arc::new(config),
-        "codex",
-        Arc::new(std::sync::Mutex::new(HashMap::new())),
-    );
+pub(super) fn spawn_test_proxy(config: HelperConfig) -> TestProxyServer {
+    let proxy = ProxyService::new(test_proxy_client(), Arc::new(config), "codex");
     spawn_proxy_service(proxy)
 }
 
@@ -76,13 +71,14 @@ pub(super) fn spawn_proxy_service(proxy: ProxyService) -> TestProxyServer {
     TestProxyServer { addr, handle }
 }
 
-pub(super) fn proxy_service(config: ProxyConfig) -> ProxyService {
-    ProxyService::new(
-        Client::new(),
-        Arc::new(config),
-        "codex",
-        Arc::new(std::sync::Mutex::new(HashMap::new())),
-    )
+pub(super) fn proxy_service(config: HelperConfig) -> ProxyService {
+    ProxyService::new(test_proxy_client(), Arc::new(config), "codex")
+}
+
+fn test_proxy_client() -> Client {
+    crate::proxy::upstream_http_client_builder()
+        .build()
+        .expect("build test proxy client")
 }
 
 pub(super) fn upstream_config(base_url: impl Into<String>) -> UpstreamConfig {
@@ -174,12 +170,7 @@ pub(super) struct BeginRequestTestBuilder<'a> {
     path: &'static str,
     session_id: Option<String>,
     session_identity_source: Option<crate::state::SessionIdentitySource>,
-    client_name: Option<String>,
-    client_addr: Option<String>,
-    cwd: Option<String>,
     model: Option<String>,
-    reasoning_effort: Option<String>,
-    service_tier: Option<String>,
     started_at_ms: u64,
 }
 
@@ -192,12 +183,7 @@ impl<'a> BeginRequestTestBuilder<'a> {
             path: "/v1/responses",
             session_id: None,
             session_identity_source: None,
-            client_name: None,
-            client_addr: None,
-            cwd: None,
             model: None,
-            reasoning_effort: None,
-            service_tier: None,
             started_at_ms: 0,
         }
     }
@@ -207,33 +193,13 @@ impl<'a> BeginRequestTestBuilder<'a> {
         self
     }
 
-    pub(super) fn client_name(mut self, value: impl Into<String>) -> Self {
-        self.client_name = Some(value.into());
-        self
-    }
-
-    pub(super) fn client_addr(mut self, value: impl Into<String>) -> Self {
-        self.client_addr = Some(value.into());
-        self
-    }
-
-    pub(super) fn cwd(mut self, value: impl Into<String>) -> Self {
-        self.cwd = Some(value.into());
+    pub(super) fn service(mut self, value: &'static str) -> Self {
+        self.service = value;
         self
     }
 
     pub(super) fn model(mut self, value: impl Into<String>) -> Self {
         self.model = Some(value.into());
-        self
-    }
-
-    pub(super) fn reasoning_effort(mut self, value: impl Into<String>) -> Self {
-        self.reasoning_effort = Some(value.into());
-        self
-    }
-
-    pub(super) fn service_tier(mut self, value: impl Into<String>) -> Self {
-        self.service_tier = Some(value.into());
         self
     }
 
@@ -250,12 +216,12 @@ impl<'a> BeginRequestTestBuilder<'a> {
                 self.path,
                 self.session_id,
                 self.session_identity_source,
-                self.client_name,
-                self.client_addr,
-                self.cwd,
+                None,
+                None,
+                None,
                 self.model,
-                self.reasoning_effort,
-                self.service_tier,
+                None,
+                None,
                 self.started_at_ms,
             )
             .await

@@ -7,6 +7,6 @@ pub mod registry;
 
 pub use model::*;
 pub use observer::{
-    build_local_fleet_snapshot, build_local_fleet_snapshot_from_dashboard,
-    build_local_fleet_snapshot_from_parts,
+    build_fleet_snapshot_from_operator_read_model,
+    build_local_fleet_snapshot_from_operator_read_model,
 };

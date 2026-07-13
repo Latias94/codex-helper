@@ -44,10 +44,6 @@ macro_rules! define_messages {
 
 define_messages! {
     LANGUAGE_LABEL => { zh: "语言：", en: "language: " },
-    LANGUAGE_SAVED => { zh: "（已保存）", en: " (saved)" },
-    LANGUAGE_SAVE_FAILED_PREFIX => { zh: "（保存失败：", en: " (save failed: " },
-    LANGUAGE_SAVE_FAILED_SUFFIX => { zh: "）", en: ")" },
-    LANGUAGE_TOGGLE_HINT => { zh: "  (按 L 切换，并落盘到 ui.language)", en: "  (press L to cycle and persist to ui.language)" },
 
     LANGUAGE_NAME_ZH => { zh: "中文", en: "Chinese" },
     LANGUAGE_NAME_EN => { zh: "English", en: "English" },
@@ -73,97 +69,36 @@ define_messages! {
     STATUS_ACTIVE_SHORT => { zh: "活跃 ", en: "active " },
     STATUS_ERRORS_SHORT => { zh: "错误(80) ", en: "errors(80) " },
     STATUS_CURRENT_SHORT => { zh: "当前 ", en: "cur " },
-    STATUS_HEALTH_CHECK_SHORT => { zh: "健康检查 ", en: "hc " },
-    STATUS_OVERRIDES_SHORT => { zh: "覆盖(M/E/C/T) ", en: "overrides(M/E/C/T) " },
-    STATUS_OVERRIDES_ROUTE_SHORT => { zh: "覆盖(M/E/R/T) ", en: "overrides(M/E/R/T) " },
-    STATUS_GLOBAL_STATION_OVERRIDE_SHORT => { zh: "覆盖(全局站点) ", en: "override(global station) " },
-    STATUS_GLOBAL_ROUTE_TARGET_SHORT => { zh: "覆盖(全局路由) ", en: "override(global route) " },
     STATUS_UPDATED_SHORT => { zh: "刷新 ", en: "updated " },
     STATUS_ACTIVE_TINY => { zh: "活 ", en: "act " },
     STATUS_ERRORS_TINY => { zh: "错 ", en: "err " },
     STATUS_UPDATED_TINY => { zh: "刷 ", en: "upd " },
 
-    OVERLAY_SESSION_PROVIDER_OVERRIDE => { zh: "会话 Provider 覆盖", en: "Session provider override" },
-    OVERLAY_GLOBAL_STATION_PIN => { zh: "全局站点 pin", en: "Global station pin" },
     OVERLAY_HELP_TITLE => { zh: "帮助", en: "Help" },
-    OVERLAY_STATION_DETAILS => { zh: "站点详情", en: "Station details" },
     OVERLAY_SESSION_TRANSCRIPT => { zh: "会话对话记录", en: "Session transcript" },
-    OVERLAY_SET_SESSION_MODEL => { zh: "设置 Session Model", en: "Set session model" },
-    OVERLAY_SET_SERVICE_TIER => { zh: "设置 Fast / Service Tier", en: "Set Fast / Service Tier" },
-    OVERLAY_INPUT_SESSION_MODEL => { zh: "输入自定义 Session Model", en: "Enter custom session model" },
-    OVERLAY_INPUT_SERVICE_TIER => { zh: "输入自定义 Service Tier", en: "Enter custom service tier" },
-    OVERLAY_MANAGE_RUNTIME_PROFILE => { zh: "管理运行时默认 Profile", en: "Manage runtime default profile" },
-    OVERLAY_MANAGE_CONFIGURED_PROFILE => { zh: "管理配置默认 Profile", en: "Manage configured default profile" },
-    OVERLAY_MANAGE_SESSION_PROFILE => { zh: "管理 Session Profile Binding", en: "Manage session profile binding" },
     OVERLAY_STARTUP_GUARDRAIL => { zh: "启动检查", en: "Startup guardrail" },
 
-    FOOTER_DASHBOARD => { zh: "1-9/0 页面  q 退出  L 语言  Tab 焦点  ↑/↓ 移动  b/M/f 覆盖  p/P 站点  ? 帮助", en: "1-9/0 pages  q quit  L language  Tab focus  ↑/↓ move  b/M/f overrides  p/P station  ? help" },
-    FOOTER_DASHBOARD_ROUTE_GRAPH => { zh: "1-9/0 页面  q 退出  L 语言  Tab 焦点  ↑/↓ 移动  b/M/f 覆盖  p/P 路由  ? 帮助", en: "1-9/0 pages  q quit  L language  Tab focus  ↑/↓ move  b/M/f overrides  p/P route  ? help" },
-    FOOTER_ROUTING => { zh: "1-9/0 页面  q 退出  L 语言  ↑/↓ provider  r/Enter 编辑  g 刷新余额  ? 帮助", en: "1-9/0 pages  q quit  L language  ↑/↓ provider  r/Enter edit  g refresh balances  ? help" },
-    FOOTER_STATIONS => { zh: "1-9/0 页面  q 退出  L 语言  ↑/↓ 选择  Enter pin  i 详情  h/H 检查  ? 帮助", en: "1-9/0 pages  q quit  L language  ↑/↓ select  Enter pin  i details  h/H check  ? help" },
+    FOOTER_DASHBOARD => { zh: "1-9/0 页面  q 退出  L 语言  Tab 焦点  ↑/↓ 移动  o/h 跳转  ? 帮助", en: "1-9/0 pages  q quit  L language  Tab focus  ↑/↓ move  o/h navigate  ? help" },
+    FOOTER_DASHBOARD_ROUTE_GRAPH => { zh: "1-9/0 页面  q 退出  L 语言  Tab 焦点  ↑/↓ 移动  o/h 跳转  ? 帮助", en: "1-9/0 pages  q quit  L language  Tab focus  ↑/↓ move  o/h navigate  ? help" },
+    FOOTER_ROUTING => { zh: "1-9/0 页面  q 退出  L 语言  ↑/↓ provider  i 详情  ? 帮助", en: "1-9/0 pages  q quit  L language  ↑/↓ provider  i details  ? help" },
+    FOOTER_STATIONS => { zh: "1-9/0 页面  q 退出  L 语言  ↑/↓ 选择  i 详情  ? 帮助", en: "1-9/0 pages  q quit  L language  ↑/↓ select  i details  ? help" },
     FOOTER_REQUESTS => { zh: "1-9/0 页面  q 退出  L 语言  ↑/↓ 选择  e 错误  s scope  o/h 跳转  ? 帮助", en: "1-9/0 pages  q quit  L language  ↑/↓ select  e errors  s scope  o/h navigate  ? help" },
-    FOOTER_SESSIONS => { zh: "1-9/0 页面  q 退出  L 语言  ↑/↓ 选择  b/M/f 覆盖  a/e/v 筛选  t 记录  ? 帮助", en: "1-9/0 pages  q quit  L language  ↑/↓ select  b/M/f overrides  a/e/v filters  t transcript  ? help" },
-    FOOTER_STATS => { zh: "1-9/0 页面  q 退出  L 语言  Tab 站点/提供商  ↑/↓ 选择  ? 帮助", en: "1-9/0 pages  q quit  L language  Tab station/provider  ↑/↓ select  ? help" },
-    FOOTER_SETTINGS_CODEX => { zh: "1-9/0 页面  q 退出  L 语言  p/P profile  R 重载  O 导入  B/I/F/V/D patch  C 诊断  ? 帮助", en: "1-9/0 pages  q quit  L language  p/P profile  R reload  O import  B/I/F/V/D patch  C diagnose  ? help" },
-    FOOTER_SETTINGS_OTHER => { zh: "1-9/0 页面  q 退出  L 语言  p/P profile  R 重载  ? 帮助", en: "1-9/0 pages  q quit  L language  p/P profile  R reload  ? help" },
+    FOOTER_SESSIONS => { zh: "1-9/0 页面  q 退出  L 语言  ↑/↓ 选择  a/e/v 筛选  t 记录  ? 帮助", en: "1-9/0 pages  q quit  L language  ↑/↓ select  a/e/v filters  t transcript  ? help" },
+    FOOTER_STATS => { zh: "1-9/0 页面  q 退出  L 语言  Tab endpoint/provider  ↑/↓ 选择  y 导出  ? 帮助", en: "1-9/0 pages  q quit  L language  Tab endpoint/provider  ↑/↓ select  y export  ? help" },
+    FOOTER_SETTINGS_CODEX => { zh: "1-9/0 页面  q 退出  L 语言  n/o 本地 Codex switch  ? 帮助", en: "1-9/0 pages  q quit  L language  n/o local Codex switch  ? help" },
+    FOOTER_SETTINGS_OTHER => { zh: "1-9/0 页面  q 退出  L 语言  ? 帮助", en: "1-9/0 pages  q quit  L language  ? help" },
     FOOTER_HISTORY => { zh: "1-9/0 页面  q 退出  L 语言  ↑/↓ 选择  r 刷新  t/Enter 记录  s/f 跳转  ? 帮助", en: "1-9/0 pages  q quit  L language  ↑/↓ select  r refresh  t/Enter transcript  s/f navigate  ? help" },
     FOOTER_RECENT => { zh: "1-9/0 页面  q 退出  L 语言  ↑/↓ 选择  [] 时间  Enter/y 复制  t 记录  s/f/h 跳转  ? 帮助", en: "1-9/0 pages  q quit  L language  ↑/↓ select  [] window  Enter/y copy  t transcript  s/f/h navigate  ? help" },
     FOOTER_FLEET => { zh: "1-9/0 页面  q 退出  L 语言  Tab 视图  ↑/↓ 选择  ? 帮助", en: "1-9/0 pages  q quit  L language  Tab view  ↑/↓ select  ? help" },
     FOOTER_SERVICE_STATUS => { zh: "1-9/0 页面  q 退出  L 语言  r 刷新状态  ? 帮助", en: "1-9/0 pages  q quit  L language  r refresh status  ? help" },
     FOOTER_HELP => { zh: "Esc 关闭帮助  L 语言", en: "Esc close help  L language" },
-    FOOTER_SELECT_APPLY => { zh: "↑/↓ 选择  Enter 应用  Esc 取消", en: "↑/↓ select  Enter apply  Esc cancel" },
-    FOOTER_MODEL_MENU => { zh: "↑/↓ 选择 model  Enter 应用  Esc 取消", en: "↑/↓ select model  Enter apply  Esc cancel" },
-    FOOTER_MODEL_INPUT => { zh: "输入 model  Enter 应用  Esc 返回菜单  Backspace 删除  Delete/Ctrl+U 清空", en: "type model  Enter apply  Esc back to menu  Backspace delete  Delete/Ctrl+U clear" },
-    FOOTER_SERVICE_TIER_MENU => { zh: "↑/↓ 选择 service tier  Enter 应用  Esc 取消", en: "↑/↓ select service tier  Enter apply  Esc cancel" },
-    FOOTER_SERVICE_TIER_INPUT => { zh: "输入 service_tier  Enter 应用  Esc 返回菜单  Backspace 删除  Delete/Ctrl+U 清空", en: "type service_tier  Enter apply  Esc back to menu  Backspace delete  Delete/Ctrl+U clear" },
-    FOOTER_PROFILE_SESSION => { zh: "↑/↓ 选择 profile 操作  Enter 应用/清除绑定  Esc 取消", en: "↑/↓ select profile action  Enter apply/clear binding  Esc cancel" },
-    FOOTER_PROFILE_RUNTIME => { zh: "↑/↓ 选择运行时默认 profile  Enter 应用/清除覆盖  Esc 取消", en: "↑/↓ select runtime default profile  Enter apply/clear override  Esc cancel" },
-    FOOTER_PROFILE_CONFIGURED => { zh: "↑/↓ 选择配置默认 profile  Enter 应用/清除默认值  Esc 取消", en: "↑/↓ select configured default profile  Enter apply/clear default  Esc cancel" },
-    FOOTER_ROUTING_MENU => { zh: "↑/↓ 选择  Enter pin  a 顺序  e/f/s 策略  1/2/0 billing  []/u/d 重排  g 刷新  Esc 关闭", en: "↑/↓ select  Enter pin  a order  e/f/s policy  1/2/0 billing  []/u/d reorder  g refresh  Esc close" },
     FOOTER_STATION_INFO => { zh: "↑/↓ 滚动  PgUp/PgDn 翻页  Esc 关闭  L 语言", en: "↑/↓ scroll  PgUp/PgDn page  Esc close  L language" },
     FOOTER_SESSION_TRANSCRIPT => { zh: "↑/↓ 滚动  PgUp/PgDn 翻页  g/G 顶/底  A 全量/尾部  y 复制  t/Esc 关闭  L 语言", en: "↑/↓ scroll  PgUp/PgDn page  g/G top/bottom  A all/tail  y copy  t/Esc close  L language" },
     FOOTER_STARTUP_GUARDRAIL => { zh: "Esc/Enter 关闭启动检查  L 语言", en: "Esc/Enter close startup guardrail  L language" },
 
-    DECLARED_LABEL => { zh: "声明：", en: "declared:" },
-    RESOLVED_LABEL => { zh: "生效：", en: "resolved:" },
-    RESOLVE_FAILED_LABEL => { zh: "解析失败：", en: "resolve failed:" },
-    SESSION_LABEL => { zh: "会话：", en: "session: " },
-    PINNED_LABEL => { zh: "固定：", en: "pinned: " },
     KEYS_LABEL => { zh: "按键：", en: "keys: " },
-    ALIAS_LABEL => { zh: "别名：", en: "alias: " },
-    STATUS_LABEL => { zh: "状态：", en: "status: " },
-    ENABLED_LABEL => { zh: "启用", en: "enabled" },
-    DISABLED_LABEL => { zh: "禁用", en: "disabled" },
-    RUNTIME_HEALTH_TITLE => { zh: "运行态（可用性/体验）", en: "Runtime health / experience" },
-    OK_PREFIX => { zh: "成功 ", en: "ok " },
-    UPSTREAMS_TITLE => { zh: "上游（Providers）", en: "Upstreams (providers)" },
     NONE_PARENS => { zh: "（无）", en: "(none)" },
-    NOT_CHECKED => { zh: "未检查", en: "not checked" },
-    MODELS_ALL => { zh: "模型：全部", en: "models: all" },
-    NO_STATION_SELECTED => { zh: "未选中任何站点。", en: "No station selected." },
     NO_TRANSCRIPT_MESSAGES => { zh: "未找到可展示的对话消息（可能该会话不在 ~/.codex/sessions，或格式发生变化）。", en: "No displayable transcript messages were found; the session may be outside ~/.codex/sessions or the format changed." },
-    CURRENT_INPUT_LABEL => { zh: "当前输入: ", en: "current: " },
-    SESSION_MODEL_HINT_LABEL => { zh: "当前会话模型: ", en: "session hint: " },
-    SESSION_TIER_HINT_LABEL => { zh: "当前会话 tier: ", en: "session hint: " },
-    CLEAR_MODEL_OVERRIDE => { zh: "Clear (清除会话 model 覆盖)", en: "Clear (remove session model override)" },
-    RESTORE_DEFAULT_ROUTING => { zh: "恢复为 request / binding / runtime 的默认路由", en: "Restore the request / binding / runtime default route" },
-    APPLY_SESSION_MODEL_OVERRIDE => { zh: "应用为当前会话的 model override", en: "Apply as the current session model override" },
-    CUSTOM_MODEL => { zh: "Custom...（输入任意 model）", en: "Custom... (enter any model)" },
-    CUSTOM_MODEL_HELP => { zh: "打开输入框，手动填写 model override", en: "Open an input box to enter a model override" },
-    MODEL_INPUT_HELP => { zh: "输入任意 model 名称。Enter 应用，Esc 返回菜单，Backspace 删除，Delete / Ctrl+U 清空。空值会清除会话 model 覆盖。", en: "Enter any model name. Enter applies, Esc returns to the menu, Backspace deletes, Delete / Ctrl+U clears. Empty input clears the session model override." },
-    CLEAR_SERVICE_TIER_OVERRIDE => { zh: "移除当前会话的 service tier 覆盖", en: "Remove the current session service tier override" },
-    USE_DEFAULT_SERVICE_TIER => { zh: "显式使用 default", en: "Explicitly use default" },
-    USE_PRIORITY_SERVICE_TIER => { zh: "通常可视为 fast mode", en: "Usually maps to fast mode" },
-    USE_FLEX_SERVICE_TIER => { zh: "显式使用 flex", en: "Explicitly use flex" },
-    CUSTOM_SERVICE_TIER => { zh: "Custom...（输入任意 service_tier）", en: "Custom... (enter any service_tier)" },
-    CUSTOM_SERVICE_TIER_HELP => { zh: "打开输入框，手动填写 service_tier override", en: "Open an input box to enter a service_tier override" },
-    SERVICE_TIER_INPUT_HELP => { zh: "输入任意 service_tier。Enter 应用，Esc 返回菜单，Backspace 删除，Delete / Ctrl+U 清空。空值会清除会话 service_tier 覆盖。", en: "Enter any service_tier. Enter applies, Esc returns to the menu, Backspace deletes, Delete / Ctrl+U clears. Empty input clears the session service_tier override." },
-    CLEAR_RUNTIME_PROFILE => { zh: "Clear runtime override（回退到配置默认 profile）", en: "Clear runtime override (fall back to configured default profile)" },
-    CLEAR_RUNTIME_PROFILE_HELP => { zh: "只清理运行时 default_profile 覆盖；保留配置文件里的 default_profile", en: "Only clears the runtime default_profile override; keeps the configured default_profile" },
-    CLEAR_CONFIGURED_PROFILE => { zh: "Clear configured default（移除配置默认 profile）", en: "Clear configured default (remove configured default profile)" },
-    CLEAR_CONFIGURED_PROFILE_HELP => { zh: "会修改并重载代理配置；新的会话将不再继承配置级 default_profile", en: "Edits and reloads proxy config; new sessions stop inheriting the configured default_profile" },
-    CLEAR_SESSION_PROFILE_BINDING => { zh: "Clear binding（移除会话已存储的 profile 绑定）", en: "Clear binding (remove stored session profile binding)" },
-    CLEAR_SESSION_PROFILE_BINDING_HELP => { zh: "只清理 profile binding；保留当前会话的 model / effort / provider / service_tier 覆盖", en: "Only clears the profile binding; keeps the current session model / effort / provider / service_tier overrides" },
 
     HISTORY_TITLE => { zh: "历史会话 (Codex 全局)", en: "History sessions (Codex global)" },
     RECENT_TITLE => { zh: "最近会话 (Codex 全局)", en: "Recent sessions (Codex global)" },
@@ -178,49 +113,19 @@ define_messages! {
     RECENT_KEYS_NAV => { zh: "  s 打开到 Sessions  f 打开到 Requests  h 打开到 History", en: "  s open Sessions  f open Requests  h open History" },
     NO_SELECTION => { zh: "未选中任何条目。", en: "No selection." },
 
-    SETTINGS_TITLE => { zh: "设置", en: "Settings" },
-    RUNTIME_OVERVIEW_TITLE => { zh: "运行态概览", en: "Runtime overview" },
-    BALANCE_OVERVIEW_TITLE => { zh: "余额 / 配额概览", en: "Balance / quota overview" },
-    PRICING_CATALOG_TITLE => { zh: "价格目录", en: "Pricing catalog" },
     TUI_OPTIONS_TITLE => { zh: "TUI 选项", en: "TUI options" },
-    REFRESH_LABEL => { zh: "刷新间隔：", en: "refresh: " },
-    WINDOW_SAMPLES_LABEL => { zh: "窗口采样：", en: "window samples: " },
     PROFILE_CONTROL_TITLE => { zh: "Profile 控制", en: "Profile control" },
     CONFIGURED_DEFAULT_LABEL => { zh: "配置默认：", en: "configured default: " },
-    PRESS_P_MANAGE => { zh: "  (按 p 管理)", en: "  (press p to manage)" },
-    RUNTIME_OVERRIDE_LABEL => { zh: "运行时覆盖：", en: "runtime override: " },
-    PRESS_CAPITAL_P_MANAGE => { zh: "  (按 P 管理)", en: "  (press P to manage)" },
     EFFECTIVE_DEFAULT_LABEL => { zh: "当前生效：", en: "effective default: " },
     NO_PROFILES => { zh: "<no profiles>", en: "<no profiles>" },
     AVAILABLE_PROFILES_LABEL => { zh: "可用 profile：", en: "available profiles: " },
-    HEALTH_CHECK_TITLE => { zh: "Health Check", en: "Health Check" },
-    PATHS_TITLE => { zh: "路径", en: "Paths" },
-    RUNTIME_CONFIG_TITLE => { zh: "运行态配置", en: "Runtime config" },
-    PRESS_R_RELOAD => { zh: "  (按 R 立即重载)", en: "  (press R to reload)" },
-    COMMON_KEYS_TITLE => { zh: "常用快捷键", en: "Common keys" },
-    COMMON_KEYS_CODEX => { zh: "  1-9/0 切页  ? 帮助  q 退出  L 语言  (Stations: i 详情  Usage: y 导出/复制  Settings: R 重载  O 覆盖导入  C 诊断  B/I/F/V/D patch)", en: "  1-9/0 pages  ? help  q quit  L language  (Stations: i details  Usage: y export/copy  Settings: R reload  O overwrite  C diagnose  B/I/F/V/D patch)" },
-    COMMON_KEYS_OTHER => { zh: "  1-9/0 切页  ? 帮助  q 退出  L 语言  (Stations: i 详情  Usage: y 导出/复制)", en: "  1-9/0 pages  ? help  q quit  L language  (Stations: i details  Usage: y export/copy)" },
-
-    CONFIRM_OVERWRITE => { zh: "再次按 O 确认覆盖导入（3s 内）", en: "Press O again to confirm overwrite (within 3s)" },
-    CONFIG_RELOADED => { zh: "已重载配置（", en: "Config reloaded (" },
-    CONFIG_CHANGED => { zh: "检测到变更", en: "changed" },
-    CONFIG_NO_CHANGE => { zh: "无变更", en: "no change" },
-    CONFIG_RELOADED_SUFFIX => { zh: "）", en: ")" },
     HISTORY_REFRESHING => { zh: "history: 刷新中…", en: "history: refreshing…" },
     RECENT_REFRESHING => { zh: "recent: 刷新中…", en: "recent: refreshing…" },
-    PROFILE_NO_OPTIONS => { zh: "profile: 当前服务没有可用 profile", en: "profile: no profiles available for this service" },
-    DEFAULT_PROFILE_NO_OPTIONS => { zh: "default profile: 当前服务没有可用 profile", en: "default profile: no profiles available for this service" },
-    DEFAULT_PROFILE_MANAGE_CONFIGURED => { zh: "default profile: 管理配置默认值", en: "default profile: manage configured default" },
-    RUNTIME_DEFAULT_PROFILE_NO_OPTIONS => { zh: "runtime default profile: 当前服务没有可用 profile", en: "runtime default profile: no profiles available for this service" },
-    RUNTIME_DEFAULT_PROFILE_MANAGE => { zh: "runtime default profile: 管理运行时默认值", en: "runtime default profile: manage runtime default" },
-    MODEL_NO_CATALOG => { zh: "model: 当前服务没有可用模型目录", en: "model: no model catalog available for this service" },
     RECENT_COPIED_SELECTED => { zh: "recent: 已复制选中条目", en: "recent: copied selected entry" },
     RECENT_SESSION_NOT_OBSERVED => { zh: "sessions: 当前 runtime 未观测到这个 recent session", en: "sessions: this recent session is not observed by the current runtime" },
     RECENT_COPIED_VISIBLE => { zh: "recent: 已复制可见列表", en: "recent: copied visible list" },
     SESSION_NOT_OBSERVED => { zh: "sessions: 当前 runtime 未观测到这个 session", en: "sessions: this session is not observed by the current runtime" },
     HISTORY_NO_TRANSCRIPT_FILE => { zh: "history: 当前选中项没有本地 transcript 文件", en: "history: selected item has no local transcript file" },
-
-    ROUTING_ACTION_PROVIDER_DETAILS => { zh: "  i            Provider 详情（可滚动）", en: "  i            provider details (scrollable)" },
 }
 
 fn lookup(table: &'static [(&'static str, &'static str)], key: TextKey) -> Option<&'static str> {
@@ -257,9 +162,6 @@ fn zh_label(en: &'static str) -> Option<&'static str> {
         "Balance / quota" => "余额 / 配额",
         "Balance/Quota" => "余额/配额",
         "Cache & speed" => "缓存 / 速度",
-        "Clear override" => "清除覆盖",
-        "Clear (use request value)" => "清除（使用请求值）",
-        "Clear (use request/binding value)" => "清除（使用请求/绑定值）",
         "CNew" => "新缓存",
         "CRead" => "读缓存",
         "CWD" => "目录",
@@ -325,8 +227,6 @@ fn zh_label(en: &'static str) -> Option<&'static str> {
         "assistant" => "助手",
         "auth" => "认证",
         "auto" => "自动",
-        "auto(level fallback)" => "自动（按级别回退）",
-        "auto(single-level fallback)" => "自动（同级回退）",
         "attention only" => "仅关注项",
         "avg" => "平均",
         "balance" => "余额",
@@ -369,9 +269,6 @@ fn zh_label(en: &'static str) -> Option<&'static str> {
         "disabled" => "已禁用",
         "done" => "完成",
         "effort" => "推理强度",
-        "effort override" => "推理强度覆盖",
-        "effort override cleared" => "推理强度覆盖已清除",
-        "effort set" => "推理强度已设置",
         "enabled" => "启用",
         "err" => "错误",
         "error" => "错误",
@@ -391,9 +288,6 @@ fn zh_label(en: &'static str) -> Option<&'static str> {
         "generation" => "生成",
         "global" => "全局",
         "global override" => "全局覆盖",
-        "global station pin" => "全局站点 pin",
-        "global route target" => "全局 route target",
-        "global_station" => "全局站点",
         "health_check" => "健康检查",
         "health" => "健康",
         "health check already running" => "健康检查已在运行",
@@ -429,10 +323,8 @@ fn zh_label(en: &'static str) -> Option<&'static str> {
         "messages" => "消息",
         "meta" => "元数据",
         "method" => "方法",
-        "missing_pinned_station" => "缺少固定站点",
         "mode" => "模式",
         "model" => "模型",
-        "model override" => "模型覆盖",
         "models" => "模型",
         "mtime" => "修改时间",
         "name" => "名称",
@@ -451,7 +343,7 @@ fn zh_label(en: &'static str) -> Option<&'static str> {
         "no session selected" => "未选择会话",
         "no transcript file loaded" => "未加载对话记录文件",
         "no host-local transcript detected" => "未检测到本机 transcript",
-        "no stored binding or session override" => "没有已存储绑定或会话覆盖",
+        "no stored profile binding" => "没有已存储的 profile 绑定",
         "no_upstreams" => "没有可路由上游",
         "now" => "当前",
         "observed bridge" => "观测桥接",
@@ -461,13 +353,7 @@ fn zh_label(en: &'static str) -> Option<&'static str> {
         "on_exhausted" => "耗尽策略",
         "off" => "关",
         "order" => "顺序",
-        "order_rule" => "排序规则",
         "out_tok/s" => "输出 tok/s",
-        "overwrite-from-codex is only supported for Codex service" => {
-            "overwrite-from-codex 仅支持 Codex 服务"
-        }
-        "override" => "覆盖",
-        "overrides_only" => "仅覆盖",
         "partial" => "部分",
         "partial_exhausted" => "部分耗尽",
         "path" => "路径",
@@ -480,6 +366,7 @@ fn zh_label(en: &'static str) -> Option<&'static str> {
         "profile binding cleared" => "profile 绑定已清除",
         "profile default" => "profile 默认值",
         "provider" => "提供商",
+        "provider endpoint" => "提供商端点",
         "probe" => "探针",
         "probes" => "探针",
         "provider enable failed" => "provider 启用失败",
@@ -552,22 +439,6 @@ fn zh_label(en: &'static str) -> Option<&'static str> {
         "rt" => "运行态",
         "route graph" => "路由图",
         "routing" => "路由",
-        "routing update failed" => "routing 更新失败",
-        "routing: apply failed" => "routing: 应用失败",
-        "routing spec not loaded" => "routing 规格未加载",
-        "routing: edit persisted policy/order" => "routing: 编辑持久化策略/顺序",
-        "routing: edit provider policy/order/tags" => "routing: 编辑 provider 策略/顺序/标签",
-        "routing: load failed" => "routing: 加载失败",
-        "routing: move failed" => "routing: 移动失败",
-        "routing: moved down" => "routing: 已下移",
-        "routing: moved up" => "routing: 已上移",
-        "routing: ordered-failover" => "routing: ordered-failover",
-        "routing: pin failed" => "routing: pin 失败",
-        "routing: pinned" => "routing: 已 pin",
-        "routing: prefer billing=monthly" => "routing: 优先 billing=monthly",
-        "routing: provider details/edit" => "routing: provider 详情/编辑",
-        "routing: refresh failed" => "routing: 刷新失败",
-        "routing: refreshed" => "routing: 已刷新",
         "run" => "运行",
         "running" => "运行中",
         "runtime default profile" => "运行时默认 profile",
@@ -579,18 +450,8 @@ fn zh_label(en: &'static str) -> Option<&'static str> {
         "session_affinity" => "会话粘性",
         "selected window starts before loaded log data" => "所选窗口早于已加载日志数据",
         "selected session has no session id" => "所选会话没有 session id",
-        "set global pin failed" => "设置全局 pin 失败",
-        "set global route target failed" => "设置全局 route target 失败",
         "session" => "会话",
-        "session-controlled route" => "会话控制路由",
-        "session manual overrides reset" => "会话手动覆盖已重置",
         "session override" => "会话覆盖",
-        "session overrides already clear" => "会话覆盖已为空",
-        "session station override" => "会话站点覆盖",
-        "session station override: <clear>" => "会话站点覆盖：<清除>",
-        "session station override: <no session>" => "会话站点覆盖：<无会话>",
-        "session route target" => "会话 route target",
-        "session route target: <no session>" => "会话 route target：<无会话>",
         "route_target" => "路由目标",
         "fleet view" => "fleet 视图",
         "sessions filter" => "sessions 筛选",
@@ -608,7 +469,7 @@ fn zh_label(en: &'static str) -> Option<&'static str> {
         "source" => "来源",
         "stale" => "过期",
         "station" => "站点",
-        "station mapping" => "站点映射",
+        "provider mapping" => "提供商映射",
         "status" => "状态",
         "strategy" => "策略",
         "stream" => "流式",
@@ -652,38 +513,19 @@ fn zh_label(en: &'static str) -> Option<&'static str> {
         "unlimited" => "不限量",
         "used" => "已用",
         "usd" => "USD",
-        "v4 routing owns provider choice; press r to edit routing" => {
-            "v4 routing 接管 provider 选择；按 r 编辑路由"
-        }
-        "v4 routing is global; editing persisted routing" => {
-            "v4 routing 是全局配置；正在编辑持久化 routing"
-        }
         "window" => "窗口",
         "yes" => "是",
         "pinned target only; breaker_open / empty upstreams block." => {
             "仅固定目标；breaker_open 或空上游会阻断。"
         }
-        "known fully exhausted stations are demoted by default; provider-level exceptions only show balance/quota." => {
-            "默认降低已知完全耗尽站点的优先级；provider 级例外只展示余额/配额。"
+        "This session keeps its stored profile binding while runtime observations explain the effective route." => {
+            "该会话保留已存储的 profile 绑定，生效路由由运行时观测解释。"
         }
-        "known fully exhausted stations are demoted by default unless a provider opts out of routing trust." => {
-            "默认降低已知完全耗尽站点的优先级，除非 provider 不信任余额参与路由。"
+        "Effective route comes from request payloads, profile defaults, and runtime fallback." => {
+            "生效路由来自请求负载、profile 默认值和运行时回退。"
         }
-        "This session keeps its stored binding until another profile or override rewrites it." => {
-            "该会话会保留已存储绑定，直到其他 profile 或覆盖写入新值。"
-        }
-        "Session overrides currently take priority over the bound profile:" => {
-            "当前优先生效的是会话覆盖字段："
-        }
-        "This session is currently pinned by overrides on:" => "该会话当前由这些覆盖字段固定：",
-        "Without a stored profile or session override, runtime/global routing explains the effective route." => {
-            "没有已存储 profile 或会话覆盖时，生效路由由运行态/全局路由解释。"
-        }
-        "Effective route comes from request payloads, station defaults, and runtime fallback." => {
-            "生效路由来自请求负载、站点默认值和运行时回退。"
-        }
-        "Effective route comes from request payloads, route graph defaults, route target overrides, and runtime fallback." => {
-            "生效路由来自请求负载、路由图默认值、route target 覆盖和运行时回退。"
+        "Effective route comes from request payloads, route graph defaults, and runtime fallback." => {
+            "生效路由来自请求负载、路由图默认值和运行时回退。"
         }
         _ => return None,
     })
@@ -703,35 +545,14 @@ pub(crate) fn next_language(lang: Language) -> Language {
     }
 }
 
-pub(crate) fn storage_code(lang: Language) -> &'static str {
-    match lang {
-        Language::Zh => "zh-CN",
-        Language::En => "en-US",
+pub(crate) fn format_language_changed(current_lang: Language, selected_lang: Language) -> String {
+    match current_lang {
+        Language::Zh => format!("语言：{}（仅当前 TUI 会话）", language_name(selected_lang)),
+        Language::En => format!(
+            "language: {} (current TUI session only)",
+            language_name(selected_lang)
+        ),
     }
-}
-
-pub(crate) fn format_language_saved(current_lang: Language, selected_lang: Language) -> String {
-    format!(
-        "{}{}{}",
-        text(current_lang, msg::LANGUAGE_LABEL),
-        language_name(selected_lang),
-        text(current_lang, msg::LANGUAGE_SAVED)
-    )
-}
-
-pub(crate) fn format_language_save_failed(
-    current_lang: Language,
-    selected_lang: Language,
-    err: &dyn std::fmt::Display,
-) -> String {
-    format!(
-        "{}{}{}{}{}",
-        text(current_lang, msg::LANGUAGE_LABEL),
-        language_name(selected_lang),
-        text(current_lang, msg::LANGUAGE_SAVE_FAILED_PREFIX),
-        err,
-        text(current_lang, msg::LANGUAGE_SAVE_FAILED_SUFFIX)
-    )
 }
 
 pub(crate) fn format_history_loaded(lang: Language, count: usize) -> String {
@@ -760,19 +581,6 @@ pub(crate) fn format_recent_load_failed(lang: Language, err: &dyn std::fmt::Disp
         Language::Zh => format!("recent: 加载失败：{err}"),
         Language::En => format!("recent: load failed: {err}"),
     }
-}
-
-pub(crate) fn format_config_reloaded(lang: Language, changed: bool) -> String {
-    format!(
-        "{}{}{}",
-        text(lang, msg::CONFIG_RELOADED),
-        if changed {
-            text(lang, msg::CONFIG_CHANGED)
-        } else {
-            text(lang, msg::CONFIG_NO_CHANGE)
-        },
-        text(lang, msg::CONFIG_RELOADED_SUFFIX)
-    )
 }
 
 pub fn parse_language(s: &str) -> Option<Language> {

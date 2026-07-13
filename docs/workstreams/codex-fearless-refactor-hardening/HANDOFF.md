@@ -3,6 +3,8 @@
 Status: Complete
 Last updated: 2026-05-28
 
+> Historical status (superseded 2026-07-12): JSONL files are now bounded post-commit debug output only, while the helper-owned SQLite store is the request-ledger authority. Route compatibility fields, schema migration readers, and wrapper-owned production ledger reads described below were removed by canonical relay/runtime modernization.
+
 Current task: none
 
 ## Continuation Notes

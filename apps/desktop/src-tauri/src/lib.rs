@@ -26,23 +26,13 @@ pub fn run() {
             commands::app::quit_app,
             commands::app::show_main_window,
             commands::app::toggle_main_window_maximized,
-            commands::control::apply_provider_runtime_override,
-            commands::control::apply_session_overrides,
             commands::control::attach_existing_proxy,
             commands::control::get_desktop_control_state,
-            commands::control::probe_station,
-            commands::control::refresh_provider_balances,
-            commands::control::reload_runtime,
-            commands::control::reset_session_overrides,
-            commands::control::set_global_route_override,
             commands::control::start_desktop_proxy,
-            commands::control::stop_proxy,
             commands::control::switch_codex,
             commands::paths::export_config,
             commands::paths::get_known_paths,
-            commands::paths::import_config,
             commands::paths::open_known_path,
-            commands::providers::save_common_provider,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run codex-helper desktop client");

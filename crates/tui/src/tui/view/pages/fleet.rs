@@ -443,10 +443,9 @@ fn push_unit_details(
     ));
     lines.push(kv_line(
         p,
-        l("station"),
-        unit.station_name
+        l("provider"),
+        unit.provider_id
             .as_deref()
-            .or(unit.provider_id.as_deref())
             .map(|value| shorten_middle(value, 48))
             .unwrap_or_else(|| "-".to_string()),
         Style::default().fg(p.text),

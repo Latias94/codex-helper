@@ -3,24 +3,26 @@ use std::time::Instant;
 
 use tokio::sync::mpsc;
 
-use crate::config::ProxyConfig;
-use crate::control_plane_client::ControlPlaneClient;
-use crate::state::ProxyState;
+use crate::config::HelperConfig;
+use crate::dashboard_core::OperatorReadModel;
 use codex_helper_core::fleet::merge::merge_fleet_snapshots;
 use codex_helper_core::fleet::poller::{node_snapshot_from_poll_result, poll_fleet_node};
-use codex_helper_core::fleet::{FleetSnapshot, build_local_fleet_snapshot, now_ms};
+use codex_helper_core::fleet::{
+    FleetNodeKind, FleetSnapshot, build_fleet_snapshot_from_operator_read_model,
+    build_local_fleet_snapshot_from_operator_read_model, now_ms,
+};
 
 use super::state::UiState;
 
 #[derive(Debug, Clone)]
 pub(super) enum FleetRefreshSource {
     Integrated {
-        state: Arc<ProxyState>,
-        cfg: Arc<ProxyConfig>,
-        service_name: &'static str,
+        model: Box<OperatorReadModel>,
+        cfg: Arc<HelperConfig>,
     },
     Attached {
-        client: ControlPlaneClient,
+        model: Box<OperatorReadModel>,
+        admin_base_url: String,
     },
 }
 
@@ -86,22 +88,29 @@ async fn load_fleet_snapshot(
     previous: Option<FleetSnapshot>,
 ) -> anyhow::Result<FleetSnapshot> {
     match source {
-        FleetRefreshSource::Integrated {
-            state,
-            cfg,
-            service_name,
-        } => load_integrated_fleet_snapshot(state, cfg, service_name, previous).await,
-        FleetRefreshSource::Attached { client } => Ok(client.fleet_snapshot().await?),
+        FleetRefreshSource::Integrated { model, cfg } => {
+            load_integrated_fleet_snapshot(model, cfg, previous).await
+        }
+        FleetRefreshSource::Attached {
+            model,
+            admin_base_url,
+        } => Ok(build_fleet_snapshot_from_operator_read_model(
+            &model,
+            "local",
+            "local",
+            FleetNodeKind::Local,
+            Some(admin_base_url),
+        )),
     }
 }
 
 async fn load_integrated_fleet_snapshot(
-    state: Arc<ProxyState>,
-    cfg: Arc<ProxyConfig>,
-    service_name: &'static str,
+    model: Box<OperatorReadModel>,
+    cfg: Arc<HelperConfig>,
     previous: Option<FleetSnapshot>,
 ) -> anyhow::Result<FleetSnapshot> {
-    let local = build_local_fleet_snapshot(&state, service_name, "local", "local").await;
+    let service_name = model.service_name.clone();
+    let local = build_local_fleet_snapshot_from_operator_read_model(&model, "local", "local");
     let mut snapshots = vec![local];
     let mut remote_nodes = Vec::new();
     let previous_nodes = previous
@@ -119,7 +128,7 @@ async fn load_integrated_fleet_snapshot(
         if node_id == "local" {
             continue;
         }
-        let result = poll_fleet_node(node_id, node).await;
+        let result = poll_fleet_node(&service_name, node_id, node).await;
         let node_snapshot = node_snapshot_from_poll_result(
             node_id,
             result,
@@ -137,7 +146,7 @@ async fn load_integrated_fleet_snapshot(
         });
     }
 
-    Ok(merge_fleet_snapshots(service_name, snapshots))
+    Ok(merge_fleet_snapshots(&service_name, snapshots))
 }
 
 fn fleet_refreshing_message(lang: super::Language) -> String {
@@ -222,7 +231,6 @@ mod tests {
                 task_name: Some("keep me".to_string()),
                 cwd: None,
                 model: None,
-                station_name: None,
                 provider_id: None,
                 last_status: None,
                 active_started_at_ms: None,
@@ -251,5 +259,24 @@ mod tests {
         assert_eq!(snapshot.last_error.as_deref(), Some("timeout"));
         assert_eq!(snapshot.work_units.len(), 1);
         assert!(snapshot.stale_since_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn attached_fleet_refresh_projects_the_current_operator_bundle() {
+        let snapshot = load_fleet_snapshot(
+            FleetRefreshSource::Attached {
+                model: Box::new(OperatorReadModel::auth_required("codex")),
+                admin_base_url: "https://admin.example".to_string(),
+            },
+            None,
+        )
+        .await
+        .expect("attached fleet snapshot");
+
+        assert_eq!(snapshot.service_name, "codex");
+        assert_eq!(snapshot.nodes.len(), 1);
+        assert_eq!(snapshot.nodes[0].health, FleetNodeHealth::AuthFailed);
+        assert!(snapshot.nodes[0].work_units.is_empty());
+        assert!(snapshot.nodes[0].active_endpoint.is_none());
     }
 }

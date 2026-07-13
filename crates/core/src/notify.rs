@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
 
 use crate::config::{NotifyConfig, NotifyPolicyConfig, load_config, proxy_home_dir};
+use crate::dashboard_core::OperatorRequestSummary;
 use crate::file_replace::write_bytes_file_async;
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -32,20 +33,6 @@ struct CodexNotificationInput {
     input_messages: Option<Vec<String>>,
     #[serde(default)]
     last_assistant_message: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-struct FinishedRequestLite {
-    #[serde(default)]
-    session_id: Option<String>,
-    #[serde(default)]
-    cwd: Option<String>,
-    service: String,
-    method: String,
-    path: String,
-    status_code: u16,
-    duration_ms: u64,
-    ended_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -144,35 +131,19 @@ async fn get_proxy_base_url() -> Option<String> {
 
 fn pick_best_recent_request(
     thread_id: &str,
-    cwd: Option<&str>,
     now_ms: u64,
     policy: &NotifyPolicyConfig,
-    recent: &[FinishedRequestLite],
-) -> Option<FinishedRequestLite> {
+    recent: &[OperatorRequestSummary],
+) -> Option<OperatorRequestSummary> {
     let min_ended_at = now_ms.saturating_sub(policy.recent_search_window_ms);
+    let session_key = crate::dashboard_core::operator_summary::operator_session_key(thread_id);
 
-    let mut candidates = recent
+    recent
         .iter()
         .filter(|r| r.service == "codex")
         .filter(|r| r.ended_at_ms >= min_ended_at)
-        .filter(|r| r.session_id.as_deref() == Some(thread_id))
+        .filter(|r| r.session_key.as_deref() == Some(session_key.as_str()))
         .cloned()
-        .collect::<Vec<_>>();
-
-    if candidates.is_empty()
-        && let Some(cwd) = cwd
-    {
-        candidates = recent
-            .iter()
-            .filter(|r| r.service == "codex")
-            .filter(|r| r.ended_at_ms >= min_ended_at)
-            .filter(|r| r.cwd.as_deref() == Some(cwd))
-            .cloned()
-            .collect::<Vec<_>>();
-    }
-
-    candidates
-        .into_iter()
         .max_by_key(|r| (request_path_score(&r.path), r.ended_at_ms))
 }
 
@@ -190,65 +161,32 @@ fn request_path_score(path: &str) -> u8 {
 async fn fetch_recent_finished(
     proxy_base_url: &str,
     timeout_ms: u64,
-) -> anyhow::Result<Vec<FinishedRequestLite>> {
-    #[derive(serde::Deserialize)]
-    struct AdminDiscovery {
-        admin_base_url: String,
-    }
+) -> anyhow::Result<Vec<OperatorRequestSummary>> {
+    let admin_base_url = notify_admin_base_url(proxy_base_url)?;
+    let endpoint = crate::control_plane_client::ControlPlaneEndpoint::new(
+        admin_base_url,
+        crate::control_plane_client::configured_local_admin_token_env(),
+    )?;
+    let client = crate::control_plane_client::ControlPlaneClient::new_with_timeout(
+        endpoint,
+        Duration::from_millis(timeout_ms),
+    )?;
+    let model = client.operator_read_model().await?;
+    model
+        .data
+        .map(|data| data.recent_requests)
+        .ok_or_else(|| anyhow::anyhow!("operator read model has no ready data"))
+}
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(timeout_ms))
-        .build()?;
-
-    let mut base_candidates = Vec::new();
-    if let Some(admin_base_url) = crate::proxy::admin_base_url_from_proxy_base_url(proxy_base_url) {
-        base_candidates.push(admin_base_url);
+fn notify_admin_base_url(proxy_base_url: &str) -> anyhow::Result<String> {
+    let proxy_base_url = crate::control_plane_client::normalize_base_url(proxy_base_url)
+        .ok_or_else(|| anyhow::anyhow!("notify proxy base URL is invalid"))?;
+    let admin_base_url = crate::proxy::admin_base_url_from_proxy_base_url(&proxy_base_url)
+        .ok_or_else(|| anyhow::anyhow!("notify proxy base URL has no derivable admin origin"))?;
+    if !crate::control_plane_client::is_loopback_control_plane_base_url(&admin_base_url) {
+        anyhow::bail!("notify accepts only a loopback proxy origin");
     }
-    let proxy_base_url = proxy_base_url.trim_end_matches('/').to_string();
-    if !base_candidates.iter().any(|base| base == &proxy_base_url) {
-        base_candidates.push(proxy_base_url.clone());
-    }
-
-    if let Ok(resp) = client
-        .get(format!(
-            "{}/.well-known/codex-helper-admin",
-            proxy_base_url.trim_end_matches('/')
-        ))
-        .send()
-        .await
-        && resp.status().is_success()
-        && let Ok(discovery) = resp.json::<AdminDiscovery>().await
-    {
-        let admin_base_url = discovery.admin_base_url.trim_end_matches('/').to_string();
-        if !admin_base_url.is_empty() && !base_candidates.iter().any(|base| base == &admin_base_url)
-        {
-            base_candidates.insert(0, admin_base_url);
-        }
-    }
-
-    let mut last_err: Option<anyhow::Error> = None;
-    for base_url in base_candidates {
-        let url = format!("{base_url}/__codex_helper/api/v1/status/recent?limit=200");
-        match client.get(url).send().await {
-            Ok(resp) => {
-                let status = resp.status();
-                if !status.is_success() {
-                    last_err = Some(anyhow::anyhow!(
-                        "proxy api/v1/status/recent returned {}",
-                        status.as_u16()
-                    ));
-                    continue;
-                }
-                let items = resp.json::<Vec<FinishedRequestLite>>().await?;
-                return Ok(items);
-            }
-            Err(err) => {
-                last_err = Some(err.into());
-            }
-        }
-    }
-
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("proxy api/v1/status/recent unavailable")))
+    Ok(admin_base_url)
 }
 
 async fn queue_event_and_spawn_flush(
@@ -334,13 +272,7 @@ pub async fn handle_codex_notify(
     };
 
     let now = now_ms();
-    let best = pick_best_recent_request(
-        thread_id,
-        payload.cwd.as_deref(),
-        now,
-        &notify_cfg.policy,
-        &recent,
-    );
+    let best = pick_best_recent_request(thread_id, now, &notify_cfg.policy, &recent);
     let Some(best) = best else {
         return Ok(());
     };
@@ -788,7 +720,218 @@ mod macos_notification {
 
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use axum::Router;
+    use axum::response::Redirect;
+    use axum::routing::get;
+    use tokio::net::TcpListener;
+
     use super::*;
+
+    const ADMIN_DISCOVERY_PATH: &str = "/.well-known/codex-helper-admin";
+    const OPERATOR_READ_MODEL_PATH: &str = "/__codex_helper/api/v1/operator/read-model";
+    const NOTIFY_TEST_PROXY_URL_ENV: &str = "CODEX_HELPER_TEST_NOTIFY_PROXY_URL";
+    const NOTIFY_TEST_EXPECT_SUCCESS_ENV: &str = "CODEX_HELPER_TEST_NOTIFY_EXPECT_SUCCESS";
+    const NOTIFY_TEST_EXPECT_PATH_ENV: &str = "CODEX_HELPER_TEST_NOTIFY_EXPECT_PATH";
+    const NOTIFY_TEST_TOKEN: &str = "notify-admin-token";
+
+    async fn spawn_server(app: Router) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
+        spawn_server_on(listener, app)
+    }
+
+    fn spawn_server_on(
+        listener: TcpListener,
+        app: Router,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let addr = listener.local_addr().expect("server address");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test app");
+        });
+        (addr, handle)
+    }
+
+    async fn bind_proxy_admin_pair() -> (TcpListener, TcpListener) {
+        for _ in 0..128 {
+            let proxy = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind proxy candidate");
+            let proxy_port = proxy.local_addr().expect("proxy address").port();
+            let admin_port = crate::proxy::admin_port_for_proxy_port(proxy_port);
+            if let Ok(admin) = TcpListener::bind(("127.0.0.1", admin_port)).await {
+                return (proxy, admin);
+            }
+        }
+        panic!("failed to bind paired proxy and admin test listeners");
+    }
+
+    async fn spawn_connection_counter(
+        bind_addr: SocketAddr,
+    ) -> (SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind(bind_addr)
+            .await
+            .expect("bind connection counter");
+        let addr = listener.local_addr().expect("connection counter address");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let recorded_hits = hits.clone();
+        let handle = tokio::spawn(async move {
+            while let Ok((_stream, _peer)) = listener.accept().await {
+                recorded_hits.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        (addr, hits, handle)
+    }
+
+    fn recent_router(path: &'static str, tokens: Arc<Mutex<Vec<String>>>) -> Router {
+        let response = notify_operator_read_model(path);
+        Router::new().route(
+            OPERATOR_READ_MODEL_PATH,
+            get(move |headers: axum::http::HeaderMap| {
+                let tokens = tokens.clone();
+                let response = response.clone();
+                async move {
+                    if let Some(token) = headers
+                        .get(crate::proxy::ADMIN_TOKEN_HEADER)
+                        .and_then(|value| value.to_str().ok())
+                    {
+                        tokens
+                            .lock()
+                            .expect("recent token lock")
+                            .push(token.to_string());
+                    }
+                    axum::Json(response)
+                }
+            }),
+        )
+    }
+
+    fn notify_request_summary(
+        thread_id: &str,
+        path: &str,
+        duration_ms: u64,
+        ended_at_ms: u64,
+    ) -> OperatorRequestSummary {
+        OperatorRequestSummary {
+            id: 1,
+            session_key: Some(
+                crate::dashboard_core::operator_summary::operator_session_key(thread_id),
+            ),
+            model: None,
+            reasoning_effort: None,
+            service_tier: None,
+            provider_id: None,
+            endpoint_id: None,
+            provider_endpoint_key: None,
+            route_path: Vec::new(),
+            upstream_origin: None,
+            usage: None,
+            cost: Default::default(),
+            retry: None,
+            provider_signal_codes: Vec::new(),
+            policy_action_codes: Vec::new(),
+            observability: crate::dashboard_core::OperatorRequestObservability {
+                duration_ms: Some(duration_ms),
+                ttfb_ms: None,
+                generation_ms: None,
+                output_tokens_per_second: None,
+                attempt_count: 1,
+                route_attempt_count: 1,
+                retried: false,
+                cross_provider_failover: false,
+                same_provider_retry: false,
+                fast_mode: false,
+                streaming: false,
+            },
+            service: "codex".to_string(),
+            method: "POST".to_string(),
+            path: path.to_string(),
+            status_code: 200,
+            duration_ms,
+            ttfb_ms: None,
+            streaming: false,
+            ended_at_ms,
+        }
+    }
+
+    fn notify_operator_read_model(path: &str) -> crate::dashboard_core::OperatorReadModel {
+        use crate::dashboard_core::{
+            ApiV1OperatorSummary, OperatorReadData, OperatorReadModel, OperatorRevisionBundle,
+        };
+
+        OperatorReadModel::ready(
+            "codex",
+            42,
+            OperatorRevisionBundle {
+                runtime_revision: 1,
+                runtime_digest: "runtime-1".to_string(),
+                route_digest: "route-1".to_string(),
+                catalog_revision: "catalog-1".to_string(),
+                pricing_revision: "pricing-1".to_string(),
+                operator_pricing_revision: "operator-pricing-1".to_string(),
+                policy_revision: 1,
+                ledger_revision: "operator-ledger-v1:test-store:1".to_string(),
+            },
+            OperatorReadData {
+                summary: ApiV1OperatorSummary {
+                    api_version: 1,
+                    service_name: "codex".to_string(),
+                    runtime: Default::default(),
+                    counts: Default::default(),
+                    retry: Default::default(),
+                    sessions: Vec::new(),
+                    profiles: Vec::new(),
+                    providers: Vec::new(),
+                },
+                active_requests: Vec::new(),
+                recent_requests: vec![notify_request_summary("thread-1", path, 1_200, 42)],
+                usage_summaries: Vec::new(),
+                usage_day: Default::default(),
+                usage_rollup: Default::default(),
+                stats_5m: Default::default(),
+                stats_1h: Default::default(),
+                pricing_catalog: Default::default(),
+                provider_balances: Vec::new(),
+            },
+        )
+    }
+
+    async fn run_notify_fetch_subprocess(
+        proxy_url: String,
+        expected_path: Option<&str>,
+    ) -> std::process::Output {
+        let test_exe = std::env::current_exe().expect("current test executable");
+        let expect_success = if expected_path.is_some() { "1" } else { "0" };
+        let expected_path = expected_path.unwrap_or_default().to_string();
+        tokio::task::spawn_blocking(move || {
+            std::process::Command::new(test_exe)
+                .args([
+                    "--exact",
+                    "notify::tests::notify_fetch_recent_finished_subprocess",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env(NOTIFY_TEST_PROXY_URL_ENV, proxy_url)
+                .env(NOTIFY_TEST_EXPECT_SUCCESS_ENV, expect_success)
+                .env(NOTIFY_TEST_EXPECT_PATH_ENV, expected_path)
+                .env(crate::proxy::ADMIN_TOKEN_ENV_VAR, NOTIFY_TEST_TOKEN)
+                .output()
+        })
+        .await
+        .expect("join notify subprocess")
+        .expect("run notify subprocess")
+    }
+
+    fn assert_subprocess_success(output: &std::process::Output) {
+        assert!(
+            output.status.success(),
+            "notify subprocess failed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn parses_agent_turn_complete_payload_with_thread_id() {
@@ -811,29 +954,278 @@ mod tests {
         let policy = NotifyPolicyConfig::default();
         let now = 1_000_000u64;
         let recent = vec![
-            FinishedRequestLite {
-                session_id: Some("th1".to_string()),
-                cwd: Some("/p".to_string()),
-                service: "codex".to_string(),
-                method: "POST".to_string(),
-                path: "/v1/chat/completions".to_string(),
-                status_code: 200,
-                duration_ms: 10_000,
-                ended_at_ms: now - 1_000,
-            },
-            FinishedRequestLite {
-                session_id: Some("th1".to_string()),
-                cwd: Some("/p".to_string()),
-                service: "codex".to_string(),
-                method: "POST".to_string(),
-                path: "/v1/responses".to_string(),
-                status_code: 200,
-                duration_ms: 20_000,
-                ended_at_ms: now - 10_000,
-            },
+            notify_request_summary("th1", "/v1/chat/completions", 10_000, now - 1_000),
+            notify_request_summary("th1", "/v1/responses", 20_000, now - 10_000),
         ];
-        let best =
-            pick_best_recent_request("th1", Some("/p"), now, &policy, &recent).expect("best");
+        let best = pick_best_recent_request("th1", now, &policy, &recent).expect("best");
         assert_eq!(best.path, "/v1/responses");
+    }
+
+    #[test]
+    fn notify_admin_origin_is_derived_from_loopback_proxy_origin() {
+        assert_eq!(
+            notify_admin_base_url("http://127.0.0.1:3211/v1")
+                .expect("derive loopback admin origin"),
+            "http://127.0.0.1:4211"
+        );
+        assert_eq!(
+            notify_admin_base_url("http://localhost:3211/backend-api/codex")
+                .expect("derive localhost admin origin"),
+            "http://localhost:4211"
+        );
+    }
+
+    #[test]
+    fn notify_admin_origin_rejects_non_loopback_proxy_before_connecting() {
+        for proxy_url in [
+            "http://192.0.2.10:3211/v1",
+            "https://relay.example:3211/v1",
+            "http://user:secret@127.0.0.1:3211/v1",
+            "http://127.0.0.1:3211/v1?token=secret",
+        ] {
+            assert!(
+                notify_admin_base_url(proxy_url).is_err(),
+                "unexpectedly trusted {proxy_url}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn notify_never_discovers_a_replacement_for_configured_origin() {
+        let admin_tokens = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (admin_addr, admin_handle) =
+            spawn_server(recent_router("/v1/responses-safe", admin_tokens.clone())).await;
+
+        let discovery_hits = Arc::new(AtomicUsize::new(0));
+        let discovery_token_hits = Arc::new(AtomicUsize::new(0));
+        let hits = discovery_hits.clone();
+        let token_hits = discovery_token_hits.clone();
+        let admin_url = format!("http://{admin_addr}");
+        let proxy = Router::new().route(
+            ADMIN_DISCOVERY_PATH,
+            get(move |headers: axum::http::HeaderMap| {
+                let hits = hits.clone();
+                let token_hits = token_hits.clone();
+                let admin_url = admin_url.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    if headers.contains_key(crate::proxy::ADMIN_TOKEN_HEADER) {
+                        token_hits.fetch_add(1, Ordering::SeqCst);
+                    }
+                    axum::Json(serde_json::json!({
+                        "api_version": 1,
+                        "service_name": "codex",
+                        "admin_base_url": admin_url
+                    }))
+                }
+            }),
+        );
+        let (proxy_addr, proxy_handle) = spawn_server(proxy).await;
+
+        let output = run_notify_fetch_subprocess(format!("http://{proxy_addr}"), None).await;
+
+        assert_subprocess_success(&output);
+        assert_eq!(discovery_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(discovery_token_hits.load(Ordering::SeqCst), 0);
+        assert!(admin_tokens.lock().expect("admin token lock").is_empty());
+        proxy_handle.abort();
+        admin_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn notify_configured_admin_origin_is_not_replaced_by_discovery() {
+        let (proxy_listener, admin_listener) = bind_proxy_admin_pair().await;
+        let configured_tokens = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (configured_addr, configured_handle) = spawn_server_on(
+            admin_listener,
+            recent_router("/v1/responses-configured", configured_tokens.clone()),
+        );
+
+        let discovered_tokens = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (discovered_addr, discovered_handle) = spawn_server(recent_router(
+            "/v1/responses-discovered",
+            discovered_tokens.clone(),
+        ))
+        .await;
+        let discovery_hits = Arc::new(AtomicUsize::new(0));
+        let hits = discovery_hits.clone();
+        let discovered_url = format!("http://{discovered_addr}");
+        let discovery = Router::new().route(
+            ADMIN_DISCOVERY_PATH,
+            get(move || {
+                let hits = hits.clone();
+                let discovered_url = discovered_url.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(serde_json::json!({
+                        "api_version": 1,
+                        "service_name": "codex",
+                        "admin_base_url": discovered_url
+                    }))
+                }
+            }),
+        );
+        let (proxy_addr, proxy_handle) = spawn_server_on(proxy_listener, discovery);
+        assert_eq!(
+            configured_addr.port(),
+            crate::proxy::admin_port_for_proxy_port(proxy_addr.port())
+        );
+
+        let output = run_notify_fetch_subprocess(
+            format!("http://{proxy_addr}"),
+            Some("/v1/responses-configured"),
+        )
+        .await;
+
+        assert_subprocess_success(&output);
+        assert_eq!(discovery_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            configured_tokens
+                .lock()
+                .expect("configured token lock")
+                .as_slice(),
+            [NOTIFY_TEST_TOKEN]
+        );
+        assert!(
+            discovered_tokens
+                .lock()
+                .expect("discovered token lock")
+                .is_empty()
+        );
+        proxy_handle.abort();
+        configured_handle.abort();
+        discovered_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn notify_configured_origin_bypasses_discovery_redirect() {
+        let (proxy_listener, admin_listener) = bind_proxy_admin_pair().await;
+        let fallback_tokens = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (admin_addr, admin_handle) = spawn_server_on(
+            admin_listener,
+            recent_router("/v1/responses-redirect-fallback", fallback_tokens.clone()),
+        );
+
+        let redirect_hits = Arc::new(AtomicUsize::new(0));
+        let redirect_token_hits = Arc::new(AtomicUsize::new(0));
+        let hits = redirect_hits.clone();
+        let token_hits = redirect_token_hits.clone();
+        let redirect_target = Router::new().route(
+            ADMIN_DISCOVERY_PATH,
+            get(move |headers: axum::http::HeaderMap| {
+                let hits = hits.clone();
+                let token_hits = token_hits.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    if headers.contains_key(crate::proxy::ADMIN_TOKEN_HEADER) {
+                        token_hits.fetch_add(1, Ordering::SeqCst);
+                    }
+                    axum::Json(serde_json::json!({ "unexpected": true }))
+                }
+            }),
+        );
+        let (redirect_addr, redirect_handle) = spawn_server(redirect_target).await;
+        let redirect_url = format!("http://{redirect_addr}{ADMIN_DISCOVERY_PATH}");
+        let discovery = Router::new().route(
+            ADMIN_DISCOVERY_PATH,
+            get(move || {
+                let redirect_url = redirect_url.clone();
+                async move { Redirect::temporary(&redirect_url) }
+            }),
+        );
+        let (proxy_addr, proxy_handle) = spawn_server_on(proxy_listener, discovery);
+        assert_eq!(
+            admin_addr.port(),
+            crate::proxy::admin_port_for_proxy_port(proxy_addr.port())
+        );
+
+        let output = run_notify_fetch_subprocess(
+            format!("http://{proxy_addr}"),
+            Some("/v1/responses-redirect-fallback"),
+        )
+        .await;
+
+        assert_subprocess_success(&output);
+        assert_eq!(redirect_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(redirect_token_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fallback_tokens
+                .lock()
+                .expect("fallback token lock")
+                .as_slice(),
+            [NOTIFY_TEST_TOKEN]
+        );
+        proxy_handle.abort();
+        admin_handle.abort();
+        redirect_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn notify_configured_origin_bypasses_private_discovery_target() {
+        let (proxy_listener, admin_listener) = bind_proxy_admin_pair().await;
+        let fallback_tokens = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (_admin_addr, admin_handle) = spawn_server_on(
+            admin_listener,
+            recent_router("/v1/responses-private-fallback", fallback_tokens.clone()),
+        );
+        let (private_addr, private_hits, private_handle) =
+            spawn_connection_counter(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)).await;
+        let private_url = format!("https://{private_addr}");
+        let discovery = Router::new().route(
+            ADMIN_DISCOVERY_PATH,
+            get(move || {
+                let private_url = private_url.clone();
+                async move {
+                    axum::Json(serde_json::json!({
+                        "api_version": 1,
+                        "service_name": "codex",
+                        "admin_base_url": private_url
+                    }))
+                }
+            }),
+        );
+        let (proxy_addr, proxy_handle) = spawn_server_on(proxy_listener, discovery);
+
+        let output = run_notify_fetch_subprocess(
+            format!("http://{proxy_addr}"),
+            Some("/v1/responses-private-fallback"),
+        )
+        .await;
+
+        assert_subprocess_success(&output);
+        assert_eq!(private_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fallback_tokens
+                .lock()
+                .expect("fallback token lock")
+                .as_slice(),
+            [NOTIFY_TEST_TOKEN]
+        );
+        proxy_handle.abort();
+        admin_handle.abort();
+        private_handle.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "subprocess helper for notify discovery tests"]
+    async fn notify_fetch_recent_finished_subprocess() {
+        let Ok(proxy_url) = std::env::var(NOTIFY_TEST_PROXY_URL_ENV) else {
+            return;
+        };
+        let expect_success =
+            std::env::var(NOTIFY_TEST_EXPECT_SUCCESS_ENV).expect("expected result mode") == "1";
+        let expected_path = std::env::var(NOTIFY_TEST_EXPECT_PATH_ENV).unwrap_or_default();
+        let result = fetch_recent_finished(&proxy_url, 250).await;
+
+        if expect_success {
+            let recent = result.expect("notify recent request should succeed");
+            assert_eq!(recent.len(), 1);
+            assert_eq!(recent[0].path, expected_path);
+        } else {
+            assert!(
+                result.is_err(),
+                "untrusted discovery must not create a candidate"
+            );
+        }
     }
 }

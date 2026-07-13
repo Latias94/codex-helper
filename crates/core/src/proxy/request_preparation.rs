@@ -3,9 +3,7 @@ use std::sync::Arc;
 use axum::body::Bytes;
 use axum::http::{HeaderMap, Method, Uri};
 
-use crate::codex_integration::{CodexHostedImageGenerationMode, CodexPatchMode};
-use crate::config::{ProxyConfig, ProxyConfigV4};
-use crate::lb::CooldownBackoff;
+use crate::endpoint_health::CooldownBackoff;
 use crate::logging::{BodyPreview, CodexBridgeLog, ServiceTierLog, make_body_preview};
 use crate::routing_ir::RouteRequestContext;
 use crate::state::{SessionBinding, SessionContinuityMode, SessionIdentitySource};
@@ -13,16 +11,16 @@ use crate::state::{SessionBinding, SessionContinuityMode, SessionIdentitySource}
 use super::ProxyService;
 use super::client_identity::ClientSessionIdentity;
 use super::request_body::{
-    apply_model_override_value, apply_reasoning_effort_override_value,
-    apply_service_tier_override_value, extract_model_from_value,
-    extract_reasoning_effort_from_value, extract_service_tier_from_value,
-    normalize_codex_compact_request_value, remove_hosted_image_generation_tools_value,
+    ReasoningOrchestrationIntent, RequestDialect, apply_model_override_value,
+    apply_reasoning_effort_override_value, apply_service_tier_override_value,
+    extract_model_from_value, extract_reasoning_effort_from_value, extract_service_tier_from_value,
+    normalize_codex_compact_request_value, remove_reasoning_effort_value,
 };
 use super::request_continuity::{
     RequestContinuityClassificationInput, RequestTransport, classify_request_continuity,
 };
-use super::request_routing::RequestRouteSelection;
 use super::retry::{RetryPlan, retry_plan};
+use super::runtime_config::{CapturedRoutePlan, RuntimeSnapshot};
 
 #[derive(Debug, Clone)]
 pub(super) struct RequestFlavor {
@@ -33,7 +31,6 @@ pub(super) struct RequestFlavor {
     pub is_remote_compaction_v2_request: bool,
     pub remote_compaction_requires_affinity: bool,
     pub is_codex_service: bool,
-    pub codex_client_patch_mode: CodexPatchMode,
     pub codex_bridge_log: Option<CodexBridgeLog>,
 }
 
@@ -54,15 +51,12 @@ impl RequestFlavor {
         self.is_remote_compaction_v2_request = continuity.is_remote_compaction_v2_request;
         self.remote_compaction_requires_affinity = continuity.remote_compaction_requires_affinity;
         if continuity.is_remote_compaction_v2_request {
-            let patch_mode = self.codex_client_patch_mode.as_str().to_string();
-            let strips_client_auth = self.codex_client_patch_mode.strips_codex_client_auth();
             let bridge = self.codex_bridge_log.get_or_insert(CodexBridgeLog {
-                patch_mode,
+                patch_mode: "request-dialect".to_string(),
                 remote_compaction_v1_request: false,
                 remote_compaction_v2_request: false,
-                downgraded_to_responses_compact: false,
                 responses_websocket_request: false,
-                strips_client_auth,
+                strips_client_auth: false,
             });
             bridge.remote_compaction_v2_request = true;
         }
@@ -84,7 +78,9 @@ impl RequestFlavor {
 pub(super) struct PreparedRequestBody {
     pub body_for_upstream: Bytes,
     pub request_model: Option<String>,
+    pub requested_model: Option<String>,
     pub effective_effort: Option<String>,
+    pub deferred_reasoning_intent: Option<ReasoningOrchestrationIntent>,
     pub base_service_tier: ServiceTierLog,
     pub request_body_len: usize,
 }
@@ -97,27 +93,20 @@ pub(super) struct BodyPreviewSet {
 
 #[derive(Debug, Clone)]
 pub(super) struct RequestConfigContext {
-    pub(super) cfg_snapshot: Arc<ProxyConfig>,
-    pub(super) v4_snapshot: Option<Arc<ProxyConfigV4>>,
-    pub(super) route_graph_config: bool,
-    pub(super) codex_patch_mode: CodexPatchMode,
-    pub(super) hosted_image_generation: CodexHostedImageGenerationMode,
+    pub(super) runtime_snapshot: Arc<RuntimeSnapshot>,
 }
 
 pub(super) struct CommonPreparedRequest {
     pub(super) session_id: Option<String>,
     pub(super) session_identity_source: Option<SessionIdentitySource>,
     pub(super) session_binding: Option<SessionBinding>,
-    pub(super) route_selection: RequestRouteSelection,
+    pub(super) route_plan: Option<CapturedRoutePlan>,
     pub(super) cwd: Option<String>,
-    pub(super) session_override_config: Option<String>,
-    pub(super) global_station_override: Option<String>,
-    pub(super) override_effort: Option<String>,
-    pub(super) override_model: Option<String>,
-    pub(super) override_service_tier: Option<String>,
     pub(super) body_for_upstream: Bytes,
+    pub(super) request_dialect: RequestDialect,
     pub(super) request_model: Option<String>,
     pub(super) effective_effort: Option<String>,
+    pub(super) deferred_reasoning_intent: Option<ReasoningOrchestrationIntent>,
     pub(super) effective_service_tier: Option<String>,
     pub(super) base_service_tier: ServiceTierLog,
     pub(super) request_body_len: usize,
@@ -133,7 +122,10 @@ pub(super) struct CommonPreparedRequest {
 
 #[derive(Debug, Clone)]
 pub(super) enum CommonRequestPreparationError {
-    NoRoutableStation {
+    LifecycleStoreUnavailable {
+        message: String,
+    },
+    NoRoutableCandidate {
         request_id: u64,
         session_id: Option<String>,
         session_identity_source: Option<SessionIdentitySource>,
@@ -150,52 +142,40 @@ pub(super) struct CommonRequestPreparationParams<'a> {
     pub(super) uri: &'a Uri,
     pub(super) client_headers: &'a HeaderMap,
     pub(super) raw_body: &'a Bytes,
-    pub(super) compact_request: bool,
+    pub(super) request_dialect: RequestDialect,
     pub(super) session_identity_hint: Option<ClientSessionIdentity>,
     pub(super) client_name: Option<String>,
     pub(super) client_addr: Option<String>,
     pub(super) started_at_ms: u64,
     pub(super) client_content_type: Option<&'a str>,
     pub(super) request_body_previews: bool,
-    pub(super) preserve_hosted_image_generation_tools: bool,
-}
-
-fn codex_patch_mode_for_proxy(proxy: &ProxyService) -> CodexPatchMode {
-    if proxy.service_name != "codex" {
-        return CodexPatchMode::Default;
-    }
-    crate::codex_integration::codex_switch_status()
-        .ok()
-        .and_then(|status| status.patch_mode)
-        .unwrap_or(CodexPatchMode::Default)
 }
 
 pub(super) async fn load_request_config_context(proxy: &ProxyService) -> RequestConfigContext {
     let config_reloaded = proxy.config.maybe_reload_from_disk().await;
-    let cfg_snapshot = proxy.config.snapshot().await;
-    let v4_snapshot = proxy.config.v4_snapshot().await;
-    let route_graph_config = v4_snapshot.is_some();
-    let mgr = proxy.service_manager(cfg_snapshot.as_ref());
+    let runtime_snapshot = proxy.config.capture().await;
     if config_reloaded {
-        proxy
-            .state
-            .prune_runtime_observability_for_service(proxy.service_name, mgr)
-            .await;
+        super::control_plane_service::prune_runtime_observability_after_reload(proxy).await;
     }
 
-    RequestConfigContext {
-        cfg_snapshot,
-        v4_snapshot,
-        route_graph_config,
-        codex_patch_mode: codex_patch_mode_for_proxy(proxy),
-        hosted_image_generation: crate::config::codex_client_patch_config_from_config_file()
-            .map(|config| config.hosted_image_generation)
-            .unwrap_or_default(),
-    }
+    RequestConfigContext { runtime_snapshot }
 }
 
 pub(super) async fn prepare_common_request(
     params: CommonRequestPreparationParams<'_>,
+) -> Result<CommonPreparedRequest, CommonRequestPreparationError> {
+    prepare_common_request_inner(params, true).await
+}
+
+pub(super) async fn prepare_common_request_without_route_plan(
+    params: CommonRequestPreparationParams<'_>,
+) -> Result<CommonPreparedRequest, CommonRequestPreparationError> {
+    prepare_common_request_inner(params, false).await
+}
+
+async fn prepare_common_request_inner(
+    params: CommonRequestPreparationParams<'_>,
+    select_route: bool,
 ) -> Result<CommonPreparedRequest, CommonRequestPreparationError> {
     let CommonRequestPreparationParams {
         proxy,
@@ -204,78 +184,47 @@ pub(super) async fn prepare_common_request(
         uri,
         client_headers,
         raw_body,
-        compact_request,
+        request_dialect,
         session_identity_hint,
         client_name,
         client_addr,
         started_at_ms,
         client_content_type,
         request_body_previews,
-        preserve_hosted_image_generation_tools,
     } = params;
-    let mgr = proxy.service_manager(config.cfg_snapshot.as_ref());
+    let config_snapshot = config.runtime_snapshot.config();
+    let view = super::control_plane_service::service_route_config(
+        config_snapshot.as_ref(),
+        proxy.service_name,
+    );
     let _ = client_headers;
     let session_identity = session_identity_hint;
     let session_id = session_identity_value(session_identity.as_ref());
     let session_identity_source = session_identity_source(session_identity.as_ref());
     let session_binding = if let Some(id) = session_id.as_deref() {
         proxy
-            .ensure_default_session_binding(mgr, id, started_at_ms)
+            .ensure_default_session_binding(view, id, started_at_ms)
             .await
     } else {
         None
     };
-    let cwd = resolve_and_touch_session_state(proxy, session_id.as_deref(), started_at_ms).await;
-    let session_override_config = if !config.route_graph_config
-        && let Some(id) = session_id.as_deref()
-    {
-        proxy.state.get_session_station_override(id).await
-    } else {
-        None
-    };
-    let global_station_override = if config.route_graph_config {
-        None
-    } else {
-        proxy.state.get_global_station_override().await
-    };
+    touch_session_state(proxy, session_id.as_deref(), started_at_ms).await;
+    let cwd = None;
 
-    let override_effort = if let Some(id) = session_id.as_deref() {
-        proxy.state.get_session_effort_override(id).await
-    } else {
-        None
-    };
-    let override_model = if let Some(id) = session_id.as_deref() {
-        proxy.state.get_session_model_override(id).await
-    } else {
-        None
-    };
-    let override_service_tier = if let Some(id) = session_id.as_deref() {
-        proxy.state.get_session_service_tier_override(id).await
-    } else {
-        None
-    };
     let binding_effort = binding_reasoning_effort_for_request(session_binding.as_ref());
     let binding_model = binding_model_for_request(session_binding.as_ref());
     let binding_service_tier = binding_service_tier_for_request(session_binding.as_ref());
-    let filter_hosted_image_generation_tools = proxy.service_name == "codex"
-        && config.hosted_image_generation.filters_request_tools()
-        && codex_path_is_responses_or_compact(uri.path())
-        && !preserve_hosted_image_generation_tools;
-
     let prepared_request = prepare_request_body(PrepareRequestBodyParams {
         raw_body,
-        compact_request,
-        override_effort: override_effort.as_deref(),
+        dialect: request_dialect,
         binding_effort,
-        override_model: override_model.as_deref(),
         binding_model,
-        override_service_tier: override_service_tier.as_deref(),
         binding_service_tier,
-        filter_hosted_image_generation_tools,
     });
     let body_for_upstream = prepared_request.body_for_upstream.clone();
     let request_model = prepared_request.request_model.clone();
     let effective_effort = prepared_request.effective_effort.clone();
+    let deferred_reasoning_intent = prepared_request.deferred_reasoning_intent;
     let effective_service_tier = prepared_request.base_service_tier.effective.clone();
     let base_service_tier = prepared_request.base_service_tier.clone();
     let request_body_len = prepared_request.request_body_len;
@@ -304,7 +253,7 @@ pub(super) async fn prepare_common_request(
 
     let request_id = proxy
         .state
-        .begin_request(
+        .try_begin_request(
             proxy.service_name,
             method.as_str(),
             uri.path(),
@@ -314,36 +263,59 @@ pub(super) async fn prepare_common_request(
             client_addr,
             cwd.clone(),
             request_model.clone(),
+            prepared_request.requested_model.clone(),
             effective_effort.clone(),
             effective_service_tier.clone(),
+            base_service_tier.requested.clone(),
+            config.runtime_snapshot.provider_catalog(),
+            config.runtime_snapshot.operator_pricing_catalog(),
+            config.runtime_snapshot.revision(),
+            config.runtime_snapshot.digest().to_string(),
+            config.runtime_snapshot.provider_policy().policy_revision,
             started_at_ms,
         )
-        .await;
+        .await
+        .map_err(
+            |error| CommonRequestPreparationError::LifecycleStoreUnavailable {
+                message: error.to_string(),
+            },
+        )?;
 
-    let plan = retry_plan(&config.cfg_snapshot.retry.resolve());
+    let plan = retry_plan(&config_snapshot.retry.resolve());
     let cooldown_backoff = CooldownBackoff {
         factor: plan.cooldown_backoff_factor,
         max_secs: plan.cooldown_backoff_max_secs,
     };
 
-    let route_request = route_request_context(
-        method,
-        uri,
-        client_headers,
-        request_model.clone(),
-        effective_effort.clone(),
-        effective_service_tier.clone(),
-    );
-    let route_selection = proxy
-        .lbs_for_request(
-            config.cfg_snapshot.as_ref(),
-            config.v4_snapshot.as_deref(),
-            &route_request,
-            session_id.as_deref(),
-        )
-        .await;
-    if route_selection.is_empty() {
-        return Err(CommonRequestPreparationError::NoRoutableStation {
+    let route_plan = if select_route {
+        let route_request = route_request_context(
+            method,
+            uri,
+            client_headers,
+            request_model.clone(),
+            effective_effort.clone(),
+            effective_service_tier.clone(),
+        );
+        match config
+            .runtime_snapshot
+            .capture_route_plan(proxy.service_name, &route_request)
+        {
+            Ok(route_plan) => route_plan,
+            Err(error) => {
+                crate::logging::log_control_trace_event(serde_json::json!({
+                    "event": "route_plan_selection_failed",
+                    "service": proxy.service_name,
+                    "runtime_revision": config.runtime_snapshot.revision(),
+                    "error": error.to_string(),
+                }));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if select_route && route_plan.as_ref().is_none_or(CapturedRoutePlan::is_empty) {
+        return Err(CommonRequestPreparationError::NoRoutableCandidate {
             request_id,
             session_id,
             session_identity_source,
@@ -357,16 +329,13 @@ pub(super) async fn prepare_common_request(
         session_id,
         session_identity_source,
         session_binding,
-        route_selection,
+        route_plan,
         cwd,
-        session_override_config,
-        global_station_override,
-        override_effort,
-        override_model,
-        override_service_tier,
         body_for_upstream,
+        request_dialect,
         request_model,
         effective_effort,
+        deferred_reasoning_intent,
         effective_service_tier,
         base_service_tier,
         request_body_len,
@@ -386,7 +355,6 @@ pub(super) fn detect_request_flavor(
     method: &Method,
     headers: &HeaderMap,
     path: &str,
-    codex_client_patch_mode: CodexPatchMode,
 ) -> RequestFlavor {
     let client_content_type = headers
         .get("content-type")
@@ -403,15 +371,13 @@ pub(super) fn detect_request_flavor(
     let is_remote_compaction_v1_request = codex_path_is_responses_compact(path);
     let is_user_turn = *method == Method::POST && is_responses_path;
     let is_codex_service = service_name == "codex";
-    let codex_bridge_log = (is_codex_service
-        && (!codex_client_patch_mode.is_default() || is_remote_compaction_v1_request))
-        .then(|| CodexBridgeLog {
-            patch_mode: codex_client_patch_mode.as_str().to_string(),
+    let codex_bridge_log =
+        (is_codex_service && is_remote_compaction_v1_request).then(|| CodexBridgeLog {
+            patch_mode: "request-dialect".to_string(),
             remote_compaction_v1_request: is_remote_compaction_v1_request,
             remote_compaction_v2_request: false,
-            downgraded_to_responses_compact: false,
             responses_websocket_request: false,
-            strips_client_auth: codex_client_patch_mode.strips_codex_client_auth(),
+            strips_client_auth: false,
         });
 
     RequestFlavor {
@@ -422,7 +388,6 @@ pub(super) fn detect_request_flavor(
         is_remote_compaction_v2_request: false,
         remote_compaction_requires_affinity: false,
         is_codex_service,
-        codex_client_patch_mode,
         codex_bridge_log,
     }
 }
@@ -508,69 +473,37 @@ fn normalize_profile_service_tier(value: Option<&str>) -> Option<&str> {
     }
 }
 
-pub(super) async fn resolve_and_touch_session_state(
+pub(super) async fn touch_session_state(
     proxy: &ProxyService,
     session_id: Option<&str>,
     started_at_ms: u64,
-) -> Option<String> {
-    let cwd = if let Some(id) = session_id {
-        proxy.state.resolve_session_cwd(id).await
-    } else {
-        None
-    };
-
+) {
     if let Some(id) = session_id {
-        proxy.state.touch_session_override(id, started_at_ms).await;
-        proxy
-            .state
-            .touch_session_station_override(id, started_at_ms)
-            .await;
-        proxy
-            .state
-            .touch_session_route_target_override(id, started_at_ms)
-            .await;
-        proxy
-            .state
-            .touch_session_model_override(id, started_at_ms)
-            .await;
-        proxy
-            .state
-            .touch_session_service_tier_override(id, started_at_ms)
-            .await;
         proxy.state.touch_session_binding(id, started_at_ms).await;
     }
-
-    cwd
 }
 
 pub(super) struct PrepareRequestBodyParams<'a> {
     raw_body: &'a Bytes,
-    compact_request: bool,
-    override_effort: Option<&'a str>,
+    dialect: RequestDialect,
     binding_effort: Option<&'a str>,
-    override_model: Option<&'a str>,
     binding_model: Option<&'a str>,
-    override_service_tier: Option<&'a str>,
     binding_service_tier: Option<&'a str>,
-    filter_hosted_image_generation_tools: bool,
 }
 
 pub(super) fn prepare_request_body(params: PrepareRequestBodyParams<'_>) -> PreparedRequestBody {
     let PrepareRequestBodyParams {
         raw_body,
-        compact_request,
-        override_effort,
+        dialect,
         binding_effort,
-        override_model,
         binding_model,
-        override_service_tier,
         binding_service_tier,
-        filter_hosted_image_generation_tools,
     } = params;
     let mut request_json = serde_json::from_slice::<serde_json::Value>(raw_body).ok();
     let original_effort = request_json
         .as_ref()
-        .and_then(extract_reasoning_effort_from_value);
+        .and_then(|value| extract_reasoning_effort_from_value(value, dialect));
+    let original_model = request_json.as_ref().and_then(extract_model_from_value);
     let original_service_tier = request_json
         .as_ref()
         .and_then(extract_service_tier_from_value);
@@ -578,21 +511,37 @@ pub(super) fn prepare_request_body(params: PrepareRequestBodyParams<'_>) -> Prep
     let is_object_root = request_json
         .as_ref()
         .is_some_and(serde_json::Value::is_object);
+    let selected_effort = if dialect.supports_reasoning_effort() {
+        binding_effort
+    } else {
+        None
+    };
+    let requested_effort = selected_effort
+        .map(str::to_owned)
+        .or_else(|| original_effort.clone());
+    let deferred_reasoning_intent = requested_effort
+        .as_deref()
+        .filter(|effort| effort.eq_ignore_ascii_case("ultra"))
+        .map(|_| ReasoningOrchestrationIntent::Ultra);
+    let effective_effort = if deferred_reasoning_intent.is_none() {
+        requested_effort
+    } else {
+        None
+    };
     if is_object_root && let Some(value) = request_json.as_mut() {
-        if let Some(effort) = override_effort.or(binding_effort) {
-            apply_reasoning_effort_override_value(value, effort);
+        if deferred_reasoning_intent.is_some() {
+            remove_reasoning_effort_value(value, dialect);
+        } else if let Some(effort) = selected_effort {
+            apply_reasoning_effort_override_value(value, dialect, effort);
         }
-        if let Some(model) = override_model.or(binding_model) {
+        if let Some(model) = binding_model {
             apply_model_override_value(value, model);
         }
-        if let Some(service_tier) = override_service_tier.or(binding_service_tier) {
+        if let Some(service_tier) = binding_service_tier {
             apply_service_tier_override_value(value, service_tier);
         }
-        if compact_request {
+        if dialect == RequestDialect::ResponsesCompact {
             normalize_codex_compact_request_value(value);
-        }
-        if filter_hosted_image_generation_tools {
-            remove_hosted_image_generation_tools_value(value);
         }
     }
 
@@ -607,10 +556,6 @@ pub(super) fn prepare_request_body(params: PrepareRequestBodyParams<'_>) -> Prep
     };
 
     let request_model = request_json.as_ref().and_then(extract_model_from_value);
-    let effective_effort = request_json
-        .as_ref()
-        .and_then(extract_reasoning_effort_from_value)
-        .or(original_effort);
     let effective_service_tier = request_json
         .as_ref()
         .and_then(extract_service_tier_from_value)
@@ -619,7 +564,9 @@ pub(super) fn prepare_request_body(params: PrepareRequestBodyParams<'_>) -> Prep
     PreparedRequestBody {
         request_body_len: raw_body.len(),
         request_model,
+        requested_model: original_model,
         effective_effort,
+        deferred_reasoning_intent,
         base_service_tier: ServiceTierLog {
             requested: original_service_tier,
             effective: effective_service_tier,
@@ -648,16 +595,49 @@ pub(super) fn build_body_previews(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
+    use std::path::PathBuf;
+    use std::sync::Arc;
 
     use axum::http::{HeaderMap, HeaderValue};
 
     use super::*;
     use crate::config::{
-        ProxyConfig, ServiceConfig, ServiceControlProfile, UpstreamAuth, UpstreamConfig,
+        HelperConfig, ProviderConfig, RouteGraphConfig, ServiceControlProfile, ServiceRouteConfig,
     };
-    use crate::lb::LbState;
+
+    struct ScopedCodexHome {
+        previous: Option<std::ffi::OsString>,
+        path: PathBuf,
+    }
+
+    impl ScopedCodexHome {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "codex-helper-no-host-session-read-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&path).expect("create temporary Codex home");
+            let previous = std::env::var_os("CODEX_HOME");
+            unsafe {
+                std::env::set_var("CODEX_HOME", &path);
+            }
+            Self { previous, path }
+        }
+    }
+
+    impl Drop for ScopedCodexHome {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(previous) => unsafe {
+                    std::env::set_var("CODEX_HOME", previous);
+                },
+                None => unsafe {
+                    std::env::remove_var("CODEX_HOME");
+                },
+            }
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
 
     #[test]
     fn detect_request_flavor_reads_stream_and_turn_shape() {
@@ -668,13 +648,7 @@ mod tests {
         );
         headers.insert("content-type", HeaderValue::from_static("application/json"));
 
-        let flavor = detect_request_flavor(
-            "codex",
-            &Method::POST,
-            &headers,
-            "/v1/responses",
-            CodexPatchMode::Default,
-        );
+        let flavor = detect_request_flavor("codex", &Method::POST, &headers, "/v1/responses");
 
         assert_eq!(
             flavor.client_content_type.as_deref(),
@@ -692,34 +666,24 @@ mod tests {
     fn detect_request_flavor_marks_codex_bridge_compact_request() {
         let headers = HeaderMap::new();
 
-        let flavor = detect_request_flavor(
-            "codex",
-            &Method::POST,
-            &headers,
-            "/v1/responses/compact",
-            CodexPatchMode::OfficialImagegenBridge,
-        );
+        let flavor =
+            detect_request_flavor("codex", &Method::POST, &headers, "/v1/responses/compact");
 
         assert!(!flavor.is_user_turn);
         assert!(flavor.is_remote_compaction_v1_request);
         let bridge = flavor.codex_bridge_log.expect("bridge log");
-        assert_eq!(bridge.patch_mode, "official-imagegen");
+        assert_eq!(bridge.patch_mode, "request-dialect");
         assert!(bridge.remote_compaction_v1_request);
         assert!(!bridge.remote_compaction_v2_request);
-        assert!(bridge.strips_client_auth);
+        assert!(!bridge.strips_client_auth);
     }
 
     #[test]
     fn detect_request_flavor_marks_trailing_slash_compact_request() {
         let headers = HeaderMap::new();
 
-        let flavor = detect_request_flavor(
-            "codex",
-            &Method::POST,
-            &headers,
-            "/v1/responses/compact/",
-            CodexPatchMode::OfficialRelayBridge,
-        );
+        let flavor =
+            detect_request_flavor("codex", &Method::POST, &headers, "/v1/responses/compact/");
 
         assert!(flavor.is_remote_compaction_v1_request);
         assert!(
@@ -734,16 +698,11 @@ mod tests {
     fn request_flavor_finalizes_remote_compaction_affinity_from_body() {
         let headers = HeaderMap::new();
 
-        let flavor = detect_request_flavor(
-            "codex",
-            &Method::POST,
-            &headers,
-            "/v1/responses/compact",
-            CodexPatchMode::Default,
-        )
-        .with_remote_compaction_context_from_body(
-            br#"{"input":[{"type":"reasoning","encrypted_content":"state"}]}"#,
-        );
+        let flavor =
+            detect_request_flavor("codex", &Method::POST, &headers, "/v1/responses/compact")
+                .with_remote_compaction_context_from_body(
+                    br#"{"input":[{"type":"reasoning","encrypted_content":"state"}]}"#,
+                );
 
         assert!(flavor.remote_compaction_requires_affinity);
     }
@@ -752,16 +711,10 @@ mod tests {
     fn request_flavor_finalizes_remote_compaction_v2_from_body() {
         let headers = HeaderMap::new();
 
-        let flavor = detect_request_flavor(
-            "codex",
-            &Method::POST,
-            &headers,
-            "/v1/responses",
-            CodexPatchMode::Default,
-        )
-        .with_remote_compaction_context_from_body(
-            br#"{"input":[{"type":"message"},{"type":"compaction_trigger"}],"stream":true}"#,
-        );
+        let flavor = detect_request_flavor("codex", &Method::POST, &headers, "/v1/responses")
+            .with_remote_compaction_context_from_body(
+                br#"{"input":[{"type":"message"},{"type":"compaction_trigger"}],"stream":true}"#,
+            );
 
         assert!(flavor.is_user_turn);
         assert!(!flavor.is_remote_compaction_v1_request);
@@ -769,28 +722,24 @@ mod tests {
         assert!(flavor.is_remote_compaction_request());
         assert!(flavor.remote_compaction_requires_affinity);
         let bridge = flavor.codex_bridge_log.expect("bridge log");
-        assert_eq!(bridge.patch_mode, "default");
+        assert_eq!(bridge.patch_mode, "request-dialect");
         assert!(!bridge.remote_compaction_v1_request);
         assert!(bridge.remote_compaction_v2_request);
         assert!(!bridge.strips_client_auth);
     }
 
     #[test]
-    fn prepare_request_body_prefers_manual_overrides_over_binding_defaults() {
+    fn prepare_request_body_applies_manual_profile_binding_defaults() {
         let raw_body = Bytes::from_static(
             br#"{"model":"gpt-5","service_tier":"priority","reasoning":{"effort":"low"}}"#,
         );
 
         let prepared = prepare_request_body(PrepareRequestBodyParams {
             raw_body: &raw_body,
-            compact_request: false,
-            override_effort: Some("high"),
-            binding_effort: Some("medium"),
-            override_model: Some("gpt-5.4"),
-            binding_model: Some("gpt-5-mini"),
-            override_service_tier: Some("flex"),
-            binding_service_tier: Some("default"),
-            filter_hosted_image_generation_tools: false,
+            dialect: RequestDialect::ResponsesHttp,
+            binding_effort: Some("high"),
+            binding_model: Some("gpt-5.4"),
+            binding_service_tier: Some("flex"),
         });
 
         assert_eq!(prepared.request_model.as_deref(), Some("gpt-5.4"));
@@ -807,71 +756,140 @@ mod tests {
     }
 
     #[test]
-    fn prepare_request_body_filters_hosted_image_generation_tools_when_enabled() {
+    fn responses_profile_effort_preserves_pro_mode_and_future_fields() {
         let raw_body = Bytes::from_static(
-            br#"{"model":"gpt-5","input":[{"type":"additional_tools","tools":[{"type":"image_generation","output_format":"png"},{"type":"function","name":"nested"}]}],"tools":[{"type":"image_generation","output_format":"png"},{"type":"function","name":"shell"}],"tool_choice":{"type":"image_generation"}}"#,
+            br#"{"model":"gpt-5.6-sol","parallel_tool_calls":false,"reasoning":{"effort":"low","mode":"pro","future_mode":"deliberate"},"future_request_field":{"enabled":true}}"#,
         );
 
         let prepared = prepare_request_body(PrepareRequestBodyParams {
             raw_body: &raw_body,
-            compact_request: false,
-            override_effort: None,
-            binding_effort: None,
-            override_model: None,
+            dialect: RequestDialect::ResponsesHttp,
+            binding_effort: Some("high"),
             binding_model: None,
-            override_service_tier: None,
             binding_service_tier: None,
-            filter_hosted_image_generation_tools: true,
         });
 
         let value: serde_json::Value =
             serde_json::from_slice(prepared.body_for_upstream.as_ref()).expect("json body");
-        let tools = value
-            .get("tools")
-            .and_then(serde_json::Value::as_array)
-            .expect("top-level tools");
-        assert_eq!(tools.len(), 1);
+        assert_eq!(value["reasoning"]["effort"].as_str(), Some("high"));
+        assert_eq!(value["reasoning"]["mode"].as_str(), Some("pro"));
         assert_eq!(
-            tools[0].get("type").and_then(serde_json::Value::as_str),
-            Some("function")
+            value["reasoning"]["future_mode"].as_str(),
+            Some("deliberate")
         );
+        assert_eq!(value["parallel_tool_calls"].as_bool(), Some(false));
         assert_eq!(
-            value.get("tool_choice").and_then(serde_json::Value::as_str),
-            Some("auto")
+            value["future_request_field"]["enabled"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(prepared.effective_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn chat_profile_effort_uses_only_reasoning_effort() {
+        let raw_body = Bytes::from_static(
+            br#"{"model":"gpt-5.6-terra","messages":[],"parallel_tool_calls":false,"reasoning_effort":"low","future_request_field":{"future_reasoning":"preserve"}}"#,
         );
 
-        let nested_tools = value
-            .get("input")
-            .and_then(serde_json::Value::as_array)
-            .and_then(|input| input.first())
-            .and_then(|item| item.get("tools"))
-            .and_then(serde_json::Value::as_array)
-            .expect("nested tools");
-        assert_eq!(nested_tools.len(), 1);
+        let prepared = prepare_request_body(PrepareRequestBodyParams {
+            raw_body: &raw_body,
+            dialect: RequestDialect::ChatCompletions,
+            binding_effort: Some("xhigh"),
+            binding_model: None,
+            binding_service_tier: None,
+        });
+
+        let value: serde_json::Value =
+            serde_json::from_slice(prepared.body_for_upstream.as_ref()).expect("json body");
+        assert_eq!(value["reasoning_effort"].as_str(), Some("xhigh"));
+        assert!(value.get("reasoning").is_none());
+        assert_eq!(value["parallel_tool_calls"].as_bool(), Some(false));
         assert_eq!(
-            nested_tools[0]
-                .get("type")
-                .and_then(serde_json::Value::as_str),
-            Some("function")
+            value["future_request_field"]["future_reasoning"].as_str(),
+            Some("preserve")
+        );
+        assert_eq!(prepared.effective_effort.as_deref(), Some("xhigh"));
+    }
+
+    #[test]
+    fn passthrough_dialect_does_not_apply_or_report_profile_effort() {
+        let raw_body = Bytes::from_static(
+            br#"{"model":"claude-sonnet","messages":[],"future_request_field":true}"#,
+        );
+
+        let prepared = prepare_request_body(PrepareRequestBodyParams {
+            raw_body: &raw_body,
+            dialect: RequestDialect::Passthrough,
+            binding_effort: Some("high"),
+            binding_model: None,
+            binding_service_tier: None,
+        });
+
+        let value: serde_json::Value =
+            serde_json::from_slice(prepared.body_for_upstream.as_ref()).expect("json body");
+        assert!(value.get("reasoning").is_none());
+        assert!(value.get("reasoning_effort").is_none());
+        assert_eq!(value["future_request_field"].as_bool(), Some(true));
+        assert_eq!(prepared.effective_effort, None);
+    }
+
+    #[test]
+    fn ultra_is_deferred_as_orchestration_intent_without_global_mapping() {
+        let raw_body = Bytes::from_static(
+            br#"{"model":"gpt-5.6-sol","reasoning":{"effort":"low","mode":"pro"}}"#,
+        );
+
+        let prepared = prepare_request_body(PrepareRequestBodyParams {
+            raw_body: &raw_body,
+            dialect: RequestDialect::ResponsesHttp,
+            binding_effort: Some("ultra"),
+            binding_model: None,
+            binding_service_tier: None,
+        });
+
+        let value: serde_json::Value =
+            serde_json::from_slice(prepared.body_for_upstream.as_ref()).expect("json body");
+        assert!(value["reasoning"].get("effort").is_none());
+        assert_eq!(value["reasoning"]["mode"].as_str(), Some("pro"));
+        assert_eq!(prepared.effective_effort, None);
+        assert_eq!(
+            prepared.deferred_reasoning_intent,
+            Some(ReasoningOrchestrationIntent::Ultra)
+        );
+
+        let raw_body = Bytes::from_static(
+            br#"{"model":"gpt-5.6-sol","reasoning":{"effort":"ultra","mode":"pro"}}"#,
+        );
+        let prepared = prepare_request_body(PrepareRequestBodyParams {
+            raw_body: &raw_body,
+            dialect: RequestDialect::ResponsesHttp,
+            binding_effort: None,
+            binding_model: None,
+            binding_service_tier: None,
+        });
+        let value: serde_json::Value =
+            serde_json::from_slice(prepared.body_for_upstream.as_ref()).expect("json body");
+        assert!(value["reasoning"].get("effort").is_none());
+        assert_eq!(value["reasoning"]["mode"].as_str(), Some("pro"));
+        assert_eq!(prepared.effective_effort, None);
+        assert_eq!(
+            prepared.deferred_reasoning_intent,
+            Some(ReasoningOrchestrationIntent::Ultra)
         );
     }
 
     #[test]
-    fn prepare_request_body_preserves_hosted_image_generation_tools_by_default() {
+    fn prepare_request_body_preserves_unknown_tool_fields_without_client_preset() {
         let raw_body = Bytes::from_static(
             br#"{"model":"gpt-5","tools":[{"type":"image_generation","output_format":"png"}],"tool_choice":{"type":"image_generation"}}"#,
         );
 
         let prepared = prepare_request_body(PrepareRequestBodyParams {
             raw_body: &raw_body,
-            compact_request: false,
-            override_effort: None,
+            dialect: RequestDialect::ResponsesHttp,
             binding_effort: None,
-            override_model: None,
             binding_model: None,
-            override_service_tier: None,
             binding_service_tier: None,
-            filter_hosted_image_generation_tools: false,
         });
 
         let value: serde_json::Value =
@@ -899,7 +917,6 @@ mod tests {
         let binding = SessionBinding {
             session_id: "sid-fast".to_string(),
             profile_name: Some("daily".to_string()),
-            station_name: Some("test".to_string()),
             model: Some("gpt-5.4".to_string()),
             reasoning_effort: Some("low".to_string()),
             service_tier: Some("default".to_string()),
@@ -919,7 +936,6 @@ mod tests {
         let binding = SessionBinding {
             session_id: "sid-fast".to_string(),
             profile_name: Some("fast".to_string()),
-            station_name: Some("test".to_string()),
             model: Some("gpt-5.4".to_string()),
             reasoning_effort: Some("low".to_string()),
             service_tier: Some("fast".to_string()),
@@ -963,44 +979,89 @@ mod tests {
         assert!(disabled.warn.is_none());
     }
 
-    fn test_proxy_with_active_station() -> ProxyService {
-        let mut cfg = ProxyConfig::default();
-        cfg.codex.active = Some("test".to_string());
-        cfg.codex.default_profile = Some("default".to_string());
-        cfg.codex.profiles.insert(
-            "default".to_string(),
-            ServiceControlProfile {
-                model: Some("gpt-5.4".to_string()),
-                ..ServiceControlProfile::default()
+    fn test_proxy_with_active_route() -> ProxyService {
+        let cfg = HelperConfig {
+            codex: ServiceRouteConfig {
+                default_profile: Some("default".to_string()),
+                profiles: std::collections::BTreeMap::from([(
+                    "default".to_string(),
+                    ServiceControlProfile {
+                        model: Some("gpt-5.4".to_string()),
+                        ..ServiceControlProfile::default()
+                    },
+                )]),
+                providers: std::collections::BTreeMap::from([(
+                    "test".to_string(),
+                    ProviderConfig {
+                        base_url: Some("https://example.com/v1".to_string()),
+                        ..ProviderConfig::default()
+                    },
+                )]),
+                routing: Some(RouteGraphConfig::ordered_failover(vec!["test".to_string()])),
             },
-        );
-        cfg.codex.configs.insert(
-            "test".to_string(),
-            ServiceConfig {
-                name: "test".to_string(),
-                alias: None,
-                enabled: true,
-                level: 1,
-                upstreams: vec![UpstreamConfig {
-                    base_url: "https://example.com/v1".to_string(),
-                    auth: UpstreamAuth::default(),
-                    tags: HashMap::new(),
-                    supported_models: HashMap::new(),
-                    model_mapping: HashMap::new(),
-                }],
-            },
-        );
-        ProxyService::new(
-            reqwest::Client::new(),
-            Arc::new(cfg),
-            "codex",
-            Arc::new(Mutex::new(HashMap::<String, LbState>::new())),
+            ..HelperConfig::default()
+        };
+        ProxyService::new(reqwest::Client::new(), Arc::new(cfg), "codex")
+    }
+
+    #[tokio::test]
+    async fn proxy_request_preparation_does_not_read_host_local_session_history() {
+        let codex_home = ScopedCodexHome::new();
+        let session_id = "019f57be-9892-7081-b735-c0a524d2a127";
+        let session_dir = codex_home.path.join("sessions/2026/07/13");
+        std::fs::create_dir_all(&session_dir).expect("create fake session directory");
+        std::fs::write(
+            session_dir.join(format!(
+                "rollout-2026-07-13T00-00-00-{session_id}.jsonl"
+            )),
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session_id}\",\"cwd\":\"/host/private/project\"}}}}\n"
+            ),
         )
+        .expect("write fake Codex session");
+        let proxy = test_proxy_with_active_route();
+        let config = load_request_config_context(&proxy).await;
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        let method = Method::POST;
+        let uri = "/v1/responses".parse::<Uri>().expect("uri");
+        let raw_body = Bytes::from(
+            serde_json::json!({
+                "model": "gpt-5",
+                "prompt_cache_key": session_id,
+            })
+            .to_string(),
+        );
+
+        let prepared = prepare_common_request_without_route_plan(CommonRequestPreparationParams {
+            proxy: &proxy,
+            config: &config,
+            method: &method,
+            uri: &uri,
+            client_headers: &headers,
+            raw_body: &raw_body,
+            request_dialect: RequestDialect::ResponsesHttp,
+            session_identity_hint:
+                super::super::client_identity::extract_session_identity_with_body_fallback(
+                    &headers,
+                    raw_body.as_ref(),
+                ),
+            client_name: None,
+            client_addr: None,
+            started_at_ms: 1,
+            client_content_type: Some("application/json"),
+            request_body_previews: false,
+        })
+        .await
+        .expect("prepare request");
+
+        assert_eq!(prepared.session_id.as_deref(), Some(session_id));
+        assert_eq!(prepared.cwd, None);
     }
 
     #[tokio::test]
     async fn prepare_common_request_tracks_prompt_cache_identity_without_default_profile_patch() {
-        let proxy = test_proxy_with_active_station();
+        let proxy = test_proxy_with_active_route();
         let config = load_request_config_context(&proxy).await;
         let mut headers = HeaderMap::new();
         headers.insert("content-type", HeaderValue::from_static("application/json"));
@@ -1016,7 +1077,7 @@ mod tests {
             uri: &uri,
             client_headers: &headers,
             raw_body: &raw_body,
-            compact_request: false,
+            request_dialect: RequestDialect::ResponsesHttp,
             session_identity_hint:
                 super::super::client_identity::extract_session_identity_with_body_fallback(
                     &headers,
@@ -1027,7 +1088,6 @@ mod tests {
             started_at_ms: 2,
             client_content_type: Some("application/json"),
             request_body_previews: false,
-            preserve_hosted_image_generation_tools: false,
         })
         .await
         .expect("prepared");
@@ -1057,7 +1117,8 @@ mod tests {
             !String::from_utf8_lossy(prepared.body_for_upstream.as_ref()).contains("\"gpt-5.4\"")
         );
         assert!(!prepared.request_body_previews);
-        assert!(!prepared.route_selection.is_empty());
+        let route_plan = prepared.route_plan.as_ref().expect("route plan");
+        assert!(!route_plan.is_empty());
 
         let active = proxy.state.list_active_requests().await;
         assert_eq!(active.len(), 1);
@@ -1069,10 +1130,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_common_request_preserves_hosted_image_generation_for_explicit_contract() {
-        let proxy = test_proxy_with_active_station();
-        let mut config = load_request_config_context(&proxy).await;
-        config.hosted_image_generation = CodexHostedImageGenerationMode::Disabled;
+    async fn prepare_common_request_preserves_unknown_tools_without_client_preset() {
+        let proxy = test_proxy_with_active_route();
+        let config = load_request_config_context(&proxy).await;
         let mut headers = HeaderMap::new();
         headers.insert("content-type", HeaderValue::from_static("application/json"));
         let method = Method::POST;
@@ -1088,7 +1148,7 @@ mod tests {
             uri: &uri,
             client_headers: &headers,
             raw_body: &raw_body,
-            compact_request: false,
+            request_dialect: RequestDialect::ResponsesHttp,
             session_identity_hint:
                 super::super::client_identity::extract_session_identity_with_body_fallback(
                     &headers,
@@ -1099,7 +1159,6 @@ mod tests {
             started_at_ms: 3,
             client_content_type: Some("application/json"),
             request_body_previews: false,
-            preserve_hosted_image_generation_tools: true,
         })
         .await
         .expect("prepared");

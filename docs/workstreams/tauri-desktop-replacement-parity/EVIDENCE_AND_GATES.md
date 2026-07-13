@@ -3,6 +3,8 @@
 Status: Complete
 Last updated: 2026-05-23
 
+Historical note (superseded 2026-07-13): references below to config import and `ProxyConfigV4` describe the retired implementation. Current startup accepts only the canonical version 5 config and uses semantic unversioned runtime types.
+
 ## Gate Set
 
 ### Desktop Frontend Gate

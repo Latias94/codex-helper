@@ -3,6 +3,8 @@
 Date: 2026-05-18
 Status: Complete
 
+> Historical status (superseded 2026-07-12): this closeout records a removed client patch preset. Responses and compact support now come from the selected provider contract and observations; the local switch only updates the helper selector/stanza in Codex `config.toml`.
+
 ## Delivered
 
 - Added `official-relay-bridge` as an explicit Codex client patch mode.

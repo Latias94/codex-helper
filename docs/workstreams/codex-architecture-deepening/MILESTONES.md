@@ -1,5 +1,10 @@
 # Codex Architecture Deepening — Milestones
 
+> Historical artifact (superseded 2026-07-12): preset aliases, auth facades,
+> compatibility readers, and remote-control mutations were removed by the
+> canonical relay runtime modernization. The current remote control plane is
+> GET/HEAD-only.
+
 Status: Complete
 Last updated: 2026-05-20
 

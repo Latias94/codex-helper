@@ -1,8 +1,8 @@
 # Config V2 Migration Guide (Historical)
 
-> Historical status: this document explains the older v2 station/provider split. The current public CLI no longer targets v2. `codex-helper config migrate` now migrates through routing-first v3 into the `version = 4` route graph schema.
+> Historical status (superseded 2026-07-12): this document records a pre-version-5 design and migration phase. The current helper accepts only `~/.codex-helper/config.toml` with `version = 5`; `codex-helper config migrate` and v2/v3/v4 compatibility readers do not exist. See [current configuration](../../CONFIGURATION.md) and the [canonical modernization plan](../../plans/2026-07-10-002-refactor-canonical-relay-runtime-modernization-plan.md). The remaining content is archival.
 
-This guide explains how to move an existing `~/.codex-helper/config.toml` from the legacy `configs` layout to the station/provider-oriented `v2` layout.
+This archived guide records how an earlier version moved an existing `~/.codex-helper/config.toml` from the legacy `configs` layout to the station/provider-oriented `v2` layout.
 
 ## Why V2
 
@@ -25,7 +25,7 @@ For a personal relay manager, that quickly becomes hard to maintain when you wan
 - `stations`: routing entries, level/enabled state, provider membership
 - `profiles`: reusable session intent (`station`, `model`, `reasoning_effort`, `service_tier`)
 
-## Current Migration Commands
+## Historical Migration Commands
 
 Preview the migrated file first:
 

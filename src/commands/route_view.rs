@@ -1,54 +1,34 @@
 use super::config_doc::{
-    ConfigDocument, load_config_document, ordered_v4_provider_names, print_v4_provider_list,
-    resolve_service, routing_exhausted_label, routing_policy_label, select_service_manager,
-    select_v4_service_view,
+    load_config_document, ordered_provider_names, print_provider_list, resolve_service,
+    routing_exhausted_label, routing_policy_label, select_service_route_config,
 };
-use crate::config::{
-    CURRENT_ROUTE_GRAPH_CONFIG_VERSION, ServiceConfig, ServiceConfigManager,
-    ServiceRoutingExplanation, ServiceViewV4, explain_service_routing, storage::config_file_path,
-};
-use crate::routing_explain::{
-    RoutingExplainCondition, RoutingExplainConditionalBranch, RoutingExplainResponse,
-    RoutingExplainRouteRef, RoutingExplainRouteRefKind, RoutingExplainSkipReason,
-    build_routing_explain_response_with_request, parse_routing_explain_headers,
-};
-use crate::routing_ir::{
-    RoutePlanRuntimeState, RouteRequestContext, compile_legacy_route_plan_template,
-    compile_v4_route_plan_template_with_request,
-};
+use crate::config::{CURRENT_CONFIG_VERSION, ServiceRouteConfig};
+use crate::routing_explain::parse_routing_explain_headers;
+use crate::routing_ir::{RouteRequestContext, compile_route_plan_template_with_request};
 use crate::{CliError, CliResult, RoutingCommand};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
-#[derive(Debug, Serialize)]
-struct ConfigExplainProvider {
-    name: String,
-    alias: Option<String>,
-    enabled: bool,
-    level: u8,
-    upstreams: Vec<String>,
-}
-
 #[derive(Debug, Serialize, Clone)]
-struct ConfigExplainV4ProviderEndpoint {
+struct ConfigExplainProviderEndpoint {
     name: String,
     base_url: String,
     enabled: bool,
 }
 
 #[derive(Debug, Serialize, Clone)]
-struct ConfigExplainV4Provider {
+struct ConfigExplainProvider {
     name: String,
     alias: Option<String>,
     enabled: bool,
     routing_index: Option<usize>,
     target: bool,
     tags: BTreeMap<String, String>,
-    endpoints: Vec<ConfigExplainV4ProviderEndpoint>,
+    endpoints: Vec<ConfigExplainProviderEndpoint>,
 }
 
-#[derive(Debug, Serialize)]
-struct ConfigExplainV4Routing {
+#[derive(Debug, Serialize, Clone)]
+struct ConfigExplainRouting {
     entry: String,
     policy: &'static str,
     target: Option<String>,
@@ -58,21 +38,60 @@ struct ConfigExplainV4Routing {
     on_exhausted: &'static str,
 }
 
-fn explain_v4_routing(view: &ServiceViewV4) -> ConfigExplainV4Routing {
-    let routing = crate::config::effective_v4_routing(view);
+#[derive(Debug, Serialize)]
+struct ConfigOnlyRouteExplain {
+    api_version: u32,
+    source: &'static str,
+    runtime_state_queried: bool,
+    schema_version: u32,
+    service_name: String,
+    routing: ConfigExplainRouting,
+    providers: Vec<ConfigExplainProvider>,
+    request: ConfigOnlyRequestContext,
+    route_graph_key: String,
+    first_config_eligible_candidate: Option<ConfigOnlyRouteCandidate>,
+    candidates: Vec<ConfigOnlyRouteCandidate>,
+}
+
+#[derive(Debug, Serialize)]
+struct ConfigOnlyRequestContext {
+    model: Option<String>,
+    service_tier: Option<String>,
+    reasoning_effort: Option<String>,
+    path: Option<String>,
+    method: Option<String>,
+    header_names: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct ConfigOnlyRouteCandidate {
+    provider_id: String,
+    provider_alias: Option<String>,
+    endpoint_id: String,
+    provider_endpoint_key: String,
+    route_path: Vec<String>,
+    preference_group: u32,
+    upstream_base_url: String,
+    model_supported: bool,
+    effective_model: Option<String>,
+    config_skip_reasons: Vec<&'static str>,
+}
+
+fn explain_routing(view: &ServiceRouteConfig) -> ConfigExplainRouting {
+    let routing = crate::config::effective_routing(view);
     let entry_node = routing.entry_node();
-    ConfigExplainV4Routing {
+    ConfigExplainRouting {
         entry: routing.entry.clone(),
         policy: routing_policy_label(
             entry_node
                 .map(|node| node.strategy)
-                .unwrap_or(crate::config::RoutingPolicyV4::OrderedFailover),
+                .unwrap_or(crate::config::RouteStrategy::OrderedFailover),
         ),
         target: entry_node.and_then(|node| node.target.clone()),
         order: entry_node
             .map(|node| node.children.clone())
             .unwrap_or_default(),
-        expanded_order: crate::config::resolved_v4_provider_order("route-view", view)
+        expanded_order: crate::config::resolved_provider_order("route-view", view)
             .unwrap_or_else(|_| view.providers.keys().cloned().collect()),
         prefer_tags: entry_node
             .map(|node| node.prefer_tags.clone())
@@ -80,23 +99,23 @@ fn explain_v4_routing(view: &ServiceViewV4) -> ConfigExplainV4Routing {
         on_exhausted: routing_exhausted_label(
             entry_node
                 .map(|node| node.on_exhausted)
-                .unwrap_or(crate::config::RoutingExhaustedActionV4::Continue),
+                .unwrap_or(crate::config::RouteExhaustedAction::Continue),
         ),
     }
 }
 
-fn explain_v4_provider(
-    view: &ServiceViewV4,
+fn explain_provider(
+    view: &ServiceRouteConfig,
     provider_name: &str,
-) -> Option<ConfigExplainV4Provider> {
+) -> Option<ConfigExplainProvider> {
     let provider = view.providers.get(provider_name)?;
-    let route_order = crate::config::resolved_v4_provider_order("route-view", view)
-        .unwrap_or_else(|_| ordered_v4_provider_names(view));
+    let route_order = crate::config::resolved_provider_order("route-view", view)
+        .unwrap_or_else(|_| ordered_provider_names(view));
     let routing_index = route_order
         .iter()
         .position(|candidate| candidate == provider_name)
         .map(|idx| idx + 1);
-    let target = crate::config::effective_v4_routing(view)
+    let target = crate::config::effective_routing(view)
         .entry_node()
         .and_then(|node| node.target.as_deref())
         .is_some_and(|target| target == provider_name);
@@ -108,21 +127,21 @@ fn explain_v4_provider(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        endpoints.push(ConfigExplainV4ProviderEndpoint {
+        endpoints.push(ConfigExplainProviderEndpoint {
             name: "default".to_string(),
             base_url: base_url.to_string(),
             enabled: provider.enabled,
         });
     }
     endpoints.extend(provider.endpoints.iter().map(|(endpoint_name, endpoint)| {
-        ConfigExplainV4ProviderEndpoint {
+        ConfigExplainProviderEndpoint {
             name: endpoint_name.clone(),
             base_url: endpoint.base_url.clone(),
             enabled: endpoint.enabled,
         }
     }));
 
-    Some(ConfigExplainV4Provider {
+    Some(ConfigExplainProvider {
         name: provider_name.to_string(),
         alias: provider.alias.clone(),
         enabled: provider.enabled,
@@ -133,20 +152,20 @@ fn explain_v4_provider(
     })
 }
 
-fn explain_v4_providers(view: &ServiceViewV4) -> Vec<ConfigExplainV4Provider> {
-    ordered_v4_provider_names(view)
+fn explain_providers(view: &ServiceRouteConfig) -> Vec<ConfigExplainProvider> {
+    ordered_provider_names(view)
         .into_iter()
-        .filter_map(|provider_name| explain_v4_provider(view, provider_name.as_str()))
+        .filter_map(|provider_name| explain_provider(view, provider_name.as_str()))
         .collect()
 }
 
-fn print_v4_explain_text(
+fn print_explain_text(
     label: &str,
-    view: &ServiceViewV4,
+    view: &ServiceRouteConfig,
     provider_name: Option<&str>,
 ) -> anyhow::Result<()> {
-    let routing = explain_v4_routing(view);
-    println!("Schema version: v{CURRENT_ROUTE_GRAPH_CONFIG_VERSION}");
+    let routing = explain_routing(view);
+    println!("Schema version: v{CURRENT_CONFIG_VERSION}");
     println!("Service: {label}");
     println!("Routing entry: {}", routing.entry);
     println!("Routing policy: {}", routing.policy);
@@ -165,7 +184,7 @@ fn print_v4_explain_text(
     }
     println!("On exhausted: {}", routing.on_exhausted);
 
-    let providers = explain_v4_providers(view);
+    let providers = explain_providers(view);
     if providers.is_empty() {
         println!("Providers: <empty>");
     } else {
@@ -199,7 +218,7 @@ fn print_v4_explain_text(
     }
 
     if let Some(provider_name) = provider_name {
-        let provider = explain_v4_provider(view, provider_name)
+        let provider = explain_provider(view, provider_name)
             .ok_or_else(|| anyhow::anyhow!("provider '{}' not found", provider_name))?;
         println!("Provider '{}': enabled={}", provider.name, provider.enabled);
         if provider.endpoints.is_empty() {
@@ -241,108 +260,134 @@ fn build_route_request_context(
     })
 }
 
-fn build_v4_runtime_explain(
+fn build_config_only_explain(
     service_name: &str,
-    view: &ServiceViewV4,
+    view: &ServiceRouteConfig,
+    provider_name: Option<&str>,
     request: RouteRequestContext,
-) -> anyhow::Result<RoutingExplainResponse> {
-    let template = compile_v4_route_plan_template_with_request(service_name, view, &request)?;
-    Ok(build_routing_explain_response_with_request(
-        service_name,
-        None,
-        request,
-        None,
-        &template,
-        &RoutePlanRuntimeState::default(),
-    ))
-}
-
-fn build_legacy_runtime_explain(
-    service_name: &str,
-    mgr: &ServiceConfigManager,
-    routing: &ServiceRoutingExplanation,
-    request: RouteRequestContext,
-) -> RoutingExplainResponse {
-    let services = legacy_runtime_services_for_explain(mgr, routing);
-    let template = compile_legacy_route_plan_template(service_name, services);
-    build_routing_explain_response_with_request(
-        service_name,
-        None,
-        request,
-        None,
-        &template,
-        &RoutePlanRuntimeState::default(),
-    )
-}
-
-fn legacy_runtime_services_for_explain<'a>(
-    mgr: &'a ServiceConfigManager,
-    routing: &ServiceRoutingExplanation,
-) -> Vec<&'a ServiceConfig> {
-    let names = if routing.eligible_stations.is_empty() {
-        routing
-            .fallback_station
-            .as_ref()
-            .map(|candidate| vec![candidate.name.as_str()])
-            .unwrap_or_default()
-    } else {
-        routing
-            .eligible_stations
-            .iter()
-            .map(|candidate| candidate.name.as_str())
-            .collect::<Vec<_>>()
+) -> anyhow::Result<ConfigOnlyRouteExplain> {
+    let providers = match provider_name {
+        Some(provider_name) => vec![
+            explain_provider(view, provider_name)
+                .ok_or_else(|| anyhow::anyhow!("provider '{}' not found", provider_name))?,
+        ],
+        None => explain_providers(view),
+    };
+    let template = compile_route_plan_template_with_request(service_name, view, &request)?;
+    let requested_model = request.model.as_deref();
+    let candidates = template
+        .candidates
+        .iter()
+        .map(|candidate| {
+            let model_supported = requested_model
+                .map(|model| candidate.is_model_supported(model))
+                .unwrap_or(true);
+            ConfigOnlyRouteCandidate {
+                provider_id: candidate.provider_id.clone(),
+                provider_alias: candidate.provider_alias.clone(),
+                endpoint_id: candidate.endpoint_id.clone(),
+                provider_endpoint_key: template
+                    .candidate_provider_endpoint_key(candidate)
+                    .stable_key(),
+                route_path: candidate.route_path.clone(),
+                preference_group: candidate.preference_group,
+                upstream_base_url: candidate.base_url.clone(),
+                model_supported,
+                effective_model: requested_model.map(|model| candidate.effective_model(model)),
+                config_skip_reasons: if model_supported {
+                    Vec::new()
+                } else {
+                    vec!["unsupported_model"]
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+    let first_config_eligible_candidate = candidates
+        .iter()
+        .find(|candidate| candidate.model_supported)
+        .cloned();
+    let request = ConfigOnlyRequestContext {
+        model: request.model,
+        service_tier: request.service_tier,
+        reasoning_effort: request.reasoning_effort,
+        path: request.path,
+        method: request.method,
+        header_names: request.headers.into_keys().collect(),
     };
 
-    names
-        .into_iter()
-        .filter_map(|name| mgr.station(name))
-        .collect()
+    Ok(ConfigOnlyRouteExplain {
+        api_version: 1,
+        source: "config_only",
+        runtime_state_queried: false,
+        schema_version: CURRENT_CONFIG_VERSION,
+        service_name: service_name.to_string(),
+        routing: explain_routing(view),
+        providers,
+        request,
+        route_graph_key: template.route_graph_key(),
+        first_config_eligible_candidate,
+        candidates,
+    })
 }
 
-fn runtime_explain_text_lines(explain: &RoutingExplainResponse) -> Vec<String> {
+fn config_only_explain_text_lines(explain: &ConfigOnlyRouteExplain) -> Vec<String> {
     let mut lines = Vec::new();
-    if let Some(model) = explain.request_model.as_deref() {
+    lines.push("Preview source: config_only".to_string());
+    lines.push("Runtime state queried: no".to_string());
+    if let Some(model) = explain.request.model.as_deref() {
         lines.push(format!("Request model: {model}"));
     }
-    if let Some(service_tier) = explain.request_context.service_tier.as_deref() {
+    if let Some(service_tier) = explain.request.service_tier.as_deref() {
         lines.push(format!("Request service tier: {service_tier}"));
     }
-    if let Some(reasoning_effort) = explain.request_context.reasoning_effort.as_deref() {
+    if let Some(reasoning_effort) = explain.request.reasoning_effort.as_deref() {
         lines.push(format!("Request reasoning effort: {reasoning_effort}"));
     }
-    if let Some(path) = explain.request_context.path.as_deref() {
+    if let Some(path) = explain.request.path.as_deref() {
         lines.push(format!("Request path: {path}"));
     }
-    if let Some(method) = explain.request_context.method.as_deref() {
+    if let Some(method) = explain.request.method.as_deref() {
         lines.push(format!("Request method: {method}"));
     }
-    if !explain.request_context.headers.is_empty() {
+    if !explain.request.header_names.is_empty() {
         lines.push(format!(
-            "Request headers: {}",
-            explain.request_context.headers.join(", ")
+            "Request header names: {}",
+            explain.request.header_names.join(", ")
         ));
     }
-    if let Some(selected) = &explain.selected_route {
+    if let Some(candidate) = &explain.first_config_eligible_candidate {
         lines.push(format!(
-            "Selected route: endpoint={} group={} provider={} path=[{}]",
-            selected.provider_endpoint_key,
-            selected.preference_group,
-            selected.provider_id,
-            selected.route_path.join(" > ")
+            "First config-eligible candidate: endpoint={} group={} provider={} path=[{}]",
+            candidate.provider_endpoint_key,
+            candidate.preference_group,
+            candidate.provider_id,
+            candidate.route_path.join(" > ")
         ));
     } else {
-        lines.push("Selected route: <none>".to_string());
+        lines.push("First config-eligible candidate: <none>".to_string());
     }
 
     if explain.candidates.is_empty() {
-        lines.push("Runtime candidates: <empty>".to_string());
+        lines.push("Config candidates: <empty>".to_string());
         return lines;
     }
 
-    lines.push("Runtime candidates:".to_string());
+    lines.push("Config candidates:".to_string());
     for (idx, candidate) in explain.candidates.iter().enumerate() {
-        let marker = if candidate.selected { "*" } else { " " };
-        let skips = format_skip_reasons(&candidate.skip_reasons);
+        let marker = if explain
+            .first_config_eligible_candidate
+            .as_ref()
+            .is_some_and(|first| first.provider_endpoint_key == candidate.provider_endpoint_key)
+        {
+            "*"
+        } else {
+            " "
+        };
+        let skips = if candidate.config_skip_reasons.is_empty() {
+            "-".to_string()
+        } else {
+            candidate.config_skip_reasons.join(",")
+        };
         lines.push(format!(
             "  {} {}. endpoint={} group={} provider={} path=[{}] skip={}",
             marker,
@@ -354,179 +399,12 @@ fn runtime_explain_text_lines(explain: &RoutingExplainResponse) -> Vec<String> {
             skips
         ));
     }
-
-    if !explain.conditional_routes.is_empty() {
-        lines.push("Conditional routes:".to_string());
-        for route in &explain.conditional_routes {
-            let target = route
-                .selected_target
-                .as_ref()
-                .map(format_route_ref)
-                .unwrap_or_else(|| "<none>".to_string());
-            lines.push(format!(
-                "  {} matched={} branch={} target={} condition=[{}]",
-                route.route_name,
-                route.matched,
-                format_conditional_branch(route.selected_branch),
-                target,
-                format_condition(&route.condition)
-            ));
-        }
-    }
-
     lines
 }
 
-fn print_runtime_explain_text(explain: &RoutingExplainResponse) {
-    for line in runtime_explain_text_lines(explain) {
+fn print_config_only_explain_text(explain: &ConfigOnlyRouteExplain) {
+    for line in config_only_explain_text_lines(explain) {
         println!("{line}");
-    }
-}
-
-fn format_skip_reasons(reasons: &[RoutingExplainSkipReason]) -> String {
-    if reasons.is_empty() {
-        return "-".to_string();
-    }
-
-    reasons
-        .iter()
-        .map(RoutingExplainSkipReason::code)
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-fn format_conditional_branch(branch: RoutingExplainConditionalBranch) -> &'static str {
-    match branch {
-        RoutingExplainConditionalBranch::Then => "then",
-        RoutingExplainConditionalBranch::Default => "default",
-    }
-}
-
-fn format_route_ref(route_ref: &RoutingExplainRouteRef) -> String {
-    let kind = match route_ref.kind {
-        RoutingExplainRouteRefKind::Route => "route",
-        RoutingExplainRouteRefKind::Provider => "provider",
-        RoutingExplainRouteRefKind::ProviderEndpoint => "endpoint",
-    };
-    format!("{kind}:{}", route_ref.name)
-}
-
-fn format_condition(condition: &RoutingExplainCondition) -> String {
-    let mut parts = Vec::new();
-    if let Some(model) = condition.model.as_deref() {
-        parts.push(format!("model={model}"));
-    }
-    if let Some(service_tier) = condition.service_tier.as_deref() {
-        parts.push(format!("service_tier={service_tier}"));
-    }
-    if let Some(reasoning_effort) = condition.reasoning_effort.as_deref() {
-        parts.push(format!("reasoning_effort={reasoning_effort}"));
-    }
-    if let Some(path) = condition.path.as_deref() {
-        parts.push(format!("path={path}"));
-    }
-    if let Some(method) = condition.method.as_deref() {
-        parts.push(format!("method={method}"));
-    }
-    if !condition.headers.is_empty() {
-        parts.push(format!("headers={}", condition.headers.join(",")));
-    }
-
-    if parts.is_empty() {
-        "<empty>".to_string()
-    } else {
-        parts.join(",")
-    }
-}
-
-fn build_group_explain(
-    mgr: &ServiceConfigManager,
-    provider_name: Option<&str>,
-) -> anyhow::Result<Option<ConfigExplainProvider>> {
-    let Some(provider_name) = provider_name else {
-        return Ok(None);
-    };
-
-    let svc = mgr
-        .configs
-        .get(provider_name)
-        .ok_or_else(|| anyhow::anyhow!("provider '{}' not found", provider_name))?;
-    Ok(Some(ConfigExplainProvider {
-        name: provider_name.to_string(),
-        alias: svc.alias.clone(),
-        enabled: svc.enabled,
-        level: svc.level.clamp(1, 10),
-        upstreams: svc.upstreams.iter().map(|up| up.base_url.clone()).collect(),
-    }))
-}
-
-fn print_explain_text(
-    label: &str,
-    schema_version: u32,
-    routing: &ServiceRoutingExplanation,
-    provider: Option<&ConfigExplainProvider>,
-) {
-    println!("Schema version: v{}", schema_version);
-    println!("Service: {}", label);
-    println!(
-        "Active provider: {}",
-        routing.active_station.as_deref().unwrap_or("<none>")
-    );
-    println!("Routing mode: {}", routing.mode);
-
-    if routing.eligible_stations.is_empty() {
-        println!("Candidate order: <empty>");
-    } else {
-        println!("Candidate order:");
-        for (idx, candidate) in routing.eligible_stations.iter().enumerate() {
-            let active = if candidate.active { " preferred" } else { "" };
-            if let Some(alias) = candidate.alias.as_deref() {
-                println!(
-                    "  {}. {}{} (alias={}, priority={}, enabled={}, upstreams={})",
-                    idx + 1,
-                    candidate.name,
-                    active,
-                    alias,
-                    candidate.level,
-                    candidate.enabled,
-                    candidate.upstreams
-                );
-            } else {
-                println!(
-                    "  {}. {}{} (priority={}, enabled={}, upstreams={})",
-                    idx + 1,
-                    candidate.name,
-                    active,
-                    candidate.level,
-                    candidate.enabled,
-                    candidate.upstreams
-                );
-            }
-        }
-    }
-
-    if let Some(fallback) = &routing.fallback_station {
-        println!(
-            "Fallback: {} (priority={}, enabled={}, upstreams={})",
-            fallback.name, fallback.level, fallback.enabled, fallback.upstreams
-        );
-    }
-
-    if let Some(provider) = provider {
-        println!(
-            "Provider '{}': priority={} enabled={} upstreams={}",
-            provider.name,
-            provider.level,
-            provider.enabled,
-            provider.upstreams.len()
-        );
-        if provider.upstreams.is_empty() {
-            println!("  <no upstreams>");
-        } else {
-            for (idx, upstream) in provider.upstreams.iter().enumerate() {
-                println!("  [{}] {}", idx, upstream);
-            }
-        }
     }
 }
 
@@ -535,73 +413,13 @@ pub async fn handle_route_view_cmd(cmd: RoutingCommand) -> CliResult<()> {
         RoutingCommand::List { codex, claude } => {
             let service = resolve_service(codex, claude)
                 .await
-                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+                .map_err(|e| CliError::Configuration(e.to_string()))?;
             let document = load_config_document()
                 .await
-                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+                .map_err(|e| CliError::Configuration(e.to_string()))?;
 
-            if let ConfigDocument::V4(cfg) = &document {
-                let (view, label) = select_v4_service_view(cfg, service);
-                print_v4_provider_list(label, view);
-                return Ok(());
-            }
-
-            let runtime = document
-                .runtime()
-                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
-            let (mgr, label) = if service == "claude" {
-                (&runtime.claude, "Claude")
-            } else {
-                (&runtime.codex, "Codex")
-            };
-            let cfg_path = config_file_path();
-
-            if mgr.configs.is_empty() {
-                println!("No {} providers in {:?}", label, cfg_path);
-            } else {
-                let active = mgr.active.clone();
-                println!("{} providers (from {:?}):", label, cfg_path);
-                let mut items = mgr
-                    .configs
-                    .iter()
-                    .map(|(name, svc)| (name.as_str(), svc))
-                    .collect::<Vec<_>>();
-                items.sort_by(|(a_name, a), (b_name, b)| {
-                    let a_level = a.level.clamp(1, 10);
-                    let b_level = b.level.clamp(1, 10);
-                    a_level.cmp(&b_level).then_with(|| a_name.cmp(b_name))
-                });
-
-                for (name, service_cfg) in items {
-                    let marker = if active.as_deref() == Some(name) {
-                        "*"
-                    } else {
-                        " "
-                    };
-                    let enabled = if service_cfg.enabled { "on" } else { "off" };
-                    let level = service_cfg.level.clamp(1, 10);
-                    if let Some(alias) = &service_cfg.alias {
-                        println!(
-                            "  {} L{} {} {} [{}] ({} upstreams)",
-                            marker,
-                            level,
-                            enabled,
-                            name,
-                            alias,
-                            service_cfg.upstreams.len()
-                        );
-                    } else {
-                        println!(
-                            "  {} L{} {} {} ({} upstreams)",
-                            marker,
-                            level,
-                            enabled,
-                            name,
-                            service_cfg.upstreams.len()
-                        );
-                    }
-                }
-            }
+            let (view, label) = select_service_route_config(&document, service);
+            print_provider_list(label, view);
         }
 
         RoutingCommand::Explain {
@@ -618,10 +436,10 @@ pub async fn handle_route_view_cmd(cmd: RoutingCommand) -> CliResult<()> {
         } => {
             let service = resolve_service(codex, claude)
                 .await
-                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+                .map_err(|e| CliError::Configuration(e.to_string()))?;
             let document = load_config_document()
                 .await
-                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+                .map_err(|e| CliError::Configuration(e.to_string()))?;
             let request = build_route_request_context(
                 model,
                 service_tier,
@@ -630,61 +448,20 @@ pub async fn handle_route_view_cmd(cmd: RoutingCommand) -> CliResult<()> {
                 method,
                 headers,
             )
-            .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+            .map_err(|e| CliError::Configuration(e.to_string()))?;
 
-            if let ConfigDocument::V4(cfg) = &document {
-                let (view, label) = select_v4_service_view(cfg, service);
-                let runtime_explain = build_v4_runtime_explain(service, view, request.clone())
-                    .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
-                if json {
-                    if let Some(provider_name) = provider.as_deref()
-                        && explain_v4_provider(view, provider_name).is_none()
-                    {
-                        return Err(CliError::ProxyConfig(format!(
-                            "provider '{}' not found",
-                            provider_name
-                        )));
-                    }
-                    let text = serde_json::to_string_pretty(&runtime_explain)
-                        .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
-                    println!("{text}");
-                } else {
-                    print_v4_explain_text(label, view, provider.as_deref())
-                        .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
-                    print_runtime_explain_text(&runtime_explain);
-                }
-                return Ok(());
-            }
-
-            let runtime = document
-                .runtime()
-                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
-            let (mgr, label) = select_service_manager(&runtime, service);
-            let routing = explain_service_routing(mgr);
-            let group_detail = build_group_explain(mgr, provider.as_deref())
-                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
-            let runtime_explain = build_legacy_runtime_explain(service, mgr, &routing, request);
-
+            let (view, label) = select_service_route_config(&document, service);
+            let config_explain =
+                build_config_only_explain(service, view, provider.as_deref(), request)
+                    .map_err(|e| CliError::Configuration(e.to_string()))?;
             if json {
-                if let Some(provider_name) = provider.as_deref()
-                    && group_detail.is_none()
-                {
-                    return Err(CliError::ProxyConfig(format!(
-                        "provider '{}' not found",
-                        provider_name
-                    )));
-                }
-                let text = serde_json::to_string_pretty(&runtime_explain)
-                    .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+                let text = serde_json::to_string_pretty(&config_explain)
+                    .map_err(|e| CliError::Configuration(e.to_string()))?;
                 println!("{text}");
             } else {
-                print_explain_text(
-                    label,
-                    document.schema_version(),
-                    &routing,
-                    group_detail.as_ref(),
-                );
-                print_runtime_explain_text(&runtime_explain);
+                print_explain_text(label, view, provider.as_deref())
+                    .map_err(|e| CliError::Configuration(e.to_string()))?;
+                print_config_only_explain_text(&config_explain);
             }
         }
         _ => unreachable!("route view handles only routing list/explain"),
@@ -696,24 +473,23 @@ pub async fn handle_route_view_cmd(cmd: RoutingCommand) -> CliResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ProviderConfigV4, RoutingConfigV4, UpstreamAuth};
-    use crate::routing_explain::{RoutingExplainCandidate, RoutingExplainResponse};
+    use crate::config::{ProviderConfig, RouteGraphConfig, UpstreamAuth};
 
-    fn provider(base_url: &str, supported_models: &[&str]) -> ProviderConfigV4 {
-        ProviderConfigV4 {
+    fn provider(base_url: &str, supported_models: &[&str]) -> ProviderConfig {
+        ProviderConfig {
             base_url: Some(base_url.to_string()),
             inline_auth: UpstreamAuth::default(),
             supported_models: supported_models
                 .iter()
                 .map(|model| ((*model).to_string(), true))
                 .collect(),
-            ..ProviderConfigV4::default()
+            ..ProviderConfig::default()
         }
     }
 
     #[test]
-    fn v4_runtime_explain_json_contract_reports_selected_route_and_model_skips() {
-        let view = ServiceViewV4 {
+    fn config_only_explain_reports_candidate_order_without_runtime_state() {
+        let view = ServiceRouteConfig {
             providers: BTreeMap::from([
                 (
                     "old".to_string(),
@@ -724,31 +500,36 @@ mod tests {
                     provider("https://new.example/v1", &["gpt-5"]),
                 ),
             ]),
-            routing: Some(RoutingConfigV4::ordered_failover(vec![
+            routing: Some(RouteGraphConfig::ordered_failover(vec![
                 "old".to_string(),
                 "new".to_string(),
             ])),
-            ..ServiceViewV4::default()
+            ..ServiceRouteConfig::default()
         };
 
-        let explain = build_v4_runtime_explain(
+        let explain = build_config_only_explain(
             "codex",
             &view,
+            None,
             RouteRequestContext {
                 model: Some("gpt-5".to_string()),
                 ..RouteRequestContext::default()
             },
         )
-        .expect("runtime explain");
-        let value = serde_json::to_value(&explain).expect("serialize runtime explain");
+        .expect("config-only explain");
+        let value = serde_json::to_value(&explain).expect("serialize config-only explain");
 
         assert_eq!(value["api_version"].as_u64(), Some(1));
+        assert_eq!(value["source"].as_str(), Some("config_only"));
+        assert_eq!(value["runtime_state_queried"].as_bool(), Some(false));
         assert_eq!(value["service_name"].as_str(), Some("codex"));
-        assert_eq!(value["request_model"].as_str(), Some("gpt-5"));
-        assert!(value["runtime_loaded_at_ms"].is_null());
-        assert_eq!(value["selected_route"]["provider_id"].as_str(), Some("new"));
+        assert_eq!(value["request"]["model"].as_str(), Some("gpt-5"));
         assert_eq!(
-            value["selected_route"]["route_path"]
+            value["first_config_eligible_candidate"]["provider_id"].as_str(),
+            Some("new")
+        );
+        assert_eq!(
+            value["first_config_eligible_candidate"]["route_path"]
                 .as_array()
                 .map(|items| items
                     .iter()
@@ -757,63 +538,40 @@ mod tests {
             Some(vec!["main", "new"])
         );
         assert_eq!(
-            value["candidates"][0]["skip_reasons"][0]["code"].as_str(),
+            value["candidates"][0]["config_skip_reasons"][0].as_str(),
             Some("unsupported_model")
         );
-        assert_eq!(
-            value["candidates"][0]["skip_reasons"][0]["requested_model"].as_str(),
-            Some("gpt-5")
-        );
+        assert!(value.get("runtime_loaded_at_ms").is_none());
+        assert!(value["candidates"][0].get("availability").is_none());
+        assert!(value["candidates"][0].get("capacity").is_none());
     }
 
     #[test]
-    fn runtime_explain_text_prefers_provider_endpoint_identity() {
-        let explain = RoutingExplainResponse {
-            api_version: 1,
-            service_name: "codex".to_string(),
-            runtime_loaded_at_ms: None,
-            request_model: None,
-            session_id: None,
-            request_context: Default::default(),
-            selected_route: Some(RoutingExplainCandidate {
-                provider_id: "input".to_string(),
-                provider_alias: None,
-                endpoint_id: "default".to_string(),
-                provider_endpoint_key: "codex/input/default".to_string(),
-                route_path: vec!["main".to_string(), "input".to_string()],
-                preference_group: 0,
-                upstream_base_url: "https://input.example/v1".to_string(),
-                capacity: Default::default(),
-                availability: Default::default(),
-                selected: true,
-                skip_reasons: Vec::new(),
-            }),
-            candidates: vec![RoutingExplainCandidate {
-                provider_id: "input".to_string(),
-                provider_alias: None,
-                endpoint_id: "default".to_string(),
-                provider_endpoint_key: "codex/input/default".to_string(),
-                route_path: vec!["main".to_string(), "input".to_string()],
-                preference_group: 0,
-                upstream_base_url: "https://input.example/v1".to_string(),
-                capacity: Default::default(),
-                availability: Default::default(),
-                selected: true,
-                skip_reasons: Vec::new(),
-            }],
-            affinity_policy: "preferred_group".to_string(),
-            affinity: None,
-            conditional_routes: Vec::new(),
+    fn config_only_explain_text_names_the_non_runtime_source() {
+        let view = ServiceRouteConfig {
+            providers: BTreeMap::from([(
+                "input".to_string(),
+                provider("https://input.example/v1", &["gpt-5"]),
+            )]),
+            routing: Some(RouteGraphConfig::ordered_failover(vec![
+                "input".to_string(),
+            ])),
+            ..ServiceRouteConfig::default()
         };
+        let explain =
+            build_config_only_explain("codex", &view, None, RouteRequestContext::default())
+                .expect("config-only explain");
 
-        let lines = runtime_explain_text_lines(&explain);
+        let lines = config_only_explain_text_lines(&explain);
 
+        assert_eq!(lines[0], "Preview source: config_only");
+        assert_eq!(lines[1], "Runtime state queried: no");
         assert_eq!(
-            lines[0],
-            "Selected route: endpoint=codex/input/default group=0 provider=input path=[main > input]"
+            lines[2],
+            "First config-eligible candidate: endpoint=codex/input/default group=0 provider=input path=[main > input]"
         );
-        assert_eq!(lines[1], "Runtime candidates:");
-        assert!(lines[2].starts_with(
+        assert_eq!(lines[3], "Config candidates:");
+        assert!(lines[4].starts_with(
             "  * 1. endpoint=codex/input/default group=0 provider=input path=[main > input]"
         ));
     }

@@ -1,12 +1,12 @@
 import { useQuery } from "@tanstack/react-query";
 
+import { useDesktopControlState } from "@/features/runtime/actions";
+import { emptyDashboardData, emptyRuntimeSummary } from "@/lib/api/empty-data";
 import { mapAdminDashboardData } from "@/lib/api/mappers";
-import { mockDashboardData } from "@/lib/api/mock-data";
 import { queryKeys } from "@/lib/api/query-keys";
-import type { QueryBackedData } from "@/lib/api/types";
+import type { DashboardData, QueryBackedData } from "@/lib/api/types";
 import { useAdminReadModelState } from "@/lib/api/use-admin-read-model";
 import { getAppMetadata } from "@/lib/tauri/commands";
-import { useDesktopControlState } from "@/features/runtime/actions";
 
 export function useAppMetadata() {
   return useQuery({
@@ -15,11 +15,11 @@ export function useAppMetadata() {
   });
 }
 
-export function useDashboardData(): QueryBackedData<typeof mockDashboardData> {
+export function useDashboardData(): QueryBackedData<DashboardData> {
   const metadata = useAppMetadata();
   const control = useDesktopControlState();
   const query = useAdminReadModelState();
-  const { readModel, state } = query;
+  const { facts, response, state } = query;
   const ownerMode = control.data
     ? control.data.connectionMode === "desktop-owned"
       ? "desktop-owned"
@@ -32,23 +32,20 @@ export function useDashboardData(): QueryBackedData<typeof mockDashboardData> {
     ownerMode,
     canStartProxy: control.data?.canStart ?? state.canStartProxy,
     canAttachProxy: control.data?.canAttach ?? state.canAttachProxy,
-    canStopProxy: control.data?.canStopOwned ?? state.canStopProxy,
     canUseLiveActions: state.canUseLiveActions && (control.data?.reachable ?? true),
   };
 
   const appVersion = metadata.data?.version ?? "0.20.0";
-  const data = readModel.data
+  const data = facts && response
     ? mapAdminDashboardData({
-        summary: readModel.data.operatorSummary,
-        runtimeStatus: readModel.data.runtimeStatus,
-        providers: readModel.data.providers,
-        recentRequests: readModel.data.recentRequests,
-        usageSummary: readModel.data.usageSummary,
-        usageDay: readModel.data.usageDay,
-        adminBaseUrl: readModel.data.endpoint.adminBaseUrl,
+        summary: facts.summary,
+        recentRequests: facts.recent_requests,
+        usageDay: facts.usage_day,
+        endpoint: response.endpoint,
         appVersion,
+        capturedAtMs: query.model?.captured_at_ms ?? 0,
       })
-    : mockDashboardData;
+    : emptyDashboardData(emptyRuntimeSummary(response?.endpoint, appVersion, ownerMode));
   const dataWithOwner = {
     ...data,
     runtime: {

@@ -3,6 +3,8 @@
 Status: Complete
 Last updated: 2026-05-20
 
+> Historical status (superseded 2026-07-12): this handoff records an intermediate architecture. The client patch-plan seam, preset/auth-facade behavior, remote-control integration, and compatibility readers described below were removed by canonical relay/runtime modernization. The current local switch only updates the helper selector/stanza in Codex `config.toml`; provider capability comes from the captured provider contract.
+
 ## Current State
 
 Goal is ready to mark complete. CAD-020, CAD-030, CAD-040, CAD-050, CAD-060, and CAD-070 are implemented and verified. The prior protocol-normalization workstream is complete and committed.

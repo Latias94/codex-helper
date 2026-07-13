@@ -4,34 +4,36 @@ use std::time::Instant;
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, HeaderValue, Method, Response, StatusCode, header};
 
-use crate::lb::{CooldownBackoff, LoadBalancer};
+use crate::endpoint_health::CooldownBackoff;
 use crate::logging::{
-    CodexBridgeLog, RouteAttemptLog, ServiceTierLog, log_retry_trace, make_body_preview,
+    CodexBridgeLog, RouteAttemptLog, ServiceTierLog, log_control_trace_event, make_body_preview,
+    upstream_origin,
 };
+use crate::runtime_store::{AttemptHandle, AttemptOutcome, EconomicsState};
 use crate::state::SessionIdentitySource;
 use crate::usage::{UsageMetrics, extract_usage_from_bytes};
-use crate::usage_providers;
 
 use super::ProxyService;
 use super::attempt_health::{
     penalize_attempt_target, record_attempt_failure, record_attempt_success,
 };
-use super::attempt_target::AttemptTarget;
 use super::classify::{
     UPSTREAM_OVERLOADED_CLASS, class_is_health_neutral, classify_observed_upstream_response,
 };
 use super::concurrency_limits::ConcurrencyPermit;
 use super::http_debug::HttpDebugBase;
 use super::models_compat::maybe_decode_models_response_body;
-use super::passive_health::{record_passive_upstream_failure, record_passive_upstream_success};
 use super::provider_evidence::{ResponseEvidenceParams, response_evidence_from_classification};
 use super::reasoning_guard::{
     REASONING_GUARD_BLOCKED_CLASS, evaluate_reasoning_guard, reasoning_guard_error_body,
     reasoning_guard_retry_count,
 };
-use super::request_body::extract_service_tier_from_response_body;
+use super::request_body::{
+    extract_model_from_response_body, extract_service_tier_from_response_body,
+};
+use super::response_entity::UpstreamResponseEntity;
 use super::response_finalization::{
-    FinalizeForwardResponseParams, finish_and_build_forward_response,
+    FinalizeForwardResponseParams, FinalizedForwardResponse, finish_and_build_forward_response,
 };
 use super::response_fixer::{
     CodexCompactSseRepair, maybe_repair_codex_compact_sse_response,
@@ -45,26 +47,31 @@ use super::retry::{
     RetryLayerOptions, RetryPlan, response_penalty_cooldown_secs, retry_info_for_observed_attempts,
     retry_sleep, should_never_retry, should_retry_class, should_retry_status,
 };
-use super::route_affinity::record_session_route_affinity_success;
+use super::route_affinity::{
+    prepare_session_route_affinity_success, record_session_route_affinity_success,
+};
 use super::route_attempts::{StatusRouteAttemptParams, record_status_route_attempt};
 use super::stream::{SseSuccessMeta, build_sse_success_response};
+use crate::routing_ir::CapturedRouteCandidate;
 
 pub(super) enum AttemptResponseOutcome {
     RetrySameUpstream,
     TryNextUpstream,
+    StopProviderChain,
     Return(Response<Body>),
 }
 
 pub(super) struct AttemptResponseParams<'a> {
     pub(super) proxy: &'a ProxyService,
-    pub(super) legacy_lb: Option<&'a LoadBalancer>,
-    pub(super) target: &'a AttemptTarget,
+    pub(super) target: &'a CapturedRouteCandidate,
     pub(super) method: &'a Method,
     pub(super) path: &'a str,
     pub(super) status: StatusCode,
+    pub(super) upstream_entity: UpstreamResponseEntity,
     pub(super) response_headers: HeaderMap,
     pub(super) response_headers_filtered: HeaderMap,
     pub(super) response_body: Bytes,
+    pub(super) attempt_handle: AttemptHandle,
     pub(super) request_id: u64,
     pub(super) duration_ms: u64,
     pub(super) started_at_ms: u64,
@@ -78,7 +85,6 @@ pub(super) struct AttemptResponseParams<'a> {
     pub(super) codex_bridge: Option<CodexBridgeLog>,
     pub(super) response_semantic_contract: Option<ResponseSemanticContract>,
     pub(super) route_graph_key: Option<&'a str>,
-    pub(super) upstream_chain: &'a mut Vec<String>,
     pub(super) route_attempts: &'a mut Vec<RouteAttemptLog>,
     pub(super) route_attempt_index: usize,
     pub(super) model_note: &'a str,
@@ -97,8 +103,7 @@ pub(super) struct AttemptResponseParams<'a> {
 
 pub(super) struct StreamingAttemptResponseParams<'a> {
     pub(super) proxy: &'a ProxyService,
-    pub(super) legacy_lb: Option<&'a LoadBalancer>,
-    pub(super) target: &'a AttemptTarget,
+    pub(super) target: &'a CapturedRouteCandidate,
     pub(super) response: reqwest::Response,
     pub(super) status: StatusCode,
     pub(super) response_headers: HeaderMap,
@@ -110,7 +115,6 @@ pub(super) struct StreamingAttemptResponseParams<'a> {
     pub(super) request_body_len: usize,
     pub(super) upstream_request_body_len: usize,
     pub(super) debug_base: Option<HttpDebugBase>,
-    pub(super) upstream_chain: &'a mut Vec<String>,
     pub(super) route_attempts: &'a mut Vec<RouteAttemptLog>,
     pub(super) route_attempt_index: usize,
     pub(super) model_note: &'a str,
@@ -131,6 +135,7 @@ pub(super) struct StreamingAttemptResponseParams<'a> {
     pub(super) method: &'a Method,
     pub(super) path: &'a str,
     pub(super) concurrency_permit: Option<ConcurrencyPermit>,
+    pub(super) attempt_handle: AttemptHandle,
 }
 
 fn summarize_upstream_error_body(response_body: &Bytes, response_headers: &HeaderMap) -> String {
@@ -232,7 +237,6 @@ pub(super) async fn handle_streaming_attempt_success(
 ) -> Response<Body> {
     let StreamingAttemptResponseParams {
         proxy,
-        legacy_lb,
         target,
         response,
         status,
@@ -245,7 +249,6 @@ pub(super) async fn handle_streaming_attempt_success(
         request_body_len,
         upstream_request_body_len,
         debug_base,
-        upstream_chain,
         route_attempts,
         route_attempt_index,
         model_note,
@@ -266,27 +269,17 @@ pub(super) async fn handle_streaming_attempt_success(
         method,
         path,
         concurrency_permit,
+        attempt_handle,
     } = params;
 
-    record_attempt_success(
-        proxy.state.as_ref(),
-        proxy.service_name,
-        legacy_lb,
-        target,
-        crate::lb::COOLDOWN_SECS,
-        cooldown_backoff,
-    )
-    .await;
     let duration_ms = start.elapsed().as_millis() as u64;
     record_status_route_attempt(
-        upstream_chain,
         route_attempts,
         StatusRouteAttemptParams {
             target,
             route_attempt_index,
             status_code: status.as_u16(),
             error_class: None,
-            reason: None,
             model_note,
             upstream_headers_ms,
             duration_ms,
@@ -296,20 +289,17 @@ pub(super) async fn handle_streaming_attempt_success(
             policy_actions: Vec::new(),
         },
     );
-    record_session_route_affinity_success(
-        proxy,
+    let route_affinity_success = prepare_session_route_affinity_success(
         session_id,
         session_identity_source,
         route_graph_key,
         target,
         route_attempts,
         route_attempt_index,
-    )
-    .await;
-    let retry = retry_info_for_observed_attempts(upstream_chain, route_attempts);
+    );
+    let retry = retry_info_for_observed_attempts(route_attempts);
     build_sse_success_response(
         proxy,
-        legacy_lb.cloned(),
         target.clone(),
         response,
         SseSuccessMeta {
@@ -344,6 +334,8 @@ pub(super) async fn handle_streaming_attempt_success(
             method: method.clone(),
             path: path.to_string(),
             concurrency_permit,
+            attempt_handle,
+            route_affinity_success,
         },
     )
     .await
@@ -354,14 +346,15 @@ pub(super) async fn handle_attempt_response(
 ) -> AttemptResponseOutcome {
     let AttemptResponseParams {
         proxy,
-        legacy_lb,
         target,
         method,
         path,
         status,
+        upstream_entity,
         response_headers,
         response_headers_filtered,
         response_body,
+        attempt_handle,
         request_id,
         duration_ms,
         started_at_ms,
@@ -375,7 +368,6 @@ pub(super) async fn handle_attempt_response(
         codex_bridge,
         response_semantic_contract,
         route_graph_key,
-        upstream_chain,
         route_attempts,
         route_attempt_index,
         model_note,
@@ -464,7 +456,6 @@ pub(super) async fn handle_attempt_response(
     } else {
         None
     };
-    let mut route_attempt_reason = None;
     if response_status.is_success() {
         let guard_decision = evaluate_reasoning_guard(
             &plan.reasoning_guard,
@@ -476,7 +467,7 @@ pub(super) async fn handle_attempt_response(
         if let Some(matched) = guard_decision.matched()
             && plan.reasoning_guard.log_matches
         {
-            log_retry_trace(serde_json::json!({
+            log_control_trace_event(serde_json::json!({
                 "event": "reasoning_guard_match",
                 "service": proxy.service_name,
                 "request_id": request_id,
@@ -498,7 +489,6 @@ pub(super) async fn handle_attempt_response(
                 HeaderValue::from_static("application/json"),
             );
             response_body = reasoning_guard_error_body(matched, class, guard_decision.retryable());
-            route_attempt_reason = Some(matched.rule.clone());
             tracing::warn!(
                 request_id,
                 error_class = class,
@@ -509,6 +499,12 @@ pub(super) async fn handle_attempt_response(
         }
     }
 
+    upstream_entity.reconcile_headers(
+        response_status,
+        &response_body,
+        &mut response_headers_filtered,
+    );
+
     let status_code = response_status.as_u16();
     let classified_response =
         classify_observed_upstream_response(status_code, &response_headers, response_body.as_ref());
@@ -517,6 +513,7 @@ pub(super) async fn handle_attempt_response(
         .map(ToOwned::to_owned)
         .or_else(|| classified_response.class.clone());
     let observed_service_tier = extract_service_tier_from_response_body(response_body.as_ref());
+    let reported_model = extract_model_from_response_body(response_body.as_ref());
     let decision = decide_attempt_response(AttemptResponseDecisionParams {
         plan,
         upstream_opt,
@@ -543,17 +540,14 @@ pub(super) async fn handle_attempt_response(
         status_code,
         error_class: cls.as_deref(),
         route_facing: route_facing_evidence,
-        default_cooldown_secs: penalty_cooldown_secs,
     });
     record_status_route_attempt(
-        upstream_chain,
         route_attempts,
         StatusRouteAttemptParams {
             target,
             route_attempt_index,
             status_code,
             error_class: cls.as_deref(),
-            reason: route_attempt_reason.as_deref(),
             model_note,
             upstream_headers_ms,
             duration_ms,
@@ -562,73 +556,71 @@ pub(super) async fn handle_attempt_response(
                 .provider_penalty
                 .then_some(cooldown_reason.as_str()),
             provider_signals: provider_evidence.signals.clone(),
-            policy_actions: provider_evidence.actions.clone(),
+            policy_actions: Vec::new(),
         },
     );
 
+    if let Err(error) = proxy.state.finish_upstream_attempt(
+        attempt_handle,
+        if response_status.is_success() {
+            AttemptOutcome::Succeeded
+        } else {
+            AttemptOutcome::Failed
+        },
+        crate::logging::now_ms(),
+        EconomicsState::Unknown,
+    ) {
+        *last_err = Some((StatusCode::INTERNAL_SERVER_ERROR, error.to_string()));
+        return AttemptResponseOutcome::StopProviderChain;
+    }
+
     if response_status.is_success() {
-        record_attempt_success(
-            proxy.state.as_ref(),
-            proxy.service_name,
-            legacy_lb,
+        let usage = success_usage;
+        let retry = retry_info_for_observed_attempts(route_attempts);
+        let finalized = finish_attempt_forward_response(
+            proxy,
+            method,
+            path,
             target,
-            crate::lb::COOLDOWN_SECS,
-            cooldown_backoff,
+            request_id,
+            response_status,
+            duration_ms,
+            started_at_ms,
+            upstream_headers_ms,
+            provider_id,
+            session_id,
+            session_identity_source,
+            cwd,
+            effective_effort,
+            base_service_tier,
+            observed_service_tier,
+            reported_model,
+            attempt_handle,
+            codex_bridge.clone(),
+            usage,
+            Some(route_decision_from_model_note(
+                route_attempts,
+                route_attempt_index,
+            )),
+            retry,
+            response_headers_filtered,
+            response_body,
         )
         .await;
-        if let Some(station_name) = target.compatibility_station_name() {
-            record_passive_upstream_success(
-                proxy.state.as_ref(),
-                proxy.service_name,
-                station_name,
-                &target.upstream().base_url,
-                status_code,
+        if finalized.terminal_published {
+            record_attempt_success(proxy.state.as_ref(), proxy.service_name, target).await;
+            record_session_route_affinity_success(
+                proxy,
+                session_id,
+                session_identity_source,
+                route_graph_key,
+                target,
+                route_attempts,
+                route_attempt_index,
             )
             .await;
         }
-        record_session_route_affinity_success(
-            proxy,
-            session_id,
-            session_identity_source,
-            route_graph_key,
-            target,
-            route_attempts,
-            route_attempt_index,
-        )
-        .await;
-
-        let usage = success_usage;
-        let retry = retry_info_for_observed_attempts(upstream_chain, route_attempts);
-        return AttemptResponseOutcome::Return(
-            finish_attempt_forward_response(
-                proxy,
-                method,
-                path,
-                target,
-                request_id,
-                response_status,
-                duration_ms,
-                started_at_ms,
-                upstream_headers_ms,
-                provider_id,
-                session_id,
-                session_identity_source,
-                cwd,
-                effective_effort,
-                base_service_tier,
-                observed_service_tier,
-                codex_bridge.clone(),
-                usage,
-                Some(route_decision_from_model_note(
-                    route_attempts,
-                    route_attempt_index,
-                )),
-                retry,
-                response_headers_filtered,
-                response_body,
-            )
-            .await,
-        );
+        return AttemptResponseOutcome::Return(finalized.response);
     }
 
     let response_text = summarize_upstream_error_body(&response_body, &response_headers);
@@ -640,27 +632,13 @@ pub(super) async fn handle_attempt_response(
             record_attempt_failure(
                 proxy.state.as_ref(),
                 proxy.service_name,
-                legacy_lb,
                 target,
-                crate::lb::COOLDOWN_SECS,
+                crate::endpoint_health::COOLDOWN_SECS,
                 cooldown_backoff,
             )
             .await;
         }
-        if let Some(station_name) = target.compatibility_station_name() {
-            record_passive_upstream_failure(
-                proxy.state.as_ref(),
-                proxy.service_name,
-                station_name,
-                &target.upstream().base_url,
-                Some(status_code),
-                cls.as_deref(),
-                Some(response_text),
-            )
-            .await;
-        }
-
-        let retry = retry_info_for_observed_attempts(upstream_chain, route_attempts);
+        let retry = retry_info_for_observed_attempts(route_attempts);
         return AttemptResponseOutcome::Return(
             finish_attempt_forward_response(
                 proxy,
@@ -679,6 +657,8 @@ pub(super) async fn handle_attempt_response(
                 effective_effort,
                 base_service_tier,
                 observed_service_tier,
+                reported_model,
+                attempt_handle,
                 codex_bridge.clone(),
                 None,
                 Some(route_decision_from_model_note(
@@ -689,7 +669,8 @@ pub(super) async fn handle_attempt_response(
                 response_headers_filtered,
                 response_body,
             )
-            .await,
+            .await
+            .response,
         );
     }
 
@@ -706,29 +687,12 @@ pub(super) async fn handle_attempt_response(
 
     if decision.provider_penalty {
         if !class_is_health_neutral(cls.as_deref()) {
-            provider_evidence
-                .apply_to_state(proxy.service_name, proxy.state.as_ref())
-                .await;
             penalize_attempt_target(
                 proxy.state.as_ref(),
                 proxy.service_name,
-                legacy_lb,
                 target,
                 penalty_cooldown_secs,
-                cooldown_reason.as_str(),
                 cooldown_backoff,
-            )
-            .await;
-        }
-        if let Some(station_name) = target.compatibility_station_name() {
-            record_passive_upstream_failure(
-                proxy.state.as_ref(),
-                proxy.service_name,
-                station_name,
-                &target.upstream().base_url,
-                Some(status_code),
-                cls.as_deref(),
-                Some(response_text.clone()),
             )
             .await;
         }
@@ -741,7 +705,7 @@ pub(super) async fn handle_attempt_response(
             return AttemptResponseOutcome::TryNextUpstream;
         }
 
-        let retry = retry_info_for_observed_attempts(upstream_chain, route_attempts);
+        let retry = retry_info_for_observed_attempts(route_attempts);
         return AttemptResponseOutcome::Return(
             finish_attempt_forward_response(
                 proxy,
@@ -760,6 +724,8 @@ pub(super) async fn handle_attempt_response(
                 effective_effort,
                 base_service_tier,
                 observed_service_tier,
+                reported_model,
+                attempt_handle,
                 codex_bridge.clone(),
                 None,
                 Some(route_decision_from_model_note(
@@ -770,24 +736,12 @@ pub(super) async fn handle_attempt_response(
                 response_headers_filtered,
                 response_body,
             )
-            .await,
+            .await
+            .response,
         );
     }
 
-    let retry = retry_info_for_observed_attempts(upstream_chain, route_attempts);
-    if let Some(station_name) = target.compatibility_station_name() {
-        record_passive_upstream_failure(
-            proxy.state.as_ref(),
-            proxy.service_name,
-            station_name,
-            &target.upstream().base_url,
-            Some(status_code),
-            cls.as_deref(),
-            Some(response_text),
-        )
-        .await;
-    }
-
+    let retry = retry_info_for_observed_attempts(route_attempts);
     AttemptResponseOutcome::Return(
         finish_attempt_forward_response(
             proxy,
@@ -806,6 +760,8 @@ pub(super) async fn handle_attempt_response(
             effective_effort,
             base_service_tier,
             observed_service_tier,
+            reported_model,
+            attempt_handle,
             codex_bridge,
             None,
             Some(route_decision_from_model_note(
@@ -816,22 +772,20 @@ pub(super) async fn handle_attempt_response(
             response_headers_filtered,
             response_body,
         )
-        .await,
+        .await
+        .response,
     )
 }
 
-async fn enqueue_usage_probe_for_target(proxy: &ProxyService, target: &AttemptTarget) {
+async fn enqueue_usage_probe_for_target(proxy: &ProxyService, target: &CapturedRouteCandidate) {
     let cfg_snapshot = proxy.config.snapshot().await;
-    if let Some(provider_endpoint) = target.provider_endpoint_ref().cloned() {
-        usage_providers::enqueue_poll_for_codex_provider_endpoint(
-            proxy.client.clone(),
-            cfg_snapshot,
-            proxy.lb_states.clone(),
-            proxy.state.clone(),
-            proxy.service_name,
-            provider_endpoint,
-        );
-    }
+    super::providers_api::enqueue_provider_balance_probe(
+        proxy.client.clone(),
+        cfg_snapshot,
+        proxy.state.clone(),
+        proxy.service_name,
+        target.provider_endpoint().clone(),
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -839,7 +793,7 @@ async fn finish_attempt_forward_response(
     proxy: &ProxyService,
     method: &Method,
     path: &str,
-    target: &AttemptTarget,
+    target: &CapturedRouteCandidate,
     request_id: u64,
     status: StatusCode,
     duration_ms: u64,
@@ -852,13 +806,15 @@ async fn finish_attempt_forward_response(
     effective_effort: Option<&str>,
     base_service_tier: &ServiceTierLog,
     observed_service_tier: Option<String>,
+    reported_model: Option<String>,
+    attempt_handle: AttemptHandle,
     codex_bridge: Option<CodexBridgeLog>,
     usage: Option<UsageMetrics>,
     route_decision: Option<crate::state::RouteDecisionProvenance>,
     retry: Option<crate::logging::RetryInfo>,
     response_headers: HeaderMap,
     response_body: Bytes,
-) -> Response<Body> {
+) -> FinalizedForwardResponse {
     let service_tier_for_log = ServiceTierLog {
         actual: observed_service_tier,
         ..base_service_tier.clone()
@@ -870,22 +826,23 @@ async fn finish_attempt_forward_response(
         path,
         FinalizeForwardResponseParams {
             request_id,
+            winning_attempt: status.is_success().then_some(attempt_handle),
             status,
             duration_ms,
             started_at_ms,
             upstream_headers_ms,
-            station_name: target.compatibility_station_name().map(ToOwned::to_owned),
             provider_id: provider_id
                 .map(ToOwned::to_owned)
-                .or_else(|| target.provider_id().map(ToOwned::to_owned)),
-            endpoint_id: target.endpoint_id(),
-            provider_endpoint_key: target.provider_endpoint_key(),
-            upstream_base_url: target.upstream().base_url.clone(),
+                .or_else(|| Some(target.provider_id().to_owned())),
+            endpoint_id: Some(target.endpoint_id().to_owned()),
+            provider_endpoint_key: Some(target.provider_endpoint_key()),
+            upstream_origin: upstream_origin(target.base_url()),
             session_id: session_id.map(ToOwned::to_owned),
             session_identity_source,
             cwd: cwd.map(ToOwned::to_owned),
             effective_effort: effective_effort.map(ToOwned::to_owned),
             service_tier: service_tier_for_log,
+            reported_model,
             codex_bridge,
             usage,
             route_decision,

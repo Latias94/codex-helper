@@ -3,6 +3,8 @@
 Status: Complete
 Last updated: 2026-05-19
 
+> Historical contract note (superseded 2026-07-12): the station/upstream selector and raw upstream URL fields described below were retired in favor of canonical `provider_id`/`endpoint_id`/`provider_endpoint_key` identity. The original text is retained as implementation history, not the current CLI or evidence schema.
+
 ## Why This Lane Exists
 
 Codex relay capability diagnostics and live smoke now share safe core execution paths, but operators

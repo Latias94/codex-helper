@@ -99,7 +99,7 @@ fn validate_endpoint_auth(
     admin_token_env: Option<&str>,
     endpoint: &ControlPlaneEndpoint,
 ) -> Result<()> {
-    let url = Url::parse(&endpoint.admin_base_url)
+    let url = Url::parse(endpoint.admin_base_url())
         .with_context(|| format!("fleet node '{node_id}' has invalid admin_url"))?;
     if is_loopback_host(&url) {
         return Ok(());
@@ -183,7 +183,28 @@ mod tests {
         let err = cfg
             .validate()
             .expect_err("remote fleet node should require token auth");
-        assert!(err.to_string().contains("does not set admin_token_env"));
+        assert!(err.to_string().contains("HTTPS"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn fleet_registry_rejects_remote_http_with_token_env() {
+        let cfg = FleetRegistryConfig {
+            nodes: BTreeMap::from([(
+                "remote".to_string(),
+                FleetNodeConfig {
+                    label: Some("Remote".to_string()),
+                    admin_url: Some("http://nas.example.com:4211".to_string()),
+                    admin_urls: Vec::new(),
+                    admin_token_env: Some("NAS_TOKEN".to_string()),
+                    enabled: true,
+                },
+            )]),
+        };
+
+        let err = cfg
+            .validate()
+            .expect_err("token auth must not make remote HTTP trustworthy");
+        assert!(err.to_string().contains("HTTPS"), "unexpected: {err}");
     }
 
     #[test]

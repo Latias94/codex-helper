@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::pricing::UsdAmount;
+use crate::runtime_identity::ProviderEndpointKey;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -27,13 +28,8 @@ impl BalanceSnapshotStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderBalanceSnapshot {
-    pub provider_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub station_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upstream_index: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider_endpoint_key: Option<String>,
+    pub observation_provider_id: String,
+    pub provider_endpoint: ProviderEndpointKey,
     pub source: String,
     pub fetched_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -150,7 +146,9 @@ pub struct ProviderUsageModelStat {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderUsageAlertKind {
+    #[serde(rename = "daily_usage_80")]
     DailyUsage80,
+    #[serde(rename = "daily_usage_95")]
     DailyUsage95,
     LowBalance,
     SubscriptionExpiringSoon,
@@ -178,10 +176,8 @@ pub struct ProviderUsageAlert {
 impl Default for ProviderBalanceSnapshot {
     fn default() -> Self {
         Self {
-            provider_id: String::new(),
-            station_name: None,
-            upstream_index: None,
-            provider_endpoint_key: None,
+            observation_provider_id: String::new(),
+            provider_endpoint: ProviderEndpointKey::new("", "", ""),
             source: String::new(),
             fetched_at_ms: 0,
             stale_after_ms: None,
@@ -219,17 +215,15 @@ impl Default for ProviderBalanceSnapshot {
 
 impl ProviderBalanceSnapshot {
     pub fn new(
-        provider_id: impl Into<String>,
-        station_name: impl Into<String>,
-        upstream_index: usize,
+        observation_provider_id: impl Into<String>,
+        provider_endpoint: ProviderEndpointKey,
         source: impl Into<String>,
         fetched_at_ms: u64,
         stale_after_ms: Option<u64>,
     ) -> Self {
         let mut snapshot = Self {
-            provider_id: provider_id.into(),
-            station_name: Some(station_name.into()),
-            upstream_index: Some(upstream_index),
+            observation_provider_id: observation_provider_id.into(),
+            provider_endpoint,
             source: source.into(),
             fetched_at_ms,
             stale_after_ms,
@@ -243,14 +237,6 @@ impl ProviderBalanceSnapshot {
         self.error = Some(error.into());
         self.exhausted = None;
         self.refresh_status(self.fetched_at_ms);
-        self
-    }
-
-    pub fn with_provider_endpoint_key(mut self, key: impl Into<String>) -> Self {
-        let key = key.into();
-        if !key.trim().is_empty() {
-            self.provider_endpoint_key = Some(key);
-        }
         self
     }
 
@@ -463,7 +449,7 @@ fn left_from_budget_and_spent(budget: &str, spent: &str) -> Option<String> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-pub struct StationRoutingBalanceSummary {
+pub struct ProviderRoutingBalanceSummary {
     pub snapshots: usize,
     #[serde(default)]
     pub ok: usize,
@@ -483,7 +469,7 @@ pub struct StationRoutingBalanceSummary {
     pub routing_ignored_exhausted: usize,
 }
 
-impl StationRoutingBalanceSummary {
+impl ProviderRoutingBalanceSummary {
     pub fn from_snapshots(snapshots: Option<&[ProviderBalanceSnapshot]>) -> Self {
         let mut out = Self::default();
         let Some(snapshots) = snapshots else {
@@ -550,6 +536,22 @@ mod tests {
         assert_eq!(BalanceSnapshotStatus::Exhausted.as_str(), "exhausted");
         assert_eq!(BalanceSnapshotStatus::Stale.as_str(), "stale");
         assert_eq!(BalanceSnapshotStatus::Error.as_str(), "error");
+    }
+
+    #[test]
+    fn provider_usage_alert_wire_codes_match_stable_codes() {
+        for kind in [
+            ProviderUsageAlertKind::DailyUsage80,
+            ProviderUsageAlertKind::DailyUsage95,
+            ProviderUsageAlertKind::LowBalance,
+            ProviderUsageAlertKind::SubscriptionExpiringSoon,
+            ProviderUsageAlertKind::SubscriptionExpired,
+        ] {
+            assert_eq!(
+                serde_json::to_value(kind).expect("serialize provider usage alert kind"),
+                serde_json::Value::String(kind.as_str().to_string())
+            );
+        }
     }
 
     #[test]

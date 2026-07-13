@@ -19,7 +19,7 @@ export function DashboardPage() {
 
   return (
     <>
-      <PageHeader title="仪表盘" subtitle="查看本地代理、Codex 连接、供应商健康和今日用量" />
+      <PageHeader title="仪表盘" subtitle="查看本地代理、Codex 连接、供应商路由状态和今日用量" />
       <DataStateBanner
         state={dashboard.state}
         onRefresh={dashboard.refetch}
@@ -46,11 +46,11 @@ export function DashboardPage() {
             <ActionStatusBanner status={actions.status} busy={actions.isBusy} />
             <WorkRow
               name="Codex"
-              status="已连接"
-              provider="CodeX Air"
+              status={runtime.codex}
+              provider={runtime.provider}
               action="Settings 中确认"
               disabled
-              active
+              active={dashboard.state.source === "live"}
             />
             <WorkRow
               name="Claude Code"
@@ -94,7 +94,7 @@ export function DashboardPage() {
             </div>
             <div className="flex items-center gap-2 text-sm text-amber-700">
               <AlertTriangle className="h-4 w-4" />
-              Switch On/Off 和 Stop Proxy 需要到 Settings 输入确认短语；普通关闭窗口不会远程停止 attached runtime。
+              Switch On/Off 需要到 Settings 显式执行；关闭或退出桌面端不会停止 attached runtime。
             </div>
           </CardContent>
         </Card>
@@ -150,17 +150,21 @@ export function DashboardPage() {
       <div className="mt-4 grid grid-cols-[0.9fr_1.1fr] gap-4">
         <Card>
           <CardHeader>
-            <CardTitle>供应商健康</CardTitle>
-            <CardDescription>余额、延迟和今日用量概览。</CardDescription>
+            <CardTitle>供应商路由状态</CardTitle>
+            <CardDescription>Canonical provider 和 endpoint inventory 概览。</CardDescription>
           </CardHeader>
           <CardContent className="space-y-3">
             {providers.slice(0, 3).map((provider) => (
               <div key={provider.name} className="flex items-center justify-between rounded-xl bg-slate-50 px-3 py-3">
                 <div>
-                  <div className="font-medium text-slate-900">{provider.name}</div>
-                  <div className="text-xs text-slate-500">{provider.balance} · {provider.latency}</div>
+                  <div className="font-medium text-slate-900">{provider.alias || provider.name}</div>
+                  <div className="text-xs text-slate-500">
+                    {provider.routableEndpoints}/{provider.endpointCount} endpoints routable
+                  </div>
                 </div>
-                <Badge variant={provider.health === "Healthy" ? "success" : "warning"}>{provider.health}</Badge>
+                <Badge variant={provider.routableEndpoints > 0 ? "success" : "warning"}>
+                  {provider.routableEndpoints > 0 ? "routable" : "not routable"}
+                </Badge>
               </div>
             ))}
           </CardContent>

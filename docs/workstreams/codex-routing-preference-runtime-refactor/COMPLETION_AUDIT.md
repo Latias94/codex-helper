@@ -1,5 +1,7 @@
 # Completion Audit: Codex Routing Preference Runtime
 
+> Historical status (superseded 2026-07-12): this audit captures the intermediate migration and dual-executor state that produced the public version 5 route graph. Current startup accepts only `version = 5`, does not import or migrate older schemas, and uses semantic unversioned runtime types with no legacy route executor or compatibility projection. The evidence below remains a record of that earlier transition, not a statement of current compatibility.
+
 ## Audit Status
 
 Status: complete.

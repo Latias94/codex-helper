@@ -2,6 +2,8 @@
 
 Status: complete.
 
+> Historical status (superseded 2026-07-12): bridge-mode and client-feature diagnostics were replaced by provider-owned capability decisions and bounded observations. Current `status`/`doctor` surfaces do not infer client patch presets or inspect Codex-owned auth, model cache, or SQLite files.
+
 Implemented:
 
 - Reusable Codex bridge diagnostics in core.

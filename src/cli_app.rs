@@ -1,42 +1,39 @@
-use crate::basellm_metadata;
 use crate::cli_types::{
-    Cli, CliError, CliResult, CodexClientPatchPresetArg, CodexCompactionStrategyArg, Command,
-    DaemonCommand, NotifyCommand, RelayCommand, RemoteControlCommand, SwitchCommand,
-    reject_legacy_mode,
+    Cli, CliError, CliResult, Command, DaemonCommand, NotifyCommand, RelayCommand, SwitchCommand,
 };
 use crate::codex_integration;
-use crate::codex_models_cache::{
-    ModelsCacheInvalidation, invalidate_stale_fast_service_tier_cache,
-};
 use crate::commands;
 use crate::config::{
-    LoadedProxyConfig, RelayTargetConfig, ServiceKind, claude_settings_backup_path,
-    claude_settings_path, codex_auth_path, codex_client_patch_config_from_config_file,
-    codex_config_path, codex_models_cache_path, codex_switch_state_path, load_config,
-    load_config_with_v4_source, load_or_bootstrap_for_service_with_v4_source,
-    normalize_config_toml_authoring, save_config, save_config_v4,
+    LoadedConfig, RelayTargetConfig, ServiceKind, load_config, load_config_with_source,
+    save_helper_config,
 };
-use crate::control_plane_client::{ControlPlaneClient, ControlPlaneEndpoint};
+use crate::control_plane_client::{
+    ControlPlaneClient, ControlPlaneEndpoint, configured_local_admin_token_env,
+};
+use crate::dashboard_core::{OperatorReadModel, OperatorReadStatus};
 use crate::notify;
 use crate::proxy::admin_loopback_addr_for_proxy_port;
 use crate::runtime_host::{
-    ProxyRuntime, build_proxy_runtime_from_bound_listeners, validate_service_has_upstream,
+    ProxyListenerBindError, ProxyRuntime, ProxyRuntimeOptions, RunningProxyRuntime,
+    build_proxy_runtime_from_loaded_with_options,
 };
 use crate::runtime_manager::{
     RuntimeOwnerKind, RuntimeOwnerMarker, RuntimeOwnerMarkerGuard, clear_owner_marker,
     read_owner_marker_best_effort, write_owner_marker,
 };
+use crate::service_manager;
 use crate::tui;
 use codex_helper_core::relay_target::{
-    ResolvedRelayTarget, normalize_relay_target_name, relay_target_config_from_args,
-    relay_target_names, resolve_relay_target,
+    ResolvedRelayTarget, default_proxy_port_for_service_kind, normalize_relay_target_name,
+    relay_target_config_from_args, relay_target_names, resolve_relay_target,
 };
 
 use clap::Parser;
+use codex_helper_core::codex_switch::{
+    self, CodexSwitchIntent, CodexSwitchPhase, ValidatedCodexBaseUrl,
+};
 use codex_helper_core::local_log_store::{LogRetention, RotatingLogWriter, repair_log};
 use owo_colors::OwoColorize;
-use reqwest::Client;
-use serde_json::Value as JsonValue;
 use std::io::ErrorKind;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -44,6 +41,35 @@ use std::process::Command as ProcessCommand;
 use std::time::Duration;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
+
+#[derive(Clone, Copy, Default)]
+struct ServeRuntimeOptions {
+    enable_tui: bool,
+    resident: bool,
+    supervisor_managed: bool,
+    desktop_managed: bool,
+    service_managed: bool,
+}
+
+impl ServeRuntimeOptions {
+    fn owner_kind(self) -> Option<RuntimeOwnerKind> {
+        if self.service_managed {
+            Some(RuntimeOwnerKind::SystemService)
+        } else if self.desktop_managed {
+            Some(RuntimeOwnerKind::Desktop)
+        } else if self.supervisor_managed {
+            Some(RuntimeOwnerKind::Supervisor)
+        } else if self.resident {
+            Some(RuntimeOwnerKind::ManualCli)
+        } else {
+            None
+        }
+    }
+
+    fn is_resident(self) -> bool {
+        self.resident || self.supervisor_managed || self.desktop_managed || self.service_managed
+    }
+}
 
 pub async fn run_cli() -> CliResult<()> {
     let cli = Cli::parse();
@@ -58,6 +84,7 @@ pub async fn run_cli() -> CliResult<()> {
         resident: false,
         supervisor_managed: false,
         desktop_managed: false,
+        service_managed: false,
     }) {
         Command::Default { codex, claude } => {
             handle_default_cmd(codex, claude).await?;
@@ -67,6 +94,10 @@ pub async fn run_cli() -> CliResult<()> {
             handle_daemon_cmd(cmd).await?;
             return Ok(());
         }
+        Command::Service { cmd } => {
+            service_manager::handle_service_command(cmd).await?;
+            return Ok(());
+        }
         Command::Tui {
             codex,
             claude,
@@ -74,10 +105,11 @@ pub async fn run_cli() -> CliResult<()> {
         } => {
             let service_name = resolve_cli_service_name(codex, claude).await?;
             let port = port.unwrap_or_else(|| default_proxy_port_for_service(service_name));
-            tui::run_attached_dashboard(
+            tui::run_attached_dashboard_with_admin_base_url(
                 service_name,
                 port,
-                admin_loopback_addr_for_proxy_port(port).port(),
+                daemon_admin_base_url_for_proxy_port(port),
+                configured_local_admin_token_env().map(str::to_string),
             )
             .await
             .map_err(|e| CliError::Other(e.to_string()))?;
@@ -89,21 +121,9 @@ pub async fn run_cli() -> CliResult<()> {
         }
         Command::Switch { cmd } => {
             match cmd {
-                SwitchCommand::On {
-                    port,
-                    preset,
-                    legacy_mode,
-                    responses_websocket,
-                    compaction,
-                    codex,
-                    claude,
-                } => {
-                    reject_legacy_mode(legacy_mode)?;
-                    do_switch_on(port, preset, responses_websocket, compaction, codex, claude)?
-                }
-                SwitchCommand::Off { codex, claude } => do_switch_off(codex, claude)?,
-                SwitchCommand::Status { codex, claude } => do_switch_status(codex, claude),
-                SwitchCommand::RemoteControl { cmd } => do_remote_control(cmd)?,
+                SwitchCommand::On { port, base_url } => do_switch_on(port, base_url)?,
+                SwitchCommand::Off => do_switch_off()?,
+                SwitchCommand::Status => do_switch_status()?,
             }
             return Ok(());
         }
@@ -132,11 +152,24 @@ pub async fn run_cli() -> CliResult<()> {
             return Ok(());
         }
         Command::Status { json } => {
-            commands::doctor::handle_status_cmd(json).await?;
+            let (codex, claude) = tokio::join!(
+                read_local_operator_model("codex", default_proxy_port_for_service("codex")),
+                read_local_operator_model("claude", default_proxy_port_for_service("claude")),
+            );
+            commands::doctor::handle_status_cmd(json, &codex?, &claude?).await?;
             return Ok(());
         }
-        Command::Usage { cmd } => {
-            commands::usage::handle_usage_cmd(cmd).await?;
+        Command::Usage {
+            codex,
+            claude,
+            port,
+            cmd,
+        } => {
+            let service_name = resolve_cli_service_name(codex, claude).await?;
+            let port = port.unwrap_or_else(|| default_proxy_port_for_service(service_name));
+            let client = local_control_plane_client(port)?;
+            let model = client.refresh_operator_read_model(service_name, None).await;
+            commands::usage::handle_usage_cmd(cmd, &client, model).await?;
             return Ok(());
         }
         Command::Pricing { cmd } => {
@@ -163,10 +196,17 @@ pub async fn run_cli() -> CliResult<()> {
             resident,
             supervisor_managed,
             desktop_managed,
+            service_managed,
         } => {
-            if supervisor_managed && desktop_managed {
+            if [supervisor_managed, desktop_managed, service_managed]
+                .into_iter()
+                .filter(|managed| *managed)
+                .count()
+                > 1
+            {
                 return Err(CliError::Other(
-                    "--supervisor-managed and --desktop-managed are mutually exclusive".to_string(),
+                    "--supervisor-managed, --desktop-managed, and --service-managed are mutually exclusive"
+                        .to_string(),
                 ));
             }
             let service_name = resolve_cli_service_name(codex, claude).await?;
@@ -175,10 +215,13 @@ pub async fn run_cli() -> CliResult<()> {
                 service_name,
                 host,
                 port,
-                !no_tui,
-                resident,
-                supervisor_managed,
-                desktop_managed,
+                ServeRuntimeOptions {
+                    enable_tui: !no_tui,
+                    resident,
+                    supervisor_managed,
+                    desktop_managed,
+                    service_managed,
+                },
             )
             .await
             .map_err(|e| CliError::Other(e.to_string()))?;
@@ -200,11 +243,13 @@ fn init_tracing(cli: &Cli) -> Option<WorkerGuard> {
             resident,
             supervisor_managed,
             desktop_managed,
+            service_managed,
             ..
         }) => {
             !*resident
                 && !*supervisor_managed
                 && !*desktop_managed
+                && !*service_managed
                 && !*no_tui
                 && atty::is(atty::Stream::Stdin)
                 && atty::is(atty::Stream::Stdout)
@@ -252,30 +297,6 @@ const RUNTIME_LOG_FILE_NAME: &str = "runtime.log";
 const DEFAULT_RUNTIME_LOG_MAX_BYTES: u64 = 20 * 1024 * 1024;
 const DEFAULT_RUNTIME_LOG_MAX_FILES: usize = 10;
 
-fn read_existing_text(path: &std::path::Path) -> Option<String> {
-    std::fs::read_to_string(path).ok()
-}
-
-async fn invalidate_codex_models_cache_if_needed() {
-    let cache_path = codex_models_cache_path();
-    match invalidate_stale_fast_service_tier_cache(&cache_path).await {
-        Ok(ModelsCacheInvalidation::Deleted) => {
-            tracing::info!(
-                "Deleted stale Codex models cache at {:?}; Codex will refetch model capabilities on next TUI startup",
-                cache_path
-            );
-        }
-        Ok(ModelsCacheInvalidation::Missing | ModelsCacheInvalidation::Kept) => {}
-        Err(err) => {
-            tracing::warn!(
-                "Failed to inspect Codex models cache for Fast service_tiers at {:?}: {}",
-                cache_path,
-                err
-            );
-        }
-    }
-}
-
 async fn handle_daemon_cmd(cmd: DaemonCommand) -> CliResult<()> {
     match cmd {
         DaemonCommand::Status {
@@ -287,15 +308,6 @@ async fn handle_daemon_cmd(cmd: DaemonCommand) -> CliResult<()> {
             let service_name = resolve_cli_service_name(codex, claude).await?;
             let port = port.unwrap_or_else(|| default_proxy_port_for_service(service_name));
             print_daemon_status(service_name, port, json).await
-        }
-        DaemonCommand::Stop {
-            codex,
-            claude,
-            port,
-        } => {
-            let service_name = resolve_cli_service_name(codex, claude).await?;
-            let port = port.unwrap_or_else(|| default_proxy_port_for_service(service_name));
-            stop_daemon(service_name, port).await
         }
         DaemonCommand::Supervise {
             codex,
@@ -360,26 +372,17 @@ async fn handle_relay_cmd(cmd: RelayCommand) -> CliResult<()> {
             admin_token_env,
             codex,
             claude,
-            preset,
-            legacy_mode,
-            responses_websocket,
         } => {
-            reject_legacy_mode(legacy_mode)?;
             let service = relay_service_from_flags(codex, claude)?;
-            add_relay_target(
-                name,
-                proxy_url,
-                admin_url,
-                admin_token_env,
-                service,
-                preset,
-                responses_websocket,
-            )
-            .await
+            add_relay_target(name, proxy_url, admin_url, admin_token_env, service).await
         }
         RelayCommand::List => list_relay_targets().await,
         RelayCommand::Status { target, json } => relay_status(target, json).await,
-        RelayCommand::Off { codex, claude } => do_switch_off(codex, claude),
+        RelayCommand::Off => {
+            println!("Relay off no longer changes client configuration.");
+            println!("Run `codex-helper switch off` explicitly to restore Codex.");
+            Ok(())
+        }
         RelayCommand::Use {
             target,
             no_tui,
@@ -433,29 +436,10 @@ async fn add_relay_target(
     admin_url: Option<String>,
     admin_token_env: Option<String>,
     service: ServiceKind,
-    preset: Option<CodexClientPatchPresetArg>,
-    responses_websocket: bool,
 ) -> CliResult<()> {
-    let discovered_admin_url = if admin_url.is_none() {
-        match ControlPlaneClient::discover_admin_base_url(&proxy_url).await {
-            Ok(discovery) => Some(discovery.admin_base_url),
-            Err(err) => {
-                tracing::warn!("failed to discover relay admin URL from {proxy_url}: {err}");
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let target = relay_target_config_from_args(
-        Some(service),
-        proxy_url,
-        admin_url.or(discovered_admin_url),
-        admin_token_env,
-        preset.map(Into::into),
-        responses_websocket.then_some(true),
-    )
-    .map_err(|err| CliError::Other(err.to_string()))?;
+    let target =
+        relay_target_config_from_args(Some(service), proxy_url, admin_url, admin_token_env)
+            .map_err(|err| CliError::Other(err.to_string()))?;
 
     save_named_relay_target(&name, target).await?;
     println!("Saved relay target '{name}'.");
@@ -469,33 +453,27 @@ async fn save_named_relay_target(name: &str, target: RelayTargetConfig) -> CliRe
             "relay target name cannot be the built-in 'local' target".to_string(),
         ));
     }
-    let mut loaded = load_config_with_v4_source()
+    let loaded = load_config_with_source()
         .await
-        .map_err(|err| CliError::ProxyConfig(err.to_string()))?;
-    if let Some(mut v4) = loaded.v4.take() {
-        v4.relay_targets.insert(name, target);
-        save_config_v4(&v4)
-            .await
-            .map_err(|err| CliError::ProxyConfig(err.to_string()))?;
-    } else {
-        loaded.runtime.relay_targets.insert(name, target);
-        save_config(&loaded.runtime)
-            .await
-            .map_err(|err| CliError::ProxyConfig(err.to_string()))?;
-    }
+        .map_err(|err| CliError::Configuration(err.to_string()))?;
+    let mut source = loaded.source;
+    source.relay_targets.insert(name, target);
+    save_helper_config(&source)
+        .await
+        .map_err(|err| CliError::Configuration(err.to_string()))?;
     Ok(())
 }
 
 async fn list_relay_targets() -> CliResult<()> {
     let cfg = load_config()
         .await
-        .map_err(|err| CliError::ProxyConfig(err.to_string()))?;
+        .map_err(|err| CliError::Configuration(err.to_string()))?;
     println!("{}", "codex-helper relay targets".bold());
     for name in relay_target_names(&cfg) {
         let target = resolve_relay_target(&cfg, &name)
-            .map_err(|err| CliError::ProxyConfig(err.to_string()))?;
+            .map_err(|err| CliError::Configuration(err.to_string()))?;
         let service = service_name_for_kind(target.service);
-        let admin = target.admin_url.as_deref().unwrap_or("<discover>");
+        let admin = target.admin_url.as_deref().unwrap_or("<unavailable>");
         let marker = if target.is_local() {
             "built-in"
         } else {
@@ -512,16 +490,16 @@ async fn list_relay_targets() -> CliResult<()> {
 async fn relay_status(target: Option<String>, json: bool) -> CliResult<()> {
     let cfg = load_config()
         .await
-        .map_err(|err| CliError::ProxyConfig(err.to_string()))?;
+        .map_err(|err| CliError::Configuration(err.to_string()))?;
     if let Some(target_name) = target {
         let target = resolve_relay_target(&cfg, &target_name)
-            .map_err(|err| CliError::ProxyConfig(err.to_string()))?;
+            .map_err(|err| CliError::Configuration(err.to_string()))?;
         return print_relay_target_status(target, json).await;
     }
 
     if json {
-        let status = codex_integration::codex_switch_status()
-            .map_err(|err| CliError::CodexConfig(err.to_string()))?;
+        let status =
+            codex_switch::inspect().map_err(|err| CliError::CodexConfig(err.to_string()))?;
         let targets = relay_target_names(&cfg);
         println!(
             "{}",
@@ -530,7 +508,9 @@ async fn relay_status(target: Option<String>, json: bool) -> CliResult<()> {
                 "codex": {
                     "enabled": status.enabled,
                     "base_url": status.base_url,
-                    "model_provider": status.model_provider,
+                    "managed": status.managed,
+                    "phase": status.phase.as_str(),
+                    "recovery_reason": status.recovery_reason,
                 }
             }))
             .unwrap_or_else(|_| "{}".to_string())
@@ -540,7 +520,7 @@ async fn relay_status(target: Option<String>, json: bool) -> CliResult<()> {
 
     println!("{}", "codex-helper relay status".bold());
     println!("targets: {}", relay_target_names(&cfg).join(", "));
-    print_codex_switch_status();
+    print_codex_switch_status()?;
     Ok(())
 }
 
@@ -551,31 +531,18 @@ async fn print_relay_target_status(target: ResolvedRelayTarget, json: bool) -> C
             target.name
         )));
     };
-    let client = ControlPlaneClient::new(ControlPlaneEndpoint::new(
-        admin_url.clone(),
-        target.admin_token_env.clone(),
-    )?)
-    .map_err(|err| CliError::Other(err.to_string()))?;
-    let runtime_status = client.runtime_status().await;
+    let service_name = service_name_for_kind(target.service);
+    let model =
+        read_operator_model(&admin_url, target.admin_token_env.as_deref(), service_name).await?;
     if json {
-        let payload = match runtime_status {
-            Ok(status) => serde_json::json!({
-                "target": target.name,
-                "service": service_name_for_kind(target.service),
-                "proxy_url": target.proxy_url,
-                "admin_url": admin_url,
-                "reachable": true,
-                "runtime": status,
-            }),
-            Err(err) => serde_json::json!({
-                "target": target.name,
-                "service": service_name_for_kind(target.service),
-                "proxy_url": target.proxy_url,
-                "admin_url": admin_url,
-                "reachable": false,
-                "error": err.to_string(),
-            }),
-        };
+        let payload = serde_json::json!({
+            "target": target.name,
+            "service": service_name,
+            "proxy_url": target.proxy_url,
+            "admin_url": admin_url,
+            "reachable": operator_read_model_is_reachable(&model),
+            "operator_read_model": model,
+        });
         println!(
             "{}",
             serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
@@ -584,33 +551,57 @@ async fn print_relay_target_status(target: ResolvedRelayTarget, json: bool) -> C
     }
 
     println!("{}", format!("relay target '{}'", target.name).bold());
-    println!("  service: {}", service_name_for_kind(target.service));
+    println!("  service: {}", service_name);
     println!("  proxy:   {}", target.proxy_url);
     println!("  admin:   {}", admin_url);
-    match runtime_status {
-        Ok(status) => {
+    match model.status {
+        OperatorReadStatus::Ready => {
             println!("  status:  {}", "[UP]".green());
-            println!("  shutdown API: {}", status.shutdown_available);
         }
-        Err(err) => {
+        OperatorReadStatus::Stale => {
+            println!("  status:  {}", "[STALE]".yellow());
+        }
+        OperatorReadStatus::AuthRequired => {
+            println!("  status:  {}", "[AUTH REQUIRED]".yellow());
+        }
+        OperatorReadStatus::Disconnected => {
             println!("  status:  {}", "[DOWN]".yellow());
-            println!("  error:   {err}");
         }
+    }
+    if let Some(data) = model.data.as_ref() {
+        let routable_endpoints = data
+            .summary
+            .providers
+            .iter()
+            .map(|provider| provider.routable_endpoints)
+            .sum::<usize>();
+        let total_endpoints = data
+            .summary
+            .providers
+            .iter()
+            .map(|provider| provider.endpoints.len())
+            .sum::<usize>();
+        println!("  captured: {}", model.captured_at_ms);
+        println!(
+            "  active requests: {}, recent requests: {}, providers: {}, routable endpoints: {}/{}",
+            data.summary.counts.active_requests,
+            data.summary.counts.recent_requests,
+            data.summary.counts.providers,
+            routable_endpoints,
+            total_endpoints
+        );
     }
     Ok(())
 }
 
 async fn use_relay_target(target_name: String, no_tui: bool, attach_only: bool) -> CliResult<()> {
-    if no_tui && attach_only {
-        return Err(CliError::Other(
-            "`--no-tui` and `--attach-only` together have no effect".to_string(),
-        ));
-    }
     let cfg = load_config()
         .await
-        .map_err(|err| CliError::ProxyConfig(err.to_string()))?;
+        .map_err(|err| CliError::Configuration(err.to_string()))?;
     let target = resolve_relay_target(&cfg, &target_name)
-        .map_err(|err| CliError::ProxyConfig(err.to_string()))?;
+        .map_err(|err| CliError::Configuration(err.to_string()))?;
+    validate_relay_use_mode(&target, no_tui, attach_only)?;
+    print_relay_client_config_hint(&target);
     if target.is_local() && !attach_only {
         let service_name = service_name_for_kind(target.service);
         let port = relay_proxy_port(&target)
@@ -619,47 +610,94 @@ async fn use_relay_target(target_name: String, no_tui: bool, attach_only: bool) 
             service_name,
             IpAddr::from([127, 0, 0, 1]),
             port,
-            !no_tui,
-            false,
-            false,
-            false,
+            ServeRuntimeOptions {
+                enable_tui: !no_tui,
+                ..ServeRuntimeOptions::default()
+            },
         )
         .await
         .map_err(|err| CliError::Other(err.to_string()));
     }
 
-    if !attach_only {
-        switch_client_to_relay_target(&target)?;
-        println!(
-            "Switched {} client to relay target '{}' ({})",
-            service_name_for_kind(target.service),
-            target.name,
-            target.proxy_url
-        );
-    }
     if !no_tui {
         attach_tui_to_relay_target(&target).await?;
     }
     Ok(())
 }
 
-fn switch_client_to_relay_target(target: &ResolvedRelayTarget) -> CliResult<()> {
-    match target.service {
-        ServiceKind::Codex => {
-            codex_integration::guard_codex_config_before_switch_on_interactive()?;
-            codex_integration::switch_on_with_base_url(
-                &target.proxy_url,
-                target.client_preset,
-                target.client_options,
-            )
-            .map_err(|err| CliError::CodexConfig(err.to_string()))?;
-        }
-        ServiceKind::Claude => {
-            codex_integration::claude_switch_on_base_url(&target.proxy_url)
-                .map_err(|err| CliError::CodexConfig(err.to_string()))?;
-        }
+fn validate_relay_use_mode(
+    target: &ResolvedRelayTarget,
+    no_tui: bool,
+    attach_only: bool,
+) -> CliResult<()> {
+    if no_tui && attach_only {
+        return Err(CliError::Other(
+            "`--no-tui` and `--attach-only` together have no effect".to_string(),
+        ));
+    }
+    if no_tui && !target.is_local() {
+        return Err(CliError::Other(
+            "`--no-tui` can only start the built-in local relay target; omit it to attach the read-only TUI to a remote target"
+                .to_string(),
+        ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod relay_use_mode_tests {
+    use super::*;
+
+    fn relay_target(built_in_local: bool) -> ResolvedRelayTarget {
+        ResolvedRelayTarget {
+            name: if built_in_local { "local" } else { "nas" }.to_string(),
+            service: ServiceKind::Codex,
+            proxy_url: "http://127.0.0.1:3211".to_string(),
+            admin_url: Some("http://127.0.0.1:4211".to_string()),
+            admin_token_env: None,
+            built_in_local,
+        }
+    }
+
+    #[test]
+    fn remote_relay_target_rejects_no_tui_instead_of_exiting_successfully() {
+        let error = validate_relay_use_mode(&relay_target(false), true, false)
+            .expect_err("remote --no-tui must not become a successful no-op");
+        assert!(error.to_string().contains("built-in local relay target"));
+    }
+
+    #[test]
+    fn local_relay_target_allows_no_tui_startup() {
+        validate_relay_use_mode(&relay_target(true), true, false)
+            .expect("local --no-tui should start without the console");
+    }
+
+    #[test]
+    fn relay_target_rejects_no_tui_with_attach_only() {
+        let error = validate_relay_use_mode(&relay_target(true), true, true)
+            .expect_err("no-tui attach-only has no observable behavior");
+        assert!(error.to_string().contains("have no effect"));
+    }
+}
+
+fn print_relay_client_config_hint(target: &ResolvedRelayTarget) {
+    println!(
+        "Relay target '{}' is read-only for client configuration.",
+        target.name
+    );
+    if target.service == ServiceKind::Codex {
+        match ValidatedCodexBaseUrl::parse(target.proxy_url.as_str()) {
+            Ok(base_url) => {
+                println!(
+                    "Run `codex-helper switch on --base-url <URL>` explicitly to update Codex."
+                );
+                println!("  URL: {}", base_url.as_str());
+            }
+            Err(error) => {
+                println!("This relay URL is incompatible with the explicit Codex switch: {error}")
+            }
+        }
+    }
 }
 
 async fn attach_tui_to_relay_target(target: &ResolvedRelayTarget) -> CliResult<()> {
@@ -698,118 +736,93 @@ fn daemon_admin_base_url_for_proxy_port(port: u16) -> String {
     format!("http://{}", admin_loopback_addr_for_proxy_port(port))
 }
 
-async fn daemon_admin_client() -> CliResult<Client> {
-    Client::builder()
-        .timeout(Duration::from_millis(1200))
-        .build()
-        .map_err(|err| CliError::Other(format!("failed to build daemon admin client: {err}")))
+async fn read_operator_model(
+    admin_url: &str,
+    admin_token_env: Option<&str>,
+    service_name: &str,
+) -> CliResult<OperatorReadModel> {
+    let client = control_plane_client(admin_url, admin_token_env)?;
+    Ok(client.refresh_operator_read_model(service_name, None).await)
 }
 
-async fn get_daemon_json(port: u16, path: &str) -> CliResult<JsonValue> {
-    let client = daemon_admin_client().await?;
-    let url = format!("{}{}", daemon_admin_base_url_for_proxy_port(port), path);
-    let response = client.get(url).send().await.map_err(|err| {
-        CliError::Other(format!(
-            "local resident proxy is not reachable on admin port {}: {err}",
-            admin_loopback_addr_for_proxy_port(port).port()
-        ))
-    })?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(CliError::Other(format!(
-            "daemon admin request failed with status {status}: {}",
-            body.trim()
-        )));
-    }
-    response
-        .json::<JsonValue>()
-        .await
-        .map_err(|err| CliError::Other(format!("daemon admin response is not valid JSON: {err}")))
+fn control_plane_client(
+    admin_url: &str,
+    admin_token_env: Option<&str>,
+) -> CliResult<ControlPlaneClient> {
+    let endpoint =
+        ControlPlaneEndpoint::new(admin_url.to_string(), admin_token_env.map(str::to_string))
+            .map_err(|err| CliError::Other(err.to_string()))?;
+    ControlPlaneClient::new(endpoint).map_err(|err| CliError::Other(err.to_string()))
+}
+
+fn local_control_plane_client(port: u16) -> CliResult<ControlPlaneClient> {
+    control_plane_client(
+        &daemon_admin_base_url_for_proxy_port(port),
+        configured_local_admin_token_env(),
+    )
+}
+
+async fn read_local_operator_model(service_name: &str, port: u16) -> CliResult<OperatorReadModel> {
+    let client = local_control_plane_client(port)?;
+    Ok(client.refresh_operator_read_model(service_name, None).await)
+}
+
+fn operator_read_model_is_reachable(model: &OperatorReadModel) -> bool {
+    model.status != OperatorReadStatus::Disconnected
 }
 
 async fn print_daemon_status(service_name: &'static str, port: u16, json: bool) -> CliResult<()> {
     let owner_marker = read_owner_marker_best_effort(service_name, port);
-    let value = match get_daemon_json(port, "/__codex_helper/api/v1/operator/summary").await {
-        Ok(value) => value,
-        Err(err) => {
-            if json {
-                let mut payload = serde_json::json!({
-                    "service_name": service_name,
-                    "port": port,
-                    "running": false,
-                    "error": err.to_string(),
-                });
-                if let Some(owner) = owner_marker.as_ref()
-                    && let Some(obj) = payload.as_object_mut()
-                {
-                    obj.insert("owner".to_string(), serde_json::json!(owner));
-                }
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
-                );
-                return Ok(());
-            }
-            println!("{}", "codex-helper daemon status".bold());
-            println!("{} {}:{}", "[DOWN]".yellow(), service_name, port);
-            println!("  {}", err);
-            println!(
-                "  高级模式可用 `codex-helper serve --{} --resident` 显式启动常驻代理。",
-                service_name
-            );
-            return Ok(());
-        }
-    };
+    let model = read_local_operator_model(service_name, port).await?;
 
     if json {
-        let mut value = value;
-        if let Some(owner) = owner_marker.as_ref()
-            && let Some(obj) = value.as_object_mut()
-        {
-            obj.insert("owner".to_string(), serde_json::json!(owner));
-        }
+        let payload = serde_json::json!({
+            "service_name": service_name,
+            "port": port,
+            "running": operator_read_model_is_reachable(&model),
+            "owner": owner_marker,
+            "operator_read_model": model,
+        });
         println!(
             "{}",
-            serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string())
+            serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
         );
         return Ok(());
     }
 
-    let reported_service = value
-        .get("service_name")
-        .and_then(JsonValue::as_str)
-        .unwrap_or(service_name);
-    let active = value
-        .pointer("/counts/active_requests")
-        .and_then(JsonValue::as_u64)
-        .unwrap_or(0);
-    let recent = value
-        .pointer("/counts/recent_requests")
-        .and_then(JsonValue::as_u64)
-        .unwrap_or(0);
-    let stations = value
-        .pointer("/counts/stations")
-        .and_then(JsonValue::as_u64)
-        .unwrap_or(0);
-    let active_station = value
-        .pointer("/runtime/effective_active_station")
-        .and_then(JsonValue::as_str)
-        .unwrap_or("<none>");
-    let default_profile = value
-        .pointer("/runtime/default_profile")
-        .and_then(JsonValue::as_str)
-        .unwrap_or("<none>");
     let admin_addr = admin_loopback_addr_for_proxy_port(port);
 
     println!("{}", "codex-helper daemon status".bold());
-    println!(
-        "{} {}:{} (admin: http://{})",
-        "[UP]".green(),
-        reported_service,
-        port,
-        admin_addr
-    );
+    match model.status {
+        OperatorReadStatus::Ready => println!(
+            "{} {}:{} (admin: http://{})",
+            "[UP]".green(),
+            model.service_name,
+            port,
+            admin_addr
+        ),
+        OperatorReadStatus::Stale => println!(
+            "{} {}:{} (admin: http://{})",
+            "[STALE]".yellow(),
+            model.service_name,
+            port,
+            admin_addr
+        ),
+        OperatorReadStatus::AuthRequired => println!(
+            "{} {}:{} (admin: http://{})",
+            "[AUTH REQUIRED]".yellow(),
+            service_name,
+            port,
+            admin_addr
+        ),
+        OperatorReadStatus::Disconnected => println!(
+            "{} {}:{} (admin: http://{})",
+            "[DOWN]".yellow(),
+            service_name,
+            port,
+            admin_addr
+        ),
+    }
     if let Some(owner) = owner_marker.as_ref() {
         println!(
             "  owner: {} (mode: {}, pid: {})",
@@ -818,41 +831,64 @@ async fn print_daemon_status(service_name: &'static str, port: u16, json: bool) 
     } else {
         println!("  owner: <unknown/manual older runtime>");
     }
-    println!("  active station: {active_station}");
-    println!("  default profile: {default_profile}");
-    println!("  active requests: {active}, recent requests: {recent}, stations: {stations}");
+    if let Some(data) = model.data.as_ref() {
+        let routable_endpoints = data
+            .summary
+            .providers
+            .iter()
+            .map(|provider| provider.routable_endpoints)
+            .sum::<usize>();
+        let total_endpoints = data
+            .summary
+            .providers
+            .iter()
+            .map(|provider| provider.endpoints.len())
+            .sum::<usize>();
+        println!(
+            "  default profile: {}",
+            data.summary
+                .runtime
+                .default_profile
+                .as_deref()
+                .unwrap_or("<none>")
+        );
+        println!(
+            "  active requests: {}, recent requests: {}, providers: {}, routable endpoints: {}/{}",
+            data.summary.counts.active_requests,
+            data.summary.counts.recent_requests,
+            data.summary.counts.providers,
+            routable_endpoints,
+            total_endpoints
+        );
+    } else if model.status == OperatorReadStatus::Disconnected {
+        println!(
+            "  高级模式可用 `codex-helper serve --{} --resident` 显式启动常驻代理。",
+            service_name
+        );
+    }
     Ok(())
 }
 
-async fn stop_daemon(service_name: &'static str, port: u16) -> CliResult<()> {
-    let client = daemon_admin_client().await?;
-    let url = format!(
-        "{}{}",
-        daemon_admin_base_url_for_proxy_port(port),
-        "/__codex_helper/api/v1/runtime/shutdown"
-    );
-    let response = client.post(url).send().await.map_err(|err| {
-        CliError::Other(format!(
-            "local resident proxy is not reachable on admin port {}: {err}",
-            admin_loopback_addr_for_proxy_port(port).port()
-        ))
-    })?;
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(CliError::Other(format!(
-            "failed to stop {service_name} daemon on port {port}: status {status}: {}",
-            body.trim()
-        )));
-    }
+#[cfg(test)]
+mod local_admin_token_contract_tests {
+    #[test]
+    fn compose_healthcheck_expands_the_configured_admin_token_inside_the_container() {
+        let compose = include_str!("../deploy/compose/codex-helper.yml");
+        let header = format!(
+            r#"-H \"{}: $${}\""#,
+            crate::proxy::ADMIN_TOKEN_HEADER,
+            crate::proxy::ADMIN_TOKEN_ENV_VAR
+        );
 
-    println!(
-        "{} requested shutdown for {} daemon on port {}",
-        "[OK]".green(),
-        service_name,
-        port
-    );
-    Ok(())
+        assert!(
+            compose.contains(&header),
+            "missing healthcheck header: {header}"
+        );
+        assert!(
+            compose.contains("/__codex_helper/api/v1/operator/read-model"),
+            "healthcheck must use the canonical operator read-model"
+        );
+    }
 }
 
 async fn supervise_daemon(
@@ -1038,23 +1074,106 @@ fn supervisor_restart_delay_secs(restart_count: u32) -> u64 {
     1u64 << restart_count.saturating_sub(1).min(5)
 }
 
-struct LocalClientStartup {
-    loaded: Option<LoadedProxyConfig>,
-    codex_patch_mode: codex_integration::CodexPatchMode,
-    codex_responses_websocket: bool,
-    codex_client_state_changed: bool,
-    codex_switch_error: Option<String>,
+async fn load_serve_config() -> anyhow::Result<LoadedConfig> {
+    load_config_with_source().await
 }
 
-impl Default for LocalClientStartup {
-    fn default() -> Self {
-        Self {
-            loaded: None,
-            codex_patch_mode: codex_integration::CodexPatchMode::Default,
-            codex_responses_websocket: false,
-            codex_client_state_changed: false,
-            codex_switch_error: None,
+fn resolve_serve_tui_language(loaded: &LoadedConfig) -> tui::Language {
+    if let Ok(language) = std::env::var("CODEX_HELPER_TUI_LANG") {
+        return tui::resolve_language_preference(Some(&language));
+    }
+    if let Some(language) = loaded.source.ui.language.as_deref() {
+        if !language.trim().eq_ignore_ascii_case("auto") && tui::parse_language(language).is_none()
+        {
+            tracing::warn!(
+                "Invalid ui.language '{}', falling back to system locale",
+                language
+            );
         }
+        return tui::resolve_language_preference(Some(language));
+    }
+    tui::detect_system_language()
+}
+
+fn codex_startup_readiness_for_existing_switch(
+    port: u16,
+) -> codex_integration::CodexStartupReadiness {
+    use codex_integration::{
+        CodexStartupReadinessIssue, CodexStartupReadinessIssueKind, CodexStartupReadinessSeverity,
+    };
+
+    let issue = match codex_switch::inspect() {
+        Err(error) => Some(CodexStartupReadinessIssue {
+            kind: CodexStartupReadinessIssueKind::DiagnosticError,
+            severity: CodexStartupReadinessSeverity::Warning,
+            title: "Codex switch status is unavailable".to_string(),
+            detail: error.to_string(),
+            action: "Inspect the helper-owned switch journal before changing Codex config."
+                .to_string(),
+        }),
+        Ok(status) => match status.phase {
+            CodexSwitchPhase::Off => Some(CodexStartupReadinessIssue {
+                kind: CodexStartupReadinessIssueKind::SwitchDisabled,
+                severity: CodexStartupReadinessSeverity::Warning,
+                title: "Codex is not switched to this proxy".to_string(),
+                detail: "No applied helper-owned Codex switch was found.".to_string(),
+                action: format!(
+                    "Run `codex-helper switch on --port {port}` explicitly before starting a Codex client."
+                ),
+            }),
+            CodexSwitchPhase::RecoveryRequired => Some(CodexStartupReadinessIssue {
+                kind: CodexStartupReadinessIssueKind::DiagnosticError,
+                severity: CodexStartupReadinessSeverity::Warning,
+                title: "Codex switch requires recovery".to_string(),
+                detail: status.recovery_reason.unwrap_or_else(|| {
+                    "The config no longer matches the switch journal.".to_string()
+                }),
+                action: "Do not overwrite Codex config; reconcile the recorded fingerprints first."
+                    .to_string(),
+            }),
+            CodexSwitchPhase::Prepared => Some(CodexStartupReadinessIssue {
+                kind: CodexStartupReadinessIssueKind::DiagnosticError,
+                severity: CodexStartupReadinessSeverity::Warning,
+                title: "Codex switch operation is incomplete".to_string(),
+                detail: "A prepared helper-owned switch operation still needs recovery."
+                    .to_string(),
+                action: format!(
+                    "Retry `codex-helper switch on --port {port}` or run `codex-helper switch off`."
+                ),
+            }),
+            CodexSwitchPhase::Applied if !status.enabled => Some(CodexStartupReadinessIssue {
+                kind: CodexStartupReadinessIssueKind::DiagnosticError,
+                severity: CodexStartupReadinessSeverity::Warning,
+                title: "Codex switch state is inconsistent".to_string(),
+                detail: "The journal is applied but Codex does not select the helper stanza."
+                    .to_string(),
+                action:
+                    "Run `codex-helper switch status` and reconcile the config before continuing."
+                        .to_string(),
+            }),
+            CodexSwitchPhase::Applied => {
+                let expected = ValidatedCodexBaseUrl::local(port);
+                (status.base_url.as_deref() != Some(expected.as_str())).then(|| {
+                    CodexStartupReadinessIssue {
+                        kind: CodexStartupReadinessIssueKind::SwitchPortMismatch,
+                        severity: CodexStartupReadinessSeverity::Warning,
+                        title: "Codex points to a different helper endpoint".to_string(),
+                        detail: format!(
+                            "Codex uses {}, but this proxy is starting at {}.",
+                            status.base_url.as_deref().unwrap_or("<unset>"),
+                            expected.as_str()
+                        ),
+                        action: format!(
+                            "Run `codex-helper switch off`, then `codex-helper switch on --port {port}`, or serve at the configured endpoint."
+                        ),
+                    }
+                })
+            }
+        },
+    };
+
+    codex_integration::CodexStartupReadiness {
+        issues: issue.into_iter().collect(),
     }
 }
 
@@ -1062,67 +1181,15 @@ async fn run_server(
     service_name: &'static str,
     host: IpAddr,
     port: u16,
-    enable_tui: bool,
-    resident: bool,
-    supervisor_managed: bool,
-    desktop_managed: bool,
+    options: ServeRuntimeOptions,
 ) -> anyhow::Result<()> {
-    let owner_kind = if desktop_managed {
-        Some(RuntimeOwnerKind::Desktop)
-    } else if supervisor_managed {
-        Some(RuntimeOwnerKind::Supervisor)
-    } else if resident {
-        Some(RuntimeOwnerKind::ManualCli)
-    } else {
-        None
-    };
-    let resident = resident || supervisor_managed || desktop_managed;
-    let interactive =
-        !resident && enable_tui && atty::is(atty::Stream::Stdin) && atty::is(atty::Stream::Stdout);
-
-    struct AutoRestoreGuard {
-        service_name: &'static str,
-        enabled: bool,
-    }
-
-    impl Drop for AutoRestoreGuard {
-        fn drop(&mut self) {
-            if !self.enabled {
-                tracing::info!(
-                    "resident proxy mode: leaving client local proxy patch active on exit"
-                );
-                return;
-            }
-            // Always try to remove the local client patch on exit. Codex uses a small switch state;
-            // Claude still uses a settings backup.
-            if self.service_name == "claude" {
-                match codex_integration::claude_switch_off() {
-                    Ok(()) => tracing::info!("Claude settings restored from backup"),
-                    Err(err) => {
-                        tracing::warn!("Failed to restore Claude settings from backup: {}", err)
-                    }
-                }
-            } else if self.service_name == "codex" {
-                match codex_integration::switch_off() {
-                    Ok(()) => tracing::info!("Codex local proxy patch disabled"),
-                    Err(err) => {
-                        tracing::warn!("Failed to disable Codex local proxy patch: {}", err)
-                    }
-                }
-            }
-        }
-    }
-
-    let _restore_guard = AutoRestoreGuard {
-        service_name,
-        enabled: !resident,
-    };
+    let owner_kind = options.owner_kind();
+    let interactive = !options.is_resident()
+        && options.enable_tui
+        && atty::is(atty::Stream::Stdin)
+        && atty::is(atty::Stream::Stdout);
     let _owner_marker_guard =
         RuntimeOwnerMarkerGuard::new(service_name, port, owner_kind.is_some());
-
-    if service_name == "codex" {
-        basellm_metadata::sync_basellm_metadata_cache_background().await;
-    }
 
     if let Some(owner_kind) = owner_kind {
         let marker = RuntimeOwnerMarker::new(owner_kind, service_name, port);
@@ -1130,35 +1197,8 @@ async fn run_server(
             tracing::warn!("failed to write runtime owner marker: {err}");
         }
     }
-    let client_startup = prepare_local_client_for_proxy(service_name, port).await?;
-
-    let loaded = if let Some(loaded) = client_startup.loaded {
-        loaded
-    } else {
-        match service_name {
-            "codex" => load_or_bootstrap_for_service_with_v4_source(ServiceKind::Codex).await?,
-            "claude" => load_or_bootstrap_for_service_with_v4_source(ServiceKind::Claude).await?,
-            _ => load_or_bootstrap_for_service_with_v4_source(ServiceKind::Codex).await?,
-        }
-    };
-    let mut cfg_for_language = loaded.runtime.clone();
-    let tui_lang = {
-        if let Ok(s) = std::env::var("CODEX_HELPER_TUI_LANG") {
-            tui::resolve_language_preference(Some(&s))
-        } else if let Some(s) = cfg_for_language.ui.language.as_deref() {
-            if !s.trim().eq_ignore_ascii_case("auto") && tui::parse_language(s).is_none() {
-                tracing::warn!("Invalid ui.language '{}', falling back to system locale", s);
-            }
-            tui::resolve_language_preference(Some(s))
-        } else {
-            let detected = tui::detect_system_language();
-            cfg_for_language.ui.language = Some("auto".to_string());
-            if let Err(err) = crate::config::save_config(&cfg_for_language).await {
-                tracing::warn!("Failed to persist ui.language to config: {}", err);
-            }
-            detected
-        }
-    };
+    let loaded = load_serve_config().await?;
+    let tui_lang = resolve_serve_tui_language(&loaded);
 
     let runtime = build_local_proxy_runtime(service_name, host, port, loaded).await?;
     let addr: SocketAddr = SocketAddr::from((host, port));
@@ -1180,8 +1220,6 @@ async fn run_server(
         service_name
     );
 
-    proxy.spawn_initial_balance_refresh();
-
     {
         let shutdown_tx = shutdown_tx.clone();
         tokio::spawn(async move {
@@ -1190,23 +1228,11 @@ async fn run_server(
         });
     }
 
-    let server_handle = runtime.start().server_handle;
+    let mut running_runtime = runtime.start();
 
     let result = if interactive {
-        let mut server_handle = server_handle;
-
-        let providers = tui::build_provider_options(&cfg, service_name);
-        let startup_readiness = (service_name == "codex").then(|| {
-            codex_integration::codex_tui_startup_readiness(
-                codex_integration::CodexStartupReadinessInput {
-                    expected_port: port,
-                    expected_patch_mode: client_startup.codex_patch_mode,
-                    expected_responses_websocket: client_startup.codex_responses_websocket,
-                    client_state_changed_this_startup: client_startup.codex_client_state_changed,
-                    switch_error: client_startup.codex_switch_error.clone(),
-                },
-            )
-        });
+        let startup_readiness =
+            (service_name == "codex").then(|| codex_startup_readiness_for_existing_switch(port));
 
         let mut tui_handle = tokio::spawn(tui::run_dashboard(
             proxy.clone(),
@@ -1215,7 +1241,6 @@ async fn run_server(
             service_name,
             port,
             admin_addr.port(),
-            providers,
             startup_readiness,
             tui_lang,
             shutdown_tx.clone(),
@@ -1223,10 +1248,10 @@ async fn run_server(
         ));
 
         tokio::select! {
-            server_res = &mut server_handle => {
+            server_res = running_runtime.wait() => {
                 let _ = shutdown_tx.send(true);
                 let _ = tui_handle.await;
-                server_res.map_err(|e| anyhow::anyhow!("server task join error: {e}"))??;
+                server_res?;
                 Ok::<(), anyhow::Error>(())
             }
             tui_res = &mut tui_handle => {
@@ -1234,25 +1259,25 @@ async fn run_server(
                     Ok(Ok(())) => {
                         // The dashboard requested a shutdown (or exited because shutdown was already triggered).
                         let _ = shutdown_tx.send(true);
-                        await_server_shutdown_with_timeout(server_handle).await?;
+                        await_server_shutdown_with_timeout(&mut running_runtime).await?;
                         Ok::<(), anyhow::Error>(())
                     }
                     Ok(Err(err)) => {
                         // If the dashboard fails (e.g. terminal issues), keep running without it.
                         tracing::warn!("TUI dashboard failed; continuing without TUI: {}", err);
-                        await_server_shutdown(server_handle).await?;
+                        await_server_shutdown(&mut running_runtime).await?;
                         Ok::<(), anyhow::Error>(())
                     }
                     Err(join_err) => {
                         tracing::warn!("TUI task join error; continuing without TUI: {}", join_err);
-                        await_server_shutdown(server_handle).await?;
+                        await_server_shutdown(&mut running_runtime).await?;
                         Ok::<(), anyhow::Error>(())
                     }
                 }
             }
         }
     } else {
-        await_server_shutdown(server_handle).await?;
+        await_server_shutdown(&mut running_runtime).await?;
         Ok(())
     };
 
@@ -1261,127 +1286,12 @@ async fn run_server(
     Ok(())
 }
 
-async fn prepare_local_client_for_proxy(
-    service_name: &'static str,
-    port: u16,
-) -> anyhow::Result<LocalClientStartup> {
-    match service_name {
-        "codex" => prepare_codex_client_for_local_proxy(port).await,
-        "claude" => {
-            prepare_claude_client_for_local_proxy(port);
-            Ok(LocalClientStartup::default())
-        }
-        _ => Ok(LocalClientStartup::default()),
-    }
-}
-
-async fn prepare_codex_client_for_local_proxy(port: u16) -> anyhow::Result<LocalClientStartup> {
-    let codex_config_before_switch = read_existing_text(&codex_config_path());
-    let codex_auth_before_switch = read_existing_text(&codex_auth_path());
-    if let Err(err) = codex_integration::guard_codex_config_before_switch_on_interactive() {
-        tracing::warn!("Failed to guard Codex config before switch on: {}", err);
-    }
-    if let Err(err) = normalize_config_toml_authoring() {
-        tracing::warn!(
-            "Failed to normalize codex-helper config authoring fields before switch on: {}",
-            err
-        );
-    }
-
-    let loaded = load_or_bootstrap_for_service_with_v4_source(ServiceKind::Codex).await?;
-    let client_patch = match codex_client_patch_config_from_config_file() {
-        Ok(config) => config,
-        Err(err) => {
-            tracing::warn!(
-                "Failed to read codex.client_patch from codex-helper config, falling back to default: {}",
-                err
-            );
-            crate::config::CodexClientPatchConfig::default()
-        }
-    };
-    let (patch_mode, switch_options) = match codex_integration::codex_switch_status() {
-        Ok(status) if status.has_switch_state => (
-            status.patch_mode.unwrap_or(client_patch.preset),
-            codex_integration::CodexSwitchOptions {
-                responses_websocket: status
-                    .supports_websockets
-                    .unwrap_or(client_patch.options.responses_websocket),
-                compaction: status.compaction_strategy,
-            },
-        ),
-        Ok(status) => {
-            if status.enabled {
-                tracing::info!(
-                    "Codex local proxy patch has no switch state; applying codex-helper config preset={} instead of inferring from stale ~/.codex/config.toml",
-                    client_patch.preset.as_preset_str()
-                );
-            }
-            (client_patch.preset, client_patch.options)
-        }
-        Err(err) => {
-            tracing::warn!(
-                "Failed to read Codex preset from ~/.codex/config.toml, falling back to default: {}",
-                err
-            );
-            (client_patch.preset, client_patch.options)
-        }
-    };
-
-    let mut codex_switch_error = None;
-    match codex_integration::switch_on_with_options(port, patch_mode, switch_options) {
-        Ok(()) => {
-            tracing::info!(
-                "Codex config switched to local proxy on port {} (preset={}, compaction={}, responses_websocket={})",
-                port,
-                patch_mode.as_preset_str(),
-                switch_options.compaction,
-                switch_options.responses_websocket
-            );
-        }
-        Err(err) => {
-            let err = err.to_string();
-            tracing::warn!("Failed to switch Codex config to local proxy: {}", err);
-            codex_switch_error = Some(err);
-        }
-    }
-    let codex_client_state_changed = codex_config_before_switch
-        != read_existing_text(&codex_config_path())
-        || codex_auth_before_switch != read_existing_text(&codex_auth_path());
-    invalidate_codex_models_cache_if_needed().await;
-
-    Ok(LocalClientStartup {
-        loaded: Some(loaded),
-        codex_patch_mode: patch_mode,
-        codex_responses_websocket: switch_options.responses_websocket,
-        codex_client_state_changed,
-        codex_switch_error,
-    })
-}
-
-fn prepare_claude_client_for_local_proxy(port: u16) {
-    if let Err(err) = codex_integration::guard_claude_settings_before_switch_on_interactive() {
-        tracing::warn!("Failed to guard Claude settings before switch on: {}", err);
-    }
-    match codex_integration::claude_switch_on(port) {
-        Ok(()) => {
-            tracing::info!(
-                "Claude settings updated to use local proxy on port {}",
-                port
-            );
-        }
-        Err(err) => {
-            tracing::warn!("Failed to update Claude settings for local proxy: {}", err);
-        }
-    }
-}
-
 async fn build_local_proxy_runtime(
     service_name: &'static str,
     host: IpAddr,
     port: u16,
-    loaded: LoadedProxyConfig,
+    loaded: LoadedConfig,
 ) -> anyhow::Result<ProxyRuntime> {
-    let addr: SocketAddr = SocketAddr::from((host, port));
     let admin_addr = admin_loopback_addr_for_proxy_port(port);
     if !host.is_loopback() {
         tracing::warn!(
@@ -1393,64 +1303,48 @@ async fn build_local_proxy_runtime(
             admin_addr
         );
     }
-    let listener = bind_local_listener_or_explain(addr, service_name).await?;
-    let admin_listener = bind_local_listener_or_explain(admin_addr, service_name).await?;
-
-    validate_service_has_upstream(service_name, &loaded.runtime)?;
-    build_proxy_runtime_from_bound_listeners(
+    build_proxy_runtime_from_loaded_with_options(
         service_name,
         host,
         port,
+        ProxyRuntimeOptions::for_proxy_port(port).with_admin_addr(admin_addr),
         loaded,
-        listener,
-        admin_listener,
     )
     .await
+    .map_err(|error| local_runtime_startup_error(error, service_name))
 }
 
-async fn await_server_shutdown(
-    server_handle: tokio::task::JoinHandle<anyhow::Result<()>>,
-) -> anyhow::Result<()> {
-    server_handle
-        .await
-        .map_err(|e| anyhow::anyhow!("server task join error: {e}"))?
+async fn await_server_shutdown(runtime: &mut RunningProxyRuntime) -> anyhow::Result<()> {
+    runtime.wait().await
 }
 
 async fn await_server_shutdown_with_timeout(
-    mut server_handle: tokio::task::JoinHandle<anyhow::Result<()>>,
+    runtime: &mut RunningProxyRuntime,
 ) -> anyhow::Result<()> {
     let timeout = std::time::Duration::from_secs(2);
     tokio::select! {
-        joined = &mut server_handle => {
-            joined.map_err(|e| anyhow::anyhow!("server task join error: {e}"))??;
-            Ok(())
-        }
+        joined = runtime.wait() => joined,
         _ = tokio::time::sleep(timeout) => {
             tracing::warn!(
                 "server graceful shutdown exceeded {}ms; aborting remaining server tasks",
                 timeout.as_millis()
             );
-            server_handle.abort();
-            match server_handle.await {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(err)) => Err(err),
-                Err(join_err) if join_err.is_cancelled() => Ok(()),
-                Err(join_err) => Err(anyhow::anyhow!(
-                    "server task join error after abort: {join_err}"
-                )),
-            }
+            runtime.abort_and_wait().await
         }
     }
 }
 
-async fn bind_local_listener_or_explain(
-    addr: SocketAddr,
-    service_name: &'static str,
-) -> anyhow::Result<tokio::net::TcpListener> {
-    tokio::net::TcpListener::bind(addr).await.map_err(|err| {
-        let help = listener_bind_help(addr, service_name, &err);
-        anyhow::Error::new(err).context(help)
-    })
+fn local_runtime_startup_error(error: anyhow::Error, service_name: &'static str) -> anyhow::Error {
+    let bind_help = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ProxyListenerBindError>())
+        .map(|bind_error| {
+            listener_bind_help(bind_error.addr(), service_name, bind_error.source_error())
+        });
+    match bind_help {
+        Some(help) => error.context(help),
+        None => error,
+    }
 }
 
 fn listener_bind_help(addr: SocketAddr, service_name: &str, err: &std::io::Error) -> String {
@@ -1750,209 +1644,42 @@ fn parse_unix_lsof_owners(output: &str) -> Vec<PortOwner> {
     owners
 }
 
-fn do_switch_on(
-    port: u16,
-    preset: Option<CodexClientPatchPresetArg>,
-    responses_websocket: bool,
-    compaction: Option<CodexCompactionStrategyArg>,
-    codex: bool,
-    claude: bool,
-) -> CliResult<()> {
-    if codex && claude {
-        return Err(CliError::Other(
-            "Please specify at most one of --codex / --claude".to_string(),
-        ));
+fn do_switch_on(port: Option<u16>, base_url: Option<String>) -> CliResult<()> {
+    let validated_base_url = match base_url {
+        Some(base_url) => ValidatedCodexBaseUrl::parse(base_url),
+        None => Ok(ValidatedCodexBaseUrl::local(port.unwrap_or_else(|| {
+            default_proxy_port_for_service_kind(ServiceKind::Codex)
+        }))),
     }
-    if claude {
-        if preset.is_some() {
-            return Err(CliError::Other(
-                "--preset is only supported for Codex switch on".to_string(),
-            ));
-        }
-        if responses_websocket {
-            return Err(CliError::Other(
-                "--responses-websocket is only supported for Codex switch on".to_string(),
-            ));
-        }
-        if compaction.is_some() {
-            return Err(CliError::Other(
-                "--compaction is only supported for Codex switch on".to_string(),
-            ));
-        }
-        if let Err(err) = codex_integration::guard_claude_settings_before_switch_on_interactive() {
-            tracing::warn!("Failed to guard Claude settings before switch on: {}", err);
-        }
-        codex_integration::claude_switch_on(port)
-            .map_err(|e| CliError::CodexConfig(e.to_string()))?;
-    } else {
-        codex_integration::guard_codex_config_before_switch_on_interactive()?;
-        let (effective_mode, effective_options) = match preset {
-            Some(preset) => (
-                codex_helper_core::codex_integration::CodexPatchMode::from(preset),
-                codex_helper_core::codex_integration::CodexSwitchOptions {
-                    responses_websocket,
-                    compaction: compaction.map(Into::into).unwrap_or_default(),
-                },
-            ),
-            None => {
-                let mut configured = codex_client_patch_config_from_config_file()
-                    .map_err(|e| CliError::CodexConfig(e.to_string()))?;
-                if responses_websocket {
-                    configured.options.responses_websocket = true;
-                }
-                if let Some(compaction) = compaction {
-                    configured.options.compaction = compaction.into();
-                }
-                (configured.preset, configured.options)
-            }
-        };
-        codex_integration::switch_on_with_options(port, effective_mode, effective_options)
-            .map_err(|e| CliError::CodexConfig(e.to_string()))?;
-        println!("Codex client preset: {}", effective_mode.as_preset_str());
-        println!("Compaction: {}", effective_options.compaction);
-        println!(
-            "Responses WebSocket: {}",
-            if effective_options.responses_websocket {
-                "enabled"
-            } else {
-                "disabled"
-            }
-        );
-        match effective_mode {
-            codex_integration::CodexPatchMode::Default => {}
-            codex_integration::CodexPatchMode::ChatGptBridge => {
-                println!(
-                    "Updated ~/.codex/config.toml and auth.json for ChatGPT bridge preset. Restart existing Codex apps to apply the client config change."
-                );
-            }
-            codex_integration::CodexPatchMode::ImagegenBridge => {
-                println!(
-                    "Updated ~/.codex/config.toml and auth.json for imagegen bridge preset. Restart existing Codex apps to apply the client config change."
-                );
-            }
-            codex_integration::CodexPatchMode::OfficialRelayBridge => {
-                println!(
-                    "Updated ~/.codex/config.toml for official relay preset. Restart existing Codex apps to apply the client config change."
-                );
-            }
-            codex_integration::CodexPatchMode::OfficialImagegenBridge => {
-                println!(
-                    "Updated ~/.codex/config.toml and auth.json for official imagegen preset. Restart existing Codex apps to apply the client config change."
-                );
-            }
-        }
+    .map_err(|error| CliError::CodexConfig(error.to_string()))?;
+    let outcome = codex_switch::apply(CodexSwitchIntent::On { validated_base_url })
+        .map_err(|error| CliError::CodexConfig(error.to_string()))?;
+    println!(
+        "Codex switch: {} ({})",
+        outcome.change.as_str(),
+        outcome.status.phase.as_str()
+    );
+    if let Some(base_url) = outcome.status.base_url.as_deref() {
+        println!("  base_url: {base_url}");
     }
+    println!("  config: {:?}", outcome.status.config_path);
+    println!("  state:  {:?}", outcome.status.state_path);
     Ok(())
 }
 
-fn do_switch_off(codex: bool, claude: bool) -> CliResult<()> {
-    if codex && claude {
-        return Err(CliError::Other(
-            "Please specify at most one of --codex / --claude".to_string(),
-        ));
-    }
-    if claude {
-        codex_integration::claude_switch_off().map_err(|e| CliError::CodexConfig(e.to_string()))?;
-    } else {
-        codex_integration::switch_off().map_err(|e| CliError::CodexConfig(e.to_string()))?;
-    }
+fn do_switch_off() -> CliResult<()> {
+    let outcome = codex_switch::apply(CodexSwitchIntent::Off)
+        .map_err(|error| CliError::CodexConfig(error.to_string()))?;
+    println!(
+        "Codex switch: {} ({})",
+        outcome.change.as_str(),
+        outcome.status.phase.as_str()
+    );
     Ok(())
 }
 
-fn do_switch_status(codex_flag: bool, claude_flag: bool) {
-    let both_unspecified = !codex_flag && !claude_flag;
-    let show_codex = codex_flag || both_unspecified;
-    let show_claude = claude_flag || both_unspecified;
-
-    if show_codex {
-        print_codex_switch_status();
-        if show_claude {
-            println!();
-        }
-    }
-    if show_claude {
-        print_claude_switch_status();
-    }
-}
-
-fn do_remote_control(cmd: RemoteControlCommand) -> CliResult<()> {
-    match cmd {
-        RemoteControlCommand::Enable => {
-            let result = codex_integration::codex_remote_control_enable()
-                .map_err(|e| CliError::CodexConfig(e.to_string()))?;
-            println!("{}", "Codex App 手机远程控制".bold());
-            println!("  已写入 [features].remote_connections = true");
-            println!(
-                "  未写入 [features].remote_control = true（该 key 在当前 Codex 源码中是 no-op/removed）"
-            );
-            println!("  SQLite 备份: {:?}", result.backup_path);
-            print_remote_control_status_details(&result.status);
-            println!();
-            println!(
-                "请完整退出并重启 Codex App，使 App 重新读取 config.toml 和本地 SQLite 状态。"
-            );
-            println!(
-                "重启后运行 `codex-helper switch remote-control check-logs`，确认 experimentalFeature/enablement/set 至少出现一次 errorCode=null。"
-            );
-            println!("手机端连接时必须先完成 ChatGPT 账号 MFA / 多因素认证。");
-        }
-        RemoteControlCommand::Status => {
-            let status = codex_integration::codex_remote_control_status()
-                .map_err(|e| CliError::CodexConfig(e.to_string()))?;
-            println!("{}", "Codex App 手机远程控制状态".bold());
-            print_remote_control_status_details(&status);
-        }
-        RemoteControlCommand::CheckLogs => {
-            let seen = codex_integration::codex_remote_control_successful_enablement_log_seen()
-                .map_err(|e| CliError::CodexConfig(e.to_string()))?;
-            println!("{}", "Codex App 远程控制日志检查".bold());
-            if seen {
-                println!(
-                    "  已在 Codex 日志中看到 experimentalFeature/enablement/set 且 errorCode=null。"
-                );
-            } else {
-                println!(
-                    "  尚未在 Codex 日志中看到 experimentalFeature/enablement/set 且 errorCode=null。"
-                );
-                println!("  请确认已完整重启 Codex App，并在 App 中触发远程控制相关设置刷新。");
-            }
-        }
-    }
-    Ok(())
-}
-
-fn print_remote_control_status_details(status: &codex_integration::CodexRemoteControlStatus) {
-    println!("  config.toml: {:?}", status.config_path);
-    println!(
-        "  features.remote_connections: {}",
-        if status.remote_connections_enabled {
-            "true".green().to_string()
-        } else {
-            "false".red().to_string()
-        }
-    );
-    println!(
-        "  features.remote_control present: {}",
-        if status.remote_control_config_present {
-            "true".red().to_string()
-        } else {
-            "false".green().to_string()
-        }
-    );
-    println!("  SQLite DB: {:?}", status.db_path);
-    println!("  SQLite DB exists: {}", status.db_exists);
-    println!(
-        "  local_app_server_feature_enablement table: {}",
-        status.db_table_exists
-    );
-    match status.db_enabled {
-        Some(enabled) => println!("  remote_control enabled: {}", enabled),
-        None => println!("  remote_control enabled: <未写入>"),
-    }
-    match status.db_updated_at {
-        Some(updated_at) => println!("  remote_control updated_at: {}", updated_at),
-        None => println!("  remote_control updated_at: <未写入>"),
-    }
+fn do_switch_status() -> CliResult<()> {
+    print_codex_switch_status()
 }
 
 async fn handle_default_cmd(codex: bool, claude: bool) -> CliResult<()> {
@@ -1962,24 +1689,25 @@ async fn handle_default_cmd(codex: bool, claude: bool) -> CliResult<()> {
         ));
     }
 
-    let mut cfg = load_config()
+    let loaded = load_config_with_source()
         .await
-        .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+        .map_err(|e| CliError::Configuration(e.to_string()))?;
 
     if codex || claude {
-        cfg.default_service = Some(if claude {
+        let mut source = loaded.source;
+        source.default_service = Some(if claude {
             ServiceKind::Claude
         } else {
             ServiceKind::Codex
         });
-        crate::config::save_config(&cfg)
+        save_helper_config(&source)
             .await
-            .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+            .map_err(|e| CliError::Configuration(e.to_string()))?;
 
         let name = if claude { "Claude" } else { "Codex" };
         println!("Default target service has been set to {}.", name);
     } else {
-        let name = match cfg.default_service {
+        let name = match loaded.source.default_service {
             Some(ServiceKind::Claude) => "Claude",
             _ => "Codex",
         };
@@ -1989,206 +1717,23 @@ async fn handle_default_cmd(codex: bool, claude: bool) -> CliResult<()> {
     Ok(())
 }
 
-fn print_codex_switch_status() {
-    use std::fs;
-
-    let cfg_path = codex_config_path();
-    let state_path = codex_switch_state_path();
-
-    println!("{}", "Codex 开关状态".bold());
-    println!("  配置文件路径: {:?}", cfg_path);
-
-    if !cfg_path.exists() {
-        println!(
-            "  当前未检测到 {:?}，可能尚未安装或初始化 Codex CLI。",
-            cfg_path
-        );
-        if state_path.exists() {
-            println!(
-                "  已检测到 switch state：{:?}（配置文件不存在，switch off 会清理这份状态）",
-                state_path
-            );
-        }
-        return;
+fn print_codex_switch_status() -> CliResult<()> {
+    let status =
+        codex_switch::inspect().map_err(|error| CliError::CodexConfig(error.to_string()))?;
+    println!("{}", "Codex switch status".bold());
+    println!("  phase:   {}", status.phase.as_str());
+    println!("  enabled: {}", status.enabled);
+    println!("  managed: {}", status.managed);
+    println!("  config:  {:?}", status.config_path);
+    println!("  state:   {:?}", status.state_path);
+    println!(
+        "  base_url: {}",
+        status.base_url.as_deref().unwrap_or("<unset>")
+    );
+    if let Some(reason) = status.recovery_reason.as_deref() {
+        println!("  recovery: {}", reason.yellow());
     }
-
-    let text = match fs::read_to_string(&cfg_path) {
-        Ok(t) => t,
-        Err(err) => {
-            println!("  无法读取配置文件：{}", err.to_string().red());
-            return;
-        }
-    };
-
-    let value: toml::Value = match toml::from_str(&text) {
-        Ok(v) => v,
-        Err(err) => {
-            println!("  无法解析配置为 TOML：{}", err.to_string().red());
-            return;
-        }
-    };
-
-    let table = match value.as_table() {
-        Some(t) => t,
-        None => {
-            println!("  配置根节点不是 TOML 表，无法解析 model_provider。");
-            return;
-        }
-    };
-
-    let provider = table
-        .get("model_provider")
-        .and_then(|v| v.as_str())
-        .unwrap_or("<未设置>");
-    println!("  当前 model_provider: {}", provider.bold());
-
-    if provider == "codex_proxy"
-        && let Some(providers) = table.get("model_providers").and_then(|v| v.as_table())
-        && let Some(proxy) = providers.get("codex_proxy").and_then(|v| v.as_table())
-    {
-        let base_url = proxy.get("base_url").and_then(|v| v.as_str()).unwrap_or("");
-        let name = proxy.get("name").and_then(|v| v.as_str()).unwrap_or("");
-        let requires_openai_auth = proxy.get("requires_openai_auth").and_then(|v| v.as_bool());
-        let supports_websockets = proxy.get("supports_websockets").and_then(|v| v.as_bool());
-        println!("  codex_proxy.name: {}", name);
-        println!("  codex_proxy.base_url: {}", base_url);
-        let status = codex_integration::codex_switch_status().ok();
-        let patch_mode = status
-            .as_ref()
-            .and_then(|status| status.patch_mode)
-            .unwrap_or_else(|| {
-                if requires_openai_auth == Some(true) {
-                    codex_integration::CodexPatchMode::ChatGptBridge
-                } else if name == "OpenAI" {
-                    codex_integration::CodexPatchMode::OfficialRelayBridge
-                } else {
-                    codex_integration::CodexPatchMode::Default
-                }
-            });
-        println!("  codex_proxy.preset: {}", patch_mode.as_preset_str());
-        if let Some(status) = status.as_ref() {
-            println!("  codex_proxy.compaction: {}", status.compaction_strategy);
-        }
-        if let Some(value) = requires_openai_auth {
-            println!("  codex_proxy.requires_openai_auth: {}", value);
-        }
-        if let Some(value) = supports_websockets {
-            println!("  codex_proxy.supports_websockets: {}", value);
-        }
-        if let Some(status) = status.as_ref() {
-            println!(
-                "  features.remote_compaction_v2: {}",
-                status.remote_compaction_v2_enabled
-            );
-        }
-
-        let is_local = base_url.contains("127.0.0.1") || base_url.contains("localhost");
-        if is_local {
-            println!("  -> 当前 Codex 已指向本地 codex-helper 代理。");
-        }
-    }
-
-    if state_path.exists() {
-        println!(
-            "  已检测到 switch state：{:?}（switch off 将局部撤销 codex_proxy patch）",
-            state_path
-        );
-    } else {
-        println!(
-            "  未检测到 switch state：{:?}，switch off 不会猜测原 provider。",
-            state_path
-        );
-    }
-
-    let bridge = codex_integration::codex_bridge_diagnostics();
-    println!("  官方桥接诊断: {}", bridge.worst_status().as_str());
-    for check in &bridge.checks {
-        if check.status == codex_integration::CodexBridgeDiagnosticStatus::Ok {
-            continue;
-        }
-        println!(
-            "    [{}] {}",
-            check.status.as_str().to_uppercase(),
-            check.message
-        );
-        if let Some(action) = check.action.as_deref() {
-            println!("        建议: {action}");
-        }
-    }
-}
-
-fn print_claude_switch_status() {
-    use serde_json::Value as JsonValue;
-    use std::fs;
-
-    let settings_path = claude_settings_path();
-    let backup_path = claude_settings_backup_path();
-
-    println!("{}", "Claude 开关状态（实验性）".bold());
-    println!("  配置文件路径: {:?}", settings_path);
-
-    if !settings_path.exists() {
-        println!(
-            "  当前未检测到 Claude 配置文件 {:?}，可能尚未安装或初始化 Claude Code。",
-            settings_path
-        );
-        return;
-    }
-
-    let text = match fs::read_to_string(&settings_path) {
-        Ok(t) => t,
-        Err(err) => {
-            println!("  无法读取配置文件：{}", err.to_string().red());
-            return;
-        }
-    };
-
-    let value: JsonValue = match serde_json::from_str(&text) {
-        Ok(v) => v,
-        Err(err) => {
-            println!("  无法解析配置为 JSON：{}", err.to_string().red());
-            return;
-        }
-    };
-
-    let obj = match value.as_object() {
-        Some(o) => o,
-        None => {
-            println!("  配置根节点不是 JSON 对象，无法解析 env 字段。");
-            return;
-        }
-    };
-
-    let env_obj = match obj.get("env").and_then(|v| v.as_object()) {
-        Some(e) => e,
-        None => {
-            println!("  未检测到 env 字段，可能不是标准的 Claude 配置结构。");
-            return;
-        }
-    };
-
-    let base_url = env_obj
-        .get("ANTHROPIC_BASE_URL")
-        .and_then(|v| v.as_str())
-        .unwrap_or("<未设置>");
-    println!("  ANTHROPIC_BASE_URL: {}", base_url.bold());
-
-    let is_local = base_url.contains("127.0.0.1") || base_url.contains("localhost");
-    if is_local {
-        println!("  -> 当前 Claude 已指向本地 codex-helper 代理。");
-    }
-
-    if backup_path.exists() {
-        println!(
-            "  已检测到备份文件：{:?}（switch off --claude 将尝试从此处恢复）",
-            backup_path
-        );
-    } else {
-        println!(
-            "  未检测到备份文件：{:?}，如直接修改过 settings.json/claude.json，建议手动备份。",
-            backup_path
-        );
-    }
+    Ok(())
 }
 
 async fn wait_for_shutdown_signal() {
@@ -2348,5 +1893,305 @@ mod supervisor_tests {
 
         crate::runtime_manager::clear_owner_marker_from(&run_dir, "codex", 3211)
             .expect("clear supervisor owner marker");
+    }
+}
+
+#[cfg(test)]
+mod serve_startup_tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    struct ScopedEnv {
+        saved: Vec<(String, Option<String>)>,
+    }
+
+    impl ScopedEnv {
+        fn new() -> Self {
+            Self { saved: Vec::new() }
+        }
+
+        unsafe fn set_path(&mut self, key: &str, value: &Path) {
+            self.saved.push((key.to_string(), std::env::var(key).ok()));
+            unsafe { std::env::set_var(key, value) };
+        }
+    }
+
+    impl Drop for ScopedEnv {
+        fn drop(&mut self) {
+            for (key, old) in self.saved.drain(..).rev() {
+                unsafe {
+                    match old {
+                        Some(value) => std::env::set_var(&key, value),
+                        None => std::env::remove_var(&key),
+                    }
+                }
+            }
+        }
+    }
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        match LOCK.get_or_init(|| Mutex::new(())).lock() {
+            Ok(guard) => guard,
+            Err(error) => error.into_inner(),
+        }
+    }
+
+    fn write_file(path: &Path, contents: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create test directory");
+        }
+        std::fs::write(path, contents).expect("write test file");
+    }
+
+    fn loaded_test_config(source: crate::config::HelperConfig) -> LoadedConfig {
+        LoadedConfig { source }
+    }
+
+    fn loaded_runtime_test_config() -> LoadedConfig {
+        let provider_id = "test".to_string();
+        loaded_test_config(crate::config::HelperConfig {
+            codex: crate::config::ServiceRouteConfig {
+                providers: std::collections::BTreeMap::from([(
+                    provider_id.clone(),
+                    crate::config::ProviderConfig {
+                        base_url: Some("http://127.0.0.1:9/v1".to_string()),
+                        ..crate::config::ProviderConfig::default()
+                    },
+                )]),
+                routing: Some(crate::config::RouteGraphConfig::ordered_failover(vec![
+                    provider_id,
+                ])),
+                ..crate::config::ServiceRouteConfig::default()
+            },
+            ..crate::config::HelperConfig::default()
+        })
+    }
+
+    fn empty_loaded_test_config() -> LoadedConfig {
+        loaded_test_config(crate::config::HelperConfig::default())
+    }
+
+    fn reserve_admin_for_free_proxy_port() -> (u16, std::net::TcpListener) {
+        for _ in 0..100 {
+            let proxy = std::net::TcpListener::bind("127.0.0.1:0")
+                .expect("reserve candidate proxy address");
+            let proxy_port = proxy.local_addr().expect("candidate proxy address").port();
+            let admin_addr = admin_loopback_addr_for_proxy_port(proxy_port);
+            if let Ok(admin) = std::net::TcpListener::bind(admin_addr) {
+                drop(proxy);
+                return (proxy_port, admin);
+            }
+        }
+        panic!("reserve a free proxy port with an occupiable admin port");
+    }
+
+    #[test]
+    fn serve_startup_preparation_is_read_only() {
+        let _lock = env_lock();
+        let root = std::env::temp_dir().join(format!(
+            "codex-helper-serve-startup-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let helper_home = root.join("helper");
+        let codex_home = root.join("codex");
+        std::fs::create_dir_all(&helper_home).expect("create helper home");
+        std::fs::create_dir_all(&codex_home).expect("create Codex home");
+
+        let mut env = ScopedEnv::new();
+        unsafe {
+            env.set_path("CODEX_HELPER_HOME", &helper_home);
+            env.set_path("CODEX_HOME", &codex_home);
+        }
+
+        let codex_config_path = codex_home.join("config.toml");
+        let codex_auth_path = codex_home.join("auth.json");
+        let models_cache_path = codex_home.join("models_cache.json");
+        let codex_config = r#"model_provider = "external"
+
+[model_providers.external]
+name = "external"
+base_url = "https://external.example.com/v1"
+env_key = "EXTERNAL_API_KEY"
+"#;
+        let codex_auth = r#"{"EXTERNAL_API_KEY":"test-only"}"#;
+        let models_cache = r#"{"models":[{"slug":"gpt-5.4","service_tiers":[]}]}"#;
+        write_file(&codex_config_path, codex_config);
+        write_file(&codex_auth_path, codex_auth);
+        write_file(&models_cache_path, models_cache);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+        let loaded = runtime
+            .block_on(load_serve_config())
+            .expect("load serve config");
+        let readiness = codex_startup_readiness_for_existing_switch(3211);
+
+        assert!(loaded.source.codex.providers.is_empty());
+        let switch_disabled = readiness
+            .issues
+            .iter()
+            .find(|issue| {
+                issue.kind == codex_integration::CodexStartupReadinessIssueKind::SwitchDisabled
+            })
+            .expect("external provider should require an explicit switch");
+        assert!(switch_disabled.action.contains("switch on"));
+        assert!(switch_disabled.action.contains("explicitly"));
+        assert!(!switch_disabled.action.contains("restart codex-helper"));
+        assert!(!helper_home.join("config.toml").exists());
+        assert!(!helper_home.join("config.json").exists());
+        assert!(!helper_home.join("state/codex-switch.json").exists());
+        assert!(!codex_home.join("codex-helper-switch-state.json").exists());
+        assert_eq!(
+            std::fs::read_to_string(&codex_config_path).expect("read Codex config"),
+            codex_config
+        );
+        assert_eq!(
+            std::fs::read_to_string(&codex_auth_path).expect("read Codex auth"),
+            codex_auth
+        );
+        assert_eq!(
+            std::fs::read_to_string(&models_cache_path).expect("read models cache"),
+            models_cache
+        );
+
+        let helper_config_path = helper_home.join("config.toml");
+        let helper_config = "version = 5\n\n[notify]\nenabled = false\n";
+        write_file(&helper_config_path, helper_config);
+        let loaded = runtime
+            .block_on(load_serve_config())
+            .expect("load existing helper config");
+        let _ = resolve_serve_tui_language(&loaded);
+        assert_eq!(
+            std::fs::read_to_string(&helper_config_path).expect("read helper config"),
+            helper_config
+        );
+
+        drop(env);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_runtime_store_failure_happens_before_listener_bind() {
+        let _lock = env_lock();
+        let root = std::env::temp_dir().join(format!(
+            "codex-helper-local-runtime-store-order-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let helper_home = root.join("helper");
+        let state_dir = helper_home.join("state");
+        std::fs::create_dir_all(&state_dir).expect("create helper state directory");
+        std::fs::write(state_dir.join("state.sqlite"), b"not a sqlite database")
+            .expect("write corrupt runtime store");
+
+        let mut env = ScopedEnv::new();
+        unsafe {
+            env.set_path("CODEX_HELPER_HOME", &helper_home);
+        }
+
+        let occupied_proxy =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("reserve occupied proxy address");
+        let proxy_addr = occupied_proxy.local_addr().expect("occupied proxy address");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+        let result = runtime.block_on(build_local_proxy_runtime(
+            "codex",
+            proxy_addr.ip(),
+            proxy_addr.port(),
+            empty_loaded_test_config(),
+        ));
+        let error = match result {
+            Ok(_) => panic!("corrupt runtime store must prevent local startup"),
+            Err(error) => error,
+        };
+
+        assert!(error.chain().any(|cause| {
+            matches!(
+                cause.downcast_ref::<codex_helper_core::runtime_store::RuntimeStoreError>(),
+                Some(codex_helper_core::runtime_store::RuntimeStoreError::CorruptDatabase { .. })
+            )
+        }));
+
+        drop(occupied_proxy);
+        drop(env);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_runtime_bind_errors_report_exact_proxy_and_admin_addresses() {
+        let _lock = env_lock();
+        let root = std::env::temp_dir().join(format!(
+            "codex-helper-local-runtime-bind-error-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let helper_home = root.join("helper");
+        let mut env = ScopedEnv::new();
+        unsafe {
+            env.set_path("CODEX_HELPER_HOME", &helper_home);
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+        runtime.block_on(async {
+            let occupied_proxy =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("reserve occupied proxy address");
+            let proxy_addr = occupied_proxy.local_addr().expect("occupied proxy address");
+            let proxy_result = build_local_proxy_runtime(
+                "codex",
+                proxy_addr.ip(),
+                proxy_addr.port(),
+                loaded_runtime_test_config(),
+            )
+            .await;
+            let proxy_error = match proxy_result {
+                Ok(_) => panic!("occupied proxy address must fail"),
+                Err(error) => error,
+            };
+            let proxy_bind_error = proxy_error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<ProxyListenerBindError>())
+                .expect("preserve proxy bind error");
+            assert_eq!(
+                proxy_bind_error.kind(),
+                crate::runtime_host::ProxyListenerKind::Proxy
+            );
+            assert_eq!(proxy_bind_error.addr(), proxy_addr);
+            assert!(proxy_error.to_string().contains(&proxy_addr.to_string()));
+            drop(occupied_proxy);
+
+            let (proxy_port, occupied_admin) = reserve_admin_for_free_proxy_port();
+            let admin_addr = occupied_admin.local_addr().expect("occupied admin address");
+            let admin_result = build_local_proxy_runtime(
+                "codex",
+                IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                proxy_port,
+                loaded_runtime_test_config(),
+            )
+            .await;
+            let admin_error = match admin_result {
+                Ok(_) => panic!("occupied admin address must fail"),
+                Err(error) => error,
+            };
+            let admin_bind_error = admin_error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<ProxyListenerBindError>())
+                .expect("preserve admin bind error");
+            assert_eq!(
+                admin_bind_error.kind(),
+                crate::runtime_host::ProxyListenerKind::Admin
+            );
+            assert_eq!(admin_bind_error.addr(), admin_addr);
+            assert!(admin_error.to_string().contains(&admin_addr.to_string()));
+            drop(occupied_admin);
+        });
+
+        drop(env);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

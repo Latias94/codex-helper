@@ -1,9 +1,5 @@
-use serde::Deserialize;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-
-use crate::codex_integration::CodexPatchMode;
-use crate::codex_patch_plan::{CodexPatchPlan, CodexSwitchOptions};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -49,66 +45,6 @@ impl CodexCapabilityDecision {
 impl Default for CodexCapabilityDecision {
     fn default() -> Self {
         Self::unknown("capability was not reported by this response")
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CodexProviderIdentity {
-    HelperRelay,
-    OfficialOpenAi,
-}
-
-impl CodexProviderIdentity {
-    pub fn from_patch_mode(patch_mode: CodexPatchMode) -> Self {
-        let plan = CodexPatchPlan::for_switch_on(patch_mode, Default::default())
-            .expect("default Codex switch options must be valid for every patch mode");
-        Self::from_patch_provider_identity(plan.provider().identity())
-    }
-
-    fn from_patch_provider_identity(
-        identity: crate::codex_patch_plan::CodexPatchProviderIdentity,
-    ) -> Self {
-        match identity {
-            crate::codex_patch_plan::CodexPatchProviderIdentity::HelperRelay => Self::HelperRelay,
-            crate::codex_patch_plan::CodexPatchProviderIdentity::OfficialOpenAi => {
-                Self::OfficialOpenAi
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CodexAuthShape {
-    None,
-    EmptyChatGptFacade,
-    CompleteChatGptLogin,
-}
-
-impl CodexAuthShape {
-    pub fn from_patch_mode(patch_mode: CodexPatchMode) -> Self {
-        let plan = CodexPatchPlan::for_switch_on(patch_mode, Default::default())
-            .expect("default Codex switch options must be valid for every patch mode");
-        Self::from_auth_patch_plan(plan.auth())
-    }
-
-    fn from_auth_patch_plan(plan: crate::codex_patch_plan::CodexAuthPatchPlan) -> Self {
-        match plan {
-            crate::codex_patch_plan::CodexAuthPatchPlan::RestoreOriginalIfHelperPatched => {
-                Self::None
-            }
-            crate::codex_patch_plan::CodexAuthPatchPlan::PatchImagegenFacade => {
-                Self::EmptyChatGptFacade
-            }
-            crate::codex_patch_plan::CodexAuthPatchPlan::PatchChatGptBridge => {
-                Self::CompleteChatGptLogin
-            }
-        }
-    }
-
-    pub fn allows_codex_backend_tools(self) -> bool {
-        matches!(self, Self::EmptyChatGptFacade | Self::CompleteChatGptLogin)
     }
 }
 
@@ -205,12 +141,11 @@ impl CodexModelCatalogProfile {
                 ),
             };
         };
-        let selected_model = CodexModelCapabilityProfile::from_codex_model_json(selected);
         Self {
             shape: CodexModelCatalogShape::CodexModels,
             selection: CodexModelSelection::Selected,
             translation_required: false,
-            selected_model: Some(selected_model),
+            selected_model: Some(CodexModelCapabilityProfile::from_codex_model_json(selected)),
             reason: "selected model metadata came from a Codex models catalog".to_string(),
         }
     }
@@ -252,433 +187,12 @@ impl CodexModelCapabilityProfile {
             .unwrap_or("<unknown>")
             .to_string();
         Self {
-            slug: slug.clone(),
+            slug,
             accepts_image_input: image_input_support(model),
             supports_web_search: web_search_support(model),
             supports_apply_patch: apply_patch_support(model),
             supports_reasoning_summaries: reasoning_summary_support(model),
         }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CodexCapabilityProfile {
-    pub patch_mode: CodexPatchMode,
-    pub provider_identity: CodexProviderIdentity,
-    pub auth_shape: CodexAuthShape,
-    pub provider_supports_websockets: bool,
-    #[serde(default)]
-    pub continuity: CodexContinuityCapabilityProfile,
-    pub model_catalog: CodexModelCatalogProfile,
-    pub remote_compaction_v1: CodexCapabilityDecision,
-    pub hosted_image_generation: CodexCapabilityDecision,
-    pub responses_websocket: CodexCapabilityDecision,
-    pub web_search: CodexCapabilityDecision,
-    pub apply_patch: CodexCapabilityDecision,
-    pub reasoning_summaries: CodexCapabilityDecision,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CodexContinuityCapabilityProfile {
-    pub identity_sets_compact_path: CodexCapabilityDecision,
-    pub state_sharing: CodexCapabilityDecision,
-    pub operator_guidance: String,
-}
-
-impl Default for CodexContinuityCapabilityProfile {
-    fn default() -> Self {
-        Self {
-            identity_sets_compact_path: CodexCapabilityDecision::default(),
-            state_sharing: CodexCapabilityDecision::unknown(
-                "continuity profile was not reported by this response",
-            ),
-            operator_guidance: String::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CodexPatchModeRecommendationConfidence {
-    High,
-    Medium,
-    Low,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CodexPatchModeRecommendationInput {
-    pub current_patch_mode: CodexPatchMode,
-    pub model_catalog: CodexModelCatalogProfile,
-    pub responses: CodexCapabilitySupport,
-    pub responses_compact: CodexCapabilitySupport,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CodexPatchModeRecommendation {
-    pub current_patch_mode: CodexPatchMode,
-    pub recommended_patch_mode: CodexPatchMode,
-    pub changes_current_mode: bool,
-    pub confidence: CodexPatchModeRecommendationConfidence,
-    pub reasons: Vec<String>,
-    pub warnings: Vec<String>,
-}
-
-impl CodexPatchModeRecommendation {
-    pub fn for_input(input: CodexPatchModeRecommendationInput) -> Self {
-        let mut reasons = Vec::new();
-        let mut warnings = Vec::new();
-
-        match input.responses {
-            CodexCapabilitySupport::Supported => {
-                reasons.push("/responses endpoint is available".to_string());
-            }
-            CodexCapabilitySupport::Unsupported => {
-                reasons.push("/responses endpoint is not available".to_string());
-                warnings.push(
-                    "no Codex preset can compensate for a relay that does not expose /responses"
-                        .to_string(),
-                );
-                return Self::new(
-                    input.current_patch_mode,
-                    CodexPatchMode::Default,
-                    CodexPatchModeRecommendationConfidence::High,
-                    reasons,
-                    warnings,
-                );
-            }
-            CodexCapabilitySupport::Unknown => {
-                reasons.push("/responses endpoint support is unknown".to_string());
-                warnings.push(
-                    "do not upgrade preset until ordinary Codex model requests are proven"
-                        .to_string(),
-                );
-                return Self::new(
-                    input.current_patch_mode,
-                    CodexPatchMode::Default,
-                    CodexPatchModeRecommendationConfidence::Low,
-                    reasons,
-                    warnings,
-                );
-            }
-        }
-
-        let image_support = input.model_catalog.selected_image_input_support();
-        let image_capable = image_support.support == CodexCapabilitySupport::Supported;
-        match image_support.support {
-            CodexCapabilitySupport::Supported => {
-                reasons.push(
-                    "selected model metadata allows hosted image generation gates".to_string(),
-                );
-                warnings.push(
-                    "hosted image generation is not actively probed because that can create artifacts or spend quota"
-                        .to_string(),
-                );
-            }
-            CodexCapabilitySupport::Unsupported => {
-                reasons.push(
-                    "selected model metadata does not allow hosted image generation".to_string(),
-                );
-            }
-            CodexCapabilitySupport::Unknown => {
-                warnings.push(format!(
-                    "hosted image generation remains uncertain: {}",
-                    image_support.reason
-                ));
-            }
-        }
-
-        let (recommended_patch_mode, confidence) = match input.responses_compact {
-            CodexCapabilitySupport::Supported if image_capable => {
-                reasons.push("/responses/compact is available".to_string());
-                reasons.push(
-                    "combine official relay identity with the image-generation auth facade"
-                        .to_string(),
-                );
-                (
-                    CodexPatchMode::OfficialImagegenBridge,
-                    CodexPatchModeRecommendationConfidence::Medium,
-                )
-            }
-            CodexCapabilitySupport::Supported => {
-                reasons.push("/responses/compact is available".to_string());
-                reasons.push(
-                    "use official relay identity but avoid exposing hosted image generation"
-                        .to_string(),
-                );
-                (
-                    CodexPatchMode::OfficialRelayBridge,
-                    confidence_without_image_uncertainty(image_support.support),
-                )
-            }
-            CodexCapabilitySupport::Unsupported if image_capable => {
-                reasons.push("/responses/compact is unavailable".to_string());
-                reasons.push(
-                    "keep the image-generation auth facade and local compaction fallback"
-                        .to_string(),
-                );
-                (
-                    CodexPatchMode::ImagegenBridge,
-                    CodexPatchModeRecommendationConfidence::Medium,
-                )
-            }
-            CodexCapabilitySupport::Unsupported => {
-                reasons.push("/responses/compact is unavailable".to_string());
-                reasons.push(
-                    "avoid official relay identity so Codex keeps local compaction fallback"
-                        .to_string(),
-                );
-                (
-                    CodexPatchMode::Default,
-                    confidence_without_image_uncertainty(image_support.support),
-                )
-            }
-            CodexCapabilitySupport::Unknown if image_capable => {
-                reasons.push("/responses/compact support is unknown".to_string());
-                warnings.push(
-                    "avoid official relay identity until remote compaction is actively proven"
-                        .to_string(),
-                );
-                (
-                    CodexPatchMode::ImagegenBridge,
-                    CodexPatchModeRecommendationConfidence::Low,
-                )
-            }
-            CodexCapabilitySupport::Unknown => {
-                reasons.push("/responses/compact support is unknown".to_string());
-                warnings.push(
-                    "avoid official relay identity until remote compaction is actively proven"
-                        .to_string(),
-                );
-                (
-                    CodexPatchMode::Default,
-                    CodexPatchModeRecommendationConfidence::Low,
-                )
-            }
-        };
-
-        Self::new(
-            input.current_patch_mode,
-            recommended_patch_mode,
-            confidence,
-            reasons,
-            warnings,
-        )
-    }
-
-    fn new(
-        current_patch_mode: CodexPatchMode,
-        recommended_patch_mode: CodexPatchMode,
-        confidence: CodexPatchModeRecommendationConfidence,
-        reasons: Vec<String>,
-        warnings: Vec<String>,
-    ) -> Self {
-        Self {
-            current_patch_mode,
-            recommended_patch_mode,
-            changes_current_mode: current_patch_mode != recommended_patch_mode,
-            confidence,
-            reasons,
-            warnings,
-        }
-    }
-}
-
-fn confidence_without_image_uncertainty(
-    image_support: CodexCapabilitySupport,
-) -> CodexPatchModeRecommendationConfidence {
-    match image_support {
-        CodexCapabilitySupport::Unknown => CodexPatchModeRecommendationConfidence::Medium,
-        CodexCapabilitySupport::Supported | CodexCapabilitySupport::Unsupported => {
-            CodexPatchModeRecommendationConfidence::High
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CodexCapabilityProfileInput {
-    pub patch_mode: CodexPatchMode,
-    pub provider_identity: CodexProviderIdentity,
-    pub auth_shape: CodexAuthShape,
-    pub provider_supports_websockets: bool,
-    pub model_catalog: CodexModelCatalogProfile,
-}
-
-impl CodexCapabilityProfileInput {
-    pub fn from_patch_mode(
-        patch_mode: CodexPatchMode,
-        model_catalog: CodexModelCatalogProfile,
-    ) -> Self {
-        Self::from_patch_mode_with_transport(patch_mode, false, model_catalog)
-    }
-
-    pub fn from_patch_mode_with_transport(
-        patch_mode: CodexPatchMode,
-        provider_supports_websockets: bool,
-        model_catalog: CodexModelCatalogProfile,
-    ) -> Self {
-        Self {
-            patch_mode,
-            provider_identity: CodexProviderIdentity::from_patch_mode(patch_mode),
-            auth_shape: CodexAuthShape::from_patch_mode(patch_mode),
-            provider_supports_websockets,
-            model_catalog,
-        }
-    }
-
-    pub fn from_patch_plan(
-        patch_plan: CodexPatchPlan,
-        model_catalog: CodexModelCatalogProfile,
-    ) -> Self {
-        Self {
-            patch_mode: patch_plan.mode(),
-            provider_identity: CodexProviderIdentity::from_patch_provider_identity(
-                patch_plan.provider().identity(),
-            ),
-            auth_shape: CodexAuthShape::from_auth_patch_plan(patch_plan.auth()),
-            provider_supports_websockets: patch_plan.options().responses_websocket,
-            model_catalog,
-        }
-    }
-
-    pub fn from_patch_config(
-        patch_mode: CodexPatchMode,
-        options: CodexSwitchOptions,
-        model_catalog: CodexModelCatalogProfile,
-    ) -> Self {
-        let plan = CodexPatchPlan::for_switch_on(patch_mode, options)
-            .expect("validated codex client patch config should produce a capability profile");
-        Self::from_patch_plan(plan, model_catalog)
-    }
-}
-
-impl CodexCapabilityProfile {
-    pub fn for_patch_mode(
-        patch_mode: CodexPatchMode,
-        model_catalog: CodexModelCatalogProfile,
-    ) -> Self {
-        Self::for_input(CodexCapabilityProfileInput::from_patch_mode(
-            patch_mode,
-            model_catalog,
-        ))
-    }
-
-    pub fn for_input(input: CodexCapabilityProfileInput) -> Self {
-        let CodexCapabilityProfileInput {
-            patch_mode,
-            provider_identity,
-            auth_shape,
-            provider_supports_websockets,
-            model_catalog,
-        } = input;
-        let remote_compaction_v1 = remote_compaction_v1_support(provider_identity);
-        let hosted_image_generation = hosted_image_generation_support(auth_shape, &model_catalog);
-        let responses_websocket = responses_websocket_support(provider_supports_websockets);
-        let continuity = continuity_capability_profile(provider_identity);
-        let web_search = model_catalog.selected_web_search_support();
-        let apply_patch = model_catalog.selected_apply_patch_support();
-        let reasoning_summaries = model_catalog.selected_reasoning_summary_support();
-
-        Self {
-            patch_mode,
-            provider_identity,
-            auth_shape,
-            provider_supports_websockets,
-            continuity,
-            model_catalog,
-            remote_compaction_v1,
-            hosted_image_generation,
-            responses_websocket,
-            web_search,
-            apply_patch,
-            reasoning_summaries,
-        }
-    }
-
-    pub fn for_models_response_json(
-        patch_mode: CodexPatchMode,
-        models_response: &Value,
-        selected_slug: Option<&str>,
-    ) -> Self {
-        Self::for_patch_mode(
-            patch_mode,
-            CodexModelCatalogProfile::from_models_response_json(models_response, selected_slug),
-        )
-    }
-}
-
-fn remote_compaction_v1_support(
-    provider_identity: CodexProviderIdentity,
-) -> CodexCapabilityDecision {
-    match provider_identity {
-        CodexProviderIdentity::OfficialOpenAi => CodexCapabilityDecision::supported(
-            "provider identity is OpenAI, which makes Codex choose the /responses/compact path; this does not prove that relay endpoints share encrypted provider state",
-        ),
-        CodexProviderIdentity::HelperRelay => CodexCapabilityDecision::unsupported(
-            "provider identity is codex-helper, so Codex uses local compaction fallback",
-        ),
-    }
-}
-
-fn continuity_capability_profile(
-    provider_identity: CodexProviderIdentity,
-) -> CodexContinuityCapabilityProfile {
-    match provider_identity {
-        CodexProviderIdentity::OfficialOpenAi => CodexContinuityCapabilityProfile {
-            identity_sets_compact_path: CodexCapabilityDecision::supported(
-                "Codex sees the provider as OpenAI and can choose remote compact transport",
-            ),
-            state_sharing: CodexCapabilityDecision::unknown(
-                "OpenAI identity only selects the client protocol; relay continuity depends on the selected upstream account and must not be inferred from host or base_url",
-            ),
-            operator_guidance:
-                "For direct api.openai.com with one authenticated account, provider-endpoint affinity is usually sufficient. For relay chains such as sub2api or New API, configure the same continuity_domain only for endpoints that intentionally share encrypted response state.".to_string(),
-        },
-        CodexProviderIdentity::HelperRelay => CodexContinuityCapabilityProfile {
-            identity_sets_compact_path: CodexCapabilityDecision::unsupported(
-                "Codex sees codex-helper identity and keeps local compaction fallback",
-            ),
-            state_sharing: CodexCapabilityDecision::unknown(
-                "helper relay identity does not prove upstream state sharing",
-            ),
-            operator_guidance:
-                "State-bound remote compact is not expected in the default helper identity path; if official relay presets are enabled later, review continuity_domain before allowing cross-provider failover.".to_string(),
-        },
-    }
-}
-
-fn hosted_image_generation_support(
-    auth_shape: CodexAuthShape,
-    model_catalog: &CodexModelCatalogProfile,
-) -> CodexCapabilityDecision {
-    if !auth_shape.allows_codex_backend_tools() {
-        return CodexCapabilityDecision::unsupported(
-            "current preset does not make Codex auth look like Codex backend auth",
-        );
-    }
-
-    match model_catalog.selected_image_input_support().support {
-        CodexCapabilitySupport::Supported => CodexCapabilityDecision::supported(
-            "auth shape allows Codex backend tools and selected model accepts image input",
-        ),
-        CodexCapabilitySupport::Unsupported => CodexCapabilityDecision::unsupported(
-            "selected model metadata does not include image input modality",
-        ),
-        CodexCapabilitySupport::Unknown => CodexCapabilityDecision::unknown(format!(
-            "auth shape allows Codex backend tools, but selected model image support is unknown: {}",
-            model_catalog.reason
-        )),
-    }
-}
-
-fn responses_websocket_support(provider_supports_websockets: bool) -> CodexCapabilityDecision {
-    if provider_supports_websockets {
-        CodexCapabilityDecision::supported(
-            "provider advertises supports_websockets, so Codex may choose Responses WebSocket transport",
-        )
-    } else {
-        CodexCapabilityDecision::unsupported(
-            "provider does not advertise Responses WebSocket transport",
-        )
     }
 }
 
@@ -737,453 +251,72 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn codex_models_response(model: Value) -> Value {
-        json!({ "models": [model] })
-    }
-
-    fn image_capable_model(slug: &str) -> Value {
-        json!({
-            "slug": slug,
-            "input_modalities": ["text", "image"],
-            "supports_search_tool": true,
-            "apply_patch_tool_type": "freeform",
-            "supports_reasoning_summaries": true
-        })
-    }
-
-    fn text_only_model(slug: &str) -> Value {
-        json!({
-            "slug": slug,
-            "input_modalities": ["text"],
-            "supports_search_tool": false,
-            "apply_patch_tool_type": null,
-            "supports_reasoning_summaries": false
-        })
-    }
-
     #[test]
-    fn codex_capability_profile_official_imagegen_bridge_exposes_compact_and_imagegen() {
-        let catalog = codex_models_response(image_capable_model("gpt-5.5"));
-
-        let profile = CodexCapabilityProfile::for_models_response_json(
-            CodexPatchMode::OfficialImagegenBridge,
-            &catalog,
-            Some("gpt-5.5"),
-        );
-
-        assert_eq!(
-            profile.remote_compaction_v1.support,
-            CodexCapabilitySupport::Supported
-        );
-        assert_eq!(
-            profile.continuity.state_sharing.support,
-            CodexCapabilitySupport::Unknown
-        );
-        assert!(
-            profile
-                .continuity
-                .state_sharing
-                .reason
-                .contains("must not be inferred")
-        );
-        assert_eq!(
-            profile.hosted_image_generation.support,
-            CodexCapabilitySupport::Supported
-        );
-        assert_eq!(
-            profile.responses_websocket.support,
-            CodexCapabilitySupport::Unsupported
-        );
-        assert_eq!(
-            profile.web_search.support,
-            CodexCapabilitySupport::Supported
-        );
-        assert_eq!(
-            profile.apply_patch.support,
-            CodexCapabilitySupport::Supported
-        );
-    }
-
-    #[test]
-    fn codex_capability_profile_official_relay_does_not_expose_imagegen_without_auth_facade() {
-        let catalog = codex_models_response(image_capable_model("gpt-5.5"));
-
-        let profile = CodexCapabilityProfile::for_models_response_json(
-            CodexPatchMode::OfficialRelayBridge,
-            &catalog,
-            Some("gpt-5.5"),
-        );
-
-        assert_eq!(
-            profile.remote_compaction_v1.support,
-            CodexCapabilitySupport::Supported
-        );
-        assert_eq!(
-            profile.hosted_image_generation.support,
-            CodexCapabilitySupport::Unsupported
-        );
-        assert_eq!(
-            profile.continuity.state_sharing.support,
-            CodexCapabilitySupport::Unknown
-        );
-        assert!(
-            profile
-                .continuity
-                .operator_guidance
-                .contains("sub2api or New API")
-        );
-        assert!(
-            profile
-                .continuity
-                .operator_guidance
-                .contains("continuity_domain only for endpoints")
-        );
-    }
-
-    #[test]
-    fn codex_capability_profile_imagegen_bridge_requires_image_capable_model() {
-        let catalog = codex_models_response(text_only_model("gpt-5.3-codex-spark"));
-
-        let profile = CodexCapabilityProfile::for_models_response_json(
-            CodexPatchMode::ImagegenBridge,
-            &catalog,
-            Some("gpt-5.3-codex-spark"),
-        );
-
-        assert_eq!(
-            profile.remote_compaction_v1.support,
-            CodexCapabilitySupport::Unsupported
-        );
-        assert_eq!(
-            profile.continuity.identity_sets_compact_path.support,
-            CodexCapabilitySupport::Unsupported
-        );
-        assert_eq!(
-            profile.hosted_image_generation.support,
-            CodexCapabilitySupport::Unsupported
-        );
-        assert_eq!(
-            profile.web_search.support,
-            CodexCapabilitySupport::Unsupported
-        );
-        assert_eq!(
-            profile.apply_patch.support,
-            CodexCapabilitySupport::Unsupported
-        );
-    }
-
-    #[test]
-    fn codex_capability_profile_chatgpt_bridge_exposes_imagegen_but_not_compact() {
-        let catalog = codex_models_response(image_capable_model("gpt-5.5"));
-
-        let profile = CodexCapabilityProfile::for_models_response_json(
-            CodexPatchMode::ChatGptBridge,
-            &catalog,
-            Some("gpt-5.5"),
-        );
-
-        assert_eq!(
-            profile.remote_compaction_v1.support,
-            CodexCapabilitySupport::Unsupported
-        );
-        assert_eq!(
-            profile.hosted_image_generation.support,
-            CodexCapabilitySupport::Supported
-        );
-    }
-
-    #[test]
-    fn codex_capability_profile_allows_auth_shape_to_be_measured_separately_from_patch_mode() {
+    fn selected_codex_model_exposes_reported_capabilities() {
         let catalog = CodexModelCatalogProfile::from_models_response_json(
-            &codex_models_response(image_capable_model("gpt-5.5")),
-            Some("gpt-5.5"),
+            &json!({
+                "models": [{
+                    "slug": "gpt-5.6-sol",
+                    "input_modalities": ["text", "image"],
+                    "supports_search_tool": true,
+                    "apply_patch_tool_type": "freeform",
+                    "supports_reasoning_summaries": true
+                }]
+            }),
+            Some("gpt-5.6-sol"),
         );
 
-        let profile = CodexCapabilityProfile::for_input(CodexCapabilityProfileInput {
-            patch_mode: CodexPatchMode::OfficialRelayBridge,
-            provider_identity: CodexProviderIdentity::OfficialOpenAi,
-            auth_shape: CodexAuthShape::CompleteChatGptLogin,
-            provider_supports_websockets: false,
-            model_catalog: catalog,
-        });
-
-        assert_eq!(
-            profile.remote_compaction_v1.support,
-            CodexCapabilitySupport::Supported
-        );
-        assert_eq!(
-            profile.hosted_image_generation.support,
-            CodexCapabilitySupport::Supported
-        );
+        assert_eq!(catalog.shape, CodexModelCatalogShape::CodexModels);
+        assert_eq!(catalog.selection, CodexModelSelection::Selected);
+        assert!(catalog.selected_image_input_support().is_supported());
+        assert!(catalog.selected_web_search_support().is_supported());
+        assert!(catalog.selected_apply_patch_support().is_supported());
+        assert!(catalog.selected_reasoning_summary_support().is_supported());
     }
 
     #[test]
-    fn codex_capability_profile_reports_websocket_if_provider_advertises_it() {
+    fn openai_data_list_requires_translation() {
         let catalog = CodexModelCatalogProfile::from_models_response_json(
-            &codex_models_response(image_capable_model("gpt-5.5")),
-            Some("gpt-5.5"),
+            &json!({
+                "object": "list",
+                "data": [{ "id": "gpt-5.6-sol", "object": "model" }]
+            }),
+            Some("gpt-5.6-sol"),
         );
 
-        let profile = CodexCapabilityProfile::for_input(CodexCapabilityProfileInput {
-            patch_mode: CodexPatchMode::Default,
-            provider_identity: CodexProviderIdentity::HelperRelay,
-            auth_shape: CodexAuthShape::None,
-            provider_supports_websockets: true,
-            model_catalog: catalog,
-        });
-
+        assert_eq!(catalog.shape, CodexModelCatalogShape::OpenAiDataList);
+        assert_eq!(catalog.selection, CodexModelSelection::NotApplicable);
+        assert!(catalog.translation_required);
         assert_eq!(
-            profile.responses_websocket.support,
-            CodexCapabilitySupport::Supported
-        );
-    }
-
-    #[test]
-    fn codex_capability_profile_official_imagegen_bridge_with_transport_exposes_compact_imagegen_and_websocket()
-     {
-        let catalog = CodexModelCatalogProfile::from_models_response_json(
-            &codex_models_response(image_capable_model("gpt-5.5")),
-            Some("gpt-5.5"),
-        );
-
-        let profile = CodexCapabilityProfile::for_input(
-            CodexCapabilityProfileInput::from_patch_mode_with_transport(
-                CodexPatchMode::OfficialImagegenBridge,
-                true,
-                catalog,
-            ),
-        );
-
-        assert_eq!(
-            profile.remote_compaction_v1.support,
-            CodexCapabilitySupport::Supported
-        );
-        assert_eq!(
-            profile.hosted_image_generation.support,
-            CodexCapabilitySupport::Supported
-        );
-        assert_eq!(
-            profile.responses_websocket.support,
-            CodexCapabilitySupport::Supported
-        );
-    }
-
-    #[test]
-    fn codex_capability_profile_openai_data_catalog_requires_translation() {
-        let models_response = json!({
-            "object": "list",
-            "data": [
-                { "id": "gpt-5.5", "object": "model" }
-            ]
-        });
-
-        let profile = CodexCapabilityProfile::for_models_response_json(
-            CodexPatchMode::OfficialImagegenBridge,
-            &models_response,
-            Some("gpt-5.5"),
-        );
-
-        assert_eq!(
-            profile.model_catalog.shape,
-            CodexModelCatalogShape::OpenAiDataList
-        );
-        assert!(profile.model_catalog.translation_required);
-        assert_eq!(
-            profile.hosted_image_generation.support,
+            catalog.selected_image_input_support().support,
             CodexCapabilitySupport::Unknown
         );
     }
 
     #[test]
-    fn codex_capability_profile_missing_input_modalities_uses_codex_default() {
-        let catalog = codex_models_response(json!({
-            "slug": "gpt-5.5",
-            "supports_search_tool": true,
-            "apply_patch_tool_type": "freeform",
-            "supports_reasoning_summaries": true
+    fn missing_selected_model_is_reported_without_inventing_capabilities() {
+        let catalog = CodexModelCatalogProfile::from_models_response_json(
+            &json!({ "models": [{ "slug": "gpt-5.6-terra" }] }),
+            Some("gpt-5.6-sol"),
+        );
+
+        assert_eq!(catalog.selection, CodexModelSelection::Missing);
+        assert!(catalog.selected_model.is_none());
+        assert_eq!(
+            catalog.selected_apply_patch_support().support,
+            CodexCapabilitySupport::Unknown
+        );
+    }
+
+    #[test]
+    fn missing_input_modalities_uses_codex_default() {
+        let model = CodexModelCapabilityProfile::from_codex_model_json(&json!({
+            "slug": "gpt-5.6-luna"
         }));
 
-        let profile = CodexCapabilityProfile::for_models_response_json(
-            CodexPatchMode::ImagegenBridge,
-            &catalog,
-            Some("gpt-5.5"),
-        );
-
         assert_eq!(
-            profile.hosted_image_generation.support,
+            model.accepts_image_input.support,
             CodexCapabilitySupport::Supported
-        );
-    }
-
-    fn recommendation(
-        current_patch_mode: CodexPatchMode,
-        model_catalog: CodexModelCatalogProfile,
-        responses_compact: CodexCapabilitySupport,
-    ) -> CodexPatchModeRecommendation {
-        CodexPatchModeRecommendation::for_input(CodexPatchModeRecommendationInput {
-            current_patch_mode,
-            model_catalog,
-            responses: CodexCapabilitySupport::Supported,
-            responses_compact,
-        })
-    }
-
-    #[test]
-    fn codex_patch_mode_recommendation_uses_official_imagegen_when_compact_and_image_are_supported()
-    {
-        let catalog = CodexModelCatalogProfile::from_models_response_json(
-            &codex_models_response(image_capable_model("gpt-5.5")),
-            Some("gpt-5.5"),
-        );
-
-        let recommendation = recommendation(
-            CodexPatchMode::Default,
-            catalog,
-            CodexCapabilitySupport::Supported,
-        );
-
-        assert_eq!(
-            recommendation.recommended_patch_mode,
-            CodexPatchMode::OfficialImagegenBridge
-        );
-        assert!(recommendation.changes_current_mode);
-        assert_eq!(
-            recommendation.confidence,
-            CodexPatchModeRecommendationConfidence::Medium
-        );
-        assert!(
-            recommendation
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("not actively probed"))
-        );
-    }
-
-    #[test]
-    fn codex_patch_mode_recommendation_uses_official_relay_without_image_capable_model() {
-        let catalog = CodexModelCatalogProfile::from_models_response_json(
-            &codex_models_response(text_only_model("gpt-5.3-codex-spark")),
-            Some("gpt-5.3-codex-spark"),
-        );
-
-        let recommendation = recommendation(
-            CodexPatchMode::Default,
-            catalog,
-            CodexCapabilitySupport::Supported,
-        );
-
-        assert_eq!(
-            recommendation.recommended_patch_mode,
-            CodexPatchMode::OfficialRelayBridge
-        );
-        assert_eq!(
-            recommendation.confidence,
-            CodexPatchModeRecommendationConfidence::High
-        );
-    }
-
-    #[test]
-    fn codex_patch_mode_recommendation_keeps_imagegen_bridge_when_compact_is_unsupported() {
-        let catalog = CodexModelCatalogProfile::from_models_response_json(
-            &codex_models_response(image_capable_model("gpt-5.5")),
-            Some("gpt-5.5"),
-        );
-
-        let recommendation = recommendation(
-            CodexPatchMode::OfficialImagegenBridge,
-            catalog,
-            CodexCapabilitySupport::Unsupported,
-        );
-
-        assert_eq!(
-            recommendation.recommended_patch_mode,
-            CodexPatchMode::ImagegenBridge
-        );
-        assert!(recommendation.changes_current_mode);
-        assert!(
-            recommendation
-                .reasons
-                .iter()
-                .any(|reason| reason.contains("local compaction"))
-        );
-    }
-
-    #[test]
-    fn codex_patch_mode_recommendation_uses_default_when_no_official_gate_is_proven() {
-        let catalog = CodexModelCatalogProfile::from_models_response_json(
-            &codex_models_response(text_only_model("gpt-5.3-codex-spark")),
-            Some("gpt-5.3-codex-spark"),
-        );
-
-        let recommendation = recommendation(
-            CodexPatchMode::OfficialRelayBridge,
-            catalog,
-            CodexCapabilitySupport::Unsupported,
-        );
-
-        assert_eq!(
-            recommendation.recommended_patch_mode,
-            CodexPatchMode::Default
-        );
-        assert_eq!(
-            recommendation.confidence,
-            CodexPatchModeRecommendationConfidence::High
-        );
-    }
-
-    #[test]
-    fn codex_patch_mode_recommendation_does_not_upgrade_to_official_when_compact_is_unknown() {
-        let catalog = CodexModelCatalogProfile::from_models_response_json(
-            &codex_models_response(image_capable_model("gpt-5.5")),
-            Some("gpt-5.5"),
-        );
-
-        let recommendation = recommendation(
-            CodexPatchMode::Default,
-            catalog,
-            CodexCapabilitySupport::Unknown,
-        );
-
-        assert_eq!(
-            recommendation.recommended_patch_mode,
-            CodexPatchMode::ImagegenBridge
-        );
-        assert_eq!(
-            recommendation.confidence,
-            CodexPatchModeRecommendationConfidence::Low
-        );
-        assert!(
-            recommendation
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("avoid official relay identity"))
-        );
-    }
-
-    #[test]
-    fn codex_patch_mode_recommendation_warns_when_responses_endpoint_is_not_available() {
-        let catalog = CodexModelCatalogProfile::from_models_response_json(
-            &codex_models_response(image_capable_model("gpt-5.5")),
-            Some("gpt-5.5"),
-        );
-
-        let recommendation =
-            CodexPatchModeRecommendation::for_input(CodexPatchModeRecommendationInput {
-                current_patch_mode: CodexPatchMode::OfficialImagegenBridge,
-                model_catalog: catalog,
-                responses: CodexCapabilitySupport::Unsupported,
-                responses_compact: CodexCapabilitySupport::Supported,
-            });
-
-        assert_eq!(
-            recommendation.recommended_patch_mode,
-            CodexPatchMode::Default
-        );
-        assert!(
-            recommendation
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("no Codex preset can compensate"))
         );
     }
 }
