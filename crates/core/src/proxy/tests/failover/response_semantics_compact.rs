@@ -1406,13 +1406,20 @@ async fn proxy_restores_route_affinity_after_restart_for_responses_compact() {
         let _ = proxy_handle.await;
     }
 
+    let mut restarted_source = source;
+    restarted_source
+        .codex
+        .routing
+        .as_mut()
+        .expect("routing config")
+        .scheduling_preset = crate::config::SchedulingPreset::ThroughputFirst;
     let runtime_store = Arc::new(
         crate::runtime_store::RuntimeStore::open_in_home(&temp_dir)
             .expect("reopen persistent runtime store"),
     );
     let proxy = ProxyService::new_with_runtime_store(
         Client::new(),
-        Arc::new(source),
+        Arc::new(restarted_source),
         "codex",
         runtime_store,
     )

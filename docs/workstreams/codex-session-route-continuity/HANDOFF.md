@@ -5,7 +5,7 @@ Last updated: 2026-05-25
 
 Update, 2026-05-27: later route-continuity work made route-graph fallback behavior
 policy-sensitive. `fallback-sticky` may bootstrap missing state-bound compact affinity by trying
-the configured route and recording the successful endpoint; `hard` and legacy multi-upstream paths
+the configured route and recording the successful endpoint; `hard` multi-endpoint route graphs
 still fail closed when state-bound compact affinity is missing.
 
 ## Current Task
@@ -62,6 +62,3 @@ Final gates:
   continuity domain.
 - Balance probes remain routing/runtime hints, not proof that compact state can
   safely move between provider endpoints.
-- The route affinity ledger is provider-opaque and can be disabled with
-  `CODEX_HELPER_SESSION_ROUTE_AFFINITY_LEDGER=off`, but disabling it reopens
-  the original restart-continuity risk.

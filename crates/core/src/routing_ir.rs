@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -29,19 +28,9 @@ pub struct RoutePlanTemplate {
 
 impl RoutePlanTemplate {
     pub fn route_graph_key(&self) -> String {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        self.service_name.hash(&mut hasher);
-        self.entry.hash(&mut hasher);
-        self.affinity_policy.hash(&mut hasher);
-        self.scheduling_preset.hash(&mut hasher);
-        self.fallback_ttl_ms.hash(&mut hasher);
-        self.reprobe_preferred_after_ms.hash(&mut hasher);
-        self.expanded_provider_order.hash(&mut hasher);
-        hash_route_nodes(&self.nodes, &mut hasher);
-        for candidate in &self.candidates {
-            hash_route_candidate(candidate, &mut hasher);
-        }
-        format!("route:{:016x}", hasher.finish())
+        let mut digest = StableRouteDigest::with_namespace("codex-helper:route-affinity:v1");
+        encode_affinity_route_identity(&mut digest, self);
+        format!("route:v1:{}", digest.finish())
     }
 
     pub fn contains_provider_endpoint(&self, key: &ProviderEndpointKey, base_url: &str) -> bool {
@@ -176,41 +165,6 @@ fn candidate_provider_endpoint_key(
         candidate.provider_id.clone(),
         candidate.endpoint_id.clone(),
     )
-}
-
-// Keep the affinity key aligned with selection semantics, not just leaf identity.
-// Any change that can alter route selection or the selected upstream's routing metadata
-// must change this fingerprint so session stickiness does not bleed across config edits.
-fn hash_route_nodes<H: Hasher>(nodes: &BTreeMap<String, RouteNodePlan>, hasher: &mut H) {
-    for (name, node) in nodes {
-        name.hash(hasher);
-        hash_route_node(node, hasher);
-    }
-}
-
-fn hash_route_node<H: Hasher>(node: &RouteNodePlan, hasher: &mut H) {
-    node.strategy.hash(hasher);
-    node.children.hash(hasher);
-    node.target.hash(hasher);
-    node.prefer_tags.hash(hasher);
-    node.on_exhausted.hash(hasher);
-    node.when.hash(hasher);
-    node.then.hash(hasher);
-    node.default_route.hash(hasher);
-}
-
-fn hash_route_candidate<H: Hasher>(candidate: &RouteCandidate, hasher: &mut H) {
-    candidate.provider_id.hash(hasher);
-    candidate.endpoint_id.hash(hasher);
-    candidate.base_url.hash(hasher);
-    candidate.continuity_domain.hash(hasher);
-    candidate.tags.hash(hasher);
-    candidate.supported_models.hash(hasher);
-    candidate.model_mapping.hash(hasher);
-    candidate.route_path.hash(hasher);
-    candidate.preference_group.hash(hasher);
-    candidate.stable_index.hash(hasher);
-    candidate.concurrency.hash(hasher);
 }
 
 #[derive(Debug, Clone)]
@@ -2051,10 +2005,14 @@ struct StableRouteDigest {
 
 impl StableRouteDigest {
     fn new() -> Self {
+        Self::with_namespace("codex-helper:compiled-route-graph")
+    }
+
+    fn with_namespace(namespace: &str) -> Self {
         let mut digest = Self {
             hasher: Sha256::new(),
         };
-        digest.text("codex-helper:compiled-route-graph");
+        digest.text(namespace);
         digest
     }
 
@@ -2119,6 +2077,100 @@ impl StableRouteDigest {
     fn finish(self) -> String {
         format!("sha256:{:x}", self.hasher.finalize())
     }
+}
+
+fn encode_affinity_route_identity(digest: &mut StableRouteDigest, template: &RoutePlanTemplate) {
+    digest.text("service_name");
+    digest.text(template.service_name.as_str());
+    digest.text("entry");
+    digest.text(template.entry.as_str());
+    digest.text("affinity_policy");
+    digest.text(affinity_policy_name(template.affinity_policy));
+    digest.text("fallback_ttl_ms");
+    digest.optional_u64(template.fallback_ttl_ms);
+    digest.text("reprobe_preferred_after_ms");
+    digest.optional_u64(template.reprobe_preferred_after_ms);
+    digest.text("expanded_provider_order");
+    digest.length(template.expanded_provider_order.len());
+    for provider_id in &template.expanded_provider_order {
+        digest.text(provider_id);
+    }
+    digest.text("nodes");
+    digest.length(template.nodes.len());
+    for (name, node) in &template.nodes {
+        digest.text(name);
+        encode_affinity_route_node(digest, node);
+    }
+    digest.text("candidates");
+    digest.length(template.candidates.len());
+    for candidate in &template.candidates {
+        encode_affinity_route_candidate(digest, template, candidate);
+    }
+}
+
+fn encode_affinity_route_node(digest: &mut StableRouteDigest, node: &RouteNodePlan) {
+    digest.text("strategy");
+    digest.text(routing_policy_name(node.strategy));
+    digest.text("children");
+    digest.length(node.children.len());
+    for child in &node.children {
+        encode_route_ref(digest, child);
+    }
+    digest.text("target");
+    encode_optional_route_ref(digest, node.target.as_ref());
+    digest.text("prefer_tags");
+    digest.length(node.prefer_tags.len());
+    for filter in &node.prefer_tags {
+        digest.string_map(filter);
+    }
+    digest.text("on_exhausted");
+    digest.text(exhausted_action_name(node.on_exhausted));
+    digest.text("when");
+    encode_optional_condition(digest, node.when.as_ref());
+    digest.text("then");
+    encode_optional_route_ref(digest, node.then.as_ref());
+    digest.text("default");
+    encode_optional_route_ref(digest, node.default_route.as_ref());
+}
+
+fn encode_affinity_route_candidate(
+    digest: &mut StableRouteDigest,
+    template: &RoutePlanTemplate,
+    candidate: &RouteCandidate,
+) {
+    digest.text("provider_id");
+    digest.text(candidate.provider_id.as_str());
+    digest.text("endpoint_id");
+    digest.text(candidate.endpoint_id.as_str());
+    digest.text("base_url");
+    digest.text(candidate.base_url.as_str());
+    digest.text("continuity_domain");
+    digest.optional_text(candidate.continuity_domain.as_deref());
+    digest.text("credential_scope");
+    digest.optional_text(
+        template
+            .candidate_identity(candidate)
+            .credential_scope
+            .as_deref(),
+    );
+    digest.text("tags");
+    digest.string_map(&candidate.tags);
+    digest.text("supported_models");
+    digest.bool_map(&candidate.supported_models);
+    digest.text("model_mapping");
+    digest.string_map(&candidate.model_mapping);
+    digest.text("route_path");
+    digest.length(candidate.route_path.len());
+    for segment in &candidate.route_path {
+        digest.text(segment);
+    }
+    digest.text("preference_group");
+    digest.u32(candidate.preference_group);
+    digest.text("stable_index");
+    digest.length(candidate.stable_index);
+    digest.text("concurrency");
+    digest.optional_u32(candidate.concurrency.max_concurrent_requests);
+    digest.optional_text(candidate.concurrency.limit_group.as_deref());
 }
 
 fn static_route_graph_digest(
@@ -2671,6 +2723,124 @@ mod tests {
             ordered_template.route_graph_key(),
             tag_preferred_template.route_graph_key()
         );
+    }
+
+    #[test]
+    fn route_graph_key_ignores_scheduling_preset() {
+        let balanced = ServiceRouteConfig {
+            providers: BTreeMap::from([
+                ("a".to_string(), provider("https://a.example/v1")),
+                ("b".to_string(), provider("https://b.example/v1")),
+            ]),
+            routing: Some(RouteGraphConfig {
+                scheduling_preset: SchedulingPreset::Balanced,
+                ..RouteGraphConfig::ordered_failover(vec!["a".to_string(), "b".to_string()])
+            }),
+            ..ServiceRouteConfig::default()
+        };
+        let mut throughput_first = balanced.clone();
+        throughput_first
+            .routing
+            .as_mut()
+            .expect("routing config")
+            .scheduling_preset = SchedulingPreset::ThroughputFirst;
+
+        let balanced_template =
+            compile_route_plan_template("codex", &balanced).expect("balanced route template");
+        let throughput_template = compile_route_plan_template("codex", &throughput_first)
+            .expect("throughput-first route template");
+
+        assert_eq!(
+            balanced_template.route_graph_key(),
+            throughput_template.route_graph_key()
+        );
+        assert_eq!(
+            balanced_template.route_graph_key(),
+            "route:v1:sha256:a855e923223535494f8d94ed9b420101e51266cddb49c43c96782e4c9827dde8"
+        );
+    }
+
+    #[test]
+    fn route_graph_key_changes_with_effective_runtime_credentials() {
+        let route = |secret: &str| ServiceRouteConfig {
+            providers: BTreeMap::from([(
+                "relay".to_string(),
+                ProviderConfig {
+                    base_url: Some("https://relay.example/v1".to_string()),
+                    auth: UpstreamAuth {
+                        auth_token: Some(secret.to_string()),
+                        ..UpstreamAuth::default()
+                    },
+                    ..ProviderConfig::default()
+                },
+            )]),
+            ..ServiceRouteConfig::default()
+        };
+
+        let account_a = compile_route_plan_template("codex", &route("account-a-secret"))
+            .expect("account A route template")
+            .route_graph_key();
+        let account_b = compile_route_plan_template("codex", &route("account-b-secret"))
+            .expect("account B route template")
+            .route_graph_key();
+
+        assert_ne!(account_a, account_b);
+        assert!(!account_a.contains("account-a-secret"));
+        assert!(!account_b.contains("account-b-secret"));
+    }
+
+    #[test]
+    fn route_graph_key_ignores_display_metadata() {
+        let route = ServiceRouteConfig {
+            providers: BTreeMap::from([(
+                "relay".to_string(),
+                ProviderConfig {
+                    alias: Some("Primary relay".to_string()),
+                    base_url: Some("https://relay.example/v1".to_string()),
+                    ..ProviderConfig::default()
+                },
+            )]),
+            routing: Some(RouteGraphConfig {
+                routes: BTreeMap::from([(
+                    "main".to_string(),
+                    RouteNodeConfig {
+                        strategy: RouteStrategy::OrderedFailover,
+                        children: vec!["relay".to_string()],
+                        metadata: BTreeMap::from([(
+                            "description".to_string(),
+                            "Primary route".to_string(),
+                        )]),
+                        ..RouteNodeConfig::default()
+                    },
+                )]),
+                ..RouteGraphConfig::default()
+            }),
+            ..ServiceRouteConfig::default()
+        };
+        let mut renamed = route.clone();
+        renamed
+            .providers
+            .get_mut("relay")
+            .expect("relay provider")
+            .alias = Some("Renamed relay".to_string());
+        renamed
+            .routing
+            .as_mut()
+            .expect("routing config")
+            .routes
+            .get_mut("main")
+            .expect("main route")
+            .metadata
+            .insert("description".to_string(), "Renamed route".to_string());
+
+        let original = compile_route_plan_template("codex", &route)
+            .expect("original route template")
+            .route_graph_key();
+        let renamed = compile_route_plan_template("codex", &renamed)
+            .expect("renamed route template")
+            .route_graph_key();
+
+        assert_eq!(original, renamed);
     }
 
     #[test]

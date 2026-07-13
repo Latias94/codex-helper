@@ -121,7 +121,7 @@ If the new version is already installed, temporarily run the previous binary's `
 
 The removed `switch remote-control enable` command also had persistent side effects outside codex-helper: it could add `[features].remote_connections = true` to `~/.codex/config.toml` and enable a `remote_control` row in Codex App SQLite. Upgrading does not undo either value, and the current helper never reads or writes that database. If the TOML key was added solely for the old helper workflow and is no longer wanted, back up the Codex config before removing that key manually. Do not edit Codex SQLite with ad hoc SQL; leave database cleanup to Codex-supported controls or Codex support guidance.
 
-The 0.20.3 `~/.codex-helper/state/session-route-affinities.json` file is generated runtime state rather than user configuration. The new release neither imports it into `state.sqlite` nor rewrites or deletes it. An in-flight multi-endpoint session therefore has no restored affinity after upgrading. Before sending a state-bound compact request for such a session, complete one ordinary Responses request with the same session key so the new runtime can record its provider endpoint; `hard` affinity explicitly rejects a state-bound compact request until that affinity has been re-established.
+The 0.20.3 `~/.codex-helper/state/session-route-affinities.json` file is generated runtime state rather than user configuration. The new release neither imports it into `state.sqlite` nor rewrites or deletes it. Finish any active state-bound session that depends on multi-endpoint affinity before upgrading, then start a new session after the upgrade. Do not try to repair an old session by sending an ordinary Responses request with the same session key: the current route may select a different provider endpoint from the one that owns the upstream state. If an old state-bound request is attempted without restored affinity, `fallback-sticky` may select through the current graph and leave validity to the upstream, while `hard` fails closed locally on a multi-endpoint graph.
 
 Proxy lifecycle is independent. `codex-helper serve` is foreground by default, `--resident` keeps it running after the console exits, and `codex-helper tui` attaches a read-only console. None of these commands run `switch on` or `switch off`. Resident runtimes write advisory owner markers under `~/.codex-helper/run/`; inspect them with the read-only `codex-helper daemon status`. Manage an installed local runtime with `codex-helper service start/stop/restart`; there is no remote HTTP shutdown command.
 
@@ -480,7 +480,7 @@ Route graph session affinity is runtime state with a small durable ledger for Co
 - `off` ignores automatic route affinity.
 - `hard` treats an existing affinity target as strict for that route graph; if the target is unavailable, no alternate candidate is selected.
 
-For each request with a session id, codex-helper keys affinity by `session_id + service + route_graph_key`. While the route graph is unchanged, the same session can keep using the previously selected provider/endpoint according to the policy. This improves upstream prompt-cache locality for relay providers that cache by account or upstream target without letting automatic stickiness override user preference by default.
+For each request with a session id, codex-helper keys affinity by `session_id + service + route_graph_key`. The route key is a versioned canonical SHA-256 digest. Scheduling presets, provider display aliases, and route-node display metadata do not change it; route selection rules, provider endpoint identity, or configured `auth_token` / `api_key` credentials do. Client-passthrough account headers and external credential fallbacks are not part of this durable identity, so changing either requires a new session.
 
 Successful route affinity is committed to the helper-owned runtime database:
 
@@ -497,7 +497,7 @@ Affinity is not a hard pin:
 - request retry, provider health, capability mismatch, cooldown, and trusted balance exhaustion still apply;
 - if the sticky provider fails, ordinary and non-state-bound requests continue through the current route graph and then stick to the next successful provider;
 - provider-state-bound compact honors the route affinity policy: `fallback-sticky` stays tryable and updates affinity after a successful fallback, while `hard` stays within the affinity continuity domain unless an explicit shared `continuity_domain` permits movement;
-- if provider tags, route node strategy, children, entry, or provider endpoint identity change, the route graph key changes and old affinity no longer matches;
+- if provider tags, route node strategy, children, entry, provider endpoint identity, or configured `auth_token` / `api_key` credentials change, the route graph key changes and old affinity no longer matches; changing only `scheduling_preset` or display aliases/metadata preserves it;
 - route graph decisions use route/provider/endpoint controls rather than a second station-shaped override path.
 
 This means monthly pools such as `monthly_pool -> paygo` normally keep a conversation on one monthly provider until that provider stops being viable, instead of round-robining every request and reducing upstream cache hit rate.

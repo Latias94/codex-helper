@@ -642,6 +642,7 @@ fn compatible_websocket_route(
     let template = graph.handshake_plan();
     let route_graph_key = template.route_graph_key();
     if route_graph_key != bound.route_graph_key
+        || template.scheduling_preset != bound.route_template.scheduling_preset
         || current_snapshot.provider_catalog().catalog_revision()
             != bound.runtime_snapshot.provider_catalog().catalog_revision()
     {
