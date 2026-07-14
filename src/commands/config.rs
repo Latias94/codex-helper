@@ -1,16 +1,20 @@
 use crate::config::{
     RetryConfig, RetryProfileName,
-    storage::{init_config_toml, load_config_with_source, save_helper_config},
+    storage::{init_config_toml_with_outcome, load_config_with_source, save_helper_config},
 };
 use crate::{CliError, CliResult, ConfigCommand, RetryProfile};
 
 pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
     match cmd {
         ConfigCommand::Init { force } => {
-            let path = init_config_toml(force)
+            let outcome = init_config_toml_with_outcome(force)
                 .await
                 .map_err(|e| CliError::Configuration(e.to_string()))?;
-            println!("Wrote TOML config template to {:?}", path);
+            if let Some(report) = outcome.migration_report {
+                print!("{report}");
+            } else {
+                println!("Wrote TOML config template to {:?}", outcome.path);
+            }
         }
         ConfigCommand::SetRetryProfile { profile } => {
             let loaded = load_config_with_source()
@@ -52,6 +56,17 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
                 resolved.cooldown_backoff_factor,
                 resolved.cooldown_backoff_max_secs,
             );
+        }
+        ConfigCommand::Migrate {
+            dry_run: _,
+            write,
+            yes: _,
+        } => {
+            // Clap enforces --write/--yes pairing; omitting --write is the safe preview mode.
+            let report = crate::config::LoadedConfig::migrate_config_file(write)
+                .await
+                .map_err(|e| CliError::Configuration(e.to_string()))?;
+            print!("{report}");
         }
     }
 

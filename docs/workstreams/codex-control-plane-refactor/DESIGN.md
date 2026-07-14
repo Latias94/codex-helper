@@ -1,5 +1,11 @@
 # Fearless Refactor Design: Codex-first Control Plane
 
+> Historical status (superseded 2026-07-13): this document describes the
+> earlier station-first mutable control plane. The current remote control plane
+> is query-only and uses the canonical provider/endpoint runtime. See
+> [Configuration](../../CONFIGURATION.md) and the
+> [canonical relay runtime modernization plan](../../plans/2026-07-10-002-refactor-canonical-relay-runtime-modernization-plan.md).
+
 > 中文速览：这份设计文档定义的是“中心中转 + 会话控制平面”的产品形态，而不是另一个全生态代理平台。设计重点是把 `session -> binding -> station/profile -> effective route` 这条链路做成可见、可控、可解释的系统，并明确局域网共享场景下哪些能力可以天然共享，哪些只能在本机或未来 companion 模式下提供。
 
 ## Problem Statement
@@ -326,9 +332,9 @@ Default expectations:
   - keep session sticky by default
   - cross-station failover disabled unless operator overrides policy
 
-Current implementation note:
+Historical implementation note:
 
-- `retry.allow_cross_station_before_first_output` is the explicit HA switch for unpinned requests
+- `retry.allow_cross_station_before_first_output` was the explicit HA switch for unpinned requests in this design
 - default behavior keeps cross-station failover disabled
 - curated retry profiles may opt in when their intent is explicitly failover-oriented
 

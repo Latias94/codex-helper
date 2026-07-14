@@ -434,6 +434,8 @@ pub struct RuntimeStoreTransaction<'transaction, 'connection> {
     fail_next_attempt_begin: &'transaction AtomicBool,
     #[cfg(test)]
     fail_next_attempt_terminal_commit: &'transaction AtomicBool,
+    #[cfg(test)]
+    fail_next_affinity_commit: &'transaction AtomicBool,
 }
 
 impl RuntimeStoreTransaction<'_, '_> {
@@ -534,6 +536,31 @@ impl RuntimeStoreTransaction<'_, '_> {
         let result = self
             .inner
             .commit_logical_request_terminal(logical_request.id, terminal);
+        self.track(result)
+    }
+
+    pub fn upsert_session_affinity(
+        &self,
+        record: SessionAffinityRecord,
+        limit: SessionAffinityLimit,
+    ) -> Result<(), RuntimeStoreError> {
+        let result = affinity::upsert_session_affinity(
+            self.inner.sqlite_transaction(),
+            self.inner.path(),
+            self.inner.store_id(),
+            &record,
+            limit,
+        );
+        #[cfg(test)]
+        let result = result.and_then(|()| {
+            if self.fail_next_affinity_commit.swap(false, Ordering::SeqCst) {
+                Err(RuntimeStoreError::InjectedFailure {
+                    operation: "upsert session affinity",
+                })
+            } else {
+                Ok(())
+            }
+        });
         self.track(result)
     }
 
@@ -1096,6 +1123,8 @@ impl RuntimeStore {
                     fail_next_attempt_begin: &self.fail_next_attempt_begin,
                     #[cfg(test)]
                     fail_next_attempt_terminal_commit: &self.fail_next_attempt_terminal_commit,
+                    #[cfg(test)]
+                    fail_next_affinity_commit: &self.fail_next_affinity_commit,
                 };
                 let result = operation(&transaction_api);
                 (result, transaction_api.failed.get())

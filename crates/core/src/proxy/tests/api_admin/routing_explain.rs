@@ -247,6 +247,7 @@ async fn proxy_routing_explain_uses_session_affinity() {
     proxy
         .state
         .record_session_route_affinity_success(
+            None,
             "sid-route",
             crate::state::SessionRouteAffinityTarget {
                 route_graph_key: template.route_graph_key(),

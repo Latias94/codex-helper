@@ -90,19 +90,3 @@ fn write_file(path: &Path, content: &str) {
     }
     std::fs::write(path, content).expect("write test file");
 }
-
-fn assert_unsupported_config(error: &anyhow::Error, version_label: &str) {
-    let message = error.to_string();
-    assert!(
-        message.contains(version_label),
-        "expected rejection to mention {version_label:?}, got: {message}"
-    );
-    assert!(
-        message.contains("normal startup only accepts version = 5"),
-        "expected normal-startup v5 boundary, got: {message}"
-    );
-    assert!(
-        message.contains("Back up the file") && message.contains("replace it"),
-        "expected explicit replacement guidance, got: {message}"
-    );
-}

@@ -1,6 +1,6 @@
 # Fearless Refactor Notes: Codex Routing Graph
 
-> Historical status (superseded 2026-07-12): this document records a pre-version-5 design and migration phase. The current helper accepts only `~/.codex-helper/config.toml` with `version = 5`; `codex-helper config migrate` and v2/v3/v4 compatibility readers do not exist. See [current configuration](../../CONFIGURATION.md) and the [canonical modernization plan](../../plans/2026-07-10-002-refactor-canonical-relay-runtime-modernization-plan.md). The remaining content is archival.
+> Historical status (superseded 2026-07-12): this document records a pre-version-5 design and migration phase. The current helper uses `~/.codex-helper/config.toml` with `version = 5`; `codex-helper config migrate` now performs a one-time, validated conversion of supported v1/v2/v3/v4 or unversioned sources, while runtime routing has no legacy compatibility reader. See [current configuration](../../CONFIGURATION.md) and the [canonical modernization plan](../../plans/2026-07-10-002-refactor-canonical-relay-runtime-modernization-plan.md). The remaining content is archival.
 
 ## What Should Go Away
 

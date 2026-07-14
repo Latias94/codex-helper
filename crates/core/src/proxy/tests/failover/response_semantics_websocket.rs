@@ -1010,7 +1010,8 @@ supports_websockets = true
 }
 
 #[tokio::test]
-async fn responses_websocket_hard_compaction_binding_rejects_cross_domain_affinity_drift() {
+async fn responses_websocket_hard_compaction_binding_allows_same_domain_failover_and_rejects_cross_domain_drift()
+ {
     let _env_guard = env_lock().await;
     let codex_home = make_temp_test_dir();
     let mut scoped = ScopedEnv::default();
@@ -1144,6 +1145,7 @@ supports_websockets = true
     let state = proxy.state.clone();
     state
         .record_session_route_affinity_success(
+            None,
             "ws-explicit-domain",
             SessionRouteAffinityTarget {
                 route_graph_key: route_graph_key.clone(),
@@ -1225,6 +1227,7 @@ supports_websockets = true
 
     state
         .record_session_route_affinity_success(
+            None,
             "ws-explicit-domain",
             SessionRouteAffinityTarget {
                 route_graph_key: route_graph_key.clone(),

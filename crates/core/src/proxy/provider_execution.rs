@@ -24,12 +24,16 @@ use super::ProxyService;
 use super::attempt_execution::{
     ExecuteSelectedUpstreamParams, SelectedUpstreamExecutionOutcome, execute_selected_upstream,
 };
-use super::concurrency_limits::ConcurrencyPermit;
+use super::concurrency_limits::{ConcurrencyAcquireError, ConcurrencyPermit};
 use super::request_body::{ReasoningOrchestrationIntent, RequestDialect};
 use super::request_continuity::{RequestContinuityContract, RouteContinuityDecisionInput};
 use super::request_preparation::RequestFlavor;
 use super::response_semantics::ResponseSemanticContract;
 use super::retry::{RetryLayerOptions, RetryPlan};
+use super::route_affinity::{
+    SessionRouteReservationDecision, apply_session_route_reservation_to_runtime,
+    claim_session_route_reservation, lock_session_route_reservation_selection,
+};
 use super::route_attempts::{UnsupportedModelSkipParams, record_unsupported_model_skip};
 use super::route_target_selection::{
     acquire_candidate_concurrency_permit, log_route_continuity_blocked,
@@ -388,7 +392,8 @@ pub(super) async fn execute_provider_chain_with_route_executor(
     let route_graph_loop = RouteGraphAttemptLoop {
         params: ExecuteRouteGraphExecutorParams {
             ctx,
-            route_graph_key: Some(route_graph_key.as_str()),
+            route_graph_key: (template.affinity_policy != RouteAffinityPolicy::Off)
+                .then_some(route_graph_key.as_str()),
             provider_attempt: 0,
             total_upstreams,
             executor: &executor,
@@ -457,6 +462,53 @@ impl<'a, 'route> RouteGraphAttemptLoop<'a, 'route> {
         } = params;
 
         loop {
+            let revalidation_affinity_policy = if executor.template().affinity_policy
+                == RouteAffinityPolicy::Hard
+                && (!policy.continuity.is_provider_state_bound()
+                    || route_state.allows_explicit_continuity_domain_failover())
+            {
+                RouteAffinityPolicy::FallbackSticky
+            } else {
+                executor.template().affinity_policy
+            };
+            let reservation_selection_guard =
+                if revalidation_affinity_policy != RouteAffinityPolicy::Off {
+                    lock_session_route_reservation_selection(ctx.proxy, ctx.session_id).await
+                } else {
+                    None
+                };
+            let reservation_decision = if reservation_selection_guard.is_some() {
+                apply_session_route_reservation_to_runtime(
+                    ctx.proxy,
+                    ctx.request_id,
+                    ctx.session_id,
+                    executor.template(),
+                    route_graph_key,
+                    runtime,
+                )
+                .await
+            } else {
+                SessionRouteReservationDecision::None
+            };
+            match reservation_decision {
+                SessionRouteReservationDecision::Busy => {
+                    *last_err = Some((
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "another active request is establishing this session's route affinity"
+                            .to_string(),
+                    ));
+                    break;
+                }
+                SessionRouteReservationDecision::Failed => {
+                    *last_err = Some((
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "session route reservation state is unavailable".to_string(),
+                    ));
+                    break;
+                }
+                SessionRouteReservationDecision::None
+                | SessionRouteReservationDecision::Available(_) => {}
+            }
             let selection_runtime =
                 runtime_for_capacity_wait_selection(executor.template(), runtime);
             let selection = select_route_graph_candidate(
@@ -478,6 +530,7 @@ impl<'a, 'route> RouteGraphAttemptLoop<'a, 'route> {
             let avoided_candidate_indices = selection.avoided_candidate_indices.clone();
             let mut avoided_total = selection.avoided_total;
             let Some(selected) = selection.selected else {
+                drop(reservation_selection_guard);
                 if let Some(report) = route_unavailable_report(
                     ctx.proxy.service_name,
                     ctx.request_id,
@@ -521,6 +574,71 @@ impl<'a, 'route> RouteGraphAttemptLoop<'a, 'route> {
                 }
                 break;
             };
+            let selected_candidate = selected.candidate;
+            let target = executor.template().capture_candidate(selected_candidate);
+            let claimed = if reservation_selection_guard.is_some() {
+                match claim_session_route_reservation(
+                    ctx.proxy,
+                    ctx.request_id,
+                    ctx.session_id,
+                    ctx.session_identity_source,
+                    route_graph_key,
+                    &target,
+                )
+                .await
+                {
+                    SessionRouteReservationDecision::Available(claimed) => Some(claimed),
+                    SessionRouteReservationDecision::None => None,
+                    SessionRouteReservationDecision::Busy => {
+                        *last_err = Some((
+                            StatusCode::TOO_MANY_REQUESTS,
+                            "another active request is establishing this session's route affinity"
+                                .to_string(),
+                        ));
+                        break;
+                    }
+                    SessionRouteReservationDecision::Failed => {
+                        *last_err = Some((
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "session route reservation state is unavailable".to_string(),
+                        ));
+                        break;
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some(claimed) = claimed
+                && claimed.provider_endpoint != selected.provider_endpoint
+                && let Some(claimed_candidate) = executor
+                    .template()
+                    .continuity_topology()
+                    .find_candidate_by_provider_endpoint(&claimed.provider_endpoint)
+                && (revalidation_affinity_policy != RouteAffinityPolicy::PreferredGroup
+                    || claimed_candidate.preference_group == selected_candidate.preference_group)
+                && executor.candidate_is_valid_after_runtime_update(
+                    route_state,
+                    &selection_runtime,
+                    claimed_candidate,
+                    ctx.request_model,
+                    revalidation_affinity_policy,
+                )
+            {
+                drop(reservation_selection_guard);
+                runtime.set_affinity_provider_endpoint_with_observed_at(
+                    Some(claimed.provider_endpoint.clone()),
+                    Some(claimed.last_selected_at_ms),
+                    Some(claimed.last_changed_at_ms),
+                );
+                log_control_trace_event(serde_json::json!({
+                    "event": "route_candidate_reconciled_to_session_claim",
+                    "service": ctx.proxy.service_name,
+                    "request_id": ctx.request_id,
+                    "provider_endpoint_key": claimed.provider_endpoint.stable_key(),
+                }));
+                continue;
+            }
+            drop(reservation_selection_guard);
             log_route_graph_selection_explain(RouteGraphSelectionExplain {
                 service_name: ctx.proxy.service_name,
                 request_id: ctx.request_id,
@@ -550,10 +668,7 @@ impl<'a, 'route> RouteGraphAttemptLoop<'a, 'route> {
                 )
                 .await;
             }
-            let selected_candidate = selected.candidate;
             let mut avoid_set = hash_set_from_indices(&avoided_candidate_indices);
-
-            let target = executor.template().capture_candidate(selected_candidate);
             let concurrency_permit = match acquire_candidate_concurrency_permit(
                 ctx.proxy,
                 executor.template(),
@@ -564,6 +679,23 @@ impl<'a, 'route> RouteGraphAttemptLoop<'a, 'route> {
             .await
             {
                 Ok(permit) => permit,
+                Err(ConcurrencyAcquireError::SessionAlreadyQueued { session_id }) => {
+                    let provider_endpoint = executor
+                        .template()
+                        .candidate_provider_endpoint_key(selected_candidate);
+                    let message = format!(
+                        "session `{session_id}` already has a pending request for this provider capacity group"
+                    );
+                    *last_err = Some((StatusCode::TOO_MANY_REQUESTS, message.clone()));
+                    log_control_trace_event(serde_json::json!({
+                        "event": "route_candidate_session_queue_rejected",
+                        "service": ctx.proxy.service_name,
+                        "request_id": ctx.request_id,
+                        "provider_endpoint_key": provider_endpoint.stable_key(),
+                        "reason": "session_already_queued",
+                    }));
+                    break;
+                }
                 Err(error) => {
                     let provider_endpoint = executor
                         .template()
@@ -597,17 +729,13 @@ impl<'a, 'route> RouteGraphAttemptLoop<'a, 'route> {
                     runtime,
                     selected_candidate,
                 );
-                let validation = select_route_graph_candidate(
-                    executor,
+                if !executor.candidate_is_valid_after_runtime_update(
                     route_state,
                     &validation_runtime,
+                    selected_candidate,
                     ctx.request_model,
-                    ctx.request_flavor.is_remote_compaction_request(),
-                    policy.continuity,
-                );
-                if validation.selected.is_none_or(|candidate| {
-                    candidate.provider_endpoint != selected_provider_endpoint
-                }) {
+                    revalidation_affinity_policy,
+                ) {
                     log_control_trace_event(serde_json::json!({
                         "event": "route_candidate_changed_after_concurrency_wait",
                         "service": ctx.proxy.service_name,

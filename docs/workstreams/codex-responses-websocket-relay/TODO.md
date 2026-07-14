@@ -1,7 +1,13 @@
 # Codex Responses WebSocket Relay — TODO
 
-Status: Active
+Status: Historical (superseded by the canonical relay runtime on 2026-07-13)
 Last updated: 2026-05-19
+
+> This completed checklist describes the retired client-patch transport
+> switch. Current WebSocket behavior is selected from canonical
+> provider/endpoint capabilities and runtime routing. See
+> [Configuration](../../CONFIGURATION.md) and the
+> [canonical relay runtime modernization plan](../../plans/2026-07-10-002-refactor-canonical-relay-runtime-modernization-plan.md).
 
 ## M0 — Scope And Safety
 
@@ -51,4 +57,3 @@ Last updated: 2026-05-19
   Goal: Let capability diagnostics and live smoke target route-graph provider ids/endpoints directly, not only legacy station names and upstream indexes.
   Validation: `--provider ciii` (and optional `--endpoint`) resolves the route-graph provider endpoint without changing normal routing; targeted unit tests cover provider, endpoint, and station fallback selection.
   Evidence: record commands in `EVIDENCE_AND_GATES.md`.
-

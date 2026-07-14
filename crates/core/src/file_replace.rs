@@ -387,6 +387,26 @@ fn write_bytes_file_validated_with_permissions<V>(
 where
     V: FnOnce(&[u8]) -> io::Result<()>,
 {
+    write_bytes_file_validated_with_permissions_and_before_replace(
+        path,
+        data,
+        permissions,
+        validate,
+        before_replace_noop,
+    )
+}
+
+fn write_bytes_file_validated_with_permissions_and_before_replace<V, B>(
+    path: &Path,
+    data: &[u8],
+    permissions: Option<fs::Permissions>,
+    validate: V,
+    before_replace: B,
+) -> std::result::Result<(), AtomicWriteError>
+where
+    V: FnOnce(&[u8]) -> io::Result<()>,
+    B: FnOnce(&Path, &Path) -> io::Result<()>,
+{
     write_bytes_file_with_operations(
         path,
         data,
@@ -395,7 +415,7 @@ where
         AtomicWriteOperations {
             write_staged: write_staged_file,
             sync_staged: flush_and_sync_staged_file,
-            before_replace: before_replace_noop,
+            before_replace,
             replace: replace_existing_file,
             sync_parent: sync_parent_directory,
         },
@@ -423,6 +443,37 @@ pub(crate) async fn write_bytes_file_async_with_permissions(
     let data = data.to_vec();
     tokio::task::spawn_blocking(move || {
         write_bytes_file_validated_with_permissions(&path, &data, Some(permissions), |_| Ok(()))
+    })
+    .await
+    .map_err(|err| {
+        AtomicWriteError::commit_state_unknown(
+            &error_path,
+            "join blocking writer",
+            io::Error::other(err),
+        )
+    })?
+}
+
+pub(crate) async fn write_bytes_file_async_with_permissions_and_before_replace<B>(
+    path: &Path,
+    data: &[u8],
+    permissions: fs::Permissions,
+    before_replace: B,
+) -> std::result::Result<(), AtomicWriteError>
+where
+    B: FnOnce(&Path, &Path) -> io::Result<()> + Send + 'static,
+{
+    let path = path.to_path_buf();
+    let error_path = path.clone();
+    let data = data.to_vec();
+    tokio::task::spawn_blocking(move || {
+        write_bytes_file_validated_with_permissions_and_before_replace(
+            &path,
+            &data,
+            Some(permissions),
+            |_| Ok(()),
+            before_replace,
+        )
     })
     .await
     .map_err(|err| {

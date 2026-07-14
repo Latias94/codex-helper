@@ -3,7 +3,7 @@ use axum::http::{HeaderMap, Method, Response, StatusCode, header};
 
 use crate::logging::{CodexBridgeLog, RetryInfo, ServiceTierLog};
 use crate::runtime_store::AttemptHandle;
-use crate::state::{RouteDecisionProvenance, SessionIdentitySource};
+use crate::state::{RouteDecisionProvenance, SessionIdentitySource, SessionRouteAffinitySuccess};
 use crate::usage::UsageMetrics;
 
 use super::ProxyService;
@@ -30,6 +30,7 @@ pub(super) struct FinalizeForwardResponseParams {
     pub usage: Option<UsageMetrics>,
     pub route_decision: Option<RouteDecisionProvenance>,
     pub retry: Option<RetryInfo>,
+    pub route_affinity_success: Option<SessionRouteAffinitySuccess>,
     pub response_headers: HeaderMap,
     pub response_body: Bytes,
 }
@@ -66,6 +67,7 @@ pub(super) async fn finish_and_build_forward_response(
         usage,
         route_decision,
         retry,
+        route_affinity_success,
         response_headers,
         response_body,
     } = params;
@@ -98,6 +100,7 @@ pub(super) async fn finish_and_build_forward_response(
     publication.usage = usage;
     publication.route_decision = route_decision;
     publication.retry = retry;
+    publication.route_affinity_success = route_affinity_success;
     let terminal_published = RequestObserver::new(proxy, method, path)
         .publish_terminal_once(publication.with_route_decision_model())
         .await;

@@ -21,8 +21,9 @@ use super::{
 };
 use crate::config::{
     HelperConfig, ProviderConcurrencyLimits, ProviderConfig, RetryConfig, RetryProfileName,
-    RetryStrategy, RouteCondition, RouteGraphConfig, RouteNodeConfig, RouteStrategy,
-    SchedulingPreset, ServiceControlProfile, ServiceRouteConfig, UpstreamAuth, UpstreamConfig,
+    RetryStrategy, RouteAffinityPolicy, RouteCondition, RouteGraphConfig, RouteNodeConfig,
+    RouteStrategy, SchedulingPreset, ServiceControlProfile, ServiceRouteConfig, UpstreamAuth,
+    UpstreamConfig,
 };
 use crate::proxy::ProxyService;
 

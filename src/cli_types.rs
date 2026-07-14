@@ -464,6 +464,18 @@ pub enum ConfigCommand {
         #[arg(value_enum)]
         profile: RetryProfile,
     },
+    /// Preview or explicitly apply a legacy configuration migration.
+    Migrate {
+        /// Preview the migrated v5 TOML without writing any file (the default).
+        #[arg(long, conflicts_with = "write")]
+        dry_run: bool,
+        /// Write the migrated v5 TOML after creating a source backup.
+        #[arg(long, conflicts_with = "dry_run", requires = "yes")]
+        write: bool,
+        /// Confirm the replacement of the canonical configuration file.
+        #[arg(long, requires = "write")]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -707,6 +719,7 @@ pub enum ProviderCommand {
 pub enum RoutingPolicy {
     ManualSticky,
     OrderedFailover,
+    RoundRobin,
     TagPreferred,
 }
 
@@ -715,6 +728,7 @@ impl From<RoutingPolicy> for codex_helper_core::config::RouteStrategy {
         match value {
             RoutingPolicy::ManualSticky => Self::ManualSticky,
             RoutingPolicy::OrderedFailover => Self::OrderedFailover,
+            RoutingPolicy::RoundRobin => Self::RoundRobin,
             RoutingPolicy::TagPreferred => Self::TagPreferred,
         }
     }
@@ -1135,8 +1149,21 @@ mod tests {
     }
 
     #[test]
-    fn config_rejects_removed_migrate_command() {
-        assert!(Cli::try_parse_from(["codex-helper", "config", "migrate"]).is_err());
+    fn config_migrate_requires_explicit_write_confirmation() {
+        assert!(Cli::try_parse_from(["codex-helper", "config", "migrate"]).is_ok());
+        assert!(Cli::try_parse_from(["codex-helper", "config", "migrate", "--dry-run"]).is_ok());
+        assert!(Cli::try_parse_from(["codex-helper", "config", "migrate", "--write"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "codex-helper",
+                "config",
+                "migrate",
+                "--write",
+                "--yes",
+                "--dry-run",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

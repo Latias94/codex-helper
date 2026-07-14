@@ -10,7 +10,7 @@ use crate::logging::{
     upstream_origin,
 };
 use crate::runtime_store::{AttemptHandle, AttemptOutcome, EconomicsState};
-use crate::state::SessionIdentitySource;
+use crate::state::{SessionIdentitySource, SessionRouteAffinitySuccess};
 use crate::usage::{UsageMetrics, extract_usage_from_bytes};
 
 use super::ProxyService;
@@ -47,9 +47,7 @@ use super::retry::{
     RetryLayerOptions, RetryPlan, response_penalty_cooldown_secs, retry_info_for_observed_attempts,
     retry_sleep, should_never_retry, should_retry_class, should_retry_status,
 };
-use super::route_affinity::{
-    prepare_session_route_affinity_success, record_session_route_affinity_success,
-};
+use super::route_affinity::prepare_session_route_affinity_success;
 use super::route_attempts::{StatusRouteAttemptParams, record_status_route_attempt};
 use super::stream::{SseSuccessMeta, build_sse_success_response};
 use crate::routing_ir::CapturedRouteCandidate;
@@ -290,6 +288,7 @@ pub(super) async fn handle_streaming_attempt_success(
         },
     );
     let route_affinity_success = prepare_session_route_affinity_success(
+        request_id,
         session_id,
         session_identity_source,
         route_graph_key,
@@ -577,6 +576,15 @@ pub(super) async fn handle_attempt_response(
     if response_status.is_success() {
         let usage = success_usage;
         let retry = retry_info_for_observed_attempts(route_attempts);
+        let route_affinity_success = prepare_session_route_affinity_success(
+            request_id,
+            session_id,
+            session_identity_source,
+            route_graph_key,
+            target,
+            route_attempts,
+            route_attempt_index,
+        );
         let finalized = finish_attempt_forward_response(
             proxy,
             method,
@@ -603,22 +611,13 @@ pub(super) async fn handle_attempt_response(
                 route_attempt_index,
             )),
             retry,
+            route_affinity_success,
             response_headers_filtered,
             response_body,
         )
         .await;
         if finalized.terminal_published {
             record_attempt_success(proxy.state.as_ref(), proxy.service_name, target).await;
-            record_session_route_affinity_success(
-                proxy,
-                session_id,
-                session_identity_source,
-                route_graph_key,
-                target,
-                route_attempts,
-                route_attempt_index,
-            )
-            .await;
         }
         return AttemptResponseOutcome::Return(finalized.response);
     }
@@ -666,6 +665,7 @@ pub(super) async fn handle_attempt_response(
                     route_attempt_index,
                 )),
                 retry,
+                None,
                 response_headers_filtered,
                 response_body,
             )
@@ -733,6 +733,7 @@ pub(super) async fn handle_attempt_response(
                     route_attempt_index,
                 )),
                 retry,
+                None,
                 response_headers_filtered,
                 response_body,
             )
@@ -769,6 +770,7 @@ pub(super) async fn handle_attempt_response(
                 route_attempt_index,
             )),
             retry,
+            None,
             response_headers_filtered,
             response_body,
         )
@@ -812,6 +814,7 @@ async fn finish_attempt_forward_response(
     usage: Option<UsageMetrics>,
     route_decision: Option<crate::state::RouteDecisionProvenance>,
     retry: Option<crate::logging::RetryInfo>,
+    route_affinity_success: Option<SessionRouteAffinitySuccess>,
     response_headers: HeaderMap,
     response_body: Bytes,
 ) -> FinalizedForwardResponse {
@@ -847,6 +850,7 @@ async fn finish_attempt_forward_response(
             usage,
             route_decision,
             retry,
+            route_affinity_success,
             response_headers,
             response_body,
         },

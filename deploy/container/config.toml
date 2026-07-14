@@ -14,3 +14,32 @@ children = ["openai"]
 
 [retry]
 profile = "balanced"
+
+# Capacity-aware round-robin example for multiple relay accounts:
+#
+# [codex.providers.input]
+# base_url = "https://input.example/v1"
+# auth_token_env = "INPUT_API_KEY"
+#
+# [codex.providers.input.limits]
+# max_concurrent_requests = 20
+#
+# [codex.providers.ciii]
+# base_url = "https://ciii.example/v1"
+# auth_token_env = "CIII_API_KEY"
+#
+# [codex.providers.ciii.limits]
+# max_concurrent_requests = 15
+#
+# [codex.routing]
+# entry = "relay_pool"
+# affinity_policy = "fallback-sticky"
+# scheduling_preset = "balanced"
+#
+# [codex.routing.routes.relay_pool]
+# strategy = "round-robin"
+# children = ["input", "ciii"]
+#
+# At idle, new sessions are distributed 20:15. Successful sessions remain
+# sticky to one account; max_concurrent_requests limits requests, not sessions.
+# Use the same limit_group only for endpoints sharing one account quota.

@@ -1,5 +1,11 @@
 # Operator Summary Contract
 
+> Historical status (superseded 2026-07-13): this contract belongs to the
+> earlier station-first mutable control plane. The current remote control plane
+> is query-only and publishes the canonical typed operator read model. See
+> [Configuration](../../CONFIGURATION.md) and the
+> [canonical relay runtime modernization plan](../../plans/2026-07-10-002-refactor-canonical-relay-runtime-modernization-plan.md).
+
 > 中文速览：这份文档把 `GET /__codex_helper/api/v1/operator/summary` 固定成未来 GUI/WebUI/外部客户端的“首页读侧 contract”。它回答的是“当前我在控制什么、运行态是什么、有哪些可见目录与能力”，而不是拿来替代深层 CRUD 或请求审计接口。
 
 ## Purpose
@@ -109,7 +115,7 @@ Canonical fields:
 | `supports_write` | whether this client can mutate retry config safely |
 | `upstream_max_attempts` | resolved upstream attempt ceiling |
 | `provider_max_attempts` | resolved provider attempt ceiling |
-| `allow_cross_station_before_first_output` | whether retry orchestration may leave the current station before first output |
+| `allow_cross_station_before_first_output` | historical projection of the retired retry setting that allowed orchestration to leave the current station before first output |
 | `recent_retried_requests` | recent finished requests that actually used more than one attempt |
 | `recent_cross_station_failovers` | recent retried requests whose retry chain touched a different station than the final routed station |
 | `recent_fast_mode_requests` | recent finished requests observed with `service_tier = "priority"` |

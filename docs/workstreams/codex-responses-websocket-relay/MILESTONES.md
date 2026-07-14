@@ -1,7 +1,12 @@
 # Codex Responses WebSocket Relay — Milestones
 
-Status: Implemented
+Status: Historical (superseded by the canonical relay runtime on 2026-07-13)
 Last updated: 2026-05-19
+
+> These milestones record the retired client-patch transport switch. Current
+> WebSocket behavior is selected from canonical provider/endpoint capabilities
+> and runtime routing. See [Configuration](../../CONFIGURATION.md) and the
+> [canonical relay runtime modernization plan](../../plans/2026-07-10-002-refactor-canonical-relay-runtime-modernization-plan.md).
 
 ## M0 — Scope And Safety
 
@@ -29,4 +34,3 @@ HTTP-only fallback posture when WS support is absent.
 
 Done. Fresh gates are recorded in `EVIDENCE_AND_GATES.md`; usage parsing/live relay smoke/permessage
 deflate parity are separated as follow-ons.
-

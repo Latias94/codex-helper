@@ -102,34 +102,27 @@ fn assert_load_rejected_without_modification(
     );
 }
 
-fn assert_retired_config_rejected_without_modification(
+fn assert_retired_config_auto_migrated(
     runtime: &tokio::runtime::Runtime,
     path: &Path,
-    retired_path: &str,
+    removed_marker: &str,
     text: &str,
 ) {
     write_file(path, text);
 
-    let error = runtime
+    runtime
         .block_on(load_config())
-        .expect_err("retired version 5 input must be rejected");
-    let message = error.to_string();
+        .expect("retired version 5 input should be cleaned automatically");
+    let migrated = std::fs::read_to_string(path).expect("read migrated config");
     assert!(
-        message.contains(retired_path),
-        "rejection must identify {retired_path}: {message}"
-    );
-    assert!(
-        message.contains("has been removed") && message.contains("Remove"),
-        "rejection must explain the migration action: {message}"
+        !migrated.contains(removed_marker),
+        "automatic cleanup retained {removed_marker}: {migrated}"
     );
     assert_eq!(
-        std::fs::read_to_string(path).expect("read rejected config"),
+        std::fs::read_to_string(path.with_file_name("config.toml.bak"))
+            .expect("read current-v5 migration backup"),
         text,
-        "rejecting {retired_path} must not modify the source file"
-    );
-    assert!(
-        !path.with_file_name("config.toml.bak").exists(),
-        "rejecting {retired_path} must not create a backup"
+        "automatic cleanup must preserve the original bytes"
     );
 }
 
@@ -496,7 +489,7 @@ fn config_init_force_backs_up_retired_v5_before_replacement() {
 }
 
 #[test]
-fn removed_codex_compaction_config_is_rejected_without_modification() {
+fn removed_codex_compaction_config_is_auto_migrated_with_backup() {
     let _env = setup_temp_codex_home();
     let path = current_config_path();
     let runtime = test_runtime();
@@ -521,98 +514,82 @@ fn removed_codex_compaction_config_is_rejected_without_modification() {
 
     for (label, text) in cases {
         write_file(&path, text);
-        let original = std::fs::read(&path).expect("read retired config bytes");
-
-        let error = runtime.block_on(load_config()).expect_err(label);
-        let message = error.to_string();
+        assert_retired_config_auto_migrated(&runtime, &path, "compaction", text);
         assert!(
-            message.contains("`[codex.compaction].remote_v2_downgrade` has been removed"),
-            "unexpected {label} rejection: {error}"
-        );
-        assert!(
-            message.contains("no longer performs remote compaction v2-to-v1 downgrade"),
-            "unexpected {label} rejection: {error}"
-        );
-        assert!(
-            message.contains("Delete the entire `[codex.compaction]` table"),
-            "unexpected {label} rejection: {error}"
-        );
-        assert_eq!(
-            std::fs::read(&path).expect("read rejected config bytes"),
-            original,
-            "rejecting {label} must not modify the source file"
-        );
-        assert!(
-            !path.with_file_name("config.toml.bak").exists(),
-            "rejecting {label} must not create a backup"
+            std::fs::read_to_string(&path)
+                .expect("read cleaned config")
+                .contains("version = 5"),
+            "{label} cleanup did not retain the current version"
         );
     }
 }
 
 #[test]
-fn removed_claude_compaction_config_is_rejected_without_modification() {
+fn removed_claude_compaction_config_is_auto_migrated_with_backup() {
     let _env = setup_temp_codex_home();
     let path = current_config_path();
     let text = "version = 5\n[claude.compaction]\nremote_v2_downgrade = false\n";
     write_file(&path, text);
 
-    let error = test_runtime()
-        .block_on(load_config())
-        .expect_err("shared-schema Claude compaction must not be silently dropped");
-    let message = error.to_string();
-    assert!(message.contains("`claude.compaction`"));
-    assert!(message.contains("had no Claude runtime effect"));
-    assert!(message.contains("Delete the entire `[claude.compaction]` table"));
-    assert_eq!(
-        std::fs::read_to_string(&path).expect("read preserved config"),
-        text
-    );
-    assert!(!path.with_file_name("config.toml.bak").exists());
+    assert_retired_config_auto_migrated(&test_runtime(), &path, "compaction", text);
 }
 
 #[test]
-fn retired_version_5_inputs_are_rejected_before_they_can_be_silently_dropped() {
+fn retired_version_5_inputs_are_auto_migrated_before_typed_load() {
     let _env = setup_temp_codex_home();
     let path = current_config_path();
     let runtime = test_runtime();
     let cases = [
         (
             "codex.client_patch",
+            "client_patch",
             "version = 5\n[codex.client_patch]\npreset = \"default\"\n",
         ),
         (
             "ui.usage_forecast",
+            "usage_forecast",
             "version = 5\n[ui.usage_forecast]\nenabled = true\n",
         ),
         (
             "retry.allow_cross_station_before_first_output",
+            "allow_cross_station_before_first_output",
             "version = 5\n[retry]\nallow_cross_station_before_first_output = true\n",
         ),
         (
             "codex.profiles.daily.station",
+            "station =",
             "version = 5\n[codex.profiles.daily]\nstation = \"primary\"\n",
         ),
         (
             "claude.profiles.deep.station",
+            "station =",
             "version = 5\n[claude.profiles.deep]\nstation = \"backup\"\n",
         ),
         (
             "relay_targets.nas.client_preset",
+            "client_preset",
             "version = 5\n[relay_targets.nas]\nproxy_url = \"http://nas.local:3211\"\nclient_preset = \"default\"\n",
         ),
         (
             "relay_targets.nas.responses_websocket",
+            "responses_websocket",
             "version = 5\n[relay_targets.nas]\nproxy_url = \"http://nas.local:3211\"\nresponses_websocket = true\n",
         ),
     ];
 
-    for (retired_path, text) in cases {
-        assert_retired_config_rejected_without_modification(&runtime, &path, retired_path, text);
+    for (retired_path, marker, text) in cases {
+        assert_retired_config_auto_migrated(&runtime, &path, marker, text);
+        assert!(
+            std::fs::read_to_string(&path)
+                .expect("read cleaned current config")
+                .contains("version = 5"),
+            "cleanup for {retired_path} did not produce a current config"
+        );
     }
 }
 
 #[test]
-fn unsupported_toml_schemas_are_rejected_without_modification() {
+fn legacy_toml_schemas_are_auto_migrated_with_backups() {
     let _env = setup_temp_codex_home();
     let path = current_config_path();
     let runtime = test_runtime();
@@ -626,61 +603,193 @@ fn unsupported_toml_schemas_are_rejected_without_modification() {
             "version 4 with retired-looking field",
             "version = 4\n[codex.client_patch]\npreset = \"default\"\n",
         ),
-        ("version 6", "version = 6\n[notify]\nenabled = true\n"),
     ];
 
     for (label, text) in cases {
-        assert_load_rejected_without_modification(&runtime, &path, label, text);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_file_name("config.toml.bak"));
+        write_file(&path, text);
+        let config = runtime
+            .block_on(load_config())
+            .unwrap_or_else(|error| panic!("{label} should migrate: {error}"));
+        assert_eq!(config.version, CURRENT_CONFIG_VERSION);
+        let migrated = std::fs::read_to_string(&path).expect("read migrated TOML");
+        assert!(
+            migrated.contains("version = 5"),
+            "{label} was not versioned"
+        );
+        assert_eq!(
+            std::fs::read_to_string(path.with_file_name("config.toml.bak"))
+                .expect("read TOML migration backup"),
+            text
+        );
     }
 }
 
 #[test]
-fn legacy_json_config_is_rejected_without_import_or_modification() {
+fn future_toml_schema_is_rejected_without_modification() {
+    let _env = setup_temp_codex_home();
+    let path = current_config_path();
+    let runtime = test_runtime();
+    assert_load_rejected_without_modification(
+        &runtime,
+        &path,
+        "version 6",
+        "version = 6\n[notify]\nenabled = true\n",
+    );
+}
+
+#[test]
+fn explicit_invalid_toml_versions_are_rejected_without_shape_inference() {
+    let _env = setup_temp_codex_home();
+    let path = current_config_path();
+    let runtime = test_runtime();
+    let cases = [
+        ("zero", "version = 0\n"),
+        ("negative", "version = -1\n"),
+        ("string", "version = \"4\"\n"),
+        ("float", "version = 4.0\n"),
+        ("boolean", "version = true\n"),
+    ];
+
+    for (label, text) in cases {
+        write_file(&path, text);
+        let error = runtime.block_on(load_config()).expect_err(label);
+        assert!(
+            error.to_string().contains("invalid config version"),
+            "unexpected {label} error: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read preserved invalid config"),
+            text
+        );
+        assert!(!path.with_file_name("config.toml.bak").exists());
+    }
+}
+
+#[test]
+fn retired_v5_cleanup_preserves_other_fields_and_permissions() {
+    let _env = setup_temp_codex_home();
+    let path = current_config_path();
+    let text = r#"version = 5
+operator_extension = "keep-me"
+
+[codex.client_patch]
+preset = "default"
+
+[notify]
+enabled = true
+"#;
+    write_file(&path, text);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))
+            .expect("set source permissions");
+    }
+    let before_permissions = std::fs::metadata(&path)
+        .expect("inspect source")
+        .permissions();
+
+    let config = test_runtime()
+        .block_on(load_config())
+        .expect("clean retired setting while retaining other fields");
+    assert!(config.notify.enabled);
+    let migrated = std::fs::read_to_string(&path).expect("read migrated config");
+    assert!(migrated.contains("operator_extension = \"keep-me\""));
+    assert!(!migrated.contains("client_patch"));
+    assert_eq!(
+        std::fs::read_to_string(path.with_file_name("config.toml.bak"))
+            .expect("read original-byte backup"),
+        text
+    );
+    let after_permissions = std::fs::metadata(&path)
+        .expect("inspect migrated config")
+        .permissions();
+    assert_eq!(after_permissions.readonly(), before_permissions.readonly());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(after_permissions.mode(), before_permissions.mode());
+    }
+}
+
+#[test]
+fn invalid_retired_v5_cleanup_candidate_is_not_written() {
+    let _env = setup_temp_codex_home();
+    let path = current_config_path();
+    let text = r#"version = 5
+
+[codex.client_patch]
+preset = "default"
+
+[codex.providers.invalid]
+base_url = ""
+"#;
+    write_file(&path, text);
+
+    let error = test_runtime()
+        .block_on(load_config())
+        .expect_err("invalid cleanup candidate must fail before backup or replacement");
+    assert!(
+        error
+            .to_string()
+            .contains("validate migrated configuration")
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read unchanged invalid candidate"),
+        text
+    );
+    assert!(!path.with_file_name("config.toml.bak").exists());
+}
+
+#[test]
+fn legacy_json_config_is_auto_migrated_and_malformed_json_is_preserved() {
     let _env = setup_temp_codex_home();
     let toml_path = current_config_path();
     let json_path = proxy_home_dir().join("config.json");
     let json = r#"{"version":5,"notify":{"enabled":true}}"#;
     write_file(&json_path, json);
 
-    let error = test_runtime()
+    let config = test_runtime()
         .block_on(load_config())
-        .expect_err("config.json must be rejected");
-
-    let message = error.to_string();
+        .expect("valid config.json should be migrated automatically");
+    assert!(config.notify.enabled);
+    assert!(toml_path.exists());
     assert!(
-        message.contains("config.json"),
-        "unexpected error: {message}"
-    );
-    assert!(
-        message.contains("unsupported legacy config source"),
-        "unexpected error: {message}"
-    );
-    assert!(
-        message.contains("normal startup only reads") && message.contains("version = 5"),
-        "unexpected error: {message}"
+        std::fs::read_to_string(&toml_path)
+            .expect("read migrated JSON config")
+            .contains("version = 5")
     );
     assert_eq!(
-        std::fs::read_to_string(&json_path).expect("read unchanged config.json"),
+        std::fs::read_to_string(&json_path).expect("read retained config.json"),
         json
     );
-    assert!(!toml_path.exists());
-    assert!(!proxy_home_dir().join("config.json.bak").exists());
-    assert!(!proxy_home_dir().join("config.toml.bak").exists());
+    assert_eq!(
+        std::fs::read_to_string(proxy_home_dir().join("config.json.bak"))
+            .expect("read JSON backup"),
+        json
+    );
 
+    std::fs::remove_file(&toml_path).expect("remove migrated TOML before malformed check");
+    std::fs::remove_file(proxy_home_dir().join("config.json.bak"))
+        .expect("remove previous JSON backup");
     let malformed = "not valid json";
     write_file(&json_path, malformed);
     let malformed_error = test_runtime()
         .block_on(load_config())
-        .expect_err("malformed config.json must get the same legacy-source rejection");
+        .expect_err("malformed config.json must fail without migration");
     assert!(
         malformed_error
             .to_string()
-            .contains("unsupported legacy config source")
+            .contains("parse legacy config.json")
     );
     assert_eq!(
-        std::fs::read_to_string(&json_path).expect("read unchanged malformed config.json"),
+        std::fs::read_to_string(&json_path).expect("read preserved malformed config.json"),
         malformed
     );
+    assert!(!toml_path.exists());
+    assert!(!proxy_home_dir().join("config.json.bak").exists());
 }
 
 #[test]
@@ -703,7 +812,7 @@ fn canonical_toml_takes_precedence_when_legacy_json_also_exists() {
 }
 
 #[test]
-fn retired_settings_are_reported_together_in_stable_path_order() {
+fn retired_settings_are_cleaned_together_with_exact_backup() {
     let _env = setup_temp_codex_home();
     let path = current_config_path();
     let text = r#"version = 5
@@ -721,28 +830,38 @@ client_preset = "default"
 "#;
     write_file(&path, text);
 
-    let error = test_runtime()
+    test_runtime()
         .block_on(load_config())
-        .expect_err("all retired settings must be reported");
-    let message = error.to_string();
-    let expected = [
-        "codex.client_patch",
-        "relay_targets.nas.client_preset",
-        "relay_targets.nas.responses_websocket",
-        "ui.usage_forecast",
-    ];
-    let positions = expected
-        .iter()
-        .map(|path| {
-            message
-                .find(path)
-                .unwrap_or_else(|| panic!("missing {path} in {message}"))
-        })
-        .collect::<Vec<_>>();
-    assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        .expect("all retired settings should be cleaned in one migration");
+    let migrated = std::fs::read_to_string(&path).expect("read cleaned config");
+    for marker in [
+        "client_patch",
+        "client_preset",
+        "responses_websocket",
+        "usage_forecast",
+    ] {
+        assert!(!migrated.contains(marker), "cleanup retained {marker}");
+    }
     assert_eq!(
-        std::fs::read_to_string(&path).expect("read unchanged config"),
+        std::fs::read_to_string(path.with_file_name("config.toml.bak"))
+            .expect("read exact current-v5 backup"),
         text
+    );
+
+    let first_migrated = std::fs::read(&path).expect("capture first migrated bytes");
+    let first_backup =
+        std::fs::read(path.with_file_name("config.toml.bak")).expect("capture first backup bytes");
+    test_runtime()
+        .block_on(load_config())
+        .expect("second load should be idempotent");
+    assert_eq!(
+        std::fs::read(&path).expect("read config after second load"),
+        first_migrated
+    );
+    assert_eq!(
+        std::fs::read(path.with_file_name("config.toml.bak"))
+            .expect("read backup after second load"),
+        first_backup
     );
 }
 
@@ -826,11 +945,7 @@ fn typed_save_refuses_to_overwrite_legacy_or_retired_sources() {
     let error = runtime
         .block_on(save_helper_config(&replacement))
         .expect_err("typed save must reject JSON-only source");
-    assert!(
-        error
-            .to_string()
-            .contains("unsupported legacy config source")
-    );
+    assert!(error.to_string().contains("is a legacy config source"));
     assert_eq!(
         std::fs::read_to_string(&json_path).expect("read preserved JSON"),
         json

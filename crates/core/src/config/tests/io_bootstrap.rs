@@ -37,7 +37,7 @@ enabled = true
 }
 
 #[test]
-fn load_config_rejects_non_current_version() {
+fn load_config_auto_migrates_legacy_toml_and_keeps_backup() {
     let _env = setup_temp_codex_home();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -46,9 +46,7 @@ fn load_config_rejects_non_current_version() {
     rt.block_on(async move {
         let dir = super::proxy_home_dir();
         let toml_path = dir.join("config.toml");
-        write_file(
-            &toml_path,
-            r#"
+        let original = r#"
 version = 1
 
 [codex]
@@ -61,18 +59,122 @@ active = "right"
 base_url = "https://www.right.codes/codex/v1"
 [codex.configs.right.upstreams.auth]
 auth_token_env = "RIGHTCODE_API_KEY"
-"#,
+"#;
+        write_file(&toml_path, original);
+
+        let cfg = super::load_config()
+            .await
+            .expect("legacy TOML should be migrated automatically");
+        assert_eq!(cfg.version, CURRENT_CONFIG_VERSION);
+        assert!(cfg.codex.providers.contains_key("right__u01"));
+        assert_eq!(
+            cfg.codex
+                .routing
+                .as_ref()
+                .map(|routing| routing.entry.as_str()),
+            Some("main")
         );
 
-        let err = super::load_config()
-            .await
-            .expect_err("non-current TOML should be rejected");
-        assert_unsupported_config(&err, "version 1");
+        let migrated = std::fs::read_to_string(&toml_path).expect("read migrated TOML");
+        assert!(migrated.contains("version = 5"));
+        assert!(!migrated.contains("[codex.configs.right]"));
+        assert_eq!(
+            std::fs::read_to_string(toml_path.with_file_name("config.toml.bak"))
+                .expect("read legacy TOML backup"),
+            original
+        );
     });
 }
 
 #[test]
-fn load_config_rejects_unversioned_toml_without_modification() {
+fn save_after_auto_migration_preserves_the_original_legacy_backup() {
+    let _env = setup_temp_codex_home();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+    rt.block_on(async move {
+        let dir = super::proxy_home_dir();
+        let toml_path = dir.join("config.toml");
+        let backup_path = dir.join("config.toml.bak");
+        let original = "version = 1\n[notify]\nenabled = true\n";
+        write_file(&toml_path, original);
+
+        let mut config = super::load_config()
+            .await
+            .expect("legacy config should migrate during load");
+        assert_eq!(
+            std::fs::read_to_string(&backup_path).expect("read migration backup"),
+            original
+        );
+
+        config.notify.enabled = false;
+        super::save_helper_config(&config)
+            .await
+            .expect("typed save after migration");
+
+        assert_eq!(
+            std::fs::read_to_string(&backup_path).expect("read preserved migration backup"),
+            original,
+            "a typed save must not replace the only original legacy backup with migrated v5 bytes"
+        );
+        assert!(
+            std::fs::read_to_string(&toml_path)
+                .expect("read saved current config")
+                .contains("enabled = false")
+        );
+    });
+}
+
+#[test]
+fn load_config_auto_migrates_flat_retry_fields_from_published_version_5() {
+    let _env = setup_temp_codex_home();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+    rt.block_on(async move {
+        let dir = super::proxy_home_dir();
+        let toml_path = dir.join("config.toml");
+        let original = r#"version = 5
+[retry]
+max_attempts = 4
+backoff_ms = 75
+strategy = "same_upstream"
+"#;
+        write_file(&toml_path, original);
+
+        let config = super::load_config()
+            .await
+            .expect("published flat retry fields should migrate automatically");
+        let upstream = config
+            .retry
+            .upstream
+            .expect("flat fields should migrate to retry.upstream");
+        assert_eq!(upstream.max_attempts, Some(4));
+        assert_eq!(upstream.backoff_ms, Some(75));
+        assert_eq!(upstream.strategy, Some(RetryStrategy::SameUpstream));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("config.toml.bak"))
+                .expect("read exact flat retry backup"),
+            original
+        );
+
+        let migrated = std::fs::read_to_string(&toml_path).expect("read migrated config");
+        let raw = toml::from_str::<TomlValue>(&migrated).expect("parse migrated config");
+        let retry = raw
+            .get("retry")
+            .and_then(TomlValue::as_table)
+            .expect("retry table");
+        assert!(!retry.contains_key("max_attempts"));
+        assert!(!retry.contains_key("backoff_ms"));
+        assert!(!retry.contains_key("strategy"));
+        assert!(retry.contains_key("upstream"));
+    });
+}
+
+#[test]
+fn load_config_auto_migrates_unversioned_toml_and_keeps_backup() {
     let _env = setup_temp_codex_home();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -96,14 +198,19 @@ auth_token_env = "RIGHTCODE_API_KEY"
 "#,
         );
 
-        let err = super::load_config()
+        let original = std::fs::read_to_string(&toml_path).expect("read original config.toml");
+        let cfg = super::load_config()
             .await
-            .expect_err("unversioned config should be rejected");
-        assert_unsupported_config(&err, "missing or invalid");
-
-        let original = std::fs::read_to_string(&toml_path).expect("read unchanged config.toml");
-        assert!(original.contains("[codex.configs.right]"));
-        assert!(!original.contains("version = 5"));
+            .expect("unversioned legacy config should be migrated");
+        assert_eq!(cfg.version, CURRENT_CONFIG_VERSION);
+        let migrated = std::fs::read_to_string(&toml_path).expect("read migrated config.toml");
+        assert!(migrated.contains("version = 5"));
+        assert!(!migrated.contains("[codex.configs.right]"));
+        assert_eq!(
+            std::fs::read_to_string(toml_path.with_file_name("config.toml.bak"))
+                .expect("read config backup"),
+            original
+        );
     });
 }
 

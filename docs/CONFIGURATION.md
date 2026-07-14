@@ -42,6 +42,27 @@ Codex-owned files remain owned by Codex:
 
 Only an explicit local `switch on/off` action may patch `~/.codex/config.toml`, and it is limited to the helper-owned provider selector and `model_providers.codex_proxy` stanza. codex-helper never reads or writes Codex `auth.json`, model cache, or SQLite files.
 
+## Automatic Configuration Migration
+
+Normal startup automatically upgrades historical helper configuration to the current `version = 5` TOML contract:
+
+- A v1-v4 or unversioned `config.toml` is validated, backed up to `config.toml.bak`, and atomically replaced with canonical version 5 TOML.
+- If `config.toml` is absent but `config.json` exists, the JSON source is backed up to `config.json.bak` and a new canonical `config.toml` is written. The original `config.json` is not deleted. `config init` uses this same migration path and prints the migration report instead of claiming that it wrote a blank template.
+- Historical station-shaped JSON is validated against the nullable fields accepted by the last published JSON loader. `null` remains valid only for those optional fields; a non-optional `null`, or any `null` in a later provider-shaped JSON file that had no published nullable contract, fails closed.
+- The migrator understands the historical station, group, routing, and version 4 route-graph shapes. It moves flat `[retry]` fields `max_attempts`, `backoff_ms`, `backoff_max_ms`, `jitter_ms`, `on_status`, `on_class`, and `strategy` into `[retry.upstream]` only when that table is absent. If `[retry.upstream]` already exists, it is the complete historical override and all flat retry fields are ignored with a warning. The migrator removes retired settings and validates the complete result against the current typed schema before replacing the canonical file.
+- Malformed input, a version newer than 5, an invalid migrated result, a symbolic-link source, or a source changed while migration is being prepared fails closed. The source is not replaced.
+- Concurrent automatic startups wait for the active config writer, then recheck whether migration is still required. Explicit init, save, and migrate mutations remain fail-fast when another writer owns the lock.
+
+To inspect the exact output and migration warnings before startup writes anything, use the explicit preview command. Applying it requires both write flags:
+
+```bash
+codex-helper config migrate --dry-run
+codex-helper config migrate --write --yes
+```
+
+Startup uses the same path to clean a current version 5 file that still contains retired fields; `config migrate` lets you preview or apply that cleanup explicitly. Explicit migration of an already-clean version 5 file is a no-op and does not replace an existing legacy backup. Backups are safety copies, not a versioned archive: preserve a backup elsewhere before another migration or forced initialization if you need long-term history.
+Inline `auth_token` and `api_key` values are redacted in preview output; the validated file written by migration retains them.
+
 ## Relay Targets
 
 Relay targets are client-side bookmarks for local or remote codex-helper runtimes. They live in `~/.codex-helper/config.toml` and are used by `ch relay ...`; provider/routing config still belongs to the server runtime that receives traffic.
@@ -466,10 +487,11 @@ Rules:
 Common strategies:
 
 - `ordered-failover`: try children from left to right. Children can be providers or nested route nodes.
+- `round-robin`: spread selections across children with smooth weights derived from each candidate's remaining local concurrency capacity. An existing viable session affinity wins before the rotation cursor.
 - `tag-preferred`: split children into preferred groups by `prefer_tags`, then fallback to the rest. `on_exhausted = "continue"` allows paid fallback after trusted exhaustion; `on_exhausted = "stop"` prevents automatic spillover.
 - `manual-sticky`: use one explicit `target`. The target can be a route node, provider, or provider endpoint.
 
-Most users should prefer `ordered-failover` for fixed priority and `tag-preferred` for "monthly first" business intent.
+Most users should prefer `ordered-failover` for fixed priority, `round-robin` for concurrent relay pools, and `tag-preferred` for "monthly first" business intent.
 
 ## Session Affinity
 
@@ -480,7 +502,7 @@ Route graph session affinity is runtime state with a small durable ledger for Co
 - `off` ignores automatic route affinity.
 - `hard` treats an existing affinity target as strict for that route graph; if the target is unavailable, no alternate candidate is selected.
 
-For each request with a session id, codex-helper keys affinity by `session_id + service + route_graph_key`. The route key is a versioned canonical SHA-256 digest. Scheduling presets, provider display aliases, and route-node display metadata do not change it; route selection rules, provider endpoint identity, or configured `auth_token` / `api_key` credentials do. Client-passthrough account headers and external credential fallbacks are not part of this durable identity, so changing either requires a new session.
+Within one helper runtime store, each session id has at most one durable provider/key binding. The record also carries a versioned canonical SHA-256 route-graph key that validates whether the binding still applies to the current graph; it is not a second database-key dimension. Scheduling presets, `max_concurrent_requests`, `limit_group`, provider display aliases, and route-node display metadata do not change that graph key, while route selection rules, provider endpoint identity, or configured `auth_token` / `api_key` credentials do. Adjusting capacity controls therefore preserves an existing durable binding, although the current scheduling preset still controls how a request behaves while its bound key is saturated. When the graph key changes, the old binding is ignored and the next successful route replaces that session's single record. Client-passthrough account headers and external credential fallbacks are not part of this durable identity, so changing either requires a new session.
 
 Successful route affinity is committed to the helper-owned runtime database:
 
@@ -490,6 +512,8 @@ Successful route affinity is committed to the helper-owned runtime database:
 
 The runtime store records helper-owned provider endpoint identity only; it does not store or infer upstream relay implementation details. Affinity persistence shares the runtime store ownership and durability settings and cannot be redirected to a separate JSON ledger.
 
+With a `round-robin` route and an affinity policy such as `fallback-sticky`, the rotation is consulted only when the request's session does not already have a viable affinity. The first request for a cold session owns an in-process provisional reservation; until that request succeeds and commits durable affinity, another concurrent follower for the same session receives local HTTP 429 backpressure and never selects a different key. With `affinity_policy = "off"`, no session reservation or durable route affinity is applied. Several different sessions may bind to the same provider/key. `max_concurrent_requests` limits simultaneous requests, not the number of sessions assigned to that key.
+
 For Codex remote compaction, helper treats compact v1 requests that mention state-bound fields such as `encrypted_content`, `previous_response_id`, or `compaction_summary`, and compact v2 requests with a structured `compaction_trigger`, as provider-state-bound. Under the default `fallback-sticky` route affinity policy, a state-bound compact request without existing route affinity is still tryable: helper follows the configured route graph, records the successful provider endpoint as the session affinity, and lets upstream decide whether the compact state is valid. Under `hard` affinity, missing affinity remains fail-closed with an explicit continuity error. If a known affinity endpoint itself fails, `fallback-sticky` may continue along the route graph and update affinity, while `hard` blocks cross-endpoint movement unless an explicit shared `continuity_domain` permits it. Non-state-bound compact can still use normal provider fallback according to the route policy.
 
 Affinity is not a hard pin:
@@ -497,7 +521,7 @@ Affinity is not a hard pin:
 - request retry, provider health, capability mismatch, cooldown, and trusted balance exhaustion still apply;
 - if the sticky provider fails, ordinary and non-state-bound requests continue through the current route graph and then stick to the next successful provider;
 - provider-state-bound compact honors the route affinity policy: `fallback-sticky` stays tryable and updates affinity after a successful fallback, while `hard` stays within the affinity continuity domain unless an explicit shared `continuity_domain` permits movement;
-- if provider tags, route node strategy, children, entry, provider endpoint identity, or configured `auth_token` / `api_key` credentials change, the route graph key changes and old affinity no longer matches; changing only `scheduling_preset` or display aliases/metadata preserves it;
+- if provider tags, route node strategy, children, entry, provider endpoint identity, or configured `auth_token` / `api_key` credentials change, the route graph key changes, the old affinity no longer matches, and the next successful route replaces the session's single binding; changing only `scheduling_preset`, `max_concurrent_requests`, `limit_group`, or display aliases/metadata preserves it;
 - route graph decisions use route/provider/endpoint controls rather than a second station-shaped override path.
 
 This means monthly pools such as `monthly_pool -> paygo` normally keep a conversation on one monthly provider until that provider stops being viable, instead of round-robining every request and reducing upstream cache hit rate.
@@ -510,6 +534,7 @@ Pick one recipe first. You can refine fields later. For Claude, replace `codex` 
 | --- | --- | --- |
 | I only have one upstream and want the dashboard/logs | [One Provider](#one-provider) | Smallest config; no accidental fallback |
 | I have several relays and want the first working one | [Ordered Fallback](#ordered-fallback) | Simple left-to-right fallback |
+| I have several relays with different concurrency limits | [Capacity-Weighted Round Robin](#capacity-weighted-round-robin) | Spreads new sessions by remaining local capacity, then keeps session affinity |
 | I have several monthly relays and one pay-as-you-go backup | [Monthly Pool With Paygo Fallback](#monthly-pool-with-paygo-fallback) | Preserves the monthly pool as one preferred group |
 | I have several monthly relays and several paid relay backups | [Monthly Pool With Relay Fallback Pool](#monthly-pool-with-relay-fallback-pool) | Keeps monthly and paid fallback pools explicit |
 | I want all monthly-tagged providers before anything paid | [Monthly First By Tag](#monthly-first-by-tag) | Uses metadata instead of hard-coding a named pool |
@@ -822,6 +847,46 @@ profile = "balanced"
 
 Do not use endpoints just to model unrelated providers. Put unrelated accounts under separate provider names.
 
+### Capacity-Weighted Round Robin
+
+Use `round-robin` when independent relay accounts should share new sessions in proportion to their available concurrency. This example gives `input` 20 local request slots and `ciii` 15:
+
+```toml
+version = 5
+
+[codex.providers.input]
+base_url = "https://input.example/v1"
+auth_token_env = "INPUT_API_KEY"
+
+[codex.providers.input.limits]
+max_concurrent_requests = 20
+
+[codex.providers.ciii]
+base_url = "https://ciii.example/v1"
+auth_token_env = "CIII_API_KEY"
+
+[codex.providers.ciii.limits]
+max_concurrent_requests = 15
+
+[codex.routing]
+entry = "relay_pool"
+affinity_policy = "fallback-sticky"
+scheduling_preset = "balanced"
+
+[codex.routing.routes.relay_pool]
+strategy = "round-robin"
+children = ["input", "ciii"]
+
+[retry]
+profile = "balanced"
+```
+
+At idle, new sessions are selected in a smooth 20:15 ratio, equivalent to 4:3 over time. The weight is recalculated from `max_concurrent_requests - active_requests`, so traffic shifts toward the provider with more remaining capacity; a saturated candidate is skipped for immediate selection, while `scheduling_preset` may wait for capacity before trying again. Once a session succeeds on one provider, affinity keeps later requests on that provider while it remains viable. This is session-to-key affinity, not a one-session-per-key allocation: each key may serve many sessions concurrently.
+
+The cursor and active-request counters are process-local. Run one codex-helper process when these values must represent the whole pool; multiple helper processes do not coordinate a distributed limit. A candidate without `max_concurrent_requests` has weight 1, so configure explicit limits on every child when capacity-proportional distribution matters.
+
+If a `round-robin` child is itself an `ordered-failover` route, the best group from every child joins the shared rotation first. Lower fallback groups become eligible only after all candidates in the preceding group are unavailable. Keep the graph flat when every provider belongs to the same capacity pool.
+
 ### Provider Concurrency Limits
 
 Use `limits.max_concurrent_requests` when an upstream relay account only allows a small number of simultaneous requests. This is a local-process cap: one running codex-helper process tracks active requests and applies the route's configured queue/failover policy. It is not a distributed quota across several codex-helper processes.
@@ -854,6 +919,8 @@ max_concurrent_requests = 2
 limit_group = "relay-us"
 ```
 
+Every endpoint in the same explicit `limit_group` must declare the same limit because the group is one shared local semaphore. Do not put independent accounts such as the 20-slot and 15-slot providers above into one group. For round-robin weighting, all candidates that share a `limit_group` observe the same active pool; the group prevents multiple endpoint aliases from multiplying one account's real capacity.
+
 `scheduling_preset` under `[codex.routing]` or `[claude.routing]` controls what happens when the selected candidate reaches that local cap:
 
 ```toml
@@ -876,6 +943,7 @@ Version 0.20.3 and earlier immediately failed over when the local cap was satura
 | Strategy | Best For | UI Mental Model |
 | --- | --- | --- |
 | `ordered-failover` | Simple fallback chains and named pools | Reorder child routes/providers |
+| `round-robin` | Concurrent relay pools with per-provider capacity | Rotate new sessions by remaining capacity |
 | `tag-preferred` | Monthly-first, region-first, vendor-class-first setups | Choose preferred tags, then fallback |
 | `manual-sticky` | Debugging or strict manual selection | Pick one target |
 
@@ -1227,13 +1295,15 @@ For BaseLLM context tiers, the threshold input is `ordinary input + cache read`;
 
 Initialize the canonical config:
 
-Normal startup, including the default TUI path, requires `~/.codex-helper/config.toml` with `version = 5`. `config init` creates a current template; `--force` replaces an existing canonical file only after writing `config.toml.bak`. Historical schemas and `config.json` are unsupported and are never imported, migrated, rewritten, or deleted automatically.
+Normal startup, including the default TUI path, uses the canonical `~/.codex-helper/config.toml` with `version = 5`. When startup finds an older/unversioned TOML, or finds `config.json` while TOML is absent, it performs the validated migration described in [Automatic Configuration Migration](#automatic-configuration-migration). `config init` creates a current template when no helper configuration exists; on a JSON-only installation it migrates that file and prints the report instead. `--force` replaces an existing canonical file only after writing `config.toml.bak`.
 
 Read-only loading may follow a valid `config.toml` symbolic link, but helper commands that rewrite the typed configuration refuse a final-file link so an atomic replacement cannot detach or retarget it. Point `CODEX_HELPER_HOME` (or the whole `.codex-helper` directory) at a stable linked directory instead if the configuration is managed in dotfiles. Mutations are serialized with a helper-owned lock, backups inherit the source file permissions, and a dangling or retargeted configuration directory fails closed.
 
 ```bash
 codex-helper config init
 codex-helper config init --force
+codex-helper config migrate --dry-run
+codex-helper config migrate --write --yes
 ```
 
 Manage providers:
@@ -1254,6 +1324,7 @@ codex-helper routing order input openai
 codex-helper routing pin input
 codex-helper routing prefer-tag --tag billing=monthly --order input,openai --on-exhausted continue
 codex-helper routing set --policy ordered-failover --order input,openai
+codex-helper routing set --policy round-robin --order input,ciii
 codex-helper routing clear-target
 codex-helper routing show
 codex-helper routing explain
@@ -1392,20 +1463,20 @@ These operator clients and the remote control plane are query-only. Edit durable
 
 ## Configuration Compatibility
 
-`version = 5` in `~/.codex-helper/config.toml` is the only public helper configuration contract. Older versioned or unversioned TOML and `config.json` are unsupported inputs. Startup reports the unsupported file/schema without importing, converting, deleting, or treating it as generated state; there is no migration command or compatibility runtime reader.
+`version = 5` in `~/.codex-helper/config.toml` remains the only public runtime contract. Older versioned or unversioned TOML and legacy `config.json` are migration inputs rather than long-lived compatibility formats: startup converts them once, creates the source-specific `.bak`, and subsequently loads canonical version 5 TOML. The runtime does not maintain a parallel legacy reader.
 
-Create a separate version 5 file with `config init`, then express provider and routing intent directly through `[service.providers]`, `[service.routing]`, and route nodes. Keep any historical file outside the canonical path if it is needed for manual reference.
+Migration preserves representable provider/routing intent, removes known retired settings, warns about known lossy conversions and unrecognized root/service fields retained verbatim, and validates the version 5 result before replacement. Flat `max_attempts`, `backoff_ms`, `backoff_max_ms`, `jitter_ms`, `on_status`, `on_class`, and `strategy` under `[retry]` are moved to `[retry.upstream]` only when that table is absent. If `[retry.upstream]` exists, it is retained as the complete historical override and all flat retry fields are ignored with a warning. Use `config migrate --dry-run` to review that conversion, especially for heavily customized files. A future schema version is never downgraded automatically.
 
-Provider, endpoint, route-graph, retry-profile, notification, fleet, and service-status settings from a normal 0.20.3 version 5 file remain usable. However, several optional fields that were also published under version 5 have been retired. The version number alone cannot identify them, so startup and typed config saves reject these exact paths and list all matches instead of silently dropping them. The source file remains unchanged.
+Provider, endpoint, route-graph, retry-profile, notification, fleet, and service-status settings from a normal 0.20.3 version 5 file remain usable. However, several optional fields that were also published under version 5 have been retired. The version number alone cannot identify them, so startup creates `config.toml.bak` and precisely removes all matching helper-config paths before loading. An explicit typed save still refuses to overwrite an uncleaned source directly, preventing unrelated commands from silently erasing fields.
 
 | Retired input | Current behavior | Upgrade action |
 | --- | --- | --- |
-| `[codex.client_patch]` | Startup rejects the table; presets, auth facades, compaction, hosted-tool switches, and WebSocket patching are no longer helper config | Remove the table and use only the explicit URL switch described above |
-| `[codex.compaction]` / `[claude.compaction]` | Startup rejects either table; the shared v0.20.3 schema accepted the Claude table even though it had no Claude runtime effect | Delete the entire table; helper no longer performs remote-v2-to-v1 downgrade |
-| `[ui.usage_forecast]` | Startup rejects the table; the old local forecast was removed | Delete the table; use committed quota pace and reset-window views instead |
-| `codex.profiles.*.station` / `claude.profiles.*.station` | Startup rejects every matching profile field | Remove it and express provider selection in the service route graph |
-| `[retry].allow_cross_station_before_first_output` | Startup rejects the retired retry field | Delete the field; failover is controlled by the canonical route/retry policy |
-| `relay_targets.*.client_preset` / `responses_websocket` | Startup rejects every matching relay-target field | Delete them; a relay bookmark stores network/admin connection data only |
+| `[codex.client_patch]` | Startup backs up the file and removes the table; presets, auth facades, compaction, hosted-tool switches, and WebSocket patching are no longer helper config | Preview with `config migrate --dry-run`; use only the explicit URL switch described above |
+| `[codex.compaction]` / `[claude.compaction]` | Startup backs up the file and removes either table; the shared v0.20.3 schema accepted the Claude table even though it had no Claude runtime effect | Preview the cleanup; helper no longer performs remote-v2-to-v1 downgrade |
+| `[ui.usage_forecast]` | Startup backs up the file and removes the table; the old local forecast was removed | Use committed quota pace and reset-window views instead |
+| `codex.profiles.*.station` / `claude.profiles.*.station` | Startup backs up the file and removes every matching profile field | Express provider selection in the service route graph |
+| `[retry].allow_cross_station_before_first_output` | Startup backs up the file and removes the retired retry field | Failover is controlled by the canonical route/retry policy |
+| `relay_targets.*.client_preset` / `responses_websocket` | Startup backs up the file and removes every matching relay-target field | A relay bookmark stores network/admin connection data only |
 | server `advertised-admin-base-url` / `host-local-session-history` and matching CLI flags | Server config parsing rejects these keys; CLI flags no longer exist | Remove them; configure each client's trusted relay `admin_url` explicitly |
 | `usage_providers.json` endpoint templates, `headers`, or `variables` | The operator-owned file fails to load | Use literal relative/absolute endpoints and typed fields such as `new_api_user_id_env` |
 

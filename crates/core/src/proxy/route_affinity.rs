@@ -1,34 +1,18 @@
 use crate::logging::{RouteAttemptLog, now_ms};
 use crate::routing_ir::{RoutePlanRuntimeState, RoutePlanTemplate};
-use crate::state::{ProxyState, SessionIdentitySource, SessionRouteAffinityTarget};
+use crate::state::{
+    SessionIdentitySource, SessionRouteAffinity, SessionRouteAffinitySuccess,
+    SessionRouteAffinityTarget, SessionRouteReservationAccess,
+};
 
 use super::ProxyService;
 use crate::routing_ir::CapturedRouteCandidate;
 
-pub(super) struct SessionRouteAffinitySuccess {
-    session_id: String,
-    target: SessionRouteAffinityTarget,
-    reason_hint: Option<String>,
-}
-
-impl SessionRouteAffinitySuccess {
-    pub(super) async fn publish(self, state: &ProxyState) {
-        if let Err(error) = state
-            .record_session_route_affinity_success(
-                self.session_id.as_str(),
-                self.target,
-                self.reason_hint,
-                now_ms(),
-            )
-            .await
-        {
-            tracing::warn!(
-                session_id = self.session_id,
-                error = %error,
-                "failed to publish durable session route affinity"
-            );
-        }
-    }
+pub(super) enum SessionRouteReservationDecision {
+    None,
+    Available(SessionRouteAffinity),
+    Busy,
+    Failed,
 }
 
 pub(super) async fn apply_session_route_affinity_to_runtime(
@@ -48,21 +32,7 @@ pub(super) async fn apply_session_route_affinity_to_runtime(
     let Some(affinity) = proxy.state.get_session_route_affinity(session_id).await else {
         return;
     };
-    if affinity.route_graph_key != route_graph_key {
-        return;
-    }
-    if !template.contains_provider_endpoint(
-        &affinity.provider_endpoint,
-        affinity.upstream_base_url.as_str(),
-    ) {
-        return;
-    }
-
-    runtime.set_affinity_provider_endpoint_with_observed_at(
-        Some(affinity.provider_endpoint),
-        Some(affinity.last_selected_at_ms),
-        Some(affinity.last_changed_at_ms),
-    );
+    apply_matching_session_affinity(template, route_graph_key, runtime, affinity);
 }
 
 pub(super) async fn apply_session_route_affinity_for_template(
@@ -82,29 +52,138 @@ pub(super) async fn apply_session_route_affinity_for_template(
     .await;
 }
 
-pub(super) async fn record_session_route_affinity_success(
+pub(super) async fn claim_session_route_reservation(
     proxy: &ProxyService,
+    request_id: u64,
     session_id: Option<&str>,
     session_identity_source: Option<SessionIdentitySource>,
     route_graph_key: Option<&str>,
     target: &CapturedRouteCandidate,
-    route_attempts: &[RouteAttemptLog],
-    route_attempt_index: usize,
-) {
-    let Some(success) = prepare_session_route_affinity_success(
-        session_id,
-        session_identity_source,
-        route_graph_key,
-        target,
-        route_attempts,
-        route_attempt_index,
-    ) else {
-        return;
+) -> SessionRouteReservationDecision {
+    let Some((session_id, target)) =
+        session_route_affinity_target(session_id, session_identity_source, route_graph_key, target)
+    else {
+        return SessionRouteReservationDecision::None;
     };
-    success.publish(proxy.state.as_ref()).await;
+    match proxy
+        .state
+        .claim_session_route_reservation(session_id.as_str(), target, request_id, now_ms())
+        .await
+    {
+        Ok(SessionRouteReservationAccess::Available(affinity)) => {
+            SessionRouteReservationDecision::Available(affinity)
+        }
+        Ok(SessionRouteReservationAccess::Busy { owner_request_id }) => {
+            tracing::debug!(
+                session_id,
+                request_id,
+                owner_request_id,
+                "session route reservation is owned by another active request"
+            );
+            SessionRouteReservationDecision::Busy
+        }
+        Ok(SessionRouteReservationAccess::None) => SessionRouteReservationDecision::None,
+        Err(error) => {
+            tracing::warn!(
+                session_id,
+                error = %error,
+                "failed to claim in-memory session route reservation"
+            );
+            SessionRouteReservationDecision::Failed
+        }
+    }
+}
+
+pub(super) async fn lock_session_route_reservation_selection(
+    proxy: &ProxyService,
+    session_id: Option<&str>,
+) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+    let session_id = session_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    Some(
+        proxy
+            .state
+            .lock_session_route_reservation_selection(session_id)
+            .await,
+    )
+}
+
+pub(super) async fn apply_session_route_reservation_to_runtime(
+    proxy: &ProxyService,
+    request_id: u64,
+    session_id: Option<&str>,
+    template: &RoutePlanTemplate,
+    route_graph_key: Option<&str>,
+    runtime: &mut RoutePlanRuntimeState,
+) -> SessionRouteReservationDecision {
+    let Some(session_id) = session_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        return SessionRouteReservationDecision::None;
+    };
+    let Some(route_graph_key) = route_graph_key
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return SessionRouteReservationDecision::None;
+    };
+    match proxy
+        .state
+        .get_session_route_reservation(session_id, route_graph_key, request_id, now_ms())
+        .await
+    {
+        Ok(SessionRouteReservationAccess::Available(affinity)) => {
+            if apply_matching_session_affinity(template, route_graph_key, runtime, affinity.clone())
+            {
+                SessionRouteReservationDecision::Available(affinity)
+            } else {
+                SessionRouteReservationDecision::None
+            }
+        }
+        Ok(SessionRouteReservationAccess::Busy { owner_request_id }) => {
+            tracing::debug!(
+                session_id,
+                request_id,
+                owner_request_id,
+                "session route reservation is owned by another active request"
+            );
+            SessionRouteReservationDecision::Busy
+        }
+        Ok(SessionRouteReservationAccess::None) => SessionRouteReservationDecision::None,
+        Err(error) => {
+            tracing::warn!(
+                session_id,
+                error = %error,
+                "failed to read in-memory session route reservation"
+            );
+            SessionRouteReservationDecision::Failed
+        }
+    }
+}
+
+fn apply_matching_session_affinity(
+    template: &RoutePlanTemplate,
+    route_graph_key: &str,
+    runtime: &mut RoutePlanRuntimeState,
+    affinity: SessionRouteAffinity,
+) -> bool {
+    if affinity.route_graph_key != route_graph_key
+        || !template.contains_provider_endpoint(
+            &affinity.provider_endpoint,
+            affinity.upstream_base_url.as_str(),
+        )
+    {
+        return false;
+    }
+    runtime.set_affinity_provider_endpoint_with_observed_at(
+        Some(affinity.provider_endpoint),
+        Some(affinity.last_selected_at_ms),
+        Some(affinity.last_changed_at_ms),
+    );
+    true
 }
 
 pub(super) fn prepare_session_route_affinity_success(
+    request_id: u64,
     session_id: Option<&str>,
     session_identity_source: Option<SessionIdentitySource>,
     route_graph_key: Option<&str>,
@@ -112,23 +191,41 @@ pub(super) fn prepare_session_route_affinity_success(
     route_attempts: &[RouteAttemptLog],
     route_attempt_index: usize,
 ) -> Option<SessionRouteAffinitySuccess> {
+    let (session_id, target) = session_route_affinity_target(
+        session_id,
+        session_identity_source,
+        route_graph_key,
+        target,
+    )?;
+    let reason_hint = route_affinity_change_reason(route_attempts, route_attempt_index);
+    Some(SessionRouteAffinitySuccess {
+        request_id,
+        session_id,
+        target,
+        reason_hint,
+    })
+}
+
+fn session_route_affinity_target(
+    session_id: Option<&str>,
+    session_identity_source: Option<SessionIdentitySource>,
+    route_graph_key: Option<&str>,
+    target: &CapturedRouteCandidate,
+) -> Option<(String, SessionRouteAffinityTarget)> {
     let session_id = session_id
         .map(str::trim)
         .filter(|value| !value.is_empty())?;
     let route_graph_key = route_graph_key?;
-    let target = SessionRouteAffinityTarget {
-        route_graph_key: route_graph_key.to_string(),
-        session_identity_source,
-        provider_endpoint: target.provider_endpoint().clone(),
-        upstream_base_url: target.base_url().to_owned(),
-        route_path: target.route_path().to_vec(),
-    };
-    let reason_hint = route_affinity_change_reason(route_attempts, route_attempt_index);
-    Some(SessionRouteAffinitySuccess {
-        session_id: session_id.to_string(),
-        target,
-        reason_hint,
-    })
+    Some((
+        session_id.to_string(),
+        SessionRouteAffinityTarget {
+            route_graph_key: route_graph_key.to_string(),
+            session_identity_source,
+            provider_endpoint: target.provider_endpoint().clone(),
+            upstream_base_url: target.base_url().to_owned(),
+            route_path: target.route_path().to_vec(),
+        },
+    ))
 }
 
 fn route_affinity_change_reason(

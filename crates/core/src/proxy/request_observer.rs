@@ -8,6 +8,7 @@ use crate::logging::{
 use crate::runtime_store::AttemptHandle;
 use crate::state::{
     FinishRequestParams, ProxyState, RouteDecisionProvenance, SessionIdentitySource,
+    SessionRouteAffinitySuccess,
 };
 use crate::usage::UsageMetrics;
 
@@ -101,6 +102,7 @@ impl RequestObserver {
             retry,
             http_debug,
             streaming,
+            route_affinity_success,
         } = publication;
 
         let finish = FinishRequestParams {
@@ -116,10 +118,19 @@ impl RequestObserver {
             ttfb_ms,
             streaming,
         };
-        let published = if include_in_economics {
-            self.state.finish_request(finish).await
-        } else {
-            self.state.finish_non_economic_request(finish).await
+        let published = match (include_in_economics, route_affinity_success) {
+            (true, Some(success)) => {
+                self.state
+                    .finish_request_with_session_route_affinity(finish, success)
+                    .await
+            }
+            (false, Some(success)) => {
+                self.state
+                    .finish_non_economic_request_with_session_route_affinity(finish, success)
+                    .await
+            }
+            (true, None) => self.state.finish_request(finish).await,
+            (false, None) => self.state.finish_non_economic_request(finish).await,
         };
         if !published {
             return false;
@@ -177,6 +188,7 @@ pub(super) struct RequestPublication {
     pub(super) retry: Option<RetryInfo>,
     pub(super) http_debug: Option<HttpDebugLog>,
     pub(super) streaming: bool,
+    pub(super) route_affinity_success: Option<SessionRouteAffinitySuccess>,
 }
 
 impl RequestPublication {
@@ -211,6 +223,7 @@ impl RequestPublication {
             retry: None,
             http_debug: None,
             streaming,
+            route_affinity_success: None,
         }
     }
 

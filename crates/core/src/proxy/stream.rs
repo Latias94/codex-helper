@@ -34,8 +34,8 @@ use super::provider_evidence::{ResponseEvidenceParams, response_evidence_from_cl
 use super::request_body::merge_response_metadata_from_value;
 use super::request_observer::{RequestObserver, RequestPublication, RequestPublicationGate};
 use super::retry::response_penalty_cooldown_secs;
-use super::route_affinity::SessionRouteAffinitySuccess;
 use crate::routing_ir::CapturedRouteCandidate;
+use crate::state::SessionRouteAffinitySuccess;
 
 fn stream_buffer_max_bytes() -> usize {
     static MAX: OnceLock<usize> = OnceLock::new();
@@ -559,7 +559,7 @@ impl StreamFinalizeWork {
             attempt_outcome,
             attempt_succeeded,
             observer,
-            publication,
+            mut publication,
             health_update,
             service_name,
             target_for_health,
@@ -580,6 +580,9 @@ impl StreamFinalizeWork {
                 "failed to commit durable streaming attempt terminal"
             );
             return false;
+        }
+        if attempt_succeeded {
+            publication.route_affinity_success = route_affinity_success;
         }
         if !observer.publish_terminal_once(publication).await {
             tracing::error!(
@@ -622,9 +625,6 @@ impl StreamFinalizeWork {
                 .await;
             }
             None => {}
-        }
-        if attempt_succeeded && let Some(route_affinity_success) = route_affinity_success {
-            route_affinity_success.publish(state.as_ref()).await;
         }
         true
     }

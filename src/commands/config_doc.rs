@@ -136,6 +136,7 @@ pub(super) fn routing_policy_label(policy: RouteStrategy) -> &'static str {
     match policy {
         RouteStrategy::ManualSticky => "manual-sticky",
         RouteStrategy::OrderedFailover => "ordered-failover",
+        RouteStrategy::RoundRobin => "round-robin",
         RouteStrategy::TagPreferred => "tag-preferred",
         RouteStrategy::Conditional => "conditional",
     }

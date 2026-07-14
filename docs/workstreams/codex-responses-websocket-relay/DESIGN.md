@@ -1,7 +1,14 @@
 # Codex Responses WebSocket Relay — Design
 
-Status: Active
+Status: Historical (superseded by the canonical relay runtime on 2026-07-13)
 Last updated: 2026-05-19
+
+> This document records the original client-patch WebSocket design. The
+> `codex.client_patch.responses_websocket` setting and matching switch option
+> were removed. Current WebSocket behavior is selected from canonical
+> provider/endpoint capabilities and runtime routing. See
+> [Configuration](../../CONFIGURATION.md) and the
+> [canonical relay runtime modernization plan](../../plans/2026-07-10-002-refactor-canonical-relay-runtime-modernization-plan.md).
 
 ## Problem
 
@@ -135,4 +142,3 @@ Request logs should show:
 
 Ship behind explicit presets only. Keep HTTP-only official presets as the recommended stable path unless
 the relay is known to support Responses WebSocket v2.
-

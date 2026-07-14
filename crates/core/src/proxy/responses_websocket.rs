@@ -58,7 +58,11 @@ use super::request_preparation::{
     prepare_common_request_without_route_plan,
 };
 use super::retry::{RetryPlan, retry_info_for_failed_attempts, retry_info_for_observed_attempts};
-use super::route_affinity::record_session_route_affinity_success;
+use super::route_affinity::{
+    SessionRouteReservationDecision, apply_session_route_reservation_to_runtime,
+    claim_session_route_reservation, lock_session_route_reservation_selection,
+    prepare_session_route_affinity_success,
+};
 use super::route_attempts::{
     ErrorRouteAttemptParams, RouteAttemptErrorKind, StartRouteAttemptParams,
     StatusRouteAttemptParams, record_error_route_attempt, record_status_route_attempt,
@@ -207,7 +211,9 @@ pub(super) async fn handle_responses_websocket(
         }
     };
 
-    let _ = proxy.config.maybe_reload_from_disk().await;
+    if proxy.config.maybe_reload_from_disk().await {
+        super::control_plane_service::prune_runtime_observability_after_reload(&proxy).await;
+    }
     let runtime_snapshot = proxy.config.capture().await;
     let route =
         match prepare_responses_websocket_handshake_route(&proxy, runtime_snapshot, &headers).await
@@ -1000,7 +1006,9 @@ async fn relay_websocket_streams(
                     prepared: &prepared,
                     attempt_scope: &attempt_scope,
                     target: route.target.clone(),
-                    route_graph_key: Some(route.route_graph_key.clone()),
+                    route_graph_key: (route.route_template.affinity_policy
+                        != crate::config::RouteAffinityPolicy::Off)
+                        .then(|| route.route_graph_key.clone()),
                     avoided_indices: route.avoided_indices.clone(),
                     avoided_total: route.avoided_total,
                     total_upstreams: route.total_upstreams,
@@ -1363,7 +1371,13 @@ async fn websocket_bound_candidate_is_current(
     route: &ResponsesWebSocketHandshakeRoute,
     prepared: &ResponsesWebSocketPrepared,
 ) -> bool {
-    let runtime = route_graph_runtime_for_request(
+    let reservation_guard =
+        if route.route_template.affinity_policy != crate::config::RouteAffinityPolicy::Off {
+            lock_session_route_reservation_selection(proxy, prepared.session_id.as_deref()).await
+        } else {
+            None
+        };
+    let mut runtime = route_graph_runtime_for_request(
         proxy,
         route.route_template.as_ref(),
         route.route_revision,
@@ -1371,6 +1385,24 @@ async fn websocket_bound_candidate_is_current(
         prepared.session_id.as_deref(),
     )
     .await;
+    if reservation_guard.is_some() {
+        match apply_session_route_reservation_to_runtime(
+            proxy,
+            prepared.request_id,
+            prepared.session_id.as_deref(),
+            route.route_template.as_ref(),
+            Some(route.route_graph_key.as_str()),
+            &mut runtime,
+        )
+        .await
+        {
+            SessionRouteReservationDecision::Busy | SessionRouteReservationDecision::Failed => {
+                return false;
+            }
+            SessionRouteReservationDecision::None
+            | SessionRouteReservationDecision::Available(_) => {}
+        }
+    }
     let provider_endpoint = route
         .route_template
         .candidate_provider_endpoint_key(route.target.candidate());
@@ -1404,6 +1436,34 @@ async fn websocket_bound_candidate_is_current(
             return false;
         }
     }
+    if reservation_guard.is_some() {
+        match claim_session_route_reservation(
+            proxy,
+            prepared.request_id,
+            prepared.session_id.as_deref(),
+            prepared.session_identity_source,
+            Some(route.route_graph_key.as_str()),
+            &route.target,
+        )
+        .await
+        {
+            SessionRouteReservationDecision::Available(claimed) => {
+                if claimed.provider_endpoint != provider_endpoint {
+                    return false;
+                }
+                runtime.set_affinity_provider_endpoint_with_observed_at(
+                    Some(claimed.provider_endpoint),
+                    Some(claimed.last_selected_at_ms),
+                    Some(claimed.last_changed_at_ms),
+                );
+            }
+            SessionRouteReservationDecision::Busy | SessionRouteReservationDecision::Failed => {
+                return false;
+            }
+            SessionRouteReservationDecision::None => {}
+        }
+    }
+    drop(reservation_guard);
     let validation_runtime = runtime_for_acquired_candidate_revalidation(
         route.route_template.as_ref(),
         &runtime,
@@ -1487,6 +1547,15 @@ async fn finish_websocket_success(
     publication.usage = terminal_body.and_then(crate::usage::extract_usage_from_bytes);
     publication.route_decision = Some(selected.route_decision.clone());
     publication.retry = retry;
+    publication.route_affinity_success = prepare_session_route_affinity_success(
+        prepared.request_id,
+        prepared.session_id.as_deref(),
+        prepared.session_identity_source,
+        selected.route_graph_key.as_deref(),
+        &selected.target,
+        &selected.route_attempts,
+        selected.route_attempt_index,
+    );
     let observer = RequestObserver::new(proxy, &prepared.method, prepared.uri.path());
     let publication = publication.with_route_decision_model();
     if let Err(error) = proxy.state.finish_upstream_attempt(
@@ -1514,16 +1583,6 @@ async fn finish_websocket_success(
     }
 
     record_attempt_success(proxy.state.as_ref(), proxy.service_name, &selected.target).await;
-    record_session_route_affinity_success(
-        proxy,
-        prepared.session_id.as_deref(),
-        prepared.session_identity_source,
-        selected.route_graph_key.as_deref(),
-        &selected.target,
-        &selected.route_attempts,
-        selected.route_attempt_index,
-    )
-    .await;
     true
 }
 

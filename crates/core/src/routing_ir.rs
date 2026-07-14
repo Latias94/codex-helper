@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
@@ -774,6 +774,82 @@ impl<'a> RoutePlanExecutor<'a> {
         )
     }
 
+    /// Revalidate an already selected candidate after waiting for a local
+    /// concurrency permit without running the scheduler a second time.
+    ///
+    /// Re-selection would advance the process-wide weighted round-robin cursor
+    /// and make admission itself change the distribution. The permit holder is
+    /// therefore checked directly against the refreshed runtime snapshot.
+    pub fn candidate_is_valid_after_runtime_update(
+        &self,
+        state: &RoutePlanAttemptState,
+        runtime: &RoutePlanRuntimeState,
+        candidate: &RouteCandidate,
+        request_model: Option<&str>,
+        affinity_policy: RouteAffinityPolicy,
+    ) -> bool {
+        let available = self
+            .template
+            .candidates
+            .iter()
+            .filter(|candidate| {
+                !state.avoids_candidate(self.template, candidate)
+                    && request_model.is_none_or(|model| candidate_supports_model(candidate, model))
+                    && candidate_available_in_runtime(self.template, runtime, candidate)
+            })
+            .collect::<Vec<_>>();
+        if !available.iter().any(|available| {
+            candidate_provider_endpoint_key(self.template, available)
+                == candidate_provider_endpoint_key(self.template, candidate)
+        }) {
+            return false;
+        }
+
+        let best_group = available
+            .iter()
+            .map(|candidate| candidate.preference_group)
+            .min();
+        let matches_candidate = |other: &RouteCandidate| {
+            candidate_provider_endpoint_key(self.template, other)
+                == candidate_provider_endpoint_key(self.template, candidate)
+        };
+
+        match affinity_policy {
+            RouteAffinityPolicy::Off => best_group == Some(candidate.preference_group),
+            RouteAffinityPolicy::PreferredGroup => {
+                best_group == Some(candidate.preference_group)
+                    && affinity_candidate_in_group(
+                        self.template,
+                        runtime,
+                        &available,
+                        candidate.preference_group,
+                    )
+                    .is_none_or(matches_candidate)
+            }
+            RouteAffinityPolicy::FallbackSticky => {
+                let affinity =
+                    affinity_candidate(self.template, runtime, &available).filter(|affinity| {
+                        fallback_affinity_within_configured_window(
+                            self.template,
+                            runtime,
+                            &available,
+                        ) || best_group.is_none_or(|best| best >= affinity.preference_group)
+                    });
+                affinity.map_or_else(
+                    || best_group == Some(candidate.preference_group),
+                    matches_candidate,
+                )
+            }
+            RouteAffinityPolicy::Hard => {
+                if let Some(affinity) = affinity_candidate(self.template, runtime, &available) {
+                    matches_candidate(affinity)
+                } else {
+                    best_group == Some(candidate.preference_group)
+                }
+            }
+        }
+    }
+
     fn select_supported_candidate_with_affinity_mode(
         &self,
         state: &mut RoutePlanAttemptState,
@@ -795,7 +871,8 @@ impl<'a> RoutePlanExecutor<'a> {
                 };
             }
 
-            let Some(candidate) = self.next_unavoided_candidate(state, runtime, affinity_mode)
+            let Some(candidate) =
+                self.next_unavoided_candidate(state, runtime, affinity_mode, request_model)
             else {
                 return RoutePlanAttemptSelection {
                     selected: None,
@@ -914,6 +991,7 @@ impl<'a> RoutePlanExecutor<'a> {
         state: &RoutePlanAttemptState,
         runtime: &RoutePlanRuntimeState,
         affinity_mode: RoutePlanAffinitySelectionMode,
+        request_model: Option<&str>,
     ) -> Option<&'a RouteCandidate> {
         let route_candidates = self
             .template
@@ -927,6 +1005,7 @@ impl<'a> RoutePlanExecutor<'a> {
             runtime,
             &route_candidates,
             affinity_mode,
+            request_model,
         )
     }
 
@@ -940,27 +1019,40 @@ fn best_candidate_by_affinity_selection_mode<'a>(
     runtime: &RoutePlanRuntimeState,
     candidates: &[&'a RouteCandidate],
     affinity_mode: RoutePlanAffinitySelectionMode,
+    request_model: Option<&str>,
 ) -> Option<&'a RouteCandidate> {
     let affinity_policy = affinity_policy_for_selection(template.affinity_policy, affinity_mode);
     match affinity_policy {
         RouteAffinityPolicy::Off => {
-            first_candidate_in_best_preference_group(template, runtime, candidates)
+            first_candidate_in_best_preference_group(template, runtime, candidates, request_model)
         }
         RouteAffinityPolicy::PreferredGroup => {
-            best_candidate_in_preference_group(template, runtime, candidates)
+            best_candidate_in_preference_group(template, runtime, candidates, request_model)
         }
         RouteAffinityPolicy::FallbackSticky => affinity_candidate(template, runtime, candidates)
             .filter(|candidate| {
                 fallback_affinity_within_configured_window(template, runtime, candidates)
-                    || first_candidate_in_best_preference_group(template, runtime, candidates)
-                        .is_none_or(|best| best.preference_group >= candidate.preference_group)
+                    || best_available_preference_group(template, runtime, candidates)
+                        .is_none_or(|best_group| best_group >= candidate.preference_group)
             })
-            .or_else(|| first_candidate_in_best_preference_group(template, runtime, candidates)),
+            .or_else(|| {
+                first_candidate_in_best_preference_group(
+                    template,
+                    runtime,
+                    candidates,
+                    request_model,
+                )
+            }),
         RouteAffinityPolicy::Hard => {
             if runtime.affinity_provider_endpoint().is_some() {
                 affinity_candidate(template, runtime, candidates)
             } else {
-                first_candidate_in_best_preference_group(template, runtime, candidates)
+                first_candidate_in_best_preference_group(
+                    template,
+                    runtime,
+                    candidates,
+                    request_model,
+                )
             }
         }
     }
@@ -982,40 +1074,215 @@ fn first_candidate_in_best_preference_group<'a>(
     template: &RoutePlanTemplate,
     runtime: &RoutePlanRuntimeState,
     candidates: &[&'a RouteCandidate],
+    request_model: Option<&str>,
 ) -> Option<&'a RouteCandidate> {
-    let best_group = candidates
-        .iter()
-        .copied()
-        .filter(|candidate| candidate_available_in_runtime(template, runtime, candidate))
-        .map(|candidate| candidate.preference_group)
-        .min()?;
+    let best_group = best_available_preference_group(template, runtime, candidates)?;
 
-    candidates.iter().copied().find(|candidate| {
+    let best_group_candidates = candidates.iter().copied().filter(|candidate| {
         candidate.preference_group == best_group
             && candidate_available_in_runtime(template, runtime, candidate)
-    })
+    });
+    let best_group_candidates = best_group_candidates.collect::<Vec<_>>();
+    weighted_round_robin_candidate(
+        template,
+        runtime,
+        best_group,
+        &best_group_candidates,
+        request_model,
+    )
+    .or_else(|| best_group_candidates.into_iter().next())
 }
 
 fn best_candidate_in_preference_group<'a>(
     template: &RoutePlanTemplate,
     runtime: &RoutePlanRuntimeState,
     candidates: &[&'a RouteCandidate],
+    request_model: Option<&str>,
 ) -> Option<&'a RouteCandidate> {
-    let best_group = candidates
-        .iter()
-        .copied()
-        .filter(|candidate| candidate_available_in_runtime(template, runtime, candidate))
-        .map(|candidate| candidate.preference_group)
-        .min()?;
+    let best_group = best_available_preference_group(template, runtime, candidates)?;
 
     if let Some(candidate) = affinity_candidate_in_group(template, runtime, candidates, best_group)
     {
         return Some(candidate);
     }
 
-    candidates.iter().copied().find(|candidate| {
+    let best_group_candidates = candidates.iter().copied().filter(|candidate| {
         candidate.preference_group == best_group
             && candidate_available_in_runtime(template, runtime, candidate)
+    });
+    let best_group_candidates = best_group_candidates.collect::<Vec<_>>();
+    weighted_round_robin_candidate(
+        template,
+        runtime,
+        best_group,
+        &best_group_candidates,
+        request_model,
+    )
+    .or_else(|| best_group_candidates.into_iter().next())
+}
+
+fn best_available_preference_group(
+    template: &RoutePlanTemplate,
+    runtime: &RoutePlanRuntimeState,
+    candidates: &[&RouteCandidate],
+) -> Option<u32> {
+    candidates
+        .iter()
+        .copied()
+        .filter(|candidate| candidate_available_in_runtime(template, runtime, candidate))
+        .map(|candidate| candidate.preference_group)
+        .min()
+}
+
+const MAX_ROUND_ROBIN_CURSOR_KEYS: usize = 4096;
+
+#[derive(Debug, Default)]
+struct WeightedRoundRobinCursor {
+    scores: BTreeMap<String, i128>,
+    member_offsets: BTreeMap<String, usize>,
+}
+
+type RoundRobinCursorKey = (String, u32, Vec<usize>);
+
+static ROUND_ROBIN_CURSORS: OnceLock<
+    Mutex<BTreeMap<RoundRobinCursorKey, WeightedRoundRobinCursor>>,
+> = OnceLock::new();
+
+fn weighted_round_robin_candidate<'a>(
+    template: &RoutePlanTemplate,
+    runtime: &RoutePlanRuntimeState,
+    preference_group: u32,
+    candidates: &[&'a RouteCandidate],
+    request_model: Option<&str>,
+) -> Option<&'a RouteCandidate> {
+    let eligible = candidates
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            candidate_uses_round_robin(template, candidate)
+                && request_model.is_none_or(|model| candidate_supports_model(candidate, model))
+        })
+        .collect::<Vec<_>>();
+    if eligible.is_empty() {
+        return None;
+    }
+    let eligible_signature = eligible
+        .iter()
+        .map(|candidate| candidate.stable_index)
+        .collect::<Vec<_>>();
+
+    let mut entities = Vec::<(String, Vec<&RouteCandidate>, u64)>::new();
+    let mut entity_indices = BTreeMap::<String, usize>::new();
+    for candidate in eligible {
+        let entity_key = round_robin_capacity_scope_key(template, candidate);
+        if let Some(index) = entity_indices.get(&entity_key).copied() {
+            entities[index].1.push(candidate);
+        } else {
+            entity_indices.insert(entity_key.clone(), entities.len());
+            entities.push((entity_key, vec![candidate], 0));
+        }
+    }
+    for (_, candidates, weight) in &mut entities {
+        *weight = candidates
+            .iter()
+            .map(|candidate| round_robin_candidate_weight(template, runtime, candidate))
+            .min()
+            .unwrap_or(0);
+    }
+    if entities.iter().any(|(_, _, weight)| *weight > 0) {
+        entities.retain(|(_, _, weight)| *weight > 0);
+    } else {
+        for (_, _, weight) in &mut entities {
+            *weight = 1;
+        }
+    }
+    let total_weight = entities
+        .iter()
+        .map(|(_, _, weight)| *weight)
+        .fold(0_u64, u64::saturating_add);
+
+    let route_graph_key = template.route_graph_key();
+    let key = (route_graph_key, preference_group, eligible_signature);
+    let cursors = ROUND_ROBIN_CURSORS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut cursors = cursors
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !cursors.contains_key(&key)
+        && cursors.len() >= MAX_ROUND_ROBIN_CURSOR_KEYS
+        && let Some(oldest_key) = cursors.keys().next().cloned()
+    {
+        cursors.remove(&oldest_key);
+    }
+    let cursor = cursors.entry(key).or_default();
+    let eligible_keys = entities
+        .iter()
+        .map(|(key, _, _)| key.clone())
+        .collect::<BTreeSet<_>>();
+    cursor.scores.retain(|key, _| eligible_keys.contains(key));
+    cursor
+        .member_offsets
+        .retain(|key, _| eligible_keys.contains(key));
+
+    let mut selected_index = None;
+    let mut selected_score = i128::MIN;
+    for (index, (entity_key, _, weight)) in entities.iter().enumerate() {
+        let score = cursor.scores.entry(entity_key.clone()).or_default();
+        *score = score.saturating_add(i128::from(*weight));
+        let score = *score;
+        if score > selected_score {
+            selected_score = score;
+            selected_index = Some(index);
+        }
+    }
+
+    let selected_index = selected_index?;
+    let (selected_key, members, _) = &entities[selected_index];
+    if let Some(score) = cursor.scores.get_mut(selected_key) {
+        *score = score.saturating_sub(i128::from(total_weight));
+    }
+    let member_offset = cursor
+        .member_offsets
+        .entry(selected_key.clone())
+        .or_default();
+    let selected = members[*member_offset % members.len()];
+    *member_offset = member_offset.wrapping_add(1);
+    Some(selected)
+}
+
+fn round_robin_capacity_scope_key(
+    template: &RoutePlanTemplate,
+    candidate: &RouteCandidate,
+) -> String {
+    let provider_endpoint = candidate_provider_endpoint_key(template, candidate);
+    candidate
+        .concurrency
+        .limit_key(template.service_name.as_str(), &provider_endpoint)
+        .unwrap_or_else(|| format!("unlimited:{}", provider_endpoint.stable_key()))
+}
+
+fn round_robin_candidate_weight(
+    template: &RoutePlanTemplate,
+    runtime: &RoutePlanRuntimeState,
+    candidate: &RouteCandidate,
+) -> u64 {
+    let key = candidate_provider_endpoint_key(template, candidate);
+    let runtime = runtime.provider_endpoint(&key);
+    let Some(limit) = runtime
+        .concurrency_limit
+        .or(candidate.concurrency.max_concurrent_requests)
+    else {
+        return 1;
+    };
+    let active = runtime.concurrency_active.unwrap_or(0);
+    u64::from(limit.saturating_sub(active))
+}
+
+fn candidate_uses_round_robin(template: &RoutePlanTemplate, candidate: &RouteCandidate) -> bool {
+    candidate.route_path.iter().any(|route_name| {
+        template
+            .nodes
+            .get(route_name)
+            .is_some_and(|node| node.strategy == RouteStrategy::RoundRobin)
     })
 }
 
@@ -1624,6 +1891,9 @@ fn expand_route_node(
         RouteStrategy::OrderedFailover => {
             expand_ordered_route_children(service_name, view, routing, &frame, expansion, stack)
         }
+        RouteStrategy::RoundRobin => {
+            expand_round_robin_route_children(service_name, view, routing, &frame, expansion, stack)
+        }
         RouteStrategy::ManualSticky => {
             expand_manual_sticky_route(service_name, view, routing, &frame, expansion, stack)
         }
@@ -1666,6 +1936,46 @@ fn expand_ordered_route_children(
             stack,
         )?;
         append_compacted_preference_groups(&mut leaves, &mut next_preference_group, child_leaves);
+    }
+    Ok(leaves)
+}
+
+fn expand_round_robin_route_children(
+    service_name: &str,
+    view: &ServiceRouteConfig,
+    routing: &RouteGraphConfig,
+    frame: &RouteExpansionFrame<'_>,
+    expansion: &RouteExpansionContext<'_>,
+    stack: &mut Vec<String>,
+) -> Result<Vec<RouteLeaf>> {
+    if frame.node.children.is_empty() {
+        anyhow::bail!(
+            "[{service_name}] round-robin route '{}' requires at least one child",
+            frame.route_name
+        );
+    }
+
+    // Each child contributes its own best group to the shared round-robin group.
+    // Relative fallback groups remain intact, so a saturated/failed primary can
+    // still progress to the next group without changing ordered-failover behavior.
+    let mut leaves = Vec::new();
+    for child_name in &frame.node.children {
+        let mut child_leaves = expand_route_ref(
+            service_name,
+            view,
+            routing,
+            child_name.as_str(),
+            frame.node_path,
+            expansion,
+            stack,
+        )?;
+        let Some(min_group) = child_leaves.iter().map(|leaf| leaf.preference_group).min() else {
+            continue;
+        };
+        for leaf in &mut child_leaves {
+            leaf.preference_group = leaf.preference_group.saturating_sub(min_group);
+        }
+        leaves.extend(child_leaves);
     }
     Ok(leaves)
 }
@@ -2168,9 +2478,6 @@ fn encode_affinity_route_candidate(
     digest.u32(candidate.preference_group);
     digest.text("stable_index");
     digest.length(candidate.stable_index);
-    digest.text("concurrency");
-    digest.optional_u32(candidate.concurrency.max_concurrent_requests);
-    digest.optional_text(candidate.concurrency.limit_group.as_deref());
 }
 
 fn static_route_graph_digest(
@@ -2326,6 +2633,7 @@ fn routing_policy_name(policy: RouteStrategy) -> &'static str {
     match policy {
         RouteStrategy::ManualSticky => "manual-sticky",
         RouteStrategy::OrderedFailover => "ordered-failover",
+        RouteStrategy::RoundRobin => "round-robin",
         RouteStrategy::TagPreferred => "tag-preferred",
         RouteStrategy::Conditional => "conditional",
     }
@@ -2611,6 +2919,21 @@ mod tests {
         }
     }
 
+    fn limited_provider_in_group(
+        base_url: &str,
+        max_concurrent_requests: u32,
+        limit_group: &str,
+    ) -> ProviderConfig {
+        ProviderConfig {
+            base_url: Some(base_url.to_string()),
+            limits: ProviderConcurrencyLimits {
+                max_concurrent_requests: Some(max_concurrent_requests),
+                limit_group: Some(limit_group.to_string()),
+            },
+            ..ProviderConfig::default()
+        }
+    }
+
     fn provider_ids(template: &RoutePlanTemplate) -> Vec<String> {
         template
             .candidates
@@ -2756,8 +3079,39 @@ mod tests {
         );
         assert_eq!(
             balanced_template.route_graph_key(),
-            "route:v1:sha256:a855e923223535494f8d94ed9b420101e51266cddb49c43c96782e4c9827dde8"
+            "route:v1:sha256:4201ef95b7971ae81af4daff01e413ff60705d1127a9621b6129ca0010abdd9f"
         );
+    }
+
+    #[test]
+    fn route_graph_key_ignores_local_concurrency_policy() {
+        let route = |limit, limit_group: Option<&str>| ServiceRouteConfig {
+            providers: BTreeMap::from([(
+                "relay".to_string(),
+                ProviderConfig {
+                    base_url: Some("https://relay.example/v1".to_string()),
+                    limits: ProviderConcurrencyLimits {
+                        max_concurrent_requests: Some(limit),
+                        limit_group: limit_group.map(str::to_string),
+                    },
+                    ..ProviderConfig::default()
+                },
+            )]),
+            ..ServiceRouteConfig::default()
+        };
+
+        let original = compile_route_plan_template("codex", &route(20, None))
+            .expect("original route template")
+            .route_graph_key();
+        let raised = compile_route_plan_template("codex", &route(25, None))
+            .expect("raised-limit route template")
+            .route_graph_key();
+        let grouped = compile_route_plan_template("codex", &route(25, Some("relay-account")))
+            .expect("grouped route template")
+            .route_graph_key();
+
+        assert_eq!(original, raised);
+        assert_eq!(original, grouped);
     }
 
     #[test]
@@ -5197,5 +5551,545 @@ mod tests {
 
         assert_eq!(next_selected.candidate.provider_id, "second");
         assert_eq!(next.avoided_candidate_indices, vec![0]);
+    }
+
+    #[test]
+    fn round_robin_uses_concurrency_capacity_as_weight() {
+        let view = ServiceRouteConfig {
+            providers: BTreeMap::from([
+                (
+                    "input".to_string(),
+                    limited_provider("https://rr-input.example/v1", 20),
+                ),
+                (
+                    "ciii".to_string(),
+                    limited_provider("https://rr-ciii.example/v1", 15),
+                ),
+            ]),
+            routing: Some(RouteGraphConfig::round_robin(vec![
+                "input".to_string(),
+                "ciii".to_string(),
+            ])),
+            ..ServiceRouteConfig::default()
+        };
+        let template = compile_route_plan_template("codex", &view).expect("route template");
+        assert_eq!(
+            provider_preference_groups(&template),
+            vec![("input".to_string(), 0), ("ciii".to_string(), 0)]
+        );
+        let executor = RoutePlanExecutor::new(&template);
+        let runtime = RoutePlanRuntimeState::default();
+        let mut counts = BTreeMap::<String, usize>::new();
+
+        for _ in 0..350 {
+            let selection = executor.select_supported_candidate_with_runtime_state(
+                &mut RoutePlanAttemptState::default(),
+                &runtime,
+                None,
+            );
+            let provider_id = selection
+                .selected
+                .expect("round-robin candidate")
+                .candidate
+                .provider_id
+                .clone();
+            *counts.entry(provider_id).or_default() += 1;
+        }
+
+        assert_eq!(counts.get("input"), Some(&200));
+        assert_eq!(counts.get("ciii"), Some(&150));
+    }
+
+    #[test]
+    fn round_robin_isolates_cursors_by_model_eligibility() {
+        let mut input = limited_provider("https://rr-model-input.example/v1", 20);
+        input.supported_models = BTreeMap::from([
+            ("model-shared".to_string(), true),
+            ("model-input-only".to_string(), true),
+        ]);
+        let mut ciii = limited_provider("https://rr-model-ciii.example/v1", 15);
+        ciii.supported_models = BTreeMap::from([("model-shared".to_string(), true)]);
+        let view = ServiceRouteConfig {
+            providers: BTreeMap::from([("input".to_string(), input), ("ciii".to_string(), ciii)]),
+            routing: Some(RouteGraphConfig::round_robin(vec![
+                "input".to_string(),
+                "ciii".to_string(),
+            ])),
+            ..ServiceRouteConfig::default()
+        };
+        let template = compile_route_plan_template("codex", &view).expect("route template");
+        let executor = RoutePlanExecutor::new(&template);
+        let runtime = RoutePlanRuntimeState::default();
+        let mut shared_counts = BTreeMap::<String, usize>::new();
+
+        for _ in 0..350 {
+            let shared = executor.select_supported_candidate_with_runtime_state(
+                &mut RoutePlanAttemptState::default(),
+                &runtime,
+                Some("model-shared"),
+            );
+            let provider_id = shared
+                .selected
+                .expect("shared-model round-robin candidate")
+                .candidate
+                .provider_id
+                .clone();
+            *shared_counts.entry(provider_id).or_default() += 1;
+
+            let input_only = executor.select_supported_candidate_with_runtime_state(
+                &mut RoutePlanAttemptState::default(),
+                &runtime,
+                Some("model-input-only"),
+            );
+            assert_eq!(
+                input_only
+                    .selected
+                    .expect("input-only candidate")
+                    .candidate
+                    .provider_id,
+                "input"
+            );
+        }
+
+        assert_eq!(shared_counts.get("input"), Some(&200));
+        assert_eq!(shared_counts.get("ciii"), Some(&150));
+    }
+
+    #[test]
+    fn round_robin_uses_remaining_active_capacity_as_weight() {
+        let view = ServiceRouteConfig {
+            providers: BTreeMap::from([
+                (
+                    "input".to_string(),
+                    limited_provider("https://rr-active-input.example/v1", 20),
+                ),
+                (
+                    "ciii".to_string(),
+                    limited_provider("https://rr-active-ciii.example/v1", 15),
+                ),
+            ]),
+            routing: Some(RouteGraphConfig::round_robin(vec![
+                "input".to_string(),
+                "ciii".to_string(),
+            ])),
+            ..ServiceRouteConfig::default()
+        };
+        let template = compile_route_plan_template("codex", &view).expect("route template");
+        let executor = RoutePlanExecutor::new(&template);
+        let mut runtime = RoutePlanRuntimeState::default();
+        runtime.set_provider_endpoint(
+            endpoint_key("codex", "input", "default"),
+            RoutePlanUpstreamRuntimeState {
+                concurrency_active: Some(10),
+                concurrency_limit: Some(20),
+                ..RoutePlanUpstreamRuntimeState::default()
+            },
+        );
+        runtime.set_provider_endpoint(
+            endpoint_key("codex", "ciii", "default"),
+            RoutePlanUpstreamRuntimeState {
+                concurrency_active: Some(0),
+                concurrency_limit: Some(15),
+                ..RoutePlanUpstreamRuntimeState::default()
+            },
+        );
+
+        let mut counts = BTreeMap::<String, usize>::new();
+        for _ in 0..250 {
+            let selection = executor.select_supported_candidate_with_runtime_state(
+                &mut RoutePlanAttemptState::default(),
+                &runtime,
+                None,
+            );
+            let provider_id = selection
+                .selected
+                .expect("round-robin candidate")
+                .candidate
+                .provider_id
+                .clone();
+            *counts.entry(provider_id).or_default() += 1;
+        }
+
+        assert_eq!(counts.get("input"), Some(&100));
+        assert_eq!(counts.get("ciii"), Some(&150));
+    }
+
+    #[test]
+    fn round_robin_uses_runtime_limit_after_config_is_lowered() {
+        let view = ServiceRouteConfig {
+            providers: BTreeMap::from([
+                (
+                    "input".to_string(),
+                    limited_provider("https://rr-lowered-input.example/v1", 20),
+                ),
+                (
+                    "ciii".to_string(),
+                    limited_provider("https://rr-lowered-ciii.example/v1", 15),
+                ),
+            ]),
+            routing: Some(RouteGraphConfig::round_robin(vec![
+                "input".to_string(),
+                "ciii".to_string(),
+            ])),
+            ..ServiceRouteConfig::default()
+        };
+        let template = compile_route_plan_template("codex", &view).expect("route template");
+        let executor = RoutePlanExecutor::new(&template);
+        let mut runtime = RoutePlanRuntimeState::default();
+        runtime.set_provider_endpoint(
+            endpoint_key("codex", "input", "default"),
+            RoutePlanUpstreamRuntimeState {
+                concurrency_active: Some(15),
+                concurrency_limit: Some(15),
+                ..RoutePlanUpstreamRuntimeState::default()
+            },
+        );
+        runtime.set_provider_endpoint(
+            endpoint_key("codex", "ciii", "default"),
+            RoutePlanUpstreamRuntimeState {
+                concurrency_active: Some(0),
+                concurrency_limit: Some(15),
+                ..RoutePlanUpstreamRuntimeState::default()
+            },
+        );
+
+        for _ in 0..30 {
+            let selection = executor.select_supported_candidate_with_runtime_state(
+                &mut RoutePlanAttemptState::default(),
+                &runtime,
+                None,
+            );
+            assert_eq!(
+                selection
+                    .selected
+                    .expect("remaining-capacity candidate")
+                    .candidate
+                    .provider_id,
+                "ciii"
+            );
+        }
+    }
+
+    #[test]
+    fn round_robin_counts_shared_limit_group_capacity_once() {
+        let view = ServiceRouteConfig {
+            providers: BTreeMap::from([
+                (
+                    "input-a".to_string(),
+                    limited_provider_in_group(
+                        "https://rr-shared-input-a.example/v1",
+                        20,
+                        "input-account",
+                    ),
+                ),
+                (
+                    "input-b".to_string(),
+                    limited_provider_in_group(
+                        "https://rr-shared-input-b.example/v1",
+                        20,
+                        "input-account",
+                    ),
+                ),
+                (
+                    "ciii".to_string(),
+                    limited_provider("https://rr-shared-ciii.example/v1", 15),
+                ),
+            ]),
+            routing: Some(RouteGraphConfig::round_robin(vec![
+                "input-a".to_string(),
+                "input-b".to_string(),
+                "ciii".to_string(),
+            ])),
+            ..ServiceRouteConfig::default()
+        };
+        let template = compile_route_plan_template("codex", &view).expect("route template");
+        let executor = RoutePlanExecutor::new(&template);
+        let runtime = RoutePlanRuntimeState::default();
+        let mut counts = BTreeMap::<String, usize>::new();
+
+        for _ in 0..350 {
+            let selection = executor.select_supported_candidate_with_runtime_state(
+                &mut RoutePlanAttemptState::default(),
+                &runtime,
+                None,
+            );
+            let provider_id = selection
+                .selected
+                .expect("round-robin candidate")
+                .candidate
+                .provider_id
+                .clone();
+            *counts.entry(provider_id).or_default() += 1;
+        }
+
+        assert_eq!(counts.get("input-a"), Some(&100));
+        assert_eq!(counts.get("input-b"), Some(&100));
+        assert_eq!(counts.get("ciii"), Some(&150));
+    }
+
+    #[test]
+    fn round_robin_prefers_positive_capacity_over_waiting_on_saturated_group() {
+        let view = ServiceRouteConfig {
+            providers: BTreeMap::from([
+                (
+                    "input".to_string(),
+                    limited_provider("https://rr-zero-input.example/v1", 20),
+                ),
+                (
+                    "ciii".to_string(),
+                    limited_provider("https://rr-zero-ciii.example/v1", 15),
+                ),
+            ]),
+            routing: Some(RouteGraphConfig::round_robin(vec![
+                "input".to_string(),
+                "ciii".to_string(),
+            ])),
+            ..ServiceRouteConfig::default()
+        };
+        let template = compile_route_plan_template("codex", &view).expect("route template");
+        let executor = RoutePlanExecutor::new(&template);
+        let mut runtime = RoutePlanRuntimeState::default();
+        runtime.set_provider_endpoint(
+            endpoint_key("codex", "input", "default"),
+            RoutePlanUpstreamRuntimeState {
+                concurrency_saturated: false,
+                concurrency_active: Some(20),
+                concurrency_limit: Some(20),
+                ..RoutePlanUpstreamRuntimeState::default()
+            },
+        );
+        runtime.set_provider_endpoint(
+            endpoint_key("codex", "ciii", "default"),
+            RoutePlanUpstreamRuntimeState {
+                concurrency_active: Some(0),
+                concurrency_limit: Some(15),
+                ..RoutePlanUpstreamRuntimeState::default()
+            },
+        );
+
+        for _ in 0..20 {
+            let selection = executor.select_supported_candidate_with_runtime_state(
+                &mut RoutePlanAttemptState::default(),
+                &runtime,
+                None,
+            );
+            assert_eq!(
+                selection
+                    .selected
+                    .expect("positive-capacity candidate")
+                    .candidate
+                    .provider_id,
+                "ciii"
+            );
+        }
+    }
+
+    #[test]
+    fn round_robin_skips_saturated_candidate() {
+        let view = ServiceRouteConfig {
+            providers: BTreeMap::from([
+                (
+                    "input".to_string(),
+                    limited_provider("https://rr-saturated-input.example/v1", 20),
+                ),
+                (
+                    "ciii".to_string(),
+                    limited_provider("https://rr-saturated-ciii.example/v1", 15),
+                ),
+            ]),
+            routing: Some(RouteGraphConfig::round_robin(vec![
+                "input".to_string(),
+                "ciii".to_string(),
+            ])),
+            ..ServiceRouteConfig::default()
+        };
+        let template = compile_route_plan_template("codex", &view).expect("route template");
+        let executor = RoutePlanExecutor::new(&template);
+        let mut runtime = RoutePlanRuntimeState::default();
+        runtime.set_provider_endpoint(
+            endpoint_key("codex", "input", "default"),
+            RoutePlanUpstreamRuntimeState {
+                concurrency_saturated: true,
+                concurrency_active: Some(20),
+                concurrency_limit: Some(20),
+                ..RoutePlanUpstreamRuntimeState::default()
+            },
+        );
+
+        for _ in 0..20 {
+            let selection = executor.select_supported_candidate_with_runtime_state(
+                &mut RoutePlanAttemptState::default(),
+                &runtime,
+                None,
+            );
+            assert_eq!(
+                selection
+                    .selected
+                    .expect("unsaturated round-robin candidate")
+                    .candidate
+                    .provider_id,
+                "ciii"
+            );
+        }
+    }
+
+    #[test]
+    fn round_robin_revalidation_does_not_advance_cursor() {
+        fn compile_round_robin_view(prefix: &str) -> RoutePlanTemplate {
+            let mut routing =
+                RouteGraphConfig::round_robin(vec!["input".to_string(), "ciii".to_string()]);
+            routing.affinity_policy = RouteAffinityPolicy::Off;
+            let view = ServiceRouteConfig {
+                providers: BTreeMap::from([
+                    (
+                        "input".to_string(),
+                        limited_provider(&format!("https://{prefix}-input.example/v1"), 1),
+                    ),
+                    (
+                        "ciii".to_string(),
+                        limited_provider(&format!("https://{prefix}-ciii.example/v1"), 1),
+                    ),
+                ]),
+                routing: Some(routing),
+                ..ServiceRouteConfig::default()
+            };
+            compile_route_plan_template("codex", &view).expect("route template")
+        }
+
+        let control_template = compile_round_robin_view("rr-control");
+        let control_executor = RoutePlanExecutor::new(&control_template);
+        let runtime = RoutePlanRuntimeState::default();
+        let mut control_state = RoutePlanAttemptState::default();
+        let control_first = control_executor
+            .select_supported_candidate_with_runtime_state(&mut control_state, &runtime, None)
+            .selected
+            .expect("control first candidate")
+            .candidate
+            .provider_id
+            .clone();
+        let control_second = control_executor
+            .select_supported_candidate_with_runtime_state(&mut control_state, &runtime, None)
+            .selected
+            .expect("control second candidate")
+            .candidate
+            .provider_id
+            .clone();
+
+        let subject_template = compile_round_robin_view("rr-revalidation");
+        let subject_executor = RoutePlanExecutor::new(&subject_template);
+        let mut subject_state = RoutePlanAttemptState::default();
+        let subject_first_selection = subject_executor
+            .select_supported_candidate_with_runtime_state(&mut subject_state, &runtime, None);
+        let subject_first = subject_first_selection
+            .selected
+            .as_ref()
+            .expect("subject first candidate")
+            .candidate
+            .provider_id
+            .clone();
+        let subject_candidate = subject_first_selection
+            .selected
+            .as_ref()
+            .expect("subject first candidate")
+            .candidate;
+        for _ in 0..3 {
+            assert!(subject_executor.candidate_is_valid_after_runtime_update(
+                &subject_state,
+                &runtime,
+                subject_candidate,
+                None,
+                RouteAffinityPolicy::Off,
+            ));
+        }
+        let subject_second = subject_executor
+            .select_supported_candidate_with_runtime_state(&mut subject_state, &runtime, None)
+            .selected
+            .expect("subject second candidate")
+            .candidate
+            .provider_id
+            .clone();
+
+        assert_eq!(subject_first, control_first);
+        assert_eq!(subject_second, control_second);
+    }
+
+    #[test]
+    fn round_robin_keeps_available_runtime_affinity_before_cursor() {
+        let view = ServiceRouteConfig {
+            providers: BTreeMap::from([
+                (
+                    "input".to_string(),
+                    limited_provider("https://affinity-input.example/v1", 20),
+                ),
+                (
+                    "ciii".to_string(),
+                    limited_provider("https://affinity-ciii.example/v1", 15),
+                ),
+            ]),
+            routing: Some(RouteGraphConfig::round_robin(vec![
+                "input".to_string(),
+                "ciii".to_string(),
+            ])),
+            ..ServiceRouteConfig::default()
+        };
+        let template = compile_route_plan_template("codex", &view).expect("route template");
+        let executor = RoutePlanExecutor::new(&template);
+        let mut runtime = RoutePlanRuntimeState::default();
+        runtime.set_affinity_provider_endpoint(Some(endpoint_key("codex", "ciii", "default")));
+
+        for _ in 0..20 {
+            let selection = executor.select_supported_candidate_with_runtime_state(
+                &mut RoutePlanAttemptState::default(),
+                &runtime,
+                None,
+            );
+            assert_eq!(
+                selection
+                    .selected
+                    .expect("affinity candidate")
+                    .candidate
+                    .provider_id,
+                "ciii"
+            );
+        }
+    }
+
+    #[test]
+    fn ordered_failover_does_not_use_round_robin_cursor() {
+        let view = ServiceRouteConfig {
+            providers: BTreeMap::from([
+                (
+                    "input".to_string(),
+                    limited_provider("https://ordered-input.example/v1", 20),
+                ),
+                (
+                    "ciii".to_string(),
+                    limited_provider("https://ordered-ciii.example/v1", 15),
+                ),
+            ]),
+            routing: Some(RouteGraphConfig::ordered_failover(vec![
+                "input".to_string(),
+                "ciii".to_string(),
+            ])),
+            ..ServiceRouteConfig::default()
+        };
+        let template = compile_route_plan_template("codex", &view).expect("route template");
+        let executor = RoutePlanExecutor::new(&template);
+
+        for _ in 0..20 {
+            let selection = executor.select_supported_candidate_with_runtime_state(
+                &mut RoutePlanAttemptState::default(),
+                &RoutePlanRuntimeState::default(),
+                None,
+            );
+            assert_eq!(
+                selection
+                    .selected
+                    .expect("ordered candidate")
+                    .candidate
+                    .provider_id,
+                "input"
+            );
+        }
     }
 }

@@ -10,6 +10,8 @@ deepened: 2026-07-10
 ---
 # Canonical Relay Runtime Modernization - Plan
 
+> Decision amendment (2026-07-14): version 5 remains the only runtime configuration contract, but supported legacy `config.json`, unversioned TOML, and version 1-4 TOML are now accepted as one-time migration inputs. Startup and `config migrate` use the same validated converter, create a source backup, and publish canonical version 5 TOML; the runtime still has no parallel legacy reader. This amendment supersedes the plan's earlier requirements to reject legacy files and remove every migration command/reader, while preserving the requirement to remove legacy runtime models and compatibility projections.
+
 ## Goal Capsule
 
 | Field | Value |

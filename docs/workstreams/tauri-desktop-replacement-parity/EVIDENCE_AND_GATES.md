@@ -3,7 +3,7 @@
 Status: Complete
 Last updated: 2026-05-23
 
-Historical note (superseded 2026-07-13): references below to config import and `ProxyConfigV4` describe the retired implementation. Current startup accepts only the canonical version 5 config and uses semantic unversioned runtime types.
+Historical note (superseded 2026-07-14): references below to config import and `ProxyConfigV4` describe the retired implementation. Version 5 remains the only runtime config contract; startup may first convert supported legacy TOML/JSON through the one-time migration boundary, then uses semantic unversioned runtime types with no legacy runtime reader.
 
 ## Gate Set
 

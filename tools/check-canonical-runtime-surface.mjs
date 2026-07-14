@@ -104,7 +104,7 @@ const forbiddenProductionStrings = [
 const allowedForbiddenProductionSnippets = new Map([
   [
     "crates/core/src/config_storage.rs",
-    ['(&["codex", "client_patch"][..], "codex.client_patch"),'],
+    ['(&["codex", "client_patch"], "codex.client_patch"),'],
   ],
 ]);
 

@@ -2,9 +2,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(test)]
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, RwLock as SyncRwLock};
+use std::sync::{Arc, OnceLock, RwLock as SyncRwLock, Weak};
 
-use tokio::sync::{Mutex as AsyncMutex, RwLock, watch};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, RwLock, watch};
 use tokio::time::Duration;
 
 pub use crate::balance::{
@@ -74,6 +74,7 @@ pub use self::runtime_types::{
     UsageRollupView,
 };
 use self::session_identity::SessionBindingEntry;
+pub(crate) use self::session_identity::SessionRouteAffinitySuccess;
 pub use self::session_identity::{
     AccountingPoolMembership, AccountingPriceCoverage, ActiveRequest, FinishRequestParams,
     FinishedRequest, RequestAccountingFacts, RequestObservability, ResolvedRouteValue,
@@ -677,6 +678,19 @@ fn operator_usage_summaries_from_sources(
 const RUNTIME_PROJECTION_PAGE_SIZE: usize = 1_024;
 const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
 
+#[derive(Debug, Clone)]
+pub enum SessionRouteReservationAccess {
+    None,
+    Available(SessionRouteAffinity),
+    Busy { owner_request_id: u64 },
+}
+
+#[derive(Debug, Clone)]
+struct OwnedSessionRouteReservation {
+    affinity: SessionRouteAffinity,
+    owner_request_id: u64,
+}
+
 #[derive(Debug, Default)]
 struct RequestLifecycleProjectionState {
     next_request_id: u64,
@@ -1010,6 +1024,46 @@ fn session_affinity_record(
     }
 }
 
+fn next_session_route_affinity(
+    existing: Option<SessionRouteAffinity>,
+    target: SessionRouteAffinityTarget,
+    reason_hint: Option<String>,
+    now_ms: u64,
+) -> SessionRouteAffinity {
+    match existing {
+        Some(mut existing) if target.same_target(&existing) => {
+            existing.last_selected_at_ms = existing.last_selected_at_ms.max(now_ms);
+            if target.session_identity_source.is_some() {
+                existing.session_identity_source = target.session_identity_source;
+            }
+            existing
+        }
+        Some(existing) => {
+            let selected_at_ms = existing.last_selected_at_ms.max(now_ms);
+            SessionRouteAffinity {
+                route_graph_key: target.route_graph_key,
+                session_identity_source: target.session_identity_source,
+                provider_endpoint: target.provider_endpoint,
+                upstream_base_url: target.upstream_base_url,
+                route_path: target.route_path,
+                last_selected_at_ms: selected_at_ms,
+                last_changed_at_ms: selected_at_ms,
+                change_reason: reason_hint.unwrap_or_else(|| "target_changed".to_string()),
+            }
+        }
+        None => SessionRouteAffinity {
+            route_graph_key: target.route_graph_key,
+            session_identity_source: target.session_identity_source,
+            provider_endpoint: target.provider_endpoint,
+            upstream_base_url: target.upstream_base_url,
+            route_path: target.route_path,
+            last_selected_at_ms: now_ms,
+            last_changed_at_ms: now_ms,
+            change_reason: reason_hint.unwrap_or_else(|| "first_success".to_string()),
+        },
+    }
+}
+
 fn provider_policy_snapshot_with_projection(
     current: &ProviderPolicySnapshot,
     policy_revision: u64,
@@ -1141,6 +1195,8 @@ pub struct ProxyState {
     session_route_affinity_ttl_ms: u64,
     session_route_affinity_max_entries: usize,
     session_route_affinity_updates: AsyncMutex<()>,
+    session_route_reservations: AsyncMutex<HashMap<String, OwnedSessionRouteReservation>>,
+    session_route_reservation_selection_locks: AsyncMutex<HashMap<String, Weak<AsyncMutex<()>>>>,
     session_transcript_path_cache_ttl_ms: u64,
     session_transcript_path_cache_max_entries: usize,
     session_bindings: RwLock<HashMap<String, SessionBindingEntry>>,
@@ -1249,6 +1305,8 @@ impl ProxyState {
             session_route_affinity_ttl_ms: policy.session_route_affinity_ttl_ms,
             session_route_affinity_max_entries: policy.session_route_affinity_max_entries,
             session_route_affinity_updates: AsyncMutex::new(()),
+            session_route_reservations: AsyncMutex::new(HashMap::new()),
+            session_route_reservation_selection_locks: AsyncMutex::new(HashMap::new()),
             session_transcript_path_cache_ttl_ms: policy.session_transcript_path_cache_ttl_ms,
             session_transcript_path_cache_max_entries: policy
                 .session_transcript_path_cache_max_entries,
@@ -1548,37 +1606,126 @@ impl ProxyState {
         }
     }
 
-    pub async fn record_session_route_affinity_success(
+    /// Claims the first route target for a session before an upstream request
+    /// starts. Concurrent cold-start requests in this process observe the same
+    /// target instead of independently advancing the route scheduler.
+    pub async fn lock_session_route_reservation_selection(
+        &self,
+        session_id: &str,
+    ) -> OwnedMutexGuard<()> {
+        let key = session_id.to_string();
+        let lock = {
+            let mut locks = self.session_route_reservation_selection_locks.lock().await;
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(AsyncMutex::new(()));
+                locks.insert(key, Arc::downgrade(&lock));
+                lock
+            }
+        };
+        lock.lock_owned().await
+    }
+
+    async fn active_request_ids(&self) -> HashSet<u64> {
+        self.request_lifecycle_projection
+            .read()
+            .await
+            .active_requests
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    pub async fn get_session_route_reservation(
+        &self,
+        session_id: &str,
+        route_graph_key: &str,
+        request_id: u64,
+        now_ms: u64,
+    ) -> Result<SessionRouteReservationAccess, RuntimeStoreError> {
+        let active_request_ids = self.active_request_ids().await;
+        let _update_guard = self.session_route_affinity_updates.lock().await;
+        let mut reservations = self.session_route_reservations.lock().await;
+        reservations.retain(|_, reservation| {
+            reservation.owner_request_id == request_id
+                || active_request_ids.contains(&reservation.owner_request_id)
+        });
+        if let Some(existing) = reservations.get_mut(session_id) {
+            if existing.owner_request_id != request_id {
+                return Ok(SessionRouteReservationAccess::Busy {
+                    owner_request_id: existing.owner_request_id,
+                });
+            }
+            if existing.affinity.route_graph_key != route_graph_key {
+                return Ok(SessionRouteReservationAccess::None);
+            }
+            existing.affinity.last_selected_at_ms = now_ms;
+            return Ok(SessionRouteReservationAccess::Available(
+                existing.affinity.clone(),
+            ));
+        }
+        drop(reservations);
+
+        Ok(self
+            .read_session_route_affinity(session_id, now_ms)?
+            .filter(|existing| existing.route_graph_key == route_graph_key)
+            .map_or(SessionRouteReservationAccess::None, |existing| {
+                SessionRouteReservationAccess::Available(existing)
+            }))
+    }
+
+    pub async fn claim_session_route_reservation(
         &self,
         session_id: &str,
         target: SessionRouteAffinityTarget,
-        reason_hint: Option<String>,
+        request_id: u64,
         now_ms: u64,
-    ) -> Result<SessionRouteAffinity, RuntimeStoreError> {
+    ) -> Result<SessionRouteReservationAccess, RuntimeStoreError> {
+        let active_request_ids = self.active_request_ids().await;
         let _update_guard = self.session_route_affinity_updates.lock().await;
-        let existing = self.read_session_route_affinity(session_id, now_ms)?;
-        let affinity = match existing {
-            Some(mut existing) if target.same_target(&existing) => {
-                existing.last_selected_at_ms = existing.last_selected_at_ms.max(now_ms);
-                if target.session_identity_source.is_some() {
-                    existing.session_identity_source = target.session_identity_source;
-                }
-                existing
+        let mut reservations = self.session_route_reservations.lock().await;
+        reservations.retain(|_, reservation| {
+            reservation.owner_request_id == request_id
+                || active_request_ids.contains(&reservation.owner_request_id)
+        });
+        if let Some(existing) = reservations.get_mut(session_id) {
+            if existing.owner_request_id != request_id {
+                return Ok(SessionRouteReservationAccess::Busy {
+                    owner_request_id: existing.owner_request_id,
+                });
             }
-            Some(existing) => {
-                let selected_at_ms = existing.last_selected_at_ms.max(now_ms);
-                SessionRouteAffinity {
+            if target.same_target(&existing.affinity) {
+                existing.affinity.last_selected_at_ms = now_ms;
+                if target.session_identity_source.is_some() {
+                    existing.affinity.session_identity_source = target.session_identity_source;
+                }
+            } else {
+                existing.affinity = SessionRouteAffinity {
                     route_graph_key: target.route_graph_key,
                     session_identity_source: target.session_identity_source,
                     provider_endpoint: target.provider_endpoint,
                     upstream_base_url: target.upstream_base_url,
                     route_path: target.route_path,
-                    last_selected_at_ms: selected_at_ms,
-                    last_changed_at_ms: selected_at_ms,
-                    change_reason: reason_hint.unwrap_or_else(|| "target_changed".to_string()),
-                }
+                    last_selected_at_ms: now_ms,
+                    last_changed_at_ms: now_ms,
+                    change_reason: "provisional_target_changed".to_string(),
+                };
             }
-            None => SessionRouteAffinity {
+            return Ok(SessionRouteReservationAccess::Available(
+                existing.affinity.clone(),
+            ));
+        }
+
+        if let Some(existing) = self.read_session_route_affinity(session_id, now_ms)?
+            && target.same_target(&existing)
+        {
+            return Ok(SessionRouteReservationAccess::Available(existing));
+        }
+
+        let reservation = OwnedSessionRouteReservation {
+            affinity: SessionRouteAffinity {
                 route_graph_key: target.route_graph_key,
                 session_identity_source: target.session_identity_source,
                 provider_endpoint: target.provider_endpoint,
@@ -1586,8 +1733,115 @@ impl ProxyState {
                 route_path: target.route_path,
                 last_selected_at_ms: now_ms,
                 last_changed_at_ms: now_ms,
-                change_reason: reason_hint.unwrap_or_else(|| "first_success".to_string()),
+                change_reason: "initial_selection".to_string(),
             },
+            owner_request_id: request_id,
+        };
+        reservations.insert(session_id.to_string(), reservation.clone());
+        Ok(SessionRouteReservationAccess::Available(
+            reservation.affinity,
+        ))
+    }
+
+    async fn prepare_session_route_affinity_transaction(
+        &self,
+        success: &SessionRouteAffinitySuccess,
+        now_ms: u64,
+    ) -> Result<Option<SessionRouteAffinity>, RuntimeStoreError> {
+        let existing = self.read_session_route_affinity(success.session_id.as_str(), now_ms)?;
+        let reservation = self
+            .session_route_reservations
+            .lock()
+            .await
+            .get(success.session_id.as_str())
+            .cloned();
+
+        match reservation {
+            Some(reservation) if reservation.owner_request_id == success.request_id => {
+                if !success.target.same_target(&reservation.affinity) {
+                    return Err(RuntimeStoreError::InvariantViolation {
+                        entity: "session route reservation",
+                        id: success.session_id.clone(),
+                        detail: format!(
+                            "request {} succeeded on a target that differs from its reservation",
+                            success.request_id
+                        ),
+                    });
+                }
+                Ok(Some(next_session_route_affinity(
+                    existing,
+                    success.target.clone(),
+                    success.reason_hint.clone(),
+                    now_ms,
+                )))
+            }
+            Some(reservation) => {
+                tracing::warn!(
+                    request_id = success.request_id,
+                    reservation_owner_request_id = reservation.owner_request_id,
+                    session_id = success.session_id,
+                    "preserving newer session route reservation after stale request success"
+                );
+                Ok(None)
+            }
+            None => match existing {
+                Some(existing) if success.target.same_target(&existing) => {
+                    Ok(Some(next_session_route_affinity(
+                        Some(existing),
+                        success.target.clone(),
+                        success.reason_hint.clone(),
+                        now_ms,
+                    )))
+                }
+                Some(existing) => {
+                    tracing::warn!(
+                        request_id = success.request_id,
+                        session_id = success.session_id,
+                        current_provider_endpoint = existing.provider_endpoint.stable_key(),
+                        successful_provider_endpoint =
+                            success.target.provider_endpoint.stable_key(),
+                        "ignoring stale cross-target session route affinity success"
+                    );
+                    Ok(None)
+                }
+                None => Err(RuntimeStoreError::InvariantViolation {
+                    entity: "session route reservation",
+                    id: success.session_id.clone(),
+                    detail: format!(
+                        "request {} has no provisional reservation for its first success",
+                        success.request_id
+                    ),
+                }),
+            },
+        }
+    }
+
+    pub async fn record_session_route_affinity_success(
+        &self,
+        request_id: Option<u64>,
+        session_id: &str,
+        target: SessionRouteAffinityTarget,
+        reason_hint: Option<String>,
+        now_ms: u64,
+    ) -> Result<SessionRouteAffinity, RuntimeStoreError> {
+        let _update_guard = self.session_route_affinity_updates.lock().await;
+        let affinity = if let Some(request_id) = request_id {
+            let success = SessionRouteAffinitySuccess {
+                request_id,
+                session_id: session_id.to_string(),
+                target,
+                reason_hint,
+            };
+            self.prepare_session_route_affinity_transaction(&success, now_ms)
+                .await?
+                .ok_or_else(|| RuntimeStoreError::InvariantViolation {
+                    entity: "session route affinity",
+                    id: session_id.to_string(),
+                    detail: format!("request {request_id} no longer owns the affinity transition"),
+                })?
+        } else {
+            let existing = self.read_session_route_affinity(session_id, now_ms)?;
+            next_session_route_affinity(existing, target, reason_hint, now_ms)
         };
         self.with_runtime_store_blocking(|runtime_store| {
             runtime_store.upsert_session_affinity(
@@ -1595,6 +1849,15 @@ impl ProxyState {
                 session_affinity_limit(self.session_route_affinity_max_entries),
             )
         })?;
+        if let Some(request_id) = request_id {
+            let mut reservations = self.session_route_reservations.lock().await;
+            if reservations
+                .get(session_id)
+                .is_some_and(|reservation| reservation.owner_request_id == request_id)
+            {
+                reservations.remove(session_id);
+            }
+        }
         drop(_update_guard);
         self.notify_state_changed();
         Ok(affinity)
@@ -3016,18 +3279,38 @@ impl ProxyState {
     }
 
     pub async fn finish_request(&self, params: FinishRequestParams) -> bool {
-        self.finish_request_inner(params, true).await
+        self.finish_request_inner(params, true, None).await
+    }
+
+    pub(crate) async fn finish_request_with_session_route_affinity(
+        &self,
+        params: FinishRequestParams,
+        route_affinity_success: SessionRouteAffinitySuccess,
+    ) -> bool {
+        self.finish_request_inner(params, true, Some(route_affinity_success))
+            .await
     }
 
     pub async fn finish_non_economic_request(&self, mut params: FinishRequestParams) -> bool {
         params.usage = None;
-        self.finish_request_inner(params, false).await
+        self.finish_request_inner(params, false, None).await
+    }
+
+    pub(crate) async fn finish_non_economic_request_with_session_route_affinity(
+        &self,
+        mut params: FinishRequestParams,
+        route_affinity_success: SessionRouteAffinitySuccess,
+    ) -> bool {
+        params.usage = None;
+        self.finish_request_inner(params, false, Some(route_affinity_success))
+            .await
     }
 
     async fn finish_request_inner(
         &self,
         params: FinishRequestParams,
         include_in_economics: bool,
+        route_affinity_success: Option<SessionRouteAffinitySuccess>,
     ) -> bool {
         let _operator_capture = self.operator_capture.write().await;
         let winning_attempt = match params.winning_attempt {
@@ -3086,6 +3369,19 @@ impl ProxyState {
         let Some(req) = request_state.active_requests.get(&params.id).cloned() else {
             return false;
         };
+        if let Some(success) = route_affinity_success.as_ref()
+            && (success.request_id != params.id
+                || req.session_id.as_deref() != Some(success.session_id.as_str()))
+        {
+            tracing::error!(
+                request_id = params.id,
+                affinity_request_id = success.request_id,
+                affinity_session_id = success.session_id,
+                request_session_id = ?req.session_id,
+                "refusing a logical terminal with mismatched session route affinity evidence"
+            );
+            return false;
+        }
 
         let winner_evidence = winning_attempt_record
             .as_ref()
@@ -3309,9 +3605,46 @@ impl ProxyState {
                 },
             }),
         };
+        let route_affinity_update_guard = if route_affinity_success.is_some() {
+            Some(self.session_route_affinity_updates.lock().await)
+        } else {
+            None
+        };
+        let committed_route_affinity = match route_affinity_success.as_ref() {
+            Some(success) => match self
+                .prepare_session_route_affinity_transaction(success, params.ended_at_ms)
+                .await
+            {
+                Ok(affinity) => affinity,
+                Err(error) => {
+                    tracing::error!(
+                        request_id = params.id,
+                        session_id = success.session_id,
+                        error = %error,
+                        "refusing a logical terminal with invalid session route affinity ownership"
+                    );
+                    return false;
+                }
+            },
+            None => None,
+        };
+        let affinity_record = committed_route_affinity.as_ref().map(|affinity| {
+            let success = route_affinity_success
+                .as_ref()
+                .expect("committed affinity requires success evidence");
+            session_affinity_record(success.session_id.as_str(), affinity)
+        });
         let terminal_disposition = match self.with_runtime_store_blocking(|runtime_store| {
             runtime_store.transaction(|transaction| {
-                transaction.commit_logical_request_terminal(lifecycle, terminal)
+                let disposition =
+                    transaction.commit_logical_request_terminal(lifecycle, terminal)?;
+                if let Some(record) = affinity_record {
+                    transaction.upsert_session_affinity(
+                        record,
+                        session_affinity_limit(self.session_route_affinity_max_entries),
+                    )?;
+                }
+                Ok(disposition)
             })
         }) {
             Ok(disposition) => disposition,
@@ -3324,6 +3657,16 @@ impl ProxyState {
                 return false;
             }
         };
+        if let Some(success) = route_affinity_success.as_ref() {
+            let mut reservations = self.session_route_reservations.lock().await;
+            if reservations
+                .get(success.session_id.as_str())
+                .is_some_and(|reservation| reservation.owner_request_id == success.request_id)
+            {
+                reservations.remove(success.session_id.as_str());
+            }
+        }
+        drop(route_affinity_update_guard);
         #[cfg(test)]
         self.pause_terminal_publication_after_commit_for_test()
             .await;
@@ -3964,6 +4307,29 @@ mod tests {
             session_route_affinity_max_entries: 5_000,
             session_transcript_path_cache_ttl_ms: 30_000,
             session_transcript_path_cache_max_entries: 5_000,
+        }
+    }
+
+    fn session_route_target(
+        route_graph_key: &str,
+        provider_id: &str,
+    ) -> SessionRouteAffinityTarget {
+        SessionRouteAffinityTarget {
+            route_graph_key: route_graph_key.to_string(),
+            session_identity_source: Some(SessionIdentitySource::Header),
+            provider_endpoint: ProviderEndpointKey::new("codex", provider_id, "default"),
+            upstream_base_url: format!("https://{provider_id}.example/v1"),
+            route_path: vec!["entry".to_string(), provider_id.to_string()],
+        }
+    }
+
+    fn available_reservation(access: SessionRouteReservationAccess) -> SessionRouteAffinity {
+        match access {
+            SessionRouteReservationAccess::Available(affinity) => affinity,
+            SessionRouteReservationAccess::None => panic!("expected an available reservation"),
+            SessionRouteReservationAccess::Busy { owner_request_id } => {
+                panic!("reservation unexpectedly busy for request {owner_request_id}")
+            }
         }
     }
 
@@ -6859,6 +7225,7 @@ confidence = "exact"
             let state = ProxyState::new_with_runtime_policy(policy);
             state
                 .record_session_route_affinity_success(
+                    None,
                     "sid-expire",
                     SessionRouteAffinityTarget {
                         route_graph_key: "graph".to_string(),
@@ -6892,6 +7259,7 @@ confidence = "exact"
             let state = ProxyState::new_with_runtime_policy(policy);
             state
                 .record_session_route_affinity_success(
+                    None,
                     "sid-peek-expired",
                     SessionRouteAffinityTarget {
                         route_graph_key: "graph".to_string(),
@@ -6938,6 +7306,7 @@ confidence = "exact"
                     .expect("create first state");
             first_state
                 .record_session_route_affinity_success(
+                    None,
                     "sid-expired-ledger",
                     SessionRouteAffinityTarget {
                         route_graph_key: "graph".to_string(),
@@ -6985,6 +7354,7 @@ confidence = "exact"
 
             let error = state
                 .record_session_route_affinity_success(
+                    None,
                     "sid-failed-commit",
                     SessionRouteAffinityTarget {
                         route_graph_key: "graph".to_string(),
@@ -7008,6 +7378,493 @@ confidence = "exact"
             );
             assert!(!state_changes.has_changed().expect("read state change flag"));
         });
+    }
+
+    #[tokio::test]
+    async fn session_route_reservation_active_owner_blocks_followers_and_can_move_target() {
+        let state = ProxyState::new();
+        let owner_request_id = BeginRequestTestBuilder::new(&state)
+            .session_id("sid-reservation-owner")
+            .begin()
+            .await;
+        let follower_request_id = BeginRequestTestBuilder::new(&state)
+            .session_id("sid-reservation-owner")
+            .begin()
+            .await;
+        let first = available_reservation(
+            state
+                .claim_session_route_reservation(
+                    "sid-reservation-owner",
+                    session_route_target("graph:owner", "input"),
+                    owner_request_id,
+                    1_000,
+                )
+                .await
+                .expect("claim first reservation"),
+        );
+        let follower = state
+            .claim_session_route_reservation(
+                "sid-reservation-owner",
+                session_route_target("graph:owner", "ciii"),
+                follower_request_id,
+                1_001,
+            )
+            .await
+            .expect("inspect reservation as follower");
+        let moved = available_reservation(
+            state
+                .claim_session_route_reservation(
+                    "sid-reservation-owner",
+                    session_route_target("graph:owner", "ciii"),
+                    owner_request_id,
+                    1_002,
+                )
+                .await
+                .expect("owner should move its provisional target"),
+        );
+
+        assert_eq!(first.provider_endpoint.provider_id, "input");
+        assert!(matches!(
+            follower,
+            SessionRouteReservationAccess::Busy {
+                owner_request_id: busy_owner
+            } if busy_owner == owner_request_id
+        ));
+        assert_eq!(moved.provider_endpoint.provider_id, "ciii");
+        assert!(
+            state
+                .peek_session_route_affinity("sid-reservation-owner")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn session_route_reservation_selection_lock_is_scoped_to_session() {
+        let state = ProxyState::new();
+        let first = state
+            .lock_session_route_reservation_selection("sid-lock")
+            .await;
+
+        let same_session = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                state
+                    .lock_session_route_reservation_selection("sid-lock")
+                    .await
+            })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), async {
+                while !same_session.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_err(),
+            "the same session must wait for its active selector"
+        );
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            state.lock_session_route_reservation_selection("sid-other"),
+        )
+        .await
+        .expect("different sessions must not share a selection lock");
+
+        drop(first);
+        tokio::time::timeout(Duration::from_millis(100), same_session)
+            .await
+            .expect("same-session selector should resume after release")
+            .expect("same-session selector task should finish");
+    }
+
+    #[tokio::test]
+    async fn session_route_reservation_does_not_expire_while_owner_is_active() {
+        let state = ProxyState::new();
+        let owner_request_id = BeginRequestTestBuilder::new(&state)
+            .session_id("sid-reservation-active")
+            .begin()
+            .await;
+        let follower_request_id = BeginRequestTestBuilder::new(&state)
+            .session_id("sid-reservation-active")
+            .begin()
+            .await;
+        let first = available_reservation(
+            state
+                .claim_session_route_reservation(
+                    "sid-reservation-active",
+                    session_route_target("graph:active", "input"),
+                    owner_request_id,
+                    1_000,
+                )
+                .await
+                .expect("claim first reservation"),
+        );
+        let follower = state
+            .get_session_route_reservation(
+                "sid-reservation-active",
+                "graph:active",
+                follower_request_id,
+                1_000 + 365 * DAY_MS,
+            )
+            .await
+            .expect("inspect long-running reservation");
+
+        assert_eq!(first.provider_endpoint.provider_id, "input");
+        assert!(matches!(
+            follower,
+            SessionRouteReservationAccess::Busy {
+                owner_request_id: busy_owner
+            } if busy_owner == owner_request_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn session_route_reservation_is_cleared_after_success() {
+        let state = ProxyState::new();
+        state
+            .claim_session_route_reservation(
+                "sid-reservation-success",
+                session_route_target("graph:success", "input"),
+                7,
+                1_000,
+            )
+            .await
+            .expect("claim provisional reservation");
+
+        let durable = state
+            .record_session_route_affinity_success(
+                Some(7),
+                "sid-reservation-success",
+                session_route_target("graph:success", "input"),
+                Some("test_success".to_string()),
+                1_001,
+            )
+            .await
+            .expect("persist successful affinity");
+        assert_eq!(durable.provider_endpoint.provider_id, "input");
+        assert!(state.session_route_reservations.lock().await.is_empty());
+
+        let claimed_after_success = state
+            .claim_session_route_reservation(
+                "sid-reservation-success",
+                session_route_target("graph:success", "input"),
+                8,
+                1_002,
+            )
+            .await
+            .expect("claim after successful affinity");
+        assert_eq!(
+            available_reservation(claimed_after_success)
+                .provider_endpoint
+                .provider_id,
+            "input"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_route_transition_reservation_blocks_cross_key_followers() {
+        let state = ProxyState::new();
+        state
+            .record_session_route_affinity_success(
+                None,
+                "sid-transition",
+                session_route_target("graph:transition", "input"),
+                Some("seed".to_string()),
+                1_000,
+            )
+            .await
+            .expect("seed durable affinity");
+        let owner_request_id = BeginRequestTestBuilder::new(&state)
+            .session_id("sid-transition")
+            .begin()
+            .await;
+        let follower_request_id = BeginRequestTestBuilder::new(&state)
+            .session_id("sid-transition")
+            .begin()
+            .await;
+
+        let transition = available_reservation(
+            state
+                .claim_session_route_reservation(
+                    "sid-transition",
+                    session_route_target("graph:transition", "ciii"),
+                    owner_request_id,
+                    1_001,
+                )
+                .await
+                .expect("claim cross-key transition"),
+        );
+        let follower = state
+            .claim_session_route_reservation(
+                "sid-transition",
+                session_route_target("graph:transition", "input"),
+                follower_request_id,
+                1_002,
+            )
+            .await
+            .expect("inspect transition as follower");
+
+        assert_eq!(transition.provider_endpoint.provider_id, "ciii");
+        assert!(matches!(
+            follower,
+            SessionRouteReservationAccess::Busy {
+                owner_request_id: busy_owner
+            } if busy_owner == owner_request_id
+        ));
+
+        state
+            .record_session_route_affinity_success(
+                Some(owner_request_id),
+                "sid-transition",
+                session_route_target("graph:transition", "ciii"),
+                Some("provider_failover".to_string()),
+                1_003,
+            )
+            .await
+            .expect("commit owned transition");
+        let after_transition = available_reservation(
+            state
+                .get_session_route_reservation(
+                    "sid-transition",
+                    "graph:transition",
+                    follower_request_id,
+                    1_004,
+                )
+                .await
+                .expect("read durable transition"),
+        );
+        assert_eq!(after_transition.provider_endpoint.provider_id, "ciii");
+    }
+
+    #[tokio::test]
+    async fn stale_owner_success_does_not_remove_new_owner_reservation() {
+        let state = ProxyState::new();
+        let stale_request_id = BeginRequestTestBuilder::new(&state)
+            .session_id("sid-stale-owner")
+            .begin()
+            .await;
+        let current_request_id = BeginRequestTestBuilder::new(&state)
+            .session_id("sid-stale-owner")
+            .begin()
+            .await;
+        state
+            .claim_session_route_reservation(
+                "sid-stale-owner",
+                session_route_target("graph:stale", "input"),
+                stale_request_id,
+                1_000,
+            )
+            .await
+            .expect("claim stale owner reservation");
+        assert!(
+            state
+                .finish_request(FinishRequestParams {
+                    id: stale_request_id,
+                    winning_attempt: None,
+                    status_code: 500,
+                    duration_ms: 1,
+                    ended_at_ms: 1_001,
+                    observed_service_tier: None,
+                    reported_model: None,
+                    usage: None,
+                    retry: None,
+                    ttfb_ms: None,
+                    streaming: false,
+                })
+                .await
+        );
+        let current = available_reservation(
+            state
+                .claim_session_route_reservation(
+                    "sid-stale-owner",
+                    session_route_target("graph:stale", "ciii"),
+                    current_request_id,
+                    1_002,
+                )
+                .await
+                .expect("replace inactive owner reservation"),
+        );
+        assert_eq!(current.provider_endpoint.provider_id, "ciii");
+
+        let error = state
+            .record_session_route_affinity_success(
+                Some(stale_request_id),
+                "sid-stale-owner",
+                session_route_target("graph:stale", "input"),
+                Some("stale_success".to_string()),
+                1_003,
+            )
+            .await
+            .expect_err("stale owner must not publish affinity");
+        assert!(matches!(
+            error,
+            RuntimeStoreError::InvariantViolation { .. }
+        ));
+        let reservations = state.session_route_reservations.lock().await;
+        let reservation = reservations
+            .get("sid-stale-owner")
+            .expect("current owner reservation must remain");
+        assert_eq!(reservation.owner_request_id, current_request_id);
+        assert_eq!(reservation.affinity.provider_endpoint.provider_id, "ciii");
+        drop(reservations);
+        assert!(
+            state
+                .peek_session_route_affinity("sid-stale-owner")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn logical_terminal_and_affinity_publish_before_owner_becomes_inactive() {
+        let state = ProxyState::new();
+        let owner_request_id = BeginRequestTestBuilder::new(&state)
+            .session_id("sid-atomic-affinity")
+            .begin()
+            .await;
+        let follower_request_id = BeginRequestTestBuilder::new(&state)
+            .session_id("sid-atomic-affinity")
+            .begin()
+            .await;
+        let target = session_route_target("graph:atomic", "input");
+        state
+            .claim_session_route_reservation(
+                "sid-atomic-affinity",
+                target.clone(),
+                owner_request_id,
+                1_000,
+            )
+            .await
+            .expect("claim owner reservation");
+        let (committed, resume) = state
+            .pause_next_terminal_publication_after_commit_for_test()
+            .await;
+        let finishing_state = state.clone();
+        let finish = tokio::spawn(async move {
+            finishing_state
+                .finish_request_with_session_route_affinity(
+                    FinishRequestParams {
+                        id: owner_request_id,
+                        winning_attempt: None,
+                        status_code: 200,
+                        duration_ms: 1,
+                        ended_at_ms: 1_001,
+                        observed_service_tier: None,
+                        reported_model: None,
+                        usage: None,
+                        retry: None,
+                        ttfb_ms: None,
+                        streaming: false,
+                    },
+                    SessionRouteAffinitySuccess {
+                        request_id: owner_request_id,
+                        session_id: "sid-atomic-affinity".to_string(),
+                        target,
+                        reason_hint: Some("first_success".to_string()),
+                    },
+                )
+                .await
+        });
+        committed
+            .await
+            .expect("terminal and affinity transaction must reach pause");
+
+        let durable = state
+            .peek_session_route_affinity("sid-atomic-affinity")
+            .await
+            .expect("affinity must be durable before active owner removal");
+        assert_eq!(durable.provider_endpoint.provider_id, "input");
+        assert!(state.session_route_reservations.lock().await.is_empty());
+
+        let follower_state = state.clone();
+        let follower = tokio::spawn(async move {
+            follower_state
+                .get_session_route_reservation(
+                    "sid-atomic-affinity",
+                    "graph:atomic",
+                    follower_request_id,
+                    1_002,
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !follower.is_finished(),
+            "follower must not observe a partially published owner terminal"
+        );
+
+        resume.send(()).expect("resume terminal publication");
+        assert!(finish.await.expect("join owner terminal publication"));
+        let follower = available_reservation(
+            follower
+                .await
+                .expect("join follower reservation")
+                .expect("read affinity after owner terminal"),
+        );
+        assert_eq!(follower.provider_endpoint.provider_id, "input");
+    }
+
+    #[tokio::test]
+    async fn affinity_failure_rolls_back_logical_terminal_transaction() {
+        let state = ProxyState::new();
+        let request_id = BeginRequestTestBuilder::new(&state)
+            .session_id("sid-affinity-rollback")
+            .begin()
+            .await;
+        let target = session_route_target("graph:rollback", "input");
+        state
+            .claim_session_route_reservation(
+                "sid-affinity-rollback",
+                target.clone(),
+                request_id,
+                1_000,
+            )
+            .await
+            .expect("claim rollback reservation");
+        state.runtime_store().fail_next_affinity_commit_for_test();
+
+        let published = state
+            .finish_request_with_session_route_affinity(
+                FinishRequestParams {
+                    id: request_id,
+                    winning_attempt: None,
+                    status_code: 200,
+                    duration_ms: 1,
+                    ended_at_ms: 1_001,
+                    observed_service_tier: None,
+                    reported_model: None,
+                    usage: None,
+                    retry: None,
+                    ttfb_ms: None,
+                    streaming: false,
+                },
+                SessionRouteAffinitySuccess {
+                    request_id,
+                    session_id: "sid-affinity-rollback".to_string(),
+                    target,
+                    reason_hint: Some("first_success".to_string()),
+                },
+            )
+            .await;
+
+        assert!(!published);
+        assert_eq!(state.list_active_requests().await.len(), 1);
+        assert!(state.list_recent_finished(10).await.is_empty());
+        assert!(
+            state
+                .peek_session_route_affinity("sid-affinity-rollback")
+                .await
+                .is_none()
+        );
+        let reservations = state.session_route_reservations.lock().await;
+        assert_eq!(
+            reservations
+                .get("sid-affinity-rollback")
+                .map(|reservation| reservation.owner_request_id),
+            Some(request_id)
+        );
     }
 
     fn atomic_quota_scope_with_revision(

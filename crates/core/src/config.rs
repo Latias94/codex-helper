@@ -16,6 +16,9 @@ pub use crate::fleet::registry::{FleetNodeConfig, FleetRegistryConfig};
 #[path = "config_storage.rs"]
 mod storage_impl;
 
+#[path = "config_legacy_json.rs"]
+mod legacy_json_impl;
+
 #[path = "config_retry.rs"]
 mod retry_impl;
 
@@ -34,14 +37,14 @@ pub use retry_impl::{
     ResolvedRetryLayerConfig, RetryConfig, RetryLayerConfig, RetryProfileName, RetryStrategy,
 };
 pub use storage_impl::{
-    LoadedConfig, config_file_path, init_config_toml, load_config, load_config_with_source,
-    save_helper_config,
+    ConfigInitOutcome, LoadedConfig, config_file_path, init_config_toml,
+    init_config_toml_with_outcome, load_config, load_config_with_source, save_helper_config,
 };
 
 pub mod storage {
     pub use super::storage_impl::{
-        LoadedConfig, config_file_path, init_config_toml, load_config, load_config_with_source,
-        save_helper_config,
+        ConfigInitOutcome, LoadedConfig, config_file_path, init_config_toml,
+        init_config_toml_with_outcome, load_config, load_config_with_source, save_helper_config,
     };
 }
 
@@ -558,6 +561,14 @@ impl RouteGraphConfig {
         })
     }
 
+    pub fn round_robin(children: Vec<String>) -> Self {
+        Self::single_entry_node(RouteNodeConfig {
+            strategy: RouteStrategy::RoundRobin,
+            children,
+            ..RouteNodeConfig::default()
+        })
+    }
+
     pub fn manual_sticky(target: String, children: Vec<String>) -> Self {
         Self::single_entry_node(RouteNodeConfig {
             strategy: RouteStrategy::ManualSticky,
@@ -853,6 +864,7 @@ impl RouteCondition {
 pub enum RouteStrategy {
     ManualSticky,
     OrderedFailover,
+    RoundRobin,
     TagPreferred,
     Conditional,
 }

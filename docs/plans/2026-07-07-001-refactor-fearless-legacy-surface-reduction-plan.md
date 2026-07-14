@@ -9,6 +9,8 @@ execution: code
 ---
 # Fearless Legacy Surface Reduction - Plan
 
+> Decision amendment (2026-07-14): the public runtime contract remains canonical version 5 TOML, but deleting startup-time legacy migration is no longer a requirement. Supported `config.json`, unversioned TOML, and version 1-4 TOML are converted once through a validated startup/CLI migration path with a source backup; no legacy schema remains in request-time configuration loading. This amendment supersedes the contrary migration-removal statements below without changing the plan's broader legacy-runtime deletion goals.
+
 ## Goal Capsule
 
 | Field | Value |

@@ -838,6 +838,230 @@ async fn proxy_route_graph_balanced_scheduling_waits_for_preferred_capacity() {
 }
 
 #[tokio::test]
+async fn proxy_duplicate_session_waiter_returns_local_backpressure_without_key_fallback() {
+    let primary_hits = Arc::new(AtomicUsize::new(0));
+    let primary_started = Arc::new(tokio::sync::Notify::new());
+    let release_primary = Arc::new(tokio::sync::Notify::new());
+    let primary_counter = primary_hits.clone();
+    let primary_started_for_route = primary_started.clone();
+    let release_primary_for_route = release_primary.clone();
+    let primary = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let primary_counter = primary_counter.clone();
+            let primary_started = primary_started_for_route.clone();
+            let release_primary = release_primary_for_route.clone();
+            async move {
+                let hit = primary_counter.fetch_add(1, Ordering::SeqCst);
+                if hit == 1 {
+                    primary_started.notify_one();
+                    release_primary.notified().await;
+                }
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "provider": "primary" })),
+                )
+            }
+        }),
+    );
+    let (primary_addr, primary_handle) = spawn_axum_server(primary);
+
+    let backup_hits = Arc::new(AtomicUsize::new(0));
+    let backup_counter = backup_hits.clone();
+    let backup = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let backup_counter = backup_counter.clone();
+            async move {
+                backup_counter.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "provider": "backup" })),
+                )
+            }
+        }),
+    );
+    let (backup_addr, backup_handle) = spawn_axum_server(backup);
+
+    let source = capacity_wait_config(
+        format!("http://{primary_addr}/v1"),
+        Some(format!("http://{backup_addr}/v1")),
+    );
+    let proxy = ProxyService::new(Client::new(), Arc::new(source), "codex");
+    let retained = proxy.clone();
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let client = reqwest::Client::new();
+
+    let warm = send_responses_json(&client, proxy_addr, Some("sid-duplicate")).await;
+    assert_eq!(warm["provider"].as_str(), Some("primary"));
+
+    let first_request = tokio::spawn({
+        let client = client.clone();
+        async move { send_responses_json(&client, proxy_addr, Some("sid-duplicate")).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), primary_started.notified())
+        .await
+        .expect("first session request should occupy primary capacity");
+
+    let second_request = tokio::spawn({
+        let client = client.clone();
+        async move { send_responses_json(&client, proxy_addr, Some("sid-duplicate")).await }
+    });
+    wait_for_provider_pending(&retained, "primary", 1, 1).await;
+
+    let rejected = send_responses_request(&client, proxy_addr, Some("sid-duplicate")).await;
+    assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 2);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
+
+    release_primary.notify_one();
+    let first = tokio::time::timeout(Duration::from_secs(2), first_request)
+        .await
+        .expect("first request should finish after release")
+        .expect("first request task should join");
+    let second = tokio::time::timeout(Duration::from_secs(2), second_request)
+        .await
+        .expect("second request should acquire released primary capacity")
+        .expect("second request task should join");
+    assert_eq!(first["provider"].as_str(), Some("primary"));
+    assert_eq!(second["provider"].as_str(), Some("primary"));
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 3);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
+
+    proxy_handle.abort();
+    primary_handle.abort();
+    backup_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_throughput_first_cold_session_owner_prevents_key_split() {
+    let primary_hits = Arc::new(AtomicUsize::new(0));
+    let primary_started = Arc::new(tokio::sync::Notify::new());
+    let release_primary = Arc::new(tokio::sync::Notify::new());
+    let primary_counter = primary_hits.clone();
+    let primary_started_for_route = primary_started.clone();
+    let release_primary_for_route = release_primary.clone();
+    let primary = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let primary_counter = primary_counter.clone();
+            let primary_started = primary_started_for_route.clone();
+            let release_primary = release_primary_for_route.clone();
+            async move {
+                primary_counter.fetch_add(1, Ordering::SeqCst);
+                primary_started.notify_one();
+                release_primary.notified().await;
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "provider": "primary" })),
+                )
+            }
+        }),
+    );
+    let (primary_addr, primary_handle) = spawn_axum_server(primary);
+
+    let backup_hits = Arc::new(AtomicUsize::new(0));
+    let backup_counter = backup_hits.clone();
+    let backup = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let backup_counter = backup_counter.clone();
+            async move {
+                backup_counter.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "provider": "backup" })),
+                )
+            }
+        }),
+    );
+    let (backup_addr, backup_handle) = spawn_axum_server(backup);
+
+    let mut source = capacity_wait_config(
+        format!("http://{primary_addr}/v1"),
+        Some(format!("http://{backup_addr}/v1")),
+    );
+    source
+        .codex
+        .routing
+        .as_mut()
+        .expect("route graph")
+        .scheduling_preset = SchedulingPreset::ThroughputFirst;
+    let proxy = ProxyService::new(Client::new(), Arc::new(source), "codex");
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let client = reqwest::Client::new();
+
+    let owner = tokio::spawn({
+        let client = client.clone();
+        async move { send_responses_json(&client, proxy_addr, Some("sid-cold-owner")).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), primary_started.notified())
+        .await
+        .expect("cold owner should reach primary");
+
+    let follower = send_responses_request(&client, proxy_addr, Some("sid-cold-owner")).await;
+    assert_eq!(follower.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
+
+    release_primary.notify_one();
+    let owner = tokio::time::timeout(Duration::from_secs(2), owner)
+        .await
+        .expect("cold owner should finish after release")
+        .expect("cold owner task should join");
+    assert_eq!(owner["provider"].as_str(), Some("primary"));
+
+    proxy_handle.abort();
+    primary_handle.abort();
+    backup_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_affinity_policy_off_never_persists_session_route_affinity() {
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        post(|| async {
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "provider": "stateless" })),
+            )
+        }),
+    );
+    let (upstream_addr, upstream_handle) = spawn_axum_server(upstream);
+    let mut source = capacity_wait_config(format!("http://{upstream_addr}/v1"), None);
+    source
+        .codex
+        .routing
+        .as_mut()
+        .expect("route graph")
+        .affinity_policy = RouteAffinityPolicy::Off;
+    let proxy = ProxyService::new(Client::new(), Arc::new(source), "codex");
+    let state = proxy.state.clone();
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let response = send_responses_json(
+        &reqwest::Client::new(),
+        proxy_addr,
+        Some("sid-affinity-off"),
+    )
+    .await;
+
+    assert_eq!(response["provider"].as_str(), Some("stateless"));
+    assert!(
+        state
+            .peek_session_route_affinity("sid-affinity-off")
+            .await
+            .is_none()
+    );
+
+    proxy_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
 async fn proxy_http_capacity_wait_keeps_captured_runtime_snapshot_across_reload() {
     let _env_guard = env_lock().await;
     let codex_home = make_temp_test_dir();

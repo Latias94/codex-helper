@@ -1,6 +1,10 @@
 use super::*;
-use crate::file_replace::{write_bytes_file_async, write_bytes_file_async_with_permissions};
+use crate::file_replace::{
+    write_bytes_file_async, write_bytes_file_async_with_permissions,
+    write_bytes_file_async_with_permissions_and_before_replace,
+};
 use std::fs::{File, OpenOptions, TryLockError};
+use std::io;
 use std::path::Path;
 
 fn config_dir() -> PathBuf {
@@ -21,13 +25,115 @@ pub struct LoadedConfig {
     pub source: HelperConfig,
 }
 
+#[derive(Debug, Clone)]
+pub struct ConfigInitOutcome {
+    pub path: PathBuf,
+    pub migration_report: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigMigrationFormat {
+    Toml,
+    Json,
+}
+
+#[derive(Debug)]
+struct ConfigMigrationPlan {
+    source_name: &'static str,
+    source_version: Option<u64>,
+    requires_write: bool,
+    source: ExistingConfigToml,
+    target_path: PathBuf,
+    backup_path: PathBuf,
+    rendered: String,
+    preview: String,
+    notices: Vec<String>,
+}
+
+impl ConfigMigrationPlan {
+    fn report(&self, wrote: bool) -> String {
+        let version = self
+            .source_version
+            .map(|version| version.to_string())
+            .unwrap_or_else(|| "unversioned".to_string());
+        let mut report = if !self.requires_write {
+            format!(
+                "{} already uses version = {}; no files were written.\n",
+                self.source_name, CURRENT_CONFIG_VERSION
+            )
+        } else if wrote {
+            format!(
+                "Migrated {} schema {} to version = {} at {}.\nBackup: {}\n",
+                self.source_name,
+                version,
+                CURRENT_CONFIG_VERSION,
+                self.target_path.display(),
+                self.backup_path.display(),
+            )
+        } else {
+            format!(
+                "Dry-run: {} schema {} can be migrated to version = {}; no files were written.\nTarget: {}\n",
+                self.source_name,
+                version,
+                CURRENT_CONFIG_VERSION,
+                self.target_path.display(),
+            )
+        };
+
+        for notice in &self.notices {
+            report.push_str("warning: ");
+            report.push_str(notice);
+            report.push('\n');
+        }
+
+        if !wrote {
+            report.push('\n');
+            report.push_str(&self.preview);
+            if !self.preview.ends_with('\n') {
+                report.push('\n');
+            }
+        }
+        report
+    }
+}
+
+impl LoadedConfig {
+    /// Preview or explicitly apply migration of the on-disk configuration to the v5 contract.
+    ///
+    /// This shares the validated migration path used by normal startup. Preview mode never
+    /// writes configuration, and neither mode reads or mutates runtime SQLite state.
+    pub async fn migrate_config_file(write: bool) -> Result<String> {
+        let Some(paths) = ResolvedConfigDirectory::inspect().await? else {
+            anyhow::bail!(
+                "no codex-helper configuration directory exists at {}; run `codex-helper config init` for a new installation",
+                config_dir().display()
+            );
+        };
+
+        if write {
+            let _lock = ConfigMutationLock::try_acquire(&paths)?;
+            paths.ensure_unchanged().await?;
+            let plan = build_config_migration_plan(&paths).await?;
+            apply_config_migration_plan(&paths, &plan).await?;
+            Ok(plan.report(true))
+        } else {
+            let plan = build_config_migration_plan(&paths).await?;
+            paths.ensure_unchanged().await?;
+            Ok(plan.report(false))
+        }
+    }
+}
+
 const CONFIG_TOML_DOC_HEADER: &str = r#"# codex-helper config.toml
 #
-# 启动路径只接受当前 `version = 5` TOML；其他版本会被拒绝，历史
-# config.json 不受支持，且会在没有 canonical config.toml 时被明确拒绝。
+# 启动路径最终只加载当前 `version = 5` TOML。发现旧版本/无版本
+# TOML，或在没有 canonical config.toml 时发现 config.json，会先自动
+# 校验迁移并把源文件保存为对应的 `.bak`；未来版本和损坏文件会拒绝启动。
 #
 # 常用命令：
 # - 生成带注释的模板：`codex-helper config init`
+# - 预览迁移：`codex-helper config migrate --dry-run`
+# - 确认写入：`codex-helper config migrate --write --yes`
 #
 # 安全建议：
 # - 尽量用环境变量保存密钥（*_env 字段，例如 auth_token_env / api_key_env），不要把 token 明文写入文件。
@@ -37,8 +143,9 @@ const CONFIG_TOML_DOC_HEADER: &str = r#"# codex-helper config.toml
 
 const CONFIG_TOML_TEMPLATE: &str = r#"# codex-helper config.toml
 #
-# codex-helper 启动路径只读取当前 `version = 5` 的 config.toml。
-# 其他版本的 TOML 会被拒绝；历史 config.json 不受支持，且不会被导入。
+# codex-helper 启动路径最终只读取当前 `version = 5` 的 config.toml。
+# 旧版本/无版本 TOML 和没有 canonical TOML 时的 config.json 会自动迁移，
+# 写入前保留 `.bak`；未来版本或损坏文件不会被猜测降级。
 #
 # 本模板以“可发现性”为主：包含可直接抄的示例，以及每个字段的说明。
 #
@@ -157,6 +264,27 @@ version = 5
 # [codex.routing.routes.main]
 # strategy = "ordered-failover"
 # children = ["openai", "backup"]
+#
+# 并发上限不同的 relay 可以使用容量加权 round-robin。下面的两个
+# provider 会按剩余本地容量分配新 session（空闲时约为 20:15），
+# 成功后仍由 session affinity 保持同一个 provider；一个 key 可以服务多个 session。
+# 要启用这个示例，请把上方 [codex.routing] 的 entry 改成 `relay_pool`。
+#
+# [codex.providers.input]
+# base_url = "https://input.example/v1"
+# auth_token_env = "INPUT_API_KEY"
+# [codex.providers.input.limits]
+# max_concurrent_requests = 20
+#
+# [codex.providers.ciii]
+# base_url = "https://ciii.example/v1"
+# auth_token_env = "CIII_API_KEY"
+# [codex.providers.ciii.limits]
+# max_concurrent_requests = 15
+#
+# [codex.routing.routes.relay_pool]
+# strategy = "round-robin"
+# children = ["input", "ciii"]
 #
 # --- 会话控制模板（profiles，可选） ---
 #
@@ -308,11 +436,26 @@ profile = "balanced"
 # cooldown_backoff_max_secs = 600
 "#;
 
-fn toml_schema_version(value: &TomlValue) -> Option<u32> {
-    value
-        .get("version")
-        .and_then(|v| v.as_integer())
-        .and_then(|value| u32::try_from(value).ok())
+fn toml_schema_version(value: &TomlValue, source_name: &str) -> Result<Option<u64>> {
+    let Some(raw_version) = value.get("version") else {
+        return Ok(None);
+    };
+    let Some(version) = raw_version.as_integer() else {
+        anyhow::bail!(
+            "{source_name} has invalid config version {raw_version:?}; `version` must be a positive integer"
+        );
+    };
+    let Ok(version) = u64::try_from(version) else {
+        anyhow::bail!(
+            "{source_name} has invalid config version {version}; `version` must be a positive integer"
+        );
+    };
+    if version == 0 {
+        anyhow::bail!(
+            "{source_name} has invalid config version 0; `version` must be a positive integer"
+        );
+    }
+    Ok(Some(version))
 }
 
 fn nested_toml_value<'a>(value: &'a TomlValue, path: &[&str]) -> Option<&'a TomlValue> {
@@ -372,31 +515,54 @@ fn collect_retired_relay_target_settings(value: &TomlValue, retired: &mut Vec<St
     }
 }
 
-fn reject_retired_v5_settings(value: &TomlValue) -> Result<()> {
+const RETIRED_V5_REMOVALS: &[(&[&str], &str)] = &[
+    (&["codex", "client_patch"], "codex.client_patch"),
+    (&["codex", "compaction"], "codex.compaction"),
+    (&["claude", "compaction"], "claude.compaction"),
+    (&["ui", "usage_forecast"], "ui.usage_forecast"),
+    (
+        &["retry", "allow_cross_station_before_first_output"],
+        "retry.allow_cross_station_before_first_output",
+    ),
+];
+
+const LEGACY_FLAT_RETRY_FIELDS: &[&str] = &[
+    "max_attempts",
+    "backoff_ms",
+    "backoff_max_ms",
+    "jitter_ms",
+    "on_status",
+    "on_class",
+    "strategy",
+];
+
+fn collect_retired_v5_settings(value: &TomlValue) -> Vec<String> {
     let mut retired = Vec::new();
-    for (path, label) in [
-        (&["codex", "client_patch"][..], "codex.client_patch"),
-        (&["codex", "compaction"][..], "codex.compaction"),
-        (&["claude", "compaction"][..], "claude.compaction"),
-        (&["ui", "usage_forecast"][..], "ui.usage_forecast"),
-        (
-            &["retry", "allow_cross_station_before_first_output"][..],
-            "retry.allow_cross_station_before_first_output",
-        ),
-    ] {
+    for &(path, label) in RETIRED_V5_REMOVALS {
         if nested_toml_value(value, path).is_some() {
             retired.push(label.to_string());
+        }
+    }
+    for field in LEGACY_FLAT_RETRY_FIELDS {
+        if nested_toml_value(value, &["retry", field]).is_some() {
+            retired.push(format!("retry.{field}"));
         }
     }
     collect_retired_profile_settings(value, "codex", &mut retired);
     collect_retired_profile_settings(value, "claude", &mut retired);
     collect_retired_relay_target_settings(value, &mut retired);
 
+    retired.sort();
+    retired
+}
+
+fn reject_retired_v5_settings(value: &TomlValue) -> Result<()> {
+    let retired = collect_retired_v5_settings(value);
+
     if retired.is_empty() {
         return Ok(());
     }
 
-    retired.sort();
     let labels = retired
         .iter()
         .map(|path| format!("`{path}`"))
@@ -419,9 +585,1630 @@ fn reject_retired_v5_settings(value: &TomlValue) -> Result<()> {
     )
 }
 
+fn remove_toml_path(value: &mut TomlValue, path: &[&str]) -> bool {
+    let Some((head, tail)) = path.split_first() else {
+        return false;
+    };
+    let Some(table) = value.as_table_mut() else {
+        return false;
+    };
+    if tail.is_empty() {
+        return table.remove(*head).is_some();
+    }
+    table
+        .get_mut(*head)
+        .is_some_and(|child| remove_toml_path(child, tail))
+}
+
+fn remove_retired_settings(value: &mut TomlValue, notices: &mut Vec<String>) {
+    for &(path, label) in RETIRED_V5_REMOVALS {
+        if remove_toml_path(value, path) {
+            notices.push(format!("removed retired setting `{label}`"));
+        }
+    }
+
+    for service in ["codex", "claude"] {
+        let profile_names = nested_toml_value(value, &[service, "profiles"])
+            .and_then(TomlValue::as_table)
+            .map(|profiles| profiles.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for profile_name in profile_names {
+            let path = [service, "profiles", profile_name.as_str(), "station"];
+            if remove_toml_path(value, &path) {
+                notices.push(format!(
+                    "removed retired setting `{service}.profiles.{}.station`; route graph routing now owns provider selection",
+                    toml_path_key(&profile_name)
+                ));
+            }
+        }
+    }
+
+    let target_names = value
+        .get("relay_targets")
+        .and_then(TomlValue::as_table)
+        .map(|targets| targets.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    for target_name in target_names {
+        for field in ["client_preset", "responses_websocket"] {
+            let path = ["relay_targets", target_name.as_str(), field];
+            if remove_toml_path(value, &path) {
+                notices.push(format!(
+                    "removed retired setting `relay_targets.{}.{field}`",
+                    toml_path_key(&target_name)
+                ));
+            }
+        }
+    }
+}
+
+fn json_value_to_toml(
+    value: serde_json::Value,
+    path: &str,
+    notices: &mut Vec<String>,
+) -> Result<Option<TomlValue>> {
+    let converted = match value {
+        serde_json::Value::Null => {
+            notices.push(format!("ignored JSON null at `{path}`"));
+            return Ok(None);
+        }
+        serde_json::Value::Bool(value) => TomlValue::Boolean(value),
+        serde_json::Value::Number(value) => {
+            if let Some(value) = value.as_i64() {
+                TomlValue::Integer(value)
+            } else if let Some(value) = value.as_u64() {
+                TomlValue::Integer(i64::try_from(value).with_context(|| {
+                    format!("JSON integer at `{path}` exceeds the TOML integer range")
+                })?)
+            } else {
+                TomlValue::Float(value.as_f64().with_context(|| {
+                    format!("JSON number at `{path}` is not representable as TOML")
+                })?)
+            }
+        }
+        serde_json::Value::String(value) => TomlValue::String(value),
+        serde_json::Value::Array(values) => {
+            let mut converted = Vec::with_capacity(values.len());
+            for (index, value) in values.into_iter().enumerate() {
+                let item_path = format!("{path}[{index}]");
+                if let Some(value) = json_value_to_toml(value, &item_path, notices)? {
+                    converted.push(value);
+                }
+            }
+            TomlValue::Array(converted)
+        }
+        serde_json::Value::Object(values) => {
+            let mut converted = toml::map::Map::new();
+            for (key, value) in values {
+                let item_path = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                if let Some(value) = json_value_to_toml(value, &item_path, notices)? {
+                    converted.insert(key, value);
+                }
+            }
+            TomlValue::Table(converted)
+        }
+    };
+    Ok(Some(converted))
+}
+
+fn parse_migration_source(
+    format: ConfigMigrationFormat,
+    source_name: &str,
+    contents: &[u8],
+    notices: &mut Vec<String>,
+) -> Result<TomlValue> {
+    match format {
+        ConfigMigrationFormat::Toml => {
+            let text = std::str::from_utf8(contents)
+                .with_context(|| format!("{source_name} is not valid UTF-8"))?;
+            toml::from_str(text).with_context(|| format!("parse legacy {source_name}"))
+        }
+        ConfigMigrationFormat::Json => {
+            let value = serde_json::from_slice(contents)
+                .with_context(|| format!("parse legacy {source_name}"))?;
+            super::legacy_json_impl::validate_json_migration_source(&value, source_name)?;
+            json_value_to_toml(value, "", notices)?.with_context(|| {
+                format!("legacy {source_name} contains only null and cannot be migrated")
+            })
+        }
+    }
+}
+
+fn service_has_legacy_station_shape(service: &toml::map::Map<String, TomlValue>) -> bool {
+    service.contains_key("configs")
+        || service
+            .get("stations")
+            .and_then(TomlValue::as_table)
+            .is_some_and(|stations| {
+                stations.values().any(|station| {
+                    station
+                        .as_table()
+                        .is_some_and(|station| station.contains_key("upstreams"))
+                })
+            })
+}
+
+fn has_legacy_station_shape(value: &TomlValue) -> bool {
+    ["codex", "claude"].iter().any(|service| {
+        value
+            .get(*service)
+            .and_then(TomlValue::as_table)
+            .is_some_and(service_has_legacy_station_shape)
+    })
+}
+
+fn service_has_v2_station_shape(service: &toml::map::Map<String, TomlValue>) -> bool {
+    service.contains_key("groups")
+        || service.contains_key("active_group")
+        || service.contains_key("active_station")
+        || service
+            .get("stations")
+            .and_then(TomlValue::as_table)
+            .is_some_and(|stations| {
+                stations.values().any(|station| {
+                    station
+                        .as_table()
+                        .is_some_and(|station| station.contains_key("members"))
+                })
+            })
+}
+
+fn has_v2_station_shape(value: &TomlValue) -> bool {
+    ["codex", "claude"].iter().any(|service| {
+        value
+            .get(*service)
+            .and_then(TomlValue::as_table)
+            .is_some_and(service_has_v2_station_shape)
+    })
+}
+
+fn service_has_legacy_v3_routing_shape(service: &toml::map::Map<String, TomlValue>) -> bool {
+    service
+        .get("routing")
+        .and_then(TomlValue::as_table)
+        .is_some_and(|routing| {
+            !routing.contains_key("routes")
+                && ["policy", "order", "target", "prefer_tags", "chain", "pools"]
+                    .iter()
+                    .any(|key| routing.contains_key(*key))
+        })
+}
+
+fn has_legacy_v3_routing_shape(value: &TomlValue) -> bool {
+    ["codex", "claude"].iter().any(|service| {
+        value
+            .get(*service)
+            .and_then(TomlValue::as_table)
+            .is_some_and(service_has_legacy_v3_routing_shape)
+    })
+}
+
+fn toml_config_requires_migration(value: &TomlValue, version: Option<u64>) -> bool {
+    version != Some(u64::from(CURRENT_CONFIG_VERSION))
+        || !collect_retired_v5_settings(value).is_empty()
+        || has_legacy_station_shape(value)
+        || has_v2_station_shape(value)
+        || has_legacy_v3_routing_shape(value)
+}
+
+fn inferred_migration_schema_version(value: &TomlValue) -> Option<u64> {
+    if has_legacy_station_shape(value) {
+        return Some(1);
+    }
+    if has_v2_station_shape(value) {
+        return Some(2);
+    }
+    if has_legacy_v3_routing_shape(value) {
+        return Some(3);
+    }
+    if ["codex", "claude"].iter().any(|service| {
+        value
+            .get(*service)
+            .and_then(|service| service.get("routing"))
+            .and_then(TomlValue::as_table)
+            .is_some_and(|routing| routing.contains_key("entry") || routing.contains_key("routes"))
+    }) {
+        return Some(4);
+    }
+    None
+}
+
+fn validate_legacy_value<T>(value: &TomlValue, path: &str, expected: &str) -> Result<()>
+where
+    T: serde::de::DeserializeOwned,
+{
+    value.clone().try_into::<T>().map(|_| ()).map_err(|source| {
+        anyhow::anyhow!(
+            "legacy configuration field `{path}` must be {expected}; migration was not written: {source}"
+        )
+    })
+}
+
+fn validate_optional_legacy_field<T>(
+    table: &toml::map::Map<String, TomlValue>,
+    field: &str,
+    parent_path: &str,
+    expected: &str,
+) -> Result<()>
+where
+    T: serde::de::DeserializeOwned,
+{
+    if let Some(value) = table.get(field) {
+        validate_legacy_value::<T>(value, &format!("{parent_path}.{field}"), expected)?;
+    }
+    Ok(())
+}
+
+fn reject_ambiguous_legacy_fields(
+    table: &toml::map::Map<String, TomlValue>,
+    allowed: &[&str],
+    parent_path: &str,
+) -> Result<()> {
+    let mut unknown = table
+        .keys()
+        .filter(|field| !allowed.contains(&field.as_str()))
+        .map(|field| format!("{parent_path}.{}", toml_path_key(field)))
+        .collect::<Vec<_>>();
+    unknown.sort();
+    if !unknown.is_empty() {
+        anyhow::bail!(
+            "legacy configuration field(s) {} cannot be migrated without guessing their new ownership; remove or migrate them explicitly before retrying",
+            unknown
+                .iter()
+                .map(|path| format!("`{path}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn validate_legacy_station_service(service_name: &str, service: &TomlValue) -> Result<()> {
+    let service = service
+        .as_table()
+        .with_context(|| format!("legacy configuration field `{service_name}` must be a table"))?;
+    validate_optional_legacy_field::<String>(service, "active", service_name, "a string")?;
+
+    if service.contains_key("configs") && service.contains_key("stations") {
+        anyhow::bail!(
+            "legacy configuration service `{service_name}` cannot define both `configs` and its `stations` alias"
+        );
+    }
+    if let Some(active) = service.get("active").and_then(TomlValue::as_str) {
+        let stations = service
+            .get("configs")
+            .or_else(|| service.get("stations"))
+            .and_then(TomlValue::as_table);
+        if !stations.is_some_and(|stations| stations.contains_key(active)) {
+            anyhow::bail!(
+                "legacy configuration field `{service_name}.active` references missing station {active:?}"
+            );
+        }
+    }
+    for container_name in ["configs", "stations"] {
+        let Some(stations) = service.get(container_name) else {
+            continue;
+        };
+        let container_path = format!("{service_name}.{container_name}");
+        let stations = stations.as_table().with_context(|| {
+            format!("legacy configuration field `{container_path}` must be a table")
+        })?;
+        for (station_name, station) in stations {
+            let station_path = format!("{container_path}.{}", toml_path_key(station_name));
+            let station = station.as_table().with_context(|| {
+                format!("legacy configuration field `{station_path}` must be a table")
+            })?;
+            reject_ambiguous_legacy_fields(
+                station,
+                &["name", "alias", "enabled", "level", "upstreams"],
+                &station_path,
+            )?;
+            validate_optional_legacy_field::<String>(station, "name", &station_path, "a string")?;
+            validate_optional_legacy_field::<String>(station, "alias", &station_path, "a string")?;
+            validate_optional_legacy_field::<bool>(station, "enabled", &station_path, "a boolean")?;
+            validate_optional_legacy_field::<u8>(
+                station,
+                "level",
+                &station_path,
+                "an integer from 0 through 255",
+            )?;
+            validate_optional_legacy_field::<Vec<UpstreamConfig>>(
+                station,
+                "upstreams",
+                &station_path,
+                "an array of legacy upstream tables",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_v2_service(service_name: &str, service: &TomlValue) -> Result<()> {
+    let service = service
+        .as_table()
+        .with_context(|| format!("legacy configuration field `{service_name}` must be a table"))?;
+    if service.contains_key("active_group") && service.contains_key("active_station") {
+        anyhow::bail!(
+            "legacy configuration service `{service_name}` cannot define both `active_group` and its `active_station` alias"
+        );
+    }
+    validate_optional_legacy_field::<String>(service, "active_group", service_name, "a string")?;
+    validate_optional_legacy_field::<String>(service, "active_station", service_name, "a string")?;
+
+    if service.contains_key("groups") && service.contains_key("stations") {
+        anyhow::bail!(
+            "legacy configuration service `{service_name}` cannot define both `groups` and its `stations` alias"
+        );
+    }
+    let active = service
+        .get("active_group")
+        .or_else(|| service.get("active_station"))
+        .and_then(TomlValue::as_str);
+    if let Some(active) = active {
+        let groups = service
+            .get("groups")
+            .or_else(|| service.get("stations"))
+            .and_then(TomlValue::as_table);
+        if !groups.is_some_and(|groups| groups.contains_key(active)) {
+            anyhow::bail!(
+                "legacy configuration active group for `{service_name}` references missing group/station {active:?}"
+            );
+        }
+    }
+    for container_name in ["groups", "stations"] {
+        let Some(groups) = service.get(container_name) else {
+            continue;
+        };
+        let container_path = format!("{service_name}.{container_name}");
+        let groups = groups.as_table().with_context(|| {
+            format!("legacy configuration field `{container_path}` must be a table")
+        })?;
+        for (group_name, group) in groups {
+            let group_path = format!("{container_path}.{}", toml_path_key(group_name));
+            let group = group.as_table().with_context(|| {
+                format!("legacy configuration field `{group_path}` must be a table")
+            })?;
+            reject_ambiguous_legacy_fields(
+                group,
+                &["alias", "enabled", "level", "members"],
+                &group_path,
+            )?;
+            validate_optional_legacy_field::<String>(group, "alias", &group_path, "a string")?;
+            validate_optional_legacy_field::<bool>(group, "enabled", &group_path, "a boolean")?;
+            validate_optional_legacy_field::<u8>(
+                group,
+                "level",
+                &group_path,
+                "an integer from 0 through 255",
+            )?;
+
+            let Some(members) = group.get("members") else {
+                continue;
+            };
+            let members_path = format!("{group_path}.members");
+            let members = members.as_array().with_context(|| {
+                format!("legacy configuration field `{members_path}` must be an array")
+            })?;
+            for (index, member) in members.iter().enumerate() {
+                let member_path = format!("{members_path}[{index}]");
+                let member = member.as_table().with_context(|| {
+                    format!("legacy configuration field `{member_path}` must be a table")
+                })?;
+                reject_ambiguous_legacy_fields(
+                    member,
+                    &["provider", "endpoint_names", "endpoints", "preferred"],
+                    &member_path,
+                )?;
+                let provider = member.get("provider").with_context(|| {
+                    format!("legacy configuration field `{member_path}.provider` is required")
+                })?;
+                validate_legacy_value::<String>(
+                    provider,
+                    &format!("{member_path}.provider"),
+                    "a string",
+                )?;
+                if member.contains_key("endpoint_names") && member.contains_key("endpoints") {
+                    anyhow::bail!(
+                        "legacy configuration member `{member_path}` cannot define both `endpoint_names` and its `endpoints` alias"
+                    );
+                }
+                validate_optional_legacy_field::<Vec<String>>(
+                    member,
+                    "endpoint_names",
+                    &member_path,
+                    "an array of strings",
+                )?;
+                validate_optional_legacy_field::<Vec<String>>(
+                    member,
+                    "endpoints",
+                    &member_path,
+                    "an array of strings",
+                )?;
+                validate_optional_legacy_field::<bool>(
+                    member,
+                    "preferred",
+                    &member_path,
+                    "a boolean",
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+const LEGACY_V3_ROUTING_FIELDS: &[&str] = &[
+    "policy",
+    "order",
+    "target",
+    "prefer_tags",
+    "chain",
+    "pools",
+    "on_exhausted",
+];
+
+fn validate_v3_routing(service_name: &str, service: &TomlValue) -> Result<()> {
+    let Some(routing) = service.get("routing") else {
+        return Ok(());
+    };
+    let routing_path = format!("{service_name}.routing");
+    let routing = routing
+        .as_table()
+        .with_context(|| format!("legacy configuration field `{routing_path}` must be a table"))?;
+    validate_optional_legacy_field::<String>(routing, "policy", &routing_path, "a string")?;
+    validate_optional_legacy_field::<Vec<String>>(
+        routing,
+        "order",
+        &routing_path,
+        "an array of strings",
+    )?;
+    validate_optional_legacy_field::<String>(routing, "target", &routing_path, "a string")?;
+    validate_optional_legacy_field::<Vec<BTreeMap<String, String>>>(
+        routing,
+        "prefer_tags",
+        &routing_path,
+        "an array of string maps",
+    )?;
+    validate_optional_legacy_field::<Vec<String>>(
+        routing,
+        "chain",
+        &routing_path,
+        "an array of strings",
+    )?;
+    validate_optional_legacy_field::<String>(routing, "on_exhausted", &routing_path, "a string")?;
+
+    let Some(pools) = routing.get("pools") else {
+        return Ok(());
+    };
+    let pools_path = format!("{routing_path}.pools");
+    let pools = pools
+        .as_table()
+        .with_context(|| format!("legacy configuration field `{pools_path}` must be a table"))?;
+    for (pool_name, pool) in pools {
+        let pool_path = format!("{pools_path}.{}", toml_path_key(pool_name));
+        let pool = pool
+            .as_table()
+            .with_context(|| format!("legacy configuration field `{pool_path}` must be a table"))?;
+        reject_ambiguous_legacy_fields(pool, &["providers"], &pool_path)?;
+        validate_optional_legacy_field::<Vec<String>>(
+            pool,
+            "providers",
+            &pool_path,
+            "an array of strings",
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_legacy_migration_input(value: &TomlValue, explicit_version: Option<u64>) -> Result<()> {
+    for service_name in ["codex", "claude"] {
+        let Some(service_value) = value.get(service_name) else {
+            continue;
+        };
+        if let Some(service) = service_value.as_table() {
+            let service_has_v1_shape = service_has_legacy_station_shape(service);
+            let service_has_v2_shape = service_has_v2_station_shape(service);
+            let validate_v1 = service_has_v1_shape || explicit_version == Some(1);
+            let validate_v2 = service_has_v2_shape || explicit_version == Some(2);
+
+            if validate_v1 {
+                let conflicting = [
+                    "providers",
+                    "routing",
+                    "groups",
+                    "active_group",
+                    "active_station",
+                ]
+                .into_iter()
+                .filter(|field| service.contains_key(*field))
+                .collect::<Vec<_>>();
+                if !conflicting.is_empty() {
+                    anyhow::bail!(
+                        "legacy configuration service `{service_name}` mixes v1 station ownership with field(s) {}; migration would overwrite current configuration",
+                        conflicting.join(", ")
+                    );
+                }
+            }
+            if validate_v2 {
+                if service.contains_key("routing") {
+                    anyhow::bail!(
+                        "legacy configuration service `{service_name}` mixes v2 group ownership with routing; migration would overwrite current configuration"
+                    );
+                }
+                if service_has_v1_shape {
+                    anyhow::bail!(
+                        "legacy configuration service `{service_name}` mixes v1 station and v2 group ownership; migration was not written"
+                    );
+                }
+            }
+            if validate_v1 {
+                validate_legacy_station_service(service_name, service_value)?;
+            }
+            if validate_v2 {
+                validate_v2_service(service_name, service_value)?;
+            }
+            if service_has_legacy_v3_routing_shape(service) || explicit_version == Some(3) {
+                validate_v3_routing(service_name, service_value)?;
+            }
+        } else if matches!(explicit_version, Some(1..=3)) {
+            anyhow::bail!("legacy configuration field `{service_name}` must be a table");
+        }
+    }
+    Ok(())
+}
+
+fn migrate_flat_retry_settings(value: &mut TomlValue, notices: &mut Vec<String>) -> Result<()> {
+    let Some(retry) = value.get_mut("retry") else {
+        return Ok(());
+    };
+    let retry = retry
+        .as_table_mut()
+        .context("legacy configuration field `retry` must be a table")?;
+    let mut flat = toml::map::Map::new();
+    for field in LEGACY_FLAT_RETRY_FIELDS {
+        if let Some(value) = retry.remove(*field) {
+            flat.insert((*field).to_string(), value);
+        }
+    }
+    if flat.is_empty() {
+        return Ok(());
+    }
+
+    for field in ["max_attempts", "backoff_ms", "backoff_max_ms", "jitter_ms"] {
+        validate_optional_legacy_field::<u64>(&flat, field, "retry", "a non-negative integer")?;
+    }
+    if let Some(max_attempts) = flat.get("max_attempts") {
+        validate_legacy_value::<u32>(max_attempts, "retry.max_attempts", "a 32-bit integer")?;
+    }
+    validate_optional_legacy_field::<String>(&flat, "on_status", "retry", "a string")?;
+    validate_optional_legacy_field::<Vec<String>>(
+        &flat,
+        "on_class",
+        "retry",
+        "an array of strings",
+    )?;
+    validate_optional_legacy_field::<RetryStrategy>(
+        &flat,
+        "strategy",
+        "retry",
+        "`failover` or `same_upstream`",
+    )?;
+
+    if let Some(upstream) = retry.get("upstream") {
+        upstream
+            .as_table()
+            .context("legacy configuration field `retry.upstream` must be a table")?;
+        let mut ignored = flat.keys().cloned().collect::<Vec<_>>();
+        ignored.sort();
+        notices.push(format!(
+            "ignored legacy flat retry settings {} because existing `retry.upstream` was the complete historical override",
+            ignored.join(", ")
+        ));
+        return Ok(());
+    }
+
+    retry.insert("upstream".to_string(), TomlValue::Table(flat));
+    notices.push("migrated legacy flat retry settings into `retry.upstream`".to_string());
+    Ok(())
+}
+
+fn toml_string(value: Option<&TomlValue>) -> Option<String> {
+    value
+        .and_then(TomlValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn toml_string_array(value: Option<&TomlValue>) -> Vec<String> {
+    value
+        .and_then(TomlValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|value| toml_string(Some(value)))
+        .collect()
+}
+
+fn toml_table_value(entries: impl IntoIterator<Item = (&'static str, TomlValue)>) -> TomlValue {
+    TomlValue::Table(
+        entries
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect(),
+    )
+}
+
+fn toml_string_array_value(values: Vec<String>) -> TomlValue {
+    TomlValue::Array(values.into_iter().map(TomlValue::String).collect())
+}
+
+fn toml_table_string(value: &TomlValue, key: &str) -> Option<String> {
+    value
+        .as_table()
+        .and_then(|table| table.get(key))
+        .and_then(|value| toml_string(Some(value)))
+}
+
+fn legacy_effective_level(value: Option<&TomlValue>) -> i64 {
+    value
+        .and_then(TomlValue::as_integer)
+        .unwrap_or(1)
+        .clamp(1, 10)
+}
+
+fn route_name_available(used: &mut BTreeSet<String>, base: &str, suffix: &str) -> String {
+    let base = if base.trim().is_empty() {
+        suffix.to_string()
+    } else {
+        base.trim().to_string()
+    };
+    if used.insert(base.clone()) {
+        return base;
+    }
+    let mut candidate = format!("{base}_{suffix}");
+    let mut index = 2usize;
+    while !used.insert(candidate.clone()) {
+        candidate = format!("{base}_{suffix}_{index}");
+        index += 1;
+    }
+    candidate
+}
+
+fn migration_route_entry(
+    service: &toml::map::Map<String, TomlValue>,
+    route_refs: &[String],
+) -> String {
+    let mut used = service
+        .get("providers")
+        .and_then(TomlValue::as_table)
+        .into_iter()
+        .flat_map(|providers| providers.keys().cloned())
+        .chain(route_refs.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    route_name_available(&mut used, "main", "route")
+}
+
+fn migrate_v3_routing_for_service(
+    service_name: &str,
+    service: &mut toml::map::Map<String, TomlValue>,
+    notices: &mut Vec<String>,
+) -> Result<()> {
+    let Some(mut routing) = service.remove("routing") else {
+        return Ok(());
+    };
+    let Some(legacy) = routing.as_table_mut() else {
+        service.insert("routing".to_string(), routing);
+        return Ok(());
+    };
+    if legacy.contains_key("routes") || legacy.contains_key("entry") {
+        service.insert("routing".to_string(), routing);
+        return Ok(());
+    }
+
+    let retained_extensions = legacy
+        .iter()
+        .filter(|(field, _)| !LEGACY_V3_ROUTING_FIELDS.contains(&field.as_str()))
+        .map(|(field, value)| (field.clone(), value.clone()))
+        .collect::<toml::map::Map<_, _>>();
+    let mut retained_extension_names = retained_extensions.keys().cloned().collect::<Vec<_>>();
+    retained_extension_names.sort();
+
+    let providers = service
+        .get("providers")
+        .and_then(TomlValue::as_table)
+        .map(|providers| providers.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let policy = toml_table_string(&TomlValue::Table(legacy.clone()), "policy")
+        .unwrap_or_else(|| "ordered-failover".to_string());
+    let on_exhausted = toml_table_string(&TomlValue::Table(legacy.clone()), "on_exhausted")
+        .unwrap_or_else(|| "continue".to_string());
+    let stops_on_exhaustion = on_exhausted == "stop";
+    let mut children = toml_string_array(legacy.get("order"));
+    if children.is_empty() {
+        children = providers.clone();
+    }
+    let mut root = toml::map::Map::new();
+    root.insert("on_exhausted".to_string(), TomlValue::String(on_exhausted));
+
+    match policy.as_str() {
+        "ordered-failover" => {
+            root.insert(
+                "strategy".to_string(),
+                TomlValue::String("ordered-failover".to_string()),
+            );
+        }
+        "manual-sticky" => {
+            root.insert(
+                "strategy".to_string(),
+                TomlValue::String("manual-sticky".to_string()),
+            );
+            let target = toml_string(legacy.get("target"))
+                .or_else(|| children.first().cloned())
+                .or_else(|| providers.first().cloned());
+            if let Some(target) = target {
+                root.insert("target".to_string(), TomlValue::String(target));
+            }
+        }
+        "tag-preferred" => {
+            root.insert(
+                "strategy".to_string(),
+                TomlValue::String("tag-preferred".to_string()),
+            );
+            if let Some(prefer_tags) = legacy.get("prefer_tags") {
+                root.insert("prefer_tags".to_string(), prefer_tags.clone());
+            }
+        }
+        "pool-fallback" => {
+            root.insert(
+                "strategy".to_string(),
+                TomlValue::String("ordered-failover".to_string()),
+            );
+            let chain = {
+                let chain = toml_string_array(legacy.get("chain"));
+                if chain.is_empty() {
+                    legacy
+                        .get("pools")
+                        .and_then(TomlValue::as_table)
+                        .map(|pools| pools.keys().cloned().collect::<Vec<_>>())
+                        .unwrap_or_default()
+                } else {
+                    chain
+                }
+            };
+            let pools = legacy
+                .get("pools")
+                .and_then(TomlValue::as_table)
+                .cloned()
+                .unwrap_or_default();
+            if chain.is_empty() {
+                anyhow::bail!(
+                    "[{service_name}] legacy pool-fallback routing requires at least one pool"
+                );
+            }
+            let mut used = providers.iter().cloned().collect::<BTreeSet<_>>();
+            let mut branch_names = Vec::new();
+            let mut routes = toml::map::Map::new();
+            for pool_name in chain {
+                let Some(pool) = pools.get(&pool_name).and_then(TomlValue::as_table) else {
+                    anyhow::bail!(
+                        "[{service_name}] legacy pool-fallback routing references missing pool `{pool_name}`"
+                    );
+                };
+                let pool_children = toml_string_array(pool.get("providers"));
+                if pool_children.is_empty() {
+                    anyhow::bail!(
+                        "[{service_name}] legacy pool `{pool_name}` must contain at least one provider"
+                    );
+                }
+                let route_name = route_name_available(&mut used, &pool_name, "pool");
+                let route = toml_table_value([
+                    (
+                        "strategy",
+                        TomlValue::String("ordered-failover".to_string()),
+                    ),
+                    ("children", toml_string_array_value(pool_children)),
+                ]);
+                routes.insert(route_name.clone(), route);
+                branch_names.push(route_name);
+            }
+            if stops_on_exhaustion {
+                branch_names.truncate(1);
+            }
+            if !branch_names.is_empty() {
+                let entry = route_name_available(&mut used, "main", "route");
+                root.insert(
+                    "children".to_string(),
+                    toml_string_array_value(branch_names),
+                );
+                let mut graph = toml::map::Map::new();
+                graph.insert(entry.clone(), TomlValue::Table(root.clone()));
+                graph.extend(routes);
+                let mut result = retained_extensions.clone();
+                result.insert("entry".to_string(), TomlValue::String(entry));
+                result.insert(
+                    "affinity_policy".to_string(),
+                    TomlValue::String("fallback-sticky".to_string()),
+                );
+                result.insert("routes".to_string(), TomlValue::Table(graph));
+                service.insert("routing".to_string(), TomlValue::Table(result));
+                if !retained_extension_names.is_empty() {
+                    notices.push(format!(
+                        "[{service_name}] retained legacy v3 routing extension field(s) at the v5 routing scope: {}",
+                        retained_extension_names.join(", ")
+                    ));
+                }
+                notices.push(format!(
+                    "[{service_name}] converted v3 pool-fallback routing into route graph nodes"
+                ));
+                return Ok(());
+            }
+        }
+        other => {
+            anyhow::bail!(
+                "[{service_name}] unsupported legacy routing policy `{other}`; migration was not written"
+            );
+        }
+    }
+
+    root.insert(
+        "children".to_string(),
+        toml_string_array_value(children.clone()),
+    );
+    let entry = migration_route_entry(service, &children);
+    let mut routes = toml::map::Map::new();
+    routes.insert(entry.clone(), TomlValue::Table(root));
+    let mut result = retained_extensions;
+    result.insert("entry".to_string(), TomlValue::String(entry));
+    result.insert(
+        "affinity_policy".to_string(),
+        TomlValue::String("fallback-sticky".to_string()),
+    );
+    result.insert("routes".to_string(), TomlValue::Table(routes));
+    service.insert("routing".to_string(), TomlValue::Table(result));
+    if !retained_extension_names.is_empty() {
+        notices.push(format!(
+            "[{service_name}] retained legacy v3 routing extension field(s) at the v5 routing scope: {}",
+            retained_extension_names.join(", ")
+        ));
+    }
+    notices.push(format!(
+        "[{service_name}] converted legacy v3 `{policy}` routing into the v5 route graph"
+    ));
+    Ok(())
+}
+
+fn migrate_v3_routing(value: &mut TomlValue, notices: &mut Vec<String>) -> Result<()> {
+    for service_name in ["codex", "claude"] {
+        let Some(service) = value
+            .get_mut(service_name)
+            .and_then(TomlValue::as_table_mut)
+        else {
+            continue;
+        };
+        migrate_v3_routing_for_service(service_name, service, notices)?;
+    }
+    Ok(())
+}
+
+fn ordered_v2_group_members(
+    service_name: &str,
+    group_name: &str,
+    group: &TomlValue,
+    provider_names: &BTreeSet<String>,
+) -> Result<Vec<String>> {
+    let Some(members) = group.get("members").and_then(TomlValue::as_array) else {
+        return Ok(Vec::new());
+    };
+    let mut members = members
+        .iter()
+        .enumerate()
+        .map(|(index, member)| -> Result<_> {
+            let provider = member
+                .get("provider")
+                .and_then(TomlValue::as_str)
+                .context("validated v2 group member is missing its provider")?
+                .to_string();
+            let preferred = member
+                .get("preferred")
+                .and_then(TomlValue::as_bool)
+                .unwrap_or(false);
+            let endpoint_names = member
+                .get("endpoint_names")
+                .or_else(|| member.get("endpoints"))
+                .and_then(TomlValue::as_array)
+                .into_iter()
+                .flatten()
+                .map(|endpoint| {
+                    endpoint
+                        .as_str()
+                        .context("validated v2 group endpoint name is not a string")
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let route_refs = if endpoint_names.is_empty() {
+                vec![provider]
+            } else {
+                if provider.is_empty() || provider.trim() != provider || provider.contains('.') {
+                    anyhow::bail!(
+                        "[{service_name}] v2 group `{group_name}` has ambiguous endpoint-scoped provider {provider:?}; provider ids must be non-empty, whitespace-exact, and contain no dots to round-trip through provider.endpoint references"
+                    );
+                }
+                let mut route_refs = Vec::with_capacity(endpoint_names.len());
+                for endpoint in endpoint_names {
+                    if endpoint.is_empty() || endpoint.trim() != endpoint {
+                        anyhow::bail!(
+                            "[{service_name}] v2 group `{group_name}` has ambiguous endpoint id {endpoint:?}; endpoint ids must be non-empty and whitespace-exact to round-trip through provider.endpoint references"
+                        );
+                    }
+                    let route_ref = format!("{provider}.{endpoint}");
+                    if provider_names.contains(&route_ref) {
+                        anyhow::bail!(
+                            "[{service_name}] v2 group `{group_name}` has ambiguous endpoint reference `{route_ref}` because a provider has the same composite name"
+                        );
+                    }
+                    route_refs.push(route_ref);
+                }
+                route_refs
+            };
+            Ok((!preferred, index, route_refs))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    members.sort_by_key(|(preferred, index, _)| (*preferred, *index));
+    Ok(members
+        .into_iter()
+        .flat_map(|(_, _, route_refs)| route_refs)
+        .collect())
+}
+
+fn insert_ordered_route_graph(
+    service: &mut toml::map::Map<String, TomlValue>,
+    children: Vec<String>,
+) {
+    if children.is_empty() {
+        return;
+    }
+    let entry = migration_route_entry(service, &children);
+    let root = toml_table_value([
+        (
+            "strategy",
+            TomlValue::String("ordered-failover".to_string()),
+        ),
+        ("children", toml_string_array_value(children)),
+    ]);
+    let mut routes = toml::map::Map::new();
+    routes.insert(entry.clone(), root);
+    let mut routing = toml::map::Map::new();
+    routing.insert("entry".to_string(), TomlValue::String(entry));
+    routing.insert(
+        "affinity_policy".to_string(),
+        TomlValue::String("fallback-sticky".to_string()),
+    );
+    routing.insert("routes".to_string(), TomlValue::Table(routes));
+    service.insert("routing".to_string(), TomlValue::Table(routing));
+}
+
+fn migrate_v2_service(
+    service_name: &str,
+    service: &mut toml::map::Map<String, TomlValue>,
+    notices: &mut Vec<String>,
+) -> Result<()> {
+    let provider_names = service
+        .get("providers")
+        .and_then(TomlValue::as_table)
+        .map(|providers| providers.keys().cloned().collect::<BTreeSet<_>>())
+        .unwrap_or_default();
+    let Some(groups) = service
+        .remove("groups")
+        .or_else(|| service.remove("stations"))
+    else {
+        if !provider_names.is_empty() {
+            anyhow::bail!(
+                "[{service_name}] v2 service has providers but no routable group members; refusing to route every provider implicitly"
+            );
+        }
+        service.remove("active_group");
+        service.remove("active_station");
+        return Ok(());
+    };
+    let Some(groups) = groups.as_table() else {
+        anyhow::bail!("[{service_name}] v2 groups/stations must be a table")
+    };
+    let active = service
+        .remove("active_group")
+        .or_else(|| service.remove("active_station"))
+        .and_then(|value| value.as_str().map(ToOwned::to_owned));
+
+    let mut ordered_groups = groups
+        .iter()
+        .map(|(name, group)| {
+            let enabled = group
+                .get("enabled")
+                .and_then(TomlValue::as_bool)
+                .unwrap_or(true);
+            let level = legacy_effective_level(group.get("level"));
+            let is_active = active.as_deref() == Some(name.as_str());
+            (name.clone(), enabled, level, is_active)
+        })
+        .collect::<Vec<_>>();
+    let fallback_group = ordered_groups
+        .iter()
+        .filter(|(_, enabled, _, is_active)| !*enabled && !*is_active)
+        .map(|(name, _, _, _)| name)
+        .min()
+        .cloned();
+    ordered_groups.retain(|(_, enabled, _, is_active)| *enabled || *is_active);
+    if ordered_groups.is_empty()
+        && let Some(fallback_group) = fallback_group
+        && let Some(group) = groups.get(&fallback_group)
+    {
+        let level = legacy_effective_level(group.get("level"));
+        ordered_groups.push((fallback_group, false, level, false));
+    }
+    ordered_groups.sort_by(
+        |(left_name, _, left_level, left_active), (right_name, _, right_level, right_active)| {
+            left_level
+                .cmp(right_level)
+                .then_with(|| right_active.cmp(left_active))
+                .then_with(|| left_name.cmp(right_name))
+        },
+    );
+
+    let mut children = Vec::new();
+    for (group_name, _, _, _) in ordered_groups {
+        let Some(group) = groups.get(&group_name) else {
+            continue;
+        };
+        for route_ref in
+            ordered_v2_group_members(service_name, &group_name, group, &provider_names)?
+        {
+            if !children.iter().any(|existing| existing == &route_ref) {
+                children.push(route_ref);
+            }
+        }
+    }
+    if children.is_empty() && !provider_names.is_empty() {
+        anyhow::bail!(
+            "[{service_name}] v2 service has no routable group members; refusing to route every provider implicitly"
+        );
+    }
+    insert_ordered_route_graph(service, children);
+    notices.push(format!(
+        "[{service_name}] flattened v2 stations/groups into one route graph entry while preserving effective level/active order and explicit endpoint scoping; group aliases are not retained"
+    ));
+    Ok(())
+}
+
+fn legacy_provider_name(station_name: &str, index: usize, used: &mut BTreeSet<String>) -> String {
+    let mut base = station_name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '_' || character == '-' {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    while base.starts_with('-') {
+        base.remove(0);
+    }
+    while base.ends_with('-') {
+        base.pop();
+    }
+    if base.is_empty() {
+        base = "station".to_string();
+    }
+    let candidate = format!("{base}__u{:02}", index + 1);
+    if used.insert(candidate.clone()) {
+        return candidate;
+    }
+    let mut suffix = 2usize;
+    loop {
+        let candidate = format!("{base}__u{:02}_{suffix}", index + 1);
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
+fn migrate_legacy_station_service(
+    service_name: &str,
+    service: &mut toml::map::Map<String, TomlValue>,
+    notices: &mut Vec<String>,
+    explicit_v1: bool,
+) -> Result<bool> {
+    let (uses_configs, stations) = if let Some(stations) = service.remove("configs") {
+        (true, stations)
+    } else if let Some(stations) = service.remove("stations") {
+        (false, stations)
+    } else {
+        return Ok(false);
+    };
+    let Some(stations) = stations.as_table() else {
+        anyhow::bail!("[{service_name}] legacy stations/configs must be a table")
+    };
+    if !explicit_v1
+        && !uses_configs
+        && !stations.values().any(|station| {
+            station
+                .as_table()
+                .is_some_and(|station| station.contains_key("upstreams"))
+        })
+    {
+        // This is the v2 stations alias, which is handled by migrate_v2_service.
+        service.insert("stations".to_string(), TomlValue::Table(stations.clone()));
+        return Ok(false);
+    }
+
+    let active = service
+        .remove("active")
+        .and_then(|value| value.as_str().map(ToOwned::to_owned));
+    let mut stations_by_priority = stations
+        .iter()
+        .map(|(name, station)| {
+            let enabled = station
+                .get("enabled")
+                .and_then(TomlValue::as_bool)
+                .unwrap_or(true);
+            let level = legacy_effective_level(station.get("level"));
+            let is_active = active.as_deref() == Some(name.as_str());
+            (name.clone(), enabled, level, is_active)
+        })
+        .collect::<Vec<_>>();
+    let mut included_stations = stations_by_priority
+        .iter()
+        .filter(|(_, enabled, _, is_active)| *enabled || *is_active)
+        .map(|(name, _, _, _)| name.clone())
+        .collect::<BTreeSet<_>>();
+    if included_stations.is_empty()
+        && let Some(fallback) = stations.keys().min()
+    {
+        included_stations.insert(fallback.clone());
+    }
+    stations_by_priority.sort_by(
+        |(left_name, _, left_level, left_active), (right_name, _, right_level, right_active)| {
+            left_level
+                .cmp(right_level)
+                .then_with(|| right_active.cmp(left_active))
+                .then_with(|| left_name.cmp(right_name))
+        },
+    );
+
+    let mut providers = toml::map::Map::new();
+    let mut children = Vec::new();
+    let mut used = BTreeSet::new();
+    for (station_name, _, _, _) in stations_by_priority {
+        let Some(station) = stations.get(&station_name).and_then(TomlValue::as_table) else {
+            continue;
+        };
+        let include = included_stations.contains(&station_name);
+        let Some(upstreams) = station.get("upstreams").and_then(TomlValue::as_array) else {
+            continue;
+        };
+        for (index, upstream) in upstreams.iter().enumerate() {
+            let Some(upstream) = upstream.as_table() else {
+                anyhow::bail!(
+                    "[{service_name}] legacy station `{station_name}` contains a non-table upstream"
+                );
+            };
+            let provider_name = legacy_provider_name(&station_name, index, &mut used);
+            let mut provider = upstream.clone();
+            provider.insert("enabled".to_string(), TomlValue::Boolean(include));
+            providers.insert(provider_name.clone(), TomlValue::Table(provider));
+            if include {
+                children.push(provider_name);
+            }
+        }
+    }
+    service.insert("providers".to_string(), TomlValue::Table(providers));
+    insert_ordered_route_graph(service, children);
+    notices.push(format!(
+        "[{service_name}] converted legacy station/config entries into provider keys and one route graph entry"
+    ));
+    Ok(true)
+}
+
+fn migrate_legacy_station_shapes(
+    value: &mut TomlValue,
+    notices: &mut Vec<String>,
+    explicit_v1: bool,
+) -> Result<()> {
+    for service_name in ["codex", "claude"] {
+        let Some(service) = value
+            .get_mut(service_name)
+            .and_then(TomlValue::as_table_mut)
+        else {
+            continue;
+        };
+        migrate_legacy_station_service(service_name, service, notices, explicit_v1)?;
+    }
+    Ok(())
+}
+
+fn migrate_v2_shapes(
+    value: &mut TomlValue,
+    notices: &mut Vec<String>,
+    explicit_v2: bool,
+) -> Result<()> {
+    for service_name in ["codex", "claude"] {
+        let Some(service) = value
+            .get_mut(service_name)
+            .and_then(TomlValue::as_table_mut)
+        else {
+            continue;
+        };
+        if !explicit_v2 && !service_has_v2_station_shape(service) {
+            continue;
+        }
+        migrate_v2_service(service_name, service, notices)?;
+    }
+    Ok(())
+}
+
+fn migration_root_unknown_fields(value: &TomlValue, notices: &mut Vec<String>) {
+    let known = [
+        "version",
+        "codex",
+        "claude",
+        "retry",
+        "notify",
+        "default_service",
+        "relay_targets",
+        "fleet",
+        "ui",
+    ];
+    if let Some(table) = value.as_table() {
+        let unknown = table
+            .keys()
+            .filter(|key| !known.contains(&key.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !unknown.is_empty() {
+            notices.push(format!(
+                "unrecognized root setting(s) were retained verbatim but are not interpreted by the current runtime: {}",
+                unknown
+                    .iter()
+                    .map(|key| format!("'{key}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+}
+
+fn migration_service_unknown_fields(value: &TomlValue, notices: &mut Vec<String>) {
+    for service_name in ["codex", "claude"] {
+        let Some(service) = value.get(service_name).and_then(TomlValue::as_table) else {
+            continue;
+        };
+        let known = ["default_profile", "profiles", "providers", "routing"];
+        let unknown = service
+            .keys()
+            .filter(|key| !known.contains(&key.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !unknown.is_empty() {
+            notices.push(format!(
+                "[{service_name}] unrecognized setting(s) were retained verbatim but are not interpreted by the current runtime: {}",
+                unknown
+                    .iter()
+                    .map(|key| format!("'{key}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+}
+
+fn redact_migration_preview(rendered: &str) -> String {
+    let Ok(mut value) = toml::from_str::<TomlValue>(rendered) else {
+        return "# preview omitted because the migrated TOML could not be redacted safely\n"
+            .to_string();
+    };
+    redact_toml_secret_values(&mut value);
+    let body = toml::to_string_pretty(&value).unwrap_or_else(|_| {
+        "# preview omitted because the migrated TOML could not be rendered safely\n".to_string()
+    });
+    format!("{CONFIG_TOML_DOC_HEADER}\n{body}")
+}
+
+fn redact_toml_secret_values(value: &mut TomlValue) {
+    match value {
+        TomlValue::Table(table) => {
+            for (key, value) in table {
+                if matches!(key.as_str(), "auth_token" | "api_key") {
+                    *value = TomlValue::String("<redacted>".to_string());
+                } else if key == "headers" {
+                    redact_all_toml_leaf_values(value);
+                } else {
+                    redact_toml_secret_values(value);
+                }
+            }
+        }
+        TomlValue::Array(values) => {
+            for value in values {
+                redact_toml_secret_values(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn redact_all_toml_leaf_values(value: &mut TomlValue) {
+    match value {
+        TomlValue::Table(table) => {
+            for (_, value) in table.iter_mut() {
+                redact_all_toml_leaf_values(value);
+            }
+        }
+        TomlValue::Array(values) => {
+            for value in values {
+                redact_all_toml_leaf_values(value);
+            }
+        }
+        _ => *value = TomlValue::String("<redacted>".to_string()),
+    }
+}
+
+async fn build_config_migration_plan(
+    paths: &ResolvedConfigDirectory,
+) -> Result<ConfigMigrationPlan> {
+    let (format, source_name, source) =
+        if let Some(source) = read_existing_config_file(paths, "config.toml").await? {
+            (ConfigMigrationFormat::Toml, "config.toml", source)
+        } else if let Some(source) = read_existing_config_file(paths, "config.json").await? {
+            (ConfigMigrationFormat::Json, "config.json", source)
+        } else {
+            anyhow::bail!(
+                "no config.toml or legacy config.json exists at {}; nothing to migrate",
+                paths.logical_path.display()
+            );
+        };
+
+    if source.entry_is_symlink {
+        anyhow::bail!(
+            "refusing to migrate {source_name} because it is a symbolic link; dry-run and write mode require the same regular-file source, and neither the link nor its target was modified"
+        );
+    }
+
+    let mut notices = Vec::new();
+    let mut raw = parse_migration_source(format, source_name, &source.contents, &mut notices)?;
+    let explicit_version = toml_schema_version(&raw, source_name)?;
+    let source_version = explicit_version.or_else(|| inferred_migration_schema_version(&raw));
+    if source_version.is_some_and(|version| version > u64::from(CURRENT_CONFIG_VERSION)) {
+        anyhow::bail!(
+            "{source_name} uses newer unsupported config version {}; migration only supports up to version {}",
+            source_version.unwrap_or_default(),
+            CURRENT_CONFIG_VERSION
+        );
+    }
+
+    let legacy_station_shape = has_legacy_station_shape(&raw);
+    let v2_shape = has_v2_station_shape(&raw);
+    let v3_shape = has_legacy_v3_routing_shape(&raw);
+    let requires_write = matches!(format, ConfigMigrationFormat::Json)
+        || toml_config_requires_migration(&raw, explicit_version);
+    validate_legacy_migration_input(&raw, explicit_version)?;
+    if legacy_station_shape || explicit_version == Some(1) {
+        migrate_legacy_station_shapes(&mut raw, &mut notices, explicit_version == Some(1))?;
+    }
+    if v2_shape || explicit_version == Some(2) {
+        migrate_v2_shapes(&mut raw, &mut notices, explicit_version == Some(2))?;
+    }
+    if v3_shape || source_version == Some(3) {
+        migrate_v3_routing(&mut raw, &mut notices)?;
+    }
+    if explicit_version.is_none() {
+        notices.push(
+            "source has no explicit schema version; fields matching the current contract were imported and the result was validated as version 5".to_string(),
+        );
+    } else if source_version == Some(4) {
+        notices.push(
+            "version 4 route-graph fields were retained and the schema version was advanced to 5"
+                .to_string(),
+        );
+    }
+
+    migrate_flat_retry_settings(&mut raw, &mut notices)?;
+    remove_retired_settings(&mut raw, &mut notices);
+    migration_root_unknown_fields(&raw, &mut notices);
+    migration_service_unknown_fields(&raw, &mut notices);
+
+    let root = raw
+        .as_table_mut()
+        .context("legacy configuration root must be a TOML/JSON object")?;
+    root.insert(
+        "version".to_string(),
+        TomlValue::Integer(i64::from(CURRENT_CONFIG_VERSION)),
+    );
+    let raw_body = toml::to_string_pretty(&raw).context("serialize migrated configuration")?;
+    let candidate = toml::from_str::<HelperConfig>(&raw_body)
+        .context("parse migrated configuration against the current v5 schema")?;
+    validate_helper_config(&candidate).context("validate migrated configuration")?;
+    // Retain every raw field that was not explicitly transformed or retired.
+    // Typed parsing above validates known settings without silently erasing
+    // unknown nested values during migration.
+    let candidate_body = raw_body;
+    let rendered = format!("{CONFIG_TOML_DOC_HEADER}\n{candidate_body}");
+    let preview = redact_migration_preview(rendered.as_str());
+
+    let backup_name = if matches!(format, ConfigMigrationFormat::Json) {
+        "config.json.bak"
+    } else {
+        "config.toml.bak"
+    };
+    Ok(ConfigMigrationPlan {
+        source_name,
+        source_version,
+        requires_write,
+        source,
+        target_path: paths.logical_file("config.toml"),
+        backup_path: paths.logical_file(backup_name),
+        rendered,
+        preview,
+        notices,
+    })
+}
+
+async fn apply_config_migration_plan(
+    paths: &ResolvedConfigDirectory,
+    plan: &ConfigMigrationPlan,
+) -> Result<()> {
+    apply_config_migration_plan_with_before_replace(paths, plan, |_, _| Ok(())).await
+}
+
+async fn apply_config_migration_plan_with_before_replace<B>(
+    paths: &ResolvedConfigDirectory,
+    plan: &ConfigMigrationPlan,
+    before_source_check: B,
+) -> Result<()>
+where
+    B: FnOnce(&Path, &Path) -> io::Result<()> + Send + 'static,
+{
+    paths.ensure_unchanged().await?;
+    if !plan.requires_write {
+        return Ok(());
+    }
+    let current = read_existing_config_file(paths, plan.source_name)
+        .await?
+        .with_context(|| format!("{} disappeared during migration", plan.source_name))?;
+    if current.entry_is_symlink {
+        anyhow::bail!(
+            "refusing to migrate {} because it is a symbolic link; the source and target were not modified",
+            plan.source_name
+        );
+    }
+    if current.contents != plan.source.contents {
+        anyhow::bail!(
+            "{} changed while migration was being prepared; the source and target were not modified",
+            plan.source_name
+        );
+    }
+    if !config_permissions_match(&current.permissions, &plan.source.permissions) {
+        anyhow::bail!(
+            "{} permissions changed while migration was being prepared; no backup or migrated target was written",
+            plan.source_name
+        );
+    }
+    if plan.source_name == "config.json"
+        && read_existing_config_file(paths, "config.toml")
+            .await?
+            .is_some()
+    {
+        anyhow::bail!("config.toml appeared while migrating config.json; no files were modified");
+    }
+
+    let verified_permissions = current.permissions.clone();
+    write_bytes_file_async_with_permissions(
+        &paths.resolved_file(
+            plan.backup_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("config.toml.bak"),
+        ),
+        &plan.source.contents,
+        verified_permissions.clone(),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "back up {} to {}",
+            plan.source_name,
+            plan.backup_path.display()
+        )
+    })?;
+
+    paths.ensure_unchanged().await?;
+    let destination = paths.resolved_file("config.toml");
+    let source_path = paths.resolved_file(plan.source_name);
+    let source_name = plan.source_name;
+    let expected_contents = plan.source.contents.clone();
+    let expected_permissions = verified_permissions.clone();
+    write_bytes_file_async_with_permissions_and_before_replace(
+        &destination,
+        plan.rendered.as_bytes(),
+        verified_permissions,
+        move |staged_path, destination| {
+            before_source_check(staged_path, destination)?;
+            verify_migration_source_before_replace(
+                &source_path,
+                destination,
+                source_name,
+                &expected_contents,
+                &expected_permissions,
+            )
+        },
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "write migrated configuration to {}",
+            plan.target_path.display()
+        )
+    })?;
+    paths.ensure_unchanged().await?;
+    Ok(())
+}
+
+fn verify_migration_source_before_replace(
+    source_path: &Path,
+    destination: &Path,
+    source_name: &str,
+    expected_contents: &[u8],
+    expected_permissions: &std::fs::Permissions,
+) -> io::Result<()> {
+    let metadata = std::fs::symlink_metadata(source_path)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(io::Error::other(format!(
+            "{source_name} is no longer the regular source file used to prepare migration"
+        )));
+    }
+    if !config_permissions_match(&metadata.permissions(), expected_permissions) {
+        return Err(io::Error::other(format!(
+            "{source_name} permissions changed while migration was being prepared"
+        )));
+    }
+    if std::fs::read(source_path)? != expected_contents {
+        return Err(io::Error::other(format!(
+            "{source_name} changed while migration was being prepared"
+        )));
+    }
+    if source_name == "config.json" {
+        match std::fs::symlink_metadata(destination) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(io::Error::other(
+                    "config.toml appeared while migrating config.json",
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn config_permissions_match(
+    current: &std::fs::Permissions,
+    expected: &std::fs::Permissions,
+) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    current.mode() == expected.mode()
+}
+
+#[cfg(not(unix))]
+fn config_permissions_match(
+    current: &std::fs::Permissions,
+    expected: &std::fs::Permissions,
+) -> bool {
+    current.readonly() == expected.readonly()
+}
+
 fn unsupported_legacy_json_error(path: &Path) -> anyhow::Error {
     anyhow::anyhow!(
-        "{} is an unsupported legacy config source; normal startup only reads ~/.codex-helper/config.toml with version = {}. Back up config.json, run `codex-helper config init`, and copy any needed settings into TOML manually. config.json was not imported, rewritten, or deleted.",
+        "{} is a legacy config source and cannot be overwritten by a typed save. Start codex-helper once to migrate it automatically, or run `codex-helper config migrate --write --yes`; migration targets version = {} and keeps config.json unchanged after creating config.json.bak.",
         path.display(),
         CURRENT_CONFIG_VERSION
     )
@@ -525,18 +2312,9 @@ struct ConfigMutationLock {
 }
 
 impl ConfigMutationLock {
-    fn acquire(paths: &ResolvedConfigDirectory) -> Result<Self> {
+    fn try_acquire(paths: &ResolvedConfigDirectory) -> Result<Self> {
         let path = paths.resolved_file("config.toml.lock");
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let file = options
-            .open(&path)
-            .with_context(|| format!("open config mutation lock {}", path.display()))?;
+        let file = open_config_mutation_lock_file(&path)?;
         match file.try_lock() {
             Ok(()) => Ok(Self { _file: file }),
             Err(TryLockError::WouldBlock) => anyhow::bail!(
@@ -548,6 +2326,31 @@ impl ConfigMutationLock {
             }
         }
     }
+
+    async fn acquire_waiting(paths: &ResolvedConfigDirectory) -> Result<Self> {
+        let path = paths.resolved_file("config.toml.lock");
+        tokio::task::spawn_blocking(move || {
+            let file = open_config_mutation_lock_file(&path)?;
+            file.lock()
+                .with_context(|| format!("wait for config mutation lock {}", path.display()))?;
+            Ok(Self { _file: file })
+        })
+        .await
+        .context("join config mutation lock wait task")?
+    }
+}
+
+fn open_config_mutation_lock_file(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(path)
+        .with_context(|| format!("open config mutation lock {}", path.display()))
 }
 
 #[derive(Debug)]
@@ -563,11 +2366,12 @@ impl ExistingConfigToml {
     }
 }
 
-async fn read_existing_config_toml(
+async fn read_existing_config_file(
     paths: &ResolvedConfigDirectory,
+    name: &str,
 ) -> Result<Option<ExistingConfigToml>> {
-    let logical_path = paths.logical_file("config.toml");
-    let entry_path = paths.resolved_file("config.toml");
+    let logical_path = paths.logical_file(name);
+    let entry_path = paths.resolved_file(name);
     let entry_metadata = match fs::symlink_metadata(&entry_path).await {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -604,8 +2408,14 @@ async fn read_existing_config_toml(
     }))
 }
 
-fn validate_current_config_toml(text: &str) -> Result<TomlValue> {
-    let raw_config = toml::from_str::<TomlValue>(text).map_err(|source| {
+async fn read_existing_config_toml(
+    paths: &ResolvedConfigDirectory,
+) -> Result<Option<ExistingConfigToml>> {
+    read_existing_config_file(paths, "config.toml").await
+}
+
+fn parse_toml_value_with_location(text: &str, source_label: &str) -> Result<TomlValue> {
+    toml::from_str::<TomlValue>(text).map_err(|source| {
         let location = source.span().map_or_else(
             || "unknown location".to_string(),
             |span| {
@@ -618,17 +2428,26 @@ fn validate_current_config_toml(text: &str) -> Result<TomlValue> {
                 format!("line {line}, column {column}")
             },
         );
-        anyhow::anyhow!(
-            "parse current config.toml at {location}: {}",
-            source.message()
-        )
-    })?;
-    let version = toml_schema_version(&raw_config);
-    if version != Some(CURRENT_CONFIG_VERSION) {
+        anyhow::anyhow!("parse {source_label} at {location}: {}", source.message())
+    })
+}
+
+fn validate_current_config_toml(text: &str) -> Result<TomlValue> {
+    let raw_config = parse_toml_value_with_location(text, "current config.toml")?;
+    let version = toml_schema_version(&raw_config, "config.toml")?;
+    if version != Some(u64::from(CURRENT_CONFIG_VERSION)) {
         return Err(unsupported_config_error("config.toml", version));
     }
 
     reject_retired_v5_settings(&raw_config)?;
+    if has_legacy_station_shape(&raw_config)
+        || has_v2_station_shape(&raw_config)
+        || has_legacy_v3_routing_shape(&raw_config)
+    {
+        anyhow::bail!(
+            "config.toml still contains a recognizable legacy configuration shape; load the configuration or run `codex-helper config migrate --write --yes` before saving current settings"
+        );
+    }
     Ok(raw_config)
 }
 
@@ -644,8 +2463,21 @@ fn reject_symlink_config_mutation(existing: &ExistingConfigToml, action: &str) -
 async fn write_config_backup(
     paths: &ResolvedConfigDirectory,
     existing: &ExistingConfigToml,
+    preserve_legacy_migration_backup: bool,
 ) -> Result<()> {
     paths.ensure_unchanged().await?;
+    if preserve_legacy_migration_backup
+        && existing_backup_is_legacy_migration_source(paths)
+            .await
+            .with_context(|| {
+                format!(
+                    "back up config.toml to {}",
+                    paths.logical_file("config.toml.bak").display()
+                )
+            })?
+    {
+        return Ok(());
+    }
     let backup_path = paths.resolved_file("config.toml.bak");
     write_bytes_file_async_with_permissions(
         &backup_path,
@@ -660,6 +2492,24 @@ async fn write_config_backup(
         )
     })?;
     paths.ensure_unchanged().await
+}
+
+async fn existing_backup_is_legacy_migration_source(
+    paths: &ResolvedConfigDirectory,
+) -> Result<bool> {
+    let Some(backup) = read_existing_config_file(paths, "config.toml.bak").await? else {
+        return Ok(false);
+    };
+    let Ok(text) = backup.text() else {
+        return Ok(false);
+    };
+    let Ok(raw) = toml::from_str::<TomlValue>(text) else {
+        return Ok(false);
+    };
+    let Ok(version) = toml_schema_version(&raw, "config.toml.bak") else {
+        return Ok(false);
+    };
+    Ok(toml_config_requires_migration(&raw, version))
 }
 
 async fn preflight_existing_config_before_save(
@@ -682,12 +2532,23 @@ async fn preflight_existing_config_before_save(
 }
 
 pub async fn init_config_toml(force: bool) -> Result<PathBuf> {
+    Ok(init_config_toml_with_outcome(force).await?.path)
+}
+
+pub async fn init_config_toml_with_outcome(force: bool) -> Result<ConfigInitOutcome> {
     let paths = ResolvedConfigDirectory::prepare().await?;
-    let _lock = ConfigMutationLock::acquire(&paths)?;
+    init_config_toml_at_paths(&paths, force).await
+}
+
+async fn init_config_toml_at_paths(
+    paths: &ResolvedConfigDirectory,
+    force: bool,
+) -> Result<ConfigInitOutcome> {
+    let _lock = ConfigMutationLock::try_acquire(paths)?;
     paths.ensure_unchanged().await?;
     let path = paths.logical_file("config.toml");
 
-    let existing = read_existing_config_toml(&paths).await?;
+    let existing = read_existing_config_toml(paths).await?;
     if existing.is_some() && !force {
         anyhow::bail!(
             "config.toml already exists at {:?}; use --force to overwrite",
@@ -695,9 +2556,22 @@ pub async fn init_config_toml(force: bool) -> Result<PathBuf> {
         );
     }
 
+    if existing.is_none()
+        && read_existing_config_file(paths, "config.json")
+            .await?
+            .is_some()
+    {
+        let plan = build_config_migration_plan(paths).await?;
+        apply_config_migration_plan(paths, &plan).await?;
+        return Ok(ConfigInitOutcome {
+            path,
+            migration_report: Some(plan.report(true)),
+        });
+    }
+
     if let Some(existing) = existing.as_ref() {
         reject_symlink_config_mutation(existing, "initialize")?;
-        write_config_backup(&paths, existing).await?;
+        write_config_backup(paths, existing, false).await?;
     }
 
     paths.ensure_unchanged().await?;
@@ -707,11 +2581,76 @@ pub async fn init_config_toml(force: bool) -> Result<PathBuf> {
     )
     .await?;
     paths.ensure_unchanged().await?;
-    Ok(path)
+    Ok(ConfigInitOutcome {
+        path,
+        migration_report: None,
+    })
 }
 
 pub async fn load_config() -> Result<HelperConfig> {
     Ok(load_config_with_source().await?.source)
+}
+
+async fn auto_migrate_legacy_config(paths: &ResolvedConfigDirectory) -> Result<()> {
+    let _lock = ConfigMutationLock::acquire_waiting(paths).await?;
+    paths.ensure_unchanged().await?;
+    if !automatic_config_migration_required(paths).await? {
+        return Ok(());
+    }
+    let plan = build_config_migration_plan(paths).await?;
+
+    apply_config_migration_plan(paths, &plan).await?;
+    if plan.notices.is_empty() {
+        tracing::info!(
+            source = plan.source_name,
+            source_version = ?plan.source_version,
+            "automatically migrated helper configuration to the current TOML contract"
+        );
+    } else {
+        tracing::warn!(
+            source = plan.source_name,
+            source_version = ?plan.source_version,
+            notices = ?plan.notices,
+            "automatically migrated helper configuration with operator-visible changes"
+        );
+    }
+    Ok(())
+}
+
+async fn automatic_config_migration_required(paths: &ResolvedConfigDirectory) -> Result<bool> {
+    if let Some(existing) = read_existing_config_toml(paths).await? {
+        let text = existing.text()?;
+        let raw = parse_toml_value_with_location(
+            text,
+            &format!(
+                "current config.toml at {}",
+                paths.logical_file("config.toml").display()
+            ),
+        )?;
+        let version = toml_schema_version(&raw, "config.toml")?;
+        if version.is_some_and(|version| version > u64::from(CURRENT_CONFIG_VERSION)) {
+            return Err(unsupported_config_error("config.toml", version));
+        }
+        return Ok(toml_config_requires_migration(&raw, version));
+    }
+
+    Ok(read_existing_config_file(paths, "config.json")
+        .await?
+        .is_some())
+}
+
+async fn load_current_config_from_paths(paths: &ResolvedConfigDirectory) -> Result<LoadedConfig> {
+    let existing = read_existing_config_toml(paths)
+        .await?
+        .context("canonical config.toml disappeared after migration")?;
+    let text = existing.text()?;
+    validate_current_config_toml(text)?;
+    let config_source = toml::from_str::<HelperConfig>(text)?;
+    validate_helper_config(&config_source)?;
+    paths.ensure_unchanged().await?;
+    Ok(LoadedConfig {
+        source: config_source,
+    })
 }
 
 pub async fn load_config_with_source() -> Result<LoadedConfig> {
@@ -723,6 +2662,21 @@ pub async fn load_config_with_source() -> Result<LoadedConfig> {
 
     if let Some(existing) = read_existing_config_toml(&paths).await? {
         let text = existing.text()?;
+        let raw = parse_toml_value_with_location(
+            text,
+            &format!(
+                "current config.toml at {}",
+                paths.logical_file("config.toml").display()
+            ),
+        )?;
+        let version = toml_schema_version(&raw, "config.toml")?;
+        if version.is_some_and(|version| version > u64::from(CURRENT_CONFIG_VERSION)) {
+            return Err(unsupported_config_error("config.toml", version));
+        }
+        if toml_config_requires_migration(&raw, version) {
+            auto_migrate_legacy_config(&paths).await?;
+            return load_current_config_from_paths(&paths).await;
+        }
         validate_current_config_toml(text)?;
         let config_source = toml::from_str::<HelperConfig>(text)?;
         validate_helper_config(&config_source)?;
@@ -735,7 +2689,10 @@ pub async fn load_config_with_source() -> Result<LoadedConfig> {
     let logical_json_path = paths.logical_file("config.json");
     let json_path = paths.resolved_file("config.json");
     match fs::symlink_metadata(json_path).await {
-        Ok(_) => return Err(unsupported_legacy_json_error(&logical_json_path)),
+        Ok(_) => {
+            auto_migrate_legacy_config(&paths).await?;
+            return load_current_config_from_paths(&paths).await;
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
             return Err(error)
@@ -749,7 +2706,7 @@ pub async fn load_config_with_source() -> Result<LoadedConfig> {
     Ok(LoadedConfig { source })
 }
 
-fn unsupported_config_error(source: &str, source_version: Option<u32>) -> anyhow::Error {
+fn unsupported_config_error(source: &str, source_version: Option<u64>) -> anyhow::Error {
     let version_label = source_version
         .map(|value| value.to_string())
         .unwrap_or_else(|| "missing or invalid".to_string());
@@ -763,7 +2720,7 @@ fn unsupported_config_error(source: &str, source_version: Option<u32>) -> anyhow
 
 pub async fn save_helper_config(cfg: &HelperConfig) -> Result<PathBuf> {
     let paths = ResolvedConfigDirectory::prepare().await?;
-    let _lock = ConfigMutationLock::acquire(&paths)?;
+    let _lock = ConfigMutationLock::try_acquire(&paths)?;
     paths.ensure_unchanged().await?;
     let existing = preflight_existing_config_before_save(&paths).await?;
 
@@ -777,7 +2734,7 @@ pub async fn save_helper_config(cfg: &HelperConfig) -> Result<PathBuf> {
     let data = text.into_bytes();
 
     if let Some(existing) = existing.as_ref() {
-        write_config_backup(&paths, existing).await?;
+        write_config_backup(&paths, existing, true).await?;
     }
 
     paths.ensure_unchanged().await?;
@@ -785,3 +2742,7 @@ pub async fn save_helper_config(cfg: &HelperConfig) -> Result<PathBuf> {
     paths.ensure_unchanged().await?;
     Ok(path)
 }
+
+#[cfg(test)]
+#[path = "config/tests/storage_migration.rs"]
+mod migration_tests;

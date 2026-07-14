@@ -677,6 +677,14 @@ impl SessionRouteAffinityTarget {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionRouteAffinitySuccess {
+    pub(crate) request_id: u64,
+    pub(crate) session_id: String,
+    pub(crate) target: SessionRouteAffinityTarget,
+    pub(crate) reason_hint: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct SessionIdentityCard {
     pub session_id: Option<String>,

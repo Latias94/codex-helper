@@ -1,6 +1,6 @@
 # Fearless Refactor Workstream: Codex Routing Graph
 
-> Historical status (superseded 2026-07-12): this document records a pre-version-5 design and migration phase. The current helper accepts only `~/.codex-helper/config.toml` with `version = 5`; `codex-helper config migrate` and v2/v3/v4 compatibility readers do not exist. See [current configuration](../../CONFIGURATION.md) and the [canonical modernization plan](../../plans/2026-07-10-002-refactor-canonical-relay-runtime-modernization-plan.md). The remaining content is archival.
+> Historical status (superseded 2026-07-12): this document records a pre-version-5 design and migration phase. The current helper uses `~/.codex-helper/config.toml` with `version = 5`; `codex-helper config migrate` now performs a one-time, validated conversion of supported v1/v2/v3/v4 or unversioned sources, while runtime routing has no legacy compatibility reader. See [current configuration](../../CONFIGURATION.md) and the [canonical modernization plan](../../plans/2026-07-10-002-refactor-canonical-relay-runtime-modernization-plan.md). The remaining content is archival.
 
 > 中文速览：本目录定义 `version = 4` 的目标路由图。它不再把 pool 当成特殊概念，而是把 `routing` 变成一张可组合的路由图：provider 仍然是叶子，route node 是内部节点，`entry` 指向根节点。这样可以同时表达单 provider、月包组、paygo 兜底、标签优先、条件分流和临时 pin。
 

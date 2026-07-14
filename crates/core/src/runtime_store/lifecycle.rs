@@ -865,6 +865,14 @@ impl<'transaction, 'connection> LifecycleTransaction<'transaction, 'connection> 
         self.store_id
     }
 
+    pub(super) fn sqlite_transaction(&self) -> &Transaction<'connection> {
+        self.transaction
+    }
+
+    pub(super) fn path(&self) -> &Path {
+        self.path
+    }
+
     pub(super) fn begin_logical_request(
         &self,
         candidate: NewLogicalRequest,
