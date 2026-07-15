@@ -642,7 +642,7 @@ struct FileIdentity {
     #[cfg(unix)]
     inode: u64,
     #[cfg(windows)]
-    volume_serial_number: u32,
+    volume_serial_number: u64,
     #[cfg(windows)]
     file_index: u64,
     #[cfg(not(any(unix, windows)))]
@@ -664,48 +664,85 @@ struct PersistentFileSet {
 }
 
 impl FileIdentity {
-    fn from_metadata(
-        metadata: &std::fs::Metadata,
-        component: &'static str,
-        path: &Path,
-    ) -> Result<Self, RuntimeStoreError> {
+    #[cfg(not(windows))]
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            let _ = (component, path);
-            Ok(Self {
+            Self {
                 device: metadata.dev(),
                 inode: metadata.ino(),
-            })
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::MetadataExt;
-            let volume_serial_number = metadata.volume_serial_number().ok_or_else(|| {
-                RuntimeStoreError::PersistentFileIdentityUnavailable {
-                    component,
-                    path: path.to_path_buf(),
-                }
-            })?;
-            let file_index = metadata.file_index().ok_or_else(|| {
-                RuntimeStoreError::PersistentFileIdentityUnavailable {
-                    component,
-                    path: path.to_path_buf(),
-                }
-            })?;
-            Ok(Self {
-                volume_serial_number,
-                file_index,
-            })
+            }
         }
         #[cfg(not(any(unix, windows)))]
         {
-            Ok(Self {
+            Self {
                 length: metadata.len(),
                 modified: metadata.modified().ok(),
-            })
+            }
         }
     }
+
+    fn from_open_file(
+        file: &File,
+        component: &'static str,
+        path: &Path,
+    ) -> Result<Self, RuntimeStoreError> {
+        #[cfg(windows)]
+        {
+            Self::from_windows_file(file, component, path)
+        }
+        #[cfg(not(windows))]
+        {
+            let metadata =
+                file.metadata()
+                    .map_err(|_| RuntimeStoreError::PersistentFileReplaced {
+                        component,
+                        path: path.to_path_buf(),
+                    })?;
+            Ok(Self::from_metadata(&metadata))
+        }
+    }
+
+    #[cfg(windows)]
+    fn from_windows_file(
+        file: &File,
+        component: &'static str,
+        path: &Path,
+    ) -> Result<Self, RuntimeStoreError> {
+        let information = crate::windows_file_info::file_information(file).map_err(|_| {
+            RuntimeStoreError::PersistentFileIdentityUnavailable {
+                component,
+                path: path.to_path_buf(),
+            }
+        })?;
+        Ok(Self::from_windows_information(&information))
+    }
+
+    #[cfg(windows)]
+    fn from_windows_information(information: &winapi_util::file::Information) -> Self {
+        Self {
+            volume_serial_number: information.volume_serial_number(),
+            file_index: information.file_index(),
+        }
+    }
+}
+
+#[cfg(windows)]
+struct WindowsFileInspection {
+    identity: FileIdentity,
+    has_multiple_links: bool,
+    is_reparse_point: bool,
+}
+
+#[cfg(windows)]
+fn inspect_windows_file(path: &Path) -> std::io::Result<WindowsFileInspection> {
+    let information = crate::windows_file_info::path_information_no_follow(path)?;
+    Ok(WindowsFileInspection {
+        identity: FileIdentity::from_windows_information(&information),
+        has_multiple_links: information.number_of_links() != 1,
+        is_reparse_point: crate::windows_file_info::is_reparse_point(&information),
+    })
 }
 
 impl PersistentFileSet {
@@ -725,16 +762,8 @@ impl PersistentFileSet {
                 path: path.clone(),
             });
         }
-        let held_writer_lease = FileIdentity::from_metadata(
-            &_writer_lease.file.metadata().map_err(|_| {
-                RuntimeStoreError::PersistentFileReplaced {
-                    component: "writer lease",
-                    path: _writer_lease.path.clone(),
-                }
-            })?,
-            "writer lease",
-            &_writer_lease.path,
-        )?;
+        let held_writer_lease =
+            FileIdentity::from_open_file(&_writer_lease.file, "writer lease", &_writer_lease.path)?;
         let writer_lease = required_runtime_file_identity(&_writer_lease.path, "writer lease")?;
         if held_writer_lease != writer_lease {
             return Err(RuntimeStoreError::PersistentFileReplaced {
@@ -765,16 +794,8 @@ impl PersistentFileSet {
         };
         ensure_runtime_file_identity(path, "database", self.database)?;
         ensure_runtime_file_identity(&_writer_lease.path, "writer lease", self.writer_lease)?;
-        let held_writer_lease = FileIdentity::from_metadata(
-            &_writer_lease.file.metadata().map_err(|_| {
-                RuntimeStoreError::PersistentFileReplaced {
-                    component: "writer lease",
-                    path: _writer_lease.path.clone(),
-                }
-            })?,
-            "writer lease",
-            &_writer_lease.path,
-        )?;
+        let held_writer_lease =
+            FileIdentity::from_open_file(&_writer_lease.file, "writer lease", &_writer_lease.path)?;
         if held_writer_lease != self.writer_lease {
             return Err(RuntimeStoreError::PersistentFileReplaced {
                 component: "writer lease",
@@ -811,16 +832,38 @@ fn optional_runtime_file_identity(
             });
         }
     };
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata_has_multiple_links(&metadata)
-    {
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(RuntimeStoreError::PersistentFileReplaced {
             component,
             path: path.to_path_buf(),
         });
     }
-    FileIdentity::from_metadata(&metadata, component, path).map(Some)
+    #[cfg(windows)]
+    {
+        let inspection = inspect_windows_file(path).map_err(|_| {
+            RuntimeStoreError::PersistentFileIdentityUnavailable {
+                component,
+                path: path.to_path_buf(),
+            }
+        })?;
+        if inspection.is_reparse_point || inspection.has_multiple_links {
+            return Err(RuntimeStoreError::PersistentFileReplaced {
+                component,
+                path: path.to_path_buf(),
+            });
+        }
+        Ok(Some(inspection.identity))
+    }
+    #[cfg(not(windows))]
+    {
+        if metadata_has_multiple_links(&metadata) {
+            return Err(RuntimeStoreError::PersistentFileReplaced {
+                component,
+                path: path.to_path_buf(),
+            });
+        }
+        Ok(Some(FileIdentity::from_metadata(&metadata)))
+    }
 }
 
 fn required_runtime_file_identity(
@@ -2237,7 +2280,21 @@ fn validate_writer_lease_path(path: &Path) -> Result<(), RuntimeStoreError> {
             "lease path is not a regular file",
         ));
     }
-    if metadata_has_multiple_links(&metadata) {
+    #[cfg(windows)]
+    let has_multiple_links = {
+        let inspection =
+            inspect_windows_file(path).map_err(|source| RuntimeStoreError::OpenWriterLease {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if inspection.is_reparse_point {
+            return Err(unsafe_writer_lease(path, "reparse points are not allowed"));
+        }
+        inspection.has_multiple_links
+    };
+    #[cfg(not(windows))]
+    let has_multiple_links = metadata_has_multiple_links(&metadata);
+    if has_multiple_links {
         return Err(unsafe_writer_lease(
             path,
             "hard-linked lease files are not allowed",
@@ -2266,22 +2323,51 @@ fn validate_database_path_if_present(
             });
         }
     };
-    let detail = if metadata.file_type().is_symlink() {
-        Some("symbolic links are not allowed")
-    } else if !metadata.is_file() {
-        Some("database path is not a regular file")
-    } else if metadata_has_multiple_links(&metadata) {
-        Some("hard-linked databases are not allowed")
-    } else {
-        None
-    };
-    if let Some(detail) = detail {
+    if metadata.file_type().is_symlink() {
         return Err(RuntimeStoreError::UnsafeDatabasePath {
             path: path.to_path_buf(),
-            detail: detail.to_string(),
+            detail: "symbolic links are not allowed".to_string(),
         });
     }
-    FileIdentity::from_metadata(&metadata, "database", path).map(Some)
+    if !metadata.is_file() {
+        return Err(RuntimeStoreError::UnsafeDatabasePath {
+            path: path.to_path_buf(),
+            detail: "database path is not a regular file".to_string(),
+        });
+    }
+    #[cfg(windows)]
+    {
+        let inspection = inspect_windows_file(path).map_err(|source| {
+            RuntimeStoreError::InspectDatabasePath {
+                path: path.to_path_buf(),
+                source,
+            }
+        })?;
+        let detail = if inspection.is_reparse_point {
+            Some("reparse points are not allowed")
+        } else if inspection.has_multiple_links {
+            Some("hard-linked databases are not allowed")
+        } else {
+            None
+        };
+        if let Some(detail) = detail {
+            return Err(RuntimeStoreError::UnsafeDatabasePath {
+                path: path.to_path_buf(),
+                detail: detail.to_string(),
+            });
+        }
+        Ok(Some(inspection.identity))
+    }
+    #[cfg(not(windows))]
+    {
+        if metadata_has_multiple_links(&metadata) {
+            return Err(RuntimeStoreError::UnsafeDatabasePath {
+                path: path.to_path_buf(),
+                detail: "hard-linked databases are not allowed".to_string(),
+            });
+        }
+        Ok(Some(FileIdentity::from_metadata(&metadata)))
+    }
 }
 
 fn probe_existing_database(path: &Path) -> Result<(), RuntimeStoreError> {
@@ -2339,13 +2425,6 @@ fn metadata_has_multiple_links(metadata: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
 
     metadata.nlink() != 1
-}
-
-#[cfg(windows)]
-fn metadata_has_multiple_links(metadata: &std::fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-
-    metadata.number_of_links().is_some_and(|links| links != 1)
 }
 
 #[cfg(not(any(unix, windows)))]

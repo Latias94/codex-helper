@@ -106,6 +106,10 @@ jobs:
         with:
           cache-bin: false
 
+      - name: Check Windows core before sidecar
+        if: runner.os == 'Windows'
+        run: cargo check --locked -p codex-helper-core --lib
+
       - name: Install Linux desktop dependencies
         if: runner.os == 'Linux'
         run: |

@@ -32,6 +32,7 @@ All notable changes to this project will be documented in this file.
 #### 修复
 
 - 本地并发 gate 现在使用有界 FIFO 等待；冷会话的第一个请求持有 provisional reservation，在它首次成功并提交 affinity 前，同一 session 的重复跟随请求会返回本地 429，不会漂移到备用 key。其他容量超时或饱和请求仍按 `scheduling_preset` 和 affinity policy 决定等待、背压或 fallback。
+- Windows stable Rust 构建不再调用尚未稳定的 `MetadataExt` by-handle 方法；runtime store 与 Codex switch 现在通过同一个稳定 Win32 句柄查询读取文件身份和硬链接计数，并继续在查询失败时 fail closed。
 
 ### English summary
 
@@ -60,6 +61,7 @@ All notable changes to this project will be documented in this file.
 #### Fixed
 
 - Local concurrency gates now use bounded FIFO waiting. The first request for a cold session owns a provisional reservation; until it succeeds and commits affinity, a duplicate follower for that session receives local 429 backpressure instead of drifting to a backup key. Other capacity timeouts or saturation follow the configured scheduling preset and affinity policy.
+- Windows builds on stable Rust no longer call unstable `MetadataExt` by-handle methods. The runtime store and Codex switch now share a stable Win32 handle query for file identity and hard-link counts, retaining fail-closed behavior when inspection fails.
 
 ## [0.20.3] - 2026-07-09
 

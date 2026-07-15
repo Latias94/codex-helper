@@ -844,6 +844,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
+ "winapi-util",
  "windows-sys 0.61.2",
  "zstd",
 ]

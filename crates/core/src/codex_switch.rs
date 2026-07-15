@@ -1170,25 +1170,16 @@ fn validate_config_topology(path: &Path, expected_present: bool) -> Result<(), C
     }
     #[cfg(windows)]
     {
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Storage::FileSystem::{
-            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
-        };
-
-        let file =
-            File::open(path).map_err(|source| io_error("open for topology check", path, source))?;
-        let mut information = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
-        let read =
-            unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) };
-        if read == 0 {
-            return Err(io_error(
-                "read hard-link count for",
-                path,
-                std::io::Error::last_os_error(),
-            ));
+        let information = crate::windows_file_info::path_information_no_follow(path)
+            .map_err(|source| io_error("read hard-link count for", path, source))?;
+        if crate::windows_file_info::is_reparse_point(&information) {
+            return Err(CodexSwitchError::UnsupportedConfigTopology {
+                path: path.to_path_buf(),
+                reason: "reparse-point configs are not replaced because their target can change"
+                    .to_string(),
+            });
         }
-        let information = unsafe { information.assume_init() };
-        if information.nNumberOfLinks > 1 {
+        if information.number_of_links() > 1 {
             return Err(CodexSwitchError::UnsupportedConfigTopology {
                 path: path.to_path_buf(),
                 reason:

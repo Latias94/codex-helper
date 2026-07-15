@@ -42,3 +42,5 @@ pub mod usage;
 pub mod usage_day;
 pub mod usage_format;
 pub mod usage_providers;
+#[cfg(windows)]
+mod windows_file_info;
