@@ -215,17 +215,15 @@ fn replace_existing_file(staged_path: &Path, destination: &Path) -> io::Result<(
         Ok(path)
     }
 
-    let staged_path = wide_path(staged_path)?;
-    let destination = wide_path(destination)?;
+    let staged_path_wide = wide_path(staged_path)?;
+    let destination_wide = wide_path(destination)?;
     let mut backoff = Duration::from_millis(1);
     for attempt in 0..WINDOWS_REPLACE_ATTEMPTS {
-        // ReplaceFileW has partial-failure modes that can temporarily remove the destination.
-        // MoveFileExW provides the single rename operation required for old-or-new visibility.
         // SAFETY: Both buffers are null-terminated and remain alive for the duration of the call.
         let replaced = unsafe {
             MoveFileExW(
-                staged_path.as_ptr(),
-                destination.as_ptr(),
+                staged_path_wide.as_ptr(),
+                destination_wide.as_ptr(),
                 MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
             )
         };
@@ -233,7 +231,17 @@ fn replace_existing_file(staged_path: &Path, destination: &Path) -> io::Result<(
             return Ok(());
         }
 
-        let err = io::Error::last_os_error();
+        let move_err = io::Error::last_os_error();
+        let err = if move_err.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) {
+            // Rust's Windows rename uses FileRenameInfoEx with POSIX semantics, allowing open
+            // destination handles to retain the old file while new opens see the replacement.
+            match fs::rename(staged_path, destination) {
+                Ok(()) => return Ok(()),
+                Err(err) => err,
+            }
+        } else {
+            move_err
+        };
         let retryable = matches!(
             err.raw_os_error(),
             Some(code)
@@ -259,8 +267,8 @@ fn replace_existing_file(staged_path: &Path, destination: &Path) -> io::Result<(
 
 #[cfg(windows)]
 fn sync_parent_directory(_parent: &Path) -> io::Result<()> {
-    // MOVEFILE_WRITE_THROUGH above is the strongest directory-entry durability primitive
-    // available without opening a directory handle with Windows-specific flags.
+    // The fast path uses MOVEFILE_WRITE_THROUGH. The POSIX fallback has no portable directory
+    // fsync equivalent, but the staged file is synced before either rename path.
     Ok(())
 }
 
