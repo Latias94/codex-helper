@@ -78,7 +78,6 @@ pub(super) async fn prepare_proxy_request(
 
     let client_name = extract_client_name(&client_headers);
 
-    let config = load_request_config_context(proxy).await;
     let request_flavor =
         detect_request_flavor(proxy.service_name, &method, &client_headers, uri.path());
     let raw_body = match to_bytes(body, MAX_PROXY_REQUEST_BYTES).await {
@@ -121,6 +120,7 @@ pub(super) async fn prepare_proxy_request(
     let request_flavor = request_flavor
         .with_remote_compaction_context_from_body(raw_body.as_ref())
         .with_responses_stream_from_body(raw_body.as_ref());
+    let config = load_request_config_context(proxy, session_identity_hint.as_ref()).await;
     let request_body_previews = crate::logging::should_log_request_body_preview();
     let prepared = match prepare_common_request(CommonRequestPreparationParams {
         proxy,
@@ -130,7 +130,6 @@ pub(super) async fn prepare_proxy_request(
         client_headers: &client_headers,
         raw_body: &raw_body,
         request_dialect: RequestDialect::from_http_path(uri.path()),
-        session_identity_hint,
         client_name,
         client_addr,
         started_at_ms,

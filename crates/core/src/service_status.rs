@@ -8,11 +8,13 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
+use crate::auth_resolution::resolve_upstream_auth_for_target;
 use crate::config::{
     HelperConfig, ServiceRouteConfig, ServiceStatusConfig, ServiceStatusProbeConfig, UpstreamAuth,
 };
 
 static SERVICE_STATUS_CACHE: OnceLock<Mutex<ServiceStatusCache>> = OnceLock::new();
+const UPSTREAM_AUTH_UNAVAILABLE_REASON: &str = "configured upstream credentials are unavailable";
 
 #[derive(Debug, Default)]
 struct ServiceStatusCache {
@@ -179,6 +181,7 @@ struct RawServiceStatusProbe {
 
 #[derive(Debug, Clone)]
 struct ProviderProbeTarget {
+    service_name: String,
     provider_id: String,
     endpoint_id: String,
     base_url: String,
@@ -259,7 +262,7 @@ fn service_status_cache_key(
     if let Some(runtime_config) = runtime_config
         && let Some(service) = service_route_config(runtime_config, service_name)
     {
-        for target in provider_probe_targets(service, None, None) {
+        for target in provider_probe_targets(service_name, service, None, None) {
             hash_provider_probe_target(&target, &mut hasher);
         }
     }
@@ -285,6 +288,7 @@ fn hash_provider_probe_target(target: &ProviderProbeTarget, hasher: &mut impl Ha
     target.auth.auth_token_env.hash(hasher);
     target.auth.api_key.hash(hasher);
     target.auth.api_key_env.hash(hasher);
+    target.auth.allow_anonymous.hash(hasher);
 }
 
 async fn fetch_service_status_snapshot(
@@ -520,6 +524,9 @@ async fn send_provider_probe_request(
     model: &str,
     timeout_ms: u64,
 ) -> Result<()> {
+    let resolved_auth =
+        resolve_upstream_auth_for_target(target.service_name.as_str(), &target.auth, url)
+            .map_err(|_| anyhow::anyhow!(UPSTREAM_AUTH_UNAVAILABLE_REASON))?;
     let mut request = client
         .post(url)
         .timeout(Duration::from_millis(timeout_ms))
@@ -533,10 +540,10 @@ async fn send_provider_probe_request(
             "stream": false
         }));
 
-    if let Some(token) = target.auth.resolve_auth_token() {
+    if let Some(token) = resolved_auth.auth_token.value() {
         request = request.bearer_auth(token);
     }
-    if let Some(key) = target.auth.resolve_api_key() {
+    if let Some(key) = resolved_auth.api_key.value() {
         request = request.header("x-api-key", key);
     }
 
@@ -572,7 +579,7 @@ fn provider_probe_target(
     let service = service_route_config(config, service_name)
         .with_context(|| format!("unknown service for provider probe: {service_name}"))?;
 
-    provider_probe_targets(service, Some(provider), endpoint)
+    provider_probe_targets(service_name, service, Some(provider), endpoint)
         .into_iter()
         .next()
         .with_context(|| {
@@ -587,6 +594,7 @@ fn provider_probe_target(
 }
 
 fn provider_probe_targets(
+    service_name: &str,
     service: &ServiceRouteConfig,
     provider_filter: Option<&str>,
     endpoint: Option<&str>,
@@ -607,6 +615,7 @@ fn provider_probe_targets(
                 .filter(|value| !value.is_empty())
         {
             targets.push(ProviderProbeTarget {
+                service_name: service_name.to_string(),
                 provider_id: provider_id.clone(),
                 endpoint_id: "default".to_string(),
                 base_url: base_url.to_string(),
@@ -629,6 +638,7 @@ fn provider_probe_targets(
                 continue;
             }
             targets.push(ProviderProbeTarget {
+                service_name: service_name.to_string(),
                 provider_id: provider_id.clone(),
                 endpoint_id: endpoint_id.clone(),
                 base_url: base_url.to_string(),
@@ -668,6 +678,7 @@ fn merge_auth(block: &UpstreamAuth, inline: &UpstreamAuth) -> UpstreamAuth {
             .api_key_env
             .clone()
             .or_else(|| block.api_key_env.clone()),
+        allow_anonymous: inline.allow_anonymous.or(block.allow_anonymous),
     }
 }
 
@@ -1119,7 +1130,7 @@ mod tests {
     fn canonical_provider_probe_target_merges_provider_and_endpoint_fields() {
         let runtime = canonical_runtime_with_endpoint("https://relay.example/v1".to_string());
 
-        let targets = provider_probe_targets(&runtime.codex, Some("relay"), Some("fast"));
+        let targets = provider_probe_targets("codex", &runtime.codex, Some("relay"), Some("fast"));
 
         assert_eq!(targets.len(), 1);
         let target = &targets[0];
@@ -1174,8 +1185,19 @@ mod tests {
             .tags
             .insert("region".to_string(), "endpoint-region".to_string());
 
+        let endpoint_tag_key = service_status_cache_key(&config, Some(&runtime), "codex");
+        assert_ne!(initial_key, endpoint_tag_key);
+
+        runtime
+            .codex
+            .providers
+            .get_mut("relay")
+            .expect("relay provider")
+            .inline_auth
+            .allow_anonymous = Some(true);
+
         assert_ne!(
-            initial_key,
+            endpoint_tag_key,
             service_status_cache_key(&config, Some(&runtime), "codex")
         );
     }
@@ -1267,5 +1289,72 @@ mod tests {
         assert_eq!(captured.body["stream"], false);
         assert_eq!(captured.body["messages"][0]["role"], "user");
         assert_eq!(captured.body["messages"][0]["content"], "ping");
+    }
+
+    #[tokio::test]
+    async fn provider_probe_remote_target_requires_auth_or_anonymous_opt_in() {
+        let hits = Arc::new(Mutex::new(0usize));
+        let hits_for_route = hits.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let hits = hits_for_route.clone();
+                async move {
+                    *hits.lock().expect("provider probe hits lock") += 1;
+                    Json(serde_json::json!({
+                        "id": "chatcmpl-probe",
+                        "object": "chat.completion",
+                        "choices": [
+                            { "message": { "role": "assistant", "content": "ok" } }
+                        ]
+                    }))
+                }
+            }),
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("set nonblocking");
+        let addr = listener.local_addr().expect("local addr");
+        let listener = tokio::net::TcpListener::from_std(listener).expect("to tokio listener");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve provider probe test");
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .resolve("relay.example", addr)
+            .build()
+            .expect("build provider probe client");
+        let mut runtime =
+            canonical_runtime_with_endpoint(format!("http://relay.example:{}/v1", addr.port()));
+        let provider = runtime
+            .codex
+            .providers
+            .get_mut("relay")
+            .expect("relay provider");
+        provider.auth = UpstreamAuth::default();
+        provider.inline_auth = UpstreamAuth::default();
+        let mut target =
+            provider_probe_targets("codex", &runtime.codex, Some("relay"), Some("fast"))
+                .into_iter()
+                .next()
+                .expect("provider probe target");
+        let url = chat_completions_url(&target.base_url);
+
+        let error = send_provider_probe_request(&client, &target, &url, "gpt-5.5", 3_000)
+            .await
+            .expect_err("remote target must fail closed without helper auth");
+
+        assert_eq!(*hits.lock().expect("provider probe hits lock"), 0);
+        assert_eq!(error.to_string(), UPSTREAM_AUTH_UNAVAILABLE_REASON);
+
+        target.auth.allow_anonymous = Some(true);
+        send_provider_probe_request(&client, &target, &url, "gpt-5.5", 3_000)
+            .await
+            .expect("explicit anonymous opt-in should allow the probe");
+
+        assert_eq!(*hits.lock().expect("provider probe hits lock"), 1);
+
+        server.abort();
     }
 }

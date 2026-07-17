@@ -2718,12 +2718,11 @@ fn unsupported_config_error(source: &str, source_version: Option<u64>) -> anyhow
     )
 }
 
-pub async fn save_helper_config(cfg: &HelperConfig) -> Result<PathBuf> {
-    let paths = ResolvedConfigDirectory::prepare().await?;
-    let _lock = ConfigMutationLock::try_acquire(&paths)?;
-    paths.ensure_unchanged().await?;
-    let existing = preflight_existing_config_before_save(&paths).await?;
-
+async fn write_helper_config_locked(
+    paths: &ResolvedConfigDirectory,
+    existing: Option<&ExistingConfigToml>,
+    cfg: &HelperConfig,
+) -> Result<PathBuf> {
     let mut normalized = cfg.clone();
     normalized.version = CURRENT_CONFIG_VERSION;
     validate_helper_config(&normalized)?;
@@ -2733,14 +2732,40 @@ pub async fn save_helper_config(cfg: &HelperConfig) -> Result<PathBuf> {
     let text = format!("{CONFIG_TOML_DOC_HEADER}\n{body}");
     let data = text.into_bytes();
 
-    if let Some(existing) = existing.as_ref() {
-        write_config_backup(&paths, existing, true).await?;
+    if let Some(existing) = existing {
+        write_config_backup(paths, existing, true).await?;
     }
 
     paths.ensure_unchanged().await?;
     write_bytes_file_async(&paths.resolved_file("config.toml"), &data).await?;
     paths.ensure_unchanged().await?;
     Ok(path)
+}
+
+#[cfg(test)]
+pub(crate) async fn mutate_helper_config<T>(
+    mutate: impl FnOnce(&mut HelperConfig) -> Result<T>,
+) -> Result<(PathBuf, T)> {
+    let paths = ResolvedConfigDirectory::prepare().await?;
+    let _lock = ConfigMutationLock::try_acquire(&paths)?;
+    paths.ensure_unchanged().await?;
+    let existing = preflight_existing_config_before_save(&paths).await?;
+    let mut config = match existing.as_ref() {
+        Some(existing) => toml::from_str::<HelperConfig>(existing.text()?)?,
+        None => HelperConfig::default(),
+    };
+    validate_helper_config(&config)?;
+    let output = mutate(&mut config)?;
+    let path = write_helper_config_locked(&paths, existing.as_ref(), &config).await?;
+    Ok((path, output))
+}
+
+pub async fn save_helper_config(cfg: &HelperConfig) -> Result<PathBuf> {
+    let paths = ResolvedConfigDirectory::prepare().await?;
+    let _lock = ConfigMutationLock::try_acquire(&paths)?;
+    paths.ensure_unchanged().await?;
+    let existing = preflight_existing_config_before_save(&paths).await?;
+    write_helper_config_locked(&paths, existing.as_ref(), cfg).await
 }
 
 #[cfg(test)]

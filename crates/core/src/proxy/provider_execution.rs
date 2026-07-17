@@ -344,12 +344,14 @@ pub(super) async fn execute_provider_chain_with_route_executor(
     let ctx = ProviderExecutionContext::from_params(&params);
     let route_plan = params.route_plan;
     let template = route_plan.template();
+    let routing_control_graph_key = route_plan.routing_control_graph_key();
     let executor = RoutePlanExecutor::new(template);
     let route_graph_key = template.route_graph_key();
     let total_upstreams = template.candidates.len();
     let mut runtime = route_graph_runtime_for_request(
         ctx.proxy,
         template,
+        routing_control_graph_key,
         route_plan.runtime_revision(),
         route_plan.provider_policy(),
         ctx.session_id,
@@ -394,6 +396,7 @@ pub(super) async fn execute_provider_chain_with_route_executor(
             ctx,
             route_graph_key: (template.affinity_policy != RouteAffinityPolicy::Off)
                 .then_some(route_graph_key.as_str()),
+            routing_control_graph_key,
             provider_attempt: 0,
             total_upstreams,
             executor: &executor,
@@ -421,6 +424,7 @@ pub(super) async fn execute_provider_chain_with_route_executor(
 struct ExecuteRouteGraphExecutorParams<'a, 'route> {
     ctx: ProviderExecutionContext<'a>,
     route_graph_key: Option<&'a str>,
+    routing_control_graph_key: &'a str,
     provider_attempt: u32,
     total_upstreams: usize,
     executor: &'a RoutePlanExecutor<'route>,
@@ -448,6 +452,7 @@ impl<'a, 'route> RouteGraphAttemptLoop<'a, 'route> {
         let ExecuteRouteGraphExecutorParams {
             ctx,
             route_graph_key,
+            routing_control_graph_key,
             provider_attempt,
             total_upstreams,
             executor,
@@ -557,6 +562,7 @@ impl<'a, 'route> RouteGraphAttemptLoop<'a, 'route> {
                         *runtime = route_graph_runtime_for_request(
                             ctx.proxy,
                             executor.template(),
+                            routing_control_graph_key,
                             runtime_revision,
                             provider_policy,
                             ctx.session_id,
@@ -719,6 +725,7 @@ impl<'a, 'route> RouteGraphAttemptLoop<'a, 'route> {
                 *runtime = route_graph_runtime_for_request(
                     ctx.proxy,
                     executor.template(),
+                    routing_control_graph_key,
                     runtime_revision,
                     provider_policy,
                     ctx.session_id,

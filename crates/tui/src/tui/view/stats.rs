@@ -1542,6 +1542,7 @@ mod tests {
             quota_analytics: sample_quota_analytics(),
             usage_rollup: crate::state::UsageRollupView::default(),
             provider_balances: HashMap::new(),
+            routing: None,
             pricing_catalog: crate::pricing::ModelPriceCatalogSnapshot {
                 source: "remote-catalog".to_string(),
                 ..Default::default()

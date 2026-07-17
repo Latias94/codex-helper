@@ -176,6 +176,7 @@ pub enum RoutingExplainSkipReason {
         requested_model: String,
     },
     RuntimeDisabled,
+    Draining,
     Cooldown,
     BreakerOpen {
         failure_count: u32,
@@ -327,6 +328,7 @@ impl From<&RoutePlanSkipReason> for RoutingExplainSkipReason {
                 }
             }
             RoutePlanSkipReason::RuntimeDisabled => RoutingExplainSkipReason::RuntimeDisabled,
+            RoutePlanSkipReason::Draining => RoutingExplainSkipReason::Draining,
             RoutePlanSkipReason::Cooldown => RoutingExplainSkipReason::Cooldown,
             RoutePlanSkipReason::BreakerOpen { failure_count } => {
                 RoutingExplainSkipReason::BreakerOpen {
@@ -392,6 +394,7 @@ impl RoutingExplainSkipReason {
         match self {
             RoutingExplainSkipReason::UnsupportedModel { .. } => "unsupported_model",
             RoutingExplainSkipReason::RuntimeDisabled => "runtime_disabled",
+            RoutingExplainSkipReason::Draining => "draining",
             RoutingExplainSkipReason::Cooldown => "cooldown",
             RoutingExplainSkipReason::BreakerOpen { .. } => "breaker_open",
             RoutingExplainSkipReason::UsageExhausted => "usage_exhausted",

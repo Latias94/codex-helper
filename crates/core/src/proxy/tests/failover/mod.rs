@@ -182,12 +182,7 @@ async fn run_failover_retries_502_then_uses_second_upstream() {
         vec![
             UpstreamConfig {
                 base_url: format!("http://{}/v1", u1_addr),
-                auth: UpstreamAuth {
-                    auth_token: None,
-                    auth_token_env: None,
-                    api_key: None,
-                    api_key_env: None,
-                },
+                auth: UpstreamAuth::default(),
                 tags: {
                     let mut t = HashMap::new();
                     t.insert("provider_id".to_string(), "u1".to_string());
@@ -198,12 +193,7 @@ async fn run_failover_retries_502_then_uses_second_upstream() {
             },
             UpstreamConfig {
                 base_url: format!("http://{}/v1", u2_addr),
-                auth: UpstreamAuth {
-                    auth_token: None,
-                    auth_token_env: None,
-                    api_key: None,
-                    api_key_env: None,
-                },
+                auth: UpstreamAuth::default(),
                 tags: {
                     let mut t = HashMap::new();
                     t.insert("provider_id".to_string(), "u2".to_string());
@@ -1658,12 +1648,7 @@ async fn proxy_same_upstream_retries_502_then_succeeds_without_failover() {
         vec![
             UpstreamConfig {
                 base_url: format!("http://{}/v1", u1_addr),
-                auth: UpstreamAuth {
-                    auth_token: None,
-                    auth_token_env: None,
-                    api_key: None,
-                    api_key_env: None,
-                },
+                auth: UpstreamAuth::default(),
                 tags: {
                     let mut t = HashMap::new();
                     t.insert("provider_id".to_string(), "u1".to_string());
@@ -1674,12 +1659,7 @@ async fn proxy_same_upstream_retries_502_then_succeeds_without_failover() {
             },
             UpstreamConfig {
                 base_url: format!("http://{}/v1", u2_addr),
-                auth: UpstreamAuth {
-                    auth_token: None,
-                    auth_token_env: None,
-                    api_key: None,
-                    api_key_env: None,
-                },
+                auth: UpstreamAuth::default(),
                 tags: {
                     let mut t = HashMap::new();
                     t.insert("provider_id".to_string(), "u2".to_string());
@@ -1791,12 +1771,7 @@ async fn proxy_failover_across_requests_penalizes_502_when_no_internal_retry() {
         vec![
             UpstreamConfig {
                 base_url: format!("http://{}/v1", u1_addr),
-                auth: UpstreamAuth {
-                    auth_token: None,
-                    auth_token_env: None,
-                    api_key: None,
-                    api_key_env: None,
-                },
+                auth: UpstreamAuth::default(),
                 tags: {
                     let mut t = HashMap::new();
                     t.insert("provider_id".to_string(), "u1".to_string());
@@ -1807,12 +1782,7 @@ async fn proxy_failover_across_requests_penalizes_502_when_no_internal_retry() {
             },
             UpstreamConfig {
                 base_url: format!("http://{}/v1", u2_addr),
-                auth: UpstreamAuth {
-                    auth_token: None,
-                    auth_token_env: None,
-                    api_key: None,
-                    api_key_env: None,
-                },
+                auth: UpstreamAuth::default(),
                 tags: {
                     let mut t = HashMap::new();
                     t.insert("provider_id".to_string(), "u2".to_string());
@@ -1962,12 +1932,7 @@ async fn proxy_failover_across_requests_penalizes_transport_error_when_no_intern
         vec![
             UpstreamConfig {
                 base_url: format!("http://{}/v1", unused),
-                auth: UpstreamAuth {
-                    auth_token: None,
-                    auth_token_env: None,
-                    api_key: None,
-                    api_key_env: None,
-                },
+                auth: UpstreamAuth::default(),
                 tags: {
                     let mut t = HashMap::new();
                     t.insert("provider_id".to_string(), "u1".to_string());
@@ -1978,12 +1943,7 @@ async fn proxy_failover_across_requests_penalizes_transport_error_when_no_intern
             },
             UpstreamConfig {
                 base_url: format!("http://{}/v1", u2_addr),
-                auth: UpstreamAuth {
-                    auth_token: None,
-                    auth_token_env: None,
-                    api_key: None,
-                    api_key_env: None,
-                },
+                auth: UpstreamAuth::default(),
                 tags: {
                     let mut t = HashMap::new();
                     t.insert("provider_id".to_string(), "u2".to_string());
@@ -2105,12 +2065,7 @@ async fn proxy_failover_across_requests_penalizes_cloudflare_challenge_when_no_i
         vec![
             UpstreamConfig {
                 base_url: format!("http://{}/v1", u1_addr),
-                auth: UpstreamAuth {
-                    auth_token: None,
-                    auth_token_env: None,
-                    api_key: None,
-                    api_key_env: None,
-                },
+                auth: UpstreamAuth::default(),
                 tags: {
                     let mut t = HashMap::new();
                     t.insert("provider_id".to_string(), "u1".to_string());
@@ -2121,12 +2076,7 @@ async fn proxy_failover_across_requests_penalizes_cloudflare_challenge_when_no_i
             },
             UpstreamConfig {
                 base_url: format!("http://{}/v1", u2_addr),
-                auth: UpstreamAuth {
-                    auth_token: None,
-                    auth_token_env: None,
-                    api_key: None,
-                    api_key_env: None,
-                },
+                auth: UpstreamAuth::default(),
                 tags: {
                     let mut t = HashMap::new();
                     t.insert("provider_id".to_string(), "u2".to_string());
@@ -2401,24 +2351,14 @@ async fn proxy_does_not_failover_when_502_is_not_retryable_and_threshold_not_rea
         vec![
             UpstreamConfig {
                 base_url: format!("http://{}/v1", u1_addr),
-                auth: UpstreamAuth {
-                    auth_token: None,
-                    auth_token_env: None,
-                    api_key: None,
-                    api_key_env: None,
-                },
+                auth: UpstreamAuth::default(),
                 tags: HashMap::new(),
                 supported_models: HashMap::new(),
                 model_mapping: HashMap::new(),
             },
             UpstreamConfig {
                 base_url: format!("http://{}/v1", u2_addr),
-                auth: UpstreamAuth {
-                    auth_token: None,
-                    auth_token_env: None,
-                    api_key: None,
-                    api_key_env: None,
-                },
+                auth: UpstreamAuth::default(),
                 tags: HashMap::new(),
                 supported_models: HashMap::new(),
                 model_mapping: HashMap::new(),
@@ -2523,24 +2463,14 @@ async fn proxy_retries_each_upstream_once_and_stops_when_all_avoided() {
         vec![
             UpstreamConfig {
                 base_url: format!("http://{}/v1", u1_addr),
-                auth: UpstreamAuth {
-                    auth_token: None,
-                    auth_token_env: None,
-                    api_key: None,
-                    api_key_env: None,
-                },
+                auth: UpstreamAuth::default(),
                 tags: HashMap::new(),
                 supported_models: HashMap::new(),
                 model_mapping: HashMap::new(),
             },
             UpstreamConfig {
                 base_url: format!("http://{}/v1", u2_addr),
-                auth: UpstreamAuth {
-                    auth_token: None,
-                    auth_token_env: None,
-                    api_key: None,
-                    api_key_env: None,
-                },
+                auth: UpstreamAuth::default(),
                 tags: HashMap::new(),
                 supported_models: HashMap::new(),
                 model_mapping: HashMap::new(),
@@ -2640,12 +2570,7 @@ async fn failed_single_attempt_records_route_attempts_for_logs() {
     let cfg = make_helper_config(
         vec![UpstreamConfig {
             base_url: format!("http://{}/v1", upstream_addr),
-            auth: UpstreamAuth {
-                auth_token: None,
-                auth_token_env: None,
-                api_key: None,
-                api_key_env: None,
-            },
+            auth: UpstreamAuth::default(),
             tags: {
                 let mut tags = HashMap::new();
                 tags.insert("provider_id".to_string(), "solo".to_string());

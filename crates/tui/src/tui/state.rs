@@ -1,7 +1,10 @@
 use ratatui::widgets::TableState;
 
 use crate::codex_integration::CodexStartupReadiness;
-use crate::dashboard_core::{ControlProfileOption, OperatorReadModel, OperatorRetrySummary};
+use crate::dashboard_core::{
+    ControlProfileOption, OperatorActionCapabilities, OperatorReadModel, OperatorRetrySummary,
+};
+use crate::proxy::{OperatorRoutingMutationRequest, OperatorSessionAffinityMutationRequest};
 use crate::sessions::{
     SessionMeta, SessionSummary, SessionSummarySource, SessionTranscriptMessage,
 };
@@ -14,6 +17,7 @@ use super::model::{
     Snapshot, codex_recent_window_threshold_ms, filtered_requests_len, now_ms,
     request_matches_page_filters, request_page_focus_session_id,
 };
+use super::operator_actions::PendingOperatorAction;
 use super::types::{Focus, Overlay, Page, StatsFocus};
 
 #[derive(Debug, Clone)]
@@ -48,7 +52,8 @@ pub(in crate::tui) struct CodexHistoryExternalFocus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::tui) enum RuntimeConnectionKind {
     Integrated,
-    Attached,
+    LocalAttached,
+    RemoteObserver,
 }
 
 impl RuntimeConnectionKind {
@@ -56,17 +61,23 @@ impl RuntimeConnectionKind {
         match (self, lang) {
             (RuntimeConnectionKind::Integrated, Language::Zh) => "内置",
             (RuntimeConnectionKind::Integrated, Language::En) => "integrated",
-            (RuntimeConnectionKind::Attached, Language::Zh) => "已附着",
-            (RuntimeConnectionKind::Attached, Language::En) => "attached",
+            (RuntimeConnectionKind::LocalAttached, Language::Zh) => "本机附着",
+            (RuntimeConnectionKind::LocalAttached, Language::En) => "local attached",
+            (RuntimeConnectionKind::RemoteObserver, Language::Zh) => "远程观察",
+            (RuntimeConnectionKind::RemoteObserver, Language::En) => "remote observer",
         }
     }
 
     pub(in crate::tui) fn is_attached(self) -> bool {
-        matches!(self, RuntimeConnectionKind::Attached)
+        matches!(self, Self::LocalAttached | Self::RemoteObserver)
     }
 
     pub(in crate::tui) fn allows_local_codex_switch(self) -> bool {
-        matches!(self, RuntimeConnectionKind::Integrated)
+        matches!(self, Self::Integrated)
+    }
+
+    pub(in crate::tui) fn is_remote_observer(self) -> bool {
+        matches!(self, Self::RemoteObserver)
     }
 }
 
@@ -222,12 +233,22 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) language: Language,
     pub(in crate::tui) runtime_connection: RuntimeConnectionKind,
     pub(in crate::tui) operator_read_model: Option<OperatorReadModel>,
+    pub(in crate::tui) operator_action_capabilities: OperatorActionCapabilities,
+    pub(in crate::tui) local_operator_transport_available: bool,
     pub(in crate::tui) runtime_status_error: Option<String>,
     pub(in crate::tui) page: Page,
     pub(in crate::tui) focus: Focus,
     pub(in crate::tui) overlay: Overlay,
+    pub(in crate::tui) routing_action_selected_idx: usize,
+    pub(in crate::tui) routing_confirmation: Option<OperatorRoutingMutationRequest>,
+    pub(in crate::tui) session_affinity_action_selected_idx: usize,
+    pub(in crate::tui) session_affinity_confirmation:
+        Option<OperatorSessionAffinityMutationRequest>,
     pub(in crate::tui) startup_readiness: Option<CodexStartupReadiness>,
     pub(in crate::tui) selected_provider_idx: usize,
+    pub(in crate::tui) selected_routing_candidate_idx: usize,
+    pub(in crate::tui) selected_routing_candidate_key: Option<(String, String)>,
+    pub(in crate::tui) routing_candidates_visible_rows: usize,
     pub(in crate::tui) selected_session_idx: usize,
     pub(in crate::tui) selected_session_id: Option<String>,
     pub(in crate::tui) selected_request_idx: usize,
@@ -265,6 +286,14 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) selected_stats_provider_idx: usize,
     pub(in crate::tui) stats_provider_detail_scroll: u16,
     pub(in crate::tui) needs_snapshot_refresh: bool,
+    pub(in crate::tui) pending_operator_action: Option<PendingOperatorAction>,
+    pub(in crate::tui) deferred_auto_balance_refresh: bool,
+    pub(in crate::tui) operator_action_in_flight: bool,
+    pub(in crate::tui) balance_refresh_in_flight: bool,
+    pub(in crate::tui) last_balance_refresh_requested_at: Option<std::time::Instant>,
+    pub(in crate::tui) last_balance_refresh_finished_at: Option<std::time::Instant>,
+    pub(in crate::tui) last_balance_refresh_message: Option<String>,
+    pub(in crate::tui) last_balance_refresh_error: Option<String>,
     pub(in crate::tui) toast: Option<(String, std::time::Instant)>,
     pub(in crate::tui) codex_history_sessions: Vec<SessionSummary>,
     pub(in crate::tui) codex_history_error: Option<String>,
@@ -299,6 +328,7 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) last_runtime_config_refresh_at: Option<std::time::Instant>,
     pub(in crate::tui) should_exit: bool,
     pub(in crate::tui) providers_table: TableState,
+    pub(in crate::tui) routing_candidates_table: TableState,
     pub(in crate::tui) sessions_table: TableState,
     pub(in crate::tui) requests_table: TableState,
     pub(in crate::tui) request_page_table: TableState,
@@ -312,6 +342,7 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) stats_pools_table: TableState,
     pub(in crate::tui) stats_projects_table: TableState,
     pub(in crate::tui) provider_info_scroll: u16,
+    pub(in crate::tui) provider_info_endpoint_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -354,12 +385,21 @@ impl Default for UiState {
             language: Language::En,
             runtime_connection: RuntimeConnectionKind::Integrated,
             operator_read_model: None,
+            operator_action_capabilities: OperatorActionCapabilities::default(),
+            local_operator_transport_available: true,
             runtime_status_error: None,
             page: Page::Dashboard,
             focus: Focus::Sessions,
             overlay: Overlay::None,
+            routing_action_selected_idx: 0,
+            routing_confirmation: None,
+            session_affinity_action_selected_idx: 0,
+            session_affinity_confirmation: None,
             startup_readiness: None,
             selected_provider_idx: 0,
+            selected_routing_candidate_idx: 0,
+            selected_routing_candidate_key: None,
+            routing_candidates_visible_rows: 10,
             selected_session_idx: 0,
             selected_session_id: None,
             selected_request_idx: 0,
@@ -397,6 +437,14 @@ impl Default for UiState {
             selected_stats_provider_idx: 0,
             stats_provider_detail_scroll: 0,
             needs_snapshot_refresh: false,
+            pending_operator_action: None,
+            deferred_auto_balance_refresh: false,
+            operator_action_in_flight: false,
+            balance_refresh_in_flight: false,
+            last_balance_refresh_requested_at: None,
+            last_balance_refresh_finished_at: None,
+            last_balance_refresh_message: None,
+            last_balance_refresh_error: None,
             toast: None,
             codex_history_sessions: Vec::new(),
             codex_history_error: None,
@@ -431,6 +479,7 @@ impl Default for UiState {
             last_runtime_config_refresh_at: None,
             should_exit: false,
             providers_table: TableState::default(),
+            routing_candidates_table: TableState::default(),
             sessions_table: TableState::default(),
             requests_table: TableState::default(),
             request_page_table: TableState::default(),
@@ -444,6 +493,7 @@ impl Default for UiState {
             stats_pools_table: TableState::default(),
             stats_projects_table: TableState::default(),
             provider_info_scroll: 0,
+            provider_info_endpoint_id: None,
         }
     }
 }
@@ -451,6 +501,48 @@ impl Default for UiState {
 impl UiState {
     pub(in crate::tui) fn allows_local_codex_switch(&self) -> bool {
         self.service_name == "codex" && self.runtime_connection.allows_local_codex_switch()
+    }
+
+    fn operator_read_model_allows_actions(&self) -> bool {
+        self.operator_read_model
+            .as_ref()
+            .is_none_or(OperatorReadModel::can_use_runtime_actions)
+    }
+
+    pub(in crate::tui) fn can_refresh_provider_balances(&self) -> bool {
+        self.operator_read_model_allows_actions()
+            && match self.runtime_connection {
+                RuntimeConnectionKind::Integrated => true,
+                RuntimeConnectionKind::LocalAttached => {
+                    self.local_operator_transport_available
+                        && self.operator_action_capabilities.refresh_provider_balances
+                }
+                RuntimeConnectionKind::RemoteObserver => false,
+            }
+    }
+
+    pub(in crate::tui) fn can_mutate_routing(&self) -> bool {
+        self.operator_read_model_allows_actions()
+            && match self.runtime_connection {
+                RuntimeConnectionKind::Integrated => true,
+                RuntimeConnectionKind::LocalAttached => {
+                    self.local_operator_transport_available
+                        && self.operator_action_capabilities.mutate_routing
+                }
+                RuntimeConnectionKind::RemoteObserver => false,
+            }
+    }
+
+    pub(in crate::tui) fn can_mutate_session_affinity(&self) -> bool {
+        self.operator_read_model_allows_actions()
+            && match self.runtime_connection {
+                RuntimeConnectionKind::Integrated => true,
+                RuntimeConnectionKind::LocalAttached => {
+                    self.local_operator_transport_available
+                        && self.operator_action_capabilities.mutate_session_affinity
+                }
+                RuntimeConnectionKind::RemoteObserver => false,
+            }
     }
 
     pub(in crate::tui) fn selected_quota_pool<'a>(
@@ -569,6 +661,38 @@ impl UiState {
         )
         .unwrap_or(0);
 
+        if let Some(routing) = snapshot.routing.as_ref() {
+            if let Some((provider_id, endpoint_id)) = self.selected_routing_candidate_key.as_ref()
+                && let Some(index) = routing.candidates.iter().position(|candidate| {
+                    candidate.provider_id == *provider_id && candidate.endpoint_id == *endpoint_id
+                })
+            {
+                self.selected_routing_candidate_idx = index;
+            } else if self.selected_routing_candidate_key.is_none()
+                && let Some(target) = routing.new_session_preference.as_ref()
+                && let Some(index) = routing.candidates.iter().position(|candidate| {
+                    candidate.provider_id == target.provider_id
+                        && candidate.endpoint_id == target.endpoint_id
+                })
+            {
+                self.selected_routing_candidate_idx = index;
+            }
+            self.selected_routing_candidate_idx = clamp_table_selection(
+                &mut self.routing_candidates_table,
+                Some(self.selected_routing_candidate_idx),
+                routing.candidates.len(),
+            )
+            .unwrap_or(0);
+            self.selected_routing_candidate_key = routing
+                .candidates
+                .get(self.selected_routing_candidate_idx)
+                .map(|candidate| (candidate.provider_id.clone(), candidate.endpoint_id.clone()));
+        } else {
+            self.selected_routing_candidate_idx = 0;
+            self.selected_routing_candidate_key = None;
+            clamp_table_selection(&mut self.routing_candidates_table, None, 0);
+        }
+
         if snapshot.rows.is_empty() {
             self.selected_session_idx = 0;
             self.selected_session_id = None;
@@ -669,6 +793,7 @@ impl UiState {
     pub(in crate::tui) fn reset_table_viewports(&mut self) {
         for table in [
             &mut self.providers_table,
+            &mut self.routing_candidates_table,
             &mut self.sessions_table,
             &mut self.requests_table,
             &mut self.request_page_table,
@@ -699,6 +824,126 @@ impl UiState {
             visible_rows,
         )
         .unwrap_or(0);
+    }
+
+    pub(in crate::tui) fn sync_routing_candidates_table_viewport(
+        &mut self,
+        snapshot: &Snapshot,
+        visible_rows: usize,
+    ) {
+        self.routing_candidates_visible_rows = visible_rows.max(1);
+        let candidates = snapshot
+            .routing
+            .as_ref()
+            .map(|routing| routing.candidates.as_slice())
+            .unwrap_or_default();
+        self.selected_routing_candidate_idx = clamp_table_viewport(
+            &mut self.routing_candidates_table,
+            Some(self.selected_routing_candidate_idx),
+            candidates.len(),
+            visible_rows,
+        )
+        .unwrap_or(0);
+        self.selected_routing_candidate_key = candidates
+            .get(self.selected_routing_candidate_idx)
+            .map(|candidate| (candidate.provider_id.clone(), candidate.endpoint_id.clone()));
+    }
+
+    pub(in crate::tui) fn move_routing_selection(
+        &mut self,
+        snapshot: &Snapshot,
+        delta: i32,
+    ) -> bool {
+        let Some(routing) = snapshot.routing.as_ref() else {
+            return false;
+        };
+        let Some(next) = adjust_table_selection(
+            &mut self.routing_candidates_table,
+            delta,
+            routing.candidates.len(),
+        ) else {
+            return false;
+        };
+        self.selected_routing_candidate_idx = next;
+        self.selected_routing_candidate_key = routing
+            .candidates
+            .get(next)
+            .map(|candidate| (candidate.provider_id.clone(), candidate.endpoint_id.clone()));
+        true
+    }
+
+    pub(in crate::tui) fn select_routing_candidate_index(
+        &mut self,
+        snapshot: &Snapshot,
+        index: usize,
+    ) -> bool {
+        let Some(routing) = snapshot.routing.as_ref() else {
+            return false;
+        };
+        let Some(candidate) = routing.candidates.get(index) else {
+            return false;
+        };
+        self.selected_routing_candidate_idx = index;
+        self.selected_routing_candidate_key =
+            Some((candidate.provider_id.clone(), candidate.endpoint_id.clone()));
+        self.routing_candidates_table.select(Some(index));
+        true
+    }
+
+    pub(in crate::tui) fn select_preferred_routing_candidate(
+        &mut self,
+        snapshot: &Snapshot,
+    ) -> bool {
+        let Some(routing) = snapshot.routing.as_ref() else {
+            return false;
+        };
+        let Some(target) = routing.new_session_preference.as_ref() else {
+            return false;
+        };
+        let Some(index) = routing.candidates.iter().position(|candidate| {
+            candidate.provider_id == target.provider_id
+                && candidate.endpoint_id == target.endpoint_id
+        }) else {
+            return false;
+        };
+        self.select_routing_candidate_index(snapshot, index)
+    }
+
+    pub(in crate::tui) fn selected_routing_candidate<'a>(
+        &self,
+        snapshot: &'a Snapshot,
+    ) -> Option<&'a crate::dashboard_core::OperatorRouteCandidateSummary> {
+        snapshot
+            .routing
+            .as_ref()?
+            .candidates
+            .get(self.selected_routing_candidate_idx)
+    }
+
+    pub(in crate::tui) fn sync_selected_provider_from_routing(
+        &mut self,
+        snapshot: &Snapshot,
+        providers: &[crate::tui::ProviderOption],
+    ) {
+        self.provider_info_endpoint_id = None;
+        let Some((provider_id, endpoint_id)) =
+            self.selected_routing_candidate(snapshot).map(|candidate| {
+                (
+                    candidate.provider_id.as_str(),
+                    candidate.endpoint_id.as_str(),
+                )
+            })
+        else {
+            return;
+        };
+        self.provider_info_endpoint_id = Some(endpoint_id.to_string());
+        if let Some(index) = providers
+            .iter()
+            .position(|provider| provider.name == provider_id)
+        {
+            self.selected_provider_idx = index;
+            self.providers_table.select(Some(index));
+        }
     }
 
     pub(in crate::tui) fn sync_rendered_page_state(&mut self, snapshot: &Snapshot) {
@@ -1035,7 +1280,10 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::dashboard_core::{OperatorRequestObservability, OperatorRequestSummary};
+    use crate::dashboard_core::{
+        OperatorRequestObservability, OperatorRequestSummary, OperatorRouteCandidateSummary,
+        OperatorRoutingSummary,
+    };
     use crate::quota_analytics::{
         PoolQuotaAnalytics, QuotaAnalyticsSupport, QuotaProjectRow, QuotaReconciliationView,
     };
@@ -1095,6 +1343,7 @@ mod tests {
                     ..ProviderBalanceSnapshot::default()
                 }],
             )]),
+            routing: None,
             pricing_catalog: Default::default(),
             stats_5m: crate::dashboard_core::WindowStats::default(),
             stats_1h: crate::dashboard_core::WindowStats::default(),
@@ -1479,5 +1728,74 @@ mod tests {
         assert_eq!(ui.providers_table.offset(), 0);
         assert_eq!(ui.sessions_table.selected(), Some(4));
         assert_eq!(ui.sessions_table.offset(), 0);
+    }
+
+    fn routing_snapshot_with_candidates(candidates: &[(&str, &str)]) -> Snapshot {
+        Snapshot {
+            routing: Some(OperatorRoutingSummary {
+                route_graph_key: "routing:sha256:test".to_string(),
+                control_revision: 0,
+                provider_policy_revision: 0,
+                entry: "main".to_string(),
+                entry_strategy: crate::config::RouteStrategy::RoundRobin,
+                entry_target: None,
+                new_session_preference: None,
+                affinity_policy: crate::config::RouteAffinityPolicy::FallbackSticky,
+                scheduling_preset: crate::config::SchedulingPreset::Balanced,
+                fallback_ttl_ms: None,
+                reprobe_preferred_after_ms: None,
+                candidates: candidates
+                    .iter()
+                    .enumerate()
+                    .map(|(route_order, (provider_id, endpoint_id))| {
+                        OperatorRouteCandidateSummary {
+                            route_order,
+                            provider_id: (*provider_id).to_string(),
+                            endpoint_id: (*endpoint_id).to_string(),
+                            preference_group: 0,
+                            route_path: Vec::new(),
+                        }
+                    })
+                    .collect(),
+            }),
+            ..Snapshot::default()
+        }
+    }
+
+    #[test]
+    fn routing_selection_follows_endpoint_identity_across_reordering() {
+        let before = routing_snapshot_with_candidates(&[("input", "a"), ("ciii", "b")]);
+        let after = routing_snapshot_with_candidates(&[("ciii", "b"), ("input", "a")]);
+        let mut ui = UiState::default();
+
+        assert!(ui.move_routing_selection(&before, 1));
+        assert_eq!(
+            ui.selected_routing_candidate_key,
+            Some(("ciii".to_string(), "b".to_string()))
+        );
+
+        ui.clamp_selection(&after, 0);
+
+        assert_eq!(ui.selected_routing_candidate_idx, 0);
+        assert_eq!(
+            ui.selected_routing_candidate_key,
+            Some(("ciii".to_string(), "b".to_string()))
+        );
+    }
+
+    #[test]
+    fn routing_selection_clamps_when_selected_endpoint_disappears() {
+        let before = routing_snapshot_with_candidates(&[("input", "a"), ("ciii", "b")]);
+        let after = routing_snapshot_with_candidates(&[("input", "a")]);
+        let mut ui = UiState::default();
+
+        assert!(ui.move_routing_selection(&before, 1));
+        ui.clamp_selection(&after, 0);
+
+        assert_eq!(ui.selected_routing_candidate_idx, 0);
+        assert_eq!(
+            ui.selected_routing_candidate_key,
+            Some(("input".to_string(), "a".to_string()))
+        );
     }
 }

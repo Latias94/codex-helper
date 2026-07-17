@@ -1,3 +1,4 @@
+mod auth_resolution;
 pub mod balance;
 pub mod basellm_catalog;
 mod client_config;
@@ -13,6 +14,7 @@ mod file_replace;
 pub mod filter;
 pub mod fleet;
 pub mod local_log_store;
+pub mod local_operator;
 pub mod logging;
 pub mod model_routing;
 pub mod notify;

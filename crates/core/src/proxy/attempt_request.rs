@@ -2,12 +2,14 @@ use std::sync::OnceLock;
 
 use axum::http::{HeaderMap, HeaderName, HeaderValue, header};
 
+use crate::auth_resolution::{
+    UpstreamAuthResolutionError, resolve_upstream_auth_for_target,
+    trusted_codex_passthrough_origin, upstream_auth_contract_is_configured,
+};
 use crate::config::UpstreamAuth;
 use crate::logging::{BodyPreview, HeaderEntry, upstream_origin};
-use crate::provider_catalog::{AccountFingerprint, ProviderAdapter};
+use crate::provider_catalog::AccountFingerprint;
 
-use super::ProxyService;
-use super::auth_resolution::{resolve_api_key_with_source, resolve_auth_token_with_source};
 use super::headers::{filter_request_headers, header_map_to_entries};
 use super::http_debug::HttpDebugBase;
 use super::request_preparation::codex_path_is_responses_compact;
@@ -26,7 +28,7 @@ pub(super) struct AttemptRequestIdentity {
 }
 
 pub(super) struct AttemptRequestIdentityParams<'a> {
-    pub(super) proxy: &'a ProxyService,
+    pub(super) service_name: &'a str,
     pub(super) auth: &'a UpstreamAuth,
     pub(super) client_headers: &'a HeaderMap,
     pub(super) client_uri: &'a str,
@@ -51,7 +53,7 @@ struct HttpDebugBaseParams<'a> {
 
 #[cfg(test)]
 pub(super) struct AttemptRequestSetupParams<'a> {
-    pub(super) proxy: &'a ProxyService,
+    pub(super) service_name: &'a str,
     pub(super) auth: &'a UpstreamAuth,
     pub(super) client_headers: &'a HeaderMap,
     pub(super) client_headers_entries_cache: &'a OnceLock<Vec<HeaderEntry>>,
@@ -85,9 +87,9 @@ pub(super) struct FrozenAttemptRequestSetupParams<'a> {
 
 pub(super) fn prepare_attempt_request_identity(
     params: AttemptRequestIdentityParams<'_>,
-) -> AttemptRequestIdentity {
+) -> Result<AttemptRequestIdentity, UpstreamAuthResolutionError> {
     let AttemptRequestIdentityParams {
-        proxy,
+        service_name,
         auth,
         client_headers,
         client_uri,
@@ -100,22 +102,22 @@ pub(super) fn prepare_attempt_request_identity(
         header::ACCEPT_ENCODING,
         HeaderValue::from_static("identity"),
     );
-    inject_auth_headers(proxy.service_name, auth, target_url, &mut headers);
-    normalize_codex_compact_headers(proxy.service_name, client_uri, &mut headers);
+    inject_auth_headers(service_name, auth, target_url, &mut headers)?;
+    normalize_codex_compact_headers(service_name, client_uri, &mut headers);
     let account_fingerprint = AccountFingerprint::from_final_headers(&headers);
 
-    AttemptRequestIdentity {
+    Ok(AttemptRequestIdentity {
         headers,
         account_fingerprint,
-    }
+    })
 }
 
 #[cfg(test)]
 pub(super) fn prepare_attempt_request(
     params: AttemptRequestSetupParams<'_>,
-) -> AttemptRequestSetup {
+) -> Result<AttemptRequestSetup, UpstreamAuthResolutionError> {
     let AttemptRequestSetupParams {
-        proxy,
+        service_name,
         auth,
         client_headers,
         client_headers_entries_cache,
@@ -132,28 +134,30 @@ pub(super) fn prepare_attempt_request(
     } = params;
 
     let identity = prepare_attempt_request_identity(AttemptRequestIdentityParams {
-        proxy,
+        service_name,
         auth,
         client_headers,
         client_uri,
         target_url,
-    });
+    })?;
 
-    prepare_attempt_request_with_identity(FrozenAttemptRequestSetupParams {
-        identity: &identity,
-        client_headers,
-        client_headers_entries_cache,
-        request_body_len,
-        upstream_request_body_len,
-        debug_max,
-        warn_max,
-        client_uri,
-        target_url,
-        client_body_debug,
-        upstream_request_body_debug,
-        client_body_warn,
-        upstream_request_body_warn,
-    })
+    Ok(prepare_attempt_request_with_identity(
+        FrozenAttemptRequestSetupParams {
+            identity: &identity,
+            client_headers,
+            client_headers_entries_cache,
+            request_body_len,
+            upstream_request_body_len,
+            debug_max,
+            warn_max,
+            client_uri,
+            target_url,
+            client_body_debug,
+            upstream_request_body_debug,
+            client_body_warn,
+            upstream_request_body_warn,
+        },
+    ))
 }
 
 pub(super) fn prepare_attempt_request_with_identity(
@@ -217,11 +221,12 @@ pub(super) fn inject_auth_headers(
     auth: &UpstreamAuth,
     target_url: &str,
     headers: &mut HeaderMap,
-) {
+) -> Result<(), UpstreamAuthResolutionError> {
     let client_has_auth = headers.contains_key("authorization");
     let client_has_x_api_key = headers.contains_key("x-api-key");
-    let (token, _token_src) = resolve_auth_token_with_source(service_name, auth);
-    let (api_key, _api_key_src) = resolve_api_key_with_source(service_name, auth);
+    let resolved_auth = resolve_upstream_auth_for_target(service_name, auth, target_url)?;
+    let token = resolved_auth.auth_token.value();
+    let api_key = resolved_auth.api_key.value();
     let helper_credential_contract = upstream_auth_contract_is_configured(auth);
     let allow_client_passthrough = service_name != "codex"
         || (!helper_credential_contract && trusted_codex_passthrough_origin(target_url));
@@ -239,31 +244,13 @@ pub(super) fn inject_auth_headers(
     }
 
     if let Some(key) = api_key
-        && let Ok(value) = HeaderValue::from_str(&key)
+        && let Ok(value) = HeaderValue::from_str(key)
     {
         headers.insert(HeaderName::from_static("x-api-key"), value);
     } else if client_has_x_api_key && !allow_client_passthrough {
         headers.remove("x-api-key");
     }
-}
-
-fn upstream_auth_contract_is_configured(auth: &UpstreamAuth) -> bool {
-    [
-        auth.auth_token.as_deref(),
-        auth.auth_token_env.as_deref(),
-        auth.api_key.as_deref(),
-        auth.api_key_env.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .any(|value| !value.trim().is_empty())
-}
-
-fn trusted_codex_passthrough_origin(target_url: &str) -> bool {
-    let Ok(url) = reqwest::Url::parse(target_url) else {
-        return false;
-    };
-    url.scheme() == "https" && ProviderAdapter::for_endpoint(&url) == ProviderAdapter::OpenAiCodex
+    Ok(())
 }
 
 fn strip_codex_client_account_headers(headers: &mut HeaderMap) {
@@ -326,25 +313,20 @@ fn build_http_debug_base(params: HttpDebugBaseParams<'_>) -> Option<HttpDebugBas
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use axum::http::HeaderValue;
 
     use super::*;
-    use crate::config::HelperConfig;
     use crate::provider_catalog::AccountFingerprint;
 
-    fn test_proxy_service() -> ProxyService {
-        ProxyService::new(
-            reqwest::Client::new(),
-            Arc::new(HelperConfig::default()),
-            "codex",
-        )
+    fn explicitly_anonymous_remote_auth() -> UpstreamAuth {
+        UpstreamAuth {
+            allow_anonymous: Some(true),
+            ..UpstreamAuth::default()
+        }
     }
 
-    #[tokio::test]
-    async fn prepare_attempt_request_overrides_auth_headers_from_upstream_auth() {
-        let proxy = test_proxy_service();
+    #[test]
+    fn prepare_attempt_request_overrides_auth_headers_from_upstream_auth() {
         let mut client_headers = HeaderMap::new();
         client_headers.insert(
             "authorization",
@@ -355,12 +337,13 @@ mod tests {
 
         let cache = OnceLock::new();
         let setup = prepare_attempt_request(AttemptRequestSetupParams {
-            proxy: &proxy,
+            service_name: "codex",
             auth: &UpstreamAuth {
                 auth_token: Some("server-token".to_string()),
                 auth_token_env: None,
                 api_key: Some("server-key".to_string()),
                 api_key_env: None,
+                allow_anonymous: None,
             },
             client_headers: &client_headers,
             client_headers_entries_cache: &cache,
@@ -374,7 +357,8 @@ mod tests {
             upstream_request_body_debug: None,
             client_body_warn: None,
             upstream_request_body_warn: None,
-        });
+        })
+        .expect("prepare attempt request");
 
         assert_eq!(
             setup.headers.get("authorization"),
@@ -399,9 +383,24 @@ mod tests {
         assert!(setup.debug_base.is_none());
     }
 
-    #[tokio::test]
-    async fn prepare_attempt_request_strips_client_credentials_for_untrusted_relay() {
-        let proxy = test_proxy_service();
+    #[test]
+    fn prepare_attempt_request_rejects_unconfigured_remote_relay_by_default() {
+        let result = prepare_attempt_request_identity(AttemptRequestIdentityParams {
+            service_name: "codex",
+            auth: &UpstreamAuth::default(),
+            client_headers: &HeaderMap::new(),
+            client_uri: "/v1/responses",
+            target_url: "https://third-party.example/v1/responses",
+        });
+
+        assert!(matches!(
+            result,
+            Err(UpstreamAuthResolutionError::AnonymousNotAllowed)
+        ));
+    }
+
+    #[test]
+    fn prepare_attempt_request_explicit_anonymous_opt_in_strips_client_credentials() {
         let mut client_headers = HeaderMap::new();
         client_headers.insert(
             "authorization",
@@ -421,8 +420,8 @@ mod tests {
 
         let cache = OnceLock::new();
         let setup = prepare_attempt_request(AttemptRequestSetupParams {
-            proxy: &proxy,
-            auth: &UpstreamAuth::default(),
+            service_name: "codex",
+            auth: &explicitly_anonymous_remote_auth(),
             client_headers: &client_headers,
             client_headers_entries_cache: &cache,
             request_body_len: 12,
@@ -435,7 +434,8 @@ mod tests {
             upstream_request_body_debug: None,
             client_body_warn: None,
             upstream_request_body_warn: None,
-        });
+        })
+        .expect("prepare attempt request");
 
         assert!(!setup.headers.contains_key("authorization"));
         assert!(!setup.headers.contains_key("x-api-key"));
@@ -448,10 +448,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn prepare_attempt_request_uses_explicit_upstream_secret_and_strips_client_account_metadata()
-     {
-        let proxy = test_proxy_service();
+    #[test]
+    fn prepare_attempt_request_uses_explicit_upstream_secret_and_strips_client_account_metadata() {
         let mut client_headers = HeaderMap::new();
         client_headers.insert(
             "authorization",
@@ -465,12 +463,13 @@ mod tests {
 
         let cache = OnceLock::new();
         let setup = prepare_attempt_request(AttemptRequestSetupParams {
-            proxy: &proxy,
+            service_name: "codex",
             auth: &UpstreamAuth {
                 auth_token: Some("relay-token".to_string()),
                 auth_token_env: None,
                 api_key: None,
                 api_key_env: None,
+                allow_anonymous: None,
             },
             client_headers: &client_headers,
             client_headers_entries_cache: &cache,
@@ -484,7 +483,8 @@ mod tests {
             upstream_request_body_debug: None,
             client_body_warn: None,
             upstream_request_body_warn: None,
-        });
+        })
+        .expect("prepare attempt request");
 
         assert_eq!(
             setup.headers.get("authorization"),
@@ -494,9 +494,8 @@ mod tests {
         assert!(!setup.headers.contains_key("x-openai-fedramp"));
     }
 
-    #[tokio::test]
-    async fn prepare_attempt_request_allows_passthrough_only_for_official_openai_origin() {
-        let proxy = test_proxy_service();
+    #[test]
+    fn prepare_attempt_request_allows_passthrough_only_for_official_openai_origin() {
         let mut client_headers = HeaderMap::new();
         client_headers.insert(
             "authorization",
@@ -509,7 +508,7 @@ mod tests {
 
         let cache = OnceLock::new();
         let setup = prepare_attempt_request(AttemptRequestSetupParams {
-            proxy: &proxy,
+            service_name: "codex",
             auth: &UpstreamAuth::default(),
             client_headers: &client_headers,
             client_headers_entries_cache: &cache,
@@ -523,7 +522,8 @@ mod tests {
             upstream_request_body_debug: None,
             client_body_warn: None,
             upstream_request_body_warn: None,
-        });
+        })
+        .expect("prepare attempt request");
 
         assert_eq!(
             setup.headers.get("authorization"),
@@ -535,9 +535,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn prepare_attempt_request_missing_helper_env_contract_fails_closed_on_official_origin() {
-        let proxy = test_proxy_service();
+    #[test]
+    fn prepare_attempt_request_missing_helper_env_contract_fails_closed_on_official_origin() {
         let mut client_headers = HeaderMap::new();
         client_headers.insert(
             "authorization",
@@ -549,8 +548,8 @@ mod tests {
         );
 
         let cache = OnceLock::new();
-        let setup = prepare_attempt_request(AttemptRequestSetupParams {
-            proxy: &proxy,
+        let result = prepare_attempt_request(AttemptRequestSetupParams {
+            service_name: "codex",
             auth: &UpstreamAuth {
                 auth_token: None,
                 auth_token_env: Some(
@@ -558,6 +557,7 @@ mod tests {
                 ),
                 api_key: None,
                 api_key_env: None,
+                allow_anonymous: None,
             },
             client_headers: &client_headers,
             client_headers_entries_cache: &cache,
@@ -573,20 +573,24 @@ mod tests {
             upstream_request_body_warn: None,
         });
 
-        assert!(!setup.headers.contains_key("authorization"));
-        assert!(!setup.headers.contains_key("chatgpt-account-id"));
+        assert!(matches!(
+            result,
+            Err(UpstreamAuthResolutionError::MissingReference {
+                kind: "Bearer token",
+                ref name,
+            }) if name == "CODEX_HELPER_TEST_DEFINITELY_MISSING_PROVIDER_TOKEN_7C2A"
+        ));
     }
 
-    #[tokio::test]
-    async fn prepare_attempt_request_forces_json_accept_for_codex_compact() {
-        let proxy = test_proxy_service();
+    #[test]
+    fn prepare_attempt_request_forces_json_accept_for_codex_compact() {
         let mut client_headers = HeaderMap::new();
         client_headers.insert("accept", HeaderValue::from_static("text/event-stream"));
 
         let cache = OnceLock::new();
         let setup = prepare_attempt_request(AttemptRequestSetupParams {
-            proxy: &proxy,
-            auth: &UpstreamAuth::default(),
+            service_name: "codex",
+            auth: &explicitly_anonymous_remote_auth(),
             client_headers: &client_headers,
             client_headers_entries_cache: &cache,
             request_body_len: 12,
@@ -599,7 +603,8 @@ mod tests {
             upstream_request_body_debug: None,
             client_body_warn: None,
             upstream_request_body_warn: None,
-        });
+        })
+        .expect("prepare attempt request");
 
         assert_eq!(
             setup.headers.get(header::ACCEPT),
@@ -607,16 +612,15 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn prepare_attempt_request_forces_json_accept_for_codex_compact_with_trailing_slash() {
-        let proxy = test_proxy_service();
+    #[test]
+    fn prepare_attempt_request_forces_json_accept_for_codex_compact_with_trailing_slash() {
         let mut client_headers = HeaderMap::new();
         client_headers.insert("accept", HeaderValue::from_static("text/event-stream"));
 
         let cache = OnceLock::new();
         let setup = prepare_attempt_request(AttemptRequestSetupParams {
-            proxy: &proxy,
-            auth: &UpstreamAuth::default(),
+            service_name: "codex",
+            auth: &explicitly_anonymous_remote_auth(),
             client_headers: &client_headers,
             client_headers_entries_cache: &cache,
             request_body_len: 12,
@@ -629,7 +633,8 @@ mod tests {
             upstream_request_body_debug: None,
             client_body_warn: None,
             upstream_request_body_warn: None,
-        });
+        })
+        .expect("prepare attempt request");
 
         assert_eq!(
             setup.headers.get(header::ACCEPT),
@@ -637,16 +642,15 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn prepare_attempt_request_forces_json_accept_for_codex_compact_with_query() {
-        let proxy = test_proxy_service();
+    #[test]
+    fn prepare_attempt_request_forces_json_accept_for_codex_compact_with_query() {
         let mut client_headers = HeaderMap::new();
         client_headers.insert("accept", HeaderValue::from_static("text/event-stream"));
 
         let cache = OnceLock::new();
         let setup = prepare_attempt_request(AttemptRequestSetupParams {
-            proxy: &proxy,
-            auth: &UpstreamAuth::default(),
+            service_name: "codex",
+            auth: &explicitly_anonymous_remote_auth(),
             client_headers: &client_headers,
             client_headers_entries_cache: &cache,
             request_body_len: 12,
@@ -659,7 +663,8 @@ mod tests {
             upstream_request_body_debug: None,
             client_body_warn: None,
             upstream_request_body_warn: None,
-        });
+        })
+        .expect("prepare attempt request");
 
         assert_eq!(
             setup.headers.get(header::ACCEPT),
@@ -667,16 +672,15 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn prepare_attempt_request_preserves_accept_for_codex_responses() {
-        let proxy = test_proxy_service();
+    #[test]
+    fn prepare_attempt_request_preserves_accept_for_codex_responses() {
         let mut client_headers = HeaderMap::new();
         client_headers.insert("accept", HeaderValue::from_static("text/event-stream"));
 
         let cache = OnceLock::new();
         let setup = prepare_attempt_request(AttemptRequestSetupParams {
-            proxy: &proxy,
-            auth: &UpstreamAuth::default(),
+            service_name: "codex",
+            auth: &explicitly_anonymous_remote_auth(),
             client_headers: &client_headers,
             client_headers_entries_cache: &cache,
             request_body_len: 12,
@@ -689,7 +693,8 @@ mod tests {
             upstream_request_body_debug: None,
             client_body_warn: None,
             upstream_request_body_warn: None,
-        });
+        })
+        .expect("prepare attempt request");
 
         assert_eq!(
             setup.headers.get(header::ACCEPT),
@@ -697,16 +702,15 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn prepare_attempt_request_builds_debug_base_when_limits_enabled() {
-        let proxy = test_proxy_service();
+    #[test]
+    fn prepare_attempt_request_builds_debug_base_when_limits_enabled() {
         let mut client_headers = HeaderMap::new();
         client_headers.insert("content-type", HeaderValue::from_static("application/json"));
 
         let cache = OnceLock::new();
         let setup = prepare_attempt_request(AttemptRequestSetupParams {
-            proxy: &proxy,
-            auth: &UpstreamAuth::default(),
+            service_name: "codex",
+            auth: &explicitly_anonymous_remote_auth(),
             client_headers: &client_headers,
             client_headers_entries_cache: &cache,
             request_body_len: 18,
@@ -719,7 +723,8 @@ mod tests {
             upstream_request_body_debug: None,
             client_body_warn: None,
             upstream_request_body_warn: None,
-        });
+        })
+        .expect("prepare attempt request");
 
         let debug_base = setup.debug_base.expect("debug_base");
         assert_eq!(debug_base.client_uri, "/v1/responses");

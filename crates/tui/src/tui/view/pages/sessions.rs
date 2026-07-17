@@ -427,6 +427,20 @@ pub(super) fn render_sessions_page(
             crate::tui::Language::Zh => "  r 重置筛选",
             crate::tui::Language::En => "  r reset filters",
         }));
+        lines.push(Line::from(match (lang, ui.can_mutate_session_affinity()) {
+            (crate::tui::Language::Zh, true) => "  Enter 会话 affinity 高级操作（仅空闲会话）",
+            (crate::tui::Language::En, true) => {
+                "  Enter advanced affinity actions (idle sessions only)"
+            }
+            (crate::tui::Language::Zh, false) if ui.runtime_connection.is_remote_observer() => {
+                "  affinity 操作：远程只读"
+            }
+            (crate::tui::Language::En, false) if ui.runtime_connection.is_remote_observer() => {
+                "  affinity actions: remote read-only"
+            }
+            (crate::tui::Language::Zh, false) => "  affinity 操作：当前只读",
+            (crate::tui::Language::En, false) => "  affinity actions: currently read-only",
+        }));
         lines.push(Line::from(match lang {
             crate::tui::Language::Zh => "  t 打开对话记录（全屏）",
             crate::tui::Language::En => "  t transcript (full-screen)",

@@ -1,4 +1,6 @@
 use super::*;
+use crate::proxy::tests::harness::TestUpstreamServer;
+use crate::state::{SessionRouteAffinityControlCommand, session_route_affinity_revision};
 
 const WS_PROVIDER_ENDPOINT_HEADER: &str = "x-codex-helper-provider-endpoint";
 
@@ -66,6 +68,47 @@ async fn send_successful_websocket_response(
             completed.to_string().into(),
         ))
         .await;
+}
+
+struct CountingWebSocketUpstream {
+    server: TestUpstreamServer,
+    frames: Arc<AtomicUsize>,
+    frame_received: Arc<tokio::sync::Notify>,
+}
+
+fn spawn_counting_websocket_upstream(response_id: &'static str) -> CountingWebSocketUpstream {
+    let frames = Arc::new(AtomicUsize::new(0));
+    let frame_received = Arc::new(tokio::sync::Notify::new());
+    let frames_for_route = Arc::clone(&frames);
+    let received_for_route = Arc::clone(&frame_received);
+    let app = axum::Router::new().route(
+        "/v1/responses",
+        get(move |ws: axum::extract::ws::WebSocketUpgrade| {
+            let frames = Arc::clone(&frames_for_route);
+            let received = Arc::clone(&received_for_route);
+            async move {
+                ws.on_upgrade(move |mut socket| async move {
+                    while let Some(Ok(message)) = socket.recv().await {
+                        if !matches!(
+                            message,
+                            axum::extract::ws::Message::Text(_)
+                                | axum::extract::ws::Message::Binary(_)
+                        ) {
+                            continue;
+                        }
+                        frames.fetch_add(1, Ordering::SeqCst);
+                        received.notify_one();
+                        send_successful_websocket_response(&mut socket, response_id).await;
+                    }
+                })
+            }
+        }),
+    );
+    CountingWebSocketUpstream {
+        server: spawn_test_upstream(app),
+        frames,
+        frame_received,
+    }
 }
 
 async fn send_failed_websocket_response(
@@ -182,6 +225,119 @@ async fn next_test_websocket_json(socket: &mut TestWebSocket) -> serde_json::Val
         .expect("websocket event frame");
     serde_json::from_str(message.to_text().expect("websocket text event"))
         .expect("websocket json event")
+}
+
+#[tokio::test]
+async fn responses_websocket_fails_closed_before_upstream_when_auth_reference_is_missing() {
+    let _env_guard = env_lock().await;
+    let codex_home = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HOME", &codex_home);
+    }
+    enable_responses_websocket_for_test(&codex_home);
+
+    let handshake_hits = Arc::new(AtomicUsize::new(0));
+    let hits_for_route = handshake_hits.clone();
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        get(move |ws: axum::extract::ws::WebSocketUpgrade| {
+            let hits = hits_for_route.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                ws.on_upgrade(|mut socket| async move { while socket.recv().await.is_some() {} })
+            }
+        }),
+    );
+    let (upstream_addr, upstream_handle) = spawn_axum_server(upstream);
+    let mut source = single_provider_websocket_config(upstream_addr, SchedulingPreset::Balanced, 1);
+    let missing_auth_reference = format!(
+        "CODEX_HELPER_TEST_MISSING_WS_AUTH_{}",
+        uuid::Uuid::new_v4().simple()
+    );
+    source
+        .codex
+        .providers
+        .get_mut("single")
+        .expect("single provider")
+        .inline_auth
+        .auth_token_env = Some(missing_auth_reference.clone());
+    let proxy = ProxyService::new(Client::new(), Arc::new(source), "codex");
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let error =
+        tokio_tungstenite::connect_async(test_websocket_request(proxy_addr, "ws-missing-auth"))
+            .await
+            .expect_err("missing auth must reject the downstream handshake");
+    let tokio_tungstenite::tungstenite::Error::Http(response) = error else {
+        panic!("expected HTTP authentication failure, got {error:?}");
+    };
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = String::from_utf8_lossy(response.body().as_deref().unwrap_or_default());
+    assert_eq!(body, "configured upstream credentials are unavailable");
+    assert!(!body.contains(missing_auth_reference.as_str()));
+    assert_eq!(handshake_hits.load(Ordering::SeqCst), 0);
+
+    proxy_handle.abort();
+    upstream_handle.abort();
+    let _ = std::fs::remove_dir_all(codex_home);
+}
+
+#[tokio::test]
+async fn responses_websocket_fails_closed_before_upstream_when_auth_header_is_invalid() {
+    let _env_guard = env_lock().await;
+    let codex_home = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HOME", &codex_home);
+    }
+    enable_responses_websocket_for_test(&codex_home);
+
+    let handshake_hits = Arc::new(AtomicUsize::new(0));
+    let hits_for_route = handshake_hits.clone();
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        get(move |ws: axum::extract::ws::WebSocketUpgrade| {
+            let hits = hits_for_route.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                ws.on_upgrade(|mut socket| async move { while socket.recv().await.is_some() {} })
+            }
+        }),
+    );
+    let (upstream_addr, upstream_handle) = spawn_axum_server(upstream);
+    let mut source = single_provider_websocket_config(upstream_addr, SchedulingPreset::Balanced, 1);
+    source
+        .codex
+        .providers
+        .get_mut("single")
+        .expect("single provider")
+        .inline_auth
+        .auth_token = Some("invalid\r\nbearer".to_string());
+    let proxy = ProxyService::new(Client::new(), Arc::new(source), "codex");
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let error =
+        tokio_tungstenite::connect_async(test_websocket_request(proxy_addr, "ws-invalid-auth"))
+            .await
+            .expect_err("invalid auth must reject the downstream handshake");
+    let tokio_tungstenite::tungstenite::Error::Http(response) = error else {
+        panic!("expected HTTP authentication failure, got {error:?}");
+    };
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response.body().as_deref().unwrap_or_default(),
+        b"configured upstream credentials are unavailable"
+    );
+    assert_eq!(handshake_hits.load(Ordering::SeqCst), 0);
+
+    proxy_handle.abort();
+    upstream_handle.abort();
+    let _ = std::fs::remove_dir_all(codex_home);
 }
 
 #[tokio::test]
@@ -671,6 +827,7 @@ supports_websockets = true
                 auth_token_env: None,
                 api_key: None,
                 api_key_env: None,
+                allow_anonymous: None,
             },
             tags: HashMap::new(),
             supported_models: HashMap::new(),
@@ -1010,7 +1167,7 @@ supports_websockets = true
 }
 
 #[tokio::test]
-async fn responses_websocket_hard_compaction_binding_allows_same_domain_failover_and_rejects_cross_domain_drift()
+async fn responses_websocket_requires_reconnect_when_same_domain_affinity_no_longer_matches_bound_endpoint()
  {
     let _env_guard = env_lock().await;
     let codex_home = make_temp_test_dir();
@@ -1197,69 +1354,528 @@ supports_websockets = true
         .await
         .expect("send first frame");
 
-    let event = socket
-        .next()
-        .await
-        .expect("event")
-        .expect("event ok")
-        .to_text()
-        .expect("event text")
-        .to_string();
-    assert!(event.contains("response.created"), "{event}");
-    assert_eq!(c_hits.load(Ordering::SeqCst), 1);
-    assert_eq!(d_hits.load(Ordering::SeqCst), 0);
-    let terminal = socket
-        .next()
-        .await
-        .expect("terminal event")
-        .expect("terminal event ok")
-        .to_text()
-        .expect("terminal event text")
-        .to_string();
-    assert!(terminal.contains("response.completed"), "{terminal}");
-
-    let affinity = state
-        .get_session_route_affinity("ws-explicit-domain")
-        .await
-        .expect("route affinity updated");
-    assert_eq!(affinity.route_graph_key, route_graph_key);
-    assert_eq!(affinity.provider_endpoint.provider_id.as_str(), "c");
-
-    state
-        .record_session_route_affinity_success(
-            None,
-            "ws-explicit-domain",
-            SessionRouteAffinityTarget {
-                route_graph_key: route_graph_key.clone(),
-                session_identity_source: Some(SessionIdentitySource::PromptCacheKey),
-                provider_endpoint: ProviderEndpointKey::new("codex", "d", "default"),
-                upstream_base_url: format!("http://{d_addr}/v1"),
-                route_path: vec!["d".to_string()],
-            },
-            Some("test_cross_domain_drift".to_string()),
-            crate::logging::now_ms(),
-        )
-        .await
-        .expect("persist route affinity");
-    socket
-        .send(tokio_tungstenite::tungstenite::Message::Text(
-            r#"{"type":"response.create","model":"gpt-5","stream":true,"prompt_cache_key":"ws-explicit-domain","input":[{"role":"user","content":"compact again"},{"type":"compaction_trigger"}]}"#.into(),
-        ))
-        .await
-        .expect("send cross-domain create");
     let rejection = next_test_websocket_json(&mut socket).await;
     assert_eq!(rejection["type"].as_str(), Some("error"));
     assert_eq!(
         rejection["code"].as_str(),
         Some("websocket_reconnect_required")
     );
-    assert_eq!(c_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(c_hits.load(Ordering::SeqCst), 0);
     assert_eq!(d_hits.load(Ordering::SeqCst), 0);
+
+    let affinity = state
+        .get_session_route_affinity("ws-explicit-domain")
+        .await
+        .expect("route affinity retained");
+    assert_eq!(affinity.route_graph_key, route_graph_key);
+    assert_eq!(affinity.provider_endpoint.provider_id.as_str(), "b");
 
     proxy_handle.abort();
     b_handle.abort();
     c_handle.abort();
     d_handle.abort();
+    let _ = std::fs::remove_dir_all(codex_home);
+}
+
+#[tokio::test]
+async fn responses_websocket_rebind_requires_reconnect_without_writing_old_upstream() {
+    let _env_guard = env_lock().await;
+    let codex_home = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HOME", &codex_home);
+    }
+    enable_responses_websocket_for_test(&codex_home);
+
+    let b_frames = Arc::new(AtomicUsize::new(0));
+    let b_frame_received = Arc::new(tokio::sync::Notify::new());
+    let b_frames_for_route = Arc::clone(&b_frames);
+    let b_received_for_route = Arc::clone(&b_frame_received);
+    let upstream_b = axum::Router::new().route(
+        "/v1/responses",
+        get(move |ws: axum::extract::ws::WebSocketUpgrade| {
+            let frames = Arc::clone(&b_frames_for_route);
+            let received = Arc::clone(&b_received_for_route);
+            async move {
+                ws.on_upgrade(move |mut socket| async move {
+                    while let Some(Ok(message)) = socket.recv().await {
+                        if !matches!(
+                            message,
+                            axum::extract::ws::Message::Text(_)
+                                | axum::extract::ws::Message::Binary(_)
+                        ) {
+                            continue;
+                        }
+                        frames.fetch_add(1, Ordering::SeqCst);
+                        received.notify_one();
+                        send_successful_websocket_response(&mut socket, "resp-b-unexpected").await;
+                    }
+                })
+            }
+        }),
+    );
+    let (b_addr, b_handle) = spawn_axum_server(upstream_b);
+
+    let c_frames = Arc::new(AtomicUsize::new(0));
+    let c_frame_received = Arc::new(tokio::sync::Notify::new());
+    let c_frames_for_route = Arc::clone(&c_frames);
+    let c_received_for_route = Arc::clone(&c_frame_received);
+    let upstream_c = axum::Router::new().route(
+        "/v1/responses",
+        get(move |ws: axum::extract::ws::WebSocketUpgrade| {
+            let frames = Arc::clone(&c_frames_for_route);
+            let received = Arc::clone(&c_received_for_route);
+            async move {
+                ws.on_upgrade(move |mut socket| async move {
+                    while let Some(Ok(message)) = socket.recv().await {
+                        if !matches!(
+                            message,
+                            axum::extract::ws::Message::Text(_)
+                                | axum::extract::ws::Message::Binary(_)
+                        ) {
+                            continue;
+                        }
+                        frames.fetch_add(1, Ordering::SeqCst);
+                        received.notify_one();
+                        send_successful_websocket_response(&mut socket, "resp-c-unexpected").await;
+                    }
+                })
+            }
+        }),
+    );
+    let (c_addr, c_handle) = spawn_axum_server(upstream_c);
+
+    let mut routing = RouteGraphConfig::ordered_failover(vec!["b".to_string(), "c".to_string()]);
+    routing.affinity_policy = crate::config::RouteAffinityPolicy::Hard;
+    let source = HelperConfig {
+        codex: ServiceRouteConfig {
+            providers: std::collections::BTreeMap::from([
+                (
+                    "b".to_string(),
+                    ProviderConfig {
+                        base_url: Some(format!("http://{b_addr}/v1")),
+                        continuity_domain: Some("relay-cluster-a".to_string()),
+                        inline_auth: UpstreamAuth::default(),
+                        ..ProviderConfig::default()
+                    },
+                ),
+                (
+                    "c".to_string(),
+                    ProviderConfig {
+                        base_url: Some(format!("http://{c_addr}/v1")),
+                        continuity_domain: Some("relay-cluster-a".to_string()),
+                        inline_auth: UpstreamAuth::default(),
+                        ..ProviderConfig::default()
+                    },
+                ),
+            ]),
+            routing: Some(routing),
+            ..ServiceRouteConfig::default()
+        },
+        ..HelperConfig::default()
+    };
+    let template = crate::routing_ir::compile_route_plan_template("codex", &source.codex)
+        .expect("route template");
+    let route_graph_key = template.route_graph_key();
+    let affinity_target = |provider_id: &str| {
+        let candidate = template
+            .candidates
+            .iter()
+            .find(|candidate| candidate.provider_id == provider_id)
+            .expect("route candidate");
+        SessionRouteAffinityTarget {
+            route_graph_key: route_graph_key.clone(),
+            session_identity_source: Some(SessionIdentitySource::Header),
+            provider_endpoint: template.candidate_provider_endpoint_key(candidate),
+            upstream_base_url: candidate.base_url.clone(),
+            route_path: candidate.route_path.clone(),
+        }
+    };
+    let proxy = ProxyService::new(Client::new(), Arc::new(source), "codex");
+    let state = Arc::clone(&proxy.state);
+    let initial = tokio::time::timeout(
+        Duration::from_secs(1),
+        state.record_session_route_affinity_success(
+            None,
+            "ws-operator-rebind",
+            affinity_target("b"),
+            Some("test_seed".to_string()),
+            crate::logging::now_ms(),
+        ),
+    )
+    .await
+    .expect("initial affinity should not deadlock")
+    .expect("persist initial affinity");
+    let initial_revision = session_route_affinity_revision(&initial);
+
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let mut request = format!("ws://{proxy_addr}/v1/responses")
+        .into_client_request()
+        .expect("ws request");
+    request
+        .headers_mut()
+        .insert("session-id", HeaderValue::from_static("ws-operator-rebind"));
+    let (mut socket, _) = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio_tungstenite::connect_async(request),
+    )
+    .await
+    .expect("WebSocket handshake should not deadlock")
+    .expect("connect proxy websocket");
+
+    let rebound = tokio::time::timeout(
+        Duration::from_secs(1),
+        state.compare_and_mutate_session_route_affinity(
+            "ws-operator-rebind",
+            Some(initial_revision.as_str()),
+            SessionRouteAffinityControlCommand::Rebind(affinity_target("c")),
+            crate::logging::now_ms(),
+        ),
+    )
+    .await
+    .expect("rebind should not deadlock")
+    .expect("rebind session affinity");
+    assert_eq!(
+        rebound.status,
+        crate::state::SessionRouteAffinityControlStatus::Applied
+    );
+
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        socket.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"response.create","model":"gpt-5","stream":true,"prompt_cache_key":"ws-operator-rebind","input":"after rebind"}"#.into(),
+        )),
+    )
+    .await
+    .expect("response.create send should not deadlock")
+    .expect("send response.create after rebind");
+    let rejection = tokio::time::timeout(
+        Duration::from_secs(2),
+        next_test_websocket_json(&mut socket),
+    )
+    .await
+    .expect("rebind mismatch must reject promptly");
+    assert_eq!(rejection["type"].as_str(), Some("error"));
+    assert_eq!(
+        rejection["code"].as_str(),
+        Some("websocket_reconnect_required")
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), b_frame_received.notified())
+            .await
+            .is_err(),
+        "the old upstream socket must receive zero response.create frames"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), c_frame_received.notified())
+            .await
+            .is_err(),
+        "the rebound endpoint must not receive a frame before reconnect"
+    );
+    assert_eq!(b_frames.load(Ordering::SeqCst), 0);
+    assert_eq!(c_frames.load(Ordering::SeqCst), 0);
+
+    proxy_handle.abort();
+    b_handle.abort();
+    c_handle.abort();
+    let _ = std::fs::remove_dir_all(codex_home);
+}
+
+#[tokio::test]
+async fn responses_websocket_clear_reselects_auto_before_reestablishing_affinity() {
+    let _env_guard = env_lock().await;
+    let codex_home = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HOME", &codex_home);
+    }
+    enable_responses_websocket_for_test(&codex_home);
+
+    let upstream_b = spawn_counting_websocket_upstream("resp-b-unexpected-after-clear");
+    let upstream_c = spawn_counting_websocket_upstream("resp-c-unexpected-before-reconnect");
+    let mut routing = RouteGraphConfig::ordered_failover(vec!["c".to_string(), "b".to_string()]);
+    routing.affinity_policy = crate::config::RouteAffinityPolicy::Hard;
+    let source = HelperConfig {
+        codex: ServiceRouteConfig {
+            providers: std::collections::BTreeMap::from([
+                (
+                    "b".to_string(),
+                    ProviderConfig {
+                        base_url: Some(upstream_b.server.base_url()),
+                        continuity_domain: Some("relay-b".to_string()),
+                        inline_auth: UpstreamAuth::default(),
+                        ..ProviderConfig::default()
+                    },
+                ),
+                (
+                    "c".to_string(),
+                    ProviderConfig {
+                        base_url: Some(upstream_c.server.base_url()),
+                        continuity_domain: Some("relay-c".to_string()),
+                        inline_auth: UpstreamAuth::default(),
+                        ..ProviderConfig::default()
+                    },
+                ),
+            ]),
+            routing: Some(routing),
+            ..ServiceRouteConfig::default()
+        },
+        ..HelperConfig::default()
+    };
+    let template = crate::routing_ir::compile_route_plan_template("codex", &source.codex)
+        .expect("route template");
+    let route_graph_key = template.route_graph_key();
+    let candidate_b = template
+        .candidates
+        .iter()
+        .find(|candidate| candidate.provider_id == "b")
+        .expect("provider b route candidate");
+    let proxy = ProxyService::new(Client::new(), Arc::new(source), "codex");
+    let state = Arc::clone(&proxy.state);
+    let initial = state
+        .record_session_route_affinity_success(
+            None,
+            "ws-operator-clear",
+            SessionRouteAffinityTarget {
+                route_graph_key: route_graph_key.clone(),
+                session_identity_source: Some(SessionIdentitySource::Header),
+                provider_endpoint: template.candidate_provider_endpoint_key(candidate_b),
+                upstream_base_url: candidate_b.base_url.clone(),
+                route_path: candidate_b.route_path.clone(),
+            },
+            Some("test_seed".to_string()),
+            crate::logging::now_ms(),
+        )
+        .await
+        .expect("persist initial affinity");
+    let initial_revision = session_route_affinity_revision(&initial);
+
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let mut socket = connect_test_websocket(proxy_addr, "ws-operator-clear").await;
+    let cleared = state
+        .compare_and_mutate_session_route_affinity(
+            "ws-operator-clear",
+            Some(initial_revision.as_str()),
+            SessionRouteAffinityControlCommand::Clear,
+            crate::logging::now_ms(),
+        )
+        .await
+        .expect("clear session affinity while websocket is idle");
+    assert_eq!(
+        cleared.status,
+        crate::state::SessionRouteAffinityControlStatus::Applied
+    );
+    assert!(
+        state
+            .get_session_route_affinity("ws-operator-clear")
+            .await
+            .is_none()
+    );
+
+    send_test_response_create(&mut socket, "after clear").await;
+    let rejection = tokio::time::timeout(
+        Duration::from_secs(2),
+        next_test_websocket_json(&mut socket),
+    )
+    .await
+    .expect("auto selection mismatch must reject promptly");
+    assert_eq!(rejection["type"].as_str(), Some("error"));
+    assert_eq!(
+        rejection["code"].as_str(),
+        Some("websocket_reconnect_required")
+    );
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            upstream_b.frame_received.notified(),
+        )
+        .await
+        .is_err(),
+        "the old upstream socket must receive zero response.create frames"
+    );
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            upstream_c.frame_received.notified(),
+        )
+        .await
+        .is_err(),
+        "the auto-selected endpoint must not receive a frame before reconnect"
+    );
+    assert_eq!(upstream_b.frames.load(Ordering::SeqCst), 0);
+    assert_eq!(upstream_c.frames.load(Ordering::SeqCst), 0);
+    assert!(
+        state
+            .get_session_route_affinity("ws-operator-clear")
+            .await
+            .is_none(),
+        "the stale websocket endpoint must not recreate affinity after clear"
+    );
+
+    proxy_handle.abort();
+    let _ = std::fs::remove_dir_all(codex_home);
+}
+
+#[tokio::test]
+async fn responses_websocket_explicit_round_robin_binding_does_not_advance_cursor_on_create() {
+    let _env_guard = env_lock().await;
+    let codex_home = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HOME", &codex_home);
+    }
+    enable_responses_websocket_for_test(&codex_home);
+
+    let upstream_b = spawn_counting_websocket_upstream("resp-explicit-b");
+    let upstream_c = spawn_counting_websocket_upstream("resp-explicit-c-unexpected");
+    let mut routing = RouteGraphConfig::round_robin(vec!["b".to_string(), "c".to_string()]);
+    routing.affinity_policy = crate::config::RouteAffinityPolicy::Off;
+    let source = HelperConfig {
+        codex: ServiceRouteConfig {
+            providers: std::collections::BTreeMap::from([
+                (
+                    "b".to_string(),
+                    ProviderConfig {
+                        base_url: Some(upstream_b.server.base_url()),
+                        inline_auth: UpstreamAuth::default(),
+                        ..ProviderConfig::default()
+                    },
+                ),
+                (
+                    "c".to_string(),
+                    ProviderConfig {
+                        base_url: Some(upstream_c.server.base_url()),
+                        inline_auth: UpstreamAuth::default(),
+                        ..ProviderConfig::default()
+                    },
+                ),
+            ]),
+            routing: Some(routing),
+            ..ServiceRouteConfig::default()
+        },
+        ..HelperConfig::default()
+    };
+    let proxy = ProxyService::new(Client::new(), Arc::new(source), "codex");
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let mut request = test_websocket_request(proxy_addr, "ws-explicit-round-robin");
+    request.headers_mut().insert(
+        WS_PROVIDER_ENDPOINT_HEADER,
+        HeaderValue::from_static("codex/b/default"),
+    );
+    let (mut socket, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("explicit round-robin websocket handshake");
+
+    send_test_response_create(&mut socket, "explicit round-robin first create").await;
+    assert_eq!(
+        next_test_websocket_json(&mut socket).await["type"].as_str(),
+        Some("response.created")
+    );
+    assert_eq!(
+        next_test_websocket_json(&mut socket).await["type"].as_str(),
+        Some("response.completed")
+    );
+    assert_eq!(upstream_b.frames.load(Ordering::SeqCst), 1);
+    assert_eq!(upstream_c.frames.load(Ordering::SeqCst), 0);
+
+    socket.close(None).await.expect("close websocket");
+    proxy_handle.abort();
+    let _ = std::fs::remove_dir_all(codex_home);
+}
+
+#[tokio::test]
+async fn responses_websocket_rejects_first_create_after_scheduling_reload() {
+    let _env_guard = env_lock().await;
+    let codex_home = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HOME", &codex_home);
+    }
+    enable_responses_websocket_for_test(&codex_home);
+
+    let create_hits = Arc::new(AtomicUsize::new(0));
+    let frame_received = Arc::new(tokio::sync::Notify::new());
+    let hits_for_route = Arc::clone(&create_hits);
+    let received_for_route = Arc::clone(&frame_received);
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        get(move |ws: axum::extract::ws::WebSocketUpgrade| {
+            let hits = Arc::clone(&hits_for_route);
+            let received = Arc::clone(&received_for_route);
+            async move {
+                ws.on_upgrade(move |mut socket| async move {
+                    while let Some(Ok(message)) = socket.recv().await {
+                        if !matches!(
+                            message,
+                            axum::extract::ws::Message::Text(_)
+                                | axum::extract::ws::Message::Binary(_)
+                        ) {
+                            continue;
+                        }
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        received.notify_one();
+                        send_successful_websocket_response(&mut socket, "unexpected-create").await;
+                    }
+                })
+            }
+        }),
+    );
+    let (upstream_addr, upstream_handle) = spawn_axum_server(upstream);
+    let initial = single_provider_websocket_config(upstream_addr, SchedulingPreset::Balanced, 1);
+    let proxy = ProxyService::new(Client::new(), Arc::new(initial), "codex");
+    let retained = proxy.clone();
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let mut socket = tokio::time::timeout(
+        Duration::from_secs(2),
+        connect_test_websocket(proxy_addr, "ws-scheduling-reload"),
+    )
+    .await
+    .expect("WebSocket handshake should not deadlock");
+
+    let reloaded =
+        single_provider_websocket_config(upstream_addr, SchedulingPreset::ContinuityFirst, 1);
+    let changed = tokio::time::timeout(
+        Duration::from_secs(1),
+        retained.config.reload_with_source(|| async {
+            Ok((crate::config::LoadedConfig { source: reloaded }, None))
+        }),
+    )
+    .await
+    .expect("scheduling reload should not deadlock")
+    .expect("reload scheduling preset");
+    assert!(changed);
+
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        send_test_response_create(&mut socket, "first after reload"),
+    )
+    .await
+    .expect("response.create send should not deadlock");
+    let rejection = tokio::time::timeout(
+        Duration::from_secs(2),
+        next_test_websocket_json(&mut socket),
+    )
+    .await
+    .expect("scheduling drift must reject the first create");
+    assert_eq!(rejection["type"].as_str(), Some("error"));
+    assert_eq!(
+        rejection["code"].as_str(),
+        Some("websocket_reconnect_required")
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), frame_received.notified())
+            .await
+            .is_err(),
+        "the stale upstream socket must receive zero response.create frames"
+    );
+    assert_eq!(create_hits.load(Ordering::SeqCst), 0);
+
+    proxy_handle.abort();
+    upstream_handle.abort();
     let _ = std::fs::remove_dir_all(codex_home);
 }
 

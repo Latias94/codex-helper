@@ -89,7 +89,7 @@ pub(crate) enum Command {
         #[command(subcommand)]
         cmd: ServiceCommand,
     },
-    /// Attach a read-only TUI dashboard to an already-running local resident proxy
+    /// Attach a TUI operator console to an already-running local resident proxy
     Tui {
         /// Target Codex proxy (default if neither flag is set)
         #[arg(long)]
@@ -260,7 +260,7 @@ pub(crate) enum ServiceCommand {
     },
     /// Show service log locations
     Logs,
-    /// Enter the Windows Service Control Manager dispatcher
+    /// Enter the legacy Windows Service Control Manager dispatcher
     #[command(hide = true)]
     Run {
         /// Target service name
@@ -275,6 +275,28 @@ pub(crate) enum ServiceCommand {
         /// Helper home captured at installation time
         #[arg(long)]
         helper_home: Option<std::path::PathBuf>,
+        /// Codex or Claude home captured at installation time
+        #[arg(long)]
+        client_home: Option<std::path::PathBuf>,
+    },
+    /// Run a Windows per-user scheduled task
+    #[command(hide = true)]
+    TaskRun {
+        /// Target service name
+        #[arg(long, default_value = "codex")]
+        service_name: String,
+        /// Listen host for the resident proxy
+        #[arg(long, default_value = "127.0.0.1")]
+        host: IpAddr,
+        /// Proxy port
+        #[arg(long)]
+        port: Option<u16>,
+        /// Helper home captured at installation time
+        #[arg(long)]
+        helper_home: Option<std::path::PathBuf>,
+        /// Codex or Claude home captured at installation time
+        #[arg(long)]
+        client_home: Option<std::path::PathBuf>,
     },
 }
 
@@ -667,6 +689,9 @@ pub enum ProviderCommand {
         /// Read X-API-Key header value from an environment variable
         #[arg(long, conflicts_with = "api_key")]
         api_key_env: Option<String>,
+        /// Explicitly allow anonymous requests to a remote third-party upstream
+        #[arg(long)]
+        allow_anonymous: bool,
         /// Optional alias for this provider
         #[arg(long)]
         alias: Option<String>,
@@ -1659,6 +1684,8 @@ mod tests {
             "4210",
             "--helper-home",
             "/tmp/helper-home",
+            "--client-home",
+            "/tmp/client-home",
         ])
         .expect("parse internal service run command");
 
@@ -1669,6 +1696,7 @@ mod tests {
                     host,
                     port,
                     helper_home,
+                    client_home,
                 },
         }) = cli.command
         else {
@@ -1680,6 +1708,55 @@ mod tests {
         assert_eq!(
             helper_home,
             Some(std::path::PathBuf::from("/tmp/helper-home"))
+        );
+        assert_eq!(
+            client_home,
+            Some(std::path::PathBuf::from("/tmp/client-home"))
+        );
+    }
+
+    #[test]
+    fn service_cli_task_run_carries_installed_runtime_identity() {
+        let cli = Cli::try_parse_from([
+            "codex-helper",
+            "service",
+            "task-run",
+            "--service-name",
+            "codex",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "3211",
+            "--helper-home",
+            r"C:\Users\test\.codex-helper",
+            "--client-home",
+            r"C:\Users\test\.codex",
+        ])
+        .expect("parse internal scheduled-task run command");
+
+        let Some(Command::Service {
+            cmd:
+                ServiceCommand::TaskRun {
+                    service_name,
+                    host,
+                    port,
+                    helper_home,
+                    client_home,
+                },
+        }) = cli.command
+        else {
+            panic!("expected internal scheduled-task run command");
+        };
+        assert_eq!(service_name, "codex");
+        assert_eq!(host, IpAddr::from([127, 0, 0, 1]));
+        assert_eq!(port, Some(3211));
+        assert_eq!(
+            helper_home,
+            Some(std::path::PathBuf::from(r"C:\Users\test\.codex-helper"))
+        );
+        assert_eq!(
+            client_home,
+            Some(std::path::PathBuf::from(r"C:\Users\test\.codex"))
         );
     }
 
@@ -1925,6 +2002,30 @@ mod tests {
         };
         assert_eq!(target, "nas");
         assert!(json);
+    }
+
+    #[test]
+    fn provider_add_parses_explicit_anonymous_opt_in() {
+        let cli = Cli::try_parse_from([
+            "codex-helper",
+            "provider",
+            "add",
+            "relay",
+            "--base-url",
+            "https://relay.example/v1",
+            "--allow-anonymous",
+        ])
+        .expect("parse provider anonymous opt-in");
+
+        assert!(matches!(
+            cli.command,
+            Some(Command::Provider {
+                cmd: ProviderCommand::Add {
+                    allow_anonymous: true,
+                    ..
+                }
+            })
+        ));
     }
 
     #[test]

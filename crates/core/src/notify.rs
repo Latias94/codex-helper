@@ -885,6 +885,7 @@ mod tests {
                     profiles: Vec::new(),
                     providers: Vec::new(),
                 },
+                routing: None,
                 active_requests: Vec::new(),
                 recent_requests: vec![notify_request_summary("thread-1", path, 1_200, 42)],
                 usage_summaries: Vec::new(),

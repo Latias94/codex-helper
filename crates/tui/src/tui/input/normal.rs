@@ -4,6 +4,7 @@ use codex_helper_core::codex_switch::{self, CodexSwitchIntent, ValidatedCodexBas
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::config::proxy_home_dir;
+use crate::proxy::{OperatorRoutingCommand, OperatorRoutingMutationRequest};
 use crate::sessions::find_codex_session_file_by_id;
 use crate::tui::Language;
 use crate::tui::i18n::{self, msg};
@@ -25,6 +26,7 @@ use super::history_bridge::{
     selected_request_page_request, session_history_summary_from_row,
 };
 use super::transcript::open_session_transcript_from_path;
+use crate::tui::operator_actions::{notify_read_only_operator_action, queue_balance_refresh};
 
 pub(in crate::tui) fn codex_switch_intent_for_key(
     code: KeyCode,
@@ -89,6 +91,9 @@ pub(super) fn apply_page_shortcuts(ui: &mut UiState, code: KeyCode) -> bool {
         }
         if ui.page == Page::Routing {
             ui.focus = Focus::Providers;
+            if previous_page != Page::Routing {
+                let _ = queue_balance_refresh(ui, false, false);
+            }
         } else if ui.page == Page::Requests {
             ui.focus = Focus::Requests;
         } else if ui.page == Page::Sessions
@@ -115,6 +120,235 @@ pub(super) fn apply_page_shortcuts(ui: &mut UiState, code: KeyCode) -> bool {
         return true;
     }
     false
+}
+
+pub(in crate::tui) fn handle_routing_operator_key(
+    ui: &mut UiState,
+    snapshot: &Snapshot,
+    code: KeyCode,
+) -> bool {
+    if ui.page != Page::Routing {
+        return false;
+    }
+    match code {
+        KeyCode::Char('g') => {
+            let _ = queue_balance_refresh(ui, true, true);
+            true
+        }
+        KeyCode::Enter | KeyCode::Char('m') => {
+            if !ui.can_mutate_routing() {
+                notify_read_only_operator_action(ui);
+                return true;
+            }
+            let Some(routing) = snapshot.routing.as_ref() else {
+                ui.toast = Some((
+                    match ui.language {
+                        Language::Zh => "当前 daemon 未提供可写路由摘要".to_string(),
+                        Language::En => {
+                            "the daemon did not provide a mutable routing summary".to_string()
+                        }
+                    },
+                    Instant::now(),
+                ));
+                return true;
+            };
+            let Some(candidate) = ui.selected_routing_candidate(snapshot) else {
+                ui.toast = Some((
+                    match ui.language {
+                        Language::Zh => "没有选中的候选端点".to_string(),
+                        Language::En => "no endpoint candidate is selected".to_string(),
+                    },
+                    Instant::now(),
+                ));
+                return true;
+            };
+            let _ = routing;
+            let _ = candidate;
+            ui.routing_action_selected_idx = if code == KeyCode::Char('m') { 2 } else { 0 };
+            ui.overlay = Overlay::RoutingActions;
+            true
+        }
+        KeyCode::Char('a') | KeyCode::Backspace | KeyCode::Delete => {
+            if !ui.can_mutate_routing() {
+                notify_read_only_operator_action(ui);
+                return true;
+            }
+            let Some(routing) = snapshot.routing.as_ref() else {
+                ui.toast = Some((
+                    match ui.language {
+                        Language::Zh => "当前 daemon 未提供可写路由摘要".to_string(),
+                        Language::En => {
+                            "the daemon did not provide a mutable routing summary".to_string()
+                        }
+                    },
+                    Instant::now(),
+                ));
+                return true;
+            };
+            if routing.new_session_preference.is_none() {
+                ui.toast = Some((
+                    match ui.language {
+                        Language::Zh => "当前已经使用自动路由".to_string(),
+                        Language::En => "automatic routing is already active".to_string(),
+                    },
+                    Instant::now(),
+                ));
+                return true;
+            }
+            let request = routing_mutation_request(
+                routing,
+                OperatorRoutingCommand::ClearNewSessionPreference,
+            );
+            ui.routing_confirmation = Some(request);
+            ui.overlay = Overlay::RoutingConfirmation;
+            true
+        }
+        _ => false,
+    }
+}
+
+pub(in crate::tui) fn handle_session_affinity_operator_key(
+    ui: &mut UiState,
+    snapshot: &Snapshot,
+    code: KeyCode,
+) -> bool {
+    if ui.page != Page::Sessions || code != KeyCode::Enter {
+        return false;
+    }
+    if !ui.can_mutate_session_affinity() {
+        notify_read_only_operator_action(ui);
+        return true;
+    }
+    let Some(row) = snapshot.rows.get(ui.selected_session_idx) else {
+        ui.toast = Some((
+            match ui.language {
+                Language::Zh => "没有选中的会话".to_string(),
+                Language::En => "no session is selected".to_string(),
+            },
+            Instant::now(),
+        ));
+        return true;
+    };
+    if row.active_count > 0 {
+        ui.toast = Some((
+            match ui.language {
+                Language::Zh => "会话仍有进行中的请求；只能在空闲后更改 affinity".to_string(),
+                Language::En => {
+                    "the session has an active request; affinity can only change when idle"
+                        .to_string()
+                }
+            },
+            Instant::now(),
+        ));
+        return true;
+    }
+    let Some(affinity) = row.route_affinity.as_ref() else {
+        ui.toast = Some((
+            match ui.language {
+                Language::Zh => "会话尚无 affinity；下一次请求会自动选择路由".to_string(),
+                Language::En => {
+                    "the session has no affinity; its next request will be routed automatically"
+                        .to_string()
+                }
+            },
+            Instant::now(),
+        ));
+        return true;
+    };
+    if affinity.revision.trim().is_empty() {
+        ui.toast = Some((
+            match ui.language {
+                Language::Zh => "daemon 未提供可写 affinity 控制元数据；已降级为只读".to_string(),
+                Language::En => {
+                    "the daemon did not provide mutable affinity control metadata; read-only mode"
+                        .to_string()
+                }
+            },
+            Instant::now(),
+        ));
+        return true;
+    }
+    let Some(routing) = snapshot.routing.as_ref() else {
+        ui.toast = Some((
+            match ui.language {
+                Language::Zh => "当前 daemon 未提供可写路由摘要".to_string(),
+                Language::En => "the daemon did not provide a mutable routing summary".to_string(),
+            },
+            Instant::now(),
+        ));
+        return true;
+    };
+    ui.session_affinity_action_selected_idx =
+        if routing.entry_strategy == crate::config::RouteStrategy::Conditional {
+            0
+        } else {
+            routing
+                .candidates
+                .iter()
+                .position(|candidate| {
+                    candidate.provider_id == affinity.provider_id
+                        && candidate.endpoint_id == affinity.endpoint_id
+                })
+                .map(|index| index + 1)
+                .unwrap_or_else(|| usize::from(!routing.candidates.is_empty()))
+        };
+    ui.overlay = Overlay::SessionAffinityActions;
+    true
+}
+
+pub(in crate::tui) fn routing_mutation_request(
+    routing: &crate::dashboard_core::OperatorRoutingSummary,
+    command: OperatorRoutingCommand,
+) -> OperatorRoutingMutationRequest {
+    OperatorRoutingMutationRequest {
+        expected_route_graph_key: routing.route_graph_key.clone(),
+        expected_control_revision: routing.control_revision,
+        expected_policy_revision: routing.provider_policy_revision,
+        command,
+    }
+}
+
+pub(in crate::tui) fn move_routing_page_selection(
+    ui: &mut UiState,
+    snapshot: &Snapshot,
+    providers_len: usize,
+    delta: i32,
+) -> bool {
+    if snapshot.routing.is_some() {
+        return ui.move_routing_selection(snapshot, delta);
+    }
+    let Some(next) = adjust_table_selection(&mut ui.providers_table, delta, providers_len) else {
+        return false;
+    };
+    ui.selected_provider_idx = next;
+    true
+}
+
+pub(in crate::tui) fn select_routing_page_edge(
+    ui: &mut UiState,
+    snapshot: &Snapshot,
+    providers_len: usize,
+    last: bool,
+) -> bool {
+    if let Some(routing) = snapshot.routing.as_ref() {
+        let index = if last {
+            routing.candidates.len().saturating_sub(1)
+        } else {
+            0
+        };
+        return ui.select_routing_candidate_index(snapshot, index);
+    }
+    if providers_len == 0 {
+        return false;
+    }
+    let index = if last {
+        providers_len.saturating_sub(1)
+    } else {
+        0
+    };
+    ui.selected_provider_idx = index;
+    ui.providers_table.select(Some(index));
+    true
 }
 
 fn apply_selected_session(ui: &mut UiState, snapshot: &Snapshot, idx: usize) {
@@ -367,6 +601,13 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
         return true;
     }
 
+    if handle_routing_operator_key(ui, snapshot, key.code) {
+        return true;
+    }
+    if handle_session_affinity_operator_key(ui, snapshot, key.code) {
+        return true;
+    }
+
     match key.code {
         KeyCode::Char('q') => {
             ui.should_exit = true;
@@ -381,6 +622,7 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
             true
         }
         KeyCode::Char('i') if ui.page == Page::Routing => {
+            ui.sync_selected_provider_from_routing(snapshot, providers);
             super::open_provider_info(ui);
             true
         }
@@ -459,21 +701,41 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
         }
         KeyCode::Up | KeyCode::Char('k') if ui.page == Page::Fleet => move_fleet_selection(ui, -1),
         KeyCode::Down | KeyCode::Char('j') if ui.page == Page::Fleet => move_fleet_selection(ui, 1),
-        KeyCode::Up | KeyCode::Char('k') if ui.page == Page::Routing => {
-            let len = providers.len();
-            if let Some(next) = adjust_table_selection(&mut ui.providers_table, -1, len) {
-                ui.selected_provider_idx = next;
-                return true;
+        KeyCode::Char('p') if ui.page == Page::Routing => {
+            if ui.select_preferred_routing_candidate(snapshot) {
+                true
+            } else {
+                ui.toast = Some((
+                    match ui.language {
+                        Language::Zh => "当前没有可定位的新会话偏好".to_string(),
+                        Language::En => {
+                            "there is no preferred new-session target to locate".to_string()
+                        }
+                    },
+                    Instant::now(),
+                ));
+                true
             }
-            false
+        }
+        KeyCode::PageUp if ui.page == Page::Routing => {
+            let delta = -(ui.routing_candidates_visible_rows.min(i32::MAX as usize) as i32);
+            move_routing_page_selection(ui, snapshot, providers.len(), delta)
+        }
+        KeyCode::PageDown if ui.page == Page::Routing => {
+            let delta = ui.routing_candidates_visible_rows.min(i32::MAX as usize) as i32;
+            move_routing_page_selection(ui, snapshot, providers.len(), delta)
+        }
+        KeyCode::Home if ui.page == Page::Routing => {
+            select_routing_page_edge(ui, snapshot, providers.len(), false)
+        }
+        KeyCode::End if ui.page == Page::Routing => {
+            select_routing_page_edge(ui, snapshot, providers.len(), true)
+        }
+        KeyCode::Up | KeyCode::Char('k') if ui.page == Page::Routing => {
+            move_routing_page_selection(ui, snapshot, providers.len(), -1)
         }
         KeyCode::Down | KeyCode::Char('j') if ui.page == Page::Routing => {
-            let len = providers.len();
-            if let Some(next) = adjust_table_selection(&mut ui.providers_table, 1, len) {
-                ui.selected_provider_idx = next;
-                return true;
-            }
-            false
+            move_routing_page_selection(ui, snapshot, providers.len(), 1)
         }
         KeyCode::Up | KeyCode::Char('k') if ui.page == Page::Stats => {
             ui.move_stats_selection(snapshot, -1)

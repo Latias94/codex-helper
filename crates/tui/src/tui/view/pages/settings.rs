@@ -357,13 +357,13 @@ mod tests {
     }
 
     #[test]
-    fn attached_settings_do_not_advertise_local_codex_switch() {
+    fn remote_observer_settings_do_not_advertise_local_codex_switch() {
         let backend = TestBackend::new(120, 32);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let mut ui = UiState {
             page: Page::Settings,
             language: Language::En,
-            runtime_connection: RuntimeConnectionKind::Attached,
+            runtime_connection: RuntimeConnectionKind::RemoteObserver,
             ..UiState::default()
         };
         let snapshot = Snapshot::default();
@@ -375,7 +375,7 @@ mod tests {
             .expect("draw attached Settings");
         let text = buffer_text(frame.buffer);
 
-        assert!(text.contains("connection: attached"), "{text}");
+        assert!(text.contains("connection: remote observer"), "{text}");
         assert!(!text.contains("Codex Local Switch"), "{text}");
         assert!(!text.contains("n/o"), "{text}");
     }

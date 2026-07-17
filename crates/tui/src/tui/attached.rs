@@ -4,7 +4,7 @@ use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
-use crate::control_plane_client::{ControlPlaneClient, ControlPlaneEndpoint};
+use crate::control_plane_client::{ControlPlaneClient, ControlPlaneEndpoint, LocalOperatorClient};
 use crate::dashboard_core::OperatorReadModel;
 
 use super::fleet_refresh::{
@@ -14,6 +14,10 @@ use super::i18n;
 use super::model::{
     Palette, ProviderOption, Snapshot, filtered_request_page_len, filtered_requests_len,
 };
+use super::operator_actions::{
+    OperatorActionOutcome, apply_operator_action_outcome, queue_balance_refresh,
+    start_attached_operator_action,
+};
 use super::operator_projection::apply_operator_read_model;
 use super::runtime_refresh::DashboardTiming;
 use super::state::{FleetViewMode, RuntimeConnectionKind, UiState, adjust_table_selection};
@@ -22,24 +26,75 @@ use super::{RenderInvalidation, enter_dashboard_terminal, input, leave_dashboard
 
 struct AttachedDashboardRuntime {
     client: ControlPlaneClient,
+    operator_client: Option<LocalOperatorClient>,
+    operator_transport_error: Option<String>,
+    connection_kind: RuntimeConnectionKind,
 }
 
 impl AttachedDashboardRuntime {
     fn new(_service_name: &'static str, _port: u16, admin_port: u16) -> anyhow::Result<Self> {
-        Self::new_with_admin_base_url(format!("http://127.0.0.1:{admin_port}"), None)
+        Self::new_local_with_admin_base_url(format!("http://127.0.0.1:{admin_port}"), None)
     }
 
     fn new_with_admin_base_url(
         admin_base_url: impl Into<String>,
         admin_token_env: Option<String>,
     ) -> anyhow::Result<Self> {
+        Self::new_remote_with_admin_base_url(admin_base_url, admin_token_env)
+    }
+
+    fn new_local_with_admin_base_url(
+        admin_base_url: impl Into<String>,
+        admin_token_env: Option<String>,
+    ) -> anyhow::Result<Self> {
+        Self::new_local_with_admin_base_url_and_token_loader(
+            admin_base_url,
+            admin_token_env,
+            crate::local_operator::ensure_local_operator_token,
+        )
+    }
+
+    fn new_local_with_admin_base_url_and_token_loader(
+        admin_base_url: impl Into<String>,
+        admin_token_env: Option<String>,
+        load_operator_token: impl FnOnce() -> anyhow::Result<String>,
+    ) -> anyhow::Result<Self> {
+        let endpoint = ControlPlaneEndpoint::new(admin_base_url, admin_token_env)?;
+        let client = ControlPlaneClient::new(endpoint.clone())?;
+        let operator_client =
+            load_operator_token().and_then(|token| LocalOperatorClient::new(endpoint, &token));
+        let (operator_client, operator_transport_error) = match operator_client {
+            Ok(client) => (Some(client), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        Ok(Self {
+            client,
+            operator_client,
+            operator_transport_error,
+            connection_kind: RuntimeConnectionKind::LocalAttached,
+        })
+    }
+
+    fn new_remote_with_admin_base_url(
+        admin_base_url: impl Into<String>,
+        admin_token_env: Option<String>,
+    ) -> anyhow::Result<Self> {
         let endpoint = ControlPlaneEndpoint::new(admin_base_url, admin_token_env)?;
         let client = ControlPlaneClient::new(endpoint)?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            operator_client: None,
+            operator_transport_error: None,
+            connection_kind: RuntimeConnectionKind::RemoteObserver,
+        })
     }
 
     fn admin_base_url(&self) -> &str {
         self.client.endpoint().admin_base_url()
+    }
+
+    fn operator_client(&self) -> Option<&LocalOperatorClient> {
+        self.operator_client.as_ref()
     }
 
     async fn operator_read_model(
@@ -73,6 +128,17 @@ pub async fn run_attached_dashboard_with_admin_base_url(
     run_attached_dashboard_runtime(service_name, port, runtime).await
 }
 
+pub async fn run_local_attached_dashboard_with_admin_base_url(
+    service_name: &'static str,
+    port: u16,
+    admin_base_url: String,
+    admin_token_env: Option<String>,
+) -> anyhow::Result<()> {
+    let runtime =
+        AttachedDashboardRuntime::new_local_with_admin_base_url(admin_base_url, admin_token_env)?;
+    run_attached_dashboard_runtime(service_name, port, runtime).await
+}
+
 async fn run_attached_dashboard_runtime(
     service_name: &'static str,
     port: u16,
@@ -82,15 +148,22 @@ async fn run_attached_dashboard_runtime(
     let timing = DashboardTiming::from_env();
 
     let mut providers = Vec::new();
+    let mut start_toast =
+        attached_start_toast(language, runtime.admin_base_url(), runtime.connection_kind);
+    if let Some(error) = runtime.operator_transport_error.as_deref() {
+        start_toast.push_str(match language {
+            super::Language::Zh => "；本机 operator 操作不可用，已降级只读：",
+            super::Language::En => "; local operator actions unavailable; read-only fallback: ",
+        });
+        start_toast.push_str(error);
+    }
     let mut ui = UiState {
         service_name,
         proxy_port: port,
         language,
-        runtime_connection: RuntimeConnectionKind::Attached,
-        toast: Some((
-            attached_start_toast(language, runtime.admin_base_url()),
-            Instant::now(),
-        )),
+        runtime_connection: runtime.connection_kind,
+        local_operator_transport_available: runtime.operator_client.is_some(),
+        toast: Some((start_toast, Instant::now())),
         ..Default::default()
     };
     let mut snapshot = Snapshot::default();
@@ -102,6 +175,8 @@ async fn run_attached_dashboard_runtime(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
     let (fleet_refresh_tx, mut fleet_refresh_rx) = mpsc::unbounded_channel::<FleetRefreshResult>();
+    let (operator_action_tx, mut operator_action_rx) =
+        mpsc::unbounded_channel::<OperatorActionOutcome>();
     let palette = Palette::default();
     let mut render_invalidation = RenderInvalidation::FullClear;
 
@@ -144,6 +219,21 @@ async fn run_attached_dashboard_runtime(
                     render_invalidation = RenderInvalidation::Redraw;
                 }
             }
+            maybe_operator_action = operator_action_rx.recv() => {
+                if let Some(outcome) = maybe_operator_action {
+                    apply_operator_action_outcome(&mut ui, outcome);
+                    if let Some(client) = runtime.operator_client() {
+                        start_attached_operator_action(
+                            &mut ui,
+                            client,
+                            operator_action_tx.clone(),
+                        );
+                    }
+                    refresh_attached_snapshot(&runtime, &mut ui, &mut snapshot, &mut providers).await;
+                    ui.needs_snapshot_refresh = false;
+                    render_invalidation = RenderInvalidation::Redraw;
+                }
+            }
             _ = &mut ctrl_c => {
                 ui.should_exit = true;
                 render_invalidation = RenderInvalidation::Redraw;
@@ -155,6 +245,13 @@ async fn run_attached_dashboard_runtime(
                         if input::should_accept_key_event(&key)
                             && handle_attached_key(&mut ui, &snapshot, &mut providers, key) =>
                     {
+                        if let Some(client) = runtime.operator_client() {
+                            start_attached_operator_action(
+                                &mut ui,
+                                client,
+                                operator_action_tx.clone(),
+                            );
+                        }
                         if ui.needs_fleet_refresh && !ui.fleet_loading {
                             start_attached_fleet_refresh(&mut ui, &runtime, fleet_refresh_tx.clone());
                         }
@@ -205,16 +302,24 @@ fn resolve_attached_language() -> super::Language {
     }
 }
 
-fn attached_start_toast(language: super::Language, admin_base_url: &str) -> String {
-    match language {
-        super::Language::Zh => {
-            format!("已进入附着观察模式：{admin_base_url}；q 只退出控制台，不停止目标 proxy")
+fn attached_start_toast(
+    language: super::Language,
+    admin_base_url: &str,
+    connection_kind: RuntimeConnectionKind,
+) -> String {
+    match (language, connection_kind) {
+        (super::Language::Zh, RuntimeConnectionKind::LocalAttached) => {
+            format!("已进入本机附着控制模式：{admin_base_url}；q 只退出控制台，不停止 proxy")
         }
-        super::Language::En => {
-            format!(
-                "attached observer mode: {admin_base_url}; q exits only this console and keeps the target proxy running"
-            )
+        (super::Language::En, RuntimeConnectionKind::LocalAttached) => format!(
+            "local attached control mode: {admin_base_url}; q exits only this console and keeps the proxy running"
+        ),
+        (super::Language::Zh, _) => {
+            format!("已进入远程只读观察模式：{admin_base_url}；q 只退出控制台，不停止目标 proxy")
         }
+        (super::Language::En, _) => format!(
+            "remote read-only observer mode: {admin_base_url}; q exits only this console and keeps the target proxy running"
+        ),
     }
 }
 
@@ -285,6 +390,22 @@ fn handle_attached_key(
         };
     }
 
+    if ui.overlay == Overlay::RoutingActions {
+        return input::handle_routing_actions_key(ui, snapshot, key);
+    }
+
+    if ui.overlay == Overlay::RoutingConfirmation {
+        return input::handle_routing_confirmation_key(ui, key);
+    }
+
+    if ui.overlay == Overlay::SessionAffinityActions {
+        return input::handle_session_affinity_actions_key(ui, snapshot, key);
+    }
+
+    if ui.overlay == Overlay::SessionAffinityConfirmation {
+        return input::handle_session_affinity_confirmation_key(ui, key);
+    }
+
     if ui.overlay == Overlay::ProviderInfo {
         if input::handle_provider_info_key(ui, key) {
             return true;
@@ -298,6 +419,13 @@ fn handle_attached_key(
         };
     }
 
+    if input::handle_routing_operator_key(ui, snapshot, key.code) {
+        return true;
+    }
+    if input::handle_session_affinity_operator_key(ui, snapshot, key.code) {
+        return true;
+    }
+
     match key.code {
         KeyCode::Char('q') => {
             ui.should_exit = true;
@@ -308,6 +436,7 @@ fn handle_attached_key(
             true
         }
         KeyCode::Char('i') if ui.page == Page::Routing => {
+            ui.sync_selected_provider_from_routing(snapshot, providers);
             input::open_provider_info(ui);
             true
         }
@@ -332,6 +461,36 @@ fn handle_attached_key(
         KeyCode::Tab => {
             cycle_attached_focus(ui);
             true
+        }
+        KeyCode::Char('p') if ui.page == Page::Routing => {
+            if ui.select_preferred_routing_candidate(snapshot) {
+                true
+            } else {
+                ui.toast = Some((
+                    match ui.language {
+                        super::Language::Zh => "当前没有可定位的新会话偏好".to_string(),
+                        super::Language::En => {
+                            "there is no preferred new-session target to locate".to_string()
+                        }
+                    },
+                    Instant::now(),
+                ));
+                true
+            }
+        }
+        KeyCode::PageUp if ui.page == Page::Routing => {
+            let delta = -(ui.routing_candidates_visible_rows.min(i32::MAX as usize) as i32);
+            input::move_routing_page_selection(ui, snapshot, providers.len(), delta)
+        }
+        KeyCode::PageDown if ui.page == Page::Routing => {
+            let delta = ui.routing_candidates_visible_rows.min(i32::MAX as usize) as i32;
+            input::move_routing_page_selection(ui, snapshot, providers.len(), delta)
+        }
+        KeyCode::Home if ui.page == Page::Routing => {
+            input::select_routing_page_edge(ui, snapshot, providers.len(), false)
+        }
+        KeyCode::End if ui.page == Page::Routing => {
+            input::select_routing_page_edge(ui, snapshot, providers.len(), true)
         }
         KeyCode::Up | KeyCode::Char('k') => {
             move_attached_selection(ui, snapshot, providers.len(), -1)
@@ -372,7 +531,12 @@ fn switch_attached_page(ui: &mut UiState, page: Page) -> bool {
         ui.needs_snapshot_refresh = true;
     }
     match ui.page {
-        Page::Routing => ui.focus = Focus::Providers,
+        Page::Routing => {
+            ui.focus = Focus::Providers;
+            if previous_page != Page::Routing {
+                let _ = queue_balance_refresh(ui, false, false);
+            }
+        }
         Page::Requests => ui.focus = Focus::Requests,
         Page::Sessions | Page::History | Page::Recent => ui.focus = Focus::Sessions,
         Page::ServiceStatus => {}
@@ -418,6 +582,9 @@ fn move_attached_selection(
 ) -> bool {
     match ui.page {
         Page::Routing => {
+            if snapshot.routing.is_some() {
+                return ui.move_routing_selection(snapshot, delta);
+            }
             if let Some(next) =
                 adjust_table_selection(&mut ui.providers_table, delta, providers_len)
             {
@@ -636,6 +803,7 @@ mod tests {
                     profiles: Vec::new(),
                     providers: Vec::new(),
                 },
+                routing: None,
                 active_requests: Vec::new(),
                 recent_requests: Vec::new(),
                 usage_summaries: Vec::new(),
@@ -661,7 +829,7 @@ mod tests {
             .expect("attached runtime");
         let mut ui = UiState {
             service_name: "codex",
-            runtime_connection: RuntimeConnectionKind::Attached,
+            runtime_connection: RuntimeConnectionKind::RemoteObserver,
             ..Default::default()
         };
         let mut snapshot = empty_snapshot();
@@ -687,7 +855,7 @@ mod tests {
         let stale = OperatorReadModel::stale_from(&ready);
         let mut ui = UiState {
             service_name: "codex",
-            runtime_connection: RuntimeConnectionKind::Attached,
+            runtime_connection: RuntimeConnectionKind::RemoteObserver,
             ..Default::default()
         };
         let mut snapshot = Snapshot::default();
@@ -721,7 +889,7 @@ mod tests {
         ] {
             let mut ui = UiState {
                 service_name: "codex",
-                runtime_connection: RuntimeConnectionKind::Attached,
+                runtime_connection: RuntimeConnectionKind::RemoteObserver,
                 ..Default::default()
             };
             let mut snapshot = Snapshot::default();
@@ -754,7 +922,7 @@ mod tests {
     #[test]
     fn attached_page_switch_keeps_exit_semantics_read_only() {
         let mut ui = UiState {
-            runtime_connection: RuntimeConnectionKind::Attached,
+            runtime_connection: RuntimeConnectionKind::RemoteObserver,
             ..Default::default()
         };
 
@@ -773,7 +941,7 @@ mod tests {
     fn attached_settings_do_not_handle_local_codex_switch_keys() {
         let mut ui = UiState {
             service_name: "codex",
-            runtime_connection: RuntimeConnectionKind::Attached,
+            runtime_connection: RuntimeConnectionKind::RemoteObserver,
             page: Page::Settings,
             ..Default::default()
         };
@@ -797,7 +965,7 @@ mod tests {
     #[test]
     fn attached_navigation_supports_core_pages() {
         let mut ui = UiState {
-            runtime_connection: RuntimeConnectionKind::Attached,
+            runtime_connection: RuntimeConnectionKind::RemoteObserver,
             ..Default::default()
         };
         let snapshot = empty_snapshot();
@@ -825,7 +993,7 @@ mod tests {
     #[test]
     fn attached_navigation_supports_fleet_page() {
         let mut ui = UiState {
-            runtime_connection: RuntimeConnectionKind::Attached,
+            runtime_connection: RuntimeConnectionKind::RemoteObserver,
             ..Default::default()
         };
         let snapshot = empty_snapshot();
@@ -843,18 +1011,56 @@ mod tests {
     }
 
     #[test]
-    fn attached_start_toast_names_observer_lifecycle() {
-        let text = attached_start_toast(crate::tui::Language::En, "http://127.0.0.1:4211");
+    fn attached_start_toast_names_remote_observer_lifecycle() {
+        let text = attached_start_toast(
+            crate::tui::Language::En,
+            "http://127.0.0.1:4211",
+            RuntimeConnectionKind::RemoteObserver,
+        );
 
-        assert!(text.contains("attached observer mode"), "{text}");
+        assert!(text.contains("remote read-only observer mode"), "{text}");
         assert!(text.contains("keeps the target proxy running"), "{text}");
+    }
+
+    #[test]
+    fn attached_start_toast_names_local_control_lifecycle() {
+        let text = attached_start_toast(
+            crate::tui::Language::En,
+            "http://127.0.0.1:4211",
+            RuntimeConnectionKind::LocalAttached,
+        );
+
+        assert!(text.contains("local attached control mode"), "{text}");
+        assert!(text.contains("keeps the proxy running"), "{text}");
+    }
+
+    #[test]
+    fn local_attached_runtime_falls_back_to_read_only_when_operator_token_fails() {
+        let runtime = AttachedDashboardRuntime::new_local_with_admin_base_url_and_token_loader(
+            "http://127.0.0.1:4211",
+            None,
+            || anyhow::bail!("test token ACL failure"),
+        )
+        .expect("read-only local runtime");
+
+        assert_eq!(
+            runtime.connection_kind,
+            RuntimeConnectionKind::LocalAttached
+        );
+        assert!(runtime.operator_client.is_none());
+        assert!(
+            runtime
+                .operator_transport_error
+                .as_deref()
+                .is_some_and(|error| error.contains("token ACL failure"))
+        );
     }
 
     #[test]
     fn attached_stats_refresh_reloads_operator_read_model() {
         let mut ui = UiState {
             page: Page::Stats,
-            runtime_connection: RuntimeConnectionKind::Attached,
+            runtime_connection: RuntimeConnectionKind::RemoteObserver,
             ..Default::default()
         };
 
@@ -872,7 +1078,7 @@ mod tests {
     fn attached_stats_tab_uses_shared_four_focus_cycle() {
         let mut ui = UiState {
             page: Page::Stats,
-            runtime_connection: RuntimeConnectionKind::Attached,
+            runtime_connection: RuntimeConnectionKind::RemoteObserver,
             ..Default::default()
         };
 
@@ -896,7 +1102,7 @@ mod tests {
     fn attached_routing_provider_info_uses_read_only_overlay_controls() {
         let mut ui = UiState {
             page: Page::Routing,
-            runtime_connection: RuntimeConnectionKind::Attached,
+            runtime_connection: RuntimeConnectionKind::RemoteObserver,
             provider_info_scroll: 9,
             ..Default::default()
         };
@@ -932,7 +1138,7 @@ mod tests {
     fn attached_stats_report_export_key_handles_empty_selection() {
         let mut ui = UiState {
             page: Page::Stats,
-            runtime_connection: RuntimeConnectionKind::Attached,
+            runtime_connection: RuntimeConnectionKind::RemoteObserver,
             ..Default::default()
         };
 
@@ -955,6 +1161,7 @@ mod tests {
             quota_analytics: crate::quota_analytics::QuotaAnalyticsView::default(),
             usage_rollup: crate::state::UsageRollupView::default(),
             provider_balances: std::collections::HashMap::new(),
+            routing: None,
             pricing_catalog: Default::default(),
             stats_5m: crate::dashboard_core::WindowStats::default(),
             stats_1h: crate::dashboard_core::WindowStats::default(),

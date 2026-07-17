@@ -17,22 +17,31 @@ fn ui_for(page: Page, runtime_connection: RuntimeConnectionKind) -> UiState {
 }
 
 #[test]
-fn routing_help_only_advertises_read_only_inspection() {
+fn local_routing_help_advertises_refresh_preference_and_clear() {
     let ui = ui_for(Page::Routing, RuntimeConnectionKind::Integrated);
     let lines = current_page_help_lines(&ui, Palette::default());
     let text = help_text_for_tests(&lines);
 
     assert!(text.contains("Current page: Routing"), "{text}");
-    assert!(text.contains("read-only provider details"), "{text}");
-    for removed in [
-        "refresh balances",
-        "Backspace",
-        "route target",
-        "health check",
-        "editor",
-    ] {
-        assert!(!text.contains(removed), "unexpected {removed:?} in {text}");
-    }
+    assert!(text.contains("endpoint candidate"), "{text}");
+    assert!(text.contains("Enter"), "{text}");
+    assert!(text.contains("new-session preference"), "{text}");
+    assert!(text.contains("Backspace"), "{text}");
+    assert!(text.contains("force-refresh all balances"), "{text}");
+}
+
+#[test]
+fn remote_routing_help_remains_read_only() {
+    let ui = ui_for(Page::Routing, RuntimeConnectionKind::RemoteObserver);
+    let lines = current_page_help_lines(&ui, Palette::default());
+    let text = help_text_for_tests(&lines);
+
+    assert!(text.contains("inspect the current provider"), "{text}");
+    assert!(
+        !text.contains("new-session preference and endpoint actions"),
+        "{text}"
+    );
+    assert!(!text.contains("Backspace"), "{text}");
 }
 
 #[test]
@@ -65,7 +74,7 @@ fn settings_help_only_advertises_the_local_codex_switch_action() {
 
 #[test]
 fn attached_settings_help_does_not_advertise_local_codex_switch() {
-    let ui = ui_for(Page::Settings, RuntimeConnectionKind::Attached);
+    let ui = ui_for(Page::Settings, RuntimeConnectionKind::RemoteObserver);
     let lines = current_page_help_lines(&ui, Palette::default());
     let text = help_text_for_tests(&lines);
 

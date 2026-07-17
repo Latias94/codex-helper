@@ -37,6 +37,29 @@ pub(in crate::tui) enum Overlay {
     ProviderInfo,
     SessionTranscript,
     StartupAlert,
+    RoutingActions,
+    RoutingConfirmation,
+    SessionAffinityActions,
+    SessionAffinityConfirmation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::tui) enum RoutingActionChoice {
+    PreferNewSessions,
+    ClearNewSessionPreference,
+    EnableEndpoint,
+    DrainEndpoint,
+    DisableEndpoint,
+}
+
+impl RoutingActionChoice {
+    pub(in crate::tui) const ALL: [Self; 5] = [
+        Self::PreferNewSessions,
+        Self::ClearNewSessionPreference,
+        Self::EnableEndpoint,
+        Self::DrainEndpoint,
+        Self::DisableEndpoint,
+    ];
 }
 
 pub(in crate::tui) fn page_titles(lang: Language) -> [&'static str; 10] {

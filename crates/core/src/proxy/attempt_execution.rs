@@ -45,6 +45,8 @@ use super::selected_upstream_request::{
 };
 use crate::routing_ir::CapturedRouteCandidate;
 
+const UPSTREAM_AUTH_UNAVAILABLE_REASON: &str = "configured upstream credentials are unavailable";
+
 pub(super) enum SelectedUpstreamExecutionOutcome {
     ContinueProviderChain,
     StopProviderChain,
@@ -226,13 +228,85 @@ pub(super) async fn execute_selected_upstream(
             };
         }
     };
-    let request_identity = prepare_attempt_request_identity(AttemptRequestIdentityParams {
-        proxy,
+    let request_identity = match prepare_attempt_request_identity(AttemptRequestIdentityParams {
+        service_name: proxy.service_name,
         auth: target.auth(),
         client_headers,
         client_uri,
         target_url: target_url.as_str(),
-    });
+    }) {
+        Ok(identity) => identity,
+        Err(error) => {
+            *global_attempt = global_attempt.saturating_add(1);
+            log_attempt_select(AttemptSelectLogParams {
+                service_name: proxy.service_name,
+                request_id,
+                global_attempt: *global_attempt,
+                provider_attempt,
+                upstream_attempt: 0,
+                provider_opt,
+                upstream_opt,
+                target,
+                provider_id: Some(target.provider_id()),
+                avoid_set,
+                avoided_total: *avoided_total,
+                total_upstreams,
+                model_note: model_mapping.model_note.as_str(),
+            });
+            let route_attempt_index = start_selected_route_attempt(
+                route_attempts,
+                StartRouteAttemptParams {
+                    target,
+                    provider_id: Some(target.provider_id()),
+                    provider_attempt,
+                    upstream_attempt: 0,
+                    provider_max_attempts: provider_opt.max_attempts,
+                    upstream_max_attempts: upstream_opt.max_attempts,
+                    model_note: model_mapping.model_note.as_str(),
+                    avoid_set,
+                    avoided_total: *avoided_total,
+                    total_upstreams,
+                },
+            );
+            tracing::warn!(
+                request_id,
+                provider_id = target.provider_id(),
+                auth_error_code = error.code(),
+                error = %error,
+                "selected provider authentication could not be resolved"
+            );
+            let outcome = handle_attempt_target_build_failure(AttemptTargetBuildFailureParams {
+                proxy,
+                target,
+                error_message: UPSTREAM_AUTH_UNAVAILABLE_REASON.to_string(),
+                transport_cooldown_secs: 0,
+                cooldown_backoff,
+                avoid_set,
+                avoided_total,
+                last_err,
+                route_attempts,
+                route_attempt_index,
+                model_note: model_mapping.model_note.as_str(),
+                allow_provider_failover,
+            })
+            .await;
+            if let Some((status, _)) = last_err.as_mut() {
+                *status = StatusCode::SERVICE_UNAVAILABLE;
+            }
+            return match outcome {
+                AttemptTransportOutcome::TryNextUpstream => {
+                    SelectedUpstreamExecutionOutcome::ContinueProviderChain
+                }
+                AttemptTransportOutcome::StopProviderChain => {
+                    SelectedUpstreamExecutionOutcome::StopProviderChain
+                }
+                AttemptTransportOutcome::RetrySameUpstream
+                | AttemptTransportOutcome::Continue(_) => {
+                    unreachable!("authentication resolution failure cannot continue transport")
+                }
+            };
+        }
+    };
     let attempt_context = match proxy
         .state
         .capture_upstream_attempt_context(

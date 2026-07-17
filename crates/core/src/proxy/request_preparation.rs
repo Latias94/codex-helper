@@ -6,7 +6,9 @@ use axum::http::{HeaderMap, Method, Uri};
 use crate::endpoint_health::CooldownBackoff;
 use crate::logging::{BodyPreview, CodexBridgeLog, ServiceTierLog, make_body_preview};
 use crate::routing_ir::RouteRequestContext;
-use crate::state::{SessionBinding, SessionContinuityMode, SessionIdentitySource};
+use crate::state::{
+    SessionBinding, SessionContinuityMode, SessionIdentitySource, SessionRouteControlGuard,
+};
 
 use super::ProxyService;
 use super::client_identity::ClientSessionIdentity;
@@ -91,9 +93,11 @@ pub(super) struct BodyPreviewSet {
     pub warn: Option<BodyPreview>,
 }
 
-#[derive(Debug, Clone)]
 pub(super) struct RequestConfigContext {
     pub(super) runtime_snapshot: Arc<RuntimeSnapshot>,
+    session_id: Option<String>,
+    session_identity_source: Option<SessionIdentitySource>,
+    session_route_control: Option<SessionRouteControlGuard>,
 }
 
 pub(super) struct CommonPreparedRequest {
@@ -143,7 +147,6 @@ pub(super) struct CommonRequestPreparationParams<'a> {
     pub(super) client_headers: &'a HeaderMap,
     pub(super) raw_body: &'a Bytes,
     pub(super) request_dialect: RequestDialect,
-    pub(super) session_identity_hint: Option<ClientSessionIdentity>,
     pub(super) client_name: Option<String>,
     pub(super) client_addr: Option<String>,
     pub(super) started_at_ms: u64,
@@ -151,14 +154,31 @@ pub(super) struct CommonRequestPreparationParams<'a> {
     pub(super) request_body_previews: bool,
 }
 
-pub(super) async fn load_request_config_context(proxy: &ProxyService) -> RequestConfigContext {
+pub(super) async fn load_request_config_context(
+    proxy: &ProxyService,
+    session_identity: Option<&ClientSessionIdentity>,
+) -> RequestConfigContext {
     let config_reloaded = proxy.config.maybe_reload_from_disk().await;
-    let runtime_snapshot = proxy.config.capture().await;
     if config_reloaded {
         super::control_plane_service::prune_runtime_observability_after_reload(proxy).await;
     }
 
-    RequestConfigContext { runtime_snapshot }
+    let session_id = session_identity_value(session_identity);
+    let session_identity_source = session_identity_source(session_identity);
+    let session_route_control = match session_id.as_deref() {
+        Some(session_id) => Some(proxy.state.lock_session_route_control(session_id).await),
+        None => None,
+    };
+    // Capturing after the per-session guard is the request's MVCC
+    // linearization point relative to affinity control mutations.
+    let runtime_snapshot = proxy.config.capture().await;
+
+    RequestConfigContext {
+        runtime_snapshot,
+        session_id,
+        session_identity_source,
+        session_route_control,
+    }
 }
 
 pub(super) async fn prepare_common_request(
@@ -167,6 +187,7 @@ pub(super) async fn prepare_common_request(
     prepare_common_request_inner(params, true).await
 }
 
+#[cfg(test)]
 pub(super) async fn prepare_common_request_without_route_plan(
     params: CommonRequestPreparationParams<'_>,
 ) -> Result<CommonPreparedRequest, CommonRequestPreparationError> {
@@ -185,7 +206,6 @@ async fn prepare_common_request_inner(
         client_headers,
         raw_body,
         request_dialect,
-        session_identity_hint,
         client_name,
         client_addr,
         started_at_ms,
@@ -198,9 +218,8 @@ async fn prepare_common_request_inner(
         proxy.service_name,
     );
     let _ = client_headers;
-    let session_identity = session_identity_hint;
-    let session_id = session_identity_value(session_identity.as_ref());
-    let session_identity_source = session_identity_source(session_identity.as_ref());
+    let session_id = config.session_id.clone();
+    let session_identity_source = config.session_identity_source;
     let session_binding = if let Some(id) = session_id.as_deref() {
         proxy
             .ensure_default_session_binding(view, id, started_at_ms)
@@ -253,11 +272,11 @@ async fn prepare_common_request_inner(
 
     let request_id = proxy
         .state
-        .try_begin_request(
+        .try_begin_request_with_session_route_control(
+            config.session_route_control.as_ref(),
             proxy.service_name,
             method.as_str(),
             uri.path(),
-            session_id.clone(),
             session_identity_source,
             client_name,
             client_addr,
@@ -405,7 +424,10 @@ pub(super) fn codex_path_is_responses_or_compact(path: &str) -> bool {
 }
 
 pub(super) fn session_identity_value(identity: Option<&ClientSessionIdentity>) -> Option<String> {
-    identity.map(|identity| identity.value().to_string())
+    identity.and_then(|identity| {
+        let value = identity.value().trim();
+        (!value.is_empty()).then(|| value.to_string())
+    })
 }
 
 pub(super) fn session_identity_source(
@@ -597,12 +619,14 @@ pub(super) fn build_body_previews(
 mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use axum::http::{HeaderMap, HeaderValue};
 
     use super::*;
     use crate::config::{
-        HelperConfig, ProviderConfig, RouteGraphConfig, ServiceControlProfile, ServiceRouteConfig,
+        HelperConfig, LoadedConfig, ProviderConfig, RouteGraphConfig, ServiceControlProfile,
+        ServiceRouteConfig,
     };
 
     struct ScopedCodexHome {
@@ -979,8 +1003,8 @@ mod tests {
         assert!(disabled.warn.is_none());
     }
 
-    fn test_proxy_with_active_route() -> ProxyService {
-        let cfg = HelperConfig {
+    fn test_config_with_active_route(provider_id: &str) -> HelperConfig {
+        HelperConfig {
             codex: ServiceRouteConfig {
                 default_profile: Some("default".to_string()),
                 profiles: std::collections::BTreeMap::from([(
@@ -991,17 +1015,142 @@ mod tests {
                     },
                 )]),
                 providers: std::collections::BTreeMap::from([(
-                    "test".to_string(),
+                    provider_id.to_string(),
                     ProviderConfig {
                         base_url: Some("https://example.com/v1".to_string()),
                         ..ProviderConfig::default()
                     },
                 )]),
-                routing: Some(RouteGraphConfig::ordered_failover(vec!["test".to_string()])),
+                routing: Some(RouteGraphConfig::ordered_failover(vec![
+                    provider_id.to_string(),
+                ])),
             },
             ..HelperConfig::default()
-        };
-        ProxyService::new(reqwest::Client::new(), Arc::new(cfg), "codex")
+        }
+    }
+
+    fn test_proxy_with_active_route() -> ProxyService {
+        ProxyService::new(
+            reqwest::Client::new(),
+            Arc::new(test_config_with_active_route("test")),
+            "codex",
+        )
+    }
+
+    #[tokio::test]
+    async fn request_context_holds_the_canonical_session_guard_through_snapshot_capture() {
+        let proxy = test_proxy_with_active_route();
+        let state = Arc::clone(&proxy.state);
+        let held = state.lock_session_route_control("session-guarded").await;
+        let waiting = state
+            .signal_next_session_route_control_lock_wait_for_test()
+            .await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "session-id",
+            HeaderValue::from_static("  session-guarded  "),
+        );
+        let session_identity = super::super::client_identity::extract_session_identity(&headers);
+        let task = tokio::spawn({
+            let proxy = proxy.clone();
+            async move { load_request_config_context(&proxy, session_identity.as_ref()).await }
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("request should reach the held session guard")
+            .expect("request wait signal should remain connected");
+        assert!(
+            !task.is_finished(),
+            "snapshot capture must wait behind control"
+        );
+
+        drop(held);
+        let context = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("request context should resume")
+            .expect("request context task should join");
+        assert_eq!(context.session_id.as_deref(), Some("session-guarded"));
+        assert!(
+            state
+                .try_lock_session_route_control("  session-guarded ")
+                .await
+                .is_none(),
+            "request context must retain its typed guard"
+        );
+
+        drop(context);
+        assert!(
+            state
+                .try_lock_session_route_control("session-guarded")
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn waiting_request_captures_runtime_snapshot_after_guard_and_reload() {
+        let proxy = test_proxy_with_active_route();
+        let before = proxy.config.capture().await;
+        let state = Arc::clone(&proxy.state);
+        let held = tokio::time::timeout(
+            Duration::from_secs(1),
+            state.lock_session_route_control("session-reload-order"),
+        )
+        .await
+        .expect("control mutation should acquire the session guard");
+        let waiting = state
+            .signal_next_session_route_control_lock_wait_for_test()
+            .await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "session-id",
+            HeaderValue::from_static("session-reload-order"),
+        );
+        let session_identity = super::super::client_identity::extract_session_identity(&headers);
+        let request = tokio::spawn({
+            let proxy = proxy.clone();
+            async move { load_request_config_context(&proxy, session_identity.as_ref()).await }
+        });
+        tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("request should reach the held session guard")
+            .expect("request wait signal should remain connected");
+
+        let changed = tokio::time::timeout(
+            Duration::from_secs(1),
+            proxy.config.reload_with_source(|| async {
+                Ok((
+                    LoadedConfig {
+                        source: test_config_with_active_route("reloaded"),
+                    },
+                    None,
+                ))
+            }),
+        )
+        .await
+        .expect("reload should not deadlock with a session guard")
+        .expect("reload runtime snapshot");
+        assert!(changed);
+        let after_reload = proxy.config.capture().await;
+        assert!(after_reload.revision() > before.revision());
+
+        drop(held);
+        let context = tokio::time::timeout(Duration::from_secs(1), request)
+            .await
+            .expect("request should resume after control mutation")
+            .expect("request context task should join");
+        assert_eq!(context.runtime_snapshot.revision(), after_reload.revision());
+        let candidate = context
+            .runtime_snapshot
+            .route_graph("codex")
+            .expect("codex route graph")
+            .handshake_plan()
+            .candidates
+            .into_iter()
+            .next()
+            .expect("reloaded route candidate");
+        assert_eq!(candidate.provider_id, "reloaded");
     }
 
     #[tokio::test]
@@ -1020,7 +1169,6 @@ mod tests {
         )
         .expect("write fake Codex session");
         let proxy = test_proxy_with_active_route();
-        let config = load_request_config_context(&proxy).await;
         let mut headers = HeaderMap::new();
         headers.insert("content-type", HeaderValue::from_static("application/json"));
         let method = Method::POST;
@@ -1032,6 +1180,12 @@ mod tests {
             })
             .to_string(),
         );
+        let session_identity =
+            super::super::client_identity::extract_session_identity_with_body_fallback(
+                &headers,
+                raw_body.as_ref(),
+            );
+        let config = load_request_config_context(&proxy, session_identity.as_ref()).await;
 
         let prepared = prepare_common_request_without_route_plan(CommonRequestPreparationParams {
             proxy: &proxy,
@@ -1041,11 +1195,6 @@ mod tests {
             client_headers: &headers,
             raw_body: &raw_body,
             request_dialect: RequestDialect::ResponsesHttp,
-            session_identity_hint:
-                super::super::client_identity::extract_session_identity_with_body_fallback(
-                    &headers,
-                    raw_body.as_ref(),
-                ),
             client_name: None,
             client_addr: None,
             started_at_ms: 1,
@@ -1062,13 +1211,18 @@ mod tests {
     #[tokio::test]
     async fn prepare_common_request_tracks_prompt_cache_identity_without_default_profile_patch() {
         let proxy = test_proxy_with_active_route();
-        let config = load_request_config_context(&proxy).await;
         let mut headers = HeaderMap::new();
         headers.insert("content-type", HeaderValue::from_static("application/json"));
         let method = Method::POST;
         let uri = "/v1/responses".parse::<Uri>().expect("uri");
         let raw_body =
             Bytes::from_static(br#"{"model":"gpt-5","prompt_cache_key":"pcache-shared"}"#);
+        let session_identity =
+            super::super::client_identity::extract_session_identity_with_body_fallback(
+                &headers,
+                raw_body.as_ref(),
+            );
+        let config = load_request_config_context(&proxy, session_identity.as_ref()).await;
 
         let prepared = prepare_common_request(CommonRequestPreparationParams {
             proxy: &proxy,
@@ -1078,11 +1232,6 @@ mod tests {
             client_headers: &headers,
             raw_body: &raw_body,
             request_dialect: RequestDialect::ResponsesHttp,
-            session_identity_hint:
-                super::super::client_identity::extract_session_identity_with_body_fallback(
-                    &headers,
-                    raw_body.as_ref(),
-                ),
             client_name: Some("test-client".to_string()),
             client_addr: None,
             started_at_ms: 2,
@@ -1132,7 +1281,6 @@ mod tests {
     #[tokio::test]
     async fn prepare_common_request_preserves_unknown_tools_without_client_preset() {
         let proxy = test_proxy_with_active_route();
-        let config = load_request_config_context(&proxy).await;
         let mut headers = HeaderMap::new();
         headers.insert("content-type", HeaderValue::from_static("application/json"));
         let method = Method::POST;
@@ -1140,6 +1288,12 @@ mod tests {
         let raw_body = Bytes::from_static(
             br#"{"model":"gpt-5","prompt_cache_key":"image-contract","tools":[{"type":"image_generation","output_format":"png"}],"tool_choice":{"type":"image_generation"}}"#,
         );
+        let session_identity =
+            super::super::client_identity::extract_session_identity_with_body_fallback(
+                &headers,
+                raw_body.as_ref(),
+            );
+        let config = load_request_config_context(&proxy, session_identity.as_ref()).await;
 
         let prepared = prepare_common_request(CommonRequestPreparationParams {
             proxy: &proxy,
@@ -1149,11 +1303,6 @@ mod tests {
             client_headers: &headers,
             raw_body: &raw_body,
             request_dialect: RequestDialect::ResponsesHttp,
-            session_identity_hint:
-                super::super::client_identity::extract_session_identity_with_body_fallback(
-                    &headers,
-                    raw_body.as_ref(),
-                ),
             client_name: Some("test-client".to_string()),
             client_addr: None,
             started_at_ms: 3,

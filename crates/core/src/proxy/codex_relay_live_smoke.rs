@@ -21,6 +21,7 @@ pub const CODEX_RELAY_LIVE_SMOKE_ACK: &str = "run-live-codex-relay-smoke";
 const LIVE_SMOKE_API_VERSION: u32 = 1;
 const MAX_LIVE_SMOKE_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const ERROR_SNIPPET_LIMIT: usize = 512;
+const UPSTREAM_AUTH_UNAVAILABLE_REASON: &str = "configured upstream credentials are unavailable";
 
 #[path = "codex_relay_live_smoke/cases.rs"]
 mod cases;
@@ -181,7 +182,9 @@ impl CodexRelayLiveSmokeClient {
         for &(name, value) in spec.headers {
             headers.insert(name, HeaderValue::from_static(value));
         }
-        apply_upstream_auth_headers(upstream, &mut headers);
+        if let Err(error) = apply_upstream_auth_headers(upstream, &mut headers) {
+            return transport_result(descriptor.case, None, error);
+        }
 
         let response = match self
             .client
@@ -234,7 +237,9 @@ impl CodexRelayLiveSmokeClient {
 
         let mut headers = HeaderMap::new();
         headers.insert("openai-beta", HeaderValue::from_static(ws.beta_header));
-        apply_upstream_auth_headers(upstream, &mut headers);
+        if let Err(error) = apply_upstream_auth_headers(upstream, &mut headers) {
+            return transport_result(descriptor.case, None, error);
+        }
         let request = match websocket_live_smoke_request(&url, &headers) {
             Ok(request) => request,
             Err(error) => return transport_result(descriptor.case, None, error),
@@ -1137,17 +1142,27 @@ fn transport_result(
     )
 }
 
-fn apply_upstream_auth_headers(upstream: &UpstreamConfig, headers: &mut HeaderMap) {
-    if let Some(token) = upstream.auth.resolve_auth_token()
+fn apply_upstream_auth_headers(
+    upstream: &UpstreamConfig,
+    headers: &mut HeaderMap,
+) -> Result<(), &'static str> {
+    let resolved_auth = crate::auth_resolution::resolve_upstream_auth_for_target(
+        "codex",
+        &upstream.auth,
+        &upstream.base_url,
+    )
+    .map_err(|_| UPSTREAM_AUTH_UNAVAILABLE_REASON)?;
+    if let Some(token) = resolved_auth.auth_token.value()
         && let Ok(value) = HeaderValue::from_str(&format!("Bearer {token}"))
     {
         headers.insert(axum::http::header::AUTHORIZATION, value);
     }
-    if let Some(key) = upstream.auth.resolve_api_key()
-        && let Ok(value) = HeaderValue::from_str(&key)
+    if let Some(key) = resolved_auth.api_key.value()
+        && let Ok(value) = HeaderValue::from_str(key)
     {
         headers.insert("x-api-key", value);
     }
+    Ok(())
 }
 
 fn websocket_transport_error_result(
@@ -1795,6 +1810,124 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 0);
 
         upstream_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_relay_live_smoke_rejects_unresolved_auth_before_upstream_io() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_for_route = hits.clone();
+        let upstream_app = axum::Router::new().route(
+            "/v1/responses/compact",
+            post(move || {
+                let hits = hits_for_route.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({ "output": [] }))
+                }
+            }),
+        );
+        let (upstream_addr, upstream_handle) = spawn_axum_server(upstream_app);
+        let mut upstream = upstream(format!("http://{upstream_addr}/v1"));
+        let missing_reference = format!(
+            "CODEX_HELPER_TEST_MISSING_LIVE_SMOKE_AUTH_{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        upstream.auth.auth_token_env = Some(missing_reference.clone());
+        let proxy = proxy_for_upstreams(vec![upstream]);
+
+        let response = codex_relay_live_smoke_for_proxy(
+            &proxy,
+            request("gpt-5.5", vec![CodexRelayLiveSmokeCase::ResponsesCompact]),
+        )
+        .await
+        .expect("live smoke should report the unavailable credential");
+
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(
+            response.results[0].outcome,
+            CodexRelayLiveSmokeOutcome::Unknown
+        );
+        assert_eq!(
+            response.results[0].confidence,
+            CodexRelayLiveSmokeConfidence::Transport
+        );
+        assert_eq!(response.results[0].status_code, None);
+        assert_eq!(response.results[0].reason, UPSTREAM_AUTH_UNAVAILABLE_REASON);
+        assert!(!response.results[0].reason.contains(&missing_reference));
+
+        upstream_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_relay_live_smoke_remote_target_requires_auth_or_anonymous_opt_in() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_for_route = hits.clone();
+        let upstream_app = axum::Router::new().route(
+            "/v1/responses/compact",
+            post(move || {
+                let hits = hits_for_route.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({
+                        "output": [
+                            { "type": "compaction", "encrypted_content": "summary" }
+                        ]
+                    }))
+                }
+            }),
+        );
+        let (upstream_addr, upstream_handle) = spawn_axum_server(upstream_app);
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .resolve("relay.example", upstream_addr)
+            .build()
+            .expect("build live smoke client");
+        let client = CodexRelayLiveSmokeClient::new(client);
+        let mut upstream = upstream(format!("http://relay.example:{}/v1", upstream_addr.port()));
+
+        let rejected = client
+            .run_case(
+                &upstream,
+                "gpt-5.5",
+                None,
+                CodexRelayLiveSmokeCase::ResponsesCompact,
+            )
+            .await;
+
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        assert_eq!(rejected.outcome, CodexRelayLiveSmokeOutcome::Unknown);
+        assert_eq!(
+            rejected.confidence,
+            CodexRelayLiveSmokeConfidence::Transport
+        );
+        assert_eq!(rejected.status_code, None);
+        assert_eq!(rejected.reason, UPSTREAM_AUTH_UNAVAILABLE_REASON);
+
+        upstream.auth.allow_anonymous = Some(true);
+        let allowed = client
+            .run_case(
+                &upstream,
+                "gpt-5.5",
+                None,
+                CodexRelayLiveSmokeCase::ResponsesCompact,
+            )
+            .await;
+
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(allowed.outcome, CodexRelayLiveSmokeOutcome::Passed);
+
+        upstream_handle.abort();
+    }
+
+    #[test]
+    fn codex_relay_live_smoke_allows_unconfigured_official_openai_auth() {
+        let upstream = upstream("https://api.openai.com/v1".to_string());
+        let mut headers = HeaderMap::new();
+
+        assert_eq!(apply_upstream_auth_headers(&upstream, &mut headers), Ok(()));
+        assert!(!headers.contains_key(axum::http::header::AUTHORIZATION));
+        assert!(!headers.contains_key("x-api-key"));
     }
 
     #[tokio::test]

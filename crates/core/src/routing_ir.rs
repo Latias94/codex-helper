@@ -439,6 +439,7 @@ pub struct RoutePlanRuntimeState {
     affinity_provider_endpoint: Option<ProviderEndpointKey>,
     affinity_last_selected_at_ms: Option<u64>,
     affinity_last_changed_at_ms: Option<u64>,
+    new_session_preference: Option<ProviderEndpointKey>,
 }
 
 impl RoutePlanRuntimeState {
@@ -492,6 +493,14 @@ impl RoutePlanRuntimeState {
         self.affinity_last_changed_at_ms = None;
     }
 
+    pub fn set_new_session_preference(&mut self, key: Option<ProviderEndpointKey>) {
+        self.new_session_preference = key;
+    }
+
+    pub fn new_session_preference(&self) -> Option<&ProviderEndpointKey> {
+        self.new_session_preference.as_ref()
+    }
+
     fn runtime_state_for_candidate(
         &self,
         template: &RoutePlanTemplate,
@@ -515,6 +524,7 @@ impl RoutePlanRuntimeState {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RoutePlanUpstreamRuntimeState {
     pub runtime_disabled: bool,
+    pub draining: bool,
     pub failure_count: u32,
     pub cooldown_active: bool,
     pub cooldown_remaining_secs: Option<u64>,
@@ -538,9 +548,11 @@ impl RoutePlanUpstreamRuntimeState {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RoutePlanCandidateRuntimeSnapshot {
     pub runtime_available: bool,
+    pub affinity_runtime_available: bool,
     pub routable_except_usage: bool,
     pub hard_unavailable: bool,
     pub runtime_disabled: bool,
+    pub draining: bool,
     pub cooldown_active: bool,
     pub cooldown_remaining_secs: Option<u64>,
     pub breaker_open: bool,
@@ -561,14 +573,20 @@ impl RoutePlanCandidateRuntimeSnapshot {
     ) -> Self {
         let breaker_open = runtime_state.breaker_open();
         let hard_unavailable = runtime_state.hard_unavailable();
-        let routable_except_usage = !hard_unavailable && !runtime_state.concurrency_saturated;
+        let affinity_routable_except_usage =
+            !hard_unavailable && !runtime_state.concurrency_saturated;
+        let routable_except_usage = affinity_routable_except_usage && !runtime_state.draining;
         let runtime_available = routable_except_usage && !runtime_state.usage_exhausted;
+        let affinity_runtime_available =
+            affinity_routable_except_usage && !runtime_state.usage_exhausted;
 
         Self {
             runtime_available,
+            affinity_runtime_available,
             routable_except_usage,
             hard_unavailable,
             runtime_disabled: runtime_state.runtime_disabled,
+            draining: runtime_state.draining,
             cooldown_active: runtime_state.cooldown_active,
             cooldown_remaining_secs: runtime_state.cooldown_remaining_secs,
             breaker_open,
@@ -605,6 +623,9 @@ impl RoutePlanCandidateRuntimeSnapshot {
         if self.runtime_disabled {
             reasons.push(RoutePlanSkipReason::RuntimeDisabled);
         }
+        if self.draining {
+            reasons.push(RoutePlanSkipReason::Draining);
+        }
         if self.cooldown_active {
             reasons.push(RoutePlanSkipReason::Cooldown);
         } else if self.failure_count >= FAILURE_THRESHOLD {
@@ -638,6 +659,7 @@ pub enum RoutePlanSkipReason {
         requested_model: String,
     },
     RuntimeDisabled,
+    Draining,
     Cooldown,
     BreakerOpen {
         failure_count: u32,
@@ -655,6 +677,7 @@ impl RoutePlanSkipReason {
         match self {
             RoutePlanSkipReason::UnsupportedModel { .. } => "unsupported_model",
             RoutePlanSkipReason::RuntimeDisabled => "runtime_disabled",
+            RoutePlanSkipReason::Draining => "draining",
             RoutePlanSkipReason::Cooldown => "cooldown",
             RoutePlanSkipReason::BreakerOpen { .. } => "breaker_open",
             RoutePlanSkipReason::UsageExhausted => "usage_exhausted",
@@ -795,7 +818,7 @@ impl<'a> RoutePlanExecutor<'a> {
             .filter(|candidate| {
                 !state.avoids_candidate(self.template, candidate)
                     && request_model.is_none_or(|model| candidate_supports_model(candidate, model))
-                    && candidate_available_in_runtime(self.template, runtime, candidate)
+                    && candidate_available_for_selection(self.template, runtime, candidate)
             })
             .collect::<Vec<_>>();
         if !available.iter().any(|available| {
@@ -1021,6 +1044,12 @@ fn best_candidate_by_affinity_selection_mode<'a>(
     affinity_mode: RoutePlanAffinitySelectionMode,
     request_model: Option<&str>,
 ) -> Option<&'a RouteCandidate> {
+    if runtime.affinity_provider_endpoint().is_none()
+        && let Some(preferred) =
+            new_session_preference_candidate(template, runtime, candidates, request_model)
+    {
+        return Some(preferred);
+    }
     let affinity_policy = affinity_policy_for_selection(template.affinity_policy, affinity_mode);
     match affinity_policy {
         RouteAffinityPolicy::Off => {
@@ -1294,7 +1323,7 @@ fn affinity_candidate<'a>(
     let affinity_key = runtime.affinity_provider_endpoint()?;
     candidates.iter().copied().find(|candidate| {
         candidate_provider_endpoint_key(template, candidate) == *affinity_key
-            && candidate_available_in_runtime(template, runtime, candidate)
+            && candidate_available_for_affinity(template, runtime, candidate)
     })
 }
 
@@ -1308,6 +1337,20 @@ fn affinity_candidate_in_group<'a>(
     candidates.iter().copied().find(|candidate| {
         candidate.preference_group == preference_group
             && candidate_provider_endpoint_key(template, candidate) == *affinity_key
+            && candidate_available_for_affinity(template, runtime, candidate)
+    })
+}
+
+fn new_session_preference_candidate<'a>(
+    template: &RoutePlanTemplate,
+    runtime: &RoutePlanRuntimeState,
+    candidates: &[&'a RouteCandidate],
+    request_model: Option<&str>,
+) -> Option<&'a RouteCandidate> {
+    let preferred = runtime.new_session_preference()?;
+    candidates.iter().copied().find(|candidate| {
+        candidate_provider_endpoint_key(template, candidate) == *preferred
+            && request_model.is_none_or(|model| candidate_supports_model(candidate, model))
             && candidate_available_in_runtime(template, runtime, candidate)
     })
 }
@@ -1373,6 +1416,29 @@ fn candidate_available_in_runtime(
     runtime
         .candidate_runtime_snapshot(template, candidate)
         .runtime_available
+}
+
+fn candidate_available_for_affinity(
+    template: &RoutePlanTemplate,
+    runtime: &RoutePlanRuntimeState,
+    candidate: &RouteCandidate,
+) -> bool {
+    runtime
+        .candidate_runtime_snapshot(template, candidate)
+        .affinity_runtime_available
+}
+
+fn candidate_available_for_selection(
+    template: &RoutePlanTemplate,
+    runtime: &RoutePlanRuntimeState,
+    candidate: &RouteCandidate,
+) -> bool {
+    let key = candidate_provider_endpoint_key(template, candidate);
+    if runtime.affinity_provider_endpoint() == Some(&key) {
+        candidate_available_for_affinity(template, runtime, candidate)
+    } else {
+        candidate_available_in_runtime(template, runtime, candidate)
+    }
 }
 
 fn candidate_routable_except_usage(
@@ -2618,6 +2684,7 @@ fn encode_auth_shape(digest: &mut StableRouteDigest, auth: &UpstreamAuth) {
     digest.bool(auth.auth_token_env.is_some());
     digest.bool(auth.api_key.is_some());
     digest.bool(auth.api_key_env.is_some());
+    digest.bool(auth.allow_anonymous == Some(true));
 }
 
 fn affinity_policy_name(policy: RouteAffinityPolicy) -> &'static str {
@@ -2744,20 +2811,25 @@ fn validate_candidate_concurrency_groups(
     service_name: &str,
     candidates: &[RouteCandidate],
 ) -> Result<()> {
-    let mut limits_by_group = BTreeMap::new();
+    let mut limits_by_group = BTreeMap::<&str, Option<u32>>::new();
     for candidate in candidates {
         let Some(group) = candidate.concurrency.limit_group.as_deref() else {
             continue;
         };
-        let Some(limit) = candidate.concurrency.max_concurrent_requests else {
-            continue;
-        };
+        let limit = candidate.concurrency.max_concurrent_requests;
         if let Some(existing_limit) = limits_by_group.get(group)
             && *existing_limit != limit
         {
+            let existing_limit = existing_limit
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "missing".to_string());
+            let limit = limit
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "missing".to_string());
             anyhow::bail!(
-                "[{service_name}] concurrency limit group '{group}' has conflicting limits \
-                 {existing_limit} and {limit}"
+                "[{service_name}] concurrency limit group '{group}' has conflicting \
+                 max_concurrent_requests values {existing_limit} and {limit}; every candidate in \
+                 an explicit group must declare the same limit"
             );
         }
         limits_by_group.insert(group, limit);
@@ -4474,6 +4546,44 @@ mod tests {
     }
 
     #[test]
+    fn routing_ir_rejects_missing_limit_in_an_explicit_shared_group() {
+        let view = ServiceRouteConfig {
+            providers: BTreeMap::from([
+                (
+                    "bounded".to_string(),
+                    ProviderConfig {
+                        base_url: Some("https://bounded.example/v1".to_string()),
+                        limits: ProviderConcurrencyLimits {
+                            max_concurrent_requests: Some(20),
+                            limit_group: Some("shared-account".to_string()),
+                        },
+                        ..ProviderConfig::default()
+                    },
+                ),
+                (
+                    "unbounded".to_string(),
+                    ProviderConfig {
+                        base_url: Some("https://unbounded.example/v1".to_string()),
+                        limits: ProviderConcurrencyLimits {
+                            max_concurrent_requests: None,
+                            limit_group: Some("shared-account".to_string()),
+                        },
+                        ..ProviderConfig::default()
+                    },
+                ),
+            ]),
+            ..ServiceRouteConfig::default()
+        };
+
+        let error = CompiledRouteGraph::compile("codex", &view)
+            .expect_err("every candidate in one capacity group must declare the same limit");
+        let message = error.to_string();
+        assert!(message.contains("shared-account"), "unexpected: {message}");
+        assert!(message.contains("20"), "unexpected: {message}");
+        assert!(message.contains("missing"), "unexpected: {message}");
+    }
+
+    #[test]
     fn routing_ir_manual_sticky_can_target_provider_endpoint() {
         let view = ServiceRouteConfig {
             providers: BTreeMap::from([(
@@ -5598,6 +5708,119 @@ mod tests {
 
         assert_eq!(counts.get("input"), Some(&200));
         assert_eq!(counts.get("ciii"), Some(&150));
+    }
+
+    #[test]
+    fn new_session_preference_preempts_round_robin_and_falls_back_when_draining() {
+        let mut routing =
+            RouteGraphConfig::round_robin(vec!["input".to_string(), "ciii".to_string()]);
+        routing.affinity_policy = RouteAffinityPolicy::Off;
+        let view = ServiceRouteConfig {
+            providers: BTreeMap::from([
+                (
+                    "input".to_string(),
+                    limited_provider("https://preference-input.example/v1", 20),
+                ),
+                (
+                    "ciii".to_string(),
+                    limited_provider("https://preference-ciii.example/v1", 15),
+                ),
+            ]),
+            routing: Some(routing),
+            ..ServiceRouteConfig::default()
+        };
+        let template = compile_route_plan_template("codex", &view).expect("route template");
+        let executor = RoutePlanExecutor::new(&template);
+        let preferred = endpoint_key("codex", "ciii", "default");
+        let mut runtime = RoutePlanRuntimeState::default();
+        runtime.set_new_session_preference(Some(preferred.clone()));
+
+        let selected = executor
+            .select_supported_candidate_with_runtime_state(
+                &mut RoutePlanAttemptState::default(),
+                &runtime,
+                None,
+            )
+            .selected
+            .expect("preferred candidate");
+        assert_eq!(selected.provider_endpoint, preferred);
+
+        runtime.set_provider_endpoint(
+            preferred,
+            RoutePlanUpstreamRuntimeState {
+                draining: true,
+                ..RoutePlanUpstreamRuntimeState::default()
+            },
+        );
+        let selected = executor
+            .select_supported_candidate_with_runtime_state(
+                &mut RoutePlanAttemptState::default(),
+                &runtime,
+                None,
+            )
+            .selected
+            .expect("automatic fallback candidate");
+        assert_eq!(selected.candidate.provider_id, "input");
+    }
+
+    #[test]
+    fn draining_endpoint_keeps_existing_affinity_but_rejects_new_sessions() {
+        let mut routing =
+            RouteGraphConfig::round_robin(vec!["input".to_string(), "ciii".to_string()]);
+        routing.affinity_policy = RouteAffinityPolicy::Hard;
+        let view = ServiceRouteConfig {
+            providers: BTreeMap::from([
+                (
+                    "input".to_string(),
+                    provider("https://drain-input.example/v1"),
+                ),
+                (
+                    "ciii".to_string(),
+                    provider("https://drain-ciii.example/v1"),
+                ),
+            ]),
+            routing: Some(routing),
+            ..ServiceRouteConfig::default()
+        };
+        let template = compile_route_plan_template("codex", &view).expect("route template");
+        let executor = RoutePlanExecutor::new(&template);
+        let draining = endpoint_key("codex", "ciii", "default");
+        let mut runtime = RoutePlanRuntimeState::default();
+        runtime.set_provider_endpoint(
+            draining.clone(),
+            RoutePlanUpstreamRuntimeState {
+                draining: true,
+                ..RoutePlanUpstreamRuntimeState::default()
+            },
+        );
+
+        let new_session = executor
+            .select_supported_candidate_with_runtime_state(
+                &mut RoutePlanAttemptState::default(),
+                &runtime,
+                None,
+            )
+            .selected
+            .expect("new-session candidate");
+        assert_eq!(new_session.candidate.provider_id, "input");
+
+        runtime.set_affinity_provider_endpoint(Some(draining.clone()));
+        let existing_session = executor
+            .select_supported_candidate_with_runtime_state(
+                &mut RoutePlanAttemptState::default(),
+                &runtime,
+                None,
+            )
+            .selected
+            .expect("draining affinity candidate");
+        assert_eq!(existing_session.provider_endpoint, draining);
+        assert!(executor.candidate_is_valid_after_runtime_update(
+            &RoutePlanAttemptState::default(),
+            &runtime,
+            existing_session.candidate,
+            None,
+            RouteAffinityPolicy::Hard,
+        ));
     }
 
     #[test]

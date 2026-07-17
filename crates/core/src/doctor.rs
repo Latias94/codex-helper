@@ -1,7 +1,10 @@
 use serde::Serialize;
-use std::env;
 use std::path::PathBuf;
 
+use crate::auth_resolution::{
+    CredentialResolution, ResolvedUpstreamAuth, resolve_upstream_auth,
+    unconfigured_upstream_auth_requires_opt_in,
+};
 use crate::codex_switch::{CodexSwitchPhase, inspect as inspect_codex_switch};
 use crate::config::{load_config, proxy_home_dir};
 use crate::logging::request_log_path;
@@ -75,45 +78,47 @@ pub async fn run_doctor(lang: DoctorLang) -> DoctorReport {
                 });
             }
 
-            fn env_is_set(key: &str) -> bool {
-                env::var(key).ok().is_some_and(|v| !v.trim().is_empty())
-            }
-
-            for (svc_label, view) in [("Codex", &cfg.codex), ("Claude", &cfg.claude)] {
+            for (service_name, svc_label, view) in [
+                ("codex", "Codex", &cfg.codex),
+                ("claude", "Claude", &cfg.claude),
+            ] {
                 for (provider_id, provider) in &view.providers {
                     let auth = provider.effective_auth();
-                    if let Some(env_name) = auth.auth_token_env.as_deref()
-                        && !env_is_set(env_name)
-                    {
-                        checks.push(DoctorCheck {
-                            id: "proxy_config.auth.env_missing",
-                            status: DoctorStatus::Warn,
-                            message: match lang {
-                                DoctorLang::Zh => format!(
-                                    "{} provider '{}' 缺少环境变量 {}（Bearer token）；请在运行 codex-helper 前设置该变量",
-                                    svc_label, provider_id, env_name
-                                ),
-                                DoctorLang::En => format!(
-                                    "{} provider '{}' is missing env var {} (Bearer token); set it before running codex-helper",
-                                    svc_label, provider_id, env_name
-                                ),
-                            },
+                    append_auth_resolution_checks(
+                        &mut checks,
+                        lang,
+                        svc_label,
+                        provider_id,
+                        resolve_upstream_auth(service_name, &auth),
+                    );
+                    let requires_explicit_auth = provider
+                        .base_url
+                        .iter()
+                        .chain(
+                            provider
+                                .endpoints
+                                .values()
+                                .map(|endpoint| &endpoint.base_url),
+                        )
+                        .any(|base_url| {
+                            unconfigured_upstream_auth_requires_opt_in(
+                                service_name,
+                                &auth,
+                                base_url,
+                            )
                         });
-                    }
-                    if let Some(env_name) = auth.api_key_env.as_deref()
-                        && !env_is_set(env_name)
-                    {
+                    if provider.enabled && requires_explicit_auth {
                         checks.push(DoctorCheck {
-                            id: "proxy_config.auth.env_missing",
+                            id: "proxy_config.auth.anonymous_not_allowed",
                             status: DoctorStatus::Warn,
                             message: match lang {
                                 DoctorLang::Zh => format!(
-                                    "{} provider '{}' 缺少环境变量 {}（X-API-Key）；请在运行 codex-helper 前设置该变量",
-                                    svc_label, provider_id, env_name
+                                    "{} provider '{}' 指向远程第三方端点但未配置 helper 凭据；请配置 auth_token_env/api_key_env，确需匿名访问时显式设置 allow_anonymous = true",
+                                    svc_label, provider_id
                                 ),
                                 DoctorLang::En => format!(
-                                    "{} provider '{}' is missing env var {} (X-API-Key); set it before running codex-helper",
-                                    svc_label, provider_id, env_name
+                                    "{} provider '{}' targets a remote third-party endpoint without helper credentials; configure auth_token_env/api_key_env, or set allow_anonymous = true only when anonymous access is intentional",
+                                    svc_label, provider_id
                                 ),
                             },
                         });
@@ -297,9 +302,83 @@ pub async fn run_doctor(lang: DoctorLang) -> DoctorReport {
     DoctorReport { checks }
 }
 
+fn append_auth_resolution_checks(
+    checks: &mut Vec<DoctorCheck>,
+    lang: DoctorLang,
+    service_label: &str,
+    provider_id: &str,
+    resolved: ResolvedUpstreamAuth,
+) {
+    append_credential_resolution_check(
+        checks,
+        lang,
+        service_label,
+        provider_id,
+        "Bearer token",
+        resolved.auth_token,
+    );
+    append_credential_resolution_check(
+        checks,
+        lang,
+        service_label,
+        provider_id,
+        "X-API-Key",
+        resolved.api_key,
+    );
+}
+
+fn append_credential_resolution_check(
+    checks: &mut Vec<DoctorCheck>,
+    lang: DoctorLang,
+    service_label: &str,
+    provider_id: &str,
+    credential_kind: &str,
+    resolution: CredentialResolution,
+) {
+    let (id, detail) = match resolution {
+        CredentialResolution::MissingReference { name } => (
+            "proxy_config.auth.missing_reference",
+            match lang {
+                DoctorLang::Zh => {
+                    format!("凭据引用 `{name}` 在 daemon 环境和显式客户端凭据字段中均不可用")
+                }
+                DoctorLang::En => format!(
+                    "credential reference `{name}` is unavailable from the daemon environment and the explicit client credential field"
+                ),
+            },
+        ),
+        CredentialResolution::InvalidValue { source } => (
+            "proxy_config.auth.invalid_value",
+            match lang {
+                DoctorLang::Zh => format!("来自 {} 的值不是合法 HTTP header", source.label()),
+                DoctorLang::En => {
+                    format!(
+                        "the value from {} is not a valid HTTP header",
+                        source.label()
+                    )
+                }
+            },
+        ),
+        CredentialResolution::Unconfigured | CredentialResolution::Resolved { .. } => return,
+    };
+    checks.push(DoctorCheck {
+        id,
+        status: DoctorStatus::Warn,
+        message: match lang {
+            DoctorLang::Zh => format!(
+                "{service_label} provider '{provider_id}' 的 {credential_kind} 不可用：{detail}；该候选会在本地失败且不会匿名请求上游"
+            ),
+            DoctorLang::En => format!(
+                "{service_label} provider '{provider_id}' has unavailable {credential_kind}: {detail}; this candidate will fail locally instead of sending an anonymous upstream request"
+            ),
+        },
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{HelperConfig, ProviderConfig, UpstreamAuth};
     use std::path::Path;
     use std::sync::{Mutex, OnceLock};
 
@@ -386,5 +465,137 @@ mod tests {
                 && check.id != "bootstrap.codex"
                 && !check.message.contains("import-from-codex")
         }));
+    }
+
+    #[test]
+    fn doctor_uses_runtime_auth_resolution_instead_of_environment_only_checks() {
+        let _lock = env_lock();
+        let home =
+            std::env::temp_dir().join(format!("codex-helper-doctor-auth-{}", uuid::Uuid::new_v4()));
+        let helper_home = home.join(".codex-helper");
+        let codex_home = home.join(".codex");
+        std::fs::create_dir_all(&helper_home).expect("create helper home");
+        std::fs::create_dir_all(&codex_home).expect("create Codex home");
+
+        let resolved_reference = format!(
+            "CODEX_HELPER_TEST_DOCTOR_RESOLVED_{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let missing_reference = format!(
+            "CODEX_HELPER_TEST_DOCTOR_MISSING_{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let invalid_reference = format!(
+            "CODEX_HELPER_TEST_DOCTOR_INVALID_{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        std::fs::write(
+            codex_home.join("auth.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                resolved_reference.as_str(): "resolved-from-auth-json",
+                invalid_reference.as_str(): "invalid\r\nbearer",
+            }))
+            .expect("serialize auth.json"),
+        )
+        .expect("write auth.json");
+
+        let mut config = HelperConfig::default();
+        config.codex.providers.insert(
+            "resolved".to_string(),
+            ProviderConfig {
+                base_url: Some("https://relay.example/v1".to_string()),
+                auth: UpstreamAuth {
+                    auth_token_env: Some(resolved_reference.clone()),
+                    ..UpstreamAuth::default()
+                },
+                ..ProviderConfig::default()
+            },
+        );
+        config.codex.providers.insert(
+            "missing".to_string(),
+            ProviderConfig {
+                base_url: Some("https://missing.example/v1".to_string()),
+                auth: UpstreamAuth {
+                    auth_token_env: Some(missing_reference.clone()),
+                    ..UpstreamAuth::default()
+                },
+                ..ProviderConfig::default()
+            },
+        );
+        config.codex.providers.insert(
+            "anonymous-denied".to_string(),
+            ProviderConfig {
+                base_url: Some("https://anonymous-denied.example/v1".to_string()),
+                ..ProviderConfig::default()
+            },
+        );
+        config.codex.providers.insert(
+            "invalid".to_string(),
+            ProviderConfig {
+                base_url: Some("https://invalid.example/v1".to_string()),
+                auth: UpstreamAuth {
+                    auth_token_env: Some(invalid_reference.clone()),
+                    ..UpstreamAuth::default()
+                },
+                ..ProviderConfig::default()
+            },
+        );
+        config.codex.providers.insert(
+            "anonymous-allowed".to_string(),
+            ProviderConfig {
+                base_url: Some("https://anonymous-allowed.example/v1".to_string()),
+                auth: UpstreamAuth {
+                    allow_anonymous: Some(true),
+                    ..UpstreamAuth::default()
+                },
+                ..ProviderConfig::default()
+            },
+        );
+
+        let mut env = ScopedEnv::new();
+        unsafe {
+            env.set("HOME", &home);
+            env.set("USERPROFILE", &home);
+            env.set("CODEX_HELPER_HOME", &helper_home);
+            env.set("CODEX_HOME", &codex_home);
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        let report = runtime.block_on(async {
+            crate::config::save_helper_config(&config)
+                .await
+                .expect("write canonical config");
+            run_doctor(DoctorLang::En).await
+        });
+
+        let missing_checks = report
+            .checks
+            .iter()
+            .filter(|check| check.id == "proxy_config.auth.missing_reference")
+            .collect::<Vec<_>>();
+        assert_eq!(missing_checks.len(), 1);
+        assert!(missing_checks[0].message.contains("provider 'missing'"));
+        assert!(missing_checks[0].message.contains(&missing_reference));
+        assert!(!missing_checks[0].message.contains(&resolved_reference));
+
+        let invalid_checks = report
+            .checks
+            .iter()
+            .filter(|check| check.id == "proxy_config.auth.invalid_value")
+            .collect::<Vec<_>>();
+        assert_eq!(invalid_checks.len(), 1);
+        assert!(invalid_checks[0].message.contains("provider 'invalid'"));
+        assert!(invalid_checks[0].message.contains(&invalid_reference));
+
+        let anonymous_checks = report
+            .checks
+            .iter()
+            .filter(|check| check.id == "proxy_config.auth.anonymous_not_allowed")
+            .collect::<Vec<_>>();
+        assert_eq!(anonymous_checks.len(), 1);
+        assert!(anonymous_checks[0].message.contains("anonymous-denied"));
+        assert!(!anonymous_checks[0].message.contains("anonymous-allowed"));
     }
 }

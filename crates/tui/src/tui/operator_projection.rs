@@ -31,6 +31,7 @@ pub(super) fn apply_operator_read_model(
         *snapshot = snapshot_from_operator_data(data, local_session_ids);
         *providers = provider_options_from_operator_data(data);
         let runtime = &data.summary.runtime;
+        ui.operator_action_capabilities = runtime.operator_actions;
         ui.last_runtime_config_loaded_at_ms = runtime.runtime_loaded_at_ms;
         ui.last_runtime_config_source_mtime_ms = runtime.runtime_source_mtime_ms;
         ui.last_retry_summary = Some(data.summary.retry.clone());
@@ -43,6 +44,7 @@ pub(super) fn apply_operator_read_model(
         ui.last_runtime_config_loaded_at_ms = None;
         ui.last_runtime_config_source_mtime_ms = None;
         ui.last_retry_summary = None;
+        ui.operator_action_capabilities = Default::default();
         ui.profile_options.clear();
         ui.configured_default_profile = None;
         ui.effective_default_profile = None;

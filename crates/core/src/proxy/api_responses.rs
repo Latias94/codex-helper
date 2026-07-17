@@ -6,10 +6,12 @@ use crate::dashboard_core::{
     ApiV1OperatorSummary, ControlProfileOption, OperatorActiveRequestSummary,
     OperatorProfileSummary, OperatorProviderBalanceSummary, OperatorProviderSummary,
     OperatorReadCapture, OperatorReadData, OperatorReadModel, OperatorRequestSummary,
-    OperatorRetrySummary, OperatorRevisionBundle, OperatorRuntimeSummary, OperatorSessionSummary,
-    OperatorSummaryCounts, build_operator_session_stats, build_profile_options_from_route_view,
-    redact_operator_pricing_catalog, redact_operator_quota_analytics, redact_operator_usage_day,
-    redact_operator_usage_summaries, summarize_recent_retry_observations,
+    OperatorRetrySummary, OperatorRevisionBundle, OperatorRoutingControlView,
+    OperatorRuntimeSummary, OperatorSessionSummary, OperatorSummaryCounts,
+    build_operator_routing_summary, build_operator_session_stats,
+    build_profile_options_from_route_view, redact_operator_pricing_catalog,
+    redact_operator_quota_analytics, redact_operator_usage_day, redact_operator_usage_summaries,
+    summarize_recent_retry_observations,
 };
 use crate::state::{
     OperatorLifecycleSnapshot, SessionIdentityCardBuildInputs,
@@ -85,10 +87,11 @@ async fn build_operator_read_model_once(
     let ledger_revision = lifecycle_snapshot.ledger_revision.to_string();
     let active = lifecycle_snapshot.active_requests;
     let recent = lifecycle_snapshot.recent_finished;
-    let (session_bindings, session_route_affinities, provider_balances) = tokio::join!(
+    let (session_bindings, session_route_affinities, provider_balances, routing_control) = tokio::join!(
         proxy.state.list_session_bindings(),
         proxy.state.list_session_route_affinities(),
         proxy.state.get_provider_balance_view(proxy.service_name),
+        proxy.state.capture_routing_operator_control(),
     );
     let default_profile = effective_default_profile_name(view);
     let session_stats = build_operator_session_stats(&recent);
@@ -123,6 +126,19 @@ async fn build_operator_read_model_once(
         .map_err(|(status, message)| {
             anyhow!("build operator providers failed with {status}: {message}")
         })?;
+    let route_template = route_graph.handshake_plan();
+    let route_graph_key = route_graph.digest();
+    let routing = build_operator_routing_summary(
+        view,
+        &route_template,
+        OperatorRoutingControlView {
+            route_graph_key,
+            control_revision: routing_control.revision(),
+            provider_policy_revision: provider_policy.policy_revision,
+            new_session_preference: routing_control
+                .new_session_preference(proxy.service_name, route_graph_key),
+        },
+    )?;
     let operator_providers = providers
         .iter()
         .map(OperatorProviderSummary::from)
@@ -153,6 +169,11 @@ async fn build_operator_read_model_once(
             configured_default_profile,
             default_profile,
             default_profile_summary,
+            operator_actions: crate::dashboard_core::OperatorActionCapabilities {
+                refresh_provider_balances: true,
+                mutate_routing: true,
+                mutate_session_affinity: true,
+            },
         },
         counts: OperatorSummaryCounts {
             active_requests: active.len(),
@@ -206,6 +227,7 @@ async fn build_operator_read_model_once(
         revisions,
         OperatorReadData {
             summary,
+            routing: Some(routing),
             active_requests: active
                 .iter()
                 .map(OperatorActiveRequestSummary::from_active_request)

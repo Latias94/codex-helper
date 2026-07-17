@@ -7,7 +7,10 @@ use crate::routing_ir::RouteRequestContext;
 use super::ProxyService;
 use super::admin_api_error::{AdminApiHttpError, AdminApiResult};
 use super::route_affinity::apply_session_route_affinity_for_template;
-use super::route_target_selection::apply_concurrency_snapshots_to_runtime;
+use super::route_target_selection::{
+    apply_auth_resolution_to_runtime, apply_concurrency_snapshots_to_runtime,
+    apply_routing_operator_control_to_runtime,
+};
 
 #[derive(serde::Deserialize)]
 pub(super) struct RequestLedgerChainQuery {
@@ -50,6 +53,7 @@ pub(super) async fn routing_explain_for_proxy(
                 "captured runtime snapshot has no route graph for the service",
             )
         })?;
+    let routing_control_graph_key = graph.digest().to_string();
     let template = graph.route_plan(&request).map_err(|error| {
         AdminApiHttpError::internal("admin_routing_explain_route_plan_failed", error.to_string())
     })?;
@@ -57,6 +61,7 @@ pub(super) async fn routing_explain_for_proxy(
         .state
         .route_plan_runtime_state_with_provider_policy(proxy.service_name, provider_policy.as_ref())
         .await;
+    apply_auth_resolution_to_runtime(proxy.service_name, &template, &mut runtime);
     apply_concurrency_snapshots_to_runtime(
         proxy,
         &template,
@@ -67,6 +72,12 @@ pub(super) async fn routing_explain_for_proxy(
         proxy,
         session_id.as_deref(),
         &template,
+        &mut runtime,
+    )
+    .await;
+    apply_routing_operator_control_to_runtime(
+        proxy,
+        routing_control_graph_key.as_str(),
         &mut runtime,
     )
     .await;

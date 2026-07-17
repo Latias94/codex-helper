@@ -132,6 +132,28 @@ pub(super) fn upsert_session_affinity(
     Ok(())
 }
 
+pub(super) fn delete_session_affinity(
+    transaction: &Transaction<'_>,
+    path: &Path,
+    store_id: Uuid,
+    session_id: &str,
+) -> Result<bool, RuntimeStoreError> {
+    if session_id.trim().is_empty() {
+        return Err(RuntimeStoreError::InvariantViolation {
+            entity: "session affinity",
+            id: session_id.to_string(),
+            detail: "session_id is empty".to_string(),
+        });
+    }
+    transaction
+        .execute(
+            "DELETE FROM session_route_affinities WHERE store_id = ?1 AND session_id = ?2",
+            params![store_id.to_string(), session_id],
+        )
+        .map(|removed| removed > 0)
+        .map_err(|source| sqlite_error(path, "delete session affinity", source))
+}
+
 pub(super) fn get_session_affinity(
     connection: &Connection,
     path: &Path,
@@ -440,6 +462,39 @@ mod tests {
                 .get_session_affinity("session-a", 101, 0)
                 .expect("read affinity through reader"),
             Some(expected)
+        );
+    }
+
+    #[test]
+    fn deleting_one_affinity_preserves_other_sessions() {
+        let store = RuntimeStore::open_in_memory().expect("open store");
+        for session_id in ["session-a", "session-b"] {
+            store
+                .upsert_session_affinity(affinity(session_id, 100), SessionAffinityLimit::Unlimited)
+                .expect("persist affinity");
+        }
+
+        assert!(
+            store
+                .delete_session_affinity("session-a")
+                .expect("delete affinity")
+        );
+        assert_eq!(
+            store
+                .get_session_affinity("session-a", 101, 0)
+                .expect("read deleted affinity"),
+            None
+        );
+        assert!(
+            store
+                .get_session_affinity("session-b", 101, 0)
+                .expect("read preserved affinity")
+                .is_some()
+        );
+        assert!(
+            !store
+                .delete_session_affinity("session-a")
+                .expect("repeat delete")
         );
     }
 

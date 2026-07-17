@@ -3,12 +3,24 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
-use reqwest::header::HeaderValue;
+use reqwest::header::{CONTENT_TYPE, HeaderValue};
 use reqwest::{Client, Url};
 use thiserror::Error;
 
 use crate::dashboard_core::{OperatorReadModel, OperatorReadStatus};
-use crate::proxy::{ADMIN_TOKEN_ENV_VAR, ADMIN_TOKEN_HEADER};
+use crate::local_operator::{
+    LocalOperatorSessionRequest, LocalOperatorSessionResponse, local_operator_client_proof,
+    local_operator_request_signature, new_local_operator_nonce, unix_time_ms,
+    verify_local_operator_server_proof,
+};
+use crate::proxy::{
+    ADMIN_TOKEN_ENV_VAR, ADMIN_TOKEN_HEADER, LOCAL_OPERATOR_NONCE_HEADER,
+    LOCAL_OPERATOR_SESSION_HEADER, LOCAL_OPERATOR_SIGNATURE_HEADER,
+    LOCAL_OPERATOR_TIMESTAMP_HEADER, LOCAL_V1_BALANCE_REFRESH, LOCAL_V1_OPERATOR_SESSION,
+    LOCAL_V1_ROUTING_MUTATION, LOCAL_V1_SESSION_AFFINITY_MUTATION, OperatorRoutingMutationRequest,
+    OperatorRoutingMutationResponse, OperatorSessionAffinityMutationRequest,
+    OperatorSessionAffinityMutationResponse, ProviderBalanceRefreshResponse,
+};
 use crate::request_chain::{RequestChainExport, RequestChainSelector};
 
 const MAX_HTTP_ERROR_BODY_BYTES: usize = 4 * 1024;
@@ -24,6 +36,34 @@ pub struct ControlPlaneClient {
     endpoint: ControlPlaneEndpoint,
     client: Client,
     admin_token: Option<HeaderValue>,
+}
+
+#[derive(Clone)]
+pub struct LocalOperatorClient {
+    endpoint: ControlPlaneEndpoint,
+    client: Client,
+    admin_token: Option<HeaderValue>,
+    local_operator_token: String,
+}
+
+impl std::fmt::Debug for LocalOperatorClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LocalOperatorClient")
+            .field("endpoint", &self.endpoint)
+            .field("local_operator_token", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+struct EstablishedLocalOperatorSession {
+    client_nonce: String,
+    response: LocalOperatorSessionResponse,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct LocalBalanceRefreshRequest {
+    force: bool,
 }
 
 #[derive(Debug, Error)]
@@ -184,6 +224,182 @@ impl ControlPlaneClient {
 
     fn admin_token(&self) -> Option<&HeaderValue> {
         self.admin_token.as_ref()
+    }
+}
+
+impl LocalOperatorClient {
+    pub fn new(endpoint: ControlPlaneEndpoint, local_operator_token: &str) -> Result<Self> {
+        if !is_loopback_control_plane_base_url(endpoint.admin_base_url()) {
+            anyhow::bail!("local operator client requires a loopback admin URL");
+        }
+        if local_operator_token.trim().is_empty() {
+            anyhow::bail!("local operator token is empty");
+        }
+        let admin_token = load_admin_token(&endpoint)?;
+        let client = control_plane_http_client(Duration::from_secs(60))?;
+        Ok(Self {
+            endpoint,
+            client,
+            admin_token,
+            local_operator_token: local_operator_token.to_string(),
+        })
+    }
+
+    pub fn endpoint(&self) -> &ControlPlaneEndpoint {
+        &self.endpoint
+    }
+
+    pub async fn refresh_provider_balances(
+        &self,
+        force: bool,
+    ) -> Result<ProviderBalanceRefreshResponse, ControlPlaneError> {
+        self.post_json_classified(
+            LOCAL_V1_BALANCE_REFRESH,
+            &LocalBalanceRefreshRequest { force },
+        )
+        .await
+    }
+
+    pub async fn mutate_operator_routing(
+        &self,
+        request: &OperatorRoutingMutationRequest,
+    ) -> Result<OperatorRoutingMutationResponse, ControlPlaneError> {
+        self.post_json_classified(LOCAL_V1_ROUTING_MUTATION, request)
+            .await
+    }
+
+    pub async fn mutate_operator_session_affinity(
+        &self,
+        request: &OperatorSessionAffinityMutationRequest,
+    ) -> Result<OperatorSessionAffinityMutationResponse, ControlPlaneError> {
+        self.post_json_classified(LOCAL_V1_SESSION_AFFINITY_MUTATION, request)
+            .await
+    }
+
+    async fn post_json_classified<RequestBody, ResponseBody>(
+        &self,
+        path: &str,
+        body: &RequestBody,
+    ) -> Result<ResponseBody, ControlPlaneError>
+    where
+        RequestBody: serde::Serialize + ?Sized,
+        ResponseBody: serde::de::DeserializeOwned,
+    {
+        let body = serde_json::to_vec(body).map_err(|error| ControlPlaneError::InvalidPayload {
+            reason: format!("local operator request cannot be serialized: {error}"),
+        })?;
+        let session = self.begin_operator_session().await?;
+        let request_nonce = new_local_operator_nonce();
+        let timestamp_ms = unix_time_ms();
+        if timestamp_ms > session.response.expires_at_ms {
+            return Err(ControlPlaneError::InvalidPayload {
+                reason: "local operator session expired before use".to_string(),
+            });
+        }
+        let signature = local_operator_request_signature(
+            &self.local_operator_token,
+            &session.client_nonce,
+            &session.response.session_id,
+            &request_nonce,
+            timestamp_ms,
+            path,
+            &body,
+        )
+        .map_err(|error| ControlPlaneError::InvalidPayload {
+            reason: format!("local operator request cannot be signed: {error}"),
+        })?;
+        let url =
+            control_plane_request_url(self.endpoint.admin_base_url(), path).map_err(|error| {
+                ControlPlaneError::UntrustedRequestPath {
+                    reason: error.to_string(),
+                }
+            })?;
+        let mut request = self
+            .client
+            .post(url)
+            .header(
+                LOCAL_OPERATOR_SESSION_HEADER,
+                session.response.session_id.as_str(),
+            )
+            .header(LOCAL_OPERATOR_NONCE_HEADER, request_nonce)
+            .header(LOCAL_OPERATOR_TIMESTAMP_HEADER, timestamp_ms.to_string())
+            .header(LOCAL_OPERATOR_SIGNATURE_HEADER, signature)
+            .header(CONTENT_TYPE, "application/json")
+            .body(body);
+        if let Some(token) = self.admin_token.as_ref() {
+            request = request.header(ADMIN_TOKEN_HEADER, token.clone());
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|source| ControlPlaneError::Transport {
+                base_url: self.endpoint.admin_base_url().to_string(),
+                source,
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            let body_excerpt = bounded_http_error_body(response).await;
+            return Err(ControlPlaneError::HttpStatus {
+                status: status.as_u16(),
+                body_excerpt,
+            });
+        }
+        response
+            .json::<ResponseBody>()
+            .await
+            .map_err(|source| ControlPlaneError::Decode { source })
+    }
+
+    async fn begin_operator_session(
+        &self,
+    ) -> Result<EstablishedLocalOperatorSession, ControlPlaneError> {
+        let client_nonce = new_local_operator_nonce();
+        let timestamp_ms = unix_time_ms();
+        let proof =
+            local_operator_client_proof(&self.local_operator_token, &client_nonce, timestamp_ms)
+                .map_err(|error| ControlPlaneError::InvalidPayload {
+                    reason: format!("local operator session request cannot be signed: {error}"),
+                })?;
+        let url =
+            control_plane_request_url(self.endpoint.admin_base_url(), LOCAL_V1_OPERATOR_SESSION)
+                .map_err(|error| ControlPlaneError::UntrustedRequestPath {
+                    reason: error.to_string(),
+                })?;
+        let mut request = self.client.post(url).json(&LocalOperatorSessionRequest {
+            client_nonce: client_nonce.clone(),
+            timestamp_ms,
+            proof,
+        });
+        if let Some(token) = self.admin_token.as_ref() {
+            request = request.header(ADMIN_TOKEN_HEADER, token.clone());
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|source| ControlPlaneError::Transport {
+                base_url: self.endpoint.admin_base_url().to_string(),
+                source,
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            let body_excerpt = bounded_http_error_body(response).await;
+            return Err(ControlPlaneError::HttpStatus {
+                status: status.as_u16(),
+                body_excerpt,
+            });
+        }
+        let response = response
+            .json::<LocalOperatorSessionResponse>()
+            .await
+            .map_err(|source| ControlPlaneError::Decode { source })?;
+        verify_local_operator_server_proof(&self.local_operator_token, &client_nonce, &response)
+            .map_err(|error| ControlPlaneError::InvalidPayload {
+                reason: format!("local operator daemon proof failed: {error}"),
+            })?;
+        Ok(EstablishedLocalOperatorSession {
+            client_nonce,
+            response,
+        })
     }
 }
 
@@ -390,9 +606,9 @@ mod tests {
     use std::sync::{Arc, Mutex, MutexGuard};
 
     use axum::Router;
-    use axum::http::StatusCode;
+    use axum::http::{HeaderMap, StatusCode};
     use axum::response::Redirect;
-    use axum::routing::get;
+    use axum::routing::{get, post};
     use serde_json::json;
     use tokio::net::TcpListener;
 
@@ -490,6 +706,7 @@ mod tests {
                     profiles: Vec::new(),
                     providers: Vec::new(),
                 },
+                routing: None,
                 active_requests: Vec::new(),
                 recent_requests: Vec::new(),
                 usage_summaries: Vec::new(),
@@ -502,6 +719,56 @@ mod tests {
                 provider_balances: Vec::new(),
             },
         )
+    }
+
+    #[tokio::test]
+    async fn fake_loopback_daemon_never_receives_the_reusable_operator_token() {
+        let token = format!("codex-helper-local-v1-{}", "a".repeat(64));
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let route_capture = captured.clone();
+        let app = Router::new().route(
+            LOCAL_V1_OPERATOR_SESSION,
+            post(move |headers: HeaderMap, body: String| {
+                let route_capture = route_capture.clone();
+                async move {
+                    let mut values = headers
+                        .values()
+                        .filter_map(|value| value.to_str().ok())
+                        .map(str::to_string)
+                        .collect::<Vec<_>>();
+                    values.push(body);
+                    route_capture
+                        .lock()
+                        .expect("capture request")
+                        .extend(values);
+                    axum::Json(LocalOperatorSessionResponse {
+                        session_id: "b".repeat(64),
+                        expires_at_ms: unix_time_ms().saturating_add(30_000),
+                        proof: "0".repeat(64),
+                    })
+                }
+            }),
+        );
+        let (addr, handle) = spawn_server(app).await;
+        let endpoint = ControlPlaneEndpoint::new(format!("http://{addr}"), None::<String>)
+            .expect("loopback endpoint");
+        let client = LocalOperatorClient::new(endpoint, &token).expect("operator client");
+
+        let error = client
+            .refresh_provider_balances(true)
+            .await
+            .expect_err("fake daemon cannot prove token possession");
+
+        assert!(matches!(error, ControlPlaneError::InvalidPayload { .. }));
+        assert!(
+            captured
+                .lock()
+                .expect("captured request")
+                .iter()
+                .all(|value| !value.contains(&token)),
+            "the reusable token must never cross loopback HTTP"
+        );
+        handle.abort();
     }
 
     #[tokio::test]

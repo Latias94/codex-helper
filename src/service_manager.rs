@@ -5,6 +5,8 @@ use std::process::Command;
 #[cfg(windows)]
 use std::time::Duration;
 
+#[cfg(any(windows, test))]
+use serde::Deserialize;
 use serde::Serialize;
 
 use crate::cli_types::{CliError, CliResult, ServiceCommand};
@@ -12,6 +14,10 @@ use crate::config::proxy_home_dir;
 
 #[cfg(windows)]
 const WINDOWS_SERVICE_NAME: &str = "codex-helper";
+#[cfg(any(windows, test))]
+const WINDOWS_TASK_BASENAME: &str = "codex-helper";
+#[cfg(windows)]
+const WINDOWS_TASK_DEFINITION_FILE: &str = "windows-task.xml";
 #[cfg(target_os = "macos")]
 const MACOS_LABEL: &str = "io.github.latias94.codex-helper";
 #[cfg(target_os = "linux")]
@@ -72,6 +78,7 @@ pub(crate) struct ServiceInstallOptions {
     pub(crate) port: u16,
     pub(crate) start: bool,
     pub(crate) helper_home: PathBuf,
+    pub(crate) client_home: PathBuf,
 }
 
 pub(crate) async fn handle_service_command(command: ServiceCommand) -> CliResult<()> {
@@ -91,6 +98,7 @@ pub(crate) async fn handle_service_command(command: ServiceCommand) -> CliResult
                 port,
                 start: !no_start,
                 helper_home: proxy_home_dir(),
+                client_home: service_client_home(service_name),
             })?;
             print_status(&status()?, false)?;
         }
@@ -108,19 +116,67 @@ pub(crate) async fn handle_service_command(command: ServiceCommand) -> CliResult
             host,
             port,
             helper_home,
+            client_home,
         } => {
             let service_name = service_name_from_value(&service_name)?;
             let helper_home = helper_home.unwrap_or_else(proxy_home_dir);
-            configure_service_process(&helper_home);
+            let client_home = client_home
+                .unwrap_or_else(|| legacy_service_client_home(service_name, &helper_home));
+            configure_service_process(service_name, &helper_home, &client_home);
             run_service_dispatcher(ServiceInstallOptions {
                 service_name,
                 host,
                 port: port.unwrap_or_else(|| default_proxy_port(service_name)),
                 start: false,
                 helper_home,
+                client_home,
             })?;
         }
+        ServiceCommand::TaskRun {
+            service_name,
+            host,
+            port,
+            helper_home,
+            client_home,
+        } => {
+            let service_name = service_name_from_value(&service_name)?;
+            let helper_home = helper_home.unwrap_or_else(proxy_home_dir);
+            let client_home = client_home
+                .unwrap_or_else(|| legacy_service_client_home(service_name, &helper_home));
+            configure_service_process(service_name, &helper_home, &client_home);
+            crate::cli_app::run_service_managed_server(
+                service_name,
+                host,
+                port.unwrap_or_else(|| default_proxy_port(service_name)),
+            )
+            .await?;
+        }
     }
+    Ok(())
+}
+
+pub(crate) fn configure_service_command_environment(command: &ServiceCommand) -> CliResult<()> {
+    let (service_name, helper_home, client_home) = match command {
+        ServiceCommand::Run {
+            service_name,
+            helper_home,
+            client_home,
+            ..
+        }
+        | ServiceCommand::TaskRun {
+            service_name,
+            helper_home,
+            client_home,
+            ..
+        } => (service_name, helper_home, client_home),
+        _ => return Ok(()),
+    };
+    let service_name = service_name_from_value(service_name)?;
+    let helper_home = helper_home.clone().unwrap_or_else(proxy_home_dir);
+    let client_home = client_home
+        .clone()
+        .unwrap_or_else(|| legacy_service_client_home(service_name, &helper_home));
+    configure_service_process(service_name, &helper_home, &client_home);
     Ok(())
 }
 
@@ -134,10 +190,320 @@ fn service_name_from_value(value: &str) -> CliResult<&'static str> {
     }
 }
 
-fn configure_service_process(helper_home: &Path) {
+fn configure_service_process(service_name: &str, helper_home: &Path, client_home: &Path) {
     unsafe {
         std::env::set_var("CODEX_HELPER_HOME", helper_home);
+        std::env::set_var(service_client_home_env(service_name), client_home);
     }
+}
+
+fn service_client_home(service_name: &str) -> PathBuf {
+    if service_name == "claude" {
+        crate::config::claude_home()
+    } else {
+        crate::config::codex_home()
+    }
+}
+
+fn service_client_home_env(service_name: &str) -> &'static str {
+    if service_name == "claude" {
+        "CLAUDE_HOME"
+    } else {
+        "CODEX_HOME"
+    }
+}
+
+fn legacy_service_client_home(service_name: &str, helper_home: &Path) -> PathBuf {
+    let default_name = if service_name == "claude" {
+        ".claude"
+    } else {
+        ".codex"
+    };
+    let is_default_helper_home = helper_home
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case(".codex-helper"));
+    if is_default_helper_home && let Some(parent) = helper_home.parent() {
+        return parent.join(default_name);
+    }
+    service_client_home(service_name)
+}
+
+#[cfg(any(windows, test))]
+fn service_task_arguments(options: &ServiceInstallOptions) -> Vec<OsString> {
+    vec![
+        OsString::from("service"),
+        OsString::from("task-run"),
+        OsString::from("--service-name"),
+        OsString::from(options.service_name),
+        OsString::from("--host"),
+        OsString::from(options.host.to_string()),
+        OsString::from("--port"),
+        OsString::from(options.port.to_string()),
+        OsString::from("--helper-home"),
+        options.helper_home.clone().into_os_string(),
+        OsString::from("--client-home"),
+        options.client_home.clone().into_os_string(),
+    ]
+}
+
+#[cfg(any(windows, test))]
+fn quote_windows_argument(value: &str) -> String {
+    if !value.is_empty()
+        && !value
+            .chars()
+            .any(|character| character.is_whitespace() || character == '"')
+    {
+        return value.to_string();
+    }
+
+    let mut quoted = String::from("\"");
+    let mut backslashes = 0_usize;
+    for character in value.chars() {
+        match character {
+            '\\' => backslashes = backslashes.saturating_add(1),
+            '"' => {
+                quoted.extend(std::iter::repeat_n('\\', backslashes.saturating_mul(2) + 1));
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                quoted.extend(std::iter::repeat_n('\\', backslashes));
+                quoted.push(character);
+                backslashes = 0;
+            }
+        }
+    }
+    quoted.extend(std::iter::repeat_n('\\', backslashes.saturating_mul(2)));
+    quoted.push('"');
+    quoted
+}
+
+#[cfg(any(windows, test))]
+fn render_windows_task_definition(
+    executable: &Path,
+    options: &ServiceInstallOptions,
+    user_sid: &str,
+) -> String {
+    let arguments = service_task_arguments(options)
+        .iter()
+        .map(|argument| quote_windows_argument(argument.to_string_lossy().as_ref()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let working_directory = executable.parent().unwrap_or_else(|| Path::new("."));
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n<RegistrationInfo><Description>Resident codex-helper relay for the current user.</Description></RegistrationInfo>\n<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{}</UserId></LogonTrigger></Triggers>\n<Principals><Principal id=\"Author\"><UserId>{}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\n<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><AllowHardTerminate>true</AllowHardTerminate><StartWhenAvailable>true</StartWhenAvailable><RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable><AllowStartOnDemand>true</AllowStartOnDemand><Enabled>true</Enabled><Hidden>false</Hidden><RunOnlyIfIdle>false</RunOnlyIfIdle><WakeToRun>false</WakeToRun><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Priority>7</Priority><RestartOnFailure><Interval>PT10S</Interval><Count>10</Count></RestartOnFailure></Settings>\n<Actions Context=\"Author\"><Exec><Command>{}</Command><Arguments>{}</Arguments><WorkingDirectory>{}</WorkingDirectory></Exec></Actions>\n</Task>\n",
+        xml_escape(user_sid),
+        xml_escape(user_sid),
+        xml_escape(executable.to_string_lossy().as_ref()),
+        xml_escape(&arguments),
+        xml_escape(working_directory.to_string_lossy().as_ref()),
+    )
+}
+
+#[cfg(any(windows, test))]
+fn windows_task_name_for_sid(user_sid: &str) -> CliResult<String> {
+    let components = user_sid.split('-').collect::<Vec<_>>();
+    let valid = components.len() >= 4
+        && components[0].eq_ignore_ascii_case("s")
+        && components[1..].iter().all(|component| {
+            !component.is_empty() && component.bytes().all(|byte| byte.is_ascii_digit())
+        });
+    if !valid || user_sid.len() > 184 {
+        return Err(CliError::Other(
+            "the current Windows principal returned an invalid SID".to_string(),
+        ));
+    }
+    Ok(format!("{WINDOWS_TASK_BASENAME}-{user_sid}"))
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct WindowsTaskRecord {
+    task_name: String,
+    task_path: String,
+    owner_sid: String,
+    state: u8,
+    enabled: bool,
+    action_count: usize,
+    execute: String,
+    arguments: String,
+    working_directory: String,
+    logon_type: String,
+    run_level: String,
+    trigger_count: usize,
+    trigger_enabled: bool,
+    trigger_type: String,
+    trigger_user_sid: String,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug, Deserialize)]
+struct WindowsTaskProbe {
+    found: bool,
+    #[serde(default)]
+    record: Option<WindowsTaskRecord>,
+}
+
+#[cfg(any(windows, test))]
+fn windows_task_owner_matches(record: &WindowsTaskRecord, expected_sid: &str) -> bool {
+    record.owner_sid.eq_ignore_ascii_case(expected_sid)
+}
+
+#[cfg(any(windows, test))]
+fn parse_windows_task_probe(output: &str) -> CliResult<Option<WindowsTaskRecord>> {
+    let probe = serde_json::from_str::<WindowsTaskProbe>(output).map_err(|error| {
+        CliError::Other(format!(
+            "parse the Windows Scheduled Task probe response: {error}"
+        ))
+    })?;
+    match (probe.found, probe.record) {
+        (false, None) => Ok(None),
+        (true, Some(record)) => Ok(Some(record)),
+        (false, Some(_)) | (true, None) => Err(CliError::Other(
+            "the Windows Scheduled Task probe returned an inconsistent response".to_string(),
+        )),
+    }
+}
+
+#[cfg(any(windows, test))]
+fn windows_path_text<'a>(path: &'a Path, description: &str) -> CliResult<&'a str> {
+    path.to_str().ok_or_else(|| {
+        CliError::Other(format!(
+            "{description} is not valid Unicode and cannot be stored in a Windows task definition"
+        ))
+    })
+}
+
+#[cfg(any(windows, test))]
+fn windows_paths_equal(left: &str, right: &str) -> bool {
+    let normalize = |value: &str| {
+        value
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase()
+    };
+    normalize(left) == normalize(right)
+}
+
+#[cfg(any(windows, test))]
+fn verify_windows_task_record(
+    record: &WindowsTaskRecord,
+    task_name: &str,
+    user_sid: &str,
+    executable: &Path,
+    options: &ServiceInstallOptions,
+) -> CliResult<()> {
+    let executable = windows_path_text(executable, "the codex-helper executable path")?;
+    let expected_arguments = service_task_arguments(options)
+        .iter()
+        .map(|argument| quote_windows_argument(argument.to_string_lossy().as_ref()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let working_directory = windows_path_text(
+        Path::new(executable)
+            .parent()
+            .unwrap_or_else(|| Path::new(".")),
+        "the codex-helper working directory",
+    )?;
+    let run_level_is_limited = record.run_level.eq_ignore_ascii_case("limited")
+        || record.run_level.eq_ignore_ascii_case("leastprivilege");
+    let logon_type_is_interactive = record.logon_type.eq_ignore_ascii_case("interactive")
+        || record.logon_type.eq_ignore_ascii_case("interactivetoken");
+    let valid = record.task_name == task_name
+        && record.task_path == "\\"
+        && windows_task_owner_matches(record, user_sid)
+        && matches!(record.state, 2..=4)
+        && record.enabled
+        && record.action_count == 1
+        && windows_paths_equal(&record.execute, executable)
+        && record.arguments == expected_arguments
+        && windows_paths_equal(&record.working_directory, working_directory)
+        && logon_type_is_interactive
+        && run_level_is_limited
+        && record.trigger_count == 1
+        && record.trigger_enabled
+        && record
+            .trigger_type
+            .eq_ignore_ascii_case("MSFT_TaskLogonTrigger")
+        && record.trigger_user_sid.eq_ignore_ascii_case(user_sid);
+    if valid {
+        Ok(())
+    } else {
+        Err(CliError::Other(format!(
+            "the registered Windows task '{task_name}' did not match the verified SID, action, trigger, or least-privilege definition"
+        )))
+    }
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsServiceProbeClassification {
+    Missing,
+    Error,
+}
+
+#[cfg(any(windows, test))]
+fn classify_windows_service_probe_error(
+    raw_os_error: Option<i32>,
+) -> WindowsServiceProbeClassification {
+    const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
+    if raw_os_error == Some(ERROR_SERVICE_DOES_NOT_EXIST) {
+        WindowsServiceProbeClassification::Missing
+    } else {
+        WindowsServiceProbeClassification::Error
+    }
+}
+
+#[cfg(any(windows, test))]
+trait WindowsInstallTransactionBackend {
+    fn preflight(&mut self) -> CliResult<()>;
+    fn register_scoped_task(&mut self) -> CliResult<()>;
+    fn verify_scoped_task(&mut self) -> CliResult<()>;
+    fn retire_owned_fixed_task(&mut self) -> CliResult<()>;
+    fn retire_legacy_scm(&mut self) -> CliResult<()>;
+    fn rollback(&mut self) -> CliResult<()>;
+    fn start_scoped_task(&mut self) -> CliResult<()>;
+}
+
+#[cfg(any(windows, test))]
+fn run_windows_install_transaction(
+    backend: &mut impl WindowsInstallTransactionBackend,
+    start: bool,
+) -> CliResult<()> {
+    backend.preflight()?;
+    let mut new_task_verified = false;
+    let migration = (|| {
+        backend.register_scoped_task()?;
+        backend.verify_scoped_task()?;
+        new_task_verified = true;
+        backend.retire_owned_fixed_task()?;
+        backend.retire_legacy_scm()
+    })();
+    if let Err(primary) = migration {
+        return match backend.rollback() {
+            Ok(()) => Err(CliError::Other(format!(
+                "Windows service migration failed and the previous runnable installation was restored: {primary}"
+            ))),
+            Err(rollback) => {
+                let fallback = if new_task_verified {
+                    "The verified SID-scoped task was left installed when required to avoid removing the last runnable installation"
+                } else {
+                    "The legacy installations were not retired; inspect and remove any partially registered SID-scoped task only after verifying its Principal SID"
+                };
+                Err(CliError::Other(format!(
+                    "Windows service migration failed: {primary}; rollback also failed: {rollback}. {fallback}"
+                )))
+            }
+        };
+    }
+    if start {
+        backend.start_scoped_task().map_err(|error| {
+            CliError::Other(format!(
+                "the SID-scoped Windows task was installed and the legacy installation was retired, but starting the new task failed: {error}"
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 fn service_name_from_flags(codex: bool, claude: bool) -> CliResult<&'static str> {
@@ -181,7 +547,7 @@ fn print_status(status: &ServiceStatus, json: bool) -> CliResult<()> {
 fn print_logs() {
     let log_dir = service_log_dir();
     println!("{}", log_dir.display());
-    for file_name in ["service.stdout.log", "service.stderr.log"] {
+    for file_name in ["runtime.log", "service.stdout.log", "service.stderr.log"] {
         let path = log_dir.join(file_name);
         if path.exists() {
             println!("  {}", path.display());
@@ -350,9 +716,8 @@ mod windows {
 
     use windows_service::define_windows_service;
     use windows_service::service::{
-        ServiceAccess, ServiceAction, ServiceActionType, ServiceControl, ServiceControlAccept,
-        ServiceErrorControl, ServiceExitCode, ServiceFailureActions, ServiceFailureResetPeriod,
-        ServiceInfo, ServiceStartType, ServiceState, ServiceStatus as WindowsStatus, ServiceType,
+        ServiceAccess, ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceStartType,
+        ServiceState, ServiceStatus as WindowsStatus, ServiceType,
     };
     use windows_service::service_control_handler::{
         self, ServiceControlHandlerResult, ServiceStatusHandle,
@@ -367,132 +732,316 @@ mod windows {
 
     define_windows_service!(service_entry, service_main);
 
-    pub(super) fn install(options: ServiceInstallOptions) -> CliResult<()> {
-        ensure_service_log_dir()?;
-        let executable = current_executable()?;
-        let manager = ServiceManager::local_computer(
-            None::<&str>,
-            ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
-        )
-        .map_err(windows_error("open Windows Service Control Manager"))?;
-        let service_info = ServiceInfo {
-            name: OsString::from(WINDOWS_SERVICE_NAME),
-            display_name: OsString::from("codex-helper relay"),
-            service_type: SERVICE_TYPE,
-            start_type: ServiceStartType::AutoStart,
-            error_control: ServiceErrorControl::Normal,
-            executable_path: executable,
-            launch_arguments: vec![
-                OsString::from("service"),
-                OsString::from("run"),
-                OsString::from("--service-name"),
-                OsString::from(options.service_name),
-                OsString::from("--host"),
-                OsString::from(options.host.to_string()),
-                OsString::from("--port"),
-                OsString::from(options.port.to_string()),
-                OsString::from("--helper-home"),
-                options.helper_home.clone().into_os_string(),
-            ],
-            dependencies: vec![],
-            account_name: None,
-            account_password: None,
-        };
-        let access = ServiceAccess::QUERY_STATUS
-            | ServiceAccess::START
-            | ServiceAccess::STOP
-            | ServiceAccess::DELETE
-            | ServiceAccess::CHANGE_CONFIG
-            | ServiceAccess::QUERY_CONFIG;
-        let service = manager
-            .create_service(&service_info, access)
-            .or_else(|_| manager.open_service(WINDOWS_SERVICE_NAME, access))
-            .map_err(windows_error("create or open codex-helper Windows service"))?;
-        service
-            .change_config(&service_info)
-            .map_err(windows_error("update codex-helper Windows service"))?;
-        service
-            .set_description(
-                "Resident codex-helper relay. The tray and TUI attach to this service.",
-            )
-            .map_err(windows_error("set Windows service description"))?;
-        service
-            .update_failure_actions(ServiceFailureActions {
-                reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(300)),
-                reboot_msg: None,
-                command: None,
-                actions: Some(vec![
-                    ServiceAction {
-                        action_type: ServiceActionType::Restart,
-                        delay: Duration::from_secs(2),
-                    },
-                    ServiceAction {
-                        action_type: ServiceActionType::Restart,
-                        delay: Duration::from_secs(10),
-                    },
-                    ServiceAction {
-                        action_type: ServiceActionType::Restart,
-                        delay: Duration::from_secs(30),
-                    },
-                ]),
-            })
-            .map_err(windows_error("set Windows service failure actions"))?;
-        service
-            .set_failure_actions_on_non_crash_failures(true)
-            .map_err(windows_error("enable Windows service failure actions"))?;
-        service
-            .set_delayed_auto_start(true)
-            .map_err(windows_error("set delayed Windows service startup"))?;
-        if options.start {
-            service
-                .start::<&OsStr>(&[])
-                .map_err(windows_error("start codex-helper Windows service"))?;
+    #[derive(Debug, Clone)]
+    struct OwnedTaskSnapshot {
+        record: WindowsTaskRecord,
+        definition: Vec<u8>,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct LegacyScmSnapshot {
+        was_running: bool,
+    }
+
+    struct WindowsInstallContext {
+        executable: PathBuf,
+        user_sid: String,
+        scoped_task_name: String,
+        definition_path: PathBuf,
+        scoped_snapshot: Option<OwnedTaskSnapshot>,
+        fixed_snapshot: Option<OwnedTaskSnapshot>,
+        legacy_scm: Option<LegacyScmSnapshot>,
+    }
+
+    struct NativeWindowsInstallBackend {
+        options: ServiceInstallOptions,
+        context: Option<WindowsInstallContext>,
+        scoped_task_changed: bool,
+        fixed_task_changed: bool,
+        legacy_scm_stopped: bool,
+        preserve_scoped_task: bool,
+    }
+
+    impl NativeWindowsInstallBackend {
+        fn new(options: ServiceInstallOptions) -> Self {
+            Self {
+                options,
+                context: None,
+                scoped_task_changed: false,
+                fixed_task_changed: false,
+                legacy_scm_stopped: false,
+                preserve_scoped_task: false,
+            }
         }
-        Ok(())
+
+        fn context(&self) -> CliResult<&WindowsInstallContext> {
+            self.context.as_ref().ok_or_else(|| {
+                CliError::Other("Windows service installation was not preflighted".to_string())
+            })
+        }
+    }
+
+    impl WindowsInstallTransactionBackend for NativeWindowsInstallBackend {
+        fn preflight(&mut self) -> CliResult<()> {
+            ensure_service_log_dir()?;
+            let executable = current_executable()?;
+            validate_windows_install_paths(&executable, &self.options)?;
+            preflight_windows_commands(&executable)?;
+            let user_sid = codex_helper_core::local_operator::current_windows_user_sid_string()
+                .map_err(|error| {
+                    CliError::Other(format!("resolve current Windows user SID: {error}"))
+                })?;
+            let scoped_task_name = windows_task_name_for_sid(&user_sid)?;
+            let definition_path = task_definition_path(&self.options.helper_home);
+            let document = render_windows_task_definition(&executable, &self.options, &user_sid);
+            write_service_definition(&definition_path, document.as_bytes())?;
+            let persisted = std::fs::read(&definition_path).map_err(|error| {
+                CliError::Other(format!(
+                    "read back Windows task definition {}: {error}",
+                    definition_path.display()
+                ))
+            })?;
+            if persisted != document.as_bytes() {
+                return Err(CliError::Other(format!(
+                    "Windows task definition {} failed read-back verification",
+                    definition_path.display()
+                )));
+            }
+
+            let scoped_snapshot = match query_scheduled_task(&scoped_task_name)? {
+                Some(record) => {
+                    require_task_owner(&record, &user_sid, "SID-scoped")?;
+                    let _ = scheduled_task_requires_end(&record)?;
+                    Some(snapshot_owned_task(record)?)
+                }
+                None => None,
+            };
+            let fixed_snapshot = match query_scheduled_task(WINDOWS_TASK_BASENAME)? {
+                Some(record) if windows_task_owner_matches(&record, &user_sid) => {
+                    let _ = scheduled_task_requires_end(&record)?;
+                    Some(snapshot_owned_task(record)?)
+                }
+                Some(_) | None => None,
+            };
+            let legacy_scm = probe_legacy_scm_for_migration()?;
+            self.context = Some(WindowsInstallContext {
+                executable,
+                user_sid,
+                scoped_task_name,
+                definition_path,
+                scoped_snapshot,
+                fixed_snapshot,
+                legacy_scm,
+            });
+            Ok(())
+        }
+
+        fn register_scoped_task(&mut self) -> CliResult<()> {
+            let context = self.context()?;
+            if let Some(record) = query_scheduled_task(&context.scoped_task_name)? {
+                require_task_owner(&record, &context.user_sid, "SID-scoped")?;
+            }
+            let task_name = context.scoped_task_name.clone();
+            let definition_path = context.definition_path.clone();
+            self.scoped_task_changed = true;
+            register_task_from_file(&task_name, &definition_path)
+        }
+
+        fn verify_scoped_task(&mut self) -> CliResult<()> {
+            let context = self.context()?;
+            let record = query_scheduled_task(&context.scoped_task_name)?.ok_or_else(|| {
+                CliError::Other(format!(
+                    "the newly registered Windows task '{}' was not found during verification",
+                    context.scoped_task_name
+                ))
+            })?;
+            require_task_owner(&record, &context.user_sid, "new SID-scoped")?;
+            verify_windows_task_record(
+                &record,
+                &context.scoped_task_name,
+                &context.user_sid,
+                &context.executable,
+                &self.options,
+            )
+        }
+
+        fn retire_owned_fixed_task(&mut self) -> CliResult<()> {
+            let Some(snapshot) = self.context()?.fixed_snapshot.clone() else {
+                return Ok(());
+            };
+            self.fixed_task_changed = true;
+            if scheduled_task_requires_end(&snapshot.record)? {
+                end_owned_scheduled_task(&snapshot.record.task_name, &snapshot.record.owner_sid)?;
+            }
+            delete_owned_scheduled_task(&snapshot.record.task_name, &snapshot.record.owner_sid)
+        }
+
+        fn retire_legacy_scm(&mut self) -> CliResult<()> {
+            let Some(snapshot) = self.context()?.legacy_scm else {
+                return Ok(());
+            };
+            let result = retire_legacy_scm_service(snapshot, &mut self.legacy_scm_stopped);
+            if let Err(primary) = result {
+                if snapshot.was_running && self.legacy_scm_stopped {
+                    if let Err(rollback) = start_legacy_scm_service() {
+                        self.preserve_scoped_task = true;
+                        return Err(CliError::Other(format!(
+                            "{primary}; restarting the legacy SCM service also failed: {rollback}"
+                        )));
+                    }
+                    self.legacy_scm_stopped = false;
+                }
+                return Err(primary);
+            }
+            Ok(())
+        }
+
+        fn rollback(&mut self) -> CliResult<()> {
+            let mut failures = Vec::new();
+            let fixed_snapshot = self.context()?.fixed_snapshot.clone();
+            let legacy_snapshot = self.context()?.legacy_scm;
+            if self.fixed_task_changed
+                && let Some(snapshot) = fixed_snapshot.as_ref()
+                && let Err(error) =
+                    restore_task_snapshot(snapshot, &self.context()?.definition_path)
+            {
+                self.preserve_scoped_task = true;
+                failures.push(format!("restore the fixed-name task: {error}"));
+            }
+            if self.legacy_scm_stopped
+                && legacy_snapshot.is_some_and(|snapshot| snapshot.was_running)
+            {
+                match start_legacy_scm_service() {
+                    Ok(()) => self.legacy_scm_stopped = false,
+                    Err(error) => {
+                        self.preserve_scoped_task = true;
+                        failures.push(format!("restart the legacy SCM service: {error}"));
+                    }
+                }
+            }
+            if self.scoped_task_changed && !self.preserve_scoped_task {
+                let context = self.context()?;
+                let result = match context.scoped_snapshot.as_ref() {
+                    Some(snapshot) => restore_task_snapshot(snapshot, &context.definition_path),
+                    None => {
+                        delete_owned_scheduled_task(&context.scoped_task_name, &context.user_sid)
+                    }
+                };
+                if let Err(error) = result {
+                    failures.push(format!(
+                        "restore the previous SID-scoped task state: {error}"
+                    ));
+                }
+            }
+            if failures.is_empty() {
+                Ok(())
+            } else {
+                Err(CliError::Other(failures.join("; ")))
+            }
+        }
+
+        fn start_scoped_task(&mut self) -> CliResult<()> {
+            let context = self.context()?;
+            let record = query_scheduled_task(&context.scoped_task_name)?.ok_or_else(|| {
+                CliError::Other(format!(
+                    "the verified Windows task '{}' disappeared before start",
+                    context.scoped_task_name
+                ))
+            })?;
+            require_task_owner(&record, &context.user_sid, "SID-scoped")?;
+            run_scheduled_task(&record.task_name)
+        }
+    }
+
+    pub(super) fn install(options: ServiceInstallOptions) -> CliResult<()> {
+        let start = options.start;
+        run_windows_install_transaction(&mut NativeWindowsInstallBackend::new(options), start)
     }
 
     pub(super) fn uninstall(stop_first: bool) -> CliResult<()> {
-        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
-            .map_err(windows_error("open Windows Service Control Manager"))?;
-        let service = manager
-            .open_service(
-                WINDOWS_SERVICE_NAME,
-                ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE,
-            )
-            .map_err(windows_error("open codex-helper Windows service"))?;
-        if stop_first
-            && service
-                .query_status()
-                .map_err(windows_error("query Windows service status"))?
-                .current_state
-                != ServiceState::Stopped
-        {
-            service
-                .stop()
-                .map_err(windows_error("stop codex-helper Windows service"))?;
+        let (user_sid, scoped_task_name) = current_task_identity()?;
+        if let Some(record) = query_scheduled_task(&scoped_task_name)? {
+            require_task_owner(&record, &user_sid, "SID-scoped")?;
+            if stop_first && scheduled_task_requires_end(&record)? {
+                end_owned_scheduled_task(&record.task_name, &user_sid)?;
+            }
+            delete_owned_scheduled_task(&record.task_name, &user_sid)?;
         }
-        service
-            .delete()
-            .map_err(windows_error("delete codex-helper Windows service"))
+        if let Some(record) = query_scheduled_task(WINDOWS_TASK_BASENAME)?
+            && windows_task_owner_matches(&record, &user_sid)
+        {
+            if stop_first && scheduled_task_requires_end(&record)? {
+                end_owned_scheduled_task(&record.task_name, &user_sid)?;
+            }
+            delete_owned_scheduled_task(&record.task_name, &user_sid)?;
+        }
+        let definition = task_definition_path(&proxy_home_dir());
+        match std::fs::remove_file(&definition) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(CliError::Other(format!(
+                    "remove scheduled-task definition {}: {error}",
+                    definition.display()
+                )));
+            }
+        }
+        remove_legacy_scm_service(stop_first)
     }
 
     pub(super) fn start() -> CliResult<()> {
-        with_service(
-            ServiceAccess::START,
-            |service| service.start::<&OsStr>(&[]),
-            "start codex-helper Windows service",
-        )
+        let (user_sid, scoped_task_name) = current_task_identity()?;
+        if let Some(record) = current_user_task(&user_sid, &scoped_task_name)? {
+            return run_scheduled_task(&record.task_name);
+        }
+        Err(CliError::Other(
+            "the current user's Windows task is not installed; run `codex-helper service install` to migrate any legacy SCM service"
+                .to_string(),
+        ))
     }
 
     pub(super) fn stop() -> CliResult<()> {
-        with_service(
-            ServiceAccess::STOP,
-            |service| service.stop().map(|_| ()),
-            "stop codex-helper Windows service",
-        )
+        let (user_sid, scoped_task_name) = current_task_identity()?;
+        if let Some(record) = current_user_task(&user_sid, &scoped_task_name)? {
+            return if scheduled_task_requires_end(&record)? {
+                end_owned_scheduled_task(&record.task_name, &user_sid)
+            } else {
+                Ok(())
+            };
+        }
+        stop_legacy_scm_service()
     }
 
     pub(super) fn status() -> CliResult<ServiceStatus> {
+        let (user_sid, scoped_task_name) = current_task_identity()?;
+        if let Some(record) = current_user_task(&user_sid, &scoped_task_name)? {
+            let state = match record.state {
+                4 => ServiceRuntimeState::Running,
+                2 => ServiceRuntimeState::Starting,
+                1 | 3 => ServiceRuntimeState::Stopped,
+                _ => ServiceRuntimeState::Unknown,
+            };
+            let fixed_name = record.task_name == WINDOWS_TASK_BASENAME;
+            let mut status = base_status(state, true, record.enabled);
+            status.service_name.clone_from(&record.task_name);
+            status.service_definition = Some(task_definition_path(&proxy_home_dir()));
+            status.detail = Some(if fixed_name {
+                format!(
+                    "legacy fixed-name per-user scheduled task owned by the current SID; run `codex-helper service install` to migrate; task_state_code={}",
+                    record.state
+                )
+            } else {
+                format!(
+                    "SID-scoped per-user scheduled task (interactive token, least privilege); task_state_code={}",
+                    record.state
+                )
+            });
+            return Ok(status);
+        }
+        legacy_scm_status()
+    }
+
+    fn legacy_scm_status() -> CliResult<ServiceStatus> {
         let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
             .map_err(windows_error("open Windows Service Control Manager"))?;
         let service = match manager.open_service(
@@ -500,7 +1049,10 @@ mod windows {
             ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG,
         ) {
             Ok(service) => service,
-            Err(_) => return Ok(base_status(ServiceRuntimeState::NotInstalled, false, false)),
+            Err(error) if windows_service_missing(&error) => {
+                return Ok(base_status(ServiceRuntimeState::NotInstalled, false, false));
+            }
+            Err(error) => return Err(windows_error("open codex-helper Windows service")(error)),
         };
         let raw = service
             .query_status()
@@ -520,8 +1072,524 @@ mod windows {
             true,
             config.start_type == ServiceStartType::AutoStart,
         );
-        status.detail = raw.process_id.map(|pid| format!("pid={pid}"));
+        status.detail = Some(match raw.process_id {
+            Some(pid) => format!(
+                "legacy LocalSystem SCM service, pid={pid}; run `codex-helper service install` to migrate"
+            ),
+            None => "legacy LocalSystem SCM service; run `codex-helper service install` to migrate"
+                .to_string(),
+        });
         Ok(status)
+    }
+
+    fn current_task_identity() -> CliResult<(String, String)> {
+        let user_sid = codex_helper_core::local_operator::current_windows_user_sid_string()
+            .map_err(|error| {
+                CliError::Other(format!("resolve current Windows user SID: {error}"))
+            })?;
+        let task_name = windows_task_name_for_sid(&user_sid)?;
+        Ok((user_sid, task_name))
+    }
+
+    fn current_user_task(
+        user_sid: &str,
+        scoped_task_name: &str,
+    ) -> CliResult<Option<WindowsTaskRecord>> {
+        if let Some(record) = query_scheduled_task(scoped_task_name)? {
+            require_task_owner(&record, user_sid, "SID-scoped")?;
+            return Ok(Some(record));
+        }
+        match query_scheduled_task(WINDOWS_TASK_BASENAME)? {
+            Some(record) if windows_task_owner_matches(&record, user_sid) => Ok(Some(record)),
+            Some(_) | None => Ok(None),
+        }
+    }
+
+    fn scheduled_task_requires_end(record: &WindowsTaskRecord) -> CliResult<bool> {
+        match record.state {
+            2 | 4 => Ok(true),
+            1 | 3 => Ok(false),
+            state => Err(CliError::Other(format!(
+                "refusing to mutate Windows task '{}' while Task Scheduler reports unknown state code {state}",
+                record.task_name
+            ))),
+        }
+    }
+
+    fn task_definition_path(helper_home: &Path) -> PathBuf {
+        helper_home
+            .join("service")
+            .join(WINDOWS_TASK_DEFINITION_FILE)
+    }
+
+    fn validate_windows_install_paths(
+        executable: &Path,
+        options: &ServiceInstallOptions,
+    ) -> CliResult<()> {
+        for (path, description) in [
+            (executable, "the codex-helper executable path"),
+            (&options.helper_home, "the codex-helper home path"),
+            (&options.client_home, "the client home path"),
+        ] {
+            if !path.is_absolute() {
+                return Err(CliError::Other(format!(
+                    "{description} must be absolute before installing a Windows task: {}",
+                    path.display()
+                )));
+            }
+            let _ = windows_path_text(path, description)?;
+        }
+        let metadata = std::fs::metadata(executable).map_err(|error| {
+            CliError::Other(format!(
+                "inspect codex-helper executable {}: {error}",
+                executable.display()
+            ))
+        })?;
+        if !metadata.is_file() {
+            return Err(CliError::Other(format!(
+                "the Windows task executable is not a file: {}",
+                executable.display()
+            )));
+        }
+        Ok(())
+    }
+
+    fn preflight_windows_commands(executable: &Path) -> CliResult<()> {
+        powershell_command(
+            "$ErrorActionPreference = 'Stop'; Get-Command schtasks.exe -ErrorAction Stop | Out-Null; Get-Command Get-ScheduledTask -ErrorAction Stop | Out-Null; Get-Command Export-ScheduledTask -ErrorAction Stop | Out-Null; [Console]::Out.Write('ok')",
+        )?;
+        let output = Command::new(executable)
+            .args(["service", "task-run", "--help"])
+            .output()
+            .map_err(|error| {
+                CliError::Other(format!(
+                    "run the scheduled-task command preflight with {}: {error}",
+                    executable.display()
+                ))
+            })?;
+        if !output.status.success() {
+            return Err(CliError::Other(format!(
+                "the current executable does not accept `service task-run --help`: {}",
+                output.status
+            )));
+        }
+        Ok(())
+    }
+
+    fn powershell_command(script: &str) -> CliResult<String> {
+        let script = format!(
+            "$OutputEncoding = [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false); {script}"
+        );
+        run_command(
+            "powershell.exe",
+            &[
+                OsString::from("-NoLogo"),
+                OsString::from("-NoProfile"),
+                OsString::from("-NonInteractive"),
+                OsString::from("-Command"),
+                OsString::from(script),
+            ],
+        )
+    }
+
+    fn powershell_single_quote(value: &str) -> String {
+        value.replace('\'', "''")
+    }
+
+    fn query_scheduled_task(task_name: &str) -> CliResult<Option<WindowsTaskRecord>> {
+        let task_name = powershell_single_quote(task_name);
+        let script = r#"
+$ErrorActionPreference = 'Stop'
+$target = '__TASK_NAME__'
+$tasks = @(Get-ScheduledTask -TaskPath '\' -ErrorAction Stop | Where-Object { $_.TaskName -ceq $target })
+if ($tasks.Count -eq 0) {
+    [Console]::Out.Write(([ordered]@{ found = $false } | ConvertTo-Json -Compress))
+    exit 0
+}
+if ($tasks.Count -ne 1) { throw "Scheduled Task lookup returned more than one exact root task" }
+function Resolve-Sid([string] $identity) {
+    try { return ([System.Security.Principal.SecurityIdentifier] $identity).Value } catch {}
+    return ([System.Security.Principal.NTAccount] $identity).Translate([System.Security.Principal.SecurityIdentifier]).Value
+}
+$task = $tasks[0]
+$actions = @($task.Actions)
+$triggers = @($task.Triggers)
+$ownerSid = Resolve-Sid ([string] $task.Principal.UserId)
+$triggerSid = ''
+$triggerType = ''
+$triggerEnabled = $false
+if ($triggers.Count -eq 1) {
+    $triggerType = [string] $triggers[0].CimClass.CimClassName
+    $triggerEnabled = [bool] $triggers[0].Enabled
+    if (-not [string]::IsNullOrWhiteSpace([string] $triggers[0].UserId)) {
+        $triggerSid = Resolve-Sid ([string] $triggers[0].UserId)
+    }
+}
+$action = if ($actions.Count -eq 1) { $actions[0] } else { $null }
+$execute = ''
+$arguments = ''
+$workingDirectory = ''
+if ($null -ne $action) {
+    $execute = [string] $action.Execute
+    $arguments = [string] $action.Arguments
+    $workingDirectory = [string] $action.WorkingDirectory
+}
+$record = [ordered]@{
+    task_name = [string] $task.TaskName
+    task_path = [string] $task.TaskPath
+    owner_sid = [string] $ownerSid
+    state = [int] $task.State
+    enabled = [bool] $task.Settings.Enabled
+    action_count = [int] $actions.Count
+    execute = $execute
+    arguments = $arguments
+    working_directory = $workingDirectory
+    logon_type = [string] $task.Principal.LogonType
+    run_level = [string] $task.Principal.RunLevel
+    trigger_count = [int] $triggers.Count
+    trigger_enabled = [bool] $triggerEnabled
+    trigger_type = [string] $triggerType
+    trigger_user_sid = [string] $triggerSid
+}
+[Console]::Out.Write(([ordered]@{ found = $true; record = $record } | ConvertTo-Json -Depth 4 -Compress))
+"#
+        .replace("__TASK_NAME__", &task_name);
+        parse_windows_task_probe(&powershell_command(&script)?)
+    }
+
+    fn require_task_owner(
+        record: &WindowsTaskRecord,
+        expected_sid: &str,
+        description: &str,
+    ) -> CliResult<()> {
+        if windows_task_owner_matches(record, expected_sid) {
+            Ok(())
+        } else {
+            Err(CliError::Other(format!(
+                "refusing to alter {description} Windows task '{}': its Principal SID does not match the current process SID",
+                record.task_name
+            )))
+        }
+    }
+
+    fn snapshot_owned_task(record: WindowsTaskRecord) -> CliResult<OwnedTaskSnapshot> {
+        use base64::Engine;
+
+        let task_name = powershell_single_quote(&record.task_name);
+        let script = r#"
+$ErrorActionPreference = 'Stop'
+$source = Export-ScheduledTask -TaskName '__TASK_NAME__' -TaskPath '\' -ErrorAction Stop
+$document = New-Object System.Xml.XmlDocument
+$document.PreserveWhitespace = $true
+$document.LoadXml($source)
+$stream = New-Object System.IO.MemoryStream
+$settings = New-Object System.Xml.XmlWriterSettings
+$settings.Encoding = New-Object System.Text.UTF8Encoding($false)
+$settings.Indent = $false
+$writer = [System.Xml.XmlWriter]::Create($stream, $settings)
+try {
+    $document.Save($writer)
+    $writer.Flush()
+    [Console]::Out.Write([Convert]::ToBase64String($stream.ToArray()))
+} finally {
+    $writer.Dispose()
+    $stream.Dispose()
+}
+"#
+        .replace("__TASK_NAME__", &task_name);
+        let encoded = powershell_command(&script)?;
+        let definition = base64::engine::general_purpose::STANDARD
+            .decode(encoded.trim())
+            .map_err(|error| {
+                CliError::Other(format!(
+                    "decode exported Windows task '{}' as UTF-8 XML bytes: {error}",
+                    record.task_name
+                ))
+            })?;
+        let definition_text = std::str::from_utf8(&definition).map_err(|error| {
+            CliError::Other(format!(
+                "exported Windows task '{}' was not normalized to UTF-8 XML: {error}",
+                record.task_name
+            ))
+        })?;
+        if definition_text.trim().is_empty() || !definition_text.contains("<Task") {
+            return Err(CliError::Other(format!(
+                "exported Windows task '{}' had an invalid normalized definition",
+                record.task_name
+            )));
+        }
+        Ok(OwnedTaskSnapshot { record, definition })
+    }
+
+    fn register_task_from_file(task_name: &str, definition: &Path) -> CliResult<()> {
+        run_command(
+            "schtasks.exe",
+            &[
+                OsString::from("/Create"),
+                OsString::from("/TN"),
+                OsString::from(task_name),
+                OsString::from("/XML"),
+                definition.as_os_str().to_os_string(),
+                OsString::from("/F"),
+            ],
+        )
+        .map(|_| ())
+    }
+
+    fn restore_task_snapshot(
+        snapshot: &OwnedTaskSnapshot,
+        installed_definition: &Path,
+    ) -> CliResult<()> {
+        if let Some(current) = query_scheduled_task(&snapshot.record.task_name)? {
+            require_task_owner(&current, &snapshot.record.owner_sid, "rollback destination")?;
+        }
+        let rollback_path = installed_definition.with_file_name(format!(
+            "windows-task-rollback-{}-{}.xml",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        write_service_definition(&rollback_path, &snapshot.definition)?;
+        let restore = register_task_from_file(&snapshot.record.task_name, &rollback_path);
+        let cleanup = match std::fs::remove_file(&rollback_path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(CliError::Other(format!(
+                "remove rollback task definition {}: {error}",
+                rollback_path.display()
+            ))),
+        };
+        restore?;
+        let restored = query_scheduled_task(&snapshot.record.task_name)?.ok_or_else(|| {
+            CliError::Other(format!(
+                "restored Windows task '{}' could not be queried",
+                snapshot.record.task_name
+            ))
+        })?;
+        require_task_owner(&restored, &snapshot.record.owner_sid, "restored")?;
+        if scheduled_task_requires_end(&snapshot.record)?
+            && !scheduled_task_requires_end(&restored)?
+        {
+            run_scheduled_task(&restored.task_name)?;
+        }
+        cleanup
+    }
+
+    fn run_scheduled_task(task_name: &str) -> CliResult<()> {
+        run_command(
+            "schtasks.exe",
+            &[
+                OsString::from("/Run"),
+                OsString::from("/TN"),
+                OsString::from(task_name),
+            ],
+        )
+        .map(|_| ())
+    }
+
+    fn end_owned_scheduled_task(task_name: &str, expected_sid: &str) -> CliResult<()> {
+        let Some(record) = query_scheduled_task(task_name)? else {
+            return Ok(());
+        };
+        require_task_owner(&record, expected_sid, "owned")?;
+        run_command(
+            "schtasks.exe",
+            &[
+                OsString::from("/End"),
+                OsString::from("/TN"),
+                OsString::from(task_name),
+            ],
+        )
+        .map(|_| ())
+    }
+
+    fn delete_owned_scheduled_task(task_name: &str, expected_sid: &str) -> CliResult<()> {
+        let Some(record) = query_scheduled_task(task_name)? else {
+            return Ok(());
+        };
+        require_task_owner(&record, expected_sid, "owned")?;
+        run_command(
+            "schtasks.exe",
+            &[
+                OsString::from("/Delete"),
+                OsString::from("/TN"),
+                OsString::from(task_name),
+                OsString::from("/F"),
+            ],
+        )
+        .map(|_| ())
+    }
+
+    fn probe_legacy_scm_for_migration() -> CliResult<Option<LegacyScmSnapshot>> {
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+            .map_err(windows_error("open Windows Service Control Manager"))?;
+        let access = ServiceAccess::QUERY_STATUS
+            | ServiceAccess::START
+            | ServiceAccess::STOP
+            | ServiceAccess::DELETE;
+        let service = match manager.open_service(WINDOWS_SERVICE_NAME, access) {
+            Ok(service) => service,
+            Err(error) if windows_service_missing(&error) => return Ok(None),
+            Err(error) => {
+                return Err(CliError::Other(format!(
+                    "preflight legacy LocalSystem SCM service migration: {error}; rerun once from an elevated terminal"
+                )));
+            }
+        };
+        let state = service
+            .query_status()
+            .map_err(windows_error(
+                "query legacy Windows service status during preflight",
+            ))?
+            .current_state;
+        Ok(Some(LegacyScmSnapshot {
+            was_running: state != ServiceState::Stopped,
+        }))
+    }
+
+    fn stop_legacy_scm_service() -> CliResult<()> {
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+            .map_err(windows_error("open Windows Service Control Manager"))?;
+        let service = match manager.open_service(
+            WINDOWS_SERVICE_NAME,
+            ServiceAccess::QUERY_STATUS | ServiceAccess::STOP,
+        ) {
+            Ok(service) => service,
+            Err(error) if windows_service_missing(&error) => return Ok(()),
+            Err(error) => return Err(windows_error("open legacy codex-helper SCM service")(error)),
+        };
+        if service
+            .query_status()
+            .map_err(windows_error("query legacy Windows service status"))?
+            .current_state
+            == ServiceState::Stopped
+        {
+            return Ok(());
+        }
+        service
+            .stop()
+            .map_err(windows_error("stop legacy codex-helper Windows service"))?;
+        wait_for_legacy_service_stop(&service)
+    }
+
+    fn start_legacy_scm_service() -> CliResult<()> {
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+            .map_err(windows_error("open Windows Service Control Manager"))?;
+        let service = match manager.open_service(
+            WINDOWS_SERVICE_NAME,
+            ServiceAccess::QUERY_STATUS | ServiceAccess::START,
+        ) {
+            Ok(service) => service,
+            Err(error) if windows_service_missing(&error) => {
+                return Err(CliError::Other(
+                    "the legacy SCM service disappeared before rollback".to_string(),
+                ));
+            }
+            Err(error) => return Err(windows_error("open legacy SCM service for rollback")(error)),
+        };
+        if service
+            .query_status()
+            .map_err(windows_error("query legacy SCM service during rollback"))?
+            .current_state
+            == ServiceState::Running
+        {
+            return Ok(());
+        }
+        service
+            .start::<&OsStr>(&[])
+            .map_err(windows_error("restart legacy codex-helper Windows service"))
+    }
+
+    fn retire_legacy_scm_service(snapshot: LegacyScmSnapshot, stopped: &mut bool) -> CliResult<()> {
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+            .map_err(windows_error("open Windows Service Control Manager"))?;
+        let service = match manager.open_service(
+            WINDOWS_SERVICE_NAME,
+            ServiceAccess::QUERY_STATUS
+                | ServiceAccess::START
+                | ServiceAccess::STOP
+                | ServiceAccess::DELETE,
+        ) {
+            Ok(service) => service,
+            Err(error) if windows_service_missing(&error) => return Ok(()),
+            Err(error) => {
+                return Err(windows_error("open legacy SCM service for migration")(
+                    error,
+                ));
+            }
+        };
+        *stopped = snapshot.was_running;
+        if service
+            .query_status()
+            .map_err(windows_error("query legacy Windows service status"))?
+            .current_state
+            != ServiceState::Stopped
+        {
+            service
+                .stop()
+                .map_err(windows_error("stop legacy codex-helper Windows service"))?;
+            wait_for_legacy_service_stop(&service)?;
+        }
+        service
+            .delete()
+            .map_err(windows_error("delete legacy codex-helper Windows service"))
+    }
+
+    fn remove_legacy_scm_service(stop_first: bool) -> CliResult<()> {
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+            .map_err(windows_error("open Windows Service Control Manager"))?;
+        let service = match manager.open_service(
+            WINDOWS_SERVICE_NAME,
+            ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE,
+        ) {
+            Ok(service) => service,
+            Err(error) if windows_service_missing(&error) => return Ok(()),
+            Err(error) => {
+                return Err(CliError::Other(format!(
+                    "remove legacy LocalSystem SCM service before installing the per-user task: {error}; rerun once from an elevated terminal"
+                )));
+            }
+        };
+        if stop_first
+            && service
+                .query_status()
+                .map_err(windows_error("query legacy Windows service status"))?
+                .current_state
+                != ServiceState::Stopped
+        {
+            service
+                .stop()
+                .map_err(windows_error("stop legacy codex-helper Windows service"))?;
+            wait_for_legacy_service_stop(&service)?;
+        }
+        service
+            .delete()
+            .map_err(windows_error("delete legacy codex-helper Windows service"))
+    }
+
+    fn wait_for_legacy_service_stop(service: &windows_service::service::Service) -> CliResult<()> {
+        for _ in 0..40 {
+            if service
+                .query_status()
+                .map_err(windows_error("query legacy Windows service status"))?
+                .current_state
+                == ServiceState::Stopped
+            {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        Err(CliError::Other(
+            "legacy codex-helper Windows service did not stop within 10 seconds".to_string(),
+        ))
+    }
+
+    fn windows_service_missing(error: &windows_service::Error) -> bool {
+        let raw_os_error = match error {
+            windows_service::Error::Winapi(error) => error.raw_os_error(),
+            _ => None,
+        };
+        classify_windows_service_probe_error(raw_os_error)
+            == WindowsServiceProbeClassification::Missing
     }
 
     pub(super) fn run_dispatcher(options: ServiceInstallOptions) -> CliResult<()> {
@@ -613,19 +1681,6 @@ mod windows {
                 process_id: None,
             })
             .map_err(windows_error("report Windows service status"))
-    }
-
-    fn with_service<T>(
-        access: ServiceAccess,
-        operation: impl FnOnce(&windows_service::service::Service) -> windows_service::Result<T>,
-        action: &'static str,
-    ) -> CliResult<T> {
-        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
-            .map_err(windows_error("open Windows Service Control Manager"))?;
-        let service = manager
-            .open_service(WINDOWS_SERVICE_NAME, access)
-            .map_err(windows_error("open codex-helper Windows service"))?;
-        operation(&service).map_err(windows_error(action))
     }
 
     fn windows_error(action: &'static str) -> impl FnOnce(windows_service::Error) -> CliError {
@@ -780,11 +1835,13 @@ mod macos {
             "--codex"
         };
         format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{MACOS_LABEL}</string>\n<key>ProgramArguments</key><array><string>{}</string><string>serve</string><string>{service_flag}</string><string>--host</string><string>{}</string><string>--port</string><string>{}</string><string>--no-tui</string><string>--service-managed</string></array>\n<key>EnvironmentVariables</key><dict><key>CODEX_HELPER_HOME</key><string>{}</string></dict>\n<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>\n<key>ThrottleInterval</key><integer>10</integer>\n<key>StandardOutPath</key><string>{}</string>\n<key>StandardErrorPath</key><string>{}</string>\n</dict></plist>\n",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{MACOS_LABEL}</string>\n<key>ProgramArguments</key><array><string>{}</string><string>serve</string><string>{service_flag}</string><string>--host</string><string>{}</string><string>--port</string><string>{}</string><string>--no-tui</string><string>--service-managed</string></array>\n<key>EnvironmentVariables</key><dict><key>CODEX_HELPER_HOME</key><string>{}</string><key>{}</key><string>{}</string></dict>\n<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>\n<key>ThrottleInterval</key><integer>10</integer>\n<key>StandardOutPath</key><string>{}</string>\n<key>StandardErrorPath</key><string>{}</string>\n</dict></plist>\n",
             xml_escape(executable.to_string_lossy().as_ref()),
             options.host,
             options.port,
             xml_escape(options.helper_home.to_string_lossy().as_ref()),
+            service_client_home_env(options.service_name),
+            xml_escape(options.client_home.to_string_lossy().as_ref()),
             xml_escape(
                 log_dir
                     .join("service.stdout.log")
@@ -939,8 +1996,12 @@ fn render_systemd_unit(executable: &Path, options: &ServiceInstallOptions) -> St
         "--codex"
     };
     let helper_home = systemd_environment_assignment("CODEX_HELPER_HOME", &options.helper_home);
+    let client_home = systemd_environment_assignment(
+        service_client_home_env(options.service_name),
+        &options.client_home,
+    );
     format!(
-        "[Unit]\nDescription=codex-helper resident relay\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nEnvironment={helper_home}\nExecStart={} serve {service_flag} --host {} --port {} --no-tui --service-managed\nRestart=on-failure\nRestartSec=10s\nStartLimitIntervalSec=300\nStartLimitBurst=10\n\n[Install]\nWantedBy=default.target\n",
+        "[Unit]\nDescription=codex-helper resident relay\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nEnvironment={helper_home}\nEnvironment={client_home}\nExecStart={} serve {service_flag} --host {} --port {} --no-tui --service-managed\nRestart=on-failure\nRestartSec=10s\nStartLimitIntervalSec=300\nStartLimitBurst=10\n\n[Install]\nWantedBy=default.target\n",
         systemd_quote(executable),
         options.host,
         options.port,
@@ -969,22 +2030,71 @@ fn write_service_definition(path: &Path, contents: &[u8]) -> CliResult<()> {
             parent.display()
         ))
     })?;
-    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    let temporary = path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
     std::fs::write(&temporary, contents).map_err(|error| {
         CliError::Other(format!(
             "write service definition {}: {error}",
             temporary.display()
         ))
     })?;
-    std::fs::rename(&temporary, path).map_err(|error| {
-        CliError::Other(format!(
+    if let Err(error) = replace_service_definition(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(CliError::Other(format!(
             "install service definition {}: {error}",
             path.display()
-        ))
-    })
+        )));
+    }
+    Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(not(windows))]
+fn replace_service_definition(temporary: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::rename(temporary, destination)
+}
+
+#[cfg(windows)]
+fn replace_service_definition(temporary: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    fn wide_path(path: &Path) -> std::io::Result<Vec<u16>> {
+        let encoded = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        if encoded[..encoded.len().saturating_sub(1)].contains(&0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path contains an embedded null",
+            ));
+        }
+        Ok(encoded)
+    }
+
+    let temporary = wide_path(temporary)?;
+    let destination = wide_path(destination)?;
+    // SAFETY: Both path buffers are NUL-terminated and remain alive for the API call.
+    if unsafe {
+        MoveFileExW(
+            temporary.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", windows, test))]
 fn xml_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -1023,6 +2133,21 @@ mod tests {
         assert!(service_name_from_flags(true, true).is_err());
     }
 
+    #[test]
+    fn service_definition_publication_replaces_an_existing_file() {
+        let directory = std::env::temp_dir().join(format!(
+            "codex-helper-service-definition-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let path = directory.join("service.xml");
+
+        write_service_definition(&path, b"first").unwrap();
+        write_service_definition(&path, b"second").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn launch_agent_escapes_paths_and_configures_external_restart() {
@@ -1032,6 +2157,7 @@ mod tests {
             port: 3211,
             start: true,
             helper_home: PathBuf::from("/tmp/helper-home"),
+            client_home: PathBuf::from("/tmp/codex-home"),
         };
         let document = macos::render_launch_agent(
             Path::new("/tmp/codex & helper"),
@@ -1043,6 +2169,7 @@ mod tests {
         assert!(document.contains("<key>KeepAlive</key>"));
         assert!(document.contains("<key>SuccessfulExit</key><false/>"));
         assert!(document.contains("--service-managed"));
+        assert!(document.contains("<key>CODEX_HOME</key><string>/tmp/codex-home</string>"));
     }
 
     #[test]
@@ -1053,6 +2180,7 @@ mod tests {
             port: 3210,
             start: true,
             helper_home: PathBuf::from("/tmp/helper home"),
+            client_home: PathBuf::from("/tmp/claude home"),
         };
         let document = render_systemd_unit(Path::new("/usr/bin/codex-helper"), &options);
 
@@ -1061,5 +2189,330 @@ mod tests {
         assert!(document.contains("--claude"));
         assert!(document.contains("--service-managed"));
         assert!(document.contains("Environment=\"CODEX_HELPER_HOME=/tmp/helper home\""));
+        assert!(document.contains("Environment=\"CLAUDE_HOME=/tmp/claude home\""));
+    }
+
+    #[test]
+    fn windows_task_arguments_include_only_non_secret_runtime_paths() {
+        let options = ServiceInstallOptions {
+            service_name: "codex",
+            host: IpAddr::from([127, 0, 0, 1]),
+            port: 3211,
+            start: true,
+            helper_home: PathBuf::from("C:/Users/test/.codex-helper"),
+            client_home: PathBuf::from("C:/Users/test/.codex"),
+        };
+
+        let arguments = service_task_arguments(&options)
+            .into_iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(&arguments[..2], ["service", "task-run"]);
+        assert!(arguments.windows(2).any(|pair| {
+            pair == [
+                "--client-home".to_string(),
+                "C:/Users/test/.codex".to_string(),
+            ]
+        }));
+        assert!(!arguments.iter().any(|argument| {
+            let argument = argument.to_ascii_lowercase();
+            argument.contains("authorization")
+                || argument.contains("api-key")
+                || argument.contains("auth.json")
+        }));
+    }
+
+    #[test]
+    fn windows_task_definition_runs_as_current_user_at_least_privilege() {
+        let options = ServiceInstallOptions {
+            service_name: "codex",
+            host: IpAddr::from([127, 0, 0, 1]),
+            port: 3211,
+            start: true,
+            helper_home: PathBuf::from(r"C:\Users\test user\.codex-helper"),
+            client_home: PathBuf::from(r"C:\Users\test user\.codex"),
+        };
+
+        let document = render_windows_task_definition(
+            Path::new(r"C:\Users\test user\.cargo\bin\codex-helper.exe"),
+            &options,
+            "S-1-5-21-100-200-300-400",
+        );
+
+        assert!(document.contains("<LogonType>InteractiveToken</LogonType>"));
+        assert!(document.contains("<RunLevel>LeastPrivilege</RunLevel>"));
+        assert!(document.contains("<RestartOnFailure>"));
+        assert!(document.contains("service task-run"));
+        assert!(document.contains("--helper-home"));
+        assert!(document.contains("&quot;C:\\Users\\test user\\.codex-helper&quot;"));
+        assert!(!document.contains("LocalSystem"));
+        assert!(!document.to_ascii_lowercase().contains("api-key"));
+    }
+
+    #[test]
+    fn windows_argument_quoting_preserves_trailing_backslashes_and_quotes() {
+        assert_eq!(quote_windows_argument("plain"), "plain");
+        assert_eq!(quote_windows_argument("two words"), r#""two words""#);
+        assert_eq!(quote_windows_argument(r#"a\"b\"#), r#""a\\\"b\\""#);
+    }
+
+    #[test]
+    fn windows_task_names_are_scoped_to_a_valid_principal_sid() {
+        let first = windows_task_name_for_sid("S-1-5-21-100-200-300-400").unwrap();
+        let second = windows_task_name_for_sid("S-1-5-21-100-200-300-401").unwrap();
+
+        assert_eq!(first, "codex-helper-S-1-5-21-100-200-300-400");
+        assert_ne!(first, second);
+        for invalid in [
+            "",
+            "Administrator",
+            "S-1",
+            "S-1-5-owner",
+            "S-1-5-21-100'bad",
+        ] {
+            assert!(windows_task_name_for_sid(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn scheduled_task_probe_only_maps_explicit_absence_to_none() {
+        assert_eq!(
+            parse_windows_task_probe(r#"{"found":false}"#).unwrap(),
+            None
+        );
+        for invalid in [
+            "",
+            r#"{"found":true}"#,
+            r#"{"found":false,"record":{"task_name":"unexpected"}}"#,
+            "Access is denied.",
+        ] {
+            assert!(parse_windows_task_probe(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn scheduled_task_readback_rejects_foreign_owner_and_changed_action() {
+        let sid = "S-1-5-21-100-200-300-400";
+        let task_name = windows_task_name_for_sid(sid).unwrap();
+        let executable = Path::new("C:/Users/test/.cargo/bin/codex-helper.exe");
+        let options = ServiceInstallOptions {
+            service_name: "codex",
+            host: IpAddr::from([127, 0, 0, 1]),
+            port: 3211,
+            start: true,
+            helper_home: PathBuf::from("C:/Users/test/.codex-helper"),
+            client_home: PathBuf::from("C:/Users/test/.codex"),
+        };
+        let arguments = service_task_arguments(&options)
+            .iter()
+            .map(|argument| quote_windows_argument(argument.to_string_lossy().as_ref()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let record = WindowsTaskRecord {
+            task_name: task_name.clone(),
+            task_path: "\\".to_string(),
+            owner_sid: sid.to_string(),
+            state: 3,
+            enabled: true,
+            action_count: 1,
+            execute: executable.display().to_string(),
+            arguments,
+            working_directory: "C:/Users/test/.cargo/bin".to_string(),
+            logon_type: "Interactive".to_string(),
+            run_level: "Limited".to_string(),
+            trigger_count: 1,
+            trigger_enabled: true,
+            trigger_type: "MSFT_TaskLogonTrigger".to_string(),
+            trigger_user_sid: sid.to_string(),
+        };
+
+        assert!(verify_windows_task_record(&record, &task_name, sid, executable, &options).is_ok());
+        let mut foreign = record.clone();
+        foreign.owner_sid = "S-1-5-21-100-200-300-999".to_string();
+        assert!(!windows_task_owner_matches(&foreign, sid));
+        assert!(
+            verify_windows_task_record(&foreign, &task_name, sid, executable, &options).is_err()
+        );
+        let mut changed_action = record;
+        changed_action.execute = "C:/Windows/System32/cmd.exe".to_string();
+        assert!(
+            verify_windows_task_record(&changed_action, &task_name, sid, executable, &options)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn windows_service_probe_only_classifies_error_1060_as_missing() {
+        assert_eq!(
+            classify_windows_service_probe_error(Some(1060)),
+            WindowsServiceProbeClassification::Missing
+        );
+        for raw_os_error in [Some(5), Some(1072), None] {
+            assert_eq!(
+                classify_windows_service_probe_error(raw_os_error),
+                WindowsServiceProbeClassification::Error
+            );
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeWindowsInstallBackend {
+        events: Vec<&'static str>,
+        fail_at: Option<&'static str>,
+        rollback_fails: bool,
+    }
+
+    impl FakeWindowsInstallBackend {
+        fn step(&mut self, name: &'static str) -> CliResult<()> {
+            self.events.push(name);
+            if self.fail_at == Some(name) || (name == "rollback" && self.rollback_fails) {
+                Err(CliError::Other(format!("injected {name} failure")))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl WindowsInstallTransactionBackend for FakeWindowsInstallBackend {
+        fn preflight(&mut self) -> CliResult<()> {
+            self.step("preflight")
+        }
+
+        fn register_scoped_task(&mut self) -> CliResult<()> {
+            self.step("register")
+        }
+
+        fn verify_scoped_task(&mut self) -> CliResult<()> {
+            self.step("verify")
+        }
+
+        fn retire_owned_fixed_task(&mut self) -> CliResult<()> {
+            self.step("retire_fixed")
+        }
+
+        fn retire_legacy_scm(&mut self) -> CliResult<()> {
+            self.step("retire_scm")
+        }
+
+        fn rollback(&mut self) -> CliResult<()> {
+            self.step("rollback")
+        }
+
+        fn start_scoped_task(&mut self) -> CliResult<()> {
+            self.step("start")
+        }
+    }
+
+    #[test]
+    fn windows_migration_verifies_new_task_before_retiring_legacy_installations() {
+        let mut backend = FakeWindowsInstallBackend::default();
+
+        run_windows_install_transaction(&mut backend, true).unwrap();
+
+        assert_eq!(
+            backend.events,
+            [
+                "preflight",
+                "register",
+                "verify",
+                "retire_fixed",
+                "retire_scm",
+                "start",
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_migration_rolls_back_every_failure_after_preflight() {
+        for (failure, expected) in [
+            ("register", vec!["preflight", "register", "rollback"]),
+            (
+                "verify",
+                vec!["preflight", "register", "verify", "rollback"],
+            ),
+            (
+                "retire_fixed",
+                vec![
+                    "preflight",
+                    "register",
+                    "verify",
+                    "retire_fixed",
+                    "rollback",
+                ],
+            ),
+            (
+                "retire_scm",
+                vec![
+                    "preflight",
+                    "register",
+                    "verify",
+                    "retire_fixed",
+                    "retire_scm",
+                    "rollback",
+                ],
+            ),
+        ] {
+            let mut backend = FakeWindowsInstallBackend {
+                fail_at: Some(failure),
+                ..FakeWindowsInstallBackend::default()
+            };
+
+            let error = run_windows_install_transaction(&mut backend, true).unwrap_err();
+
+            assert_eq!(backend.events, expected, "{failure}");
+            assert!(error.to_string().contains("restored"), "{error}");
+        }
+    }
+
+    #[test]
+    fn windows_migration_preflight_failure_never_registers_or_retires() {
+        let mut backend = FakeWindowsInstallBackend {
+            fail_at: Some("preflight"),
+            ..FakeWindowsInstallBackend::default()
+        };
+
+        assert!(run_windows_install_transaction(&mut backend, true).is_err());
+        assert_eq!(backend.events, ["preflight"]);
+    }
+
+    #[test]
+    fn windows_migration_reports_rollback_failure_and_keeps_verified_fallback() {
+        let mut backend = FakeWindowsInstallBackend {
+            fail_at: Some("retire_scm"),
+            rollback_fails: true,
+            ..FakeWindowsInstallBackend::default()
+        };
+
+        let error = run_windows_install_transaction(&mut backend, true).unwrap_err();
+
+        assert!(error.to_string().contains("rollback also failed"));
+        assert!(error.to_string().contains("left installed"));
+        assert_eq!(backend.events.last(), Some(&"rollback"));
+    }
+
+    #[test]
+    fn windows_migration_start_failure_does_not_remove_verified_installed_task() {
+        let mut backend = FakeWindowsInstallBackend {
+            fail_at: Some("start"),
+            ..FakeWindowsInstallBackend::default()
+        };
+
+        let error = run_windows_install_transaction(&mut backend, true).unwrap_err();
+
+        assert!(error.to_string().contains("was installed"));
+        assert!(!backend.events.contains(&"rollback"));
+    }
+
+    #[test]
+    fn legacy_default_service_derives_client_home_from_helper_owner() {
+        assert_eq!(
+            legacy_service_client_home("codex", Path::new("C:/Users/test/.codex-helper")),
+            PathBuf::from("C:/Users/test/.codex")
+        );
+        assert_eq!(
+            legacy_service_client_home("claude", Path::new("C:/Users/test/.codex-helper")),
+            PathBuf::from("C:/Users/test/.claude")
+        );
     }
 }

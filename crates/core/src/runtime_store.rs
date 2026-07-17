@@ -564,6 +564,26 @@ impl RuntimeStoreTransaction<'_, '_> {
         self.track(result)
     }
 
+    pub fn delete_session_affinity(&self, session_id: &str) -> Result<bool, RuntimeStoreError> {
+        let result = affinity::delete_session_affinity(
+            self.inner.sqlite_transaction(),
+            self.inner.path(),
+            self.inner.store_id(),
+            session_id,
+        );
+        #[cfg(test)]
+        let result = result.and_then(|removed| {
+            if self.fail_next_affinity_commit.swap(false, Ordering::SeqCst) {
+                Err(RuntimeStoreError::InjectedFailure {
+                    operation: "delete session affinity",
+                })
+            } else {
+                Ok(removed)
+            }
+        });
+        self.track(result)
+    }
+
     fn require_logical_request_handle(
         &self,
         handle: LogicalRequestHandle,
@@ -1546,6 +1566,25 @@ impl RuntimeStore {
             if result.is_ok() && self.fail_next_affinity_commit.swap(false, Ordering::SeqCst) {
                 return Err(RuntimeStoreError::InjectedFailure {
                     operation: "upsert session affinity",
+                });
+            }
+            result
+        })
+    }
+
+    /// Atomically deletes one session affinity when it exists.
+    pub fn delete_session_affinity(&self, session_id: &str) -> Result<bool, RuntimeStoreError> {
+        self.write_store_transaction("delete session affinity", |transaction, path| {
+            let result = affinity::delete_session_affinity(
+                transaction,
+                path,
+                self.identity.store_id,
+                session_id,
+            );
+            #[cfg(test)]
+            if result.is_ok() && self.fail_next_affinity_commit.swap(false, Ordering::SeqCst) {
+                return Err(RuntimeStoreError::InjectedFailure {
+                    operation: "delete session affinity",
                 });
             }
             result

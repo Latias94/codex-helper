@@ -178,12 +178,124 @@ fn footer_parts_fit(parts: &[&str], next: &str, max_width: usize) -> bool {
 }
 
 fn footer_help_text(ui: &UiState) -> &'static str {
+    if ui.overlay == Overlay::None && ui.page == Page::Sessions {
+        return match (
+            ui.language,
+            ui.can_mutate_session_affinity(),
+            ui.runtime_connection.is_attached(),
+            ui.runtime_connection.is_remote_observer(),
+        ) {
+            (crate::tui::Language::Zh, true, false, _) => {
+                "1-9/0 页面  q 退出  ↑/↓ 会话  Enter affinity  a/e 筛选  t 记录  ? 帮助"
+            }
+            (crate::tui::Language::En, true, false, _) => {
+                "1-9/0 pages  q quit  ↑/↓ session  Enter affinity  a/e filters  t transcript  ? help"
+            }
+            (crate::tui::Language::Zh, false, false, _) => {
+                "1-9/0 页面  q 退出  ↑/↓ 会话  a/e 筛选  t 记录  当前只读  ? 帮助"
+            }
+            (crate::tui::Language::En, false, false, _) => {
+                "1-9/0 pages  q quit  ↑/↓ session  a/e filters  t transcript  currently read-only  ? help"
+            }
+            (crate::tui::Language::Zh, true, true, _) => {
+                "q 只退出控制台  ↑/↓ 会话  Enter affinity  a/e 筛选  t 记录  ? 帮助"
+            }
+            (crate::tui::Language::En, true, true, _) => {
+                "q exit console only  ↑/↓ session  Enter affinity  a/e filters  t transcript  ? help"
+            }
+            (crate::tui::Language::Zh, false, true, true) => {
+                "q 只退出控制台  ↑/↓ 会话  a/e 筛选  t 记录  远程只读  ? 帮助"
+            }
+            (crate::tui::Language::En, false, true, true) => {
+                "q exit console only  ↑/↓ session  a/e filters  t transcript  remote read-only  ? help"
+            }
+            (crate::tui::Language::Zh, false, true, false) => {
+                "q 只退出控制台  ↑/↓ 会话  a/e 筛选  t 记录  本机只读  ? 帮助"
+            }
+            (crate::tui::Language::En, false, true, false) => {
+                "q exit console only  ↑/↓ session  a/e filters  t transcript  local read-only  ? help"
+            }
+        };
+    }
+
+    if !ui.runtime_connection.is_attached()
+        && ui.overlay == Overlay::None
+        && ui.page == Page::Routing
+    {
+        return match (
+            ui.language,
+            ui.can_mutate_routing(),
+            ui.can_refresh_provider_balances(),
+        ) {
+            (crate::tui::Language::Zh, true, true) => {
+                "1-9/0 页面  q 退出  ↑/↓/Pg 端点  Enter 操作  a 自动  m 模式  g 刷新  i 详情  ? 帮助"
+            }
+            (crate::tui::Language::En, true, true) => {
+                "1-9/0 pages  q quit  ↑/↓/Pg endpoint  Enter actions  a auto  m mode  g refresh  i details  ? help"
+            }
+            (crate::tui::Language::Zh, true, false) => {
+                "1-9/0 页面  q 退出  ↑/↓/Pg 端点  Enter 操作  a 自动  m 模式  i 详情  ? 帮助"
+            }
+            (crate::tui::Language::En, true, false) => {
+                "1-9/0 pages  q quit  ↑/↓/Pg endpoint  Enter actions  a auto  m mode  i details  ? help"
+            }
+            (crate::tui::Language::Zh, false, true) => {
+                "1-9/0 页面  q 退出  ↑/↓/Pg 端点  g 刷新  i 详情  ? 帮助"
+            }
+            (crate::tui::Language::En, false, true) => {
+                "1-9/0 pages  q quit  ↑/↓/Pg endpoint  g refresh  i details  ? help"
+            }
+            (crate::tui::Language::Zh, false, false) => {
+                "1-9/0 页面  q 退出  ↑/↓ 端点  i 详情  当前只读  ? 帮助"
+            }
+            (crate::tui::Language::En, false, false) => {
+                "1-9/0 pages  q quit  ↑/↓ endpoint  i details  currently read-only  ? help"
+            }
+        };
+    }
+
     if ui.runtime_connection.is_attached() && ui.overlay == Overlay::None {
-        return match ui.language {
-            crate::tui::Language::Zh => {
+        return match (
+            ui.language,
+            ui.page,
+            ui.can_mutate_routing(),
+            ui.can_refresh_provider_balances(),
+            ui.runtime_connection.is_remote_observer(),
+        ) {
+            (crate::tui::Language::Zh, Page::Routing, true, true, _) => {
+                "q 只退出控制台  ↑/↓/Pg 端点  Enter 操作  a 自动  m 模式  g 刷新  i 详情  ? 帮助"
+            }
+            (crate::tui::Language::En, Page::Routing, true, true, _) => {
+                "q exit console only  ↑/↓/Pg endpoint  Enter actions  a auto  m mode  g refresh  i details  ? help"
+            }
+            (crate::tui::Language::Zh, Page::Routing, true, false, _) => {
+                "q 只退出控制台  ↑/↓/Pg 端点  Enter 操作  a 自动  m 模式  i 详情  ? 帮助"
+            }
+            (crate::tui::Language::En, Page::Routing, true, false, _) => {
+                "q exit console only  ↑/↓/Pg endpoint  Enter actions  a auto  m mode  i details  ? help"
+            }
+            (crate::tui::Language::Zh, Page::Routing, false, true, _) => {
+                "q 只退出控制台  ↑/↓/Pg 端点  g 刷新  i 详情  ? 帮助"
+            }
+            (crate::tui::Language::En, Page::Routing, false, true, _) => {
+                "q exit console only  ↑/↓/Pg endpoint  g refresh  i details  ? help"
+            }
+            (crate::tui::Language::Zh, Page::Routing, false, false, true) => {
+                "q 只退出控制台  ↑/↓ 端点  i 详情  远程只读  ? 帮助"
+            }
+            (crate::tui::Language::En, Page::Routing, false, false, true) => {
+                "q exit console only  ↑/↓ endpoint  i details  remote read-only  ? help"
+            }
+            (crate::tui::Language::Zh, Page::Routing, false, false, false) => {
+                "q 只退出控制台  ↑/↓ 端点  i 详情  本机只读  ? 帮助"
+            }
+            (crate::tui::Language::En, Page::Routing, false, false, false) => {
+                "q exit console only  ↑/↓ endpoint  i details  local read-only  ? help"
+            }
+            (crate::tui::Language::Zh, _, _, _, _) => {
                 "1-9/0 页面  q 只退出控制台  L 语言  Tab 焦点  ↑/↓ 移动  ? 帮助"
             }
-            crate::tui::Language::En => {
+            (crate::tui::Language::En, _, _, _, _) => {
                 "1-9/0 pages  q exit console only  L language  Tab focus  ↑/↓ move  ? help"
             }
         };
@@ -209,6 +321,22 @@ fn footer_help_text(ui: &UiState) -> &'static str {
         Overlay::ProviderInfo => i18n::text(ui.language, msg::FOOTER_PROVIDER_INFO),
         Overlay::SessionTranscript => i18n::text(ui.language, msg::FOOTER_SESSION_TRANSCRIPT),
         Overlay::StartupAlert => i18n::text(ui.language, msg::FOOTER_STARTUP_GUARDRAIL),
+        Overlay::RoutingActions => match ui.language {
+            crate::tui::Language::Zh => "↑/↓ 选择  Enter 继续  Esc 取消",
+            crate::tui::Language::En => "↑/↓ select  Enter continue  Esc cancel",
+        },
+        Overlay::RoutingConfirmation => match ui.language {
+            crate::tui::Language::Zh => "Enter / y 确认  Esc / n 取消",
+            crate::tui::Language::En => "Enter / y confirm  Esc / n cancel",
+        },
+        Overlay::SessionAffinityActions => match ui.language {
+            crate::tui::Language::Zh => "↑/↓ 选择  Enter 继续  Esc 取消",
+            crate::tui::Language::En => "↑/↓ select  Enter continue  Esc cancel",
+        },
+        Overlay::SessionAffinityConfirmation => match ui.language {
+            crate::tui::Language::Zh => "Enter / y 确认  Esc / n 取消",
+            crate::tui::Language::En => "Enter / y confirm  Esc / n cancel",
+        },
     }
 }
 
@@ -687,8 +815,10 @@ mod tests {
 
     #[test]
     fn split_footer_help_uses_second_line_for_overflow() {
-        let (first, second) =
-            split_footer_help("1-9 pages  q quit  L language  Tab focus  P global pin", 26);
+        let (first, second) = split_footer_help(
+            "1-9 pages  q quit  L language  Tab focus  Enter actions",
+            26,
+        );
 
         assert!(UnicodeWidthStr::width(first.as_str()) <= 26);
         assert!(!second.is_empty());
@@ -709,7 +839,7 @@ mod tests {
     }
 
     #[test]
-    fn footer_help_text_uses_query_only_routing_copy() {
+    fn footer_help_text_advertises_routing_operator_actions() {
         let ui = UiState {
             page: Page::Routing,
             language: crate::tui::Language::En,
@@ -718,9 +848,171 @@ mod tests {
 
         let text = footer_help_text(&ui);
 
-        assert!(text.contains("provider"), "{text}");
+        assert!(text.contains("endpoint"), "{text}");
         assert!(text.contains("i details"), "{text}");
-        assert!(!text.contains("refresh"), "{text}");
+        assert!(text.contains("Enter actions"), "{text}");
+        assert!(text.contains("a auto"), "{text}");
+        assert!(text.contains("g refresh"), "{text}");
+    }
+
+    #[test]
+    fn integrated_routing_footer_does_not_advertise_blocked_actions() {
+        let ui = UiState {
+            page: Page::Routing,
+            language: crate::tui::Language::En,
+            operator_read_model: Some(crate::dashboard_core::OperatorReadModel {
+                api_version: 1,
+                service_name: "codex".to_string(),
+                status: crate::dashboard_core::OperatorReadStatus::Stale,
+                captured_at_ms: 1,
+                revisions: None,
+                data: None,
+                issue: Some(crate::dashboard_core::OperatorReadIssue::RefreshFailed),
+            }),
+            ..Default::default()
+        };
+
+        let text = footer_help_text(&ui);
+
+        assert!(text.contains("currently read-only"), "{text}");
+        assert!(!text.contains("Enter actions"), "{text}");
+        assert!(!text.contains("g refresh"), "{text}");
+    }
+
+    #[test]
+    fn remote_routing_footer_is_explicitly_read_only() {
+        let ui = UiState {
+            page: Page::Routing,
+            language: crate::tui::Language::En,
+            runtime_connection: crate::tui::state::RuntimeConnectionKind::RemoteObserver,
+            ..Default::default()
+        };
+
+        let text = footer_help_text(&ui);
+
+        assert!(text.contains("endpoint"), "{text}");
+        assert!(text.contains("remote read-only"), "{text}");
+        assert!(!text.contains("Enter actions"), "{text}");
+        assert!(!text.contains("g refresh"), "{text}");
+    }
+
+    #[test]
+    fn local_attached_routing_footer_advertises_only_balance_refresh_capability() {
+        let ui = UiState {
+            page: Page::Routing,
+            language: crate::tui::Language::En,
+            runtime_connection: crate::tui::state::RuntimeConnectionKind::LocalAttached,
+            operator_action_capabilities: crate::dashboard_core::OperatorActionCapabilities {
+                refresh_provider_balances: true,
+                mutate_routing: false,
+                mutate_session_affinity: false,
+            },
+            ..Default::default()
+        };
+
+        let text = footer_help_text(&ui);
+
+        assert!(text.contains("g refresh"), "{text}");
+        assert!(!text.contains("Enter actions"), "{text}");
+        assert!(!text.contains("a auto"), "{text}");
+        assert!(!text.contains("read-only"), "{text}");
+    }
+
+    #[test]
+    fn local_attached_routing_footer_advertises_all_operator_capabilities() {
+        let ui = UiState {
+            page: Page::Routing,
+            language: crate::tui::Language::En,
+            runtime_connection: crate::tui::state::RuntimeConnectionKind::LocalAttached,
+            operator_action_capabilities: crate::dashboard_core::OperatorActionCapabilities {
+                refresh_provider_balances: true,
+                mutate_routing: true,
+                mutate_session_affinity: true,
+            },
+            ..Default::default()
+        };
+
+        let text = footer_help_text(&ui);
+
+        assert!(text.contains("Enter actions"), "{text}");
+        assert!(text.contains("a auto"), "{text}");
+        assert!(text.contains("g refresh"), "{text}");
+        assert!(!text.contains("read-only"), "{text}");
+    }
+
+    #[test]
+    fn local_attached_routing_footer_advertises_only_routing_mutation_capability() {
+        let ui = UiState {
+            page: Page::Routing,
+            language: crate::tui::Language::En,
+            runtime_connection: crate::tui::state::RuntimeConnectionKind::LocalAttached,
+            operator_action_capabilities: crate::dashboard_core::OperatorActionCapabilities {
+                refresh_provider_balances: false,
+                mutate_routing: true,
+                mutate_session_affinity: false,
+            },
+            ..Default::default()
+        };
+
+        let text = footer_help_text(&ui);
+
+        assert!(text.contains("Enter actions"), "{text}");
+        assert!(text.contains("a auto"), "{text}");
+        assert!(!text.contains("g refresh"), "{text}");
+        assert!(!text.contains("read-only"), "{text}");
+    }
+
+    #[test]
+    fn local_attached_routing_footer_does_not_claim_remote_read_only() {
+        let ui = UiState {
+            page: Page::Routing,
+            language: crate::tui::Language::En,
+            runtime_connection: crate::tui::state::RuntimeConnectionKind::LocalAttached,
+            ..Default::default()
+        };
+
+        let text = footer_help_text(&ui);
+
+        assert!(text.contains("local read-only"), "{text}");
+        assert!(!text.contains("remote read-only"), "{text}");
+    }
+
+    #[test]
+    fn integrated_sessions_footer_advertises_affinity_actions() {
+        let ui = UiState {
+            page: Page::Sessions,
+            language: crate::tui::Language::En,
+            ..Default::default()
+        };
+
+        let text = footer_help_text(&ui);
+
+        assert!(text.contains("Enter affinity"), "{text}");
+        assert!(!text.contains("read-only"), "{text}");
+    }
+
+    #[test]
+    fn attached_sessions_footer_distinguishes_local_and_remote_read_only() {
+        let local = UiState {
+            page: Page::Sessions,
+            language: crate::tui::Language::En,
+            runtime_connection: crate::tui::state::RuntimeConnectionKind::LocalAttached,
+            ..Default::default()
+        };
+        let remote = UiState {
+            page: Page::Sessions,
+            language: crate::tui::Language::En,
+            runtime_connection: crate::tui::state::RuntimeConnectionKind::RemoteObserver,
+            ..Default::default()
+        };
+
+        let local_text = footer_help_text(&local);
+        let remote_text = footer_help_text(&remote);
+
+        assert!(local_text.contains("local read-only"), "{local_text}");
+        assert!(!local_text.contains("Enter affinity"), "{local_text}");
+        assert!(remote_text.contains("remote read-only"), "{remote_text}");
+        assert!(!remote_text.contains("Enter affinity"), "{remote_text}");
     }
 
     #[test]

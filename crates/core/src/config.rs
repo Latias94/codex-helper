@@ -2,14 +2,13 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::path::PathBuf;
 
-use crate::client_config::codex_home;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use toml::Value as TomlValue;
 
 pub use crate::client_config::{
-    claude_settings_backup_path, claude_settings_path, codex_config_path,
+    claude_home, claude_settings_backup_path, claude_settings_path, codex_config_path, codex_home,
 };
 pub use crate::fleet::registry::{FleetNodeConfig, FleetRegistryConfig};
 
@@ -36,6 +35,8 @@ pub use retry_impl::{
     ReasoningGuardStreamMode, ResolvedReasoningGuardConfig, ResolvedRetryConfig,
     ResolvedRetryLayerConfig, RetryConfig, RetryLayerConfig, RetryProfileName, RetryStrategy,
 };
+#[cfg(test)]
+pub(crate) use storage_impl::mutate_helper_config;
 pub use storage_impl::{
     ConfigInitOutcome, LoadedConfig, config_file_path, init_config_toml,
     init_config_toml_with_outcome, load_config, load_config_with_source, save_helper_config,
@@ -62,6 +63,9 @@ pub struct UpstreamAuth {
     /// Environment variable name for API key header value
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
+    /// Explicitly allow a remote third-party upstream to receive an anonymous request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_anonymous: Option<bool>,
 }
 
 impl UpstreamAuth {
@@ -80,6 +84,7 @@ impl UpstreamAuth {
                 .api_key_env
                 .clone()
                 .or_else(|| self.api_key_env.clone()),
+            allow_anonymous: overrides.allow_anonymous.or(self.allow_anonymous),
         }
     }
 
@@ -975,6 +980,7 @@ fn is_default_upstream_auth(auth: &UpstreamAuth) -> bool {
         && auth.auth_token_env.is_none()
         && auth.api_key.is_none()
         && auth.api_key_env.is_none()
+        && auth.allow_anonymous.is_none()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]

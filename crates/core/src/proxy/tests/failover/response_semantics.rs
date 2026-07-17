@@ -40,6 +40,7 @@ fn official_openai_test_proxy_service(
     mut upstream_config: UpstreamConfig,
 ) -> ProxyService {
     upstream_config.base_url = format!("http://api.openai.com:{}/v1", upstream.addr.port());
+    upstream_config.auth.allow_anonymous = Some(true);
     let client = crate::proxy::upstream_http_client_builder()
         .no_proxy()
         .connect_timeout(Duration::from_secs(2))
@@ -1923,6 +1924,7 @@ async fn proxy_codex_retryable_429_enqueues_usage_probe_for_provider_endpoint() 
         ..HelperConfig::default()
     };
     let proxy = ProxyService::new(Client::new(), Arc::new(source), "codex");
+    let proxy_state = proxy.state_handle();
     let app = crate::proxy::router(proxy);
     let (proxy_addr, proxy_handle) = spawn_axum_server(app);
 
@@ -1940,6 +1942,7 @@ async fn proxy_codex_retryable_429_enqueues_usage_probe_for_provider_endpoint() 
     assert_eq!(backup_hits.load(Ordering::SeqCst), 1);
     assert!(
         crate::usage_providers::request_balance_refresh_queued_for_provider_endpoint(
+            proxy_state.as_ref(),
             &crate::runtime_identity::ProviderEndpointKey::new("codex", "primary", "default")
         ),
         "retryable 429 should enqueue a balance refresh for the failed provider endpoint"
@@ -3523,6 +3526,341 @@ async fn proxy_preserves_upstream_validators_for_byte_for_byte_response() {
 }
 
 #[tokio::test]
+async fn proxy_resolves_helper_auth_from_codex_auth_json() {
+    let _env_guard = env_lock().await;
+    let codex_home = make_temp_test_dir();
+    let auth_field = format!(
+        "CODEX_HELPER_TEST_RELAY_AUTH_{}",
+        uuid::Uuid::new_v4().simple()
+    );
+    let provider_token = "provider-token-from-auth-json";
+    let auth_json = serde_json::to_string_pretty(&serde_json::json!({
+        auth_field.as_str(): provider_token,
+    }))
+    .expect("serialize Codex auth.json");
+    write_text_file(&codex_home.join("auth.json"), &auth_json);
+
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HOME", &codex_home);
+    }
+
+    let upstream_authorization = Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
+    let seen_authorization = Arc::clone(&upstream_authorization);
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        post(move |headers: axum::http::HeaderMap| {
+            let seen_authorization = Arc::clone(&seen_authorization);
+            async move {
+                seen_authorization.lock().expect("authorization lock").push(
+                    headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string),
+                );
+                Json(serde_json::json!({ "ok": true }))
+            }
+        }),
+    );
+    let upstream = spawn_test_upstream(upstream);
+    let mut upstream_config = upstream.upstream_config();
+    upstream_config.auth.auth_token_env = Some(auth_field.clone());
+    let retry = retry_config(1, "502", Vec::new(), RetryStrategy::Failover);
+    let proxy = spawn_test_proxy(make_helper_config(vec![upstream_config], retry));
+
+    let response = local_http_test_client()
+        .post(proxy.responses_url())
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .header(
+            axum::http::header::AUTHORIZATION,
+            "Bearer codex-client-account-token",
+        )
+        .body(r#"{"model":"gpt-5","input":"hi"}"#)
+        .send()
+        .await
+        .expect("send through proxy");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        upstream_authorization
+            .lock()
+            .expect("authorization lock")
+            .as_slice(),
+        [Some("Bearer provider-token-from-auth-json".to_string())]
+    );
+
+    let rotated_token = "rotated-provider-token-from-auth-json";
+    let rotated_auth_json = serde_json::to_string_pretty(&serde_json::json!({
+        auth_field.as_str(): rotated_token,
+    }))
+    .expect("serialize rotated Codex auth.json");
+    write_text_file(&codex_home.join("auth.json"), &rotated_auth_json);
+    tokio::time::sleep(Duration::from_millis(40)).await;
+
+    let rotated_response = local_http_test_client()
+        .post(proxy.responses_url())
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .header(
+            axum::http::header::AUTHORIZATION,
+            "Bearer codex-client-account-token",
+        )
+        .body(r#"{"model":"gpt-5","input":"after rotation"}"#)
+        .send()
+        .await
+        .expect("send through proxy after auth rotation");
+
+    assert_eq!(rotated_response.status(), StatusCode::OK);
+    assert_eq!(
+        upstream_authorization
+            .lock()
+            .expect("authorization lock")
+            .as_slice(),
+        [
+            Some("Bearer provider-token-from-auth-json".to_string()),
+            Some("Bearer rotated-provider-token-from-auth-json".to_string()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn proxy_fails_closed_before_remote_http_upstream_when_explicit_auth_reference_is_missing() {
+    const RELAY_HOST: &str = "relay-auth-missing-env.test";
+
+    let _env_guard = env_lock().await;
+    let codex_home = make_temp_test_dir();
+    let auth_path = codex_home.join("auth.json");
+    let missing_reference = format!(
+        "CODEX_HELPER_TEST_MISSING_RELAY_AUTH_{}",
+        uuid::Uuid::new_v4().simple()
+    );
+    let auth_json = serde_json::to_string_pretty(&serde_json::json!({
+        missing_reference.as_str(): "temporary-provider-token",
+    }))
+    .expect("serialize Codex auth.json");
+    write_text_file(&auth_path, &auth_json);
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HOME", &codex_home);
+    }
+
+    let primary_hits = Arc::new(AtomicUsize::new(0));
+    let primary_hits_for_route = primary_hits.clone();
+    let auth_path_for_route = auth_path.clone();
+    let primary = spawn_test_upstream(axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let hits = primary_hits_for_route.clone();
+            let auth_path = auth_path_for_route.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                write_text_file(&auth_path, "{}");
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({ "error": "primary failed" })),
+                )
+            }
+        }),
+    ));
+
+    let backup_hits = Arc::new(AtomicUsize::new(0));
+    let backup_hits_for_route = backup_hits.clone();
+    let backup = spawn_test_upstream(axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let hits = backup_hits_for_route.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                Json(serde_json::json!({ "unexpected": true }))
+            }
+        }),
+    ));
+    let mut backup_config = backup.upstream_config();
+    backup_config.base_url = format!("http://{RELAY_HOST}:{}/v1", backup.addr.port());
+    backup_config.auth.auth_token_env = Some(missing_reference.clone());
+    let proxy_client = crate::proxy::upstream_http_client_builder()
+        .no_proxy()
+        .resolve(RELAY_HOST, backup.addr)
+        .build()
+        .expect("build remote relay test client");
+    let proxy = spawn_proxy_service(ProxyService::new(
+        proxy_client,
+        Arc::new(make_helper_config(
+            vec![primary.upstream_config(), backup_config],
+            retry_config(1, "502", Vec::new(), RetryStrategy::Failover),
+        )),
+        "codex",
+    ));
+
+    let response = local_http_test_client()
+        .post(proxy.responses_url())
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .header(
+            axum::http::header::AUTHORIZATION,
+            "Bearer codex-client-account-token",
+        )
+        .body(r#"{"model":"gpt-5","input":"hi"}"#)
+        .send()
+        .await
+        .expect("send through proxy");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = response.text().await.expect("read proxy response body");
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
+    assert!(
+        body.contains("last_error: configured upstream credentials are unavailable"),
+        "{body}"
+    );
+    assert!(!body.contains(&missing_reference), "{body}");
+}
+
+#[tokio::test]
+async fn proxy_fails_closed_before_http_upstream_when_auth_header_is_invalid() {
+    let upstream_hits = Arc::new(AtomicUsize::new(0));
+    let hits_for_route = upstream_hits.clone();
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let hits = hits_for_route.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                Json(serde_json::json!({ "unexpected": true }))
+            }
+        }),
+    );
+    let upstream = spawn_test_upstream(upstream);
+    let mut upstream_config = upstream.upstream_config();
+    upstream_config.auth.auth_token = Some("invalid\r\nbearer".to_string());
+    let retry = retry_config(1, "502", Vec::new(), RetryStrategy::Failover);
+    let proxy = spawn_test_proxy(make_helper_config(vec![upstream_config], retry));
+
+    let response = local_http_test_client()
+        .post(proxy.responses_url())
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .header(
+            axum::http::header::AUTHORIZATION,
+            "Bearer codex-client-account-token",
+        )
+        .body(r#"{"model":"gpt-5","input":"hi"}"#)
+        .send()
+        .await
+        .expect("send through proxy");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn proxy_fails_closed_before_remote_http_upstream_when_auth_is_unconfigured() {
+    const RELAY_HOST: &str = "relay-auth-default.test";
+
+    let upstream_hits = Arc::new(AtomicUsize::new(0));
+    let hits_for_route = upstream_hits.clone();
+    let upstream = spawn_test_upstream(axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let hits = hits_for_route.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                Json(serde_json::json!({ "unexpected": true }))
+            }
+        }),
+    ));
+    let mut upstream_config = upstream.upstream_config();
+    upstream_config.base_url = format!("http://{RELAY_HOST}:{}/v1", upstream.addr.port());
+    let proxy_client = crate::proxy::upstream_http_client_builder()
+        .no_proxy()
+        .resolve(RELAY_HOST, upstream.addr)
+        .build()
+        .expect("build remote relay test client");
+    let proxy = spawn_proxy_service(ProxyService::new(
+        proxy_client,
+        Arc::new(make_helper_config(
+            vec![upstream_config],
+            retry_config(1, "502", Vec::new(), RetryStrategy::Failover),
+        )),
+        "codex",
+    ));
+
+    let response = local_http_test_client()
+        .post(proxy.responses_url())
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .header(
+            axum::http::header::AUTHORIZATION,
+            "Bearer codex-client-account-token",
+        )
+        .body(r#"{"model":"gpt-5","input":"hi"}"#)
+        .send()
+        .await
+        .expect("send through proxy");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn proxy_allows_explicit_anonymous_remote_http_upstream_without_client_account_headers() {
+    const RELAY_HOST: &str = "relay-auth-opt-in.test";
+
+    let upstream_hits = Arc::new(AtomicUsize::new(0));
+    let upstream_headers = Arc::new(std::sync::Mutex::new(None::<axum::http::HeaderMap>));
+    let hits_for_route = upstream_hits.clone();
+    let headers_for_route = upstream_headers.clone();
+    let upstream = spawn_test_upstream(axum::Router::new().route(
+        "/v1/responses",
+        post(move |headers: axum::http::HeaderMap| {
+            let hits = hits_for_route.clone();
+            let seen_headers = headers_for_route.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                *seen_headers.lock().expect("upstream headers lock") = Some(headers);
+                Json(serde_json::json!({ "ok": true }))
+            }
+        }),
+    ));
+    let mut upstream_config = upstream.upstream_config();
+    upstream_config.base_url = format!("http://{RELAY_HOST}:{}/v1", upstream.addr.port());
+    upstream_config.auth.allow_anonymous = Some(true);
+    let proxy_client = crate::proxy::upstream_http_client_builder()
+        .no_proxy()
+        .resolve(RELAY_HOST, upstream.addr)
+        .build()
+        .expect("build remote relay test client");
+    let proxy = spawn_proxy_service(ProxyService::new(
+        proxy_client,
+        Arc::new(make_helper_config(
+            vec![upstream_config],
+            retry_config(1, "502", Vec::new(), RetryStrategy::Failover),
+        )),
+        "codex",
+    ));
+
+    let response = local_http_test_client()
+        .post(proxy.responses_url())
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .header(
+            axum::http::header::AUTHORIZATION,
+            "Bearer codex-client-account-token",
+        )
+        .header("chatgpt-account-id", "codex-client-account")
+        .body(r#"{"model":"gpt-5","input":"hi"}"#)
+        .send()
+        .await
+        .expect("send through proxy");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+    let headers = upstream_headers
+        .lock()
+        .expect("upstream headers lock")
+        .clone()
+        .expect("captured upstream headers");
+    assert!(!headers.contains_key(axum::http::header::AUTHORIZATION));
+    assert!(!headers.contains_key("chatgpt-account-id"));
+}
+
+#[tokio::test]
 async fn proxy_does_not_follow_cross_origin_redirect_with_credentials() {
     let target_hits = Arc::new(AtomicUsize::new(0));
     let target_headers = Arc::new(std::sync::Mutex::new(None::<axum::http::HeaderMap>));
@@ -3569,6 +3907,7 @@ async fn proxy_does_not_follow_cross_origin_redirect_with_credentials() {
         auth_token_env: None,
         api_key: Some("relay-api-key-secret".to_string()),
         api_key_env: None,
+        allow_anonymous: None,
     };
     let retry = retry_config(1, "502", Vec::new(), RetryStrategy::Failover);
     let proxy = spawn_test_proxy(make_helper_config(vec![source_config], retry));

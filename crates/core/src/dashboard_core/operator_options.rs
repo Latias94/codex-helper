@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use crate::config::{ServiceControlProfile, ServiceRouteConfig};
 use crate::routing_ir::{RoutePlanRuntimeState, RoutePlanTemplate};
 use crate::runtime_identity::ProviderEndpointKey;
+use crate::state::RuntimeConfigState;
 
 use super::types::{ControlProfileOption, ProviderEndpointOption, ProviderOption};
 
@@ -140,6 +141,16 @@ pub fn build_provider_options_from_route_runtime(
         endpoint.effective_enabled =
             endpoint.configured_enabled && !candidate_runtime.runtime_disabled;
         endpoint.routable = endpoint.configured_enabled && candidate_runtime.runtime_available;
+        endpoint.runtime_enabled_override = candidate_runtime.runtime_disabled.then_some(false);
+        endpoint.runtime_state = if candidate_runtime.draining {
+            RuntimeConfigState::Draining
+        } else if candidate_runtime.breaker_open {
+            RuntimeConfigState::BreakerOpen
+        } else {
+            RuntimeConfigState::Normal
+        };
+        endpoint.runtime_state_override = (endpoint.runtime_state != RuntimeConfigState::Normal)
+            .then_some(endpoint.runtime_state);
     }
 
     for provider in &mut providers {

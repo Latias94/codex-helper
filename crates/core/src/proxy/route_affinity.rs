@@ -2,7 +2,7 @@ use crate::logging::{RouteAttemptLog, now_ms};
 use crate::routing_ir::{RoutePlanRuntimeState, RoutePlanTemplate};
 use crate::state::{
     SessionIdentitySource, SessionRouteAffinity, SessionRouteAffinitySuccess,
-    SessionRouteAffinityTarget, SessionRouteReservationAccess,
+    SessionRouteAffinityTarget, SessionRouteControlGuard, SessionRouteReservationAccess,
 };
 
 use super::ProxyService;
@@ -97,16 +97,11 @@ pub(super) async fn claim_session_route_reservation(
 pub(super) async fn lock_session_route_reservation_selection(
     proxy: &ProxyService,
     session_id: Option<&str>,
-) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+) -> Option<SessionRouteControlGuard> {
     let session_id = session_id
         .map(str::trim)
         .filter(|value| !value.is_empty())?;
-    Some(
-        proxy
-            .state
-            .lock_session_route_reservation_selection(session_id)
-            .await,
-    )
+    Some(proxy.state.lock_session_route_control(session_id).await)
 }
 
 pub(super) async fn apply_session_route_reservation_to_runtime(

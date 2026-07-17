@@ -1,5 +1,5 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use axum::http::StatusCode;
 
@@ -18,44 +18,10 @@ use crate::usage_providers::{
 use super::ProxyService;
 use super::concurrency_limits::ConcurrencyLimit;
 use super::control_plane_service::service_route_config;
-use super::route_target_selection::apply_concurrency_snapshots_to_runtime;
+use super::route_target_selection::{
+    apply_auth_resolution_to_runtime, apply_concurrency_snapshots_to_runtime,
+};
 use super::runtime_config::RuntimeSnapshot;
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ProviderBalanceRefreshKey {
-    service_name: String,
-    route_provider_id: Option<String>,
-    provider_id: Option<String>,
-    force: bool,
-}
-
-static IN_FLIGHT_PROVIDER_BALANCE_REFRESHES: OnceLock<Mutex<HashSet<ProviderBalanceRefreshKey>>> =
-    OnceLock::new();
-
-struct ProviderBalanceRefreshInFlight {
-    key: ProviderBalanceRefreshKey,
-}
-
-impl Drop for ProviderBalanceRefreshInFlight {
-    fn drop(&mut self) {
-        if let Some(in_flight) = IN_FLIGHT_PROVIDER_BALANCE_REFRESHES.get()
-            && let Ok(mut guard) = in_flight.lock()
-        {
-            guard.remove(&self.key);
-        }
-    }
-}
-
-fn try_mark_provider_balance_refresh_in_flight(
-    key: ProviderBalanceRefreshKey,
-) -> Option<ProviderBalanceRefreshInFlight> {
-    let in_flight = IN_FLIGHT_PROVIDER_BALANCE_REFRESHES.get_or_init(|| Mutex::new(HashSet::new()));
-    let mut guard = in_flight.lock().ok()?;
-    if !guard.insert(key.clone()) {
-        return None;
-    }
-    Some(ProviderBalanceRefreshInFlight { key })
-}
 
 fn format_provider_balance_refresh_error(error: &anyhow::Error) -> String {
     format!("failed to refresh provider balances: {error:#}")
@@ -324,6 +290,7 @@ pub(super) async fn build_provider_options_for_runtime_snapshot(
         .state
         .route_plan_runtime_state_with_provider_policy(proxy.service_name, provider_policy.as_ref())
         .await;
+    apply_auth_resolution_to_runtime(proxy.service_name, &template, &mut runtime);
     apply_concurrency_snapshots_to_runtime(
         proxy,
         &template,
@@ -345,26 +312,6 @@ pub(super) async fn refresh_provider_balances_for_proxy(
     provider_id_filter: Option<&str>,
     force: bool,
 ) -> Result<UsageProviderRefreshSummary, (StatusCode, String)> {
-    let refresh_key = ProviderBalanceRefreshKey {
-        service_name: proxy.service_name.to_string(),
-        route_provider_id: route_provider_id_filter.map(ToOwned::to_owned),
-        provider_id: provider_id_filter.map(ToOwned::to_owned),
-        force,
-    };
-    let Some(_in_flight) = try_mark_provider_balance_refresh_in_flight(refresh_key) else {
-        tracing::debug!(
-            "provider balance refresh deduplicated: service={}, route_provider_id={:?}, provider_id={:?}, force={}",
-            proxy.service_name,
-            route_provider_id_filter,
-            provider_id_filter,
-            force
-        );
-        return Ok(UsageProviderRefreshSummary {
-            deduplicated: 1,
-            ..UsageProviderRefreshSummary::default()
-        });
-    };
-
     let runtime_snapshot = proxy.config.capture().await;
     let refresh = refresh_balances_for_service(
         &proxy.client,
@@ -403,45 +350,6 @@ pub(super) async fn refresh_provider_balances_for_proxy(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn provider_balance_refresh_in_flight_guard_deduplicates_exact_key() {
-        let key = ProviderBalanceRefreshKey {
-            service_name: "codex-test-dedupe".to_string(),
-            route_provider_id: Some("route-provider".to_string()),
-            provider_id: Some("provider-a".to_string()),
-            force: false,
-        };
-
-        let guard = try_mark_provider_balance_refresh_in_flight(key.clone())
-            .expect("first refresh should enter");
-        assert!(try_mark_provider_balance_refresh_in_flight(key.clone()).is_none());
-
-        drop(guard);
-        assert!(try_mark_provider_balance_refresh_in_flight(key).is_some());
-    }
-
-    #[test]
-    fn provider_balance_refresh_in_flight_guard_keeps_force_separate() {
-        let normal = ProviderBalanceRefreshKey {
-            service_name: "codex-test-force-dedupe".to_string(),
-            route_provider_id: Some("route-provider".to_string()),
-            provider_id: Some("provider-a".to_string()),
-            force: false,
-        };
-        let forced = ProviderBalanceRefreshKey {
-            force: true,
-            ..normal.clone()
-        };
-
-        let normal_guard = try_mark_provider_balance_refresh_in_flight(normal)
-            .expect("normal refresh should enter");
-        let forced_guard =
-            try_mark_provider_balance_refresh_in_flight(forced).expect("forced refresh can enter");
-
-        drop(normal_guard);
-        drop(forced_guard);
-    }
 
     #[test]
     fn provider_balance_refresh_error_preserves_cause_chain() {

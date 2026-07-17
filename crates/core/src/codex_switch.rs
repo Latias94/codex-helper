@@ -16,6 +16,15 @@ const PROVIDER_NAME: &str = "codex-helper";
 const STATE_FILE_NAME: &str = "codex-switch.json";
 const LOCK_FILE_NAME: &str = "codex-switch.lock";
 const LEGACY_STATE_FILE_NAME: &str = "codex-helper-switch-state.json";
+const SWITCH_TEMP_FILE_PREFIX: &str = ".codex-switch-v1-";
+const LEGACY_SWITCH_TEMP_FILE_PREFIX: &str = ".codex-switch-";
+const SWITCH_TEMP_FILE_SUFFIX: &str = ".tmp";
+const SWITCH_DELETE_TOMBSTONE_PREFIX: &str = ".codex-switch-delete-v1-";
+#[cfg(windows)]
+const WINDOWS_FILE_OPERATION_ATTEMPTS: usize = 10;
+#[cfg(windows)]
+const WINDOWS_FILE_OPERATION_MAX_BACKOFF: std::time::Duration =
+    std::time::Duration::from_millis(16);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedCodexBaseUrl(String);
@@ -149,16 +158,27 @@ pub enum CodexSwitchError {
     )]
     OrphanedActiveProvider,
     #[error(
-        "legacy Codex switch state exists at {path:?}. Use codex-helper v0.20.3 (or the older binary that created it) to run `switch off` before upgrading. Do not run old and new switch commands concurrently. Do not delete, edit, or share this file because it may contain authentication recovery data"
+        "legacy Codex switch state exists at {path:?}. The next `switch on` or `switch off` will attempt a safe automatic recovery. Do not run old and new switch commands concurrently, and do not delete, edit, or share this file because it may contain authentication recovery data"
     )]
     LegacySwitchState { path: PathBuf },
+    #[error(
+        "legacy Codex switch state at {legacy_path:?} conflicts with current switch journal at {current_path:?}; neither state was modified"
+    )]
+    LegacySwitchStateConflict {
+        legacy_path: PathBuf,
+        current_path: PathBuf,
+    },
+    #[error(
+        "cannot safely recover legacy Codex switch state at {path:?}: {reason}; the legacy recovery state was preserved for reconciliation"
+    )]
+    LegacyRecoveryRequired { path: PathBuf, reason: String },
     #[error("unsupported Codex config file topology at {path:?}: {reason}")]
     UnsupportedConfigTopology { path: PathBuf, reason: String },
     #[error(
         "Codex helper is already applied to {current}; run explicit switch off before switching to {requested}"
     )]
     AlreadyAppliedToDifferentTarget { current: String, requested: String },
-    #[error("Codex switch recovery is required: {reason}; config was not modified")]
+    #[error("Codex switch recovery is required: {reason}")]
     RecoveryRequired { reason: String },
     #[error("Codex switch state changed repeatedly while it was being inspected")]
     UnstableInspection,
@@ -201,6 +221,90 @@ struct SwitchJournal {
     target_base_url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     recovery_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct LegacySwitchState {
+    version: u32,
+    #[serde(default)]
+    patch_mode: Option<LegacyCodexPatchMode>,
+    #[serde(default)]
+    responses_websocket: bool,
+    #[serde(default)]
+    compaction: LegacyCodexCompactionStrategy,
+    original_config_absent: bool,
+    original_model_provider: Option<String>,
+    original_codex_proxy: Option<TomlValue>,
+    had_model_providers: bool,
+    #[serde(default)]
+    original_auth_json_absent: bool,
+    #[serde(default)]
+    original_auth_json: Option<String>,
+    #[serde(default)]
+    patched_auth_json: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum LegacyCodexPatchMode {
+    Default,
+    ChatGptBridge,
+    ImagegenBridge,
+    #[serde(
+        rename = "official-relay",
+        alias = "official_relay",
+        alias = "official-relay-bridge",
+        alias = "official_relay_bridge"
+    )]
+    OfficialRelay,
+    #[serde(
+        rename = "official-imagegen",
+        alias = "official_imagegen",
+        alias = "official-imagegen-bridge",
+        alias = "official_imagegen_bridge"
+    )]
+    OfficialImagegen,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum LegacyCodexCompactionStrategy {
+    #[default]
+    Auto,
+    Local,
+    #[serde(alias = "remote_v1")]
+    RemoteV1,
+    #[serde(alias = "remote_v2")]
+    RemoteV2,
+}
+
+impl LegacyCodexPatchMode {
+    fn uses_official_identity(self) -> bool {
+        matches!(self, Self::OfficialRelay | Self::OfficialImagegen)
+    }
+
+    fn patches_auth(self) -> bool {
+        matches!(
+            self,
+            Self::ChatGptBridge | Self::ImagegenBridge | Self::OfficialImagegen
+        )
+    }
+}
+
+impl LegacySwitchState {
+    fn patch_mode(&self) -> LegacyCodexPatchMode {
+        self.patch_mode.unwrap_or(LegacyCodexPatchMode::Default)
+    }
+
+    fn uses_official_identity(&self) -> bool {
+        match self.compaction {
+            LegacyCodexCompactionStrategy::Auto => self.patch_mode().uses_official_identity(),
+            LegacyCodexCompactionStrategy::Local => false,
+            LegacyCodexCompactionStrategy::RemoteV1 | LegacyCodexCompactionStrategy::RemoteV2 => {
+                true
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -253,6 +357,15 @@ struct ConfigCommitExpectation<'a> {
     state: ExpectedConfigState,
 }
 
+#[derive(Clone, Copy)]
+enum FileCommitExpectation<'a> {
+    Journal(ConfigCommitExpectation<'a>),
+    LegacySnapshot {
+        expected: &'a ConfigSnapshot,
+        legacy_path: &'a Path,
+    },
+}
+
 impl ConfigEdit {
     fn matches_original(&self, journal: &SwitchJournal) -> bool {
         match self {
@@ -276,6 +389,8 @@ enum ApplyFailpoint {
     None,
     AfterPrepared,
     AfterConfigWrite,
+    AfterLegacyConfigRestore,
+    AfterLegacyAuthRestore,
 }
 
 impl ApplyFailpoint {
@@ -285,6 +400,8 @@ impl ApplyFailpoint {
             Self::None => "none",
             Self::AfterPrepared => "after_prepared",
             Self::AfterConfigWrite => "after_config_write",
+            Self::AfterLegacyConfigRestore => "after_legacy_config_restore",
+            Self::AfterLegacyAuthRestore => "after_legacy_auth_restore",
         }
     }
 }
@@ -334,9 +451,26 @@ fn apply_with_failpoint(
     failpoint: ApplyFailpoint,
 ) -> Result<CodexSwitchOutcome, CodexSwitchError> {
     let paths = SwitchPaths::resolve()?;
-    reject_legacy_switch_state(&paths)?;
     let _lock = OperationLock::acquire(paths.lock.as_path())?;
-    reject_legacy_switch_state(&paths)?;
+    cleanup_managed_switch_artifacts(&paths)?;
+    let current_state_present =
+        switch_path_entry_present(paths.state.as_path(), "inspect current switch state at")?;
+    if legacy_state_present(paths.legacy_state.as_path())? {
+        if current_state_present {
+            return Err(CodexSwitchError::LegacySwitchStateConflict {
+                legacy_path: paths.legacy_state.clone(),
+                current_path: paths.state.clone(),
+            });
+        }
+        recover_legacy_switch_state(&paths, failpoint)?;
+        let current = read_config_snapshot(paths.config.as_path())?;
+        return match intent {
+            CodexSwitchIntent::On { validated_base_url } => {
+                begin_on(&paths, current, validated_base_url, failpoint)
+            }
+            CodexSwitchIntent::Off => outcome(&paths, CodexSwitchChange::Recovered),
+        };
+    }
     let journal = read_journal(paths.state.as_path())?;
     if let Some(journal) = journal.as_ref() {
         ensure_journal_config_matches(&paths, journal)?;
@@ -374,6 +508,455 @@ fn reject_legacy_switch_state(paths: &SwitchPaths) -> Result<(), CodexSwitchErro
         return Err(legacy_switch_error(paths));
     }
     Ok(())
+}
+
+fn read_legacy_switch_state(
+    path: &Path,
+) -> Result<(ConfigSnapshot, LegacySwitchState), CodexSwitchError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(CodexSwitchError::LegacySwitchState {
+                path: path.to_path_buf(),
+            });
+        }
+        Err(source) => return Err(io_error("read", path, source)),
+    };
+    let text = String::from_utf8(bytes).map_err(|error| CodexSwitchError::InvalidState {
+        path: path.to_path_buf(),
+        reason: error.to_string(),
+    })?;
+    let snapshot = ConfigSnapshot::from_text(true, text);
+    validate_config_topology(path, true)?;
+    let state = serde_json::from_str::<LegacySwitchState>(&snapshot.text).map_err(|error| {
+        CodexSwitchError::InvalidState {
+            path: path.to_path_buf(),
+            reason: error.to_string(),
+        }
+    })?;
+    if !matches!(state.version, 1 | 2) {
+        return Err(CodexSwitchError::InvalidState {
+            path: path.to_path_buf(),
+            reason: format!(
+                "unsupported legacy state version {}; expected 1 or 2",
+                state.version
+            ),
+        });
+    }
+    if state
+        .original_codex_proxy
+        .as_ref()
+        .is_some_and(|value| !value.is_table())
+    {
+        return Err(CodexSwitchError::InvalidState {
+            path: path.to_path_buf(),
+            reason: "legacy original_codex_proxy must be a TOML table".to_string(),
+        });
+    }
+    validate_legacy_auth_state(path, &state)?;
+    validate_legacy_state_contract(path, &state)?;
+    Ok((snapshot, state))
+}
+
+fn validate_legacy_auth_state(
+    path: &Path,
+    state: &LegacySwitchState,
+) -> Result<(), CodexSwitchError> {
+    match state.patched_auth_json.as_deref() {
+        None if state.original_auth_json_absent || state.original_auth_json.is_some() => {
+            Err(CodexSwitchError::InvalidState {
+                path: path.to_path_buf(),
+                reason: "legacy auth recovery fields require patched_auth_json".to_string(),
+            })
+        }
+        None => Ok(()),
+        Some(_) if state.original_auth_json_absent && state.original_auth_json.is_some() => {
+            Err(CodexSwitchError::InvalidState {
+                path: path.to_path_buf(),
+                reason: "legacy auth state cannot be both absent and present".to_string(),
+            })
+        }
+        Some(_) if !state.original_auth_json_absent && state.original_auth_json.is_none() => {
+            Err(CodexSwitchError::InvalidState {
+                path: path.to_path_buf(),
+                reason: "legacy auth state is missing its original JSON".to_string(),
+            })
+        }
+        Some(_) => Ok(()),
+    }
+}
+
+fn validate_legacy_state_contract(
+    path: &Path,
+    state: &LegacySwitchState,
+) -> Result<(), CodexSwitchError> {
+    let invalid = |reason: &str| CodexSwitchError::InvalidState {
+        path: path.to_path_buf(),
+        reason: reason.to_string(),
+    };
+    if state.original_config_absent
+        && (state.original_model_provider.is_some()
+            || state.original_codex_proxy.is_some()
+            || state.had_model_providers)
+    {
+        return Err(invalid(
+            "an absent original config cannot contain saved model provider state",
+        ));
+    }
+    if !state.had_model_providers && state.original_codex_proxy.is_some() {
+        return Err(invalid(
+            "legacy original_codex_proxy requires had_model_providers",
+        ));
+    }
+
+    let mode = state.patch_mode();
+    if matches!(
+        state.compaction,
+        LegacyCodexCompactionStrategy::RemoteV1 | LegacyCodexCompactionStrategy::RemoteV2
+    ) && !mode.uses_official_identity()
+    {
+        return Err(invalid(
+            "remote compaction requires an official-relay or official-imagegen patch mode",
+        ));
+    }
+    if state.responses_websocket && !state.uses_official_identity() {
+        return Err(invalid(
+            "responses_websocket requires an official OpenAI provider identity",
+        ));
+    }
+    if mode.patches_auth() != state.patched_auth_json.is_some() {
+        return Err(invalid(
+            "legacy patch_mode and auth recovery fields do not describe the same completed patch",
+        ));
+    }
+    Ok(())
+}
+
+fn legacy_recovery_required(path: &Path, reason: impl Into<String>) -> CodexSwitchError {
+    CodexSwitchError::LegacyRecoveryRequired {
+        path: path.to_path_buf(),
+        reason: reason.into(),
+    }
+}
+
+fn legacy_base_url_matches_patch_shape(base_url: &str) -> bool {
+    let normalized = base_url.trim().trim_end_matches('/');
+    normalized == base_url
+        && !normalized.is_empty()
+        && Url::parse(normalized).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+}
+
+fn expected_legacy_helper_stanza(
+    legacy_path: &Path,
+    state: &LegacySwitchState,
+    current: &TomlValue,
+) -> Result<TomlValue, CodexSwitchError> {
+    let current_table = current.as_table().ok_or_else(|| {
+        legacy_recovery_required(
+            legacy_path,
+            "model_providers.codex_proxy is no longer a TOML table",
+        )
+    })?;
+    let base_url = current_table
+        .get("base_url")
+        .and_then(TomlValue::as_str)
+        .filter(|base_url| legacy_base_url_matches_patch_shape(base_url))
+        .ok_or_else(|| {
+            legacy_recovery_required(
+                legacy_path,
+                "model_providers.codex_proxy.base_url no longer matches a v0.20.3 switch target",
+            )
+        })?;
+    let mut expected = state
+        .original_codex_proxy
+        .as_ref()
+        .and_then(TomlValue::as_table)
+        .cloned()
+        .unwrap_or_default();
+    expected.insert(
+        "name".to_string(),
+        TomlValue::String(if state.uses_official_identity() {
+            "OpenAI".to_string()
+        } else {
+            PROVIDER_NAME.to_string()
+        }),
+    );
+    expected.insert(
+        "base_url".to_string(),
+        TomlValue::String(base_url.to_string()),
+    );
+    expected.insert(
+        "wire_api".to_string(),
+        TomlValue::String("responses".to_string()),
+    );
+    expected
+        .entry("request_max_retries".to_string())
+        .or_insert(TomlValue::Integer(0));
+
+    if state.patch_mode() == LegacyCodexPatchMode::ChatGptBridge {
+        expected.insert("requires_openai_auth".to_string(), TomlValue::Boolean(true));
+    } else {
+        expected.remove("requires_openai_auth");
+    }
+    match state.patch_mode() {
+        LegacyCodexPatchMode::Default | LegacyCodexPatchMode::ImagegenBridge => {
+            expected.remove("supports_websockets");
+        }
+        LegacyCodexPatchMode::ChatGptBridge => {
+            expected.insert("supports_websockets".to_string(), TomlValue::Boolean(false));
+        }
+        LegacyCodexPatchMode::OfficialRelay | LegacyCodexPatchMode::OfficialImagegen => {
+            expected.insert(
+                "supports_websockets".to_string(),
+                TomlValue::Boolean(state.responses_websocket),
+            );
+        }
+    }
+    Ok(TomlValue::Table(expected))
+}
+
+fn legacy_config_restore_edit(
+    path: &Path,
+    legacy_path: &Path,
+    current: &ConfigSnapshot,
+    state: &LegacySwitchState,
+) -> Result<Option<ConfigEdit>, CodexSwitchError> {
+    if !current.present {
+        // v0.20.3 preserved an external config deletion while still restoring auth and
+        // clearing its switch state. Treat absence as an intentional current projection;
+        // the snapshot CAS prevents a concurrently recreated file from being ignored.
+        return Ok(None);
+    }
+    let inspection = inspect_config(path, current.text.as_str())?;
+    let selector_is_original = inspection.model_provider == state.original_model_provider;
+    let selector_matches_applied = inspection.model_provider.as_deref() == Some(PROVIDER_ID);
+    let selector_is_owned = selector_matches_applied && !selector_is_original;
+    let stanza_is_original = inspection.helper_stanza == state.original_codex_proxy;
+    let stanza_matches_applied = if let Some(stanza) = inspection.helper_stanza.as_ref()
+        && (!stanza_is_original || selector_is_owned)
+    {
+        expected_legacy_helper_stanza(legacy_path, state, stanza)? == *stanza
+    } else {
+        false
+    };
+    let stanza_is_owned = stanza_matches_applied && !stanza_is_original;
+    if !stanza_is_original && !stanza_is_owned {
+        return Err(legacy_recovery_required(
+            legacy_path,
+            "model_providers.codex_proxy contains edits that cannot be attributed to the v0.20.3 switch patch",
+        ));
+    }
+    let selector_owned_stanza_original =
+        selector_is_owned && stanza_is_original && !stanza_matches_applied;
+    let selector_original_stanza_owned =
+        selector_is_original && !selector_matches_applied && stanza_is_owned;
+    if selector_owned_stanza_original || selector_original_stanza_owned {
+        return Err(legacy_recovery_required(
+            legacy_path,
+            "model_provider and model_providers.codex_proxy form a hybrid original/helper projection that cannot be attributed to an atomic v0.20.3 switch write",
+        ));
+    }
+
+    let mut document = editable_document(path, current.text.as_str())?;
+    let root = document.as_table_mut();
+    if selector_is_owned {
+        if let Some(original) = state.original_model_provider.as_deref() {
+            set_string_preserving_decor(root, "model_provider", original);
+        } else {
+            root.remove("model_provider");
+        }
+    }
+
+    let remove_model_providers =
+        if let Some(providers) = root.get_mut("model_providers").and_then(Item::as_table_mut) {
+            if stanza_is_owned {
+                if let Some(original) = state.original_codex_proxy.as_ref() {
+                    providers.insert(PROVIDER_ID, editable_item_from_toml_value(original, path)?);
+                } else {
+                    providers.remove(PROVIDER_ID);
+                }
+            }
+            !state.had_model_providers && providers.is_empty()
+        } else {
+            false
+        };
+    if remove_model_providers {
+        root.remove("model_providers");
+    }
+
+    let changed = selector_is_owned || stanza_is_owned || remove_model_providers;
+    let edit = if state.original_config_absent && root.is_empty() {
+        ConfigEdit::Remove
+    } else {
+        ConfigEdit::Write(document.to_string())
+    };
+    let unchanged = match &edit {
+        ConfigEdit::Write(text) => text == &current.text,
+        ConfigEdit::Remove => !current.present,
+    };
+    Ok((changed || !unchanged).then_some(edit))
+}
+
+fn json_text_semantically_matches(current: &str, expected: &str) -> bool {
+    if current == expected {
+        return true;
+    }
+    match (
+        serde_json::from_str::<serde_json::Value>(current),
+        serde_json::from_str::<serde_json::Value>(expected),
+    ) {
+        (Ok(current), Ok(expected)) => current == expected,
+        _ => false,
+    }
+}
+
+fn legacy_auth_restore_edit(
+    legacy_path: &Path,
+    current: &ConfigSnapshot,
+    state: &LegacySwitchState,
+) -> Result<Option<ConfigEdit>, CodexSwitchError> {
+    let Some(patched) = state.patched_auth_json.as_deref() else {
+        return Ok(None);
+    };
+    if current.present && json_text_semantically_matches(&current.text, patched) {
+        return Ok(if state.original_auth_json_absent {
+            Some(ConfigEdit::Remove)
+        } else {
+            state
+                .original_auth_json
+                .as_ref()
+                .map(|original| ConfigEdit::Write(original.clone()))
+        });
+    }
+    let already_restored = if state.original_auth_json_absent {
+        !current.present
+    } else {
+        current.present
+            && state
+                .original_auth_json
+                .as_deref()
+                .is_some_and(|original| json_text_semantically_matches(&current.text, original))
+    };
+    if already_restored {
+        Ok(None)
+    } else {
+        Err(legacy_recovery_required(
+            legacy_path,
+            "auth.json no longer matches either the v0.20.3 helper patch or its saved original",
+        ))
+    }
+}
+
+fn apply_snapshot_edit_if_needed(
+    path: &Path,
+    legacy_path: &Path,
+    current: &ConfigSnapshot,
+    edit: Option<ConfigEdit>,
+) -> Result<(), CodexSwitchError> {
+    match edit {
+        Some(edit) => write_snapshot_edit(path, legacy_path, edit, current),
+        None => verify_legacy_snapshot_before_commit(path, legacy_path, current),
+    }
+}
+
+fn recover_legacy_switch_state(
+    paths: &SwitchPaths,
+    failpoint: ApplyFailpoint,
+) -> Result<(), CodexSwitchError> {
+    recover_legacy_switch_state_with_before_remove(paths, failpoint, || Ok(()))
+}
+
+fn recover_legacy_switch_state_with_before_remove(
+    paths: &SwitchPaths,
+    failpoint: ApplyFailpoint,
+    before_remove: impl FnOnce() -> Result<(), CodexSwitchError>,
+) -> Result<(), CodexSwitchError> {
+    let (legacy_snapshot, state) = read_legacy_switch_state(paths.legacy_state.as_path())?;
+
+    let config = read_config_snapshot(paths.config.as_path())?;
+    validate_config_topology(paths.config.as_path(), config.present)?;
+    let config_edit = legacy_config_restore_edit(
+        paths.config.as_path(),
+        paths.legacy_state.as_path(),
+        &config,
+        &state,
+    )?;
+
+    let auth_plan = if state.patched_auth_json.is_some() {
+        let auth = read_config_snapshot(paths.auth.as_path())?;
+        validate_config_topology(paths.auth.as_path(), auth.present)?;
+        let edit = legacy_auth_restore_edit(paths.legacy_state.as_path(), &auth, &state)?;
+        Some((auth, edit))
+    } else {
+        None
+    };
+
+    apply_snapshot_edit_if_needed(
+        paths.config.as_path(),
+        paths.legacy_state.as_path(),
+        &config,
+        config_edit,
+    )?;
+    fail_if_requested(failpoint, ApplyFailpoint::AfterLegacyConfigRestore)?;
+
+    if let Some((auth, auth_edit)) = auth_plan {
+        apply_snapshot_edit_if_needed(
+            paths.auth.as_path(),
+            paths.legacy_state.as_path(),
+            &auth,
+            auth_edit,
+        )?;
+        fail_if_requested(failpoint, ApplyFailpoint::AfterLegacyAuthRestore)?;
+    }
+
+    let final_config = read_config_snapshot(paths.config.as_path())?;
+    validate_config_topology(paths.config.as_path(), final_config.present)?;
+    if legacy_config_restore_edit(
+        paths.config.as_path(),
+        paths.legacy_state.as_path(),
+        &final_config,
+        &state,
+    )?
+    .is_some()
+    {
+        return Err(legacy_recovery_required(
+            paths.legacy_state.as_path(),
+            "Codex config did not reach its recoverable original projection",
+        ));
+    }
+    let final_auth = if state.patched_auth_json.is_some() {
+        let final_auth = read_config_snapshot(paths.auth.as_path())?;
+        validate_config_topology(paths.auth.as_path(), final_auth.present)?;
+        if legacy_auth_restore_edit(paths.legacy_state.as_path(), &final_auth, &state)?.is_some() {
+            return Err(legacy_recovery_required(
+                paths.legacy_state.as_path(),
+                "auth.json did not reach its saved original state",
+            ));
+        }
+        Some(final_auth)
+    } else {
+        None
+    };
+
+    before_remove()?;
+    verify_legacy_snapshot_before_commit(
+        paths.config.as_path(),
+        paths.legacy_state.as_path(),
+        &final_config,
+    )?;
+    if let Some(final_auth) = final_auth.as_ref() {
+        verify_legacy_snapshot_before_commit(
+            paths.auth.as_path(),
+            paths.legacy_state.as_path(),
+            final_auth,
+        )?;
+    }
+    verify_legacy_snapshot_before_commit(
+        paths.legacy_state.as_path(),
+        paths.legacy_state.as_path(),
+        &legacy_snapshot,
+    )?;
+    remove_file_durable(paths.legacy_state.as_path())
 }
 
 fn legacy_switch_status(paths: &SwitchPaths) -> Result<CodexSwitchStatus, CodexSwitchError> {
@@ -1191,7 +1774,7 @@ fn validate_config_topology(path: &Path, expected_present: bool) -> Result<(), C
     Ok(())
 }
 
-fn verify_config_before_commit(
+fn verify_journal_before_commit(
     path: &Path,
     expectation: ConfigCommitExpectation<'_>,
 ) -> Result<(), CodexSwitchError> {
@@ -1213,6 +1796,41 @@ fn verify_config_before_commit(
     validate_config_topology(path, present).map_err(|error| CodexSwitchError::RecoveryRequired {
         reason: error.to_string(),
     })
+}
+
+fn verify_legacy_snapshot_before_commit(
+    path: &Path,
+    legacy_path: &Path,
+    expectation: &ConfigSnapshot,
+) -> Result<(), CodexSwitchError> {
+    let (present, current_fingerprint) = read_config_identity(path)
+        .map_err(|error| legacy_recovery_required(legacy_path, error.to_string()))?;
+    if present != expectation.present || current_fingerprint != expectation.fingerprint {
+        return Err(legacy_recovery_required(
+            legacy_path,
+            format!(
+                "{} changed while legacy Codex switch state was being recovered",
+                path.display()
+            ),
+        ));
+    }
+    validate_config_topology(path, present)
+        .map_err(|error| legacy_recovery_required(legacy_path, error.to_string()))
+}
+
+fn verify_file_before_commit(
+    path: &Path,
+    expectation: FileCommitExpectation<'_>,
+) -> Result<(), CodexSwitchError> {
+    match expectation {
+        FileCommitExpectation::Journal(expectation) => {
+            verify_journal_before_commit(path, expectation)
+        }
+        FileCommitExpectation::LegacySnapshot {
+            expected,
+            legacy_path,
+        } => verify_legacy_snapshot_before_commit(path, legacy_path, expected),
+    }
 }
 
 fn read_config_identity(path: &Path) -> Result<(bool, String), CodexSwitchError> {
@@ -1280,9 +1898,33 @@ fn write_config_edit(
     journal: &SwitchJournal,
     expected: ExpectedConfigState,
 ) -> Result<(), CodexSwitchError> {
-    let expectation = ConfigCommitExpectation {
+    let expectation = FileCommitExpectation::Journal(ConfigCommitExpectation {
         journal,
         state: expected,
+    });
+    match edit {
+        ConfigEdit::Write(text) => atomic_write_text(
+            path,
+            text.as_str(),
+            FilePermissions::PreserveOrSecure,
+            Some(expectation),
+        ),
+        ConfigEdit::Remove => {
+            verify_file_before_commit(path, expectation)?;
+            remove_file_durable(path)
+        }
+    }
+}
+
+fn write_snapshot_edit(
+    path: &Path,
+    legacy_path: &Path,
+    edit: ConfigEdit,
+    expected: &ConfigSnapshot,
+) -> Result<(), CodexSwitchError> {
+    let expectation = FileCommitExpectation::LegacySnapshot {
+        expected,
+        legacy_path,
     };
     match edit {
         ConfigEdit::Write(text) => atomic_write_text(
@@ -1292,7 +1934,7 @@ fn write_config_edit(
             Some(expectation),
         ),
         ConfigEdit::Remove => {
-            verify_config_before_commit(path, expectation)?;
+            verify_file_before_commit(path, expectation)?;
             remove_file_durable(path)
         }
     }
@@ -1308,7 +1950,7 @@ fn atomic_write_text(
     path: &Path,
     text: &str,
     permissions: FilePermissions,
-    expectation: Option<ConfigCommitExpectation<'_>>,
+    expectation: Option<FileCommitExpectation<'_>>,
 ) -> Result<(), CodexSwitchError> {
     let parent = path.parent().ok_or_else(|| {
         io_error(
@@ -1321,7 +1963,10 @@ fn atomic_write_text(
         FilePermissions::Secure => prepare_state_directory(path)?,
         FilePermissions::PreserveOrSecure => prepare_config_directory(path)?,
     }
-    let temp_path = parent.join(format!(".codex-switch-{}.tmp", Uuid::new_v4()));
+    let temp_path = parent.join(format!(
+        "{SWITCH_TEMP_FILE_PREFIX}{}{SWITCH_TEMP_FILE_SUFFIX}",
+        Uuid::new_v4()
+    ));
 
     let result = (|| {
         #[cfg(unix)]
@@ -1361,7 +2006,7 @@ fn atomic_write_text(
             .map_err(|source| io_error("sync temporary file for", path, source))?;
         drop(file);
         if let Some(expectation) = expectation {
-            verify_config_before_commit(path, expectation)?;
+            verify_file_before_commit(path, expectation)?;
         }
         replace_file(temp_path.as_path(), path)?;
         sync_parent_directory(path)
@@ -1375,36 +2020,101 @@ fn atomic_write_text(
 
 #[cfg(windows)]
 fn replace_file(source: &Path, destination: &Path) -> Result<(), CodexSwitchError> {
+    move_file_write_through(source, destination, true)
+}
+
+#[cfg(windows)]
+fn windows_path_wide(path: &Path) -> std::io::Result<Vec<u16>> {
     use std::os::windows::ffi::OsStrExt;
+
+    let encoded = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    if encoded[..encoded.len().saturating_sub(1)].contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path contains an embedded null",
+        ));
+    }
+    Ok(encoded)
+}
+
+#[cfg(windows)]
+fn windows_file_operation_is_retryable(error: &std::io::Error) -> bool {
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION,
+    };
+
+    matches!(
+        error.raw_os_error(),
+        Some(code)
+            if code == ERROR_ACCESS_DENIED as i32
+                || code == ERROR_SHARING_VIOLATION as i32
+                || code == ERROR_LOCK_VIOLATION as i32
+    )
+}
+
+#[cfg(windows)]
+fn retry_windows_file_operation(
+    mut operation: impl FnMut() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let mut backoff = std::time::Duration::from_millis(1);
+    for attempt in 0..WINDOWS_FILE_OPERATION_ATTEMPTS {
+        match operation() {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if windows_file_operation_is_retryable(&error)
+                    && attempt + 1 < WINDOWS_FILE_OPERATION_ATTEMPTS =>
+            {
+                std::thread::sleep(backoff);
+                backoff = std::cmp::min(
+                    backoff.saturating_mul(2),
+                    WINDOWS_FILE_OPERATION_MAX_BACKOFF,
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("the bounded Windows file-operation loop returns on its final attempt")
+}
+
+#[cfg(windows)]
+fn move_file_write_through(
+    source: &Path,
+    destination: &Path,
+    replace_existing: bool,
+) -> Result<(), CodexSwitchError> {
+    use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
     use windows_sys::Win32::Storage::FileSystem::{
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
     };
 
-    let source_wide = source
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let destination_wide = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let replaced = unsafe {
-        MoveFileExW(
-            source_wide.as_ptr(),
-            destination_wide.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if replaced == 0 {
-        return Err(io_error(
-            "atomically replace",
-            destination,
-            std::io::Error::last_os_error(),
-        ));
-    }
-    Ok(())
+    let source_wide = windows_path_wide(source)
+        .map_err(|error| io_error("encode Windows path for", source, error))?;
+    let destination_wide = windows_path_wide(destination)
+        .map_err(|source| io_error("encode Windows path for", destination, source))?;
+    let flags = MOVEFILE_WRITE_THROUGH
+        | if replace_existing {
+            MOVEFILE_REPLACE_EXISTING
+        } else {
+            0
+        };
+    retry_windows_file_operation(|| {
+        // SAFETY: Both encoded paths are null-terminated and live for the duration of the call.
+        let moved = unsafe { MoveFileExW(source_wide.as_ptr(), destination_wide.as_ptr(), flags) };
+        if moved != 0 {
+            return Ok(());
+        }
+        let move_error = std::io::Error::last_os_error();
+        if replace_existing && move_error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) {
+            std::fs::rename(source, destination)
+        } else {
+            Err(move_error)
+        }
+    })
+    .map_err(|source| io_error("move with write-through", destination, source))
 }
 
 #[cfg(not(windows))]
@@ -1413,12 +2123,176 @@ fn replace_file(source: &Path, destination: &Path) -> Result<(), CodexSwitchErro
         .map_err(|source| io_error("atomically replace", destination, source))
 }
 
+#[cfg(not(windows))]
 fn remove_file_durable(path: &Path) -> Result<(), CodexSwitchError> {
     match std::fs::remove_file(path) {
         Ok(()) => sync_parent_directory(path),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(source) => Err(io_error("remove", path, source)),
     }
+}
+
+#[cfg(any(windows, test))]
+fn pending_delete_path(path: &Path) -> Result<PathBuf, CodexSwitchError> {
+    let parent = path.parent().ok_or_else(|| {
+        io_error(
+            "resolve parent for",
+            path,
+            std::io::Error::other("path has no parent directory"),
+        )
+    })?;
+    path.file_name().ok_or_else(|| {
+        io_error(
+            "resolve file name for",
+            path,
+            std::io::Error::other("path has no file name"),
+        )
+    })?;
+    Ok(parent.join(format!(
+        "{SWITCH_DELETE_TOMBSTONE_PREFIX}{}",
+        Uuid::new_v4()
+    )))
+}
+
+#[cfg(any(windows, test))]
+fn ensure_pending_delete_destination_absent(path: &Path) -> Result<(), CodexSwitchError> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(io_error(
+            "inspect pending durable deletion destination",
+            path,
+            source,
+        )),
+        Ok(_) => Err(io_error(
+            "reserve pending durable deletion destination",
+            path,
+            std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "managed deletion tombstone already exists",
+            ),
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn remove_file_with_windows_retry(
+    path: &Path,
+    action: &'static str,
+) -> Result<(), CodexSwitchError> {
+    retry_windows_file_operation(|| match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    })
+    .map_err(|source| io_error(action, path, source))
+}
+
+#[cfg(windows)]
+fn remove_file_durable(path: &Path) -> Result<(), CodexSwitchError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => return Err(io_error("inspect before durable removal of", path, source)),
+    }
+    let tombstone = pending_delete_path(path)?;
+    ensure_pending_delete_destination_absent(tombstone.as_path())?;
+    move_file_write_through(path, tombstone.as_path(), false)?;
+    remove_file_with_windows_retry(tombstone.as_path(), "finish pending durable deletion for")
+}
+
+fn managed_switch_artifact_uuid(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 36
+        && [8, 13, 18, 23]
+            .into_iter()
+            .all(|index| bytes[index] == b'-')
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 8 | 13 | 18 | 23) || byte.is_ascii_hexdigit())
+        && Uuid::parse_str(value).is_ok()
+}
+
+fn managed_switch_artifact_name(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    if name
+        .strip_prefix(SWITCH_DELETE_TOMBSTONE_PREFIX)
+        .is_some_and(managed_switch_artifact_uuid)
+    {
+        return true;
+    }
+    [SWITCH_TEMP_FILE_PREFIX, LEGACY_SWITCH_TEMP_FILE_PREFIX]
+        .into_iter()
+        .any(|prefix| {
+            name.strip_prefix(prefix)
+                .and_then(|suffix| suffix.strip_suffix(SWITCH_TEMP_FILE_SUFFIX))
+                .is_some_and(managed_switch_artifact_uuid)
+        })
+}
+
+fn remove_managed_switch_artifact(path: &Path) -> Result<(), CodexSwitchError> {
+    #[cfg(windows)]
+    {
+        remove_file_with_windows_retry(path, "remove stale managed switch artifact")
+    }
+    #[cfg(not(windows))]
+    {
+        match std::fs::remove_file(path) {
+            Ok(()) => sync_parent_directory(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(io_error(
+                "remove stale managed switch artifact",
+                path,
+                source,
+            )),
+        }
+    }
+}
+
+fn cleanup_managed_switch_artifacts(paths: &SwitchPaths) -> Result<(), CodexSwitchError> {
+    let mut parents = Vec::<PathBuf>::new();
+    for path in [
+        paths.config.as_path(),
+        paths.auth.as_path(),
+        paths.state.as_path(),
+        paths.legacy_state.as_path(),
+    ] {
+        if let Some(parent) = path.parent()
+            && !parents.iter().any(|known| known == parent)
+        {
+            parents.push(parent.to_path_buf());
+        }
+    }
+    for parent in parents {
+        let entries = match std::fs::read_dir(parent.as_path()) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                return Err(io_error(
+                    "scan managed switch artifacts in",
+                    &parent,
+                    source,
+                ));
+            }
+        };
+        for entry in entries {
+            let entry = entry.map_err(|source| {
+                io_error("read managed switch artifact entry in", &parent, source)
+            })?;
+            if !managed_switch_artifact_name(&entry.file_name()) {
+                continue;
+            }
+            let file_type = entry.file_type().map_err(|source| {
+                io_error("inspect managed switch artifact", &entry.path(), source)
+            })?;
+            if file_type.is_file() && !file_type.is_symlink() {
+                remove_managed_switch_artifact(entry.path().as_path())?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1543,6 +2417,7 @@ fn io_error(action: &'static str, path: &Path, source: std::io::Error) -> CodexS
 
 struct SwitchPaths {
     config: PathBuf,
+    auth: PathBuf,
     config_fingerprint: String,
     state: PathBuf,
     lock: PathBuf,
@@ -1556,9 +2431,11 @@ impl SwitchPaths {
         let state_dir = resolve_existing_ancestor(state_dir.as_path())?;
         let config = resolve_config_path(crate::config::codex_config_path().as_path())?;
         let legacy_state = config.with_file_name(LEGACY_STATE_FILE_NAME);
+        let auth = config.with_file_name("auth.json");
         Ok(Self {
             config_fingerprint: config_path_fingerprint(config.as_path()),
             config,
+            auth,
             state: state_dir.join(STATE_FILE_NAME),
             lock: state_dir.join(LOCK_FILE_NAME),
             legacy_state,
@@ -1729,6 +2606,10 @@ mod tests {
             self.codex_home.join(LEGACY_STATE_FILE_NAME)
         }
 
+        fn auth_path(&self) -> PathBuf {
+            self.codex_home.join("auth.json")
+        }
+
         fn lock_path(&self) -> PathBuf {
             self.helper_home.join("state").join(LOCK_FILE_NAME)
         }
@@ -1739,6 +2620,14 @@ mod tests {
 
         fn read_config(&self) -> String {
             std::fs::read_to_string(self.config_path()).expect("read config")
+        }
+
+        fn write_legacy_state(&self, value: serde_json::Value) {
+            std::fs::write(
+                self.legacy_state_path(),
+                serde_json::to_vec_pretty(&value).expect("serialize legacy state"),
+            )
+            .expect("write legacy state");
         }
     }
 
@@ -1924,6 +2813,893 @@ trust_level = "trusted"
         assert_eq!(env.read_config(), "");
     }
 
+    fn legacy_applied_config(base_url: &str) -> String {
+        format!(
+            r#"model_provider = "codex_proxy"
+
+[model_providers.codex_proxy]
+name = "codex-helper"
+base_url = "{base_url}"
+wire_api = "responses"
+request_max_retries = 0
+"#
+        )
+    }
+
+    fn legacy_official_applied_config(base_url: &str, responses_websocket: bool) -> String {
+        format!(
+            r#"model_provider = "codex_proxy"
+
+[model_providers.codex_proxy]
+name = "OpenAI"
+base_url = "{base_url}"
+wire_api = "responses"
+request_max_retries = 0
+supports_websockets = {responses_websocket}
+"#
+        )
+    }
+
+    fn legacy_chatgpt_applied_config(base_url: &str) -> String {
+        format!(
+            r#"model_provider = "codex_proxy"
+
+[model_providers.codex_proxy]
+name = "codex-helper"
+base_url = "{base_url}"
+wire_api = "responses"
+request_max_retries = 0
+requires_openai_auth = true
+supports_websockets = false
+"#
+        )
+    }
+
+    fn legacy_state(version: u32) -> serde_json::Value {
+        serde_json::json!({
+            "version": version,
+            "original_config_absent": false,
+            "original_model_provider": "openai",
+            "original_codex_proxy": null,
+            "had_model_providers": false
+        })
+    }
+
+    fn legacy_state_with_auth(
+        original_absent: bool,
+        original: Option<&str>,
+        patched: &str,
+    ) -> serde_json::Value {
+        legacy_state_with_auth_mode("imagegen-bridge", original_absent, original, patched)
+    }
+
+    fn legacy_state_with_auth_mode(
+        patch_mode: &str,
+        original_absent: bool,
+        original: Option<&str>,
+        patched: &str,
+    ) -> serde_json::Value {
+        let mut state = legacy_state(2);
+        let object = state.as_object_mut().expect("legacy state object");
+        object.insert(
+            "patch_mode".to_string(),
+            serde_json::Value::String(patch_mode.to_string()),
+        );
+        object.insert(
+            "original_auth_json_absent".to_string(),
+            serde_json::Value::Bool(original_absent),
+        );
+        if let Some(original) = original {
+            object.insert(
+                "original_auth_json".to_string(),
+                serde_json::Value::String(original.to_string()),
+            );
+        }
+        object.insert(
+            "patched_auth_json".to_string(),
+            serde_json::Value::String(patched.to_string()),
+        );
+        state
+    }
+
+    #[test]
+    fn switch_off_automatically_recovers_v1_and_v2_legacy_state() {
+        for version in [1, 2] {
+            let env = TestEnvironment::new();
+            env.write_config(&legacy_applied_config("http://127.0.0.1:3211"));
+            env.write_legacy_state(legacy_state(version));
+
+            let outcome = apply(CodexSwitchIntent::Off).expect("recover legacy switch state");
+
+            assert_eq!(outcome.change, CodexSwitchChange::Recovered);
+            assert_eq!(env.read_config(), "model_provider = \"openai\"\n");
+            assert!(!env.legacy_state_path().exists());
+            assert!(!env.state_path().exists());
+        }
+    }
+
+    #[test]
+    fn legacy_recovery_preserves_an_external_config_deletion_and_restores_auth() {
+        let env = TestEnvironment::new();
+        let original_auth = r#"{"OPENAI_API_KEY":"original-secret"}"#;
+        let patched_auth = "{}";
+        env.write_config(&legacy_applied_config("http://127.0.0.1:3211"));
+        std::fs::write(env.auth_path(), patched_auth).expect("write patched auth");
+        env.write_legacy_state(legacy_state_with_auth(
+            false,
+            Some(original_auth),
+            patched_auth,
+        ));
+        std::fs::remove_file(env.config_path()).expect("delete config outside helper");
+
+        let outcome = apply(CodexSwitchIntent::Off)
+            .expect("preserve config deletion while completing legacy recovery");
+
+        assert_eq!(outcome.change, CodexSwitchChange::Recovered);
+        assert!(!env.config_path().exists());
+        assert_eq!(
+            std::fs::read_to_string(env.auth_path()).expect("read restored auth"),
+            original_auth
+        );
+        assert!(!env.legacy_state_path().exists());
+    }
+
+    #[test]
+    fn legacy_recovery_rejects_selector_stanza_hybrid_projections() {
+        let original_stanza = r#"name = "original proxy"
+base_url = "https://original.example/v1"
+wire_api = "chat"
+request_max_retries = 7"#;
+        let original_state = serde_json::json!({
+            "version": 2,
+            "original_config_absent": false,
+            "original_model_provider": "openai",
+            "original_codex_proxy": {
+                "name": "original proxy",
+                "base_url": "https://original.example/v1",
+                "wire_api": "chat",
+                "request_max_retries": 7
+            },
+            "had_model_providers": true
+        });
+        let cases = [
+            format!(
+                "model_provider = \"codex_proxy\"\n\n[model_providers.codex_proxy]\n{original_stanza}\n"
+            ),
+            legacy_applied_config("http://127.0.0.1:3211")
+                .replace("model_provider = \"codex_proxy\"", "model_provider = \"openai\"")
+                .replace(
+                    "name = \"codex-helper\"\nbase_url = \"http://127.0.0.1:3211\"\nwire_api = \"responses\"\nrequest_max_retries = 0",
+                    "name = \"codex-helper\"\nbase_url = \"http://127.0.0.1:3211\"\nwire_api = \"responses\"\nrequest_max_retries = 7",
+                ),
+        ];
+
+        for hybrid in cases {
+            let env = TestEnvironment::new();
+            env.write_config(&hybrid);
+            env.write_legacy_state(original_state.clone());
+            let stored_state = std::fs::read(env.legacy_state_path()).expect("read legacy state");
+
+            let error = apply(CodexSwitchIntent::Off)
+                .expect_err("hybrid selector/stanza projection must fail closed");
+
+            assert!(matches!(
+                error,
+                CodexSwitchError::LegacyRecoveryRequired { .. }
+            ));
+            assert_eq!(env.read_config(), hybrid);
+            assert_eq!(
+                std::fs::read(env.legacy_state_path()).expect("read preserved legacy state"),
+                stored_state
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_recovery_accepts_an_original_stanza_identical_to_the_helper_patch() {
+        let env = TestEnvironment::new();
+        let applied = legacy_applied_config("http://127.0.0.1:3211");
+        env.write_config(&applied);
+        env.write_legacy_state(serde_json::json!({
+            "version": 2,
+            "original_config_absent": false,
+            "original_model_provider": "openai",
+            "original_codex_proxy": {
+                "name": "codex-helper",
+                "base_url": "http://127.0.0.1:3211",
+                "wire_api": "responses",
+                "request_max_retries": 0
+            },
+            "had_model_providers": true
+        }));
+
+        let outcome = apply(CodexSwitchIntent::Off)
+            .expect("restore only the selector when the original stanza equals the patch");
+
+        assert_eq!(outcome.change, CodexSwitchChange::Recovered);
+        assert_eq!(
+            env.read_config(),
+            applied.replace(
+                "model_provider = \"codex_proxy\"",
+                "model_provider = \"openai\""
+            )
+        );
+        assert!(!env.legacy_state_path().exists());
+    }
+
+    #[test]
+    fn legacy_noop_snapshot_plan_still_uses_commit_time_cas() {
+        let env = TestEnvironment::new();
+        env.write_config("model_provider = \"openai\"\n");
+        let snapshot = read_config_snapshot(env.config_path().as_path()).expect("read snapshot");
+        env.write_config("model_provider = \"external\"\n");
+
+        let error = apply_snapshot_edit_if_needed(
+            env.config_path().as_path(),
+            env.legacy_state_path().as_path(),
+            &snapshot,
+            None,
+        )
+        .expect_err("a no-op plan must still verify its source snapshot");
+
+        assert!(matches!(
+            error,
+            CodexSwitchError::LegacyRecoveryRequired { .. }
+        ));
+        assert_eq!(env.read_config(), "model_provider = \"external\"\n");
+    }
+
+    #[test]
+    fn legacy_snapshot_cas_reports_topology_replacement_as_legacy_recovery() {
+        let env = TestEnvironment::new();
+        env.write_config("model_provider = \"openai\"\n");
+        let snapshot = read_config_snapshot(env.config_path().as_path()).expect("read snapshot");
+        std::fs::remove_file(env.config_path()).expect("remove snapshotted config");
+        std::fs::create_dir(env.config_path()).expect("replace config with directory");
+
+        let error = apply_snapshot_edit_if_needed(
+            env.config_path().as_path(),
+            env.legacy_state_path().as_path(),
+            &snapshot,
+            None,
+        )
+        .expect_err("a topology replacement must preserve legacy recovery authority");
+
+        assert!(matches!(
+            error,
+            CodexSwitchError::LegacyRecoveryRequired { .. }
+        ));
+        assert!(env.config_path().is_dir());
+    }
+
+    #[test]
+    fn legacy_final_config_snapshot_is_rechecked_before_state_removal() {
+        let env = TestEnvironment::new();
+        env.write_config(&legacy_applied_config("http://127.0.0.1:3211"));
+        env.write_legacy_state(legacy_state(2));
+        let paths = SwitchPaths::resolve().expect("resolve switch paths");
+        let external = "model_provider = \"external\"\n";
+
+        let error =
+            recover_legacy_switch_state_with_before_remove(&paths, ApplyFailpoint::None, || {
+                env.write_config(external);
+                Ok(())
+            })
+            .expect_err("a final-read race must preserve legacy recovery state");
+
+        assert!(matches!(
+            error,
+            CodexSwitchError::LegacyRecoveryRequired { .. }
+        ));
+        assert_eq!(env.read_config(), external);
+        assert!(env.legacy_state_path().exists());
+    }
+
+    #[test]
+    fn legacy_final_auth_snapshot_is_rechecked_before_state_removal() {
+        let env = TestEnvironment::new();
+        let original_auth = r#"{"OPENAI_API_KEY":"original-secret"}"#;
+        let patched_auth = "{}";
+        env.write_config(&legacy_applied_config("http://127.0.0.1:3211"));
+        std::fs::write(env.auth_path(), patched_auth).expect("write patched auth");
+        env.write_legacy_state(legacy_state_with_auth(
+            false,
+            Some(original_auth),
+            patched_auth,
+        ));
+        let paths = SwitchPaths::resolve().expect("resolve switch paths");
+        let external_auth = r#"{"external":"edit"}"#;
+
+        let error =
+            recover_legacy_switch_state_with_before_remove(&paths, ApplyFailpoint::None, || {
+                std::fs::write(env.auth_path(), external_auth).expect("write external auth");
+                Ok(())
+            })
+            .expect_err("an auth final-read race must preserve legacy recovery state");
+
+        assert!(matches!(
+            error,
+            CodexSwitchError::LegacyRecoveryRequired { .. }
+        ));
+        assert_eq!(
+            std::fs::read_to_string(env.auth_path()).expect("read external auth"),
+            external_auth
+        );
+        assert!(env.legacy_state_path().exists());
+    }
+
+    #[test]
+    fn legacy_state_snapshot_is_rechecked_before_removal() {
+        let env = TestEnvironment::new();
+        env.write_config(&legacy_applied_config("http://127.0.0.1:3211"));
+        env.write_legacy_state(legacy_state(2));
+        let paths = SwitchPaths::resolve().expect("resolve switch paths");
+        let replacement = serde_json::to_vec_pretty(&legacy_state(1))
+            .expect("serialize replacement legacy state");
+
+        let error =
+            recover_legacy_switch_state_with_before_remove(&paths, ApplyFailpoint::None, || {
+                std::fs::write(env.legacy_state_path(), &replacement)
+                    .expect("replace legacy state concurrently");
+                Ok(())
+            })
+            .expect_err("a legacy-state race must preserve the replacement state");
+
+        assert!(matches!(
+            error,
+            CodexSwitchError::LegacyRecoveryRequired { .. }
+        ));
+        assert_eq!(
+            std::fs::read(env.legacy_state_path()).expect("read replacement state"),
+            replacement
+        );
+    }
+
+    #[test]
+    fn managed_switch_artifact_names_require_an_exact_uuid_shape() {
+        let uuid = Uuid::new_v4();
+        for name in [
+            format!("{SWITCH_TEMP_FILE_PREFIX}{uuid}{SWITCH_TEMP_FILE_SUFFIX}"),
+            format!("{LEGACY_SWITCH_TEMP_FILE_PREFIX}{uuid}{SWITCH_TEMP_FILE_SUFFIX}"),
+            format!("{SWITCH_DELETE_TOMBSTONE_PREFIX}{uuid}"),
+        ] {
+            assert!(managed_switch_artifact_name(std::ffi::OsStr::new(&name)));
+        }
+        for name in [
+            ".codex-switch-not-a-uuid.tmp",
+            ".codex-switch-v1-not-a-uuid.tmp",
+            ".codex-switch-delete-v1-not-a-uuid",
+            ".config.toml.codex-switch-delete-pending",
+            ".codex-switch-delete-v1-00000000-0000-0000-0000-000000000000.extra",
+            ".codex-switch-v1-00000000-0000-0000-0000-000000000000",
+            &format!(
+                "{LEGACY_SWITCH_TEMP_FILE_PREFIX}{}{SWITCH_TEMP_FILE_SUFFIX}",
+                uuid.simple()
+            ),
+            &format!("{LEGACY_SWITCH_TEMP_FILE_PREFIX}{{{uuid}}}{SWITCH_TEMP_FILE_SUFFIX}"),
+        ] {
+            assert!(!managed_switch_artifact_name(std::ffi::OsStr::new(name)));
+        }
+    }
+
+    #[test]
+    fn pending_delete_collision_guard_preserves_both_files() {
+        let env = TestEnvironment::new();
+        let target = env.codex_home.join("durable-delete-target");
+        let tombstone = pending_delete_path(target.as_path()).expect("build tombstone path");
+        std::fs::write(&target, b"canonical").expect("write canonical target");
+        std::fs::write(&tombstone, b"existing tombstone").expect("write tombstone collision");
+
+        let error = ensure_pending_delete_destination_absent(tombstone.as_path())
+            .expect_err("an existing tombstone must fail closed");
+
+        assert!(matches!(
+            error,
+            CodexSwitchError::Io { source, .. }
+                if source.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(
+            std::fs::read(target).expect("read canonical target"),
+            b"canonical"
+        );
+        assert_eq!(
+            std::fs::read(tombstone).expect("read existing tombstone"),
+            b"existing tombstone"
+        );
+    }
+
+    #[test]
+    fn startup_cleanup_removes_only_strict_managed_switch_artifacts() {
+        let env = TestEnvironment::new();
+        let paths = SwitchPaths::resolve().expect("resolve switch paths");
+        let state_path = env.state_path();
+        let state_parent = state_path.parent().expect("state parent");
+        std::fs::create_dir_all(state_parent).expect("create state parent");
+        let managed = [
+            env.codex_home.join(format!(
+                "{SWITCH_TEMP_FILE_PREFIX}{}{SWITCH_TEMP_FILE_SUFFIX}",
+                Uuid::new_v4()
+            )),
+            env.codex_home.join(format!(
+                "{LEGACY_SWITCH_TEMP_FILE_PREFIX}{}{SWITCH_TEMP_FILE_SUFFIX}",
+                Uuid::new_v4()
+            )),
+            state_parent.join(format!(
+                "{SWITCH_DELETE_TOMBSTONE_PREFIX}{}",
+                Uuid::new_v4()
+            )),
+        ];
+        let unmanaged = [
+            env.codex_home.join(".codex-switch-user-data.tmp"),
+            env.codex_home
+                .join(".config.toml.codex-switch-delete-pending"),
+            state_parent.join(".codex-switch-delete-v1-not-a-uuid"),
+        ];
+        let managed_directory = env.codex_home.join(format!(
+            "{SWITCH_TEMP_FILE_PREFIX}{}{SWITCH_TEMP_FILE_SUFFIX}",
+            Uuid::new_v4()
+        ));
+        for path in managed.iter().chain(unmanaged.iter()) {
+            std::fs::write(path, b"sensitive-or-external").expect("write cleanup fixture");
+        }
+        std::fs::create_dir(&managed_directory).expect("create managed-name directory");
+
+        cleanup_managed_switch_artifacts(&paths).expect("clean managed switch artifacts");
+
+        for path in managed {
+            assert!(!path.exists(), "managed artifact survived: {path:?}");
+        }
+        for path in unmanaged {
+            assert!(path.exists(), "unmanaged artifact was removed: {path:?}");
+        }
+        assert!(
+            managed_directory.is_dir(),
+            "a directory in the managed namespace must be preserved"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_cleanup_preserves_managed_name_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let env = TestEnvironment::new();
+        let paths = SwitchPaths::resolve().expect("resolve switch paths");
+        let external = env.root.join("external-sensitive-file");
+        let link = env.codex_home.join(format!(
+            "{LEGACY_SWITCH_TEMP_FILE_PREFIX}{}{SWITCH_TEMP_FILE_SUFFIX}",
+            Uuid::new_v4()
+        ));
+        std::fs::write(&external, b"external").expect("write external file");
+        symlink(&external, &link).expect("create managed-name symlink");
+
+        cleanup_managed_switch_artifacts(&paths).expect("clean managed switch artifacts");
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("inspect preserved symlink")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read(external).expect("read external file"),
+            b"external"
+        );
+    }
+
+    #[test]
+    fn switch_off_recovers_complete_v0203_state_schema() {
+        let env = TestEnvironment::new();
+        env.write_config(&legacy_official_applied_config(
+            "https://relay.example/v1",
+            true,
+        ));
+        env.write_legacy_state(serde_json::json!({
+            "version": 2,
+            "patch_mode": "official-relay",
+            "responses_websocket": true,
+            "compaction": "remote-v2",
+            "original_config_absent": false,
+            "original_model_provider": "openai",
+            "original_codex_proxy": null,
+            "had_model_providers": false,
+            "original_auth_json_absent": false
+        }));
+
+        let outcome = apply(CodexSwitchIntent::Off).expect("recover v0.20.3 switch state");
+
+        assert_eq!(outcome.change, CodexSwitchChange::Recovered);
+        assert_eq!(env.read_config(), "model_provider = \"openai\"\n");
+        assert!(!env.legacy_state_path().exists());
+        assert!(!env.state_path().exists());
+    }
+
+    #[test]
+    fn legacy_recovery_restores_real_imagegen_auth_facades() {
+        let original_auth = r#"{"auth_mode":"chatgpt","OPENAI_API_KEY":"sk-platform-onboarding","tokens":{"access_token":"access","refresh_token":"refresh","account_id":"acct"}}"#;
+        for (patch_mode, config) in [
+            (
+                "imagegen-bridge",
+                legacy_applied_config("http://127.0.0.1:3211"),
+            ),
+            (
+                "official-imagegen",
+                legacy_official_applied_config("http://127.0.0.1:3211", false),
+            ),
+        ] {
+            let env = TestEnvironment::new();
+            env.write_config(&config);
+            std::fs::write(env.auth_path(), "{\n}\n").expect("write empty auth facade");
+            env.write_legacy_state(legacy_state_with_auth_mode(
+                patch_mode,
+                false,
+                Some(original_auth),
+                "{}",
+            ));
+
+            let outcome =
+                apply(CodexSwitchIntent::Off).expect("recover a real v0.20.3 imagegen auth facade");
+
+            assert_eq!(outcome.change, CodexSwitchChange::Recovered);
+            assert_eq!(env.read_config(), "model_provider = \"openai\"\n");
+            assert_eq!(
+                std::fs::read_to_string(env.auth_path()).expect("read restored auth"),
+                original_auth
+            );
+            assert!(!env.legacy_state_path().exists());
+        }
+    }
+
+    #[test]
+    fn legacy_recovery_restores_real_chatgpt_bridge_auth_object() {
+        let env = TestEnvironment::new();
+        let original_auth = r#"{"auth_mode":"chatgpt","OPENAI_API_KEY":"sk-platform-onboarding","tokens":{"id_token":"id","access_token":"access","refresh_token":"refresh","account_id":"acct"},"last_refresh":"2026-05-17T00:00:00Z"}"#;
+        let patched_auth = r#"{"auth_mode":"chatgpt","OPENAI_API_KEY":null,"tokens":{"id_token":"id","access_token":"access","refresh_token":"refresh","account_id":"acct"},"last_refresh":"2026-05-17T00:00:00Z"}"#;
+        env.write_config(&legacy_chatgpt_applied_config("http://127.0.0.1:3211"));
+        std::fs::write(env.auth_path(), patched_auth).expect("write ChatGPT bridge auth facade");
+        env.write_legacy_state(legacy_state_with_auth_mode(
+            "chat-gpt-bridge",
+            false,
+            Some(original_auth),
+            patched_auth,
+        ));
+
+        let outcome = apply(CodexSwitchIntent::Off)
+            .expect("recover a real v0.20.3 ChatGPT bridge auth object");
+
+        assert_eq!(outcome.change, CodexSwitchChange::Recovered);
+        assert_eq!(env.read_config(), "model_provider = \"openai\"\n");
+        assert_eq!(
+            std::fs::read_to_string(env.auth_path()).expect("read restored auth"),
+            original_auth
+        );
+        assert!(!env.legacy_state_path().exists());
+    }
+
+    #[test]
+    fn legacy_recovery_accepts_state_first_crash_boundaries() {
+        let original_config = "model_provider = \"openai\"\n";
+        let original_auth = r#"{"OPENAI_API_KEY":"original-secret"}"#;
+        for config in [
+            original_config.to_string(),
+            legacy_applied_config("http://127.0.0.1:3211"),
+        ] {
+            let env = TestEnvironment::new();
+            env.write_config(&config);
+            std::fs::write(env.auth_path(), original_auth).expect("write original auth");
+            env.write_legacy_state(legacy_state_with_auth(false, Some(original_auth), "{}"));
+
+            let outcome = apply(CodexSwitchIntent::Off)
+                .expect("complete recovery after a state-first legacy crash");
+
+            assert_eq!(outcome.change, CodexSwitchChange::Recovered);
+            assert_eq!(env.read_config(), original_config);
+            assert_eq!(
+                std::fs::read_to_string(env.auth_path()).expect("read original auth"),
+                original_auth
+            );
+            assert!(!env.legacy_state_path().exists());
+        }
+    }
+
+    #[test]
+    fn switch_off_recovers_v1_state_rewritten_with_later_legacy_extensions() {
+        let env = TestEnvironment::new();
+        env.write_config(&legacy_official_applied_config(
+            "https://relay.example/v1",
+            true,
+        ));
+        env.write_legacy_state(serde_json::json!({
+            "version": 1,
+            "patch_mode": "official-relay-bridge",
+            "responses_websocket": true,
+            "compaction": "remote_v2",
+            "original_config_absent": false,
+            "original_model_provider": "openai",
+            "original_codex_proxy": null,
+            "had_model_providers": false
+        }));
+
+        let outcome = apply(CodexSwitchIntent::Off)
+            .expect("recover v1 state carrying later legacy extension fields");
+
+        assert_eq!(outcome.change, CodexSwitchChange::Recovered);
+        assert_eq!(env.read_config(), "model_provider = \"openai\"\n");
+        assert!(!env.legacy_state_path().exists());
+    }
+
+    #[test]
+    fn legacy_recovery_reconstructs_patch_from_original_stanza_fields() {
+        let env = TestEnvironment::new();
+        let applied = r#"model_provider = "codex_proxy"
+
+[model_providers.codex_proxy]
+name = "OpenAI"
+base_url = "https://relay.example/v1"
+wire_api = "responses"
+request_max_retries = 7
+extra_setting = "preserved"
+supports_websockets = false
+"#;
+        env.write_config(applied);
+        env.write_legacy_state(serde_json::json!({
+            "version": 2,
+            "patch_mode": "official-relay",
+            "original_config_absent": false,
+            "original_model_provider": "openai",
+            "original_codex_proxy": {
+                "name": "original proxy",
+                "base_url": "https://original.example/v1",
+                "wire_api": "chat",
+                "request_max_retries": 7,
+                "extra_setting": "preserved",
+                "supports_websockets": true
+            },
+            "had_model_providers": true
+        }));
+
+        apply(CodexSwitchIntent::Off).expect("recover reconstructed legacy patch");
+
+        let restored =
+            toml::from_str::<TomlValue>(&env.read_config()).expect("parse restored config");
+        assert_eq!(restored["model_provider"].as_str(), Some("openai"));
+        let stanza = &restored["model_providers"][PROVIDER_ID];
+        assert_eq!(stanza["name"].as_str(), Some("original proxy"));
+        assert_eq!(
+            stanza["base_url"].as_str(),
+            Some("https://original.example/v1")
+        );
+        assert_eq!(stanza["wire_api"].as_str(), Some("chat"));
+        assert_eq!(stanza["request_max_retries"].as_integer(), Some(7));
+        assert_eq!(stanza["extra_setting"].as_str(), Some("preserved"));
+        assert_eq!(stanza["supports_websockets"].as_bool(), Some(true));
+        assert!(!env.legacy_state_path().exists());
+    }
+
+    #[test]
+    fn malformed_known_v0203_fields_are_preserved_without_mutation() {
+        for (field, value) in [
+            ("patch_mode", serde_json::json!(123)),
+            ("responses_websocket", serde_json::json!("yes")),
+            ("compaction", serde_json::json!("remote-v3")),
+        ] {
+            let env = TestEnvironment::new();
+            let original = legacy_applied_config("http://127.0.0.1:3211");
+            env.write_config(&original);
+            let mut state = legacy_state(2);
+            state
+                .as_object_mut()
+                .expect("legacy state object")
+                .insert(field.to_string(), value);
+            env.write_legacy_state(state);
+            let stored_state = std::fs::read(env.legacy_state_path()).expect("read legacy state");
+
+            let error = apply(CodexSwitchIntent::Off)
+                .expect_err("malformed known legacy field must block recovery");
+
+            assert!(matches!(error, CodexSwitchError::InvalidState { .. }));
+            assert_eq!(env.read_config(), original);
+            assert_eq!(
+                std::fs::read(env.legacy_state_path()).expect("read preserved legacy state"),
+                stored_state
+            );
+        }
+    }
+
+    #[test]
+    fn external_edits_to_legacy_helper_stanza_fail_closed() {
+        for (field, replacement) in [
+            ("wire_api", "wire_api = \"chat\""),
+            ("request_max_retries", "request_max_retries = 9"),
+        ] {
+            let env = TestEnvironment::new();
+            let applied = legacy_applied_config("http://127.0.0.1:3211");
+            let edited = match field {
+                "wire_api" => applied.replace("wire_api = \"responses\"", replacement),
+                "request_max_retries" => applied.replace("request_max_retries = 0", replacement),
+                _ => unreachable!("covered legacy stanza field"),
+            };
+            env.write_config(&edited);
+            env.write_legacy_state(legacy_state(2));
+            let stored_state = std::fs::read(env.legacy_state_path()).expect("read legacy state");
+
+            let error = apply(CodexSwitchIntent::Off)
+                .expect_err("externally edited helper stanza must block automatic recovery");
+
+            assert!(matches!(
+                error,
+                CodexSwitchError::LegacyRecoveryRequired { .. }
+            ));
+            assert_eq!(env.read_config(), edited);
+            assert_eq!(
+                std::fs::read(env.legacy_state_path()).expect("read preserved legacy state"),
+                stored_state
+            );
+        }
+    }
+
+    #[test]
+    fn switch_on_recovers_legacy_state_before_creating_current_journal() {
+        let env = TestEnvironment::new();
+        env.write_config(&legacy_applied_config("http://127.0.0.1:3111"));
+        env.write_legacy_state(legacy_state(2));
+
+        let outcome = apply(CodexSwitchIntent::On {
+            validated_base_url: ValidatedCodexBaseUrl::local(3211),
+        })
+        .expect("migrate legacy state and switch on");
+
+        assert_eq!(outcome.change, CodexSwitchChange::Applied);
+        assert!(!env.legacy_state_path().exists());
+        assert!(env.state_path().exists());
+        assert!(
+            env.read_config()
+                .contains("base_url = \"http://127.0.0.1:3211\"")
+        );
+        apply(CodexSwitchIntent::Off).expect("switch off current journal");
+        assert_eq!(env.read_config(), "model_provider = \"openai\"\n");
+    }
+
+    #[test]
+    fn legacy_auth_is_restored_only_while_helper_patch_still_matches() {
+        let env = TestEnvironment::new();
+        let original_auth = r#"{"OPENAI_API_KEY":"original-secret"}"#;
+        let patched_auth = "{}";
+        env.write_config(&legacy_applied_config("http://127.0.0.1:3211"));
+        std::fs::write(env.auth_path(), "{\n}\n").expect("write semantically matching auth");
+        let state = legacy_state_with_auth(false, Some(original_auth), patched_auth);
+        env.write_legacy_state(state.clone());
+
+        apply(CodexSwitchIntent::Off).expect("recover matching auth patch");
+
+        assert_eq!(
+            std::fs::read_to_string(env.auth_path()).expect("read restored auth"),
+            original_auth
+        );
+
+        env.write_config(&legacy_applied_config("http://127.0.0.1:3211"));
+        std::fs::write(env.auth_path(), r#"{"external":"edit"}"#)
+            .expect("write external auth edit");
+        env.write_legacy_state(state);
+        let edited_config = env.read_config();
+
+        let stored_state = std::fs::read(env.legacy_state_path()).expect("read legacy state");
+        let error = apply(CodexSwitchIntent::Off)
+            .expect_err("external auth edit must block ambiguous automatic recovery");
+
+        assert!(matches!(
+            error,
+            CodexSwitchError::LegacyRecoveryRequired { .. }
+        ));
+        assert_eq!(
+            std::fs::read_to_string(env.auth_path()).expect("read external auth"),
+            r#"{"external":"edit"}"#
+        );
+        assert_eq!(env.read_config(), edited_config);
+        assert_eq!(
+            std::fs::read(env.legacy_state_path()).expect("read preserved legacy state"),
+            stored_state
+        );
+    }
+
+    #[test]
+    fn legacy_recovery_is_retryable_after_each_durable_boundary() {
+        let env = TestEnvironment::new();
+        let original_config = "model_provider = \"openai\"\n";
+        let original_auth = r#"{"OPENAI_API_KEY":"original-secret"}"#;
+        let patched_auth = "{}";
+        env.write_config(&legacy_applied_config("http://127.0.0.1:3211"));
+        std::fs::write(env.auth_path(), patched_auth).expect("write patched auth");
+        env.write_legacy_state(legacy_state_with_auth(
+            false,
+            Some(original_auth),
+            patched_auth,
+        ));
+
+        assert!(matches!(
+            apply_with_failpoint(
+                CodexSwitchIntent::Off,
+                ApplyFailpoint::AfterLegacyConfigRestore,
+            ),
+            Err(CodexSwitchError::InjectedFailure(
+                "after_legacy_config_restore"
+            ))
+        ));
+        assert_eq!(env.read_config(), original_config);
+        assert_eq!(
+            std::fs::read_to_string(env.auth_path()).expect("read patched auth"),
+            patched_auth
+        );
+        assert!(env.legacy_state_path().exists());
+
+        assert!(matches!(
+            apply_with_failpoint(
+                CodexSwitchIntent::Off,
+                ApplyFailpoint::AfterLegacyAuthRestore,
+            ),
+            Err(CodexSwitchError::InjectedFailure(
+                "after_legacy_auth_restore"
+            ))
+        ));
+        assert_eq!(env.read_config(), original_config);
+        assert_eq!(
+            std::fs::read_to_string(env.auth_path()).expect("read restored auth"),
+            original_auth
+        );
+        assert!(env.legacy_state_path().exists());
+
+        let outcome = apply(CodexSwitchIntent::Off).expect("finish legacy recovery");
+        assert_eq!(outcome.change, CodexSwitchChange::Recovered);
+        assert_eq!(env.read_config(), original_config);
+        assert_eq!(
+            std::fs::read_to_string(env.auth_path()).expect("read restored auth"),
+            original_auth
+        );
+        assert!(!env.legacy_state_path().exists());
+    }
+
+    #[test]
+    fn legacy_recovery_removes_auth_created_by_old_helper() {
+        let env = TestEnvironment::new();
+        let patched_auth = "{}";
+        env.write_config(&legacy_applied_config("http://127.0.0.1:3211"));
+        std::fs::write(env.auth_path(), patched_auth).expect("write patched auth");
+        env.write_legacy_state(legacy_state_with_auth(true, None, patched_auth));
+
+        apply(CodexSwitchIntent::Off).expect("recover legacy switch state");
+
+        assert!(!env.auth_path().exists());
+        assert!(!env.legacy_state_path().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_only_legacy_recovery_does_not_inspect_unmanaged_auth() {
+        use std::os::unix::fs::symlink;
+
+        let env = TestEnvironment::new();
+        let external_auth = env.root.join("external-auth.json");
+        std::fs::write(&external_auth, r#"{"external":true}"#).expect("write external auth");
+        symlink(&external_auth, env.auth_path()).expect("link unmanaged auth");
+        env.write_config(&legacy_applied_config("http://127.0.0.1:3211"));
+        env.write_legacy_state(legacy_state(1));
+
+        apply(CodexSwitchIntent::Off).expect("recover config-only legacy state");
+
+        assert_eq!(env.read_config(), "model_provider = \"openai\"\n");
+        assert!(
+            std::fs::symlink_metadata(env.auth_path())
+                .expect("inspect unmanaged auth link")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(external_auth).expect("read external auth"),
+            r#"{"external":true}"#
+        );
+        assert!(!env.legacy_state_path().exists());
+    }
+
     #[test]
     fn whitespace_only_config_round_trips_byte_for_byte() {
         let env = TestEnvironment::new();
@@ -2059,7 +3835,7 @@ request_max_retries = 0
     }
 
     #[test]
-    fn legacy_switch_state_requires_previous_version_recovery_without_being_read() {
+    fn malformed_legacy_switch_state_is_preserved_when_automatic_recovery_fails() {
         let env = TestEnvironment::new();
         let original = r#"model_provider = "codex_proxy"
 
@@ -2085,9 +3861,8 @@ request_max_retries = 0
         assert_eq!(status.state_path, resolved_legacy_state);
         let reason = status.recovery_reason.expect("legacy recovery reason");
         assert!(reason.contains("codex-helper-switch-state.json"));
-        assert!(reason.contains("v0.20.3"));
-        assert!(reason.contains("switch off"));
-        assert!(reason.contains("Do not delete, edit, or share"));
+        assert!(reason.contains("safe automatic recovery"));
+        assert!(reason.contains("do not delete, edit, or share"));
         assert!(!reason.contains("preserved-auth-material"));
 
         for intent in [
@@ -2096,16 +3871,14 @@ request_max_retries = 0
             },
             CodexSwitchIntent::Off,
         ] {
-            let error = apply(intent).expect_err("legacy state must block switch mutation");
+            let error = apply(intent).expect_err("malformed legacy state must remain untouched");
             assert!(matches!(
                 &error,
-                CodexSwitchError::LegacySwitchState { path }
+                CodexSwitchError::InvalidState { path, .. }
                     if path == &resolved_legacy_state
             ));
             let message = error.to_string();
             assert!(message.contains("codex-helper-switch-state.json"));
-            assert!(message.contains("v0.20.3"));
-            assert!(message.contains("switch off"));
             assert!(!message.contains("preserved-auth-material"));
         }
 
@@ -2115,7 +3888,32 @@ request_max_retries = 0
         assert_eq!(preserved_metadata.len(), legacy_metadata.len());
         assert_eq!(preserved_metadata.file_type(), legacy_metadata.file_type());
         assert!(!env.state_path().exists());
-        assert!(!env.lock_path().exists());
+        assert!(env.lock_path().exists());
+    }
+
+    #[test]
+    fn unsupported_legacy_version_is_preserved_without_mutation() {
+        let env = TestEnvironment::new();
+        let original = legacy_applied_config("http://127.0.0.1:3211");
+        env.write_config(&original);
+        env.write_legacy_state(legacy_state(3));
+        let stored_state = std::fs::read(env.legacy_state_path()).expect("read legacy state");
+
+        let error = apply(CodexSwitchIntent::Off)
+            .expect_err("unsupported legacy state must not be migrated");
+
+        assert!(matches!(error, CodexSwitchError::InvalidState { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported legacy state version 3")
+        );
+        assert_eq!(env.read_config(), original);
+        assert_eq!(
+            std::fs::read(env.legacy_state_path()).expect("read preserved legacy state"),
+            stored_state
+        );
+        assert!(!env.state_path().exists());
     }
 
     #[cfg(unix)]
@@ -2136,14 +3934,14 @@ request_max_retries = 0
             status
                 .recovery_reason
                 .as_deref()
-                .is_some_and(|reason| reason.contains("v0.20.3"))
+                .is_some_and(|reason| reason.contains("safe automatic recovery"))
         );
         assert!(matches!(
             apply(CodexSwitchIntent::Off),
             Err(CodexSwitchError::LegacySwitchState { .. })
         ));
         assert!(std::fs::symlink_metadata(env.legacy_state_path()).is_ok());
-        assert!(!env.lock_path().exists());
+        assert!(env.lock_path().exists());
     }
 
     #[test]
@@ -2172,12 +3970,40 @@ request_max_retries = 0
         );
         assert!(matches!(
             apply(CodexSwitchIntent::Off),
-            Err(CodexSwitchError::LegacySwitchState { .. })
+            Err(CodexSwitchError::LegacySwitchStateConflict { .. })
         ));
         assert_eq!(env.read_config(), applied_config);
         assert_eq!(
             std::fs::read(env.state_path()).expect("read preserved current journal"),
             current_state
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_current_journal_conflicts_with_legacy_recovery() {
+        use std::os::unix::fs::symlink;
+
+        let env = TestEnvironment::new();
+        env.write_config(&legacy_applied_config("http://127.0.0.1:3211"));
+        env.write_legacy_state(legacy_state(2));
+        std::fs::create_dir_all(env.state_path().parent().expect("state parent"))
+            .expect("create state directory");
+        symlink(env.root.join("missing-current-journal"), env.state_path())
+            .expect("create dangling current journal");
+        let stored_state = std::fs::read(env.legacy_state_path()).expect("read legacy state");
+
+        let error = apply(CodexSwitchIntent::Off)
+            .expect_err("any current journal path entry must conflict with legacy recovery");
+
+        assert!(matches!(
+            error,
+            CodexSwitchError::LegacySwitchStateConflict { .. }
+        ));
+        assert!(std::fs::symlink_metadata(env.state_path()).is_ok());
+        assert_eq!(
+            std::fs::read(env.legacy_state_path()).expect("read preserved legacy state"),
+            stored_state
         );
     }
 

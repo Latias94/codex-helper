@@ -8,7 +8,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::dashboard_core::{
     OperatorProviderBalanceSummary, OperatorProviderEndpointSummary, OperatorProviderSummary,
-    OperatorReadData, OperatorRequestSummary, OperatorSessionSummary, WindowStats,
+    OperatorReadData, OperatorRequestSummary, OperatorRoutingSummary, OperatorSessionSummary,
+    WindowStats,
 };
 use crate::pricing::{ModelPriceCatalogSnapshot, UsdAmount};
 use crate::quota_analytics::QuotaAnalyticsView;
@@ -121,6 +122,7 @@ fn sanitize_route_decision(decision: &RouteDecisionProvenance) -> RouteDecisionP
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::tui) struct SessionRouteAffinityView {
+    pub(in crate::tui) revision: String,
     pub(in crate::tui) provider_id: String,
     pub(in crate::tui) endpoint_id: String,
     pub(in crate::tui) upstream_origin: String,
@@ -170,6 +172,7 @@ pub(in crate::tui) struct Snapshot {
     #[allow(dead_code)]
     pub(in crate::tui) usage_rollup: UsageRollupView,
     pub(in crate::tui) provider_balances: HashMap<String, Vec<ProviderBalanceSnapshot>>,
+    pub(in crate::tui) routing: Option<OperatorRoutingSummary>,
     pub(in crate::tui) pricing_catalog: ModelPriceCatalogSnapshot,
     pub(in crate::tui) stats_5m: WindowStats,
     pub(in crate::tui) stats_1h: WindowStats,
@@ -187,6 +190,7 @@ impl Default for Snapshot {
             quota_analytics: QuotaAnalyticsView::default(),
             usage_rollup: UsageRollupView::default(),
             provider_balances: HashMap::new(),
+            routing: None,
             pricing_catalog: ModelPriceCatalogSnapshot::default(),
             stats_5m: WindowStats::default(),
             stats_1h: WindowStats::default(),
@@ -368,14 +372,6 @@ pub(in crate::tui) fn short_sid(sid: &str, max: usize) -> String {
     // Prefer head truncation (end ellipsis) over middle truncation so the string stays readable
     // and copy/paste friendly in terminals.
     shorten_head(sid, max)
-}
-
-pub(in crate::tui) fn operator_provider_policy_action_count(provider: &ProviderOption) -> usize {
-    provider
-        .endpoints
-        .iter()
-        .map(|endpoint| endpoint.policy_actions.len())
-        .sum()
 }
 
 pub(in crate::tui) fn balance_status_style(p: Palette, status: BalanceSnapshotStatus) -> Style {
@@ -806,6 +802,7 @@ fn balance_snapshot_status_brief_lang(
     }
 }
 
+#[cfg(test)]
 pub(in crate::tui) fn balance_status_label_lang(
     status: BalanceSnapshotStatus,
     lang: Language,
@@ -827,6 +824,7 @@ pub(in crate::tui) fn balance_snapshot_status_label(
     balance_snapshot_status_label_lang(snapshot, Language::En)
 }
 
+#[cfg(test)]
 pub(in crate::tui) fn balance_snapshot_status_label_lang(
     snapshot: &ProviderBalanceSnapshot,
     lang: Language,
@@ -1330,6 +1328,7 @@ fn build_session_rows_from_cards(cards: &[SessionIdentityCard]) -> Vec<SessionRo
                     .map(sanitize_route_decision),
                 route_affinity: card.route_affinity.as_ref().and_then(|affinity| {
                     Some(SessionRouteAffinityView {
+                        revision: crate::state::session_route_affinity_revision(affinity),
                         provider_id: affinity.provider_endpoint.provider_id.clone(),
                         endpoint_id: affinity.provider_endpoint.endpoint_id.clone(),
                         upstream_origin: sanitize_upstream_origin(&affinity.upstream_base_url)?,
@@ -1454,6 +1453,7 @@ pub(in crate::tui) fn snapshot_from_operator_data(
             &data.summary.service_name,
             &data.provider_balances,
         ),
+        routing: data.routing.clone(),
         pricing_catalog: data.pricing_catalog.clone(),
         stats_5m: data.stats_5m.clone(),
         stats_1h: data.stats_1h.clone(),
@@ -1505,6 +1505,7 @@ fn session_row_from_operator(
             .map(sanitize_route_decision),
         route_affinity: session.route_affinity.as_ref().and_then(|affinity| {
             Some(SessionRouteAffinityView {
+                revision: affinity.revision.clone(),
                 provider_id: affinity.provider_id.clone(),
                 endpoint_id: affinity.endpoint_id.clone(),
                 upstream_origin: sanitize_upstream_origin(&affinity.upstream_origin)?,
@@ -1937,6 +1938,7 @@ mod tests {
             binding_continuity_mode: None,
             last_route_decision: Some(route_decision.clone()),
             route_affinity: Some(OperatorSessionRouteAffinitySummary {
+                revision: "affinity:v1:test".to_string(),
                 provider_id: "provider-a".to_string(),
                 endpoint_id: "responses".to_string(),
                 upstream_origin: "https://relay.example.test".to_string(),
@@ -2031,6 +2033,7 @@ mod tests {
                 profiles: Vec::new(),
                 providers: Vec::new(),
             },
+            routing: None,
             active_requests: Vec::new(),
             recent_requests: vec![request],
             usage_summaries: Vec::new(),
@@ -2063,6 +2066,12 @@ mod tests {
                 .as_ref()
                 .map(|affinity| affinity.endpoint_id.as_str()),
             Some("responses")
+        );
+        assert_eq!(
+            row.route_affinity
+                .as_ref()
+                .map(|affinity| affinity.revision.as_str()),
+            Some("affinity:v1:test")
         );
         assert_eq!(
             row.effective_model
@@ -2407,6 +2416,7 @@ mod tests {
                     capacity: OperatorProviderCapacity::default(),
                 }],
             },
+            routing: None,
             active_requests: Vec::new(),
             recent_requests: Vec::new(),
             usage_summaries: Vec::new(),
@@ -2556,6 +2566,7 @@ mod tests {
             quota_analytics: QuotaAnalyticsView::default(),
             usage_rollup: UsageRollupView::default(),
             provider_balances: HashMap::new(),
+            routing: None,
             pricing_catalog: ModelPriceCatalogSnapshot::default(),
             stats_5m: WindowStats::default(),
             stats_1h: WindowStats::default(),
@@ -2613,6 +2624,7 @@ mod tests {
             quota_analytics: QuotaAnalyticsView::default(),
             usage_rollup: UsageRollupView::default(),
             provider_balances: HashMap::new(),
+            routing: None,
             pricing_catalog: ModelPriceCatalogSnapshot::default(),
             stats_5m: WindowStats::default(),
             stats_1h: WindowStats::default(),
@@ -2647,6 +2659,7 @@ mod tests {
             quota_analytics: QuotaAnalyticsView::default(),
             usage_rollup: UsageRollupView::default(),
             provider_balances: HashMap::new(),
+            routing: None,
             pricing_catalog: ModelPriceCatalogSnapshot::default(),
             stats_5m: WindowStats::default(),
             stats_1h: WindowStats::default(),
@@ -2667,6 +2680,7 @@ mod tests {
             quota_analytics: QuotaAnalyticsView::default(),
             usage_rollup: UsageRollupView::default(),
             provider_balances: HashMap::new(),
+            routing: None,
             pricing_catalog: ModelPriceCatalogSnapshot::default(),
             stats_5m: WindowStats::default(),
             stats_1h: WindowStats::default(),

@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use crate::auth_resolution::resolve_upstream_auth_for_target;
 use crate::config::SchedulingPreset;
 use crate::logging::log_control_trace_event;
 use crate::routing_ir::{
@@ -18,6 +19,7 @@ use super::route_affinity::apply_session_route_affinity_for_template;
 pub(super) async fn route_graph_runtime_for_request(
     proxy: &ProxyService,
     template: &RoutePlanTemplate,
+    routing_control_graph_key: &str,
     runtime_revision: u64,
     provider_policy: &ProviderPolicySnapshot,
     session_id: Option<&str>,
@@ -26,9 +28,42 @@ pub(super) async fn route_graph_runtime_for_request(
         .state
         .route_plan_runtime_state_with_provider_policy(proxy.service_name, provider_policy)
         .await;
+    apply_auth_resolution_to_runtime(proxy.service_name, template, &mut runtime);
     apply_concurrency_snapshots_to_runtime(proxy, template, runtime_revision, &mut runtime);
     apply_session_route_affinity_for_template(proxy, session_id, template, &mut runtime).await;
+    apply_routing_operator_control_to_runtime(proxy, routing_control_graph_key, &mut runtime).await;
     runtime
+}
+
+pub(super) async fn apply_routing_operator_control_to_runtime(
+    proxy: &ProxyService,
+    route_graph_key: &str,
+    runtime: &mut RoutePlanRuntimeState,
+) {
+    let control = proxy.state.capture_routing_operator_control().await;
+    runtime.set_new_session_preference(
+        control
+            .new_session_preference(proxy.service_name, route_graph_key)
+            .cloned(),
+    );
+}
+
+pub(super) fn apply_auth_resolution_to_runtime(
+    service_name: &str,
+    template: &RoutePlanTemplate,
+    runtime: &mut RoutePlanRuntimeState,
+) {
+    for candidate in &template.candidates {
+        let provider_endpoint = template.candidate_provider_endpoint_key(candidate);
+        let mut state = runtime.provider_endpoint(&provider_endpoint);
+        state.missing_auth = resolve_upstream_auth_for_target(
+            service_name,
+            &candidate.auth,
+            candidate.base_url.as_str(),
+        )
+        .is_err();
+        runtime.set_provider_endpoint(provider_endpoint, state);
+    }
 }
 
 pub(super) fn apply_concurrency_snapshots_to_runtime(

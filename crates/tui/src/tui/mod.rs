@@ -3,6 +3,7 @@ mod fleet_refresh;
 mod i18n;
 mod input;
 mod model;
+mod operator_actions;
 mod operator_projection;
 mod report;
 mod runtime_refresh;
@@ -13,7 +14,10 @@ mod terminal;
 mod types;
 mod view;
 
-pub use attached::{run_attached_dashboard, run_attached_dashboard_with_admin_base_url};
+pub use attached::{
+    run_attached_dashboard, run_attached_dashboard_with_admin_base_url,
+    run_local_attached_dashboard_with_admin_base_url,
+};
 pub use i18n::Language;
 pub use i18n::{detect_system_language, parse_language, resolve_language_preference};
 #[allow(unused_imports)]
@@ -40,6 +44,9 @@ use self::fleet_refresh::{
     FleetRefreshResult, FleetRefreshSource, apply_fleet_refresh_result, start_fleet_refresh,
 };
 use self::model::{Palette, Snapshot};
+use self::operator_actions::{
+    OperatorActionOutcome, apply_operator_action_outcome, start_integrated_operator_action,
+};
 use self::operator_projection::apply_operator_read_model;
 use self::runtime_refresh::{
     DashboardTiming, apply_pending_refresh_requests, handle_ticker_refreshes,
@@ -98,6 +105,7 @@ struct RenderSurfaceKey {
     stats_attention_only: bool,
     stats_errors_only: bool,
     selected_provider_idx: usize,
+    selected_routing_candidate_idx: usize,
     selected_session_idx: usize,
     selected_request_idx: usize,
     selected_request_page_idx: usize,
@@ -128,6 +136,7 @@ impl RenderSurfaceKey {
             stats_attention_only: ui.stats_attention_only,
             stats_errors_only: ui.stats_errors_only,
             selected_provider_idx: ui.selected_provider_idx,
+            selected_routing_candidate_idx: ui.selected_routing_candidate_idx,
             selected_session_idx: ui.selected_session_idx,
             selected_request_idx: ui.selected_request_idx,
             selected_request_page_idx: ui.selected_request_page_idx,
@@ -266,6 +275,8 @@ pub async fn run_dashboard(
     let (recent_refresh_tx, mut recent_refresh_rx) =
         mpsc::unbounded_channel::<CodexRecentRefreshResult>();
     let (fleet_refresh_tx, mut fleet_refresh_rx) = mpsc::unbounded_channel::<FleetRefreshResult>();
+    let (operator_action_tx, mut operator_action_rx) =
+        mpsc::unbounded_channel::<OperatorActionOutcome>();
     let mut snapshot_refresh = SnapshotRefreshController::new(snapshot_refresh_tx);
 
     let mut render_invalidation = RenderInvalidation::FullClear;
@@ -370,6 +381,19 @@ pub async fn run_dashboard(
                     request_redraw(&mut render_invalidation);
                 }
             }
+            maybe_operator_action = operator_action_rx.recv() => {
+                if let Some(outcome) = maybe_operator_action {
+                    apply_operator_action_outcome(&mut ui, outcome);
+                    start_integrated_operator_action(
+                        &mut ui,
+                        &proxy,
+                        operator_action_tx.clone(),
+                    );
+                    snapshot_refresh.invalidate();
+                    snapshot_refresh.request(proxy.clone());
+                    request_redraw(&mut render_invalidation);
+                }
+            }
             changed = shutdown_rx.changed() => {
                 let _ = changed;
                 ui.should_exit = true;
@@ -401,6 +425,11 @@ pub async fn run_dashboard(
                                 history_refresh_tx.clone(),
                                 recent_refresh_tx.clone(),
                             ).await;
+                            start_integrated_operator_action(
+                                &mut ui,
+                                &proxy,
+                                operator_action_tx.clone(),
+                            );
                             if ui.needs_fleet_refresh && !ui.fleet_loading {
                                 start_integrated_fleet_refresh(
                                     &mut ui,

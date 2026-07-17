@@ -1,14 +1,20 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use futures_util::FutureExt;
+use futures_util::future::BoxFuture;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
 
+use crate::auth_resolution::{resolve_named_credential, resolve_upstream_auth};
 use crate::balance::{
     BalanceSnapshotStatus, ProviderBalanceSnapshot, ProviderUsageAlert, ProviderUsageAlertKind,
     ProviderUsageModelStat, ProviderUsageRateSnapshot, ProviderUsageWindow,
@@ -147,7 +153,7 @@ impl UsageProviderExtractConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct UsageProviderConfig {
     id: String,
@@ -184,7 +190,7 @@ struct UsageProviderConfig {
     extract: UsageProviderExtractConfig,
 }
 
-#[derive(Debug, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields)]
 struct UsageProvidersFile {
     #[serde(default)]
@@ -226,18 +232,18 @@ pub struct UsageProviderRefreshSummary {
     pub attempted: usize,
     pub refreshed: usize,
     pub failed: usize,
-    #[serde(skip_serializing_if = "usize_is_zero")]
+    #[serde(default, skip_serializing_if = "usize_is_zero")]
     pub suppressed: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_retry_at_ms: Option<u64>,
     pub missing_token: usize,
-    #[serde(skip_serializing_if = "usize_is_zero")]
+    #[serde(default, skip_serializing_if = "usize_is_zero")]
     pub auto_attempted: usize,
-    #[serde(skip_serializing_if = "usize_is_zero")]
+    #[serde(default, skip_serializing_if = "usize_is_zero")]
     pub auto_refreshed: usize,
-    #[serde(skip_serializing_if = "usize_is_zero")]
+    #[serde(default, skip_serializing_if = "usize_is_zero")]
     pub auto_failed: usize,
-    #[serde(skip_serializing_if = "usize_is_zero")]
+    #[serde(default, skip_serializing_if = "usize_is_zero")]
     pub deduplicated: usize,
 }
 
@@ -310,6 +316,265 @@ enum UsageProviderRefreshOutcome {
     MissingToken,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ProviderBalanceRefreshTargetKey {
+    provider_endpoint: ProviderEndpointKey,
+    upstream_base_url: String,
+    observation_provider_id: String,
+    adapter_kind: ProviderKind,
+    usage_endpoint: String,
+    account_fingerprint: String,
+    config_revision: String,
+}
+
+type ProviderBalanceRefreshWork =
+    Arc<dyn Fn(bool) -> BoxFuture<'static, UsageProviderRefreshOutcome> + Send + Sync + 'static>;
+
+struct ProviderBalanceRefreshWaiter {
+    target_round: u8,
+    result_tx: oneshot::Sender<UsageProviderRefreshOutcome>,
+}
+
+struct ProviderBalanceRefreshEntry {
+    active_round: u8,
+    active_force: bool,
+    trailing_force: bool,
+    work: ProviderBalanceRefreshWork,
+    waiters: Vec<ProviderBalanceRefreshWaiter>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CoordinatedProviderBalanceRefresh {
+    outcome: UsageProviderRefreshOutcome,
+    deduplicated: bool,
+}
+
+#[derive(Default)]
+pub(crate) struct ProviderBalanceRefreshCoordinator {
+    entries: Mutex<HashMap<ProviderBalanceRefreshTargetKey, ProviderBalanceRefreshEntry>>,
+    request_queue: Mutex<HashMap<ProviderEndpointKey, Instant>>,
+    last_usage_poll: Mutex<HashMap<String, Instant>>,
+}
+
+impl std::fmt::Debug for ProviderBalanceRefreshCoordinator {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProviderBalanceRefreshCoordinator")
+            .field("active_targets", &self.lock_entries().len())
+            .field("queued_request_targets", &self.lock_request_queue().len())
+            .finish()
+    }
+}
+
+impl ProviderBalanceRefreshCoordinator {
+    fn lock_entries(
+        &self,
+    ) -> std::sync::MutexGuard<
+        '_,
+        HashMap<ProviderBalanceRefreshTargetKey, ProviderBalanceRefreshEntry>,
+    > {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn lock_request_queue(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<ProviderEndpointKey, Instant>> {
+        self.request_queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn lock_last_usage_poll(&self) -> std::sync::MutexGuard<'_, HashMap<String, Instant>> {
+        self.last_usage_poll
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn enqueue_request_refresh(&self, key: ProviderEndpointKey) -> Option<Duration> {
+        let now = Instant::now();
+        let mut queue = self.lock_request_queue();
+        match queue.get(&key).copied() {
+            Some(due_at) if due_at > now => None,
+            Some(_) => Some(Duration::ZERO),
+            None => {
+                queue.insert(key, now + REQUEST_BALANCE_REFRESH_DELAY);
+                Some(REQUEST_BALANCE_REFRESH_DELAY)
+            }
+        }
+    }
+
+    fn schedule_request_refresh_at(&self, key: ProviderEndpointKey, due_at: Instant) {
+        self.lock_request_queue().insert(key, due_at);
+    }
+
+    fn take_request_refresh_if_due(&self, key: &ProviderEndpointKey) -> RequestBalanceQueueDue {
+        let now = Instant::now();
+        let mut queue = self.lock_request_queue();
+        match queue.get(key).copied() {
+            Some(due_at) if due_at <= now => {
+                queue.remove(key);
+                RequestBalanceQueueDue::Due
+            }
+            Some(due_at) => RequestBalanceQueueDue::NotDue(due_at.saturating_duration_since(now)),
+            None => RequestBalanceQueueDue::Missing,
+        }
+    }
+
+    #[cfg(test)]
+    fn request_refresh_queued(&self, key: &ProviderEndpointKey) -> bool {
+        self.lock_request_queue().contains_key(key)
+    }
+
+    async fn coordinate<F, Fut>(
+        self: &Arc<Self>,
+        key: ProviderBalanceRefreshTargetKey,
+        force: bool,
+        work: F,
+    ) -> CoordinatedProviderBalanceRefresh
+    where
+        F: Fn(bool) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = UsageProviderRefreshOutcome> + Send + 'static,
+    {
+        let work: ProviderBalanceRefreshWork = Arc::new(move |round_force| {
+            let future = work(round_force);
+            Box::pin(future)
+        });
+        let (result_tx, result_rx) = oneshot::channel();
+        let mut should_start_owner = false;
+        let deduplicated;
+
+        {
+            let mut entries = self.lock_entries();
+            if let Some(entry) = entries.get_mut(&key) {
+                let target_round = if force && !entry.active_force {
+                    entry.trailing_force = true;
+                    entry.active_round.saturating_add(1)
+                } else {
+                    entry.active_round
+                };
+                entry.waiters.push(ProviderBalanceRefreshWaiter {
+                    target_round,
+                    result_tx,
+                });
+                deduplicated = true;
+            } else {
+                entries.insert(
+                    key.clone(),
+                    ProviderBalanceRefreshEntry {
+                        active_round: 1,
+                        active_force: force,
+                        trailing_force: false,
+                        work,
+                        waiters: vec![ProviderBalanceRefreshWaiter {
+                            target_round: 1,
+                            result_tx,
+                        }],
+                    },
+                );
+                should_start_owner = true;
+                deduplicated = false;
+            }
+        }
+
+        if should_start_owner {
+            let coordinator = Arc::clone(self);
+            tokio::spawn(async move {
+                coordinator.run_owner(key).await;
+            });
+        }
+
+        CoordinatedProviderBalanceRefresh {
+            outcome: result_rx
+                .await
+                .unwrap_or(UsageProviderRefreshOutcome::Failed),
+            deduplicated,
+        }
+    }
+
+    async fn run_owner(self: Arc<Self>, key: ProviderBalanceRefreshTargetKey) {
+        loop {
+            let Some((active_round, active_force, work)) = ({
+                let entries = self.lock_entries();
+                entries.get(&key).map(|entry| {
+                    (
+                        entry.active_round,
+                        entry.active_force,
+                        Arc::clone(&entry.work),
+                    )
+                })
+            }) else {
+                return;
+            };
+
+            let outcome = match AssertUnwindSafe(async move { work(active_force).await })
+                .catch_unwind()
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    warn!(
+                        provider_endpoint = %key.provider_endpoint.stable_key(),
+                        observation_provider = %key.observation_provider_id,
+                        "provider balance refresh worker panicked"
+                    );
+                    UsageProviderRefreshOutcome::Failed
+                }
+            };
+
+            let (should_continue, orphaned_waiters) = {
+                let mut entries = self.lock_entries();
+                let Some(entry) = entries.get_mut(&key) else {
+                    return;
+                };
+                let mut pending = Vec::with_capacity(entry.waiters.len());
+                for waiter in entry.waiters.drain(..) {
+                    if waiter.target_round <= active_round {
+                        let _ = waiter.result_tx.send(outcome);
+                    } else {
+                        pending.push(waiter);
+                    }
+                }
+                entry.waiters = pending;
+
+                if entry.trailing_force {
+                    entry.trailing_force = false;
+                    entry.active_round = active_round.saturating_add(1);
+                    entry.active_force = true;
+                    (true, Vec::new())
+                } else {
+                    let waiters = entries
+                        .remove(&key)
+                        .map_or_else(Vec::new, |removed| removed.waiters);
+                    (false, waiters)
+                }
+            };
+
+            for waiter in orphaned_waiters {
+                let _ = waiter.result_tx.send(UsageProviderRefreshOutcome::Failed);
+            }
+
+            if should_continue {
+                continue;
+            }
+            return;
+        }
+    }
+
+    #[cfg(test)]
+    fn entry_count_for_test(&self) -> usize {
+        self.lock_entries().len()
+    }
+
+    #[cfg(test)]
+    fn waiter_count_for_test(&self, key: &ProviderBalanceRefreshTargetKey) -> usize {
+        self.lock_entries()
+            .get(key)
+            .map_or(0, |entry| entry.waiters.len())
+    }
+}
+
 struct RefreshProviderTargetParams<'a> {
     client: &'a Client,
     provider: &'a UsageProviderConfig,
@@ -320,10 +585,6 @@ struct RefreshProviderTargetParams<'a> {
     force: bool,
 }
 
-// 全局节流状态：按 provider.id 记录最近一次查询时间，避免高频请求。
-static LAST_USAGE_POLL: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
-static REQUEST_BALANCE_QUEUE: OnceLock<Mutex<HashMap<ProviderEndpointKey, Instant>>> =
-    OnceLock::new();
 static AUTO_PROBE_KIND_HINTS: OnceLock<Mutex<HashMap<String, ProviderKind>>> = OnceLock::new();
 static AUTO_PROBE_KIND_FAILURES: OnceLock<Mutex<HashMap<AutoProbeKindFailureKey, Instant>>> =
     OnceLock::new();
@@ -1129,60 +1390,14 @@ fn target_key(target: &UsageProviderTarget) -> ProviderEndpointKey {
     target.endpoint.provider_endpoint.clone()
 }
 
-fn enqueue_request_balance_refresh(key: ProviderEndpointKey) -> Option<Duration> {
-    let now = Instant::now();
-    let queue = REQUEST_BALANCE_QUEUE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut queue = match queue.lock() {
-        Ok(queue) => queue,
-        Err(_) => return None,
-    };
-
-    match queue.get(&key).copied() {
-        Some(due_at) if due_at > now => None,
-        Some(_) => Some(Duration::ZERO),
-        None => {
-            queue.insert(key, now + REQUEST_BALANCE_REFRESH_DELAY);
-            Some(REQUEST_BALANCE_REFRESH_DELAY)
-        }
-    }
-}
-
-fn schedule_request_balance_refresh_at(key: ProviderEndpointKey, due_at: Instant) {
-    let queue = REQUEST_BALANCE_QUEUE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(mut queue) = queue.lock() {
-        queue.insert(key, due_at);
-    }
-}
-
-fn take_request_balance_refresh_if_due(key: &ProviderEndpointKey) -> RequestBalanceQueueDue {
-    let now = Instant::now();
-    let queue = REQUEST_BALANCE_QUEUE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut queue = match queue.lock() {
-        Ok(queue) => queue,
-        Err(_) => return RequestBalanceQueueDue::Missing,
-    };
-
-    match queue.get(key).copied() {
-        Some(due_at) if due_at <= now => {
-            queue.remove(key);
-            RequestBalanceQueueDue::Due
-        }
-        Some(due_at) => RequestBalanceQueueDue::NotDue(due_at.saturating_duration_since(now)),
-        None => RequestBalanceQueueDue::Missing,
-    }
-}
-
 #[cfg(test)]
 pub fn request_balance_refresh_queued_for_provider_endpoint(
+    state: &ProxyState,
     provider_endpoint: &ProviderEndpointKey,
 ) -> bool {
-    let Some(queue) = REQUEST_BALANCE_QUEUE.get() else {
-        return false;
-    };
-    match queue.lock() {
-        Ok(guard) => guard.contains_key(provider_endpoint),
-        Err(error) => error.into_inner().contains_key(provider_endpoint),
-    }
+    state
+        .provider_balance_refresh_coordinator()
+        .request_refresh_queued(provider_endpoint)
 }
 
 fn usage_provider_target_for_provider_endpoint(
@@ -1212,22 +1427,25 @@ fn configured_target_keys(
 }
 
 fn resolve_token(provider: &UsageProviderConfig, target: &UsageProviderTarget) -> Option<String> {
-    // 优先: token_env 环境变量
-    if let Some(env_name) = &provider.token_env
-        && let Ok(v) = std::env::var(env_name)
-        && !v.trim().is_empty()
+    let service_name = target.endpoint.provider_endpoint.service_name.as_str();
+    if let Some(env_name) = provider.token_env.as_deref()
+        && let Some(value) = resolve_named_credential(service_name, env_name).into_value()
     {
-        return Some(v);
+        return Some(value);
     }
 
     if provider.require_token_env {
         return None;
     }
 
-    if let Some(token) = target.auth.resolve_auth_token() {
-        return Some(token);
+    let resolved = resolve_upstream_auth(service_name, &target.auth);
+    if resolved.has_unavailable_credential() {
+        return None;
     }
-    target.auth.resolve_api_key()
+    resolved
+        .auth_token
+        .into_value()
+        .or_else(|| resolved.api_key.into_value())
 }
 
 fn new_api_user_id_env_name(provider: &UsageProviderConfig) -> Result<Option<&str>> {
@@ -1498,6 +1716,48 @@ fn resolve_endpoint(
         resolved
     };
     validate_provider_endpoint(provider, &resolved, token)
+}
+
+fn provider_balance_refresh_target_key(
+    provider: &UsageProviderConfig,
+    target: &UsageProviderTarget,
+    config_revision_override: Option<&str>,
+) -> Option<ProviderBalanceRefreshTargetKey> {
+    let token = resolve_token(provider, target)?;
+    let new_api_user_id = resolve_new_api_user_id(provider).ok()?;
+    let account_fingerprint =
+        usage_provider_account_fingerprint(&token, new_api_user_id.as_deref());
+    let mut usage_endpoint = reqwest::Url::parse(
+        resolve_endpoint(provider, &target.base_url, &token)
+            .ok()?
+            .as_str(),
+    )
+    .ok()?;
+    if provider.kind == ProviderKind::OpenAiOrganizationCosts {
+        let stable_query = usage_endpoint
+            .query_pairs()
+            .filter(|(name, _)| name != "start_time" && name != "limit")
+            .map(|(name, value)| (name.into_owned(), value.into_owned()))
+            .collect::<Vec<_>>();
+        usage_endpoint.set_query(None);
+        if !stable_query.is_empty() {
+            usage_endpoint.query_pairs_mut().extend_pairs(stable_query);
+        }
+    }
+    let config_revision = config_revision_override
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| usage_provider_config_revision(provider, target));
+
+    Some(ProviderBalanceRefreshTargetKey {
+        provider_endpoint: target.endpoint.provider_endpoint.clone(),
+        upstream_base_url: normalized_balance_base_url(&target.base_url)
+            .unwrap_or_else(|| target.base_url.clone()),
+        observation_provider_id: provider.id.clone(),
+        adapter_kind: provider.kind,
+        usage_endpoint: usage_endpoint.into(),
+        account_fingerprint,
+        config_revision,
+    })
 }
 
 struct PreparedProviderPoll {
@@ -4300,13 +4560,15 @@ async fn refresh_provider_target(
     }
 }
 
-struct ConfiguredRefreshJob<'a> {
-    provider: &'a UsageProviderConfig,
+#[derive(Clone)]
+struct ConfiguredRefreshJob {
+    provider: UsageProviderConfig,
     target: UsageProviderTarget,
     interval_secs: u64,
     force: bool,
 }
 
+#[derive(Clone)]
 struct AutoRefreshJob {
     target: UsageProviderTarget,
     force: bool,
@@ -4319,24 +4581,82 @@ pub struct UsageProviderRefreshOptions<'a> {
     pub force: bool,
 }
 
-async fn run_configured_refresh_job<'a>(
-    client: &'a Client,
-    job: ConfiguredRefreshJob<'a>,
-    state: &'a Arc<ProxyState>,
-    service_name: &'a str,
-) -> (String, UsageProviderRefreshOutcome) {
-    let provider_id = job.provider.id.clone();
-    let outcome = refresh_provider_target(RefreshProviderTargetParams {
+async fn execute_configured_refresh_job(
+    client: &Client,
+    job: &ConfiguredRefreshJob,
+    state: &Arc<ProxyState>,
+    service_name: &str,
+) -> UsageProviderRefreshOutcome {
+    refresh_provider_target(RefreshProviderTargetParams {
         client,
-        provider: job.provider,
+        provider: &job.provider,
         target: &job.target,
         state,
         service_name,
         interval_secs: job.interval_secs,
         force: job.force,
     })
-    .await;
-    (provider_id, outcome)
+    .await
+}
+
+async fn execute_auto_refresh_job(
+    client: &Client,
+    job: &AutoRefreshJob,
+    state: &Arc<ProxyState>,
+    service_name: &str,
+) -> UsageProviderRefreshOutcome {
+    auto_probe_provider_target(client, &job.target, state, service_name, job.force).await
+}
+
+async fn run_configured_refresh_job(
+    client: &Client,
+    job: ConfiguredRefreshJob,
+    state: &Arc<ProxyState>,
+    service_name: &str,
+) -> (String, CoordinatedProviderBalanceRefresh) {
+    let provider_id = job.provider.id.clone();
+    let Some(key) = provider_balance_refresh_target_key(&job.provider, &job.target, None) else {
+        return (
+            provider_id,
+            CoordinatedProviderBalanceRefresh {
+                outcome: execute_configured_refresh_job(client, &job, state, service_name).await,
+                deduplicated: false,
+            },
+        );
+    };
+
+    let force = job.force;
+    let coordinator = state.provider_balance_refresh_coordinator();
+    let job_template = job;
+    let client = client.clone();
+    let state = Arc::clone(state);
+    let service_name = service_name.to_string();
+    let coordinated = coordinator
+        .coordinate(key, force, move |round_force| {
+            let mut job = job_template.clone();
+            let client = client.clone();
+            let state = Arc::clone(&state);
+            let service_name = service_name.clone();
+            async move {
+                job.force = round_force;
+                execute_configured_refresh_job(&client, &job, &state, &service_name).await
+            }
+        })
+        .await;
+    (provider_id, coordinated)
+}
+
+fn auto_refresh_target_key(
+    target: &UsageProviderTarget,
+) -> Option<ProviderBalanceRefreshTargetKey> {
+    let provider = if is_official_openai_base_url(&target.base_url) {
+        auto_openai_official_provider(target)
+    } else {
+        auto_usage_provider(target, first_auto_probe_kind(target))
+    };
+    let config_revision = (!is_official_openai_base_url(&target.base_url))
+        .then(|| auto_usage_provider_config_revision(target));
+    provider_balance_refresh_target_key(&provider, target, config_revision.as_deref())
 }
 
 async fn run_auto_refresh_job(
@@ -4344,16 +4664,40 @@ async fn run_auto_refresh_job(
     job: AutoRefreshJob,
     state: &Arc<ProxyState>,
     service_name: &str,
-) -> UsageProviderRefreshOutcome {
-    auto_probe_provider_target(client, &job.target, state, service_name, job.force).await
+) -> CoordinatedProviderBalanceRefresh {
+    let Some(key) = auto_refresh_target_key(&job.target) else {
+        return CoordinatedProviderBalanceRefresh {
+            outcome: execute_auto_refresh_job(client, &job, state, service_name).await,
+            deduplicated: false,
+        };
+    };
+
+    let force = job.force;
+    let coordinator = state.provider_balance_refresh_coordinator();
+    let job_template = job;
+    let client = client.clone();
+    let state = Arc::clone(state);
+    let service_name = service_name.to_string();
+    coordinator
+        .coordinate(key, force, move |round_force| {
+            let mut job = job_template.clone();
+            let client = client.clone();
+            let state = Arc::clone(&state);
+            let service_name = service_name.clone();
+            async move {
+                job.force = round_force;
+                execute_auto_refresh_job(&client, &job, &state, &service_name).await
+            }
+        })
+        .await
 }
 
-async fn run_configured_refresh_jobs<'a>(
-    client: &'a Client,
-    jobs: Vec<ConfiguredRefreshJob<'a>>,
-    state: &'a Arc<ProxyState>,
-    service_name: &'a str,
-) -> Vec<(String, UsageProviderRefreshOutcome)> {
+async fn run_configured_refresh_jobs(
+    client: &Client,
+    jobs: Vec<ConfiguredRefreshJob>,
+    state: &Arc<ProxyState>,
+    service_name: &str,
+) -> Vec<(String, CoordinatedProviderBalanceRefresh)> {
     let mut pending = jobs.into_iter();
     let mut running = FuturesUnordered::new();
     let mut results = Vec::new();
@@ -4381,7 +4725,7 @@ async fn run_auto_refresh_jobs(
     jobs: Vec<AutoRefreshJob>,
     state: &Arc<ProxyState>,
     service_name: &str,
-) -> Vec<UsageProviderRefreshOutcome> {
+) -> Vec<CoordinatedProviderBalanceRefresh> {
     let mut pending = jobs.into_iter();
     let mut running = FuturesUnordered::new();
     let mut results = Vec::new();
@@ -5089,7 +5433,7 @@ pub async fn refresh_balances_for_service(
         ..UsageProviderRefreshSummary::default()
     };
 
-    let poll_map = LAST_USAGE_POLL.get_or_init(|| Mutex::new(HashMap::new()));
+    let refresh_coordinator = state.provider_balance_refresh_coordinator();
     let mut configured_jobs = Vec::new();
     let mut configured_job_keys = HashSet::new();
     for provider in &providers_file.providers {
@@ -5112,7 +5456,7 @@ pub async fn refresh_balances_for_service(
             summary.attempted += 1;
             configured_job_keys.insert(target_key(&target));
             configured_jobs.push(ConfiguredRefreshJob {
-                provider,
+                provider: provider.clone(),
                 target,
                 interval_secs,
                 force,
@@ -5122,10 +5466,11 @@ pub async fn refresh_balances_for_service(
 
     let mut refreshed_provider_ids = HashSet::new();
     if !configured_jobs.is_empty() {
-        for (provider_id, outcome) in
+        for (provider_id, coordinated) in
             run_configured_refresh_jobs(client, configured_jobs, &state, service_name).await
         {
-            if summary.record_configured_outcome(outcome) {
+            summary.deduplicated += usize::from(coordinated.deduplicated);
+            if summary.record_configured_outcome(coordinated.outcome) {
                 refreshed_provider_ids.insert(provider_id);
             }
         }
@@ -5146,14 +5491,14 @@ pub async fn refresh_balances_for_service(
     }
 
     if !auto_jobs.is_empty() {
-        for outcome in run_auto_refresh_jobs(client, auto_jobs, &state, service_name).await {
-            summary.record_auto_outcome(outcome);
+        for coordinated in run_auto_refresh_jobs(client, auto_jobs, &state, service_name).await {
+            summary.deduplicated += usize::from(coordinated.deduplicated);
+            summary.record_auto_outcome(coordinated.outcome);
         }
     }
 
-    if !refreshed_provider_ids.is_empty()
-        && let Ok(mut map) = poll_map.lock()
-    {
+    if !refreshed_provider_ids.is_empty() {
+        let mut map = refresh_coordinator.lock_last_usage_poll();
         let now = Instant::now();
         for provider_id in refreshed_provider_ids {
             map.insert(provider_id, now);
@@ -5172,7 +5517,8 @@ pub fn enqueue_poll_for_codex_provider_endpoint(
     provider_endpoint: ProviderEndpointKey,
 ) {
     let key = provider_endpoint.clone();
-    let Some(initial_sleep_for) = enqueue_request_balance_refresh(key.clone()) else {
+    let refresh_coordinator = state.provider_balance_refresh_coordinator();
+    let Some(initial_sleep_for) = refresh_coordinator.enqueue_request_refresh(key.clone()) else {
         return;
     };
 
@@ -5181,7 +5527,7 @@ pub fn enqueue_poll_for_codex_provider_endpoint(
         let mut sleep_for = initial_sleep_for;
         loop {
             tokio::time::sleep(sleep_for).await;
-            match take_request_balance_refresh_if_due(&key) {
+            match refresh_coordinator.take_request_refresh_if_due(&key) {
                 RequestBalanceQueueDue::Due => {}
                 RequestBalanceQueueDue::NotDue(delay) => {
                     sleep_for = delay;
@@ -5208,7 +5554,8 @@ pub fn enqueue_poll_for_codex_provider_endpoint(
                     return;
                 }
                 RequestBalancePollOutcome::Deferred(delay) => {
-                    schedule_request_balance_refresh_at(key.clone(), Instant::now() + delay);
+                    refresh_coordinator
+                        .schedule_request_refresh_at(key.clone(), Instant::now() + delay);
                     sleep_for = delay;
                 }
             }
@@ -5243,7 +5590,7 @@ async fn poll_for_codex_target(
     };
 
     let now = Instant::now();
-    let poll_map = LAST_USAGE_POLL.get_or_init(|| Mutex::new(HashMap::new()));
+    let refresh_coordinator = state.provider_balance_refresh_coordinator();
     let mut matched_configured_provider = false;
     let mut configured_jobs = Vec::new();
     let mut next_cooldown = None::<Duration>;
@@ -5259,10 +5606,7 @@ async fn poll_for_codex_target(
         };
 
         {
-            let mut map = match poll_map.lock() {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
+            let mut map = refresh_coordinator.lock_last_usage_poll();
             if let Some(last) = map.get(&provider.id)
                 && let Some(cooldown) = remaining_poll_cooldown(*last, interval_secs, now)
             {
@@ -5275,7 +5619,7 @@ async fn poll_for_codex_target(
 
         warn_if_provider_spans_hosts(&cfg, service_name, provider);
         configured_jobs.push(ConfiguredRefreshJob {
-            provider,
+            provider: provider.clone(),
             target: current_target.clone(),
             interval_secs,
             force: false,
@@ -5303,10 +5647,7 @@ async fn poll_for_codex_target(
     };
 
     {
-        let mut map = match poll_map.lock() {
-            Ok(m) => m,
-            Err(_) => return RequestBalancePollOutcome::Skipped,
-        };
+        let mut map = refresh_coordinator.lock_last_usage_poll();
         if let Some(last) = map.get(&auto_provider.id)
             && let Some(cooldown) = remaining_poll_cooldown(*last, interval_secs, now)
         {
@@ -5315,7 +5656,16 @@ async fn poll_for_codex_target(
         map.insert(auto_provider.id.clone(), now);
     }
 
-    let _ = auto_probe_provider_target(&client, &current_target, &state, service_name, false).await;
+    let _ = run_auto_refresh_job(
+        &client,
+        AutoRefreshJob {
+            target: current_target,
+            force: false,
+        },
+        &state,
+        service_name,
+    )
+    .await;
     RequestBalancePollOutcome::Attempted
 }
 
@@ -5329,6 +5679,393 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn refresh_summary_round_trips_when_optional_counters_are_omitted() {
+        let expected = UsageProviderRefreshSummary::default();
+        let encoded = serde_json::to_value(&expected).expect("serialize refresh summary");
+
+        let decoded: UsageProviderRefreshSummary =
+            serde_json::from_value(encoded).expect("deserialize omitted refresh counters");
+
+        assert_eq!(decoded, expected);
+    }
+
+    fn coordinator_key(label: &str) -> ProviderBalanceRefreshTargetKey {
+        ProviderBalanceRefreshTargetKey {
+            provider_endpoint: ProviderEndpointKey::new("codex", label, "default"),
+            upstream_base_url: format!("https://{label}.example.test"),
+            observation_provider_id: format!("{label}-usage"),
+            adapter_kind: ProviderKind::Sub2ApiUsage,
+            usage_endpoint: format!("https://{label}.example.test/v1/usage"),
+            account_fingerprint: format!("sha256:{label}"),
+            config_revision: format!("sha256:config-{label}"),
+        }
+    }
+
+    async fn wait_for_waiter_count(
+        coordinator: &ProviderBalanceRefreshCoordinator,
+        key: &ProviderBalanceRefreshTargetKey,
+        expected: usize,
+    ) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if coordinator.waiter_count_for_test(key) >= expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("provider balance refresh waiters should register");
+    }
+
+    async fn wait_for_no_coordinator_entries(coordinator: &ProviderBalanceRefreshCoordinator) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if coordinator.entry_count_for_test() == 0 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("provider balance refresh owner should clean up its entry");
+    }
+
+    #[tokio::test]
+    async fn same_target_manual_request_and_sampler_paths_share_one_upstream_round() {
+        let coordinator = Arc::new(ProviderBalanceRefreshCoordinator::default());
+        let key = coordinator_key("cross-path");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let manual = tokio::spawn({
+            let coordinator = Arc::clone(&coordinator);
+            let key = key.clone();
+            let hits = Arc::clone(&hits);
+            let release = Arc::clone(&release);
+            async move {
+                coordinator
+                    .coordinate(key, false, move |_| {
+                        let hits = Arc::clone(&hits);
+                        let release = Arc::clone(&release);
+                        let started_tx = started_tx.clone();
+                        async move {
+                            hits.fetch_add(1, Ordering::SeqCst);
+                            let _ = started_tx.send("manual");
+                            let permit = release.acquire().await.expect("release manual refresh");
+                            permit.forget();
+                            UsageProviderRefreshOutcome::Refreshed
+                        }
+                    })
+                    .await
+            }
+        });
+        assert_eq!(started_rx.recv().await, Some("manual"));
+
+        let request = tokio::spawn({
+            let coordinator = Arc::clone(&coordinator);
+            let key = key.clone();
+            async move {
+                coordinator
+                    .coordinate(key, false, |_| async {
+                        panic!("request-path work must join the existing target")
+                    })
+                    .await
+            }
+        });
+        let sampler = tokio::spawn({
+            let coordinator = Arc::clone(&coordinator);
+            let key = key.clone();
+            async move {
+                coordinator
+                    .coordinate(key, false, |_| async {
+                        panic!("sampler work must join the existing target")
+                    })
+                    .await
+            }
+        });
+        wait_for_waiter_count(&coordinator, &key, 3).await;
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        release.add_permits(1);
+        let manual = manual.await.expect("manual waiter");
+        let request = request.await.expect("request waiter");
+        let sampler = sampler.await.expect("sampler waiter");
+        assert!(!manual.deduplicated);
+        assert!(request.deduplicated);
+        assert!(sampler.deduplicated);
+        assert_eq!(manual.outcome, UsageProviderRefreshOutcome::Refreshed);
+        assert_eq!(request.outcome, manual.outcome);
+        assert_eq!(sampler.outcome, manual.outcome);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(coordinator.entry_count_for_test(), 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_force_requests_upgrade_one_normal_round_at_most_once() {
+        let coordinator = Arc::new(ProviderBalanceRefreshCoordinator::default());
+        let key = coordinator_key("force-upgrade");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let normal = tokio::spawn({
+            let coordinator = Arc::clone(&coordinator);
+            let key = key.clone();
+            let hits = Arc::clone(&hits);
+            let release = Arc::clone(&release);
+            async move {
+                coordinator
+                    .coordinate(key, false, move |force| {
+                        let hits = Arc::clone(&hits);
+                        let release = Arc::clone(&release);
+                        let started_tx = started_tx.clone();
+                        async move {
+                            hits.fetch_add(1, Ordering::SeqCst);
+                            let _ = started_tx.send(force);
+                            let permit = release.acquire().await.expect("release refresh round");
+                            permit.forget();
+                            UsageProviderRefreshOutcome::Refreshed
+                        }
+                    })
+                    .await
+            }
+        });
+        assert_eq!(started_rx.recv().await, Some(false));
+
+        let mut forced_waiters = Vec::new();
+        for _ in 0..3 {
+            forced_waiters.push(tokio::spawn({
+                let coordinator = Arc::clone(&coordinator);
+                let key = key.clone();
+                async move {
+                    coordinator
+                        .coordinate(key, true, |_| async {
+                            panic!("force waiter must use the shared trailing round")
+                        })
+                        .await
+                }
+            }));
+        }
+        wait_for_waiter_count(&coordinator, &key, 4).await;
+        release.add_permits(1);
+        assert_eq!(started_rx.recv().await, Some(true));
+        release.add_permits(1);
+
+        assert_eq!(
+            normal.await.expect("normal waiter").outcome,
+            UsageProviderRefreshOutcome::Refreshed
+        );
+        for waiter in forced_waiters {
+            let result = waiter.await.expect("forced waiter");
+            assert!(result.deduplicated);
+            assert_eq!(result.outcome, UsageProviderRefreshOutcome::Refreshed);
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert_eq!(coordinator.entry_count_for_test(), 0);
+    }
+
+    #[tokio::test]
+    async fn different_balance_targets_can_refresh_concurrently() {
+        let coordinator = Arc::new(ProviderBalanceRefreshCoordinator::default());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut handles = Vec::new();
+
+        for label in ["target-a", "target-b"] {
+            handles.push(tokio::spawn({
+                let coordinator = Arc::clone(&coordinator);
+                let key = coordinator_key(label);
+                let release = Arc::clone(&release);
+                let started_tx = started_tx.clone();
+                async move {
+                    coordinator
+                        .coordinate(key, false, move |_| {
+                            let release = Arc::clone(&release);
+                            let started_tx = started_tx.clone();
+                            async move {
+                                let _ = started_tx.send(label);
+                                let permit = release.acquire().await.expect("release target");
+                                permit.forget();
+                                UsageProviderRefreshOutcome::Refreshed
+                            }
+                        })
+                        .await
+                }
+            }));
+        }
+
+        let mut started = vec![
+            started_rx.recv().await.expect("first target starts"),
+            started_rx.recv().await.expect("second target starts"),
+        ];
+        started.sort_unstable();
+        assert_eq!(started, ["target-a", "target-b"]);
+        assert_eq!(coordinator.entry_count_for_test(), 2);
+        release.add_permits(2);
+        for handle in handles {
+            assert_eq!(
+                handle.await.expect("target waiter").outcome,
+                UsageProviderRefreshOutcome::Refreshed
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn independent_proxy_states_do_not_coalesce_balance_refreshes() {
+        let first_state = ProxyState::new();
+        let second_state = ProxyState::new();
+        let first = first_state.provider_balance_refresh_coordinator();
+        let second = second_state.provider_balance_refresh_coordinator();
+        let key = coordinator_key("runtime-isolation");
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let first_handle = tokio::spawn({
+            let first = Arc::clone(&first);
+            let key = key.clone();
+            let release = Arc::clone(&release);
+            let started_tx = started_tx.clone();
+            async move {
+                first
+                    .coordinate(key, false, move |_| {
+                        let release = Arc::clone(&release);
+                        let started_tx = started_tx.clone();
+                        async move {
+                            let _ = started_tx.send("first");
+                            let permit = release.acquire().await.expect("release first runtime");
+                            permit.forget();
+                            UsageProviderRefreshOutcome::Refreshed
+                        }
+                    })
+                    .await
+            }
+        });
+        let second_handle = tokio::spawn({
+            let second = Arc::clone(&second);
+            let release = Arc::clone(&release);
+            async move {
+                second
+                    .coordinate(key, false, move |_| {
+                        let release = Arc::clone(&release);
+                        let started_tx = started_tx.clone();
+                        async move {
+                            let _ = started_tx.send("second");
+                            let permit = release.acquire().await.expect("release second runtime");
+                            permit.forget();
+                            UsageProviderRefreshOutcome::Refreshed
+                        }
+                    })
+                    .await
+            }
+        });
+
+        let mut started = vec![
+            started_rx.recv().await.expect("first runtime starts"),
+            started_rx.recv().await.expect("second runtime starts"),
+        ];
+        started.sort_unstable();
+        assert_eq!(started, ["first", "second"]);
+        release.add_permits(2);
+        assert!(
+            !first_handle
+                .await
+                .expect("first runtime waiter")
+                .deduplicated
+        );
+        assert!(
+            !second_handle
+                .await
+                .expect("second runtime waiter")
+                .deduplicated
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_waiter_does_not_cancel_owner_and_entry_is_reusable() {
+        let coordinator = Arc::new(ProviderBalanceRefreshCoordinator::default());
+        let key = coordinator_key("waiter-cancel");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let waiter = tokio::spawn({
+            let coordinator = Arc::clone(&coordinator);
+            let key = key.clone();
+            let hits = Arc::clone(&hits);
+            let release = Arc::clone(&release);
+            async move {
+                coordinator
+                    .coordinate(key, false, move |_| {
+                        let hits = Arc::clone(&hits);
+                        let release = Arc::clone(&release);
+                        let started_tx = started_tx.clone();
+                        async move {
+                            hits.fetch_add(1, Ordering::SeqCst);
+                            let _ = started_tx.send(());
+                            let permit = release.acquire().await.expect("release cancelled owner");
+                            permit.forget();
+                            UsageProviderRefreshOutcome::Refreshed
+                        }
+                    })
+                    .await
+            }
+        });
+        started_rx.recv().await.expect("owner starts");
+        waiter.abort();
+        let _ = waiter.await;
+        release.add_permits(1);
+        wait_for_no_coordinator_entries(&coordinator).await;
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        let result = coordinator
+            .coordinate(key, false, {
+                let hits = Arc::clone(&hits);
+                move |_| {
+                    let hits = Arc::clone(&hits);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        UsageProviderRefreshOutcome::Refreshed
+                    }
+                }
+            })
+            .await;
+        assert!(!result.deduplicated);
+        assert_eq!(result.outcome, UsageProviderRefreshOutcome::Refreshed);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn failed_or_panicked_owner_cleans_entry_and_wakes_waiters() {
+        let coordinator = Arc::new(ProviderBalanceRefreshCoordinator::default());
+        let failed_key = coordinator_key("owner-failed");
+        let failed = coordinator
+            .coordinate(failed_key, false, |_| async {
+                UsageProviderRefreshOutcome::Failed
+            })
+            .await;
+        assert_eq!(failed.outcome, UsageProviderRefreshOutcome::Failed);
+        assert_eq!(coordinator.entry_count_for_test(), 0);
+
+        let panic_key = coordinator_key("owner-panic");
+        let panicked = coordinator
+            .coordinate(panic_key.clone(), false, |_| async {
+                panic!("intentional balance worker panic")
+            })
+            .await;
+        assert_eq!(panicked.outcome, UsageProviderRefreshOutcome::Failed);
+        assert_eq!(coordinator.entry_count_for_test(), 0);
+
+        let recovered = coordinator
+            .coordinate(panic_key, false, |_| async {
+                UsageProviderRefreshOutcome::Refreshed
+            })
+            .await;
+        assert_eq!(recovered.outcome, UsageProviderRefreshOutcome::Refreshed);
+    }
 
     async fn spawn_axum_server(app: axum::Router) -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -6080,6 +6817,145 @@ mod tests {
     }
 
     #[test]
+    fn explicit_missing_upstream_credential_prevents_partial_usage_auth_fallback() {
+        let provider = provider("sub2api", ProviderKind::OpenAiBalanceHttpJson);
+
+        let mut missing_bearer = usage_provider_target("https://sub2api.example/v1", "sub2api");
+        missing_bearer.auth.auth_token_env =
+            Some("__CODEX_HELPER_TEST_MISSING_BEARER__".to_string());
+        missing_bearer.auth.api_key = Some("resolved-api-key".to_string());
+        assert_eq!(resolve_token(&provider, &missing_bearer), None);
+
+        let mut missing_api_key = usage_provider_target("https://sub2api.example/v1", "sub2api");
+        missing_api_key.auth.auth_token = Some("resolved-bearer".to_string());
+        missing_api_key.auth.api_key_env =
+            Some("__CODEX_HELPER_TEST_MISSING_API_KEY__".to_string());
+        assert_eq!(resolve_token(&provider, &missing_api_key), None);
+    }
+
+    #[tokio::test]
+    async fn configured_usage_refresh_injects_bearer_from_target_auth() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen_authorization = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+        let hits_for_route = Arc::clone(&hits);
+        let authorization_for_route = Arc::clone(&seen_authorization);
+        let app = axum::Router::new().fallback(get(move |headers: axum::http::HeaderMap| {
+            let hits = Arc::clone(&hits_for_route);
+            let seen_authorization = Arc::clone(&authorization_for_route);
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                seen_authorization
+                    .lock()
+                    .expect("authorization capture lock")
+                    .push(
+                        headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string),
+                    );
+                axum::Json(serde_json::json!({ "balance": "12.5" }))
+            }
+        }));
+        let (addr, handle) = spawn_axum_server(app).await;
+        let provider_id = format!("sub2api-auth-{}", uuid::Uuid::new_v4().simple());
+        let mut configured_provider = provider(&provider_id, ProviderKind::OpenAiBalanceHttpJson);
+        configured_provider.domains = vec!["127.0.0.1".to_string()];
+        configured_provider.endpoint = format!("http://{addr}/user/balance");
+        let mut target = usage_provider_target(&format!("http://{addr}/v1"), &provider_id);
+        target.auth.auth_token = Some("sub2api-provider-token".to_string());
+        let state = ProxyState::new();
+
+        let outcome = refresh_provider_target(RefreshProviderTargetParams {
+            client: &Client::new(),
+            provider: &configured_provider,
+            target: &target,
+            state: &state,
+            service_name: "codex",
+            interval_secs: 60,
+            force: false,
+        })
+        .await;
+
+        assert_eq!(outcome, UsageProviderRefreshOutcome::Refreshed);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            seen_authorization
+                .lock()
+                .expect("authorization capture lock")
+                .as_slice(),
+            [Some("Bearer sub2api-provider-token".to_string())]
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn configured_usage_refresh_fails_closed_for_missing_or_invalid_target_auth() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_for_route = Arc::clone(&hits);
+        let app = axum::Router::new().fallback(get(move || {
+            let hits = Arc::clone(&hits_for_route);
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                axum::Json(serde_json::json!({ "balance": "12.5" }))
+            }
+        }));
+        let (addr, handle) = spawn_axum_server(app).await;
+
+        let missing_provider_id = format!("sub2api-missing-{}", uuid::Uuid::new_v4().simple());
+        let mut missing_provider =
+            provider(&missing_provider_id, ProviderKind::OpenAiBalanceHttpJson);
+        missing_provider.domains = vec!["127.0.0.1".to_string()];
+        missing_provider.endpoint = format!("http://{addr}/user/balance");
+        let mut missing_target =
+            usage_provider_target(&format!("http://{addr}/v1"), &missing_provider_id);
+        missing_target.auth.auth_token_env = Some(format!(
+            "CODEX_HELPER_TEST_MISSING_USAGE_AUTH_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        missing_target.auth.api_key = Some("must-not-partially-fallback".to_string());
+        let missing_state = ProxyState::new();
+
+        let missing_outcome = refresh_provider_target(RefreshProviderTargetParams {
+            client: &Client::new(),
+            provider: &missing_provider,
+            target: &missing_target,
+            state: &missing_state,
+            service_name: "codex",
+            interval_secs: 60,
+            force: false,
+        })
+        .await;
+
+        assert_eq!(missing_outcome, UsageProviderRefreshOutcome::MissingToken);
+
+        let invalid_provider_id = format!("sub2api-invalid-{}", uuid::Uuid::new_v4().simple());
+        let mut invalid_provider =
+            provider(&invalid_provider_id, ProviderKind::OpenAiBalanceHttpJson);
+        invalid_provider.domains = vec!["127.0.0.1".to_string()];
+        invalid_provider.endpoint = format!("http://{addr}/user/balance");
+        let mut invalid_target =
+            usage_provider_target(&format!("http://{addr}/v1"), &invalid_provider_id);
+        invalid_target.auth.auth_token = Some("invalid\r\nbearer".to_string());
+        invalid_target.auth.api_key = Some("must-not-partially-fallback".to_string());
+        let invalid_state = ProxyState::new();
+
+        let invalid_outcome = refresh_provider_target(RefreshProviderTargetParams {
+            client: &Client::new(),
+            provider: &invalid_provider,
+            target: &invalid_target,
+            state: &invalid_state,
+            service_name: "codex",
+            interval_secs: 60,
+            force: false,
+        })
+        .await;
+
+        assert_eq!(invalid_outcome, UsageProviderRefreshOutcome::MissingToken);
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        handle.abort();
+    }
+
+    #[test]
     fn effective_poll_interval_respects_disable_flag_zero_and_minimum() {
         let mut provider = provider("sub2api", ProviderKind::OpenAiBalanceHttpJson);
 
@@ -6456,66 +7332,70 @@ mod tests {
     #[test]
     fn request_balance_queue_deduplicates_until_due() {
         let key = ProviderEndpointKey::new("codex", "input", "default");
-        let queue = REQUEST_BALANCE_QUEUE.get_or_init(|| Mutex::new(HashMap::new()));
-        {
-            let mut queue = queue.lock().expect("queue");
-            queue.remove(&key);
-        }
+        let coordinator = ProviderBalanceRefreshCoordinator::default();
 
         assert_eq!(
-            enqueue_request_balance_refresh(key.clone()),
+            coordinator.enqueue_request_refresh(key.clone()),
             Some(REQUEST_BALANCE_REFRESH_DELAY)
         );
-        assert_eq!(enqueue_request_balance_refresh(key.clone()), None);
+        assert_eq!(coordinator.enqueue_request_refresh(key.clone()), None);
         assert!(matches!(
-            take_request_balance_refresh_if_due(&key),
+            coordinator.take_request_refresh_if_due(&key),
             RequestBalanceQueueDue::NotDue(_)
         ));
 
-        {
-            let mut queue = queue.lock().expect("queue");
-            queue.insert(key.clone(), Instant::now() - Duration::from_secs(1));
-        }
+        coordinator
+            .schedule_request_refresh_at(key.clone(), Instant::now() - Duration::from_secs(1));
 
         assert_eq!(
-            take_request_balance_refresh_if_due(&key),
+            coordinator.take_request_refresh_if_due(&key),
             RequestBalanceQueueDue::Due
         );
         assert_eq!(
-            take_request_balance_refresh_if_due(&key),
+            coordinator.take_request_refresh_if_due(&key),
             RequestBalanceQueueDue::Missing
         );
         assert_eq!(
-            enqueue_request_balance_refresh(key.clone()),
+            coordinator.enqueue_request_refresh(key.clone()),
             Some(REQUEST_BALANCE_REFRESH_DELAY)
         );
-
-        queue.lock().expect("queue").remove(&key);
     }
 
     #[test]
     fn request_balance_queue_does_not_extend_due_refresh() {
         let key = ProviderEndpointKey::new("codex", "input", "default");
-        let queue = REQUEST_BALANCE_QUEUE.get_or_init(|| Mutex::new(HashMap::new()));
-        {
-            let mut queue = queue.lock().expect("queue");
-            queue.insert(key.clone(), Instant::now() - Duration::from_secs(1));
-        }
+        let coordinator = ProviderBalanceRefreshCoordinator::default();
+        coordinator
+            .schedule_request_refresh_at(key.clone(), Instant::now() - Duration::from_secs(1));
 
         assert_eq!(
-            enqueue_request_balance_refresh(key.clone()),
+            coordinator.enqueue_request_refresh(key.clone()),
             Some(Duration::ZERO)
         );
         assert_eq!(
-            take_request_balance_refresh_if_due(&key),
+            coordinator.take_request_refresh_if_due(&key),
             RequestBalanceQueueDue::Due
         );
         assert_eq!(
-            take_request_balance_refresh_if_due(&key),
+            coordinator.take_request_refresh_if_due(&key),
             RequestBalanceQueueDue::Missing
         );
+    }
 
-        queue.lock().expect("queue").remove(&key);
+    #[test]
+    fn independent_proxy_states_keep_request_balance_queues_isolated() {
+        let key = ProviderEndpointKey::new("codex", "input", "default");
+        let first = ProxyState::new().provider_balance_refresh_coordinator();
+        let second = ProxyState::new().provider_balance_refresh_coordinator();
+
+        assert_eq!(
+            first.enqueue_request_refresh(key.clone()),
+            Some(REQUEST_BALANCE_REFRESH_DELAY)
+        );
+        assert_eq!(
+            second.enqueue_request_refresh(key),
+            Some(REQUEST_BALANCE_REFRESH_DELAY)
+        );
     }
 
     #[test]

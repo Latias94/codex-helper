@@ -20,12 +20,13 @@ pub(super) struct RouteUnavailableReport {
     pub(super) route_attempts: Vec<RouteAttemptLog>,
     pub(super) provider_endpoints_to_probe: Vec<ProviderEndpointKey>,
     pub(super) message: String,
+    status: StatusCode,
     short_cooldown_remaining_secs: Option<u64>,
 }
 
 impl RouteUnavailableReport {
     pub(super) fn failure_status_message(&self) -> (StatusCode, String) {
-        (StatusCode::BAD_GATEWAY, self.message.clone())
+        (self.status, self.message.clone())
     }
 
     pub(super) fn short_cooldown_wait_secs(&self, max_secs: u64) -> Option<u64> {
@@ -54,6 +55,7 @@ pub(super) fn route_unavailable_report(
     let mut retry_after_secs = None::<u64>;
     let mut has_runtime_unavailable_reason = false;
     let mut has_short_cooldown_reason = false;
+    let mut has_missing_auth_reason = false;
     let mut reason_counts = BTreeMap::<String, usize>::new();
 
     for candidate in &template.candidates {
@@ -86,6 +88,9 @@ pub(super) fn route_unavailable_report(
         has_short_cooldown_reason |= reasons
             .iter()
             .any(|reason| matches!(reason, RoutePlanSkipReason::Cooldown));
+        has_missing_auth_reason |= reasons
+            .iter()
+            .any(|reason| matches!(reason, RoutePlanSkipReason::MissingAuth));
 
         let mut reason_codes = reasons
             .iter()
@@ -131,8 +136,12 @@ pub(super) fn route_unavailable_report(
             attempt.cooldown_reason = Some("route_unavailable".to_string());
         }
     }
-    let message =
-        format!("No upstreams are currently routable; try again in {retry_after_secs} seconds");
+    let message = if has_missing_auth_reason {
+        "No upstreams are currently routable because configured upstream credentials are unavailable"
+            .to_string()
+    } else {
+        format!("No upstreams are currently routable; try again in {retry_after_secs} seconds")
+    };
 
     log_control_trace_event(serde_json::json!({
         "event": "route_graph_unavailable",
@@ -151,6 +160,11 @@ pub(super) fn route_unavailable_report(
         route_attempts,
         provider_endpoints_to_probe,
         message,
+        status: if has_missing_auth_reason {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::BAD_GATEWAY
+        },
         short_cooldown_remaining_secs: has_short_cooldown_reason.then_some(retry_after_secs),
     })
 }

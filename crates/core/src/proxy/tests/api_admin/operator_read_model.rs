@@ -232,13 +232,8 @@ async fn operator_provider_projection_uses_compiled_candidate_order_and_route_me
         .operator_read_capture()
         .await
         .expect("capture operator read model");
-    let providers = &capture
-        .model
-        .data
-        .as_ref()
-        .expect("ready operator data")
-        .summary
-        .providers;
+    let data = capture.model.data.as_ref().expect("ready operator data");
+    let providers = &data.summary.providers;
 
     assert_eq!(
         providers
@@ -255,6 +250,121 @@ async fn operator_provider_projection_uses_compiled_candidate_order_and_route_me
     assert!(!unused.effective_enabled);
     assert_eq!(unused.routable_endpoints, 0);
     assert!(unused.endpoints.iter().all(|endpoint| !endpoint.routable));
+
+    let routing = data.routing.as_ref().expect("operator routing summary");
+    assert_eq!(routing.entry, "main");
+    assert_eq!(routing.entry_strategy, RouteStrategy::OrderedFailover);
+    assert_eq!(routing.affinity_policy, RouteAffinityPolicy::FallbackSticky);
+    assert_eq!(routing.scheduling_preset, SchedulingPreset::Balanced);
+    assert_eq!(routing.fallback_ttl_ms, None);
+    assert_eq!(routing.reprobe_preferred_after_ms, None);
+    assert_eq!(
+        routing
+            .candidates
+            .iter()
+            .map(|candidate| (
+                candidate.route_order,
+                candidate.provider_id.as_str(),
+                candidate.endpoint_id.as_str(),
+                candidate.preference_group,
+                candidate.route_path.as_slice(),
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                0,
+                "z-preferred",
+                "default",
+                0,
+                &["main".to_string(), "z-preferred".to_string()][..],
+            ),
+            (
+                1,
+                "a-fallback",
+                "default",
+                1,
+                &["main".to_string(), "a-fallback".to_string()][..],
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn operator_runtime_revision_covers_scheduling_without_changing_topology_key() {
+    let balanced_config = operator_provider_config(&["input"], None);
+    let mut throughput_config = balanced_config.clone();
+    throughput_config
+        .codex
+        .routing
+        .as_mut()
+        .expect("routing config")
+        .scheduling_preset = SchedulingPreset::ThroughputFirst;
+
+    let balanced = proxy_service(balanced_config)
+        .operator_read_capture()
+        .await
+        .expect("capture balanced operator model")
+        .model;
+    let throughput = proxy_service(throughput_config)
+        .operator_read_capture()
+        .await
+        .expect("capture throughput-first operator model")
+        .model;
+    let balanced_revisions = balanced.revisions.as_ref().expect("balanced revisions");
+    let throughput_revisions = throughput
+        .revisions
+        .as_ref()
+        .expect("throughput-first revisions");
+    let balanced_routing = balanced
+        .data
+        .as_ref()
+        .and_then(|data| data.routing.as_ref())
+        .expect("balanced routing summary");
+    let throughput_routing = throughput
+        .data
+        .as_ref()
+        .and_then(|data| data.routing.as_ref())
+        .expect("throughput-first routing summary");
+
+    assert_eq!(
+        balanced_revisions.route_digest,
+        throughput_revisions.route_digest
+    );
+    assert_ne!(
+        balanced_revisions.runtime_digest,
+        throughput_revisions.runtime_digest
+    );
+    assert_eq!(
+        balanced_routing.route_graph_key,
+        throughput_routing.route_graph_key
+    );
+    assert_eq!(
+        balanced_routing.scheduling_preset,
+        SchedulingPreset::Balanced
+    );
+    assert_eq!(
+        throughput_routing.scheduling_preset,
+        SchedulingPreset::ThroughputFirst
+    );
+}
+
+#[tokio::test]
+async fn operator_read_model_accepts_legacy_payload_without_routing_summary() {
+    let proxy = proxy_service(operator_provider_config(&["input"], None));
+    let capture = proxy
+        .operator_read_capture()
+        .await
+        .expect("capture operator read model");
+    let mut encoded = serde_json::to_value(capture.model).expect("serialize operator read model");
+    encoded["data"]
+        .as_object_mut()
+        .expect("operator data")
+        .remove("routing");
+
+    let decoded: OperatorReadModel =
+        serde_json::from_value(encoded).expect("deserialize legacy operator read model");
+
+    assert!(decoded.data.expect("ready operator data").routing.is_none());
 }
 
 #[tokio::test]

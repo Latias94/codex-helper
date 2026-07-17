@@ -12,6 +12,8 @@ use axum::response::{IntoResponse, Response};
 use futures_util::future::BoxFuture;
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::connect_async;
+
+use crate::auth_resolution::UpstreamAuthResolutionError;
 use tokio_tungstenite::tungstenite;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http as tungstenite_http;
@@ -54,8 +56,8 @@ use super::request_failures::{
 };
 use super::request_observer::{RequestObserver, RequestPublication};
 use super::request_preparation::{
-    CommonRequestPreparationError, CommonRequestPreparationParams, RequestConfigContext,
-    prepare_common_request_without_route_plan,
+    CommonRequestPreparationError, CommonRequestPreparationParams, load_request_config_context,
+    prepare_common_request,
 };
 use super::retry::{RetryPlan, retry_info_for_failed_attempts, retry_info_for_observed_attempts};
 use super::route_affinity::{
@@ -69,16 +71,20 @@ use super::route_attempts::{
     start_selected_route_attempt,
 };
 use super::route_target_selection::{
-    acquire_candidate_concurrency_permit, route_graph_request_requires_existing_affinity,
-    route_graph_runtime_for_request, runtime_for_acquired_candidate_revalidation,
+    acquire_candidate_concurrency_permit, apply_auth_resolution_to_runtime,
+    apply_routing_operator_control_to_runtime, restrict_route_state_to_affinity_continuity_domain,
+    route_graph_request_requires_existing_affinity, route_graph_runtime_for_request,
+    runtime_for_acquired_candidate_revalidation, runtime_for_capacity_wait_selection,
+    select_route_graph_candidate,
 };
-use super::runtime_config::RuntimeSnapshot;
+use super::runtime_config::{CapturedRoutePlan, RuntimeSnapshot};
 use super::selected_upstream_request::apply_selected_model_mapping;
 use super::{CLIENT_NAME_HEADER, ProxyService};
 use crate::routing_ir::CapturedRouteCandidate;
 
 const RESPONSES_WS_BETA_HEADER: &str = "responses_websockets=2026-02-06";
 const WS_PROVIDER_ENDPOINT_HEADER: &str = "x-codex-helper-provider-endpoint";
+const UPSTREAM_AUTH_UNAVAILABLE_REASON: &str = "configured upstream credentials are unavailable";
 const WS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const WS_CONNECTIONS_PER_REQUEST_SLOT: u32 = 2;
 
@@ -105,6 +111,7 @@ struct ResponsesWebSocketPrepared {
     is_warmup: bool,
     plan: RetryPlan,
     cooldown_backoff: crate::endpoint_health::CooldownBackoff,
+    route_plan: CapturedRoutePlan,
 }
 
 struct ResponsesWebSocketSelected {
@@ -124,6 +131,8 @@ struct ResponsesWebSocketHandshakeRoute {
     runtime_snapshot: Arc<RuntimeSnapshot>,
     route_revision: u64,
     route_template: Arc<RoutePlanTemplate>,
+    binding_source: WebSocketHandshakeBindingSource,
+    routing_control_graph_key: String,
     target: CapturedRouteCandidate,
     route_graph_key: String,
     avoided_indices: Vec<usize>,
@@ -167,7 +176,6 @@ struct PrepareResponsesWebSocketParams {
     first_message: AxumWsMessage,
     start: Instant,
     started_at_ms: u64,
-    runtime_snapshot: Arc<RuntimeSnapshot>,
 }
 
 struct ResponsesWebSocketSelectionFailure {
@@ -232,7 +240,22 @@ pub(super) async fn handle_responses_websocket(
         }
     };
     let upstream_headers =
-        upstream_ws_handshake_headers(&headers, &route.target, target_url.as_str());
+        match upstream_ws_handshake_headers(&headers, &route.target, target_url.as_str()) {
+            Ok(headers) => headers,
+            Err(error) => {
+                tracing::warn!(
+                    provider_id = route.target.provider_id(),
+                    auth_error_code = error.code(),
+                    error = %error,
+                    "selected WebSocket provider authentication could not be resolved"
+                );
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    UPSTREAM_AUTH_UNAVAILABLE_REASON,
+                )
+                    .into_response();
+            }
+        };
     let upstream_url = match http_url_to_ws(target_url.clone()) {
         Ok(url) => url,
         Err(message) => return (StatusCode::BAD_GATEWAY, message).into_response(),
@@ -333,7 +356,6 @@ async fn prepare_responses_websocket(
         first_message,
         start,
         started_at_ms,
-        runtime_snapshot,
     } = params;
     let method = Method::GET;
     let mut client_headers = client_headers;
@@ -342,10 +364,6 @@ async fn prepare_responses_websocket(
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
     let client_addr = None;
-
-    let config = RequestConfigContext {
-        runtime_snapshot: Arc::clone(&runtime_snapshot),
-    };
 
     let raw_body = first_message_body_bytes(&first_message).ok_or_else(|| {
         (
@@ -372,6 +390,7 @@ async fn prepare_responses_websocket(
         == Some(false);
     let (session_identity_hint, raw_body) =
         codex_session_identity_and_completed_body(&mut client_headers, &raw_body);
+    let config = load_request_config_context(proxy, session_identity_hint.as_ref()).await;
     let request_continuity = classify_request_continuity(RequestContinuityClassificationInput {
         transport: RequestTransport::ResponsesWebSocket,
         is_codex_service: proxy.service_name == "codex",
@@ -380,7 +399,7 @@ async fn prepare_responses_websocket(
         raw_body: raw_body.as_ref(),
     });
 
-    let prepared = match prepare_common_request_without_route_plan(CommonRequestPreparationParams {
+    let prepared = match prepare_common_request(CommonRequestPreparationParams {
         proxy,
         config: &config,
         method: &method,
@@ -388,7 +407,6 @@ async fn prepare_responses_websocket(
         client_headers: &client_headers,
         raw_body: &raw_body,
         request_dialect: RequestDialect::ResponsesWebSocket,
-        session_identity_hint,
         client_name,
         client_addr,
         started_at_ms,
@@ -438,6 +456,12 @@ async fn prepare_responses_websocket(
             return Err((StatusCode::BAD_GATEWAY, message));
         }
     };
+    let route_plan = prepared.route_plan.ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "WebSocket request route plan was not prepared".to_string(),
+        )
+    })?;
 
     Ok(ResponsesWebSocketPrepared {
         method,
@@ -459,6 +483,7 @@ async fn prepare_responses_websocket(
         is_warmup,
         plan: prepared.plan,
         cooldown_backoff: prepared.cooldown_backoff,
+        route_plan,
     })
 }
 
@@ -480,11 +505,19 @@ async fn prepare_responses_websocket_handshake_route(
                 "captured WebSocket route graph has an unknown service",
             )
         })?;
+    let routing_control_graph_key = graph.digest().to_string();
     let template = graph.handshake_plan();
     let mut runtime = proxy
         .state
         .route_plan_runtime_state_with_provider_policy(proxy.service_name, provider_policy.as_ref())
         .await;
+    apply_auth_resolution_to_runtime(proxy.service_name, &template, &mut runtime);
+    apply_routing_operator_control_to_runtime(
+        proxy,
+        routing_control_graph_key.as_str(),
+        &mut runtime,
+    )
+    .await;
 
     let route_graph_key = template.route_graph_key();
     let affinity = if let Some(session_id) = session_id.as_deref() {
@@ -530,6 +563,16 @@ async fn prepare_responses_websocket_handshake_route(
         HandshakeSelectionHint::Explicit(candidate)
     } else if let Some(affinity) = affinity.as_ref() {
         HandshakeSelectionHint::Affinity(affinity.provider_endpoint.clone())
+    } else if let Some(preferred) = runtime
+        .new_session_preference()
+        .filter(|preferred| {
+            candidates
+                .iter()
+                .any(|(key, _)| key == &preferred.stable_key())
+        })
+        .cloned()
+    {
+        HandshakeSelectionHint::Preference(preferred)
     } else if candidates.len() == 1 {
         HandshakeSelectionHint::Singleton(candidates[0].0.clone())
     } else {
@@ -552,6 +595,7 @@ async fn prepare_responses_websocket_handshake_route(
         runtime_snapshot,
         template,
         runtime,
+        routing_control_graph_key,
         route_graph_key,
         selection_hint,
         affinity
@@ -563,7 +607,16 @@ async fn prepare_responses_websocket_handshake_route(
 enum HandshakeSelectionHint {
     Explicit(String),
     Affinity(ProviderEndpointKey),
+    Preference(ProviderEndpointKey),
     Singleton(String),
+}
+
+#[derive(Clone, Copy)]
+enum WebSocketHandshakeBindingSource {
+    Explicit,
+    Affinity,
+    Preference,
+    Singleton,
 }
 
 fn unique_handshake_candidates(template: &RoutePlanTemplate) -> Vec<(String, &RouteCandidate)> {
@@ -645,15 +698,68 @@ fn compatible_websocket_route(
     attempt_scope: &ResponsesWebSocketAttemptScope,
 ) -> Option<ResponsesWebSocketHandshakeRoute> {
     let graph = current_snapshot.route_graph(proxy.service_name)?;
-    let template = graph.handshake_plan();
-    let route_graph_key = template.route_graph_key();
-    if route_graph_key != bound.route_graph_key
+    let routing_control_graph_key = graph.digest().to_string();
+    if routing_control_graph_key != bound.routing_control_graph_key {
+        return None;
+    }
+    compatible_websocket_route_with_template(
+        proxy,
+        bound,
+        current_snapshot,
+        Arc::clone(&bound.route_template),
+        routing_control_graph_key,
+        client_headers,
+        uri,
+        attempt_scope,
+    )
+}
+
+fn compatible_websocket_route_for_plan(
+    proxy: &ProxyService,
+    bound: &ResponsesWebSocketHandshakeRoute,
+    route_plan: &CapturedRoutePlan,
+    client_headers: &HeaderMap,
+    uri: &Uri,
+    attempt_scope: &ResponsesWebSocketAttemptScope,
+) -> Option<ResponsesWebSocketHandshakeRoute> {
+    let runtime_snapshot = route_plan.runtime_snapshot();
+    let routing_control_graph_key = route_plan.routing_control_graph_key().to_string();
+    if routing_control_graph_key != bound.routing_control_graph_key {
+        return None;
+    }
+    compatible_websocket_route_with_template(
+        proxy,
+        bound,
+        runtime_snapshot,
+        Arc::new(route_plan.template().clone()),
+        routing_control_graph_key,
+        client_headers,
+        uri,
+        attempt_scope,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compatible_websocket_route_with_template(
+    proxy: &ProxyService,
+    bound: &ResponsesWebSocketHandshakeRoute,
+    current_snapshot: Arc<RuntimeSnapshot>,
+    template: Arc<RoutePlanTemplate>,
+    routing_control_graph_key: String,
+    client_headers: &HeaderMap,
+    uri: &Uri,
+    attempt_scope: &ResponsesWebSocketAttemptScope,
+) -> Option<ResponsesWebSocketHandshakeRoute> {
+    let current_graph = current_snapshot.route_graph(proxy.service_name)?;
+    if current_graph.digest() != routing_control_graph_key
+        || current_graph.handshake_plan().scheduling_preset != template.scheduling_preset
         || template.scheduling_preset != bound.route_template.scheduling_preset
         || current_snapshot.provider_catalog().catalog_revision()
             != bound.runtime_snapshot.provider_catalog().catalog_revision()
     {
         return None;
     }
+    let route_graph_key = template.route_graph_key();
     let topology = template.continuity_topology();
     let candidate =
         topology.find_candidate_by_provider_endpoint(bound.target.provider_endpoint())?;
@@ -667,7 +773,7 @@ fn compatible_websocket_route(
         return None;
     }
     let upstream_headers =
-        upstream_ws_handshake_headers(client_headers, &target, target_url.as_str());
+        upstream_ws_handshake_headers(client_headers, &target, target_url.as_str()).ok()?;
     if AccountFingerprint::from_final_headers(&upstream_headers)
         != attempt_scope.account_fingerprint
     {
@@ -677,7 +783,9 @@ fn compatible_websocket_route(
     Some(ResponsesWebSocketHandshakeRoute {
         route_revision: current_snapshot.revision(),
         runtime_snapshot: current_snapshot,
-        route_template: Arc::new(template),
+        route_template: template,
+        binding_source: bound.binding_source,
+        routing_control_graph_key,
         target,
         route_graph_key,
         avoided_indices: bound.avoided_indices.clone(),
@@ -691,6 +799,7 @@ fn select_captured_handshake_route(
     runtime_snapshot: Arc<RuntimeSnapshot>,
     template: RoutePlanTemplate,
     runtime: RoutePlanRuntimeState,
+    routing_control_graph_key: String,
     route_graph_key: String,
     selection_hint: HandshakeSelectionHint,
     affinity_endpoint: Option<&ProviderEndpointKey>,
@@ -707,11 +816,27 @@ fn select_captured_handshake_route(
         executor.select_supported_candidate_with_runtime_state(&mut route_state, &runtime, None)
     };
     let selected = selection.selected.ok_or_else(|| {
+        let all_candidates_missing_auth = !template.candidates.is_empty()
+            && template.candidates.iter().all(|candidate| {
+                runtime
+                    .candidate_runtime_snapshot(&template, candidate)
+                    .missing_auth
+            });
         ResponsesWebSocketSelectionFailure::new(
             StatusCode::SERVICE_UNAVAILABLE,
-            "captured WebSocket endpoint is not currently eligible",
+            if all_candidates_missing_auth {
+                UPSTREAM_AUTH_UNAVAILABLE_REASON
+            } else {
+                "captured WebSocket endpoint is not currently eligible"
+            },
         )
     })?;
+    let binding_source = match &selection_hint {
+        HandshakeSelectionHint::Explicit(_) => WebSocketHandshakeBindingSource::Explicit,
+        HandshakeSelectionHint::Affinity(_) => WebSocketHandshakeBindingSource::Affinity,
+        HandshakeSelectionHint::Preference(_) => WebSocketHandshakeBindingSource::Preference,
+        HandshakeSelectionHint::Singleton(_) => WebSocketHandshakeBindingSource::Singleton,
+    };
     let selected_key = selected.provider_endpoint.stable_key();
     match &selection_hint {
         HandshakeSelectionHint::Explicit(expected)
@@ -742,6 +867,12 @@ fn select_captured_handshake_route(
                 ));
             }
         }
+        HandshakeSelectionHint::Preference(expected) if selected.provider_endpoint != *expected => {
+            return Err(ResponsesWebSocketSelectionFailure::new(
+                StatusCode::CONFLICT,
+                "new-session WebSocket preference is not currently selectable",
+            ));
+        }
         _ => {}
     }
 
@@ -750,6 +881,8 @@ fn select_captured_handshake_route(
         route_revision: runtime_snapshot.revision(),
         runtime_snapshot,
         route_template: Arc::new(template.clone()),
+        binding_source,
+        routing_control_graph_key,
         target,
         route_graph_key,
         avoided_indices: selection.avoided_candidate_indices,
@@ -976,6 +1109,7 @@ async fn relay_websocket_streams(
                     &proxy,
                     &route,
                     &pending_create.prepared,
+                    WebSocketCandidateValidationPhase::AfterAdmission,
                 )
                 .await
                 {
@@ -1148,28 +1282,6 @@ async fn relay_websocket_streams(
                                 close_reason = message;
                                 break;
                             }
-                            let current = proxy.config.capture().await;
-                            let Some(current_route) = compatible_websocket_route(
-                                &proxy,
-                                &route,
-                                current,
-                                &client_headers,
-                                &uri,
-                                &attempt_scope,
-                            )
-                            else {
-                                let message = "WebSocket route changed; reconnect required".to_string();
-                                send_client_ws_error_and_close(
-                                    &mut client_sender,
-                                    1012,
-                                    "websocket_reconnect_required",
-                                    message.as_str(),
-                                )
-                                .await;
-                                close_reason = message;
-                                break;
-                            };
-                            route = current_route;
                             let prepared = match prepare_responses_websocket(
                                 &proxy,
                                 PrepareResponsesWebSocketParams {
@@ -1178,7 +1290,6 @@ async fn relay_websocket_streams(
                                     first_message: message,
                                     start: Instant::now(),
                                     started_at_ms: crate::logging::now_ms(),
-                                    runtime_snapshot: Arc::clone(&route.runtime_snapshot),
                                 },
                             )
                             .await
@@ -1196,6 +1307,61 @@ async fn relay_websocket_streams(
                                     break;
                                 }
                             };
+                            let Some(admitted_route) = compatible_websocket_route_for_plan(
+                                &proxy,
+                                &route,
+                                &prepared.route_plan,
+                                &client_headers,
+                                &uri,
+                                &attempt_scope,
+                            ) else {
+                                let message = "WebSocket route changed; reconnect required".to_string();
+                                finish_websocket_pre_upstream_failure(
+                                    &proxy,
+                                    &prepared,
+                                    StatusCode::CONFLICT,
+                                    message.clone(),
+                                    Vec::new(),
+                                )
+                                .await;
+                                send_client_ws_error_and_close(
+                                    &mut client_sender,
+                                    1012,
+                                    "websocket_reconnect_required",
+                                    message.as_str(),
+                                )
+                                .await;
+                                close_reason = message;
+                                break;
+                            };
+                            route = admitted_route;
+                            if !websocket_bound_candidate_is_current(
+                                &proxy,
+                                &route,
+                                &prepared,
+                                WebSocketCandidateValidationPhase::BeforeAdmission,
+                            )
+                            .await
+                            {
+                                let message = "WebSocket endpoint binding is no longer eligible; reconnect required".to_string();
+                                finish_websocket_pre_upstream_failure(
+                                    &proxy,
+                                    &prepared,
+                                    StatusCode::CONFLICT,
+                                    message.clone(),
+                                    Vec::new(),
+                                )
+                                .await;
+                                send_client_ws_error_and_close(
+                                    &mut client_sender,
+                                    1012,
+                                    "websocket_reconnect_required",
+                                    message.as_str(),
+                                )
+                                .await;
+                                close_reason = message;
+                                break;
+                            }
                             let admission = websocket_concurrency_admission(
                                 proxy.clone(),
                                 route.route_template.clone(),
@@ -1370,6 +1536,7 @@ async fn websocket_bound_candidate_is_current(
     proxy: &ProxyService,
     route: &ResponsesWebSocketHandshakeRoute,
     prepared: &ResponsesWebSocketPrepared,
+    phase: WebSocketCandidateValidationPhase,
 ) -> bool {
     let reservation_guard =
         if route.route_template.affinity_policy != crate::config::RouteAffinityPolicy::Off {
@@ -1380,6 +1547,7 @@ async fn websocket_bound_candidate_is_current(
     let mut runtime = route_graph_runtime_for_request(
         proxy,
         route.route_template.as_ref(),
+        route.routing_control_graph_key.as_str(),
         route.route_revision,
         route.runtime_snapshot.provider_policy().as_ref(),
         prepared.session_id.as_deref(),
@@ -1422,17 +1590,70 @@ async fn websocket_bound_candidate_is_current(
     ) {
         return false;
     }
-    if let Some(affinity) = runtime.affinity_provider_endpoint()
-        && affinity != &provider_endpoint
-    {
-        let topology = route.route_template.continuity_topology();
-        let Some(affinity_candidate) = topology.find_candidate_by_provider_endpoint(affinity)
-        else {
+    let mut route_state = RoutePlanAttemptState::default();
+    restrict_route_state_to_affinity_continuity_domain(
+        continuity,
+        &mut route_state,
+        route.route_template.as_ref(),
+        &runtime,
+    );
+    let executor = RoutePlanExecutor::new(route.route_template.as_ref());
+    let selection_runtime = match phase {
+        WebSocketCandidateValidationPhase::BeforeAdmission => {
+            runtime_for_capacity_wait_selection(route.route_template.as_ref(), &runtime)
+        }
+        WebSocketCandidateValidationPhase::AfterAdmission => {
+            runtime_for_acquired_candidate_revalidation(
+                route.route_template.as_ref(),
+                &runtime,
+                route.target.candidate(),
+            )
+        }
+    };
+    if matches!(
+        route.binding_source,
+        WebSocketHandshakeBindingSource::Explicit | WebSocketHandshakeBindingSource::Singleton
+    ) {
+        let validation_runtime = runtime_for_acquired_candidate_revalidation(
+            route.route_template.as_ref(),
+            &runtime,
+            route.target.candidate(),
+        );
+        let candidate = validation_runtime
+            .candidate_runtime_snapshot(route.route_template.as_ref(), route.target.candidate());
+        if !candidate
+            .skip_reasons_for_candidate(route.target.candidate(), prepared.request_model.as_deref())
+            .is_empty()
+        {
             return false;
+        }
+    } else {
+        let selection = select_route_graph_candidate(
+            &executor,
+            &mut route_state,
+            &selection_runtime,
+            prepared.request_model.as_deref(),
+            is_remote_compaction_request,
+            continuity,
+        );
+        let Some(selected) = selection.selected else {
+            let validation_runtime = runtime_for_acquired_candidate_revalidation(
+                route.route_template.as_ref(),
+                &runtime,
+                route.target.candidate(),
+            );
+            let candidate = validation_runtime.candidate_runtime_snapshot(
+                route.route_template.as_ref(),
+                route.target.candidate(),
+            );
+            return candidate
+                .skip_reasons_for_candidate(
+                    route.target.candidate(),
+                    prepared.request_model.as_deref(),
+                )
+                .is_empty();
         };
-        let affinity_domain = topology.candidate_domain(affinity_candidate);
-        let bound_domain = topology.candidate_domain(route.target.candidate());
-        if !affinity_domain.is_explicit() || affinity_domain != bound_domain {
+        if selected.provider_endpoint != provider_endpoint {
             return false;
         }
     }
@@ -1474,6 +1695,12 @@ async fn websocket_bound_candidate_is_current(
     candidate
         .skip_reasons_for_candidate(route.target.candidate(), prepared.request_model.as_deref())
         .is_empty()
+}
+
+#[derive(Clone, Copy)]
+enum WebSocketCandidateValidationPhase {
+    BeforeAdmission,
+    AfterAdmission,
 }
 
 async fn finish_websocket_success(
@@ -1863,7 +2090,7 @@ fn upstream_ws_handshake_headers(
     client_headers: &HeaderMap,
     target: &CapturedRouteCandidate,
     target_url: &str,
-) -> HeaderMap {
+) -> Result<HeaderMap, UpstreamAuthResolutionError> {
     const ALLOWED_CLIENT_HEADERS: &[&str] = &[
         "authorization",
         "chatgpt-account-id",
@@ -1906,12 +2133,12 @@ fn upstream_ws_handshake_headers(
             }
         }
     }
-    inject_auth_headers("codex", target.auth(), target_url, &mut headers);
+    inject_auth_headers("codex", target.auth(), target_url, &mut headers)?;
     headers.insert(
         HeaderName::from_static("openai-beta"),
         HeaderValue::from_static(RESPONSES_WS_BETA_HEADER),
     );
-    headers
+    Ok(headers)
 }
 
 fn filter_upstream_ws_success_headers(headers: &HeaderMap) -> HeaderMap {
@@ -2128,7 +2355,7 @@ mod tests {
     }
 
     #[test]
-    fn websocket_handshake_preserves_client_auth_only_for_official_origin() {
+    fn websocket_handshake_requires_explicit_anonymous_opt_in_for_remote_relay() {
         let client_headers = codex_account_headers();
         let official_target = ws_target(
             "https://api.openai.com/v1",
@@ -2139,7 +2366,8 @@ mod tests {
             &client_headers,
             &official_target,
             "https://api.openai.com/v1/responses",
-        );
+        )
+        .expect("build official WebSocket handshake headers");
 
         for header in [
             "authorization",
@@ -2157,11 +2385,30 @@ mod tests {
             "https://relay.example/v1",
             crate::config::UpstreamAuth::default(),
         );
-        let relay = upstream_ws_handshake_headers(
+        let relay_error = upstream_ws_handshake_headers(
             &client_headers,
             &relay_target,
             "https://relay.example/v1/responses",
+        )
+        .expect_err("remote relay must not receive an anonymous handshake by default");
+        assert!(matches!(
+            relay_error,
+            UpstreamAuthResolutionError::AnonymousNotAllowed
+        ));
+
+        let anonymous_relay_target = ws_target(
+            "https://relay.example/v1",
+            crate::config::UpstreamAuth {
+                allow_anonymous: Some(true),
+                ..crate::config::UpstreamAuth::default()
+            },
         );
+        let relay = upstream_ws_handshake_headers(
+            &client_headers,
+            &anonymous_relay_target,
+            "https://relay.example/v1/responses",
+        )
+        .expect("build explicitly anonymous relay WebSocket handshake headers");
 
         for header in [
             "authorization",
@@ -2186,7 +2433,8 @@ mod tests {
             &client_headers,
             &helper_target,
             "https://api.openai.com/v1/responses",
-        );
+        )
+        .expect("build helper-authenticated WebSocket handshake headers");
         assert_eq!(
             helper.get("authorization"),
             Some(&HeaderValue::from_static("Bearer helper-token"))
@@ -2200,6 +2448,34 @@ mod tests {
         ] {
             assert!(!helper.contains_key(header), "{header}");
         }
+    }
+
+    #[test]
+    fn websocket_handshake_rejects_missing_explicit_auth_reference() {
+        let missing_reference = format!(
+            "CODEX_HELPER_TEST_MISSING_WS_AUTH_{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let target = ws_target(
+            "https://relay.example/v1",
+            crate::config::UpstreamAuth {
+                auth_token_env: Some(missing_reference.clone()),
+                ..crate::config::UpstreamAuth::default()
+            },
+        );
+
+        let error = upstream_ws_handshake_headers(
+            &codex_account_headers(),
+            &target,
+            "https://relay.example/v1/responses",
+        )
+        .expect_err("missing explicit auth reference must fail closed");
+
+        assert!(matches!(
+            error,
+            UpstreamAuthResolutionError::MissingReference { name, .. }
+                if name == missing_reference
+        ));
     }
 
     #[tokio::test]

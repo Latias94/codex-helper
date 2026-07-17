@@ -43,22 +43,27 @@ use crate::runtime_store::{
     FrozenProviderCatalogScope, FrozenProviderEpochIdentity, FrozenProviderPriceKey,
     LogicalRequestHandle, LogicalRequestId, LogicalRequestOutcome, LogicalRequestTerminal,
     LogicalRequestTerminalPayload, NewAttempt, NewLogicalRequest, OperatorLedgerRevision,
-    ProviderAutomaticEligibility, ProviderEffectiveEligibility, ProviderEligibilityProjection,
-    ProviderManualEligibility, ProviderObservation, ProviderObservationCommit,
-    ProviderObservationDisposition, ProviderObservationReservation, ProviderObservationScope,
-    ProviderPolicySnapshot, RequestAccountingScope, RuntimeDocumentCommit, RuntimeDocumentKind,
-    RuntimeDocumentWrite, RuntimeStore, RuntimeStoreError, SessionAffinityIdentitySource,
-    SessionAffinityLimit, SessionAffinityRecord, TerminalDisposition,
+    ProviderAutomaticEligibility, ProviderEligibilityProjection, ProviderManualEligibility,
+    ProviderObservation, ProviderObservationCommit, ProviderObservationDisposition,
+    ProviderObservationReservation, ProviderObservationScope, ProviderPolicySnapshot,
+    RequestAccountingScope, RuntimeDocumentCommit, RuntimeDocumentKind, RuntimeDocumentWrite,
+    RuntimeStore, RuntimeStoreError, SessionAffinityIdentitySource, SessionAffinityLimit,
+    SessionAffinityRecord, TerminalDisposition,
 };
 #[cfg(test)]
-use crate::runtime_store::{ProviderObservationAuthority, ProviderPolicyEffect};
+use crate::runtime_store::{
+    ProviderEffectiveEligibility, ProviderObservationAuthority, ProviderPolicyEffect,
+};
 use crate::sessions;
 #[cfg(test)]
 use crate::usage::UsageMetrics;
 use crate::usage_day;
+use crate::usage_providers::ProviderBalanceRefreshCoordinator;
 
 mod attribution_index;
+mod routing_control;
 mod runtime_types;
+mod session_affinity_control;
 mod session_identity;
 
 use self::attribution_index::AttributionIndex;
@@ -67,11 +72,19 @@ pub use self::attribution_index::{
     AttributionPoolKey, AttributionQuery, AttributionQueryResult,
 };
 
+pub use self::routing_control::{
+    NewSessionPreference, RoutingOperatorControlCommit, RoutingOperatorControlError,
+    RoutingOperatorControlSnapshot, RoutingOperatorControlUpdate,
+};
 use self::runtime_types::UsageRollup;
 pub use self::runtime_types::{
     RuntimeConfigState, UsageBucket, UsageDayCoverage, UsageDayDimensionRow, UsageDayHourRow,
     UsageDayView, UsageRetryGateReasonRow, UsageRetryGateSummary, UsageRollupCoverage,
     UsageRollupView,
+};
+pub use self::session_affinity_control::{
+    SessionRouteAffinityControlCommand, SessionRouteAffinityControlCommit,
+    SessionRouteAffinityControlStatus, session_route_affinity_revision,
 };
 use self::session_identity::SessionBindingEntry;
 pub(crate) use self::session_identity::SessionRouteAffinitySuccess;
@@ -86,6 +99,35 @@ pub use self::session_identity::{
 };
 pub use crate::sessions::{ProjectIdentity, ProjectIdentityKind};
 type ProviderBalanceMap = HashMap<ProviderEndpointKey, HashMap<String, ProviderBalanceSnapshot>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderManualEligibilityUpdate {
+    Applied,
+    Unchanged,
+    Conflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderManualEligibilityCommit {
+    pub status: ProviderManualEligibilityUpdate,
+    pub snapshot: Arc<ProviderPolicySnapshot>,
+}
+
+pub(crate) struct SessionRouteControlGuard {
+    session_id: String,
+    owner: Arc<()>,
+    _guard: OwnedMutexGuard<()>,
+}
+
+impl SessionRouteControlGuard {
+    pub(crate) fn session_id(&self) -> &str {
+        self.session_id.as_str()
+    }
+
+    fn belongs_to(&self, owner: &Arc<()>) -> bool {
+        Arc::ptr_eq(&self.owner, owner)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProviderBalanceSnapshotPublication {
@@ -1196,13 +1238,15 @@ pub struct ProxyState {
     session_route_affinity_max_entries: usize,
     session_route_affinity_updates: AsyncMutex<()>,
     session_route_reservations: AsyncMutex<HashMap<String, OwnedSessionRouteReservation>>,
-    session_route_reservation_selection_locks: AsyncMutex<HashMap<String, Weak<AsyncMutex<()>>>>,
+    session_route_control_locks: AsyncMutex<HashMap<String, Weak<AsyncMutex<()>>>>,
+    session_route_control_owner: Arc<()>,
     session_transcript_path_cache_ttl_ms: u64,
     session_transcript_path_cache_max_entries: usize,
     session_bindings: RwLock<HashMap<String, SessionBindingEntry>>,
     session_transcript_path_cache: RwLock<HashMap<String, SessionTranscriptPathCacheEntry>>,
     request_lifecycle_projection: RwLock<RequestLifecycleProjectionState>,
     provider_balances: RwLock<ProviderBalanceMap>,
+    provider_balance_refresh_coordinator: Arc<ProviderBalanceRefreshCoordinator>,
     quota_pool_registry: SyncRwLock<QuotaPoolRegistry>,
     quota_registry_document_revision: AtomicU64,
     quota_install_key: [u8; 32],
@@ -1210,6 +1254,7 @@ pub struct ProxyState {
         RwLock<HashMap<String, HashMap<ProviderEndpointKey, ProviderEndpointRuntimeHealth>>>,
     provider_policy_updates: AsyncMutex<()>,
     provider_policy_snapshot: RwLock<Arc<ProviderPolicySnapshot>>,
+    routing_operator_control: RwLock<RoutingOperatorControlSnapshot>,
     state_version_tx: watch::Sender<u64>,
     operator_capture: RwLock<()>,
     #[cfg(test)]
@@ -1218,6 +1263,8 @@ pub struct ProxyState {
     operator_aggregation_pause: AsyncMutex<Option<OperatorAggregationPause>>,
     #[cfg(test)]
     provider_balance_lock_wait_signal: AsyncMutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    #[cfg(test)]
+    session_route_control_lock_wait_signal: AsyncMutex<Option<tokio::sync::oneshot::Sender<()>>>,
     runtime_store: Arc<RuntimeStore>,
 }
 
@@ -1306,7 +1353,8 @@ impl ProxyState {
             session_route_affinity_max_entries: policy.session_route_affinity_max_entries,
             session_route_affinity_updates: AsyncMutex::new(()),
             session_route_reservations: AsyncMutex::new(HashMap::new()),
-            session_route_reservation_selection_locks: AsyncMutex::new(HashMap::new()),
+            session_route_control_locks: AsyncMutex::new(HashMap::new()),
+            session_route_control_owner: Arc::new(()),
             session_transcript_path_cache_ttl_ms: policy.session_transcript_path_cache_ttl_ms,
             session_transcript_path_cache_max_entries: policy
                 .session_transcript_path_cache_max_entries,
@@ -1314,6 +1362,9 @@ impl ProxyState {
             session_transcript_path_cache: RwLock::new(HashMap::new()),
             request_lifecycle_projection: RwLock::new(hydrated),
             provider_balances: RwLock::new(HashMap::new()),
+            provider_balance_refresh_coordinator: Arc::new(
+                ProviderBalanceRefreshCoordinator::default(),
+            ),
             quota_pool_registry: SyncRwLock::new(quota_pool_registry),
             quota_registry_document_revision: AtomicU64::new(
                 quota_registry_document_revision.unwrap_or(0),
@@ -1322,6 +1373,7 @@ impl ProxyState {
             provider_endpoint_runtime_health: RwLock::new(HashMap::new()),
             provider_policy_updates: AsyncMutex::new(()),
             provider_policy_snapshot: RwLock::new(provider_policy_snapshot),
+            routing_operator_control: RwLock::new(RoutingOperatorControlSnapshot::default()),
             state_version_tx: watch::channel(0).0,
             operator_capture: RwLock::new(()),
             #[cfg(test)]
@@ -1330,6 +1382,8 @@ impl ProxyState {
             operator_aggregation_pause: AsyncMutex::new(None),
             #[cfg(test)]
             provider_balance_lock_wait_signal: AsyncMutex::new(None),
+            #[cfg(test)]
+            session_route_control_lock_wait_signal: AsyncMutex::new(None),
             runtime_store,
         }))
     }
@@ -1344,6 +1398,12 @@ impl ProxyState {
 
     pub(crate) fn runtime_store(&self) -> &RuntimeStore {
         self.runtime_store.as_ref()
+    }
+
+    pub(crate) fn provider_balance_refresh_coordinator(
+        &self,
+    ) -> Arc<ProviderBalanceRefreshCoordinator> {
+        Arc::clone(&self.provider_balance_refresh_coordinator)
     }
 
     fn with_runtime_store_blocking<T>(&self, operation: impl FnOnce(&RuntimeStore) -> T) -> T {
@@ -1606,16 +1666,10 @@ impl ProxyState {
         }
     }
 
-    /// Claims the first route target for a session before an upstream request
-    /// starts. Concurrent cold-start requests in this process observe the same
-    /// target instead of independently advancing the route scheduler.
-    pub async fn lock_session_route_reservation_selection(
-        &self,
-        session_id: &str,
-    ) -> OwnedMutexGuard<()> {
-        let key = session_id.to_string();
-        let lock = {
-            let mut locks = self.session_route_reservation_selection_locks.lock().await;
+    async fn session_route_control_lock(&self, session_id: &str) -> Arc<AsyncMutex<()>> {
+        let key = session_id.trim().to_string();
+        {
+            let mut locks = self.session_route_control_locks.lock().await;
             locks.retain(|_, lock| lock.strong_count() > 0);
             if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
                 lock
@@ -1624,8 +1678,83 @@ impl ProxyState {
                 locks.insert(key, Arc::downgrade(&lock));
                 lock
             }
-        };
-        lock.lock_owned().await
+        }
+    }
+
+    fn validate_session_route_control_guard(
+        &self,
+        guard: &SessionRouteControlGuard,
+    ) -> Result<(), RuntimeStoreError> {
+        if guard.belongs_to(&self.session_route_control_owner) {
+            return Ok(());
+        }
+        Err(RuntimeStoreError::InvariantViolation {
+            entity: "session route control guard",
+            id: guard.session_id().to_string(),
+            detail: "guard belongs to a different ProxyState".to_string(),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn signal_next_session_route_control_lock_wait_for_test(
+        &self,
+    ) -> tokio::sync::oneshot::Receiver<()> {
+        let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
+        let mut signal = self.session_route_control_lock_wait_signal.lock().await;
+        assert!(
+            signal.is_none(),
+            "a session route control wait signal is already armed"
+        );
+        *signal = Some(waiting_tx);
+        waiting_rx
+    }
+
+    #[cfg(test)]
+    async fn signal_session_route_control_lock_wait_for_test(&self) {
+        if let Some(signal) = self
+            .session_route_control_lock_wait_signal
+            .lock()
+            .await
+            .take()
+        {
+            let _ = signal.send(());
+        }
+    }
+
+    /// Serializes request admission, first-target selection, and explicit route
+    /// control for one canonical session ID.
+    pub(crate) async fn lock_session_route_control(
+        &self,
+        session_id: &str,
+    ) -> SessionRouteControlGuard {
+        let session_id = session_id.trim().to_string();
+        let lock = self.session_route_control_lock(session_id.as_str()).await;
+        #[cfg(test)]
+        self.signal_session_route_control_lock_wait_for_test().await;
+        let guard = lock.lock_owned().await;
+        SessionRouteControlGuard {
+            session_id,
+            owner: Arc::clone(&self.session_route_control_owner),
+            _guard: guard,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn try_lock_session_route_control(
+        &self,
+        session_id: &str,
+    ) -> Option<SessionRouteControlGuard> {
+        let session_id = session_id.trim().to_string();
+        let guard = self
+            .session_route_control_lock(session_id.as_str())
+            .await
+            .try_lock_owned()
+            .ok()?;
+        Some(SessionRouteControlGuard {
+            session_id,
+            owner: Arc::clone(&self.session_route_control_owner),
+            _guard: guard,
+        })
     }
 
     async fn active_request_ids(&self) -> HashSet<u64> {
@@ -1941,6 +2070,7 @@ impl ProxyState {
                         endpoint_key.clone(),
                         RoutePlanUpstreamRuntimeState {
                             runtime_disabled: false,
+                            draining: false,
                             failure_count: health.failure_count,
                             cooldown_active,
                             cooldown_remaining_secs,
@@ -1981,10 +2111,16 @@ impl ProxyState {
                         .filter(|remaining| *remaining > 0);
                 }
             }
-            if projection.effective == ProviderEffectiveEligibility::Ineligible
-                && projection.manual != ProviderManualEligibility::Enabled
-            {
-                upstream_state.runtime_disabled = true;
+            match projection.manual {
+                ProviderManualEligibility::Enabled => {}
+                ProviderManualEligibility::Disabled => {
+                    upstream_state.runtime_disabled = true;
+                    upstream_state.draining = false;
+                }
+                ProviderManualEligibility::Draining => {
+                    upstream_state.runtime_disabled = false;
+                    upstream_state.draining = true;
+                }
             }
             runtime.set_provider_endpoint(projection.provider_endpoint.clone(), upstream_state);
         }
@@ -1994,6 +2130,74 @@ impl ProxyState {
 
     pub async fn capture_provider_policy_snapshot(&self) -> Arc<ProviderPolicySnapshot> {
         self.provider_policy_snapshot.read().await.clone()
+    }
+
+    pub async fn capture_routing_operator_control(&self) -> RoutingOperatorControlSnapshot {
+        self.routing_operator_control.read().await.clone()
+    }
+
+    pub async fn compare_and_set_new_session_preference(
+        &self,
+        service_name: &str,
+        route_graph_key: &str,
+        expected_revision: u64,
+        target: Option<ProviderEndpointKey>,
+    ) -> Result<RoutingOperatorControlCommit, RoutingOperatorControlError> {
+        let service_name = service_name.trim();
+        if service_name.is_empty() {
+            return Err(RoutingOperatorControlError::EmptyServiceName);
+        }
+        let route_graph_key = route_graph_key.trim();
+        if route_graph_key.is_empty() {
+            return Err(RoutingOperatorControlError::EmptyRouteGraphKey);
+        }
+        if let Some(target) = target.as_ref()
+            && target.service_name != service_name
+        {
+            return Err(RoutingOperatorControlError::ServiceMismatch {
+                expected: service_name.to_string(),
+                actual: target.service_name.clone(),
+            });
+        }
+
+        let mut control = self.routing_operator_control.write().await;
+        if control.revision() != expected_revision {
+            return Ok(RoutingOperatorControlCommit {
+                status: RoutingOperatorControlUpdate::Conflict,
+                snapshot: control.clone(),
+            });
+        }
+        let status = control.apply_new_session_preference(service_name, route_graph_key, target);
+        let snapshot = control.clone();
+        drop(control);
+        if status == RoutingOperatorControlUpdate::Applied {
+            self.notify_state_changed();
+        }
+        Ok(RoutingOperatorControlCommit { status, snapshot })
+    }
+
+    pub async fn reconcile_routing_operator_route_graph(
+        &self,
+        service_name: &str,
+        route_graph_key: &str,
+    ) -> Result<RoutingOperatorControlSnapshot, RoutingOperatorControlError> {
+        let service_name = service_name.trim();
+        if service_name.is_empty() {
+            return Err(RoutingOperatorControlError::EmptyServiceName);
+        }
+        let route_graph_key = route_graph_key.trim();
+        if route_graph_key.is_empty() {
+            return Err(RoutingOperatorControlError::EmptyRouteGraphKey);
+        }
+
+        let mut control = self.routing_operator_control.write().await;
+        let status = control.reconcile_route_graph(service_name, route_graph_key);
+        let snapshot = control.clone();
+        drop(control);
+        if status == RoutingOperatorControlUpdate::Applied {
+            self.notify_state_changed();
+        }
+        Ok(snapshot)
     }
 
     pub async fn reconcile_runtime_upstream_identities(
@@ -2072,6 +2276,55 @@ impl ProxyState {
             projection.clone(),
         );
         Ok(projection)
+    }
+
+    pub async fn compare_and_set_provider_manual_eligibility(
+        &self,
+        expected_policy_revision: u64,
+        provider_endpoint: ProviderEndpointKey,
+        manual: ProviderManualEligibility,
+        reason: Option<String>,
+        updated_at_ms: u64,
+    ) -> Result<ProviderManualEligibilityCommit, RuntimeStoreError> {
+        let _update_guard = self.provider_policy_updates.lock().await;
+        let mut current = self.provider_policy_snapshot.write().await;
+        if current.policy_revision != expected_policy_revision {
+            return Ok(ProviderManualEligibilityCommit {
+                status: ProviderManualEligibilityUpdate::Conflict,
+                snapshot: Arc::clone(&current),
+            });
+        }
+        let current_manual = current
+            .projections
+            .iter()
+            .find(|projection| projection.provider_endpoint == provider_endpoint)
+            .map_or(ProviderManualEligibility::Enabled, |projection| {
+                projection.manual
+            });
+        if current_manual == manual {
+            return Ok(ProviderManualEligibilityCommit {
+                status: ProviderManualEligibilityUpdate::Unchanged,
+                snapshot: Arc::clone(&current),
+            });
+        }
+
+        let projection = self.with_runtime_store_blocking(|runtime_store| {
+            runtime_store.set_provider_manual_eligibility(
+                provider_endpoint,
+                manual,
+                reason,
+                updated_at_ms,
+            )
+        })?;
+        self.publish_provider_policy_projection(
+            &mut current,
+            projection.policy_revision,
+            projection,
+        );
+        Ok(ProviderManualEligibilityCommit {
+            status: ProviderManualEligibilityUpdate::Applied,
+            snapshot: Arc::clone(&current),
+        })
     }
 
     #[cfg(test)]
@@ -3029,6 +3282,66 @@ impl ProxyState {
         policy_revision: u64,
         started_at_ms: u64,
     ) -> Result<u64, RuntimeStoreError> {
+        let session_id = session_id.and_then(|session_id| {
+            let canonical = session_id.trim();
+            (!canonical.is_empty()).then(|| canonical.to_string())
+        });
+        let session_route_control = match session_id.as_deref() {
+            Some(session_id) => Some(self.lock_session_route_control(session_id).await),
+            None => None,
+        };
+        self.try_begin_request_with_session_route_control(
+            session_route_control.as_ref(),
+            service,
+            method,
+            path,
+            session_identity_source,
+            client_name,
+            client_addr,
+            cwd,
+            model,
+            requested_model,
+            reasoning_effort,
+            service_tier,
+            requested_service_tier,
+            provider_catalog,
+            operator_pricing_catalog,
+            runtime_revision,
+            runtime_digest,
+            policy_revision,
+            started_at_ms,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn try_begin_request_with_session_route_control(
+        &self,
+        session_route_control: Option<&SessionRouteControlGuard>,
+        service: &str,
+        method: &str,
+        path: &str,
+        session_identity_source: Option<SessionIdentitySource>,
+        client_name: Option<String>,
+        client_addr: Option<String>,
+        cwd: Option<String>,
+        model: Option<String>,
+        requested_model: Option<String>,
+        reasoning_effort: Option<String>,
+        service_tier: Option<String>,
+        requested_service_tier: Option<String>,
+        provider_catalog: Arc<ProviderCatalogSnapshot>,
+        operator_pricing_catalog: Arc<CapturedModelPriceCatalog>,
+        runtime_revision: u64,
+        runtime_digest: String,
+        policy_revision: u64,
+        started_at_ms: u64,
+    ) -> Result<u64, RuntimeStoreError> {
+        if let Some(session_route_control) = session_route_control {
+            self.validate_session_route_control_guard(session_route_control)?;
+        }
+        let session_id = session_route_control.map(|guard| guard.session_id().to_string());
+        let session_identity_source = session_id.as_ref().and(session_identity_source);
         let lifecycle_id = LogicalRequestId::new();
         let mut request_state = self.request_lifecycle_projection.write().await;
         let lifecycle = self.with_runtime_store_blocking(|runtime_store| {
@@ -7440,19 +7753,13 @@ confidence = "exact"
     }
 
     #[tokio::test]
-    async fn session_route_reservation_selection_lock_is_scoped_to_session() {
+    async fn session_route_control_lock_is_scoped_to_session() {
         let state = ProxyState::new();
-        let first = state
-            .lock_session_route_reservation_selection("sid-lock")
-            .await;
+        let first = state.lock_session_route_control("sid-lock").await;
 
         let same_session = {
             let state = state.clone();
-            tokio::spawn(async move {
-                state
-                    .lock_session_route_reservation_selection("sid-lock")
-                    .await
-            })
+            tokio::spawn(async move { state.lock_session_route_control("sid-lock").await })
         };
         assert!(
             tokio::time::timeout(Duration::from_millis(20), async {
@@ -7467,7 +7774,7 @@ confidence = "exact"
 
         tokio::time::timeout(
             Duration::from_millis(100),
-            state.lock_session_route_reservation_selection("sid-other"),
+            state.lock_session_route_control("sid-other"),
         )
         .await
         .expect("different sessions must not share a selection lock");

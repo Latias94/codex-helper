@@ -1,5 +1,6 @@
 use crate::cli_types::{
-    Cli, CliError, CliResult, Command, DaemonCommand, NotifyCommand, RelayCommand, SwitchCommand,
+    Cli, CliError, CliResult, Command, DaemonCommand, NotifyCommand, RelayCommand, ServiceCommand,
+    SwitchCommand,
 };
 use crate::codex_integration;
 use crate::commands;
@@ -73,6 +74,9 @@ impl ServeRuntimeOptions {
 
 pub async fn run_cli() -> CliResult<()> {
     let cli = Cli::parse();
+    if let Some(Command::Service { cmd }) = cli.command.as_ref() {
+        service_manager::configure_service_command_environment(cmd)?;
+    }
     let _log_guard = init_tracing(&cli);
 
     match cli.command.unwrap_or(Command::Serve {
@@ -105,7 +109,7 @@ pub async fn run_cli() -> CliResult<()> {
         } => {
             let service_name = resolve_cli_service_name(codex, claude).await?;
             let port = port.unwrap_or_else(|| default_proxy_port_for_service(service_name));
-            tui::run_attached_dashboard_with_admin_base_url(
+            tui::run_local_attached_dashboard_with_admin_base_url(
                 service_name,
                 port,
                 daemon_admin_base_url_for_proxy_port(port),
@@ -266,7 +270,14 @@ fn init_tracing(cli: &Cli) -> Option<WorkerGuard> {
         _ => false,
     };
 
-    if interactive_tui {
+    let service_entrypoint = matches!(
+        &cli.command,
+        Some(Command::Service {
+            cmd: ServiceCommand::Run { .. } | ServiceCommand::TaskRun { .. }
+        })
+    );
+
+    if interactive_tui || service_entrypoint {
         let log_dir = crate::config::proxy_home_dir().join("logs");
         let _ = std::fs::create_dir_all(&log_dir);
 
@@ -707,16 +718,27 @@ async fn attach_tui_to_relay_target(target: &ResolvedRelayTarget) -> CliResult<(
             target.name
         )));
     };
-    tui::run_attached_dashboard_with_admin_base_url(
-        service_name_for_kind(target.service),
-        relay_proxy_port(target).unwrap_or_else(|| {
-            default_proxy_port_for_service(service_name_for_kind(target.service))
-        }),
-        admin_url,
-        target.admin_token_env.clone(),
-    )
-    .await
-    .map_err(|err| CliError::Other(err.to_string()))
+    let service_name = service_name_for_kind(target.service);
+    let proxy_port =
+        relay_proxy_port(target).unwrap_or_else(|| default_proxy_port_for_service(service_name));
+    let result = if target.is_local() {
+        tui::run_local_attached_dashboard_with_admin_base_url(
+            service_name,
+            proxy_port,
+            admin_url,
+            target.admin_token_env.clone(),
+        )
+        .await
+    } else {
+        tui::run_attached_dashboard_with_admin_base_url(
+            service_name,
+            proxy_port,
+            admin_url,
+            target.admin_token_env.clone(),
+        )
+        .await
+    };
+    result.map_err(|err| CliError::Other(err.to_string()))
 }
 
 fn service_name_for_kind(service: ServiceKind) -> &'static str {
@@ -1284,6 +1306,25 @@ async fn run_server(
     result?;
 
     Ok(())
+}
+
+pub(crate) async fn run_service_managed_server(
+    service_name: &'static str,
+    host: IpAddr,
+    port: u16,
+) -> CliResult<()> {
+    run_server(
+        service_name,
+        host,
+        port,
+        ServeRuntimeOptions {
+            enable_tui: false,
+            service_managed: true,
+            ..ServeRuntimeOptions::default()
+        },
+    )
+    .await
+    .map_err(|error| CliError::Other(error.to_string()))
 }
 
 async fn build_local_proxy_runtime(

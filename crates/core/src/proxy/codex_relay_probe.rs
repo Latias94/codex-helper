@@ -11,6 +11,7 @@ use super::classify::{ROUTING_MISMATCH_CAPABILITY_CLASS, classify_upstream_respo
 use super::models_compat::maybe_decode_models_response_body;
 
 const MAX_PROBE_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+const UPSTREAM_AUTH_UNAVAILABLE_REASON: &str = "configured upstream credentials are unavailable";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -413,13 +414,23 @@ impl CodexRelayProbeClient {
                 HeaderValue::from_static("application/json"),
             );
         }
-        if let Some(token) = upstream.auth.resolve_auth_token()
+        let resolved_auth = match crate::auth_resolution::resolve_upstream_auth_for_target(
+            "codex",
+            &upstream.auth,
+            url.as_str(),
+        ) {
+            Ok(resolved_auth) => resolved_auth,
+            Err(_) => {
+                return transport_observation(spec.kind, None, UPSTREAM_AUTH_UNAVAILABLE_REASON);
+            }
+        };
+        if let Some(token) = resolved_auth.auth_token.value()
             && let Ok(value) = HeaderValue::from_str(&format!("Bearer {token}"))
         {
             headers.insert(axum::http::header::AUTHORIZATION, value);
         }
-        if let Some(key) = upstream.auth.resolve_api_key()
-            && let Ok(value) = HeaderValue::from_str(&key)
+        if let Some(key) = resolved_auth.api_key.value()
+            && let Ok(value) = HeaderValue::from_str(key)
         {
             headers.insert("x-api-key", value);
         }
@@ -745,6 +756,50 @@ mod tests {
             result.confidence,
             CodexRelayProbeConfidence::EndpointValidation
         );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_relay_probe_remote_target_requires_helper_auth_or_anonymous_opt_in() {
+        let hits = Arc::new(Mutex::new(0usize));
+        let hits_for_route = hits.clone();
+        let app = axum::Router::new().route(
+            "/v1/models",
+            get(move || {
+                let hits = hits_for_route.clone();
+                async move {
+                    *hits.lock().expect("lock hits") += 1;
+                    Json(serde_json::json!({
+                        "object": "list",
+                        "data": [{ "id": "gpt-5.5", "object": "model" }]
+                    }))
+                }
+            }),
+        );
+        let (addr, handle) = spawn_axum_server(app);
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .resolve("relay.example", addr)
+            .build()
+            .expect("build probe client");
+        let client = CodexRelayProbeClient::new(client);
+        let mut target = upstream(format!("http://relay.example:{}/v1", addr.port()));
+        let spec = CodexRelayProbeSpec::for_kind(CodexRelayProbeKind::Models);
+
+        let rejected = client.probe_upstream(&target, &spec).await;
+
+        assert_eq!(*hits.lock().expect("lock hits"), 0);
+        assert_eq!(rejected.support, CodexRelayProbeSupport::Unknown);
+        assert_eq!(rejected.confidence, CodexRelayProbeConfidence::Transport);
+        assert_eq!(rejected.status_code, None);
+        assert_eq!(rejected.reason, UPSTREAM_AUTH_UNAVAILABLE_REASON);
+
+        target.auth.allow_anonymous = Some(true);
+        let allowed = client.probe_upstream(&target, &spec).await;
+
+        assert_eq!(*hits.lock().expect("lock hits"), 1);
+        assert_eq!(allowed.support, CodexRelayProbeSupport::Supported);
 
         handle.abort();
     }

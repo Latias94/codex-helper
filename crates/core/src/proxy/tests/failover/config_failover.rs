@@ -289,6 +289,7 @@ async fn proxy_operator_summary_reports_retry_profile_and_attempt_limits() {
                 auth_token_env: None,
                 api_key: None,
                 api_key_env: None,
+                allow_anonymous: None,
             },
             tags: HashMap::new(),
             supported_models: HashMap::new(),

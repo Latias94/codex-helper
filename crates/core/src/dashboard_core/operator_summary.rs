@@ -7,11 +7,15 @@ use crate::balance::{
     BalanceSnapshotStatus, ProviderBalanceSnapshot, ProviderUsageAlertKind, ProviderUsageModelStat,
     ProviderUsageRateSnapshot, ProviderUsageWindow,
 };
-use crate::config::RetryProfileName;
+use crate::config::{
+    RetryProfileName, RouteAffinityPolicy, RouteGraphConfig, RouteStrategy, SchedulingPreset,
+    ServiceRouteConfig,
+};
 use crate::logging::{RouteAttemptLog, upstream_origin};
 use crate::pricing::{CostBreakdown, ModelPriceCatalogSnapshot};
 use crate::quota_analytics::QuotaAnalyticsView;
 use crate::request_ledger::{RequestUsageSummary, RequestUsageSummaryGroup};
+use crate::routing_ir::{RouteCandidate, RoutePlanTemplate};
 use crate::runtime_identity::ProviderEndpointKey;
 use crate::state::{
     ActiveRequest, FinishedRequest, ResolvedRouteValue, RouteDecisionProvenance,
@@ -77,6 +81,8 @@ pub struct OperatorReadCapture {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct OperatorReadData {
     pub summary: ApiV1OperatorSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<OperatorRoutingSummary>,
     #[serde(default)]
     pub active_requests: Vec<OperatorActiveRequestSummary>,
     #[serde(default)]
@@ -96,6 +102,101 @@ pub struct OperatorReadData {
     pub pricing_catalog: ModelPriceCatalogSnapshot,
     #[serde(default)]
     pub provider_balances: Vec<OperatorProviderBalanceSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OperatorRoutingSummary {
+    pub route_graph_key: String,
+    pub control_revision: u64,
+    pub provider_policy_revision: u64,
+    pub entry: String,
+    pub entry_strategy: RouteStrategy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_session_preference: Option<OperatorRouteTargetSummary>,
+    pub affinity_policy: RouteAffinityPolicy,
+    pub scheduling_preset: SchedulingPreset,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_ttl_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reprobe_preferred_after_ms: Option<u64>,
+    #[serde(default)]
+    pub candidates: Vec<OperatorRouteCandidateSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OperatorRouteTargetSummary {
+    pub provider_id: String,
+    pub endpoint_id: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct OperatorRoutingControlView<'a> {
+    pub route_graph_key: &'a str,
+    pub control_revision: u64,
+    pub provider_policy_revision: u64,
+    pub new_session_preference: Option<&'a ProviderEndpointKey>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OperatorRouteCandidateSummary {
+    pub route_order: usize,
+    pub provider_id: String,
+    pub endpoint_id: String,
+    pub preference_group: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub route_path: Vec<String>,
+}
+
+impl From<&RouteCandidate> for OperatorRouteCandidateSummary {
+    fn from(candidate: &RouteCandidate) -> Self {
+        Self {
+            route_order: candidate.stable_index,
+            provider_id: candidate.provider_id.clone(),
+            endpoint_id: candidate.endpoint_id.clone(),
+            preference_group: candidate.preference_group,
+            route_path: candidate.route_path.clone(),
+        }
+    }
+}
+
+pub fn build_operator_routing_summary(
+    view: &ServiceRouteConfig,
+    route_template: &RoutePlanTemplate,
+    control: OperatorRoutingControlView<'_>,
+) -> anyhow::Result<OperatorRoutingSummary> {
+    let entry_strategy = route_template
+        .nodes
+        .get(route_template.entry.as_str())
+        .map(|node| node.strategy)
+        .unwrap_or(RouteStrategy::OrderedFailover);
+    let configured_entry = view.routing.as_ref().and_then(RouteGraphConfig::entry_node);
+    let entry_target = configured_entry.and_then(|node| node.target.clone());
+
+    Ok(OperatorRoutingSummary {
+        route_graph_key: control.route_graph_key.to_string(),
+        control_revision: control.control_revision,
+        provider_policy_revision: control.provider_policy_revision,
+        entry: route_template.entry.clone(),
+        entry_strategy,
+        entry_target,
+        new_session_preference: control.new_session_preference.map(|target| {
+            OperatorRouteTargetSummary {
+                provider_id: target.provider_id.clone(),
+                endpoint_id: target.endpoint_id.clone(),
+            }
+        }),
+        affinity_policy: route_template.affinity_policy,
+        scheduling_preset: route_template.scheduling_preset,
+        fallback_ttl_ms: route_template.fallback_ttl_ms,
+        reprobe_preferred_after_ms: route_template.reprobe_preferred_after_ms,
+        candidates: route_template
+            .candidates
+            .iter()
+            .map(OperatorRouteCandidateSummary::from)
+            .collect(),
+    })
 }
 
 impl OperatorReadModel {
@@ -396,6 +497,8 @@ pub struct OperatorSessionSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OperatorSessionRouteAffinitySummary {
+    #[serde(default)]
+    pub revision: String,
     pub provider_id: String,
     pub endpoint_id: String,
     pub upstream_origin: String,
@@ -404,6 +507,21 @@ pub struct OperatorSessionRouteAffinitySummary {
     pub last_selected_at_ms: u64,
     pub last_changed_at_ms: u64,
     pub change_reason: String,
+}
+
+impl OperatorSessionRouteAffinitySummary {
+    pub(crate) fn from_affinity(affinity: &crate::state::SessionRouteAffinity) -> Option<Self> {
+        Some(Self {
+            revision: crate::state::session_route_affinity_revision(affinity),
+            provider_id: affinity.provider_endpoint.provider_id.clone(),
+            endpoint_id: affinity.provider_endpoint.endpoint_id.clone(),
+            upstream_origin: upstream_origin(&affinity.upstream_base_url)?,
+            route_path: affinity.route_path.clone(),
+            last_selected_at_ms: affinity.last_selected_at_ms,
+            last_changed_at_ms: affinity.last_changed_at_ms,
+            change_reason: affinity.change_reason.clone(),
+        })
+    }
 }
 
 impl OperatorSessionSummary {
@@ -436,17 +554,10 @@ impl OperatorSessionSummary {
                 .last_route_decision
                 .as_ref()
                 .map(redact_operator_route_decision),
-            route_affinity: card.route_affinity.as_ref().and_then(|affinity| {
-                Some(OperatorSessionRouteAffinitySummary {
-                    provider_id: affinity.provider_endpoint.provider_id.clone(),
-                    endpoint_id: affinity.provider_endpoint.endpoint_id.clone(),
-                    upstream_origin: upstream_origin(&affinity.upstream_base_url)?,
-                    route_path: affinity.route_path.clone(),
-                    last_selected_at_ms: affinity.last_selected_at_ms,
-                    last_changed_at_ms: affinity.last_changed_at_ms,
-                    change_reason: affinity.change_reason.clone(),
-                })
-            }),
+            route_affinity: card
+                .route_affinity
+                .as_ref()
+                .and_then(OperatorSessionRouteAffinitySummary::from_affinity),
             effective_model: card.effective_model.clone(),
             effective_reasoning_effort: card.effective_reasoning_effort.clone(),
             effective_service_tier: card.effective_service_tier.clone(),
@@ -1121,6 +1232,24 @@ pub struct OperatorRuntimeSummary {
     pub default_profile: Option<String>,
     #[serde(default)]
     pub default_profile_summary: Option<OperatorProfileSummary>,
+    #[serde(default, skip_serializing_if = "OperatorActionCapabilities::is_empty")]
+    pub operator_actions: OperatorActionCapabilities,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct OperatorActionCapabilities {
+    #[serde(default)]
+    pub refresh_provider_balances: bool,
+    #[serde(default)]
+    pub mutate_routing: bool,
+    #[serde(default)]
+    pub mutate_session_affinity: bool,
+}
+
+impl OperatorActionCapabilities {
+    pub fn is_empty(&self) -> bool {
+        !self.refresh_provider_balances && !self.mutate_routing && !self.mutate_session_affinity
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -1243,6 +1372,7 @@ mod tests {
                     profiles: Vec::new(),
                     providers: Vec::new(),
                 },
+                routing: None,
                 active_requests: Vec::new(),
                 recent_requests: Vec::new(),
                 usage_summaries: Vec::new(),
@@ -1372,6 +1502,7 @@ mod tests {
             "last_station_name",
             "last_upstream_origin",
             "effective_upstream_origin",
+            "route_graph_key",
         ] {
             assert!(
                 !json.contains(removed),

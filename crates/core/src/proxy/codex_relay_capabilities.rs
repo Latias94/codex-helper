@@ -305,7 +305,8 @@ fn capture_provider_catalog_epoch(
         &target.upstream.auth,
         endpoint.as_str(),
         &mut final_headers,
-    );
+    )
+    .ok()?;
     let route_scope = target.provider_endpoint.stable_key();
     let scope = ProviderCatalogScope::new(
         adapter,

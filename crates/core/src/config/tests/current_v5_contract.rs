@@ -468,6 +468,46 @@ fn loading_version_5_config_does_not_rewrite_original_bytes() {
 }
 
 #[test]
+fn conflicting_limit_group_in_version_5_fails_closed_without_rewrite() {
+    let _env = setup_temp_codex_home();
+    let path = current_config_path();
+    let text = r#"version = 5
+
+[codex.providers.bounded]
+base_url = "https://bounded.example/v1"
+
+[codex.providers.bounded.limits]
+max_concurrent_requests = 20
+limit_group = "shared-account"
+
+[codex.providers.unbounded]
+base_url = "https://unbounded.example/v1"
+
+[codex.providers.unbounded.limits]
+limit_group = "shared-account"
+"#;
+    write_file(&path, text);
+
+    let error = test_runtime()
+        .block_on(load_config_with_source())
+        .expect_err("conflicting shared concurrency group should fail closed");
+    let message = format!("{error:#}");
+
+    assert!(message.contains("shared-account"), "unexpected: {message}");
+    assert!(message.contains("20"), "unexpected: {message}");
+    assert!(message.contains("missing"), "unexpected: {message}");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read rejected config"),
+        text,
+        "validation failure must not rewrite the source config"
+    );
+    assert!(
+        !path.with_file_name("config.toml.bak").exists(),
+        "validation failure must not publish a migration backup"
+    );
+}
+
+#[test]
 fn config_init_force_backs_up_retired_v5_before_replacement() {
     let _env = setup_temp_codex_home();
     let path = current_config_path();

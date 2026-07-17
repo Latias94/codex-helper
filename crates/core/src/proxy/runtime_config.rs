@@ -121,6 +121,7 @@ pub(super) struct RuntimeSnapshot {
 pub(super) struct CapturedRoutePlan {
     snapshot: Arc<RuntimeSnapshot>,
     template: RoutePlanTemplate,
+    routing_control_graph_key: String,
 }
 
 impl CapturedRoutePlan {
@@ -132,8 +133,16 @@ impl CapturedRoutePlan {
         self.snapshot.revision()
     }
 
+    pub(super) fn routing_control_graph_key(&self) -> &str {
+        self.routing_control_graph_key.as_str()
+    }
+
     pub(super) fn provider_policy(&self) -> &ProviderPolicySnapshot {
         self.snapshot.provider_policy.as_ref()
+    }
+
+    pub(super) fn runtime_snapshot(&self) -> Arc<RuntimeSnapshot> {
+        Arc::clone(&self.snapshot)
     }
 
     pub(super) fn is_empty(&self) -> bool {
@@ -176,6 +185,7 @@ impl RuntimeSnapshot {
         Ok(Some(CapturedRoutePlan {
             snapshot: Arc::clone(self),
             template,
+            routing_control_graph_key: graph.digest().to_string(),
         }))
     }
 
@@ -488,7 +498,10 @@ impl RuntimeConfig {
     }
 
     #[cfg(test)]
-    async fn reload_with_source<Source, SourceFuture>(&self, source: Source) -> Result<bool>
+    pub(super) async fn reload_with_source<Source, SourceFuture>(
+        &self,
+        source: Source,
+    ) -> Result<bool>
     where
         Source: FnOnce() -> SourceFuture,
         SourceFuture: Future<Output = Result<(LoadedConfig, Option<SystemTime>)>>,
@@ -583,6 +596,10 @@ impl RuntimeConfig {
 
         let previous = self.capture_current();
         let next_identities = prepared.candidate_identities();
+        let routing_control_graphs = [
+            ("codex", prepared.codex_route_graph.digest().to_string()),
+            ("claude", prepared.claude_route_graph.digest().to_string()),
+        ];
         let identity_delta =
             diff_runtime_upstream_identities(&previous.candidate_identities(), &next_identities);
         let provider_policy = match self.policy_state.as_ref() {
@@ -597,6 +614,18 @@ impl RuntimeConfig {
             Some(policy_state) => policy_state.capture_provider_policy_snapshot().await,
             None => previous.provider_policy(),
         };
+        if let Some(policy_state) = self.policy_state.as_ref() {
+            for (service_name, route_graph_key) in routing_control_graphs {
+                policy_state
+                    .reconcile_routing_operator_route_graph(service_name, route_graph_key.as_str())
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "reconcile {service_name} routing operator control after config reload"
+                        )
+                    })?;
+            }
+        }
         let mut next = prepared.finish(provider_policy, previous.revision());
         let changed = next.digest() != previous.digest();
         if changed {

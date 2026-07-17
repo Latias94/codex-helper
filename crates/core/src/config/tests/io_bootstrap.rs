@@ -301,6 +301,52 @@ fn save_helper_config_overwrites_existing_toml_and_updates_backup() {
 }
 
 #[test]
+fn locked_config_mutation_reads_latest_source_and_aborts_without_writing() {
+    let _env = setup_temp_codex_home();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    rt.block_on(async move {
+        let mut initial = HelperConfig::default();
+        initial.notify.enabled = true;
+        let path = super::save_helper_config(&initial)
+            .await
+            .expect("save initial config");
+
+        super::mutate_helper_config(|current| {
+            assert!(
+                current.notify.enabled,
+                "mutation must read the latest source"
+            );
+            current.ui.language = Some("zh".to_string());
+            Ok(())
+        })
+        .await
+        .expect("mutate current config under lock");
+
+        let updated = super::load_config().await.expect("load updated config");
+        assert!(updated.notify.enabled);
+        assert_eq!(updated.ui.language.as_deref(), Some("zh"));
+        let before_failure = std::fs::read(&path).expect("read config before failed mutation");
+
+        let error = super::mutate_helper_config(|current| -> Result<()> {
+            current.notify.enabled = false;
+            anyhow::bail!("injected mutation failure")
+        })
+        .await
+        .expect_err("failed mutation must not write");
+
+        assert!(error.to_string().contains("injected mutation failure"));
+        assert_eq!(
+            std::fs::read(path).expect("read config after failed mutation"),
+            before_failure
+        );
+    });
+}
+
+#[test]
 fn config_mutations_fail_before_overwrite_when_backup_cannot_be_written() {
     let _env = setup_temp_codex_home();
     let rt = tokio::runtime::Builder::new_current_thread()

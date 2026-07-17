@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use reqwest::Client;
 
@@ -12,7 +11,6 @@ mod attempt_health;
 mod attempt_request;
 mod attempt_response;
 mod attempt_transport;
-mod auth_resolution;
 mod classify;
 mod client_identity;
 mod codex_failure;
@@ -30,6 +28,7 @@ mod entrypoint;
 mod failure_summary;
 mod headers;
 mod http_debug;
+mod local_operator_routes;
 mod models_compat;
 mod openai_images;
 mod profile_defaults;
@@ -56,10 +55,12 @@ mod route_provenance;
 mod route_target_selection;
 mod route_unavailability;
 mod router_setup;
+mod routing_control;
 mod runtime_admin_api;
 mod runtime_config;
 mod selected_upstream_request;
 mod service_core;
+mod session_affinity_control;
 mod stream;
 mod target_builder;
 #[cfg(test)]
@@ -94,12 +95,28 @@ pub use self::codex_relay_probe::{
     classify_codex_relay_probe_response,
 };
 use self::concurrency_limits::ConcurrencyLimiter;
+pub(crate) use self::control_plane_manifest::{
+    LOCAL_V1_BALANCE_REFRESH, LOCAL_V1_OPERATOR_SESSION, LOCAL_V1_ROUTING_MUTATION,
+    LOCAL_V1_SESSION_AFFINITY_MUTATION,
+};
 pub(crate) use self::entrypoint::handle_proxy;
+pub(crate) use self::local_operator_routes::{
+    LOCAL_OPERATOR_NONCE_HEADER, LOCAL_OPERATOR_SESSION_HEADER, LOCAL_OPERATOR_SIGNATURE_HEADER,
+    LOCAL_OPERATOR_TIMESTAMP_HEADER,
+};
 pub use self::response_entity::upstream_http_client_builder;
 #[cfg(test)]
 pub(crate) use self::router_setup::router;
 pub(crate) use self::router_setup::{admin_listener_router, proxy_only_router};
+pub use self::routing_control::{
+    OperatorEndpointMode, OperatorRoutingCommand, OperatorRoutingMutationRequest,
+    OperatorRoutingMutationResponse, OperatorRoutingMutationStatus,
+};
 use self::runtime_config::RuntimeConfig;
+pub use self::session_affinity_control::{
+    OperatorSessionAffinityCommand, OperatorSessionAffinityMutationRequest,
+    OperatorSessionAffinityMutationResponse, OperatorSessionAffinityMutationStatus,
+};
 
 pub const ADMIN_TOKEN_ENV_VAR: &str = "CODEX_HELPER_ADMIN_TOKEN";
 pub const ADMIN_TOKEN_HEADER: &str = "x-codex-helper-admin-token";
@@ -107,13 +124,8 @@ pub const CLIENT_NAME_HEADER: &str = "x-codex-helper-client-name";
 pub const ADMIN_PORT_OFFSET: u16 = 1000;
 
 #[cfg(test)]
-const AUTH_FILE_CACHE_MIN_CHECK_INTERVAL: Duration = Duration::from_millis(20);
-#[cfg(not(test))]
-const AUTH_FILE_CACHE_MIN_CHECK_INTERVAL: Duration = Duration::from_millis(800);
-
-#[cfg(test)]
 fn claude_settings_env_value(key: &str) -> Option<String> {
-    auth_resolution::claude_settings_env_value(key)
+    crate::auth_resolution::claude_settings_env_value(key)
 }
 
 /// Generic proxy service; currently used by both Codex and Claude.

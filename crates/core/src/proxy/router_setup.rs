@@ -10,6 +10,7 @@ use super::ProxyService;
 use super::admin::{reject_admin_paths_from_proxy, require_admin_path_only};
 use super::control_plane_routes::control_plane_routes;
 use super::handle_proxy;
+use super::local_operator_routes::local_operator_routes;
 use super::openai_images::{handle_openai_images_edits, handle_openai_images_generations};
 use super::responses_websocket::handle_responses_websocket;
 
@@ -81,7 +82,9 @@ fn responses_websocket_route(proxy: ProxyService) -> axum::routing::MethodRouter
 }
 
 pub(crate) fn admin_listener_router(proxy: ProxyService) -> Router {
-    router(proxy).layer(middleware::from_fn(require_admin_path_only))
+    router(proxy.clone())
+        .merge(local_operator_routes(proxy))
+        .layer(middleware::from_fn(require_admin_path_only))
 }
 
 #[cfg(test)]
@@ -97,6 +100,10 @@ mod tests {
 
     use super::*;
     use crate::config::{HelperConfig, ProviderConfig, RouteGraphConfig, ServiceRouteConfig};
+    use crate::proxy::{
+        LOCAL_V1_BALANCE_REFRESH, LOCAL_V1_OPERATOR_SESSION, LOCAL_V1_ROUTING_MUTATION,
+        LOCAL_V1_SESSION_AFFINITY_MUTATION,
+    };
 
     fn proxy_with_upstream(base_url: String) -> ProxyService {
         let config = HelperConfig {
@@ -162,5 +169,70 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
         upstream_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn public_proxy_rejects_local_operator_paths_without_forwarding() {
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let hits = upstream_hits.clone();
+        let upstream = Router::new().fallback(move || {
+            let hits = hits.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                StatusCode::OK
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind hostile upstream");
+        let upstream_addr = listener.local_addr().expect("hostile upstream address");
+        let upstream_handle = tokio::spawn(async move {
+            axum::serve(listener, upstream)
+                .await
+                .expect("serve hostile upstream");
+        });
+        let app = proxy_only_router(proxy_with_upstream(format!("http://{upstream_addr}")));
+
+        for path in [
+            LOCAL_V1_OPERATOR_SESSION,
+            LOCAL_V1_BALANCE_REFRESH,
+            LOCAL_V1_ROUTING_MUTATION,
+            LOCAL_V1_SESSION_AFFINITY_MUTATION,
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("build local operator request"),
+                )
+                .await
+                .expect("local operator rejection");
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "path={path}");
+        }
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+        upstream_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn admin_listener_rejects_unsigned_local_operator_actions() {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri(LOCAL_V1_BALANCE_REFRESH)
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"force":true}"#))
+            .expect("build local operator request");
+        request.extensions_mut().insert(axum::extract::ConnectInfo(
+            "127.0.0.1:32100"
+                .parse::<std::net::SocketAddr>()
+                .expect("loopback address"),
+        ));
+        let app = admin_listener_router(proxy_with_upstream("http://127.0.0.1:1".to_string()));
+
+        let response = app.oneshot(request).await.expect("unsigned response");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 }

@@ -281,6 +281,7 @@ mod tests {
                     profiles: Vec::new(),
                     providers: Vec::new(),
                 },
+                routing: None,
                 active_requests: Vec::new(),
                 recent_requests: Vec::new(),
                 usage_summaries: Vec::new(),

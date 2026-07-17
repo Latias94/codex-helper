@@ -46,6 +46,7 @@ struct ProviderView {
     api_key_env: Option<String>,
     has_inline_auth_token: bool,
     has_inline_api_key: bool,
+    allow_anonymous: bool,
     tags: BTreeMap<String, String>,
     supported_models: Vec<String>,
     model_mapping: BTreeMap<String, String>,
@@ -111,6 +112,7 @@ pub async fn handle_provider_cmd(cmd: ProviderCommand) -> CliResult<()> {
             auth_token_env,
             api_key,
             api_key_env,
+            allow_anonymous,
             alias,
             tags,
             supported_models,
@@ -148,6 +150,7 @@ pub async fn handle_provider_cmd(cmd: ProviderCommand) -> CliResult<()> {
                             auth_token_env,
                             api_key,
                             api_key_env,
+                            allow_anonymous: allow_anonymous.then_some(true),
                         },
                         tags: parsed_tags,
                         supported_models: parsed_supported_models,
@@ -241,6 +244,7 @@ fn build_provider_views(view: &ServiceRouteConfig) -> Vec<ProviderView> {
 
 fn build_provider_view(view: &ServiceRouteConfig, name: &str) -> Option<ProviderView> {
     let provider = view.providers.get(name)?;
+    let effective_auth = provider.effective_auth();
     let route_order = crate::config::resolved_provider_order("provider-cli", view)
         .unwrap_or_else(|_| ordered_provider_names(view));
     let routing_index = route_order
@@ -276,6 +280,7 @@ fn build_provider_view(view: &ServiceRouteConfig, name: &str) -> Option<Provider
             || provider.auth.auth_token.is_some(),
         has_inline_api_key: provider.inline_auth.api_key.is_some()
             || provider.auth.api_key.is_some(),
+        allow_anonymous: effective_auth.allow_anonymous == Some(true),
         tags: provider.tags.clone(),
         supported_models: provider
             .supported_models
@@ -400,6 +405,9 @@ fn provider_auth_summary(provider: &ProviderView) -> String {
     }
     if provider.has_inline_api_key {
         parts.push("api_key_inline=<redacted>".to_string());
+    }
+    if provider.allow_anonymous {
+        parts.push("anonymous=explicit".to_string());
     }
     if parts.is_empty() {
         "<none>".to_string()

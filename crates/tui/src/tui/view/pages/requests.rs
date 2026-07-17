@@ -765,6 +765,7 @@ mod tests {
             quota_analytics: crate::quota_analytics::QuotaAnalyticsView::default(),
             usage_rollup: UsageRollupView::default(),
             provider_balances: HashMap::new(),
+            routing: None,
             pricing_catalog: Default::default(),
             stats_5m: WindowStats::default(),
             stats_1h: WindowStats::default(),

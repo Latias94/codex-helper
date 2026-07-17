@@ -52,15 +52,39 @@ pub(super) fn current_page_help_lines(ui: &UiState, p: Palette) -> Vec<Line<'sta
             "  ↑/↓        移动当前选择",
             "  O/H o/h    跳到关联请求、会话或历史",
         ],
-        (Language::Zh, Page::Routing, _) => vec![
-            "  ↑/↓        移动提供商选择",
-            "  i          查看只读提供商详情",
-        ],
-        (Language::Zh, Page::Sessions, _) => vec![
-            "  a/e        活跃、错误筛选；r 重置筛选",
-            "  t          打开全屏对话记录",
-            "  o/H        跳到 Requests / History",
-        ],
+        (Language::Zh, Page::Routing, _) => {
+            let mut entries = vec![
+                "  ↑/↓ PgUp/PgDn  移动或整页浏览候选端点",
+                "  Home/End   跳到首个或末个候选端点",
+                "  p          定位当前新会话偏好",
+            ];
+            if ui.can_mutate_routing() {
+                entries.extend([
+                    "  Enter      打开新会话偏好与端点状态菜单",
+                    "  a/Backspace 清除新会话偏好并恢复自动调度",
+                    "  m          打开端点 Enabled/Draining/Disabled 菜单",
+                ]);
+            }
+            if ui.can_refresh_provider_balances() {
+                entries.push("  g          强制全量刷新余额/额度");
+            }
+            entries.extend([
+                "  i          查看当前提供商与端点详情",
+                "  Order/Group/Pri = 路由顺序 / 偏好组 / 端点优先级",
+            ]);
+            entries
+        }
+        (Language::Zh, Page::Sessions, _) => {
+            let mut entries = vec!["  a/e        活跃、错误筛选；r 重置筛选"];
+            if ui.can_mutate_session_affinity() {
+                entries.push("  Enter      打开空闲会话的 affinity 高级操作");
+            }
+            entries.extend([
+                "  t          打开全屏对话记录",
+                "  o/H        跳到 Requests / History",
+            ]);
+            entries
+        }
         (Language::Zh, Page::Requests, _) => vec![
             "  e/c/s      错误、控制证据与会话范围筛选",
             "  x          清除显式 session 聚焦",
@@ -99,15 +123,39 @@ pub(super) fn current_page_help_lines(ui: &UiState, p: Palette) -> Vec<Line<'sta
             "  ↑/↓        move the active selection",
             "  O/H o/h    jump to related requests, sessions, or history",
         ],
-        (Language::En, Page::Routing, _) => vec![
-            "  ↑/↓        move the provider selection",
-            "  i          inspect read-only provider details",
-        ],
-        (Language::En, Page::Sessions, _) => vec![
-            "  a/e        active and error filters; r resets",
-            "  t          open the full-screen transcript",
-            "  o/H        jump to Requests / History",
-        ],
+        (Language::En, Page::Routing, _) => {
+            let mut entries = vec![
+                "  ↑/↓ PgUp/PgDn  move or page through endpoint candidates",
+                "  Home/End   jump to the first or last endpoint candidate",
+                "  p          locate the preferred new-session target",
+            ];
+            if ui.can_mutate_routing() {
+                entries.extend([
+                    "  Enter      open new-session preference and endpoint actions",
+                    "  a/Backspace clear the new-session preference and restore auto",
+                    "  m          open endpoint Enabled/Draining/Disabled actions",
+                ]);
+            }
+            if ui.can_refresh_provider_balances() {
+                entries.push("  g          force-refresh all balances and quotas");
+            }
+            entries.extend([
+                "  i          inspect the current provider and endpoint",
+                "  Order/Group/Pri = route order / preference group / endpoint priority",
+            ]);
+            entries
+        }
+        (Language::En, Page::Sessions, _) => {
+            let mut entries = vec!["  a/e        active and error filters; r resets"];
+            if ui.can_mutate_session_affinity() {
+                entries.push("  Enter      open advanced affinity actions for an idle session");
+            }
+            entries.extend([
+                "  t          open the full-screen transcript",
+                "  o/H        jump to Requests / History",
+            ]);
+            entries
+        }
         (Language::En, Page::Requests, _) => vec![
             "  e/c/s      error, control-evidence, and session-scope filters",
             "  x          clear explicit session focus",

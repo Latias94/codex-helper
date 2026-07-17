@@ -1,6 +1,70 @@
 use super::*;
 
 #[test]
+fn upstream_anonymous_policy_is_explicit_and_round_trips_in_v5() {
+    let legacy_shape = toml::from_str::<HelperConfig>(
+        r#"
+version = 5
+
+[codex.providers.relay]
+base_url = "https://relay.example/v1"
+"#,
+    )
+    .expect("parse v5 provider without anonymous policy");
+    assert_eq!(
+        legacy_shape
+            .codex
+            .providers
+            .get("relay")
+            .expect("relay provider")
+            .effective_auth()
+            .allow_anonymous,
+        None
+    );
+
+    let explicit = toml::from_str::<HelperConfig>(
+        r#"
+version = 5
+
+[codex.providers.relay]
+base_url = "https://relay.example/v1"
+allow_anonymous = true
+"#,
+    )
+    .expect("parse explicit anonymous opt-in");
+    let rendered = toml::to_string_pretty(&explicit).expect("serialize explicit opt-in");
+    assert!(rendered.contains("allow_anonymous = true"));
+    let reparsed = toml::from_str::<HelperConfig>(&rendered).expect("reparse explicit opt-in");
+    assert_eq!(
+        reparsed
+            .codex
+            .providers
+            .get("relay")
+            .expect("relay provider")
+            .effective_auth()
+            .allow_anonymous,
+        Some(true)
+    );
+}
+
+#[test]
+fn inline_anonymous_policy_can_tighten_provider_auth() {
+    let provider = ProviderConfig {
+        auth: UpstreamAuth {
+            allow_anonymous: Some(true),
+            ..UpstreamAuth::default()
+        },
+        inline_auth: UpstreamAuth {
+            allow_anonymous: Some(false),
+            ..UpstreamAuth::default()
+        },
+        ..ProviderConfig::default()
+    };
+
+    assert_eq!(provider.effective_auth().allow_anonymous, Some(false));
+}
+
+#[test]
 fn load_config_supports_v5_route_graph_schema() {
     let _env = setup_temp_codex_home();
     let rt = tokio::runtime::Builder::new_current_thread()

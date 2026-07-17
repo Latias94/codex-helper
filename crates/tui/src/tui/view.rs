@@ -8,7 +8,6 @@ use super::types::Overlay;
 mod chrome;
 mod modals;
 mod pages;
-mod provider_control;
 mod stats;
 mod widgets;
 
@@ -41,6 +40,14 @@ pub(in crate::tui) fn render_app(
         Overlay::Help => modals::render_help_modal(f, p, ui),
         Overlay::ProviderInfo => modals::render_provider_info_modal(f, p, ui, snapshot, providers),
         Overlay::StartupAlert => modals::render_startup_alert_modal(f, p, ui),
+        Overlay::RoutingActions => modals::render_routing_actions_modal(f, p, ui, snapshot),
+        Overlay::RoutingConfirmation => modals::render_routing_confirmation_modal(f, p, ui),
+        Overlay::SessionAffinityActions => {
+            modals::render_session_affinity_actions_modal(f, p, ui, snapshot)
+        }
+        Overlay::SessionAffinityConfirmation => {
+            modals::render_session_affinity_confirmation_modal(f, p, ui, snapshot)
+        }
         Overlay::SessionTranscript => modals::render_session_transcript_modal(f, p, ui),
     }
 }
@@ -59,11 +66,15 @@ mod tests {
         CodexStartupReadiness, CodexStartupReadinessIssue, CodexStartupReadinessIssueKind,
         CodexStartupReadinessSeverity,
     };
+    use crate::dashboard_core::{
+        OperatorPolicyActionSummary, OperatorProviderCapacity, OperatorRouteCandidateSummary,
+        OperatorRoutingSummary,
+    };
     use crate::state::{
         BalanceSnapshotStatus, ProviderBalanceSnapshot, SessionObservationScope, UsageBucket,
     };
     use crate::tui::Language;
-    use crate::tui::model::{SessionRow, Snapshot, UpstreamSummary};
+    use crate::tui::model::{SessionRouteAffinityView, SessionRow, Snapshot, UpstreamSummary};
     use crate::tui::types::{Focus, Overlay, Page, StatsFocus};
     use codex_helper_core::fleet::{
         FleetConfidence, FleetEvidence, FleetEvidenceSource, FleetNodeHealth, FleetNodeKind,
@@ -156,6 +167,36 @@ mod tests {
                     }],
                 ),
             ]),
+            routing: Some(OperatorRoutingSummary {
+                route_graph_key: "routing:sha256:sample".to_string(),
+                control_revision: 0,
+                provider_policy_revision: 0,
+                entry: "main".to_string(),
+                entry_strategy: crate::config::RouteStrategy::RoundRobin,
+                entry_target: Some("input-light.default".to_string()),
+                new_session_preference: None,
+                affinity_policy: crate::config::RouteAffinityPolicy::FallbackSticky,
+                scheduling_preset: crate::config::SchedulingPreset::Balanced,
+                fallback_ttl_ms: Some(300_000),
+                reprobe_preferred_after_ms: Some(30_000),
+                candidates: [
+                    "input",
+                    "input1",
+                    "input2",
+                    "input-light",
+                    "超级中转套餐年度输入提供商",
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(route_order, provider_id)| OperatorRouteCandidateSummary {
+                    route_order,
+                    provider_id: provider_id.to_string(),
+                    endpoint_id: "default".to_string(),
+                    preference_group: if route_order < 2 { 0 } else { 1 },
+                    route_path: vec!["main".to_string()],
+                })
+                .collect(),
+            }),
             pricing_catalog: Default::default(),
             stats_5m: crate::dashboard_core::WindowStats::default(),
             stats_1h: crate::dashboard_core::WindowStats::default(),
@@ -192,10 +233,32 @@ mod tests {
                 runtime_enabled_override: None,
                 runtime_state: Default::default(),
                 runtime_state_override: None,
-                capacity: Default::default(),
-                policy_actions: Vec::new(),
+                capacity: OperatorProviderCapacity {
+                    configured_max_concurrent_requests: Some(if idx == 3 { 20 } else { 15 }),
+                    effective_max_concurrent_requests: Some(if idx == 3 { 20 } else { 15 }),
+                    active: Some(idx as u32),
+                    limit: Some(if idx == 3 { 20 } else { 15 }),
+                    saturated: false,
+                    inherited_from_provider: Some(false),
+                },
+                policy_actions: if idx == 3 {
+                    vec![OperatorPolicyActionSummary {
+                        active_cooldown: true,
+                        code: "provider_cooldown".to_string(),
+                        cooldown_remaining_secs: Some(42),
+                    }]
+                } else {
+                    Vec::new()
+                },
             }],
-            capacity: Default::default(),
+            capacity: OperatorProviderCapacity {
+                configured_max_concurrent_requests: Some(if idx == 3 { 20 } else { 15 }),
+                effective_max_concurrent_requests: Some(if idx == 3 { 20 } else { 15 }),
+                active: Some(idx as u32),
+                limit: Some(if idx == 3 { 20 } else { 15 }),
+                saturated: false,
+                inherited_from_provider: None,
+            },
         })
         .collect()
     }
@@ -419,7 +482,7 @@ mod tests {
                 Page::Routing => {
                     assert!(text.contains("input-light"), "{text}");
                     assert!(compact_text.contains("路由"), "{text}");
-                    assert!(compact_text.contains("提供商"), "{text}");
+                    assert!(compact_text.contains("候选端点"), "{text}");
                 }
                 _ => unreachable!(),
             }
@@ -427,7 +490,7 @@ mod tests {
     }
 
     #[test]
-    fn routing_narrow_layout_keeps_provider_table_and_details_scannable() {
+    fn routing_narrow_layout_keeps_priority_capacity_and_balance_scannable() {
         let snapshot = sample_snapshot();
         let providers = sample_providers();
         let mut ui = UiState {
@@ -441,18 +504,166 @@ mod tests {
         let text = render_app_text_with_providers(76, 22, &mut ui, &snapshot, &providers);
 
         for expected in [
-            "Providers",
-            "Name",
-            "Cfg",
-            "Eff",
-            "Routable",
-            "Balance/Quota",
-            "Provider details: input-light",
-            "Balance / quota",
-            "Endpoints",
+            "Routing policy",
+            "Endpoint candidates",
+            "Target",
+            "Pri",
+            "Cap",
         ] {
             assert!(text.contains(expected), "missing {expected:?}\n{text}");
         }
+        assert!(text.contains("input-light"), "{text}");
+        assert!(text.contains("3/20"), "{text}");
+    }
+
+    #[test]
+    fn routing_wide_layout_uses_a_full_height_master_detail_view() {
+        let snapshot = sample_snapshot();
+        let providers = sample_providers();
+        let mut ui = UiState {
+            page: Page::Routing,
+            focus: Focus::Providers,
+            selected_routing_candidate_idx: 3,
+            language: Language::En,
+            ..UiState::default()
+        };
+
+        let text = render_app_text_with_providers(132, 30, &mut ui, &snapshot, &providers);
+
+        for expected in [
+            "Endpoint candidates",
+            "Routing policy",
+            "Selected endpoint",
+            "new-session preference",
+            "preference / endpoint state menu",
+            "a/Backspace",
+            "priority=3",
+            "3/20",
+            "policy action=provider_cooldown",
+            "cooldown=42s",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?}\n{text}");
+        }
+        assert!(ui.routing_candidates_visible_rows >= 19);
+    }
+
+    #[test]
+    fn routing_wide_short_layout_keeps_refresh_status_and_controls_visible() {
+        let snapshot = sample_snapshot();
+        let providers = sample_providers();
+
+        for height in [22, 24] {
+            let mut ui = UiState {
+                page: Page::Routing,
+                focus: Focus::Providers,
+                selected_routing_candidate_idx: 3,
+                language: Language::En,
+                balance_refresh_in_flight: true,
+                ..UiState::default()
+            };
+
+            let text = render_app_text_with_providers(132, height, &mut ui, &snapshot, &providers);
+            for expected in [
+                "balance/quota refresh in progress",
+                "Routing controls",
+                "preference / endpoint state menu",
+                "a/Backspace",
+                "force-refresh all balances/quotas",
+            ] {
+                assert!(
+                    text.contains(expected),
+                    "height={height}, missing {expected:?}\n{text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn routing_master_list_scrolls_the_selected_candidate_into_view() {
+        let mut snapshot = sample_snapshot();
+        let routing = snapshot.routing.as_mut().expect("routing");
+        routing.candidates = (0..25)
+            .map(|index| OperatorRouteCandidateSummary {
+                route_order: index,
+                provider_id: format!("provider-{index}"),
+                endpoint_id: "default".to_string(),
+                preference_group: (index / 5) as u32,
+                route_path: vec!["main".to_string()],
+            })
+            .collect();
+        let mut ui = UiState {
+            page: Page::Routing,
+            focus: Focus::Providers,
+            selected_routing_candidate_idx: 24,
+            language: Language::En,
+            ..UiState::default()
+        };
+
+        let text = render_app_text_with_providers(132, 30, &mut ui, &snapshot, &[]);
+
+        assert!(text.contains("provider-24"), "{text}");
+        assert_eq!(ui.routing_candidates_table.selected(), Some(24));
+        assert!(ui.routing_candidates_table.offset() > 0);
+    }
+
+    #[test]
+    fn routing_tiny_layout_uses_two_lines_without_dropping_priority_or_capacity() {
+        let snapshot = sample_snapshot();
+        let providers = sample_providers();
+        let mut ui = UiState {
+            page: Page::Routing,
+            focus: Focus::Providers,
+            selected_routing_candidate_idx: 3,
+            language: Language::En,
+            ..UiState::default()
+        };
+
+        let text = render_app_text_with_providers(60, 30, &mut ui, &snapshot, &providers);
+
+        assert!(text.contains("input-li"), "{text}");
+        assert!(text.contains("G2"), "{text}");
+        assert!(text.contains("Pri 3"), "{text}");
+        assert!(text.contains("3/20"), "{text}");
+    }
+
+    #[test]
+    fn typed_routing_table_renders_at_each_responsive_boundary() {
+        let snapshot = sample_snapshot();
+        let providers = sample_providers();
+
+        for width in [160, 132, 131, 118, 100, 99, 76, 72, 71, 60] {
+            let mut ui = UiState {
+                page: Page::Routing,
+                focus: Focus::Providers,
+                language: Language::En,
+                ..UiState::default()
+            };
+            let text = render_app_text_with_providers(width, 30, &mut ui, &snapshot, &providers);
+
+            assert!(text.contains("Routing policy"), "width={width}\n{text}");
+            assert!(
+                text.contains("Endpoint candidates"),
+                "width={width}\n{text}"
+            );
+            assert!(text.contains("input"), "width={width}\n{text}");
+        }
+    }
+
+    #[test]
+    fn routing_legacy_snapshot_falls_back_to_read_only_provider_table() {
+        let mut snapshot = sample_snapshot();
+        snapshot.routing = None;
+        let providers = sample_providers();
+        let mut ui = UiState {
+            page: Page::Routing,
+            language: Language::En,
+            ..UiState::default()
+        };
+
+        let text = render_app_text_with_providers(100, 24, &mut ui, &snapshot, &providers);
+
+        assert!(text.contains("legacy read-only data"), "{text}");
+        assert!(text.contains("input-light"), "{text}");
     }
 
     #[test]
@@ -488,6 +699,83 @@ mod tests {
         assert!(text.contains("switch requires recovery"), "{text}");
         assert!(text.contains("recorded fingerprints"), "{text}");
         assert!(text.contains("Esc/Enter close"), "{text}");
+    }
+
+    #[test]
+    fn session_affinity_clear_confirmation_shows_state_bound_risk() {
+        let snapshot = sample_snapshot();
+        let mut ui = UiState {
+            page: Page::Sessions,
+            overlay: Overlay::SessionAffinityConfirmation,
+            language: Language::En,
+            session_affinity_confirmation: Some(
+                crate::proxy::OperatorSessionAffinityMutationRequest {
+                    session_key: "session:sha256:test".to_string(),
+                    expected_affinity_revision: Some("affinity:v1:test".to_string()),
+                    command: crate::proxy::OperatorSessionAffinityCommand::Clear,
+                },
+            ),
+            ..UiState::default()
+        };
+
+        let text = render_app_text(104, 30, &mut ui, &snapshot);
+
+        assert!(
+            text.contains("state-bound / hard requests may be rejected"),
+            "{text}"
+        );
+        assert!(
+            text.contains("next eligible request reruns current")
+                && text.contains("routing policy"),
+            "{text}"
+        );
+        assert!(
+            text.contains("WebSocket selects another endpoint")
+                && text.contains("requires reconnect"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn session_affinity_actions_keep_selected_candidate_visible_in_long_list() {
+        let mut snapshot = sample_snapshot();
+        snapshot.routing.as_mut().expect("routing").candidates = (0..41)
+            .map(|index| OperatorRouteCandidateSummary {
+                route_order: index,
+                provider_id: format!("provider-{index}"),
+                endpoint_id: "default".to_string(),
+                preference_group: (index / 5) as u32,
+                route_path: vec!["main".to_string()],
+            })
+            .collect();
+        let mut row = unknown_session_row();
+        row.session_id = Some("session:sha256:test".to_string());
+        row.active_count = 0;
+        row.route_affinity = Some(SessionRouteAffinityView {
+            revision: "affinity:v1:test".to_string(),
+            provider_id: "provider-0".to_string(),
+            endpoint_id: "default".to_string(),
+            upstream_origin: "https://provider-0.example.test".to_string(),
+            route_path: vec!["main".to_string()],
+            last_selected_at_ms: 1,
+            last_changed_at_ms: 1,
+            change_reason: "selected".to_string(),
+        });
+        snapshot.rows.push(row);
+        let mut ui = UiState {
+            page: Page::Sessions,
+            overlay: Overlay::SessionAffinityActions,
+            language: Language::En,
+            session_affinity_action_selected_idx: 38,
+            ..UiState::default()
+        };
+
+        let text = render_app_text(110, 30, &mut ui, &snapshot);
+
+        assert!(text.contains("Clear affinity"), "{text}");
+        assert!(text.contains("Rebind to provider-37.default"), "{text}");
+        assert!(text.contains("Candidates"), "{text}");
+        assert!(text.contains("of 41"), "{text}");
     }
 
     #[test]

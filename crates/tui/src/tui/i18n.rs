@@ -81,7 +81,7 @@ define_messages! {
     OVERLAY_STARTUP_GUARDRAIL => { zh: "启动检查", en: "Startup guardrail" },
 
     FOOTER_DASHBOARD => { zh: "1-9/0 页面  q 退出  L 语言  Tab 焦点  ↑/↓ 移动  o/h 跳转  ? 帮助", en: "1-9/0 pages  q quit  L language  Tab focus  ↑/↓ move  o/h navigate  ? help" },
-    FOOTER_ROUTING => { zh: "1-9/0 页面  q 退出  L 语言  ↑/↓ 提供商  i 详情  ? 帮助", en: "1-9/0 pages  q quit  L language  ↑/↓ provider  i details  ? help" },
+    FOOTER_ROUTING => { zh: "1-9/0 页面  q 退出  ↑/↓/Pg 端点  Enter 操作  a 自动  m 模式  g 刷新  i 详情  ? 帮助", en: "1-9/0 pages  q quit  ↑/↓/Pg endpoint  Enter actions  a auto  m mode  g refresh  i details  ? help" },
     FOOTER_REQUESTS => { zh: "1-9/0 页面  q 退出  L 语言  ↑/↓ 选择  e 错误  s scope  o/h 跳转  ? 帮助", en: "1-9/0 pages  q quit  L language  ↑/↓ select  e errors  s scope  o/h navigate  ? help" },
     FOOTER_SESSIONS => { zh: "1-9/0 页面  q 退出  L 语言  ↑/↓ 选择  a/e/v 筛选  t 记录  ? 帮助", en: "1-9/0 pages  q quit  L language  ↑/↓ select  a/e/v filters  t transcript  ? help" },
     FOOTER_STATS => { zh: "1-9/0 页面  q 退出  L 语言  Tab 池/项目/提供商/端点  ↑/↓ 选择  g 刷新  y 报告  ? 帮助", en: "1-9/0 pages  q quit  L language  Tab pool/project/provider/endpoint  ↑/↓ select  g refresh  y report  ? help" },
@@ -97,7 +97,6 @@ define_messages! {
     FOOTER_STARTUP_GUARDRAIL => { zh: "Esc/Enter 关闭启动检查  L 语言", en: "Esc/Enter close startup guardrail  L language" },
 
     KEYS_LABEL => { zh: "按键：", en: "keys: " },
-    NONE_PARENS => { zh: "（无）", en: "(none)" },
     NO_TRANSCRIPT_MESSAGES => { zh: "未找到可展示的对话消息（可能该会话不在 ~/.codex/sessions，或格式发生变化）。", en: "No displayable transcript messages were found; the session may be outside ~/.codex/sessions or the format changed." },
 
     HISTORY_TITLE => { zh: "历史会话 (Codex 全局)", en: "History sessions (Codex global)" },

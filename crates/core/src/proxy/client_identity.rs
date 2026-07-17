@@ -33,11 +33,12 @@ pub(super) struct ClientSessionIdentity {
 }
 
 impl ClientSessionIdentity {
-    fn header(value: &str) -> Self {
-        Self {
+    fn header(value: &str) -> Option<Self> {
+        let value = value.trim();
+        (!value.is_empty()).then(|| Self {
             value: value.to_string(),
             source: SessionIdentitySource::Header,
-        }
+        })
     }
 
     fn prompt_cache_key(value: String) -> Self {
@@ -71,12 +72,15 @@ impl ClientSessionIdentity {
 }
 
 pub(super) fn extract_session_identity(headers: &HeaderMap) -> Option<ClientSessionIdentity> {
-    header_str(headers, "session_id")
-        .or_else(|| header_str(headers, "x-session-id"))
-        .or_else(|| header_str(headers, "session-id"))
-        .or_else(|| header_str(headers, "conversation_id"))
-        .or_else(|| header_str(headers, "thread-id"))
-        .map(ClientSessionIdentity::header)
+    [
+        "session_id",
+        "x-session-id",
+        "session-id",
+        "conversation_id",
+        "thread-id",
+    ]
+    .into_iter()
+    .find_map(|name| header_str(headers, name).and_then(ClientSessionIdentity::header))
 }
 
 pub(super) fn extract_session_identity_with_body_fallback(
@@ -253,6 +257,27 @@ mod tests {
             extract_session_identity(&headers).map(|identity| identity.source()),
             Some(SessionIdentitySource::Header)
         );
+    }
+
+    #[test]
+    fn extract_session_id_trims_headers_and_ignores_blank_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert("session_id", HeaderValue::from_static("  sid-trimmed  "));
+        assert_eq!(
+            extract_session_identity(&headers)
+                .as_ref()
+                .map(|identity| identity.value()),
+            Some("sid-trimmed")
+        );
+
+        headers.insert("session_id", HeaderValue::from_static("   "));
+        let identity = extract_session_identity_with_body_fallback(
+            &headers,
+            br#"{"session_id":"sid-from-body"}"#,
+        )
+        .expect("blank header should not shadow the body identity");
+        assert_eq!(identity.value(), "sid-from-body");
+        assert_eq!(identity.source(), SessionIdentitySource::BodySessionId);
     }
 
     #[test]

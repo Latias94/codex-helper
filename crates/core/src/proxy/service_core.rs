@@ -205,6 +205,20 @@ impl ProxyService {
             .map(|capture| capture.model)
     }
 
+    pub async fn mutate_operator_routing(
+        &self,
+        request: super::OperatorRoutingMutationRequest,
+    ) -> Result<super::OperatorRoutingMutationResponse, ProxyControlError> {
+        super::routing_control::mutate_operator_routing(self, request).await
+    }
+
+    pub async fn mutate_operator_session_affinity(
+        &self,
+        request: super::OperatorSessionAffinityMutationRequest,
+    ) -> Result<super::OperatorSessionAffinityMutationResponse, ProxyControlError> {
+        super::session_affinity_control::mutate_operator_session_affinity(self, request).await
+    }
+
     pub async fn codex_relay_capabilities(
         &self,
         request: CodexRelayCapabilitiesRequest,
