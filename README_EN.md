@@ -97,7 +97,7 @@ Start the proxy without the TUI:
 codex-helper serve --no-tui
 ```
 
-Advanced: run a system service or attached proxy. Only an explicitly installed service or the `--resident`/`daemon`/`tui` subcommands let the proxy outlive the current console:
+Advanced: run a background service or attached proxy. Only an explicitly installed service or the `--resident`/`daemon`/`tui` subcommands let the proxy outlive the current console:
 
 ```bash
 codex-helper service install --codex
@@ -107,7 +107,7 @@ codex-helper tui --codex
 codex-helper service stop
 ```
 
-By default, the built-in `codex-helper serve` TUI follows “the console owns the proxy”: exiting the UI stops the proxy it started but never runs `switch on/off`. `daemon status` is read-only; manage an installed local service with `service start/stop/restart`. There is no remote HTTP shutdown command. The `tui` subcommand attaches read-only to an existing resident proxy, so exiting that attached TUI does not stop the proxy. For automatic restart after child crashes, run `codex-helper daemon supervise --codex`; the supervisor records lightweight crash markers under `~/.codex-helper/run/`.
+By default, the built-in `codex-helper serve` TUI follows “the console owns the proxy”: exiting the UI stops the proxy it started but never runs `switch on/off`. `daemon status` is read-only; manage an installed local service with `service start/stop/restart`. There is no remote HTTP shutdown command. The `tui` subcommand attaches to an existing resident proxy. On the daemon host, a locally signed operator capability can perform the balance refresh, routing, and session actions explicitly advertised by that daemon; it falls back to read-only when local signing is unavailable. `RemoteObserver` is always read-only and never sends operator mutations. Exiting an attached TUI does not stop the proxy. For automatic restart after child crashes, run `codex-helper daemon supervise --codex`; the supervisor records lightweight crash markers under `~/.codex-helper/run/`.
 
 `daemon status` best-effort shows the resident proxy owner marker (manual CLI, supervisor, or a future desktop/tray owner). The marker is only observability metadata: read or cleanup failures never block proxy startup or shutdown. A hidden managed sidecar mode is reserved for the future desktop shell, so ordinary users do not need to choose it manually.
 
@@ -143,9 +143,9 @@ Plain `ch` still starts the local foreground helper. `ch relay local` is the exp
 
 Container and server runtimes do not provide access to a client's local transcript/session files. Local `session` commands read only the Codex session files on the machine where the command runs.
 
-The client switch only points Codex at one helper URL. `switch on` records the original selector and helper stanza, then writes `model_providers.codex_proxy`; `switch off` restores only the recorded content. Conflicting external edits move the state to `recovery_required` and leave the file untouched. Codex `auth.json`, `models_cache.json`, SQLite, feature flags, compaction, and WebSocket settings are never read or changed.
+The client switch only points Codex at one helper URL. `switch on` records the original selector and helper stanza, then writes `model_providers.codex_proxy`; `switch off` restores only the recorded content. Conflicting external edits move the state to `recovery_required` and leave the file untouched. Except for the one-time legacy recovery described below, Codex `auth.json`, `models_cache.json`, SQLite, feature flags, compaction, and WebSocket settings are never read or changed.
 
-When upgrading from 0.20.3 or earlier, if `~/.codex/codex-helper-switch-state.json` still exists, first run `codex-helper switch off` with the old binary that created it; upgrade and run the new `switch on` only after that succeeds. The legacy state may contain original auth content, so do not delete or share it before recovery. The new release does not undo `remote_connections` or Codex SQLite state written by the removed `switch remote-control enable`, and that database must not be cleaned with an SQL hack. See [Configuration Compatibility](docs/CONFIGURATION.md#configuration-compatibility) for the full sequence and retired version 5 fields.
+When upgrading from 0.20.3 or earlier, a current `switch off` safely and automatically restores the selector/provider stanza and any verifiable auth facade managed by a remaining `~/.codex/codex-helper-switch-state.json`; `switch on` performs the same recovery before creating its new journal. Recovery writes only while the current files still match the old helper patch. Malformed or unknown state and legacy/current journal conflicts preserve the original state and fail closed. The legacy file may contain original auth content, so do not delete, edit, or share it. The new release does not undo `remote_connections` or Codex SQLite state written by the removed `switch remote-control enable`, and that database must not be cleaned with an SQL hack. See [Configuration Compatibility](docs/CONFIGURATION.md#configuration-compatibility) for the full sequence and retired version 5 fields.
 
 Relay capabilities come from the selected provider adapter, catalog, and bounded observations rather than switch configuration. Inspect the provider contract, live `/models` / `/responses` / `/responses/compact` results, continuity, and mismatches with:
 
@@ -153,7 +153,7 @@ Relay capabilities come from the selected provider adapter, catalog, and bounded
 codex-helper codex relay-capabilities --model gpt-5.5 --provider ciii --endpoint default
 ```
 
-Third-party relays should configure their own `auth_token_env`, `auth_token`, or equivalent API key. Codex client authentication may pass only to the official OpenAI origin, preventing account headers from leaking to a relay.
+Third-party relays should configure their own `auth_token_env`, `auth_token`, or equivalent API key. Credentials resolve from inline config, the daemon process environment, then an explicitly referenced same-name field in Codex `auth.json` or Claude settings; an unresolved explicit reference fails closed before upstream I/O. A Windows per-user Scheduled Task does not capture temporary `$env:*` values from the current PowerShell window; see [Provider Fields](docs/CONFIGURATION.md#provider-fields) for service-safe options. Codex client authentication may pass only to the official OpenAI origin, preventing account headers from leaking to a relay.
 
 To avoid degrading capable relays, codex-helper normalizes compressed HTTP request bodies before routing by default (`zstd`, `gzip` / `x-gzip`, `br`, and `deflate`). For Codex `/responses`, `/responses/compact`, and Responses WebSocket, helper also completes missing `session_id`, `x-session-id`, official `session-id` / `thread-id`, and `prompt_cache_key` fields from existing request evidence: header session ids, body `session_id`, `prompt_cache_key`, or `metadata.session_id`. `previous_response_id` is only used for stale-response repair, not as a session identity source. It does not invent a synthetic session id and does not overwrite session fields the client already sent.
 

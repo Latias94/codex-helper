@@ -26,16 +26,6 @@ stdin/stdout are not TTYs.
 5. Press `Enter` or `Esc`.
 6. Confirm the modal closes and normal TUI navigation works.
 
-## Remote-Control Follow-Up
-
-1. Enable remote control with `codex-helper switch remote-control enable`.
-2. Start the TUI before Codex App has produced a successful
-   `experimentalFeature/enablement/set` log.
-3. Confirm the modal points to restarting Codex App and running
-   `codex-helper switch remote-control check-logs`.
-4. Press `Enter` or `Esc`.
-5. Confirm the modal does not return during the same TUI session.
-
 ## Narrow Terminal
 
 1. Resize the terminal to about 64 columns wide.

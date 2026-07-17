@@ -40,7 +40,7 @@ Codex-owned files remain owned by Codex:
 - `~/.codex/auth.json`
 - `~/.codex/config.toml`
 
-Only an explicit local `switch on/off` action may patch `~/.codex/config.toml`, and it is limited to the helper-owned provider selector and `model_providers.codex_proxy` stanza. codex-helper never reads or writes Codex `auth.json`, model cache, or SQLite files.
+Only an explicit local `switch on/off` action may patch `~/.codex/config.toml`, and it is limited to the helper-owned provider selector and `model_providers.codex_proxy` stanza. codex-helper never reads or writes the Codex model cache or SQLite. Ordinary runtime operation does not write `auth.json`; however, when a provider explicitly configures `auth_token_env` / `api_key_env` and the running process lacks that variable, a Codex runtime may read only the same-named top-level string field from `$CODEX_HOME/auth.json`. The only auth-writing exception is the one-time legacy switch recovery below, which may restore an auth facade managed by the old helper while it strictly matches the old patch.
 
 ## Automatic Configuration Migration
 
@@ -126,19 +126,19 @@ codex-helper switch off
 
 `switch on` records the original selector and helper stanza, then writes only the helper-owned `model_providers.codex_proxy` stanza and selects it. `switch off` restores only the recorded selector/stanza. The recovery journal lives under `~/.codex-helper/state/`; an external edit that makes the current file match neither the original nor helper-applied fingerprint moves the switch to `recovery_required` and leaves the file untouched for human reconciliation.
 
-The switch never changes `~/.codex/auth.json`, `models_cache.json`, Codex SQLite, unrelated providers, feature flags, compaction settings, WebSocket settings, or hosted-tool settings. Provider capabilities come from the selected provider contract and live observations, not from switch configuration.
+Except for the one-time v0.20.3 legacy-state recovery below, the switch never reads or changes `~/.codex/auth.json`, `models_cache.json`, Codex SQLite, unrelated providers, feature flags, compaction settings, WebSocket settings, or hosted-tool settings. Provider capabilities come from the selected provider contract and live observations, not from switch configuration.
 
 ### Upgrading From 0.20.3 Or Earlier
 
-Releases through 0.20.3 used a different switch implementation and stored recovery data in `~/.codex/codex-helper-switch-state.json`. That state can contain the original provider selector and, for the old bridge presets, the original `auth.json` content. The current switch journal does not consume that file and intentionally does not read Codex auth state.
+Releases through 0.20.3 used a different switch implementation and stored recovery data in `~/.codex/codex-helper-switch-state.json`. That state can contain the original provider selector and, for the old bridge presets, the original `auth.json` content. The current binary reads it only during an explicit `switch on` or `switch off` for one-time safe recovery; the new journal itself stores no auth content.
 
 Use this upgrade order if the legacy state file exists:
 
-1. Before replacing the old binary, run `codex-helper switch off` with the version that created the legacy state. This restores the old selector/provider stanza and any auth facade managed by that switch.
-2. Keep `~/.codex/codex-helper-switch-state.json` until the old `switch off` succeeds. Do not delete, edit, share, or paste it into an issue because it may contain authentication material.
-3. Upgrade codex-helper, run `codex-helper switch status`, and only then run the new `switch on` if the helper should be selected again.
+1. Upgrade codex-helper and first run `codex-helper switch status`. This is read-only: it reports the legacy state as `recovery_required` without printing or rewriting its authentication material.
+2. Run `codex-helper switch off` to restore the pre-upgrade Codex configuration. It automatically restores the selector/provider stanza and any verifiable auth facade managed by the old helper.
+3. To keep using the helper, the new `codex-helper switch on` may be run directly instead: it performs the same legacy recovery first, then creates a new journal and applies the new target.
 
-If the new version is already installed, temporarily run the previous binary's `switch off` before using the new switch. Do not run old and new switch commands concurrently. The new implementation detects the legacy state path without reading its contents, reports `recovery_required`, and will not claim or overwrite the old state or provider stanza.
+Recovery runs under the exclusive switch-operation lock; do not run old and new switch commands concurrently. A config or auth file is restored only while it still matches the old helper patch, so external edits are preserved. Malformed or unknown legacy state, or a legacy state that conflicts with a current journal, fails closed without rewriting either state. The legacy file is deleted only after durable recovery completes; until then, do not delete, edit, share, or paste it into an issue. Running `switch off` with the old binary remains valid when it is still available, but is no longer an upgrade prerequisite.
 
 The removed `switch remote-control enable` command also had persistent side effects outside codex-helper: it could add `[features].remote_connections = true` to `~/.codex/config.toml` and enable a `remote_control` row in Codex App SQLite. Upgrading does not undo either value, and the current helper never reads or writes that database. If the TOML key was added solely for the old helper workflow and is no longer wanted, back up the Codex config before removing that key manually. Do not edit Codex SQLite with ad hoc SQL; leave database cleanup to Codex-supported controls or Codex support guidance.
 
@@ -354,7 +354,15 @@ codex-helper usage find --path responses --limit 20
 
 An HTTP compact request appears as `POST /responses/compact`; remote compaction v2 travels through ordinary `/responses` with a structured `compaction_trigger` item. A WebSocket turn uses a `GET /responses`-style upgrade. The request ledger records the path and captured provider endpoint without inferring client-side capability settings.
 
-Authentication is origin-scoped. Client authentication may pass only to the official OpenAI origin; third-party relays must configure helper-side `auth_token_env`, `auth_token`, or equivalent API-key credentials, and Codex client account headers are stripped before forwarding.
+Authentication is origin-scoped. Client authentication may pass only to the official OpenAI origin; third-party relays must configure helper-side `auth_token_env`, `auth_token`, or equivalent API-key credentials, and Codex client account headers are stripped before forwarding. A remote third-party Codex endpoint without helper credentials now returns 503 before any upstream I/O by default. Set provider-level `allow_anonymous = true` only when the relay intentionally requires no authentication. Loopback endpoints allow anonymous access automatically, while the official OpenAI origin continues to receive safe client credential passthrough. A declared `auth_token_env` or `api_key_env` reference that cannot be resolved still fails closed even when anonymous access is enabled.
+
+This is a backward-compatible addition within version 5, so existing files do not need a schema rewrite. Providers that already configure helper credentials need no migration. A provider that previously relied on anonymous remote access must add credentials or record that intent explicitly:
+
+```toml
+[codex.providers.anonymous_relay]
+base_url = "https://relay.example/v1"
+allow_anonymous = true
+```
 
 ## Recommended Start
 
@@ -974,6 +982,7 @@ Common provider fields:
 | `auth_token` | Inline bearer token | Supported, but avoid committing it |
 | `api_key_env` | Environment variable for `X-API-Key` auth | Use only when required |
 | `api_key` | Inline `X-API-Key` value | Supported, but avoid committing it |
+| `allow_anonymous` | Explicitly permit credential-free routing to a remote third-party Codex endpoint | Default off; use only for intentionally unauthenticated relays; it does not bypass an unresolved explicit credential reference |
 | `tags` | Free-form metadata | Use stable tags like `billing`, `vendor`, `region` |
 | `enabled` | Whether the provider is routeable | Prefer `provider disable/enable` for temporary changes |
 | `supported_models` | Optional model allowlist | Advanced |
@@ -987,11 +996,24 @@ For authentication, first decide which HTTP header the provider expects:
 - Use `api_key_env` / `api_key` only when the provider explicitly documents an
   `X-API-Key` header.
 - Prefer the `*_env` fields so secrets stay out of `~/.codex-helper/config.toml`.
-  The value in config is the environment variable name, not the secret itself; the variable must
-  be set in the process that runs codex-helper.
+  The value in config is a credential reference name, not the secret itself. Resolution order is
+  inline value, the environment of the running codex-helper process, then the explicitly referenced
+  client credential field. Codex looks for an exactly same-named top-level string field in
+  `$CODEX_HOME/auth.json`; Claude looks under the `env` object in `$CLAUDE_HOME/settings.json`.
+  Without a configured `*_env` reference, these files are not scanned and fields are not guessed.
 - If an inline value and an env reference are both configured for the same header family, the
   inline value wins. If both bearer and `X-API-Key` credentials are configured, codex-helper sends
   both headers; avoid that unless the relay explicitly requires it.
+
+On Windows, `service install` now registers a SID-scoped per-user Scheduled Task instead of a LocalSystem SCM service. Its actual name resembles `codex-helper-S-1-5-21-...`; `service start/stop/status/uninstall` resolves the current Principal SID automatically, so normal CLI use does not need that name. It runs with `InteractiveToken` and `LeastPrivilege`, starts at that user's logon, and may also be run through `service start/restart`. The task definition records the executable, helper home, client home, listen address, and port, but never a credential value. To migrate an older SCM installation, run the new binary once from an elevated PowerShell:
+
+```powershell
+& $helper service install --codex --no-start
+& $helper service restart
+& $helper service status
+```
+
+Installation first preflights the executable, paths, SID, PowerShell/ScheduledTasks commands, and XML read-back, then registers and queries the new SID-scoped task. It retires a fixed-name task owned by the current SID and the legacy SCM service only after the new owner SID, action, logon trigger, and least-privilege settings are verified. Permission, query, registration, and verification errors fail closed. If retirement fails after an old runtime was stopped, installation restores the old task or restarts the old SCM service; it keeps the verified new task as a runnable fallback only when restoration cannot be proven. A fixed-name `codex-helper` task owned by another SID is never overwritten or deleted. A successful status reports `SID-scoped per-user scheduled task`; if it still reports `legacy LocalSystem SCM service` or `legacy fixed-name per-user scheduled task`, rerun installation from an elevated terminal. Temporary `$env:NAME` values in the current PowerShell window are not captured by the task definition. Use a persistent user environment value, the exact-name client credential-file fallback above, or a locally permission-protected inline value. If an explicit credential reference cannot be resolved or is not a valid header value, HTTP, WebSocket, probe, live-smoke, and balance-refresh paths all fail closed before upstream I/O.
 
 Use `model_mapping` when the model requested by Codex differs from the model name expected by a specific relay. The mapping is provider-scoped: codex-helper rewrites the request body `model` only after that provider is selected, so other providers are not affected.
 
@@ -1182,10 +1204,10 @@ Important balance behavior:
 - New API conversion first probes the same origin's public `GET /api/status` and reads `quota_per_unit`, then falls back to the adapter's positive `quota_divisor`. If neither is available, codex-helper keeps the counters in `raw` units instead of claiming an exact USD conversion. Token usage snapshots with `unlimited_quota = true` are never treated as exhausted.
 - RightCode `balance` is shown as wallet balance. Matched `subscriptions[*].total_quota` and `remaining_quota` are shown as daily quota; `reset_today = false` means codex-helper includes today's fresh daily quota before displaying remaining quota.
 - If a provider reports misleading zero balances for active subscriptions, set `trust_exhaustion_for_routing = false`.
-- UI surfaces expose the last committed balance observation and its freshness; they do not mutate or refresh provider state.
+- UI surfaces expose the last committed balance observation and its freshness. An integrated or loopback-attached TUI with the signed local-operator capability may ask the daemon to refresh observations; a remote observer and the desktop read path remain read-only.
 - Balance HTTP calls are bounded and reuse the same outbound client as proxy runtime calls. A failed lookup should surface the probed origin and adapter kind in logs, for example whether `sub2api_usage` or `openai_balance_http_json` returned non-JSON.
 
-The resident proxy runtime owns one quota sampler. It refreshes once on startup and normally schedules another pass about every five minutes with up to 10% positive jitter; provider polling throttles, reset/exhaustion suppression, and `Retry-After` may delay actual HTTP requests. Repeated all-provider failures use bounded exponential backoff. Valid semantic observations are committed to bounded RuntimeStore tables in `~/.codex-helper/state/state.sqlite` and resume across restarts; failures and offline gaps are not interpolated. Attached clients read the canonical operator model with `GET` / `HEAD` only, so they neither start a competing sampler nor force a remote refresh.
+The resident proxy runtime owns one quota sampler. It refreshes once on startup and normally schedules another pass about every five minutes with up to 10% positive jitter; provider polling throttles, reset/exhaustion suppression, and `Retry-After` may delay actual HTTP requests. Repeated all-provider failures use bounded exponential backoff. Valid semantic observations are committed to bounded RuntimeStore tables in `~/.codex-helper/state/state.sqlite` and resume across restarts; failures and offline gaps are not interpolated. Observer clients only read the canonical operator model and never start a competing sampler. A loopback-attached TUI may request an immediate daemon-owned refresh through the one-shot signed local-operator API when the daemon advertises that capability; it never performs provider polling itself.
 
 ## Usage Page
 
@@ -1195,14 +1217,15 @@ How to read it:
 
 - Remote pool rows make scoped `used` or `observed since <time>`, `remaining`, and state first-viewport signals. The selected pool also shows 15/60-minute burn rates, required rate until reset, faster/on-pace/slower status, exhaustion ETA, reset, source, scope, identity confidence, and freshness. A direct remote total may still be shown when there are too few continuous samples for rates or ETA.
 - Only a proven calendar-day window may be called `today` or use a `midnight` reset label. Rolling, custom, monthly, resetless, and reset-unknown counters keep their own window wording; a resetless wallet has an ETA when possible but no required reset pace.
-- The daemon-owned background sampler refreshes quota observations. Attached TUI and desktop clients remain read-only and never issue a remote refresh mutation. One provider failure leaves its last committed value visibly offline/stale and does not clear other pools or interrupt redraw.
+- The daemon-owned background sampler refreshes quota observations. A local attached TUI may request a signed daemon-owned refresh with `g`; remote observers and desktop read clients remain read-only. One provider failure leaves its last committed value visibly offline/stale and does not clear other pools or interrupt redraw.
 - The remote pool counter is authoritative for total burn in its declared account/key/subscription scope and can include traffic from other computers. RuntimeStore request facts committed to `state.sqlite` are authoritative for this daemon's project attribution. Reconciliation uses `external = max(remote - local, 0)`, retains a negative signed gap when local exceeds remote, and never multiplies local request prices or distributes external usage across projects.
 - Project rows normalize new requests to a Git root when possible, with explicit fallback/unknown and omitted rows. New request costs retain their selected tier and effective pricing source/generation; older reconstructed rows lower coverage instead of being presented as captured billing facts. The local-day provider/endpoint/model/session context and 24-hour activity remain available below the remote quota panels.
 - Identity confidence reflects the evidence used to recognize a shared pool. Proven remote ownership is high confidence; an explicit `quota_pool_id` or installation-local keyed credential fingerprint is medium; endpoint-only or conflicting evidence is low/ambiguous. Ambiguous pools remain separate and are not summed into an exact shared total. Credentials and full fingerprints are not exposed.
 - Reconciliation requires aligned remote/local windows, USD units, the same conversion generation, and adequate committed-request and price coverage. Raw units, divisor changes, incompatible generations, window mismatch, truncated/reconstructed records, unpriced or unmatched requests, deduplication/boundary uncertainty, and arithmetic overflow keep the available values visible but make the difference unavailable or incomplete. A coverage warning is not a claim that earlier usage was zero.
 - `unknown` means there is no trusted remote data or the lookup failed; `stale`, `offline`, `exhausted`, `error`, and `unlimited` are distinct states. Derived rates and predictions freeze or become unavailable when freshness or sample continuity is insufficient.
 - In the desktop Usage table, the per-row `Chain` action loads the sanitized request chain only on demand. Use it for single-request diagnosis after the totals show an unusual pattern.
-- The `Routing` page keeps compact balance context and route-eligibility controls. Use TUI `Usage` for pool burn and pace; use Routing for provider-endpoint eligibility.
+- The `Routing` page keeps compact balance context and route-eligibility controls. `Enter` opens local runtime actions for new-session preference and endpoint Enabled / Draining / Disabled state; these actions never rewrite route configuration or move existing sessions. Use TUI `Usage` for pool burn and pace; use Routing for provider-endpoint eligibility.
+- The `Sessions` page owns explicit changes to an existing session binding. Its Clear/Rebind menu is available only through the integrated TUI or a loopback-attached TUI with the signed local-operator capability. The daemon rejects active sessions, stale affinity revisions, stale route graphs, conditional route graphs, unavailable targets, and cross-endpoint Rebind unless both endpoints share the same explicit `continuity_domain`. Clear removes the binding without immediately choosing a replacement; the next eligible request reruns current routing policy, so a state-bound request under `hard` affinity can fail for missing affinity while an ordinary request can establish a new affinity. If an idle session still holds a WebSocket and reselects another endpoint, the old socket returns `websocket_reconnect_required` before writing any application frame to the old upstream. Prefer starting a new Codex session when upstream state ownership is uncertain.
 
 The same daemon-owned DTO is available from the canonical operator read model:
 
@@ -1277,6 +1300,7 @@ Pricing is separate from relay config. BaseLLM is an estimate catalog, not a rel
 - Automatic remote source: `https://basellm.github.io/llm-metadata/api/all.json`
 - Effective precedence: `bundled < validated remote LKG < manual whole-model override`. A manual model row replaces the remote model, including its context tiers; rows stay namespaced by canonical provider.
 - The resident daemon checks BaseLLM on startup and about every six hours using conditional requests. A candidate must pass bounded parsing and semantic/economic validation before becoming last-known-good (LKG); failures preserve the prior LKG, while suspicious economic changes are quarantined for explicit approval. LKG, last-check, and quarantine facts are committed through RuntimeStore in `state.sqlite`; there is no separate JSON cache authority. Automatic refresh never writes `pricing_overrides.toml`.
+- A 0.20.3 override file with root `[models.*]` rows remains readable. Bare legacy rows are interpreted as `openai` and normalize to the provider-scoped version 2 shape on the first explicit pricing write. If a legacy row was intended for Anthropic/Claude pricing, move it manually under `[providers.anthropic.models.*]`; the old global catalog did not record enough provider identity to infer that safely.
 - Operator commands:
 
 ```bash
@@ -1311,6 +1335,8 @@ Manage providers:
 ```bash
 codex-helper provider add input --base-url https://ai.input.im/v1 --auth-token-env INPUT_API_KEY --tag billing=monthly
 codex-helper provider add openai --base-url https://api.openai.com/v1 --auth-token-env OPENAI_API_KEY --tag billing=paygo
+# Only for a remote relay that intentionally requires no authentication
+codex-helper provider add anonymous-relay --base-url https://relay.example/v1 --allow-anonymous
 codex-helper provider list
 codex-helper provider show input
 codex-helper provider disable input
@@ -1459,7 +1485,9 @@ TUI and desktop consume the same typed, redacted `OperatorReadModel`. They use o
 - Requests and sessions show provider choice, route affinity, retry chain, token/cache evidence, and committed economics.
 - `ready`, `stale`, `disconnected`, and `auth_required` states remain explicit; clients never fabricate a local fallback view.
 
-These operator clients and the remote control plane are query-only. Edit durable provider and routing intent through local CLI commands or `config.toml`. An attached TUI neither handles `n` / `o` nor inspects or changes local Codex configuration. In terminal workflows, client switching is available only through a separate explicit local `switch on/off` CLI action or `n` / `o` on the integrated local TUI Settings page; neither path is a remote control-plane operation.
+On page `2 Routing` in an integrated TUI or an authenticated loopback-attached TUI, select a candidate and press `Enter` to open runtime actions. Setting a new-session preference affects only sessions that do not already have affinity; `a`, `Backspace`, or `Delete` restores automatic capacity-aware selection, while `g` forces a full balance/quota refresh. Endpoint draining/disabling is a separate maintenance action. None of these operations rewrites `config.toml` or silently migrates an existing session.
+
+Remote operator clients and the remote control plane are query-only. The local signed operator interface may refresh balances and apply ephemeral routing or idle-session-affinity controls, but it never edits durable provider or routing intent. Edit that intent through local CLI commands or `config.toml`. An attached TUI neither handles `n` / `o` nor inspects or changes local Codex configuration. In terminal workflows, client switching is available only through a separate explicit local `switch on/off` CLI action or `n` / `o` on the integrated local TUI Settings page; neither path is a remote control-plane operation.
 
 ## Configuration Compatibility
 
@@ -1469,7 +1497,7 @@ Migration preserves representable provider/routing intent, removes known retired
 
 Provider, endpoint, route-graph, retry-profile, notification, fleet, and service-status settings from a normal 0.20.3 version 5 file remain usable. However, several optional fields that were also published under version 5 have been retired. The version number alone cannot identify them, so startup creates `config.toml.bak` and precisely removes all matching helper-config paths before loading. An explicit typed save still refuses to overwrite an uncleaned source directly, preventing unrelated commands from silently erasing fields.
 
-| Retired input | Current behavior | Upgrade action |
+| 0.20.3 input or behavior | Current behavior | Upgrade action |
 | --- | --- | --- |
 | `[codex.client_patch]` | Startup backs up the file and removes the table; presets, auth facades, compaction, hosted-tool switches, and WebSocket patching are no longer helper config | Preview with `config migrate --dry-run`; use only the explicit URL switch described above |
 | `[codex.compaction]` / `[claude.compaction]` | Startup backs up the file and removes either table; the shared v0.20.3 schema accepted the Claude table even though it had no Claude runtime effect | Preview the cleanup; helper no longer performs remote-v2-to-v1 downgrade |
@@ -1479,6 +1507,10 @@ Provider, endpoint, route-graph, retry-profile, notification, fleet, and service
 | `relay_targets.*.client_preset` / `responses_websocket` | Startup backs up the file and removes every matching relay-target field | A relay bookmark stores network/admin connection data only |
 | server `advertised-admin-base-url` / `host-local-session-history` and matching CLI flags | Server config parsing rejects these keys; CLI flags no longer exist | Remove them; configure each client's trusted relay `admin_url` explicitly |
 | `usage_providers.json` endpoint templates, `headers`, or `variables` | The operator-owned file fails to load | Use literal relative/absolute endpoints and typed fields such as `new_api_user_id_env` |
+| Remote `relay_targets.*` without `admin_url`, or with a non-loopback HTTP admin URL / missing token env | The bookmark remains in version 5 but target resolution fails closed; remote admin authority is never derived from `proxy_url` or a response | Set an explicit trusted HTTPS `admin_url` and valid `admin_token_env`, or terminate a trusted tunnel on loopback; this is not auto-rewritten |
+| Enabled non-loopback `fleet.nodes.*` using HTTP or missing/invalid `admin_token_env` | Main configuration validation fails closed before the runtime starts | Use HTTPS plus a valid token environment name, or a trusted loopback tunnel; update the file manually |
+| One explicit `limit_group` with missing or different `max_concurrent_requests` values | Route-graph compilation and normal version 5 loading fail closed without rewriting the source | Give every candidate in that group the same limit, or split independent 20-slot and 15-slot accounts into different groups |
+| Root `[models.*]` rows in `pricing_overrides.toml` | They remain readable as OpenAI rows and normalize to provider-scoped schema v2 on the first explicit pricing write | No action for OpenAI; manually move Anthropic/Claude rows under `[providers.anthropic.models.*]` |
 
 An older route graph without `scheduling_preset` now defaults to `balanced`, which waits up to two seconds for local concurrency capacity. Set `scheduling_preset = "throughput-first"` to retain the 0.20.3 behavior of immediately trying the next candidate when the selected local limit is saturated.
 

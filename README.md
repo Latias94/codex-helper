@@ -109,7 +109,7 @@ ch
 codex-helper serve --no-tui
 ```
 
-高级：系统服务/附着代理（只有显式安装服务或使用 `--resident`/`daemon`/`tui` 子命令时，代理才会独立于当前控制台继续运行）：
+高级：后台服务/附着代理（只有显式安装服务或使用 `--resident`/`daemon`/`tui` 子命令时，代理才会独立于当前控制台继续运行）：
 
 ```bash
 codex-helper service install --codex
@@ -119,7 +119,7 @@ codex-helper tui --codex
 codex-helper service stop
 ```
 
-默认 `codex-helper serve` 的内置 TUI 遵循“界面拥有代理”：退出界面会停止它自己启动的代理，但不会执行 `switch on/off`。`daemon status` 只读查询 resident proxy；已安装的本地服务使用 `service start/stop/restart` 管理，不提供远程 HTTP shutdown 命令。`tui` 子命令只读附着到已有 resident proxy，退出这个 attached TUI 不会停止代理。需要自动拉起/崩溃重启时可用 `codex-helper daemon supervise --codex`，supervisor 会写入轻量 crash marker 到 `~/.codex-helper/run/` 便于排查。
+默认 `codex-helper serve` 的内置 TUI 遵循“界面拥有代理”：退出界面会停止它自己启动的代理，但不会执行 `switch on/off`。`daemon status` 只读查询 resident proxy；已安装的本地服务使用 `service start/stop/restart` 管理，不提供远程 HTTP shutdown 命令。`tui` 子命令附着到已有 resident proxy：在 daemon 所在机器，本机签名 operator capability 可执行 daemon 明确声明的余额刷新、路由和会话操作；本机签名不可用时会降级为只读。`RemoteObserver` 绝对只读，不发送 operator mutation。退出 attached TUI 不会停止代理。需要自动拉起/崩溃重启时可用 `codex-helper daemon supervise --codex`，supervisor 会写入轻量 crash marker 到 `~/.codex-helper/run/` 便于排查。
 
 `daemon status` 会尽量显示当前 resident proxy 的 owner marker（manual CLI、supervisor 或未来桌面/托盘 owner）；marker 只用于可观测性，读取或清理失败不会阻断代理启动/退出。面向未来桌面端的 sidecar 语义已经预留为隐藏的 managed 启动模式，普通用户无需手动判断或使用。
 
@@ -155,9 +155,9 @@ ch relay off
 
 容器和服务器不提供客户端本地 transcript/session 能力。本地 `session` 命令只读取执行该命令机器上的 Codex 会话文件。
 
-客户端 switch 只负责把 Codex 指向一个 helper URL。`switch on` 记录原 selector 和 helper stanza，只写入 `model_providers.codex_proxy`；`switch off` 只恢复记录过的内容。外部编辑发生冲突时，状态进入 `recovery_required` 并保持文件不动。Codex `auth.json`、`models_cache.json`、SQLite、feature flags、compaction 和 WebSocket 设置都不会被读取或修改。
+客户端 switch 只负责把 Codex 指向一个 helper URL。`switch on` 记录原 selector 和 helper stanza，只写入 `model_providers.codex_proxy`；`switch off` 只恢复记录过的内容。外部编辑发生冲突时，状态进入 `recovery_required` 并保持文件不动。除下述一次性 legacy 恢复外，Codex `auth.json`、`models_cache.json`、SQLite、feature flags、compaction 和 WebSocket 设置都不会被读取或修改。
 
-从 0.20.3 或更早版本升级时，如果 `~/.codex/codex-helper-switch-state.json` 仍存在，请先用创建它的旧 binary 运行 `codex-helper switch off`，成功后再升级并重新 `switch on`；旧 state 可能包含原始 auth 内容，恢复前不要删除或分享。旧 `switch remote-control enable` 写入的 `remote_connections` 和 Codex SQLite 状态不会被新版自动撤销，也不要用 SQL hack 清理；完整顺序和 v5 退休字段见[中文配置兼容性说明](docs/CONFIGURATION.zh.md#配置兼容性)。
+从 0.20.3 或更早版本升级时，如果 `~/.codex/codex-helper-switch-state.json` 仍存在，新版 `switch off` 会安全自动恢复旧 helper 管理过的 selector/provider stanza 和可验证的 auth facade；`switch on` 会先完成同样的恢复，再创建新 journal。恢复只在当前文件仍匹配旧 helper patch 时写入；损坏、未知版本或新旧 journal 冲突都会保留原 state 并失败关闭。旧 state 可能包含原始 auth，不要删除、编辑或分享。旧 `switch remote-control enable` 写入的 `remote_connections` 和 Codex SQLite 状态不会被新版自动撤销，也不要用 SQL hack 清理；完整顺序和 v5 退休字段见[中文配置兼容性说明](docs/CONFIGURATION.zh.md#配置兼容性)。
 
 Relay 能力由选中 provider 的 adapter、catalog 和有界观测决定，不由 switch 配置推断。可用下面的本地命令查看 provider contract、实际 `/models` / `/responses` / `/responses/compact` 结果、continuity 和 mismatches：
 
@@ -165,7 +165,7 @@ Relay 能力由选中 provider 的 adapter、catalog 和有界观测决定，不
 codex-helper codex relay-capabilities --model gpt-5.5 --provider ciii --endpoint default
 ```
 
-第三方 relay 应配置自己的 `auth_token_env`、`auth_token` 或等价 API key。Codex 客户端认证只允许透传给官方 OpenAI origin，避免把账号 header 泄露给中转。
+第三方 relay 应配置自己的 `auth_token_env`、`auth_token` 或等价 API key。凭据解析顺序为 inline、daemon 进程环境、显式引用的 Codex `auth.json` / Claude settings 同名字段；缺失的显式引用会在访问上游前失败关闭。Windows per-user Scheduled Task 不会捕获当前 PowerShell 窗口的临时 `$env:*`，详见[凭据与 service 说明](docs/CONFIGURATION.zh.md#provider-字段)。Codex 客户端认证只允许透传给官方 OpenAI origin，避免把账号 header 泄露给中转。
 
 为了不拖能力较强的中转后腿，codex-helper 默认会在路由前归一化压缩 HTTP 请求体（`zstd`、`gzip` / `x-gzip`、`br`、`deflate`）。对 Codex `/responses`、`/responses/compact` 和 Responses WebSocket，helper 还会从已有请求证据补齐缺失的 `session_id`、`x-session-id`、官方 `session-id` / `thread-id` 和 `prompt_cache_key`，来源包括 header session、body `session_id`、`prompt_cache_key` 和 `metadata.session_id`。`previous_response_id` 只用于 stale-response 修复，不作为 session identity 来源；helper 不会凭空生成 session id，也不会覆盖用户已经带上的 session 字段。
 

@@ -2,10 +2,10 @@
   "schema_version": 1,
   "slug": "codex-tui-startup-guardrail",
   "title": "Codex TUI Startup Guardrail",
-  "status": "active",
-  "updated": "2026-05-18",
+  "status": "complete",
+  "updated": "2026-07-13",
   "scope_kind": "execution",
-  "problem": "Interactive Codex TUI startups can skip the normal verification flow, so stale patch or remote-control state is only noticed after the session has already started.",
+  "problem": "Historical startup-readiness work superseded by helper-owned config/runtime checks and explicit local switch-journal conflict reporting; Codex auth, model cache, SQLite, and remote-control state are no longer inputs.",
   "authoritative_docs": [
     {
       "role": "design",
@@ -18,10 +18,6 @@
     {
       "role": "gates",
       "path": "docs/workstreams/codex-tui-startup-guardrail/EVIDENCE_AND_GATES.md"
-    },
-    {
-      "role": "manual-smoke",
-      "path": "docs/workstreams/codex-tui-startup-guardrail/SMOKE.md"
     }
   ],
   "gates": [
@@ -35,6 +31,6 @@
   "adr_refs": [],
   "continue_policy": {
     "default_action": "continue",
-    "notes": "Continue while the startup readiness prompt remains the target. Split capability-matrix, response-fixer, GUI wizard, or protocol-normalizer follow-ons into separate lanes."
+    "notes": "This historical lane is complete and superseded. New startup-readiness work must use only helper-owned config/runtime state and the current switch journal."
   }
 }
