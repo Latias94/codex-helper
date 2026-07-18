@@ -4523,6 +4523,21 @@ async fn refresh_provider_target(
 
     let fetched_at_ms = unix_now_ms();
     let stale_after_ms = stale_after_ms(fetched_at_ms, interval_secs);
+    let Some(token) = token else {
+        if provider.kind == ProviderKind::OpenAiOrganizationCosts {
+            warn!(
+                "usage provider '{}' is missing OPENAI_ADMIN_KEY; OpenAI official costs stay unknown",
+                provider.id
+            );
+        } else {
+            warn!(
+                "usage provider '{}' has no usable token (checked token_env and associated upstream auth_token); \
+跳过本次用量查询，请检查 usage_providers.json 和 ~/.codex-helper/config.toml",
+                provider.id
+            );
+        }
+        return UsageProviderRefreshOutcome::MissingToken;
+    };
     let snapshot_decision = existing_usage_provider_target_suppression_decision(
         state,
         &provider.id,
@@ -4564,39 +4579,6 @@ async fn refresh_provider_target(
         return UsageProviderRefreshOutcome::Suppressed { wake_at };
     }
 
-    let Some(token) = token else {
-        let snapshot = if provider.kind == ProviderKind::OpenAiOrganizationCosts {
-            base_snapshot(provider, &target.endpoint, fetched_at_ms, stale_after_ms)
-        } else {
-            base_snapshot(provider, &target.endpoint, fetched_at_ms, stale_after_ms)
-                .with_error("no usable token; checked provider token_env and upstream auth")
-        };
-        let persisted = commit_provider_poll_snapshot(
-            state.as_ref(),
-            ProviderPollCommitGuard::RuntimeIdentity(target.runtime_identity.clone()),
-            snapshot,
-            None,
-            unix_now_ms(),
-            None,
-        )
-        .await;
-        if persisted.persistence_failed() {
-            return UsageProviderRefreshOutcome::Failed;
-        }
-        if provider.kind == ProviderKind::OpenAiOrganizationCosts {
-            warn!(
-                "usage provider '{}' is missing OPENAI_ADMIN_KEY; OpenAI official costs stay unknown",
-                provider.id
-            );
-        } else {
-            warn!(
-                "usage provider '{}' has no usable token (checked token_env and associated upstream auth_token); \
-跳过本次用量查询，请检查 usage_providers.json 和 ~/.codex-helper/config.toml",
-                provider.id
-            );
-        }
-        return UsageProviderRefreshOutcome::MissingToken;
-    };
     let token_secret = token;
     let token = usage_token_text(token_secret);
 
@@ -5300,18 +5282,6 @@ async fn auto_probe_provider_target_with_token(
     if is_official_openai_base_url(&target.base_url) {
         let provider = auto_openai_official_provider(target);
         let Some(token) = token else {
-            let persisted = commit_provider_poll_snapshot(
-                state.as_ref(),
-                ProviderPollCommitGuard::RuntimeIdentity(target.runtime_identity.clone()),
-                base_snapshot(&provider, &target.endpoint, fetched_at_ms, stale_after_ms),
-                None,
-                unix_now_ms(),
-                None,
-            )
-            .await;
-            if persisted.persistence_failed() {
-                return UsageProviderRefreshOutcome::Failed;
-            }
             warn!(
                 "OpenAI organization costs require OPENAI_ADMIN_KEY; balance stays unknown for {}[{}]",
                 target.endpoint.provider_endpoint.provider_id, target.endpoint.catalog_index
@@ -5412,6 +5382,15 @@ async fn auto_probe_provider_target_with_token(
 
     let first_provider = auto_usage_provider(target, first_auto_probe_kind(target));
     let provider_id = first_provider.id.clone();
+    let Some(token) = token else {
+        warn!(
+            "auto usage provider '{}' has no usable upstream token for {}[{}]",
+            first_provider.id,
+            target.endpoint.provider_endpoint.provider_id,
+            target.endpoint.catalog_index
+        );
+        return UsageProviderRefreshOutcome::MissingToken;
+    };
     let snapshot_decision = existing_usage_provider_target_suppression_decision(
         state,
         &provider_id,
@@ -5453,27 +5432,6 @@ async fn auto_probe_provider_target_with_token(
         return UsageProviderRefreshOutcome::Suppressed { wake_at };
     }
 
-    let Some(token) = token else {
-        let persisted = commit_provider_poll_snapshot(
-            state.as_ref(),
-            ProviderPollCommitGuard::RuntimeIdentity(target.runtime_identity.clone()),
-            base_snapshot(
-                &first_provider,
-                &target.endpoint,
-                fetched_at_ms,
-                stale_after_ms,
-            )
-            .with_error("no usable token; checked upstream auth"),
-            None,
-            unix_now_ms(),
-            None,
-        )
-        .await;
-        if persisted.persistence_failed() {
-            return UsageProviderRefreshOutcome::Failed;
-        }
-        return UsageProviderRefreshOutcome::MissingToken;
-    };
     let token_secret = token;
     let token = usage_token_text(token_secret);
 
@@ -9637,17 +9595,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_missing_token_does_not_recover_committed_eligibility() {
+    async fn configured_missing_token_preserves_balance_and_committed_eligibility() {
         let target = usage_provider_target_at("backup", 1, "https://backup.example/v1", "right");
         let state = ProxyState::new();
         let endpoint = target.endpoint.provider_endpoint.clone();
+        let fetched_at_ms = unix_now_ms().saturating_sub(120_000);
+        let stale_after_ms = fetched_at_ms.saturating_add(60_000);
         state
             .set_provider_automatic_block_for_runtime_identity_for_test(
                 target.runtime_identity().clone(),
                 true,
-                1_000,
+                fetched_at_ms,
             )
             .await;
+        let previous = ProviderBalanceSnapshot {
+            observation_provider_id: "sub2api".to_string(),
+            provider_endpoint: endpoint.clone(),
+            source: ProviderKind::OpenAiBalanceHttpJson
+                .source_name()
+                .to_string(),
+            fetched_at_ms,
+            stale_after_ms: Some(stale_after_ms),
+            exhausted: Some(false),
+            quota_period: Some("daily".to_string()),
+            quota_remaining_usd: Some("12.50".to_string()),
+            quota_limit_usd: Some("20.00".to_string()),
+            ..ProviderBalanceSnapshot::default()
+        };
+        assert_eq!(
+            commit_provider_poll_snapshot(
+                state.as_ref(),
+                ProviderPollCommitGuard::RuntimeIdentity(target.runtime_identity.clone()),
+                previous,
+                None,
+                fetched_at_ms.saturating_add(1),
+                None,
+            )
+            .await,
+            ProviderPollPublication::UnreservedSnapshotPublished
+        );
+        let policy_before = state.capture_provider_policy_snapshot().await;
 
         let outcome = refresh_provider_target(RefreshProviderTargetParams {
             client: &Client::new(),
@@ -9661,10 +9648,87 @@ mod tests {
         .await;
 
         assert_eq!(outcome, UsageProviderRefreshOutcome::MissingToken);
+        let policy_after = state.capture_provider_policy_snapshot().await;
+        assert_eq!(policy_after.policy_revision, policy_before.policy_revision);
+        assert_eq!(policy_after.projections, policy_before.projections);
         let runtime = state
             .route_plan_runtime_state_for_provider_endpoints("codex")
             .await;
         assert!(runtime.provider_endpoint(&endpoint).usage_exhausted);
+        let balances = state.get_provider_balance_view("codex").await;
+        assert_eq!(balances.len(), 1);
+        assert_eq!(balances[0].fetched_at_ms, fetched_at_ms);
+        assert_eq!(balances[0].stale_after_ms, Some(stale_after_ms));
+        assert_eq!(balances[0].status, BalanceSnapshotStatus::Stale);
+        assert_eq!(balances[0].quota_remaining_usd.as_deref(), Some("12.50"));
+        assert_eq!(balances[0].quota_limit_usd.as_deref(), Some("20.00"));
+        assert!(balances[0].error.is_none());
+    }
+
+    #[tokio::test]
+    async fn auto_missing_token_preserves_last_successful_balance_fact() {
+        let target = usage_provider_target_at(
+            "default",
+            0,
+            "https://auto-balance.example/v1",
+            "auto-balance",
+        );
+        let state = Arc::new(ProxyState::new());
+        let provider = auto_usage_provider(&target, first_auto_probe_kind(&target));
+        let fetched_at_ms = unix_now_ms().saturating_sub(120_000);
+        let stale_after_ms = fetched_at_ms.saturating_add(60_000);
+        state
+            .set_provider_automatic_block_for_runtime_identity_for_test(
+                target.runtime_identity().clone(),
+                false,
+                fetched_at_ms,
+            )
+            .await;
+        let previous = ProviderBalanceSnapshot {
+            observation_provider_id: provider.id.clone(),
+            provider_endpoint: target.endpoint.provider_endpoint.clone(),
+            source: provider.kind.source_name().to_string(),
+            fetched_at_ms,
+            stale_after_ms: Some(stale_after_ms),
+            exhausted: Some(false),
+            total_balance_usd: Some("7.25".to_string()),
+            ..ProviderBalanceSnapshot::default()
+        };
+        assert_eq!(
+            commit_provider_poll_snapshot(
+                state.as_ref(),
+                ProviderPollCommitGuard::RuntimeIdentity(target.runtime_identity.clone()),
+                previous,
+                None,
+                fetched_at_ms.saturating_add(1),
+                None,
+            )
+            .await,
+            ProviderPollPublication::UnreservedSnapshotPublished
+        );
+        let policy_before = state.capture_provider_policy_snapshot().await;
+
+        let outcome = auto_probe_provider_target_with_token(
+            &Client::new(),
+            &target,
+            None,
+            &state,
+            "codex",
+            false,
+        )
+        .await;
+
+        assert_eq!(outcome, UsageProviderRefreshOutcome::MissingToken);
+        let policy_after = state.capture_provider_policy_snapshot().await;
+        assert_eq!(policy_after.policy_revision, policy_before.policy_revision);
+        assert_eq!(policy_after.projections, policy_before.projections);
+        let balances = state.get_provider_balance_view("codex").await;
+        assert_eq!(balances.len(), 1);
+        assert_eq!(balances[0].fetched_at_ms, fetched_at_ms);
+        assert_eq!(balances[0].stale_after_ms, Some(stale_after_ms));
+        assert_eq!(balances[0].status, BalanceSnapshotStatus::Stale);
+        assert_eq!(balances[0].total_balance_usd.as_deref(), Some("7.25"));
+        assert!(balances[0].error.is_none());
     }
 
     #[tokio::test]
