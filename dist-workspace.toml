@@ -16,6 +16,9 @@ installers = ["shell", "powershell"]
 targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 # Which actions to run on pull requests
 pr-run-mode = "plan"
+# Consume local artifacts and block the built-in host/release job on real service checks.
+global-artifacts-jobs = ["./native-credential-smoke"]
+github-custom-job-permissions = { "native-credential-smoke" = { actions = "read", contents = "read" } }
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
 # Whether to install an updater program

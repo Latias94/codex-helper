@@ -44,7 +44,7 @@ English: [README_EN.md](README_EN.md)
 - **Provider-owned 能力契约**：Responses、compact、WebSocket、hosted tool 和模型能力来自捕获的 provider/catalog 事实，不由客户端 patch 假设。
 - **OpenAI Images 兼容入口**：本地代理额外暴露 `POST /v1/images/generations` 和 JSON `POST /v1/images/edits`，会转成 Responses hosted `image_generation` 请求并复用同一套 provider routing / fallback，方便本地 skill 或脚本稳定生图或带参考图生成。
 - **中转能力诊断**：显式、本进程的 CLI 动作可以有界检查 `/models`、`/responses`、`/responses/compact`，展示 provider contract、观测、continuity 和 mismatch，但不会修改配置或路由。
-- **provider / routing 配置**：`version = 5` route graph 格式，新增 provider 后用 routing entry/routes 决定顺序、固定、分组或标签优先。
+- **provider / routing 配置**：`version = 6` route graph 格式，新增 provider 后用 routing entry/routes 决定顺序、固定、分组或标签优先。
 - **会话粘性与自动兜底**：同一 Codex 会话会尽量粘住已选 provider，请求失败、上游不可用或可信余额显示耗尽时再按策略切换候选 provider/upstream。
 - **provider 信号控制循环**：限流、配额、传输错误和余额耗尽会先记录为 provider signal，再生成 helper 拥有的临时 policy action 投影到路由；手动禁用优先级更高，自动 action 不会修改 Codex auth 或第三方账号文件。
 - **本地并发上限**：可为 provider 或 endpoint 配置本进程并发上限，relay 账号饱和时自动跳过并走 fallback。
@@ -99,7 +99,7 @@ ch
 默认行为：
 
 - 启动本地代理；
-- 读取唯一支持的 `version = 5` `~/.codex-helper/config.toml`；
+- 读取唯一支持的 `version = 6` `~/.codex-helper/config.toml`；已有 v5 配置会先备份再自动迁移；
 - 交互终端中打开 TUI；
 - 退出时停止当前前台控制台启动的代理。
 
@@ -157,7 +157,7 @@ ch relay off
 
 客户端 switch 只负责把 Codex 指向一个 helper URL。`switch on` 记录原 selector 和 helper stanza，只写入 `model_providers.codex_proxy`；`switch off` 只恢复记录过的内容。外部编辑发生冲突时，状态进入 `recovery_required` 并保持文件不动。除下述一次性 legacy 恢复外，Codex `auth.json`、`models_cache.json`、SQLite、feature flags、compaction 和 WebSocket 设置都不会被读取或修改。
 
-从 0.20.3 或更早版本升级时，如果 `~/.codex/codex-helper-switch-state.json` 仍存在，新版 `switch off` 会安全自动恢复旧 helper 管理过的 selector/provider stanza 和可验证的 auth facade；`switch on` 会先完成同样的恢复，再创建新 journal。恢复只在当前文件仍匹配旧 helper patch 时写入；损坏、未知版本或新旧 journal 冲突都会保留原 state 并失败关闭。旧 state 可能包含原始 auth，不要删除、编辑或分享。旧 `switch remote-control enable` 写入的 `remote_connections` 和 Codex SQLite 状态不会被新版自动撤销，也不要用 SQL hack 清理；完整顺序和 v5 退休字段见[中文配置兼容性说明](docs/CONFIGURATION.zh.md#配置兼容性)。
+从 0.20.3 或更早版本升级时，如果 `~/.codex/codex-helper-switch-state.json` 仍存在，新版 `switch off` 会安全自动恢复旧 helper 管理过的 selector/provider stanza 和可验证的 auth facade；`switch on` 会先完成同样的恢复，再创建新 journal。恢复只在当前文件仍匹配旧 helper patch 时写入；损坏、未知版本或新旧 journal 冲突都会保留原 state 并失败关闭。旧 state 可能包含原始 auth，不要删除、编辑或分享。旧 `switch remote-control enable` 写入的 `remote_connections` 和 Codex SQLite 状态不会被新版自动撤销，也不要用 SQL hack 清理；完整顺序、v5 到 v6 迁移和退休字段见[中文配置兼容性说明](docs/CONFIGURATION.zh.md#配置兼容性)。
 
 Relay 能力由选中 provider 的 adapter、catalog 和有界观测决定，不由 switch 配置推断。可用下面的本地命令查看 provider contract、实际 `/models` / `/responses` / `/responses/compact` 结果、continuity 和 mismatches：
 
@@ -165,7 +165,7 @@ Relay 能力由选中 provider 的 adapter、catalog 和有界观测决定，不
 codex-helper codex relay-capabilities --model gpt-5.5 --provider ciii --endpoint default
 ```
 
-第三方 relay 应配置自己的 `auth_token_env`、`auth_token` 或等价 API key。凭据解析顺序为 inline、daemon 进程环境、显式引用的 Codex `auth.json` / Claude settings 同名字段；缺失的显式引用会在访问上游前失败关闭。Windows per-user Scheduled Task 不会捕获当前 PowerShell 窗口的临时 `$env:*`，详见[凭据与 service 说明](docs/CONFIGURATION.zh.md#provider-字段)。Codex 客户端认证只允许透传给官方 OpenAI origin，避免把账号 header 泄露给中转。
+第三方 relay 应显式配置 helper 侧凭据。v6 可以把 bearer 或 `X-API-Key` 绑定到原生凭据、绝对路径的只读 secret file、环境变量或兼容期 inline 值；选择 `auth_token_ref` / `api_key_ref` 后不会再回退同类 legacy 来源。本机已安装 service 优先使用当前登录用户的 Credential Manager、Keychain 或 Secret Service，Docker/headless server 使用环境变量或 mounted secret；server 不支持 native reference，也不会创建明文或 SQLite fallback。完整命令、解析顺序和 readiness 语义见[凭据与 service 说明](docs/CONFIGURATION.zh.md#provider-字段)。Codex 客户端认证只允许透传给官方 OpenAI origin，避免把账号 header 泄露给中转。
 
 为了不拖能力较强的中转后腿，codex-helper 默认会在路由前归一化压缩 HTTP 请求体（`zstd`、`gzip` / `x-gzip`、`br`、`deflate`）。对 Codex `/responses`、`/responses/compact` 和 Responses WebSocket，helper 还会从已有请求证据补齐缺失的 `session_id`、`x-session-id`、官方 `session-id` / `thread-id` 和 `prompt_cache_key`，来源包括 header session、body `session_id`、`prompt_cache_key` 和 `metadata.session_id`。`previous_response_id` 只用于 stale-response 修复，不作为 session identity 来源；helper 不会凭空生成 session id，也不会覆盖用户已经带上的 session 字段。
 
@@ -237,7 +237,7 @@ codex-helper 侧只负责上游和路由：
 
 ```toml
 # ~/.codex-helper/config.toml
-version = 5
+version = 6
 
 [codex.providers.relay]
 base_url = "https://relay.example/v1"
@@ -281,7 +281,7 @@ codex-helper config set-retry-profile balanced
 对应的 `~/.codex-helper/config.toml` 很薄：
 
 ```toml
-version = 5
+version = 6
 
 [codex.providers.input]
 base_url = "https://ai.input.im/v1"

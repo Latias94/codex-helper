@@ -1950,6 +1950,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unchanged_native_refresh_advances_freshness_without_generation_churn() {
+        let backend = Arc::new(CountingNativeStore::default());
+        *backend.value.lock().expect("native value lock") =
+            Some(SecretValue::new(b"generation-a".to_vec()).expect("valid credential"));
+        let store = Arc::new(RuntimeStore::open_in_memory().expect("open runtime store"));
+        let runtime = CredentialRuntime::from_runtime_store(
+            CredentialSourceCapabilities::from_backend(Arc::clone(&backend)),
+            store.as_ref(),
+        )
+        .expect("build credential runtime");
+        let auth = native_auth();
+        let endpoint = endpoint();
+        let initial = runtime
+            .build_generation([CredentialCandidateInput {
+                provider_endpoint: endpoint.clone(),
+                auth: &auth,
+            }])
+            .expect("build initial generation");
+        let initial_revision = initial.revision();
+        let initial_digest = initial.digest().to_string();
+        let initial_scope = initial
+            .credential_scope_for_route_digest(&endpoint)
+            .expect("initial credential scope")
+            .map(str::to_string);
+        let initial_deadline = initial
+            .next_native_deadline()
+            .expect("initial native freshness deadline");
+
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let refreshed = runtime
+            .refresh_generation(
+                Arc::clone(&initial),
+                None,
+                CredentialRuntimeRefreshCause::ExplicitRefresh,
+            )
+            .await
+            .expect("refresh unchanged native credential");
+
+        assert_eq!(backend.reads.load(Ordering::SeqCst), 2);
+        assert_eq!(refreshed.revision(), initial_revision);
+        assert_eq!(refreshed.digest(), initial_digest);
+        assert!(initial.marker().matches(refreshed.as_ref()));
+        assert_eq!(
+            refreshed
+                .credential_scope_for_route_digest(&endpoint)
+                .expect("refreshed credential scope"),
+            initial_scope.as_deref()
+        );
+        assert!(
+            refreshed
+                .next_native_deadline()
+                .expect("refreshed native freshness deadline")
+                > initial_deadline
+        );
+        assert_eq!(
+            refreshed
+                .capture(&endpoint)
+                .bearer_header()
+                .expect("refreshed bearer")
+                .as_bytes(),
+            b"Bearer generation-a"
+        );
+    }
+
+    #[tokio::test]
     async fn explicit_delete_invalidates_then_allows_a_new_generation() {
         let backend = Arc::new(CountingNativeStore::default());
         *backend.value.lock().expect("native value lock") =

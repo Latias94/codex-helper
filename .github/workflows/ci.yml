@@ -28,6 +28,11 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Install cargo-dist
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-dist@0.32.0
+
       - name: Install Linux desktop dependencies
         run: |
           sudo apt-get update
@@ -73,6 +78,17 @@ jobs:
 
       - name: Check canonical runtime source surface
         run: node tools/check-canonical-runtime-surface.mjs
+
+      - name: Check credential source and dependency surface
+        run: node tools/check-credential-surface.mjs
+
+      - name: Check generated cargo-dist workflow
+        run: cargo dist generate --mode=ci --check
+
+      - name: Test native credential smoke safeguards
+        run: |
+          node tools/native-credential-smoke.mjs --self-test
+          node tools/verify-native-credential-evidence.mjs --self-test
 
       - name: Test desktop
         run: pnpm --dir apps/desktop test -- --run
@@ -145,6 +161,12 @@ jobs:
         run: |
           cargo --version
           cargo nextest --version
+
+      - name: Check native credential core for this platform
+        run: cargo check --locked -p codex-helper-core --features native-credentials --all-targets
+
+      - name: Check isolated server capability boundary
+        run: cargo check --locked -p codex-helper-server --all-targets
 
       - name: Test (nextest)
         run: cargo nextest run --locked --workspace --no-fail-fast

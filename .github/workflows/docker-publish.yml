@@ -27,6 +27,7 @@ on:
       - "crates/**"
       - ".github/workflows/docker-publish.yml"
       - "deploy/**"
+      - "tools/check-credential-surface.mjs"
       - "tools/docker-mounted-secret-smoke.sh"
 
 permissions:
@@ -97,6 +98,17 @@ jobs:
         with:
           ref: ${{ github.event_name == 'pull_request' && github.sha || steps.release.outputs.ref }}
           persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Check server credential boundary
+        run: node tools/check-credential-surface.mjs
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4

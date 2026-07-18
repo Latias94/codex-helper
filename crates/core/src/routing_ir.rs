@@ -5871,6 +5871,110 @@ mod tests {
     }
 
     #[test]
+    fn round_robin_reenters_a_restored_credential_without_losing_session_affinity() {
+        let view = ServiceRouteConfig {
+            providers: BTreeMap::from([
+                (
+                    "input".to_string(),
+                    limited_provider("https://rr-credential-input.example/v1", 20),
+                ),
+                (
+                    "ciii".to_string(),
+                    limited_provider("https://rr-credential-ciii.example/v1", 15),
+                ),
+            ]),
+            routing: Some(RouteGraphConfig::round_robin(vec![
+                "input".to_string(),
+                "ciii".to_string(),
+            ])),
+            ..ServiceRouteConfig::default()
+        };
+        let template = compile_route_plan_template("codex", &view).expect("route template");
+        let executor = RoutePlanExecutor::new(&template);
+        let input = endpoint_key("codex", "input", "default");
+        let mut runtime = RoutePlanRuntimeState::default();
+        runtime.set_provider_endpoint(
+            input.clone(),
+            RoutePlanUpstreamRuntimeState {
+                credential_readiness: CredentialReadinessCode::Missing,
+                ..RoutePlanUpstreamRuntimeState::default()
+            },
+        );
+
+        for _ in 0..40 {
+            let selected = executor
+                .select_supported_candidate_with_runtime_state(
+                    &mut RoutePlanAttemptState::default(),
+                    &runtime,
+                    None,
+                )
+                .selected
+                .expect("remaining credential-ready candidate");
+            assert_eq!(selected.candidate.provider_id, "ciii");
+        }
+
+        runtime.set_provider_endpoint(
+            input.clone(),
+            RoutePlanUpstreamRuntimeState {
+                credential_readiness: CredentialReadinessCode::Ready,
+                ..RoutePlanUpstreamRuntimeState::default()
+            },
+        );
+        let mut counts = BTreeMap::<String, usize>::new();
+        for _ in 0..350 {
+            let provider_id = executor
+                .select_supported_candidate_with_runtime_state(
+                    &mut RoutePlanAttemptState::default(),
+                    &runtime,
+                    None,
+                )
+                .selected
+                .expect("restored round-robin candidate")
+                .candidate
+                .provider_id
+                .clone();
+            *counts.entry(provider_id).or_default() += 1;
+        }
+        assert_eq!(counts.get("input"), Some(&200));
+        assert_eq!(counts.get("ciii"), Some(&150));
+
+        runtime.set_affinity_provider_endpoint(Some(input.clone()));
+        runtime.set_provider_endpoint(
+            input.clone(),
+            RoutePlanUpstreamRuntimeState {
+                credential_readiness: CredentialReadinessCode::Missing,
+                ..RoutePlanUpstreamRuntimeState::default()
+            },
+        );
+        let fallback = executor
+            .select_supported_candidate_with_runtime_state(
+                &mut RoutePlanAttemptState::default(),
+                &runtime,
+                None,
+            )
+            .selected
+            .expect("fallback while affinity credential is unavailable");
+        assert_eq!(fallback.candidate.provider_id, "ciii");
+
+        runtime.set_provider_endpoint(
+            input.clone(),
+            RoutePlanUpstreamRuntimeState {
+                credential_readiness: CredentialReadinessCode::Ready,
+                ..RoutePlanUpstreamRuntimeState::default()
+            },
+        );
+        let restored_affinity = executor
+            .select_supported_candidate_with_runtime_state(
+                &mut RoutePlanAttemptState::default(),
+                &runtime,
+                None,
+            )
+            .selected
+            .expect("restored affinity candidate");
+        assert_eq!(restored_affinity.provider_endpoint, input);
+    }
+
+    #[test]
     fn new_session_preference_preempts_round_robin_and_falls_back_when_draining() {
         let mut routing =
             RouteGraphConfig::round_robin(vec!["input".to_string(), "ciii".to_string()]);

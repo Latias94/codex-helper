@@ -2,7 +2,7 @@
 
 中文参考: [CONFIGURATION.zh.md](CONFIGURATION.zh.md)
 
-This guide documents the public `version = 5` route graph config format.
+This guide documents the public `version = 6` route graph config format.
 
 The short version: define providers once, then point `routing.entry` at a named route node under `routing.routes`. Most users only need `[codex.providers.*]`, `[codex.routing]`, `[codex.routing.routes.*]`, and `[retry]`.
 
@@ -44,13 +44,13 @@ Only an explicit local `switch on/off` action may patch `~/.codex/config.toml`, 
 
 ## Automatic Configuration Migration
 
-Normal startup automatically upgrades historical helper configuration to the current `version = 5` TOML contract:
+Normal startup automatically upgrades historical helper configuration to the current `version = 6` TOML contract:
 
-- A v1-v4 or unversioned `config.toml` is validated, backed up to `config.toml.bak`, and atomically replaced with canonical version 5 TOML.
+- A v1-v5 or unversioned `config.toml` is validated, backed up to `config.toml.bak`, and atomically replaced with canonical version 6 TOML. Version 5 credentials keep their existing inline/environment/client-file semantics; migration never invents a native or secret-file reference and never copies or deletes a credential value.
 - If `config.toml` is absent but `config.json` exists, the JSON source is backed up to `config.json.bak` and a new canonical `config.toml` is written. The original `config.json` is not deleted. `config init` uses this same migration path and prints the migration report instead of claiming that it wrote a blank template.
 - Historical station-shaped JSON is validated against the nullable fields accepted by the last published JSON loader. `null` remains valid only for those optional fields; a non-optional `null`, or any `null` in a later provider-shaped JSON file that had no published nullable contract, fails closed.
 - The migrator understands the historical station, group, routing, and version 4 route-graph shapes. It moves flat `[retry]` fields `max_attempts`, `backoff_ms`, `backoff_max_ms`, `jitter_ms`, `on_status`, `on_class`, and `strategy` into `[retry.upstream]` only when that table is absent. If `[retry.upstream]` already exists, it is the complete historical override and all flat retry fields are ignored with a warning. The migrator removes retired settings and validates the complete result against the current typed schema before replacing the canonical file.
-- Malformed input, a version newer than 5, an invalid migrated result, a symbolic-link source, or a source changed while migration is being prepared fails closed. The source is not replaced.
+- Malformed input, a version newer than 6, an invalid migrated result, a symbolic-link source, or a source changed while migration is being prepared fails closed. The source is not replaced.
 - Concurrent automatic startups wait for the active config writer, then recheck whether migration is still required. Explicit init, save, and migrate mutations remain fail-fast when another writer owns the lock.
 
 To inspect the exact output and migration warnings before startup writes anything, use the explicit preview command. Applying it requires both write flags:
@@ -60,7 +60,7 @@ codex-helper config migrate --dry-run
 codex-helper config migrate --write --yes
 ```
 
-Startup uses the same path to clean a current version 5 file that still contains retired fields; `config migrate` lets you preview or apply that cleanup explicitly. Explicit migration of an already-clean version 5 file is a no-op and does not replace an existing legacy backup. Backups are safety copies, not a versioned archive: preserve a backup elsewhere before another migration or forced initialization if you need long-term history.
+Version 5 is always a one-time migration input, including files that need no retired-field cleanup. `config migrate` lets you preview or explicitly apply the same conversion. Explicit migration of an already-clean version 6 file is a no-op and does not replace an existing migration backup. Backups are safety copies, not a versioned archive: preserve a backup elsewhere before another migration or forced initialization if you need long-term history.
 Inline `auth_token` and `api_key` values are redacted in preview output; the validated file written by migration retains them.
 
 ## Relay Targets
@@ -232,6 +232,8 @@ relays, the same rules apply: the relay can either return Codex-shaped model met
 return an OpenAI model list that codex-helper can translate. If the selected model is absent or its
 metadata is not authoritative, model-scoped capability decisions remain `unknown`.
 
+Normal proxy `/models` failover is request-local. An unsupported or malformed model-catalog response may try the next eligible catalog candidate for that request, but it neither opens nor clears shared inference cooldown, quota policy, or session affinity. A `/models` 401/403 may request credential refresh for later work; the failed request is not replayed automatically. Request-body filters and model-list translation are compatibility transforms, not route-health signals.
+
 Hosted `image_generation` is not actively probed by this diagnostic endpoint because that can spend
 quota or create image artifacts, so the contract reports it without fabricating live evidence.
 Responses WebSocket support comes from the captured provider/model catalog. If Codex sends a
@@ -356,7 +358,7 @@ An HTTP compact request appears as `POST /responses/compact`; remote compaction 
 
 Authentication is origin-scoped. Client authentication may pass only to the official OpenAI origin; third-party relays must configure helper-side `auth_token_env`, `auth_token`, or equivalent API-key credentials, and Codex client account headers are stripped before forwarding. A remote third-party Codex endpoint without helper credentials now returns 503 before any upstream I/O by default. Set provider-level `allow_anonymous = true` only when the relay intentionally requires no authentication. Loopback endpoints allow anonymous access automatically, while the official OpenAI origin continues to receive safe client credential passthrough. A declared `auth_token_env` or `api_key_env` reference that cannot be resolved still fails closed even when anonymous access is enabled.
 
-This is a backward-compatible addition within version 5, so existing files do not need a schema rewrite. Providers that already configure helper credentials need no migration. A provider that previously relied on anonymous remote access must add credentials or record that intent explicitly:
+This anonymous-auth rule was a backward-compatible version 5 addition. Automatic version 6 migration preserves it without changing configured credentials. A provider that previously relied on anonymous remote access must add credentials or record that intent explicitly:
 
 ```toml
 [codex.providers.anonymous_relay]
@@ -388,7 +390,7 @@ codex-helper config set-retry-profile balanced
 This creates the same thin TOML shape you would write by hand:
 
 ```toml
-version = 5
+version = 6
 
 [codex.providers.input]
 base_url = "https://ai.input.im/v1"
@@ -505,7 +507,7 @@ Most users should prefer `ordered-failover` for fixed priority, `round-robin` fo
 
 Route graph session affinity is runtime state with a small durable ledger for Codex route continuity. The TOML config chooses the affinity policy and can optionally bound fallback stickiness:
 
-- `fallback-sticky` is the default used by the canonical version 5 config template. It keeps a session on the last successful fallback provider while that provider remains viable, which is safer for official relay features such as remote compaction that may carry upstream-account-bound encrypted state. Set `fallback_ttl_ms` to cap how long a lower-priority fallback affinity can be reused, or `reprobe_preferred_after_ms` to force a preferred-group reprobe after a fallback target change.
+- `fallback-sticky` is the default used by the canonical version 6 config template. It keeps a session on the last successful fallback provider while that provider remains viable, which is safer for official relay features such as remote compaction that may carry upstream-account-bound encrypted state. Set `fallback_ttl_ms` to cap how long a lower-priority fallback affinity can be reused, or `reprobe_preferred_after_ms` to force a preferred-group reprobe after a fallback target change.
 - `preferred-group` applies session affinity only inside the currently best available preference group, so a session that temporarily falls back to paygo returns to monthly as soon as a monthly provider is viable again.
 - `off` ignores automatic route affinity.
 - `hard` treats an existing affinity target as strict for that route graph; if the target is unavailable, no alternate candidate is selected.
@@ -557,7 +559,7 @@ Routing decisions use runtime provider endpoints. Diagnostics and balance DTOs e
 Use this when you only want codex-helper as a local proxy and dashboard.
 
 ```toml
-version = 5
+version = 6
 
 [codex.providers.main]
 base_url = "https://api.example.com/v1"
@@ -579,7 +581,7 @@ profile = "balanced"
 Use this as the default for multiple relays: first working provider wins, then fallback in order.
 
 ```toml
-version = 5
+version = 6
 
 [codex.providers.monthly]
 base_url = "https://monthly.example/v1"
@@ -614,7 +616,7 @@ This is the most direct replacement for old priority or level-based setups.
 Use this when several monthly providers form one preferred group and a paygo provider is only the fallback of last resort.
 
 ```toml
-version = 5
+version = 6
 
 [codex.providers.input]
 base_url = "https://ai.input.im/v1"
@@ -658,7 +660,7 @@ This keeps the monthly pool as a first-class route node. Temporary 502/429-style
 Use this when you want to spend monthly providers first, then try several relay fallbacks in a fixed order.
 
 ```toml
-version = 5
+version = 6
 
 [codex.providers.monthly_a]
 base_url = "https://monthly-a.example/v1"
@@ -716,7 +718,7 @@ This is the clearest shape for "monthly first, several relays as backup". Sessio
 Use this when the business intent is metadata: prefer every provider tagged `billing=monthly`, then continue to the rest.
 
 ```toml
-version = 5
+version = 6
 
 [codex.providers.monthly_a]
 base_url = "https://monthly-a.example/v1"
@@ -753,7 +755,7 @@ Only known fully exhausted monthly candidates are demoted. A balance lookup fail
 Use this when you would rather fail than spill into a paid fallback.
 
 ```toml
-version = 5
+version = 6
 
 [codex.providers.monthly_a]
 base_url = "https://monthly-a.example/v1"
@@ -794,7 +796,7 @@ profile = "balanced"
 Use this for debugging, strict vendor selection, or temporary steering.
 
 ```toml
-version = 5
+version = 6
 
 [codex.providers.input]
 base_url = "https://ai.input.im/v1"
@@ -825,7 +827,7 @@ the route instead of silently selecting a different provider.
 Use explicit endpoints only when one account really has several upstream targets.
 
 ```toml
-version = 5
+version = 6
 
 [codex.providers.relay]
 alias = "Relay account"
@@ -860,7 +862,7 @@ Do not use endpoints just to model unrelated providers. Put unrelated accounts u
 Use `round-robin` when independent relay accounts should share new sessions in proportion to their available concurrency. This example gives `input` 20 local request slots and `ciii` 15:
 
 ```toml
-version = 5
+version = 6
 
 [codex.providers.input]
 base_url = "https://input.example/v1"
@@ -978,8 +980,10 @@ Common provider fields:
 | --- | --- | --- |
 | `alias` | Human-friendly display name | Optional |
 | `base_url` | OpenAI-compatible endpoint | Use for single-endpoint providers |
-| `auth_token_env` | Environment variable for bearer auth | Preferred for secrets |
+| `auth_token_ref` | Typed native-store or absolute secret-file reference for bearer auth | Preferred for installed services and mounted-secret deployments |
+| `auth_token_env` | Environment variable for bearer auth | Suitable for foreground and deployment-managed server environments |
 | `auth_token` | Inline bearer token | Supported, but avoid committing it |
+| `api_key_ref` | Typed native-store or absolute secret-file reference for `X-API-Key` auth | Use only when the provider requires this header |
 | `api_key_env` | Environment variable for `X-API-Key` auth | Use only when required |
 | `api_key` | Inline `X-API-Key` value | Supported, but avoid committing it |
 | `allow_anonymous` | Explicitly permit credential-free routing to a remote third-party Codex endpoint | Default off; use only for intentionally unauthenticated relays; it does not bypass an unresolved explicit credential reference |
@@ -991,16 +995,20 @@ Common provider fields:
 For authentication, first decide which HTTP header the provider expects:
 
 - **OpenAI and most OpenAI-compatible relays** use bearer auth: `Authorization: Bearer <key>`.
-  Configure `auth_token_env` for normal use, or `auth_token` only for local scratch configs.
+  Configure `auth_token_ref` for native/mounted-secret deployments, `auth_token_env` for a
+  deployment-managed environment, or `auth_token` only for local scratch configs.
   This is true even when the provider's dashboard calls the secret an "API key".
 - Use `api_key_env` / `api_key` only when the provider explicitly documents an
   `X-API-Key` header.
-- Prefer the `*_env` fields so secrets stay out of `~/.codex-helper/config.toml`.
-  The value in config is a credential reference name, not the secret itself. Resolution order is
-  inline value, the environment of the running codex-helper process, then the explicitly referenced
-  client credential field. Codex looks for an exactly same-named top-level string field in
-  `$CODEX_HOME/auth.json`; Claude looks under the `env` object in `$CLAUDE_HOME/settings.json`.
-  Without a configured `*_env` reference, these files are not scanned and fields are not guessed.
+- `auth_token_ref` and `api_key_ref` are tagged values: `{ source = "native", name = "relay.primary" }`
+  or `{ source = "secret_file", path = "/run/secrets/relay" }`. A reference is mutually exclusive
+  with inline and environment fields for the same header kind, including fields inherited through a
+  provider/endpoint override. Configuration validation rejects a mixed source instead of guessing.
+- Without a typed reference, version 5 compatibility precedence remains inline value, the running
+  process environment, then the explicitly referenced client credential field. Codex looks for an
+  exactly same-named top-level string field in `$CODEX_HOME/auth.json`; Claude looks under the `env`
+  object in `$CLAUDE_HOME/settings.json`. Without a configured `*_env` name, these files are not
+  scanned and fields are not guessed.
 - If an inline value and an env reference are both configured for the same header family, the
   inline value wins. If both bearer and `X-API-Key` credentials are configured, codex-helper sends
   both headers; avoid that unless the relay explicitly requires it.
@@ -1017,6 +1025,8 @@ codex-helper service status --json
 ```
 
 Interactive create/set uses masked input and confirmation. Use explicit `--stdin` only for automation. `provider set-auth` stores the typed reference, not its value. The native backend is Windows Credential Manager, the macOS user Keychain, or the Linux session's Secret Service implementation (for example GNOME Keyring or KWallet).
+
+On a new helper home, the first credential mutation can report `store_committed_runtime_refresh_failed` because no matching service receipt/runtime exists yet. The native-store write has already committed and is not rolled back. Verify it with `credential status`, bind the provider, and install or restart the intended service; do not repeat a create-only command as though the store write had failed.
 
 `service install`, `service start`, and `service restart` first evaluate configuration and credentials offline. A blocked preflight fails before replacing or stopping the current service. After launch, the command polls the signed loopback operator model and verifies the service kind, helper home, client home, and non-secret install generation from the committed receipt. `ready` succeeds, `degraded` succeeds with a warning, and `blocked` returns nonzero while leaving the daemon and local admin listener running for diagnosis. No readiness check sends upstream traffic.
 
@@ -1035,6 +1045,20 @@ On Windows, `service install` registers a SID-scoped per-user Scheduled Task ins
 Installation first preflights the executable, paths, SID, PowerShell/ScheduledTasks commands, credentials, and XML read-back, then registers and queries the new SID-scoped task. It publishes the matching receipt only after that verification and before retiring any older installation. It retires a fixed-name task owned by the current SID and the legacy SCM service only after the new owner SID, action, logon trigger, and least-privilege settings are verified. Definition, receipt, permission, query, registration, and verification errors fail closed and restore the previous artifacts when rollback can be proven. A fixed-name `codex-helper` task owned by another SID is never overwritten or deleted. If status still reports `legacy LocalSystem SCM service` or `legacy fixed-name per-user scheduled task`, rerun installation from an elevated terminal.
 
 On macOS, the receipt targets the logged-in user's `gui/<uid>` LaunchAgent domain and the same user's Keychain. On Linux, it targets `systemctl --user` and the user's session bus. Installing as one user and starting or inspecting as another intentionally fails identity/readiness verification instead of falling back to another credential store.
+
+Native values publish as immutable runtime generations. `credential create`, `set`, `import`, and `delete` request an immediate signed refresh for the matching installed runtime. Requests already in flight keep the generation they captured; later requests use the newly published generation. Native entries soft-refresh after 60 seconds and hard-expire after 10 minutes. A failed refresh may keep the last-known-good value as `stale` only within that window, while explicit deletion invalidates immediately. A 401/403 can schedule a refresh for later requests but never replays the failed request automatically. Environment and secret-file changes require a runtime reload or restart because their deployment rotation semantics are not portable.
+
+Native release runners are part of the release trust boundary. Configure required reviewers on both GitHub Environments: `native-credential-smoke-execution` authorizes mutation of the four dedicated logged-in runner contexts, while `native-credential-release` is approved only after their redacted evidence artifacts are available for review. The second job verifies all four candidate/archive identities, checksums, platform/readiness matrices, leakage roots, and freshness before producing the signoff manifest that unblocks cargo-dist hosting. Before service installation, the verified candidate is staged outside the Actions checkout and its SHA-256 is recorded in the cleanup journal, so a cancelled Windows service cannot lock the next checkout. A cancelled runner keeps that non-secret recovery journal and isolated helper home under `~/.codex-helper-native-smoke`; the next run for that backend must validate the staged candidate when present, remove the native entry and user service, and verify both are absent before testing. Failed recovery retains the journal and blocks the release. Repository owners must configure the environment protection rules; merely creating an environment with that name is not an approval policy. Keep promotion held until the release owner has recorded the required initial, +1 hour, and +24 hour canary observations.
+
+### Headless and container credentials
+
+`codex-helper-server` supports process-environment sources and absolute `secret_file` references. It rejects native references even if another workspace package caused Cargo to compile native backend code, and it never creates a plaintext or SQLite credential fallback. Check a deployment before binding listeners:
+
+```bash
+codex-helper-server --config /etc/codex-helper/server.toml --check --json
+```
+
+The check loads and compiles configuration and resolves only supported credential inputs. It opens no runtime store or listener and sends no upstream request. `ready` and `degraded` exit with status 0; `blocked` emits a redacted report and exits with status 1. See [Docker Compose Deployment](DOCKER_COMPOSE.md) for the tested read-only mount, ACL, and replacement procedure.
 
 Use `model_mapping` when the model requested by Codex differs from the model name expected by a specific relay. The mapping is provider-scoped: codex-helper rewrites the request body `model` only after that provider is selected, so other providers are not affected.
 
@@ -1340,7 +1364,7 @@ For BaseLLM context tiers, the threshold input is `ordinary input + cache read`;
 
 Initialize the canonical config:
 
-Normal startup, including the default TUI path, uses the canonical `~/.codex-helper/config.toml` with `version = 5`. When startup finds an older/unversioned TOML, or finds `config.json` while TOML is absent, it performs the validated migration described in [Automatic Configuration Migration](#automatic-configuration-migration). `config init` creates a current template when no helper configuration exists; on a JSON-only installation it migrates that file and prints the report instead. `--force` replaces an existing canonical file only after writing `config.toml.bak`.
+Normal startup, including the default TUI path, uses the canonical `~/.codex-helper/config.toml` with `version = 6`. When startup finds v5 or older/unversioned TOML, or finds `config.json` while TOML is absent, it performs the validated migration described in [Automatic Configuration Migration](#automatic-configuration-migration). `config init` creates a current template when no helper configuration exists; on a JSON-only installation it migrates that file and prints the report instead. `--force` replaces an existing canonical file only after writing `config.toml.bak`.
 
 Read-only loading may follow a valid `config.toml` symbolic link, but helper commands that rewrite the typed configuration refuse a final-file link so an atomic replacement cannot detach or retarget it. Point `CODEX_HELPER_HOME` (or the whole `.codex-helper` directory) at a stable linked directory instead if the configuration is managed in dotfiles. Mutations are serialized with a helper-owned lock, backups inherit the source file permissions, and a dangling or retargeted configuration directory fails closed.
 
@@ -1512,11 +1536,13 @@ Remote operator clients and the remote control plane are query-only. The local s
 
 ## Configuration Compatibility
 
-`version = 5` in `~/.codex-helper/config.toml` remains the only public runtime contract. Older versioned or unversioned TOML and legacy `config.json` are migration inputs rather than long-lived compatibility formats: startup converts them once, creates the source-specific `.bak`, and subsequently loads canonical version 5 TOML. The runtime does not maintain a parallel legacy reader.
+`version = 6` in `~/.codex-helper/config.toml` is the only public runtime contract. Version 5 and older versioned/unversioned TOML, plus legacy `config.json`, are one-time migration inputs rather than long-lived runtime formats: startup converts them, creates the source-specific `.bak`, and subsequently loads only canonical version 6 TOML. The runtime does not maintain a parallel legacy reader.
 
-Migration preserves representable provider/routing intent, removes known retired settings, warns about known lossy conversions and unrecognized root/service fields retained verbatim, and validates the version 5 result before replacement. Flat `max_attempts`, `backoff_ms`, `backoff_max_ms`, `jitter_ms`, `on_status`, `on_class`, and `strategy` under `[retry]` are moved to `[retry.upstream]` only when that table is absent. If `[retry.upstream]` exists, it is retained as the complete historical override and all flat retry fields are ignored with a warning. Use `config migrate --dry-run` to review that conversion, especially for heavily customized files. A future schema version is never downgraded automatically.
+Migration preserves representable provider/routing intent, removes known retired settings, warns about known lossy conversions and unrecognized root/service fields retained verbatim, and validates the version 6 result before replacement. Flat `max_attempts`, `backoff_ms`, `backoff_max_ms`, `jitter_ms`, `on_status`, `on_class`, and `strategy` under `[retry]` are moved to `[retry.upstream]` only when that table is absent. If `[retry.upstream]` exists, it is retained as the complete historical override and all flat retry fields are ignored with a warning. Use `config migrate --dry-run` to review that conversion, especially for heavily customized files. A future schema version is never downgraded automatically.
 
-Provider, endpoint, route-graph, retry-profile, notification, fleet, and service-status settings from a normal 0.20.3 version 5 file remain usable. However, several optional fields that were also published under version 5 have been retired. The version number alone cannot identify them, so startup creates `config.toml.bak` and precisely removes all matching helper-config paths before loading. An explicit typed save still refuses to overwrite an uncleaned source directly, preventing unrelated commands from silently erasing fields.
+Provider, endpoint, route-graph, retry-profile, notification, Fleet, service-status, and legacy credential settings from a normal 0.20.3 version 5 file remain usable after migration. No native entry, secret-file reference, or credential value is imported, synthesized, moved, or deleted. Several optional fields published during the version 5 lifetime are retired; startup creates `config.toml.bak` and precisely removes those helper-config paths while producing version 6. An explicit typed save still refuses to overwrite an uncleaned source directly, preventing unrelated commands from silently erasing fields.
+
+Downgrade is backup-based, not an in-place edit. Once version 6 is saved, a version 5-only binary rejects it. Stop the new binary and restore the exact pre-migration source backup before starting the old binary. That rollback is fully reversible only before making version 6-only reference/provider changes; restoring the old config later discards those config changes and does not delete native-store entries, so review any orphaned logical names explicitly.
 
 | 0.20.3 input or behavior | Current behavior | Upgrade action |
 | --- | --- | --- |
@@ -1528,9 +1554,9 @@ Provider, endpoint, route-graph, retry-profile, notification, fleet, and service
 | `relay_targets.*.client_preset` / `responses_websocket` | Startup backs up the file and removes every matching relay-target field | A relay bookmark stores network/admin connection data only |
 | server `advertised-admin-base-url` / `host-local-session-history` and matching CLI flags | Server config parsing rejects these keys; CLI flags no longer exist | Remove them; configure each client's trusted relay `admin_url` explicitly |
 | `usage_providers.json` endpoint templates, `headers`, or `variables` | The operator-owned file fails to load | Use literal relative/absolute endpoints and typed fields such as `new_api_user_id_env` |
-| Remote `relay_targets.*` without `admin_url`, or with a non-loopback HTTP admin URL / missing token env | The bookmark remains in version 5 but target resolution fails closed; remote admin authority is never derived from `proxy_url` or a response | Set an explicit trusted HTTPS `admin_url` and valid `admin_token_env`, or terminate a trusted tunnel on loopback; this is not auto-rewritten |
+| Remote `relay_targets.*` without `admin_url`, or with a non-loopback HTTP admin URL / missing token env | Version 6 target resolution fails closed; remote admin authority is never derived from `proxy_url` or a response | Set an explicit trusted HTTPS `admin_url` and valid `admin_token_env`, or terminate a trusted tunnel on loopback; this is not auto-rewritten |
 | Enabled non-loopback `fleet.nodes.*` using HTTP or missing/invalid `admin_token_env` | Main configuration validation fails closed before the runtime starts | Use HTTPS plus a valid token environment name, or a trusted loopback tunnel; update the file manually |
-| One explicit `limit_group` with missing or different `max_concurrent_requests` values | Route-graph compilation and normal version 5 loading fail closed without rewriting the source | Give every candidate in that group the same limit, or split independent 20-slot and 15-slot accounts into different groups |
+| One explicit `limit_group` with missing or different `max_concurrent_requests` values | Route-graph compilation and normal version 6 loading fail closed without rewriting the source | Give every candidate in that group the same limit, or split independent 20-slot and 15-slot accounts into different groups |
 | Root `[models.*]` rows in `pricing_overrides.toml` | They remain readable as OpenAI rows and normalize to provider-scoped schema v2 on the first explicit pricing write | No action for OpenAI; manually move Anthropic/Claude rows under `[providers.anthropic.models.*]` |
 
 An older route graph without `scheduling_preset` now defaults to `balanced`, which waits up to two seconds for local concurrency capacity. Set `scheduling_preset = "throughput-first"` to retain the 0.20.3 behavior of immediately trying the next candidate when the selected local limit is saturated.
