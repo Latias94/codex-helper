@@ -37,6 +37,7 @@ pub mod runtime_host;
 pub mod runtime_identity;
 pub mod runtime_manager;
 pub mod runtime_store;
+pub mod service_readiness;
 pub mod service_status;
 pub mod service_target;
 pub mod sessions;

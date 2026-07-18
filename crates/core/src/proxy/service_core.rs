@@ -161,9 +161,11 @@ impl ProxyService {
             filter: RequestFilter::new(),
             state,
             service_install_generation: None,
+            service_runtime_identity: None,
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn with_service_install_generation(
         mut self,
         generation: Option<ServiceInstallGeneration>,
@@ -174,6 +176,23 @@ impl ProxyService {
 
     pub(crate) fn service_install_generation(&self) -> Option<&ServiceInstallGeneration> {
         self.service_install_generation.as_ref()
+    }
+
+    pub(crate) fn with_service_runtime_identity(
+        mut self,
+        identity: Option<crate::service_target::ServiceRuntimeIdentity>,
+    ) -> Self {
+        self.service_install_generation = identity
+            .as_ref()
+            .map(|identity| identity.install_generation.clone());
+        self.service_runtime_identity = identity;
+        self
+    }
+
+    pub(crate) fn service_runtime_identity(
+        &self,
+    ) -> Option<&crate::service_target::ServiceRuntimeIdentity> {
+        self.service_runtime_identity.as_ref()
     }
 
     pub(crate) async fn refresh_native_credential(

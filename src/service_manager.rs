@@ -2,7 +2,6 @@ use std::ffi::OsString;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-#[cfg(windows)]
 use std::time::Duration;
 
 #[cfg(any(windows, test))]
@@ -11,6 +10,10 @@ use serde::Serialize;
 
 use crate::cli_types::{CliError, CliResult, ServiceCommand};
 use crate::config::proxy_home_dir;
+use crate::service_receipt::{
+    ServicePlatformBackend, ServiceReceipt, ServiceReceiptError, ServiceReceiptTransaction,
+    read_service_receipt,
+};
 
 #[cfg(windows)]
 const WINDOWS_SERVICE_NAME: &str = "codex-helper";
@@ -22,6 +25,7 @@ const WINDOWS_TASK_DEFINITION_FILE: &str = "windows-task.xml";
 const MACOS_LABEL: &str = "io.github.latias94.codex-helper";
 #[cfg(target_os = "linux")]
 const LINUX_UNIT_NAME: &str = "codex-helper.service";
+const MAX_SERVICE_DEFINITION_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -59,6 +63,27 @@ pub(crate) enum ServiceRuntimeState {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ServiceReceiptState {
+    Absent,
+    Current,
+    Legacy,
+    Invalid,
+    Foreign,
+    PlatformMismatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ServiceCredentialContext {
+    Unverified,
+    Ready,
+    Degraded,
+    Blocked,
+    RuntimeUnavailable,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ServiceStatus {
     platform: ServicePlatform,
@@ -69,6 +94,11 @@ pub(crate) struct ServiceStatus {
     service_definition: Option<PathBuf>,
     log_directory: PathBuf,
     detail: Option<String>,
+    receipt_state: ServiceReceiptState,
+    credential_context: ServiceCredentialContext,
+    runtime_identity_verified: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    install_generation: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +109,7 @@ pub(crate) struct ServiceInstallOptions {
     pub(crate) start: bool,
     pub(crate) helper_home: PathBuf,
     pub(crate) client_home: PathBuf,
+    pub(crate) install_generation: codex_helper_core::service_target::ServiceInstallGeneration,
 }
 
 pub(crate) async fn handle_service_command(command: ServiceCommand) -> CliResult<()> {
@@ -92,24 +123,46 @@ pub(crate) async fn handle_service_command(command: ServiceCommand) -> CliResult
         } => {
             let service_name = service_name_from_flags(codex, claude)?;
             let port = port.unwrap_or_else(|| default_proxy_port(service_name));
-            install(ServiceInstallOptions {
+            let install_generation =
+                codex_helper_core::service_target::ServiceInstallGeneration::generate();
+            let options = ServiceInstallOptions {
                 service_name,
                 host,
                 port,
                 start: !no_start,
                 helper_home: proxy_home_dir(),
                 client_home: service_client_home(service_name),
-            })?;
-            print_status(&status()?, false)?;
+                install_generation,
+            };
+            preflight_service_credentials(service_kind(service_name)?, &options.helper_home)
+                .await?;
+            ensure_service_operator_token()?;
+            install(options)?;
+            if no_start {
+                println!(
+                    "Credential readiness is valid in the installer context but remains unverified in the installed service context until start."
+                );
+            } else {
+                verify_started_service_runtime().await?;
+            }
+            print_status(&service_status().await?, false)?;
         }
-        ServiceCommand::Uninstall { keep_running } => uninstall(!keep_running)?,
-        ServiceCommand::Start => start()?,
+        ServiceCommand::Uninstall { keep_running } => uninstall_with_receipt(!keep_running)?,
+        ServiceCommand::Start => {
+            preflight_installed_service_credentials().await?;
+            ensure_service_operator_token()?;
+            start()?;
+            verify_started_service_runtime().await?;
+        }
         ServiceCommand::Stop => stop()?,
         ServiceCommand::Restart => {
+            preflight_installed_service_credentials().await?;
+            ensure_service_operator_token()?;
             stop()?;
             start()?;
+            verify_started_service_runtime().await?;
         }
-        ServiceCommand::Status { json } => print_status(&status()?, json)?,
+        ServiceCommand::Status { json } => print_status(&service_status().await?, json)?,
         ServiceCommand::Logs => print_logs(),
         ServiceCommand::Run {
             service_name,
@@ -122,7 +175,13 @@ pub(crate) async fn handle_service_command(command: ServiceCommand) -> CliResult
             let helper_home = helper_home.unwrap_or_else(proxy_home_dir);
             let client_home = client_home
                 .unwrap_or_else(|| legacy_service_client_home(service_name, &helper_home));
-            configure_service_process(service_name, &helper_home, &client_home);
+            let install_generation = service_process_install_generation()?;
+            configure_service_process(
+                service_name,
+                &helper_home,
+                &client_home,
+                &install_generation,
+            );
             run_service_dispatcher(ServiceInstallOptions {
                 service_name,
                 host,
@@ -130,6 +189,7 @@ pub(crate) async fn handle_service_command(command: ServiceCommand) -> CliResult
                 start: false,
                 helper_home,
                 client_home,
+                install_generation,
             })?;
         }
         ServiceCommand::TaskRun {
@@ -138,12 +198,19 @@ pub(crate) async fn handle_service_command(command: ServiceCommand) -> CliResult
             port,
             helper_home,
             client_home,
+            install_generation,
         } => {
             let service_name = service_name_from_value(&service_name)?;
             let helper_home = helper_home.unwrap_or_else(proxy_home_dir);
             let client_home = client_home
                 .unwrap_or_else(|| legacy_service_client_home(service_name, &helper_home));
-            configure_service_process(service_name, &helper_home, &client_home);
+            let install_generation = command_install_generation(install_generation.as_deref())?;
+            configure_service_process(
+                service_name,
+                &helper_home,
+                &client_home,
+                &install_generation,
+            );
             crate::cli_app::run_service_managed_server(
                 service_name,
                 host,
@@ -156,19 +223,25 @@ pub(crate) async fn handle_service_command(command: ServiceCommand) -> CliResult
 }
 
 pub(crate) fn configure_service_command_environment(command: &ServiceCommand) -> CliResult<()> {
-    let (service_name, helper_home, client_home) = match command {
+    let (service_name, helper_home, client_home, install_generation) = match command {
         ServiceCommand::Run {
             service_name,
             helper_home,
             client_home,
             ..
-        }
-        | ServiceCommand::TaskRun {
+        } => (service_name, helper_home, client_home, None),
+        ServiceCommand::TaskRun {
             service_name,
             helper_home,
             client_home,
+            install_generation,
             ..
-        } => (service_name, helper_home, client_home),
+        } => (
+            service_name,
+            helper_home,
+            client_home,
+            install_generation.as_deref(),
+        ),
         _ => return Ok(()),
     };
     let service_name = service_name_from_value(service_name)?;
@@ -176,7 +249,13 @@ pub(crate) fn configure_service_command_environment(command: &ServiceCommand) ->
     let client_home = client_home
         .clone()
         .unwrap_or_else(|| legacy_service_client_home(service_name, &helper_home));
-    configure_service_process(service_name, &helper_home, &client_home);
+    let install_generation = command_install_generation(install_generation)?;
+    configure_service_process(
+        service_name,
+        &helper_home,
+        &client_home,
+        &install_generation,
+    );
     Ok(())
 }
 
@@ -190,10 +269,40 @@ fn service_name_from_value(value: &str) -> CliResult<&'static str> {
     }
 }
 
-fn configure_service_process(service_name: &str, helper_home: &Path, client_home: &Path) {
+fn command_install_generation(
+    value: Option<&str>,
+) -> CliResult<codex_helper_core::service_target::ServiceInstallGeneration> {
+    if let Some(value) = value {
+        return codex_helper_core::service_target::ServiceInstallGeneration::parse(value)
+            .map_err(|error| CliError::Other(error.to_string()));
+    }
+    service_process_install_generation()
+}
+
+fn service_process_install_generation()
+-> CliResult<codex_helper_core::service_target::ServiceInstallGeneration> {
+    codex_helper_core::service_target::ServiceInstallGeneration::from_process_env()
+        .map_err(|error| CliError::Other(error.to_string()))
+        .map(|generation| {
+            generation.unwrap_or_else(
+                codex_helper_core::service_target::ServiceInstallGeneration::generate,
+            )
+        })
+}
+
+fn configure_service_process(
+    service_name: &str,
+    helper_home: &Path,
+    client_home: &Path,
+    install_generation: &codex_helper_core::service_target::ServiceInstallGeneration,
+) {
     unsafe {
         std::env::set_var("CODEX_HELPER_HOME", helper_home);
         std::env::set_var(service_client_home_env(service_name), client_home);
+        std::env::set_var(
+            codex_helper_core::service_target::SERVICE_INSTALL_GENERATION_ENV_VAR,
+            install_generation.as_str(),
+        );
     }
 }
 
@@ -243,6 +352,8 @@ fn service_task_arguments(options: &ServiceInstallOptions) -> Vec<OsString> {
         options.helper_home.clone().into_os_string(),
         OsString::from("--client-home"),
         options.client_home.clone().into_os_string(),
+        OsString::from("--install-generation"),
+        OsString::from(options.install_generation.as_str()),
     ]
 }
 
@@ -459,8 +570,10 @@ trait WindowsInstallTransactionBackend {
     fn preflight(&mut self) -> CliResult<()>;
     fn register_scoped_task(&mut self) -> CliResult<()>;
     fn verify_scoped_task(&mut self) -> CliResult<()>;
+    fn publish_receipt(&mut self) -> CliResult<()>;
     fn retire_owned_fixed_task(&mut self) -> CliResult<()>;
     fn retire_legacy_scm(&mut self) -> CliResult<()>;
+    fn rollback_receipt(&mut self) -> CliResult<()>;
     fn rollback(&mut self) -> CliResult<()>;
     fn start_scoped_task(&mut self) -> CliResult<()>;
 }
@@ -476,22 +589,31 @@ fn run_windows_install_transaction(
         backend.register_scoped_task()?;
         backend.verify_scoped_task()?;
         new_task_verified = true;
+        backend.publish_receipt()?;
         backend.retire_owned_fixed_task()?;
         backend.retire_legacy_scm()
     })();
     if let Err(primary) = migration {
-        return match backend.rollback() {
-            Ok(()) => Err(CliError::Other(format!(
+        let receipt_rollback = backend.rollback_receipt();
+        let platform_rollback = backend.rollback();
+        return match (receipt_rollback, platform_rollback) {
+            (Ok(()), Ok(())) => Err(CliError::Other(format!(
                 "Windows service migration failed and the previous runnable installation was restored: {primary}"
             ))),
-            Err(rollback) => {
+            (receipt_rollback, platform_rollback) => {
                 let fallback = if new_task_verified {
                     "The verified SID-scoped task was left installed when required to avoid removing the last runnable installation"
                 } else {
                     "The legacy installations were not retired; inspect and remove any partially registered SID-scoped task only after verifying its Principal SID"
                 };
+                let failures = [receipt_rollback.err(), platform_rollback.err()]
+                    .into_iter()
+                    .flatten()
+                    .map(|error| error.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ");
                 Err(CliError::Other(format!(
-                    "Windows service migration failed: {primary}; rollback also failed: {rollback}. {fallback}"
+                    "Windows service migration failed: {primary}; rollback also failed: {failures}. {fallback}"
                 )))
             }
         };
@@ -516,6 +638,193 @@ fn service_name_from_flags(codex: bool, claude: bool) -> CliResult<&'static str>
     }
 }
 
+fn service_kind(service_name: &str) -> CliResult<codex_helper_core::config::ServiceKind> {
+    match service_name {
+        "codex" => Ok(codex_helper_core::config::ServiceKind::Codex),
+        "claude" => Ok(codex_helper_core::config::ServiceKind::Claude),
+        _ => Err(CliError::Other(format!(
+            "unsupported service name '{service_name}'; expected codex or claude"
+        ))),
+    }
+}
+
+fn service_receipt(options: &ServiceInstallOptions) -> CliResult<ServiceReceipt> {
+    let platform_backend = ServicePlatformBackend::current().ok_or_else(|| {
+        CliError::Other("system service management is unsupported on this platform".to_string())
+    })?;
+    ServiceReceipt::new(
+        service_kind(options.service_name)?,
+        options.helper_home.clone(),
+        options.client_home.clone(),
+        codex_helper_core::proxy::local_admin_base_url_for_proxy_port(options.port),
+        platform_backend,
+        options.install_generation.clone(),
+    )
+    .map_err(|error| CliError::Other(format!("build service install receipt: {error}")))
+}
+
+fn begin_service_receipt_transaction(
+    options: &ServiceInstallOptions,
+) -> CliResult<(ServiceReceiptTransaction, ServiceReceipt)> {
+    let receipt = service_receipt(options)?;
+    let transaction = ServiceReceiptTransaction::begin(options.helper_home.clone())
+        .map_err(|error| CliError::Other(format!("begin service receipt transaction: {error}")))?;
+    Ok((transaction, receipt))
+}
+
+async fn preflight_installed_service_credentials()
+-> CliResult<codex_helper_core::service_readiness::ServiceCredentialReadinessReport> {
+    let helper_home = proxy_home_dir();
+    let receipt = read_service_receipt(&helper_home).map_err(|error| {
+        CliError::Other(format!(
+            "cannot preflight the installed service without a current receipt: {error}; run `codex-helper service install`"
+        ))
+    })?;
+    if ServicePlatformBackend::current() != Some(receipt.platform_backend()) {
+        return Err(CliError::Other(
+            "the installed service receipt targets a different platform backend; run `codex-helper service install`"
+                .to_string(),
+        ));
+    }
+    preflight_service_credentials(receipt.service(), receipt.helper_home()).await
+}
+
+async fn preflight_service_credentials(
+    service: codex_helper_core::config::ServiceKind,
+    helper_home: &Path,
+) -> CliResult<codex_helper_core::service_readiness::ServiceCredentialReadinessReport> {
+    let config = codex_helper_core::config::load_config()
+        .await
+        .map_err(|error| CliError::Configuration(error.to_string()))?;
+    let helper_home = helper_home.to_path_buf();
+    let report = tokio::task::spawn_blocking(move || {
+        codex_helper_core::service_readiness::evaluate_service_credential_readiness(
+            &config,
+            service,
+            codex_helper_core::credentials::CredentialSourceCapabilities::platform_native(),
+            helper_home,
+        )
+    })
+    .await
+    .map_err(|error| CliError::Other(format!("credential preflight task failed: {error}")))?
+    .map_err(|error| CliError::Other(format!("credential preflight failed: {error}")))?;
+    let unavailable = report
+        .endpoints
+        .iter()
+        .filter(|endpoint| !endpoint.code.is_routable())
+        .map(|endpoint| {
+            format!(
+                "{}/{}={}",
+                endpoint.provider_id,
+                endpoint.endpoint_id,
+                endpoint.code.as_str()
+            )
+        })
+        .collect::<Vec<_>>();
+    match report.aggregate {
+        codex_helper_core::credentials::CredentialAggregateReadiness::Ready => {}
+        codex_helper_core::credentials::CredentialAggregateReadiness::Degraded => {
+            eprintln!(
+                "Credential preflight is degraded; unavailable endpoints: {}",
+                unavailable.join(", ")
+            );
+        }
+        codex_helper_core::credentials::CredentialAggregateReadiness::Blocked => {
+            return Err(CliError::Other(format!(
+                "credential preflight is blocked; no route is usable ({})",
+                unavailable.join(", ")
+            )));
+        }
+    }
+    Ok(report)
+}
+
+fn ensure_service_operator_token() -> CliResult<()> {
+    codex_helper_core::local_operator::ensure_local_operator_token()
+        .map(|_| ())
+        .map_err(|error| CliError::Other(format!("prepare local service operator token: {error}")))
+}
+
+async fn verify_started_service_runtime() -> CliResult<()> {
+    const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+    const POLL_INTERVAL: Duration = Duration::from_millis(200);
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+    let receipt = read_service_receipt(proxy_home_dir()).map_err(|error| {
+        CliError::Other(format!(
+            "cannot verify the started service without its committed receipt: {error}"
+        ))
+    })?;
+    let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        match read_service_runtime_with_timeout(receipt.clone(), PROBE_TIMEOUT).await {
+            Ok(runtime) => {
+                return ensure_started_service_credential_readiness(runtime.credential_readiness);
+            }
+            Err(error) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(CliError::Other(format!(
+                        "installed service did not publish its matching runtime identity within {} seconds; the service remains installed for diagnosis: {error}",
+                        STARTUP_TIMEOUT.as_secs(),
+                    )));
+                }
+            }
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+fn ensure_started_service_credential_readiness(
+    readiness: codex_helper_core::credentials::CredentialAggregateReadiness,
+) -> CliResult<()> {
+    match readiness {
+        codex_helper_core::credentials::CredentialAggregateReadiness::Ready => Ok(()),
+        codex_helper_core::credentials::CredentialAggregateReadiness::Degraded => {
+            eprintln!(
+                "Installed service is running with degraded credential readiness; inspect `codex-helper service status`."
+            );
+            Ok(())
+        }
+        codex_helper_core::credentials::CredentialAggregateReadiness::Blocked => {
+            Err(CliError::Other(
+                "installed service is running but credential readiness is blocked; the local admin endpoint remains available for diagnosis"
+                    .to_string(),
+            ))
+        }
+    }
+}
+
+async fn read_service_runtime_with_timeout(
+    receipt: ServiceReceipt,
+    timeout: Duration,
+) -> Result<codex_helper_core::service_target::LocalServiceRuntimeReadResponse, String> {
+    tokio::time::timeout(
+        timeout,
+        crate::cli_app::read_service_runtime_for_receipt(receipt),
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "local service runtime probe exceeded {}ms",
+            timeout.as_millis()
+        )
+    })?
+    .map_err(|error| error.to_string())
+}
+
+fn rollback_error(primary: CliError, failures: Vec<String>) -> CliError {
+    if failures.is_empty() {
+        CliError::Other(format!(
+            "service installation failed and the previous installation was restored: {primary}"
+        ))
+    } else {
+        CliError::Other(format!(
+            "service installation failed: {primary}; rollback also failed: {}",
+            failures.join("; ")
+        ))
+    }
+}
+
 fn default_proxy_port(service_name: &str) -> u16 {
     if service_name == "claude" { 3210 } else { 3211 }
 }
@@ -534,6 +843,15 @@ fn print_status(status: &ServiceStatus, json: bool) -> CliResult<()> {
     println!("  installed: {}", status.installed);
     println!("  autostart: {}", status.autostart);
     println!("  state: {:?}", status.state);
+    println!("  receipt: {:?}", status.receipt_state);
+    println!("  credential context: {:?}", status.credential_context);
+    println!(
+        "  runtime identity verified: {}",
+        status.runtime_identity_verified
+    );
+    if let Some(generation) = status.install_generation.as_deref() {
+        println!("  install generation: {generation}");
+    }
     if let Some(path) = status.service_definition.as_ref() {
         println!("  definition: {}", path.display());
     }
@@ -553,6 +871,25 @@ fn print_logs() {
             println!("  {}", path.display());
         }
     }
+}
+
+fn uninstall_with_receipt(stop_first: bool) -> CliResult<()> {
+    let mut receipt = ServiceReceiptTransaction::begin(proxy_home_dir())
+        .map_err(|error| CliError::Other(format!("begin service receipt removal: {error}")))?;
+    receipt
+        .remove()
+        .map_err(|error| CliError::Other(format!("remove service receipt: {error}")))?;
+    if let Err(primary) = uninstall(stop_first) {
+        return match receipt.rollback() {
+            Ok(()) => Err(CliError::Other(format!(
+                "service uninstall failed and its receipt was restored: {primary}"
+            ))),
+            Err(rollback) => Err(CliError::Other(format!(
+                "service uninstall failed: {primary}; restoring its receipt also failed: {rollback}"
+            ))),
+        };
+    }
+    Ok(())
 }
 
 fn service_log_dir() -> PathBuf {
@@ -692,6 +1029,94 @@ fn status() -> CliResult<ServiceStatus> {
     Err(unsupported_platform())
 }
 
+async fn service_status() -> CliResult<ServiceStatus> {
+    Ok(enrich_service_status(status()?, &proxy_home_dir()).await)
+}
+
+async fn enrich_service_status(
+    mut service_status: ServiceStatus,
+    helper_home: &Path,
+) -> ServiceStatus {
+    let receipt = match read_service_receipt(helper_home) {
+        Ok(receipt) => receipt,
+        Err(ServiceReceiptError::Missing) => {
+            service_status.receipt_state = ServiceReceiptState::Absent;
+            return service_status;
+        }
+        Err(ServiceReceiptError::LegacySchema { .. }) => {
+            service_status.receipt_state = ServiceReceiptState::Legacy;
+            append_status_detail(
+                &mut service_status,
+                "service receipt uses an unsupported legacy schema; reinstall the service",
+            );
+            return service_status;
+        }
+        Err(ServiceReceiptError::ForeignHelperHome) => {
+            service_status.receipt_state = ServiceReceiptState::Foreign;
+            append_status_detail(
+                &mut service_status,
+                "service receipt belongs to a different helper home",
+            );
+            return service_status;
+        }
+        Err(error) => {
+            service_status.receipt_state = ServiceReceiptState::Invalid;
+            append_status_detail(
+                &mut service_status,
+                &format!("service receipt is invalid: {error}"),
+            );
+            return service_status;
+        }
+    };
+    if ServicePlatformBackend::current() != Some(receipt.platform_backend()) {
+        service_status.receipt_state = ServiceReceiptState::PlatformMismatch;
+        append_status_detail(
+            &mut service_status,
+            "service receipt targets a different platform backend",
+        );
+        return service_status;
+    }
+    service_status.receipt_state = ServiceReceiptState::Current;
+    service_status.install_generation = Some(receipt.install_generation().to_string());
+    if !matches!(
+        service_status.state,
+        ServiceRuntimeState::Running | ServiceRuntimeState::Starting
+    ) {
+        return service_status;
+    }
+    match read_service_runtime_with_timeout(receipt, Duration::from_secs(2)).await {
+        Ok(runtime) => {
+            service_status.runtime_identity_verified = true;
+            service_status.credential_context = match runtime.credential_readiness {
+                codex_helper_core::credentials::CredentialAggregateReadiness::Ready => {
+                    ServiceCredentialContext::Ready
+                }
+                codex_helper_core::credentials::CredentialAggregateReadiness::Degraded => {
+                    ServiceCredentialContext::Degraded
+                }
+                codex_helper_core::credentials::CredentialAggregateReadiness::Blocked => {
+                    ServiceCredentialContext::Blocked
+                }
+            };
+        }
+        Err(error) => {
+            service_status.credential_context = ServiceCredentialContext::RuntimeUnavailable;
+            append_status_detail(
+                &mut service_status,
+                &format!("service runtime identity/readiness is unavailable: {error}"),
+            );
+        }
+    }
+    service_status
+}
+
+fn append_status_detail(status: &mut ServiceStatus, detail: &str) {
+    status.detail = Some(match status.detail.take() {
+        Some(existing) if !existing.trim().is_empty() => format!("{existing}; {detail}"),
+        Some(_) | None => detail.to_string(),
+    });
+}
+
 #[cfg(windows)]
 fn run_service_dispatcher(options: ServiceInstallOptions) -> CliResult<()> {
     windows::run_dispatcher(options)
@@ -748,6 +1173,7 @@ mod windows {
         user_sid: String,
         scoped_task_name: String,
         definition_path: PathBuf,
+        definition_document: Vec<u8>,
         scoped_snapshot: Option<OwnedTaskSnapshot>,
         fixed_snapshot: Option<OwnedTaskSnapshot>,
         legacy_scm: Option<LegacyScmSnapshot>,
@@ -760,6 +1186,9 @@ mod windows {
         fixed_task_changed: bool,
         legacy_scm_stopped: bool,
         preserve_scoped_task: bool,
+        definition_transaction: Option<codex_helper_core::ManagedFileTransaction>,
+        receipt_transaction: Option<ServiceReceiptTransaction>,
+        receipt: Option<ServiceReceipt>,
     }
 
     impl NativeWindowsInstallBackend {
@@ -771,12 +1200,29 @@ mod windows {
                 fixed_task_changed: false,
                 legacy_scm_stopped: false,
                 preserve_scoped_task: false,
+                definition_transaction: None,
+                receipt_transaction: None,
+                receipt: None,
             }
         }
 
         fn context(&self) -> CliResult<&WindowsInstallContext> {
             self.context.as_ref().ok_or_else(|| {
                 CliError::Other("Windows service installation was not preflighted".to_string())
+            })
+        }
+
+        fn definition_transaction_mut(
+            &mut self,
+        ) -> CliResult<&mut codex_helper_core::ManagedFileTransaction> {
+            self.definition_transaction.as_mut().ok_or_else(|| {
+                CliError::Other("Windows definition transaction is unavailable".to_string())
+            })
+        }
+
+        fn receipt_transaction_mut(&mut self) -> CliResult<&mut ServiceReceiptTransaction> {
+            self.receipt_transaction.as_mut().ok_or_else(|| {
+                CliError::Other("Windows receipt transaction is unavailable".to_string())
             })
         }
     }
@@ -793,20 +1239,8 @@ mod windows {
                 })?;
             let scoped_task_name = windows_task_name_for_sid(&user_sid)?;
             let definition_path = task_definition_path(&self.options.helper_home);
-            let document = render_windows_task_definition(&executable, &self.options, &user_sid);
-            write_service_definition(&definition_path, document.as_bytes())?;
-            let persisted = std::fs::read(&definition_path).map_err(|error| {
-                CliError::Other(format!(
-                    "read back Windows task definition {}: {error}",
-                    definition_path.display()
-                ))
-            })?;
-            if persisted != document.as_bytes() {
-                return Err(CliError::Other(format!(
-                    "Windows task definition {} failed read-back verification",
-                    definition_path.display()
-                )));
-            }
+            let definition_document =
+                render_windows_task_definition(&executable, &self.options, &user_sid).into_bytes();
 
             let scoped_snapshot = match query_scheduled_task(&scoped_task_name)? {
                 Some(record) => {
@@ -824,15 +1258,27 @@ mod windows {
                 Some(_) | None => None,
             };
             let legacy_scm = probe_legacy_scm_for_migration()?;
+            let definition_transaction = codex_helper_core::ManagedFileTransaction::begin(
+                definition_path.clone(),
+                MAX_SERVICE_DEFINITION_BYTES,
+            )
+            .map_err(|error| {
+                CliError::Other(format!("begin Windows definition transaction: {error}"))
+            })?;
+            let (receipt_transaction, receipt) = begin_service_receipt_transaction(&self.options)?;
             self.context = Some(WindowsInstallContext {
                 executable,
                 user_sid,
                 scoped_task_name,
                 definition_path,
+                definition_document,
                 scoped_snapshot,
                 fixed_snapshot,
                 legacy_scm,
             });
+            self.definition_transaction = Some(definition_transaction);
+            self.receipt_transaction = Some(receipt_transaction);
+            self.receipt = Some(receipt);
             Ok(())
         }
 
@@ -843,6 +1289,20 @@ mod windows {
             }
             let task_name = context.scoped_task_name.clone();
             let definition_path = context.definition_path.clone();
+            let definition_document = context.definition_document.clone();
+            self.definition_transaction_mut()?
+                .replace(&definition_document)
+                .map_err(|error| {
+                    CliError::Other(format!("publish Windows task definition: {error}"))
+                })?;
+            if self.definition_transaction_mut()?.current().bytes()
+                != Some(definition_document.as_slice())
+            {
+                return Err(CliError::Other(format!(
+                    "Windows task definition {} failed transaction read-back verification",
+                    definition_path.display()
+                )));
+            }
             self.scoped_task_changed = true;
             register_task_from_file(&task_name, &definition_path)
         }
@@ -863,6 +1323,17 @@ mod windows {
                 &context.executable,
                 &self.options,
             )
+        }
+
+        fn publish_receipt(&mut self) -> CliResult<()> {
+            let receipt = self.receipt.clone().ok_or_else(|| {
+                CliError::Other("Windows service receipt is unavailable".to_string())
+            })?;
+            self.receipt_transaction_mut()?
+                .replace(&receipt)
+                .map_err(|error| {
+                    CliError::Other(format!("publish Windows service receipt: {error}"))
+                })
         }
 
         fn retire_owned_fixed_task(&mut self) -> CliResult<()> {
@@ -894,6 +1365,12 @@ mod windows {
                 return Err(primary);
             }
             Ok(())
+        }
+
+        fn rollback_receipt(&mut self) -> CliResult<()> {
+            self.receipt_transaction_mut()?.rollback().map_err(|error| {
+                CliError::Other(format!("restore previous Windows service receipt: {error}"))
+            })
         }
 
         fn rollback(&mut self) -> CliResult<()> {
@@ -932,6 +1409,9 @@ mod windows {
                         "restore the previous SID-scoped task state: {error}"
                     ));
                 }
+            }
+            if let Err(error) = self.definition_transaction_mut()?.rollback() {
+                failures.push(format!("restore the Windows task definition: {error}"));
             }
             if failures.is_empty() {
                 Ok(())
@@ -1697,6 +2177,10 @@ try {
             service_definition: None,
             log_directory: service_log_dir(),
             detail: None,
+            receipt_state: ServiceReceiptState::Absent,
+            credential_context: ServiceCredentialContext::Unverified,
+            runtime_identity_verified: false,
+            install_generation: None,
         }
     }
 }
@@ -1710,20 +2194,66 @@ mod macos {
         let log_dir = ensure_service_log_dir()?;
         let path = launch_agent_path()?;
         let document = render_launch_agent(&executable, &log_dir, &options);
-        write_service_definition(&path, document.as_bytes())?;
         let domain = launchd_domain()?;
-        let _ = run_command(
+        let target = format!("{}/{MACOS_LABEL}", launchd_domain_string()?);
+        let was_loaded = run_command(
             "launchctl",
-            &[
-                OsString::from("bootout"),
-                domain.clone(),
-                path.clone().into_os_string(),
-            ],
-        );
-        run_command(
-            "launchctl",
-            &[OsString::from("bootstrap"), domain, path.into_os_string()],
-        )?;
+            &[OsString::from("print"), OsString::from(target)],
+        )
+        .is_ok();
+        let mut definition = codex_helper_core::ManagedFileTransaction::begin(
+            path.clone(),
+            MAX_SERVICE_DEFINITION_BYTES,
+        )
+        .map_err(|error| CliError::Other(format!("begin LaunchAgent transaction: {error}")))?;
+        let original_definition_exists = definition.current().bytes().is_some();
+        let (mut receipt_transaction, receipt) = begin_service_receipt_transaction(&options)?;
+        let mutation = (|| {
+            if was_loaded {
+                run_command(
+                    "launchctl",
+                    &[
+                        OsString::from("bootout"),
+                        domain.clone(),
+                        path.clone().into_os_string(),
+                    ],
+                )?;
+            }
+            definition.replace(document.as_bytes()).map_err(|error| {
+                CliError::Other(format!("publish LaunchAgent definition: {error}"))
+            })?;
+            if definition.current().bytes() != Some(document.as_bytes()) {
+                return Err(CliError::Other(
+                    "LaunchAgent definition failed transaction read-back verification".to_string(),
+                ));
+            }
+            run_command(
+                "plutil",
+                &[OsString::from("-lint"), path.clone().into_os_string()],
+            )?;
+            receipt_transaction.replace(&receipt).map_err(|error| {
+                CliError::Other(format!("publish LaunchAgent service receipt: {error}"))
+            })
+        })();
+        if let Err(primary) = mutation {
+            let mut failures = Vec::new();
+            if let Err(error) = receipt_transaction.rollback() {
+                failures.push(format!("restore previous service receipt: {error}"));
+            }
+            if let Err(error) = definition.rollback() {
+                failures.push(format!("restore previous LaunchAgent definition: {error}"));
+            }
+            if was_loaded
+                && original_definition_exists
+                && let Err(error) = run_command(
+                    "launchctl",
+                    &[OsString::from("bootstrap"), domain, path.into_os_string()],
+                )
+            {
+                failures.push(format!("reload previous LaunchAgent: {error}"));
+            }
+            return Err(rollback_error(primary, failures));
+        }
         if options.start {
             start()?;
         }
@@ -1753,12 +2283,29 @@ mod macos {
     }
 
     pub(super) fn start() -> CliResult<()> {
+        let target = format!("{}/{MACOS_LABEL}", launchd_domain_string()?);
+        if run_command(
+            "launchctl",
+            &[OsString::from("print"), OsString::from(&target)],
+        )
+        .is_err()
+        {
+            return run_command(
+                "launchctl",
+                &[
+                    OsString::from("bootstrap"),
+                    launchd_domain()?,
+                    launch_agent_path()?.into_os_string(),
+                ],
+            )
+            .map(|_| ());
+        }
         run_command(
             "launchctl",
             &[
                 OsString::from("kickstart"),
                 OsString::from("-k"),
-                OsString::from(format!("{}/{MACOS_LABEL}", launchd_domain_string()?)),
+                OsString::from(target),
             ],
         )
         .map(|_| ())
@@ -1835,13 +2382,15 @@ mod macos {
             "--codex"
         };
         format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{MACOS_LABEL}</string>\n<key>ProgramArguments</key><array><string>{}</string><string>serve</string><string>{service_flag}</string><string>--host</string><string>{}</string><string>--port</string><string>{}</string><string>--no-tui</string><string>--service-managed</string></array>\n<key>EnvironmentVariables</key><dict><key>CODEX_HELPER_HOME</key><string>{}</string><key>{}</key><string>{}</string></dict>\n<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>\n<key>ThrottleInterval</key><integer>10</integer>\n<key>StandardOutPath</key><string>{}</string>\n<key>StandardErrorPath</key><string>{}</string>\n</dict></plist>\n",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{MACOS_LABEL}</string>\n<key>ProgramArguments</key><array><string>{}</string><string>serve</string><string>{service_flag}</string><string>--host</string><string>{}</string><string>--port</string><string>{}</string><string>--no-tui</string><string>--service-managed</string></array>\n<key>EnvironmentVariables</key><dict><key>CODEX_HELPER_HOME</key><string>{}</string><key>{}</key><string>{}</string><key>{}</key><string>{}</string></dict>\n<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>\n<key>ThrottleInterval</key><integer>10</integer>\n<key>StandardOutPath</key><string>{}</string>\n<key>StandardErrorPath</key><string>{}</string>\n</dict></plist>\n",
             xml_escape(executable.to_string_lossy().as_ref()),
             options.host,
             options.port,
             xml_escape(options.helper_home.to_string_lossy().as_ref()),
             service_client_home_env(options.service_name),
             xml_escape(options.client_home.to_string_lossy().as_ref()),
+            codex_helper_core::service_target::SERVICE_INSTALL_GENERATION_ENV_VAR,
+            options.install_generation,
             xml_escape(
                 log_dir
                     .join("service.stdout.log")
@@ -1872,6 +2421,10 @@ mod macos {
             service_definition: definition,
             log_directory: service_log_dir(),
             detail: None,
+            receipt_state: ServiceReceiptState::Absent,
+            credential_context: ServiceCredentialContext::Unverified,
+            runtime_identity_verified: false,
+            install_generation: None,
         }
     }
 }
@@ -1883,11 +2436,66 @@ mod linux {
     pub(super) fn install(options: ServiceInstallOptions) -> CliResult<()> {
         let executable = current_executable()?;
         ensure_service_log_dir()?;
+        systemctl(&["show-environment"])?;
         let path = user_unit_path()?;
         let document = render_systemd_unit(&executable, &options);
-        write_service_definition(&path, document.as_bytes())?;
-        systemctl(&["daemon-reload"])?;
-        systemctl(&["enable", LINUX_UNIT_NAME])?;
+        let was_active =
+            systemctl_output(&["is-active", LINUX_UNIT_NAME]).is_ok_and(|value| value == "active");
+        let was_enabled = systemctl_output(&["is-enabled", LINUX_UNIT_NAME])
+            .is_ok_and(|value| value == "enabled");
+        let mut definition =
+            codex_helper_core::ManagedFileTransaction::begin(path, MAX_SERVICE_DEFINITION_BYTES)
+                .map_err(|error| {
+                    CliError::Other(format!("begin systemd unit transaction: {error}"))
+                })?;
+        let (mut receipt_transaction, receipt) = begin_service_receipt_transaction(&options)?;
+        let mutation = (|| {
+            if was_active {
+                systemctl(&["stop", LINUX_UNIT_NAME])?;
+            }
+            definition
+                .replace(document.as_bytes())
+                .map_err(|error| CliError::Other(format!("publish systemd user unit: {error}")))?;
+            if definition.current().bytes() != Some(document.as_bytes()) {
+                return Err(CliError::Other(
+                    "systemd user unit failed transaction read-back verification".to_string(),
+                ));
+            }
+            systemctl(&["daemon-reload"])?;
+            systemctl(&["enable", LINUX_UNIT_NAME])?;
+            if systemctl_output(&["is-enabled", LINUX_UNIT_NAME]).as_deref() != Ok("enabled") {
+                return Err(CliError::Other(
+                    "systemd user unit did not report enabled after installation".to_string(),
+                ));
+            }
+            receipt_transaction.replace(&receipt).map_err(|error| {
+                CliError::Other(format!("publish systemd service receipt: {error}"))
+            })
+        })();
+        if let Err(primary) = mutation {
+            let mut failures = Vec::new();
+            if let Err(error) = receipt_transaction.rollback() {
+                failures.push(format!("restore previous service receipt: {error}"));
+            }
+            if let Err(error) = definition.rollback() {
+                failures.push(format!("restore previous systemd user unit: {error}"));
+            }
+            if let Err(error) = systemctl(&["daemon-reload"]) {
+                failures.push(format!("reload restored systemd user units: {error}"));
+            }
+            let restore_enablement = if was_enabled {
+                systemctl(&["enable", LINUX_UNIT_NAME])
+            } else {
+                systemctl(&["disable", LINUX_UNIT_NAME])
+            };
+            if let Err(error) = restore_enablement {
+                failures.push(format!("restore systemd user unit enablement: {error}"));
+            }
+            if was_active && let Err(error) = systemctl(&["start", LINUX_UNIT_NAME]) {
+                failures.push(format!("restart previous systemd user unit: {error}"));
+            }
+            return Err(rollback_error(primary, failures));
+        }
         if options.start {
             systemctl(&["start", LINUX_UNIT_NAME])?;
         }
@@ -1984,6 +2592,10 @@ mod linux {
             service_definition: definition,
             log_directory: service_log_dir(),
             detail: None,
+            receipt_state: ServiceReceiptState::Absent,
+            credential_context: ServiceCredentialContext::Unverified,
+            runtime_identity_verified: false,
+            install_generation: None,
         }
     }
 }
@@ -2000,8 +2612,13 @@ fn render_systemd_unit(executable: &Path, options: &ServiceInstallOptions) -> St
         service_client_home_env(options.service_name),
         &options.client_home,
     );
+    let install_generation = format!(
+        "\"{}={}\"",
+        codex_helper_core::service_target::SERVICE_INSTALL_GENERATION_ENV_VAR,
+        options.install_generation
+    );
     format!(
-        "[Unit]\nDescription=codex-helper resident relay\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nEnvironment={helper_home}\nEnvironment={client_home}\nExecStart={} serve {service_flag} --host {} --port {} --no-tui --service-managed\nRestart=on-failure\nRestartSec=10s\nStartLimitIntervalSec=300\nStartLimitBurst=10\n\n[Install]\nWantedBy=default.target\n",
+        "[Unit]\nDescription=codex-helper resident relay\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nEnvironment={helper_home}\nEnvironment={client_home}\nEnvironment={install_generation}\nExecStart={} serve {service_flag} --host {} --port {} --no-tui --service-managed\nRestart=on-failure\nRestartSec=10s\nStartLimitIntervalSec=300\nStartLimitBurst=10\n\n[Install]\nWantedBy=default.target\n",
         systemd_quote(executable),
         options.host,
         options.port,
@@ -2017,6 +2634,7 @@ fn systemd_environment_assignment(name: &str, value: &Path) -> String {
     )
 }
 
+#[cfg(any(windows, test))]
 fn write_service_definition(path: &Path, contents: &[u8]) -> CliResult<()> {
     let parent = path.parent().ok_or_else(|| {
         CliError::Other(format!(
@@ -2051,7 +2669,7 @@ fn write_service_definition(path: &Path, contents: &[u8]) -> CliResult<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), test))]
 fn replace_service_definition(temporary: &Path, destination: &Path) -> std::io::Result<()> {
     std::fs::rename(temporary, destination)
 }
@@ -2133,6 +2751,117 @@ mod tests {
         assert!(service_name_from_flags(true, true).is_err());
     }
 
+    fn test_service_status(state: ServiceRuntimeState) -> ServiceStatus {
+        ServiceStatus {
+            platform: ServicePlatform::current(),
+            service_name: "test-service".to_string(),
+            state,
+            installed: true,
+            autostart: true,
+            service_definition: None,
+            log_directory: PathBuf::from("/tmp/test-service-logs"),
+            detail: None,
+            receipt_state: ServiceReceiptState::Absent,
+            credential_context: ServiceCredentialContext::Unverified,
+            runtime_identity_verified: false,
+            install_generation: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn status_tolerates_absent_legacy_invalid_and_unreachable_runtime_receipts() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-helper-service-status-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let absent_home = root.join("absent");
+        std::fs::create_dir_all(&absent_home).expect("create absent helper home");
+        let absent = enrich_service_status(
+            test_service_status(ServiceRuntimeState::Stopped),
+            &absent_home,
+        )
+        .await;
+        assert_eq!(absent.receipt_state, ServiceReceiptState::Absent);
+
+        let legacy_home = root.join("legacy");
+        std::fs::create_dir_all(&legacy_home).expect("create legacy helper home");
+        std::fs::write(
+            crate::service_receipt::service_receipt_path(&legacy_home),
+            br#"{"schema_version":0}"#,
+        )
+        .expect("write legacy receipt");
+        let legacy = enrich_service_status(
+            test_service_status(ServiceRuntimeState::Stopped),
+            &legacy_home,
+        )
+        .await;
+        assert_eq!(legacy.receipt_state, ServiceReceiptState::Legacy);
+
+        let invalid_home = root.join("invalid");
+        std::fs::create_dir_all(&invalid_home).expect("create invalid helper home");
+        std::fs::write(
+            crate::service_receipt::service_receipt_path(&invalid_home),
+            b"not-json",
+        )
+        .expect("write invalid receipt");
+        let invalid = enrich_service_status(
+            test_service_status(ServiceRuntimeState::Stopped),
+            &invalid_home,
+        )
+        .await;
+        assert_eq!(invalid.receipt_state, ServiceReceiptState::Invalid);
+
+        let current_home = root.join("current");
+        let client_home = root.join("client");
+        std::fs::create_dir_all(&current_home).expect("create current helper home");
+        std::fs::create_dir_all(&client_home).expect("create client home");
+        let generation = codex_helper_core::service_target::ServiceInstallGeneration::generate();
+        let receipt = ServiceReceipt::new(
+            codex_helper_core::config::ServiceKind::Codex,
+            current_home.clone(),
+            client_home,
+            "http://127.0.0.1:4211",
+            ServicePlatformBackend::current().expect("supported test platform"),
+            generation.clone(),
+        )
+        .expect("build current receipt");
+        {
+            let mut transaction = ServiceReceiptTransaction::begin(&current_home)
+                .expect("begin current receipt transaction");
+            transaction
+                .replace(&receipt)
+                .expect("publish current receipt");
+        }
+        let stopped = enrich_service_status(
+            test_service_status(ServiceRuntimeState::Stopped),
+            &current_home,
+        )
+        .await;
+        assert_eq!(stopped.receipt_state, ServiceReceiptState::Current);
+        assert_eq!(
+            stopped.credential_context,
+            ServiceCredentialContext::Unverified
+        );
+        assert_eq!(
+            stopped.install_generation.as_deref(),
+            Some(generation.as_str())
+        );
+
+        let unreachable = enrich_service_status(
+            test_service_status(ServiceRuntimeState::Running),
+            &current_home,
+        )
+        .await;
+        assert_eq!(unreachable.receipt_state, ServiceReceiptState::Current);
+        assert_eq!(
+            unreachable.credential_context,
+            ServiceCredentialContext::RuntimeUnavailable
+        );
+        assert!(!unreachable.runtime_identity_verified);
+
+        std::fs::remove_dir_all(root).expect("remove service status test root");
+    }
+
     #[test]
     fn service_definition_publication_replaces_an_existing_file() {
         let directory = std::env::temp_dir().join(format!(
@@ -2148,6 +2877,28 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    #[test]
+    fn started_service_readiness_has_distinct_ready_degraded_and_blocked_outcomes() {
+        use codex_helper_core::credentials::CredentialAggregateReadiness;
+
+        assert!(
+            ensure_started_service_credential_readiness(CredentialAggregateReadiness::Ready)
+                .is_ok()
+        );
+        assert!(
+            ensure_started_service_credential_readiness(CredentialAggregateReadiness::Degraded)
+                .is_ok()
+        );
+        let blocked =
+            ensure_started_service_credential_readiness(CredentialAggregateReadiness::Blocked)
+                .expect_err("blocked runtime must return a nonzero CLI outcome");
+        assert!(
+            blocked
+                .to_string()
+                .contains("admin endpoint remains available")
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn launch_agent_escapes_paths_and_configures_external_restart() {
@@ -2158,6 +2909,8 @@ mod tests {
             start: true,
             helper_home: PathBuf::from("/tmp/helper-home"),
             client_home: PathBuf::from("/tmp/codex-home"),
+            install_generation:
+                codex_helper_core::service_target::ServiceInstallGeneration::generate(),
         };
         let document = macos::render_launch_agent(
             Path::new("/tmp/codex & helper"),
@@ -2170,6 +2923,11 @@ mod tests {
         assert!(document.contains("<key>SuccessfulExit</key><false/>"));
         assert!(document.contains("--service-managed"));
         assert!(document.contains("<key>CODEX_HOME</key><string>/tmp/codex-home</string>"));
+        assert!(
+            document
+                .contains(codex_helper_core::service_target::SERVICE_INSTALL_GENERATION_ENV_VAR)
+        );
+        assert!(document.contains(options.install_generation.as_str()));
     }
 
     #[test]
@@ -2181,6 +2939,8 @@ mod tests {
             start: true,
             helper_home: PathBuf::from("/tmp/helper home"),
             client_home: PathBuf::from("/tmp/claude home"),
+            install_generation:
+                codex_helper_core::service_target::ServiceInstallGeneration::generate(),
         };
         let document = render_systemd_unit(Path::new("/usr/bin/codex-helper"), &options);
 
@@ -2190,6 +2950,11 @@ mod tests {
         assert!(document.contains("--service-managed"));
         assert!(document.contains("Environment=\"CODEX_HELPER_HOME=/tmp/helper home\""));
         assert!(document.contains("Environment=\"CLAUDE_HOME=/tmp/claude home\""));
+        assert!(
+            document
+                .contains(codex_helper_core::service_target::SERVICE_INSTALL_GENERATION_ENV_VAR)
+        );
+        assert!(document.contains(options.install_generation.as_str()));
     }
 
     #[test]
@@ -2201,6 +2966,8 @@ mod tests {
             start: true,
             helper_home: PathBuf::from("C:/Users/test/.codex-helper"),
             client_home: PathBuf::from("C:/Users/test/.codex"),
+            install_generation:
+                codex_helper_core::service_target::ServiceInstallGeneration::generate(),
         };
 
         let arguments = service_task_arguments(&options)
@@ -2213,6 +2980,12 @@ mod tests {
             pair == [
                 "--client-home".to_string(),
                 "C:/Users/test/.codex".to_string(),
+            ]
+        }));
+        assert!(arguments.windows(2).any(|pair| {
+            pair == [
+                "--install-generation".to_string(),
+                options.install_generation.to_string(),
             ]
         }));
         assert!(!arguments.iter().any(|argument| {
@@ -2232,6 +3005,8 @@ mod tests {
             start: true,
             helper_home: PathBuf::from(r"C:\Users\test user\.codex-helper"),
             client_home: PathBuf::from(r"C:\Users\test user\.codex"),
+            install_generation:
+                codex_helper_core::service_target::ServiceInstallGeneration::generate(),
         };
 
         let document = render_windows_task_definition(
@@ -2303,6 +3078,8 @@ mod tests {
             start: true,
             helper_home: PathBuf::from("C:/Users/test/.codex-helper"),
             client_home: PathBuf::from("C:/Users/test/.codex"),
+            install_generation:
+                codex_helper_core::service_target::ServiceInstallGeneration::generate(),
         };
         let arguments = service_task_arguments(&options)
             .iter()
@@ -2387,12 +3164,20 @@ mod tests {
             self.step("verify")
         }
 
+        fn publish_receipt(&mut self) -> CliResult<()> {
+            self.step("publish_receipt")
+        }
+
         fn retire_owned_fixed_task(&mut self) -> CliResult<()> {
             self.step("retire_fixed")
         }
 
         fn retire_legacy_scm(&mut self) -> CliResult<()> {
             self.step("retire_scm")
+        }
+
+        fn rollback_receipt(&mut self) -> CliResult<()> {
+            self.step("rollback_receipt")
         }
 
         fn rollback(&mut self) -> CliResult<()> {
@@ -2416,6 +3201,7 @@ mod tests {
                 "preflight",
                 "register",
                 "verify",
+                "publish_receipt",
                 "retire_fixed",
                 "retire_scm",
                 "start",
@@ -2426,10 +3212,30 @@ mod tests {
     #[test]
     fn windows_migration_rolls_back_every_failure_after_preflight() {
         for (failure, expected) in [
-            ("register", vec!["preflight", "register", "rollback"]),
+            (
+                "register",
+                vec!["preflight", "register", "rollback_receipt", "rollback"],
+            ),
             (
                 "verify",
-                vec!["preflight", "register", "verify", "rollback"],
+                vec![
+                    "preflight",
+                    "register",
+                    "verify",
+                    "rollback_receipt",
+                    "rollback",
+                ],
+            ),
+            (
+                "publish_receipt",
+                vec![
+                    "preflight",
+                    "register",
+                    "verify",
+                    "publish_receipt",
+                    "rollback_receipt",
+                    "rollback",
+                ],
             ),
             (
                 "retire_fixed",
@@ -2437,7 +3243,9 @@ mod tests {
                     "preflight",
                     "register",
                     "verify",
+                    "publish_receipt",
                     "retire_fixed",
+                    "rollback_receipt",
                     "rollback",
                 ],
             ),
@@ -2447,8 +3255,10 @@ mod tests {
                     "preflight",
                     "register",
                     "verify",
+                    "publish_receipt",
                     "retire_fixed",
                     "retire_scm",
+                    "rollback_receipt",
                     "rollback",
                 ],
             ),

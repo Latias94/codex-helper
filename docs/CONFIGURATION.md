@@ -1005,7 +1005,26 @@ For authentication, first decide which HTTP header the provider expects:
   inline value wins. If both bearer and `X-API-Key` credentials are configured, codex-helper sends
   both headers; avoid that unless the relay explicitly requires it.
 
-On Windows, `service install` now registers a SID-scoped per-user Scheduled Task instead of a LocalSystem SCM service. Its actual name resembles `codex-helper-S-1-5-21-...`; `service start/stop/status/uninstall` resolves the current Principal SID automatically, so normal CLI use does not need that name. It runs with `InteractiveToken` and `LeastPrivilege`, starts at that user's logon, and may also be run through `service start/restart`. The task definition records the executable, helper home, client home, listen address, and port, but never a credential value. To migrate an older SCM installation, run the new binary once from an elevated PowerShell:
+### Native credentials in OS services
+
+For an installed desktop service, a native credential is the portable default because it is read in the service's real user context and is never copied into TOML, argv, the service definition, or the install receipt:
+
+```bash
+codex-helper credential create relay.primary
+codex-helper provider set-auth relay --kind bearer --native relay.primary --codex
+codex-helper service install --codex
+codex-helper service status --json
+```
+
+Interactive create/set uses masked input and confirmation. Use explicit `--stdin` only for automation. `provider set-auth` stores the typed reference, not its value. The native backend is Windows Credential Manager, the macOS user Keychain, or the Linux session's Secret Service implementation (for example GNOME Keyring or KWallet).
+
+`service install`, `service start`, and `service restart` first evaluate configuration and credentials offline. A blocked preflight fails before replacing or stopping the current service. After launch, the command polls the signed loopback operator model and verifies the service kind, helper home, client home, and non-secret install generation from the committed receipt. `ready` succeeds, `degraded` succeeds with a warning, and `blocked` returns nonzero while leaving the daemon and local admin listener running for diagnosis. No readiness check sends upstream traffic.
+
+`service install --no-start` verifies only the installer process context. It deliberately reports the installed service context as unverified until `service start` or `service restart`. `service status` keeps OS state separate from `receipt_state`, `credential_context`, and `runtime_identity_verified`; JSON remains available when the process is stopped, the receipt is absent/legacy/invalid, or the admin endpoint is unreachable. Reinstall to replace an absent or legacy receipt.
+
+The generated Scheduled Task, LaunchAgent, and systemd user unit contain only the executable, selected homes, listen settings, and install generation. They do not capture arbitrary shell environment variables. An `--environment` binding is therefore valid only when that variable is independently present in the actual service manager environment. For predictable service deployments, use a native binding or an absolute `--secret-file` path readable by the service user. On Linux, a missing session bus, unavailable Secret Service, or locked collection is reported as blocked; codex-helper does not create a file or SQLite fallback.
+
+On Windows, `service install` registers a SID-scoped per-user Scheduled Task instead of a LocalSystem SCM service. Its actual name resembles `codex-helper-S-1-5-21-...`; `service start/stop/status/uninstall` resolves the current Principal SID automatically, so normal CLI use does not need that name. It runs with `InteractiveToken` and `LeastPrivilege`, starts at that user's logon, and may also be run through `service start/restart`. To migrate an older SCM installation, run the new binary once from an elevated PowerShell:
 
 ```powershell
 & $helper service install --codex --no-start
@@ -1013,7 +1032,9 @@ On Windows, `service install` now registers a SID-scoped per-user Scheduled Task
 & $helper service status
 ```
 
-Installation first preflights the executable, paths, SID, PowerShell/ScheduledTasks commands, and XML read-back, then registers and queries the new SID-scoped task. It retires a fixed-name task owned by the current SID and the legacy SCM service only after the new owner SID, action, logon trigger, and least-privilege settings are verified. Permission, query, registration, and verification errors fail closed. If retirement fails after an old runtime was stopped, installation restores the old task or restarts the old SCM service; it keeps the verified new task as a runnable fallback only when restoration cannot be proven. A fixed-name `codex-helper` task owned by another SID is never overwritten or deleted. A successful status reports `SID-scoped per-user scheduled task`; if it still reports `legacy LocalSystem SCM service` or `legacy fixed-name per-user scheduled task`, rerun installation from an elevated terminal. Temporary `$env:NAME` values in the current PowerShell window are not captured by the task definition. Use a persistent user environment value, the exact-name client credential-file fallback above, or a locally permission-protected inline value. If an explicit credential reference cannot be resolved or is not a valid header value, HTTP, WebSocket, probe, live-smoke, and balance-refresh paths all fail closed before upstream I/O.
+Installation first preflights the executable, paths, SID, PowerShell/ScheduledTasks commands, credentials, and XML read-back, then registers and queries the new SID-scoped task. It publishes the matching receipt only after that verification and before retiring any older installation. It retires a fixed-name task owned by the current SID and the legacy SCM service only after the new owner SID, action, logon trigger, and least-privilege settings are verified. Definition, receipt, permission, query, registration, and verification errors fail closed and restore the previous artifacts when rollback can be proven. A fixed-name `codex-helper` task owned by another SID is never overwritten or deleted. If status still reports `legacy LocalSystem SCM service` or `legacy fixed-name per-user scheduled task`, rerun installation from an elevated terminal.
+
+On macOS, the receipt targets the logged-in user's `gui/<uid>` LaunchAgent domain and the same user's Keychain. On Linux, it targets `systemctl --user` and the user's session bus. Installing as one user and starting or inspecting as another intentionally fails identity/readiness verification instead of falling back to another credential store.
 
 Use `model_mapping` when the model requested by Codex differs from the model name expected by a specific relay. The mapping is provider-scoped: codex-helper rewrites the request body `model` only after that provider is selected, so other providers are not affected.
 

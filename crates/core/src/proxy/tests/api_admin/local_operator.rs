@@ -17,7 +17,7 @@ use crate::proxy::{
 };
 use crate::service_target::{
     LocalCredentialRefreshAction, LocalCredentialRefreshRequest, LocalCredentialRefreshStatus,
-    ServiceInstallGeneration,
+    LocalServiceRuntimeReadRequest, ServiceInstallGeneration, ServiceRuntimeIdentity,
 };
 use crate::state::{FinishRequestParams, RuntimeConfigState, SessionRouteAffinityTarget};
 
@@ -548,6 +548,73 @@ async fn signed_credential_refresh_publishes_only_for_matching_service_generatio
         .expect("publish explicit delete");
     assert_eq!(deleted.status, LocalCredentialRefreshStatus::Published);
     assert_eq!(control.read_count(), 4);
+
+    drop(server);
+    drop(scoped);
+    std::fs::remove_dir_all(home).expect("remove helper home");
+}
+
+#[tokio::test]
+async fn signed_service_runtime_read_binds_identity_and_operator_model_atomically() {
+    const CREDENTIAL_CANARY: &str = "service-runtime-canary-fb41804311c849a086438241d33b71fd";
+
+    let _env_guard = env_lock().await;
+    let home = make_temp_test_dir();
+    let client_home = home.join("client");
+    std::fs::create_dir_all(&client_home).expect("create client home");
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HELPER_HOME", &home);
+        scoped.set(ADMIN_TOKEN_ENV_VAR, "");
+    }
+    crate::local_operator::ensure_local_operator_token().expect("create operator token");
+    let install_generation = ServiceInstallGeneration::generate();
+    let identity = ServiceRuntimeIdentity {
+        service: crate::config::ServiceKind::Codex,
+        helper_home: home.clone(),
+        client_home: client_home.clone(),
+        install_generation: install_generation.clone(),
+    };
+    let (proxy, control) = native_credential_proxy(Some(install_generation.clone()));
+    control.set_value(SecretValue::new(CREDENTIAL_CANARY.as_bytes().to_vec()).expect("canary"));
+    let server = spawn_admin_listener(proxy.with_service_runtime_identity(Some(identity.clone())));
+    let endpoint = ControlPlaneEndpoint::new(format!("http://{}", server.addr), None::<String>)
+        .expect("loopback endpoint");
+    let operator = LocalOperatorClient::from_helper_home(endpoint, &home)
+        .expect("local operator client from selected helper home");
+
+    let response = operator
+        .read_service_runtime(&LocalServiceRuntimeReadRequest {
+            service: crate::config::ServiceKind::Codex,
+            install_generation: install_generation.clone(),
+        })
+        .await
+        .expect("read bound service runtime");
+    assert_eq!(response.identity, identity);
+    assert_eq!(response.operator.service_name, "codex");
+    assert_eq!(
+        response.credential_readiness,
+        crate::credentials::CredentialAggregateReadiness::Ready
+    );
+    let rendered = format!(
+        "{:?} {}",
+        response,
+        serde_json::to_string(&response).expect("serialize service runtime response")
+    );
+    assert!(!rendered.contains(CREDENTIAL_CANARY));
+    assert!(!rendered.contains("fingerprint"));
+
+    let stale = operator
+        .read_service_runtime(&LocalServiceRuntimeReadRequest {
+            service: crate::config::ServiceKind::Codex,
+            install_generation: ServiceInstallGeneration::generate(),
+        })
+        .await
+        .expect_err("reject stale receipt generation");
+    assert!(matches!(
+        stale,
+        crate::control_plane_client::ControlPlaneError::HttpStatus { status: 409, .. }
+    ));
 
     drop(server);
     drop(scoped);

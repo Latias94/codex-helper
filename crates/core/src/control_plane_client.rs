@@ -18,13 +18,16 @@ use crate::proxy::{
     ADMIN_TOKEN_ENV_VAR, ADMIN_TOKEN_HEADER, LOCAL_OPERATOR_NONCE_HEADER,
     LOCAL_OPERATOR_SESSION_HEADER, LOCAL_OPERATOR_SIGNATURE_HEADER,
     LOCAL_OPERATOR_TIMESTAMP_HEADER, LOCAL_V1_BALANCE_REFRESH, LOCAL_V1_CREDENTIAL_REFRESH,
-    LOCAL_V1_OPERATOR_SESSION, LOCAL_V1_ROUTING_MUTATION, LOCAL_V1_SESSION_AFFINITY_MUTATION,
-    OperatorRoutingMutationRequest, OperatorRoutingMutationResponse,
-    OperatorSessionAffinityMutationRequest, OperatorSessionAffinityMutationResponse,
-    ProviderBalanceRefreshResponse,
+    LOCAL_V1_OPERATOR_SESSION, LOCAL_V1_ROUTING_MUTATION, LOCAL_V1_SERVICE_RUNTIME_READ,
+    LOCAL_V1_SESSION_AFFINITY_MUTATION, OperatorRoutingMutationRequest,
+    OperatorRoutingMutationResponse, OperatorSessionAffinityMutationRequest,
+    OperatorSessionAffinityMutationResponse, ProviderBalanceRefreshResponse,
 };
 use crate::request_chain::{RequestChainExport, RequestChainSelector};
-use crate::service_target::{LocalCredentialRefreshRequest, LocalCredentialRefreshResponse};
+use crate::service_target::{
+    LocalCredentialRefreshRequest, LocalCredentialRefreshResponse, LocalServiceRuntimeReadRequest,
+    LocalServiceRuntimeReadResponse,
+};
 
 const MAX_HTTP_ERROR_BODY_BYTES: usize = 4 * 1024;
 
@@ -287,6 +290,28 @@ impl LocalOperatorClient {
         {
             return Err(ControlPlaneError::InvalidPayload {
                 reason: "local operator daemon returned a different service generation".to_string(),
+            });
+        }
+        Ok(response)
+    }
+
+    pub async fn read_service_runtime(
+        &self,
+        request: &LocalServiceRuntimeReadRequest,
+    ) -> Result<LocalServiceRuntimeReadResponse, ControlPlaneError> {
+        let response = self
+            .post_json_classified::<_, LocalServiceRuntimeReadResponse>(
+                LOCAL_V1_SERVICE_RUNTIME_READ,
+                request,
+            )
+            .await?;
+        if response.identity.service != request.service
+            || response.identity.install_generation != request.install_generation
+            || response.operator.service_name
+                != crate::runtime_host::service_name_for_kind(request.service)
+        {
+            return Err(ControlPlaneError::InvalidPayload {
+                reason: "local operator daemon returned a different service runtime".to_string(),
             });
         }
         Ok(response)

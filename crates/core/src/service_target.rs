@@ -1,11 +1,13 @@
 use std::fmt;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::config::ServiceKind;
-use crate::credentials::CredentialName;
+use crate::credentials::{CredentialAggregateReadiness, CredentialName};
+use crate::dashboard_core::OperatorReadModel;
 
 pub const SERVICE_INSTALL_GENERATION_ENV_VAR: &str = "CODEX_HELPER_SERVICE_INSTALL_GENERATION";
 
@@ -111,6 +113,30 @@ pub struct LocalCredentialRefreshResponse {
     pub runtime_revision: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceRuntimeIdentity {
+    pub service: ServiceKind,
+    pub helper_home: PathBuf,
+    pub client_home: PathBuf,
+    pub install_generation: ServiceInstallGeneration,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LocalServiceRuntimeReadRequest {
+    pub service: ServiceKind,
+    pub install_generation: ServiceInstallGeneration,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LocalServiceRuntimeReadResponse {
+    pub identity: ServiceRuntimeIdentity,
+    pub credential_readiness: CredentialAggregateReadiness,
+    pub operator: OperatorReadModel,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,6 +167,20 @@ mod tests {
             .expect("deserialize request");
 
         assert_eq!(decoded, request);
+        assert!(!encoded.contains("credential_value"));
+        assert!(!encoded.contains("fingerprint"));
+    }
+
+    #[test]
+    fn service_runtime_read_contract_contains_only_non_secret_target_identity() {
+        let request = LocalServiceRuntimeReadRequest {
+            service: ServiceKind::Codex,
+            install_generation: ServiceInstallGeneration::generate(),
+        };
+
+        let encoded = serde_json::to_string(&request).expect("serialize request");
+
+        assert!(encoded.contains("install_generation"));
         assert!(!encoded.contains("credential_value"));
         assert!(!encoded.contains("fingerprint"));
     }

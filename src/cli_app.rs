@@ -850,17 +850,43 @@ pub(crate) async fn refresh_resident_credential(
 }
 
 pub(crate) async fn read_resident_operator_model() -> anyhow::Result<OperatorReadModel> {
+    Ok(read_resident_service_runtime().await?.operator)
+}
+
+pub(crate) async fn read_resident_service_runtime()
+-> anyhow::Result<codex_helper_core::service_target::LocalServiceRuntimeReadResponse> {
     let helper_home = crate::config::proxy_home_dir();
     let target = resolve_service_refresh_target_inner(&helper_home, None)?;
-    let service = service_name_for_kind(target.receipt.service());
-    let model = ControlPlaneClient::new(target.endpoint.clone())?
-        .operator_read_model()
+    read_service_runtime_from_target(target).await
+}
+
+pub(crate) async fn read_service_runtime_for_receipt(
+    receipt: ServiceReceipt,
+) -> anyhow::Result<codex_helper_core::service_target::LocalServiceRuntimeReadResponse> {
+    let target = verify_service_refresh_target(receipt, None)?;
+    read_service_runtime_from_target(target).await
+}
+
+async fn read_service_runtime_from_target(
+    target: VerifiedServiceRefreshTarget,
+) -> anyhow::Result<codex_helper_core::service_target::LocalServiceRuntimeReadResponse> {
+    let request = codex_helper_core::service_target::LocalServiceRuntimeReadRequest {
+        service: target.receipt.service(),
+        install_generation: target.receipt.install_generation().clone(),
+    };
+    let response = target
+        .local_operator_client()?
+        .read_service_runtime(&request)
         .await?;
     anyhow::ensure!(
-        model.service_name == service,
-        "service receipt and resident operator model identify different services"
+        response.identity.helper_home == target.receipt.helper_home(),
+        "service receipt and resident runtime identify different helper homes"
     );
-    Ok(model)
+    anyhow::ensure!(
+        response.identity.client_home == target.receipt.client_home(),
+        "service receipt and resident runtime identify different client homes"
+    );
+    Ok(response)
 }
 
 async fn read_operator_model(
@@ -1458,6 +1484,18 @@ async fn build_local_proxy_runtime(
             admin_addr
         );
     }
+    let service_runtime_identity = service_install_generation.as_ref().map(|generation| {
+        codex_helper_core::service_target::ServiceRuntimeIdentity {
+            service: codex_helper_core::runtime_host::service_kind_for_name(service_name),
+            helper_home: crate::config::proxy_home_dir(),
+            client_home: if service_name == "claude" {
+                crate::config::claude_home()
+            } else {
+                crate::config::codex_home()
+            },
+            install_generation: generation.clone(),
+        }
+    });
     build_proxy_runtime_from_loaded_with_options(
         service_name,
         host,
@@ -1465,7 +1503,7 @@ async fn build_local_proxy_runtime(
         ProxyRuntimeOptions::for_proxy_port(port)
             .with_admin_addr(admin_addr)
             .with_credential_sources(CredentialSourceCapabilities::platform_native())
-            .with_service_install_generation(service_install_generation),
+            .with_service_runtime_identity(service_runtime_identity),
         loaded,
     )
     .await

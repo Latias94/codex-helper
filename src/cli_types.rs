@@ -302,6 +302,9 @@ pub(crate) enum ServiceCommand {
         /// Codex or Claude home captured at installation time
         #[arg(long)]
         client_home: Option<std::path::PathBuf>,
+        /// Non-secret install generation captured by the service definition
+        #[arg(long, hide = true)]
+        install_generation: Option<String>,
     },
 }
 
@@ -1826,6 +1829,8 @@ mod tests {
             r"C:\Users\test\.codex-helper",
             "--client-home",
             r"C:\Users\test\.codex",
+            "--install-generation",
+            "2c387ce9-aa5d-43ff-a266-35c894e63695",
         ])
         .expect("parse internal scheduled-task run command");
 
@@ -1837,6 +1842,7 @@ mod tests {
                     port,
                     helper_home,
                     client_home,
+                    install_generation,
                 },
         }) = cli.command
         else {
@@ -1852,6 +1858,10 @@ mod tests {
         assert_eq!(
             client_home,
             Some(std::path::PathBuf::from(r"C:\Users\test\.codex"))
+        );
+        assert_eq!(
+            install_generation.as_deref(),
+            Some("2c387ce9-aa5d-43ff-a266-35c894e63695")
         );
     }
 

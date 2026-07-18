@@ -11,7 +11,7 @@ use super::admin::{AdminAccessConfig, require_admin_access};
 use super::admin_api_error::{AdminApiHttpError, AdminApiResult};
 use super::control_plane_manifest::{
     LOCAL_V1_BALANCE_REFRESH, LOCAL_V1_CREDENTIAL_REFRESH, LOCAL_V1_OPERATOR_SESSION,
-    LOCAL_V1_ROUTING_MUTATION, LOCAL_V1_SESSION_AFFINITY_MUTATION,
+    LOCAL_V1_ROUTING_MUTATION, LOCAL_V1_SERVICE_RUNTIME_READ, LOCAL_V1_SESSION_AFFINITY_MUTATION,
 };
 use super::{
     OperatorRoutingMutationRequest, OperatorSessionAffinityMutationRequest,
@@ -43,6 +43,7 @@ pub(super) fn local_operator_routes(proxy: ProxyService) -> Router {
         .route(LOCAL_V1_OPERATOR_SESSION, post(begin_session))
         .route(LOCAL_V1_BALANCE_REFRESH, post(refresh_balances))
         .route(LOCAL_V1_CREDENTIAL_REFRESH, post(refresh_credential))
+        .route(LOCAL_V1_SERVICE_RUNTIME_READ, post(read_service_runtime))
         .route(LOCAL_V1_ROUTING_MUTATION, post(mutate_routing))
         .route(
             LOCAL_V1_SESSION_AFFINITY_MUTATION,
@@ -54,6 +55,47 @@ pub(super) fn local_operator_routes(proxy: ProxyService) -> Router {
             AdminAccessConfig::from_env(),
             require_admin_access,
         ))
+}
+
+async fn read_service_runtime(
+    State(state): State<LocalOperatorRouteState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> AdminApiResult<crate::service_target::LocalServiceRuntimeReadResponse> {
+    authorize_local_operator_action(&state, &headers, LOCAL_V1_SERVICE_RUNTIME_READ, &body)?;
+    let request =
+        serde_json::from_slice::<crate::service_target::LocalServiceRuntimeReadRequest>(&body)
+            .map_err(|_| {
+                AdminApiHttpError::bad_request(
+                    "local_operator_invalid_json",
+                    "invalid local operator service runtime request",
+                )
+            })?;
+    let Some(identity) = state.proxy.service_runtime_identity() else {
+        return Err(service_generation_conflict());
+    };
+    if request.service != identity.service
+        || request.install_generation != identity.install_generation
+    {
+        return Err(service_generation_conflict());
+    }
+    let operator = state
+        .proxy
+        .operator_read_model()
+        .await
+        .map_err(AdminApiHttpError::from)?;
+    let credential_readiness = operator
+        .data
+        .as_ref()
+        .and_then(|data| data.summary.credential_readiness)
+        .unwrap_or(crate::credentials::CredentialAggregateReadiness::Blocked);
+    Ok(Json(
+        crate::service_target::LocalServiceRuntimeReadResponse {
+            identity: identity.clone(),
+            credential_readiness,
+            operator,
+        },
+    ))
 }
 
 async fn refresh_credential(
