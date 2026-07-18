@@ -10,6 +10,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http as tungstenite_http;
 
 use crate::config::UpstreamConfig;
+use crate::credentials::CapturedUpstreamCredential;
 use crate::model_routing;
 
 use super::classify::{ROUTING_MISMATCH_CAPABILITY_CLASS, classify_upstream_response};
@@ -123,11 +124,12 @@ pub struct CodexRelayLiveSmokeResponse {
 #[derive(Debug, Clone)]
 pub struct CodexRelayLiveSmokeClient {
     client: reqwest::Client,
+    credential: CapturedUpstreamCredential,
 }
 
 impl CodexRelayLiveSmokeClient {
-    pub fn new(client: reqwest::Client) -> Self {
-        Self { client }
+    pub(crate) fn new(client: reqwest::Client, credential: CapturedUpstreamCredential) -> Self {
+        Self { client, credential }
     }
 
     async fn run_case(
@@ -182,7 +184,7 @@ impl CodexRelayLiveSmokeClient {
         for &(name, value) in spec.headers {
             headers.insert(name, HeaderValue::from_static(value));
         }
-        if let Err(error) = apply_upstream_auth_headers(upstream, &mut headers) {
+        if let Err(error) = apply_upstream_auth_headers(upstream, &self.credential, &mut headers) {
             return transport_result(descriptor.case, None, error);
         }
 
@@ -237,7 +239,7 @@ impl CodexRelayLiveSmokeClient {
 
         let mut headers = HeaderMap::new();
         headers.insert("openai-beta", HeaderValue::from_static(ws.beta_header));
-        if let Err(error) = apply_upstream_auth_headers(upstream, &mut headers) {
+        if let Err(error) = apply_upstream_auth_headers(upstream, &self.credential, &mut headers) {
             return transport_result(descriptor.case, None, error);
         }
         let request = match websocket_live_smoke_request(&url, &headers) {
@@ -341,8 +343,17 @@ pub(super) async fn codex_relay_live_smoke_for_proxy(
     )?;
     let upstream_model =
         model_routing::effective_model(&target.upstream.model_mapping, &requested_model);
+    let credential = runtime_snapshot
+        .credential_generation()
+        .capture_bound(&target.provider_endpoint)
+        .map_err(|_| {
+            ProxyControlError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "selected Codex relay target has no captured credential binding",
+            )
+        })?;
 
-    let client = CodexRelayLiveSmokeClient::new(proxy.client.clone());
+    let client = CodexRelayLiveSmokeClient::new(proxy.client.clone(), credential);
     let mut results = Vec::with_capacity(cases.len());
     for case in cases.iter().copied() {
         results.push(
@@ -1144,25 +1155,11 @@ fn transport_result(
 
 fn apply_upstream_auth_headers(
     upstream: &UpstreamConfig,
+    credential: &CapturedUpstreamCredential,
     headers: &mut HeaderMap,
 ) -> Result<(), &'static str> {
-    let resolved_auth = crate::auth_resolution::resolve_upstream_auth_for_target(
-        "codex",
-        &upstream.auth,
-        &upstream.base_url,
-    )
-    .map_err(|_| UPSTREAM_AUTH_UNAVAILABLE_REASON)?;
-    if let Some(token) = resolved_auth.auth_token.value()
-        && let Ok(value) = HeaderValue::from_str(&format!("Bearer {token}"))
-    {
-        headers.insert(axum::http::header::AUTHORIZATION, value);
-    }
-    if let Some(key) = resolved_auth.api_key.value()
-        && let Ok(value) = HeaderValue::from_str(key)
-    {
-        headers.insert("x-api-key", value);
-    }
-    Ok(())
+    super::attempt_request::inject_auth_headers("codex", credential, &upstream.base_url, headers)
+        .map_err(|_| UPSTREAM_AUTH_UNAVAILABLE_REASON)
 }
 
 fn websocket_transport_error_result(
@@ -1413,6 +1410,26 @@ mod tests {
             supported_models: HashMap::new(),
             model_mapping: HashMap::new(),
         }
+    }
+
+    fn captured_credential(upstream: &UpstreamConfig) -> CapturedUpstreamCredential {
+        let store = crate::runtime_store::RuntimeStore::open_in_memory()
+            .expect("open credential runtime store");
+        let runtime = crate::credentials::CredentialRuntime::from_runtime_store(
+            crate::credentials::CredentialSourceCapabilities::server(),
+            &store,
+        )
+        .expect("build credential runtime");
+        let provider_endpoint =
+            crate::runtime_identity::ProviderEndpointKey::new("codex", "test", "default");
+        runtime
+            .build_generation([crate::credentials::CredentialCandidateInput {
+                provider_endpoint: provider_endpoint.clone(),
+                auth: &upstream.auth,
+            }])
+            .expect("build credential generation")
+            .capture_bound(&provider_endpoint)
+            .expect("capture registered credential")
     }
 
     fn proxy_for_upstreams(upstreams: Vec<UpstreamConfig>) -> ProxyService {
@@ -1883,8 +1900,8 @@ mod tests {
             .resolve("relay.example", upstream_addr)
             .build()
             .expect("build live smoke client");
-        let client = CodexRelayLiveSmokeClient::new(client);
         let mut upstream = upstream(format!("http://relay.example:{}/v1", upstream_addr.port()));
+        let client = CodexRelayLiveSmokeClient::new(client, captured_credential(&upstream));
 
         let rejected = client
             .run_case(
@@ -1905,6 +1922,8 @@ mod tests {
         assert_eq!(rejected.reason, UPSTREAM_AUTH_UNAVAILABLE_REASON);
 
         upstream.auth.allow_anonymous = Some(true);
+        let client =
+            CodexRelayLiveSmokeClient::new(client.client.clone(), captured_credential(&upstream));
         let allowed = client
             .run_case(
                 &upstream,
@@ -1923,9 +1942,13 @@ mod tests {
     #[test]
     fn codex_relay_live_smoke_allows_unconfigured_official_openai_auth() {
         let upstream = upstream("https://api.openai.com/v1".to_string());
+        let credential = captured_credential(&upstream);
         let mut headers = HeaderMap::new();
 
-        assert_eq!(apply_upstream_auth_headers(&upstream, &mut headers), Ok(()));
+        assert_eq!(
+            apply_upstream_auth_headers(&upstream, &credential, &mut headers),
+            Ok(())
+        );
         assert!(!headers.contains_key(axum::http::header::AUTHORIZATION));
         assert!(!headers.contains_key("x-api-key"));
     }
@@ -1975,8 +1998,8 @@ mod tests {
         );
         let (upstream_addr, upstream_handle) = spawn_axum_server(upstream_app);
         let mut upstream = upstream(format!("http://{upstream_addr}/v1"));
-        upstream.auth.auth_token = Some("live-token".to_string());
-        upstream.auth.api_key = Some("live-api-key".to_string());
+        upstream.auth.auth_token = Some("live-token".to_string().into());
+        upstream.auth.api_key = Some("live-api-key".to_string().into());
         let proxy = proxy_for_upstreams(vec![upstream]);
 
         let response = codex_relay_live_smoke_for_proxy(&proxy, request("gpt-5.5", Vec::new()))
@@ -2089,8 +2112,8 @@ mod tests {
         );
         let (upstream_addr, upstream_handle) = spawn_axum_server(upstream_app);
         let mut upstream = upstream(format!("http://{upstream_addr}/v1"));
-        upstream.auth.auth_token = Some("live-token".to_string());
-        upstream.auth.api_key = Some("live-api-key".to_string());
+        upstream.auth.auth_token = Some("live-token".to_string().into());
+        upstream.auth.api_key = Some("live-api-key".to_string().into());
         let proxy = proxy_for_upstreams(vec![upstream]);
 
         let response = codex_relay_live_smoke_for_proxy(
@@ -2275,8 +2298,8 @@ mod tests {
         let captured = Arc::new(Mutex::new(CapturedWebSocketSmoke::default()));
         let (upstream_addr, upstream_handle) = spawn_websocket_server(captured.clone());
         let mut upstream = upstream(format!("http://{upstream_addr}/v1"));
-        upstream.auth.auth_token = Some("live-token".to_string());
-        upstream.auth.api_key = Some("live-api-key".to_string());
+        upstream.auth.auth_token = Some("live-token".to_string().into());
+        upstream.auth.api_key = Some("live-api-key".to_string().into());
         upstream
             .model_mapping
             .insert("gpt-5.5".to_string(), "openai/gpt-5.5".to_string());

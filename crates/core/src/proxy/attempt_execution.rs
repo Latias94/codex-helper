@@ -230,7 +230,9 @@ pub(super) async fn execute_selected_upstream(
     };
     let request_identity = match prepare_attempt_request_identity(AttemptRequestIdentityParams {
         service_name: proxy.service_name,
-        auth: target.auth(),
+        credential: target.credential(),
+        credential_scope: target.runtime_identity().credential_scope.as_deref(),
+        state: proxy.state.as_ref(),
         client_headers,
         client_uri,
         target_url: target_url.as_str(),

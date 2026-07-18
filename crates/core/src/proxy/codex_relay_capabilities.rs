@@ -152,7 +152,16 @@ pub(super) async fn codex_relay_capabilities_for_proxy(
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
 
-    let probe_client = CodexRelayProbeClient::new(proxy.client.clone());
+    let credential = runtime_snapshot
+        .credential_generation()
+        .capture_bound(&target.provider_endpoint)
+        .map_err(|_| {
+            ProxyControlError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "selected Codex relay target has no captured credential binding",
+            )
+        })?;
+    let probe_client = CodexRelayProbeClient::new(proxy.client.clone(), credential);
     let observations = run_capability_probe_cases(&probe_client, &target.upstream).await;
     let models_observation = observation_for_kind(&observations, CodexRelayProbeKind::Models);
 
@@ -299,20 +308,25 @@ fn capture_provider_catalog_epoch(
         return None;
     }
 
-    let mut final_headers = axum::http::HeaderMap::new();
-    super::attempt_request::inject_auth_headers(
-        "codex",
-        &target.upstream.auth,
-        endpoint.as_str(),
-        &mut final_headers,
-    )
-    .ok()?;
+    let credential_generation = runtime_snapshot.credential_generation();
+    let credential = credential_generation
+        .capture_bound(&target.provider_endpoint)
+        .ok()?;
+    if !credential.is_available() {
+        return None;
+    }
+    let credential_scope = credential_generation
+        .credential_scope_for_route_digest(&target.provider_endpoint)
+        .ok()?;
+    let account_fingerprint = credential_scope
+        .map(AccountFingerprint::from_credential_scope)
+        .unwrap_or_else(AccountFingerprint::unscoped);
     let route_scope = target.provider_endpoint.stable_key();
     let scope = ProviderCatalogScope::new(
         adapter,
         endpoint.as_str(),
         route_scope,
-        AccountFingerprint::from_final_headers(&final_headers),
+        account_fingerprint,
         runtime_snapshot.digest(),
     )
     .ok()?;

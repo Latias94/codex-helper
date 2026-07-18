@@ -57,11 +57,29 @@ pub(super) async fn routing_explain_for_proxy(
     let template = graph.route_plan(&request).map_err(|error| {
         AdminApiHttpError::internal("admin_routing_explain_route_plan_failed", error.to_string())
     })?;
+    let runtime_identities = template.candidate_identities().map_err(|error| {
+        AdminApiHttpError::internal(
+            "admin_routing_explain_credential_binding_failed",
+            error.to_string(),
+        )
+    })?;
     let mut runtime = proxy
         .state
-        .route_plan_runtime_state_with_provider_policy(proxy.service_name, provider_policy.as_ref())
+        .route_plan_runtime_state_with_provider_policy(
+            proxy.service_name,
+            provider_policy.as_ref(),
+            runtime_snapshot.revision(),
+            runtime_identities.as_slice(),
+        )
         .await;
-    apply_auth_resolution_to_runtime(proxy.service_name, &template, &mut runtime);
+    apply_auth_resolution_to_runtime(proxy.service_name, &template, &mut runtime).map_err(
+        |error| {
+            AdminApiHttpError::internal(
+                "admin_routing_explain_credential_binding_failed",
+                error.to_string(),
+            )
+        },
+    )?;
     apply_concurrency_snapshots_to_runtime(
         proxy,
         &template,

@@ -88,7 +88,7 @@ fn assert_load_rejected_without_modification(
     assert!(
         error
             .to_string()
-            .contains("normal startup only accepts version = 5"),
+            .contains("normal startup only accepts version = 6"),
         "unexpected {label} rejection: {error}"
     );
     assert_eq!(
@@ -215,7 +215,7 @@ fn complex_version_5_route_graph_loads_from_the_current_contract() {
 }
 
 #[test]
-fn v0_20_3_supported_version_5_fixture_loads_without_rewrite() {
+fn v0_20_3_supported_version_5_fixture_migrates_with_exact_backup() {
     let _env = setup_temp_codex_home();
     let path = current_config_path();
     write_file(&path, V0_20_3_TYPICAL_CONFIG);
@@ -442,15 +442,16 @@ fn v0_20_3_supported_version_5_fixture_loads_without_rewrite() {
             .collect::<Vec<_>>(),
         vec![("primary", "default"), ("regional", "fast")]
     );
+    let migrated = std::fs::read_to_string(&path).expect("read migrated fixture");
+    assert!(migrated.contains("version = 6"));
     assert_eq!(
-        std::fs::read(&path).expect("read fixture after load"),
+        std::fs::read(path.with_file_name("config.toml.bak")).expect("read exact v0.20.3 backup"),
         original
     );
-    assert!(!path.with_file_name("config.toml.bak").exists());
 }
 
 #[test]
-fn loading_version_5_config_does_not_rewrite_original_bytes() {
+fn loading_version_5_config_writes_v6_and_preserves_original_bytes_in_backup() {
     let _env = setup_temp_codex_home();
     let path = current_config_path();
     write_file(&path, COMPLEX_VERSION_5_CONFIG);
@@ -458,13 +459,14 @@ fn loading_version_5_config_does_not_rewrite_original_bytes() {
 
     test_runtime()
         .block_on(load_config())
-        .expect("load current config without rewriting it");
+        .expect("migrate version 5 config");
 
+    let migrated = std::fs::read_to_string(&path).expect("read migrated config");
+    assert!(migrated.contains("version = 6"));
     assert_eq!(
-        std::fs::read(&path).expect("read config bytes after load"),
+        std::fs::read(path.with_file_name("config.toml.bak")).expect("read exact version 5 backup"),
         original
     );
-    assert!(!path.with_file_name("config.toml.bak").exists());
 }
 
 #[test]
@@ -524,7 +526,7 @@ fn config_init_force_backs_up_retired_v5_before_replacement() {
         retired
     );
     let replacement = std::fs::read_to_string(&path).expect("read replacement template");
-    assert!(replacement.contains("version = 5"));
+    assert!(replacement.contains("version = 6"));
     assert!(!replacement.contains("[ui.usage_forecast]"));
 }
 
@@ -558,7 +560,7 @@ fn removed_codex_compaction_config_is_auto_migrated_with_backup() {
         assert!(
             std::fs::read_to_string(&path)
                 .expect("read cleaned config")
-                .contains("version = 5"),
+                .contains("version = 6"),
             "{label} cleanup did not retain the current version"
         );
     }
@@ -622,7 +624,7 @@ fn retired_version_5_inputs_are_auto_migrated_before_typed_load() {
         assert!(
             std::fs::read_to_string(&path)
                 .expect("read cleaned current config")
-                .contains("version = 5"),
+                .contains("version = 6"),
             "cleanup for {retired_path} did not produce a current config"
         );
     }
@@ -655,7 +657,7 @@ fn legacy_toml_schemas_are_auto_migrated_with_backups() {
         assert_eq!(config.version, CURRENT_CONFIG_VERSION);
         let migrated = std::fs::read_to_string(&path).expect("read migrated TOML");
         assert!(
-            migrated.contains("version = 5"),
+            migrated.contains("version = 6"),
             "{label} was not versioned"
         );
         assert_eq!(
@@ -674,8 +676,8 @@ fn future_toml_schema_is_rejected_without_modification() {
     assert_load_rejected_without_modification(
         &runtime,
         &path,
-        "version 6",
-        "version = 6\n[notify]\nenabled = true\n",
+        "version 7",
+        "version = 7\n[notify]\nenabled = true\n",
     );
 }
 
@@ -799,7 +801,7 @@ fn legacy_json_config_is_auto_migrated_and_malformed_json_is_preserved() {
     assert!(
         std::fs::read_to_string(&toml_path)
             .expect("read migrated JSON config")
-            .contains("version = 5")
+            .contains("version = 6")
     );
     assert_eq!(
         std::fs::read_to_string(&json_path).expect("read retained config.json"),
@@ -954,8 +956,8 @@ fn typed_save_refuses_to_overwrite_legacy_or_retired_sources() {
 
     for (label, text, expected) in [
         (
-            "retired v5",
-            "version = 5\n[ui.usage_forecast]\nenabled = false\n",
+            "retired current schema",
+            "version = 6\n[ui.usage_forecast]\nenabled = false\n",
             "ui.usage_forecast",
         ),
         (

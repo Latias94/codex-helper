@@ -1854,7 +1854,7 @@ async fn proxy_does_not_infer_continuity_domain_from_same_base_url_for_hard_stat
                     ProviderConfig {
                         base_url: Some(shared_base_url.clone()),
                         inline_auth: UpstreamAuth {
-                            auth_token: Some("b-token".to_string()),
+                            auth_token: Some("b-token".to_string().into()),
                             ..UpstreamAuth::default()
                         },
                         tags: std::collections::BTreeMap::from([(
@@ -1869,7 +1869,7 @@ async fn proxy_does_not_infer_continuity_domain_from_same_base_url_for_hard_stat
                     ProviderConfig {
                         base_url: Some(shared_base_url),
                         inline_auth: UpstreamAuth {
-                            auth_token: Some("c-token".to_string()),
+                            auth_token: Some("c-token".to_string().into()),
                             ..UpstreamAuth::default()
                         },
                         tags: std::collections::BTreeMap::from([(
@@ -3063,6 +3063,10 @@ async fn proxy_waits_short_affinity_cooldown_before_responses_compact_under_hard
     };
     let proxy = ProxyService::new(Client::new(), Arc::new(source), "codex");
     let state = proxy.state.clone();
+    let b_endpoint = crate::runtime_identity::ProviderEndpointKey::new("codex", "b", "default");
+    let b_identity = proxy
+        .runtime_identity_for_provider_endpoint_for_test(&b_endpoint)
+        .await;
     let app = crate::proxy::router(proxy);
     let (proxy_addr, proxy_handle) = spawn_axum_server(app);
 
@@ -3084,9 +3088,9 @@ async fn proxy_waits_short_affinity_cooldown_before_responses_compact_under_hard
     assert_eq!(b_responses_hits.load(Ordering::SeqCst), 1);
 
     state
-        .penalize_provider_endpoint_attempt(
+        .penalize_runtime_upstream_attempt(
             "codex",
-            crate::runtime_identity::ProviderEndpointKey::new("codex", "b", "default"),
+            &b_identity,
             1,
             crate::endpoint_health::CooldownBackoff {
                 factor: 1,

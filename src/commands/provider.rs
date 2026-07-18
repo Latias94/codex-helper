@@ -5,8 +5,8 @@ use super::config_doc::{
 };
 use crate::cli_types::ProviderCommand;
 use crate::config::{
-    CURRENT_CONFIG_VERSION, ProviderConfig, ProviderEndpointConfig, ServiceRouteConfig,
-    UpstreamAuth, storage::save_helper_config,
+    CURRENT_CONFIG_VERSION, CredentialRef, ProviderConfig, ProviderEndpointConfig,
+    ServiceRouteConfig, UpstreamAuth, storage::save_helper_config,
 };
 use crate::{CliError, CliResult};
 use serde::Serialize;
@@ -43,7 +43,9 @@ struct ProviderView {
     routing_index: Option<usize>,
     routing_target: bool,
     auth_token_env: Option<String>,
+    auth_token_ref: Option<CredentialRef>,
     api_key_env: Option<String>,
+    api_key_ref: Option<CredentialRef>,
     has_inline_auth_token: bool,
     has_inline_api_key: bool,
     allow_anonymous: bool,
@@ -146,10 +148,12 @@ pub async fn handle_provider_cmd(cmd: ProviderCommand) -> CliResult<()> {
                         enabled: !disabled,
                         base_url: Some(base_url),
                         inline_auth: UpstreamAuth {
-                            auth_token,
+                            auth_token: auth_token.map(Into::into),
                             auth_token_env,
-                            api_key,
+                            auth_token_ref: None,
+                            api_key: api_key.map(Into::into),
                             api_key_env,
+                            api_key_ref: None,
                             allow_anonymous: allow_anonymous.then_some(true),
                         },
                         tags: parsed_tags,
@@ -266,20 +270,12 @@ fn build_provider_view(view: &ServiceRouteConfig, name: &str) -> Option<Provider
         enabled: provider.enabled,
         routing_index,
         routing_target,
-        auth_token_env: provider
-            .inline_auth
-            .auth_token_env
-            .clone()
-            .or_else(|| provider.auth.auth_token_env.clone()),
-        api_key_env: provider
-            .inline_auth
-            .api_key_env
-            .clone()
-            .or_else(|| provider.auth.api_key_env.clone()),
-        has_inline_auth_token: provider.inline_auth.auth_token.is_some()
-            || provider.auth.auth_token.is_some(),
-        has_inline_api_key: provider.inline_auth.api_key.is_some()
-            || provider.auth.api_key.is_some(),
+        auth_token_env: effective_auth.auth_token_env.clone(),
+        auth_token_ref: effective_auth.auth_token_ref.clone(),
+        api_key_env: effective_auth.api_key_env.clone(),
+        api_key_ref: effective_auth.api_key_ref.clone(),
+        has_inline_auth_token: effective_auth.auth_token.is_some(),
+        has_inline_api_key: effective_auth.api_key.is_some(),
         allow_anonymous: effective_auth.allow_anonymous == Some(true),
         tags: provider.tags.clone(),
         supported_models: provider
@@ -394,8 +390,14 @@ fn parse_cli_supported_models(raw_models: &[String]) -> anyhow::Result<BTreeMap<
 
 fn provider_auth_summary(provider: &ProviderView) -> String {
     let mut parts = Vec::new();
+    if let Some(reference) = provider.auth_token_ref.as_ref() {
+        parts.push(format!("bearer_ref={}", credential_ref_summary(reference)));
+    }
     if let Some(env) = provider.auth_token_env.as_deref() {
         parts.push(format!("bearer_env={env}"));
+    }
+    if let Some(reference) = provider.api_key_ref.as_ref() {
+        parts.push(format!("api_key_ref={}", credential_ref_summary(reference)));
     }
     if let Some(env) = provider.api_key_env.as_deref() {
         parts.push(format!("api_key_env={env}"));
@@ -413,6 +415,13 @@ fn provider_auth_summary(provider: &ProviderView) -> String {
         "<none>".to_string()
     } else {
         parts.join(" ")
+    }
+}
+
+fn credential_ref_summary(reference: &CredentialRef) -> String {
+    match reference {
+        CredentialRef::Native { name } => format!("native:{name}"),
+        CredentialRef::SecretFile { path } => format!("secret_file:{path}"),
     }
 }
 
@@ -454,5 +463,33 @@ mod tests {
 
         assert!(parse_cli_supported_models(&[" ".to_string()]).is_err());
         assert!(parse_cli_supported_models(&["gpt-5".to_string(), "gpt-5".to_string()]).is_err());
+    }
+
+    #[test]
+    fn provider_view_projects_configured_credential_references() {
+        let mut view = ServiceRouteConfig::default();
+        view.providers.insert(
+            "relay".to_string(),
+            ProviderConfig {
+                base_url: Some("https://relay.example/v1".to_string()),
+                auth: UpstreamAuth {
+                    auth_token_ref: Some(crate::config::CredentialRef::Native {
+                        name: "relay.primary".to_string(),
+                    }),
+                    ..UpstreamAuth::default()
+                },
+                ..ProviderConfig::default()
+            },
+        );
+
+        let provider = build_provider_view(&view, "relay").expect("provider view");
+        let serialized = serde_json::to_value(&provider).expect("serialize provider view");
+
+        assert_eq!(serialized["auth_token_ref"]["source"], "native");
+        assert_eq!(serialized["auth_token_ref"]["name"], "relay.primary");
+        assert_eq!(
+            provider_auth_summary(&provider),
+            "bearer_ref=native:relay.primary"
+        );
     }
 }

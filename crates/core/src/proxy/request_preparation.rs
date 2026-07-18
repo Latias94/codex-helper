@@ -158,11 +158,6 @@ pub(super) async fn load_request_config_context(
     proxy: &ProxyService,
     session_identity: Option<&ClientSessionIdentity>,
 ) -> RequestConfigContext {
-    let config_reloaded = proxy.config.maybe_reload_from_disk().await;
-    if config_reloaded {
-        super::control_plane_service::prune_runtime_observability_after_reload(proxy).await;
-    }
-
     let session_id = session_identity_value(session_identity);
     let session_identity_source = session_identity_source(session_identity);
     let session_route_control = match session_id.as_deref() {

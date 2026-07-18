@@ -7,6 +7,7 @@ pub mod codex_integration;
 pub mod codex_switch;
 pub mod config;
 pub mod control_plane_client;
+pub mod credentials;
 pub mod dashboard_core;
 pub mod doctor;
 pub mod endpoint_health;

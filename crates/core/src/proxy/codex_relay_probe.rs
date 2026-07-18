@@ -6,6 +6,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::config::UpstreamConfig;
+use crate::credentials::CapturedUpstreamCredential;
 
 use super::classify::{ROUTING_MISMATCH_CAPABILITY_CLASS, classify_upstream_response};
 use super::models_compat::maybe_decode_models_response_body;
@@ -374,16 +375,18 @@ fn looks_like_validation_error(body: &[u8]) -> bool {
 }
 
 #[derive(Debug, Clone)]
-pub struct CodexRelayProbeClient {
+pub(crate) struct CodexRelayProbeClient {
     client: reqwest::Client,
+    credential: CapturedUpstreamCredential,
 }
 
 impl CodexRelayProbeClient {
-    pub fn new(client: reqwest::Client) -> Self {
-        Self { client }
+    pub(crate) fn new(client: reqwest::Client, credential: CapturedUpstreamCredential) -> Self {
+        Self { client, credential }
     }
 
-    pub async fn probe_upstream(
+    #[cfg(test)]
+    pub(crate) async fn probe_upstream(
         &self,
         upstream: &UpstreamConfig,
         spec: &CodexRelayProbeSpec,
@@ -414,25 +417,15 @@ impl CodexRelayProbeClient {
                 HeaderValue::from_static("application/json"),
             );
         }
-        let resolved_auth = match crate::auth_resolution::resolve_upstream_auth_for_target(
+        if super::attempt_request::inject_auth_headers(
             "codex",
-            &upstream.auth,
+            &self.credential,
             url.as_str(),
-        ) {
-            Ok(resolved_auth) => resolved_auth,
-            Err(_) => {
-                return transport_observation(spec.kind, None, UPSTREAM_AUTH_UNAVAILABLE_REASON);
-            }
-        };
-        if let Some(token) = resolved_auth.auth_token.value()
-            && let Ok(value) = HeaderValue::from_str(&format!("Bearer {token}"))
+            &mut headers,
+        )
+        .is_err()
         {
-            headers.insert(axum::http::header::AUTHORIZATION, value);
-        }
-        if let Some(key) = resolved_auth.api_key.value()
-            && let Ok(value) = HeaderValue::from_str(key)
-        {
-            headers.insert("x-api-key", value);
+            return transport_observation(spec.kind, None, UPSTREAM_AUTH_UNAVAILABLE_REASON);
         }
 
         let mut request = self
@@ -562,6 +555,26 @@ mod tests {
             supported_models: HashMap::new(),
             model_mapping: HashMap::new(),
         }
+    }
+
+    fn captured_credential(upstream: &UpstreamConfig) -> CapturedUpstreamCredential {
+        let store = crate::runtime_store::RuntimeStore::open_in_memory()
+            .expect("open credential runtime store");
+        let runtime = crate::credentials::CredentialRuntime::from_runtime_store(
+            crate::credentials::CredentialSourceCapabilities::server(),
+            &store,
+        )
+        .expect("build credential runtime");
+        let provider_endpoint =
+            crate::runtime_identity::ProviderEndpointKey::new("codex", "test", "default");
+        runtime
+            .build_generation([crate::credentials::CredentialCandidateInput {
+                provider_endpoint: provider_endpoint.clone(),
+                auth: &upstream.auth,
+            }])
+            .expect("build credential generation")
+            .capture_bound(&provider_endpoint)
+            .expect("capture registered credential")
     }
 
     fn spawn_axum_server(app: axum::Router) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
@@ -735,9 +748,10 @@ mod tests {
         );
         let (addr, handle) = spawn_axum_server(app);
         let mut upstream = upstream(format!("http://{addr}/v1"));
-        upstream.auth.auth_token = Some("probe-token".to_string());
+        upstream.auth.auth_token = Some("probe-token".to_string().into());
 
-        let client = CodexRelayProbeClient::new(reqwest::Client::new());
+        let client =
+            CodexRelayProbeClient::new(reqwest::Client::new(), captured_credential(&upstream));
         let result = client
             .probe_upstream(
                 &upstream,
@@ -783,8 +797,8 @@ mod tests {
             .resolve("relay.example", addr)
             .build()
             .expect("build probe client");
-        let client = CodexRelayProbeClient::new(client);
         let mut target = upstream(format!("http://relay.example:{}/v1", addr.port()));
+        let client = CodexRelayProbeClient::new(client, captured_credential(&target));
         let spec = CodexRelayProbeSpec::for_kind(CodexRelayProbeKind::Models);
 
         let rejected = client.probe_upstream(&target, &spec).await;
@@ -796,6 +810,8 @@ mod tests {
         assert_eq!(rejected.reason, UPSTREAM_AUTH_UNAVAILABLE_REASON);
 
         target.auth.allow_anonymous = Some(true);
+        let client =
+            CodexRelayProbeClient::new(client.client.clone(), captured_credential(&target));
         let allowed = client.probe_upstream(&target, &spec).await;
 
         assert_eq!(*hits.lock().expect("lock hits"), 1);
@@ -835,10 +851,12 @@ mod tests {
         );
         let (target_addr, target_handle) = spawn_axum_server(target_app);
 
-        let client = CodexRelayProbeClient::new(reqwest::Client::new());
+        let target = upstream(format!("http://{target_addr}/v1"));
+        let client =
+            CodexRelayProbeClient::new(reqwest::Client::new(), captured_credential(&target));
         let result = client
             .probe_upstream(
-                &upstream(format!("http://{target_addr}/v1")),
+                &target,
                 &CodexRelayProbeSpec::for_kind(CodexRelayProbeKind::Models),
             )
             .await;
@@ -873,11 +891,13 @@ mod tests {
             }),
         );
         let (addr, handle) = spawn_axum_server(app);
-        let client = CodexRelayProbeClient::new(reqwest::Client::new());
+        let target = upstream(format!("http://{addr}/v1"));
+        let client =
+            CodexRelayProbeClient::new(reqwest::Client::new(), captured_credential(&target));
 
         let result = client
             .probe_upstream(
-                &upstream(format!("http://{addr}/v1")),
+                &target,
                 &CodexRelayProbeSpec::for_kind(CodexRelayProbeKind::Models),
             )
             .await;

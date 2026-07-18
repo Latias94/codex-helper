@@ -348,7 +348,7 @@ pub(super) async fn execute_provider_chain_with_route_executor(
     let executor = RoutePlanExecutor::new(template);
     let route_graph_key = template.route_graph_key();
     let total_upstreams = template.candidates.len();
-    let mut runtime = route_graph_runtime_for_request(
+    let mut runtime = match route_graph_runtime_for_request(
         ctx.proxy,
         template,
         routing_control_graph_key,
@@ -356,7 +356,25 @@ pub(super) async fn execute_provider_chain_with_route_executor(
         route_plan.provider_policy(),
         ctx.session_id,
     )
-    .await;
+    .await
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            tracing::error!(
+                service = ctx.proxy.service_name,
+                request_id = ctx.request_id,
+                error = %error,
+                "captured runtime credential binding is invalid"
+            );
+            return ProviderExecutionOutcome::Exhausted(ProviderExecutionState {
+                route_attempts: Vec::new(),
+                last_err: Some((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "configured upstream credentials are unavailable".to_string(),
+                )),
+            });
+        }
+    };
     let mut route_state = RoutePlanAttemptState::default();
     let provider_chain_policy =
         ProviderChainAttemptPolicy::route_graph(ctx.request_flavor, Some(template.affinity_policy));
@@ -559,7 +577,7 @@ impl<'a, 'route> RouteGraphAttemptLoop<'a, 'route> {
                             "reason": "short_cooldown",
                         }));
                         tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
-                        *runtime = route_graph_runtime_for_request(
+                        let refreshed_runtime = route_graph_runtime_for_request(
                             ctx.proxy,
                             executor.template(),
                             routing_control_graph_key,
@@ -568,10 +586,27 @@ impl<'a, 'route> RouteGraphAttemptLoop<'a, 'route> {
                             ctx.session_id,
                         )
                         .await;
+                        match refreshed_runtime {
+                            Ok(refreshed_runtime) => *runtime = refreshed_runtime,
+                            Err(error) => {
+                                tracing::error!(
+                                    service = ctx.proxy.service_name,
+                                    request_id = ctx.request_id,
+                                    error = %error,
+                                    "captured runtime credential binding became invalid"
+                                );
+                                *last_err = Some((
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    "configured upstream credentials are unavailable".to_string(),
+                                ));
+                                break;
+                            }
+                        }
                         continue;
                     }
                     enqueue_usage_probes_for_provider_endpoints(
                         ctx.proxy,
+                        executor.template(),
                         report.provider_endpoints_to_probe.iter(),
                     )
                     .await;
@@ -581,7 +616,23 @@ impl<'a, 'route> RouteGraphAttemptLoop<'a, 'route> {
                 break;
             };
             let selected_candidate = selected.candidate;
-            let target = executor.template().capture_candidate(selected_candidate);
+            let target = match executor.template().capture_candidate(selected_candidate) {
+                Ok(target) => target,
+                Err(error) => {
+                    log_control_trace_event(serde_json::json!({
+                        "event": "route_candidate_credential_binding_failed",
+                        "service": ctx.proxy.service_name,
+                        "request_id": ctx.request_id,
+                        "provider_endpoint_key": selected.provider_endpoint.stable_key(),
+                        "error": error.to_string(),
+                    }));
+                    *last_err = Some((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "captured runtime route has no matching credential binding".to_string(),
+                    ));
+                    break;
+                }
+            };
             let claimed = if reservation_selection_guard.is_some() {
                 match claim_session_route_reservation(
                     ctx.proxy,
@@ -670,6 +721,7 @@ impl<'a, 'route> RouteGraphAttemptLoop<'a, 'route> {
                 );
                 enqueue_usage_probes_for_provider_endpoints(
                     ctx.proxy,
+                    executor.template(),
                     balance_probe_targets.iter(),
                 )
                 .await;
@@ -722,7 +774,7 @@ impl<'a, 'route> RouteGraphAttemptLoop<'a, 'route> {
                 let selected_provider_endpoint = executor
                     .template()
                     .candidate_provider_endpoint_key(selected_candidate);
-                *runtime = route_graph_runtime_for_request(
+                let refreshed_runtime = route_graph_runtime_for_request(
                     ctx.proxy,
                     executor.template(),
                     routing_control_graph_key,
@@ -731,6 +783,22 @@ impl<'a, 'route> RouteGraphAttemptLoop<'a, 'route> {
                     ctx.session_id,
                 )
                 .await;
+                match refreshed_runtime {
+                    Ok(refreshed_runtime) => *runtime = refreshed_runtime,
+                    Err(error) => {
+                        tracing::error!(
+                            service = ctx.proxy.service_name,
+                            request_id = ctx.request_id,
+                            error = %error,
+                            "captured runtime credential binding became invalid"
+                        );
+                        *last_err = Some((
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "configured upstream credentials are unavailable".to_string(),
+                        ));
+                        break;
+                    }
+                }
                 let validation_runtime = runtime_for_acquired_candidate_revalidation(
                     executor.template(),
                     runtime,
@@ -1017,6 +1085,7 @@ fn log_degraded_selection_balance_reprobe(
 
 async fn enqueue_usage_probes_for_provider_endpoints<'a>(
     proxy: &ProxyService,
+    template: &crate::routing_ir::RoutePlanTemplate,
     provider_endpoints: impl IntoIterator<Item = &'a ProviderEndpointKey>,
 ) {
     let provider_endpoints = provider_endpoints.into_iter().cloned().collect::<Vec<_>>();
@@ -1024,14 +1093,19 @@ async fn enqueue_usage_probes_for_provider_endpoints<'a>(
         return;
     }
 
-    let cfg_snapshot = proxy.config.snapshot().await;
+    let topology = template.continuity_topology();
     for provider_endpoint in provider_endpoints {
+        let Some(candidate) = topology.find_candidate_by_provider_endpoint(&provider_endpoint)
+        else {
+            continue;
+        };
+        let Ok(target) = template.capture_candidate(candidate) else {
+            continue;
+        };
         super::providers_api::enqueue_provider_balance_probe(
             proxy.client.clone(),
-            cfg_snapshot.clone(),
             proxy.state.clone(),
-            proxy.service_name,
-            provider_endpoint,
+            target,
         );
     }
 }
@@ -1048,7 +1122,9 @@ fn record_executor_unsupported_model_skips(
             continue;
         };
         let avoid_set = hash_set_from_indices(&skipped.avoided_candidate_indices);
-        let target = executor.template().capture_candidate(skipped.candidate);
+        let Ok(target) = executor.template().capture_candidate(skipped.candidate) else {
+            continue;
+        };
         record_unsupported_model_skip(
             route_attempts,
             UnsupportedModelSkipParams {
@@ -1137,6 +1213,7 @@ mod tests {
                 .enumerate()
                 .map(|(idx, provider)| test_route_candidate(provider, idx as u32))
                 .collect(),
+            credential_generation: crate::credentials::CredentialGeneration::empty(),
         }
     }
 

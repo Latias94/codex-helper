@@ -47,8 +47,8 @@ use crate::runtime_store::{
     ProviderObservation, ProviderObservationCommit, ProviderObservationDisposition,
     ProviderObservationReservation, ProviderObservationScope, ProviderPolicySnapshot,
     RequestAccountingScope, RuntimeDocumentCommit, RuntimeDocumentKind, RuntimeDocumentWrite,
-    RuntimeStore, RuntimeStoreError, SessionAffinityIdentitySource, SessionAffinityLimit,
-    SessionAffinityRecord, TerminalDisposition,
+    RuntimeQuotaIdentity, RuntimeStore, RuntimeStoreError, SessionAffinityIdentitySource,
+    SessionAffinityLimit, SessionAffinityRecord, TerminalDisposition,
 };
 #[cfg(test)]
 use crate::runtime_store::{
@@ -72,6 +72,7 @@ pub use self::attribution_index::{
     AttributionPoolKey, AttributionQuery, AttributionQueryResult,
 };
 
+pub(crate) use self::routing_control::PreparedRoutingOperatorRouteGraph;
 pub use self::routing_control::{
     NewSessionPreference, RoutingOperatorControlCommit, RoutingOperatorControlError,
     RoutingOperatorControlSnapshot, RoutingOperatorControlUpdate,
@@ -98,7 +99,14 @@ pub use self::session_identity::{
     enrich_session_identity_cards_with_host_transcripts,
 };
 pub use crate::sessions::{ProjectIdentity, ProjectIdentityKind};
-type ProviderBalanceMap = HashMap<ProviderEndpointKey, HashMap<String, ProviderBalanceSnapshot>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderBalanceRecord {
+    snapshot: ProviderBalanceSnapshot,
+    route_scope: Option<String>,
+}
+
+type ProviderBalanceMap = HashMap<ProviderEndpointKey, HashMap<String, ProviderBalanceRecord>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderManualEligibilityUpdate {
@@ -134,6 +142,7 @@ pub(crate) enum ProviderBalanceSnapshotPublication {
     Published,
     IgnoredOlder,
     IgnoredInvalidIdentity,
+    IgnoredInactiveRuntimeIdentity,
 }
 
 type OperatorUsageSummaryDayMap = HashMap<i32, RequestUsageAggregate>;
@@ -151,6 +160,128 @@ struct ProviderEndpointRuntimeHealth {
     cooldown_until: Option<std::time::Instant>,
     penalty_streak: u32,
     last_good_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ProviderEndpointRuntimeHealthKey {
+    provider_endpoint: ProviderEndpointKey,
+    route_scope: String,
+}
+
+impl ProviderEndpointRuntimeHealthKey {
+    fn for_service(service_name: &str, identity: &RuntimeUpstreamIdentity) -> Option<Self> {
+        if identity.provider_endpoint.service_name != service_name {
+            return None;
+        }
+        Some(Self {
+            provider_endpoint: identity.provider_endpoint.clone(),
+            route_scope: identity.policy_route_scope(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProviderEndpointRuntimeHealthState {
+    active_revision: Option<u64>,
+    identities_authoritative: bool,
+    active_identities: HashSet<ProviderEndpointRuntimeHealthKey>,
+    health: HashMap<ProviderEndpointRuntimeHealthKey, ProviderEndpointRuntimeHealth>,
+}
+
+fn project_provider_endpoint_runtime_health(
+    runtime: &mut RoutePlanRuntimeState,
+    state: &mut ProviderEndpointRuntimeHealthState,
+    identities: &[ProviderEndpointRuntimeHealthKey],
+    now: std::time::Instant,
+) {
+    let mut affinity: Option<(ProviderEndpointKey, u64)> = None;
+    for identity in identities {
+        let Some(health) = state.health.get_mut(identity) else {
+            continue;
+        };
+        if health.cooldown_until.is_some_and(|until| now >= until) {
+            health.failure_count = 0;
+            health.cooldown_until = None;
+        }
+        let cooldown_active = health.cooldown_until.is_some_and(|until| now < until);
+        let cooldown_remaining_secs = health
+            .cooldown_until
+            .and_then(|until| (now < until).then(|| until.duration_since(now).as_secs().max(1)));
+        runtime.set_provider_endpoint(
+            identity.provider_endpoint.clone(),
+            RoutePlanUpstreamRuntimeState {
+                runtime_disabled: false,
+                draining: false,
+                failure_count: health.failure_count,
+                cooldown_active,
+                cooldown_remaining_secs,
+                usage_exhausted: false,
+                missing_auth: false,
+                concurrency_saturated: false,
+                concurrency_active: None,
+                concurrency_limit: None,
+            },
+        );
+        if let Some(last_good_at_ms) = health.last_good_at_ms
+            && affinity
+                .as_ref()
+                .is_none_or(|(_, current)| last_good_at_ms > *current)
+        {
+            affinity = Some((identity.provider_endpoint.clone(), last_good_at_ms));
+        }
+    }
+    if let Some((provider_endpoint, _)) = affinity {
+        runtime.set_affinity_provider_endpoint(Some(provider_endpoint));
+    }
+}
+
+fn apply_provider_policy_to_route_runtime(
+    runtime: &mut RoutePlanRuntimeState,
+    service_name: &str,
+    policy_snapshot: &ProviderPolicySnapshot,
+    now_ms: u64,
+) {
+    for projection in policy_snapshot
+        .projections
+        .iter()
+        .filter(|projection| projection.provider_endpoint.service_name == service_name)
+    {
+        let mut upstream_state = runtime.provider_endpoint(&projection.provider_endpoint);
+        if projection.automatic == ProviderAutomaticEligibility::Blocked {
+            upstream_state.usage_exhausted = true;
+            if let Some(action) = projection.active_action.as_ref() {
+                upstream_state.cooldown_active = true;
+                upstream_state.cooldown_remaining_secs = action
+                    .expires_at_unix_ms
+                    .map(|expires_at| expires_at.saturating_sub(now_ms).div_ceil(1_000))
+                    .filter(|remaining| *remaining > 0);
+            }
+        }
+        match projection.manual {
+            ProviderManualEligibility::Enabled => {}
+            ProviderManualEligibility::Disabled => {
+                upstream_state.runtime_disabled = true;
+                upstream_state.draining = false;
+            }
+            ProviderManualEligibility::Draining => {
+                upstream_state.runtime_disabled = false;
+                upstream_state.draining = true;
+            }
+        }
+        runtime.set_provider_endpoint(projection.provider_endpoint.clone(), upstream_state);
+    }
+}
+
+fn active_provider_endpoint_runtime_health<'a>(
+    service_name: &str,
+    identity: &RuntimeUpstreamIdentity,
+    state: &'a mut ProviderEndpointRuntimeHealthState,
+) -> Option<&'a mut ProviderEndpointRuntimeHealth> {
+    let key = ProviderEndpointRuntimeHealthKey::for_service(service_name, identity)?;
+    if state.active_revision.is_some() && !state.active_identities.contains(&key) {
+        return None;
+    }
+    Some(state.health.entry(key).or_default())
 }
 
 #[derive(Debug, Clone)]
@@ -227,12 +358,11 @@ fn quota_runtime_error(detail: impl Into<String>) -> RuntimeStoreError {
 
 fn load_quota_runtime_state(
     runtime_store: &RuntimeStore,
-) -> Result<(QuotaPoolRegistry, [u8; 32], Option<u64>), RuntimeStoreError> {
+) -> Result<(QuotaPoolRegistry, RuntimeQuotaIdentity, Option<u64>), RuntimeStoreError> {
     let identity = runtime_store.load_or_create_quota_identity()?;
-    let install_key = *identity.key();
     let Some(document) = runtime_store.read_runtime_document(RuntimeDocumentKind::QuotaRegistry)?
     else {
-        return Ok((QuotaPoolRegistry::default(), install_key, None));
+        return Ok((QuotaPoolRegistry::default(), identity, None));
     };
     if document.schema_version != QUOTA_CHECKPOINT_SCHEMA_VERSION {
         return Err(quota_runtime_error(format!(
@@ -254,7 +384,7 @@ fn load_quota_runtime_state(
         DEFAULT_SAMPLE_RETENTION_MS,
     )
     .ok_or_else(|| quota_runtime_error("checkpoint cannot be restored"))?;
-    Ok((registry, install_key, Some(document.revision)))
+    Ok((registry, identity, Some(document.revision)))
 }
 
 struct PreparedQuotaRegistryCheckpoint {
@@ -1249,9 +1379,8 @@ pub struct ProxyState {
     provider_balance_refresh_coordinator: Arc<ProviderBalanceRefreshCoordinator>,
     quota_pool_registry: SyncRwLock<QuotaPoolRegistry>,
     quota_registry_document_revision: AtomicU64,
-    quota_install_key: [u8; 32],
-    provider_endpoint_runtime_health:
-        RwLock<HashMap<String, HashMap<ProviderEndpointKey, ProviderEndpointRuntimeHealth>>>,
+    quota_identity: RuntimeQuotaIdentity,
+    provider_endpoint_runtime_health: RwLock<HashMap<String, ProviderEndpointRuntimeHealthState>>,
     provider_policy_updates: AsyncMutex<()>,
     provider_policy_snapshot: RwLock<Arc<ProviderPolicySnapshot>>,
     routing_operator_control: RwLock<RoutingOperatorControlSnapshot>,
@@ -1335,7 +1464,7 @@ impl ProxyState {
         policy: RuntimePolicy,
         runtime_store: Arc<RuntimeStore>,
     ) -> Result<Arc<Self>, RuntimeStoreError> {
-        let (quota_pool_registry, quota_install_key, quota_registry_document_revision) =
+        let (quota_pool_registry, quota_identity, quota_registry_document_revision) =
             load_quota_runtime_state(runtime_store.as_ref())?;
         let hydrated = hydrate_runtime_projections(&runtime_store)?;
         runtime_store.prune_session_affinities(
@@ -1369,7 +1498,7 @@ impl ProxyState {
             quota_registry_document_revision: AtomicU64::new(
                 quota_registry_document_revision.unwrap_or(0),
             ),
-            quota_install_key,
+            quota_identity,
             provider_endpoint_runtime_health: RwLock::new(HashMap::new()),
             provider_policy_updates: AsyncMutex::new(()),
             provider_policy_snapshot: RwLock::new(provider_policy_snapshot),
@@ -1398,6 +1527,29 @@ impl ProxyState {
 
     pub(crate) fn runtime_store(&self) -> &RuntimeStore {
         self.runtime_store.as_ref()
+    }
+
+    pub(crate) fn derive_usage_account_fingerprint(
+        &self,
+        token: &[u8],
+        new_api_user_id: Option<&str>,
+    ) -> String {
+        self.quota_identity
+            .derive_usage_account_fingerprint(token, new_api_user_id)
+    }
+
+    pub(crate) fn derive_provider_account_fingerprint(
+        &self,
+        credential_scope: Option<&str>,
+        final_headers: &http::HeaderMap,
+    ) -> AccountFingerprint {
+        if let Some(credential_scope) = credential_scope {
+            return AccountFingerprint::from_credential_scope(credential_scope);
+        }
+        self.quota_identity
+            .derive_provider_account_fingerprint(final_headers)
+            .map(AccountFingerprint::from_keyed_account_digest)
+            .unwrap_or_else(AccountFingerprint::unscoped)
     }
 
     pub(crate) fn provider_balance_refresh_coordinator(
@@ -1439,6 +1591,11 @@ impl ProxyState {
     #[cfg(test)]
     async fn hold_attempt_publication_for_test(&self) -> impl Drop + '_ {
         self.request_lifecycle_projection.write().await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn hold_provider_runtime_health_publication_for_test(&self) -> impl Drop + '_ {
+        self.provider_endpoint_runtime_health.write().await
     }
 
     #[cfg(test)]
@@ -2032,100 +2189,135 @@ impl ProxyState {
         }
     }
 
+    #[cfg(test)]
     pub async fn route_plan_runtime_state_for_provider_endpoints(
         &self,
         service_name: &str,
     ) -> RoutePlanRuntimeState {
         let policy_snapshot = self.capture_provider_policy_snapshot().await;
-        self.route_plan_runtime_state_with_provider_policy(service_name, &policy_snapshot)
-            .await
+        let mut runtime = RoutePlanRuntimeState::default();
+        let now = std::time::Instant::now();
+        {
+            let mut guard = self.provider_endpoint_runtime_health.write().await;
+            if let Some(per_service) = guard.get_mut(service_name) {
+                let keys = per_service.health.keys().cloned().collect::<Vec<_>>();
+                project_provider_endpoint_runtime_health(
+                    &mut runtime,
+                    per_service,
+                    keys.as_slice(),
+                    now,
+                );
+            }
+        }
+        apply_provider_policy_to_route_runtime(
+            &mut runtime,
+            service_name,
+            policy_snapshot.as_ref(),
+            unix_now_ms(),
+        );
+        runtime
     }
 
     pub async fn route_plan_runtime_state_with_provider_policy(
         &self,
         service_name: &str,
         policy_snapshot: &ProviderPolicySnapshot,
+        runtime_revision: u64,
+        runtime_identities: &[RuntimeUpstreamIdentity],
     ) -> RoutePlanRuntimeState {
+        let projected_keys = runtime_identities
+            .iter()
+            .filter_map(|identity| {
+                ProviderEndpointRuntimeHealthKey::for_service(service_name, identity)
+            })
+            .collect::<HashSet<_>>();
         let mut runtime = RoutePlanRuntimeState::default();
         let now = std::time::Instant::now();
-        let now_ms = unix_now_ms();
         {
             let mut guard = self.provider_endpoint_runtime_health.write().await;
-            if let Some(per_service) = guard.get_mut(service_name) {
-                let mut affinity: Option<(ProviderEndpointKey, u64)> = None;
-                for (endpoint_key, health) in per_service.iter_mut() {
-                    if health.cooldown_until.is_some_and(|until| now >= until) {
-                        health.failure_count = 0;
-                        health.cooldown_until = None;
+            let per_service = guard.entry(service_name.to_string()).or_default();
+            if per_service.identities_authoritative {
+                if per_service
+                    .active_revision
+                    .is_none_or(|active_revision| runtime_revision > active_revision)
+                {
+                    per_service.active_revision = Some(runtime_revision);
+                }
+            } else {
+                match per_service.active_revision {
+                    Some(active_revision) if runtime_revision < active_revision => {}
+                    Some(active_revision) if runtime_revision == active_revision => {
+                        per_service
+                            .active_identities
+                            .extend(projected_keys.iter().cloned());
                     }
-                    let cooldown_active = health.cooldown_until.is_some_and(|until| now < until);
-                    let cooldown_remaining_secs = health.cooldown_until.and_then(|until| {
-                        if now < until {
-                            Some(until.duration_since(now).as_secs().max(1))
-                        } else {
-                            None
-                        }
-                    });
-                    runtime.set_provider_endpoint(
-                        endpoint_key.clone(),
-                        RoutePlanUpstreamRuntimeState {
-                            runtime_disabled: false,
-                            draining: false,
-                            failure_count: health.failure_count,
-                            cooldown_active,
-                            cooldown_remaining_secs,
-                            usage_exhausted: false,
-                            missing_auth: false,
-                            concurrency_saturated: false,
-                            concurrency_active: None,
-                            concurrency_limit: None,
-                        },
-                    );
-                    if let Some(last_good_at_ms) = health.last_good_at_ms
-                        && affinity
-                            .as_ref()
-                            .is_none_or(|(_, current)| last_good_at_ms > *current)
-                    {
-                        affinity = Some((endpoint_key.clone(), last_good_at_ms));
+                    _ => {
+                        per_service.active_revision = Some(runtime_revision);
+                        per_service.active_identities = projected_keys.clone();
+                        per_service
+                            .health
+                            .retain(|identity, _| projected_keys.contains(identity));
                     }
                 }
-                if let Some((endpoint_key, _)) = affinity {
-                    runtime.set_affinity_provider_endpoint(Some(endpoint_key));
-                }
             }
+
+            let active_keys = projected_keys
+                .into_iter()
+                .filter(|identity| per_service.active_identities.contains(identity))
+                .collect::<Vec<_>>();
+            project_provider_endpoint_runtime_health(
+                &mut runtime,
+                per_service,
+                active_keys.as_slice(),
+                now,
+            );
         }
 
-        for projection in policy_snapshot
-            .projections
-            .iter()
-            .filter(|projection| projection.provider_endpoint.service_name == service_name)
-        {
-            let mut upstream_state = runtime.provider_endpoint(&projection.provider_endpoint);
-            if projection.automatic == ProviderAutomaticEligibility::Blocked {
-                upstream_state.usage_exhausted = true;
-                if let Some(action) = projection.active_action.as_ref() {
-                    upstream_state.cooldown_active = true;
-                    upstream_state.cooldown_remaining_secs = action
-                        .expires_at_unix_ms
-                        .map(|expires_at| expires_at.saturating_sub(now_ms).div_ceil(1_000))
-                        .filter(|remaining| *remaining > 0);
-                }
-            }
-            match projection.manual {
-                ProviderManualEligibility::Enabled => {}
-                ProviderManualEligibility::Disabled => {
-                    upstream_state.runtime_disabled = true;
-                    upstream_state.draining = false;
-                }
-                ProviderManualEligibility::Draining => {
-                    upstream_state.runtime_disabled = false;
-                    upstream_state.draining = true;
-                }
-            }
-            runtime.set_provider_endpoint(projection.provider_endpoint.clone(), upstream_state);
-        }
-
+        apply_provider_policy_to_route_runtime(
+            &mut runtime,
+            service_name,
+            policy_snapshot,
+            unix_now_ms(),
+        );
         runtime
+    }
+
+    pub async fn prune_provider_endpoint_runtime_for_service(
+        &self,
+        service_name: &str,
+        runtime_revision: u64,
+        active_runtime_identities: &[RuntimeUpstreamIdentity],
+    ) {
+        let active_identities = active_runtime_identities
+            .iter()
+            .filter_map(|identity| {
+                ProviderEndpointRuntimeHealthKey::for_service(service_name, identity)
+            })
+            .collect::<HashSet<_>>();
+        let mut changed = false;
+        {
+            let mut guard = self.provider_endpoint_runtime_health.write().await;
+            let per_service = guard.entry(service_name.to_string()).or_default();
+            if per_service
+                .active_revision
+                .is_none_or(|active_revision| runtime_revision >= active_revision)
+            {
+                changed = !per_service.identities_authoritative
+                    || per_service.active_revision != Some(runtime_revision)
+                    || per_service.active_identities != active_identities;
+                per_service.active_revision = Some(runtime_revision);
+                per_service.identities_authoritative = true;
+                per_service.active_identities = active_identities;
+                let before = per_service.health.len();
+                per_service
+                    .health
+                    .retain(|identity, _| per_service.active_identities.contains(identity));
+                changed |= before != per_service.health.len();
+            }
+        }
+        if changed {
+            self.notify_state_changed();
+        }
     }
 
     pub async fn capture_provider_policy_snapshot(&self) -> Arc<ProviderPolicySnapshot> {
@@ -2176,28 +2368,62 @@ impl ProxyState {
         Ok(RoutingOperatorControlCommit { status, snapshot })
     }
 
-    pub async fn reconcile_routing_operator_route_graph(
+    pub(crate) async fn commit_runtime_reload<T>(
         &self,
-        service_name: &str,
-        route_graph_key: &str,
-    ) -> Result<RoutingOperatorControlSnapshot, RoutingOperatorControlError> {
-        let service_name = service_name.trim();
-        if service_name.is_empty() {
-            return Err(RoutingOperatorControlError::EmptyServiceName);
+        route_graphs: &[PreparedRoutingOperatorRouteGraph],
+        identities: &[RuntimeUpstreamIdentity],
+        reconcile_identities: bool,
+        updated_at_ms: u64,
+        commit: impl FnOnce(Arc<ProviderPolicySnapshot>) -> T,
+    ) -> Result<(RoutingOperatorControlSnapshot, T), RuntimeStoreError> {
+        let _update_guard = self.provider_policy_updates.lock().await;
+        let mut current = self.provider_policy_snapshot.write().await;
+        let mut health = self.provider_endpoint_runtime_health.write().await;
+        let mut control = self.routing_operator_control.write().await;
+
+        let (next, next_health, health_changed) = if reconcile_identities {
+            let (next_health, health_changed) =
+                Self::replaced_active_provider_runtime_health_identities(&health, identities);
+            let next = Arc::new(self.with_runtime_store_blocking(|runtime_store| {
+                runtime_store.reconcile_runtime_upstream_identities(identities, updated_at_ms)
+            })?);
+            (next, Some(next_health), health_changed)
+        } else {
+            (Arc::clone(&current), None, false)
+        };
+        let policy_changed = **current != *next;
+        if policy_changed {
+            *current = Arc::clone(&next);
         }
-        let route_graph_key = route_graph_key.trim();
-        if route_graph_key.is_empty() {
-            return Err(RoutingOperatorControlError::EmptyRouteGraphKey);
+        if let Some(next_health) = next_health
+            && health_changed
+        {
+            *health = next_health;
         }
 
-        let mut control = self.routing_operator_control.write().await;
-        let status = control.reconcile_route_graph(service_name, route_graph_key);
+        let mut control_changed = false;
+        for route_graph in route_graphs {
+            control_changed |= control
+                .reconcile_route_graph(route_graph.service_name(), route_graph.route_graph_key())
+                == RoutingOperatorControlUpdate::Applied;
+        }
+        let committed = commit(next);
         let snapshot = control.clone();
         drop(control);
-        if status == RoutingOperatorControlUpdate::Applied {
+        drop(health);
+        drop(current);
+        drop(_update_guard);
+        if policy_changed || health_changed || control_changed {
             self.notify_state_changed();
         }
-        Ok(snapshot)
+        Ok((snapshot, committed))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn hold_routing_operator_control_publication_for_test(
+        &self,
+    ) -> tokio::sync::RwLockWriteGuard<'_, RoutingOperatorControlSnapshot> {
+        self.routing_operator_control.write().await
     }
 
     pub async fn reconcile_runtime_upstream_identities(
@@ -2207,14 +2433,64 @@ impl ProxyState {
     ) -> Result<Arc<ProviderPolicySnapshot>, RuntimeStoreError> {
         let _update_guard = self.provider_policy_updates.lock().await;
         let mut current = self.provider_policy_snapshot.write().await;
+        let mut health = self.provider_endpoint_runtime_health.write().await;
+        let (next_health, health_changed) =
+            Self::replaced_active_provider_runtime_health_identities(&health, identities);
         let next = Arc::new(self.with_runtime_store_blocking(|runtime_store| {
             runtime_store.reconcile_runtime_upstream_identities(identities, updated_at_ms)
         })?);
-        if **current != *next {
+        let policy_changed = **current != *next;
+        if policy_changed {
             *current = Arc::clone(&next);
+        }
+        if health_changed {
+            *health = next_health;
+        }
+        if policy_changed || health_changed {
             self.notify_state_changed();
         }
         Ok(next)
+    }
+
+    fn replaced_active_provider_runtime_health_identities(
+        current: &HashMap<String, ProviderEndpointRuntimeHealthState>,
+        identities: &[RuntimeUpstreamIdentity],
+    ) -> (HashMap<String, ProviderEndpointRuntimeHealthState>, bool) {
+        let mut active_by_service =
+            HashMap::<String, HashSet<ProviderEndpointRuntimeHealthKey>>::new();
+        for identity in identities {
+            let service_name = identity.provider_endpoint.service_name.as_str();
+            let Some(key) = ProviderEndpointRuntimeHealthKey::for_service(service_name, identity)
+            else {
+                continue;
+            };
+            active_by_service
+                .entry(service_name.to_string())
+                .or_default()
+                .insert(key);
+        }
+
+        let mut next = current.clone();
+        let service_names = next
+            .keys()
+            .cloned()
+            .chain(active_by_service.keys().cloned())
+            .collect::<HashSet<_>>();
+        let mut changed = false;
+        for service_name in service_names {
+            let active_identities = active_by_service.remove(&service_name).unwrap_or_default();
+            let state = next.entry(service_name).or_default();
+            changed |=
+                !state.identities_authoritative || state.active_identities != active_identities;
+            state.identities_authoritative = true;
+            state.active_identities = active_identities;
+            let before = state.health.len();
+            state
+                .health
+                .retain(|identity, _| state.active_identities.contains(identity));
+            changed |= before != state.health.len();
+        }
+        (next, changed)
     }
 
     pub async fn reserve_provider_observation(
@@ -2445,37 +2721,39 @@ impl ProxyState {
             .collect()
     }
 
-    pub async fn record_provider_endpoint_attempt_success(
+    pub async fn record_runtime_upstream_attempt_success(
         &self,
         service_name: &str,
-        endpoint_key: ProviderEndpointKey,
+        identity: &RuntimeUpstreamIdentity,
         now_ms: u64,
     ) {
         let mut guard = self.provider_endpoint_runtime_health.write().await;
-        let entry = guard
-            .entry(service_name.to_string())
-            .or_default()
-            .entry(endpoint_key)
-            .or_default();
+        let per_service = guard.entry(service_name.to_string()).or_default();
+        let Some(entry) =
+            active_provider_endpoint_runtime_health(service_name, identity, per_service)
+        else {
+            return;
+        };
         entry.failure_count = 0;
         entry.cooldown_until = None;
         entry.penalty_streak = 0;
         entry.last_good_at_ms = Some(now_ms);
     }
 
-    pub async fn record_provider_endpoint_attempt_failure(
+    pub async fn record_runtime_upstream_attempt_failure(
         &self,
         service_name: &str,
-        endpoint_key: ProviderEndpointKey,
+        identity: &RuntimeUpstreamIdentity,
         failure_threshold_cooldown_secs: u64,
         cooldown_backoff: CooldownBackoff,
     ) {
         let mut guard = self.provider_endpoint_runtime_health.write().await;
-        let entry = guard
-            .entry(service_name.to_string())
-            .or_default()
-            .entry(endpoint_key)
-            .or_default();
+        let per_service = guard.entry(service_name.to_string()).or_default();
+        let Some(entry) =
+            active_provider_endpoint_runtime_health(service_name, identity, per_service)
+        else {
+            return;
+        };
 
         entry.failure_count = entry.failure_count.saturating_add(1);
         if entry.failure_count >= FAILURE_THRESHOLD {
@@ -2499,19 +2777,20 @@ impl ProxyState {
         }
     }
 
-    pub async fn penalize_provider_endpoint_attempt(
+    pub async fn penalize_runtime_upstream_attempt(
         &self,
         service_name: &str,
-        endpoint_key: ProviderEndpointKey,
+        identity: &RuntimeUpstreamIdentity,
         cooldown_secs: u64,
         cooldown_backoff: CooldownBackoff,
     ) {
         let mut guard = self.provider_endpoint_runtime_health.write().await;
-        let entry = guard
-            .entry(service_name.to_string())
-            .or_default()
-            .entry(endpoint_key)
-            .or_default();
+        let per_service = guard.entry(service_name.to_string()).or_default();
+        let Some(entry) =
+            active_provider_endpoint_runtime_health(service_name, identity, per_service)
+        else {
+            return;
+        };
         let effective_secs =
             cooldown_backoff.effective_cooldown_secs(cooldown_secs, entry.penalty_streak);
         entry.failure_count = FAILURE_THRESHOLD;
@@ -2521,26 +2800,36 @@ impl ProxyState {
         entry.last_good_at_ms = None;
     }
 
-    pub async fn prune_provider_endpoint_runtime_for_service(
+    #[cfg(test)]
+    pub async fn record_provider_endpoint_attempt_success(
         &self,
         service_name: &str,
-        active_provider_endpoints: &HashSet<ProviderEndpointKey>,
+        endpoint: ProviderEndpointKey,
+        now_ms: u64,
     ) {
-        let mut changed = false;
-        {
-            let mut guard = self.provider_endpoint_runtime_health.write().await;
-            if let Some(per_service) = guard.get_mut(service_name) {
-                let before = per_service.len();
-                per_service.retain(|key, _| active_provider_endpoints.contains(key));
-                changed |= before != per_service.len();
-                if per_service.is_empty() {
-                    guard.remove(service_name);
-                }
-            }
-        }
-        if changed {
-            self.notify_state_changed();
-        }
+        self.record_runtime_upstream_attempt_success(
+            service_name,
+            &RuntimeUpstreamIdentity::new(endpoint, "https://provider.test"),
+            now_ms,
+        )
+        .await;
+    }
+
+    #[cfg(test)]
+    pub async fn record_provider_endpoint_attempt_failure(
+        &self,
+        service_name: &str,
+        endpoint: ProviderEndpointKey,
+        failure_threshold_cooldown_secs: u64,
+        cooldown_backoff: CooldownBackoff,
+    ) {
+        self.record_runtime_upstream_attempt_failure(
+            service_name,
+            &RuntimeUpstreamIdentity::new(endpoint, "https://provider.test"),
+            failure_threshold_cooldown_secs,
+            cooldown_backoff,
+        )
+        .await;
     }
 
     pub async fn prune_runtime_observability_for_service(
@@ -2588,9 +2877,16 @@ impl ProxyState {
         {
             let mut guard = self.provider_endpoint_runtime_health.write().await;
             if let Some(per_service) = guard.get_mut(service_name) {
-                per_service
-                    .retain(|endpoint_key, _| active_provider_endpoint_keys.contains(endpoint_key));
-                if per_service.is_empty() {
+                per_service.active_identities.retain(|identity| {
+                    active_provider_endpoint_keys.contains(&identity.provider_endpoint)
+                });
+                per_service.health.retain(|identity, _| {
+                    active_provider_endpoint_keys.contains(&identity.provider_endpoint)
+                });
+                if !per_service.identities_authoritative
+                    && per_service.active_identities.is_empty()
+                    && per_service.health.is_empty()
+                {
                     guard.remove(service_name);
                 }
             }
@@ -2638,7 +2934,7 @@ impl ProxyState {
         snapshot: &ProviderBalanceSnapshot,
     ) -> Result<RegistryUpdate, RuntimeStoreError> {
         if context.install_key.is_none() {
-            context.install_key = Some(self.quota_install_key.to_vec());
+            context.install_key = Some(self.quota_identity.key().to_vec());
         }
         let mut registry = self
             .quota_pool_registry
@@ -2776,12 +3072,13 @@ impl ProxyState {
         balances
             .get(&snapshot.provider_endpoint)
             .and_then(|endpoint_balances| endpoint_balances.get(&snapshot.observation_provider_id))
-            .is_some_and(|previous| snapshot.fetched_at_ms <= previous.fetched_at_ms)
+            .is_some_and(|previous| snapshot.fetched_at_ms <= previous.snapshot.fetched_at_ms)
     }
 
     fn publish_provider_balance_snapshot_locked(
         balances: &mut ProviderBalanceMap,
         mut snapshot: ProviderBalanceSnapshot,
+        route_scope: Option<&str>,
         now_ms: u64,
     ) {
         let provider_endpoint = snapshot.provider_endpoint.clone();
@@ -2790,11 +3087,18 @@ impl ProxyState {
         let endpoint_balances = balances.entry(provider_endpoint).or_default();
         if !snapshot.has_amount_data()
             && let Some(previous) = endpoint_balances.get(&observation_provider_id)
+            && previous.route_scope.as_deref() == route_scope
         {
-            snapshot.carry_forward_amount_data_from(previous);
+            snapshot.carry_forward_amount_data_from(&previous.snapshot);
             snapshot.refresh_status(now_ms);
         }
-        endpoint_balances.insert(observation_provider_id, snapshot);
+        endpoint_balances.insert(
+            observation_provider_id,
+            ProviderBalanceRecord {
+                snapshot,
+                route_scope: route_scope.map(str::to_string),
+            },
+        );
     }
 
     pub(crate) async fn try_record_provider_balance_snapshot(
@@ -2814,8 +3118,20 @@ impl ProxyState {
 
     pub(crate) async fn try_record_provider_balance_snapshot_with_quota_context(
         &self,
+        snapshot: ProviderBalanceSnapshot,
+        context: QuotaObservationContext,
+    ) -> Result<ProviderBalanceSnapshotPublication, RuntimeStoreError> {
+        self.try_record_provider_balance_snapshot_with_quota_context_and_route_scope(
+            snapshot, context, None,
+        )
+        .await
+    }
+
+    async fn try_record_provider_balance_snapshot_with_quota_context_and_route_scope(
+        &self,
         mut snapshot: ProviderBalanceSnapshot,
         mut context: QuotaObservationContext,
+        route_scope: Option<&str>,
     ) -> Result<ProviderBalanceSnapshotPublication, RuntimeStoreError> {
         if snapshot.observation_provider_id.trim().is_empty()
             || snapshot.provider_endpoint.service_name.trim().is_empty()
@@ -2832,7 +3148,7 @@ impl ProxyState {
             return Ok(ProviderBalanceSnapshotPublication::IgnoredOlder);
         }
         if context.install_key.is_none() {
-            context.install_key = Some(self.quota_install_key.to_vec());
+            context.install_key = Some(self.quota_identity.key().to_vec());
         }
         let mut registry = self
             .quota_pool_registry
@@ -2848,11 +3164,50 @@ impl ProxyState {
 
         self.publish_quota_registry_document_revision(committed_revision);
         *registry = candidate;
-        Self::publish_provider_balance_snapshot_locked(&mut balances, snapshot, now_ms);
+        Self::publish_provider_balance_snapshot_locked(
+            &mut balances,
+            snapshot,
+            route_scope,
+            now_ms,
+        );
         drop(registry);
         drop(balances);
         self.notify_state_changed();
         Ok(ProviderBalanceSnapshotPublication::Published)
+    }
+
+    pub(crate) async fn try_record_provider_balance_snapshot_for_runtime_identity(
+        &self,
+        snapshot: ProviderBalanceSnapshot,
+        identity: &RuntimeUpstreamIdentity,
+    ) -> Result<ProviderBalanceSnapshotPublication, RuntimeStoreError> {
+        let context = Self::quota_context_for_balance_snapshot(&snapshot);
+        self.try_record_provider_balance_snapshot_with_quota_context_for_runtime_identity(
+            snapshot, context, identity,
+        )
+        .await
+    }
+
+    pub(crate) async fn try_record_provider_balance_snapshot_with_quota_context_for_runtime_identity(
+        &self,
+        snapshot: ProviderBalanceSnapshot,
+        context: QuotaObservationContext,
+        identity: &RuntimeUpstreamIdentity,
+    ) -> Result<ProviderBalanceSnapshotPublication, RuntimeStoreError> {
+        let _update_guard = self.provider_policy_updates.lock().await;
+        let active = self.with_runtime_store_blocking(|runtime_store| {
+            runtime_store.runtime_upstream_identity_is_active(identity)
+        })?;
+        if !active {
+            return Ok(ProviderBalanceSnapshotPublication::IgnoredInactiveRuntimeIdentity);
+        }
+        let route_scope = identity.policy_route_scope();
+        self.try_record_provider_balance_snapshot_with_quota_context_and_route_scope(
+            snapshot,
+            context,
+            Some(route_scope.as_str()),
+        )
+        .await
     }
 
     pub(crate) async fn commit_provider_observation_and_balance_snapshot(
@@ -2894,8 +3249,9 @@ impl ProxyState {
                 snapshot.provider_endpoint.stable_key()
             )));
         }
+        let route_scope = reservation.route_scope().to_string();
         if context.install_key.is_none() {
-            context.install_key = Some(self.quota_install_key.to_vec());
+            context.install_key = Some(self.quota_identity.key().to_vec());
         }
         snapshot.refresh_status(unix_now_ms());
 
@@ -2944,6 +3300,7 @@ impl ProxyState {
                 Self::publish_provider_balance_snapshot_locked(
                     &mut balances,
                     snapshot,
+                    Some(route_scope.as_str()),
                     unix_now_ms(),
                 );
                 drop(registry);
@@ -2967,7 +3324,7 @@ impl ProxyState {
         let mut snapshots = guard
             .iter()
             .filter(|(provider_endpoint, _)| provider_endpoint.service_name == service_name)
-            .flat_map(|(_, providers)| providers.values().cloned())
+            .flat_map(|(_, providers)| providers.values().map(|record| record.snapshot.clone()))
             .collect::<Vec<_>>();
         for snapshot in &mut snapshots {
             snapshot.refresh_status(now_ms);
@@ -2979,6 +3336,30 @@ impl ProxyState {
                     left.observation_provider_id
                         .cmp(&right.observation_provider_id)
                 })
+        });
+        snapshots
+    }
+
+    pub(crate) async fn get_provider_balance_view_for_runtime_identity(
+        &self,
+        identity: &RuntimeUpstreamIdentity,
+    ) -> Vec<ProviderBalanceSnapshot> {
+        let now_ms = unix_now_ms();
+        let route_scope = identity.policy_route_scope();
+        let guard = self.provider_balances.read().await;
+        let mut snapshots = guard
+            .get(&identity.provider_endpoint)
+            .into_iter()
+            .flat_map(|providers| providers.values())
+            .filter(|record| record.route_scope.as_deref() == Some(route_scope.as_str()))
+            .map(|record| record.snapshot.clone())
+            .collect::<Vec<_>>();
+        for snapshot in &mut snapshots {
+            snapshot.refresh_status(now_ms);
+        }
+        snapshots.sort_by(|left, right| {
+            left.observation_provider_id
+                .cmp(&right.observation_provider_id)
         });
         snapshots
     }
@@ -4682,6 +5063,26 @@ mod tests {
         .expect("hydrate injected runtime projections");
 
         assert!(Arc::ptr_eq(&runtime_store, &state.runtime_store_handle()));
+    }
+
+    #[test]
+    fn usage_account_fingerprint_delegates_to_runtime_store_identity() {
+        let runtime_store = Arc::new(
+            RuntimeStore::open_in_memory().expect("open injected in-memory runtime store"),
+        );
+        let expected_identity = runtime_store
+            .load_or_create_quota_identity()
+            .expect("load runtime quota identity");
+        let state = ProxyState::new_with_runtime_policy_and_store(
+            test_runtime_policy(0, 0, 2_000),
+            runtime_store,
+        )
+        .expect("hydrate injected runtime projections");
+
+        assert_eq!(
+            state.derive_usage_account_fingerprint(b"provider-token", Some("user-42")),
+            expected_identity.derive_usage_account_fingerprint(b"provider-token", Some("user-42"))
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -7226,7 +7627,7 @@ confidence = "exact"
     }
 
     #[test]
-    fn provider_endpoint_runtime_health_is_keyed_by_provider_endpoint() {
+    fn provider_runtime_health_projects_endpoint_state_and_policy() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         runtime.block_on(async {
             let state = ProxyState::new();
@@ -7298,6 +7699,107 @@ confidence = "exact"
                 .route_plan_runtime_state_for_provider_endpoints("codex")
                 .await;
             assert!(runtime.provider_endpoint(&fallback).runtime_disabled);
+        });
+    }
+
+    #[test]
+    fn credential_rotation_ignores_late_passive_health_writes_from_old_identity() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            let endpoint = ProviderEndpointKey::new("codex", "relay", "default");
+            let identity_a = RuntimeUpstreamIdentity::new_with_credential_scope(
+                endpoint.clone(),
+                "https://relay.example/v1",
+                None,
+                Some("credential-a".to_string()),
+            );
+            let identity_b = RuntimeUpstreamIdentity::new_with_credential_scope(
+                endpoint.clone(),
+                "https://relay.example/v1",
+                None,
+                Some("credential-b".to_string()),
+            );
+            let policy = state.capture_provider_policy_snapshot().await;
+            let cooldown_backoff = CooldownBackoff {
+                factor: 1,
+                max_secs: 0,
+            };
+
+            state
+                .reconcile_runtime_upstream_identities(std::slice::from_ref(&identity_a), 1)
+                .await
+                .expect("publish credential A runtime identity");
+            state
+                .route_plan_runtime_state_with_provider_policy(
+                    "codex",
+                    policy.as_ref(),
+                    1,
+                    std::slice::from_ref(&identity_a),
+                )
+                .await;
+            state
+                .penalize_runtime_upstream_attempt("codex", &identity_a, 30, cooldown_backoff)
+                .await;
+
+            state
+                .reconcile_runtime_upstream_identities(std::slice::from_ref(&identity_b), 2)
+                .await
+                .expect("publish credential B runtime identity");
+            let rotated = state
+                .route_plan_runtime_state_with_provider_policy(
+                    "codex",
+                    policy.as_ref(),
+                    2,
+                    std::slice::from_ref(&identity_b),
+                )
+                .await;
+            assert!(!rotated.provider_endpoint(&endpoint).cooldown_active);
+
+            state
+                .penalize_runtime_upstream_attempt("codex", &identity_a, 30, cooldown_backoff)
+                .await;
+            state
+                .penalize_runtime_upstream_attempt("codex", &identity_b, 30, cooldown_backoff)
+                .await;
+
+            state
+                .route_plan_runtime_state_with_provider_policy(
+                    "codex",
+                    policy.as_ref(),
+                    1,
+                    std::slice::from_ref(&identity_a),
+                )
+                .await;
+            state
+                .record_runtime_upstream_attempt_success("codex", &identity_a, 10)
+                .await;
+            state
+                .record_runtime_upstream_attempt_failure("codex", &identity_a, 30, cooldown_backoff)
+                .await;
+
+            let current = state
+                .route_plan_runtime_state_with_provider_policy(
+                    "codex",
+                    policy.as_ref(),
+                    2,
+                    std::slice::from_ref(&identity_b),
+                )
+                .await;
+            let projected = current.provider_endpoint(&endpoint);
+            assert_eq!(projected.failure_count, FAILURE_THRESHOLD);
+            assert!(projected.cooldown_active);
+
+            let guard = state.provider_endpoint_runtime_health.read().await;
+            let per_service = guard.get("codex").expect("codex passive health state");
+            let identity_b_key =
+                ProviderEndpointRuntimeHealthKey::for_service("codex", &identity_b)
+                    .expect("credential B runtime health key");
+            assert_eq!(per_service.active_revision, Some(2));
+            assert_eq!(per_service.active_identities.len(), 1);
+            assert!(per_service.active_identities.contains(&identity_b_key));
+            assert_eq!(per_service.health.len(), 1);
+            assert!(per_service.health.contains_key(&identity_b_key));
         });
     }
 

@@ -5,6 +5,7 @@ use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use codex_helper_core::config::ServiceKind;
 use codex_helper_core::control_plane_client::validate_admin_token_header_value;
+use codex_helper_core::credentials::CredentialSourceCapabilities;
 use codex_helper_core::proxy::{ADMIN_TOKEN_ENV_VAR, admin_port_for_proxy_port};
 use codex_helper_core::runtime_host::ProxyRuntimeOptions;
 use serde::Deserialize;
@@ -91,7 +92,9 @@ impl EffectiveServerConfig {
     }
 
     pub fn runtime_options(&self) -> ProxyRuntimeOptions {
-        ProxyRuntimeOptions::for_proxy_port(self.port).with_admin_addr(self.admin_addr())
+        ProxyRuntimeOptions::for_proxy_port(self.port)
+            .with_admin_addr(self.admin_addr())
+            .with_credential_sources(CredentialSourceCapabilities::server())
     }
 
     fn validate(&self) -> Result<()> {
@@ -351,6 +354,22 @@ mod tests {
 
         assert_eq!(config.service, ServerService::Codex);
         assert_eq!(config.port, 3211);
+    }
+
+    #[test]
+    fn server_runtime_forbids_native_credentials_under_feature_unification() {
+        let config = EffectiveServerConfig::from_sources(
+            ServerConfigSection::default(),
+            ServerConfigOverrides::default(),
+        )
+        .expect("effective server config");
+
+        assert!(
+            !config
+                .runtime_options()
+                .credential_sources
+                .native_supported()
+        );
     }
 
     #[test]

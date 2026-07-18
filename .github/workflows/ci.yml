@@ -19,6 +19,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
+        with:
+          # The real v0.20.3 downgrade gate archives its pinned historical loader.
+          fetch-depth: 0
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -82,6 +85,9 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Verify v0.20.3 downgrade boundary
+        run: node tools/check-v5-loader-downgrade.mjs
 
   test-build:
     name: test-build (${{ matrix.os }})

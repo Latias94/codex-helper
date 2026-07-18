@@ -1,3 +1,6 @@
+// U4 wires this tested probe engine into the trusted operator projection and TUI.
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::{Mutex, OnceLock};
@@ -8,10 +11,10 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::auth_resolution::resolve_upstream_auth_for_target;
-use crate::config::{
-    HelperConfig, ServiceRouteConfig, ServiceStatusConfig, ServiceStatusProbeConfig, UpstreamAuth,
-};
+use crate::auth_resolution::unconfigured_upstream_auth_contract_requires_opt_in;
+use crate::config::{ServiceStatusConfig, ServiceStatusProbeConfig};
+use crate::credentials::CapturedUpstreamCredential;
+use crate::routing_ir::CompiledRouteGraph;
 
 static SERVICE_STATUS_CACHE: OnceLock<Mutex<ServiceStatusCache>> = OnceLock::new();
 const UPSTREAM_AUTH_UNAVAILABLE_REASON: &str = "configured upstream credentials are unavailable";
@@ -185,29 +188,30 @@ struct ProviderProbeTarget {
     provider_id: String,
     endpoint_id: String,
     base_url: String,
-    priority: u32,
-    auth: UpstreamAuth,
+    stable_index: usize,
+    route_scope: String,
+    credential: CapturedUpstreamCredential,
     tags: HashMap<String, String>,
     supported_models: HashMap<String, bool>,
     model_mapping: HashMap<String, String>,
 }
 
-pub async fn refresh_service_status_snapshot(
+pub(crate) async fn refresh_service_status_snapshot(
     config: &ServiceStatusConfig,
-    runtime_config: Option<&HelperConfig>,
+    runtime_route: Option<&CompiledRouteGraph>,
     service_name: &str,
 ) -> ServiceStatusSnapshot {
     if !config.is_active() {
         return ServiceStatusSnapshot::disabled(config);
     }
 
-    let config_key = service_status_cache_key(config, runtime_config, service_name);
+    let config_key = service_status_cache_key(config, runtime_route, service_name);
     let interval = Duration::from_secs(config.refresh_interval_secs.max(1));
     if let Some(cached) = cached_service_status_snapshot(config_key, interval) {
         return cached;
     }
 
-    let snapshot = fetch_service_status_snapshot(config, runtime_config, service_name).await;
+    let snapshot = fetch_service_status_snapshot(config, runtime_route, service_name).await;
     store_service_status_snapshot(config_key, snapshot.clone());
     snapshot
 }
@@ -239,7 +243,7 @@ fn store_service_status_snapshot(config_key: u64, snapshot: ServiceStatusSnapsho
 
 fn service_status_cache_key(
     config: &ServiceStatusConfig,
-    runtime_config: Option<&HelperConfig>,
+    runtime_route: Option<&CompiledRouteGraph>,
     service_name: &str,
 ) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -259,21 +263,26 @@ fn service_status_cache_key(
         probe.high_latency_ms.hash(&mut hasher);
         probe.headers.hash(&mut hasher);
     }
-    if let Some(runtime_config) = runtime_config
-        && let Some(service) = service_route_config(runtime_config, service_name)
-    {
-        for target in provider_probe_targets(service_name, service, None, None) {
-            hash_provider_probe_target(&target, &mut hasher);
+    if let Some(runtime_route) = runtime_route {
+        runtime_route.digest().hash(&mut hasher);
+        if let Ok(targets) = provider_probe_targets(runtime_route, None, None) {
+            for target in targets {
+                hash_provider_probe_target(&target, &mut hasher);
+            }
         }
     }
     hasher.finish()
 }
 
 fn hash_provider_probe_target(target: &ProviderProbeTarget, hasher: &mut impl Hasher) {
+    target.service_name.hash(hasher);
     target.provider_id.hash(hasher);
     target.endpoint_id.hash(hasher);
     target.base_url.hash(hasher);
-    target.priority.hash(hasher);
+    target.stable_index.hash(hasher);
+    target.route_scope.hash(hasher);
+    target.credential.configured_contract().hash(hasher);
+    target.credential.allow_anonymous().hash(hasher);
 
     let mut tags = target.tags.iter().collect::<Vec<_>>();
     tags.sort_by(|left, right| left.0.cmp(right.0));
@@ -284,21 +293,17 @@ fn hash_provider_probe_target(target: &ProviderProbeTarget, hasher: &mut impl Ha
     let mut model_mapping = target.model_mapping.iter().collect::<Vec<_>>();
     model_mapping.sort_by(|left, right| left.0.cmp(right.0));
     model_mapping.hash(hasher);
-    target.auth.auth_token.hash(hasher);
-    target.auth.auth_token_env.hash(hasher);
-    target.auth.api_key.hash(hasher);
-    target.auth.api_key_env.hash(hasher);
-    target.auth.allow_anonymous.hash(hasher);
 }
 
 async fn fetch_service_status_snapshot(
     config: &ServiceStatusConfig,
-    runtime_config: Option<&HelperConfig>,
+    runtime_route: Option<&CompiledRouteGraph>,
     service_name: &str,
 ) -> ServiceStatusSnapshot {
     let client = match Client::builder()
         .timeout(Duration::from_millis(config.timeout_ms.max(1)))
         .connect_timeout(Duration::from_millis(config.timeout_ms.max(1)))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
     {
         Ok(client) => client,
@@ -319,7 +324,7 @@ async fn fetch_service_status_snapshot(
         .probes
         .iter()
         .filter(|probe| probe_has_target(probe))
-        .map(|probe| fetch_probe(&client, config, runtime_config, service_name, probe))
+        .map(|probe| fetch_probe(&client, config, runtime_route, service_name, probe))
         .collect::<FuturesUnordered<_>>();
 
     let mut probes = Vec::new();
@@ -342,13 +347,13 @@ async fn fetch_service_status_snapshot(
 async fn fetch_probe(
     client: &Client,
     config: &ServiceStatusConfig,
-    runtime_config: Option<&HelperConfig>,
+    runtime_route: Option<&CompiledRouteGraph>,
     service_name: &str,
     probe: &ServiceStatusProbeConfig,
 ) -> ServiceStatusProbeSnapshot {
     let fetched_at_ms = unix_now_ms();
     let id = probe_id(probe);
-    match fetch_probe_inner(client, config, runtime_config, service_name, probe).await {
+    match fetch_probe_inner(client, config, runtime_route, service_name, probe).await {
         Ok(mut snapshot) => {
             snapshot.id = id;
             snapshot.fetched_at_ms = fetched_at_ms;
@@ -374,12 +379,12 @@ async fn fetch_probe(
 async fn fetch_probe_inner(
     client: &Client,
     config: &ServiceStatusConfig,
-    runtime_config: Option<&HelperConfig>,
+    runtime_route: Option<&CompiledRouteGraph>,
     service_name: &str,
     probe: &ServiceStatusProbeConfig,
 ) -> Result<ServiceStatusProbeSnapshot> {
     if has_provider_probe_target(probe) {
-        return fetch_provider_probe(client, config, runtime_config, service_name, probe).await;
+        return fetch_provider_probe(client, config, runtime_route, service_name, probe).await;
     }
     let Some(url) = probe
         .url
@@ -418,11 +423,11 @@ async fn fetch_probe_inner(
 async fn fetch_provider_probe(
     client: &Client,
     config: &ServiceStatusConfig,
-    runtime_config: Option<&HelperConfig>,
+    runtime_route: Option<&CompiledRouteGraph>,
     service_name: &str,
     probe: &ServiceStatusProbeConfig,
 ) -> Result<ServiceStatusProbeSnapshot> {
-    let target = provider_probe_target(runtime_config, service_name, probe)?;
+    let target = provider_probe_target(runtime_route, service_name, probe)?;
     let timeout_ms = probe.timeout_ms.unwrap_or(config.timeout_ms).max(1);
     let high_latency_ms = probe.high_latency_ms.unwrap_or(config.high_latency_ms);
     let models = provider_probe_models(probe, &target);
@@ -524,9 +529,16 @@ async fn send_provider_probe_request(
     model: &str,
     timeout_ms: u64,
 ) -> Result<()> {
-    let resolved_auth =
-        resolve_upstream_auth_for_target(target.service_name.as_str(), &target.auth, url)
-            .map_err(|_| anyhow::anyhow!(UPSTREAM_AUTH_UNAVAILABLE_REASON))?;
+    if target.credential.first_error().is_some()
+        || unconfigured_upstream_auth_contract_requires_opt_in(
+            target.service_name.as_str(),
+            target.credential.configured_contract(),
+            target.credential.allow_anonymous(),
+            url,
+        )
+    {
+        anyhow::bail!(UPSTREAM_AUTH_UNAVAILABLE_REASON);
+    }
     let mut request = client
         .post(url)
         .timeout(Duration::from_millis(timeout_ms))
@@ -540,10 +552,10 @@ async fn send_provider_probe_request(
             "stream": false
         }));
 
-    if let Some(token) = resolved_auth.auth_token.value() {
-        request = request.bearer_auth(token);
+    if let Some(token) = target.credential.bearer_header() {
+        request = request.header("authorization", token);
     }
-    if let Some(key) = resolved_auth.api_key.value() {
+    if let Some(key) = target.credential.api_key_header() {
         request = request.header("x-api-key", key);
     }
 
@@ -560,7 +572,7 @@ async fn send_provider_probe_request(
 }
 
 fn provider_probe_target(
-    runtime_config: Option<&HelperConfig>,
+    runtime_route: Option<&CompiledRouteGraph>,
     service_name: &str,
     probe: &ServiceStatusProbeConfig,
 ) -> Result<ProviderProbeTarget> {
@@ -575,11 +587,13 @@ fn provider_probe_target(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let config = runtime_config.context("provider probes require runtime config")?;
-    let service = service_route_config(config, service_name)
-        .with_context(|| format!("unknown service for provider probe: {service_name}"))?;
+    let runtime_route =
+        runtime_route.context("provider probes require a captured runtime route")?;
+    if runtime_route.service_name() != service_name {
+        anyhow::bail!("unknown service for provider probe: {service_name}");
+    }
 
-    provider_probe_targets(service_name, service, Some(provider), endpoint)
+    provider_probe_targets(runtime_route, Some(provider), endpoint)?
         .into_iter()
         .next()
         .with_context(|| {
@@ -594,101 +608,40 @@ fn provider_probe_target(
 }
 
 fn provider_probe_targets(
-    service_name: &str,
-    service: &ServiceRouteConfig,
+    runtime_route: &CompiledRouteGraph,
     provider_filter: Option<&str>,
     endpoint: Option<&str>,
-) -> Vec<ProviderProbeTarget> {
+) -> Result<Vec<ProviderProbeTarget>> {
+    let template = runtime_route.handshake_plan();
     let mut targets = Vec::new();
-    for (provider_id, provider) in &service.providers {
-        if !provider.enabled || provider_filter.is_some_and(|filter| filter != provider_id.as_str())
+    for candidate in &template.candidates {
+        if provider_filter.is_some_and(|filter| filter != candidate.provider_id.as_str())
+            || endpoint.is_some_and(|filter| filter != candidate.endpoint_id.as_str())
         {
             continue;
         }
-
-        let auth = merge_auth(&provider.auth, &provider.inline_auth);
-        if endpoint.is_none_or(|endpoint| endpoint == "default")
-            && let Some(base_url) = provider
-                .base_url
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-        {
-            targets.push(ProviderProbeTarget {
-                service_name: service_name.to_string(),
-                provider_id: provider_id.clone(),
-                endpoint_id: "default".to_string(),
-                base_url: base_url.to_string(),
-                priority: 0,
-                auth: auth.clone(),
-                tags: provider.tags.clone().into_iter().collect(),
-                supported_models: provider.supported_models.clone().into_iter().collect(),
-                model_mapping: provider.model_mapping.clone().into_iter().collect(),
-            });
-        }
-
-        for (endpoint_id, endpoint_config) in &provider.endpoints {
-            if !endpoint_config.enabled
-                || endpoint.is_some_and(|filter| filter != endpoint_id.as_str())
-            {
-                continue;
-            }
-            let base_url = endpoint_config.base_url.trim();
-            if base_url.is_empty() {
-                continue;
-            }
-            targets.push(ProviderProbeTarget {
-                service_name: service_name.to_string(),
-                provider_id: provider_id.clone(),
-                endpoint_id: endpoint_id.clone(),
-                base_url: base_url.to_string(),
-                priority: endpoint_config.priority,
-                auth: auth.clone(),
-                tags: merge_maps(&provider.tags, &endpoint_config.tags),
-                supported_models: merge_maps(
-                    &provider.supported_models,
-                    &endpoint_config.supported_models,
-                ),
-                model_mapping: merge_maps(&provider.model_mapping, &endpoint_config.model_mapping),
-            });
-        }
+        let captured = template.capture_candidate(candidate)?;
+        targets.push(ProviderProbeTarget {
+            service_name: runtime_route.service_name().to_string(),
+            provider_id: candidate.provider_id.clone(),
+            endpoint_id: candidate.endpoint_id.clone(),
+            base_url: candidate.base_url.clone(),
+            stable_index: candidate.stable_index,
+            route_scope: captured.runtime_identity().policy_route_scope(),
+            credential: captured.credential().clone(),
+            tags: candidate.tags.clone().into_iter().collect(),
+            supported_models: candidate.supported_models.clone().into_iter().collect(),
+            model_mapping: candidate.model_mapping.clone().into_iter().collect(),
+        });
     }
     targets.sort_by(|left, right| {
         left.provider_id
             .cmp(&right.provider_id)
-            .then_with(|| left.priority.cmp(&right.priority))
+            .then_with(|| left.stable_index.cmp(&right.stable_index))
             .then_with(|| left.endpoint_id.cmp(&right.endpoint_id))
             .then_with(|| left.base_url.cmp(&right.base_url))
     });
-    targets
-}
-
-fn merge_auth(block: &UpstreamAuth, inline: &UpstreamAuth) -> UpstreamAuth {
-    UpstreamAuth {
-        auth_token: inline
-            .auth_token
-            .clone()
-            .or_else(|| block.auth_token.clone()),
-        auth_token_env: inline
-            .auth_token_env
-            .clone()
-            .or_else(|| block.auth_token_env.clone()),
-        api_key: inline.api_key.clone().or_else(|| block.api_key.clone()),
-        api_key_env: inline
-            .api_key_env
-            .clone()
-            .or_else(|| block.api_key_env.clone()),
-        allow_anonymous: inline.allow_anonymous.or(block.allow_anonymous),
-    }
-}
-
-fn merge_maps<T: Clone>(
-    provider_values: &std::collections::BTreeMap<String, T>,
-    endpoint_values: &std::collections::BTreeMap<String, T>,
-) -> HashMap<String, T> {
-    let mut merged = provider_values.clone();
-    merged.extend(endpoint_values.clone());
-    merged.into_iter().collect()
+    Ok(targets)
 }
 
 fn provider_probe_models(
@@ -717,17 +670,6 @@ fn provider_probe_models(
     models.sort();
     models.dedup();
     models
-}
-
-fn service_route_config<'a>(
-    config: &'a HelperConfig,
-    service_name: &str,
-) -> Option<&'a ServiceRouteConfig> {
-    match service_name {
-        "claude" => Some(&config.claude),
-        "codex" => Some(&config.codex),
-        _ => None,
-    }
 }
 
 fn chat_completions_url(base_url: &str) -> String {
@@ -982,22 +924,107 @@ fn decimal_string_from_json(value: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::SocketAddr;
     use std::sync::Arc;
 
     use axum::extract::State;
     use axum::http::HeaderMap;
-    use axum::routing::post;
+    use axum::routing::{any, post};
     use axum::{Json, Router};
 
     use crate::config::{
-        ProviderConcurrencyLimits, ProviderConfig, ProviderEndpointConfig, ServiceRouteConfig,
+        CredentialRef, HelperConfig, ProviderConcurrencyLimits, ProviderConfig,
+        ProviderEndpointConfig, ServiceRouteConfig, UpstreamAuth,
     };
+    use crate::credentials::{
+        CredentialCandidateInput, CredentialRuntime, CredentialSourceCapabilities, SecretValue,
+    };
+    use crate::runtime_identity::ProviderEndpointKey;
+    use crate::runtime_store::RuntimeStore;
 
     #[derive(Debug, Clone, Default)]
     struct CapturedProviderProbeRequest {
         body: serde_json::Value,
         authorization: Option<String>,
         api_key: Option<String>,
+    }
+
+    async fn spawn_server(app: Router) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind service status test server");
+        let address = listener.local_addr().expect("service status test address");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve service status test server");
+        });
+        (address, handle)
+    }
+
+    struct RedirectFixture {
+        source_address: SocketAddr,
+        source_hits: Arc<Mutex<usize>>,
+        target_headers: Arc<Mutex<Vec<HeaderMap>>>,
+        source_handle: tokio::task::JoinHandle<()>,
+        target_handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl RedirectFixture {
+        async fn spawn(status: axum::http::StatusCode) -> Self {
+            let target_headers = Arc::new(Mutex::new(Vec::<HeaderMap>::new()));
+            let target_headers_for_route = target_headers.clone();
+            let target = Router::new().fallback(any(move |headers: HeaderMap| {
+                let target_headers = target_headers_for_route.clone();
+                async move {
+                    target_headers
+                        .lock()
+                        .expect("redirect target headers")
+                        .push(headers);
+                    axum::http::StatusCode::OK
+                }
+            }));
+            let (target_address, target_handle) = spawn_server(target).await;
+
+            let source_hits = Arc::new(Mutex::new(0usize));
+            let source_hits_for_route = source_hits.clone();
+            let redirect_location = format!("http://{target_address}/capture");
+            let source = Router::new().fallback(any(move || {
+                let source_hits = source_hits_for_route.clone();
+                let redirect_location = redirect_location.clone();
+                async move {
+                    *source_hits.lock().expect("redirect source hits") += 1;
+                    (status, [(axum::http::header::LOCATION, redirect_location)])
+                }
+            }));
+            let (source_address, source_handle) = spawn_server(source).await;
+
+            Self {
+                source_address,
+                source_hits,
+                target_headers,
+                source_handle,
+                target_handle,
+            }
+        }
+
+        fn assert_not_followed(&self) {
+            assert_eq!(*self.source_hits.lock().expect("redirect source hits"), 1);
+            assert!(
+                self.target_headers
+                    .lock()
+                    .expect("redirect target headers")
+                    .is_empty(),
+                "redirect target received a service-status request"
+            );
+        }
+    }
+
+    impl Drop for RedirectFixture {
+        fn drop(&mut self) {
+            self.source_handle.abort();
+            self.target_handle.abort();
+        }
     }
 
     fn probe(models: Vec<&str>) -> ServiceStatusProbeConfig {
@@ -1020,12 +1047,12 @@ mod tests {
                     "relay".to_string(),
                     ProviderConfig {
                         auth: UpstreamAuth {
-                            auth_token: Some("test-token".to_string()),
-                            api_key: Some("provider-api-key".to_string()),
+                            auth_token: Some("test-token".to_string().into()),
+                            api_key: Some("provider-api-key".to_string().into()),
                             ..UpstreamAuth::default()
                         },
                         inline_auth: UpstreamAuth {
-                            api_key: Some("endpoint-api-key".to_string()),
+                            api_key: Some("endpoint-api-key".to_string().into()),
                             ..UpstreamAuth::default()
                         },
                         tags: std::collections::BTreeMap::from([
@@ -1069,6 +1096,49 @@ mod tests {
             },
             ..HelperConfig::default()
         }
+    }
+
+    fn bound_route_graph(runtime: &HelperConfig, service_name: &str) -> CompiledRouteGraph {
+        bind_route_graph_with_capabilities(
+            runtime,
+            service_name,
+            CredentialSourceCapabilities::server(),
+        )
+    }
+
+    fn bind_route_graph_with_capabilities(
+        runtime: &HelperConfig,
+        service_name: &str,
+        capabilities: CredentialSourceCapabilities,
+    ) -> CompiledRouteGraph {
+        let service = match service_name {
+            "codex" => &runtime.codex,
+            "claude" => &runtime.claude,
+            _ => panic!("unsupported test service: {service_name}"),
+        };
+        let graph =
+            CompiledRouteGraph::compile(service_name, service).expect("compile route graph");
+        let runtime_store = RuntimeStore::open_in_memory().expect("open credential runtime store");
+        let credential_runtime =
+            CredentialRuntime::from_runtime_store(capabilities, &runtime_store)
+                .expect("build credential runtime");
+        let generation =
+            credential_runtime
+                .build_generation(graph.candidates().iter().map(|candidate| {
+                    CredentialCandidateInput {
+                        provider_endpoint: ProviderEndpointKey::new(
+                            service_name,
+                            candidate.provider_id.clone(),
+                            candidate.endpoint_id.clone(),
+                        ),
+                        auth: &candidate.auth,
+                    }
+                }))
+                .expect("build credential generation");
+        let digest = graph.digest().to_string();
+        graph
+            .with_credential_generation(generation, digest)
+            .expect("bind credential generation")
     }
 
     #[test]
@@ -1129,17 +1199,35 @@ mod tests {
     #[test]
     fn canonical_provider_probe_target_merges_provider_and_endpoint_fields() {
         let runtime = canonical_runtime_with_endpoint("https://relay.example/v1".to_string());
+        let route = bound_route_graph(&runtime, "codex");
 
-        let targets = provider_probe_targets("codex", &runtime.codex, Some("relay"), Some("fast"));
+        let targets = provider_probe_targets(&route, Some("relay"), Some("fast"))
+            .expect("capture provider targets");
 
         assert_eq!(targets.len(), 1);
         let target = &targets[0];
         assert_eq!(target.provider_id, "relay");
         assert_eq!(target.endpoint_id, "fast");
         assert_eq!(target.base_url, "https://relay.example/v1");
-        assert_eq!(target.priority, 3);
-        assert_eq!(target.auth.auth_token.as_deref(), Some("test-token"));
-        assert_eq!(target.auth.api_key.as_deref(), Some("endpoint-api-key"));
+        assert_eq!(target.stable_index, 0);
+        assert_eq!(
+            target
+                .credential
+                .bearer_header()
+                .expect("captured bearer")
+                .to_str()
+                .expect("bearer text"),
+            "Bearer test-token"
+        );
+        assert_eq!(
+            target
+                .credential
+                .api_key_header()
+                .expect("captured API key")
+                .to_str()
+                .expect("API key text"),
+            "endpoint-api-key"
+        );
         assert_eq!(
             target.tags.get("region").map(String::as_str),
             Some("provider-region")
@@ -1174,7 +1262,8 @@ mod tests {
             ..ServiceStatusConfig::default()
         };
         let mut runtime = canonical_runtime_with_endpoint("https://relay.example/v1".to_string());
-        let initial_key = service_status_cache_key(&config, Some(&runtime), "codex");
+        let initial_route = bound_route_graph(&runtime, "codex");
+        let initial_key = service_status_cache_key(&config, Some(&initial_route), "codex");
 
         runtime
             .codex
@@ -1185,7 +1274,9 @@ mod tests {
             .tags
             .insert("region".to_string(), "endpoint-region".to_string());
 
-        let endpoint_tag_key = service_status_cache_key(&config, Some(&runtime), "codex");
+        let endpoint_tag_route = bound_route_graph(&runtime, "codex");
+        let endpoint_tag_key =
+            service_status_cache_key(&config, Some(&endpoint_tag_route), "codex");
         assert_ne!(initial_key, endpoint_tag_key);
 
         runtime
@@ -1198,7 +1289,11 @@ mod tests {
 
         assert_ne!(
             endpoint_tag_key,
-            service_status_cache_key(&config, Some(&runtime), "codex")
+            service_status_cache_key(
+                &config,
+                Some(&bound_route_graph(&runtime, "codex")),
+                "codex"
+            )
         );
     }
 
@@ -1245,7 +1340,16 @@ mod tests {
                 .expect("serve provider probe test");
         });
 
-        let runtime = canonical_runtime_with_endpoint(format!("http://{addr}/v1"));
+        let mut runtime = canonical_runtime_with_endpoint(format!("http://{addr}/v1"));
+        let provider = runtime
+            .codex
+            .providers
+            .get_mut("relay")
+            .expect("relay provider");
+        provider.auth.auth_token = None;
+        provider.auth.auth_token_ref = Some(CredentialRef::Native {
+            name: "relay.primary".to_string(),
+        });
         let config = ServiceStatusConfig {
             enabled: true,
             refresh_interval_secs: 60,
@@ -1264,7 +1368,15 @@ mod tests {
             }],
         };
 
-        let snapshot = fetch_service_status_snapshot(&config, Some(&runtime), "codex").await;
+        let (capabilities, control) = CredentialSourceCapabilities::test_native(
+            SecretValue::new(b"test-token".to_vec()).expect("valid native credential"),
+        );
+        let route = bind_route_graph_with_capabilities(&runtime, "codex", capabilities);
+        assert_eq!(control.read_count(), 1);
+        control.set_value(
+            SecretValue::new(b"rotated-token".to_vec()).expect("valid rotated credential"),
+        );
+        let snapshot = fetch_service_status_snapshot(&config, Some(&route), "codex").await;
         server.abort();
 
         assert_eq!(snapshot.probes.len(), 1);
@@ -1289,6 +1401,109 @@ mod tests {
         assert_eq!(captured.body["stream"], false);
         assert_eq!(captured.body["messages"][0]["role"], "user");
         assert_eq!(captured.body["messages"][0]["content"], "ping");
+        assert_eq!(
+            control.read_count(),
+            1,
+            "provider probe execution must not re-read the native credential"
+        );
+    }
+
+    #[tokio::test]
+    async fn service_status_refuses_provider_redirects_with_native_api_keys() {
+        let native_api_key = "native-api-key-must-not-leave-origin";
+
+        for redirect_status in [
+            axum::http::StatusCode::TEMPORARY_REDIRECT,
+            axum::http::StatusCode::PERMANENT_REDIRECT,
+        ] {
+            let fixture = RedirectFixture::spawn(redirect_status).await;
+
+            let mut runtime =
+                canonical_runtime_with_endpoint(format!("http://{}/v1", fixture.source_address));
+            let provider = runtime
+                .codex
+                .providers
+                .get_mut("relay")
+                .expect("relay provider");
+            provider.auth = UpstreamAuth {
+                api_key_ref: Some(CredentialRef::Native {
+                    name: "relay.primary".to_string(),
+                }),
+                ..UpstreamAuth::default()
+            };
+            provider.inline_auth = UpstreamAuth::default();
+            let (capabilities, _control) = CredentialSourceCapabilities::test_native(
+                SecretValue::new(native_api_key.as_bytes().to_vec()).expect("valid native API key"),
+            );
+            let route = bind_route_graph_with_capabilities(&runtime, "codex", capabilities);
+            let config = ServiceStatusConfig {
+                enabled: true,
+                timeout_ms: 3_000,
+                probes: vec![ServiceStatusProbeConfig {
+                    id: Some(format!("provider-{}", redirect_status.as_u16())),
+                    provider: Some("relay".to_string()),
+                    endpoint: Some("fast".to_string()),
+                    models: vec!["gpt-5.5".to_string()],
+                    ..ServiceStatusProbeConfig::default()
+                }],
+                ..ServiceStatusConfig::default()
+            };
+
+            let snapshot = fetch_service_status_snapshot(&config, Some(&route), "codex").await;
+            let sample = snapshot.probes[0].services[0]
+                .latest
+                .as_ref()
+                .expect("failed provider probe sample");
+            let error = sample.error.as_deref().expect("provider redirect error");
+
+            assert_eq!(sample.ok, Some(false));
+            assert!(
+                error.contains(&format!("HTTP {redirect_status}")),
+                "unexpected provider redirect error: {error}"
+            );
+            assert!(!error.contains(native_api_key));
+            fixture.assert_not_followed();
+        }
+    }
+
+    #[tokio::test]
+    async fn service_status_refuses_custom_header_redirects() {
+        let custom_secret = "custom-header-must-not-leave-origin";
+
+        for redirect_status in [
+            axum::http::StatusCode::TEMPORARY_REDIRECT,
+            axum::http::StatusCode::PERMANENT_REDIRECT,
+        ] {
+            let fixture = RedirectFixture::spawn(redirect_status).await;
+            let config = ServiceStatusConfig {
+                enabled: true,
+                timeout_ms: 3_000,
+                probes: vec![ServiceStatusProbeConfig {
+                    id: Some(format!("custom-{}", redirect_status.as_u16())),
+                    url: Some(format!("http://{}/status", fixture.source_address)),
+                    models: vec!["gpt-5.5".to_string()],
+                    headers: std::collections::BTreeMap::from([
+                        ("x-api-key".to_string(), custom_secret.to_string()),
+                        ("x-custom-secret".to_string(), custom_secret.to_string()),
+                    ]),
+                    ..ServiceStatusProbeConfig::default()
+                }],
+                ..ServiceStatusConfig::default()
+            };
+
+            let snapshot = fetch_service_status_snapshot(&config, None, "codex").await;
+            let error = snapshot.probes[0]
+                .error
+                .as_deref()
+                .expect("custom header redirect error");
+
+            assert!(
+                error.contains(&format!("HTTP {redirect_status}")),
+                "unexpected custom header redirect error: {error}"
+            );
+            assert!(!error.contains(custom_secret));
+            fixture.assert_not_followed();
+        }
     }
 
     #[tokio::test]
@@ -1334,11 +1549,12 @@ mod tests {
             .expect("relay provider");
         provider.auth = UpstreamAuth::default();
         provider.inline_auth = UpstreamAuth::default();
-        let mut target =
-            provider_probe_targets("codex", &runtime.codex, Some("relay"), Some("fast"))
-                .into_iter()
-                .next()
-                .expect("provider probe target");
+        let route = bound_route_graph(&runtime, "codex");
+        let target = provider_probe_targets(&route, Some("relay"), Some("fast"))
+            .expect("capture provider probe targets")
+            .into_iter()
+            .next()
+            .expect("provider probe target");
         let url = chat_completions_url(&target.base_url);
 
         let error = send_provider_probe_request(&client, &target, &url, "gpt-5.5", 3_000)
@@ -1348,8 +1564,21 @@ mod tests {
         assert_eq!(*hits.lock().expect("provider probe hits lock"), 0);
         assert_eq!(error.to_string(), UPSTREAM_AUTH_UNAVAILABLE_REASON);
 
-        target.auth.allow_anonymous = Some(true);
-        send_provider_probe_request(&client, &target, &url, "gpt-5.5", 3_000)
+        runtime
+            .codex
+            .providers
+            .get_mut("relay")
+            .expect("relay provider")
+            .inline_auth
+            .allow_anonymous = Some(true);
+        let anonymous_route = bound_route_graph(&runtime, "codex");
+        let anonymous_target =
+            provider_probe_targets(&anonymous_route, Some("relay"), Some("fast"))
+                .expect("capture anonymous provider probe targets")
+                .into_iter()
+                .next()
+                .expect("anonymous provider probe target");
+        send_provider_probe_request(&client, &anonymous_target, &url, "gpt-5.5", 3_000)
             .await
             .expect("explicit anonymous opt-in should allow the probe");
 

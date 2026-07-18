@@ -6,7 +6,7 @@ use crate::auth_resolution::{
     unconfigured_upstream_auth_requires_opt_in,
 };
 use crate::codex_switch::{CodexSwitchPhase, inspect as inspect_codex_switch};
-use crate::config::{load_config, proxy_home_dir};
+use crate::config::{CURRENT_CONFIG_VERSION, load_config, proxy_home_dir};
 use crate::logging::request_log_path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,11 +160,11 @@ pub async fn run_doctor(lang: DoctorLang) -> DoctorReport {
                 status: DoctorStatus::Fail,
                 message: match lang {
                     DoctorLang::Zh => format!(
-                        "无法读取 canonical ~/.codex-helper/config.toml：{}；请确认它是有效的 version = 5 TOML。",
-                        err
+                        "无法读取 canonical ~/.codex-helper/config.toml：{}；请确认它是有效的 version = {} TOML。",
+                        err, CURRENT_CONFIG_VERSION
                     ),
                     DoctorLang::En => format!(
-                        "Failed to read canonical ~/.codex-helper/config.toml: {err}; ensure it is valid version = 5 TOML.",
+                        "Failed to read canonical ~/.codex-helper/config.toml: {err}; ensure it is valid version = {CURRENT_CONFIG_VERSION} TOML.",
                     ),
                 },
             });
@@ -356,6 +356,15 @@ fn append_credential_resolution_check(
                         "the value from {} is not a valid HTTP header",
                         source.label()
                     )
+                }
+            },
+        ),
+        CredentialResolution::UnsupportedReference { source_kind } => (
+            "proxy_config.auth.unsupported_reference",
+            match lang {
+                DoctorLang::Zh => format!("当前 runtime 尚不支持 `{source_kind}` 凭据源"),
+                DoctorLang::En => {
+                    format!("the current runtime does not support `{source_kind}` credentials")
                 }
             },
         ),

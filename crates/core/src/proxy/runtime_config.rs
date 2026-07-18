@@ -1,27 +1,75 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
+use std::ops::Deref;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, Notify, watch};
+use tokio::time::Instant as TokioInstant;
 use tracing::warn;
 
-use crate::config::{HelperConfig, LoadedConfig, ServiceRouteConfig};
+#[cfg(test)]
+use crate::config::ServiceRouteConfig;
+use crate::config::{HelperConfig, LoadedConfig};
+use crate::credentials::{
+    CapturedUpstreamCredential, CredentialCandidateInput, CredentialGeneration,
+    CredentialGenerationMarker, CredentialHandle, CredentialName, CredentialRuntime,
+    CredentialRuntimeRefreshCause, CredentialSourceCapabilities,
+};
 use crate::logging::log_control_trace_event;
 use crate::pricing::{CapturedModelPriceCatalog, try_capture_operator_model_price_catalog};
 use crate::provider_catalog::ProviderCatalogSnapshot;
 use crate::routing_ir::{CompiledRouteGraph, RoutePlanTemplate, RouteRequestContext};
 use crate::runtime_identity::{RuntimeUpstreamIdentity, diff_runtime_upstream_identities};
 use crate::runtime_store::{ProviderPolicySnapshot, RuntimeStore};
-use crate::state::ProxyState;
+use crate::state::{PreparedRoutingOperatorRouteGraph, ProxyState};
+use crate::usage_providers::{
+    credential_generation_catalog, usage_provider_source_revision_from_disk,
+};
+
+const AUTH_FAILURE_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(5);
+
+struct TransientRuntimeConfig(HelperConfig);
+
+impl Deref for TransientRuntimeConfig {
+    type Target = HelperConfig;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for TransientRuntimeConfig {
+    fn drop(&mut self) {
+        self.0.zeroize_inline_credentials();
+    }
+}
+
+struct TransientRouteGraph(CompiledRouteGraph);
+
+impl Deref for TransientRouteGraph {
+    type Target = CompiledRouteGraph;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for TransientRouteGraph {
+    fn drop(&mut self) {
+        self.0.zeroize_inline_credentials();
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct RuntimeSourceStamp {
     config_mtime: Option<SystemTime>,
     pricing_mtime: Option<SystemTime>,
+    usage_providers_revision: [u8; 32],
 }
 
 impl RuntimeSourceStamp {
@@ -30,6 +78,7 @@ impl RuntimeSourceStamp {
         Self {
             config_mtime,
             pricing_mtime: None,
+            usage_providers_revision: [0; 32],
         }
     }
 }
@@ -41,6 +90,7 @@ struct PreparedRuntimeSnapshot {
     claude_route_graph: Arc<CompiledRouteGraph>,
     provider_catalog: Arc<ProviderCatalogSnapshot>,
     operator_pricing_catalog: Arc<CapturedModelPriceCatalog>,
+    credential_generation: Arc<CredentialGeneration>,
     digest_seed: Sha256,
     loaded_at_ms: u64,
     source_stamp: RuntimeSourceStamp,
@@ -51,9 +101,110 @@ impl PreparedRuntimeSnapshot {
         config: Arc<HelperConfig>,
         operator_pricing_catalog: Arc<CapturedModelPriceCatalog>,
         source_stamp: RuntimeSourceStamp,
+        credential_runtime: &CredentialRuntime,
     ) -> Result<Self> {
-        let codex_route_graph = compile_route_graph("codex", &config.codex)?;
-        let claude_route_graph = compile_route_graph("claude", &config.claude)?;
+        Self::build_with_previous(
+            config,
+            operator_pricing_catalog,
+            source_stamp,
+            credential_runtime,
+            None,
+        )
+    }
+
+    fn build_from_previous(
+        config: Arc<HelperConfig>,
+        operator_pricing_catalog: Arc<CapturedModelPriceCatalog>,
+        source_stamp: RuntimeSourceStamp,
+        credential_runtime: &CredentialRuntime,
+        previous_generation: &CredentialGeneration,
+    ) -> Result<Self> {
+        Self::build_with_previous(
+            config,
+            operator_pricing_catalog,
+            source_stamp,
+            credential_runtime,
+            Some(previous_generation),
+        )
+    }
+
+    fn build_with_previous(
+        config: Arc<HelperConfig>,
+        operator_pricing_catalog: Arc<CapturedModelPriceCatalog>,
+        source_stamp: RuntimeSourceStamp,
+        credential_runtime: &CredentialRuntime,
+        previous_generation: Option<&CredentialGeneration>,
+    ) -> Result<Self> {
+        let source_config = TransientRuntimeConfig(match Arc::try_unwrap(config) {
+            Ok(config) => config,
+            Err(config) => config.as_ref().clone(),
+        });
+        let source_codex_route_graph = TransientRouteGraph(
+            CompiledRouteGraph::compile("codex", &source_config.codex)
+                .context("compile codex route graph for credential ingestion")?,
+        );
+        let source_claude_route_graph = TransientRouteGraph(
+            CompiledRouteGraph::compile("claude", &source_config.claude)
+                .context("compile claude route graph for credential ingestion")?,
+        );
+        let candidates = || {
+            source_codex_route_graph
+                .candidates()
+                .iter()
+                .map(|candidate| CredentialCandidateInput {
+                    provider_endpoint: crate::runtime_identity::ProviderEndpointKey::new(
+                        "codex",
+                        candidate.provider_id.clone(),
+                        candidate.endpoint_id.clone(),
+                    ),
+                    auth: &candidate.auth,
+                })
+                .chain(
+                    source_claude_route_graph
+                        .candidates()
+                        .iter()
+                        .map(|candidate| CredentialCandidateInput {
+                            provider_endpoint: crate::runtime_identity::ProviderEndpointKey::new(
+                                "claude",
+                                candidate.provider_id.clone(),
+                                candidate.endpoint_id.clone(),
+                            ),
+                            auth: &candidate.auth,
+                        }),
+                )
+        };
+        let (named_credentials, named_catalog_revision) =
+            credential_generation_catalog().into_parts();
+        let credential_generation = match previous_generation {
+            Some(previous) => credential_runtime.build_generation_from_previous_with_named(
+                candidates(),
+                named_credentials,
+                named_catalog_revision.as_str(),
+                previous,
+            )?,
+            None => credential_runtime.build_generation_with_named(
+                candidates(),
+                named_credentials,
+                named_catalog_revision.as_str(),
+            )?,
+        };
+        let config = Arc::new(redacted_runtime_config(source_config.0.clone()));
+        let codex_route_graph = Arc::new(
+            CompiledRouteGraph::compile("codex", &config.codex)
+                .context("compile codex route graph for runtime snapshot")?
+                .with_credential_generation(
+                    Arc::clone(&credential_generation),
+                    source_codex_route_graph.digest().to_string(),
+                )?,
+        );
+        let claude_route_graph = Arc::new(
+            CompiledRouteGraph::compile("claude", &config.claude)
+                .context("compile claude route graph for runtime snapshot")?
+                .with_credential_generation(
+                    Arc::clone(&credential_generation),
+                    source_claude_route_graph.digest().to_string(),
+                )?,
+        );
         let provider_catalog = Arc::new(ProviderCatalogSnapshot::bundled());
         let digest_seed = runtime_snapshot_digest_seed(
             config.as_ref(),
@@ -61,6 +212,7 @@ impl PreparedRuntimeSnapshot {
             claude_route_graph.as_ref(),
             provider_catalog.as_ref(),
             operator_pricing_catalog.revision(),
+            credential_generation.as_ref(),
         )?;
 
         Ok(Self {
@@ -69,16 +221,52 @@ impl PreparedRuntimeSnapshot {
             claude_route_graph,
             provider_catalog,
             operator_pricing_catalog,
+            credential_generation,
             digest_seed,
             loaded_at_ms: now_ms(),
             source_stamp,
         })
     }
 
-    fn candidate_identities(&self) -> Vec<RuntimeUpstreamIdentity> {
-        let mut identities = self.codex_route_graph.candidate_identities();
-        identities.extend(self.claude_route_graph.candidate_identities());
-        identities
+    fn candidate_identities(&self) -> Result<Vec<RuntimeUpstreamIdentity>> {
+        let mut identities = self.codex_route_graph.candidate_identities()?;
+        identities.extend(self.claude_route_graph.candidate_identities()?);
+        Ok(identities)
+    }
+
+    fn with_refreshed_credentials(
+        snapshot: &RuntimeSnapshot,
+        credential_generation: Arc<CredentialGeneration>,
+    ) -> Result<Self> {
+        let codex_route_graph = Arc::new(
+            snapshot
+                .codex_route_graph
+                .rebound_credential_generation(Arc::clone(&credential_generation))?,
+        );
+        let claude_route_graph = Arc::new(
+            snapshot
+                .claude_route_graph
+                .rebound_credential_generation(Arc::clone(&credential_generation))?,
+        );
+        let digest_seed = runtime_snapshot_digest_seed(
+            snapshot.config.as_ref(),
+            codex_route_graph.as_ref(),
+            claude_route_graph.as_ref(),
+            snapshot.provider_catalog.as_ref(),
+            snapshot.operator_pricing_catalog.revision(),
+            credential_generation.as_ref(),
+        )?;
+        Ok(Self {
+            config: Arc::clone(&snapshot.config),
+            codex_route_graph,
+            claude_route_graph,
+            provider_catalog: Arc::clone(&snapshot.provider_catalog),
+            operator_pricing_catalog: Arc::clone(&snapshot.operator_pricing_catalog),
+            credential_generation,
+            digest_seed,
+            loaded_at_ms: now_ms(),
+            source_stamp: snapshot.source_stamp,
+        })
     }
 
     fn finish(
@@ -93,6 +281,7 @@ impl PreparedRuntimeSnapshot {
             claude_route_graph: self.claude_route_graph,
             provider_catalog: self.provider_catalog,
             operator_pricing_catalog: self.operator_pricing_catalog,
+            credential_generation: self.credential_generation,
             provider_policy,
             revision,
             digest,
@@ -110,6 +299,7 @@ pub(super) struct RuntimeSnapshot {
     claude_route_graph: Arc<CompiledRouteGraph>,
     provider_catalog: Arc<ProviderCatalogSnapshot>,
     operator_pricing_catalog: Arc<CapturedModelPriceCatalog>,
+    credential_generation: Arc<CredentialGeneration>,
     provider_policy: Arc<ProviderPolicySnapshot>,
     revision: u64,
     digest: String,
@@ -160,6 +350,20 @@ impl RuntimeSnapshot {
             return Ok(None);
         };
         let template = graph.route_plan(request)?;
+        let provider_endpoint_candidates = template
+            .candidates
+            .iter()
+            .map(|candidate| {
+                let identity = template.candidate_identity(candidate)?;
+                Ok(serde_json::json!({
+                    "provider_id": candidate.provider_id,
+                    "endpoint_id": candidate.endpoint_id,
+                    "provider_endpoint_key": identity.provider_endpoint.stable_key(),
+                    "preference_group": candidate.preference_group,
+                    "route_path": candidate.route_path,
+                }))
+            })
+            .collect::<Result<Vec<_>>>()?;
         log_control_trace_event(serde_json::json!({
             "event": "route_plan_selected",
             "service": template.service_name,
@@ -167,20 +371,7 @@ impl RuntimeSnapshot {
             "route_graph_key": template.route_graph_key(),
             "runtime_revision": self.revision,
             "candidate_count": template.candidates.len(),
-            "provider_endpoint_candidates": template
-                .candidates
-                .iter()
-                .map(|candidate| {
-                    let identity = template.candidate_identity(candidate);
-                    serde_json::json!({
-                        "provider_id": candidate.provider_id,
-                        "endpoint_id": candidate.endpoint_id,
-                        "provider_endpoint_key": identity.provider_endpoint.stable_key(),
-                        "preference_group": candidate.preference_group,
-                        "route_path": candidate.route_path,
-                    })
-                })
-                .collect::<Vec<_>>(),
+            "provider_endpoint_candidates": provider_endpoint_candidates,
         }));
         Ok(Some(CapturedRoutePlan {
             snapshot: Arc::clone(self),
@@ -202,6 +393,7 @@ impl RuntimeSnapshot {
             claude_route_graph: Arc::clone(&self.claude_route_graph),
             provider_catalog: Arc::clone(&self.provider_catalog),
             operator_pricing_catalog: Arc::clone(&self.operator_pricing_catalog),
+            credential_generation: Arc::clone(&self.credential_generation),
             provider_policy,
             revision,
             digest,
@@ -223,6 +415,7 @@ impl RuntimeSnapshot {
             self.claude_route_graph.as_ref(),
             self.provider_catalog.as_ref(),
             operator_pricing_catalog.revision(),
+            self.credential_generation.as_ref(),
         )?;
         let digest = runtime_snapshot_digest_from_seed(digest_seed.clone(), &self.provider_policy);
         Ok(Self {
@@ -231,6 +424,7 @@ impl RuntimeSnapshot {
             claude_route_graph: Arc::clone(&self.claude_route_graph),
             provider_catalog: Arc::clone(&self.provider_catalog),
             operator_pricing_catalog,
+            credential_generation: Arc::clone(&self.credential_generation),
             provider_policy: Arc::clone(&self.provider_policy),
             revision,
             digest,
@@ -260,14 +454,18 @@ impl RuntimeSnapshot {
         Arc::clone(&self.operator_pricing_catalog)
     }
 
+    pub(super) fn credential_generation(&self) -> Arc<CredentialGeneration> {
+        Arc::clone(&self.credential_generation)
+    }
+
     pub(super) fn provider_policy(&self) -> Arc<ProviderPolicySnapshot> {
         Arc::clone(&self.provider_policy)
     }
 
-    fn candidate_identities(&self) -> Vec<RuntimeUpstreamIdentity> {
-        let mut identities = self.codex_route_graph.candidate_identities();
-        identities.extend(self.claude_route_graph.candidate_identities());
-        identities
+    fn candidate_identities(&self) -> Result<Vec<RuntimeUpstreamIdentity>> {
+        let mut identities = self.codex_route_graph.candidate_identities()?;
+        identities.extend(self.claude_route_graph.candidate_identities()?);
+        Ok(identities)
     }
 
     pub(super) fn revision(&self) -> u64 {
@@ -299,6 +497,14 @@ impl RuntimeSnapshot {
 
 pub(super) struct RuntimeConfig {
     current: RwLock<Arc<RuntimeSnapshot>>,
+    credential_runtime: CredentialRuntime,
+    pending_credential_refresh:
+        Mutex<BTreeMap<CredentialGenerationMarker, BTreeSet<CredentialHandle>>>,
+    recent_auth_refresh:
+        Mutex<BTreeMap<(CredentialGenerationMarker, CredentialHandle), TokioInstant>>,
+    credential_refresh_notify: Notify,
+    #[cfg(test)]
+    credential_refresh_wait_epoch: AtomicU64,
     reload_check: AsyncMutex<RuntimeConfigReloadCheckState>,
     publish: AsyncMutex<RuntimeConfigPublishState>,
     next_build_ticket: AtomicU64,
@@ -358,7 +564,68 @@ struct RuntimeConfigPublishState {
     highest_publish_ticket: u64,
 }
 
+enum CredentialRefreshDriverWork {
+    Scheduled,
+    AuthenticationFailure(BTreeMap<CredentialGenerationMarker, BTreeSet<CredentialHandle>>),
+    Wait(Option<Instant>),
+}
+
+enum PreparedRuntimePublishOutcome {
+    Published { changed: bool },
+    Stale,
+}
+
 impl RuntimeConfig {
+    pub(super) fn new_with_runtime_store_and_credential_sources(
+        initial_config: Arc<HelperConfig>,
+        runtime_store: Arc<RuntimeStore>,
+        credential_sources: CredentialSourceCapabilities,
+    ) -> Result<(Self, Arc<ProxyState>)> {
+        let credential_runtime =
+            CredentialRuntime::from_runtime_store(credential_sources, runtime_store.as_ref())?;
+        let operator_pricing_catalog = try_capture_operator_model_price_catalog()
+            .map(Arc::new)
+            .map_err(anyhow::Error::msg)
+            .context("load initial operator pricing catalog")?;
+        let source_stamp = runtime_source_stamp_from_disk_sync();
+        let prepared = PreparedRuntimeSnapshot::build(
+            initial_config,
+            operator_pricing_catalog,
+            source_stamp,
+            &credential_runtime,
+        )?;
+        let provider_policy = Arc::new(
+            runtime_store
+                .reconcile_runtime_upstream_identities(&prepared.candidate_identities()?, now_ms())
+                .context("reconcile initial runtime upstream identities")?,
+        );
+        let state = ProxyState::new_with_runtime_store(runtime_store)?;
+        let initial = prepared.finish(provider_policy, 1);
+        #[cfg(not(test))]
+        let automatic_reload = RuntimeAutomaticReload::disk();
+        #[cfg(test)]
+        let automatic_reload = RuntimeAutomaticReload::unchanged(source_stamp);
+        let runtime = Self {
+            current: RwLock::new(Arc::new(initial)),
+            credential_runtime,
+            pending_credential_refresh: Mutex::new(BTreeMap::new()),
+            recent_auth_refresh: Mutex::new(BTreeMap::new()),
+            credential_refresh_notify: Notify::new(),
+            #[cfg(test)]
+            credential_refresh_wait_epoch: AtomicU64::new(0),
+            reload_check: AsyncMutex::new(RuntimeConfigReloadCheckState {
+                last_check_at: Instant::now()
+                    .checked_sub(Duration::from_secs(60))
+                    .unwrap_or_else(Instant::now),
+            }),
+            publish: AsyncMutex::new(RuntimeConfigPublishState::default()),
+            next_build_ticket: AtomicU64::new(1),
+            policy_state: Some(Arc::clone(&state)),
+            automatic_reload,
+        };
+        Ok((runtime, state))
+    }
+
     #[cfg(test)]
     pub(super) fn new_with_config(
         initial_config: Arc<HelperConfig>,
@@ -367,6 +634,7 @@ impl RuntimeConfig {
         Self::new_inner(initial_config, provider_policy, None)
     }
 
+    #[cfg(test)]
     pub(super) fn new_with_policy_state(
         initial_config: Arc<HelperConfig>,
         provider_policy: Arc<ProviderPolicySnapshot>,
@@ -375,25 +643,49 @@ impl RuntimeConfig {
         Self::new_inner(initial_config, provider_policy, Some(policy_state))
     }
 
+    #[cfg(test)]
     fn new_inner(
         initial_config: Arc<HelperConfig>,
         provider_policy: Arc<ProviderPolicySnapshot>,
         policy_state: Option<Arc<ProxyState>>,
     ) -> Result<Self> {
+        let credential_runtime = match policy_state.as_ref() {
+            Some(state) => CredentialRuntime::from_runtime_store(
+                CredentialSourceCapabilities::server(),
+                state.runtime_store(),
+            )?,
+            None => {
+                let runtime_store = RuntimeStore::open_in_memory()
+                    .context("open isolated runtime credential store")?;
+                CredentialRuntime::from_runtime_store(
+                    CredentialSourceCapabilities::server(),
+                    &runtime_store,
+                )?
+            }
+        };
         let operator_pricing_catalog = try_capture_operator_model_price_catalog()
             .map(Arc::new)
             .map_err(anyhow::Error::msg)
             .context("load initial operator pricing catalog")?;
         let source_stamp = runtime_source_stamp_from_disk_sync();
-        let initial =
-            PreparedRuntimeSnapshot::build(initial_config, operator_pricing_catalog, source_stamp)?
-                .finish(provider_policy, 1);
+        let initial = PreparedRuntimeSnapshot::build(
+            initial_config,
+            operator_pricing_catalog,
+            source_stamp,
+            &credential_runtime,
+        )?
+        .finish(provider_policy, 1);
         #[cfg(not(test))]
         let automatic_reload = RuntimeAutomaticReload::disk();
         #[cfg(test)]
         let automatic_reload = RuntimeAutomaticReload::unchanged(source_stamp);
         Ok(Self {
             current: RwLock::new(Arc::new(initial)),
+            credential_runtime,
+            pending_credential_refresh: Mutex::new(BTreeMap::new()),
+            recent_auth_refresh: Mutex::new(BTreeMap::new()),
+            credential_refresh_notify: Notify::new(),
+            credential_refresh_wait_epoch: AtomicU64::new(0),
             reload_check: AsyncMutex::new(RuntimeConfigReloadCheckState {
                 last_check_at: Instant::now()
                     .checked_sub(Duration::from_secs(60))
@@ -413,15 +705,29 @@ impl RuntimeConfig {
         source_stamp: RuntimeSourceStamp,
         automatic_reload: RuntimeAutomaticReload,
     ) -> Result<Self> {
+        let runtime_store = RuntimeStore::open_in_memory().context("open test credential store")?;
+        let credential_runtime = CredentialRuntime::from_runtime_store(
+            CredentialSourceCapabilities::server(),
+            &runtime_store,
+        )?;
         let operator_pricing_catalog = try_capture_operator_model_price_catalog()
             .map(Arc::new)
             .map_err(anyhow::Error::msg)
             .context("load initial operator pricing catalog")?;
-        let initial =
-            PreparedRuntimeSnapshot::build(initial_config, operator_pricing_catalog, source_stamp)?
-                .finish(provider_policy, 1);
+        let initial = PreparedRuntimeSnapshot::build(
+            initial_config,
+            operator_pricing_catalog,
+            source_stamp,
+            &credential_runtime,
+        )?
+        .finish(provider_policy, 1);
         Ok(Self {
             current: RwLock::new(Arc::new(initial)),
+            credential_runtime,
+            pending_credential_refresh: Mutex::new(BTreeMap::new()),
+            recent_auth_refresh: Mutex::new(BTreeMap::new()),
+            credential_refresh_notify: Notify::new(),
+            credential_refresh_wait_epoch: AtomicU64::new(0),
             reload_check: AsyncMutex::new(RuntimeConfigReloadCheckState {
                 last_check_at: Instant::now()
                     .checked_sub(Duration::from_secs(60))
@@ -434,14 +740,54 @@ impl RuntimeConfig {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn reconcile_initial_provider_policy(
         config: &HelperConfig,
         runtime_store: &RuntimeStore,
     ) -> Result<Arc<ProviderPolicySnapshot>> {
-        let codex_route_graph = compile_route_graph("codex", &config.codex)?;
-        let claude_route_graph = compile_route_graph("claude", &config.claude)?;
-        let mut identities = codex_route_graph.candidate_identities();
-        identities.extend(claude_route_graph.candidate_identities());
+        let credential_runtime = CredentialRuntime::from_runtime_store(
+            CredentialSourceCapabilities::server(),
+            runtime_store,
+        )?;
+        let source_codex = compile_route_graph("codex", &config.codex)?;
+        let source_claude = compile_route_graph("claude", &config.claude)?;
+        let generation = credential_runtime.build_generation(
+            source_codex
+                .candidates()
+                .iter()
+                .map(|candidate| CredentialCandidateInput {
+                    provider_endpoint: crate::runtime_identity::ProviderEndpointKey::new(
+                        "codex",
+                        candidate.provider_id.clone(),
+                        candidate.endpoint_id.clone(),
+                    ),
+                    auth: &candidate.auth,
+                })
+                .chain(source_claude.candidates().iter().map(|candidate| {
+                    CredentialCandidateInput {
+                        provider_endpoint: crate::runtime_identity::ProviderEndpointKey::new(
+                            "claude",
+                            candidate.provider_id.clone(),
+                            candidate.endpoint_id.clone(),
+                        ),
+                        auth: &candidate.auth,
+                    }
+                })),
+        )?;
+        let runtime_config = redacted_runtime_config(config.clone());
+        let codex_route_graph = Arc::new(
+            CompiledRouteGraph::compile("codex", &runtime_config.codex)?
+                .with_credential_generation(
+                    Arc::clone(&generation),
+                    source_codex.digest().into(),
+                )?,
+        );
+        let claude_route_graph = Arc::new(
+            CompiledRouteGraph::compile("claude", &runtime_config.claude)?
+                .with_credential_generation(generation, source_claude.digest().into())?,
+        );
+        let mut identities = codex_route_graph.candidate_identities()?;
+        identities.extend(claude_route_graph.candidate_identities()?);
         runtime_store
             .reconcile_runtime_upstream_identities(&identities, now_ms())
             .map(Arc::new)
@@ -481,8 +827,277 @@ impl RuntimeConfig {
         self.capture_current()
     }
 
+    pub(super) fn automatic_reload_check_interval(&self) -> Duration {
+        self.automatic_reload.min_check_interval
+    }
+
     pub(super) async fn snapshot(&self) -> Arc<HelperConfig> {
         self.capture().await.config()
+    }
+
+    pub(super) fn schedule_credential_refresh(&self, credential: &CapturedUpstreamCredential) {
+        self.schedule_credential_refresh_at(credential, TokioInstant::now());
+    }
+
+    fn schedule_credential_refresh_at(
+        &self,
+        credential: &CapturedUpstreamCredential,
+        now: TokioInstant,
+    ) {
+        let handles = credential.refresh_handles();
+        if handles.is_empty() {
+            return;
+        }
+        let marker = credential.generation_marker();
+        let current_marker = self.capture_current().credential_generation.marker();
+        if marker != current_marker {
+            return;
+        }
+        let mut recent = self
+            .recent_auth_refresh
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        recent.retain(|(generation, _), _| generation == &current_marker);
+        let eligible = handles
+            .iter()
+            .filter(|handle| {
+                recent
+                    .get(&(marker.clone(), (*handle).clone()))
+                    .is_none_or(|attempted_at| {
+                        now.saturating_duration_since(*attempted_at)
+                            >= AUTH_FAILURE_REFRESH_MIN_INTERVAL
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        drop(recent);
+        if eligible.is_empty() {
+            return;
+        }
+        self.pending_credential_refresh
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(marker)
+            .or_default()
+            .extend(eligible);
+        self.credential_refresh_notify.notify_one();
+    }
+
+    fn take_pending_credential_refresh(
+        &self,
+    ) -> BTreeMap<CredentialGenerationMarker, BTreeSet<CredentialHandle>> {
+        let mut pending = self
+            .pending_credential_refresh
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *pending)
+    }
+
+    async fn refresh_pending_credentials(
+        &self,
+        pending: BTreeMap<CredentialGenerationMarker, BTreeSet<CredentialHandle>>,
+    ) -> Result<bool> {
+        let current = self.capture_current();
+        let generation = current.credential_generation();
+        let marker = generation.marker();
+        let handles = pending
+            .into_values()
+            .flatten()
+            .filter(|handle| generation.contains_handle(handle))
+            .collect::<BTreeSet<_>>();
+        if handles.is_empty() {
+            return Ok(false);
+        }
+        {
+            let now = TokioInstant::now();
+            let mut recent = self
+                .recent_auth_refresh
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            recent.retain(|(generation, _), _| generation == &marker);
+            recent.extend(
+                handles
+                    .iter()
+                    .cloned()
+                    .map(|handle| ((marker.clone(), handle), now)),
+            );
+        }
+        self.refresh_credentials(
+            Some(handles.into_iter().collect::<Vec<_>>().into()),
+            CredentialRuntimeRefreshCause::AuthenticationFailure,
+            Some(marker),
+        )
+        .await
+    }
+
+    // U9 exposes these operations only through the signed local operator boundary.
+    #[allow(dead_code)]
+    pub(super) async fn refresh_native_credential_after_upsert(
+        &self,
+        name: &CredentialName,
+    ) -> Result<bool> {
+        self.publish_named_native_credential(name, CredentialRuntimeRefreshCause::ExplicitRefresh)
+            .await
+    }
+
+    #[allow(dead_code)]
+    pub(super) async fn invalidate_deleted_native_credential(
+        &self,
+        name: &CredentialName,
+    ) -> Result<bool> {
+        self.publish_named_native_credential(name, CredentialRuntimeRefreshCause::ExplicitDelete)
+            .await
+    }
+
+    async fn publish_named_native_credential(
+        &self,
+        name: &CredentialName,
+        cause: CredentialRuntimeRefreshCause,
+    ) -> Result<bool> {
+        loop {
+            let previous = self.capture_current();
+            let generation = previous.credential_generation();
+            let handles = generation.native_handles_for_name(name);
+            if handles.is_empty() {
+                return Ok(false);
+            }
+            let ticket = self.reserve_build_ticket();
+            let next_generation = self
+                .credential_runtime
+                .refresh_generation(generation, Some(handles), cause)
+                .await?;
+            let prepared =
+                PreparedRuntimeSnapshot::with_refreshed_credentials(&previous, next_generation)?;
+            match self
+                .publish_prepared_with_expected(ticket, prepared, Some(&previous))
+                .await?
+            {
+                PreparedRuntimePublishOutcome::Published { changed } => return Ok(changed),
+                PreparedRuntimePublishOutcome::Stale => continue,
+            }
+        }
+    }
+
+    fn take_credential_refresh_driver_work(&self) -> CredentialRefreshDriverWork {
+        let deadline = self
+            .capture_current()
+            .credential_generation
+            .next_native_deadline();
+        if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+            return CredentialRefreshDriverWork::Scheduled;
+        }
+        let pending = self.take_pending_credential_refresh();
+        if pending.is_empty() {
+            CredentialRefreshDriverWork::Wait(deadline)
+        } else {
+            CredentialRefreshDriverWork::AuthenticationFailure(pending)
+        }
+    }
+
+    async fn refresh_credentials(
+        &self,
+        requested: Option<Arc<[CredentialHandle]>>,
+        cause: CredentialRuntimeRefreshCause,
+        expected_generation: Option<CredentialGenerationMarker>,
+    ) -> Result<bool> {
+        let previous = self.capture_current();
+        if expected_generation
+            .as_ref()
+            .is_some_and(|marker| !marker.matches(previous.credential_generation.as_ref()))
+        {
+            return Ok(false);
+        }
+        let ticket = self.reserve_build_ticket();
+        let next_generation = self
+            .credential_runtime
+            .refresh_generation(previous.credential_generation(), requested.clone(), cause)
+            .await?;
+        if Arc::ptr_eq(&next_generation, &previous.credential_generation) {
+            return Ok(false);
+        }
+        let prepared =
+            PreparedRuntimeSnapshot::with_refreshed_credentials(&previous, next_generation)?;
+        match self
+            .publish_prepared_with_expected(ticket, prepared, Some(&previous))
+            .await?
+        {
+            PreparedRuntimePublishOutcome::Published { changed } => Ok(changed),
+            PreparedRuntimePublishOutcome::Stale => {
+                let current = self.capture_current();
+                if let (Some(requested), Some(expected_generation)) =
+                    (requested, expected_generation)
+                    && expected_generation.matches(current.credential_generation.as_ref())
+                {
+                    self.pending_credential_refresh
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .entry(expected_generation)
+                        .or_default()
+                        .extend(requested.iter().cloned());
+                    self.credential_refresh_notify.notify_one();
+                }
+                Ok(false)
+            }
+        }
+    }
+
+    pub(super) async fn run_credential_refresh_driver(
+        &self,
+        mut shutdown_rx: watch::Receiver<bool>,
+    ) {
+        loop {
+            if *shutdown_rx.borrow() {
+                return;
+            }
+
+            match self.take_credential_refresh_driver_work() {
+                CredentialRefreshDriverWork::Scheduled => {
+                    let refresh = self.refresh_credentials(
+                        None,
+                        CredentialRuntimeRefreshCause::Scheduled,
+                        None,
+                    );
+                    match await_refresh_or_shutdown(&mut shutdown_rx, refresh).await {
+                        None => return,
+                        Some(Ok(_)) => {}
+                        Some(Err(error)) => {
+                            warn!(error = %error, "scheduled credential refresh failed");
+                        }
+                    }
+                }
+                CredentialRefreshDriverWork::AuthenticationFailure(requested) => {
+                    let refresh = self.refresh_pending_credentials(requested);
+                    match await_refresh_or_shutdown(&mut shutdown_rx, refresh).await {
+                        None => return,
+                        Some(Ok(_)) => {}
+                        Some(Err(error)) => {
+                            warn!(error = %error, "credential refresh after upstream auth failure failed");
+                        }
+                    }
+                }
+                CredentialRefreshDriverWork::Wait(Some(deadline)) => {
+                    #[cfg(test)]
+                    self.credential_refresh_wait_epoch
+                        .fetch_add(1, Ordering::SeqCst);
+                    tokio::select! {
+                        biased;
+                        _ = wait_for_shutdown(&mut shutdown_rx) => return,
+                        _ = self.credential_refresh_notify.notified() => continue,
+                        () = tokio::time::sleep_until(TokioInstant::from_std(deadline)) => {}
+                    }
+                }
+                CredentialRefreshDriverWork::Wait(None) => {
+                    #[cfg(test)]
+                    self.credential_refresh_wait_epoch
+                        .fetch_add(1, Ordering::SeqCst);
+                    tokio::select! {
+                        biased;
+                        _ = wait_for_shutdown(&mut shutdown_rx) => return,
+                        _ = self.credential_refresh_notify.notified() => {}
+                    }
+                }
+            }
+        }
     }
 
     pub(super) async fn force_reload_from_disk(&self) -> Result<bool> {
@@ -535,8 +1150,15 @@ impl RuntimeConfig {
         let ticket = self.reserve_build_ticket();
         let (loaded, source_stamp) = source().await?;
         let operator_pricing_catalog = pricing().await?;
-        let prepared =
-            prepare_runtime_snapshot(loaded, source_stamp, operator_pricing_catalog).await?;
+        let previous_generation = self.capture_current().credential_generation();
+        let prepared = prepare_runtime_snapshot(
+            loaded,
+            source_stamp,
+            operator_pricing_catalog,
+            self.credential_runtime.clone(),
+            previous_generation,
+        )
+        .await?;
         self.publish_prepared(ticket, prepared).await
     }
 
@@ -578,8 +1200,15 @@ impl RuntimeConfig {
         let ticket = self.reserve_build_ticket();
         let loaded = loader().await?;
         let operator_pricing_catalog = pricing().await?;
-        let prepared =
-            prepare_runtime_snapshot(loaded, source_stamp, operator_pricing_catalog).await?;
+        let previous_generation = self.capture_current().credential_generation();
+        let prepared = prepare_runtime_snapshot(
+            loaded,
+            source_stamp,
+            operator_pricing_catalog,
+            self.credential_runtime.clone(),
+            previous_generation,
+        )
+        .await?;
         self.publish_prepared(ticket, prepared).await
     }
 
@@ -588,51 +1217,77 @@ impl RuntimeConfig {
         ticket: u64,
         prepared: PreparedRuntimeSnapshot,
     ) -> Result<bool> {
+        match self
+            .publish_prepared_with_expected(ticket, prepared, None)
+            .await?
+        {
+            PreparedRuntimePublishOutcome::Published { changed } => Ok(changed),
+            PreparedRuntimePublishOutcome::Stale => Ok(false),
+        }
+    }
+
+    async fn publish_prepared_with_expected(
+        &self,
+        ticket: u64,
+        prepared: PreparedRuntimeSnapshot,
+        expected: Option<&Arc<RuntimeSnapshot>>,
+    ) -> Result<PreparedRuntimePublishOutcome> {
         let mut publish_state = self.publish.lock().await;
         if ticket <= publish_state.highest_publish_ticket {
-            return Ok(false);
+            return Ok(PreparedRuntimePublishOutcome::Stale);
         }
-        publish_state.highest_publish_ticket = ticket;
 
         let previous = self.capture_current();
-        let next_identities = prepared.candidate_identities();
+        if expected.is_some_and(|expected| !Arc::ptr_eq(expected, &previous)) {
+            return Ok(PreparedRuntimePublishOutcome::Stale);
+        }
+        publish_state.highest_publish_ticket = ticket;
+        let next_identities = prepared.candidate_identities()?;
         let routing_control_graphs = [
-            ("codex", prepared.codex_route_graph.digest().to_string()),
-            ("claude", prepared.claude_route_graph.digest().to_string()),
+            PreparedRoutingOperatorRouteGraph::new(
+                "codex",
+                prepared.codex_route_graph.digest().to_string(),
+            )
+            .context("prepare codex routing operator control reconciliation")?,
+            PreparedRoutingOperatorRouteGraph::new(
+                "claude",
+                prepared.claude_route_graph.digest().to_string(),
+            )
+            .context("prepare claude routing operator control reconciliation")?,
         ];
         let identity_delta =
-            diff_runtime_upstream_identities(&previous.candidate_identities(), &next_identities);
-        let provider_policy = match self.policy_state.as_ref() {
-            Some(policy_state)
-                if !identity_delta.added.is_empty() || !identity_delta.removed.is_empty() =>
-            {
-                policy_state
-                    .reconcile_runtime_upstream_identities(&next_identities, now_ms())
-                    .await
-                    .context("reconcile reloaded runtime upstream identities")?
-            }
-            Some(policy_state) => policy_state.capture_provider_policy_snapshot().await,
-            None => previous.provider_policy(),
-        };
+            diff_runtime_upstream_identities(&previous.candidate_identities()?, &next_identities);
         if let Some(policy_state) = self.policy_state.as_ref() {
-            for (service_name, route_graph_key) in routing_control_graphs {
-                policy_state
-                    .reconcile_routing_operator_route_graph(service_name, route_graph_key.as_str())
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "reconcile {service_name} routing operator control after config reload"
-                        )
-                    })?;
+            let reconcile_identities =
+                !identity_delta.added.is_empty() || !identity_delta.removed.is_empty();
+            let (_, outcome) = policy_state
+                .commit_runtime_reload(
+                    &routing_control_graphs,
+                    &next_identities,
+                    reconcile_identities,
+                    now_ms(),
+                    |provider_policy| {
+                        let mut next = prepared.finish(provider_policy, previous.revision());
+                        let changed = next.digest() != previous.digest();
+                        if changed {
+                            next.revision = previous.revision().saturating_add(1);
+                        }
+                        self.store_current(next);
+                        PreparedRuntimePublishOutcome::Published { changed }
+                    },
+                )
+                .await
+                .context("commit reloaded runtime identities and snapshot")?;
+            Ok(outcome)
+        } else {
+            let mut next = prepared.finish(previous.provider_policy(), previous.revision());
+            let changed = next.digest() != previous.digest();
+            if changed {
+                next.revision = previous.revision().saturating_add(1);
             }
+            self.store_current(next);
+            Ok(PreparedRuntimePublishOutcome::Published { changed })
         }
-        let mut next = prepared.finish(provider_policy, previous.revision());
-        let changed = next.digest() != previous.digest();
-        if changed {
-            next.revision = previous.revision().saturating_add(1);
-        }
-        self.store_current(next);
-        Ok(changed)
     }
 
     pub(super) async fn publish_provider_policy(
@@ -715,13 +1370,15 @@ impl RuntimeConfig {
 }
 
 async fn runtime_source_stamp_from_disk() -> RuntimeSourceStamp {
-    let (config_mtime, pricing_mtime) = tokio::join!(
+    let (config_mtime, pricing_mtime, usage_providers_revision) = tokio::join!(
         source_mtime(crate::config::config_file_path()),
         source_mtime(crate::pricing::model_price_overrides_path()),
+        tokio::task::spawn_blocking(usage_provider_source_revision_from_disk),
     );
     RuntimeSourceStamp {
         config_mtime,
         pricing_mtime,
+        usage_providers_revision: usage_providers_revision.unwrap_or([0; 32]),
     }
 }
 
@@ -729,6 +1386,7 @@ fn runtime_source_stamp_from_disk_sync() -> RuntimeSourceStamp {
     RuntimeSourceStamp {
         config_mtime: source_mtime_sync(crate::config::config_file_path()),
         pricing_mtime: source_mtime_sync(crate::pricing::model_price_overrides_path()),
+        usage_providers_revision: usage_provider_source_revision_from_disk(),
     }
 }
 
@@ -745,6 +1403,28 @@ async fn source_mtime(path: std::path::PathBuf) -> Option<SystemTime> {
         .and_then(|metadata| metadata.modified().ok())
 }
 
+async fn await_refresh_or_shutdown<F>(
+    shutdown_rx: &mut watch::Receiver<bool>,
+    refresh: F,
+) -> Option<Result<bool>>
+where
+    F: Future<Output = Result<bool>>,
+{
+    tokio::select! {
+        biased;
+        _ = wait_for_shutdown(shutdown_rx) => None,
+        result = refresh => Some(result),
+    }
+}
+
+async fn wait_for_shutdown(shutdown_rx: &mut watch::Receiver<bool>) {
+    loop {
+        if *shutdown_rx.borrow() || shutdown_rx.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 async fn capture_strict_operator_pricing_catalog() -> Result<CapturedModelPriceCatalog> {
     tokio::task::spawn_blocking(try_capture_operator_model_price_catalog)
         .await
@@ -757,18 +1437,23 @@ async fn prepare_runtime_snapshot(
     loaded: LoadedConfig,
     source_stamp: RuntimeSourceStamp,
     operator_pricing_catalog: CapturedModelPriceCatalog,
+    credential_runtime: CredentialRuntime,
+    previous_generation: Arc<CredentialGeneration>,
 ) -> Result<PreparedRuntimeSnapshot> {
     tokio::task::spawn_blocking(move || {
-        PreparedRuntimeSnapshot::build(
+        PreparedRuntimeSnapshot::build_from_previous(
             Arc::new(loaded.source),
             Arc::new(operator_pricing_catalog),
             source_stamp,
+            &credential_runtime,
+            previous_generation.as_ref(),
         )
     })
     .await
     .context("join runtime snapshot builder")?
 }
 
+#[cfg(test)]
 fn compile_route_graph(
     service_name: &str,
     service: &ServiceRouteConfig,
@@ -776,6 +1461,11 @@ fn compile_route_graph(
     CompiledRouteGraph::compile(service_name, service)
         .with_context(|| format!("compile {service_name} route graph for runtime snapshot"))
         .map(Arc::new)
+}
+
+fn redacted_runtime_config(mut config: HelperConfig) -> HelperConfig {
+    config.zeroize_inline_credentials();
+    config
 }
 
 #[cfg(test)]
@@ -793,6 +1483,7 @@ fn runtime_snapshot_digest(
         claude_route_graph,
         provider_catalog,
         operator_pricing_revision,
+        CredentialGeneration::empty().as_ref(),
     )?;
     Ok(runtime_snapshot_digest_from_seed(seed, provider_policy))
 }
@@ -803,6 +1494,7 @@ fn runtime_snapshot_digest_seed(
     claude_route_graph: &CompiledRouteGraph,
     provider_catalog: &ProviderCatalogSnapshot,
     operator_pricing_revision: &str,
+    credential_generation: &CredentialGeneration,
 ) -> Result<Sha256> {
     let mut hasher = Sha256::new();
     hash_digest_part(&mut hasher, b"codex-helper:runtime-snapshot:v1");
@@ -822,6 +1514,7 @@ fn runtime_snapshot_digest_seed(
         provider_catalog.pricing_revision().as_str().as_bytes(),
     );
     hash_digest_part(&mut hasher, operator_pricing_revision.as_bytes());
+    hash_digest_part(&mut hasher, credential_generation.digest().as_bytes());
     Ok(hasher)
 }
 
@@ -880,11 +1573,32 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use axum::http::{HeaderMap, header};
+
     use super::*;
-    use crate::config::{ProviderConfig, RouteGraphConfig, UpstreamAuth};
+    use crate::config::{
+        CURRENT_CONFIG_VERSION, CredentialRef, ProviderConfig, RouteGraphConfig, SchedulingPreset,
+        UpstreamAuth,
+    };
+    use crate::credentials::{CredentialName, SecretValue};
     use crate::pricing::capture_operator_model_price_catalog;
     use crate::runtime_identity::ProviderEndpointKey;
     use tokio::sync::oneshot;
+
+    fn assert_secret_canary_absent(surface: &str, rendered: &str, canary: &str) {
+        let raw_sha256 = format!("{:x}", sha2::Sha256::digest(canary.as_bytes()));
+        for forbidden in [
+            canary.to_string(),
+            format!("Bearer {canary}"),
+            canary[..16].to_string(),
+            raw_sha256,
+        ] {
+            assert!(
+                !rendered.contains(&forbidden),
+                "{surface} leaked credential material matching {forbidden:?}: {rendered}"
+            );
+        }
+    }
 
     fn loaded_route_graph(label: &str) -> LoadedConfig {
         let source = route_graph_source(label);
@@ -897,6 +1611,68 @@ mod tests {
         HelperConfig {
             codex: service_view(&codex_provider),
             claude: service_view(&claude_provider),
+            ..HelperConfig::default()
+        }
+    }
+
+    fn native_route_graph_source(label: &str, credential_name: &str) -> HelperConfig {
+        let provider_id = format!("codex-{label}");
+        HelperConfig {
+            codex: ServiceRouteConfig {
+                providers: BTreeMap::from([(
+                    provider_id.clone(),
+                    ProviderConfig {
+                        base_url: Some(format!("https://{provider_id}.example/v1")),
+                        auth: UpstreamAuth {
+                            auth_token_ref: Some(CredentialRef::Native {
+                                name: credential_name.to_string(),
+                            }),
+                            ..UpstreamAuth::default()
+                        },
+                        ..ProviderConfig::default()
+                    },
+                )]),
+                routing: Some(RouteGraphConfig::ordered_failover(vec![provider_id])),
+                ..ServiceRouteConfig::default()
+            },
+            ..HelperConfig::default()
+        }
+    }
+
+    fn two_native_route_graph_source(
+        first_credential_name: &str,
+        second_credential_name: &str,
+    ) -> HelperConfig {
+        let providers = [
+            ("first", first_credential_name),
+            ("second", second_credential_name),
+        ]
+        .into_iter()
+        .map(|(provider_id, credential_name)| {
+            (
+                provider_id.to_string(),
+                ProviderConfig {
+                    base_url: Some(format!("https://{provider_id}.example/v1")),
+                    auth: UpstreamAuth {
+                        auth_token_ref: Some(CredentialRef::Native {
+                            name: credential_name.to_string(),
+                        }),
+                        ..UpstreamAuth::default()
+                    },
+                    ..ProviderConfig::default()
+                },
+            )
+        })
+        .collect();
+        HelperConfig {
+            codex: ServiceRouteConfig {
+                providers,
+                routing: Some(RouteGraphConfig::ordered_failover(vec![
+                    "first".to_string(),
+                    "second".to_string(),
+                ])),
+                ..ServiceRouteConfig::default()
+            },
             ..HelperConfig::default()
         }
     }
@@ -955,16 +1731,91 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn published_runtime_surfaces_do_not_debug_or_serialize_credential_material() {
+        const CANARY: &str = "RzT4Yq9P2nK8vL6cF3sW7mX5hJ1dB0aQ";
+
+        let mut source = stable_identity_source("https://relay.example/v1", "relay-account");
+        source
+            .codex
+            .providers
+            .get_mut("stable")
+            .expect("stable provider")
+            .auth = UpstreamAuth {
+            auth_token: Some(CANARY.to_string().into()),
+            ..UpstreamAuth::default()
+        };
+        assert!(!format!("{source:?}").contains(CANARY));
+
+        let runtime = RuntimeConfig::new_with_config(Arc::new(source), provider_policy())
+            .expect("build canary-backed runtime");
+        let snapshot = runtime.capture().await;
+        let redacted_config = snapshot.config();
+        let graph = snapshot.route_graph("codex").expect("codex route graph");
+        let route_plan = snapshot
+            .capture_route_plan("codex", &RouteRequestContext::default())
+            .expect("capture route plan")
+            .expect("configured route plan");
+        let candidate = route_plan
+            .template()
+            .candidates
+            .first()
+            .expect("route candidate");
+        let captured = route_plan
+            .template()
+            .capture_candidate(candidate)
+            .expect("capture route candidate credential");
+        let serialized_config =
+            serde_json::to_string(redacted_config.as_ref()).expect("serialize redacted config");
+
+        for (surface, rendered) in [
+            ("runtime snapshot", format!("{snapshot:?}")),
+            ("redacted helper config", format!("{redacted_config:?}")),
+            ("serialized helper config", serialized_config),
+            ("compiled route graph", format!("{graph:?}")),
+            (
+                "route plan template",
+                format!("{:?}", route_plan.template()),
+            ),
+            (
+                "credential generation",
+                format!("{:?}", snapshot.credential_generation()),
+            ),
+            ("captured route candidate", format!("{captured:?}")),
+        ] {
+            assert_secret_canary_absent(surface, &rendered, CANARY);
+        }
+    }
+
     fn blocked_policy_runtime(
         source: HelperConfig,
     ) -> (RuntimeConfig, Arc<ProxyState>, Arc<RuntimeStore>) {
         let runtime_store = Arc::new(RuntimeStore::open_in_memory().expect("open runtime store"));
         let graph = compile_route_graph("codex", &source.codex).expect("compile initial graph");
-        let identity = graph
-            .candidate_identities()
-            .into_iter()
-            .next()
-            .expect("initial identity");
+        let candidate = graph.candidates().first().expect("initial candidate");
+        let provider_endpoint = ProviderEndpointKey::new(
+            "codex",
+            candidate.provider_id.clone(),
+            candidate.endpoint_id.clone(),
+        );
+        let credential_runtime = CredentialRuntime::from_runtime_store(
+            CredentialSourceCapabilities::server(),
+            runtime_store.as_ref(),
+        )
+        .expect("build test credential runtime");
+        let generation = credential_runtime
+            .build_generation([CredentialCandidateInput {
+                provider_endpoint: provider_endpoint.clone(),
+                auth: &candidate.auth,
+            }])
+            .expect("build initial credential generation");
+        let identity = generation
+            .bind_upstream_identity(
+                provider_endpoint,
+                candidate.base_url.clone(),
+                candidate.continuity_domain.clone(),
+            )
+            .expect("bind initial runtime identity");
         let scope = crate::runtime_store::ProviderObservationScope::new(
             identity.provider_endpoint.clone(),
             identity.base_url.as_str(),
@@ -1029,6 +1880,17 @@ mod tests {
         let loaded = loaded_route_graph(label);
         RuntimeConfig::new_with_config(Arc::new(loaded.source), provider_policy())
             .expect("build test runtime config")
+    }
+
+    fn replace_credential_generation_for_test(
+        runtime: &RuntimeConfig,
+        previous: &RuntimeSnapshot,
+        generation: Arc<CredentialGeneration>,
+    ) -> Arc<RuntimeSnapshot> {
+        let prepared = PreparedRuntimeSnapshot::with_refreshed_credentials(previous, generation)
+            .expect("rebind test credential generation");
+        runtime.store_current(prepared.finish(previous.provider_policy(), previous.revision()));
+        runtime.capture_current()
     }
 
     fn assert_snapshot_label(snapshot: &RuntimeSnapshot, label: &str) {
@@ -1111,6 +1973,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_capture_uses_lkg_while_background_native_reload_is_blocked() {
+        let initial_source = native_route_graph_source("old", "relay.old");
+        let reloaded_source = native_route_graph_source("new", "relay.new");
+        let runtime_store = Arc::new(RuntimeStore::open_in_memory().expect("open runtime store"));
+        let (credential_sources, native_control) = CredentialRuntime::test_blocking_sources(
+            SecretValue::new(b"generation-a".to_vec()).expect("valid initial credential"),
+        );
+        let mut proxy = super::super::ProxyService::new_with_runtime_store_and_credential_sources(
+            reqwest::Client::new(),
+            Arc::new(initial_source),
+            "codex",
+            runtime_store,
+            credential_sources,
+        )
+        .expect("build native-backed proxy");
+        assert_eq!(native_control.read_count(), 1);
+
+        let before = proxy.config.capture().await;
+        let changed_stamp = RuntimeSourceStamp {
+            config_mtime: Some(
+                before
+                    .source_stamp()
+                    .config_mtime
+                    .and_then(|stamp| stamp.checked_add(Duration::from_secs(1)))
+                    .unwrap_or(SystemTime::UNIX_EPOCH),
+            ),
+            pricing_mtime: before.source_stamp().pricing_mtime,
+            usage_providers_revision: before.source_stamp().usage_providers_revision,
+        };
+        let pricing = before.operator_pricing_catalog().as_ref().clone();
+        Arc::get_mut(&mut proxy.config)
+            .expect("proxy exclusively owns runtime config before driver start")
+            .automatic_reload = RuntimeAutomaticReload {
+            min_check_interval: RuntimeAutomaticReload::MIN_CHECK_INTERVAL,
+            metadata: Arc::new(move || Box::pin(std::future::ready(changed_stamp))),
+            config: Arc::new(move || {
+                let source = reloaded_source.clone();
+                Box::pin(async move { Ok(LoadedConfig { source }) })
+            }),
+            pricing: Arc::new(move || {
+                let pricing = pricing.clone();
+                Box::pin(async move { Ok(pricing) })
+            }),
+        };
+
+        native_control.block();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let driver = proxy.spawn_runtime_config_driver(shutdown_rx);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while native_control.read_count() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background reload should reach the blocked native backend");
+
+        let context = tokio::time::timeout(
+            Duration::from_secs(1),
+            super::super::request_preparation::load_request_config_context(&proxy, None),
+        )
+        .await
+        .expect("request capture must not wait for background credential I/O");
+        assert!(Arc::ptr_eq(&before, &context.runtime_snapshot));
+        let route_plan = context
+            .runtime_snapshot
+            .capture_route_plan("codex", &RouteRequestContext::default())
+            .expect("capture route plan")
+            .expect("configured route plan");
+        let candidate = route_plan
+            .template()
+            .candidates
+            .first()
+            .expect("old route candidate");
+        assert_eq!(candidate.provider_id, "codex-old");
+        let target = route_plan
+            .template()
+            .capture_candidate(candidate)
+            .expect("capture old credential generation");
+        let mut headers = HeaderMap::new();
+        super::super::attempt_request::inject_auth_headers(
+            "codex",
+            target.credential(),
+            target.base_url(),
+            &mut headers,
+        )
+        .expect("inject captured native credential");
+        assert_eq!(
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer generation-a")
+        );
+
+        native_control.release();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let current = proxy.config.capture().await;
+                if current.revision() > before.revision() {
+                    assert_eq!(
+                        current
+                            .route_graph("codex")
+                            .expect("reloaded codex graph")
+                            .candidates()[0]
+                            .provider_id,
+                        "codex-new"
+                    );
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background reload should publish after native I/O completes");
+
+        shutdown_tx.send(true).expect("request driver shutdown");
+        driver.await.expect("join runtime config driver");
+    }
+
+    #[tokio::test]
     async fn captured_snapshot_is_all_old_or_all_new_across_reload() {
         let runtime = runtime_config("old");
         let old = runtime.capture().await;
@@ -1187,7 +2168,7 @@ mod tests {
             .get_mut("stable")
             .expect("stable provider")
             .auth = UpstreamAuth {
-            auth_token: Some("account-a-secret".to_string()),
+            auth_token: Some("account-a-secret".to_string().into()),
             ..UpstreamAuth::default()
         };
         let mut reloaded = initial.clone();
@@ -1197,7 +2178,7 @@ mod tests {
             .get_mut("stable")
             .expect("stable provider")
             .auth = UpstreamAuth {
-            auth_token: Some("account-b-secret".to_string()),
+            auth_token: Some("account-b-secret".to_string().into()),
             ..UpstreamAuth::default()
         };
         let (runtime, state, _) = blocked_policy_runtime(initial);
@@ -1229,6 +2210,888 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reload_preserves_automatic_policy_when_only_legacy_config_version_migrates() {
+        let mut initial = stable_identity_source("https://old.example/v1", "continuity-a");
+        initial.version = 5;
+        initial
+            .codex
+            .providers
+            .get_mut("stable")
+            .expect("stable provider")
+            .auth = UpstreamAuth {
+            auth_token: Some("unchanged-legacy-secret".to_string().into()),
+            ..UpstreamAuth::default()
+        };
+        let mut migrated = initial.clone();
+        migrated.version = CURRENT_CONFIG_VERSION;
+        let (runtime, state, runtime_store) = blocked_policy_runtime(initial);
+        let before = runtime.capture().await;
+        let before_projection = before.provider_policy().projections[0].clone();
+        assert_eq!(
+            before_projection.automatic,
+            crate::runtime_store::ProviderAutomaticEligibility::Blocked
+        );
+        assert!(before_projection.active_action.is_some());
+        assert!(before_projection.incarnation_id.is_some());
+
+        let changed = runtime
+            .reload_with_source(|| async { Ok((LoadedConfig { source: migrated }, None)) })
+            .await
+            .expect("reload migrated legacy configuration");
+
+        assert!(changed, "the canonical config revision must advance");
+        let after = runtime.capture().await;
+        assert_eq!(after.config.version, CURRENT_CONFIG_VERSION);
+        assert_eq!(after.provider_policy().projections[0], before_projection);
+        assert_eq!(
+            *state.capture_provider_policy_snapshot().await,
+            runtime_store
+                .provider_policy_snapshot()
+                .expect("read durable policy after migration reload")
+        );
+    }
+
+    #[tokio::test]
+    async fn published_rotation_preserves_old_request_capture_and_updates_later_requests() {
+        let mut source = stable_identity_source("https://relay.example/v1", "continuity-a");
+        source
+            .codex
+            .providers
+            .get_mut("stable")
+            .expect("stable provider")
+            .auth = UpstreamAuth {
+            auth_token_ref: Some(CredentialRef::Native {
+                name: "relay.primary".to_string(),
+            }),
+            ..UpstreamAuth::default()
+        };
+        let (capabilities, control) = CredentialSourceCapabilities::test_native(
+            SecretValue::new(b"generation-a".to_vec()).expect("valid credential"),
+        );
+        let runtime_store = Arc::new(RuntimeStore::open_in_memory().expect("open runtime store"));
+        let (runtime, _state) = RuntimeConfig::new_with_runtime_store_and_credential_sources(
+            Arc::new(source),
+            runtime_store,
+            capabilities,
+        )
+        .expect("build credential-backed runtime");
+        let runtime = Arc::new(runtime);
+        let before = runtime.capture().await;
+        let old_plan = before
+            .capture_route_plan("codex", &RouteRequestContext::default())
+            .expect("capture old route plan")
+            .expect("old route plan");
+        let old_candidate = old_plan
+            .template()
+            .candidates
+            .first()
+            .expect("old candidate");
+        let old_target = old_plan
+            .template()
+            .capture_candidate(old_candidate)
+            .expect("capture old target credential binding");
+        let old_route_graph_key = old_plan.template().route_graph_key();
+        assert_eq!(
+            old_target
+                .credential()
+                .bearer_header()
+                .expect("old bearer")
+                .as_bytes(),
+            b"Bearer generation-a"
+        );
+        let old_generation_revision = before.credential_generation().revision();
+
+        control.set_value(SecretValue::new(b"generation-b".to_vec()).expect("valid credential"));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let driver_runtime = Arc::clone(&runtime);
+        let driver = tokio::spawn(async move {
+            driver_runtime
+                .run_credential_refresh_driver(shutdown_rx)
+                .await;
+        });
+        runtime.schedule_credential_refresh(old_target.credential());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if runtime.capture().await.credential_generation().revision()
+                    > old_generation_revision
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("credential rotation should publish");
+
+        assert_eq!(control.read_count(), 2);
+        assert_eq!(
+            old_target
+                .credential()
+                .bearer_header()
+                .expect("captured old bearer")
+                .as_bytes(),
+            b"Bearer generation-a"
+        );
+        let after = runtime.capture().await;
+        let new_plan = after
+            .capture_route_plan("codex", &RouteRequestContext::default())
+            .expect("capture new route plan")
+            .expect("new route plan");
+        let new_target = new_plan
+            .template()
+            .capture_candidate(
+                new_plan
+                    .template()
+                    .candidates
+                    .first()
+                    .expect("new candidate"),
+            )
+            .expect("capture new target credential binding");
+        assert_eq!(
+            new_target
+                .credential()
+                .bearer_header()
+                .expect("new bearer")
+                .as_bytes(),
+            b"Bearer generation-b"
+        );
+        assert_ne!(old_route_graph_key, new_plan.template().route_graph_key());
+
+        runtime.schedule_credential_refresh(old_target.credential());
+        let delayed_old_refresh = runtime.take_pending_credential_refresh();
+        assert!(
+            delayed_old_refresh.is_empty(),
+            "a superseded generation must be discarded before entering the refresh queue"
+        );
+        assert_eq!(
+            control.read_count(),
+            2,
+            "a delayed auth failure from generation A must be discarded before native I/O"
+        );
+
+        let _ = shutdown_tx.send(true);
+        driver.await.expect("join credential refresh driver");
+    }
+
+    #[tokio::test]
+    async fn explicit_native_delete_then_upsert_publishes_new_generations() {
+        let name = CredentialName::parse("relay.primary").expect("valid credential name");
+        let source = native_route_graph_source("managed", name.as_str());
+        let (capabilities, control) = CredentialSourceCapabilities::test_native(
+            SecretValue::new(b"generation-a".to_vec()).expect("valid credential"),
+        );
+        let runtime_store = Arc::new(RuntimeStore::open_in_memory().expect("open runtime store"));
+        let (runtime, _state) = RuntimeConfig::new_with_runtime_store_and_credential_sources(
+            Arc::new(source),
+            runtime_store,
+            capabilities,
+        )
+        .expect("build credential-backed runtime");
+
+        let before = runtime.capture().await;
+        let old_plan = before
+            .capture_route_plan("codex", &RouteRequestContext::default())
+            .expect("capture old route plan")
+            .expect("old route plan");
+        let old_target = old_plan
+            .template()
+            .capture_candidate(
+                old_plan
+                    .template()
+                    .candidates
+                    .first()
+                    .expect("old candidate"),
+            )
+            .expect("capture old target");
+        let old_route_graph_key = old_plan.template().route_graph_key();
+        let old_policy_route_scope = old_target.runtime_identity().policy_route_scope();
+        assert_eq!(control.read_count(), 1);
+
+        control.set_missing();
+        assert!(
+            runtime
+                .invalidate_deleted_native_credential(&name)
+                .await
+                .expect("publish explicit delete")
+        );
+        assert_eq!(
+            control.read_count(),
+            1,
+            "an explicit delete must publish unavailability without rereading the backend"
+        );
+        let deleted = runtime.capture().await;
+        let deleted_plan = deleted
+            .capture_route_plan("codex", &RouteRequestContext::default())
+            .expect("capture deleted route plan")
+            .expect("deleted route plan");
+        let deleted_target = deleted_plan
+            .template()
+            .capture_candidate(
+                deleted_plan
+                    .template()
+                    .candidates
+                    .first()
+                    .expect("deleted candidate"),
+            )
+            .expect("capture deleted target");
+        assert!(!deleted_target.credential().is_available());
+        assert!(deleted_target.credential().bearer_header().is_none());
+        assert_eq!(
+            old_target
+                .credential()
+                .bearer_header()
+                .expect("captured A remains available")
+                .as_bytes(),
+            b"Bearer generation-a"
+        );
+
+        control.set_value(SecretValue::new(b"generation-b".to_vec()).expect("valid credential"));
+        assert!(
+            runtime
+                .refresh_native_credential_after_upsert(&name)
+                .await
+                .expect("publish explicit upsert")
+        );
+        assert_eq!(control.read_count(), 2);
+
+        let after = runtime.capture().await;
+        let new_plan = after
+            .capture_route_plan("codex", &RouteRequestContext::default())
+            .expect("capture new route plan")
+            .expect("new route plan");
+        let new_target = new_plan
+            .template()
+            .capture_candidate(
+                new_plan
+                    .template()
+                    .candidates
+                    .first()
+                    .expect("new candidate"),
+            )
+            .expect("capture new target");
+        assert_eq!(
+            new_target
+                .credential()
+                .bearer_header()
+                .expect("new B bearer")
+                .as_bytes(),
+            b"Bearer generation-b"
+        );
+        assert_eq!(
+            old_target
+                .credential()
+                .bearer_header()
+                .expect("old request remains bound to A")
+                .as_bytes(),
+            b"Bearer generation-a"
+        );
+        assert_ne!(old_route_graph_key, new_plan.template().route_graph_key());
+        assert_ne!(
+            old_policy_route_scope,
+            new_target.runtime_identity().policy_route_scope()
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_auth_refresh_rebinds_other_handle_to_current_generation() {
+        let source = two_native_route_graph_source("relay.first", "relay.second");
+        let (capabilities, control) = CredentialRuntime::test_blocking_sources(
+            SecretValue::new(b"generation-a".to_vec()).expect("valid credential"),
+        );
+        let runtime_store = Arc::new(RuntimeStore::open_in_memory().expect("open runtime store"));
+        let (runtime, _state) = RuntimeConfig::new_with_runtime_store_and_credential_sources(
+            Arc::new(source),
+            runtime_store,
+            capabilities,
+        )
+        .expect("build two-handle credential runtime");
+        let runtime = Arc::new(runtime);
+        let before = runtime.capture().await;
+        let old_plan = before
+            .capture_route_plan("codex", &RouteRequestContext::default())
+            .expect("capture old route plan")
+            .expect("old route plan");
+        let old_targets = old_plan
+            .template()
+            .candidates
+            .iter()
+            .map(|candidate| old_plan.template().capture_candidate(candidate))
+            .collect::<Result<Vec<_>>>()
+            .expect("capture both old targets");
+        assert_eq!(old_targets.len(), 2);
+        assert_eq!(control.read_count(), 2);
+
+        control.block();
+        runtime.schedule_credential_refresh(old_targets[0].credential());
+        let first_pending = runtime.take_pending_credential_refresh();
+        let refresh_runtime = Arc::clone(&runtime);
+        let first_refresh = tokio::spawn(async move {
+            refresh_runtime
+                .refresh_pending_credentials(first_pending)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while control.read_count() < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first handle refresh reaches blocked backend");
+
+        runtime.schedule_credential_refresh(old_targets[1].credential());
+        let second_pending = runtime.take_pending_credential_refresh();
+        assert_eq!(
+            second_pending.values().map(BTreeSet::len).sum::<usize>(),
+            1,
+            "the second handle must remain queued under the captured old generation"
+        );
+
+        control.set_value(SecretValue::new(b"generation-b".to_vec()).expect("valid credential"));
+        control.release();
+        assert!(
+            first_refresh
+                .await
+                .expect("join first handle refresh")
+                .expect("publish first handle refresh")
+        );
+
+        assert!(
+            runtime
+                .refresh_pending_credentials(second_pending)
+                .await
+                .expect("refresh queued second handle against current generation")
+        );
+        assert_eq!(control.read_count(), 4);
+
+        let after = runtime.capture().await;
+        let new_plan = after
+            .capture_route_plan("codex", &RouteRequestContext::default())
+            .expect("capture new route plan")
+            .expect("new route plan");
+        let new_targets = new_plan
+            .template()
+            .candidates
+            .iter()
+            .map(|candidate| new_plan.template().capture_candidate(candidate))
+            .collect::<Result<Vec<_>>>()
+            .expect("capture both new targets");
+        for target in &new_targets {
+            assert_eq!(
+                target
+                    .credential()
+                    .bearer_header()
+                    .expect("new bearer")
+                    .as_bytes(),
+                b"Bearer generation-b"
+            );
+        }
+        for target in &old_targets {
+            assert_eq!(
+                target
+                    .credential()
+                    .bearer_header()
+                    .expect("captured old bearer")
+                    .as_bytes(),
+                b"Bearer generation-a"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_driver_refreshes_stale_native_credential_through_hard_expiry_and_recovery() {
+        let mut source = stable_identity_source("https://relay.example/v1", "continuity-a");
+        source
+            .codex
+            .providers
+            .get_mut("stable")
+            .expect("stable provider")
+            .auth = UpstreamAuth {
+            auth_token_ref: Some(CredentialRef::Native {
+                name: "relay.primary".to_string(),
+            }),
+            ..UpstreamAuth::default()
+        };
+        let (capabilities, control) = CredentialSourceCapabilities::test_native(
+            SecretValue::new(b"generation-a".to_vec()).expect("valid credential"),
+        );
+        let runtime_store = Arc::new(RuntimeStore::open_in_memory().expect("open runtime store"));
+        let (runtime, _state) = RuntimeConfig::new_with_runtime_store_and_credential_sources(
+            Arc::new(source),
+            runtime_store,
+            capabilities,
+        )
+        .expect("build credential-backed runtime");
+        let runtime = Arc::new(runtime);
+        let endpoint = ProviderEndpointKey::new("codex", "stable", "default");
+        let initial = runtime.capture_current();
+        let initial_generation = initial.credential_generation();
+        assert_eq!(control.read_count(), 1);
+
+        // Keep the std::time deadline in the near future so the real driver registers a
+        // Tokio timer before virtual time advances.
+        let soft_due_generation = initial_generation.aged_for_test(Duration::from_secs(55));
+        assert!(
+            soft_due_generation
+                .next_native_deadline()
+                .is_some_and(|deadline| deadline > Instant::now())
+        );
+        assert!(
+            soft_due_generation
+                .capture_bound(&endpoint)
+                .expect("capture nearly soft-due credential")
+                .is_available()
+        );
+        let soft_due = replace_credential_generation_for_test(
+            runtime.as_ref(),
+            initial.as_ref(),
+            soft_due_generation,
+        );
+        let soft_due_revision = soft_due.credential_generation().revision();
+
+        control.set_missing();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let driver_runtime = Arc::clone(&runtime);
+        let driver = tokio::spawn(async move {
+            driver_runtime
+                .run_credential_refresh_driver(shutdown_rx)
+                .await;
+        });
+
+        while runtime.credential_refresh_wait_epoch.load(Ordering::SeqCst) < 1 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(control.read_count(), 1);
+        tokio::time::advance(Duration::from_secs(6)).await;
+
+        while control.read_count() < 2 {
+            tokio::task::yield_now().await;
+        }
+        let stale = loop {
+            let snapshot = runtime.capture_current();
+            if snapshot.credential_generation().revision() > soft_due_revision {
+                break snapshot;
+            }
+            tokio::task::yield_now().await;
+        };
+        let stale_generation = stale.credential_generation();
+        let stale_credential = stale_generation
+            .capture_bound(&endpoint)
+            .expect("capture stale credential");
+        assert!(stale_credential.is_available());
+        assert_eq!(
+            stale_credential
+                .bearer_header()
+                .expect("stale bearer remains usable")
+                .as_bytes(),
+            b"Bearer generation-a"
+        );
+        assert_ne!(
+            stale_generation.digest(),
+            soft_due.credential_generation().digest()
+        );
+
+        while runtime.credential_refresh_wait_epoch.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(control.read_count(), 2);
+        let _scheduled_retry = stale_generation
+            .next_native_deadline()
+            .expect("stale native retry deadline");
+
+        // Cross the real-clock hard boundary without waking the already-registered retry timer.
+        let hard_expired_generation = (0_u32..=16)
+            .map(|power| stale_generation.aged_for_test(Duration::from_secs(1_u64 << power)))
+            .find(|generation| {
+                !generation
+                    .capture_bound(&endpoint)
+                    .expect("capture aged stale credential")
+                    .is_available()
+            })
+            .expect("find an age past native hard expiry");
+        let hard_expired = replace_credential_generation_for_test(
+            runtime.as_ref(),
+            stale.as_ref(),
+            hard_expired_generation,
+        );
+        let unavailable = hard_expired
+            .credential_generation()
+            .capture_bound(&endpoint)
+            .expect("capture hard-expired credential");
+        assert!(!unavailable.is_available());
+        assert!(unavailable.bearer_header().is_none());
+        assert_eq!(control.read_count(), 2);
+
+        control.set_value(SecretValue::new(b"generation-b".to_vec()).expect("valid credential"));
+        // The test-only generation replacement bypasses the driver's normal publication loop.
+        // Wake its registered wait so it recalculates the now-expired native deadline.
+        runtime.credential_refresh_notify.notify_one();
+
+        while control.read_count() < 3 {
+            tokio::task::yield_now().await;
+        }
+        let recovered = loop {
+            let snapshot = runtime.capture_current();
+            let credential = snapshot
+                .credential_generation()
+                .capture_bound(&endpoint)
+                .expect("capture recovered credential");
+            if credential
+                .bearer_header()
+                .is_some_and(|header| header.as_bytes() == b"Bearer generation-b")
+            {
+                break snapshot;
+            }
+            tokio::task::yield_now().await;
+        };
+        assert!(
+            recovered
+                .credential_generation()
+                .capture_bound(&endpoint)
+                .expect("capture published recovery")
+                .is_available()
+        );
+
+        shutdown_tx.send(true).expect("request driver shutdown");
+        driver.await.expect("join idle credential refresh driver");
+        assert_eq!(control.read_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn credential_rotation_ticket_rejects_an_older_reload_finishing_last() {
+        let mut source = stable_identity_source("https://relay.example/v1", "continuity-a");
+        source
+            .codex
+            .providers
+            .get_mut("stable")
+            .expect("stable provider")
+            .auth = UpstreamAuth {
+            auth_token_ref: Some(CredentialRef::Native {
+                name: "relay.primary".to_string(),
+            }),
+            ..UpstreamAuth::default()
+        };
+        let reload_source = source.clone();
+        let (capabilities, control) = CredentialSourceCapabilities::test_native(
+            SecretValue::new(b"generation-a".to_vec()).expect("valid credential"),
+        );
+        let runtime_store = Arc::new(RuntimeStore::open_in_memory().expect("open runtime store"));
+        let (runtime, _state) = RuntimeConfig::new_with_runtime_store_and_credential_sources(
+            Arc::new(source),
+            runtime_store,
+            capabilities,
+        )
+        .expect("build credential-backed runtime");
+        let runtime = Arc::new(runtime);
+        let before = runtime.capture().await;
+        let plan = before
+            .capture_route_plan("codex", &RouteRequestContext::default())
+            .expect("capture route plan")
+            .expect("configured route plan");
+        let target = plan
+            .template()
+            .capture_candidate(plan.template().candidates.first().expect("route candidate"))
+            .expect("capture credential target");
+
+        let (reload_started_tx, reload_started_rx) = oneshot::channel();
+        let (release_reload_tx, release_reload_rx) = oneshot::channel();
+        let reload_runtime = Arc::clone(&runtime);
+        let reload = tokio::spawn(async move {
+            reload_runtime
+                .reload_with_source(|| async move {
+                    let _ = reload_started_tx.send(());
+                    release_reload_rx.await.expect("release old reload");
+                    Ok((
+                        LoadedConfig {
+                            source: reload_source,
+                        },
+                        None,
+                    ))
+                })
+                .await
+        });
+        reload_started_rx.await.expect("old reload started");
+
+        control.set_value(SecretValue::new(b"generation-b".to_vec()).expect("valid credential"));
+        runtime.schedule_credential_refresh(target.credential());
+        let pending = runtime.take_pending_credential_refresh();
+        assert!(
+            runtime
+                .refresh_pending_credentials(pending)
+                .await
+                .expect("publish credential rotation")
+        );
+
+        control.set_value(SecretValue::new(b"generation-a".to_vec()).expect("valid credential"));
+        release_reload_tx.send(()).expect("release old reload");
+        assert!(
+            !reload
+                .await
+                .expect("join old reload")
+                .expect("reject old reload")
+        );
+
+        let after = runtime.capture().await;
+        let plan = after
+            .capture_route_plan("codex", &RouteRequestContext::default())
+            .expect("capture final route plan")
+            .expect("configured final route plan");
+        let target = plan
+            .template()
+            .capture_candidate(plan.template().candidates.first().expect("final candidate"))
+            .expect("capture final credential target");
+        assert_eq!(
+            target
+                .credential()
+                .bearer_header()
+                .expect("final bearer")
+                .as_bytes(),
+            b"Bearer generation-b"
+        );
+        assert_eq!(control.read_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn repeated_auth_failures_are_throttled_per_generation_and_handle() {
+        let mut source = stable_identity_source("https://relay.example/v1", "continuity-a");
+        source
+            .codex
+            .providers
+            .get_mut("stable")
+            .expect("stable provider")
+            .auth = UpstreamAuth {
+            auth_token_ref: Some(CredentialRef::Native {
+                name: "relay.primary".to_string(),
+            }),
+            ..UpstreamAuth::default()
+        };
+        let (capabilities, control) = CredentialSourceCapabilities::test_native(
+            SecretValue::new(b"generation-a".to_vec()).expect("valid credential"),
+        );
+        let runtime_store = Arc::new(RuntimeStore::open_in_memory().expect("open runtime store"));
+        let (runtime, _state) = RuntimeConfig::new_with_runtime_store_and_credential_sources(
+            Arc::new(source),
+            runtime_store,
+            capabilities,
+        )
+        .expect("build credential-backed runtime");
+        let runtime = Arc::new(runtime);
+        let snapshot = runtime.capture().await;
+        let plan = snapshot
+            .capture_route_plan("codex", &RouteRequestContext::default())
+            .expect("capture route plan")
+            .expect("configured route plan");
+        let target = plan
+            .template()
+            .capture_candidate(plan.template().candidates.first().expect("route candidate"))
+            .expect("capture credential target");
+
+        runtime.schedule_credential_refresh(target.credential());
+        runtime
+            .refresh_pending_credentials(runtime.take_pending_credential_refresh())
+            .await
+            .expect("first auth refresh");
+        assert_eq!(control.read_count(), 2);
+
+        let attempted_at = *runtime
+            .recent_auth_refresh
+            .lock()
+            .expect("recent auth refresh lock")
+            .values()
+            .next()
+            .expect("recorded auth refresh attempt");
+
+        runtime.schedule_credential_refresh_at(
+            target.credential(),
+            attempted_at + AUTH_FAILURE_REFRESH_MIN_INTERVAL - Duration::from_nanos(1),
+        );
+        assert!(runtime.take_pending_credential_refresh().is_empty());
+        assert_eq!(control.read_count(), 2);
+
+        runtime.schedule_credential_refresh_at(
+            target.credential(),
+            attempted_at + AUTH_FAILURE_REFRESH_MIN_INTERVAL,
+        );
+        runtime
+            .refresh_pending_credentials(runtime.take_pending_credential_refresh())
+            .await
+            .expect("auth refresh after throttle window");
+        assert_eq!(control.read_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn driver_shutdown_detaches_blocked_native_read_without_starting_another() {
+        let mut source = stable_identity_source("https://relay.example/v1", "continuity-a");
+        source
+            .codex
+            .providers
+            .get_mut("stable")
+            .expect("stable provider")
+            .auth = UpstreamAuth {
+            auth_token_ref: Some(CredentialRef::Native {
+                name: "relay.primary".to_string(),
+            }),
+            ..UpstreamAuth::default()
+        };
+        let (capabilities, control) = CredentialRuntime::test_blocking_sources(
+            SecretValue::new(b"generation-a".to_vec()).expect("valid credential"),
+        );
+        let runtime_store = Arc::new(RuntimeStore::open_in_memory().expect("open runtime store"));
+        let (runtime, _state) = RuntimeConfig::new_with_runtime_store_and_credential_sources(
+            Arc::new(source),
+            runtime_store,
+            capabilities,
+        )
+        .expect("build credential-backed runtime");
+        let runtime = Arc::new(runtime);
+        let snapshot = runtime.capture().await;
+        let plan = snapshot
+            .capture_route_plan("codex", &RouteRequestContext::default())
+            .expect("capture route plan")
+            .expect("configured route plan");
+        let target = plan
+            .template()
+            .capture_candidate(plan.template().candidates.first().expect("route candidate"))
+            .expect("capture credential target");
+
+        control.block();
+        runtime.schedule_credential_refresh(target.credential());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let driver_runtime = Arc::clone(&runtime);
+        let driver = tokio::spawn(async move {
+            driver_runtime
+                .run_credential_refresh_driver(shutdown_rx)
+                .await;
+        });
+        while control.read_count() < 2 {
+            tokio::task::yield_now().await;
+        }
+        shutdown_tx.send(true).expect("request driver shutdown");
+        driver.await.expect("driver exits while native read blocks");
+
+        let second_runtime = runtime.credential_runtime.clone();
+        let generation = snapshot.credential_generation();
+        let second = tokio::spawn(async move {
+            second_runtime
+                .refresh_generation(
+                    generation,
+                    None,
+                    CredentialRuntimeRefreshCause::AuthenticationFailure,
+                )
+                .await
+        });
+        while runtime
+            .credential_runtime
+            .native_inflight_owner_count_for_test()
+            < 3
+        {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            control.read_count(),
+            2,
+            "the blocked flight must remain the singleflight owner"
+        );
+        control.release();
+        second
+            .await
+            .expect("join second refresh")
+            .expect("second refresh joins original native read");
+        assert_eq!(control.read_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn unchanged_native_refresh_advances_freshness_without_identity_churn() {
+        let mut source = stable_identity_source("https://relay.example/v1", "continuity-a");
+        source
+            .codex
+            .providers
+            .get_mut("stable")
+            .expect("stable provider")
+            .auth = UpstreamAuth {
+            auth_token_ref: Some(CredentialRef::Native {
+                name: "relay.primary".to_string(),
+            }),
+            ..UpstreamAuth::default()
+        };
+        let (capabilities, control) = CredentialSourceCapabilities::test_native(
+            SecretValue::new(b"generation-a".to_vec()).expect("valid credential"),
+        );
+        let runtime_store = Arc::new(RuntimeStore::open_in_memory().expect("open runtime store"));
+        let (runtime, _state) = RuntimeConfig::new_with_runtime_store_and_credential_sources(
+            Arc::new(source),
+            runtime_store,
+            capabilities,
+        )
+        .expect("build credential-backed runtime");
+        let before = runtime.capture().await;
+        let old_plan = before
+            .capture_route_plan("codex", &RouteRequestContext::default())
+            .expect("capture old route plan")
+            .expect("old route plan");
+        let old_candidate = old_plan
+            .template()
+            .candidates
+            .first()
+            .expect("old candidate");
+        let old_target = old_plan
+            .template()
+            .capture_candidate(old_candidate)
+            .expect("capture old target credential binding");
+        let before_deadline = before
+            .credential_generation()
+            .next_native_deadline()
+            .expect("native refresh deadline");
+        let before_identities = before
+            .candidate_identities()
+            .expect("capture old runtime identities");
+        let before_policy = before.provider_policy();
+        let before_route_graph_key = old_plan.template().route_graph_key().to_string();
+
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        runtime.schedule_credential_refresh(old_target.credential());
+        let pending = runtime.take_pending_credential_refresh();
+        assert!(
+            !runtime
+                .refresh_pending_credentials(pending)
+                .await
+                .expect("refresh unchanged native credential"),
+            "the same credential content must not advance the runtime revision"
+        );
+
+        let after = runtime.capture().await;
+        let new_plan = after
+            .capture_route_plan("codex", &RouteRequestContext::default())
+            .expect("capture refreshed route plan")
+            .expect("refreshed route plan");
+        assert_eq!(control.read_count(), 2);
+        assert_eq!(after.revision(), before.revision());
+        assert_eq!(after.digest(), before.digest());
+        assert_eq!(
+            after.credential_generation().revision(),
+            before.credential_generation().revision()
+        );
+        assert_eq!(
+            new_plan.template().route_graph_key(),
+            before_route_graph_key
+        );
+        assert_eq!(
+            after
+                .candidate_identities()
+                .expect("capture refreshed runtime identities"),
+            before_identities
+        );
+        assert_eq!(after.provider_policy().as_ref(), before_policy.as_ref());
+        assert!(
+            after
+                .credential_generation()
+                .next_native_deadline()
+                .expect("refreshed native deadline")
+                > before_deadline,
+            "an unchanged successful read must still extend native freshness"
+        );
+    }
+
+    #[tokio::test]
     async fn capture_publishes_newer_policy_from_durable_state_and_rejects_stale_publish() {
         let source = stable_identity_source("https://old.example/v1", "continuity-a");
         let runtime_store = Arc::new(RuntimeStore::open_in_memory().expect("open runtime store"));
@@ -1243,9 +3106,12 @@ mod tests {
             Arc::clone(&state),
         )
         .expect("build runtime");
-        let identity = compile_route_graph("codex", &source.codex)
-            .expect("compile graph")
+        let identity = runtime
+            .capture_current()
+            .route_graph("codex")
+            .expect("captured codex graph")
             .candidate_identities()
+            .expect("capture runtime identities")
             .into_iter()
             .next()
             .expect("runtime identity");
@@ -1344,6 +3210,303 @@ mod tests {
                 .provider_policy_snapshot()
                 .expect("durable LKG policy")
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_reload_waiting_for_health_publication_preserves_old_composite() {
+        let initial = stable_identity_source("https://old.example/v1", "continuity-a");
+        let reloaded = stable_identity_source("https://new.example/v1", "continuity-a");
+        let (runtime, state, runtime_store) = blocked_policy_runtime(initial);
+        let runtime = Arc::new(runtime);
+        let before = runtime.capture().await;
+        let policy_before = state.capture_provider_policy_snapshot().await;
+        let durable_before = runtime_store
+            .provider_policy_snapshot()
+            .expect("read durable policy before cancelled reload");
+        let health_publication = state
+            .hold_provider_runtime_health_publication_for_test()
+            .await;
+
+        let reload_runtime = Arc::clone(&runtime);
+        let cancelled_source = reloaded.clone();
+        let reload = tokio::spawn(async move {
+            reload_runtime
+                .reload_with_source(|| async move {
+                    Ok((
+                        LoadedConfig {
+                            source: cancelled_source,
+                        },
+                        None,
+                    ))
+                })
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if tokio::time::timeout(
+                    Duration::from_millis(10),
+                    state.capture_provider_policy_snapshot(),
+                )
+                .await
+                .is_err()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reload must reach the health publication lock before durable commit");
+        assert_eq!(
+            runtime_store
+                .provider_policy_snapshot()
+                .expect("read durable policy while reload is blocked"),
+            durable_before
+        );
+
+        reload.abort();
+        drop(health_publication);
+        assert!(
+            reload
+                .await
+                .expect_err("blocked reload must be cancelled")
+                .is_cancelled()
+        );
+        assert!(Arc::ptr_eq(&before, &runtime.capture().await));
+        assert_eq!(
+            *state.capture_provider_policy_snapshot().await,
+            *policy_before
+        );
+        assert_eq!(
+            runtime_store
+                .provider_policy_snapshot()
+                .expect("read durable policy after cancelled reload"),
+            durable_before
+        );
+
+        assert!(
+            runtime
+                .reload_with_source(|| async { Ok((LoadedConfig { source: reloaded }, None)) })
+                .await
+                .expect("publish retry after cancelled reload")
+        );
+        let published = runtime.capture().await;
+        assert!(!Arc::ptr_eq(&before, &published));
+        assert_eq!(
+            published.provider_policy(),
+            state.capture_provider_policy_snapshot().await
+        );
+        assert_eq!(
+            published.provider_policy().as_ref(),
+            &runtime_store
+                .provider_policy_snapshot()
+                .expect("read durable policy after successful retry")
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_reload_waiting_for_operator_control_preserves_old_composite() {
+        let initial = stable_identity_source("https://old.example/v1", "continuity-a");
+        let mut reloaded = stable_identity_source("https://new.example/v1", "continuity-a");
+        reloaded
+            .codex
+            .routing
+            .as_mut()
+            .expect("configured route graph")
+            .scheduling_preset = SchedulingPreset::ThroughputFirst;
+        let (runtime, state, runtime_store) = blocked_policy_runtime(initial);
+        let runtime = Arc::new(runtime);
+        let before = runtime.capture_current();
+        let policy_before = state.capture_provider_policy_snapshot().await;
+        let durable_before = runtime_store
+            .provider_policy_snapshot()
+            .expect("read durable policy before cancelled reload");
+        let control_before = state.capture_routing_operator_control().await;
+        let operator_publication = state
+            .hold_routing_operator_control_publication_for_test()
+            .await;
+
+        let reload_runtime = Arc::clone(&runtime);
+        let cancelled_source = reloaded.clone();
+        let reload = tokio::spawn(async move {
+            reload_runtime
+                .reload_with_source(|| async move {
+                    Ok((
+                        LoadedConfig {
+                            source: cancelled_source,
+                        },
+                        None,
+                    ))
+                })
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if tokio::time::timeout(
+                    Duration::from_millis(10),
+                    state.capture_provider_policy_snapshot(),
+                )
+                .await
+                .is_err()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reload must reach operator-control publication");
+        assert!(Arc::ptr_eq(&before, &runtime.capture_current()));
+        assert_eq!(
+            runtime_store
+                .provider_policy_snapshot()
+                .expect("read durable policy while reload is blocked"),
+            durable_before
+        );
+
+        reload.abort();
+        drop(operator_publication);
+        assert!(
+            reload
+                .await
+                .expect_err("blocked reload must be cancelled")
+                .is_cancelled()
+        );
+        assert!(Arc::ptr_eq(&before, &runtime.capture_current()));
+        assert_eq!(
+            state.capture_routing_operator_control().await,
+            control_before
+        );
+        assert_eq!(
+            *state.capture_provider_policy_snapshot().await,
+            *policy_before
+        );
+        assert_eq!(
+            runtime_store
+                .provider_policy_snapshot()
+                .expect("read durable policy after cancelled reload"),
+            durable_before
+        );
+
+        assert!(
+            runtime
+                .reload_with_source(|| async { Ok((LoadedConfig { source: reloaded }, None)) })
+                .await
+                .expect("publish retry after cancelled reload")
+        );
+        let published = runtime.capture().await;
+        let published_graph_key = published
+            .route_graph("codex")
+            .expect("published codex route graph")
+            .digest()
+            .to_string();
+        assert_eq!(
+            state
+                .capture_routing_operator_control()
+                .await
+                .route_graph_key("codex"),
+            Some(published_graph_key.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_rebuilds_matching_snapshot_after_durable_identity_commit() {
+        let helper_home = std::env::temp_dir().join(format!(
+            "codex-helper-runtime-publication-recovery-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let runtime_store =
+            Arc::new(RuntimeStore::open_in_home(&helper_home).expect("open runtime store"));
+        let mut initial = stable_identity_source("https://relay.example/v1", "continuity-a");
+        initial
+            .codex
+            .providers
+            .get_mut("stable")
+            .expect("stable provider")
+            .auth = UpstreamAuth {
+            auth_token: Some("generation-a".to_string().into()),
+            ..UpstreamAuth::default()
+        };
+        let (runtime, state) = RuntimeConfig::new_with_runtime_store_and_credential_sources(
+            Arc::new(initial.clone()),
+            Arc::clone(&runtime_store),
+            CredentialSourceCapabilities::server(),
+        )
+        .expect("build initial runtime");
+        let old_identities = runtime
+            .capture_current()
+            .candidate_identities()
+            .expect("capture old identities");
+
+        let mut rotated = initial;
+        rotated
+            .codex
+            .providers
+            .get_mut("stable")
+            .expect("stable provider")
+            .auth = UpstreamAuth {
+            auth_token: Some("generation-b".to_string().into()),
+            ..UpstreamAuth::default()
+        };
+        let prepared = PreparedRuntimeSnapshot::build(
+            Arc::new(rotated.clone()),
+            runtime.capture_current().operator_pricing_catalog(),
+            RuntimeSourceStamp::default(),
+            &runtime.credential_runtime,
+        )
+        .expect("prepare rotated runtime snapshot");
+        let committed_identities = prepared
+            .candidate_identities()
+            .expect("capture committed identities");
+        assert_ne!(old_identities, committed_identities);
+        let committed_policy = state
+            .reconcile_runtime_upstream_identities(&committed_identities, now_ms())
+            .await
+            .expect("commit rotated runtime identities");
+        assert_eq!(
+            runtime
+                .capture_current()
+                .candidate_identities()
+                .expect("capture current identities"),
+            old_identities
+        );
+
+        drop(prepared);
+        drop(runtime);
+        drop(state);
+        drop(runtime_store);
+
+        let reopened_store =
+            Arc::new(RuntimeStore::open_in_home(&helper_home).expect("reopen runtime store"));
+        let (restarted, restarted_state) =
+            RuntimeConfig::new_with_runtime_store_and_credential_sources(
+                Arc::new(rotated),
+                Arc::clone(&reopened_store),
+                CredentialSourceCapabilities::server(),
+            )
+            .expect("rebuild runtime after interrupted publication");
+        let restarted_snapshot = restarted.capture_current();
+
+        assert_eq!(
+            restarted_snapshot
+                .candidate_identities()
+                .expect("capture restarted identities"),
+            committed_identities
+        );
+        assert_eq!(restarted_snapshot.provider_policy(), committed_policy);
+        assert_eq!(
+            restarted_snapshot.provider_policy().as_ref(),
+            &reopened_store
+                .provider_policy_snapshot()
+                .expect("read restarted durable policy")
+        );
+
+        drop(restarted);
+        drop(restarted_state);
+        drop(reopened_store);
+        let _ = std::fs::remove_dir_all(helper_home);
     }
 
     #[tokio::test]
@@ -1573,6 +3736,7 @@ mod tests {
                     RuntimeSourceStamp {
                         config_mtime: None,
                         pricing_mtime: Some(pricing_mtime),
+                        ..RuntimeSourceStamp::default()
                     }
                 },
                 || async {
@@ -1596,6 +3760,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn usage_provider_source_change_triggers_runtime_rebuild() {
+        let runtime = runtime_config("old");
+        let before = runtime.capture().await;
+        let pricing = before.operator_pricing_catalog().as_ref().clone();
+        let config_loads = AtomicUsize::new(0);
+        let pricing_loads = AtomicUsize::new(0);
+        let mut changed_stamp = before.source_stamp();
+        changed_stamp.usage_providers_revision = [7; 32];
+        assert_ne!(changed_stamp, before.source_stamp());
+
+        let changed = runtime
+            .maybe_reload_with(
+                Duration::ZERO,
+                || async { changed_stamp },
+                || async {
+                    config_loads.fetch_add(1, Ordering::SeqCst);
+                    Ok(loaded_route_graph("old"))
+                },
+                || async {
+                    pricing_loads.fetch_add(1, Ordering::SeqCst);
+                    Ok(pricing)
+                },
+            )
+            .await
+            .expect("usage-provider source reload");
+
+        assert!(!changed);
+        assert_eq!(config_loads.load(Ordering::SeqCst), 1);
+        assert_eq!(pricing_loads.load(Ordering::SeqCst), 1);
+        let after = runtime.capture().await;
+        assert_eq!(after.revision(), before.revision());
+        assert_eq!(
+            after.source_stamp().usage_providers_revision,
+            changed_stamp.usage_providers_revision
+        );
+    }
+
+    #[tokio::test]
     async fn pricing_build_failure_preserves_the_complete_lkg_snapshot() {
         let runtime = runtime_config("old");
         let before = runtime.capture().await;
@@ -1608,6 +3810,7 @@ mod tests {
                         RuntimeSourceStamp {
                             config_mtime: None,
                             pricing_mtime: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(41)),
+                            ..RuntimeSourceStamp::default()
                         },
                     ))
                 },

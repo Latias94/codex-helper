@@ -1,4 +1,4 @@
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use serde_json::Value;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -8,6 +8,11 @@ pub(super) const ROUTING_MISMATCH_CAPABILITY_CLASS: &str = "routing_mismatch_cap
 pub(super) const UPSTREAM_RATE_LIMITED_CLASS: &str = "upstream_rate_limited";
 pub(super) const UPSTREAM_OVERLOADED_CLASS: &str = "upstream_overloaded";
 pub(super) const CLIENT_ERROR_NON_RETRYABLE_CLASS: &str = "client_error_non_retryable";
+
+pub(super) fn is_credential_auth_failure(status: StatusCode, class: Option<&str>) -> bool {
+    matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+        && class != Some("cloudflare_challenge")
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct UpstreamThrottleSignal {

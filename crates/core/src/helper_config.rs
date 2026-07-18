@@ -7,6 +7,7 @@ fn validate_runtime_provider_shape(
     provider_name: &str,
     provider: &ProviderConfig,
 ) -> Result<()> {
+    validate_provider_auth(service_name, provider_name, provider)?;
     validate_provider_concurrency_limits(service_name, provider_name, None, &provider.limits)?;
     let mut has_endpoint = false;
     if let Some(_base_url) = provider
@@ -42,6 +43,72 @@ fn validate_runtime_provider_shape(
         anyhow::bail!("[{service_name}] provider '{provider_name}' has no base_url or endpoints");
     }
 
+    Ok(())
+}
+
+fn validate_provider_auth(
+    service_name: &str,
+    provider_name: &str,
+    provider: &ProviderConfig,
+) -> Result<()> {
+    validate_auth_layer(service_name, provider_name, "auth", &provider.auth)?;
+    validate_auth_layer(
+        service_name,
+        provider_name,
+        "flattened auth",
+        &provider.inline_auth,
+    )?;
+    validate_auth_layer(
+        service_name,
+        provider_name,
+        "effective auth",
+        &provider.effective_auth(),
+    )
+}
+
+fn validate_auth_layer(
+    service_name: &str,
+    provider_name: &str,
+    layer: &str,
+    auth: &UpstreamAuth,
+) -> Result<()> {
+    validate_credential_kind(
+        service_name,
+        provider_name,
+        layer,
+        "auth_token_ref",
+        auth.auth_token_ref.as_ref(),
+        auth.auth_token.is_some() || auth.auth_token_env.is_some(),
+    )?;
+    validate_credential_kind(
+        service_name,
+        provider_name,
+        layer,
+        "api_key_ref",
+        auth.api_key_ref.as_ref(),
+        auth.api_key.is_some() || auth.api_key_env.is_some(),
+    )
+}
+
+fn validate_credential_kind(
+    service_name: &str,
+    provider_name: &str,
+    layer: &str,
+    field: &str,
+    reference: Option<&CredentialRef>,
+    has_legacy_source: bool,
+) -> Result<()> {
+    let Some(reference) = reference else {
+        return Ok(());
+    };
+    reference
+        .validate()
+        .with_context(|| format!("[{service_name}] provider '{provider_name}' {layer}.{field}"))?;
+    if has_legacy_source {
+        anyhow::bail!(
+            "[{service_name}] provider '{provider_name}' {layer}.{field} cannot be combined with legacy inline or environment fields for the same credential kind"
+        );
+    }
     Ok(())
 }
 

@@ -488,10 +488,10 @@ pub enum ConfigCommand {
     },
     /// Preview or explicitly apply a legacy configuration migration.
     Migrate {
-        /// Preview the migrated v5 TOML without writing any file (the default).
+        /// Preview the migrated v6 TOML without writing any file (the default).
         #[arg(long, conflicts_with = "write")]
         dry_run: bool,
-        /// Write the migrated v5 TOML after creating a source backup.
+        /// Write the migrated v6 TOML after creating a source backup.
         #[arg(long, conflicts_with = "dry_run", requires = "yes")]
         write: bool,
         /// Confirm the replacement of the canonical configuration file.

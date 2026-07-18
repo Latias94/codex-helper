@@ -33,6 +33,7 @@ use clap::Parser;
 use codex_helper_core::codex_switch::{
     self, CodexSwitchIntent, CodexSwitchPhase, ValidatedCodexBaseUrl,
 };
+use codex_helper_core::credentials::CredentialSourceCapabilities;
 use codex_helper_core::local_log_store::{LogRetention, RotatingLogWriter, repair_log};
 use owo_colors::OwoColorize;
 use std::io::ErrorKind;
@@ -1348,7 +1349,9 @@ async fn build_local_proxy_runtime(
         service_name,
         host,
         port,
-        ProxyRuntimeOptions::for_proxy_port(port).with_admin_addr(admin_addr),
+        ProxyRuntimeOptions::for_proxy_port(port)
+            .with_admin_addr(admin_addr)
+            .with_credential_sources(CredentialSourceCapabilities::platform_native()),
         loaded,
     )
     .await
@@ -2099,7 +2102,7 @@ env_key = "EXTERNAL_API_KEY"
         );
 
         let helper_config_path = helper_home.join("config.toml");
-        let helper_config = "version = 5\n\n[notify]\nenabled = false\n";
+        let helper_config = "version = 6\n\n[notify]\nenabled = false\n";
         write_file(&helper_config_path, helper_config);
         let loaded = runtime
             .block_on(load_serve_config())

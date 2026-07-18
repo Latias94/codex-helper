@@ -89,8 +89,9 @@ pub use self::codex_relay_live_smoke::{
     CodexRelayLiveSmokeOutcome, CodexRelayLiveSmokeRequest, CodexRelayLiveSmokeResponse,
     CodexRelayLiveSmokeResult, CodexRelayLiveSmokeSideEffect,
 };
+pub(crate) use self::codex_relay_probe::CodexRelayProbeClient;
 pub use self::codex_relay_probe::{
-    CodexRelayProbeClient, CodexRelayProbeConfidence, CodexRelayProbeKind, CodexRelayProbeResult,
+    CodexRelayProbeConfidence, CodexRelayProbeKind, CodexRelayProbeResult,
     CodexRelayProbeSideEffect, CodexRelayProbeSpec, CodexRelayProbeSupport,
     classify_codex_relay_probe_response,
 };

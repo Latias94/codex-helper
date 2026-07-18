@@ -36,7 +36,7 @@ fn routing_proxy_config() -> HelperConfig {
                         base_url: Some("https://input.example.test/v1".to_string()),
                         continuity_domain: Some("shared-relay-state".to_string()),
                         inline_auth: UpstreamAuth {
-                            auth_token: Some("input-test-token".to_string()),
+                            auth_token: Some("input-test-token".to_string().into()),
                             ..UpstreamAuth::default()
                         },
                         ..ProviderConfig::default()
@@ -48,7 +48,7 @@ fn routing_proxy_config() -> HelperConfig {
                         base_url: Some("https://ciii.example.test/v1".to_string()),
                         continuity_domain: Some("shared-relay-state".to_string()),
                         inline_auth: UpstreamAuth {
-                            auth_token: Some("ciii-test-token".to_string()),
+                            auth_token: Some("ciii-test-token".to_string().into()),
                             ..UpstreamAuth::default()
                         },
                         ..ProviderConfig::default()

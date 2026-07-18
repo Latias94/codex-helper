@@ -1,0 +1,8 @@
+# Canonical version 6 input shared with the real v0.20.3 downgrade gate.
+version = 6
+default_service = "codex"
+
+[codex.providers.relay]
+base_url = "https://relay.example/v1"
+auth_token = "fixture-inline-token"
+auth_token_env = "FIXTURE_INLINE_ENV"

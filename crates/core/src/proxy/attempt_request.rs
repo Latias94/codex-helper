@@ -3,10 +3,12 @@ use std::sync::OnceLock;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, header};
 
 use crate::auth_resolution::{
-    UpstreamAuthResolutionError, resolve_upstream_auth_for_target,
-    trusted_codex_passthrough_origin, upstream_auth_contract_is_configured,
+    UpstreamAuthResolutionError, trusted_codex_passthrough_origin,
+    unconfigured_upstream_auth_contract_requires_opt_in,
 };
+#[cfg(test)]
 use crate::config::UpstreamAuth;
+use crate::credentials::CapturedUpstreamCredential;
 use crate::logging::{BodyPreview, HeaderEntry, upstream_origin};
 use crate::provider_catalog::AccountFingerprint;
 
@@ -29,7 +31,9 @@ pub(super) struct AttemptRequestIdentity {
 
 pub(super) struct AttemptRequestIdentityParams<'a> {
     pub(super) service_name: &'a str,
-    pub(super) auth: &'a UpstreamAuth,
+    pub(super) credential: &'a CapturedUpstreamCredential,
+    pub(super) credential_scope: Option<&'a str>,
+    pub(super) state: &'a crate::state::ProxyState,
     pub(super) client_headers: &'a HeaderMap,
     pub(super) client_uri: &'a str,
     pub(super) target_url: &'a str,
@@ -90,7 +94,9 @@ pub(super) fn prepare_attempt_request_identity(
 ) -> Result<AttemptRequestIdentity, UpstreamAuthResolutionError> {
     let AttemptRequestIdentityParams {
         service_name,
-        auth,
+        credential,
+        credential_scope,
+        state,
         client_headers,
         client_uri,
         target_url,
@@ -102,9 +108,9 @@ pub(super) fn prepare_attempt_request_identity(
         header::ACCEPT_ENCODING,
         HeaderValue::from_static("identity"),
     );
-    inject_auth_headers(service_name, auth, target_url, &mut headers)?;
+    inject_auth_headers(service_name, credential, target_url, &mut headers)?;
     normalize_codex_compact_headers(service_name, client_uri, &mut headers);
-    let account_fingerprint = AccountFingerprint::from_final_headers(&headers);
+    let account_fingerprint = state.derive_provider_account_fingerprint(credential_scope, &headers);
 
     Ok(AttemptRequestIdentity {
         headers,
@@ -133,9 +139,21 @@ pub(super) fn prepare_attempt_request(
         upstream_request_body_warn,
     } = params;
 
+    let provider_endpoint =
+        crate::runtime_identity::ProviderEndpointKey::new(service_name, "test", "default");
+    let (credential, runtime_identity) =
+        CapturedUpstreamCredential::runtime_binding_from_config_for_test(
+            &provider_endpoint,
+            "https://example.test/v1",
+            None,
+            auth,
+        );
+    let state = crate::state::ProxyState::new();
     let identity = prepare_attempt_request_identity(AttemptRequestIdentityParams {
         service_name,
-        auth,
+        credential: &credential,
+        credential_scope: runtime_identity.credential_scope.as_deref(),
+        state: state.as_ref(),
         client_headers,
         client_uri,
         target_url,
@@ -218,16 +236,46 @@ fn client_uri_path(client_uri: &str) -> &str {
 
 pub(super) fn inject_auth_headers(
     service_name: &str,
-    auth: &UpstreamAuth,
+    credential: &CapturedUpstreamCredential,
     target_url: &str,
     headers: &mut HeaderMap,
 ) -> Result<(), UpstreamAuthResolutionError> {
     let client_has_auth = headers.contains_key("authorization");
     let client_has_x_api_key = headers.contains_key("x-api-key");
-    let resolved_auth = resolve_upstream_auth_for_target(service_name, auth, target_url)?;
-    let token = resolved_auth.auth_token.value();
-    let api_key = resolved_auth.api_key.value();
-    let helper_credential_contract = upstream_auth_contract_is_configured(auth);
+    if let Some(error) = credential.first_error() {
+        let resolution_error = match (error.code(), error.source_kind()) {
+            (crate::credentials::CredentialErrorCode::Missing, "environment") => {
+                UpstreamAuthResolutionError::MissingReference {
+                    kind: error.kind_label(),
+                    name: error.reference().to_string(),
+                }
+            }
+            (crate::credentials::CredentialErrorCode::Unsupported, source_kind) => {
+                UpstreamAuthResolutionError::UnsupportedReference {
+                    kind: error.kind_label(),
+                    source_kind,
+                }
+            }
+            _ => UpstreamAuthResolutionError::RuntimeCredentialUnavailable {
+                kind: error.kind_label(),
+                source_kind: error.source_kind(),
+                reason: error.code().as_str(),
+                reference: error.reference().to_string(),
+            },
+        };
+        return Err(resolution_error);
+    }
+    if unconfigured_upstream_auth_contract_requires_opt_in(
+        service_name,
+        credential.configured_contract(),
+        credential.allow_anonymous(),
+        target_url,
+    ) {
+        return Err(UpstreamAuthResolutionError::AnonymousNotAllowed);
+    }
+    let token = credential.bearer_header();
+    let api_key = credential.api_key_header();
+    let helper_credential_contract = credential.configured_contract();
     let allow_client_passthrough = service_name != "codex"
         || (!helper_credential_contract && trusted_codex_passthrough_origin(target_url));
 
@@ -235,17 +283,13 @@ pub(super) fn inject_auth_headers(
         strip_codex_client_account_headers(headers);
     }
 
-    if let Some(token) = token
-        && let Ok(value) = HeaderValue::from_str(&format!("Bearer {token}"))
-    {
+    if let Some(value) = token {
         headers.insert(HeaderName::from_static("authorization"), value);
     } else if client_has_auth && !allow_client_passthrough {
         headers.remove("authorization");
     }
 
-    if let Some(key) = api_key
-        && let Ok(value) = HeaderValue::from_str(key)
-    {
+    if let Some(value) = api_key {
         headers.insert(HeaderName::from_static("x-api-key"), value);
     } else if client_has_x_api_key && !allow_client_passthrough {
         headers.remove("x-api-key");
@@ -339,10 +383,12 @@ mod tests {
         let setup = prepare_attempt_request(AttemptRequestSetupParams {
             service_name: "codex",
             auth: &UpstreamAuth {
-                auth_token: Some("server-token".to_string()),
+                auth_token: Some("server-token".to_string().into()),
                 auth_token_env: None,
-                api_key: Some("server-key".to_string()),
+                auth_token_ref: None,
+                api_key: Some("server-key".to_string().into()),
                 api_key_env: None,
+                api_key_ref: None,
                 allow_anonymous: None,
             },
             client_headers: &client_headers,
@@ -372,22 +418,20 @@ mod tests {
             setup.headers.get("accept-encoding"),
             Some(&HeaderValue::from_static("identity"))
         );
-        assert_eq!(
-            setup.account_fingerprint,
-            AccountFingerprint::from_final_headers(&setup.headers)
-        );
-        assert_ne!(
-            setup.account_fingerprint,
-            AccountFingerprint::from_final_headers(&client_headers)
-        );
+        assert_ne!(setup.account_fingerprint, AccountFingerprint::unscoped());
         assert!(setup.debug_base.is_none());
     }
 
     #[test]
     fn prepare_attempt_request_rejects_unconfigured_remote_relay_by_default() {
+        let credential =
+            CapturedUpstreamCredential::from_config_for_test("codex", &UpstreamAuth::default());
+        let state = crate::state::ProxyState::new();
         let result = prepare_attempt_request_identity(AttemptRequestIdentityParams {
             service_name: "codex",
-            auth: &UpstreamAuth::default(),
+            credential: &credential,
+            credential_scope: None,
+            state: state.as_ref(),
             client_headers: &HeaderMap::new(),
             client_uri: "/v1/responses",
             target_url: "https://third-party.example/v1/responses",
@@ -397,6 +441,51 @@ mod tests {
             result,
             Err(UpstreamAuthResolutionError::AnonymousNotAllowed)
         ));
+    }
+
+    #[test]
+    fn official_passthrough_account_identity_is_keyed_stable_and_account_scoped() {
+        let state = crate::state::ProxyState::new();
+        let credential =
+            CapturedUpstreamCredential::from_config_for_test("codex", &UpstreamAuth::default());
+        let prepare = |headers: &HeaderMap| {
+            prepare_attempt_request_identity(AttemptRequestIdentityParams {
+                service_name: "codex",
+                credential: &credential,
+                credential_scope: None,
+                state: state.as_ref(),
+                client_headers: headers,
+                client_uri: "/v1/responses",
+                target_url: "https://api.openai.com/v1/responses",
+            })
+            .expect("prepare official passthrough identity")
+        };
+
+        let mut first_headers = HeaderMap::new();
+        first_headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer passthrough-account-one"),
+        );
+        let mut same_headers = first_headers.clone();
+        same_headers.insert("x-request-id", HeaderValue::from_static("request-two"));
+        let mut second_headers = HeaderMap::new();
+        second_headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer passthrough-account-two"),
+        );
+
+        let first = prepare(&first_headers);
+        let same = prepare(&same_headers);
+        let second = prepare(&second_headers);
+        let anonymous = prepare(&HeaderMap::new());
+
+        assert_eq!(first.account_fingerprint, same.account_fingerprint);
+        assert_ne!(first.account_fingerprint, second.account_fingerprint);
+        assert_eq!(
+            anonymous.account_fingerprint,
+            AccountFingerprint::unscoped()
+        );
+        assert_ne!(first.account_fingerprint, anonymous.account_fingerprint);
     }
 
     #[test]
@@ -446,6 +535,7 @@ mod tests {
             setup.headers.get("content-type"),
             Some(&HeaderValue::from_static("application/json"))
         );
+        assert_eq!(setup.account_fingerprint, AccountFingerprint::unscoped());
     }
 
     #[test]
@@ -465,10 +555,12 @@ mod tests {
         let setup = prepare_attempt_request(AttemptRequestSetupParams {
             service_name: "codex",
             auth: &UpstreamAuth {
-                auth_token: Some("relay-token".to_string()),
+                auth_token: Some("relay-token".to_string().into()),
                 auth_token_env: None,
+                auth_token_ref: None,
                 api_key: None,
                 api_key_env: None,
+                api_key_ref: None,
                 allow_anonymous: None,
             },
             client_headers: &client_headers,
@@ -555,8 +647,10 @@ mod tests {
                 auth_token_env: Some(
                     "CODEX_HELPER_TEST_DEFINITELY_MISSING_PROVIDER_TOKEN_7C2A".to_string(),
                 ),
+                auth_token_ref: None,
                 api_key: None,
                 api_key_env: None,
+                api_key_ref: None,
                 allow_anonymous: None,
             },
             client_headers: &client_headers,
@@ -579,6 +673,46 @@ mod tests {
                 kind: "Bearer token",
                 ref name,
             }) if name == "CODEX_HELPER_TEST_DEFINITELY_MISSING_PROVIDER_TOKEN_7C2A"
+        ));
+    }
+
+    #[test]
+    fn prepare_attempt_request_does_not_passthrough_official_auth_for_a_configured_reference() {
+        let mut client_headers = HeaderMap::new();
+        client_headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer official-token"),
+        );
+
+        let cache = OnceLock::new();
+        let result = prepare_attempt_request(AttemptRequestSetupParams {
+            service_name: "codex",
+            auth: &UpstreamAuth {
+                auth_token_ref: Some(crate::config::CredentialRef::Native {
+                    name: "relay.primary".to_string(),
+                }),
+                ..UpstreamAuth::default()
+            },
+            client_headers: &client_headers,
+            client_headers_entries_cache: &cache,
+            request_body_len: 12,
+            upstream_request_body_len: 12,
+            debug_max: 0,
+            warn_max: 0,
+            client_uri: "/v1/responses",
+            target_url: "https://api.openai.com/v1/responses",
+            client_body_debug: None,
+            upstream_request_body_debug: None,
+            client_body_warn: None,
+            upstream_request_body_warn: None,
+        });
+
+        assert!(matches!(
+            result,
+            Err(UpstreamAuthResolutionError::UnsupportedReference {
+                kind: "Bearer token",
+                source_kind: "native",
+            })
         ));
     }
 

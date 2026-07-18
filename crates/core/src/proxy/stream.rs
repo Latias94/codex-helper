@@ -25,6 +25,7 @@ use super::attempt_health::{
 };
 use super::classify::{
     UPSTREAM_OVERLOADED_CLASS, UPSTREAM_RATE_LIMITED_CLASS, classify_observed_upstream_response,
+    is_credential_auth_failure,
 };
 use super::codex_failure::CodexFailureSse;
 use super::concurrency_limits::ConcurrencyPermit;
@@ -34,6 +35,7 @@ use super::provider_evidence::{ResponseEvidenceParams, response_evidence_from_cl
 use super::request_body::merge_response_metadata_from_value;
 use super::request_observer::{RequestObserver, RequestPublication, RequestPublicationGate};
 use super::retry::response_penalty_cooldown_secs;
+use super::runtime_config::RuntimeConfig;
 use crate::routing_ir::CapturedRouteCandidate;
 use crate::state::SessionRouteAffinitySuccess;
 
@@ -124,6 +126,7 @@ struct StreamUsageState {
     terminal_publication: RequestPublicationGate,
     stream_error: Option<StreamErrorInfo>,
     protocol_terminal: StreamProtocolTerminal,
+    body_complete: bool,
     warned_non_success: bool,
     first_chunk_ms: Option<u64>,
     usage: Option<crate::usage::UsageMetrics>,
@@ -290,6 +293,7 @@ struct StreamFinalize {
     route_decision: Option<RouteDecisionProvenance>,
     request_id: u64,
     state: Arc<ProxyState>,
+    runtime_config: Arc<RuntimeConfig>,
     resp_headers: HeaderMap,
     debug_base: Option<HttpDebugBase>,
     usage_state: Arc<Mutex<StreamUsageState>>,
@@ -320,6 +324,12 @@ struct StreamFinalizeWork {
 }
 
 impl StreamFinalize {
+    fn mark_body_complete(&self) {
+        if let Ok(mut guard) = self.usage_state.lock() {
+            guard.body_complete = true;
+        }
+    }
+
     fn mark_protocol_terminal(&self, terminal: StreamProtocolTerminal) {
         let Ok(mut guard) = self.usage_state.lock() else {
             return;
@@ -412,6 +422,7 @@ impl StreamFinalize {
         let reported_model = guard.reported_model.clone();
         let stream_error = guard.stream_error.clone();
         let protocol_terminal = guard.protocol_terminal;
+        let body_complete = guard.body_complete;
         let response_body = guard.buffer.iter().copied().collect::<Vec<_>>();
 
         let dur = self.start.elapsed().as_millis() as u64;
@@ -446,6 +457,13 @@ impl StreamFinalize {
         let health_update = terminal_decision.health_update;
         let classified_response =
             classify_observed_upstream_response(status_code, &self.resp_headers, &response_body);
+        if body_complete
+            && let Ok(status) = StatusCode::from_u16(status_code)
+            && is_credential_auth_failure(status, classified_response.class.as_deref())
+        {
+            self.runtime_config
+                .schedule_credential_refresh(self.target.credential());
+        }
         let evidence_route_facing = matches!(
             &health_update,
             Some(StreamHealthUpdate::FailureAndPenalty { .. })
@@ -943,6 +961,7 @@ impl StreamForwardState {
                         self.finished = true;
                         return None;
                     }
+                    self.finalize.mark_body_complete();
                     if !self.gate_success_terminal {
                         if self.finalize.commit_terminal().await {
                             self.finished = true;
@@ -1276,6 +1295,7 @@ pub(super) async fn build_sse_success_response(
         route_decision,
         request_id,
         state: proxy.state.clone(),
+        runtime_config: Arc::clone(&proxy.config),
         resp_headers: resp_headers.clone(),
         debug_base,
         usage_state: usage_state.clone(),
@@ -1290,17 +1310,9 @@ pub(super) async fn build_sse_success_response(
     };
 
     if is_user_turn && is_codex_service {
-        let cfg_snapshot = proxy.config.snapshot().await;
         let state = proxy.state.clone();
         let client = proxy.client.clone();
-        let service_name = proxy.service_name.to_string();
-        super::providers_api::enqueue_provider_balance_probe(
-            client,
-            cfg_snapshot,
-            state,
-            service_name.as_str(),
-            target.provider_endpoint().clone(),
-        );
+        super::providers_api::enqueue_provider_balance_probe(client, state, target.clone());
     }
 
     let stream_state = StreamForwardState {

@@ -188,7 +188,7 @@ mod tests {
     use super::export_config_file;
 
     const VALID_CONFIG: &str = r#"
-version = 5
+version = 6
 
 [codex.routing]
 entry = "relay"

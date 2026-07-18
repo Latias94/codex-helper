@@ -38,7 +38,7 @@ name = "ch"
 path = "src/bin/ch.rs"
 
 [dependencies]
-codex-helper-core = { path = "crates/core", version = "0.20.3" }
+codex-helper-core = { path = "crates/core", version = "0.20.3", features = ["native-credentials"] }
 codex-helper-tui = { path = "crates/tui", version = "0.20.3" }
 anyhow = "1.0.103"
 base64 = "0.22.1"

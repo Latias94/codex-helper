@@ -1,6 +1,6 @@
 use super::*;
 use crate::file_replace::{
-    write_bytes_file_async, write_bytes_file_async_with_permissions,
+    AtomicWriteError, write_bytes_file_async,
     write_bytes_file_async_with_permissions_and_before_replace,
 };
 use std::fs::{File, OpenOptions, TryLockError};
@@ -98,7 +98,7 @@ impl ConfigMigrationPlan {
 }
 
 impl LoadedConfig {
-    /// Preview or explicitly apply migration of the on-disk configuration to the v5 contract.
+    /// Preview or explicitly apply migration of the on-disk configuration to the current contract.
     ///
     /// This shares the validated migration path used by normal startup. Preview mode never
     /// writes configuration, and neither mode reads or mutates runtime SQLite state.
@@ -126,7 +126,7 @@ impl LoadedConfig {
 
 const CONFIG_TOML_DOC_HEADER: &str = r#"# codex-helper config.toml
 #
-# 启动路径最终只加载当前 `version = 5` TOML。发现旧版本/无版本
+# 启动路径最终只加载当前 `version = 6` TOML。发现旧版本/无版本
 # TOML，或在没有 canonical config.toml 时发现 config.json，会先自动
 # 校验迁移并把源文件保存为对应的 `.bak`；未来版本和损坏文件会拒绝启动。
 #
@@ -143,7 +143,7 @@ const CONFIG_TOML_DOC_HEADER: &str = r#"# codex-helper config.toml
 
 const CONFIG_TOML_TEMPLATE: &str = r#"# codex-helper config.toml
 #
-# codex-helper 启动路径最终只读取当前 `version = 5` 的 config.toml。
+# codex-helper 启动路径最终只读取当前 `version = 6` 的 config.toml。
 # 旧版本/无版本 TOML 和没有 canonical TOML 时的 config.json 会自动迁移，
 # 写入前保留 `.bak`；未来版本或损坏文件不会被猜测降级。
 #
@@ -157,7 +157,7 @@ const CONFIG_TOML_TEMPLATE: &str = r#"# codex-helper config.toml
 # - 生成/覆盖本模板：`codex-helper config init [--force]`
 # - 新安装时：首次写入配置默认会写 TOML。
 
-version = 5
+version = 6
 
 # 省略 --codex/--claude 时默认使用哪个服务。
 # default_service = "codex"
@@ -222,7 +222,7 @@ version = 5
 # models = ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"]
 # # headers = { "x-status-token" = "use-an-env-rendered-static-token-only-if-needed" }
 
-# --- 推荐：provider / routing 配置（v5 route graph） ---
+# --- 推荐：provider / routing 配置（version 6 route graph） ---
 #
 # 大部分用户只需要改这一段。
 #
@@ -236,6 +236,10 @@ version = 5
 # [codex.providers.openai]
 # base_url = "https://api.openai.com/v1"
 # auth_token_env = "OPENAI_API_KEY"
+# # 本地用户服务也可显式引用 native store；值不会写入本文件：
+# # auth_token_ref = { source = "native", name = "openai.primary" }
+# # headless/Docker 可显式引用只读挂载的绝对路径：
+# # auth_token_ref = { source = "secret_file", path = "/run/secrets/openai-token" }
 # tags = { vendor = "openai", region = "us" }
 #
 # [codex.providers.backup]
@@ -1159,6 +1163,96 @@ fn validate_legacy_migration_input(value: &TomlValue, explicit_version: Option<u
     Ok(())
 }
 
+const CREDENTIAL_REFERENCE_SCHEMA_VERSION: u64 = 6;
+const CREDENTIAL_REFERENCE_FIELDS: &[&str] = &["auth_token_ref", "api_key_ref"];
+
+fn collect_auth_reference_fields(value: &TomlValue, path: &str, references: &mut Vec<String>) {
+    let Some(table) = value.as_table() else {
+        return;
+    };
+    for field in CREDENTIAL_REFERENCE_FIELDS {
+        if table.contains_key(*field) {
+            references.push(format!("{path}.{field}"));
+        }
+    }
+}
+
+fn collect_provider_credential_reference_paths(
+    service_name: &str,
+    service: &TomlValue,
+    references: &mut Vec<String>,
+) {
+    let Some(service) = service.as_table() else {
+        return;
+    };
+
+    if let Some(providers) = service.get("providers").and_then(TomlValue::as_table) {
+        for (provider_name, provider) in providers {
+            let provider_path =
+                format!("{service_name}.providers.{}", toml_path_key(provider_name));
+            collect_auth_reference_fields(provider, &provider_path, references);
+            if let Some(auth) = provider.get("auth") {
+                collect_auth_reference_fields(auth, &format!("{provider_path}.auth"), references);
+            }
+        }
+    }
+
+    for container_name in ["configs", "stations"] {
+        let Some(stations) = service.get(container_name).and_then(TomlValue::as_table) else {
+            continue;
+        };
+        for (station_name, station) in stations {
+            let Some(upstreams) = station.get("upstreams").and_then(TomlValue::as_array) else {
+                continue;
+            };
+            for (index, upstream) in upstreams.iter().enumerate() {
+                let upstream_path = format!(
+                    "{service_name}.{container_name}.{}.upstreams[{index}]",
+                    toml_path_key(station_name)
+                );
+                collect_auth_reference_fields(upstream, &upstream_path, references);
+                let Some(auth) = upstream.get("auth") else {
+                    continue;
+                };
+                collect_auth_reference_fields(auth, &format!("{upstream_path}.auth"), references);
+            }
+        }
+    }
+}
+
+fn reject_pre_v6_credential_references(
+    value: &TomlValue,
+    explicit_version: Option<u64>,
+) -> Result<()> {
+    if explicit_version.is_some_and(|version| version >= CREDENTIAL_REFERENCE_SCHEMA_VERSION) {
+        return Ok(());
+    }
+
+    let mut references = Vec::new();
+    for service_name in ["codex", "claude"] {
+        if let Some(service) = value.get(service_name) {
+            collect_provider_credential_reference_paths(service_name, service, &mut references);
+        }
+    }
+    references.sort();
+    references.dedup();
+    if references.is_empty() {
+        return Ok(());
+    }
+
+    let source_version = explicit_version
+        .map(|version| version.to_string())
+        .unwrap_or_else(|| "unversioned".to_string());
+    anyhow::bail!(
+        "configuration schema {source_version} contains version 6 credential reference field(s) {}; migration was not written because a pre-v6 binary could ignore these fields",
+        references
+            .iter()
+            .map(|path| format!("`{path}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
 fn migrate_flat_retry_settings(value: &mut TomlValue, notices: &mut Vec<String>) -> Result<()> {
     let Some(retry) = value.get_mut("retry") else {
         return Ok(());
@@ -1435,7 +1529,7 @@ fn migrate_v3_routing_for_service(
                 service.insert("routing".to_string(), TomlValue::Table(result));
                 if !retained_extension_names.is_empty() {
                     notices.push(format!(
-                        "[{service_name}] retained legacy v3 routing extension field(s) at the v5 routing scope: {}",
+                        "[{service_name}] retained legacy v3 routing extension field(s) at the version 6 routing scope: {}",
                         retained_extension_names.join(", ")
                     ));
                 }
@@ -1469,12 +1563,12 @@ fn migrate_v3_routing_for_service(
     service.insert("routing".to_string(), TomlValue::Table(result));
     if !retained_extension_names.is_empty() {
         notices.push(format!(
-            "[{service_name}] retained legacy v3 routing extension field(s) at the v5 routing scope: {}",
+            "[{service_name}] retained legacy v3 routing extension field(s) at the version 6 routing scope: {}",
             retained_extension_names.join(", ")
         ));
     }
     notices.push(format!(
-        "[{service_name}] converted legacy v3 `{policy}` routing into the v5 route graph"
+        "[{service_name}] converted legacy v3 `{policy}` routing into the version 6 route graph"
     ));
     Ok(())
 }
@@ -1984,6 +2078,7 @@ async fn build_config_migration_plan(
             CURRENT_CONFIG_VERSION
         );
     }
+    reject_pre_v6_credential_references(&raw, explicit_version)?;
 
     let legacy_station_shape = has_legacy_station_shape(&raw);
     let v2_shape = has_v2_station_shape(&raw);
@@ -2002,11 +2097,11 @@ async fn build_config_migration_plan(
     }
     if explicit_version.is_none() {
         notices.push(
-            "source has no explicit schema version; fields matching the current contract were imported and the result was validated as version 5".to_string(),
+            "source has no explicit schema version; fields matching the current contract were imported and the result was validated as version 6".to_string(),
         );
     } else if source_version == Some(4) {
         notices.push(
-            "version 4 route-graph fields were retained and the schema version was advanced to 5"
+            "version 4 route-graph fields were retained and the schema version was advanced to 6"
                 .to_string(),
         );
     }
@@ -2025,7 +2120,7 @@ async fn build_config_migration_plan(
     );
     let raw_body = toml::to_string_pretty(&raw).context("serialize migrated configuration")?;
     let candidate = toml::from_str::<HelperConfig>(&raw_body)
-        .context("parse migrated configuration against the current v5 schema")?;
+        .context("parse migrated configuration against the current v6 schema")?;
     validate_helper_config(&candidate).context("validate migrated configuration")?;
     // Retain every raw field that was not explicitly transformed or retired.
     // Typed parsing above validates known settings without silently erasing
@@ -2056,16 +2151,18 @@ async fn apply_config_migration_plan(
     paths: &ResolvedConfigDirectory,
     plan: &ConfigMigrationPlan,
 ) -> Result<()> {
-    apply_config_migration_plan_with_before_replace(paths, plan, |_, _| Ok(())).await
+    apply_config_migration_plan_with_race_hooks(paths, plan, || Ok(()), || Ok(())).await
 }
 
-async fn apply_config_migration_plan_with_before_replace<B>(
+async fn apply_config_migration_plan_with_race_hooks<B, A>(
     paths: &ResolvedConfigDirectory,
     plan: &ConfigMigrationPlan,
-    before_source_check: B,
+    before_backup_publication_check: B,
+    after_backup_publication_check: A,
 ) -> Result<()>
 where
-    B: FnOnce(&Path, &Path) -> io::Result<()> + Send + 'static,
+    B: FnOnce() -> io::Result<()> + Send + 'static,
+    A: FnOnce() -> io::Result<()> + Send + 'static,
 {
     paths.ensure_unchanged().await?;
     if !plan.requires_write {
@@ -2086,9 +2183,9 @@ where
             plan.source_name
         );
     }
-    if !config_permissions_match(&current.permissions, &plan.source.permissions) {
+    if !current.metadata.matches(&plan.source.metadata) {
         anyhow::bail!(
-            "{} permissions changed while migration was being prepared; no backup or migrated target was written",
+            "{} ownership or permissions changed while migration was being prepared; no backup or migrated target was written",
             plan.source_name
         );
     }
@@ -2100,16 +2197,56 @@ where
         anyhow::bail!("config.toml appeared while migrating config.json; no files were modified");
     }
 
-    let verified_permissions = current.permissions.clone();
-    write_bytes_file_async_with_permissions(
-        &paths.resolved_file(
-            plan.backup_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("config.toml.bak"),
-        ),
+    let backup_name = plan
+        .backup_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.toml.bak");
+    let previous_backup = read_existing_config_file(paths, backup_name).await?;
+    if previous_backup
+        .as_ref()
+        .is_some_and(|backup| backup.entry_is_symlink)
+    {
+        anyhow::bail!(
+            "refusing to migrate because {} is a symbolic link and cannot be restored safely if target publication is rejected",
+            plan.backup_path.display()
+        );
+    }
+
+    let verified_metadata = current.metadata.clone();
+    let backup_destination = paths.resolved_file(backup_name);
+    let backup_source_path = paths.resolved_file(plan.source_name);
+    let backup_source_name = plan.source_name;
+    let backup_expected_contents = plan.source.contents.clone();
+    let backup_expected_metadata = verified_metadata.clone();
+    let staged_backup_metadata = verified_metadata.clone();
+    let expected_previous_backup = previous_backup.clone();
+    let backup_destination_for_check = backup_destination.clone();
+    let target_destination = paths.resolved_file("config.toml");
+    let logical_directory = paths.logical_path.clone();
+    let resolved_directory = paths.resolved_path.clone();
+    // Finalize every source and target precondition at the backup publication boundary. A
+    // rejected precondition must not replace an existing backup.
+    write_bytes_file_async_with_permissions_and_before_replace(
+        &backup_destination,
         &plan.source.contents,
-        verified_permissions.clone(),
+        verified_metadata.permissions.clone(),
+        move |staged_path, _destination| {
+            staged_backup_metadata.apply_to_staged_file(staged_path)?;
+            before_backup_publication_check()?;
+            verify_config_directory_binding(&logical_directory, &resolved_directory)?;
+            verify_migration_source_before_replace(
+                &backup_source_path,
+                &target_destination,
+                backup_source_name,
+                &backup_expected_contents,
+                &backup_expected_metadata,
+            )?;
+            verify_migration_backup_snapshot(
+                &backup_destination_for_check,
+                expected_previous_backup.as_ref(),
+            )
+        },
     )
     .await
     .with_context(|| {
@@ -2120,35 +2257,178 @@ where
         )
     })?;
 
-    paths.ensure_unchanged().await?;
     let destination = paths.resolved_file("config.toml");
-    let source_path = paths.resolved_file(plan.source_name);
-    let source_name = plan.source_name;
-    let expected_contents = plan.source.contents.clone();
-    let expected_permissions = verified_permissions.clone();
-    write_bytes_file_async_with_permissions_and_before_replace(
+    let target_source_path = paths.resolved_file(plan.source_name);
+    let target_source_name = plan.source_name;
+    let target_expected_contents = plan.source.contents.clone();
+    let target_expected_metadata = verified_metadata.clone();
+    let staged_target_metadata = verified_metadata.clone();
+    let target_logical_directory = paths.logical_path.clone();
+    let target_resolved_directory = paths.resolved_path.clone();
+    // The successful path remains backup-first. A rejected target precondition restores the
+    // previous backup, but a crash between backup commit and target commit or rollback can leave
+    // the new backup beside the old target; these replacements are not a cross-file transaction.
+    let target_write = write_bytes_file_async_with_permissions_and_before_replace(
         &destination,
         plan.rendered.as_bytes(),
-        verified_permissions,
+        staged_target_metadata.permissions.clone(),
         move |staged_path, destination| {
-            before_source_check(staged_path, destination)?;
+            staged_target_metadata.apply_to_staged_file(staged_path)?;
+            after_backup_publication_check()?;
+            verify_config_directory_binding(&target_logical_directory, &target_resolved_directory)?;
             verify_migration_source_before_replace(
-                &source_path,
+                &target_source_path,
                 destination,
-                source_name,
-                &expected_contents,
-                &expected_permissions,
+                target_source_name,
+                &target_expected_contents,
+                &target_expected_metadata,
             )
         },
     )
-    .await
-    .with_context(|| {
-        format!(
-            "write migrated configuration to {}",
-            plan.target_path.display()
+    .await;
+
+    match target_write {
+        Ok(()) => Ok(()),
+        Err(error @ AtomicWriteError::BeforeCommit { .. }) => {
+            if let Err(rollback_error) = rollback_migration_backup(
+                paths,
+                &backup_destination,
+                previous_backup.as_ref(),
+                &plan.source.contents,
+                &verified_metadata,
+            )
+            .await
+            {
+                anyhow::bail!(
+                    "write migrated configuration to {} failed before commit: {error}; restoring the prior backup also failed: {rollback_error:#}",
+                    plan.target_path.display()
+                );
+            }
+            Err(error).with_context(|| {
+                format!(
+                    "write migrated configuration to {}",
+                    plan.target_path.display()
+                )
+            })
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "write migrated configuration to {}",
+                plan.target_path.display()
+            )
+        }),
+    }
+}
+
+fn verify_config_directory_binding(logical_path: &Path, resolved_path: &Path) -> io::Result<()> {
+    let current = std::fs::canonicalize(logical_path)?;
+    if current != resolved_path {
+        return Err(io::Error::other(format!(
+            "config directory {} changed target during migration; expected {}, found {}",
+            logical_path.display(),
+            resolved_path.display(),
+            current.display()
+        )));
+    }
+    Ok(())
+}
+
+fn verify_migration_backup_snapshot(
+    backup_path: &Path,
+    expected: Option<&ExistingConfigToml>,
+) -> io::Result<()> {
+    let Some(expected) = expected else {
+        return match std::fs::symlink_metadata(backup_path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Ok(_) => Err(io::Error::other(
+                "migration backup appeared while migration was being prepared",
+            )),
+            Err(error) => Err(error),
+        };
+    };
+
+    verify_migration_source_snapshot(
+        backup_path,
+        "migration backup",
+        &expected.contents,
+        &expected.metadata,
+    )
+}
+
+async fn rollback_migration_backup(
+    paths: &ResolvedConfigDirectory,
+    backup_path: &Path,
+    previous: Option<&ExistingConfigToml>,
+    published_contents: &[u8],
+    published_metadata: &ConfigFileMetadata,
+) -> Result<()> {
+    let logical_directory = paths.logical_path.clone();
+    let resolved_directory = paths.resolved_path.clone();
+    let backup_path = backup_path.to_path_buf();
+    let expected_contents = published_contents.to_vec();
+    let expected_metadata = published_metadata.clone();
+
+    if let Some(previous) = previous {
+        let staged_metadata = previous.metadata.clone();
+        return write_bytes_file_async_with_permissions_and_before_replace(
+            &backup_path,
+            &previous.contents,
+            previous.metadata.permissions.clone(),
+            move |staged_path, destination| {
+                staged_metadata.apply_to_staged_file(staged_path)?;
+                verify_config_directory_binding(&logical_directory, &resolved_directory)?;
+                verify_migration_source_snapshot(
+                    destination,
+                    "published migration backup",
+                    &expected_contents,
+                    &expected_metadata,
+                )
+            },
         )
-    })?;
-    paths.ensure_unchanged().await?;
+        .await
+        .context("restore the previous migration backup");
+    }
+
+    // There is no portable conditional unlink. Verify that the entry is still our published
+    // backup immediately before this best-effort removal, without claiming race-free rollback.
+    tokio::task::spawn_blocking(move || {
+        verify_config_directory_binding(&logical_directory, &resolved_directory)?;
+        verify_migration_source_snapshot(
+            &backup_path,
+            "published migration backup",
+            &expected_contents,
+            &expected_metadata,
+        )?;
+        std::fs::remove_file(&backup_path)
+    })
+    .await
+    .context("join migration backup rollback")?
+    .context("remove the newly published migration backup")
+}
+
+fn verify_migration_source_snapshot(
+    source_path: &Path,
+    source_name: &str,
+    expected_contents: &[u8],
+    expected_metadata: &ConfigFileMetadata,
+) -> io::Result<()> {
+    let metadata = std::fs::symlink_metadata(source_path)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(io::Error::other(format!(
+            "{source_name} is no longer the regular source file used to prepare migration"
+        )));
+    }
+    let current_metadata = ConfigFileMetadata::capture(source_path, &metadata)?;
+    if !current_metadata.matches(expected_metadata) {
+        return Err(io::Error::other(format!(
+            "{source_name} ownership or permissions changed while migration was being prepared"
+        )));
+    }
+    if std::fs::read(source_path)? != expected_contents {
+        return Err(io::Error::other(format!(
+            "{source_name} changed while migration was being prepared"
+        )));
+    }
     Ok(())
 }
 
@@ -2157,24 +2437,14 @@ fn verify_migration_source_before_replace(
     destination: &Path,
     source_name: &str,
     expected_contents: &[u8],
-    expected_permissions: &std::fs::Permissions,
+    expected_metadata: &ConfigFileMetadata,
 ) -> io::Result<()> {
-    let metadata = std::fs::symlink_metadata(source_path)?;
-    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-        return Err(io::Error::other(format!(
-            "{source_name} is no longer the regular source file used to prepare migration"
-        )));
-    }
-    if !config_permissions_match(&metadata.permissions(), expected_permissions) {
-        return Err(io::Error::other(format!(
-            "{source_name} permissions changed while migration was being prepared"
-        )));
-    }
-    if std::fs::read(source_path)? != expected_contents {
-        return Err(io::Error::other(format!(
-            "{source_name} changed while migration was being prepared"
-        )));
-    }
+    verify_migration_source_snapshot(
+        source_path,
+        source_name,
+        expected_contents,
+        expected_metadata,
+    )?;
     if source_name == "config.json" {
         match std::fs::symlink_metadata(destination) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -2353,16 +2623,650 @@ fn open_config_mutation_lock_file(path: &Path) -> Result<File> {
         .with_context(|| format!("open config mutation lock {}", path.display()))
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ExistingConfigToml {
     entry_is_symlink: bool,
-    permissions: std::fs::Permissions,
+    metadata: ConfigFileMetadata,
     contents: Vec<u8>,
 }
 
 impl ExistingConfigToml {
     fn text(&self) -> Result<&str> {
         std::str::from_utf8(&self.contents).context("config.toml is not valid UTF-8")
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ConfigFileMetadata {
+    permissions: std::fs::Permissions,
+    platform: PlatformConfigFileMetadata,
+}
+
+impl ConfigFileMetadata {
+    fn capture(path: &Path, metadata: &std::fs::Metadata) -> io::Result<Self> {
+        Ok(Self {
+            permissions: metadata.permissions(),
+            platform: PlatformConfigFileMetadata::capture(path, metadata)?,
+        })
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        config_permissions_match(&self.permissions, &other.permissions)
+            && self.platform == other.platform
+    }
+
+    fn apply_to_staged_file(&self, path: &Path) -> io::Result<()> {
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        self.platform.apply(path, &file)?;
+        file.set_permissions(self.permissions.clone())?;
+        file.sync_all()?;
+        let metadata = std::fs::symlink_metadata(path)?;
+        let applied = Self::capture(path, &metadata)?;
+        if !applied.matches(self) {
+            return Err(io::Error::other(
+                "staged config ownership or permissions do not match the source snapshot",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlatformConfigFileMetadata {
+    uid: u32,
+    gid: u32,
+    acl: Option<Vec<u8>>,
+}
+
+#[cfg(unix)]
+impl PlatformConfigFileMetadata {
+    fn capture(path: &Path, metadata: &std::fs::Metadata) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+
+        Ok(Self {
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            acl: capture_config_file_acl(path)?,
+        })
+    }
+
+    fn apply(&self, _path: &Path, file: &File) -> io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = file.metadata()?;
+        if metadata.uid() != self.uid || metadata.gid() != self.gid {
+            std::os::unix::fs::fchown(file, Some(self.uid), Some(self.gid))?;
+        }
+        apply_config_file_acl(file, self.acl.as_deref())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn capture_config_file_acl(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "config path contains an embedded null",
+        )
+    })?;
+    let name = c"system.posix_acl_access";
+    for _ in 0..3 {
+        // SAFETY: Both C strings are NUL-terminated and a null value pointer with size zero is a
+        // supported size query.
+        let size = unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
+        if size < 0 {
+            let error = io::Error::last_os_error();
+            if linux_acl_is_absent(&error) {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+        let size = usize::try_from(size)
+            .map_err(|_| io::Error::other("config ACL size does not fit in memory"))?;
+        if size > 64 * 1024 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "config ACL exceeds the supported 64 KiB metadata bound",
+            ));
+        }
+        let mut acl = vec![0_u8; size];
+        // SAFETY: The buffer is writable for `size` bytes and both C strings remain live.
+        let read = unsafe {
+            libc::getxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                acl.as_mut_ptr().cast(),
+                acl.len(),
+            )
+        };
+        if read >= 0 {
+            acl.truncate(usize::try_from(read).unwrap_or(acl.len()));
+            return Ok(Some(acl));
+        }
+        let error = io::Error::last_os_error();
+        if linux_acl_is_absent(&error) {
+            return Ok(None);
+        }
+        if error.raw_os_error() != Some(libc::ERANGE) {
+            return Err(error);
+        }
+    }
+    Err(io::Error::other(
+        "config ACL changed repeatedly while it was being captured",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn apply_config_file_acl(file: &File, acl: Option<&[u8]>) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let name = c"system.posix_acl_access";
+    let result = match acl {
+        Some(acl) => {
+            // SAFETY: The file descriptor, name, and ACL byte slice remain valid for the call.
+            unsafe {
+                libc::fsetxattr(
+                    file.as_raw_fd(),
+                    name.as_ptr(),
+                    acl.as_ptr().cast(),
+                    acl.len(),
+                    0,
+                )
+            }
+        }
+        None => {
+            // A staging file may inherit an ACL from its parent even when the source has none.
+            // SAFETY: The file descriptor and NUL-terminated attribute name are valid.
+            unsafe { libc::fremovexattr(file.as_raw_fd(), name.as_ptr()) }
+        }
+    };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if acl.is_none() && linux_acl_is_absent(&error) {
+        return Ok(());
+    }
+    Err(error)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_acl_is_absent(error: &io::Error) -> bool {
+    error
+        .raw_os_error()
+        .is_some_and(|code| code == libc::ENODATA || code == libc::ENOTSUP)
+}
+
+#[cfg(target_os = "macos")]
+const MACOS_ACL_TYPE_EXTENDED: std::ffi::c_int = 0x0000_0100;
+
+#[cfg(target_os = "macos")]
+const MACOS_ACL_FIRST_ENTRY: std::ffi::c_int = 0;
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn acl_get_file(
+        path: *const std::ffi::c_char,
+        acl_type: std::ffi::c_int,
+    ) -> *mut std::ffi::c_void;
+    fn acl_get_entry(
+        acl: *mut std::ffi::c_void,
+        entry_id: std::ffi::c_int,
+        entry: *mut *mut std::ffi::c_void,
+    ) -> std::ffi::c_int;
+    fn acl_init(count: std::ffi::c_int) -> *mut std::ffi::c_void;
+    fn acl_copy_ext(
+        buffer: *mut std::ffi::c_void,
+        acl: *mut std::ffi::c_void,
+        size: isize,
+    ) -> isize;
+    fn acl_copy_int(buffer: *const std::ffi::c_void) -> *mut std::ffi::c_void;
+    fn acl_size(acl: *mut std::ffi::c_void) -> isize;
+    fn acl_set_fd_np(
+        file_descriptor: std::ffi::c_int,
+        acl: *mut std::ffi::c_void,
+        acl_type: std::ffi::c_int,
+    ) -> std::ffi::c_int;
+    fn acl_free(value: *mut std::ffi::c_void) -> std::ffi::c_int;
+}
+
+#[cfg(target_os = "macos")]
+struct OwnedMacosAcl(*mut std::ffi::c_void);
+
+#[cfg(target_os = "macos")]
+impl Drop for OwnedMacosAcl {
+    fn drop(&mut self) {
+        // SAFETY: The pointer was returned by a macOS ACL allocation API and remains owned here.
+        unsafe {
+            acl_free(self.0);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn capture_config_file_acl(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "config path contains an embedded null",
+        )
+    })?;
+    // SAFETY: The path is NUL-terminated and the ACL type is supported by macOS.
+    let acl = unsafe { acl_get_file(path.as_ptr(), MACOS_ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        let error = io::Error::last_os_error();
+        if error
+            .raw_os_error()
+            .is_some_and(|code| code == libc::ENOENT || code == libc::ENOTSUP)
+        {
+            return Ok(None);
+        }
+        return Err(error);
+    }
+    let acl = OwnedMacosAcl(acl);
+    let mut entry = std::ptr::null_mut();
+    // SAFETY: The ACL guard owns a valid ACL and the output pointer is valid for the call.
+    if unsafe { acl_get_entry(acl.0, MACOS_ACL_FIRST_ENTRY, &mut entry) } != 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EINVAL) {
+            return Ok(None);
+        }
+        return Err(error);
+    }
+    // SAFETY: The ACL guard owns a valid ACL.
+    let size = unsafe { acl_size(acl.0) };
+    if size < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let size = usize::try_from(size)
+        .map_err(|_| io::Error::other("config ACL size does not fit in memory"))?;
+    if size > 64 * 1024 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "config ACL exceeds the supported 64 KiB metadata bound",
+        ));
+    }
+    let mut external = vec![0_u8; size];
+    // SAFETY: The output buffer is writable for `size` bytes and the ACL guard remains live.
+    let copied = unsafe { acl_copy_ext(external.as_mut_ptr().cast(), acl.0, size as isize) };
+    if copied < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    external.truncate(usize::try_from(copied).unwrap_or(external.len()));
+    Ok(Some(external))
+}
+
+#[cfg(target_os = "macos")]
+fn apply_config_file_acl(file: &File, acl: Option<&[u8]>) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let acl = match acl {
+        Some(external) => {
+            // SAFETY: The bytes were produced by acl_copy_ext and remain live for this call.
+            unsafe { acl_copy_int(external.as_ptr().cast()) }
+        }
+        None => {
+            // SAFETY: Zero creates a valid empty ACL used to clear inherited entries.
+            unsafe { acl_init(0) }
+        }
+    };
+    if acl.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let acl = OwnedMacosAcl(acl);
+    // SAFETY: The descriptor and owned ACL remain valid for the duration of the call.
+    if unsafe { acl_set_fd_np(file.as_raw_fd(), acl.0, MACOS_ACL_TYPE_EXTENDED) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn capture_config_file_acl(_path: &Path) -> io::Result<Option<Vec<u8>>> {
+    Ok(None)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn apply_config_file_acl(_file: &File, _acl: Option<&[u8]>) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
+#[derive(Clone)]
+struct PlatformConfigFileMetadata {
+    descriptor: Vec<usize>,
+    descriptor_len: usize,
+    owner_sid: Option<Vec<u8>>,
+    group_sid: Option<Vec<u8>>,
+    dacl: WindowsDaclSnapshot,
+    dacl_protected: bool,
+}
+
+#[cfg(windows)]
+#[derive(Clone, PartialEq, Eq)]
+enum WindowsDaclSnapshot {
+    NotPresent,
+    Null,
+    Present(Vec<u8>),
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+enum WindowsSidKind {
+    Owner,
+    Group,
+}
+
+#[cfg(windows)]
+impl PartialEq for PlatformConfigFileMetadata {
+    fn eq(&self, other: &Self) -> bool {
+        self.owner_sid == other.owner_sid
+            && self.group_sid == other.group_sid
+            && self.dacl == other.dacl
+            && self.dacl_protected == other.dacl_protected
+    }
+}
+
+#[cfg(windows)]
+impl Eq for PlatformConfigFileMetadata {}
+
+#[cfg(windows)]
+impl std::fmt::Debug for PlatformConfigFileMetadata {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PlatformConfigFileMetadata")
+            .field("descriptor_len", &self.descriptor_len)
+            .field("owner_present", &self.owner_sid.is_some())
+            .field("group_present", &self.group_sid.is_some())
+            .field("dacl", &self.dacl.kind_name())
+            .field("dacl_protected", &self.dacl_protected)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(windows)]
+impl WindowsDaclSnapshot {
+    fn kind_name(&self) -> &'static str {
+        match self {
+            Self::NotPresent => "not_present",
+            Self::Null => "null",
+            Self::Present(_) => "present",
+        }
+    }
+}
+
+#[cfg(windows)]
+impl PlatformConfigFileMetadata {
+    fn capture(path: &Path, _metadata: &std::fs::Metadata) -> io::Result<Self> {
+        use windows_sys::Win32::Security::{
+            DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, GetFileSecurityW,
+            GetSecurityDescriptorControl, GetSecurityDescriptorDacl, OWNER_SECURITY_INFORMATION,
+            SE_DACL_PROTECTED,
+        };
+
+        let path = windows_wide_path(path)?;
+        let requested =
+            OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+        let mut required_bytes = 0_u32;
+        // SAFETY: The path is NUL-terminated and the size-query output pointer is valid.
+        unsafe {
+            GetFileSecurityW(
+                path.as_ptr(),
+                requested,
+                std::ptr::null_mut(),
+                0,
+                &mut required_bytes,
+            );
+        }
+        if required_bytes == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let word_size = std::mem::size_of::<usize>();
+        let descriptor_words = usize::try_from(required_bytes)
+            .unwrap_or(usize::MAX)
+            .saturating_add(word_size.saturating_sub(1))
+            / word_size;
+        let mut descriptor = vec![0_usize; descriptor_words];
+        let descriptor_capacity = descriptor
+            .len()
+            .checked_mul(word_size)
+            .and_then(|bytes| u32::try_from(bytes).ok())
+            .ok_or_else(|| io::Error::other("Windows security descriptor is too large"))?;
+        // SAFETY: The aligned descriptor buffer has the advertised capacity and all pointers live
+        // for the duration of the call.
+        if unsafe {
+            GetFileSecurityW(
+                path.as_ptr(),
+                requested,
+                descriptor.as_mut_ptr().cast(),
+                descriptor_capacity,
+                &mut required_bytes,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut control = 0_u16;
+        let mut revision = 0_u32;
+        // SAFETY: GetFileSecurityW initialized a self-relative security descriptor in the buffer.
+        if unsafe {
+            GetSecurityDescriptorControl(
+                descriptor.as_mut_ptr().cast(),
+                &mut control,
+                &mut revision,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+
+        let descriptor_pointer = descriptor.as_mut_ptr().cast();
+        let owner_sid = windows_security_descriptor_sid(
+            &descriptor,
+            usize::try_from(required_bytes).unwrap_or(usize::MAX),
+            descriptor_pointer,
+            WindowsSidKind::Owner,
+        )?;
+        let group_sid = windows_security_descriptor_sid(
+            &descriptor,
+            usize::try_from(required_bytes).unwrap_or(usize::MAX),
+            descriptor_pointer,
+            WindowsSidKind::Group,
+        )?;
+        let mut dacl_present = 0;
+        let mut dacl_defaulted = 0;
+        let mut dacl = std::ptr::null_mut();
+        // SAFETY: GetFileSecurityW initialized the descriptor and all output pointers are valid.
+        if unsafe {
+            GetSecurityDescriptorDacl(
+                descriptor_pointer,
+                &mut dacl_present,
+                &mut dacl,
+                &mut dacl_defaulted,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let dacl = if dacl_present == 0 {
+            WindowsDaclSnapshot::NotPresent
+        } else if dacl.is_null() {
+            WindowsDaclSnapshot::Null
+        } else {
+            // SAFETY: GetSecurityDescriptorDacl returned a valid ACL pointer in the descriptor.
+            let dacl_len = usize::from(unsafe { (*dacl).AclSize });
+            WindowsDaclSnapshot::Present(windows_descriptor_region(
+                &descriptor,
+                usize::try_from(required_bytes).unwrap_or(usize::MAX),
+                dacl.cast(),
+                dacl_len,
+            )?)
+        };
+
+        Ok(Self {
+            descriptor,
+            descriptor_len: usize::try_from(required_bytes).unwrap_or(usize::MAX),
+            owner_sid,
+            group_sid,
+            dacl,
+            dacl_protected: control & SE_DACL_PROTECTED != 0,
+        })
+    }
+
+    fn apply(&self, path: &Path, file: &File) -> io::Result<()> {
+        use windows_sys::Win32::Security::{
+            DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+            PROTECTED_DACL_SECURITY_INFORMATION, SetFileSecurityW,
+            UNPROTECTED_DACL_SECURITY_INFORMATION,
+        };
+
+        if self.descriptor_len == 0
+            || self.descriptor_len > self.descriptor.len() * std::mem::size_of::<usize>()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid Windows security descriptor snapshot",
+            ));
+        }
+        let staged = Self::capture(path, &file.metadata()?)?;
+        let path = windows_wide_path(path)?;
+        let mut requested = 0;
+        if self.owner_sid != staged.owner_sid {
+            requested |= OWNER_SECURITY_INFORMATION;
+        }
+        if self.group_sid != staged.group_sid {
+            requested |= GROUP_SECURITY_INFORMATION;
+        }
+        if self.dacl != staged.dacl || self.dacl_protected != staged.dacl_protected {
+            requested |= DACL_SECURITY_INFORMATION;
+            requested |= if self.dacl_protected {
+                PROTECTED_DACL_SECURITY_INFORMATION
+            } else {
+                UNPROTECTED_DACL_SECURITY_INFORMATION
+            };
+        }
+        if requested == 0 {
+            return Ok(());
+        }
+        // SAFETY: The path is NUL-terminated and the aligned descriptor buffer remains live.
+        if unsafe {
+            SetFileSecurityW(
+                path.as_ptr(),
+                requested,
+                self.descriptor.as_ptr().cast_mut().cast(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn windows_security_descriptor_sid(
+    descriptor: &[usize],
+    descriptor_len: usize,
+    descriptor_pointer: *mut std::ffi::c_void,
+    kind: WindowsSidKind,
+) -> io::Result<Option<Vec<u8>>> {
+    use windows_sys::Win32::Security::{
+        GetLengthSid, GetSecurityDescriptorGroup, GetSecurityDescriptorOwner,
+    };
+
+    let mut sid = std::ptr::null_mut();
+    let mut defaulted = 0;
+    // SAFETY: The descriptor and output pointers are valid for the selected accessor call.
+    let succeeded = unsafe {
+        match kind {
+            WindowsSidKind::Owner => {
+                GetSecurityDescriptorOwner(descriptor_pointer, &mut sid, &mut defaulted)
+            }
+            WindowsSidKind::Group => {
+                GetSecurityDescriptorGroup(descriptor_pointer, &mut sid, &mut defaulted)
+            }
+        }
+    };
+    if succeeded == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if sid.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: The accessor returned a valid SID pointer in the descriptor.
+    let sid_len = usize::try_from(unsafe { GetLengthSid(sid) }).unwrap_or(usize::MAX);
+    Ok(Some(windows_descriptor_region(
+        descriptor,
+        descriptor_len,
+        sid.cast(),
+        sid_len,
+    )?))
+}
+
+#[cfg(windows)]
+fn windows_descriptor_region(
+    descriptor: &[usize],
+    descriptor_len: usize,
+    region: *const u8,
+    region_len: usize,
+) -> io::Result<Vec<u8>> {
+    let descriptor_start = descriptor.as_ptr() as usize;
+    let descriptor_end = descriptor_start
+        .checked_add(descriptor_len)
+        .ok_or_else(|| io::Error::other("Windows security descriptor range overflow"))?;
+    let region_start = region as usize;
+    let region_end = region_start
+        .checked_add(region_len)
+        .ok_or_else(|| io::Error::other("Windows security descriptor component overflow"))?;
+    if region_start < descriptor_start || region_end > descriptor_end {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Windows security descriptor component is out of bounds",
+        ));
+    }
+    // SAFETY: The bounds check proves the component lies within the initialized descriptor.
+    Ok(unsafe { std::slice::from_raw_parts(region, region_len) }.to_vec())
+}
+
+#[cfg(windows)]
+fn windows_wide_path(path: &Path) -> io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    if wide[..wide.len().saturating_sub(1)].contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path contains an embedded null",
+        ));
+    }
+    Ok(wide)
+}
+
+#[cfg(not(any(unix, windows)))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlatformConfigFileMetadata;
+
+#[cfg(not(any(unix, windows)))]
+impl PlatformConfigFileMetadata {
+    fn capture(_path: &Path, _metadata: &std::fs::Metadata) -> io::Result<Self> {
+        Ok(Self)
+    }
+
+    fn apply(&self, _path: &Path, _file: &File) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -2403,7 +3307,8 @@ async fn read_existing_config_file(
         .with_context(|| format!("read config {}", logical_path.display()))?;
     Ok(Some(ExistingConfigToml {
         entry_is_symlink,
-        permissions: source_metadata.permissions(),
+        metadata: ConfigFileMetadata::capture(&source_path, &source_metadata)
+            .with_context(|| format!("capture config metadata {}", logical_path.display()))?,
         contents,
     }))
 }
@@ -2479,10 +3384,23 @@ async fn write_config_backup(
         return Ok(());
     }
     let backup_path = paths.resolved_file("config.toml.bak");
-    write_bytes_file_async_with_permissions(
+    let source_path = paths.resolved_file("config.toml");
+    let expected_contents = existing.contents.clone();
+    let expected_metadata = existing.metadata.clone();
+    let staged_metadata = existing.metadata.clone();
+    write_bytes_file_async_with_permissions_and_before_replace(
         &backup_path,
         &existing.contents,
-        existing.permissions.clone(),
+        existing.metadata.permissions.clone(),
+        move |staged_path, _destination| {
+            staged_metadata.apply_to_staged_file(staged_path)?;
+            verify_migration_source_snapshot(
+                &source_path,
+                "config.toml",
+                &expected_contents,
+                &expected_metadata,
+            )
+        },
     )
     .await
     .with_context(|| {
@@ -2737,7 +3655,30 @@ async fn write_helper_config_locked(
     }
 
     paths.ensure_unchanged().await?;
-    write_bytes_file_async(&paths.resolved_file("config.toml"), &data).await?;
+    let destination = paths.resolved_file("config.toml");
+    if let Some(existing) = existing {
+        let source_path = destination.clone();
+        let expected_contents = existing.contents.clone();
+        let expected_metadata = existing.metadata.clone();
+        let staged_metadata = existing.metadata.clone();
+        write_bytes_file_async_with_permissions_and_before_replace(
+            &destination,
+            &data,
+            existing.metadata.permissions.clone(),
+            move |staged_path, _destination| {
+                staged_metadata.apply_to_staged_file(staged_path)?;
+                verify_migration_source_snapshot(
+                    &source_path,
+                    "config.toml",
+                    &expected_contents,
+                    &expected_metadata,
+                )
+            },
+        )
+        .await?;
+    } else {
+        write_bytes_file_async(&destination, &data).await?;
+    }
     paths.ensure_unchanged().await?;
     Ok(path)
 }

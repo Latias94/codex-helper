@@ -19,6 +19,7 @@ use super::attempt_health::{
 };
 use super::classify::{
     UPSTREAM_OVERLOADED_CLASS, class_is_health_neutral, classify_observed_upstream_response,
+    is_credential_auth_failure,
 };
 use super::concurrency_limits::ConcurrencyPermit;
 use super::http_debug::HttpDebugBase;
@@ -190,8 +191,10 @@ fn decide_attempt_response(params: AttemptResponseDecisionParams<'_>) -> Attempt
         is_codex_service,
     } = params;
     let status_code = status.as_u16();
+    let auth_failure = is_credential_auth_failure(status, class);
     let reasoning_guard_blocked = matches!(class, Some(REASONING_GUARD_BLOCKED_CLASS));
-    let never_retry = should_never_retry(plan, status_code, class)
+    let never_retry = auth_failure
+        || should_never_retry(plan, status_code, class)
         || compact_protocol_failure
         || reasoning_guard_blocked;
     let semantic_failure_requires_provider_failover =
@@ -511,6 +514,11 @@ pub(super) async fn handle_attempt_response(
     let cls = semantic_error_class
         .map(ToOwned::to_owned)
         .or_else(|| classified_response.class.clone());
+    if is_credential_auth_failure(response_status, cls.as_deref()) {
+        proxy
+            .config
+            .schedule_credential_refresh(target.credential());
+    }
     let observed_service_tier = extract_service_tier_from_response_body(response_body.as_ref());
     let reported_model = extract_model_from_response_body(response_body.as_ref());
     let decision = decide_attempt_response(AttemptResponseDecisionParams {
@@ -780,13 +788,10 @@ pub(super) async fn handle_attempt_response(
 }
 
 async fn enqueue_usage_probe_for_target(proxy: &ProxyService, target: &CapturedRouteCandidate) {
-    let cfg_snapshot = proxy.config.snapshot().await;
     super::providers_api::enqueue_provider_balance_probe(
         proxy.client.clone(),
-        cfg_snapshot,
         proxy.state.clone(),
-        proxy.service_name,
-        target.provider_endpoint().clone(),
+        target.clone(),
     );
 }
 

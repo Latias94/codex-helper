@@ -441,27 +441,6 @@ pub async fn write_bytes_file_async(
     write_bytes_file_validated_async(path, data, |_| Ok(())).await
 }
 
-pub(crate) async fn write_bytes_file_async_with_permissions(
-    path: &Path,
-    data: &[u8],
-    permissions: fs::Permissions,
-) -> std::result::Result<(), AtomicWriteError> {
-    let path = path.to_path_buf();
-    let error_path = path.clone();
-    let data = data.to_vec();
-    tokio::task::spawn_blocking(move || {
-        write_bytes_file_validated_with_permissions(&path, &data, Some(permissions), |_| Ok(()))
-    })
-    .await
-    .map_err(|err| {
-        AtomicWriteError::commit_state_unknown(
-            &error_path,
-            "join blocking writer",
-            io::Error::other(err),
-        )
-    })?
-}
-
 pub(crate) async fn write_bytes_file_async_with_permissions_and_before_replace<B>(
     path: &Path,
     data: &[u8],
