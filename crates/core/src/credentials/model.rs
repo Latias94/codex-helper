@@ -141,6 +141,19 @@ impl CredentialReadinessCode {
     pub fn is_routable(self) -> bool {
         matches!(self, Self::Ready | Self::Stale)
     }
+
+    pub fn from_binding_codes(codes: impl IntoIterator<Item = CredentialReadinessCode>) -> Self {
+        let mut routable = Self::Ready;
+        for code in codes {
+            if !code.is_routable() {
+                return code;
+            }
+            if code == Self::Stale {
+                routable = Self::Stale;
+            }
+        }
+        routable
+    }
 }
 
 impl From<CredentialErrorCode> for CredentialReadinessCode {

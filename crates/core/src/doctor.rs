@@ -1,13 +1,20 @@
+use anyhow::{Context, Result};
 use serde::Serialize;
 use std::path::PathBuf;
 
-use crate::auth_resolution::{
-    CredentialResolution, ResolvedUpstreamAuth, resolve_upstream_auth,
-    unconfigured_upstream_auth_requires_opt_in,
-};
+use crate::auth_resolution::target_credential_readiness;
 use crate::codex_switch::{CodexSwitchPhase, inspect as inspect_codex_switch};
-use crate::config::{CURRENT_CONFIG_VERSION, load_config, proxy_home_dir};
+use crate::config::{
+    CURRENT_CONFIG_VERSION, HelperConfig, UpstreamAuth, load_config, proxy_home_dir,
+};
+use crate::credentials::{
+    CredentialBindingKind, CredentialCandidateInput, CredentialReadinessCode,
+    CredentialReadinessDetail, CredentialReadinessEvaluator, CredentialSourceCapabilities,
+    InstallationIdentity,
+};
 use crate::logging::request_log_path;
+use crate::routing_ir::CompiledRouteGraph;
+use crate::runtime_identity::ProviderEndpointKey;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DoctorLang {
@@ -43,7 +50,101 @@ pub struct DoctorReport {
     pub checks: Vec<DoctorCheck>,
 }
 
-pub async fn run_doctor(lang: DoctorLang) -> DoctorReport {
+#[derive(Clone)]
+struct DoctorCredentialTarget {
+    service_label: &'static str,
+    provider_endpoint: ProviderEndpointKey,
+    base_url: String,
+    auth: UpstreamAuth,
+}
+
+struct DoctorCredentialObservation {
+    service_label: &'static str,
+    provider_endpoint: ProviderEndpointKey,
+    details: Vec<CredentialReadinessDetail>,
+}
+
+async fn capture_doctor_credential_observations(
+    config: HelperConfig,
+    credential_sources: CredentialSourceCapabilities,
+) -> Result<Vec<DoctorCredentialObservation>> {
+    tokio::task::spawn_blocking(move || {
+        let installation = InstallationIdentity::resolve_default()
+            .context("resolve canonical installation identity")?;
+        let targets = doctor_credential_targets(&config)?;
+        let evaluator = CredentialReadinessEvaluator::new(credential_sources, installation);
+        let mut evaluated =
+            evaluator.evaluate(targets.iter().map(|target| CredentialCandidateInput {
+                provider_endpoint: target.provider_endpoint.clone(),
+                auth: &target.auth,
+            }))?;
+
+        targets
+            .into_iter()
+            .map(|target| {
+                let endpoint = evaluated.remove(&target.provider_endpoint).ok_or_else(|| {
+                    anyhow::anyhow!("credential evaluator omitted {}", target.provider_endpoint)
+                })?;
+                let code = target_credential_readiness(
+                    target.provider_endpoint.service_name.as_str(),
+                    endpoint.configured_contract,
+                    endpoint.allow_anonymous,
+                    target.base_url.as_str(),
+                    endpoint.code,
+                );
+                let mut details = endpoint.details;
+                if code == CredentialReadinessCode::Missing && details.is_empty() {
+                    details.push(CredentialReadinessDetail {
+                        kind: None,
+                        code,
+                        stale_cause: None,
+                        source_kind: Some("configuration".to_string()),
+                        reference: None,
+                    });
+                }
+                Ok(DoctorCredentialObservation {
+                    service_label: target.service_label,
+                    provider_endpoint: target.provider_endpoint,
+                    details,
+                })
+            })
+            .collect()
+    })
+    .await
+    .context("credential readiness task failed")?
+}
+
+fn doctor_credential_targets(config: &HelperConfig) -> Result<Vec<DoctorCredentialTarget>> {
+    let mut targets = Vec::new();
+    for (service_name, service_label, view) in [
+        ("codex", "Codex", &config.codex),
+        ("claude", "Claude", &config.claude),
+    ] {
+        let graph = CompiledRouteGraph::compile(service_name, view)
+            .with_context(|| format!("compile {service_name} route graph for doctor"))?;
+        targets.extend(
+            graph
+                .candidates()
+                .iter()
+                .map(|candidate| DoctorCredentialTarget {
+                    service_label,
+                    provider_endpoint: ProviderEndpointKey::new(
+                        service_name,
+                        candidate.provider_id.clone(),
+                        candidate.endpoint_id.clone(),
+                    ),
+                    base_url: candidate.base_url.clone(),
+                    auth: candidate.auth.clone(),
+                }),
+        );
+    }
+    Ok(targets)
+}
+
+pub async fn run_doctor(
+    lang: DoctorLang,
+    credential_sources: CredentialSourceCapabilities,
+) -> DoctorReport {
     let mut checks: Vec<DoctorCheck> = Vec::new();
 
     // 1) codex-helper main config
@@ -78,51 +179,28 @@ pub async fn run_doctor(lang: DoctorLang) -> DoctorReport {
                 });
             }
 
-            for (service_name, svc_label, view) in [
-                ("codex", "Codex", &cfg.codex),
-                ("claude", "Claude", &cfg.claude),
-            ] {
-                for (provider_id, provider) in &view.providers {
-                    let auth = provider.effective_auth();
-                    append_auth_resolution_checks(
-                        &mut checks,
-                        lang,
-                        svc_label,
-                        provider_id,
-                        resolve_upstream_auth(service_name, &auth),
-                    );
-                    let requires_explicit_auth = provider
-                        .base_url
-                        .iter()
-                        .chain(
-                            provider
-                                .endpoints
-                                .values()
-                                .map(|endpoint| &endpoint.base_url),
-                        )
-                        .any(|base_url| {
-                            unconfigured_upstream_auth_requires_opt_in(
-                                service_name,
-                                &auth,
-                                base_url,
-                            )
-                        });
-                    if provider.enabled && requires_explicit_auth {
-                        checks.push(DoctorCheck {
-                            id: "proxy_config.auth.anonymous_not_allowed",
-                            status: DoctorStatus::Warn,
-                            message: match lang {
-                                DoctorLang::Zh => format!(
-                                    "{} provider '{}' 指向远程第三方端点但未配置 helper 凭据；请配置 auth_token_env/api_key_env，确需匿名访问时显式设置 allow_anonymous = true",
-                                    svc_label, provider_id
-                                ),
-                                DoctorLang::En => format!(
-                                    "{} provider '{}' targets a remote third-party endpoint without helper credentials; configure auth_token_env/api_key_env, or set allow_anonymous = true only when anonymous access is intentional",
-                                    svc_label, provider_id
-                                ),
-                            },
-                        });
+            match capture_doctor_credential_observations(cfg.clone(), credential_sources).await {
+                Ok(observations) => {
+                    for observation in &observations {
+                        append_credential_readiness_checks(&mut checks, lang, observation);
                     }
+                }
+                Err(error) => checks.push(DoctorCheck {
+                    id: "proxy_config.auth.readiness",
+                    status: DoctorStatus::Fail,
+                    message: match lang {
+                        DoctorLang::Zh => {
+                            format!("无法从 canonical credential runtime 评估凭据状态：{error}")
+                        }
+                        DoctorLang::En => format!(
+                            "Failed to evaluate credential readiness through the canonical credential runtime: {error}"
+                        ),
+                    },
+                }),
+            }
+
+            for (svc_label, view) in [("Codex", &cfg.codex), ("Claude", &cfg.claude)] {
+                for (provider_id, provider) in &view.providers {
                     let has_plaintext =
                         [&provider.auth, &provider.inline_auth]
                             .into_iter()
@@ -302,92 +380,175 @@ pub async fn run_doctor(lang: DoctorLang) -> DoctorReport {
     DoctorReport { checks }
 }
 
-fn append_auth_resolution_checks(
+fn append_credential_readiness_checks(
     checks: &mut Vec<DoctorCheck>,
     lang: DoctorLang,
-    service_label: &str,
-    provider_id: &str,
-    resolved: ResolvedUpstreamAuth,
+    observation: &DoctorCredentialObservation,
 ) {
-    append_credential_resolution_check(
-        checks,
-        lang,
-        service_label,
-        provider_id,
-        "Bearer token",
-        resolved.auth_token,
-    );
-    append_credential_resolution_check(
-        checks,
-        lang,
-        service_label,
-        provider_id,
-        "X-API-Key",
-        resolved.api_key,
-    );
-}
-
-fn append_credential_resolution_check(
-    checks: &mut Vec<DoctorCheck>,
-    lang: DoctorLang,
-    service_label: &str,
-    provider_id: &str,
-    credential_kind: &str,
-    resolution: CredentialResolution,
-) {
-    let (id, detail) = match resolution {
-        CredentialResolution::MissingReference { name } => (
-            "proxy_config.auth.missing_reference",
-            match lang {
-                DoctorLang::Zh => {
-                    format!("凭据引用 `{name}` 在 daemon 环境和显式客户端凭据字段中均不可用")
-                }
+    for detail in &observation.details {
+        if detail.code == CredentialReadinessCode::Ready {
+            continue;
+        }
+        let credential_kind = credential_kind_label(detail.kind, lang);
+        let source_kind = detail.source_kind.as_deref().unwrap_or("unreported");
+        let (id, remediation) = if detail.code == CredentialReadinessCode::Missing
+            && source_kind == "configuration"
+        {
+            (
+                "proxy_config.auth.anonymous_not_allowed",
+                match lang {
+                    DoctorLang::Zh => {
+                        "请配置 helper 凭据；确需匿名访问时显式设置 allow_anonymous = true"
+                    }
+                    DoctorLang::En => {
+                        "configure helper credentials, or set allow_anonymous = true only when anonymous access is intentional"
+                    }
+                },
+            )
+        } else {
+            credential_remediation(detail.code, lang)
+        };
+        let reference = detail
+            .reference
+            .as_deref()
+            .map(escape_doctor_reference)
+            .unwrap_or_else(|| "<none>".to_string());
+        let stale_cause = detail
+            .stale_cause
+            .map(|cause| match lang {
+                DoctorLang::Zh => format!("，最近刷新失败类别={cause}"),
+                DoctorLang::En => format!(", last refresh failure={cause}"),
+            })
+            .unwrap_or_default();
+        checks.push(DoctorCheck {
+            id,
+            status: DoctorStatus::Warn,
+            message: match lang {
+                DoctorLang::Zh => format!(
+                    "{} provider '{}.{}' 的 {} 状态={}（source={}, reference=`{}`{}）：{}",
+                    observation.service_label,
+                    observation.provider_endpoint.provider_id,
+                    observation.provider_endpoint.endpoint_id,
+                    credential_kind,
+                    detail.code,
+                    source_kind,
+                    reference,
+                    stale_cause,
+                    remediation
+                ),
                 DoctorLang::En => format!(
-                    "credential reference `{name}` is unavailable from the daemon environment and the explicit client credential field"
+                    "{} provider '{}.{}' {} readiness={} (source={}, reference=`{}`{}): {}",
+                    observation.service_label,
+                    observation.provider_endpoint.provider_id,
+                    observation.provider_endpoint.endpoint_id,
+                    credential_kind,
+                    detail.code,
+                    source_kind,
+                    reference,
+                    stale_cause,
+                    remediation
                 ),
             },
+        });
+    }
+}
+
+fn credential_kind_label(kind: Option<CredentialBindingKind>, lang: DoctorLang) -> &'static str {
+    match (kind, lang) {
+        (Some(CredentialBindingKind::Bearer), DoctorLang::Zh) => "Bearer token",
+        (Some(CredentialBindingKind::Bearer), DoctorLang::En) => "Bearer token",
+        (Some(CredentialBindingKind::ApiKey), DoctorLang::Zh) => "X-API-Key",
+        (Some(CredentialBindingKind::ApiKey), DoctorLang::En) => "X-API-Key",
+        (None, DoctorLang::Zh) => "上游凭据",
+        (None, DoctorLang::En) => "upstream credential",
+    }
+}
+
+fn credential_remediation(
+    code: CredentialReadinessCode,
+    lang: DoctorLang,
+) -> (&'static str, &'static str) {
+    match (code, lang) {
+        (CredentialReadinessCode::Ready, _) => ("proxy_config.auth.ready", "credential is ready"),
+        (CredentialReadinessCode::Stale, DoctorLang::Zh) => (
+            "proxy_config.auth.stale",
+            "daemon 正在使用 last-known-good 值并会自动重试；请在硬过期前修复凭据源访问",
         ),
-        CredentialResolution::InvalidValue { source } => (
+        (CredentialReadinessCode::Stale, DoctorLang::En) => (
+            "proxy_config.auth.stale",
+            "the daemon is using the last-known-good value and will retry automatically; restore source access before hard expiry",
+        ),
+        (CredentialReadinessCode::Missing, DoctorLang::Zh) => (
+            "proxy_config.auth.missing_reference",
+            "请为运行服务的账号创建该凭据，或配置其可读取的 env/secret_file；该候选会在本地失败，不会匿名请求上游",
+        ),
+        (CredentialReadinessCode::Missing, DoctorLang::En) => (
+            "proxy_config.auth.missing_reference",
+            "create the credential for the service account or use an env/secret_file it can read; the candidate fails locally and never sends an anonymous upstream request",
+        ),
+        (CredentialReadinessCode::Invalid, DoctorLang::Zh) => (
             "proxy_config.auth.invalid_value",
-            match lang {
-                DoctorLang::Zh => format!("来自 {} 的值不是合法 HTTP header", source.label()),
-                DoctorLang::En => {
-                    format!(
-                        "the value from {} is not a valid HTTP header",
-                        source.label()
-                    )
-                }
-            },
+            "请替换为空值以外且可用于 HTTP header 的凭据值",
         ),
-        CredentialResolution::UnsupportedReference { source_kind } => (
+        (CredentialReadinessCode::Invalid, DoctorLang::En) => (
+            "proxy_config.auth.invalid_value",
+            "replace it with a non-empty credential value valid for an HTTP header",
+        ),
+        (CredentialReadinessCode::Locked, DoctorLang::Zh) => (
+            "proxy_config.auth.locked",
+            "请解锁系统凭据存储，并确认运行服务的账号拥有解锁会话",
+        ),
+        (CredentialReadinessCode::Locked, DoctorLang::En) => (
+            "proxy_config.auth.locked",
+            "unlock the system credential store and ensure the service account has an unlocked session",
+        ),
+        (CredentialReadinessCode::PermissionDenied, DoctorLang::Zh) => (
+            "proxy_config.auth.permission_denied",
+            "请授予运行服务的账号读取该凭据源的权限",
+        ),
+        (CredentialReadinessCode::PermissionDenied, DoctorLang::En) => (
+            "proxy_config.auth.permission_denied",
+            "grant the service account read access to this credential source",
+        ),
+        (CredentialReadinessCode::InteractionRequired, DoctorLang::Zh) => (
+            "proxy_config.auth.interaction_required",
+            "请在运行服务的账号会话中完成一次系统授权，或改用无需交互的 secret_file/env",
+        ),
+        (CredentialReadinessCode::InteractionRequired, DoctorLang::En) => (
+            "proxy_config.auth.interaction_required",
+            "complete system authorization once in the service account session, or use a non-interactive secret_file/env source",
+        ),
+        (CredentialReadinessCode::BackendUnavailable, DoctorLang::Zh) => (
+            "proxy_config.auth.backend_unavailable",
+            "请启动或修复系统凭据服务；daemon 会继续按刷新周期重试",
+        ),
+        (CredentialReadinessCode::BackendUnavailable, DoctorLang::En) => (
+            "proxy_config.auth.backend_unavailable",
+            "start or repair the system credential service; the daemon will retry on its refresh schedule",
+        ),
+        (CredentialReadinessCode::Unsupported, DoctorLang::Zh) => (
             "proxy_config.auth.unsupported_reference",
-            match lang {
-                DoctorLang::Zh => format!("当前 runtime 尚不支持 `{source_kind}` 凭据源"),
-                DoctorLang::En => {
-                    format!("the current runtime does not support `{source_kind}` credentials")
-                }
-            },
+            "当前执行上下文不支持该凭据源；请使用启用 native credentials 的本机 CLI/runtime，或改用 env/secret_file",
         ),
-        CredentialResolution::Unconfigured | CredentialResolution::Resolved { .. } => return,
-    };
-    checks.push(DoctorCheck {
-        id,
-        status: DoctorStatus::Warn,
-        message: match lang {
-            DoctorLang::Zh => format!(
-                "{service_label} provider '{provider_id}' 的 {credential_kind} 不可用：{detail}；该候选会在本地失败且不会匿名请求上游"
-            ),
-            DoctorLang::En => format!(
-                "{service_label} provider '{provider_id}' has unavailable {credential_kind}: {detail}; this candidate will fail locally instead of sending an anonymous upstream request"
-            ),
-        },
-    });
+        (CredentialReadinessCode::Unsupported, DoctorLang::En) => (
+            "proxy_config.auth.unsupported_reference",
+            "this execution context does not support the source; use a local CLI/runtime with native credentials enabled, or switch to env/secret_file",
+        ),
+    }
+}
+
+fn escape_doctor_reference(reference: &str) -> String {
+    reference.chars().flat_map(char::escape_default).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{HelperConfig, ProviderConfig, UpstreamAuth};
+    use crate::config::{
+        CredentialRef, HelperConfig, ProviderConfig, RouteGraphConfig, UpstreamAuth,
+    };
+    use crate::credentials::SecretValue;
+    use crate::runtime_store::RuntimeStore;
     use std::path::Path;
     use std::sync::{Mutex, OnceLock};
 
@@ -455,7 +616,7 @@ mod tests {
                 .expect("write canonical config");
             std::fs::write(codex_home.join("auth.json"), "not-json")
                 .expect("write invalid auth file");
-            run_doctor(DoctorLang::En).await
+            run_doctor(DoctorLang::En, CredentialSourceCapabilities::server()).await
         });
         assert!(
             report
@@ -477,7 +638,7 @@ mod tests {
     }
 
     #[test]
-    fn doctor_uses_runtime_auth_resolution_instead_of_environment_only_checks() {
+    fn doctor_uses_canonical_readiness_instead_of_environment_only_checks() {
         let _lock = env_lock();
         let home =
             std::env::temp_dir().join(format!("codex-helper-doctor-auth-{}", uuid::Uuid::new_v4()));
@@ -520,6 +681,13 @@ mod tests {
                 ..ProviderConfig::default()
             },
         );
+        config.codex.routing = Some(RouteGraphConfig::ordered_failover(vec![
+            "resolved".to_string(),
+            "missing".to_string(),
+            "anonymous-denied".to_string(),
+            "invalid".to_string(),
+            "anonymous-allowed".to_string(),
+        ]));
         config.codex.providers.insert(
             "missing".to_string(),
             ProviderConfig {
@@ -576,7 +744,7 @@ mod tests {
             crate::config::save_helper_config(&config)
                 .await
                 .expect("write canonical config");
-            run_doctor(DoctorLang::En).await
+            run_doctor(DoctorLang::En, CredentialSourceCapabilities::server()).await
         });
 
         let missing_checks = report
@@ -585,7 +753,11 @@ mod tests {
             .filter(|check| check.id == "proxy_config.auth.missing_reference")
             .collect::<Vec<_>>();
         assert_eq!(missing_checks.len(), 1);
-        assert!(missing_checks[0].message.contains("provider 'missing'"));
+        assert!(
+            missing_checks[0]
+                .message
+                .contains("provider 'missing.default'")
+        );
         assert!(missing_checks[0].message.contains(&missing_reference));
         assert!(!missing_checks[0].message.contains(&resolved_reference));
 
@@ -595,7 +767,11 @@ mod tests {
             .filter(|check| check.id == "proxy_config.auth.invalid_value")
             .collect::<Vec<_>>();
         assert_eq!(invalid_checks.len(), 1);
-        assert!(invalid_checks[0].message.contains("provider 'invalid'"));
+        assert!(
+            invalid_checks[0]
+                .message
+                .contains("provider 'invalid.default'")
+        );
         assert!(invalid_checks[0].message.contains(&invalid_reference));
 
         let anonymous_checks = report
@@ -606,5 +782,133 @@ mod tests {
         assert_eq!(anonymous_checks.len(), 1);
         assert!(anonymous_checks[0].message.contains("anonymous-denied"));
         assert!(!anonymous_checks[0].message.contains("anonymous-allowed"));
+    }
+
+    #[test]
+    fn doctor_reports_unsupported_native_reference_in_server_context() {
+        let _lock = env_lock();
+        let home = std::env::temp_dir().join(format!(
+            "codex-helper-doctor-native-server-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let helper_home = home.join(".codex-helper");
+        let codex_home = home.join(".codex");
+        std::fs::create_dir_all(&helper_home).expect("create helper home");
+        std::fs::create_dir_all(&codex_home).expect("create Codex home");
+
+        let reference = format!("relay.doctor.{}", uuid::Uuid::new_v4().simple());
+        let mut config = HelperConfig::default();
+        config.codex.providers.insert(
+            "native".to_string(),
+            ProviderConfig {
+                base_url: Some("https://native.example/v1".to_string()),
+                auth: UpstreamAuth {
+                    auth_token_ref: Some(CredentialRef::Native {
+                        name: reference.clone(),
+                    }),
+                    ..UpstreamAuth::default()
+                },
+                ..ProviderConfig::default()
+            },
+        );
+        config.codex.routing = Some(RouteGraphConfig::ordered_failover(vec![
+            "native".to_string(),
+        ]));
+
+        let mut env = ScopedEnv::new();
+        unsafe {
+            env.set("HOME", &home);
+            env.set("USERPROFILE", &home);
+            env.set("CODEX_HELPER_HOME", &helper_home);
+            env.set("CODEX_HOME", &codex_home);
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        let report = runtime.block_on(async {
+            crate::config::save_helper_config(&config)
+                .await
+                .expect("write canonical config");
+            run_doctor(DoctorLang::En, CredentialSourceCapabilities::server()).await
+        });
+
+        let unsupported = report
+            .checks
+            .iter()
+            .filter(|check| check.id == "proxy_config.auth.unsupported_reference")
+            .collect::<Vec<_>>();
+        assert_eq!(unsupported.len(), 1);
+        assert!(unsupported[0].message.contains("provider 'native.default'"));
+        assert!(unsupported[0].message.contains(&reference));
+        assert!(!unsupported[0].message.contains("native-secret"));
+    }
+
+    #[test]
+    fn doctor_reads_native_credential_while_daemon_writer_is_active() {
+        let _lock = env_lock();
+        let home = std::env::temp_dir().join(format!(
+            "codex-helper-doctor-native-reader-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let helper_home = home.join(".codex-helper");
+        let codex_home = home.join(".codex");
+        std::fs::create_dir_all(&helper_home).expect("create helper home");
+        std::fs::create_dir_all(&codex_home).expect("create Codex home");
+
+        let reference = format!("relay.doctor.{}", uuid::Uuid::new_v4().simple());
+        let mut config = HelperConfig::default();
+        config.codex.providers.insert(
+            "native".to_string(),
+            ProviderConfig {
+                base_url: Some("https://native.example/v1".to_string()),
+                auth: UpstreamAuth {
+                    auth_token_ref: Some(CredentialRef::Native {
+                        name: reference.clone(),
+                    }),
+                    ..UpstreamAuth::default()
+                },
+                ..ProviderConfig::default()
+            },
+        );
+        config.codex.routing = Some(RouteGraphConfig::ordered_failover(vec![
+            "native".to_string(),
+        ]));
+
+        let mut env = ScopedEnv::new();
+        unsafe {
+            env.set("HOME", &home);
+            env.set("USERPROFILE", &home);
+            env.set("CODEX_HELPER_HOME", &helper_home);
+            env.set("CODEX_HOME", &codex_home);
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        let (capabilities, control) = CredentialSourceCapabilities::test_native(
+            SecretValue::new(b"native-secret".to_vec()).expect("valid native secret"),
+        );
+        let report = runtime.block_on(async {
+            crate::config::save_helper_config(&config)
+                .await
+                .expect("write canonical config");
+            let _daemon_store = RuntimeStore::open_in_home(&helper_home)
+                .expect("open daemon-owned runtime store writer");
+            run_doctor(DoctorLang::En, capabilities).await
+        });
+
+        assert_eq!(control.read_count(), 1);
+        assert!(report.checks.iter().all(|check| {
+            check.id != "proxy_config.auth.readiness"
+                && check.id != "proxy_config.auth.unsupported_reference"
+                && check.id != "proxy_config.auth.missing_reference"
+        }));
+        assert!(
+            report
+                .checks
+                .iter()
+                .all(|check| !check.message.contains("native-secret"))
+        );
     }
 }

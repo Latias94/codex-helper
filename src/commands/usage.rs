@@ -887,6 +887,7 @@ mod tests {
                     runtime: Default::default(),
                     counts: Default::default(),
                     retry: Default::default(),
+                    credential_readiness: None,
                     sessions: Vec::new(),
                     profiles: Vec::new(),
                     providers: Vec::new(),

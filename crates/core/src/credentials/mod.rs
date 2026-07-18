@@ -22,7 +22,8 @@ pub use model::{
     CredentialSourceKind, CredentialValueError, SecretValue,
 };
 pub(crate) use runtime::{
-    CredentialCandidateInput, CredentialRuntime, CredentialRuntimeRefreshCause,
+    CredentialCandidateInput, CredentialReadinessEvaluator, CredentialRuntime,
+    CredentialRuntimeRefreshCause,
 };
 pub use secret_file::read_secret_file;
 

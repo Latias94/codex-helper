@@ -94,6 +94,28 @@ fn aggregate_readiness_distinguishes_ready_degraded_and_blocked_routes() {
     );
 }
 
+#[test]
+fn binding_readiness_prioritizes_unavailable_then_stale() {
+    assert_eq!(
+        CredentialReadinessCode::from_binding_codes([]),
+        CredentialReadinessCode::Ready
+    );
+    assert_eq!(
+        CredentialReadinessCode::from_binding_codes([
+            CredentialReadinessCode::Ready,
+            CredentialReadinessCode::Stale,
+        ]),
+        CredentialReadinessCode::Stale
+    );
+    assert_eq!(
+        CredentialReadinessCode::from_binding_codes([
+            CredentialReadinessCode::Stale,
+            CredentialReadinessCode::PermissionDenied,
+        ]),
+        CredentialReadinessCode::PermissionDenied
+    );
+}
+
 #[derive(Default)]
 struct FakeNativeStore {
     values: Mutex<BTreeMap<String, SecretValue>>,

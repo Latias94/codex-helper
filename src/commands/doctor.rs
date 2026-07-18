@@ -1,6 +1,7 @@
 use crate::CliResult;
 use crate::dashboard_core::{OperatorReadModel, OperatorReadStatus};
 use crate::doctor::{DoctorLang, DoctorStatus, run_doctor};
+use codex_helper_core::credentials::CredentialSourceCapabilities;
 use owo_colors::OwoColorize;
 
 pub async fn handle_status_cmd(
@@ -77,7 +78,11 @@ fn print_operator_status(label: &str, model: &OperatorReadModel) {
 }
 
 pub async fn handle_doctor_cmd(json: bool) -> CliResult<()> {
-    let report = run_doctor(DoctorLang::Zh).await;
+    let report = run_doctor(
+        DoctorLang::Zh,
+        CredentialSourceCapabilities::platform_native(),
+    )
+    .await;
     if json {
         let text = serde_json::to_string_pretty(&report)
             .map_err(|error| crate::CliError::Other(error.to_string()))?;

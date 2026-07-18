@@ -107,7 +107,7 @@ impl RuntimeCredentialKind {
         }
     }
 
-    fn binding_kind(self) -> CredentialBindingKind {
+    pub(super) fn binding_kind(self) -> CredentialBindingKind {
         match self {
             Self::Bearer => CredentialBindingKind::Bearer,
             Self::ApiKey => CredentialBindingKind::ApiKey,
@@ -223,21 +223,14 @@ impl CapturedUpstreamCredential {
     }
 
     pub(crate) fn readiness_code(&self) -> CredentialReadinessCode {
-        let codes = [
-            self.auth_token.readiness_code(),
-            self.api_key.readiness_code(),
-        ];
-        codes
+        CredentialReadinessCode::from_binding_codes(
+            [
+                self.auth_token.readiness_code(),
+                self.api_key.readiness_code(),
+            ]
             .into_iter()
-            .flatten()
-            .find(|code| !code.is_routable())
-            .or_else(|| {
-                codes
-                    .into_iter()
-                    .flatten()
-                    .find(|code| *code == CredentialReadinessCode::Stale)
-            })
-            .unwrap_or(CredentialReadinessCode::Ready)
+            .flatten(),
+        )
     }
 
     pub(crate) fn readiness_details(&self) -> Vec<CredentialReadinessDetail> {

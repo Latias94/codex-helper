@@ -22,8 +22,6 @@ use crate::runtime_identity::RuntimeUpstreamIdentity;
 use crate::runtime_store::{RuntimeQuotaIdentity, RuntimeStore};
 
 #[cfg(test)]
-use super::CredentialReadinessCode;
-#[cfg(test)]
 use super::generation::CapturedUpstreamCredential;
 use super::generation::{
     CredentialCatalog, CredentialGeneration, CredentialHandle, CredentialLoadFailure,
@@ -32,8 +30,9 @@ use super::generation::{
     generation_digest, preserve_last_known_good,
 };
 use super::{
-    CredentialErrorCode, CredentialName, CredentialSourceCapabilities, CredentialSourceKind,
-    InstallationIdentity, NativeCredentialDaemon, SecretValue, read_secret_file,
+    CredentialErrorCode, CredentialName, CredentialReadinessCode, CredentialReadinessDetail,
+    CredentialSourceCapabilities, CredentialSourceKind, InstallationIdentity,
+    NativeCredentialDaemon, SecretValue, read_secret_file,
 };
 
 const NATIVE_READ_TIMEOUT: Duration = Duration::from_secs(5);
@@ -87,6 +86,24 @@ pub(crate) struct CredentialCandidateInput<'a> {
     pub(crate) auth: &'a UpstreamAuth,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CredentialEndpointReadiness {
+    pub(crate) code: CredentialReadinessCode,
+    pub(crate) details: Vec<CredentialReadinessDetail>,
+    pub(crate) configured_contract: bool,
+    pub(crate) allow_anonymous: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct CredentialReadinessEvaluator {
+    runtime: CredentialRuntime,
+}
+
+struct EvaluatedCredentialCatalog {
+    catalog: CredentialCatalog,
+    states: BTreeMap<CredentialHandle, CredentialSourceState>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CredentialRuntimeRefreshCause {
     Scheduled,
@@ -98,11 +115,11 @@ pub(crate) enum CredentialRuntimeRefreshCause {
 #[derive(Clone)]
 pub(crate) struct CredentialRuntime {
     inner: Arc<CredentialRuntimeInner>,
+    scope_identity: Option<RuntimeQuotaIdentity>,
 }
 
 struct CredentialRuntimeInner {
     native: NativeCredentialDaemon,
-    scope_identity: RuntimeQuotaIdentity,
     inflight: Mutex<BTreeMap<CredentialHandle, Arc<NativeReadFlight>>>,
     read_timeout: Duration,
 }
@@ -200,7 +217,6 @@ impl fmt::Debug for CredentialRuntimeInner {
         formatter
             .debug_struct("CredentialRuntime")
             .field("native", &self.native)
-            .field("scope_identity", &self.scope_identity)
             .field(
                 "inflight_count",
                 &self
@@ -238,14 +254,26 @@ impl CredentialRuntime {
         let scope_identity = runtime_store
             .load_or_create_quota_identity()
             .context("load runtime credential scope identity")?;
-        Ok(Self {
+        Ok(Self::from_installation(
+            capabilities,
+            installation,
+            Some(scope_identity),
+        ))
+    }
+
+    fn from_installation(
+        capabilities: CredentialSourceCapabilities,
+        installation: InstallationIdentity,
+        scope_identity: Option<RuntimeQuotaIdentity>,
+    ) -> Self {
+        Self {
             inner: Arc::new(CredentialRuntimeInner {
                 native: capabilities.daemon(installation),
-                scope_identity,
                 inflight: Mutex::new(BTreeMap::new()),
                 read_timeout: NATIVE_READ_TIMEOUT,
             }),
-        })
+            scope_identity,
+        }
     }
 
     #[cfg(test)]
@@ -315,6 +343,33 @@ impl CredentialRuntime {
         named_catalog_revision: &str,
         previous: Option<&CredentialGeneration>,
     ) -> Result<Arc<CredentialGeneration>> {
+        let evaluated = self.evaluate_catalog_with_previous(
+            candidates,
+            named,
+            named_catalog_revision,
+            previous,
+        )?;
+        let previous_revision = previous.map_or(0, |generation| generation.revision);
+        let mut next = self.finish_generation(
+            previous_revision,
+            Arc::new(evaluated.catalog),
+            evaluated.states,
+        )?;
+        if previous.is_some_and(|generation| generation.digest != next.digest) {
+            Arc::get_mut(&mut next)
+                .expect("fresh credential generation is uniquely owned")
+                .revision = previous_revision.saturating_add(1);
+        }
+        Ok(next)
+    }
+
+    fn evaluate_catalog_with_previous<'a>(
+        &self,
+        candidates: impl IntoIterator<Item = CredentialCandidateInput<'a>>,
+        named: impl IntoIterator<Item = NamedCredentialReference>,
+        named_catalog_revision: &str,
+        previous: Option<&CredentialGeneration>,
+    ) -> Result<EvaluatedCredentialCatalog> {
         let now = Instant::now();
         let mut catalog = CredentialCatalog {
             named_catalog_revision: Arc::from(named_catalog_revision),
@@ -387,14 +442,7 @@ impl CredentialRuntime {
                 (handle, state)
             })
             .collect();
-        let previous_revision = previous.map_or(0, |generation| generation.revision);
-        let mut next = self.finish_generation(previous_revision, Arc::new(catalog), states)?;
-        if previous.is_some_and(|generation| generation.digest != next.digest) {
-            Arc::get_mut(&mut next)
-                .expect("fresh credential generation is uniquely owned")
-                .revision = previous_revision.saturating_add(1);
-        }
-        Ok(next)
+        Ok(EvaluatedCredentialCatalog { catalog, states })
     }
 
     fn register_named(
@@ -575,6 +623,10 @@ impl CredentialRuntime {
         catalog: Arc<CredentialCatalog>,
         states: BTreeMap<CredentialHandle, CredentialSourceState>,
     ) -> Result<Arc<CredentialGeneration>> {
+        let scope_identity = self
+            .scope_identity
+            .as_ref()
+            .context("credential generation requires a runtime scope identity")?;
         let now = Instant::now();
         let mut scopes = BTreeMap::new();
         for (endpoint, binding) in &catalog.endpoints {
@@ -588,7 +640,7 @@ impl CredentialRuntime {
                 .as_ref()
                 .and_then(|handle| states.get(handle))
                 .and_then(|state| state.value_at(now));
-            let scope = self.inner.scope_identity.derive_credential_scope(
+            let scope = scope_identity.derive_credential_scope(
                 bearer.map(SecretValue::expose),
                 api_key.map(SecretValue::expose),
             );
@@ -604,9 +656,7 @@ impl CredentialRuntime {
                     .map(SecretValue::expose);
                 (
                     reference.clone(),
-                    self.inner
-                        .scope_identity
-                        .derive_credential_scope(value, None),
+                    scope_identity.derive_credential_scope(value, None),
                 )
             })
             .collect();
@@ -904,11 +954,125 @@ impl CredentialRuntime {
     }
 }
 
+impl CredentialReadinessEvaluator {
+    pub(crate) fn new(
+        capabilities: CredentialSourceCapabilities,
+        installation: InstallationIdentity,
+    ) -> Self {
+        Self {
+            runtime: CredentialRuntime::from_installation(capabilities, installation, None),
+        }
+    }
+
+    pub(crate) fn evaluate<'a>(
+        &self,
+        candidates: impl IntoIterator<Item = CredentialCandidateInput<'a>>,
+    ) -> Result<BTreeMap<ProviderEndpointKey, CredentialEndpointReadiness>> {
+        let evaluated = self.runtime.evaluate_catalog_with_previous(
+            candidates,
+            std::iter::empty(),
+            "",
+            None,
+        )?;
+        let now = Instant::now();
+        Ok(evaluated
+            .catalog
+            .endpoints
+            .iter()
+            .map(|(provider_endpoint, binding)| {
+                let details = [
+                    (binding.auth_token.as_ref(), RuntimeCredentialKind::Bearer),
+                    (binding.api_key.as_ref(), RuntimeCredentialKind::ApiKey),
+                ]
+                .into_iter()
+                .filter_map(|(handle, kind)| {
+                    evaluated_part_readiness_detail(
+                        &evaluated.catalog,
+                        &evaluated.states,
+                        handle,
+                        kind,
+                        now,
+                    )
+                })
+                .collect::<Vec<_>>();
+                let code = CredentialReadinessCode::from_binding_codes(
+                    details.iter().map(|detail| detail.code),
+                );
+                (
+                    provider_endpoint.clone(),
+                    CredentialEndpointReadiness {
+                        code,
+                        details,
+                        configured_contract: binding.configured_contract,
+                        allow_anonymous: binding.allow_anonymous,
+                    },
+                )
+            })
+            .collect())
+    }
+}
+
 type PreparedCredentialSource<'a> = (
     CredentialHandle,
     CredentialSourceSpec,
     Box<dyn FnOnce() -> CredentialLoadResult + 'a>,
 );
+
+fn evaluated_part_readiness_detail(
+    catalog: &CredentialCatalog,
+    states: &BTreeMap<CredentialHandle, CredentialSourceState>,
+    handle: Option<&CredentialHandle>,
+    kind: RuntimeCredentialKind,
+    now: Instant,
+) -> Option<CredentialReadinessDetail> {
+    let handle = handle?;
+    let Some(spec) = catalog.sources.get(handle) else {
+        return Some(CredentialReadinessDetail {
+            kind: Some(kind.binding_kind()),
+            code: CredentialReadinessCode::Invalid,
+            stale_cause: None,
+            source_kind: Some("runtime".to_string()),
+            reference: None,
+        });
+    };
+    let Some(state) = states.get(handle) else {
+        return Some(CredentialReadinessDetail {
+            kind: Some(kind.binding_kind()),
+            code: CredentialReadinessCode::Invalid,
+            stale_cause: None,
+            source_kind: Some("runtime".to_string()),
+            reference: None,
+        });
+    };
+    let (code, stale_cause, source_kind, reference) = match state {
+        CredentialSourceState::Ready { .. } => (
+            CredentialReadinessCode::Ready,
+            None,
+            spec.source_kind(),
+            spec.reference(),
+        ),
+        CredentialSourceState::Stale { failure, .. } if state.value_at(now).is_some() => (
+            CredentialReadinessCode::Stale,
+            Some(failure.code.into()),
+            failure.source_kind,
+            failure.reference.as_str(),
+        ),
+        CredentialSourceState::Stale { failure, .. }
+        | CredentialSourceState::Unavailable { failure, .. } => (
+            failure.code.into(),
+            None,
+            failure.source_kind,
+            failure.reference.as_str(),
+        ),
+    };
+    Some(CredentialReadinessDetail {
+        kind: Some(kind.binding_kind()),
+        code,
+        stale_cause,
+        source_kind: Some(source_kind.to_string()),
+        reference: Some(reference.to_string()),
+    })
+}
 
 fn native_refresh_failure(reference: String) -> CredentialLoadFailure {
     CredentialLoadFailure {
@@ -982,11 +1146,6 @@ fn map_runtime_resolution(
             code: CredentialErrorCode::Invalid,
             source_kind: fallback_source_kind,
             reference: source.label(),
-        }),
-        CredentialResolution::UnsupportedReference { source_kind } => Err(CredentialLoadFailure {
-            code: CredentialErrorCode::Unsupported,
-            source_kind,
-            reference: fallback_reference,
         }),
         CredentialResolution::Unconfigured => Err(CredentialLoadFailure {
             code: CredentialErrorCode::Missing,
