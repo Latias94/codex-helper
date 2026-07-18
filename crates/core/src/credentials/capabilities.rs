@@ -8,7 +8,7 @@ use super::model::{
 use super::native::{NativeCredentialLocator, NativeCredentialNamespace};
 
 pub(super) type NativeStoreErrorCode = CredentialErrorCode;
-pub(super) const NATIVE_CREDENTIAL_MAX_BYTES: usize = 2_560;
+pub const NATIVE_CREDENTIAL_MAX_BYTES: usize = 2_560;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct NativeStoreError {
@@ -140,6 +140,7 @@ impl NativeCredentialManager {
         })
     }
 
+    /// Creates or replaces a credential while preserving create-only semantics on [`Self::create`].
     pub fn set(&self, name: &CredentialName, value: &SecretValue) -> Result<(), CredentialError> {
         self.write(name, value, |backend, locator| backend.set(locator, value))
     }

@@ -65,9 +65,6 @@ impl NativeCredentialStore for WindowsNativeCredentialStore {
         validate_windows_secret_size(value.expose())?;
         self.locks.with_lock(locator, || {
             let entry = Self::entry(locator)?;
-            if !Self::exists(&entry)? {
-                return Err(error(NativeStoreErrorCode::Missing));
-            }
             entry.set_secret(value.expose()).map_err(map_keyring_error)
         })
     }

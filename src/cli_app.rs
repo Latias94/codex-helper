@@ -148,6 +148,10 @@ pub async fn run_cli() -> CliResult<()> {
             commands::provider::handle_provider_cmd(cmd).await?;
             return Ok(());
         }
+        Command::Credential { cmd } => {
+            commands::credential::handle_credential_cmd(cmd).await?;
+            return Ok(());
+        }
         Command::Codex { cmd } => {
             commands::codex::handle_codex_cmd(cmd).await?;
             return Ok(());
@@ -781,7 +785,6 @@ struct VerifiedServiceRefreshTarget {
 }
 
 impl VerifiedServiceRefreshTarget {
-    #[allow(dead_code)]
     fn local_operator_client(
         &self,
     ) -> Result<crate::control_plane_client::LocalOperatorClient, ServiceRefreshTargetError> {
@@ -793,13 +796,27 @@ impl VerifiedServiceRefreshTarget {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn resolve_service_refresh_target(
     helper_home: &Path,
     expected_service: ServiceKind,
 ) -> Result<VerifiedServiceRefreshTarget, ServiceRefreshTargetError> {
+    resolve_service_refresh_target_inner(helper_home, Some(expected_service))
+}
+
+fn resolve_service_refresh_target_inner(
+    helper_home: &Path,
+    expected_service: Option<ServiceKind>,
+) -> Result<VerifiedServiceRefreshTarget, ServiceRefreshTargetError> {
     let receipt = read_service_receipt(helper_home)?;
-    if receipt.service() != expected_service {
+    verify_service_refresh_target(receipt, expected_service)
+}
+
+fn verify_service_refresh_target(
+    receipt: ServiceReceipt,
+    expected_service: Option<ServiceKind>,
+) -> Result<VerifiedServiceRefreshTarget, ServiceRefreshTargetError> {
+    if expected_service.is_some_and(|expected| receipt.service() != expected) {
         return Err(ServiceRefreshTargetError::ServiceMismatch);
     }
     if ServicePlatformBackend::current() != Some(receipt.platform_backend()) {
@@ -811,6 +828,39 @@ fn resolve_service_refresh_target(
     )
     .map_err(ServiceRefreshTargetError::AdminAuthority)?;
     Ok(VerifiedServiceRefreshTarget { receipt, endpoint })
+}
+
+pub(crate) async fn refresh_resident_credential(
+    credential_name: codex_helper_core::credentials::CredentialName,
+    action: codex_helper_core::service_target::LocalCredentialRefreshAction,
+) -> anyhow::Result<codex_helper_core::service_target::LocalCredentialRefreshResponse> {
+    let helper_home = crate::config::proxy_home_dir();
+    let target = resolve_service_refresh_target_inner(&helper_home, None)?;
+    let service = target.receipt.service();
+    let request = codex_helper_core::service_target::LocalCredentialRefreshRequest {
+        service,
+        install_generation: target.receipt.install_generation().clone(),
+        credential_name,
+        action,
+    };
+    Ok(target
+        .local_operator_client()?
+        .refresh_native_credential(&request)
+        .await?)
+}
+
+pub(crate) async fn read_resident_operator_model() -> anyhow::Result<OperatorReadModel> {
+    let helper_home = crate::config::proxy_home_dir();
+    let target = resolve_service_refresh_target_inner(&helper_home, None)?;
+    let service = service_name_for_kind(target.receipt.service());
+    let model = ControlPlaneClient::new(target.endpoint.clone())?
+        .operator_read_model()
+        .await?;
+    anyhow::ensure!(
+        model.service_name == service,
+        "service receipt and resident operator model identify different services"
+    );
+    Ok(model)
 }
 
 async fn read_operator_model(

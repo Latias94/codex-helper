@@ -38,17 +38,17 @@ pub use retry_impl::{
     ReasoningGuardStreamMode, ResolvedReasoningGuardConfig, ResolvedRetryConfig,
     ResolvedRetryLayerConfig, RetryConfig, RetryLayerConfig, RetryProfileName, RetryStrategy,
 };
-#[cfg(test)]
-pub(crate) use storage_impl::mutate_helper_config;
 pub use storage_impl::{
     ConfigInitOutcome, LoadedConfig, config_file_path, init_config_toml,
-    init_config_toml_with_outcome, load_config, load_config_with_source, save_helper_config,
+    init_config_toml_with_outcome, load_config, load_config_with_source, mutate_helper_config,
+    save_helper_config,
 };
 
 pub mod storage {
     pub use super::storage_impl::{
         ConfigInitOutcome, LoadedConfig, config_file_path, init_config_toml,
-        init_config_toml_with_outcome, load_config, load_config_with_source, save_helper_config,
+        init_config_toml_with_outcome, load_config, load_config_with_source, mutate_helper_config,
+        save_helper_config,
     };
 }
 

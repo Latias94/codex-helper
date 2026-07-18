@@ -9,7 +9,8 @@ mod secret_file;
 #[cfg(test)]
 pub(crate) use capabilities::TestNativeCredentialControl;
 pub use capabilities::{
-    CredentialSourceCapabilities, NativeCredentialDaemon, NativeCredentialManager,
+    CredentialSourceCapabilities, NATIVE_CREDENTIAL_MAX_BYTES, NativeCredentialDaemon,
+    NativeCredentialManager,
 };
 pub(crate) use generation::{
     CapturedUpstreamCredential, CredentialGeneration, CredentialGenerationMarker, CredentialHandle,

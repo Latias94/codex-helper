@@ -2,6 +2,7 @@ mod config_doc;
 
 pub mod codex;
 pub mod config;
+pub mod credential;
 pub mod doctor;
 pub mod pricing;
 pub mod provider;

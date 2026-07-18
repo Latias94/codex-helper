@@ -158,11 +158,10 @@ impl NativeCredentialStore for FakeNativeStore {
         value: &SecretValue,
     ) -> Result<(), NativeStoreError> {
         self.begin_operation()?;
-        let mut values = self.values.lock().expect("fake values lock");
-        let Some(stored) = values.get_mut(locator.as_str()) else {
-            return Err(NativeStoreError::new(NativeStoreErrorCode::Missing));
-        };
-        *stored = value.clone();
+        self.values
+            .lock()
+            .expect("fake values lock")
+            .insert(locator.as_str().to_owned(), value.clone());
         Ok(())
     }
 
@@ -272,6 +271,26 @@ fn fake_backend_obeys_management_and_daemon_contract() {
             .expect("unavailable backend must fail")
             .code(),
         CredentialErrorCode::BackendUnavailable
+    );
+}
+
+#[test]
+fn set_upserts_a_missing_native_credential() {
+    let backend = Arc::new(FakeNativeStore::default());
+    let capabilities = CredentialSourceCapabilities::from_backend(backend);
+    let manager = capabilities.manager(test_identity(11));
+    let daemon = capabilities.daemon(test_identity(11));
+    let reference = name("relay.upsert");
+
+    manager
+        .set(&reference, &secret("created-by-set"))
+        .expect("set must create a missing credential");
+    assert_eq!(
+        daemon
+            .read(&reference)
+            .expect("read upserted credential")
+            .expose_for_test(),
+        b"created-by-set"
     );
 }
 

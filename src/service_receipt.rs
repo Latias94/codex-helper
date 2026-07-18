@@ -96,7 +96,6 @@ impl ServiceReceipt {
         self.platform_backend
     }
 
-    #[allow(dead_code)]
     pub(crate) fn install_generation(&self) -> &ServiceInstallGeneration {
         &self.install_generation
     }

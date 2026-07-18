@@ -12,7 +12,7 @@ const MAX_CREDENTIAL_NAME_BYTES: usize = 128;
 #[error("credential name must match [a-z0-9][a-z0-9._-]{{0,127}}")]
 pub struct CredentialNameError;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CredentialName(String);
 
 impl CredentialName {
@@ -385,6 +385,14 @@ impl SecretValue {
             .expect("SecretValue validates HTTP header bytes at construction");
         value.set_sensitive(true);
         value
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.bytes.is_empty()
     }
 
     pub(crate) fn sensitive_bearer_header_value(&self) -> HeaderValue {

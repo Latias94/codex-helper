@@ -86,6 +86,24 @@ impl NativeCredentialStore for LinuxNativeCredentialStore {
             let found = service
                 .search_items(Self::attributes(locator))
                 .map_err(map_secret_service_error)?;
+            if search_selection(&found) == SearchSelection::Missing {
+                let collection = service
+                    .get_default_collection()
+                    .map_err(map_secret_service_error)?;
+                if collection.is_locked().map_err(map_secret_service_error)? {
+                    collection.unlock().map_err(map_secret_service_error)?;
+                }
+                collection
+                    .create_item(
+                        ITEM_LABEL,
+                        Self::attributes(locator),
+                        value.expose(),
+                        false,
+                        CONTENT_TYPE,
+                    )
+                    .map_err(map_secret_service_error)?;
+                return Ok(());
+            }
             let item = management_item(&found)?;
             if item.is_locked().map_err(map_secret_service_error)? {
                 item.unlock().map_err(map_secret_service_error)?;

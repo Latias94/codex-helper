@@ -86,7 +86,9 @@ impl NativeCredentialStore for MacosNativeCredentialStore {
         self.locks.with_lock(locator, || {
             let mut entries = Self::search(locator)?;
             match entries.len() {
-                0 => Err(error(NativeStoreErrorCode::Missing)),
+                0 => Self::entry(locator)?
+                    .set_secret(value.expose())
+                    .map_err(map_keyring_error),
                 1 => entries
                     .pop()
                     .expect("one keychain entry")

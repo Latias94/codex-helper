@@ -3683,8 +3683,7 @@ async fn write_helper_config_locked(
     Ok(path)
 }
 
-#[cfg(test)]
-pub(crate) async fn mutate_helper_config<T>(
+pub async fn mutate_helper_config<T>(
     mutate: impl FnOnce(&mut HelperConfig) -> Result<T>,
 ) -> Result<(PathBuf, T)> {
     let paths = ResolvedConfigDirectory::prepare().await?;

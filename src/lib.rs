@@ -6,9 +6,9 @@ mod service_receipt;
 
 pub use cli_app::run_cli;
 pub use cli_types::{
-    CliError, CliResult, ConfigCommand, PricingCommand, PricingConfidence, ProviderCommand,
-    RecentFormat, RecentTerminal, RetryProfile, RoutingCommand, RoutingExhaustedAction,
-    RoutingPolicy, SessionCommand, UsageCommand, UsageSummaryBy,
+    CliError, CliResult, ConfigCommand, CredentialCommand, PricingCommand, PricingConfidence,
+    ProviderAuthKind, ProviderCommand, RecentFormat, RecentTerminal, RetryProfile, RoutingCommand,
+    RoutingExhaustedAction, RoutingPolicy, SessionCommand, UsageCommand, UsageSummaryBy,
 };
 pub use codex_helper_core::{
     codex_integration, codex_switch, config, control_plane_client, dashboard_core, doctor,
