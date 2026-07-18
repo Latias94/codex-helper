@@ -22,6 +22,8 @@ use crate::runtime_identity::RuntimeUpstreamIdentity;
 use crate::runtime_store::{RuntimeQuotaIdentity, RuntimeStore};
 
 #[cfg(test)]
+use super::CredentialReadinessCode;
+#[cfg(test)]
 use super::generation::CapturedUpstreamCredential;
 use super::generation::{
     CredentialCatalog, CredentialGeneration, CredentialHandle, CredentialLoadFailure,
@@ -1276,6 +1278,46 @@ mod tests {
     }
 
     #[test]
+    fn credential_debug_surfaces_redact_logical_references() {
+        const REFERENCE_CANARY: &str = "relay.reference-canary-7d4e";
+        let store = RuntimeStore::open_in_memory().expect("open runtime store");
+        let runtime =
+            CredentialRuntime::from_runtime_store(CredentialSourceCapabilities::server(), &store)
+                .expect("build credential runtime");
+        let endpoint = endpoint();
+        let auth = UpstreamAuth {
+            auth_token_ref: Some(CredentialRef::Native {
+                name: REFERENCE_CANARY.to_string(),
+            }),
+            ..UpstreamAuth::default()
+        };
+        let generation = runtime
+            .build_generation([CredentialCandidateInput {
+                provider_endpoint: endpoint.clone(),
+                auth: &auth,
+            }])
+            .expect("build unavailable native generation");
+        let captured = generation.capture(&endpoint);
+
+        assert_eq!(
+            captured.readiness_code(),
+            CredentialReadinessCode::Unsupported
+        );
+        assert_eq!(
+            captured.readiness_details()[0].reference.as_deref(),
+            Some(REFERENCE_CANARY)
+        );
+        for rendered in [
+            format!("{:?}", generation.catalog),
+            format!("{:?}", generation.sources),
+            format!("{:?}", captured.readiness_details()),
+            format!("{captured:?}"),
+        ] {
+            assert!(!rendered.contains(REFERENCE_CANARY), "{rendered}");
+        }
+    }
+
+    #[test]
     fn named_credentials_change_only_when_a_new_generation_is_built() {
         const ENV_NAME: &str = "CODEX_HELPER_TEST_NAMED_GENERATION_TOKEN_7D433498";
         let environment = ScopedEnvironment::set(ENV_NAME, "named-generation-a");
@@ -1694,10 +1736,18 @@ mod tests {
             )
             .await
             .expect("publish stale generation");
-        assert!(stale.capture(&endpoint).is_available());
+        let captured_stale = stale.capture(&endpoint);
+        assert!(captured_stale.is_available());
         assert_eq!(
-            stale
-                .capture(&endpoint)
+            captured_stale.readiness_code(),
+            CredentialReadinessCode::Stale
+        );
+        assert_eq!(
+            captured_stale.readiness_details()[0].stale_cause,
+            Some(CredentialReadinessCode::Missing)
+        );
+        assert_eq!(
+            captured_stale
                 .bearer_header()
                 .expect("stale bearer")
                 .as_bytes(),

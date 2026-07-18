@@ -275,7 +275,7 @@ pub(super) async fn execute_selected_upstream(
                 request_id,
                 provider_id = target.provider_id(),
                 auth_error_code = error.code(),
-                error = %error,
+                auth_source_kind = error.source_kind(),
                 "selected provider authentication could not be resolved"
             );
             let outcome = handle_attempt_target_build_failure(AttemptTargetBuildFailureParams {

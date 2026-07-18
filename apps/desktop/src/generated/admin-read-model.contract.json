@@ -133,6 +133,7 @@
       "struct": "OperatorReadData",
       "fields": [
         "summary",
+        "routing",
         "active_requests",
         "recent_requests",
         "usage_summaries",
@@ -149,6 +150,11 @@
           "name": "summary",
           "optional": false,
           "type": "ApiOperatorSummary"
+        },
+        {
+          "name": "routing",
+          "optional": true,
+          "type": "ApiOperatorRoutingSummary"
         },
         {
           "name": "active_requests",
@@ -211,6 +217,7 @@
         "runtime",
         "counts",
         "retry",
+        "credential_readiness",
         "sessions",
         "profiles",
         "providers"
@@ -240,6 +247,11 @@
           "name": "retry",
           "optional": false,
           "type": "ApiOperatorRetrySummary"
+        },
+        {
+          "name": "credential_readiness",
+          "optional": true,
+          "type": "ApiCredentialAggregateReadiness"
         },
         {
           "name": "sessions",
@@ -347,6 +359,170 @@
       ]
     },
     {
+      "file": "../../crates/core/src/dashboard_core/operator_summary.rs",
+      "struct": "OperatorActionCapabilities",
+      "fields": [
+        "refresh_provider_balances",
+        "mutate_routing",
+        "mutate_session_affinity"
+      ],
+      "shape": [
+        {
+          "name": "refresh_provider_balances",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "mutate_routing",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "mutate_session_affinity",
+          "optional": false,
+          "type": "boolean"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/dashboard_core/operator_summary.rs",
+      "struct": "OperatorRoutingSummary",
+      "fields": [
+        "route_graph_key",
+        "control_revision",
+        "provider_policy_revision",
+        "entry",
+        "entry_strategy",
+        "entry_target",
+        "new_session_preference",
+        "affinity_policy",
+        "scheduling_preset",
+        "fallback_ttl_ms",
+        "reprobe_preferred_after_ms",
+        "candidates"
+      ],
+      "shape": [
+        {
+          "name": "route_graph_key",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "control_revision",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "provider_policy_revision",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "entry",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "entry_strategy",
+          "optional": false,
+          "type": "ApiRouteStrategy"
+        },
+        {
+          "name": "entry_target",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "new_session_preference",
+          "optional": true,
+          "type": "ApiOperatorRouteTargetSummary"
+        },
+        {
+          "name": "affinity_policy",
+          "optional": false,
+          "type": "ApiRouteAffinityPolicy"
+        },
+        {
+          "name": "scheduling_preset",
+          "optional": false,
+          "type": "ApiSchedulingPreset"
+        },
+        {
+          "name": "fallback_ttl_ms",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "reprobe_preferred_after_ms",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "candidates",
+          "optional": false,
+          "type": "ApiOperatorRouteCandidateSummary[]"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/dashboard_core/operator_summary.rs",
+      "struct": "OperatorRouteTargetSummary",
+      "fields": [
+        "provider_id",
+        "endpoint_id"
+      ],
+      "shape": [
+        {
+          "name": "provider_id",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "endpoint_id",
+          "optional": false,
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/dashboard_core/operator_summary.rs",
+      "struct": "OperatorRouteCandidateSummary",
+      "fields": [
+        "route_order",
+        "provider_id",
+        "endpoint_id",
+        "preference_group",
+        "route_path"
+      ],
+      "shape": [
+        {
+          "name": "route_order",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "provider_id",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "endpoint_id",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "preference_group",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "route_path",
+          "optional": true,
+          "type": "string[]"
+        }
+      ]
+    },
+    {
       "file": "../../crates/core/src/dashboard_core/types.rs",
       "struct": "ControlProfileOption",
       "fields": [
@@ -405,6 +581,7 @@
         "configured_enabled",
         "effective_enabled",
         "routable_endpoints",
+        "credential_readiness",
         "endpoints",
         "capacity"
       ],
@@ -435,6 +612,11 @@
           "type": "number"
         },
         {
+          "name": "credential_readiness",
+          "optional": true,
+          "type": "ApiCredentialAggregateReadiness"
+        },
+        {
           "name": "endpoints",
           "optional": false,
           "type": "ApiOperatorProviderEndpointSummary[]"
@@ -458,6 +640,8 @@
         "configured_enabled",
         "effective_enabled",
         "routable",
+        "credential_readiness",
+        "credential_details",
         "runtime_enabled_override",
         "runtime_state",
         "runtime_state_override",
@@ -506,6 +690,16 @@
           "type": "boolean"
         },
         {
+          "name": "credential_readiness",
+          "optional": true,
+          "type": "ApiCredentialReadinessCode"
+        },
+        {
+          "name": "credential_details",
+          "optional": true,
+          "type": "ApiCredentialReadinessDetail[]"
+        },
+        {
           "name": "runtime_enabled_override",
           "optional": true,
           "type": "boolean"
@@ -529,6 +723,44 @@
           "name": "policy_actions",
           "optional": true,
           "type": "ApiOperatorPolicyActionSummary[]"
+        }
+      ]
+    },
+    {
+      "file": "../../crates/core/src/credentials/model.rs",
+      "struct": "CredentialReadinessDetail",
+      "fields": [
+        "kind",
+        "code",
+        "stale_cause",
+        "source_kind",
+        "reference"
+      ],
+      "shape": [
+        {
+          "name": "kind",
+          "optional": true,
+          "type": "ApiCredentialBindingKind"
+        },
+        {
+          "name": "code",
+          "optional": false,
+          "type": "ApiCredentialReadinessCode"
+        },
+        {
+          "name": "stale_cause",
+          "optional": true,
+          "type": "ApiCredentialReadinessCode"
+        },
+        {
+          "name": "source_kind",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "reference",
+          "optional": true,
+          "type": "string"
         }
       ]
     },
@@ -752,6 +984,7 @@
       "file": "../../crates/core/src/dashboard_core/operator_summary.rs",
       "struct": "OperatorSessionRouteAffinitySummary",
       "fields": [
+        "revision",
         "provider_id",
         "endpoint_id",
         "upstream_origin",
@@ -761,6 +994,11 @@
         "change_reason"
       ],
       "shape": [
+        {
+          "name": "revision",
+          "optional": false,
+          "type": "string"
+        },
         {
           "name": "provider_id",
           "optional": false,
@@ -1690,7 +1928,8 @@
         "runtime_source_mtime_ms",
         "configured_default_profile",
         "default_profile",
-        "default_profile_summary"
+        "default_profile_summary",
+        "operator_actions"
       ],
       "shape": [
         {
@@ -1717,6 +1956,11 @@
           "name": "default_profile_summary",
           "optional": false,
           "type": "ApiOperatorProfileSummary|null"
+        },
+        {
+          "name": "operator_actions",
+          "optional": true,
+          "type": "ApiOperatorActionCapabilities"
         }
       ]
     },
@@ -2977,6 +3221,7 @@
       "type": "ApiOperatorReadData",
       "fields": [
         "summary",
+        "routing",
         "active_requests",
         "recent_requests",
         "usage_summaries",
@@ -2993,6 +3238,11 @@
           "name": "summary",
           "optional": false,
           "type": "ApiOperatorSummary"
+        },
+        {
+          "name": "routing",
+          "optional": true,
+          "type": "ApiOperatorRoutingSummary"
         },
         {
           "name": "active_requests",
@@ -3055,6 +3305,7 @@
         "runtime",
         "counts",
         "retry",
+        "credential_readiness",
         "sessions",
         "profiles",
         "providers"
@@ -3084,6 +3335,11 @@
           "name": "retry",
           "optional": false,
           "type": "ApiOperatorRetrySummary"
+        },
+        {
+          "name": "credential_readiness",
+          "optional": true,
+          "type": "ApiCredentialAggregateReadiness"
         },
         {
           "name": "sessions",
@@ -3192,6 +3448,170 @@
     },
     {
       "file": "src/lib/api/admin-types.ts",
+      "type": "ApiOperatorActionCapabilities",
+      "fields": [
+        "refresh_provider_balances",
+        "mutate_routing",
+        "mutate_session_affinity"
+      ],
+      "shape": [
+        {
+          "name": "refresh_provider_balances",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "mutate_routing",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "mutate_session_affinity",
+          "optional": false,
+          "type": "boolean"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiOperatorRoutingSummary",
+      "fields": [
+        "route_graph_key",
+        "control_revision",
+        "provider_policy_revision",
+        "entry",
+        "entry_strategy",
+        "entry_target",
+        "new_session_preference",
+        "affinity_policy",
+        "scheduling_preset",
+        "fallback_ttl_ms",
+        "reprobe_preferred_after_ms",
+        "candidates"
+      ],
+      "shape": [
+        {
+          "name": "route_graph_key",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "control_revision",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "provider_policy_revision",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "entry",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "entry_strategy",
+          "optional": false,
+          "type": "ApiRouteStrategy"
+        },
+        {
+          "name": "entry_target",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "new_session_preference",
+          "optional": true,
+          "type": "ApiOperatorRouteTargetSummary"
+        },
+        {
+          "name": "affinity_policy",
+          "optional": false,
+          "type": "ApiRouteAffinityPolicy"
+        },
+        {
+          "name": "scheduling_preset",
+          "optional": false,
+          "type": "ApiSchedulingPreset"
+        },
+        {
+          "name": "fallback_ttl_ms",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "reprobe_preferred_after_ms",
+          "optional": true,
+          "type": "number"
+        },
+        {
+          "name": "candidates",
+          "optional": false,
+          "type": "ApiOperatorRouteCandidateSummary[]"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiOperatorRouteTargetSummary",
+      "fields": [
+        "provider_id",
+        "endpoint_id"
+      ],
+      "shape": [
+        {
+          "name": "provider_id",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "endpoint_id",
+          "optional": false,
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiOperatorRouteCandidateSummary",
+      "fields": [
+        "route_order",
+        "provider_id",
+        "endpoint_id",
+        "preference_group",
+        "route_path"
+      ],
+      "shape": [
+        {
+          "name": "route_order",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "provider_id",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "endpoint_id",
+          "optional": false,
+          "type": "string"
+        },
+        {
+          "name": "preference_group",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "route_path",
+          "optional": true,
+          "type": "string[]"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
       "type": "ApiControlProfileOption",
       "fields": [
         "name",
@@ -3249,6 +3669,7 @@
         "configured_enabled",
         "effective_enabled",
         "routable_endpoints",
+        "credential_readiness",
         "endpoints",
         "capacity"
       ],
@@ -3279,6 +3700,11 @@
           "type": "number"
         },
         {
+          "name": "credential_readiness",
+          "optional": true,
+          "type": "ApiCredentialAggregateReadiness"
+        },
+        {
           "name": "endpoints",
           "optional": false,
           "type": "ApiOperatorProviderEndpointSummary[]"
@@ -3302,6 +3728,8 @@
         "configured_enabled",
         "effective_enabled",
         "routable",
+        "credential_readiness",
+        "credential_details",
         "runtime_enabled_override",
         "runtime_state",
         "runtime_state_override",
@@ -3350,6 +3778,16 @@
           "type": "boolean"
         },
         {
+          "name": "credential_readiness",
+          "optional": true,
+          "type": "ApiCredentialReadinessCode"
+        },
+        {
+          "name": "credential_details",
+          "optional": true,
+          "type": "ApiCredentialReadinessDetail[]"
+        },
+        {
           "name": "runtime_enabled_override",
           "optional": true,
           "type": "boolean"
@@ -3373,6 +3811,44 @@
           "name": "policy_actions",
           "optional": true,
           "type": "ApiOperatorPolicyActionSummary[]"
+        }
+      ]
+    },
+    {
+      "file": "src/lib/api/admin-types.ts",
+      "type": "ApiCredentialReadinessDetail",
+      "fields": [
+        "kind",
+        "code",
+        "stale_cause",
+        "source_kind",
+        "reference"
+      ],
+      "shape": [
+        {
+          "name": "kind",
+          "optional": true,
+          "type": "ApiCredentialBindingKind"
+        },
+        {
+          "name": "code",
+          "optional": false,
+          "type": "ApiCredentialReadinessCode"
+        },
+        {
+          "name": "stale_cause",
+          "optional": true,
+          "type": "ApiCredentialReadinessCode"
+        },
+        {
+          "name": "source_kind",
+          "optional": true,
+          "type": "string"
+        },
+        {
+          "name": "reference",
+          "optional": true,
+          "type": "string"
         }
       ]
     },
@@ -3596,6 +4072,7 @@
       "file": "src/lib/api/admin-types.ts",
       "type": "ApiOperatorSessionRouteAffinitySummary",
       "fields": [
+        "revision",
         "provider_id",
         "endpoint_id",
         "upstream_origin",
@@ -3605,6 +4082,11 @@
         "change_reason"
       ],
       "shape": [
+        {
+          "name": "revision",
+          "optional": false,
+          "type": "string"
+        },
         {
           "name": "provider_id",
           "optional": false,
@@ -4534,7 +5016,8 @@
         "runtime_source_mtime_ms",
         "configured_default_profile",
         "default_profile",
-        "default_profile_summary"
+        "default_profile_summary",
+        "operator_actions"
       ],
       "shape": [
         {
@@ -4561,6 +5044,11 @@
           "name": "default_profile_summary",
           "optional": false,
           "type": "ApiOperatorProfileSummary|null"
+        },
+        {
+          "name": "operator_actions",
+          "optional": true,
+          "type": "ApiOperatorActionCapabilities"
         }
       ]
     },
@@ -5690,6 +6178,80 @@
     }
   ],
   "enums": [
+    {
+      "file": "../../crates/core/src/credentials/model.rs",
+      "rust": "CredentialReadinessCode",
+      "typescriptFile": "src/lib/api/admin-types.ts",
+      "typescript": "ApiCredentialReadinessCode",
+      "values": [
+        "ready",
+        "stale",
+        "missing",
+        "invalid",
+        "locked",
+        "permission_denied",
+        "interaction_required",
+        "backend_unavailable",
+        "unsupported"
+      ]
+    },
+    {
+      "file": "../../crates/core/src/credentials/model.rs",
+      "rust": "CredentialBindingKind",
+      "typescriptFile": "src/lib/api/admin-types.ts",
+      "typescript": "ApiCredentialBindingKind",
+      "values": [
+        "bearer",
+        "api_key"
+      ]
+    },
+    {
+      "file": "../../crates/core/src/credentials/model.rs",
+      "rust": "CredentialAggregateReadiness",
+      "typescriptFile": "src/lib/api/admin-types.ts",
+      "typescript": "ApiCredentialAggregateReadiness",
+      "values": [
+        "ready",
+        "degraded",
+        "blocked"
+      ]
+    },
+    {
+      "file": "../../crates/core/src/config.rs",
+      "rust": "RouteStrategy",
+      "typescriptFile": "src/lib/api/admin-types.ts",
+      "typescript": "ApiRouteStrategy",
+      "values": [
+        "manual-sticky",
+        "ordered-failover",
+        "round-robin",
+        "tag-preferred",
+        "conditional"
+      ]
+    },
+    {
+      "file": "../../crates/core/src/config.rs",
+      "rust": "RouteAffinityPolicy",
+      "typescriptFile": "src/lib/api/admin-types.ts",
+      "typescript": "ApiRouteAffinityPolicy",
+      "values": [
+        "off",
+        "preferred-group",
+        "fallback-sticky",
+        "hard"
+      ]
+    },
+    {
+      "file": "../../crates/core/src/config.rs",
+      "rust": "SchedulingPreset",
+      "typescriptFile": "src/lib/api/admin-types.ts",
+      "typescript": "ApiSchedulingPreset",
+      "values": [
+        "continuity-first",
+        "balanced",
+        "throughput-first"
+      ]
+    },
     {
       "file": "../../crates/core/src/dashboard_core/operator_summary.rs",
       "rust": "OperatorReadStatus",

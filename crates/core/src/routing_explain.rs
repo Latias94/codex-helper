@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::config::{RouteAffinityPolicy, RouteCondition};
+use crate::credentials::CredentialReadinessCode;
 use crate::dashboard_core::ProviderCapacity;
 use crate::routing_ir::{
     RouteCandidate, RoutePlanAttemptState, RoutePlanCandidateRuntimeSnapshot, RoutePlanExecutor,
@@ -143,6 +144,8 @@ pub struct RoutingExplainAvailability {
     pub breaker_open: bool,
     pub failure_count: u32,
     pub usage_exhausted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_readiness: Option<CredentialReadinessCode>,
     pub missing_auth: bool,
     pub concurrency_saturated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -367,6 +370,7 @@ impl RoutingExplainAvailability {
             breaker_open: snapshot.breaker_open,
             failure_count: snapshot.failure_count,
             usage_exhausted: snapshot.usage_exhausted,
+            credential_readiness: Some(snapshot.credential_readiness),
             missing_auth: snapshot.missing_auth,
             concurrency_saturated: snapshot.concurrency_saturated,
             concurrency_active: snapshot.concurrency_active,

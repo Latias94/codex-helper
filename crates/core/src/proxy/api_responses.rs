@@ -143,6 +143,14 @@ async fn build_operator_read_model_once(
         .iter()
         .map(OperatorProviderSummary::from)
         .collect::<Vec<_>>();
+    let credential_codes = providers
+        .iter()
+        .flat_map(|provider| provider.endpoints.iter())
+        .filter_map(|endpoint| endpoint.credential_readiness)
+        .collect::<Vec<_>>();
+    let credential_readiness = Some(
+        crate::credentials::CredentialAggregateReadiness::from_endpoint_codes(credential_codes),
+    );
     let retry_observations = summarize_recent_retry_observations(&recent);
     let local_session_ids = session_cards
         .iter()
@@ -191,6 +199,7 @@ async fn build_operator_read_model_once(
             recent_same_provider_retries: retry_observations.recent_same_provider_retries,
             recent_fast_mode_requests: retry_observations.recent_fast_mode_requests,
         },
+        credential_readiness,
         sessions,
         profiles,
         providers: operator_providers,

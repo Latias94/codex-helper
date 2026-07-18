@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+use crate::credentials::{
+    CredentialAggregateReadiness, CredentialReadinessCode, CredentialReadinessDetail,
+};
 use crate::policy_actions::PolicyActionProjection;
 use crate::state::RuntimeConfigState;
 
@@ -39,6 +42,10 @@ pub struct ProviderEndpointOption {
     pub effective_enabled: bool,
     #[serde(default)]
     pub routable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_readiness: Option<CredentialReadinessCode>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credential_details: Vec<CredentialReadinessDetail>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_enabled_override: Option<bool>,
     #[serde(default)]
@@ -62,6 +69,8 @@ pub struct ProviderOption {
     pub effective_enabled: bool,
     #[serde(default)]
     pub routable_endpoints: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_readiness: Option<CredentialAggregateReadiness>,
     #[serde(default)]
     pub endpoints: Vec<ProviderEndpointOption>,
     #[serde(default, skip_serializing_if = "ProviderCapacity::is_empty")]

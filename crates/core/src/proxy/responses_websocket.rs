@@ -246,7 +246,7 @@ pub(super) async fn handle_responses_websocket(
                 tracing::warn!(
                     provider_id = route.target.provider_id(),
                     auth_error_code = error.code(),
-                    error = %error,
+                    auth_source_kind = error.source_kind(),
                     "selected WebSocket provider authentication could not be resolved"
                 );
                 return (

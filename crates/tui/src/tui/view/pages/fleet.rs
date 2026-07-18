@@ -9,6 +9,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Color, Line, Modifier, Span, Style, Text};
 use ratatui::widgets::{Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Table, Wrap};
 
+use crate::credentials::CredentialAggregateReadiness;
 use crate::tui::Language;
 use crate::tui::i18n;
 use crate::tui::model::{
@@ -88,9 +89,15 @@ fn render_nodes_table(
         .border_style(Style::default().fg(p.border))
         .style(Style::default().bg(p.panel));
 
-    let header = Row::new([l("node"), l("health"), l("work units"), l("age")])
-        .style(Style::default().fg(p.muted))
-        .height(1);
+    let header = Row::new([
+        l("node"),
+        l("health"),
+        l("credentials"),
+        l("work units"),
+        l("age"),
+    ])
+    .style(Style::default().fg(p.muted))
+    .height(1);
 
     let now = now_ms();
     let rows = snapshot
@@ -105,6 +112,12 @@ fn render_nodes_table(
                         Cell::from(Span::styled(
                             fleet_node_health_label(lang, node.health),
                             fleet_node_health_style(p, node.health),
+                        )),
+                        Cell::from(Span::styled(
+                            node.credential_readiness
+                                .map(CredentialAggregateReadiness::as_str)
+                                .unwrap_or("-"),
+                            credential_readiness_style(p, node.credential_readiness),
                         )),
                         Cell::from(Span::styled(
                             format!("{work}/{}", node.work_units.len()),
@@ -123,9 +136,10 @@ fn render_nodes_table(
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(38),
-            Constraint::Length(13),
+            Constraint::Percentage(30),
+            Constraint::Length(12),
             Constraint::Length(10),
+            Constraint::Length(8),
             Constraint::Min(6),
         ],
     )
@@ -317,6 +331,15 @@ fn push_snapshot_details(
         l("health"),
         fleet_node_health_label(lang, node.health),
         fleet_node_health_style(p, node.health),
+    ));
+    lines.push(kv_line(
+        p,
+        l("credentials"),
+        node.credential_readiness
+            .map(CredentialAggregateReadiness::as_str)
+            .unwrap_or("unreported")
+            .to_string(),
+        credential_readiness_style(p, node.credential_readiness),
     ));
     lines.push(kv_line(
         p,
@@ -659,6 +682,18 @@ fn fleet_node_health_style(p: Palette, health: FleetNodeHealth) -> Style {
         | FleetNodeHealth::RateLimited
         | FleetNodeHealth::Unreachable
         | FleetNodeHealth::ParseFailed => Style::default().fg(p.bad),
+    }
+}
+
+fn credential_readiness_style(
+    p: Palette,
+    readiness: Option<CredentialAggregateReadiness>,
+) -> Style {
+    match readiness {
+        Some(CredentialAggregateReadiness::Ready) => Style::default().fg(p.good),
+        Some(CredentialAggregateReadiness::Degraded) => Style::default().fg(p.warn),
+        Some(CredentialAggregateReadiness::Blocked) => Style::default().fg(p.bad),
+        None => Style::default().fg(p.muted),
     }
 }
 

@@ -10,7 +10,10 @@ use sha2::{Digest, Sha256};
 
 use crate::runtime_identity::{ProviderEndpointKey, RuntimeUpstreamIdentity};
 
-use super::{CredentialErrorCode, CredentialName, CredentialSourceKind, SecretValue};
+use super::{
+    CredentialBindingKind, CredentialErrorCode, CredentialName, CredentialReadinessCode,
+    CredentialReadinessDetail, CredentialSourceKind, SecretValue,
+};
 
 const NATIVE_SOFT_REFRESH: Duration = Duration::from_secs(60);
 pub(super) const NATIVE_HARD_EXPIRY: Duration = Duration::from_secs(10 * 60);
@@ -56,11 +59,22 @@ impl NamedCredentialLookup {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct NamedCredentialReference {
     pub(crate) service_name: String,
     pub(crate) name: String,
     pub(crate) lookup: NamedCredentialLookup,
+}
+
+impl fmt::Debug for NamedCredentialReference {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NamedCredentialReference")
+            .field("service_name", &self.service_name)
+            .field("name", &"<redacted>")
+            .field("lookup", &self.lookup)
+            .finish()
+    }
 }
 
 impl fmt::Debug for CredentialHandle {
@@ -92,6 +106,13 @@ impl RuntimeCredentialKind {
             Self::ApiKey => "X-API-Key",
         }
     }
+
+    fn binding_kind(self) -> CredentialBindingKind {
+        match self {
+            Self::Bearer => CredentialBindingKind::Bearer,
+            Self::ApiKey => CredentialBindingKind::ApiKey,
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -118,6 +139,16 @@ impl CapturedCredentialError {
     pub(crate) fn reference(&self) -> &str {
         self.reference.as_str()
     }
+
+    fn readiness_detail(&self) -> CredentialReadinessDetail {
+        CredentialReadinessDetail {
+            kind: Some(self.kind.binding_kind()),
+            code: self.code.into(),
+            stale_cause: None,
+            source_kind: Some(self.source_kind.to_string()),
+            reference: Some(self.reference.clone()),
+        }
+    }
 }
 
 impl fmt::Debug for CapturedCredentialError {
@@ -127,7 +158,7 @@ impl fmt::Debug for CapturedCredentialError {
             .field("kind", &self.kind)
             .field("code", &self.code)
             .field("source_kind", &self.source_kind)
-            .field("reference", &self.reference)
+            .field("reference", &"<redacted>")
             .finish()
     }
 }
@@ -135,15 +166,40 @@ impl fmt::Debug for CapturedCredentialError {
 #[derive(Clone)]
 enum CapturedCredentialPart {
     Unconfigured,
-    Available(SecretValue),
+    Available {
+        value: SecretValue,
+        detail: CredentialReadinessDetail,
+    },
     Unavailable(CapturedCredentialError),
+}
+
+impl CapturedCredentialPart {
+    fn readiness_code(&self) -> Option<CredentialReadinessCode> {
+        match self {
+            Self::Unconfigured => None,
+            Self::Available { detail, .. } => Some(detail.code),
+            Self::Unavailable(error) => Some(error.code.into()),
+        }
+    }
+
+    fn readiness_detail(&self) -> Option<CredentialReadinessDetail> {
+        match self {
+            Self::Unconfigured => None,
+            Self::Available { detail, .. } => Some(detail.clone()),
+            Self::Unavailable(error) => Some(error.readiness_detail()),
+        }
+    }
 }
 
 impl fmt::Debug for CapturedCredentialPart {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unconfigured => formatter.write_str("Unconfigured"),
-            Self::Available(_) => formatter.write_str("Available(<redacted>)"),
+            Self::Available { detail, .. } => formatter
+                .debug_struct("Available")
+                .field("value", &"<redacted>")
+                .field("detail", detail)
+                .finish(),
             Self::Unavailable(error) => formatter.debug_tuple("Unavailable").field(error).finish(),
         }
     }
@@ -163,8 +219,32 @@ pub(crate) struct CapturedUpstreamCredential {
 
 impl CapturedUpstreamCredential {
     pub(crate) fn is_available(&self) -> bool {
-        !matches!(self.auth_token, CapturedCredentialPart::Unavailable(_))
-            && !matches!(self.api_key, CapturedCredentialPart::Unavailable(_))
+        self.readiness_code().is_routable()
+    }
+
+    pub(crate) fn readiness_code(&self) -> CredentialReadinessCode {
+        let codes = [
+            self.auth_token.readiness_code(),
+            self.api_key.readiness_code(),
+        ];
+        codes
+            .into_iter()
+            .flatten()
+            .find(|code| !code.is_routable())
+            .or_else(|| {
+                codes
+                    .into_iter()
+                    .flatten()
+                    .find(|code| *code == CredentialReadinessCode::Stale)
+            })
+            .unwrap_or(CredentialReadinessCode::Ready)
+    }
+
+    pub(crate) fn readiness_details(&self) -> Vec<CredentialReadinessDetail> {
+        [&self.auth_token, &self.api_key]
+            .into_iter()
+            .filter_map(CapturedCredentialPart::readiness_detail)
+            .collect()
     }
 
     pub(crate) fn configured_contract(&self) -> bool {
@@ -178,12 +258,11 @@ impl CapturedUpstreamCredential {
     pub(crate) fn first_error(&self) -> Option<&CapturedCredentialError> {
         match &self.auth_token {
             CapturedCredentialPart::Unavailable(error) => Some(error),
-            CapturedCredentialPart::Unconfigured | CapturedCredentialPart::Available(_) => {
+            CapturedCredentialPart::Unconfigured | CapturedCredentialPart::Available { .. } => {
                 match &self.api_key {
                     CapturedCredentialPart::Unavailable(error) => Some(error),
-                    CapturedCredentialPart::Unconfigured | CapturedCredentialPart::Available(_) => {
-                        None
-                    }
+                    CapturedCredentialPart::Unconfigured
+                    | CapturedCredentialPart::Available { .. } => None,
                 }
             }
         }
@@ -191,14 +270,16 @@ impl CapturedUpstreamCredential {
 
     pub(crate) fn bearer_header(&self) -> Option<HeaderValue> {
         match &self.auth_token {
-            CapturedCredentialPart::Available(value) => Some(value.sensitive_bearer_header_value()),
+            CapturedCredentialPart::Available { value, .. } => {
+                Some(value.sensitive_bearer_header_value())
+            }
             CapturedCredentialPart::Unconfigured | CapturedCredentialPart::Unavailable(_) => None,
         }
     }
 
     pub(crate) fn api_key_header(&self) -> Option<HeaderValue> {
         match &self.api_key {
-            CapturedCredentialPart::Available(value) => Some(value.sensitive_header_value()),
+            CapturedCredentialPart::Available { value, .. } => Some(value.sensitive_header_value()),
             CapturedCredentialPart::Unconfigured | CapturedCredentialPart::Unavailable(_) => None,
         }
     }
@@ -208,10 +289,10 @@ impl CapturedUpstreamCredential {
             return None;
         }
         match &self.auth_token {
-            CapturedCredentialPart::Available(value) => Some(value.clone()),
+            CapturedCredentialPart::Available { value, .. } => Some(value.clone()),
             CapturedCredentialPart::Unconfigured | CapturedCredentialPart::Unavailable(_) => {
                 match &self.api_key {
-                    CapturedCredentialPart::Available(value) => Some(value.clone()),
+                    CapturedCredentialPart::Available { value, .. } => Some(value.clone()),
                     CapturedCredentialPart::Unconfigured
                     | CapturedCredentialPart::Unavailable(_) => None,
                 }
@@ -273,7 +354,7 @@ impl CredentialGenerationMarker {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(super) enum CredentialSourceSpec {
     Static {
         source_kind: &'static str,
@@ -282,6 +363,22 @@ pub(super) enum CredentialSourceSpec {
     Native {
         name: CredentialName,
     },
+}
+
+impl fmt::Debug for CredentialSourceSpec {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Static { source_kind, .. } => formatter
+                .debug_struct("Static")
+                .field("source_kind", source_kind)
+                .field("reference", &"<redacted>")
+                .finish(),
+            Self::Native { .. } => formatter
+                .debug_struct("Native")
+                .field("name", &"<redacted>")
+                .finish(),
+        }
+    }
 }
 
 impl CredentialSourceSpec {
@@ -312,12 +409,24 @@ pub(super) struct EndpointCredentialBinding {
     pub(super) allow_anonymous: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub(super) struct CredentialCatalog {
     pub(super) sources: BTreeMap<CredentialHandle, CredentialSourceSpec>,
     pub(super) endpoints: BTreeMap<ProviderEndpointKey, EndpointCredentialBinding>,
     pub(super) named: BTreeMap<NamedCredentialReference, CredentialHandle>,
     pub(super) named_catalog_revision: Arc<str>,
+}
+
+impl fmt::Debug for CredentialCatalog {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CredentialCatalog")
+            .field("source_count", &self.sources.len())
+            .field("endpoint_count", &self.endpoints.len())
+            .field("named_credential_count", &self.named.len())
+            .field("named_catalog_revision", &self.named_catalog_revision)
+            .finish()
+    }
 }
 
 #[derive(Clone)]
@@ -333,7 +442,7 @@ impl fmt::Debug for CredentialLoadFailure {
             .debug_struct("CredentialLoadFailure")
             .field("code", &self.code)
             .field("source_kind", &self.source_kind)
-            .field("reference", &self.reference)
+            .field("reference", &"<redacted>")
             .finish()
     }
 }
@@ -550,22 +659,49 @@ impl CredentialGeneration {
             return CapturedCredentialPart::Unconfigured;
         };
         handles.insert(handle.clone());
+        let Some(spec) = self.catalog.sources.get(handle) else {
+            return CapturedCredentialPart::Unavailable(CapturedCredentialError {
+                kind,
+                code: CredentialErrorCode::Invalid,
+                source_kind: "runtime",
+                reference: "unbound".to_string(),
+            });
+        };
         let Some(state) = self.sources.get(handle) else {
             return CapturedCredentialPart::Unavailable(CapturedCredentialError {
                 kind,
                 code: CredentialErrorCode::Invalid,
                 source_kind: "runtime",
-                reference: handle.opaque(),
+                reference: "unbound".to_string(),
             });
         };
         match state {
-            CredentialSourceState::Ready { value, .. } => {
-                CapturedCredentialPart::Available(value.clone())
-            }
+            CredentialSourceState::Ready { value, .. } => CapturedCredentialPart::Available {
+                value: value.clone(),
+                detail: CredentialReadinessDetail {
+                    kind: Some(kind.binding_kind()),
+                    code: CredentialReadinessCode::Ready,
+                    stale_cause: None,
+                    source_kind: Some(spec.source_kind().to_string()),
+                    reference: Some(spec.reference().to_string()),
+                },
+            },
             CredentialSourceState::Stale {
-                value, loaded_at, ..
+                value,
+                loaded_at,
+                failure,
+                ..
             } if Instant::now().saturating_duration_since(*loaded_at) < NATIVE_HARD_EXPIRY => {
-                CapturedCredentialPart::Available(value.clone())
+                CapturedCredentialPart::Available {
+                    value: value.clone(),
+                    detail: CredentialReadinessDetail {
+                        kind: Some(kind.binding_kind()),
+                        code: CredentialReadinessCode::Stale,
+                        stale_cause: Some(failure.code.into()),
+                        source_kind: Some(failure.source_kind.to_string()),
+                        reference: Some(failure.reference.clone()),
+                    },
+                }
             }
             CredentialSourceState::Stale { failure, .. }
             | CredentialSourceState::Unavailable { failure, .. } => {

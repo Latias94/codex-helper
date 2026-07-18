@@ -2,6 +2,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use http::HeaderValue;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -100,6 +101,147 @@ impl CredentialErrorCode {
 impl fmt::Display for CredentialErrorCode {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
+    }
+}
+
+/// Redacted credential readiness shared by routing and trusted operator surfaces.
+///
+/// Management-only and structurally ambiguous failures collapse to `invalid`; they
+/// are not distinct runtime availability states.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialReadinessCode {
+    #[default]
+    Ready,
+    Stale,
+    Missing,
+    Invalid,
+    Locked,
+    PermissionDenied,
+    InteractionRequired,
+    BackendUnavailable,
+    Unsupported,
+}
+
+impl CredentialReadinessCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Stale => "stale",
+            Self::Missing => "missing",
+            Self::Invalid => "invalid",
+            Self::Locked => "locked",
+            Self::PermissionDenied => "permission_denied",
+            Self::InteractionRequired => "interaction_required",
+            Self::BackendUnavailable => "backend_unavailable",
+            Self::Unsupported => "unsupported",
+        }
+    }
+
+    pub fn is_routable(self) -> bool {
+        matches!(self, Self::Ready | Self::Stale)
+    }
+}
+
+impl From<CredentialErrorCode> for CredentialReadinessCode {
+    fn from(code: CredentialErrorCode) -> Self {
+        match code {
+            CredentialErrorCode::Missing => Self::Missing,
+            CredentialErrorCode::Invalid
+            | CredentialErrorCode::AlreadyExists
+            | CredentialErrorCode::Ambiguous => Self::Invalid,
+            CredentialErrorCode::Locked => Self::Locked,
+            CredentialErrorCode::PermissionDenied => Self::PermissionDenied,
+            CredentialErrorCode::InteractionRequired => Self::InteractionRequired,
+            CredentialErrorCode::BackendUnavailable => Self::BackendUnavailable,
+            CredentialErrorCode::Unsupported => Self::Unsupported,
+        }
+    }
+}
+
+impl fmt::Display for CredentialReadinessCode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialBindingKind {
+    Bearer,
+    ApiKey,
+}
+
+impl CredentialBindingKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bearer => "bearer",
+            Self::ApiKey => "api_key",
+        }
+    }
+}
+
+/// Trusted, redacted detail for one configured credential binding.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CredentialReadinessDetail {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<CredentialBindingKind>,
+    pub code: CredentialReadinessCode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_cause: Option<CredentialReadinessCode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
+}
+
+impl fmt::Debug for CredentialReadinessDetail {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CredentialReadinessDetail")
+            .field("kind", &self.kind)
+            .field("code", &self.code)
+            .field("stale_cause", &self.stale_cause)
+            .field("source_kind", &self.source_kind)
+            .field("reference", &self.reference.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialAggregateReadiness {
+    #[default]
+    Ready,
+    Degraded,
+    Blocked,
+}
+
+impl CredentialAggregateReadiness {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Degraded => "degraded",
+            Self::Blocked => "blocked",
+        }
+    }
+
+    pub fn from_endpoint_codes(codes: impl IntoIterator<Item = CredentialReadinessCode>) -> Self {
+        let mut has_routable = false;
+        let mut has_degraded = false;
+        let mut has_endpoint = false;
+        for code in codes {
+            has_endpoint = true;
+            has_routable |= code.is_routable();
+            has_degraded |= code != CredentialReadinessCode::Ready;
+        }
+        if !has_endpoint || !has_routable {
+            Self::Blocked
+        } else if has_degraded {
+            Self::Degraded
+        } else {
+            Self::Ready
+        }
     }
 }
 

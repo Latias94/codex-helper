@@ -2029,6 +2029,7 @@ mod tests {
                 runtime: OperatorRuntimeSummary::default(),
                 counts: OperatorSummaryCounts::default(),
                 retry: OperatorRetrySummary::default(),
+                credential_readiness: None,
                 sessions: vec![session],
                 profiles: Vec::new(),
                 providers: Vec::new(),
@@ -2386,6 +2387,7 @@ mod tests {
                 runtime: OperatorRuntimeSummary::default(),
                 counts: OperatorSummaryCounts::default(),
                 retry: OperatorRetrySummary::default(),
+                credential_readiness: Some(crate::credentials::CredentialAggregateReadiness::Ready),
                 sessions: Vec::new(),
                 profiles: Vec::new(),
                 providers: vec![OperatorProviderSummary {
@@ -2394,6 +2396,9 @@ mod tests {
                     configured_enabled: true,
                     effective_enabled: true,
                     routable_endpoints: 1,
+                    credential_readiness: Some(
+                        crate::credentials::CredentialAggregateReadiness::Ready,
+                    ),
                     endpoints: vec![OperatorProviderEndpointSummary {
                         provider_name: "alpha".to_string(),
                         name: "default".to_string(),
@@ -2403,6 +2408,10 @@ mod tests {
                         configured_enabled: true,
                         effective_enabled: true,
                         routable: true,
+                        credential_readiness: Some(
+                            crate::credentials::CredentialReadinessCode::Ready,
+                        ),
+                        credential_details: Vec::new(),
                         runtime_enabled_override: None,
                         runtime_state: Default::default(),
                         runtime_state_override: None,

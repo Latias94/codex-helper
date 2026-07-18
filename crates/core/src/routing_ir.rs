@@ -9,7 +9,9 @@ use crate::config::{
     RouteExhaustedAction, RouteGraphConfig, RouteNodeConfig, RouteStrategy, SchedulingPreset,
     ServiceRouteConfig, UpstreamAuth, effective_routing,
 };
-use crate::credentials::{CapturedUpstreamCredential, CredentialGeneration};
+use crate::credentials::{
+    CapturedUpstreamCredential, CredentialGeneration, CredentialReadinessCode,
+};
 use crate::endpoint_health::FAILURE_THRESHOLD;
 use crate::model_routing;
 use crate::runtime_identity::{ContinuityDomainKey, ProviderEndpointKey, RuntimeUpstreamIdentity};
@@ -589,7 +591,7 @@ pub struct RoutePlanUpstreamRuntimeState {
     pub cooldown_active: bool,
     pub cooldown_remaining_secs: Option<u64>,
     pub usage_exhausted: bool,
-    pub missing_auth: bool,
+    pub credential_readiness: CredentialReadinessCode,
     pub concurrency_saturated: bool,
     pub concurrency_active: Option<u32>,
     pub concurrency_limit: Option<u32>,
@@ -601,7 +603,7 @@ impl RoutePlanUpstreamRuntimeState {
     }
 
     fn hard_unavailable(self) -> bool {
-        self.runtime_disabled || self.missing_auth || self.breaker_open()
+        self.runtime_disabled || !self.credential_readiness.is_routable() || self.breaker_open()
     }
 }
 
@@ -618,6 +620,7 @@ pub struct RoutePlanCandidateRuntimeSnapshot {
     pub breaker_open: bool,
     pub failure_count: u32,
     pub usage_exhausted: bool,
+    pub credential_readiness: CredentialReadinessCode,
     pub missing_auth: bool,
     pub concurrency_saturated: bool,
     pub concurrency_active: Option<u32>,
@@ -652,7 +655,8 @@ impl RoutePlanCandidateRuntimeSnapshot {
             breaker_open,
             failure_count: runtime_state.failure_count,
             usage_exhausted: runtime_state.usage_exhausted,
-            missing_auth: runtime_state.missing_auth,
+            credential_readiness: runtime_state.credential_readiness,
+            missing_auth: !runtime_state.credential_readiness.is_routable(),
             concurrency_saturated: runtime_state.concurrency_saturated,
             concurrency_active: runtime_state.concurrency_active,
             concurrency_limit: runtime_state.concurrency_limit,
@@ -4926,7 +4930,7 @@ mod tests {
         runtime.set_provider_endpoint(
             endpoint_key("codex", "missing-auth", "default"),
             RoutePlanUpstreamRuntimeState {
-                missing_auth: true,
+                credential_readiness: CredentialReadinessCode::Missing,
                 ..RoutePlanUpstreamRuntimeState::default()
             },
         );
@@ -5068,7 +5072,7 @@ mod tests {
                 cooldown_active: true,
                 cooldown_remaining_secs: Some(30),
                 usage_exhausted: true,
-                missing_auth: true,
+                credential_readiness: CredentialReadinessCode::Missing,
                 concurrency_saturated: true,
                 concurrency_active: Some(2),
                 concurrency_limit: Some(2),
@@ -5085,6 +5089,10 @@ mod tests {
         assert!(snapshot.breaker_open);
         assert_eq!(snapshot.cooldown_remaining_secs, Some(30));
         assert!(snapshot.usage_exhausted);
+        assert_eq!(
+            snapshot.credential_readiness,
+            CredentialReadinessCode::Missing
+        );
         assert!(snapshot.missing_auth);
         assert!(snapshot.concurrency_saturated);
         assert_eq!(snapshot.concurrency_active, Some(2));

@@ -65,6 +65,15 @@ impl UpstreamAuthResolutionError {
             Self::AnonymousNotAllowed => "missing_auth",
         }
     }
+
+    pub(crate) fn source_kind(&self) -> &'static str {
+        match self {
+            Self::MissingReference { .. } => "environment",
+            Self::UnsupportedReference { source_kind, .. }
+            | Self::RuntimeCredentialUnavailable { source_kind, .. } => source_kind,
+            Self::AnonymousNotAllowed => "configuration",
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -653,5 +662,18 @@ mod tests {
                 source_kind: "native",
             }
         ));
+    }
+
+    #[test]
+    fn auth_resolution_log_fields_do_not_expose_logical_references() {
+        const REFERENCE_CANARY: &str = "CODEX_HELPER_REFERENCE_CANARY_7D4E";
+        let error = UpstreamAuthResolutionError::MissingReference {
+            kind: "Bearer token",
+            name: REFERENCE_CANARY.to_string(),
+        };
+        let rendered = format!("code={} source={}", error.code(), error.source_kind());
+
+        assert_eq!(rendered, "code=missing_auth source=environment");
+        assert!(!rendered.contains(REFERENCE_CANARY));
     }
 }

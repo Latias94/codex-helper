@@ -113,6 +113,7 @@ export type ProviderCardView = {
   configuredEnabled: boolean;
   effectiveEnabled: boolean;
   routableEndpoints: number;
+  credentialReadiness?: "ready" | "degraded" | "blocked";
   endpointCount: number;
   capacity?: string;
   endpoints: ProviderEndpointInventoryView[];
@@ -128,9 +129,19 @@ export type ProviderEndpointInventoryView = {
   configuredEnabled: boolean;
   effectiveEnabled: boolean;
   routable: boolean;
+  credentialReadiness?: string;
+  credentialDetails: ProviderCredentialDetailView[];
   runtimeState: string;
   capacity?: string;
   policyActionCount: number;
+};
+
+export type ProviderCredentialDetailView = {
+  kind: string;
+  code: string;
+  staleCause?: string;
+  sourceKind: string;
+  reference: string;
 };
 
 export type ProviderControlBadgeView = {

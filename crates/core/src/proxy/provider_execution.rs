@@ -1314,7 +1314,7 @@ mod tests {
         runtime.set_provider_endpoint(
             template.candidate_provider_endpoint_key(&template.candidates[2]),
             RoutePlanUpstreamRuntimeState {
-                missing_auth: true,
+                credential_readiness: crate::credentials::CredentialReadinessCode::Missing,
                 ..Default::default()
             },
         );

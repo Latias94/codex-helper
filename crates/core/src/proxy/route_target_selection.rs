@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use crate::auth_resolution::unconfigured_upstream_auth_contract_requires_opt_in;
 use crate::config::SchedulingPreset;
+use crate::credentials::CredentialReadinessCode;
 use crate::logging::log_control_trace_event;
 use crate::routing_ir::{
     RouteCandidate, RoutePlanAttemptSelection, RoutePlanAttemptState, RoutePlanExecutor,
@@ -66,13 +67,15 @@ pub(super) fn apply_auth_resolution_to_runtime(
         let credential = template
             .credential_generation
             .capture_bound(&provider_endpoint)?;
-        state.missing_auth = !credential.is_available()
-            || unconfigured_upstream_auth_contract_requires_opt_in(
-                service_name,
-                credential.configured_contract(),
-                credential.allow_anonymous(),
-                candidate.base_url.as_str(),
-            );
+        state.credential_readiness = credential.readiness_code();
+        if unconfigured_upstream_auth_contract_requires_opt_in(
+            service_name,
+            credential.configured_contract(),
+            credential.allow_anonymous(),
+            candidate.base_url.as_str(),
+        ) {
+            state.credential_readiness = CredentialReadinessCode::Missing;
+        }
         runtime.set_provider_endpoint(provider_endpoint, state);
     }
     Ok(())

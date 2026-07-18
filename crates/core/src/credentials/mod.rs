@@ -17,7 +17,8 @@ pub use installation_identity::{
     InstallationIdentity, InstallationIdentityError, InstallationIdentityErrorCode,
 };
 pub use model::{
-    CredentialError, CredentialErrorCode, CredentialName, CredentialNameError,
+    CredentialAggregateReadiness, CredentialBindingKind, CredentialError, CredentialErrorCode,
+    CredentialName, CredentialNameError, CredentialReadinessCode, CredentialReadinessDetail,
     CredentialSourceKind, CredentialValueError, SecretValue,
 };
 pub(crate) use runtime::{

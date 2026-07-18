@@ -37,6 +37,7 @@ mod tests {
             label: node_id.to_string(),
             kind: FleetNodeKind::Remote,
             health: FleetNodeHealth::Fresh,
+            credential_readiness: None,
             refreshed_at_ms: 1,
             stale_since_ms: None,
             snapshot_age_ms: None,

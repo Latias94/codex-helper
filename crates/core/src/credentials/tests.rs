@@ -8,11 +8,91 @@ use uuid::Uuid;
 
 use super::capabilities::{NativeCredentialStore, NativeStoreError, NativeStoreErrorCode};
 use super::installation_identity::{InstallationIdentity, InstallationIdentityErrorCode};
-use super::model::{CredentialErrorCode, CredentialName, SecretValue};
+use super::model::{
+    CredentialAggregateReadiness, CredentialErrorCode, CredentialName, CredentialReadinessCode,
+    SecretValue,
+};
 use super::native::{NativeCredentialLocator, NativeCredentialNamespace};
 use super::{CredentialSourceCapabilities, read_secret_file};
 
 assert_not_impl_any!(SecretValue: std::fmt::Debug, serde::Serialize);
+
+#[test]
+fn credential_errors_map_to_stable_runtime_readiness_codes() {
+    let cases = [
+        (
+            CredentialErrorCode::AlreadyExists,
+            CredentialReadinessCode::Invalid,
+        ),
+        (
+            CredentialErrorCode::Missing,
+            CredentialReadinessCode::Missing,
+        ),
+        (
+            CredentialErrorCode::Invalid,
+            CredentialReadinessCode::Invalid,
+        ),
+        (CredentialErrorCode::Locked, CredentialReadinessCode::Locked),
+        (
+            CredentialErrorCode::PermissionDenied,
+            CredentialReadinessCode::PermissionDenied,
+        ),
+        (
+            CredentialErrorCode::InteractionRequired,
+            CredentialReadinessCode::InteractionRequired,
+        ),
+        (
+            CredentialErrorCode::BackendUnavailable,
+            CredentialReadinessCode::BackendUnavailable,
+        ),
+        (
+            CredentialErrorCode::Ambiguous,
+            CredentialReadinessCode::Invalid,
+        ),
+        (
+            CredentialErrorCode::Unsupported,
+            CredentialReadinessCode::Unsupported,
+        ),
+    ];
+
+    for (error, expected) in cases {
+        let readiness = CredentialReadinessCode::from(error);
+        assert_eq!(readiness, expected);
+        assert_eq!(
+            serde_json::from_str::<CredentialReadinessCode>(
+                &serde_json::to_string(&readiness).expect("serialize readiness")
+            )
+            .expect("deserialize readiness"),
+            readiness
+        );
+    }
+}
+
+#[test]
+fn aggregate_readiness_distinguishes_ready_degraded_and_blocked_routes() {
+    assert_eq!(
+        CredentialAggregateReadiness::from_endpoint_codes([CredentialReadinessCode::Ready]),
+        CredentialAggregateReadiness::Ready
+    );
+    assert_eq!(
+        CredentialAggregateReadiness::from_endpoint_codes([
+            CredentialReadinessCode::Ready,
+            CredentialReadinessCode::Missing,
+        ]),
+        CredentialAggregateReadiness::Degraded
+    );
+    assert_eq!(
+        CredentialAggregateReadiness::from_endpoint_codes([CredentialReadinessCode::Stale]),
+        CredentialAggregateReadiness::Degraded
+    );
+    assert_eq!(
+        CredentialAggregateReadiness::from_endpoint_codes([
+            CredentialReadinessCode::Missing,
+            CredentialReadinessCode::Unsupported,
+        ]),
+        CredentialAggregateReadiness::Blocked
+    );
+}
 
 #[derive(Default)]
 struct FakeNativeStore {

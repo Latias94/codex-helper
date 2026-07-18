@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
 
 use crate::config::{ServiceControlProfile, ServiceRouteConfig};
+use crate::credentials::{
+    CredentialAggregateReadiness, CredentialReadinessCode, CredentialReadinessDetail,
+};
 use crate::routing_ir::{RoutePlanRuntimeState, RoutePlanTemplate};
 use crate::runtime_identity::ProviderEndpointKey;
 use crate::state::RuntimeConfigState;
@@ -94,6 +97,7 @@ pub fn build_provider_options_from_route_runtime(
                     .iter()
                     .filter(|endpoint| endpoint.routable)
                     .count(),
+                credential_readiness: None,
                 endpoints,
                 capacity: Default::default(),
             }
@@ -141,6 +145,23 @@ pub fn build_provider_options_from_route_runtime(
         endpoint.effective_enabled =
             endpoint.configured_enabled && !candidate_runtime.runtime_disabled;
         endpoint.routable = endpoint.configured_enabled && candidate_runtime.runtime_available;
+        endpoint.credential_readiness = Some(candidate_runtime.credential_readiness);
+        endpoint.credential_details = template
+            .credential_generation
+            .capture_bound(&template.candidate_provider_endpoint_key(candidate))
+            .map(|credential| credential.readiness_details())
+            .unwrap_or_default();
+        if endpoint.credential_details.is_empty()
+            && candidate_runtime.credential_readiness == CredentialReadinessCode::Missing
+        {
+            endpoint.credential_details.push(CredentialReadinessDetail {
+                kind: None,
+                code: CredentialReadinessCode::Missing,
+                stale_cause: None,
+                source_kind: Some("configuration".to_string()),
+                reference: None,
+            });
+        }
         endpoint.runtime_enabled_override = candidate_runtime.runtime_disabled.then_some(false);
         endpoint.runtime_state = if candidate_runtime.draining {
             RuntimeConfigState::Draining
@@ -177,6 +198,13 @@ pub fn build_provider_options_from_route_runtime(
             .iter()
             .filter(|endpoint| endpoint.routable)
             .count();
+        let credential_codes = provider
+            .endpoints
+            .iter()
+            .filter_map(|endpoint| endpoint.credential_readiness)
+            .collect::<Vec<_>>();
+        provider.credential_readiness = (!credential_codes.is_empty())
+            .then(|| CredentialAggregateReadiness::from_endpoint_codes(credential_codes));
     }
     providers.sort_by(|left, right| {
         let left_order = provider_order
@@ -219,6 +247,8 @@ fn build_route_provider_endpoint_option(
         configured_enabled,
         effective_enabled: configured_enabled,
         routable: configured_enabled,
+        credential_readiness: None,
+        credential_details: Vec::new(),
         runtime_enabled_override: None,
         runtime_state: Default::default(),
         runtime_state_override: None,

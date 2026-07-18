@@ -211,6 +211,7 @@ export function mapProviders(
       configuredEnabled: provider.configured_enabled,
       effectiveEnabled: provider.effective_enabled,
       routableEndpoints: provider.routable_endpoints,
+      credentialReadiness: provider.credential_readiness,
       endpointCount,
       capacity: capacitySummary(provider.capacity),
       endpoints: endpoints.map((endpoint) => ({
@@ -221,6 +222,14 @@ export function mapProviders(
         configuredEnabled: endpoint.configured_enabled,
         effectiveEnabled: endpoint.effective_enabled,
         routable: endpoint.routable,
+        credentialReadiness: endpoint.credential_readiness,
+        credentialDetails: (endpoint.credential_details ?? []).map((detail) => ({
+          kind: detail.kind ?? "upstream",
+          code: detail.code,
+          staleCause: detail.stale_cause,
+          sourceKind: detail.source_kind ?? "unreported",
+          reference: detail.reference ?? "-",
+        })),
         runtimeState: endpoint.runtime_state,
         capacity: capacitySummary(endpoint.capacity),
         policyActionCount: endpoint.policy_actions?.length ?? 0,

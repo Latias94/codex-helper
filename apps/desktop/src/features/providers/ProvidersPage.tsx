@@ -27,7 +27,7 @@ export function ProvidersPage() {
         </Badge>
       </div>
 
-      <div className="app-scroll grid min-h-0 flex-1 grid-cols-2 content-start gap-4 overflow-y-auto pr-1">
+      <div className="app-scroll grid min-h-0 flex-1 grid-cols-1 content-start gap-4 overflow-y-auto pr-1 xl:grid-cols-2">
           {providers.length === 0 ? (
             <div className="col-span-2">
               <EmptyState

@@ -216,7 +216,7 @@ fn project_provider_endpoint_runtime_health(
                 cooldown_active,
                 cooldown_remaining_secs,
                 usage_exhausted: false,
-                missing_auth: false,
+                credential_readiness: Default::default(),
                 concurrency_saturated: false,
                 concurrency_active: None,
                 concurrency_limit: None,

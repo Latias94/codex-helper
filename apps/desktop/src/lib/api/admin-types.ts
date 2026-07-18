@@ -103,6 +103,13 @@ export type ApiOperatorRuntimeSummary = {
   configured_default_profile: string | null;
   default_profile: string | null;
   default_profile_summary: ApiOperatorProfileSummary | null;
+  operator_actions?: ApiOperatorActionCapabilities;
+};
+
+export type ApiOperatorActionCapabilities = {
+  refresh_provider_balances: boolean;
+  mutate_routing: boolean;
+  mutate_session_affinity: boolean;
 };
 
 export type ApiOperatorSummaryCounts = {
@@ -148,6 +155,7 @@ export type ApiOperatorRouteDecision = {
 };
 
 export type ApiOperatorSessionRouteAffinitySummary = {
+  revision: string;
   provider_id: string;
   endpoint_id: string;
   upstream_origin: string;
@@ -173,6 +181,7 @@ export type ApiOperatorSummary = {
   runtime: ApiOperatorRuntimeSummary;
   counts: ApiOperatorSummaryCounts;
   retry: ApiOperatorRetrySummary;
+  credential_readiness?: ApiCredentialAggregateReadiness;
   sessions: ApiOperatorSessionSummary[];
   profiles: ApiControlProfileOption[];
   providers: ApiOperatorProviderSummary[];
@@ -498,6 +507,28 @@ export type ApiOperatorPolicyActionSummary = {
   cooldown_remaining_secs?: number;
 };
 
+export type ApiCredentialReadinessCode =
+  | "ready"
+  | "stale"
+  | "missing"
+  | "invalid"
+  | "locked"
+  | "permission_denied"
+  | "interaction_required"
+  | "backend_unavailable"
+  | "unsupported";
+
+export type ApiCredentialBindingKind = "bearer" | "api_key";
+export type ApiCredentialAggregateReadiness = "ready" | "degraded" | "blocked";
+
+export type ApiCredentialReadinessDetail = {
+  kind?: ApiCredentialBindingKind;
+  code: ApiCredentialReadinessCode;
+  stale_cause?: ApiCredentialReadinessCode;
+  source_kind?: string;
+  reference?: string;
+};
+
 export type ApiOperatorProviderCapacity = {
   configured_max_concurrent_requests?: number;
   effective_max_concurrent_requests?: number;
@@ -516,6 +547,8 @@ export type ApiOperatorProviderEndpointSummary = {
   configured_enabled: boolean;
   effective_enabled: boolean;
   routable: boolean;
+  credential_readiness?: ApiCredentialReadinessCode;
+  credential_details?: ApiCredentialReadinessDetail[];
   runtime_enabled_override?: boolean;
   runtime_state: ApiRuntimeConfigState;
   runtime_state_override?: ApiRuntimeConfigState;
@@ -529,6 +562,7 @@ export type ApiOperatorProviderSummary = {
   configured_enabled: boolean;
   effective_enabled: boolean;
   routable_endpoints: number;
+  credential_readiness?: ApiCredentialAggregateReadiness;
   endpoints: ApiOperatorProviderEndpointSummary[];
   capacity?: ApiOperatorProviderCapacity;
 };
@@ -998,6 +1032,7 @@ export type ApiOperatorRevisionBundle = {
 
 export type ApiOperatorReadData = {
   summary: ApiOperatorSummary;
+  routing?: ApiOperatorRoutingSummary;
   active_requests: ApiOperatorActiveRequestSummary[];
   recent_requests: ApiOperatorRequestSummary[];
   usage_summaries: ApiRequestUsageSummary[];
@@ -1008,6 +1043,43 @@ export type ApiOperatorReadData = {
   stats_1h: ApiWindowStats;
   pricing_catalog: ApiModelPriceCatalogSnapshot;
   provider_balances: ApiOperatorProviderBalanceSummary[];
+};
+
+export type ApiRouteStrategy =
+  | "manual-sticky"
+  | "ordered-failover"
+  | "round-robin"
+  | "tag-preferred"
+  | "conditional";
+export type ApiRouteAffinityPolicy = "off" | "preferred-group" | "fallback-sticky" | "hard";
+export type ApiSchedulingPreset = "continuity-first" | "balanced" | "throughput-first";
+
+export type ApiOperatorRouteTargetSummary = {
+  provider_id: string;
+  endpoint_id: string;
+};
+
+export type ApiOperatorRouteCandidateSummary = {
+  route_order: number;
+  provider_id: string;
+  endpoint_id: string;
+  preference_group: number;
+  route_path?: string[];
+};
+
+export type ApiOperatorRoutingSummary = {
+  route_graph_key: string;
+  control_revision: number;
+  provider_policy_revision: number;
+  entry: string;
+  entry_strategy: ApiRouteStrategy;
+  entry_target?: string;
+  new_session_preference?: ApiOperatorRouteTargetSummary;
+  affinity_policy: ApiRouteAffinityPolicy;
+  scheduling_preset: ApiSchedulingPreset;
+  fallback_ttl_ms?: number;
+  reprobe_preferred_after_ms?: number;
+  candidates: ApiOperatorRouteCandidateSummary[];
 };
 
 export type ApiOperatorReadStatus = "ready" | "stale" | "disconnected" | "auth_required";

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::credentials::CredentialAggregateReadiness;
 use crate::usage::UsageMetrics;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -215,6 +216,8 @@ pub struct FleetNodeSnapshot {
     pub label: String,
     pub kind: FleetNodeKind,
     pub health: FleetNodeHealth,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_readiness: Option<CredentialAggregateReadiness>,
     pub refreshed_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stale_since_ms: Option<u64>,

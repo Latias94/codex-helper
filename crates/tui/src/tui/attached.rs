@@ -799,6 +799,7 @@ mod tests {
                     runtime: OperatorRuntimeSummary::default(),
                     counts: OperatorSummaryCounts::default(),
                     retry: Default::default(),
+                    credential_readiness: None,
                     sessions: Vec::new(),
                     profiles: Vec::new(),
                     providers: Vec::new(),
