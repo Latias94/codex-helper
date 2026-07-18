@@ -143,6 +143,7 @@
         "stats_5m",
         "stats_1h",
         "pricing_catalog",
+        "service_status",
         "provider_balances"
       ],
       "shape": [
@@ -200,6 +201,11 @@
           "name": "pricing_catalog",
           "optional": false,
           "type": "ApiModelPriceCatalogSnapshot"
+        },
+        {
+          "name": "service_status",
+          "optional": true,
+          "type": "ApiServiceStatusSnapshot"
         },
         {
           "name": "provider_balances",
@@ -3231,6 +3237,7 @@
         "stats_5m",
         "stats_1h",
         "pricing_catalog",
+        "service_status",
         "provider_balances"
       ],
       "shape": [
@@ -3288,6 +3295,11 @@
           "name": "pricing_catalog",
           "optional": false,
           "type": "ApiModelPriceCatalogSnapshot"
+        },
+        {
+          "name": "service_status",
+          "optional": true,
+          "type": "ApiServiceStatusSnapshot"
         },
         {
           "name": "provider_balances",

@@ -117,7 +117,7 @@ pub(super) fn current_page_help_lines(ui: &UiState, p: Palette) -> Vec<Line<'sta
             "  Tab        切换节点 / 工作单元焦点",
             "  r          刷新快照；t 切换 Tree / Flat",
         ],
-        (Language::Zh, Page::ServiceStatus, _) => vec!["  r          刷新只读服务状态快照"],
+        (Language::Zh, Page::ServiceStatus, _) => vec!["  r          读取最新只读快照"],
         (Language::En, Page::Dashboard, _) => vec![
             "  Tab        switch Sessions / Requests focus",
             "  ↑/↓        move the active selection",
@@ -189,7 +189,7 @@ pub(super) fn current_page_help_lines(ui: &UiState, p: Palette) -> Vec<Line<'sta
             "  r          refresh the snapshot; t toggles Tree / Flat",
         ],
         (Language::En, Page::ServiceStatus, _) => {
-            vec!["  r          refresh the read-only service status snapshot"]
+            vec!["  r          read the latest service status snapshot"]
         }
     };
     lines.extend(entries.into_iter().map(Line::from));

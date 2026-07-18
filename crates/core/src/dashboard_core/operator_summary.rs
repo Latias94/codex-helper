@@ -103,6 +103,8 @@ pub struct OperatorReadData {
     #[serde(default)]
     pub stats_1h: WindowStats,
     pub pricing_catalog: ModelPriceCatalogSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_status: Option<crate::service_status::ServiceStatusSnapshot>,
     #[serde(default)]
     pub provider_balances: Vec<OperatorProviderBalanceSummary>,
 }
@@ -1397,6 +1399,7 @@ mod tests {
                 stats_5m: Default::default(),
                 stats_1h: Default::default(),
                 pricing_catalog: Default::default(),
+                service_status: None,
                 provider_balances: Vec::new(),
             },
         )

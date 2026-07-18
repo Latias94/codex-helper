@@ -257,7 +257,7 @@ fn endpoint_status_label(
     }
 }
 
-fn credential_readiness_short_label(
+pub(super) fn credential_readiness_short_label(
     readiness: CredentialReadinessCode,
     lang: Language,
 ) -> &'static str {

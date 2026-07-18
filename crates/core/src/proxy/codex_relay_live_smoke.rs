@@ -10,7 +10,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http as tungstenite_http;
 
 use crate::config::UpstreamConfig;
-use crate::credentials::CapturedUpstreamCredential;
+use crate::credentials::{CapturedUpstreamCredential, CredentialReadinessCode};
 use crate::model_routing;
 
 use super::classify::{ROUTING_MISMATCH_CAPABILITY_CLASS, classify_upstream_response};
@@ -21,7 +21,6 @@ pub const CODEX_RELAY_LIVE_SMOKE_ACK: &str = "run-live-codex-relay-smoke";
 
 const LIVE_SMOKE_API_VERSION: u32 = 1;
 const MAX_LIVE_SMOKE_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
-const ERROR_SNIPPET_LIMIT: usize = 512;
 const UPSTREAM_AUTH_UNAVAILABLE_REASON: &str = "configured upstream credentials are unavailable";
 
 #[path = "codex_relay_live_smoke/cases.rs"]
@@ -78,6 +77,7 @@ pub enum CodexRelayLiveSmokeConfidence {
     LiveOutputShape,
     LiveAccepted,
     LiveError,
+    Credential,
     Transport,
     Malformed,
 }
@@ -93,6 +93,8 @@ pub struct CodexRelayLiveSmokeResult {
     pub case: CodexRelayLiveSmokeCase,
     pub outcome: CodexRelayLiveSmokeOutcome,
     pub confidence: CodexRelayLiveSmokeConfidence,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_readiness: Option<CredentialReadinessCode>,
     pub side_effect: CodexRelayLiveSmokeSideEffect,
     pub status_code: Option<u16>,
     pub response_shape: Option<String>,
@@ -132,6 +134,17 @@ impl CodexRelayLiveSmokeClient {
         Self { client, credential }
     }
 
+    fn credential_readiness(&self, upstream: &UpstreamConfig) -> CredentialReadinessCode {
+        crate::auth_resolution::target_credential_readiness(
+            "codex",
+            self.credential.configured_contract(),
+            self.credential.allow_anonymous(),
+            upstream.base_url.as_str(),
+            self.credential.readiness_code(),
+        )
+    }
+
+    #[cfg(test)]
     async fn run_case(
         &self,
         upstream: &UpstreamConfig,
@@ -139,8 +152,24 @@ impl CodexRelayLiveSmokeClient {
         service_tier: Option<&str>,
         case: CodexRelayLiveSmokeCase,
     ) -> CodexRelayLiveSmokeResult {
+        let readiness = self.credential_readiness(upstream);
+        self.run_case_with_readiness(upstream, model, service_tier, case, readiness)
+            .await
+    }
+
+    async fn run_case_with_readiness(
+        &self,
+        upstream: &UpstreamConfig,
+        model: &str,
+        service_tier: Option<&str>,
+        case: CodexRelayLiveSmokeCase,
+        readiness: CredentialReadinessCode,
+    ) -> CodexRelayLiveSmokeResult {
+        if !readiness.is_routable() {
+            return credential_result(case, readiness);
+        }
         let descriptor = live_smoke_case_descriptor(case);
-        match descriptor.executor {
+        let result = match descriptor.executor {
             LiveSmokeExecutor::Http(_) => {
                 self.run_http_case(upstream, model, service_tier, descriptor)
                     .await
@@ -149,7 +178,8 @@ impl CodexRelayLiveSmokeClient {
                 self.run_websocket_case(upstream, model, service_tier, descriptor)
                     .await
             }
-        }
+        };
+        result.with_credential_readiness(readiness)
     }
 
     async fn run_http_case(
@@ -184,8 +214,8 @@ impl CodexRelayLiveSmokeClient {
         for &(name, value) in spec.headers {
             headers.insert(name, HeaderValue::from_static(value));
         }
-        if let Err(error) = apply_upstream_auth_headers(upstream, &self.credential, &mut headers) {
-            return transport_result(descriptor.case, None, error);
+        if apply_upstream_auth_headers(upstream, &self.credential, &mut headers).is_err() {
+            return credential_result(descriptor.case, CredentialReadinessCode::Invalid);
         }
 
         let response = match self
@@ -202,7 +232,7 @@ impl CodexRelayLiveSmokeClient {
                 return transport_result(
                     descriptor.case,
                     None,
-                    format!("transport error during live smoke: {error}"),
+                    reqwest_live_smoke_transport_reason(&error),
                 );
             }
         };
@@ -239,8 +269,8 @@ impl CodexRelayLiveSmokeClient {
 
         let mut headers = HeaderMap::new();
         headers.insert("openai-beta", HeaderValue::from_static(ws.beta_header));
-        if let Err(error) = apply_upstream_auth_headers(upstream, &self.credential, &mut headers) {
-            return transport_result(descriptor.case, None, error);
+        if apply_upstream_auth_headers(upstream, &self.credential, &mut headers).is_err() {
+            return credential_result(descriptor.case, CredentialReadinessCode::Invalid);
         }
         let request = match websocket_live_smoke_request(&url, &headers) {
             Ok(request) => request,
@@ -266,11 +296,11 @@ impl CodexRelayLiveSmokeClient {
 
         let body = (ws.body)(model, service_tier);
         let message = TungsteniteMessage::Text(body.to_string().into());
-        if let Err(error) = socket.send(message).await {
+        if socket.send(message).await.is_err() {
             return transport_result(
                 descriptor.case,
                 Some(StatusCode::SWITCHING_PROTOCOLS),
-                format!("websocket live smoke send failed: {error}"),
+                "websocket live smoke send failed",
             );
         }
 
@@ -354,17 +384,28 @@ pub(super) async fn codex_relay_live_smoke_for_proxy(
         })?;
 
     let client = CodexRelayLiveSmokeClient::new(proxy.client.clone(), credential);
+    let credential_readiness = client.credential_readiness(&target.upstream);
     let mut results = Vec::with_capacity(cases.len());
-    for case in cases.iter().copied() {
-        results.push(
-            client
-                .run_case(
-                    &target.upstream,
-                    upstream_model.as_str(),
-                    service_tier.as_deref(),
-                    case,
-                )
-                .await,
+    if credential_readiness.is_routable() {
+        for case in cases.iter().copied() {
+            results.push(
+                client
+                    .run_case_with_readiness(
+                        &target.upstream,
+                        upstream_model.as_str(),
+                        service_tier.as_deref(),
+                        case,
+                        credential_readiness,
+                    )
+                    .await,
+            );
+        }
+    } else {
+        results.extend(
+            cases
+                .iter()
+                .copied()
+                .map(|case| credential_result(case, credential_readiness)),
         );
     }
 
@@ -456,11 +497,11 @@ async fn read_websocket_live_smoke_result(
             };
             let message = match message {
                 Ok(message) => message,
-                Err(error) => {
+                Err(_) => {
                     return transport_result(
                         case,
                         Some(StatusCode::SWITCHING_PROTOCOLS),
-                        format!("websocket live smoke read failed: {error}"),
+                        "websocket live smoke read failed",
                     );
                 }
             };
@@ -476,18 +517,7 @@ async fn read_websocket_live_smoke_result(
                 }
                 TungsteniteMessage::Pong(_) => {}
                 TungsteniteMessage::Close(frame) => {
-                    let reason = frame
-                        .map(|frame| {
-                            if frame.reason.is_empty() {
-                                format!("websocket live smoke closed with code {}", frame.code)
-                            } else {
-                                format!(
-                                    "websocket live smoke closed with code {}: {}",
-                                    frame.code, frame.reason
-                                )
-                            }
-                        })
-                        .unwrap_or_else(|| "websocket live smoke closed".to_string());
+                    let reason = websocket_live_smoke_close_reason(frame.as_ref());
                     return base_result(
                         case,
                         CodexRelayLiveSmokeOutcome::Unknown,
@@ -512,6 +542,12 @@ async fn read_websocket_live_smoke_result(
     }
 }
 
+fn websocket_live_smoke_close_reason(frame: Option<&tungstenite::protocol::CloseFrame>) -> String {
+    frame
+        .map(|frame| format!("websocket live smoke closed with code {}", frame.code))
+        .unwrap_or_else(|| "websocket live smoke closed".to_string())
+}
+
 fn classify_websocket_live_smoke_message_for_case(
     case: CodexRelayLiveSmokeCase,
     body: &[u8],
@@ -530,7 +566,6 @@ fn classify_websocket_live_smoke_message_for_case(
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or("<missing type>");
-    let event_message = websocket_error_event_message(&value);
     let mut result = if matches!(
         event_type,
         "error" | "response.failed" | "response.incomplete"
@@ -540,10 +575,7 @@ fn classify_websocket_live_smoke_message_for_case(
             CodexRelayLiveSmokeOutcome::Failed,
             CodexRelayLiveSmokeConfidence::LiveError,
             Some(StatusCode::SWITCHING_PROTOCOLS.as_u16()),
-            match event_message {
-                Some(message) => format!("responses websocket returned {event_type}: {message}"),
-                None => format!("responses websocket returned {event_type}"),
-            },
+            "responses websocket returned an error event",
         );
         result.error_class = Some("websocket_error_event".to_string());
         result
@@ -553,7 +585,7 @@ fn classify_websocket_live_smoke_message_for_case(
             CodexRelayLiveSmokeOutcome::Passed,
             CodexRelayLiveSmokeConfidence::LiveAccepted,
             Some(StatusCode::SWITCHING_PROTOCOLS.as_u16()),
-            format!("responses websocket accepted response.create and returned {event_type}"),
+            "responses websocket accepted response.create and returned a response event",
         )
     } else {
         base_result(
@@ -561,10 +593,10 @@ fn classify_websocket_live_smoke_message_for_case(
             CodexRelayLiveSmokeOutcome::Unknown,
             CodexRelayLiveSmokeConfidence::Malformed,
             Some(StatusCode::SWITCHING_PROTOCOLS.as_u16()),
-            format!("websocket live smoke returned unexpected event type {event_type}"),
+            "websocket live smoke returned an unexpected event type",
         )
     };
-    result.response_shape = Some(event_type.to_string());
+    result.response_shape = Some(stable_websocket_event_shape(event_type).to_string());
     result.output_items_seen = count_output_items(&value);
     result.compaction_output_items_seen = compaction_output_done_item_count(&value);
     result.compaction_output_seen = result.compaction_output_items_seen > 0;
@@ -574,29 +606,13 @@ fn classify_websocket_live_smoke_message_for_case(
     result
 }
 
-fn websocket_error_event_message(value: &Value) -> Option<String> {
-    [
-        "message",
-        "error.message",
-        "error.code",
-        "response.status",
-        "response.status_details.error.message",
-    ]
-    .iter()
-    .find_map(|path| json_string_path(value, path))
-    .map(|message| sanitized_error_snippet(message.as_bytes()))
-    .filter(|message| !message.is_empty())
-}
-
-fn json_string_path(value: &Value, path: &str) -> Option<String> {
-    let mut current = value;
-    for part in path.split('.') {
-        current = current.get(part)?;
+fn stable_websocket_event_shape(event_type: &str) -> &'static str {
+    match event_type {
+        "error" | "response.failed" | "response.incomplete" => "websocket_error_event",
+        "codex.rate_limits" => "codex.rate_limits",
+        event_type if event_type.starts_with("response.") => "response_event",
+        _ => "unexpected_event",
     }
-    current
-        .as_str()
-        .map(ToOwned::to_owned)
-        .or_else(|| (!current.is_null()).then(|| current.to_string()))
 }
 
 fn classify_compact_live_smoke_response(
@@ -686,15 +702,10 @@ fn classify_remote_compaction_v2_live_smoke_response(
             CodexRelayLiveSmokeOutcome::Failed,
             CodexRelayLiveSmokeConfidence::LiveError,
             Some(status.as_u16()),
-            match websocket_error_event_message(error_event) {
-                Some(message) => {
-                    format!("remote compaction v2 stream returned {event_type}: {message}")
-                }
-                None => format!("remote compaction v2 stream returned {event_type}"),
-            },
+            "remote compaction v2 stream returned an error event",
         );
         result.error_class = Some("responses_error_event".to_string());
-        result.response_shape = Some(event_type.to_string());
+        result.response_shape = Some("responses_error_event".to_string());
         result.accepted_by_responses = event_type.starts_with("response.");
         return result;
     }
@@ -854,7 +865,7 @@ fn classify_live_smoke_error(
         CodexRelayLiveSmokeOutcome::Failed,
         CodexRelayLiveSmokeConfidence::LiveError,
         Some(status.as_u16()),
-        live_smoke_error_reason(case, status, body),
+        live_smoke_error_reason(case, status),
     );
     result.error_class = error_class;
     result.response_shape = Some(if body_mentions_unsupported(case, body) {
@@ -869,22 +880,14 @@ fn classify_live_smoke_error(
     result
 }
 
-fn live_smoke_error_reason(
-    case: CodexRelayLiveSmokeCase,
-    status: StatusCode,
-    body: &[u8],
-) -> String {
+fn live_smoke_error_reason(case: CodexRelayLiveSmokeCase, status: StatusCode) -> String {
     let prefix = match case {
         CodexRelayLiveSmokeCase::ResponsesCompact => "compact live smoke failed",
         CodexRelayLiveSmokeCase::RemoteCompactionV2 => "remote compaction v2 live smoke failed",
         CodexRelayLiveSmokeCase::HostedImageGeneration => "image live smoke failed",
         CodexRelayLiveSmokeCase::ResponsesWebSocket => "responses websocket live smoke failed",
     };
-    let snippet = sanitized_error_snippet(body);
-    if snippet.is_empty() {
-        return format!("{prefix} with HTTP {}", status.as_u16());
-    }
-    format!("{prefix} with HTTP {}: {snippet}", status.as_u16())
+    format!("{prefix} with HTTP {}", status.as_u16())
 }
 
 fn body_mentions_unsupported(case: CodexRelayLiveSmokeCase, body: &[u8]) -> bool {
@@ -1096,23 +1099,6 @@ fn value_mentions_type(value: &Value, expected_type: &str) -> bool {
     }
 }
 
-fn sanitized_error_snippet(body: &[u8]) -> String {
-    let text = String::from_utf8_lossy(body);
-    let mut out = String::new();
-    for ch in text.chars() {
-        if out.len() >= ERROR_SNIPPET_LIMIT {
-            out.push_str("...");
-            break;
-        }
-        if ch.is_control() && ch != '\n' && ch != '\r' && ch != '\t' {
-            out.push(' ');
-        } else {
-            out.push(ch);
-        }
-    }
-    out
-}
-
 fn base_result(
     case: CodexRelayLiveSmokeCase,
     outcome: CodexRelayLiveSmokeOutcome,
@@ -1124,6 +1110,7 @@ fn base_result(
         case,
         outcome,
         confidence,
+        credential_readiness: None,
         side_effect: CodexRelayLiveSmokeSideEffect::LiveRequest,
         status_code,
         response_shape: None,
@@ -1139,6 +1126,27 @@ fn base_result(
     }
 }
 
+impl CodexRelayLiveSmokeResult {
+    fn with_credential_readiness(mut self, readiness: CredentialReadinessCode) -> Self {
+        self.credential_readiness = Some(readiness);
+        self
+    }
+}
+
+fn credential_result(
+    case: CodexRelayLiveSmokeCase,
+    readiness: CredentialReadinessCode,
+) -> CodexRelayLiveSmokeResult {
+    base_result(
+        case,
+        CodexRelayLiveSmokeOutcome::Unknown,
+        CodexRelayLiveSmokeConfidence::Credential,
+        None,
+        UPSTREAM_AUTH_UNAVAILABLE_REASON,
+    )
+    .with_credential_readiness(readiness)
+}
+
 fn transport_result(
     case: CodexRelayLiveSmokeCase,
     status: Option<StatusCode>,
@@ -1151,6 +1159,16 @@ fn transport_result(
         status.map(|status| status.as_u16()),
         reason,
     )
+}
+
+fn reqwest_live_smoke_transport_reason(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "live smoke request timed out"
+    } else if error.is_connect() {
+        "live smoke connection failed"
+    } else {
+        "live smoke transport error"
+    }
 }
 
 fn apply_upstream_auth_headers(
@@ -1169,37 +1187,28 @@ fn websocket_transport_error_result(
     match error {
         tungstenite::Error::Http(response) => {
             let status = StatusCode::from_u16(response.status().as_u16()).ok();
-            let body = response
-                .body()
-                .as_deref()
-                .map(|body| format!(": {}", sanitized_error_snippet(body)))
-                .unwrap_or_default();
+            let body = response.body().as_deref().unwrap_or_default();
             let mut result = classify_live_smoke_error(
                 case,
                 status.unwrap_or(StatusCode::BAD_GATEWAY),
                 &HeaderMap::new(),
-                body.as_bytes(),
+                body,
             );
             result.status_code = status.map(|status| status.as_u16());
             result.reason = format!(
-                "websocket live smoke handshake failed with HTTP {}{}",
-                response.status().as_u16(),
-                body
+                "websocket live smoke handshake failed with HTTP {}",
+                response.status().as_u16()
             );
             result
         }
-        other => transport_result(
-            case,
-            None,
-            format!("websocket live smoke transport error: {other}"),
-        ),
+        _ => transport_result(case, None, "websocket live smoke transport error"),
     }
 }
 
 fn build_live_smoke_url(base_url: &str, path: &str) -> Result<reqwest::Url, String> {
     let base = base_url.trim_end_matches('/');
     let base_url =
-        reqwest::Url::parse(base).map_err(|error| format!("invalid upstream base_url: {error}"))?;
+        reqwest::Url::parse(base).map_err(|_| "invalid upstream base_url".to_string())?;
     let base_path = base_url.path().trim_end_matches('/');
     let mut path = path.to_string();
     if !base_path.is_empty()
@@ -1217,18 +1226,14 @@ fn build_live_smoke_url(base_url: &str, path: &str) -> Result<reqwest::Url, Stri
         path = format!("/{path}");
     }
     let full = format!("{base}{path}");
-    reqwest::Url::parse(&full).map_err(|error| format!("invalid live smoke url: {error}"))
+    reqwest::Url::parse(&full).map_err(|_| "invalid live smoke url".to_string())
 }
 
 fn http_url_to_ws_url(mut url: reqwest::Url) -> Result<reqwest::Url, String> {
     let scheme = match url.scheme() {
         "http" => "ws",
         "https" => "wss",
-        other => {
-            return Err(format!(
-                "unsupported websocket live smoke base_url scheme '{other}'"
-            ));
-        }
+        _ => return Err("unsupported websocket live smoke base_url scheme".to_string()),
     };
     url.set_scheme(scheme)
         .map_err(|_| format!("failed to convert live smoke url to {scheme}"))?;
@@ -1242,12 +1247,12 @@ fn websocket_live_smoke_request(
     let mut request = url
         .as_str()
         .into_client_request()
-        .map_err(|error| format!("invalid websocket live smoke request: {error}"))?;
+        .map_err(|_| "invalid websocket live smoke request".to_string())?;
     for (name, value) in headers {
         let name = tungstenite_http::HeaderName::from_bytes(name.as_str().as_bytes())
-            .map_err(|error| format!("invalid websocket live smoke header name: {error}"))?;
+            .map_err(|_| "invalid websocket live smoke header name".to_string())?;
         let value = tungstenite_http::HeaderValue::from_bytes(value.as_bytes())
-            .map_err(|error| format!("invalid websocket live smoke header value: {error}"))?;
+            .map_err(|_| "invalid websocket live smoke header value".to_string())?;
         request.headers_mut().insert(name, value);
     }
     Ok(request)
@@ -1257,7 +1262,7 @@ async fn read_limited_body(response: reqwest::Response, max_bytes: usize) -> Res
     let mut stream = response.bytes_stream();
     let mut out = Vec::new();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| format!("read live smoke body: {error}"))?;
+        let chunk = chunk.map_err(|_| "read live smoke response body failed".to_string())?;
         if out.len() + chunk.len() > max_bytes {
             return Err(format!(
                 "live smoke response body exceeded {max_bytes} bytes"
@@ -1769,15 +1774,101 @@ mod tests {
     }
 
     #[test]
-    fn codex_relay_live_smoke_websocket_error_includes_message() {
+    fn codex_relay_live_smoke_websocket_error_redacts_upstream_message() {
+        const CANARY: &str = "daily limit exceeded";
         let result = classify_websocket_live_smoke_message_for_case(
             CodexRelayLiveSmokeCase::ResponsesWebSocket,
-            br#"{"type":"error","error":{"code":"quota_exceeded","message":"daily limit exceeded"}}"#,
+            format!(
+                r#"{{"type":"error","error":{{"code":"quota_exceeded","message":"{CANARY}"}}}}"#
+            )
+            .as_bytes(),
         );
 
         assert_eq!(result.outcome, CodexRelayLiveSmokeOutcome::Failed);
         assert_eq!(result.error_class.as_deref(), Some("websocket_error_event"));
-        assert!(result.reason.contains("daily limit exceeded"));
+        assert_eq!(result.reason, "responses websocket returned an error event");
+        assert!(
+            !serde_json::to_string(&result)
+                .expect("serialize live smoke result")
+                .contains(CANARY)
+        );
+    }
+
+    #[test]
+    fn codex_relay_live_smoke_http_error_redacts_upstream_body() {
+        const CANARY: &str = "secret-upstream-account-canary";
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        let result = classify_live_smoke_error(
+            CodexRelayLiveSmokeCase::ResponsesCompact,
+            StatusCode::UNAUTHORIZED,
+            &headers,
+            format!(r#"{{"error":{{"message":"{CANARY}"}}}}"#).as_bytes(),
+        );
+
+        assert_eq!(result.outcome, CodexRelayLiveSmokeOutcome::Failed);
+        assert!(
+            !serde_json::to_string(&result)
+                .expect("serialize live smoke result")
+                .contains(CANARY)
+        );
+    }
+
+    #[test]
+    fn codex_relay_live_smoke_websocket_handshake_redacts_upstream_body() {
+        const CANARY: &str = "secret-handshake-canary";
+        let response = tungstenite_http::Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .body(Some(CANARY.as_bytes().to_vec()))
+            .expect("build handshake response");
+        let result = websocket_transport_error_result(
+            CodexRelayLiveSmokeCase::ResponsesWebSocket,
+            tungstenite::Error::Http(Box::new(response)),
+        );
+
+        assert_eq!(result.outcome, CodexRelayLiveSmokeOutcome::Failed);
+        assert!(
+            !serde_json::to_string(&result)
+                .expect("serialize live smoke result")
+                .contains(CANARY)
+        );
+    }
+
+    #[test]
+    fn codex_relay_live_smoke_websocket_close_redacts_upstream_reason() {
+        const CANARY: &str = "secret-close-reason-canary";
+        let frame = tungstenite::protocol::CloseFrame {
+            code: tungstenite::protocol::frame::coding::CloseCode::Policy,
+            reason: CANARY.to_string().into(),
+        };
+        let reason = websocket_live_smoke_close_reason(Some(&frame));
+
+        assert!(reason.contains("1008"));
+        assert!(!reason.contains(CANARY));
+    }
+
+    #[test]
+    fn codex_relay_live_smoke_old_json_defaults_credential_readiness() {
+        let mut value = serde_json::to_value(base_result(
+            CodexRelayLiveSmokeCase::ResponsesCompact,
+            CodexRelayLiveSmokeOutcome::Passed,
+            CodexRelayLiveSmokeConfidence::LiveAccepted,
+            Some(200),
+            "ok",
+        ))
+        .expect("serialize live smoke result");
+        value
+            .as_object_mut()
+            .expect("live smoke result object")
+            .remove("credential_readiness");
+
+        let decoded = serde_json::from_value::<CodexRelayLiveSmokeResult>(value)
+            .expect("old live smoke result should deserialize");
+
+        assert_eq!(decoded.credential_readiness, None);
     }
 
     #[test]
@@ -1800,16 +1891,13 @@ mod tests {
     async fn codex_relay_live_smoke_rejects_missing_ack_before_upstream_io() {
         let hits = Arc::new(AtomicUsize::new(0));
         let hits_for_route = hits.clone();
-        let upstream_app = axum::Router::new().route(
-            "/v1/responses/compact",
-            post(move || {
-                let hits = hits_for_route.clone();
-                async move {
-                    hits.fetch_add(1, Ordering::SeqCst);
-                    Json(json!({ "output": [] }))
-                }
-            }),
-        );
+        let upstream_app = axum::Router::new().fallback(move || {
+            let hits = hits_for_route.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                Json(json!({ "output": [] }))
+            }
+        });
         let (upstream_addr, upstream_handle) = spawn_axum_server(upstream_app);
         let proxy = proxy_for_upstreams(vec![upstream(format!("http://{upstream_addr}/v1"))]);
 
@@ -1854,24 +1942,34 @@ mod tests {
 
         let response = codex_relay_live_smoke_for_proxy(
             &proxy,
-            request("gpt-5.5", vec![CodexRelayLiveSmokeCase::ResponsesCompact]),
+            request(
+                "gpt-5.5",
+                vec![
+                    CodexRelayLiveSmokeCase::ResponsesCompact,
+                    CodexRelayLiveSmokeCase::ResponsesWebSocket,
+                ],
+            ),
         )
         .await
         .expect("live smoke should report the unavailable credential");
 
         assert_eq!(hits.load(Ordering::SeqCst), 0);
-        assert_eq!(response.results.len(), 1);
-        assert_eq!(
-            response.results[0].outcome,
-            CodexRelayLiveSmokeOutcome::Unknown
+        assert_eq!(response.results.len(), 2);
+        for result in &response.results {
+            assert_eq!(result.outcome, CodexRelayLiveSmokeOutcome::Unknown);
+            assert_eq!(result.confidence, CodexRelayLiveSmokeConfidence::Credential);
+            assert_eq!(
+                result.credential_readiness,
+                Some(CredentialReadinessCode::Missing)
+            );
+            assert_eq!(result.status_code, None);
+            assert_eq!(result.reason, UPSTREAM_AUTH_UNAVAILABLE_REASON);
+        }
+        assert!(
+            !serde_json::to_string(&response)
+                .expect("serialize live smoke response")
+                .contains(&missing_reference)
         );
-        assert_eq!(
-            response.results[0].confidence,
-            CodexRelayLiveSmokeConfidence::Transport
-        );
-        assert_eq!(response.results[0].status_code, None);
-        assert_eq!(response.results[0].reason, UPSTREAM_AUTH_UNAVAILABLE_REASON);
-        assert!(!response.results[0].reason.contains(&missing_reference));
 
         upstream_handle.abort();
     }
@@ -1916,7 +2014,11 @@ mod tests {
         assert_eq!(rejected.outcome, CodexRelayLiveSmokeOutcome::Unknown);
         assert_eq!(
             rejected.confidence,
-            CodexRelayLiveSmokeConfidence::Transport
+            CodexRelayLiveSmokeConfidence::Credential
+        );
+        assert_eq!(
+            rejected.credential_readiness,
+            Some(CredentialReadinessCode::Missing)
         );
         assert_eq!(rejected.status_code, None);
         assert_eq!(rejected.reason, UPSTREAM_AUTH_UNAVAILABLE_REASON);
@@ -1935,6 +2037,10 @@ mod tests {
 
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         assert_eq!(allowed.outcome, CodexRelayLiveSmokeOutcome::Passed);
+        assert_eq!(
+            allowed.credential_readiness,
+            Some(CredentialReadinessCode::Ready)
+        );
 
         upstream_handle.abort();
     }

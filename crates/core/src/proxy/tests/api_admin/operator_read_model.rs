@@ -125,6 +125,12 @@ async fn operator_read_model_isolates_requests_and_sessions_by_service() {
     assert_eq!(data.summary.counts.active_requests, 1);
     assert_eq!(data.summary.counts.recent_requests, 1);
     assert_eq!(data.summary.counts.sessions, 2);
+    let service_status = data
+        .service_status
+        .as_ref()
+        .expect("operator service status projection");
+    assert!(!service_status.enabled);
+    assert!(!service_status.configured);
     assert_eq!(
         data.summary.credential_readiness,
         Some(CredentialAggregateReadiness::Blocked)

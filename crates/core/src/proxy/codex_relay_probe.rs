@@ -6,7 +6,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::config::UpstreamConfig;
-use crate::credentials::CapturedUpstreamCredential;
+use crate::credentials::{CapturedUpstreamCredential, CredentialReadinessCode};
 
 use super::classify::{ROUTING_MISMATCH_CAPABILITY_CLASS, classify_upstream_response};
 use super::models_compat::maybe_decode_models_response_body;
@@ -36,6 +36,7 @@ pub enum CodexRelayProbeConfidence {
     SuccessStatus,
     EndpointValidation,
     ErrorClassification,
+    Credential,
     Transport,
     Malformed,
 }
@@ -140,6 +141,8 @@ pub struct CodexRelayProbeResult {
     pub kind: CodexRelayProbeKind,
     pub support: CodexRelayProbeSupport,
     pub confidence: CodexRelayProbeConfidence,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_readiness: Option<CredentialReadinessCode>,
     pub status_code: Option<u16>,
     pub response_shape: Option<String>,
     pub translation_required: bool,
@@ -166,6 +169,7 @@ impl CodexRelayProbeResult {
             kind,
             support: CodexRelayProbeSupport::Supported,
             confidence,
+            credential_readiness: None,
             status_code,
             response_shape: None,
             translation_required: false,
@@ -184,6 +188,7 @@ impl CodexRelayProbeResult {
             kind,
             support: CodexRelayProbeSupport::Unsupported,
             confidence,
+            credential_readiness: None,
             status_code,
             response_shape: None,
             translation_required: false,
@@ -202,6 +207,7 @@ impl CodexRelayProbeResult {
             kind,
             support: CodexRelayProbeSupport::Unknown,
             confidence,
+            credential_readiness: None,
             status_code,
             response_shape: None,
             translation_required: false,
@@ -385,6 +391,19 @@ impl CodexRelayProbeClient {
         Self { client, credential }
     }
 
+    pub(in crate::proxy) fn credential_readiness(
+        &self,
+        upstream: &UpstreamConfig,
+    ) -> CredentialReadinessCode {
+        crate::auth_resolution::target_credential_readiness(
+            "codex",
+            self.credential.configured_contract(),
+            self.credential.allow_anonymous(),
+            upstream.base_url.as_str(),
+            self.credential.readiness_code(),
+        )
+    }
+
     #[cfg(test)]
     pub(crate) async fn probe_upstream(
         &self,
@@ -394,15 +413,31 @@ impl CodexRelayProbeClient {
         self.probe_upstream_observation(upstream, spec).await.result
     }
 
+    #[cfg(test)]
     pub(in crate::proxy) async fn probe_upstream_observation(
         &self,
         upstream: &UpstreamConfig,
         spec: &CodexRelayProbeSpec,
     ) -> CodexRelayProbeObservation {
+        let readiness = self.credential_readiness(upstream);
+        self.probe_upstream_observation_with_readiness(upstream, spec, readiness)
+            .await
+    }
+
+    pub(in crate::proxy) async fn probe_upstream_observation_with_readiness(
+        &self,
+        upstream: &UpstreamConfig,
+        spec: &CodexRelayProbeSpec,
+        readiness: CredentialReadinessCode,
+    ) -> CodexRelayProbeObservation {
+        if !readiness.is_routable() {
+            return credential_observation(spec.kind, readiness);
+        }
         let url = match build_probe_url(&upstream.base_url, spec.path.as_str()) {
             Ok(url) => url,
             Err(error) => {
-                return transport_observation(spec.kind, None, error);
+                return transport_observation(spec.kind, None, error)
+                    .with_credential_readiness(readiness);
             }
         };
 
@@ -425,7 +460,7 @@ impl CodexRelayProbeClient {
         )
         .is_err()
         {
-            return transport_observation(spec.kind, None, UPSTREAM_AUTH_UNAVAILABLE_REASON);
+            return credential_observation(spec.kind, CredentialReadinessCode::Invalid);
         }
 
         let mut request = self
@@ -442,8 +477,9 @@ impl CodexRelayProbeClient {
                 return transport_observation(
                     spec.kind,
                     None,
-                    format!("transport error during probe: {error}"),
-                );
+                    reqwest_probe_transport_reason(&error),
+                )
+                .with_credential_readiness(readiness);
             }
         };
 
@@ -453,7 +489,8 @@ impl CodexRelayProbeClient {
         let body = match read_limited_body(response, MAX_PROBE_RESPONSE_BYTES).await {
             Ok(body) => body,
             Err(error) => {
-                return transport_observation(spec.kind, Some(status), error);
+                return transport_observation(spec.kind, Some(status), error)
+                    .with_credential_readiness(readiness);
             }
         };
         let result = classify_codex_relay_probe_response(spec, status, &headers, body.as_ref());
@@ -463,6 +500,36 @@ impl CodexRelayProbeClient {
             headers,
             body,
         }
+        .with_credential_readiness(readiness)
+    }
+}
+
+impl CodexRelayProbeObservation {
+    fn with_credential_readiness(mut self, readiness: CredentialReadinessCode) -> Self {
+        self.result.credential_readiness = Some(readiness);
+        self
+    }
+}
+
+pub(in crate::proxy) fn credential_observation(
+    kind: CodexRelayProbeKind,
+    readiness: CredentialReadinessCode,
+) -> CodexRelayProbeObservation {
+    CodexRelayProbeObservation {
+        result: CodexRelayProbeResult {
+            kind,
+            support: CodexRelayProbeSupport::Unknown,
+            confidence: CodexRelayProbeConfidence::Credential,
+            credential_readiness: Some(readiness),
+            status_code: None,
+            response_shape: None,
+            translation_required: false,
+            error_class: None,
+            reason: UPSTREAM_AUTH_UNAVAILABLE_REASON.to_string(),
+        },
+        status: None,
+        headers: HeaderMap::new(),
+        body: Bytes::new(),
     }
 }
 
@@ -484,10 +551,20 @@ fn transport_observation(
     }
 }
 
+fn reqwest_probe_transport_reason(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "probe request timed out"
+    } else if error.is_connect() {
+        "probe connection failed"
+    } else {
+        "probe transport error"
+    }
+}
+
 fn build_probe_url(base_url: &str, path: &str) -> Result<reqwest::Url, String> {
     let base = base_url.trim_end_matches('/');
     let base_url =
-        reqwest::Url::parse(base).map_err(|error| format!("invalid upstream base_url: {error}"))?;
+        reqwest::Url::parse(base).map_err(|_| "invalid upstream base_url".to_string())?;
     let base_path = base_url.path().trim_end_matches('/');
     let mut path = path.to_string();
     if !base_path.is_empty()
@@ -505,14 +582,14 @@ fn build_probe_url(base_url: &str, path: &str) -> Result<reqwest::Url, String> {
         path = format!("/{path}");
     }
     let full = format!("{base}{path}");
-    reqwest::Url::parse(&full).map_err(|error| format!("invalid probe url: {error}"))
+    reqwest::Url::parse(&full).map_err(|_| "invalid probe url".to_string())
 }
 
 async fn read_limited_body(response: reqwest::Response, max_bytes: usize) -> Result<Bytes, String> {
     let mut stream = response.bytes_stream();
     let mut out = Vec::new();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| format!("read probe body: {error}"))?;
+        let chunk = chunk.map_err(|_| "read probe response body failed".to_string())?;
         if out.len() + chunk.len() > max_bytes {
             return Err(format!("probe response body exceeded {max_bytes} bytes"));
         }
@@ -629,6 +706,26 @@ mod tests {
         assert_eq!(result.support, CodexRelayProbeSupport::Supported);
         assert_eq!(result.response_shape.as_deref(), Some("codex_models"));
         assert!(!result.translation_required);
+    }
+
+    #[test]
+    fn codex_relay_probe_old_json_defaults_credential_readiness() {
+        let mut value = serde_json::to_value(CodexRelayProbeResult::supported(
+            CodexRelayProbeKind::Models,
+            CodexRelayProbeConfidence::SuccessStatus,
+            Some(200),
+            "ok",
+        ))
+        .expect("serialize probe result");
+        value
+            .as_object_mut()
+            .expect("probe result object")
+            .remove("credential_readiness");
+
+        let decoded = serde_json::from_value::<CodexRelayProbeResult>(value)
+            .expect("old probe result should deserialize");
+
+        assert_eq!(decoded.credential_readiness, None);
     }
 
     #[test]
@@ -805,7 +902,11 @@ mod tests {
 
         assert_eq!(*hits.lock().expect("lock hits"), 0);
         assert_eq!(rejected.support, CodexRelayProbeSupport::Unknown);
-        assert_eq!(rejected.confidence, CodexRelayProbeConfidence::Transport);
+        assert_eq!(rejected.confidence, CodexRelayProbeConfidence::Credential);
+        assert_eq!(
+            rejected.credential_readiness,
+            Some(CredentialReadinessCode::Missing)
+        );
         assert_eq!(rejected.status_code, None);
         assert_eq!(rejected.reason, UPSTREAM_AUTH_UNAVAILABLE_REASON);
 
@@ -816,6 +917,10 @@ mod tests {
 
         assert_eq!(*hits.lock().expect("lock hits"), 1);
         assert_eq!(allowed.support, CodexRelayProbeSupport::Supported);
+        assert_eq!(
+            allowed.credential_readiness,
+            Some(CredentialReadinessCode::Ready)
+        );
 
         handle.abort();
     }

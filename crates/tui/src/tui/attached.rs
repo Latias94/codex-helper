@@ -814,6 +814,7 @@ mod tests {
                 stats_5m: Default::default(),
                 stats_1h: Default::default(),
                 pricing_catalog: Default::default(),
+                service_status: None,
                 provider_balances: Vec::new(),
             },
         );

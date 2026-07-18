@@ -1457,7 +1457,7 @@ pub(in crate::tui) fn snapshot_from_operator_data(
         pricing_catalog: data.pricing_catalog.clone(),
         stats_5m: data.stats_5m.clone(),
         stats_1h: data.stats_1h.clone(),
-        service_status: None,
+        service_status: data.service_status.clone(),
         refreshed_at: Instant::now(),
     }
 }
@@ -2048,12 +2048,29 @@ mod tests {
             stats_5m: WindowStats::default(),
             stats_1h: WindowStats::default(),
             pricing_catalog: crate::pricing::bundled_model_price_catalog_snapshot(),
+            service_status: Some(crate::service_status::ServiceStatusSnapshot {
+                generated_at_ms: 32,
+                configured: false,
+                enabled: false,
+                refresh_interval_secs: 60,
+                history_cells: 60,
+                probes: Vec::new(),
+                error: None,
+            }),
             provider_balances: Vec::new(),
         };
         let local_session_ids =
             HashMap::from([(session_key.to_string(), "raw-session-id".to_string())]);
 
         let snapshot = snapshot_from_operator_data(&data, &local_session_ids);
+
+        assert_eq!(
+            snapshot
+                .service_status
+                .as_ref()
+                .map(|status| status.generated_at_ms),
+            Some(32)
+        );
 
         let row = snapshot.rows.first().expect("operator session row");
         assert_eq!(row.session_id.as_deref(), Some(session_key));
@@ -2435,6 +2452,7 @@ mod tests {
             stats_5m: WindowStats::default(),
             stats_1h: WindowStats::default(),
             pricing_catalog: Default::default(),
+            service_status: None,
             provider_balances: Vec::new(),
         };
 

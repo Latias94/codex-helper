@@ -676,7 +676,7 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
         KeyCode::Char('r') if ui.page == Page::ServiceStatus => {
             ui.needs_snapshot_refresh = true;
             ui.toast = Some((
-                i18n::label(ui.language, "service status: refreshing").to_string(),
+                i18n::label(ui.language, "service status: reading snapshot").to_string(),
                 Instant::now(),
             ));
             true

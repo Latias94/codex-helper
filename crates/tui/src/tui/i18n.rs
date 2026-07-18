@@ -460,7 +460,7 @@ fn zh_label(en: &'static str) -> Option<&'static str> {
         "sessions: no session selected" => "sessions: 未选择会话",
         "sessions: selected row has no session id" => "sessions: 所选行没有 session id",
         "service status" => "服务状态",
-        "service status: refreshing" => "service status: 正在刷新",
+        "service status: reading snapshot" => "service status: 正在读取快照",
         "service_tier" => "服务层级",
         "service_tier set" => "service_tier 已设置",
         "sid" => "会话 ID",

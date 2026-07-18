@@ -1030,6 +1030,50 @@ export type ApiOperatorRevisionBundle = {
   ledger_revision: string;
 };
 
+export type ApiServiceStatusKind = "ok" | "slow" | "failed" | "unknown";
+
+export type ApiServiceStatusProbeSample = {
+  ts_ms?: number;
+  ok?: boolean;
+  latency_ms?: number;
+  error?: string;
+};
+
+export type ApiServiceStatusCellSnapshot = {
+  kind: ApiServiceStatusKind;
+  probe?: ApiServiceStatusProbeSample;
+};
+
+export type ApiServiceStatusServiceSnapshot = {
+  model: string;
+  uptime_pct?: string;
+  latest_kind: ApiServiceStatusKind;
+  latest?: ApiServiceStatusProbeSample;
+  history: ApiServiceStatusCellSnapshot[];
+};
+
+export type ApiServiceStatusProbeSnapshot = {
+  id: string;
+  url: string;
+  fetched_at_ms: number;
+  generated_at_ms?: number;
+  all_ok?: boolean;
+  services: ApiServiceStatusServiceSnapshot[];
+  credential_readiness?: ApiCredentialReadinessCode;
+  credential_details?: ApiCredentialReadinessDetail[];
+  error?: string;
+};
+
+export type ApiServiceStatusSnapshot = {
+  generated_at_ms: number;
+  configured: boolean;
+  enabled: boolean;
+  refresh_interval_secs: number;
+  history_cells: number;
+  probes: ApiServiceStatusProbeSnapshot[];
+  error?: string;
+};
+
 export type ApiOperatorReadData = {
   summary: ApiOperatorSummary;
   routing?: ApiOperatorRoutingSummary;
@@ -1042,6 +1086,7 @@ export type ApiOperatorReadData = {
   stats_5m: ApiWindowStats;
   stats_1h: ApiWindowStats;
   pricing_catalog: ApiModelPriceCatalogSnapshot;
+  service_status?: ApiServiceStatusSnapshot;
   provider_balances: ApiOperatorProviderBalanceSummary[];
 };
 

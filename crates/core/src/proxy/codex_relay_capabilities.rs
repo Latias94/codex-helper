@@ -162,7 +162,9 @@ pub(super) async fn codex_relay_capabilities_for_proxy(
             )
         })?;
     let probe_client = CodexRelayProbeClient::new(proxy.client.clone(), credential);
-    let observations = run_capability_probe_cases(&probe_client, &target.upstream).await;
+    let credential_readiness = probe_client.credential_readiness(&target.upstream);
+    let observations =
+        run_capability_probe_cases(&probe_client, &target.upstream, credential_readiness).await;
     let models_observation = observation_for_kind(&observations, CodexRelayProbeKind::Models);
 
     let expected = build_expected_provider_contract(
@@ -209,12 +211,25 @@ pub(super) async fn codex_relay_capabilities_for_proxy(
 async fn run_capability_probe_cases(
     probe_client: &CodexRelayProbeClient,
     upstream: &crate::config::UpstreamConfig,
+    credential_readiness: crate::credentials::CredentialReadinessCode,
 ) -> Vec<CodexRelayProbeObservation> {
+    if !credential_readiness.is_routable() {
+        return codex_relay_probe_cases()
+            .iter()
+            .map(|case| {
+                super::codex_relay_probe::credential_observation(case.kind, credential_readiness)
+            })
+            .collect();
+    }
     let mut observations = Vec::with_capacity(codex_relay_probe_cases().len());
     for case in codex_relay_probe_cases() {
         observations.push(
             probe_client
-                .probe_upstream_observation(upstream, &case.spec())
+                .probe_upstream_observation_with_readiness(
+                    upstream,
+                    &case.spec(),
+                    credential_readiness,
+                )
                 .await,
         );
     }
@@ -565,6 +580,9 @@ fn push_endpoint_mismatch(
     expected: &CodexCapabilityDecision,
     observed: &CodexRelayProbeResult,
 ) {
+    if observed.confidence == super::CodexRelayProbeConfidence::Credential {
+        return;
+    }
     let expected_label = support_label(expected.support);
     let observed_label = format!(
         "{} via {}",
@@ -604,6 +622,7 @@ fn probe_confidence_label(confidence: super::CodexRelayProbeConfidence) -> &'sta
         super::CodexRelayProbeConfidence::SuccessStatus => "success_status",
         super::CodexRelayProbeConfidence::EndpointValidation => "endpoint_validation",
         super::CodexRelayProbeConfidence::ErrorClassification => "error_classification",
+        super::CodexRelayProbeConfidence::Credential => "credential",
         super::CodexRelayProbeConfidence::Transport => "transport",
         super::CodexRelayProbeConfidence::Malformed => "malformed",
     }
@@ -613,7 +632,9 @@ fn probe_confidence_label(confidence: super::CodexRelayProbeConfidence) -> &'sta
 mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use axum::Json;
     use reqwest::Client;
 
     use super::*;
@@ -630,6 +651,7 @@ mod tests {
             kind,
             support,
             confidence: super::super::CodexRelayProbeConfidence::SuccessStatus,
+            credential_readiness: None,
             status_code: Some(200),
             response_shape: Some("ok".to_string()),
             translation_required: false,
@@ -764,6 +786,92 @@ mod tests {
                 "missing canonical field {field} should fail"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn credential_blocked_capabilities_do_not_probe_or_report_mismatches() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_for_route = hits.clone();
+        let app = axum::Router::new().fallback(move || {
+            let hits = hits_for_route.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                Json(serde_json::json!({ "models": [] }))
+            }
+        });
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve probe target");
+        });
+        let missing_reference = format!(
+            "CODEX_HELPER_TEST_MISSING_CAPABILITY_AUTH_{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let source = HelperConfig {
+            codex: ServiceRouteConfig {
+                providers: BTreeMap::from([(
+                    "openai".to_string(),
+                    ProviderConfig {
+                        base_url: Some(format!("http://api.openai.com:{}/v1", addr.port())),
+                        inline_auth: UpstreamAuth {
+                            auth_token_env: Some(missing_reference.clone()),
+                            ..UpstreamAuth::default()
+                        },
+                        ..ProviderConfig::default()
+                    },
+                )]),
+                routing: Some(RouteGraphConfig::ordered_failover(vec![
+                    "openai".to_string(),
+                ])),
+                ..ServiceRouteConfig::default()
+            },
+            ..HelperConfig::default()
+        };
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .resolve("api.openai.com", addr)
+            .build()
+            .expect("build capability client");
+        let proxy = ProxyService::new(client, Arc::new(source), "codex");
+
+        let response = codex_relay_capabilities_for_proxy(
+            &proxy,
+            CodexRelayCapabilitiesRequest {
+                provider_id: Some("openai".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("credential blockage should be reported as observations");
+
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            response.expected.provider_adapter,
+            ProviderAdapter::OpenAiCodex
+        );
+        assert!(response.mismatches.is_empty());
+        for result in [
+            &response.observed.models,
+            &response.observed.responses,
+            &response.observed.responses_compact,
+        ] {
+            assert_eq!(
+                result.confidence,
+                super::super::CodexRelayProbeConfidence::Credential
+            );
+            assert_eq!(
+                result.credential_readiness,
+                Some(crate::credentials::CredentialReadinessCode::Missing)
+            );
+            assert!(!result.reason.contains(&missing_reference));
+        }
+
+        handle.abort();
     }
 
     #[tokio::test]
