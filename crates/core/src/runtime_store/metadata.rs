@@ -95,6 +95,7 @@ impl RuntimeQuotaIdentity {
             "openai-organization",
             "openai-project",
             "x-api-key",
+            "x-openai-actor-authorization",
             "x-openai-fedramp",
             "x-openai-organization",
             "x-openai-project",
@@ -541,6 +542,31 @@ mod tests {
         assert_eq!(
             identity.derive_provider_account_fingerprint(&HeaderMap::new()),
             None
+        );
+    }
+
+    #[test]
+    fn provider_account_fingerprint_partitions_openai_actor_authorizations() {
+        let identity = identity([0x11; 32]);
+        let mut first = HeaderMap::new();
+        first.insert(
+            "x-openai-actor-authorization",
+            HeaderValue::from_static("actor-account-one"),
+        );
+        let mut second = HeaderMap::new();
+        second.insert(
+            "x-openai-actor-authorization",
+            HeaderValue::from_static("actor-account-two"),
+        );
+
+        assert_ne!(
+            identity.derive_provider_account_fingerprint(&first),
+            identity.derive_provider_account_fingerprint(&second)
+        );
+        assert!(
+            identity
+                .derive_provider_account_fingerprint(&first)
+                .is_some()
         );
     }
 

@@ -29,7 +29,7 @@ It is probably unnecessary if you only use one official account and do not need 
 ## Main Features
 
 - **Local proxy**: listens on `127.0.0.1:3211` by default.
-- **Explicit safe switch**: only a local `switch on/off` action edits the helper provider selector/stanza in `~/.codex/config.toml`; conflicting external edits produce `recovery_required`, while Codex auth, model cache, and SQLite remain outside helper ownership.
+- **Explicit safe switch**: only a local `switch on/off` action edits the helper provider selector/stanza in `~/.codex/config.toml`; `--client-facade compatible|openai|openai-tools` explicitly advertises client capabilities, conflicting external edits produce `recovery_required`, and Codex auth, model cache, and SQLite remain outside helper ownership.
 - **Provider-owned capability contract**: Responses, compact, WebSocket, hosted-tool, and model decisions come from captured provider/catalog facts rather than client patch assumptions.
 - **OpenAI Images-compatible entrypoint**: the local proxy also exposes `POST /v1/images/generations` and JSON `POST /v1/images/edits`, translates them into Responses hosted `image_generation` requests, and keeps using the same provider routing / fallback chain for local skills and scripts.
 - **Relay capability diagnostics**: explicit, process-local CLI actions perform bounded `/models`, `/responses`, and `/responses/compact` checks and show provider contract, observations, continuity, and mismatches without changing configuration or routing.
@@ -119,6 +119,7 @@ Switch the Codex client to helper explicitly:
 codex-helper switch on
 codex-helper switch on --port 4321
 codex-helper switch on --base-url https://relay.example/v1
+codex-helper switch on --client-facade openai-tools
 codex-helper switch status
 codex-helper switch off
 ```
@@ -143,7 +144,7 @@ Plain `ch` still starts the local foreground helper. `ch relay local` is the exp
 
 Container and server runtimes do not provide access to a client's local transcript/session files. Local `session` commands read only the Codex session files on the machine where the command runs.
 
-The client switch only points Codex at one helper URL. `switch on` records the original selector and helper stanza, then writes `model_providers.codex_proxy`; `switch off` restores only the recorded content. Conflicting external edits move the state to `recovery_required` and leave the file untouched. Except for the one-time legacy recovery described below, Codex `auth.json`, `models_cache.json`, SQLite, feature flags, compaction, and WebSocket settings are never read or changed.
+The client switch points Codex at one helper URL and can explicitly select `compatible` (default), `openai` (remote-compaction and Web Search eligibility), or `openai-tools` (plus hosted image-generation eligibility) through `--client-facade`. A facade controls client exposure; it does not guarantee relay support. `switch on` records the original selector and helper stanza, then writes `model_providers.codex_proxy`; `switch off` restores only the recorded content. Conflicting external edits move the state to `recovery_required` and leave the file untouched. Run `switch off` before changing the URL or facade. Except for the one-time legacy recovery described below, Codex `auth.json`, `models_cache.json`, SQLite, global feature flags, compaction, and WebSocket settings are never read or changed. The historical empty `{}` auth facade is not recreated. The helper capability marker never reaches an upstream, while real actor authorization can pass only to an official OpenAI origin without configured helper credentials.
 
 When upgrading from 0.20.3 or earlier, a current `switch off` safely and automatically restores the selector/provider stanza and any verifiable auth facade managed by a remaining `~/.codex/codex-helper-switch-state.json`; `switch on` performs the same recovery before creating its new journal. Recovery writes only while the current files still match the old helper patch. Malformed or unknown state and legacy/current journal conflicts preserve the original state and fail closed. The legacy file may contain original auth content, so do not delete, edit, or share it. The new release does not undo `remote_connections` or Codex SQLite state written by the removed `switch remote-control enable`, and that database must not be cleaned with an SQL hack. See [Configuration Compatibility](docs/CONFIGURATION.md#configuration-compatibility) for the full sequence, v5-to-v6 migration, and retired fields.
 

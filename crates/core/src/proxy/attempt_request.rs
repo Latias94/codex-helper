@@ -6,13 +6,16 @@ use crate::auth_resolution::{
     UpstreamAuthResolutionError, trusted_codex_passthrough_origin,
     unconfigured_upstream_auth_contract_requires_opt_in,
 };
+use crate::codex_switch::CODEX_CLIENT_FACADE_ACTOR_HEADER;
 #[cfg(test)]
 use crate::config::UpstreamAuth;
 use crate::credentials::CapturedUpstreamCredential;
 use crate::logging::{BodyPreview, HeaderEntry, upstream_origin};
 use crate::provider_catalog::AccountFingerprint;
 
-use super::headers::{filter_request_headers, header_map_to_entries};
+use super::headers::{
+    filter_request_headers, header_map_to_entries, strip_codex_client_facade_marker,
+};
 use super::http_debug::HttpDebugBase;
 use super::request_preparation::codex_path_is_responses_compact;
 
@@ -104,6 +107,7 @@ pub(super) fn prepare_attempt_request_identity(
 
     // Codex client credentials pass through only to the official origin when helper auth is absent.
     let mut headers = filter_request_headers(client_headers);
+    strip_codex_client_facade_marker(&mut headers);
     headers.insert(
         header::ACCEPT_ENCODING,
         HeaderValue::from_static("identity"),
@@ -278,9 +282,13 @@ pub(super) fn inject_auth_headers(
     let helper_credential_contract = credential.configured_contract();
     let allow_client_passthrough = service_name != "codex"
         || (!helper_credential_contract && trusted_codex_passthrough_origin(target_url));
+    let allow_codex_actor_passthrough = service_name == "codex" && allow_client_passthrough;
 
     if service_name == "codex" && !allow_client_passthrough {
         strip_codex_client_account_headers(headers);
+    }
+    if !allow_codex_actor_passthrough {
+        headers.remove(CODEX_CLIENT_FACADE_ACTOR_HEADER);
     }
 
     if let Some(value) = token {
@@ -294,6 +302,9 @@ pub(super) fn inject_auth_headers(
     } else if client_has_x_api_key && !allow_client_passthrough {
         headers.remove("x-api-key");
     }
+    if let Some(value) = headers.get_mut(CODEX_CLIENT_FACADE_ACTOR_HEADER) {
+        value.set_sensitive(true);
+    }
     Ok(())
 }
 
@@ -304,6 +315,7 @@ fn strip_codex_client_account_headers(headers: &mut HeaderMap) {
         "openai-organization",
         "openai-project",
         "x-api-key",
+        CODEX_CLIENT_FACADE_ACTOR_HEADER,
         "x-oai-attestation",
         "x-openai-fedramp",
         "x-openai-organization",
@@ -505,6 +517,10 @@ mod tests {
             "x-oai-attestation",
             HeaderValue::from_static("device-attestation"),
         );
+        client_headers.insert(
+            "x-openai-actor-authorization",
+            HeaderValue::from_static("real-actor-token"),
+        );
         client_headers.insert("content-type", HeaderValue::from_static("application/json"));
 
         let cache = OnceLock::new();
@@ -531,6 +547,7 @@ mod tests {
         assert!(!setup.headers.contains_key("chatgpt-account-id"));
         assert!(!setup.headers.contains_key("x-openai-fedramp"));
         assert!(!setup.headers.contains_key("x-oai-attestation"));
+        assert!(!setup.headers.contains_key("x-openai-actor-authorization"));
         assert_eq!(
             setup.headers.get("content-type"),
             Some(&HeaderValue::from_static("application/json"))
@@ -548,6 +565,10 @@ mod tests {
         client_headers.insert(
             "chatgpt-account-id",
             HeaderValue::from_static("account-client"),
+        );
+        client_headers.insert(
+            "x-openai-actor-authorization",
+            HeaderValue::from_static("real-actor-token"),
         );
         client_headers.insert("x-openai-fedramp", HeaderValue::from_static("true"));
 
@@ -584,6 +605,7 @@ mod tests {
         );
         assert!(!setup.headers.contains_key("chatgpt-account-id"));
         assert!(!setup.headers.contains_key("x-openai-fedramp"));
+        assert!(!setup.headers.contains_key("x-openai-actor-authorization"));
     }
 
     #[test]
@@ -596,6 +618,10 @@ mod tests {
         client_headers.insert(
             "chatgpt-account-id",
             HeaderValue::from_static("account-client"),
+        );
+        client_headers.insert(
+            "x-openai-actor-authorization",
+            HeaderValue::from_static("real-actor-token"),
         );
 
         let cache = OnceLock::new();
@@ -624,6 +650,108 @@ mod tests {
         assert_eq!(
             setup.headers.get("chatgpt-account-id"),
             Some(&HeaderValue::from_static("account-client"))
+        );
+        assert_eq!(
+            setup.headers.get("x-openai-actor-authorization"),
+            Some(&HeaderValue::from_static("real-actor-token"))
+        );
+        assert!(
+            setup
+                .headers
+                .get("x-openai-actor-authorization")
+                .expect("actor authorization")
+                .is_sensitive()
+        );
+    }
+
+    #[test]
+    fn prepare_attempt_request_never_forwards_codex_actor_auth_for_other_services() {
+        let mut client_headers = HeaderMap::new();
+        client_headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer claude-client-token"),
+        );
+        client_headers.insert("x-api-key", HeaderValue::from_static("claude-client-key"));
+        client_headers.insert(
+            CODEX_CLIENT_FACADE_ACTOR_HEADER,
+            HeaderValue::from_static("real-actor-token"),
+        );
+
+        let cache = OnceLock::new();
+        let setup = prepare_attempt_request(AttemptRequestSetupParams {
+            service_name: "claude",
+            auth: &UpstreamAuth::default(),
+            client_headers: &client_headers,
+            client_headers_entries_cache: &cache,
+            request_body_len: 12,
+            upstream_request_body_len: 12,
+            debug_max: 0,
+            warn_max: 0,
+            client_uri: "/v1/messages",
+            target_url: "https://third-party.example/v1/messages",
+            client_body_debug: None,
+            upstream_request_body_debug: None,
+            client_body_warn: None,
+            upstream_request_body_warn: None,
+        })
+        .expect("prepare non-Codex attempt request");
+
+        assert_eq!(
+            setup.headers.get("authorization"),
+            Some(&HeaderValue::from_static("Bearer claude-client-token"))
+        );
+        assert_eq!(
+            setup.headers.get("x-api-key"),
+            Some(&HeaderValue::from_static("claude-client-key"))
+        );
+        assert!(!setup.headers.contains_key(CODEX_CLIENT_FACADE_ACTOR_HEADER));
+    }
+
+    #[test]
+    fn prepare_attempt_request_consumes_and_redacts_client_facade_marker() {
+        let mut client_headers = HeaderMap::new();
+        client_headers.insert(
+            crate::codex_switch::CODEX_CLIENT_FACADE_ACTOR_HEADER,
+            HeaderValue::from_static(crate::codex_switch::CODEX_CLIENT_FACADE_ACTOR_VALUE),
+        );
+
+        let cache = OnceLock::new();
+        let setup = prepare_attempt_request(AttemptRequestSetupParams {
+            service_name: "codex",
+            auth: &UpstreamAuth::default(),
+            client_headers: &client_headers,
+            client_headers_entries_cache: &cache,
+            request_body_len: 12,
+            upstream_request_body_len: 12,
+            debug_max: 128,
+            warn_max: 0,
+            client_uri: "/v1/responses",
+            target_url: "https://api.openai.com/v1/responses",
+            client_body_debug: None,
+            upstream_request_body_debug: None,
+            client_body_warn: None,
+            upstream_request_body_warn: None,
+        })
+        .expect("prepare facade request");
+
+        assert!(
+            !setup
+                .headers
+                .contains_key(crate::codex_switch::CODEX_CLIENT_FACADE_ACTOR_HEADER)
+        );
+        assert_eq!(setup.account_fingerprint, AccountFingerprint::unscoped());
+        assert!(
+            setup
+                .debug_base
+                .expect("debug metadata")
+                .client_headers
+                .iter()
+                .any(|entry| {
+                    entry
+                        .name
+                        .eq_ignore_ascii_case(crate::codex_switch::CODEX_CLIENT_FACADE_ACTOR_HEADER)
+                        && entry.value == "[REDACTED]"
+                })
         );
     }
 

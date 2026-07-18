@@ -120,13 +120,27 @@ Client switching is a separate local action from starting, selecting, or diagnos
 codex-helper switch on                         # http://127.0.0.1:3211
 codex-helper switch on --port 4321
 codex-helper switch on --base-url https://relay.example/v1
+codex-helper switch on --client-facade openai
+codex-helper switch on --client-facade openai-tools
 codex-helper switch status
 codex-helper switch off
 ```
 
 `switch on` records the original selector and helper stanza, then writes only the helper-owned `model_providers.codex_proxy` stanza and selects it. `switch off` restores only the recorded selector/stanza. The recovery journal lives under `~/.codex-helper/state/`; an external edit that makes the current file match neither the original nor helper-applied fingerprint moves the switch to `recovery_required` and leaves the file untouched for human reconciliation.
 
-Except for the one-time v0.20.3 legacy-state recovery below, the switch never reads or changes `~/.codex/auth.json`, `models_cache.json`, Codex SQLite, unrelated providers, feature flags, compaction settings, WebSocket settings, or hosted-tool settings. Provider capabilities come from the selected provider contract and live observations, not from switch configuration.
+`--client-facade` is an explicit client-side capability advertisement:
+
+| Facade | Helper-owned Codex provider stanza | Client behavior made eligible |
+| --- | --- | --- |
+| `compatible` (default) | `name = "codex-helper"` | Ordinary OpenAI-compatible Responses behavior only |
+| `openai` | `name = "OpenAI"` | Remote compaction and Web Search, subject to Codex feature/model rules |
+| `openai-tools` | `name = "OpenAI"` plus a helper marker in `x-openai-actor-authorization` | The `openai` behavior plus hosted image generation, subject to Codex feature/model rules |
+
+This facade controls what the Codex client is willing to expose; it does not prove that the selected relay supports the corresponding request. In particular, `openai` can make Codex call `/responses/compact`, and `openai-tools` can emit hosted image-generation traffic. Verify the relay contract separately. The exact helper marker is consumed locally before every HTTP or WebSocket upstream handshake. A real actor-authorization value remains passthrough-capable only for an unconfigured official OpenAI origin and is stripped from third-party or helper-authenticated routes. Both forms are redacted from request diagnostics.
+
+Changing the target URL or facade while a switch journal is active is rejected. Run `switch off` first so the original provider stanza is restored through the journal, then run `switch on` with the new choice. `switch status` reports the recorded facade.
+
+Except for the one-time v0.20.3 legacy-state recovery below, the switch never reads or changes `~/.codex/auth.json`, `models_cache.json`, Codex SQLite, unrelated providers, global feature flags, compaction settings, or WebSocket settings. It never creates the historical empty `{}` auth facade. The current Codex source exposes the hosted-image tool through the provider header contract above, so mutating login state is unnecessary. Actual upstream capabilities still come from the selected provider contract and live observations.
 
 ### Upgrading From 0.20.3 Or Earlier
 

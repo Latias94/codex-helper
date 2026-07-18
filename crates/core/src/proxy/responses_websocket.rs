@@ -41,6 +41,7 @@ use super::codex_failure::CodexFailureKind;
 use super::concurrency_limits::{
     ConcurrencyAcquireError, ConcurrencyLimit, ConcurrencyPermit, ConcurrencyWaitPolicy,
 };
+use super::headers::strip_codex_client_facade_marker;
 use super::request_body::{
     ReasoningOrchestrationIntent, RequestDialect, apply_deferred_reasoning_intent,
     codex_session_identity_and_completed_body, extract_model_from_response_body,
@@ -2154,6 +2155,7 @@ fn upstream_ws_handshake_headers(
         "openai-organization",
         "openai-project",
         "x-api-key",
+        "x-openai-actor-authorization",
         "x-openai-fedramp",
         "x-openai-organization",
         "x-openai-project",
@@ -2181,6 +2183,7 @@ fn upstream_ws_handshake_headers(
     ];
 
     let mut headers = copy_allowlisted_ws_headers(client_headers, ALLOWED_CLIENT_HEADERS);
+    strip_codex_client_facade_marker(&mut headers);
     if let Some(session_identity) = extract_session_identity(client_headers)
         && let Ok(value) = HeaderValue::from_str(session_identity.value())
     {
@@ -2398,6 +2401,10 @@ mod tests {
                 HeaderValue::from_static("client-api-key"),
             ),
             (
+                HeaderName::from_static("x-openai-actor-authorization"),
+                HeaderValue::from_static("real-actor-token"),
+            ),
+            (
                 HeaderName::from_static("x-oai-attestation"),
                 HeaderValue::from_static("device-attestation"),
             ),
@@ -2433,10 +2440,17 @@ mod tests {
             "openai-organization",
             "openai-project",
             "x-api-key",
+            "x-openai-actor-authorization",
             "x-oai-attestation",
         ] {
             assert_eq!(official.get(header), client_headers.get(header), "{header}");
         }
+        assert!(
+            official
+                .get("x-openai-actor-authorization")
+                .expect("actor authorization")
+                .is_sensitive()
+        );
         assert!(!official.contains_key("cookie"));
 
         let relay_target = ws_target(
@@ -2474,6 +2488,7 @@ mod tests {
             "openai-organization",
             "openai-project",
             "x-api-key",
+            "x-openai-actor-authorization",
             "x-oai-attestation",
         ] {
             assert!(!relay.contains_key(header), "{header}");
@@ -2517,10 +2532,33 @@ mod tests {
             "openai-organization",
             "openai-project",
             "x-api-key",
+            "x-openai-actor-authorization",
             "x-oai-attestation",
         ] {
             assert!(!helper.contains_key(header), "{header}");
         }
+    }
+
+    #[test]
+    fn websocket_handshake_consumes_client_facade_marker() {
+        let mut client_headers = codex_account_headers();
+        client_headers.insert(
+            crate::codex_switch::CODEX_CLIENT_FACADE_ACTOR_HEADER,
+            HeaderValue::from_static(crate::codex_switch::CODEX_CLIENT_FACADE_ACTOR_VALUE),
+        );
+        let target = ws_target(
+            "https://api.openai.com/v1",
+            crate::config::UpstreamAuth::default(),
+        );
+
+        let headers = upstream_ws_handshake_headers(
+            &client_headers,
+            &target,
+            "https://api.openai.com/v1/responses",
+        )
+        .expect("build facade WebSocket handshake headers");
+
+        assert!(!headers.contains_key(crate::codex_switch::CODEX_CLIENT_FACADE_ACTOR_HEADER));
     }
 
     #[test]

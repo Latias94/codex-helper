@@ -120,13 +120,27 @@ enabled = true
 codex-helper switch on                         # http://127.0.0.1:3211
 codex-helper switch on --port 4321
 codex-helper switch on --base-url https://relay.example/v1
+codex-helper switch on --client-facade openai
+codex-helper switch on --client-facade openai-tools
 codex-helper switch status
 codex-helper switch off
 ```
 
 `switch on` 会记录原 selector 和 helper stanza，然后只写入 helper 自有的 `model_providers.codex_proxy` stanza 并选中它。`switch off` 只恢复记录过的 selector/stanza。恢复 journal 位于 `~/.codex-helper/state/`；如果外部编辑导致当前文件既不匹配原 fingerprint，也不匹配 helper 应用后的 fingerprint，状态会进入 `recovery_required`，配置文件保持不动，等待人工协调。
 
-除下述 v0.20.3 legacy state 的一次性恢复外，Switch 不会读写 `~/.codex/auth.json`、`models_cache.json`、Codex SQLite、无关 providers、feature flags、compaction 设置、WebSocket 设置或 hosted-tool 设置。Provider capability 来自选中 provider 的契约和实时观测，而不是 switch 配置。
+`--client-facade` 是显式的客户端能力声明：
+
+| Facade | helper 自有 Codex provider stanza | 让客户端具备的候选行为 |
+| --- | --- | --- |
+| `compatible`（默认） | `name = "codex-helper"` | 只提供普通 OpenAI-compatible Responses 行为 |
+| `openai` | `name = "OpenAI"` | Remote compaction 与 Web Search，仍受 Codex feature/model 规则约束 |
+| `openai-tools` | `name = "OpenAI"`，并在 `x-openai-actor-authorization` 写入 helper marker | 在 `openai` 基础上允许 hosted image generation，仍受 Codex feature/model 规则约束 |
+
+Facade 只决定 Codex 客户端是否愿意暴露对应能力，并不证明所选 relay 真能处理请求。例如 `openai` 可能让 Codex 调用 `/responses/compact`，`openai-tools` 可能产生 hosted image-generation 流量；relay 契约需要另行验证。helper 生成的精确 marker 会在每次 HTTP 或 WebSocket 上游握手前于本地消费，不会转发。真实 actor-authorization 值只允许在“未配置 helper 凭据且目标为 OpenAI 官方源站”时透传；第三方或 helper-authenticated route 会剥离它。两类值在请求诊断中都会脱敏。
+
+Switch journal 存在时不能原地更换 target URL 或 facade。请先运行 `switch off`，让 journal 恢复原 provider stanza，再用新选项执行 `switch on`。`switch status` 会显示 journal 记录的 facade。
+
+除下述 v0.20.3 legacy state 的一次性恢复外，Switch 不会读写 `~/.codex/auth.json`、`models_cache.json`、Codex SQLite、无关 providers、全局 feature flags、compaction 设置或 WebSocket 设置，也不会再创建历史上的空 `{}` auth facade。当前 Codex 源码已通过上述 provider header contract 暴露 hosted-image tool，因此无需篡改登录状态。真实上游能力仍来自选中 provider 的契约和实时观测。
 
 ### 从 0.20.3 及更早版本升级
 

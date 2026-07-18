@@ -1,6 +1,6 @@
 use crate::cli_types::{
-    Cli, CliError, CliResult, Command, DaemonCommand, NotifyCommand, RelayCommand, ServiceCommand,
-    SwitchCommand,
+    Cli, CliError, CliResult, CodexClientFacadeArg, Command, DaemonCommand, NotifyCommand,
+    RelayCommand, ServiceCommand, SwitchCommand,
 };
 use crate::codex_integration;
 use crate::commands;
@@ -130,7 +130,11 @@ pub async fn run_cli() -> CliResult<()> {
         }
         Command::Switch { cmd } => {
             match cmd {
-                SwitchCommand::On { port, base_url } => do_switch_on(port, base_url)?,
+                SwitchCommand::On {
+                    port,
+                    base_url,
+                    client_facade,
+                } => do_switch_on(port, base_url, client_facade)?,
                 SwitchCommand::Off => do_switch_off()?,
                 SwitchCommand::Status => do_switch_status()?,
             }
@@ -530,6 +534,7 @@ async fn relay_status(target: Option<String>, json: bool) -> CliResult<()> {
                     "base_url": status.base_url,
                     "managed": status.managed,
                     "phase": status.phase.as_str(),
+                    "client_facade": status.client_facade.map(|facade| facade.as_str()),
                     "recovery_reason": status.recovery_reason,
                 }
             }))
@@ -1840,7 +1845,11 @@ fn parse_unix_lsof_owners(output: &str) -> Vec<PortOwner> {
     owners
 }
 
-fn do_switch_on(port: Option<u16>, base_url: Option<String>) -> CliResult<()> {
+fn do_switch_on(
+    port: Option<u16>,
+    base_url: Option<String>,
+    client_facade: CodexClientFacadeArg,
+) -> CliResult<()> {
     let validated_base_url = match base_url {
         Some(base_url) => ValidatedCodexBaseUrl::parse(base_url),
         None => Ok(ValidatedCodexBaseUrl::local(port.unwrap_or_else(|| {
@@ -1848,8 +1857,11 @@ fn do_switch_on(port: Option<u16>, base_url: Option<String>) -> CliResult<()> {
         }))),
     }
     .map_err(|error| CliError::CodexConfig(error.to_string()))?;
-    let outcome = codex_switch::apply(CodexSwitchIntent::On { validated_base_url })
-        .map_err(|error| CliError::CodexConfig(error.to_string()))?;
+    let outcome = codex_switch::apply_with_client_facade(
+        CodexSwitchIntent::On { validated_base_url },
+        client_facade.into(),
+    )
+    .map_err(|error| CliError::CodexConfig(error.to_string()))?;
     println!(
         "Codex switch: {} ({})",
         outcome.change.as_str(),
@@ -1857,6 +1869,9 @@ fn do_switch_on(port: Option<u16>, base_url: Option<String>) -> CliResult<()> {
     );
     if let Some(base_url) = outcome.status.base_url.as_deref() {
         println!("  base_url: {base_url}");
+    }
+    if let Some(client_facade) = outcome.status.client_facade {
+        println!("  client_facade: {}", client_facade.as_str());
     }
     println!("  config: {:?}", outcome.status.config_path);
     println!("  state:  {:?}", outcome.status.state_path);
@@ -1925,6 +1940,13 @@ fn print_codex_switch_status() -> CliResult<()> {
     println!(
         "  base_url: {}",
         status.base_url.as_deref().unwrap_or("<unset>")
+    );
+    println!(
+        "  client_facade: {}",
+        status
+            .client_facade
+            .map(|facade| facade.as_str())
+            .unwrap_or("<unset>")
     );
     if let Some(reason) = status.recovery_reason.as_deref() {
         println!("  recovery: {}", reason.yellow());

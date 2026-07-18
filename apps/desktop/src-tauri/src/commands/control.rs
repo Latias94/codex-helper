@@ -437,6 +437,7 @@ mod tests {
                 enabled: false,
                 managed: true,
                 base_url: Some("http://127.0.0.1:3211/v1".to_string()),
+                client_facade: Some(codex_helper_core::codex_switch::CodexClientFacade::Compatible),
                 recovery_reason: Some("Codex config changed after switch on".to_string()),
                 config_path: "/tmp/codex/config.toml".into(),
                 state_path: "/tmp/helper/state/codex-switch.json".into(),

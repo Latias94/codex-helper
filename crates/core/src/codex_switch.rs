@@ -12,7 +12,12 @@ use uuid::Uuid;
 
 const STATE_VERSION: u32 = 1;
 const PROVIDER_ID: &str = "codex_proxy";
-const PROVIDER_NAME: &str = "codex-helper";
+const COMPATIBLE_PROVIDER_NAME: &str = "codex-helper";
+const OPENAI_PROVIDER_NAME: &str = "OpenAI";
+// Current Codex treats a non-empty actor header as a client capability gate. The proxy consumes
+// this exact non-secret marker locally before applying upstream authentication policy.
+pub const CODEX_CLIENT_FACADE_ACTOR_HEADER: &str = "x-openai-actor-authorization";
+pub const CODEX_CLIENT_FACADE_ACTOR_VALUE: &str = "codex-helper-client-facade-v1";
 const STATE_FILE_NAME: &str = "codex-switch.json";
 const LOCK_FILE_NAME: &str = "codex-switch.lock";
 const LEGACY_STATE_FILE_NAME: &str = "codex-helper-switch-state.json";
@@ -65,6 +70,36 @@ impl ValidatedCodexBaseUrl {
 
     pub fn as_str(&self) -> &str {
         self.0.as_str()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexClientFacade {
+    #[default]
+    Compatible,
+    OpenAi,
+    OpenAiTools,
+}
+
+impl CodexClientFacade {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Compatible => "compatible",
+            Self::OpenAi => "openai",
+            Self::OpenAiTools => "openai-tools",
+        }
+    }
+
+    const fn provider_name(self) -> &'static str {
+        match self {
+            Self::Compatible => COMPATIBLE_PROVIDER_NAME,
+            Self::OpenAi | Self::OpenAiTools => OPENAI_PROVIDER_NAME,
+        }
+    }
+
+    const fn exposes_openai_tools(self) -> bool {
+        matches!(self, Self::OpenAiTools)
     }
 }
 
@@ -121,6 +156,7 @@ pub struct CodexSwitchStatus {
     pub enabled: bool,
     pub managed: bool,
     pub base_url: Option<String>,
+    pub client_facade: Option<CodexClientFacade>,
     pub recovery_reason: Option<String>,
     pub config_path: PathBuf,
     pub state_path: PathBuf,
@@ -178,6 +214,10 @@ pub enum CodexSwitchError {
         "Codex helper is already applied to {current}; run explicit switch off before switching to {requested}"
     )]
     AlreadyAppliedToDifferentTarget { current: String, requested: String },
+    #[error(
+        "Codex helper is already applied with client facade {current}; run explicit switch off before switching to {requested}"
+    )]
+    AlreadyAppliedWithDifferentFacade { current: String, requested: String },
     #[error("Codex switch recovery is required: {reason}")]
     RecoveryRequired { reason: String },
     #[error("Codex switch state changed repeatedly while it was being inspected")]
@@ -219,6 +259,8 @@ struct SwitchJournal {
     original_helper_stanza: Option<TomlValue>,
     original_model_providers_present: bool,
     target_base_url: String,
+    #[serde(default)]
+    client_facade: CodexClientFacade,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     recovery_reason: Option<String>,
 }
@@ -417,7 +459,14 @@ struct PlannedOnWrite {
 }
 
 pub fn apply(intent: CodexSwitchIntent) -> Result<CodexSwitchOutcome, CodexSwitchError> {
-    apply_with_failpoint(intent, ApplyFailpoint::None)
+    apply_with_client_facade(intent, CodexClientFacade::Compatible)
+}
+
+pub fn apply_with_client_facade(
+    intent: CodexSwitchIntent,
+    client_facade: CodexClientFacade,
+) -> Result<CodexSwitchOutcome, CodexSwitchError> {
+    apply_with_client_facade_and_failpoint(intent, client_facade, ApplyFailpoint::None)
 }
 
 pub fn inspect() -> Result<CodexSwitchStatus, CodexSwitchError> {
@@ -446,8 +495,17 @@ pub fn inspect() -> Result<CodexSwitchStatus, CodexSwitchError> {
     Err(CodexSwitchError::UnstableInspection)
 }
 
+#[cfg(test)]
 fn apply_with_failpoint(
     intent: CodexSwitchIntent,
+    failpoint: ApplyFailpoint,
+) -> Result<CodexSwitchOutcome, CodexSwitchError> {
+    apply_with_client_facade_and_failpoint(intent, CodexClientFacade::Compatible, failpoint)
+}
+
+fn apply_with_client_facade_and_failpoint(
+    intent: CodexSwitchIntent,
+    client_facade: CodexClientFacade,
     failpoint: ApplyFailpoint,
 ) -> Result<CodexSwitchOutcome, CodexSwitchError> {
     let paths = SwitchPaths::resolve()?;
@@ -465,9 +523,13 @@ fn apply_with_failpoint(
         recover_legacy_switch_state(&paths, failpoint)?;
         let current = read_config_snapshot(paths.config.as_path())?;
         return match intent {
-            CodexSwitchIntent::On { validated_base_url } => {
-                begin_on(&paths, current, validated_base_url, failpoint)
-            }
+            CodexSwitchIntent::On { validated_base_url } => begin_on(
+                &paths,
+                current,
+                validated_base_url,
+                client_facade,
+                failpoint,
+            ),
             CodexSwitchIntent::Off => outcome(&paths, CodexSwitchChange::Recovered),
         };
     }
@@ -478,9 +540,14 @@ fn apply_with_failpoint(
     let current = read_config_snapshot(paths.config.as_path())?;
 
     match intent {
-        CodexSwitchIntent::On { validated_base_url } => {
-            apply_on(&paths, current, journal, validated_base_url, failpoint)
-        }
+        CodexSwitchIntent::On { validated_base_url } => apply_on(
+            &paths,
+            current,
+            journal,
+            validated_base_url,
+            client_facade,
+            failpoint,
+        ),
         CodexSwitchIntent::Off => apply_off(&paths, current, journal, failpoint),
     }
 }
@@ -678,7 +745,7 @@ fn expected_legacy_helper_stanza(
         TomlValue::String(if state.uses_official_identity() {
             "OpenAI".to_string()
         } else {
-            PROVIDER_NAME.to_string()
+            COMPATIBLE_PROVIDER_NAME.to_string()
         }),
     );
     expected.insert(
@@ -985,6 +1052,7 @@ fn legacy_switch_status(paths: &SwitchPaths) -> Result<CodexSwitchStatus, CodexS
         enabled,
         managed: current_state_present,
         base_url,
+        client_facade: None,
         recovery_reason: Some(recovery_reason),
         config_path: paths.config.clone(),
         state_path: paths.legacy_state.clone(),
@@ -1030,10 +1098,11 @@ fn apply_on(
     current: ConfigSnapshot,
     journal: Option<SwitchJournal>,
     target: ValidatedCodexBaseUrl,
+    client_facade: CodexClientFacade,
     failpoint: ApplyFailpoint,
 ) -> Result<CodexSwitchOutcome, CodexSwitchError> {
     match journal {
-        None => begin_on(paths, current, target, failpoint),
+        None => begin_on(paths, current, target, client_facade, failpoint),
         Some(mut journal) => match journal.phase {
             JournalPhase::RecoveryRequired => Err(CodexSwitchError::RecoveryRequired {
                 reason: journal
@@ -1048,29 +1117,29 @@ fn apply_on(
                         "Codex config changed after helper applied its provider stanza",
                     );
                 }
-                ensure_target_matches(&journal, &target)?;
+                ensure_switch_matches(&journal, &target, client_facade)?;
                 outcome(paths, CodexSwitchChange::Unchanged)
             }
             JournalPhase::Prepared => match journal.operation {
                 JournalOperation::On if current.matches_applied(&journal) => {
+                    ensure_switch_matches(&journal, &target, client_facade)?;
                     journal.phase = JournalPhase::Applied;
                     write_current_journal(paths, &journal)?;
-                    ensure_target_matches(&journal, &target)?;
                     outcome(paths, CodexSwitchChange::Recovered)
                 }
                 JournalOperation::On if current.matches_original(&journal) => {
-                    ensure_target_matches(&journal, &target)?;
+                    ensure_switch_matches(&journal, &target, client_facade)?;
                     resume_on(paths, journal, failpoint, None)
                 }
                 JournalOperation::Off if current.matches_original(&journal) => {
                     remove_current_journal(paths)?;
-                    begin_on(paths, current, target, failpoint)
+                    begin_on(paths, current, target, client_facade, failpoint)
                 }
                 JournalOperation::Off if current.matches_applied(&journal) => {
+                    ensure_switch_matches(&journal, &target, client_facade)?;
                     journal.phase = JournalPhase::Applied;
                     journal.operation = JournalOperation::On;
                     write_current_journal(paths, &journal)?;
-                    ensure_target_matches(&journal, &target)?;
                     outcome(paths, CodexSwitchChange::Recovered)
                 }
                 _ => mark_recovery(
@@ -1081,6 +1150,21 @@ fn apply_on(
             },
         },
     }
+}
+
+fn ensure_switch_matches(
+    journal: &SwitchJournal,
+    target: &ValidatedCodexBaseUrl,
+    client_facade: CodexClientFacade,
+) -> Result<(), CodexSwitchError> {
+    ensure_target_matches(journal, target)?;
+    if journal.client_facade == client_facade {
+        return Ok(());
+    }
+    Err(CodexSwitchError::AlreadyAppliedWithDifferentFacade {
+        current: journal.client_facade.as_str().to_string(),
+        requested: client_facade.as_str().to_string(),
+    })
 }
 
 fn ensure_target_matches(
@@ -1112,13 +1196,19 @@ fn begin_on(
     paths: &SwitchPaths,
     current: ConfigSnapshot,
     target: ValidatedCodexBaseUrl,
+    client_facade: CodexClientFacade,
     failpoint: ApplyFailpoint,
 ) -> Result<CodexSwitchOutcome, CodexSwitchError> {
     validate_config_topology(paths.config.as_path(), current.present)?;
     let original = inspect_config(paths.config.as_path(), &current.text)?;
     reject_unowned_helper_config(&original)?;
 
-    let patch = patch_on(paths.config.as_path(), &current.text, target.as_str())?;
+    let patch = patch_on(
+        paths.config.as_path(),
+        &current.text,
+        target.as_str(),
+        client_facade,
+    )?;
     let applied_fingerprint = fingerprint(patch.text.as_bytes());
     let planned_write = PlannedOnWrite {
         original_text: current.text,
@@ -1138,6 +1228,7 @@ fn begin_on(
         original_helper_stanza: original.helper_stanza,
         original_model_providers_present: original.model_providers_present,
         target_base_url: target.0,
+        client_facade,
         recovery_reason: None,
     };
     write_current_journal(paths, &journal)?;
@@ -1170,6 +1261,7 @@ fn resume_on(
                 paths.config.as_path(),
                 current.text.as_str(),
                 journal.target_base_url.as_str(),
+                journal.client_facade,
             )?
             .text
         }
@@ -1373,6 +1465,7 @@ fn status_from_snapshot(
             enabled: false,
             managed: true,
             base_url: Some(journal.target_base_url.clone()),
+            client_facade: Some(journal.client_facade),
             recovery_reason: Some(
                 "switch state belongs to a different Codex config path".to_string(),
             ),
@@ -1398,6 +1491,7 @@ fn status_from_snapshot(
             enabled,
             managed: false,
             base_url: config_base_url,
+            client_facade: None,
             recovery_reason: orphaned.then(|| {
                 "helper provider config exists without helper-owned switch state".to_string()
             }),
@@ -1412,6 +1506,7 @@ fn status_from_snapshot(
             enabled,
             managed: true,
             base_url: config_base_url.or_else(|| Some(journal.target_base_url.clone())),
+            client_facade: Some(journal.client_facade),
             recovery_reason: Some(error.to_string()),
             config_path: paths.config.clone(),
             state_path: paths.state.clone(),
@@ -1442,6 +1537,7 @@ fn status_from_snapshot(
         enabled,
         managed: true,
         base_url: config_base_url.or_else(|| Some(journal.target_base_url.clone())),
+        client_facade: Some(journal.client_facade),
         recovery_reason,
         config_path: paths.config.clone(),
         state_path: paths.state.clone(),
@@ -1524,7 +1620,12 @@ fn inspect_config(path: &Path, text: &str) -> Result<ConfigInspection, CodexSwit
     })
 }
 
-fn patch_on(path: &Path, text: &str, base_url: &str) -> Result<OnPatch, CodexSwitchError> {
+fn patch_on(
+    path: &Path,
+    text: &str,
+    base_url: &str,
+    client_facade: CodexClientFacade,
+) -> Result<OnPatch, CodexSwitchError> {
     let mut document = editable_document(path, text)?;
     let original_model_provider_repr = model_provider_repr_from_document(path, &document)?;
     let root = document.as_table_mut();
@@ -1539,10 +1640,18 @@ fn patch_on(path: &Path, text: &str, base_url: &str) -> Result<OnPatch, CodexSwi
             reason: "model_providers must be a table".to_string(),
         })?;
     let mut helper = Table::new();
-    helper.insert("name", editable_value(PROVIDER_NAME));
+    helper.insert("name", editable_value(client_facade.provider_name()));
     helper.insert("base_url", editable_value(base_url));
     helper.insert("wire_api", editable_value("responses"));
     helper.insert("request_max_retries", editable_value(0));
+    if client_facade.exposes_openai_tools() {
+        let mut headers = Table::new();
+        headers.insert(
+            CODEX_CLIENT_FACADE_ACTOR_HEADER,
+            editable_value(CODEX_CLIENT_FACADE_ACTOR_VALUE),
+        );
+        helper.insert("http_headers", Item::Table(headers));
+    }
     providers.insert(PROVIDER_ID, Item::Table(helper));
     set_string_preserving_decor(root, "model_provider", PROVIDER_ID);
     Ok(OnPatch {
@@ -2535,6 +2644,15 @@ mod tests {
 
     #[test]
     fn switch_wire_labels_are_stable_and_exhaustive() {
+        let facades = [
+            (CodexClientFacade::Compatible, "compatible"),
+            (CodexClientFacade::OpenAi, "openai"),
+            (CodexClientFacade::OpenAiTools, "openai-tools"),
+        ];
+        for (facade, expected) in facades {
+            assert_eq!(facade.as_str(), expected);
+        }
+
         let phases = [
             (CodexSwitchPhase::Off, "off"),
             (CodexSwitchPhase::Prepared, "prepared"),
@@ -2769,6 +2887,140 @@ trust_level = "trusted"
             std::fs::read(env.codex_home.join("sqlite/codex-dev.db"))
                 .expect("read sqlite sentinel"),
             b"sqlite sentinel"
+        );
+    }
+
+    #[test]
+    fn explicit_client_facades_expose_only_the_requested_codex_capabilities() {
+        for (facade, provider_name, exposes_tools) in [
+            (CodexClientFacade::Compatible, "codex-helper", false),
+            (CodexClientFacade::OpenAi, "OpenAI", false),
+            (CodexClientFacade::OpenAiTools, "OpenAI", true),
+        ] {
+            let env = TestEnvironment::new();
+            let original = "model_provider = \"openai\"\n";
+            env.write_config(original);
+            std::fs::write(env.auth_path(), b"auth sentinel").expect("write auth sentinel");
+
+            let outcome = apply_with_client_facade(
+                CodexSwitchIntent::On {
+                    validated_base_url: ValidatedCodexBaseUrl::local(3211),
+                },
+                facade,
+            )
+            .expect("switch on with explicit client facade");
+
+            assert_eq!(outcome.status.client_facade, Some(facade));
+            let applied = env.read_config();
+            assert!(applied.contains(format!("name = \"{provider_name}\"").as_str()));
+            assert_eq!(
+                applied.contains("[model_providers.codex_proxy.http_headers]"),
+                exposes_tools
+            );
+            assert_eq!(
+                applied.contains(CODEX_CLIENT_FACADE_ACTOR_HEADER),
+                exposes_tools
+            );
+            assert_eq!(
+                applied.contains(CODEX_CLIENT_FACADE_ACTOR_VALUE),
+                exposes_tools
+            );
+            assert!(!applied.contains("requires_openai_auth"));
+            assert_eq!(
+                std::fs::read(env.auth_path()).expect("read auth sentinel"),
+                b"auth sentinel"
+            );
+
+            apply(CodexSwitchIntent::Off).expect("switch off facade");
+            assert_eq!(env.read_config(), original);
+            assert_eq!(
+                std::fs::read(env.auth_path()).expect("read restored auth sentinel"),
+                b"auth sentinel"
+            );
+        }
+    }
+
+    #[test]
+    fn changing_client_facade_requires_explicit_switch_off() {
+        let env = TestEnvironment::new();
+        env.write_config("model_provider = \"openai\"\n");
+        let on = CodexSwitchIntent::On {
+            validated_base_url: ValidatedCodexBaseUrl::local(3211),
+        };
+        apply_with_client_facade(on.clone(), CodexClientFacade::OpenAi)
+            .expect("switch on OpenAI facade");
+        let config_before = env.read_config();
+        let state_before = std::fs::read(env.state_path()).expect("read state before mismatch");
+
+        assert!(matches!(
+            apply_with_client_facade(on.clone(), CodexClientFacade::OpenAiTools),
+            Err(CodexSwitchError::AlreadyAppliedWithDifferentFacade { .. })
+        ));
+        assert_eq!(env.read_config(), config_before);
+        assert_eq!(
+            std::fs::read(env.state_path()).expect("read state after mismatch"),
+            state_before
+        );
+
+        apply(CodexSwitchIntent::Off).expect("switch off old facade");
+        apply_with_client_facade(on, CodexClientFacade::OpenAiTools)
+            .expect("switch on new facade after off");
+        assert!(env.read_config().contains(CODEX_CLIENT_FACADE_ACTOR_VALUE));
+    }
+
+    #[test]
+    fn prepared_switch_recovers_with_its_recorded_client_facade() {
+        let env = TestEnvironment::new();
+        env.write_config("model_provider = \"openai\"\n");
+        let on = CodexSwitchIntent::On {
+            validated_base_url: ValidatedCodexBaseUrl::local(3211),
+        };
+
+        assert!(matches!(
+            apply_with_client_facade_and_failpoint(
+                on.clone(),
+                CodexClientFacade::OpenAiTools,
+                ApplyFailpoint::AfterPrepared,
+            ),
+            Err(CodexSwitchError::InjectedFailure("after_prepared"))
+        ));
+        let outcome = apply_with_client_facade(on, CodexClientFacade::OpenAiTools)
+            .expect("resume prepared facade switch");
+
+        assert_eq!(
+            outcome.status.client_facade,
+            Some(CodexClientFacade::OpenAiTools)
+        );
+        assert!(env.read_config().contains(CODEX_CLIENT_FACADE_ACTOR_VALUE));
+    }
+
+    #[test]
+    fn journals_without_client_facade_default_to_compatible() {
+        let env = TestEnvironment::new();
+        env.write_config("model_provider = \"openai\"\n");
+        let on = CodexSwitchIntent::On {
+            validated_base_url: ValidatedCodexBaseUrl::local(3211),
+        };
+        apply(on.clone()).expect("switch on compatible facade");
+        let mut state = serde_json::from_slice::<serde_json::Value>(
+            &std::fs::read(env.state_path()).expect("read current journal"),
+        )
+        .expect("parse current journal");
+        state
+            .as_object_mut()
+            .expect("journal object")
+            .remove("client_facade");
+        std::fs::write(
+            env.state_path(),
+            serde_json::to_vec_pretty(&state).expect("serialize old journal"),
+        )
+        .expect("write old journal shape");
+
+        let status = inspect().expect("inspect old journal shape");
+        assert_eq!(status.client_facade, Some(CodexClientFacade::Compatible));
+        assert_eq!(
+            apply(on).expect("reuse old journal shape").change,
+            CodexSwitchChange::Unchanged
         );
     }
 

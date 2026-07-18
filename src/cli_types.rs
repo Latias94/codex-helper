@@ -457,11 +457,35 @@ pub(crate) enum SwitchCommand {
         /// Explicit helper proxy base URL
         #[arg(long, conflicts_with = "port")]
         base_url: Option<String>,
+        /// Codex capability facade written into the helper-owned provider stanza
+        #[arg(long, value_enum, default_value_t = CodexClientFacadeArg::Compatible)]
+        client_facade: CodexClientFacadeArg,
     },
     /// Restore the selector and helper stanza recorded by the explicit switch operation
     Off,
     /// Show the helper-owned Codex switch status
     Status,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[value(rename_all = "kebab-case")]
+pub(crate) enum CodexClientFacadeArg {
+    #[default]
+    Compatible,
+    #[value(name = "openai")]
+    OpenAi,
+    #[value(name = "openai-tools")]
+    OpenAiTools,
+}
+
+impl From<CodexClientFacadeArg> for codex_helper_core::codex_switch::CodexClientFacade {
+    fn from(value: CodexClientFacadeArg) -> Self {
+        match value {
+            CodexClientFacadeArg::Compatible => Self::Compatible,
+            CodexClientFacadeArg::OpenAi => Self::OpenAi,
+            CodexClientFacadeArg::OpenAiTools => Self::OpenAiTools,
+        }
+    }
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -1304,12 +1328,33 @@ mod tests {
                 SwitchCommand::On {
                     port: None,
                     base_url: Some(base_url),
+                    client_facade: CodexClientFacadeArg::Compatible,
                 },
         }) = cli.command
         else {
             panic!("expected explicit switch-on base URL");
         };
         assert_eq!(base_url, "https://relay.example/v1");
+    }
+
+    #[test]
+    fn switch_on_accepts_explicit_client_facades() {
+        for (label, expected) in [
+            ("compatible", CodexClientFacadeArg::Compatible),
+            ("openai", CodexClientFacadeArg::OpenAi),
+            ("openai-tools", CodexClientFacadeArg::OpenAiTools),
+        ] {
+            let cli =
+                Cli::try_parse_from(["codex-helper", "switch", "on", "--client-facade", label])
+                    .expect("parse client facade");
+            let Some(Command::Switch {
+                cmd: SwitchCommand::On { client_facade, .. },
+            }) = cli.command
+            else {
+                panic!("expected switch-on client facade");
+            };
+            assert_eq!(client_facade, expected);
+        }
     }
 
     #[test]
