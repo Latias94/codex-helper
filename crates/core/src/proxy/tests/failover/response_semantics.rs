@@ -1883,7 +1883,7 @@ async fn proxy_codex_stream_route_unavailable_returns_retryable_response_failed_
     assert!(retry.route_attempts.iter().all(|attempt| {
         attempt.stable_code() == "route_unavailable"
             && attempt.cooldown_secs.is_some()
-            && attempt.cooldown_reason.as_deref() == Some("route_unavailable")
+            && attempt.cooldown_reason.as_deref() == Some("runtime_cooldown")
     }));
 
     proxy_handle.abort();
@@ -2430,7 +2430,8 @@ async fn proxy_codex_stream_usage_exhausted_route_returns_retryable_response_fai
     let body = resp.text().await.expect("body");
     assert!(body.contains("event: response.failed"), "{body}");
     assert!(body.contains(r#""code":"rate_limit_exceeded""#), "{body}");
-    assert!(body.contains("try again in 8 seconds"), "{body}");
+    assert!(body.contains(r#""retry_after_secs":8"#), "{body}");
+    assert!(!body.contains("try again in 8 seconds"), "{body}");
     assert_eq!(primary_hits.load(Ordering::SeqCst), 0);
     assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
 
@@ -4685,14 +4686,16 @@ async fn proxy_fails_closed_before_remote_http_upstream_when_auth_is_unconfigure
         .resolve(RELAY_HOST, upstream.addr)
         .build()
         .expect("build remote relay test client");
-    let proxy = spawn_proxy_service(ProxyService::new(
+    let service = ProxyService::new(
         proxy_client,
         Arc::new(make_helper_config(
             vec![upstream_config],
             retry_config(1, "502", Vec::new(), RetryStrategy::Failover),
         )),
         "codex",
-    ));
+    );
+    let state = service.state.clone();
+    let proxy = spawn_proxy_service(service);
 
     let response = local_http_test_client()
         .post(proxy.responses_url())
@@ -4708,6 +4711,19 @@ async fn proxy_fails_closed_before_remote_http_upstream_when_auth_is_unconfigure
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+
+    let failed = find_finished_request(&state, 10, |request| {
+        request.status_code == StatusCode::SERVICE_UNAVAILABLE.as_u16()
+    })
+    .await
+    .expect("credential-blocked request");
+    let retry = failed.retry.as_ref().expect("route decision trace");
+    assert!(!retry.route_attempts.is_empty());
+    assert!(retry.route_attempts.iter().all(|attempt| {
+        attempt.decision == "route_unavailable"
+            && attempt.cooldown_secs.is_none()
+            && attempt.cooldown_reason.is_none()
+    }));
 }
 
 #[tokio::test]
