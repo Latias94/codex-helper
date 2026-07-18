@@ -28,6 +28,8 @@ use super::concurrency_limits::{ConcurrencyAcquireError, ConcurrencyPermit};
 use super::request_body::{ReasoningOrchestrationIntent, RequestDialect};
 use super::request_continuity::{RequestContinuityContract, RouteContinuityDecisionInput};
 use super::request_preparation::RequestFlavor;
+#[cfg(test)]
+use super::request_preparation::SharedRouteStateImpact;
 use super::response_semantics::ResponseSemanticContract;
 use super::retry::{RetryLayerOptions, RetryPlan};
 use super::route_affinity::{
@@ -348,13 +350,18 @@ pub(super) async fn execute_provider_chain_with_route_executor(
     let executor = RoutePlanExecutor::new(template);
     let route_graph_key = template.route_graph_key();
     let total_upstreams = template.candidates.len();
+    let shared_route_updates_allowed = ctx
+        .request_flavor
+        .shared_route_state_impact
+        .allows_shared_updates();
+    let route_state_session_id = ctx.request_flavor.route_state_session_id(ctx.session_id);
     let mut runtime = match route_graph_runtime_for_request(
         ctx.proxy,
         template,
         routing_control_graph_key,
         route_plan.runtime_revision(),
         route_plan.provider_policy(),
-        ctx.session_id,
+        route_state_session_id,
     )
     .await
     {
@@ -412,8 +419,10 @@ pub(super) async fn execute_provider_chain_with_route_executor(
     let route_graph_loop = RouteGraphAttemptLoop {
         params: ExecuteRouteGraphExecutorParams {
             ctx,
-            route_graph_key: (template.affinity_policy != RouteAffinityPolicy::Off)
+            route_graph_key: (template.affinity_policy != RouteAffinityPolicy::Off
+                && shared_route_updates_allowed)
                 .then_some(route_graph_key.as_str()),
+            route_state_session_id,
             routing_control_graph_key,
             provider_attempt: 0,
             total_upstreams,
@@ -442,6 +451,7 @@ pub(super) async fn execute_provider_chain_with_route_executor(
 struct ExecuteRouteGraphExecutorParams<'a, 'route> {
     ctx: ProviderExecutionContext<'a>,
     route_graph_key: Option<&'a str>,
+    route_state_session_id: Option<&'a str>,
     routing_control_graph_key: &'a str,
     provider_attempt: u32,
     total_upstreams: usize,
@@ -470,6 +480,7 @@ impl<'a, 'route> RouteGraphAttemptLoop<'a, 'route> {
         let ExecuteRouteGraphExecutorParams {
             ctx,
             route_graph_key,
+            route_state_session_id,
             routing_control_graph_key,
             provider_attempt,
             total_upstreams,
@@ -483,10 +494,15 @@ impl<'a, 'route> RouteGraphAttemptLoop<'a, 'route> {
             route_attempts,
             policy,
         } = params;
+        let shared_route_updates_allowed = ctx
+            .request_flavor
+            .shared_route_state_impact
+            .allows_shared_updates();
 
         loop {
-            let revalidation_affinity_policy = if executor.template().affinity_policy
-                == RouteAffinityPolicy::Hard
+            let revalidation_affinity_policy = if !shared_route_updates_allowed {
+                RouteAffinityPolicy::Off
+            } else if executor.template().affinity_policy == RouteAffinityPolicy::Hard
                 && (!policy.continuity.is_provider_state_bound()
                     || route_state.allows_explicit_continuity_domain_failover())
             {
@@ -494,17 +510,18 @@ impl<'a, 'route> RouteGraphAttemptLoop<'a, 'route> {
             } else {
                 executor.template().affinity_policy
             };
-            let reservation_selection_guard =
-                if revalidation_affinity_policy != RouteAffinityPolicy::Off {
-                    lock_session_route_reservation_selection(ctx.proxy, ctx.session_id).await
-                } else {
-                    None
-                };
+            let reservation_selection_guard = if revalidation_affinity_policy
+                != RouteAffinityPolicy::Off
+            {
+                lock_session_route_reservation_selection(ctx.proxy, route_state_session_id).await
+            } else {
+                None
+            };
             let reservation_decision = if reservation_selection_guard.is_some() {
                 apply_session_route_reservation_to_runtime(
                     ctx.proxy,
                     ctx.request_id,
-                    ctx.session_id,
+                    route_state_session_id,
                     executor.template(),
                     route_graph_key,
                     runtime,
@@ -583,7 +600,7 @@ impl<'a, 'route> RouteGraphAttemptLoop<'a, 'route> {
                             routing_control_graph_key,
                             runtime_revision,
                             provider_policy,
-                            ctx.session_id,
+                            route_state_session_id,
                         )
                         .await;
                         match refreshed_runtime {
@@ -604,12 +621,14 @@ impl<'a, 'route> RouteGraphAttemptLoop<'a, 'route> {
                         }
                         continue;
                     }
-                    enqueue_usage_probes_for_provider_endpoints(
-                        ctx.proxy,
-                        executor.template(),
-                        report.provider_endpoints_to_probe.iter(),
-                    )
-                    .await;
+                    if shared_route_updates_allowed {
+                        enqueue_usage_probes_for_provider_endpoints(
+                            ctx.proxy,
+                            executor.template(),
+                            report.provider_endpoints_to_probe.iter(),
+                        )
+                        .await;
+                    }
                     route_attempts.extend(report.route_attempts.clone());
                     *last_err = Some(report.failure_status_message());
                 }
@@ -637,7 +656,7 @@ impl<'a, 'route> RouteGraphAttemptLoop<'a, 'route> {
                 match claim_session_route_reservation(
                     ctx.proxy,
                     ctx.request_id,
-                    ctx.session_id,
+                    route_state_session_id,
                     ctx.session_identity_source,
                     route_graph_key,
                     &target,
@@ -712,7 +731,7 @@ impl<'a, 'route> RouteGraphAttemptLoop<'a, 'route> {
                 ctx.request_model,
                 &selected,
             );
-            if !balance_probe_targets.is_empty() {
+            if !balance_probe_targets.is_empty() && shared_route_updates_allowed {
                 log_degraded_selection_balance_reprobe(
                     ctx.proxy.service_name,
                     ctx.request_id,
@@ -732,7 +751,7 @@ impl<'a, 'route> RouteGraphAttemptLoop<'a, 'route> {
                 executor.template(),
                 selected_candidate,
                 runtime_revision,
-                ctx.session_id,
+                route_state_session_id,
             )
             .await
             {
@@ -780,7 +799,7 @@ impl<'a, 'route> RouteGraphAttemptLoop<'a, 'route> {
                     routing_control_graph_key,
                     runtime_revision,
                     provider_policy,
-                    ctx.session_id,
+                    route_state_session_id,
                 )
                 .await;
                 match refreshed_runtime {
@@ -1175,6 +1194,7 @@ mod tests {
             is_remote_compaction_v2_request: false,
             remote_compaction_requires_affinity,
             is_codex_service: false,
+            shared_route_state_impact: SharedRouteStateImpact::RouteFacing,
             codex_bridge_log: None,
         }
     }

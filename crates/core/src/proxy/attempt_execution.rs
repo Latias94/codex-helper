@@ -212,6 +212,7 @@ pub(super) async fn execute_selected_upstream(
                 route_attempt_index,
                 model_note: model_mapping.model_note.as_str(),
                 allow_provider_failover,
+                shared_route_state_impact: request_flavor.shared_route_state_impact,
             })
             .await
             {
@@ -290,6 +291,7 @@ pub(super) async fn execute_selected_upstream(
                 route_attempt_index,
                 model_note: model_mapping.model_note.as_str(),
                 allow_provider_failover,
+                shared_route_state_impact: request_flavor.shared_route_state_impact,
             })
             .await;
             if let Some((status, _)) = last_err.as_mut() {
@@ -456,6 +458,7 @@ pub(super) async fn execute_selected_upstream(
                 route_attempt_index,
                 model_note: model_note.as_str(),
                 allow_provider_failover,
+                shared_route_state_impact: request_flavor.shared_route_state_impact,
             })
             .await;
             let (resp, upstream_start, upstream_headers_ms, debug_base, attempt_handle) =
@@ -545,6 +548,7 @@ pub(super) async fn execute_selected_upstream(
                 model_note: model_note.as_str(),
                 allow_provider_failover,
                 attempt_handle,
+                shared_route_state_impact: request_flavor.shared_route_state_impact,
             })
             .await
             {
@@ -648,6 +652,7 @@ pub(super) async fn execute_selected_upstream(
                 is_user_turn: request_flavor.is_user_turn,
                 allow_provider_failover,
                 is_codex_service: request_flavor.is_codex_service,
+                shared_route_state_impact: request_flavor.shared_route_state_impact,
             })
             .await
             {

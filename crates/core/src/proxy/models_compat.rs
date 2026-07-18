@@ -6,13 +6,20 @@ use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 
 const MAX_DECODED_MODELS_BYTES: usize = 8 * 1024 * 1024;
 
+pub(super) fn codex_path_is_models(path: &str) -> bool {
+    path.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .is_some_and(|segment| segment == "models")
+}
+
 pub(super) fn maybe_decode_models_response_body(
     service_name: &str,
     path: &str,
     headers: &HeaderMap,
     body: Bytes,
 ) -> Bytes {
-    if service_name != "codex" || path != "/models" {
+    if service_name != "codex" || !codex_path_is_models(path) {
         return body;
     }
 
@@ -149,6 +156,21 @@ mod tests {
             maybe_decode_models_response_body("codex", "/models", &HeaderMap::new(), body.clone());
 
         assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn codex_models_path_matches_supported_prefixes_and_trailing_slashes() {
+        for path in [
+            "/models",
+            "/models/",
+            "/v1/models",
+            "/backend-api/codex/models/",
+        ] {
+            assert!(codex_path_is_models(path), "{path}");
+        }
+        for path in ["/model", "/models/item", "/v1/responses", "/"] {
+            assert!(!codex_path_is_models(path), "{path}");
+        }
     }
 
     #[test]

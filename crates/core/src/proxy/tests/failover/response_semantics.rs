@@ -36,6 +36,40 @@ fn local_http_test_client() -> reqwest::Client {
         .expect("build local HTTP test client")
 }
 
+fn request_local_models_retry_config(on_status: &str, on_class: Vec<String>) -> RetryConfig {
+    RetryConfig {
+        upstream: Some(retry_layer_config(
+            1,
+            on_status,
+            on_class.clone(),
+            RetryStrategy::SameUpstream,
+        )),
+        provider: Some(retry_layer_config(
+            2,
+            on_status,
+            on_class,
+            RetryStrategy::Failover,
+        )),
+        cloudflare_challenge_cooldown_secs: Some(30),
+        cloudflare_timeout_cooldown_secs: Some(30),
+        transport_cooldown_secs: Some(30),
+        cooldown_backoff_factor: Some(1),
+        cooldown_backoff_max_secs: Some(0),
+        ..RetryConfig::default()
+    }
+}
+
+fn request_local_models_config(upstreams: Vec<UpstreamConfig>, retry: RetryConfig) -> HelperConfig {
+    let mut config = make_helper_config(upstreams, retry);
+    config
+        .codex
+        .routing
+        .as_mut()
+        .expect("route graph")
+        .affinity_policy = RouteAffinityPolicy::FallbackSticky;
+    config
+}
+
 fn legacy_raw_bearer_account_fingerprint(token: &str) -> String {
     let value = format!("Bearer {token}");
     let mut digest = Sha256::new();
@@ -1359,6 +1393,332 @@ fn assert_openai_models_response(body: &[u8], expected_slug: &str) -> serde_json
         .find(|model| model["id"].as_str() == Some(expected_slug))
         .expect("expected model");
     value
+}
+
+#[tokio::test]
+async fn models_status_failover_does_not_poison_inference_health_or_affinity() {
+    let primary_models_hits = Arc::new(AtomicUsize::new(0));
+    let primary_responses_hits = Arc::new(AtomicUsize::new(0));
+    let primary_models_counter = primary_models_hits.clone();
+    let primary_responses_counter = primary_responses_hits.clone();
+    let primary = spawn_test_upstream(
+        axum::Router::new()
+            .route(
+                "/v1/models",
+                get(move || {
+                    let hits = primary_models_counter.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(serde_json::json!({ "error": "models unsupported" })),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/v1/responses",
+                post(move || {
+                    let hits = primary_responses_counter.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({ "provider": "primary" }))
+                    }
+                }),
+            ),
+    );
+
+    let backup_models_hits = Arc::new(AtomicUsize::new(0));
+    let backup_responses_hits = Arc::new(AtomicUsize::new(0));
+    let backup_models_counter = backup_models_hits.clone();
+    let backup_responses_counter = backup_responses_hits.clone();
+    let backup = spawn_test_upstream(
+        axum::Router::new()
+            .route(
+                "/v1/models",
+                get(move || {
+                    let hits = backup_models_counter.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({
+                            "object": "list",
+                            "data": [{ "id": "gpt-5.6-sol", "object": "model" }]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1/responses",
+                post(move || {
+                    let hits = backup_responses_counter.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({ "provider": "backup" }))
+                    }
+                }),
+            ),
+    );
+
+    let config = request_local_models_config(
+        vec![primary.upstream_config(), backup.upstream_config()],
+        request_local_models_retry_config("503", Vec::new()),
+    );
+    let service = proxy_service(config);
+    let state = service.state.clone();
+    let proxy = spawn_proxy_service(service);
+    let client = local_http_test_client();
+    let session_id = "models-request-local-status";
+
+    let response = client
+        .get(proxy.url("/models"))
+        .header("accept", "text/event-stream")
+        .header("session-id", session_id)
+        .send()
+        .await
+        .expect("send models request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.bytes().await.expect("read models response");
+    assert_openai_models_response(body.as_ref(), "gpt-5.6-sol");
+    assert_eq!(primary_models_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_models_hits.load(Ordering::SeqCst), 1);
+    assert!(
+        state
+            .peek_session_route_affinity(session_id)
+            .await
+            .is_none()
+    );
+
+    let runtime = state
+        .route_plan_runtime_state_for_provider_endpoints("codex")
+        .await;
+    let primary_health =
+        runtime.provider_endpoint(&ProviderEndpointKey::new("codex", "test", "default"));
+    assert_eq!(primary_health.failure_count, 0);
+    assert!(!primary_health.cooldown_active);
+
+    let finished = find_finished_request(&state, 10, |request| request.path == "/models")
+        .await
+        .expect("finished models request");
+    let first_failure = finished
+        .retry
+        .as_ref()
+        .expect("models retry trace")
+        .route_attempts
+        .iter()
+        .find(|attempt| attempt.status_code == Some(StatusCode::SERVICE_UNAVAILABLE.as_u16()))
+        .expect("models failure attempt");
+    assert_eq!(first_failure.cooldown_secs, None);
+    assert_eq!(first_failure.cooldown_reason, None);
+    assert!(
+        first_failure
+            .provider_signals
+            .iter()
+            .all(|signal| !signal.route_facing)
+    );
+
+    let response = client
+        .post(proxy.responses_url())
+        .header("content-type", "application/json")
+        .header("session-id", session_id)
+        .body(r#"{"model":"gpt-5","input":"hi"}"#)
+        .send()
+        .await
+        .expect("send inference request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.expect("read inference response");
+    assert_eq!(body["provider"].as_str(), Some("primary"));
+    assert_eq!(primary_responses_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_responses_hits.load(Ordering::SeqCst), 0);
+
+    proxy.handle.abort();
+}
+
+#[tokio::test]
+async fn models_success_does_not_clear_existing_inference_failure_state() {
+    let upstream = spawn_test_upstream(axum::Router::new().route(
+        "/v1/models",
+        get(|| async {
+            Json(serde_json::json!({
+                "object": "list",
+                "data": [{ "id": "gpt-5.6-sol", "object": "model" }]
+            }))
+        }),
+    ));
+    let config = request_local_models_config(
+        vec![upstream.upstream_config()],
+        request_local_models_retry_config("503", Vec::new()),
+    );
+    let service = proxy_service(config);
+    let state = service.state.clone();
+    let endpoint = ProviderEndpointKey::new("codex", "test", "default");
+    let identity = service
+        .runtime_identity_for_provider_endpoint_for_test(&endpoint)
+        .await;
+    state
+        .record_runtime_upstream_attempt_failure(
+            "codex",
+            &identity,
+            30,
+            crate::endpoint_health::CooldownBackoff {
+                factor: 1,
+                max_secs: 0,
+            },
+        )
+        .await;
+    let runtime = state
+        .route_plan_runtime_state_for_provider_endpoints("codex")
+        .await;
+    assert_eq!(runtime.provider_endpoint(&endpoint).failure_count, 1);
+
+    let proxy = spawn_proxy_service(service);
+    let response = local_http_test_client()
+        .get(proxy.url("/models"))
+        .send()
+        .await
+        .expect("send models request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.bytes().await.expect("read models response");
+
+    let runtime = state
+        .route_plan_runtime_state_for_provider_endpoints("codex")
+        .await;
+    let health = runtime.provider_endpoint(&endpoint);
+    assert_eq!(health.failure_count, 1);
+    assert!(!health.cooldown_active);
+
+    proxy.handle.abort();
+}
+
+#[tokio::test]
+async fn models_auth_failure_refreshes_credentials_without_cross_account_replay() {
+    let primary_hits = Arc::new(AtomicUsize::new(0));
+    let primary_counter = primary_hits.clone();
+    let primary = spawn_test_upstream(axum::Router::new().route(
+        "/v1/models",
+        get(move || {
+            let hits = primary_counter.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({ "error": "credential rejected" })),
+                )
+            }
+        }),
+    ));
+    let backup_hits = Arc::new(AtomicUsize::new(0));
+    let backup_counter = backup_hits.clone();
+    let backup = spawn_test_upstream(axum::Router::new().route(
+        "/v1/models",
+        get(move || {
+            let hits = backup_counter.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                Json(serde_json::json!({
+                    "object": "list",
+                    "data": [{ "id": "gpt-5.6-sol", "object": "model" }]
+                }))
+            }
+        }),
+    ));
+    let config = request_local_models_config(
+        vec![primary.upstream_config(), backup.upstream_config()],
+        request_local_models_retry_config("401", Vec::new()),
+    );
+    let service = proxy_service(config);
+    let state = service.state.clone();
+    let proxy = spawn_proxy_service(service);
+    let session_id = "models-request-local-auth";
+
+    let response = local_http_test_client()
+        .get(proxy.url("/models"))
+        .header("session-id", session_id)
+        .send()
+        .await
+        .expect("send models request");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let _ = response.bytes().await.expect("read auth failure response");
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
+    assert!(
+        state
+            .peek_session_route_affinity(session_id)
+            .await
+            .is_none()
+    );
+
+    let runtime = state
+        .route_plan_runtime_state_for_provider_endpoints("codex")
+        .await;
+    let primary_health =
+        runtime.provider_endpoint(&ProviderEndpointKey::new("codex", "test", "default"));
+    assert_eq!(primary_health.failure_count, 0);
+    assert!(!primary_health.cooldown_active);
+
+    proxy.handle.abort();
+}
+
+#[tokio::test]
+async fn models_transport_failover_does_not_penalize_inference_health() {
+    let unused_addr = reserve_unused_local_addr();
+    let backup_hits = Arc::new(AtomicUsize::new(0));
+    let backup_counter = backup_hits.clone();
+    let backup = spawn_test_upstream(axum::Router::new().route(
+        "/v1/models",
+        get(move || {
+            let hits = backup_counter.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                Json(serde_json::json!({
+                    "object": "list",
+                    "data": [{ "id": "gpt-5.6-sol", "object": "model" }]
+                }))
+            }
+        }),
+    ));
+    let mut unreachable = backup.upstream_config();
+    unreachable.base_url = format!("http://{unused_addr}/v1");
+    let config = request_local_models_config(
+        vec![unreachable, backup.upstream_config()],
+        request_local_models_retry_config("", vec!["upstream_transport_error".to_string()]),
+    );
+    let service = proxy_service(config);
+    let state = service.state.clone();
+    let proxy = spawn_proxy_service(service);
+
+    let response = local_http_test_client()
+        .get(proxy.url("/models"))
+        .send()
+        .await
+        .expect("send models request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.bytes().await.expect("read models response");
+    assert_openai_models_response(body.as_ref(), "gpt-5.6-sol");
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 1);
+
+    let runtime = state
+        .route_plan_runtime_state_for_provider_endpoints("codex")
+        .await;
+    let primary_health =
+        runtime.provider_endpoint(&ProviderEndpointKey::new("codex", "test", "default"));
+    assert_eq!(primary_health.failure_count, 0);
+    assert!(!primary_health.cooldown_active);
+
+    let finished = find_finished_request(&state, 10, |request| request.path == "/models")
+        .await
+        .expect("finished models request");
+    let transport_failure = finished
+        .retry
+        .as_ref()
+        .expect("models retry trace")
+        .route_attempts
+        .iter()
+        .find(|attempt| attempt.error_class.as_deref() == Some("upstream_transport_error"))
+        .expect("transport failure attempt");
+    assert_eq!(transport_failure.cooldown_secs, None);
+    assert_eq!(transport_failure.cooldown_reason, None);
+
+    proxy.handle.abort();
 }
 
 #[tokio::test]

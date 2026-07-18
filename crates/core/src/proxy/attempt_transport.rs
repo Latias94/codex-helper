@@ -17,6 +17,7 @@ use super::attempt_request::{
     AttemptRequestIdentity, FrozenAttemptRequestSetupParams, prepare_attempt_request_with_identity,
 };
 use super::http_debug::{HttpDebugBase, format_reqwest_error_for_retry_chain};
+use super::request_preparation::SharedRouteStateImpact;
 use super::retry::{RetryLayerOptions, backoff_sleep, should_retry_class};
 use super::route_attempts::{
     ErrorRouteAttemptParams, RouteAttemptErrorKind, record_error_route_attempt,
@@ -157,6 +158,7 @@ pub(super) struct AttemptTransportParams<'a> {
     pub(super) route_attempt_index: usize,
     pub(super) model_note: &'a str,
     pub(super) allow_provider_failover: bool,
+    pub(super) shared_route_state_impact: SharedRouteStateImpact,
 }
 
 pub(super) struct AttemptTargetBuildFailureParams<'a> {
@@ -172,6 +174,7 @@ pub(super) struct AttemptTargetBuildFailureParams<'a> {
     pub(super) route_attempt_index: usize,
     pub(super) model_note: &'a str,
     pub(super) allow_provider_failover: bool,
+    pub(super) shared_route_state_impact: SharedRouteStateImpact,
 }
 
 pub(super) struct AttemptReadBodyParams<'a> {
@@ -190,6 +193,7 @@ pub(super) struct AttemptReadBodyParams<'a> {
     pub(super) model_note: &'a str,
     pub(super) allow_provider_failover: bool,
     pub(super) attempt_handle: AttemptHandle,
+    pub(super) shared_route_state_impact: SharedRouteStateImpact,
 }
 
 pub(super) async fn handle_attempt_target_build_failure(
@@ -208,6 +212,7 @@ pub(super) async fn handle_attempt_target_build_failure(
         route_attempt_index,
         model_note,
         allow_provider_failover,
+        shared_route_state_impact,
     } = params;
     apply_terminal_upstream_failure(TerminalUpstreamFailureParams {
         proxy,
@@ -229,8 +234,12 @@ pub(super) async fn handle_attempt_target_build_failure(
             kind: RouteAttemptErrorKind::TargetBuild,
             model_note,
             duration_ms: None,
-            cooldown_secs: Some(transport_cooldown_secs),
-            cooldown_reason: Some("target_build_error"),
+            cooldown_secs: shared_route_state_impact
+                .allows_shared_updates()
+                .then_some(transport_cooldown_secs),
+            cooldown_reason: shared_route_state_impact
+                .allows_shared_updates()
+                .then_some("target_build_error"),
         },
     );
     if allow_provider_failover {
@@ -275,6 +284,7 @@ pub(super) async fn handle_attempt_transport(
         route_attempt_index,
         model_note,
         allow_provider_failover,
+        shared_route_state_impact,
     } = params;
 
     let attempt_request = prepare_attempt_request_with_identity(FrozenAttemptRequestSetupParams {
@@ -367,8 +377,12 @@ pub(super) async fn handle_attempt_transport(
                     kind: RouteAttemptErrorKind::Transport,
                     model_note,
                     duration_ms: Some(upstream_start.elapsed().as_millis() as u64),
-                    cooldown_secs: (!can_retry_upstream).then_some(transport_cooldown_secs),
-                    cooldown_reason: (!can_retry_upstream).then_some("upstream_transport_error"),
+                    cooldown_secs: (!can_retry_upstream
+                        && shared_route_state_impact.allows_shared_updates())
+                    .then_some(transport_cooldown_secs),
+                    cooldown_reason: (!can_retry_upstream
+                        && shared_route_state_impact.allows_shared_updates())
+                    .then_some("upstream_transport_error"),
                 },
             );
             if can_retry_upstream {
@@ -379,7 +393,7 @@ pub(super) async fn handle_attempt_transport(
             apply_terminal_upstream_failure(TerminalUpstreamFailureParams {
                 proxy,
                 target,
-                penalize_endpoint: true,
+                penalize_endpoint: shared_route_state_impact.allows_shared_updates(),
                 cooldown_secs: transport_cooldown_secs,
                 cooldown_backoff,
                 error_message: err_str,
@@ -424,6 +438,7 @@ pub(super) async fn read_attempt_response_body(
         model_note,
         allow_provider_failover,
         attempt_handle,
+        shared_route_state_impact,
     } = params;
 
     match read_response_body_with_limit(response).await {
@@ -476,8 +491,12 @@ pub(super) async fn read_attempt_response_body(
                     kind: route_kind,
                     model_note,
                     duration_ms: None,
-                    cooldown_secs: (!can_retry_upstream).then_some(transport_cooldown_secs),
-                    cooldown_reason: (!can_retry_upstream).then_some(cooldown_reason),
+                    cooldown_secs: (!can_retry_upstream
+                        && shared_route_state_impact.allows_shared_updates())
+                    .then_some(transport_cooldown_secs),
+                    cooldown_reason: (!can_retry_upstream
+                        && shared_route_state_impact.allows_shared_updates())
+                    .then_some(cooldown_reason),
                 },
             );
             if matches!(error, ResponseBodyReadError::Read(_)) && can_retry_upstream {
@@ -488,7 +507,7 @@ pub(super) async fn read_attempt_response_body(
             apply_terminal_upstream_failure(TerminalUpstreamFailureParams {
                 proxy,
                 target,
-                penalize_endpoint: true,
+                penalize_endpoint: shared_route_state_impact.allows_shared_updates(),
                 cooldown_secs: transport_cooldown_secs,
                 cooldown_backoff,
                 error_message: err_str,

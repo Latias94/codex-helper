@@ -32,6 +32,7 @@ use super::reasoning_guard::{
 use super::request_body::{
     extract_model_from_response_body, extract_service_tier_from_response_body,
 };
+use super::request_preparation::SharedRouteStateImpact;
 use super::response_entity::UpstreamResponseEntity;
 use super::response_finalization::{
     FinalizeForwardResponseParams, FinalizedForwardResponse, finish_and_build_forward_response,
@@ -98,6 +99,7 @@ pub(super) struct AttemptResponseParams<'a> {
     pub(super) is_user_turn: bool,
     pub(super) allow_provider_failover: bool,
     pub(super) is_codex_service: bool,
+    pub(super) shared_route_state_impact: SharedRouteStateImpact,
 }
 
 pub(super) struct StreamingAttemptResponseParams<'a> {
@@ -384,6 +386,7 @@ pub(super) async fn handle_attempt_response(
         is_user_turn,
         allow_provider_failover,
         is_codex_service,
+        shared_route_state_impact,
     } = params;
 
     let mut response_headers_filtered = response_headers_filtered;
@@ -539,8 +542,10 @@ pub(super) async fn handle_attempt_response(
         .as_deref()
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| format!("status_{status_code}"));
-    let route_facing_evidence =
-        decision.provider_penalty && !class_is_health_neutral(cls.as_deref());
+    let shared_route_updates_allowed = shared_route_state_impact.allows_shared_updates();
+    let route_facing_evidence = shared_route_updates_allowed
+        && decision.provider_penalty
+        && !class_is_health_neutral(cls.as_deref());
     let provider_evidence = response_evidence_from_classification(ResponseEvidenceParams {
         target,
         classified_response: &classified_response,
@@ -558,9 +563,9 @@ pub(super) async fn handle_attempt_response(
             model_note,
             upstream_headers_ms,
             duration_ms,
-            cooldown_secs: decision.provider_penalty.then_some(penalty_cooldown_secs),
-            cooldown_reason: decision
-                .provider_penalty
+            cooldown_secs: (shared_route_updates_allowed && decision.provider_penalty)
+                .then_some(penalty_cooldown_secs),
+            cooldown_reason: (shared_route_updates_allowed && decision.provider_penalty)
                 .then_some(cooldown_reason.as_str()),
             provider_signals: provider_evidence.signals.clone(),
             policy_actions: Vec::new(),
@@ -624,18 +629,18 @@ pub(super) async fn handle_attempt_response(
             response_body,
         )
         .await;
-        if finalized.terminal_published {
+        if finalized.terminal_published && shared_route_updates_allowed {
             record_attempt_success(proxy.state.as_ref(), proxy.service_name, target).await;
         }
         return AttemptResponseOutcome::Return(finalized.response);
     }
 
     let response_text = summarize_upstream_error_body(&response_body, &response_headers);
-    if decision.should_probe_codex_usage {
+    if decision.should_probe_codex_usage && shared_route_updates_allowed {
         enqueue_usage_probe_for_target(proxy, target).await;
     }
     if decision.never_retry {
-        if !class_is_health_neutral(cls.as_deref()) {
+        if shared_route_updates_allowed && !class_is_health_neutral(cls.as_deref()) {
             record_attempt_failure(
                 proxy.state.as_ref(),
                 proxy.service_name,
@@ -694,7 +699,7 @@ pub(super) async fn handle_attempt_response(
     }
 
     if decision.provider_penalty {
-        if !class_is_health_neutral(cls.as_deref()) {
+        if shared_route_updates_allowed && !class_is_health_neutral(cls.as_deref()) {
             penalize_attempt_target(
                 proxy.state.as_ref(),
                 proxy.service_name,
