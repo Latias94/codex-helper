@@ -276,6 +276,20 @@ impl CredentialRuntime {
         }
     }
 
+    fn without_runtime_store(capabilities: CredentialSourceCapabilities) -> Result<Self> {
+        let native = capabilities.forbidden_daemon().context(
+            "runtime-store-free credential evaluation requires native credentials to be forbidden",
+        )?;
+        Ok(Self {
+            inner: Arc::new(CredentialRuntimeInner {
+                native,
+                inflight: Mutex::new(BTreeMap::new()),
+                read_timeout: NATIVE_READ_TIMEOUT,
+            }),
+            scope_identity: None,
+        })
+    }
+
     #[cfg(test)]
     fn set_read_timeout_for_test(&mut self, timeout: Duration) {
         Arc::get_mut(&mut self.inner)
@@ -962,6 +976,14 @@ impl CredentialReadinessEvaluator {
         Self {
             runtime: CredentialRuntime::from_installation(capabilities, installation, None),
         }
+    }
+
+    pub(crate) fn without_runtime_store(
+        capabilities: CredentialSourceCapabilities,
+    ) -> Result<Self> {
+        Ok(Self {
+            runtime: CredentialRuntime::without_runtime_store(capabilities)?,
+        })
     }
 
     pub(crate) fn evaluate<'a>(

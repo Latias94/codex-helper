@@ -27,6 +27,7 @@ on:
       - "crates/**"
       - ".github/workflows/docker-publish.yml"
       - "deploy/**"
+      - "tools/docker-mounted-secret-smoke.sh"
 
 permissions:
   contents: read
@@ -109,9 +110,9 @@ jobs:
           set -euo pipefail
           docker build --target runtime -t codex-helper-server:smoke .
 
-      - name: Smoke test image
+      - name: Smoke test environment and mounted-secret deployments
         shell: bash
-        run: docker run --rm codex-helper-server:smoke --help
+        run: bash tools/docker-mounted-secret-smoke.sh codex-helper-server:smoke
 
       - name: Login to GHCR
         if: env.DOCKER_PUBLISH == 'true'

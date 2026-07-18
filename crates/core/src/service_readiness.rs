@@ -35,6 +35,37 @@ pub fn evaluate_service_credential_readiness(
     capabilities: CredentialSourceCapabilities,
     helper_home: impl AsRef<Path>,
 ) -> Result<ServiceCredentialReadinessReport> {
+    let installation = InstallationIdentity::resolve_in_home(helper_home)
+        .context("resolve canonical installation identity for credential preflight")?;
+    evaluate_with(
+        config,
+        service,
+        CredentialReadinessEvaluator::new(capabilities, installation),
+    )
+}
+
+/// Evaluates server-safe credential readiness without opening runtime state or listeners.
+///
+/// The supplied capabilities must forbid native credentials because native namespaces are
+/// installation-scoped. Environment and secret-file sources are resolved directly; no client
+/// files or upstream endpoints are accessed.
+pub fn evaluate_service_credential_readiness_without_runtime_store(
+    config: &HelperConfig,
+    service: ServiceKind,
+    capabilities: CredentialSourceCapabilities,
+) -> Result<ServiceCredentialReadinessReport> {
+    evaluate_with(
+        config,
+        service,
+        CredentialReadinessEvaluator::without_runtime_store(capabilities)?,
+    )
+}
+
+fn evaluate_with(
+    config: &HelperConfig,
+    service: ServiceKind,
+    evaluator: CredentialReadinessEvaluator,
+) -> Result<ServiceCredentialReadinessReport> {
     let service_name = service_name(service);
     let view = match service {
         ServiceKind::Codex => &config.codex,
@@ -42,9 +73,6 @@ pub fn evaluate_service_credential_readiness(
     };
     let graph = CompiledRouteGraph::compile(service_name, view)
         .with_context(|| format!("compile {service_name} route graph for credential preflight"))?;
-    let installation = InstallationIdentity::resolve_in_home(helper_home)
-        .context("resolve canonical installation identity for credential preflight")?;
-    let evaluator = CredentialReadinessEvaluator::new(capabilities, installation);
     let mut evaluated = evaluator.evaluate(graph.candidates().iter().map(|candidate| {
         CredentialCandidateInput {
             provider_endpoint: ProviderEndpointKey::new(
@@ -104,7 +132,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::config::{ProviderConfig, RouteGraphConfig, ServiceRouteConfig, UpstreamAuth};
+    use crate::config::{
+        CredentialRef, ProviderConfig, RouteGraphConfig, ServiceRouteConfig, UpstreamAuth,
+    };
+    use crate::credentials::SecretValue;
 
     fn config_with_auth(auth: Vec<(&str, UpstreamAuth)>) -> HelperConfig {
         let providers = auth
@@ -174,5 +205,36 @@ mod tests {
         )
         .expect("evaluate ready route");
         assert_eq!(ready.aggregate, CredentialAggregateReadiness::Ready);
+    }
+
+    #[test]
+    fn runtime_store_free_evaluator_rejects_native_capability_before_adapter_read() {
+        let config = config_with_auth(vec![(
+            "native",
+            UpstreamAuth {
+                auth_token_ref: Some(CredentialRef::Native {
+                    name: "relay.primary".to_string(),
+                }),
+                ..UpstreamAuth::default()
+            },
+        )]);
+        let (capabilities, control) = CredentialSourceCapabilities::test_native(
+            SecretValue::new(b"native-test-token".to_vec()).expect("valid test credential"),
+        );
+
+        let error = evaluate_service_credential_readiness_without_runtime_store(
+            &config,
+            ServiceKind::Codex,
+            capabilities,
+        )
+        .expect_err("store-free evaluation must reject native-capable adapters");
+
+        assert!(
+            error
+                .to_string()
+                .contains("requires native credentials to be forbidden"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(control.read_count(), 0);
     }
 }

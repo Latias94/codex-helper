@@ -94,8 +94,18 @@ impl CredentialSourceCapabilities {
     pub fn daemon(&self, installation: InstallationIdentity) -> NativeCredentialDaemon {
         NativeCredentialDaemon {
             backend: self.native.clone(),
-            namespace: NativeCredentialNamespace::new(installation),
+            namespace: Some(NativeCredentialNamespace::new(installation)),
         }
+    }
+
+    pub(crate) fn forbidden_daemon(&self) -> Option<NativeCredentialDaemon> {
+        if self.native.is_some() {
+            return None;
+        }
+        Some(NativeCredentialDaemon {
+            backend: None,
+            namespace: None,
+        })
     }
 
     #[cfg(any(feature = "native-credentials", test))]
@@ -191,13 +201,14 @@ impl fmt::Debug for NativeCredentialManager {
 #[derive(Clone)]
 pub struct NativeCredentialDaemon {
     backend: Option<Arc<dyn NativeCredentialStore>>,
-    namespace: NativeCredentialNamespace,
+    namespace: Option<NativeCredentialNamespace>,
 }
 
 impl NativeCredentialDaemon {
     pub fn read(&self, name: &CredentialName) -> Result<SecretValue, CredentialError> {
         let backend = self.backend.as_deref().ok_or_else(|| unsupported(name))?;
-        let locator = self.namespace.locator(name);
+        let namespace = self.namespace.as_ref().ok_or_else(|| unsupported(name))?;
+        let locator = namespace.locator(name);
         let value = backend
             .read(&locator)
             .map_err(|error| map_backend_error(name, error))?;

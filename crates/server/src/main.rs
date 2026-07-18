@@ -1,7 +1,9 @@
+mod check;
 mod config;
 
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -34,12 +36,28 @@ struct Cli {
     /// Admin listen port. Defaults to proxy port + 1000.
     #[arg(long)]
     admin_port: Option<u16>,
+    /// Validate route credentials without opening runtime state, listeners, clients, or upstreams.
+    #[arg(long)]
+    check: bool,
+    /// Emit the credential check as stable JSON. Requires --check.
+    #[arg(long, requires = "check")]
+    json: bool,
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> ExitCode {
     init_tracing();
     let cli = Cli::parse();
+    match run(cli).await {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("Error: {error:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run(cli: Cli) -> Result<ExitCode> {
     let file_config = load_server_config(cli.config.as_deref())?;
     let effective = EffectiveServerConfig::from_sources(
         file_config,
@@ -58,6 +76,21 @@ async fn main() -> Result<()> {
     let loaded = load_config_with_source()
         .await
         .with_context(|| format!("load {service_name} proxy config"))?;
+    if cli.check {
+        let evaluation = check::evaluate(&loaded.source, service_kind)
+            .with_context(|| format!("check {service_name} credential readiness"))?;
+        let output = if cli.json {
+            evaluation.render_json()?
+        } else {
+            evaluation.render_text()
+        };
+        println!("{output}");
+        return Ok(if evaluation.succeeded() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        });
+    }
     let runtime = build_proxy_runtime_from_loaded_with_options(
         service_name,
         effective.host,
@@ -92,7 +125,8 @@ async fn main() -> Result<()> {
     );
 
     let mut running_runtime = runtime.start();
-    running_runtime.wait().await
+    running_runtime.wait().await?;
+    Ok(ExitCode::SUCCESS)
 }
 
 fn init_tracing() {
@@ -122,5 +156,19 @@ async fn wait_for_shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_requires_check_mode() {
+        assert!(Cli::try_parse_from(["codex-helper-server", "--json"]).is_err());
+        let cli = Cli::try_parse_from(["codex-helper-server", "--check", "--json"])
+            .expect("parse check JSON flags");
+        assert!(cli.check);
+        assert!(cli.json);
     }
 }
