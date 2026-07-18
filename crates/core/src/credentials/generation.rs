@@ -761,6 +761,16 @@ impl CredentialGeneration {
             .into()
     }
 
+    pub(crate) fn handles_are_ready(&self, handles: &[CredentialHandle]) -> bool {
+        !handles.is_empty()
+            && handles.iter().all(|handle| {
+                matches!(
+                    self.sources.get(handle),
+                    Some(CredentialSourceState::Ready { .. })
+                )
+            })
+    }
+
     pub(crate) fn contains_handle(&self, handle: &CredentialHandle) -> bool {
         self.catalog.sources.contains_key(handle)
     }

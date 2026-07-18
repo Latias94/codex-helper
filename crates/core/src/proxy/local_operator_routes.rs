@@ -10,8 +10,8 @@ use axum::{Json, Router};
 use super::admin::{AdminAccessConfig, require_admin_access};
 use super::admin_api_error::{AdminApiHttpError, AdminApiResult};
 use super::control_plane_manifest::{
-    LOCAL_V1_BALANCE_REFRESH, LOCAL_V1_OPERATOR_SESSION, LOCAL_V1_ROUTING_MUTATION,
-    LOCAL_V1_SESSION_AFFINITY_MUTATION,
+    LOCAL_V1_BALANCE_REFRESH, LOCAL_V1_CREDENTIAL_REFRESH, LOCAL_V1_OPERATOR_SESSION,
+    LOCAL_V1_ROUTING_MUTATION, LOCAL_V1_SESSION_AFFINITY_MUTATION,
 };
 use super::{
     OperatorRoutingMutationRequest, OperatorSessionAffinityMutationRequest,
@@ -42,6 +42,7 @@ pub(super) fn local_operator_routes(proxy: ProxyService) -> Router {
     Router::new()
         .route(LOCAL_V1_OPERATOR_SESSION, post(begin_session))
         .route(LOCAL_V1_BALANCE_REFRESH, post(refresh_balances))
+        .route(LOCAL_V1_CREDENTIAL_REFRESH, post(refresh_credential))
         .route(LOCAL_V1_ROUTING_MUTATION, post(mutate_routing))
         .route(
             LOCAL_V1_SESSION_AFFINITY_MUTATION,
@@ -53,6 +54,44 @@ pub(super) fn local_operator_routes(proxy: ProxyService) -> Router {
             AdminAccessConfig::from_env(),
             require_admin_access,
         ))
+}
+
+async fn refresh_credential(
+    State(state): State<LocalOperatorRouteState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> AdminApiResult<crate::service_target::LocalCredentialRefreshResponse> {
+    authorize_local_operator_action(&state, &headers, LOCAL_V1_CREDENTIAL_REFRESH, &body)?;
+    let request =
+        serde_json::from_slice::<crate::service_target::LocalCredentialRefreshRequest>(&body)
+            .map_err(|_| {
+                AdminApiHttpError::bad_request(
+                    "local_operator_invalid_json",
+                    "invalid local operator credential refresh request",
+                )
+            })?;
+    let service_matches =
+        crate::runtime_host::service_name_for_kind(request.service) == state.proxy.service_name;
+    let Some(install_generation) = state.proxy.service_install_generation() else {
+        return Err(service_generation_conflict());
+    };
+    if !service_matches || request.install_generation != *install_generation {
+        return Err(service_generation_conflict());
+    }
+
+    let (status, runtime_revision) = state
+        .proxy
+        .refresh_native_credential(&request.credential_name, request.action)
+        .await
+        .map_err(AdminApiHttpError::from)?;
+    Ok(Json(
+        crate::service_target::LocalCredentialRefreshResponse {
+            service: request.service,
+            install_generation: install_generation.clone(),
+            status,
+            runtime_revision,
+        },
+    ))
 }
 
 async fn begin_session(
@@ -195,6 +234,14 @@ fn forbidden_local_operator_action() -> AdminApiHttpError {
         StatusCode::FORBIDDEN,
         "local_operator_forbidden",
         "valid local operator proof is required",
+    )
+}
+
+fn service_generation_conflict() -> AdminApiHttpError {
+    AdminApiHttpError::new(
+        StatusCode::CONFLICT,
+        "local_operator_service_generation_mismatch",
+        "local operator target does not match this service generation",
     )
 }
 

@@ -38,6 +38,7 @@ pub mod runtime_identity;
 pub mod runtime_manager;
 pub mod runtime_store;
 pub mod service_status;
+pub mod service_target;
 pub mod sessions;
 mod sse;
 pub mod state;
@@ -47,3 +48,8 @@ pub mod usage_format;
 pub mod usage_providers;
 #[cfg(windows)]
 mod windows_file_info;
+
+pub use file_replace::{
+    ManagedFileSnapshot, ManagedFileTransaction, ManagedFileTransactionError,
+    read_managed_file_snapshot,
+};

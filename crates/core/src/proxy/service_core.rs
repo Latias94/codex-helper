@@ -12,6 +12,9 @@ use crate::filter::RequestFilter;
 use crate::routing_explain::RoutingExplainResponse;
 use crate::routing_ir::RouteRequestContext;
 use crate::runtime_store::RuntimeStore;
+use crate::service_target::{
+    LocalCredentialRefreshAction, LocalCredentialRefreshStatus, ServiceInstallGeneration,
+};
 use crate::state::{ProxyState, SessionBinding, SessionContinuityMode};
 
 use super::profile_defaults::effective_default_profile_name;
@@ -157,7 +160,49 @@ impl ProxyService {
             concurrency_limiter: Arc::new(super::concurrency_limits::ConcurrencyLimiter::default()),
             filter: RequestFilter::new(),
             state,
+            service_install_generation: None,
         })
+    }
+
+    pub(crate) fn with_service_install_generation(
+        mut self,
+        generation: Option<ServiceInstallGeneration>,
+    ) -> Self {
+        self.service_install_generation = generation;
+        self
+    }
+
+    pub(crate) fn service_install_generation(&self) -> Option<&ServiceInstallGeneration> {
+        self.service_install_generation.as_ref()
+    }
+
+    pub(crate) async fn refresh_native_credential(
+        &self,
+        name: &crate::credentials::CredentialName,
+        action: LocalCredentialRefreshAction,
+    ) -> Result<(LocalCredentialRefreshStatus, u64), ProxyControlError> {
+        let result = match action {
+            LocalCredentialRefreshAction::Upsert => {
+                self.config
+                    .refresh_native_credential_after_upsert(name)
+                    .await
+            }
+            LocalCredentialRefreshAction::Delete => {
+                self.config.invalidate_deleted_native_credential(name).await
+            }
+        }
+        .map_err(|error| {
+            tracing::warn!(
+                service = self.service_name,
+                error = %error,
+                "local credential runtime refresh failed"
+            );
+            ProxyControlError::new(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "credential runtime refresh failed",
+            )
+        })?;
+        Ok((result.status, result.runtime_revision))
     }
 
     pub fn new_ephemeral_diagnostic(

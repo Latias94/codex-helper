@@ -97,8 +97,8 @@ pub use self::codex_relay_probe::{
 };
 use self::concurrency_limits::ConcurrencyLimiter;
 pub(crate) use self::control_plane_manifest::{
-    LOCAL_V1_BALANCE_REFRESH, LOCAL_V1_OPERATOR_SESSION, LOCAL_V1_ROUTING_MUTATION,
-    LOCAL_V1_SESSION_AFFINITY_MUTATION,
+    LOCAL_V1_BALANCE_REFRESH, LOCAL_V1_CREDENTIAL_REFRESH, LOCAL_V1_OPERATOR_SESSION,
+    LOCAL_V1_ROUTING_MUTATION, LOCAL_V1_SESSION_AFFINITY_MUTATION,
 };
 pub(crate) use self::entrypoint::handle_proxy;
 pub(crate) use self::local_operator_routes::{
@@ -138,6 +138,7 @@ pub struct ProxyService {
     concurrency_limiter: Arc<ConcurrencyLimiter>,
     filter: RequestFilter,
     state: Arc<ProxyState>,
+    service_install_generation: Option<crate::service_target::ServiceInstallGeneration>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

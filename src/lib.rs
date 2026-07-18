@@ -2,6 +2,7 @@ pub mod cli_app;
 pub mod cli_types;
 pub mod commands;
 mod service_manager;
+mod service_receipt;
 
 pub use cli_app::run_cli;
 pub use cli_types::{

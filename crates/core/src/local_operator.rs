@@ -462,7 +462,7 @@ fn read_concurrently_created_token(path: &Path) -> Result<String> {
     )
 }
 
-fn read_local_operator_token_from(home: impl AsRef<Path>) -> Result<Option<String>> {
+pub(crate) fn read_local_operator_token_from(home: impl AsRef<Path>) -> Result<Option<String>> {
     read_local_operator_token_path(&local_operator_token_path_in(home))
 }
 

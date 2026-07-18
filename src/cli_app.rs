@@ -23,7 +23,11 @@ use crate::runtime_manager::{
     read_owner_marker_best_effort, write_owner_marker,
 };
 use crate::service_manager;
+use crate::service_receipt::{
+    ServicePlatformBackend, ServiceReceipt, ServiceReceiptError, read_service_receipt,
+};
 use crate::tui;
+use anyhow::Context;
 use codex_helper_core::relay_target::{
     ResolvedRelayTarget, default_proxy_port_for_service_kind, normalize_relay_target_name,
     relay_target_config_from_args, relay_target_names, resolve_relay_target,
@@ -759,6 +763,56 @@ fn daemon_admin_base_url_for_proxy_port(port: u16) -> String {
     format!("http://{}", admin_loopback_addr_for_proxy_port(port))
 }
 
+#[derive(Debug, thiserror::Error)]
+enum ServiceRefreshTargetError {
+    #[error(transparent)]
+    Receipt(#[from] ServiceReceiptError),
+    #[error("service receipt targets a different service")]
+    ServiceMismatch,
+    #[error("service receipt targets a different platform backend")]
+    PlatformMismatch,
+    #[error("service receipt admin authority is invalid: {0}")]
+    AdminAuthority(#[from] anyhow::Error),
+}
+
+struct VerifiedServiceRefreshTarget {
+    receipt: ServiceReceipt,
+    endpoint: ControlPlaneEndpoint,
+}
+
+impl VerifiedServiceRefreshTarget {
+    #[allow(dead_code)]
+    fn local_operator_client(
+        &self,
+    ) -> Result<crate::control_plane_client::LocalOperatorClient, ServiceRefreshTargetError> {
+        crate::control_plane_client::LocalOperatorClient::from_helper_home(
+            self.endpoint.clone(),
+            self.receipt.helper_home(),
+        )
+        .map_err(ServiceRefreshTargetError::AdminAuthority)
+    }
+}
+
+#[allow(dead_code)]
+fn resolve_service_refresh_target(
+    helper_home: &Path,
+    expected_service: ServiceKind,
+) -> Result<VerifiedServiceRefreshTarget, ServiceRefreshTargetError> {
+    let receipt = read_service_receipt(helper_home)?;
+    if receipt.service() != expected_service {
+        return Err(ServiceRefreshTargetError::ServiceMismatch);
+    }
+    if ServicePlatformBackend::current() != Some(receipt.platform_backend()) {
+        return Err(ServiceRefreshTargetError::PlatformMismatch);
+    }
+    let endpoint = ControlPlaneEndpoint::new(
+        receipt.admin_base_url(),
+        configured_local_admin_token_env().map(str::to_string),
+    )
+    .map_err(ServiceRefreshTargetError::AdminAuthority)?;
+    Ok(VerifiedServiceRefreshTarget { receipt, endpoint })
+}
+
 async fn read_operator_model(
     admin_url: &str,
     admin_token_env: Option<&str>,
@@ -1223,7 +1277,9 @@ async fn run_server(
     let loaded = load_serve_config().await?;
     let tui_lang = resolve_serve_tui_language(&loaded);
 
-    let runtime = build_local_proxy_runtime(service_name, host, port, loaded).await?;
+    let runtime =
+        build_local_proxy_runtime(service_name, host, port, options.service_managed, loaded)
+            .await?;
     let addr: SocketAddr = SocketAddr::from((host, port));
     let admin_addr = runtime.admin_addr;
     let cfg = runtime.config.clone();
@@ -1332,9 +1388,16 @@ async fn build_local_proxy_runtime(
     service_name: &'static str,
     host: IpAddr,
     port: u16,
+    service_managed: bool,
     loaded: LoadedConfig,
 ) -> anyhow::Result<ProxyRuntime> {
     let admin_addr = admin_loopback_addr_for_proxy_port(port);
+    let service_install_generation = if service_managed {
+        codex_helper_core::service_target::ServiceInstallGeneration::from_process_env()
+            .context("read service install generation from process environment")?
+    } else {
+        None
+    };
     if !host.is_loopback() {
         tracing::warn!(
             "Binding to non-loopback address {}. This may expose your proxy to other machines. Consider using 127.0.0.1 + SSH port forwarding instead.",
@@ -1351,7 +1414,8 @@ async fn build_local_proxy_runtime(
         port,
         ProxyRuntimeOptions::for_proxy_port(port)
             .with_admin_addr(admin_addr)
-            .with_credential_sources(CredentialSourceCapabilities::platform_native()),
+            .with_credential_sources(CredentialSourceCapabilities::platform_native())
+            .with_service_install_generation(service_install_generation),
         loaded,
     )
     .await
@@ -1898,6 +1962,173 @@ node    7777 user   23u  IPv4 0x0      0t0     TCP 127.0.0.1:3211 (LISTEN)\n\
 }
 
 #[cfg(test)]
+mod service_refresh_target_tests {
+    use super::*;
+    use crate::service_receipt::{ServiceReceiptTransaction, service_receipt_path};
+    use codex_helper_core::service_target::ServiceInstallGeneration;
+
+    struct TestHome(PathBuf);
+
+    impl TestHome {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "codex-helper-service-target-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(path.join("client")).expect("create target test home");
+            Self(path)
+        }
+
+        fn install_receipt(
+            &self,
+            service: ServiceKind,
+            admin_base_url: &str,
+            platform: ServicePlatformBackend,
+        ) -> ServiceReceipt {
+            let receipt = ServiceReceipt::new(
+                service,
+                self.0.clone(),
+                self.0.join("client"),
+                admin_base_url,
+                platform,
+                ServiceInstallGeneration::generate(),
+            )
+            .expect("build service receipt");
+            let mut transaction =
+                ServiceReceiptTransaction::begin(self.0.clone()).expect("begin receipt write");
+            transaction
+                .replace(&receipt)
+                .expect("write service receipt");
+            receipt
+        }
+    }
+
+    impl Drop for TestHome {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn foreign_platform() -> ServicePlatformBackend {
+        match ServicePlatformBackend::current().expect("supported test platform") {
+            ServicePlatformBackend::WindowsScheduledTask => {
+                ServicePlatformBackend::MacosLaunchAgent
+            }
+            ServicePlatformBackend::MacosLaunchAgent | ServicePlatformBackend::LinuxSystemdUser => {
+                ServicePlatformBackend::WindowsScheduledTask
+            }
+        }
+    }
+
+    #[test]
+    fn receipt_discovery_uses_exact_default_or_custom_admin_authority() {
+        let default_home = TestHome::new();
+        let custom_home = TestHome::new();
+        default_home.install_receipt(
+            ServiceKind::Codex,
+            "http://127.0.0.1:4211",
+            ServicePlatformBackend::current().expect("supported platform"),
+        );
+        let custom_receipt = custom_home.install_receipt(
+            ServiceKind::Claude,
+            "http://127.0.0.1:5310",
+            ServicePlatformBackend::current().expect("supported platform"),
+        );
+
+        let default = resolve_service_refresh_target(&default_home.0, ServiceKind::Codex)
+            .expect("resolve default target");
+        let custom = resolve_service_refresh_target(&custom_home.0, ServiceKind::Claude)
+            .expect("resolve custom target");
+
+        assert_eq!(default.endpoint.admin_base_url(), "http://127.0.0.1:4211");
+        assert_eq!(custom.endpoint.admin_base_url(), "http://127.0.0.1:5310");
+        assert_eq!(
+            custom.receipt.install_generation(),
+            custom_receipt.install_generation()
+        );
+        assert_eq!(custom.receipt.client_home(), custom_home.0.join("client"));
+    }
+
+    #[test]
+    fn receipt_discovery_rejects_absent_legacy_mismatched_and_foreign_targets_without_fallback() {
+        let selected = TestHome::new();
+        let other = TestHome::new();
+        other.install_receipt(
+            ServiceKind::Codex,
+            "http://127.0.0.1:6551",
+            ServicePlatformBackend::current().expect("supported platform"),
+        );
+
+        assert!(matches!(
+            resolve_service_refresh_target(&selected.0, ServiceKind::Codex),
+            Err(ServiceRefreshTargetError::Receipt(
+                ServiceReceiptError::Missing
+            ))
+        ));
+
+        std::fs::write(
+            service_receipt_path(&selected.0),
+            br#"{"schema_version":0,"admin_base_url":"http://127.0.0.1:6551"}"#,
+        )
+        .expect("write legacy receipt");
+        assert!(matches!(
+            resolve_service_refresh_target(&selected.0, ServiceKind::Codex),
+            Err(ServiceRefreshTargetError::Receipt(
+                ServiceReceiptError::LegacySchema { .. }
+            ))
+        ));
+
+        std::fs::remove_file(service_receipt_path(&selected.0)).expect("remove legacy receipt");
+        selected.install_receipt(
+            ServiceKind::Claude,
+            "http://127.0.0.1:4310",
+            ServicePlatformBackend::current().expect("supported platform"),
+        );
+        assert!(matches!(
+            resolve_service_refresh_target(&selected.0, ServiceKind::Codex),
+            Err(ServiceRefreshTargetError::ServiceMismatch)
+        ));
+
+        let foreign = TestHome::new();
+        let foreign_receipt = ServiceReceipt::new(
+            ServiceKind::Codex,
+            foreign.0.clone(),
+            foreign.0.join("client"),
+            "http://127.0.0.1:4999",
+            ServicePlatformBackend::current().expect("supported platform"),
+            ServiceInstallGeneration::generate(),
+        )
+        .expect("build foreign receipt");
+        std::fs::write(
+            service_receipt_path(&selected.0),
+            serde_json::to_vec(&foreign_receipt).expect("serialize foreign receipt"),
+        )
+        .expect("write foreign receipt");
+        assert!(matches!(
+            resolve_service_refresh_target(&selected.0, ServiceKind::Codex),
+            Err(ServiceRefreshTargetError::Receipt(
+                ServiceReceiptError::ForeignHelperHome
+            ))
+        ));
+    }
+
+    #[test]
+    fn receipt_discovery_rejects_platform_mismatch() {
+        let home = TestHome::new();
+        home.install_receipt(
+            ServiceKind::Codex,
+            "http://127.0.0.1:4211",
+            foreign_platform(),
+        );
+
+        assert!(matches!(
+            resolve_service_refresh_target(&home.0, ServiceKind::Codex),
+            Err(ServiceRefreshTargetError::PlatformMismatch)
+        ));
+    }
+}
+
+#[cfg(test)]
 mod supervisor_tests {
     use super::*;
 
@@ -2146,6 +2377,7 @@ env_key = "EXTERNAL_API_KEY"
             "codex",
             proxy_addr.ip(),
             proxy_addr.port(),
+            false,
             empty_loaded_test_config(),
         ));
         let error = match result {
@@ -2190,6 +2422,7 @@ env_key = "EXTERNAL_API_KEY"
                 "codex",
                 proxy_addr.ip(),
                 proxy_addr.port(),
+                false,
                 loaded_runtime_test_config(),
             )
             .await;
@@ -2215,6 +2448,7 @@ env_key = "EXTERNAL_API_KEY"
                 "codex",
                 IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
                 proxy_port,
+                false,
                 loaded_runtime_test_config(),
             )
             .await;

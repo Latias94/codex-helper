@@ -101,8 +101,8 @@ mod tests {
     use super::*;
     use crate::config::{HelperConfig, ProviderConfig, RouteGraphConfig, ServiceRouteConfig};
     use crate::proxy::{
-        LOCAL_V1_BALANCE_REFRESH, LOCAL_V1_OPERATOR_SESSION, LOCAL_V1_ROUTING_MUTATION,
-        LOCAL_V1_SESSION_AFFINITY_MUTATION,
+        LOCAL_V1_BALANCE_REFRESH, LOCAL_V1_CREDENTIAL_REFRESH, LOCAL_V1_OPERATOR_SESSION,
+        LOCAL_V1_ROUTING_MUTATION, LOCAL_V1_SESSION_AFFINITY_MUTATION,
     };
 
     fn proxy_with_upstream(base_url: String) -> ProxyService {
@@ -196,6 +196,7 @@ mod tests {
         for path in [
             LOCAL_V1_OPERATOR_SESSION,
             LOCAL_V1_BALANCE_REFRESH,
+            LOCAL_V1_CREDENTIAL_REFRESH,
             LOCAL_V1_ROUTING_MUTATION,
             LOCAL_V1_SESSION_AFFINITY_MUTATION,
         ] {
@@ -218,21 +219,26 @@ mod tests {
 
     #[tokio::test]
     async fn admin_listener_rejects_unsigned_local_operator_actions() {
-        let mut request = Request::builder()
-            .method("POST")
-            .uri(LOCAL_V1_BALANCE_REFRESH)
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"force":true}"#))
-            .expect("build local operator request");
-        request.extensions_mut().insert(axum::extract::ConnectInfo(
-            "127.0.0.1:32100"
-                .parse::<std::net::SocketAddr>()
-                .expect("loopback address"),
-        ));
         let app = admin_listener_router(proxy_with_upstream("http://127.0.0.1:1".to_string()));
+        for path in [LOCAL_V1_BALANCE_REFRESH, LOCAL_V1_CREDENTIAL_REFRESH] {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"force":true}"#))
+                .expect("build local operator request");
+            request.extensions_mut().insert(axum::extract::ConnectInfo(
+                "127.0.0.1:32100"
+                    .parse::<std::net::SocketAddr>()
+                    .expect("loopback address"),
+            ));
+            let response = app
+                .clone()
+                .oneshot(request)
+                .await
+                .expect("unsigned response");
 
-        let response = app.oneshot(request).await.expect("unsigned response");
-
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "path={path}");
+        }
     }
 }

@@ -6,6 +6,8 @@ mod native;
 mod runtime;
 mod secret_file;
 
+#[cfg(test)]
+pub(crate) use capabilities::TestNativeCredentialControl;
 pub use capabilities::{
     CredentialSourceCapabilities, NativeCredentialDaemon, NativeCredentialManager,
 };

@@ -20,6 +20,7 @@ use crate::proxy::{
 };
 use crate::quota_sampler::{QuotaSampler, QuotaSamplerConfig, QuotaSamplerRefreshOutcome};
 use crate::runtime_store::RuntimeStore;
+use crate::service_target::ServiceInstallGeneration;
 use crate::state::ProxyState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +75,7 @@ struct RuntimeTaskJoinResults {
 pub struct ProxyRuntimeOptions {
     pub admin_addr: SocketAddr,
     pub credential_sources: CredentialSourceCapabilities,
+    pub service_install_generation: Option<ServiceInstallGeneration>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +122,7 @@ impl ProxyRuntimeOptions {
         Self {
             admin_addr,
             credential_sources: CredentialSourceCapabilities::server(),
+            service_install_generation: None,
         }
     }
 
@@ -133,6 +136,14 @@ impl ProxyRuntimeOptions {
         credential_sources: CredentialSourceCapabilities,
     ) -> Self {
         self.credential_sources = credential_sources;
+        self
+    }
+
+    pub fn with_service_install_generation(
+        mut self,
+        service_install_generation: Option<ServiceInstallGeneration>,
+    ) -> Self {
+        self.service_install_generation = service_install_generation;
         self
     }
 }
@@ -445,6 +456,7 @@ async fn build_proxy_runtime_from_loaded_with_options_and_runtime_store(
     let ProxyRuntimeOptions {
         admin_addr,
         credential_sources,
+        service_install_generation,
     } = options;
     validate_service_has_upstream(service_name, &loaded.source)?;
     let client = crate::proxy::upstream_http_client_builder()
@@ -465,6 +477,7 @@ async fn build_proxy_runtime_from_loaded_with_options_and_runtime_store(
             proxy_store,
             credential_sources,
         )
+        .map(|proxy| proxy.with_service_install_generation(service_install_generation))
     })
     .await
     .context("join initial credential and runtime snapshot builder")??;

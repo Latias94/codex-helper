@@ -26,6 +26,7 @@ use crate::provider_catalog::ProviderCatalogSnapshot;
 use crate::routing_ir::{CompiledRouteGraph, RoutePlanTemplate, RouteRequestContext};
 use crate::runtime_identity::{RuntimeUpstreamIdentity, diff_runtime_upstream_identities};
 use crate::runtime_store::{ProviderPolicySnapshot, RuntimeStore};
+use crate::service_target::LocalCredentialRefreshStatus;
 use crate::state::{PreparedRoutingOperatorRouteGraph, ProxyState};
 use crate::usage_providers::{
     credential_generation_catalog, usage_provider_source_revision_from_disk,
@@ -575,6 +576,11 @@ enum PreparedRuntimePublishOutcome {
     Stale,
 }
 
+pub(super) struct NamedNativeCredentialPublishOutcome {
+    pub(super) status: LocalCredentialRefreshStatus,
+    pub(super) runtime_revision: u64,
+}
+
 impl RuntimeConfig {
     pub(super) fn new_with_runtime_store_and_credential_sources(
         initial_config: Arc<HelperConfig>,
@@ -930,21 +936,18 @@ impl RuntimeConfig {
         .await
     }
 
-    // U9 exposes these operations only through the signed local operator boundary.
-    #[allow(dead_code)]
     pub(super) async fn refresh_native_credential_after_upsert(
         &self,
         name: &CredentialName,
-    ) -> Result<bool> {
+    ) -> Result<NamedNativeCredentialPublishOutcome> {
         self.publish_named_native_credential(name, CredentialRuntimeRefreshCause::ExplicitRefresh)
             .await
     }
 
-    #[allow(dead_code)]
     pub(super) async fn invalidate_deleted_native_credential(
         &self,
         name: &CredentialName,
-    ) -> Result<bool> {
+    ) -> Result<NamedNativeCredentialPublishOutcome> {
         self.publish_named_native_credential(name, CredentialRuntimeRefreshCause::ExplicitDelete)
             .await
     }
@@ -953,26 +956,44 @@ impl RuntimeConfig {
         &self,
         name: &CredentialName,
         cause: CredentialRuntimeRefreshCause,
-    ) -> Result<bool> {
+    ) -> Result<NamedNativeCredentialPublishOutcome> {
         loop {
             let previous = self.capture_current();
             let generation = previous.credential_generation();
             let handles = generation.native_handles_for_name(name);
             if handles.is_empty() {
-                return Ok(false);
+                return Ok(NamedNativeCredentialPublishOutcome {
+                    status: LocalCredentialRefreshStatus::NotReferenced,
+                    runtime_revision: previous.revision(),
+                });
             }
             let ticket = self.reserve_build_ticket();
             let next_generation = self
                 .credential_runtime
-                .refresh_generation(generation, Some(handles), cause)
+                .refresh_generation(generation, Some(Arc::clone(&handles)), cause)
                 .await?;
+            let requested_generation_ready = cause
+                != CredentialRuntimeRefreshCause::ExplicitRefresh
+                || next_generation.handles_are_ready(&handles);
             let prepared =
                 PreparedRuntimeSnapshot::with_refreshed_credentials(&previous, next_generation)?;
             match self
                 .publish_prepared_with_expected(ticket, prepared, Some(&previous))
                 .await?
             {
-                PreparedRuntimePublishOutcome::Published { changed } => return Ok(changed),
+                PreparedRuntimePublishOutcome::Published { changed } => {
+                    if !requested_generation_ready {
+                        anyhow::bail!("explicit credential refresh did not become ready");
+                    }
+                    return Ok(NamedNativeCredentialPublishOutcome {
+                        status: if changed {
+                            LocalCredentialRefreshStatus::Published
+                        } else {
+                            LocalCredentialRefreshStatus::Unchanged
+                        },
+                        runtime_revision: self.capture_current().revision(),
+                    });
+                }
                 PreparedRuntimePublishOutcome::Stale => continue,
             }
         }
@@ -2408,11 +2429,13 @@ mod tests {
         assert_eq!(control.read_count(), 1);
 
         control.set_missing();
-        assert!(
+        assert_eq!(
             runtime
                 .invalidate_deleted_native_credential(&name)
                 .await
                 .expect("publish explicit delete")
+                .status,
+            LocalCredentialRefreshStatus::Published
         );
         assert_eq!(
             control.read_count(),
@@ -2446,11 +2469,13 @@ mod tests {
         );
 
         control.set_value(SecretValue::new(b"generation-b".to_vec()).expect("valid credential"));
-        assert!(
+        assert_eq!(
             runtime
                 .refresh_native_credential_after_upsert(&name)
                 .await
                 .expect("publish explicit upsert")
+                .status,
+            LocalCredentialRefreshStatus::Published
         );
         assert_eq!(control.read_count(), 2);
 
