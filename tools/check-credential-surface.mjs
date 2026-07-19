@@ -441,7 +441,7 @@ for (const marker of [
   "node tools/native-credential-smoke.mjs --self-test",
   "node tools/verify-native-credential-evidence.mjs --self-test",
   "tool: cargo-dist@0.32.0",
-  "cargo dist generate --mode=ci --check",
+  "dist generate --mode=ci --check",
   "cargo check --locked -p codex-helper-core --features native-credentials --all-targets",
   "cargo build --locked -p codex-helper-server --target-dir target/server-isolated",
   "test(server_runtime_forbids_native_credentials_under_feature_unification)",
