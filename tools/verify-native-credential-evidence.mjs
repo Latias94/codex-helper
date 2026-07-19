@@ -150,6 +150,7 @@ function validateEvidence(
   );
   for (const [phase, expected] of [
     ["initial", "ready"],
+    ["degraded", "degraded"],
     ["missing", "blocked"],
     ["restored", "ready"],
     ["same_value_refresh", "ready"],
@@ -160,15 +161,19 @@ function validateEvidence(
   }
 
   for (const key of [
+    "import_from_environment_preserves_source",
+    "initial_relay_used_imported_credential",
+    "rotated_relay_used_recreated_credential",
     "service_context_ready",
+    "degraded_keeps_service_running",
+    "blocked_relay_made_zero_upstream_attempts",
     "explicit_delete_blocks_without_stopping_daemon",
     "recreate_restores_service_context",
     "same_value_refresh_avoids_generation_churn",
+    "observed_commands_completed_without_prompt_or_timeout",
+    "observed_readiness_was_classified",
   ]) {
     expectEqual(evidence.failure_matrix?.[key], "passed", `${backend} ${key}`);
-  }
-  for (const key of ["prompt_or_timeout", "unknown_readiness"]) {
-    expectEqual(evidence.failure_matrix?.[key], "fail_closed", `${backend} ${key}`);
   }
   expectEqual(evidence.leakage_audit?.status, "passed", `${backend} leakage audit`);
   if (!(evidence.leakage_audit?.files_scanned > 0) || !(evidence.leakage_audit?.bytes_scanned > 0)) {
@@ -425,17 +430,23 @@ function selfTestEvidence({
     },
     readiness_observations: [
       observation("initial", "ready"),
+      observation("degraded", "degraded"),
       observation("missing", "blocked"),
       observation("restored", "ready"),
       observation("same_value_refresh", "ready"),
     ],
     failure_matrix: {
+      import_from_environment_preserves_source: "passed",
+      initial_relay_used_imported_credential: "passed",
+      rotated_relay_used_recreated_credential: "passed",
       service_context_ready: "passed",
+      degraded_keeps_service_running: "passed",
+      blocked_relay_made_zero_upstream_attempts: "passed",
       explicit_delete_blocks_without_stopping_daemon: "passed",
       recreate_restores_service_context: "passed",
       same_value_refresh_avoids_generation_churn: "passed",
-      prompt_or_timeout: "fail_closed",
-      unknown_readiness: "fail_closed",
+      observed_commands_completed_without_prompt_or_timeout: "passed",
+      observed_readiness_was_classified: "passed",
     },
     leakage_audit: {
       status: "passed",

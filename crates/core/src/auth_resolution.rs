@@ -171,11 +171,13 @@ fn service_file_value(service_name: &str, key: &str) -> Option<(String, Credenti
     (!value.0.trim().is_empty()).then_some(value)
 }
 
+type ClientFileLookup<'a> = &'a dyn Fn(&str, &str) -> Option<(String, CredentialSource)>;
+
 fn resolve_credential(
     service_name: &str,
     inline: Option<&str>,
     env_name: Option<&str>,
-    file_lookup: &impl Fn(&str, &str) -> Option<(String, CredentialSource)>,
+    client_file_lookup: Option<ClientFileLookup<'_>>,
 ) -> CredentialResolution {
     if let Some(value) = inline.filter(|value| !value.trim().is_empty()) {
         return CredentialResolution::Resolved {
@@ -204,7 +206,8 @@ fn resolve_credential(
             },
         };
     }
-    if let Some((value, source)) = file_lookup(service_name, env_name)
+    if let Some(file_lookup) = client_file_lookup
+        && let Some((value, source)) = file_lookup(service_name, env_name)
         && !value.trim().is_empty()
     {
         return CredentialResolution::Resolved {
@@ -226,12 +229,15 @@ pub(crate) fn resolve_service_credential_for_runtime(
     service_name: &str,
     inline: Option<&str>,
     env_name: Option<&str>,
+    client_file_fallback_enabled: bool,
 ) -> CredentialResolution {
-    resolve_credential(service_name, inline, env_name, &service_file_value)
+    let client_file_lookup: Option<ClientFileLookup<'_>> =
+        client_file_fallback_enabled.then_some(&service_file_value);
+    resolve_credential(service_name, inline, env_name, client_file_lookup)
 }
 
 pub(crate) fn resolve_environment_credential_for_runtime(env_name: &str) -> CredentialResolution {
-    resolve_credential("environment", None, Some(env_name), &|_, _| None)
+    resolve_credential("environment", None, Some(env_name), None)
 }
 
 pub(crate) fn trusted_codex_passthrough_origin(target_url: &str) -> bool {
@@ -332,20 +338,39 @@ mod tests {
             CredentialResolution::MissingReference { name: ref missing } if missing == &name
         ));
 
-        let service_credential = resolve_credential("codex", None, Some(&name), &|_, field| {
-            (field == name).then(|| {
-                (
-                    "client-file-value".to_string(),
-                    CredentialSource::CodexAuthJson {
-                        field: field.to_string(),
-                    },
-                )
-            })
-        });
+        let service_credential = resolve_credential(
+            "codex",
+            None,
+            Some(&name),
+            Some(&|_, field| {
+                (field == name).then(|| {
+                    (
+                        "client-file-value".to_string(),
+                        CredentialSource::CodexAuthJson {
+                            field: field.to_string(),
+                        },
+                    )
+                })
+            }),
+        );
         assert!(matches!(
             service_credential,
             CredentialResolution::Resolved { ref value, .. }
                 if value.as_str() == "client-file-value"
+        ));
+    }
+
+    #[test]
+    fn forbidden_client_file_resolution_has_no_lookup_to_invoke() {
+        let name = format!(
+            "CODEX_HELPER_TEST_NO_CLIENT_FILE_{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let resolution = resolve_credential("codex", None, Some(&name), None);
+
+        assert!(matches!(
+            resolution,
+            CredentialResolution::MissingReference { name: ref missing } if missing == &name
         ));
     }
 
@@ -368,7 +393,7 @@ mod tests {
             "codex",
             Some("token-1"),
             Some("UNUSED_AUTH_ENV_FOR_TEST"),
-            &|_, _| panic!("inline credentials must not read client files"),
+            Some(&|_, _| panic!("inline credentials must not read client files")),
         );
 
         assert!(matches!(
@@ -382,9 +407,12 @@ mod tests {
 
     #[test]
     fn unconfigured_resolution_does_not_consult_client_files() {
-        let resolved = resolve_credential("codex", None, None, &|_, _| {
-            panic!("unconfigured credentials must not read client files")
-        });
+        let resolved = resolve_credential(
+            "codex",
+            None,
+            None,
+            Some(&|_, _| panic!("unconfigured credentials must not read client files")),
+        );
 
         assert!(matches!(resolved, CredentialResolution::Unconfigured));
     }

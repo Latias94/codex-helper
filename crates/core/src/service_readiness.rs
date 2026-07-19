@@ -237,4 +237,32 @@ mod tests {
         );
         assert_eq!(control.read_count(), 0);
     }
+
+    #[test]
+    fn runtime_store_free_evaluator_requires_client_file_fallback_to_be_forbidden() {
+        let config = config_with_auth(vec![(
+            "environment",
+            UpstreamAuth {
+                auth_token_env: Some(format!(
+                    "CODEX_HELPER_TEST_OFFLINE_{}",
+                    uuid::Uuid::new_v4().simple()
+                )),
+                ..UpstreamAuth::default()
+            },
+        )]);
+
+        let error = evaluate_service_credential_readiness_without_runtime_store(
+            &config,
+            ServiceKind::Codex,
+            CredentialSourceCapabilities::server(),
+        )
+        .expect_err("store-free evaluation must reject client-file fallback capability");
+
+        assert!(
+            error
+                .to_string()
+                .contains("requires client-file fallback to be forbidden"),
+            "unexpected error: {error:#}"
+        );
+    }
 }

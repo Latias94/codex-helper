@@ -3515,6 +3515,7 @@ async fn proxy_does_not_retry_or_failover_on_400() {
 
 #[tokio::test]
 async fn proxy_buffered_401_and_403_share_one_native_refresh_without_replay_or_failover() {
+    const CREDENTIAL_CANARY: &str = "native-auth-failure-canary-3e9f64b10a7842cd";
     let unauthorized_hits = Arc::new(AtomicUsize::new(0));
     let forbidden_hits = Arc::new(AtomicUsize::new(0));
     let unauthorized_counter = Arc::clone(&unauthorized_hits);
@@ -3581,7 +3582,7 @@ async fn proxy_buffered_401_and_403_share_one_native_refresh_without_replay_or_f
     );
     let (credential_sources, credential_control) =
         crate::credentials::CredentialSourceCapabilities::test_native(
-            crate::credentials::SecretValue::new(b"generation-a".to_vec())
+            crate::credentials::SecretValue::new(CREDENTIAL_CANARY.as_bytes().to_vec())
                 .expect("valid initial credential"),
         );
     let runtime_store =
@@ -3609,14 +3610,24 @@ async fn proxy_buffered_401_and_403_share_one_native_refresh_without_replay_or_f
     );
     assert_eq!(unauthorized_response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(forbidden_response.status(), StatusCode::FORBIDDEN);
-    let _ = unauthorized_response
+    let unauthorized_body = unauthorized_response
         .bytes()
         .await
         .expect("drain buffered 401 response");
-    let _ = forbidden_response
+    let forbidden_body = forbidden_response
         .bytes()
         .await
         .expect("drain buffered 403 response");
+    assert!(
+        !unauthorized_body
+            .windows(CREDENTIAL_CANARY.len())
+            .any(|bytes| bytes == CREDENTIAL_CANARY.as_bytes())
+    );
+    assert!(
+        !forbidden_body
+            .windows(CREDENTIAL_CANARY.len())
+            .any(|bytes| bytes == CREDENTIAL_CANARY.as_bytes())
+    );
 
     assert_eq!(unauthorized_hits.load(Ordering::SeqCst), 1);
     assert_eq!(forbidden_hits.load(Ordering::SeqCst), 1);

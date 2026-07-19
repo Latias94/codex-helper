@@ -103,6 +103,8 @@ ch
 - 交互终端中打开 TUI；
 - 退出时停止当前前台控制台启动的代理。
 
+自动配置迁移只会把受支持的旧语法转换为 version 6，并保留源文件的精确备份；它不会复制、删除或重新解释任何凭据值。把值导入 OS 凭据存储是另一项必须显式执行的操作，例如 `codex-helper credential import relay.primary --from-env RELAY_TOKEN`。
+
 只启动代理、不打开 TUI：
 
 ```bash

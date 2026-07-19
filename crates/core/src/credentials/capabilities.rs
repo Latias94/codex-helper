@@ -65,18 +65,40 @@ pub(super) trait NativeCredentialStore: Send + Sync {
     fn delete(&self, locator: &NativeCredentialLocator) -> Result<(), NativeStoreError>;
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct CredentialSourceCapabilities {
     native: Option<Arc<dyn NativeCredentialStore>>,
+    client_file_fallback_enabled: bool,
+}
+
+impl Default for CredentialSourceCapabilities {
+    fn default() -> Self {
+        Self {
+            native: None,
+            client_file_fallback_enabled: true,
+        }
+    }
 }
 
 impl CredentialSourceCapabilities {
     pub fn server() -> Self {
-        Self { native: None }
+        Self::default()
+    }
+
+    /// Restricts store-free server checks to deployment-provided credential sources.
+    pub fn server_check() -> Self {
+        Self {
+            native: None,
+            client_file_fallback_enabled: false,
+        }
     }
 
     pub fn native_supported(&self) -> bool {
         self.native.is_some()
+    }
+
+    pub(super) fn client_file_fallback_enabled(&self) -> bool {
+        self.client_file_fallback_enabled
     }
 
     #[cfg(feature = "native-credentials")]
@@ -112,6 +134,7 @@ impl CredentialSourceCapabilities {
     pub(super) fn with_backend(backend: Arc<dyn NativeCredentialStore>) -> Self {
         Self {
             native: Some(backend),
+            client_file_fallback_enabled: true,
         }
     }
 
@@ -129,6 +152,10 @@ impl fmt::Debug for CredentialSourceCapabilities {
         formatter
             .debug_struct("CredentialSourceCapabilities")
             .field("native_supported", &self.native_supported())
+            .field(
+                "client_file_fallback_enabled",
+                &self.client_file_fallback_enabled(),
+            )
             .finish()
     }
 }

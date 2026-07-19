@@ -8,6 +8,7 @@ container="codex-helper-secret-smoke-$$"
 compose_project="codex-helper-secret-smoke-$$"
 admin_token="docker-smoke-admin-token"
 use_sudo=false
+upstream_pid=""
 
 if [[ "$(uname -s)" == "Linux" && "$(id -u)" != "0" ]]; then
   use_sudo=true
@@ -22,6 +23,10 @@ run_root() {
 }
 
 cleanup() {
+  if [[ -n "$upstream_pid" ]]; then
+    kill "$upstream_pid" >/dev/null 2>&1 || true
+    wait "$upstream_pid" >/dev/null 2>&1 || true
+  fi
   docker rm -f "$container" >/dev/null 2>&1 || true
   CODEX_HELPER_ADMIN_TOKEN="$admin_token" \
   CODEX_HELPER_OPENAI_SECRET_FILE="${secret_file:-/dev/null}" \
@@ -78,8 +83,29 @@ prepare_secret_file() {
   if [[ "$(uname -s)" == "Linux" ]]; then
     run_root chown 0:10001 "$file"
     run_root chmod 0440 "$file"
+    [[ "$(run_root stat -c '%u:%g:%a' "$file")" == "0:10001:440" ]] \
+      || fail "secret file ACL does not match root:10001 mode 0440"
   else
     chmod 0444 "$file"
+  fi
+}
+
+write_secret_file() {
+  local file="$1"
+  run_root tee "$file" >/dev/null
+  prepare_secret_file "$file"
+}
+
+prepare_secret_directory() {
+  local directory="$1"
+  mkdir -p "$directory"
+  if [[ "$(uname -s)" == "Linux" ]]; then
+    run_root chown 0:10001 "$directory"
+    run_root chmod 0750 "$directory"
+    [[ "$(run_root stat -c '%u:%g:%a' "$directory")" == "0:10001:750" ]] \
+      || fail "secret directory ACL does not match root:10001 mode 0750"
+  else
+    chmod 0755 "$directory"
   fi
 }
 
@@ -140,10 +166,82 @@ start_live_container() {
   local secret_file="$2"
   docker run -d --name "$container" \
     -e "CODEX_HELPER_ADMIN_TOKEN=$admin_token" \
+    --add-host host.docker.internal:host-gateway \
+    --publish 127.0.0.1::3211 \
     --mount "type=bind,src=$data_dir,dst=/data" \
     --mount "type=bind,src=$secret_file,dst=/run/secrets/openai_api_key,readonly" \
     --mount "type=bind,src=$repo_root/deploy/container/server.toml,dst=/config/server.toml,readonly" \
     "$image" --config /config/server.toml >/dev/null
+}
+
+start_smoke_upstream() {
+  local credential_fixture="$work_dir/upstream-credentials.json"
+  local ready_file="$work_dir/upstream-ready.json"
+  printf '{"old":"%s","new":"%s"}\n' "$old_canary" "$new_canary" \
+    >"$credential_fixture"
+  chmod 0600 "$credential_fixture"
+  node "$repo_root/tools/docker-smoke-upstream.mjs" \
+    --credentials "$credential_fixture" \
+    --records "$work_dir/upstream-records.jsonl" \
+    --ready "$ready_file" \
+    >"$work_dir/upstream.stdout" \
+    2>"$work_dir/upstream.stderr" &
+  upstream_pid=$!
+  for _ in $(seq 1 40); do
+    [[ -f "$ready_file" ]] && break
+    if ! kill -0 "$upstream_pid" 2>/dev/null; then
+      fail "credential-capture upstream exited before becoming ready"
+    fi
+    sleep 0.25
+  done
+  [[ -f "$ready_file" ]] || fail "credential-capture upstream did not become ready"
+  upstream_port="$(node -e '
+    const fs = require("node:fs");
+    const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    if (!Number.isInteger(value.port)) process.exit(1);
+    process.stdout.write(String(value.port));
+  ' "$ready_file")"
+}
+
+relay_endpoint() {
+  local published
+  published="$(docker port "$container" 3211/tcp | head -n 1)"
+  [[ "$published" == 127.0.0.1:* ]] || fail "relay port is not loopback-published"
+  printf '%s' "$published"
+}
+
+expect_relay_generation() {
+  local phase="$1"
+  local expected="$2"
+  local response="$work_dir/relay-$phase.json"
+  local probe_id="$container-$phase"
+  local before=0
+  [[ -f "$work_dir/upstream-records.jsonl" ]] \
+    && before="$(wc -l <"$work_dir/upstream-records.jsonl" | tr -d ' ')"
+  curl --connect-timeout 5 --max-time 30 -fsS \
+    -H 'content-type: application/json' \
+    -H "session_id: docker-smoke-$phase" \
+    -H "x-codex-helper-smoke-probe: $probe_id" \
+    --data '{"model":"gpt-5","input":"credential generation probe","stream":false}' \
+    "http://$(relay_endpoint)/v1/responses" >"$response"
+  node -e '
+    const fs = require("node:fs");
+    const records = fs.readFileSync(process.argv[1], "utf8")
+      .trim()
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .slice(Number.parseInt(process.argv[2], 10))
+      .map((line) => JSON.parse(line));
+    const record = records.find((item) => item.probe_id === process.argv[3]);
+    if (
+      !record ||
+      record.generation !== process.argv[4] ||
+      !record.path.split("?", 1)[0].endsWith("/responses")
+    ) {
+      process.exit(1);
+    }
+  ' "$work_dir/upstream-records.jsonl" "$before" "$probe_id" "$expected" \
+    || fail "$phase relay request did not use the expected $expected credential generation"
 }
 
 compose_secret() {
@@ -188,10 +286,9 @@ run_root grep -F 'version = 5' "$env_data/config.toml.bak" >/dev/null \
 
 # The overlay has no provider credential in its environment and mounts one server-only secret.
 secret_dir="$work_dir/secrets"
-mkdir -p "$secret_dir"
+prepare_secret_directory "$secret_dir"
 secret_file="$secret_dir/openai_api_key"
-printf '%s\n' "$old_canary" >"$secret_file"
-prepare_secret_file "$secret_file"
+printf '%s\n' "$old_canary" | write_secret_file "$secret_file"
 compose_secret config >"$work_dir/compose.json"
 assert_contains "$work_dir/compose.json" 'OPENAI_API_KEY: ""'
 assert_contains "$work_dir/compose.json" 'target: openai_api_key'
@@ -214,7 +311,9 @@ assert_no_canary_file "$work_dir/compose-check.json"
 
 secret_data="$work_dir/secret-data"
 mkdir -p "$secret_data"
-cp "$repo_root/deploy/container/config.secrets.toml" "$secret_data/config.toml"
+start_smoke_upstream
+sed "s#https://api.openai.com/v1#http://host.docker.internal:${upstream_port}/v1#" \
+  "$repo_root/deploy/container/config.secrets.toml" >"$secret_data/config.toml"
 prepare_data_dir "$secret_data"
 docker_check \
   "$secret_data" \
@@ -226,22 +325,21 @@ assert_contains "$work_dir/secret-check.json" '"aggregate": "ready"'
 
 # Invalid mounted inputs fail with stable categories and no raw value.
 empty_secret="$secret_dir/empty"
-: >"$empty_secret"
-prepare_secret_file "$empty_secret"
+: | write_secret_file "$empty_secret"
 expect_blocked_check "$secret_data" "$empty_secret" empty-secret
 
 oversize_secret="$secret_dir/oversize"
-head -c 65537 /dev/zero | tr '\0' x >"$oversize_secret"
-prepare_secret_file "$oversize_secret"
+head -c 65537 /dev/zero | tr '\0' x | write_secret_file "$oversize_secret"
 expect_blocked_check "$secret_data" "$oversize_secret" oversize-secret
 
 nonregular_secret="$secret_dir/nonregular"
-mkdir "$nonregular_secret"
+run_root mkdir "$nonregular_secret"
 expect_blocked_check "$secret_data" "$nonregular_secret" nonregular-secret
 
 # Start the actual runtime as image UID/GID 10001 and exercise the authenticated operator API.
 start_live_container "$secret_data" "$secret_file"
 wait_for_operator "$work_dir/operator-old.json"
+expect_relay_generation initial old
 [[ "$(docker exec "$container" id -u)" == "10001" ]] || fail "container UID is not 10001"
 [[ "$(docker exec "$container" id -g)" == "10001" ]] || fail "container GID is not 10001"
 docker exec "$container" sh -c \
@@ -257,9 +355,8 @@ inside_hash="$(docker exec "$container" sha256sum /run/secrets/openai_api_key | 
 # reload cannot remount it; an ordinary container restart is the first tested operation that
 # resolves the source path again and exposes the new generation.
 replacement="$secret_dir/.openai_api_key.new"
-printf '%s\n' "$new_canary" >"$replacement"
-prepare_secret_file "$replacement"
-mv "$replacement" "$secret_file"
+printf '%s\n' "$new_canary" | write_secret_file "$replacement"
+run_root mv "$replacement" "$secret_file"
 new_hash="$(host_sha256 "$secret_file")"
 [[ "$new_hash" != "$old_hash" ]] || fail "replacement did not change the secret generation"
 if [[ "$(uname -s)" == "Linux" ]]; then
@@ -271,6 +368,7 @@ if [[ "$(uname -s)" == "Linux" ]]; then
   inside_hash="$(docker exec "$container" sha256sum /run/secrets/openai_api_key | awk '{print $1}')"
   [[ "$inside_hash" == "$old_hash" ]] \
     || fail "runtime reload unexpectedly remounted the source path"
+  expect_relay_generation reloaded old
 fi
 
 docker restart "$container" >/dev/null
@@ -278,6 +376,7 @@ wait_for_operator "$work_dir/operator-restarted.json"
 inside_hash="$(docker exec "$container" sha256sum /run/secrets/openai_api_key | awk '{print $1}')"
 [[ "$inside_hash" == "$new_hash" ]] \
   || fail "ordinary restart did not expose the atomically replaced source inode"
+expect_relay_generation restarted new
 docker logs "$container" >"$work_dir/runtime-restarted.log" 2>&1
 
 docker rm -f "$container" >/dev/null
@@ -285,6 +384,7 @@ start_live_container "$secret_data" "$secret_file"
 wait_for_operator "$work_dir/operator-recreated.json"
 inside_hash="$(docker exec "$container" sha256sum /run/secrets/openai_api_key | awk '{print $1}')"
 [[ "$inside_hash" == "$new_hash" ]] || fail "container recreation did not expose the new inode"
+expect_relay_generation recreated new
 docker exec "$container" codex-helper-server --check --json >"$work_dir/recreated-check.json"
 assert_contains "$work_dir/recreated-check.json" '"aggregate": "ready"'
 
@@ -319,7 +419,14 @@ for artifact in \
   "$work_dir/inspect-recreated.json" \
   "$work_dir/runtime-old.log" \
   "$work_dir/runtime-restarted.log" \
-  "$work_dir/runtime-recreated.log"; do
+  "$work_dir/runtime-recreated.log" \
+  "$work_dir/upstream-records.jsonl" \
+  "$work_dir/upstream.stdout" \
+  "$work_dir/upstream.stderr" \
+  "$work_dir/relay-initial.json" \
+  "$work_dir/relay-reloaded.json" \
+  "$work_dir/relay-restarted.json" \
+  "$work_dir/relay-recreated.json"; do
   assert_no_canary_file "$artifact"
 done
 

@@ -109,11 +109,7 @@ impl ServiceReceipt {
     }
 
     fn validate_fields(&self) -> Result<(), ServiceReceiptError> {
-        if self.schema_version != SERVICE_RECEIPT_SCHEMA_VERSION {
-            return Err(ServiceReceiptError::LegacySchema {
-                schema_version: Some(u64::from(self.schema_version)),
-            });
-        }
+        validate_schema_version(Some(u64::from(self.schema_version)))?;
         validate_absolute_home(&self.helper_home, "helper_home")?;
         validate_absolute_home(&self.client_home, "client_home")?;
         let normalized = normalize_receipt_admin_url(&self.admin_base_url)?;
@@ -132,6 +128,8 @@ pub(crate) enum ServiceReceiptError {
     Missing,
     #[error("service receipt uses an unsupported legacy schema version: {schema_version:?}")]
     LegacySchema { schema_version: Option<u64> },
+    #[error("service receipt uses a newer unsupported schema version: {schema_version}")]
+    UnsupportedSchema { schema_version: u64 },
     #[error("service receipt is invalid: {reason}")]
     Invalid { reason: &'static str },
     #[error("service receipt belongs to a different helper home")]
@@ -167,6 +165,16 @@ impl ServiceReceiptTransaction {
             MAX_SERVICE_RECEIPT_BYTES,
         )?;
         Ok(Self { helper_home, inner })
+    }
+
+    pub(crate) fn begin_install_replacement(
+        helper_home: impl Into<PathBuf>,
+    ) -> Result<Self, ServiceReceiptError> {
+        let transaction = Self::begin(helper_home)?;
+        match transaction.current() {
+            Ok(_) | Err(ServiceReceiptError::LegacySchema { .. }) => Ok(transaction),
+            Err(error) => Err(error),
+        }
     }
 
     pub(crate) fn current(&self) -> Result<Option<ServiceReceipt>, ServiceReceiptError> {
@@ -234,9 +242,7 @@ fn parse_service_receipt_snapshot(
     let schema_version = value
         .get("schema_version")
         .and_then(serde_json::Value::as_u64);
-    if schema_version != Some(u64::from(SERVICE_RECEIPT_SCHEMA_VERSION)) {
-        return Err(ServiceReceiptError::LegacySchema { schema_version });
-    }
+    validate_schema_version(schema_version)?;
     let receipt = serde_json::from_value::<ServiceReceipt>(value).map_err(|_| {
         ServiceReceiptError::Invalid {
             reason: "receipt does not match the current schema",
@@ -244,6 +250,19 @@ fn parse_service_receipt_snapshot(
     })?;
     receipt.validate_for_selected_home(selected_home)?;
     Ok(Some(receipt))
+}
+
+fn validate_schema_version(schema_version: Option<u64>) -> Result<(), ServiceReceiptError> {
+    let current = u64::from(SERVICE_RECEIPT_SCHEMA_VERSION);
+    match schema_version {
+        Some(version) if version == current => Ok(()),
+        Some(version) if version > current => Err(ServiceReceiptError::UnsupportedSchema {
+            schema_version: version,
+        }),
+        legacy => Err(ServiceReceiptError::LegacySchema {
+            schema_version: legacy,
+        }),
+    }
 }
 
 fn normalize_receipt_admin_url(value: &str) -> Result<String, ServiceReceiptError> {
@@ -375,6 +394,34 @@ mod tests {
     }
 
     #[test]
+    fn install_replacement_accepts_legacy_and_preserves_future_receipts() {
+        let home = TestHome::new();
+        let path = service_receipt_path(&home.0);
+
+        std::fs::write(&path, br#"{"schema_version":0}"#).expect("write legacy receipt");
+        let legacy = ServiceReceiptTransaction::begin_install_replacement(home.0.clone())
+            .expect("legacy receipt remains replaceable by service install");
+        assert!(matches!(
+            legacy.current(),
+            Err(ServiceReceiptError::LegacySchema {
+                schema_version: Some(0)
+            })
+        ));
+        drop(legacy);
+
+        let future = br#"{"schema_version":2,"future_field":"preserve-me"}"#;
+        std::fs::write(&path, future).expect("write future receipt");
+        assert!(matches!(
+            ServiceReceiptTransaction::begin_install_replacement(home.0.clone()),
+            Err(ServiceReceiptError::UnsupportedSchema { schema_version: 2 })
+        ));
+        assert_eq!(
+            std::fs::read(&path).expect("read preserved future receipt"),
+            future
+        );
+    }
+
+    #[test]
     fn receipt_rejects_corrupt_legacy_foreign_and_concurrent_changes() {
         let home = TestHome::new();
         let foreign = TestHome::new();
@@ -391,6 +438,13 @@ mod tests {
             Err(ServiceReceiptError::LegacySchema {
                 schema_version: Some(0)
             })
+        ));
+
+        std::fs::write(&path, br#"{"schema_version":2}"#)
+            .expect("write unsupported future receipt");
+        assert!(matches!(
+            read_service_receipt(&home.0),
+            Err(ServiceReceiptError::UnsupportedSchema { schema_version: 2 })
         ));
 
         let foreign_receipt = receipt(&foreign, ServiceInstallGeneration::generate());

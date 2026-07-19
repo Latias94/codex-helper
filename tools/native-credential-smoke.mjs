@@ -9,13 +9,15 @@ import process from "node:process";
 import { spawnSync } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
 
+import { startCredentialSmokeUpstream } from "./docker-smoke-upstream.mjs";
+
 const SECRET_PREFIX = "codex-helper-native-smoke-secret-";
 const COMMAND_TIMEOUT_MS = 60_000;
 const STATUS_TIMEOUT_MS = 30_000;
 
 const options = parseArguments(process.argv.slice(2));
 if (options.selfTest) {
-  runSelfTest();
+  await runSelfTest();
 } else {
   await runSmoke(options);
 }
@@ -39,6 +41,9 @@ async function runSmoke({ binary, backend, evidence }) {
   const executable = stagedCandidate.executable;
 
   const logicalName = `native.smoke.${crypto.randomBytes(10).toString("hex")}`;
+  const missingLogicalName = `native.smoke.${crypto.randomBytes(10).toString("hex")}`;
+  const importEnvironmentName =
+    `CODEX_HELPER_NATIVE_SMOKE_IMPORT_${crypto.randomBytes(10).toString("hex").toUpperCase()}`;
   const initialSecret = `${SECRET_PREFIX}${crypto.randomBytes(32).toString("base64url")}`;
   const rotatedSecret = `${SECRET_PREFIX}${crypto.randomBytes(32).toString("base64url")}`;
   const sensitiveValues = [SECRET_PREFIX, initialSecret, rotatedSecret];
@@ -49,10 +54,12 @@ async function runSmoke({ binary, backend, evidence }) {
     CODEX_HOME: clientHome,
     RUST_BACKTRACE: "full",
     RUST_LOG: "trace",
+    [importEnvironmentName]: initialSecret,
   };
   const runnerIdentity = detectRunnerIdentity(backend);
   const candidate = candidateIdentity(executable);
   const proxyPort = await findFreePortPair();
+  let upstreamProbe;
   let cleanupJournal;
   let smokeError;
   let cleanupError;
@@ -94,22 +101,31 @@ async function runSmoke({ binary, backend, evidence }) {
       candidateSha256: stagedCandidate.sha256,
     });
     const firstCreate = run(
-      "initial credential create",
-      ["credential", "create", logicalName, "--stdin"],
-      { input: initialSecret, allowedExitCodes: [1] },
+      "initial credential import",
+      ["credential", "import", logicalName, "--from-env", importEnvironmentName],
+      { allowedExitCodes: [1] },
     );
     if (!combinedOutput(firstCreate).includes("store_committed_runtime_refresh_failed")) {
       throw new Error(
-        "initial credential create did not report the required store-committed/runtime-unavailable partial outcome",
+        "initial credential import did not report the required store-committed/runtime-unavailable partial outcome",
       );
     }
+    expectEqual(
+      smokeEnvironment[importEnvironmentName],
+      initialSecret,
+      "credential import source environment",
+    );
+
+    upstreamProbe = await startCredentialSmokeUpstream({
+      credentials: { old: initialSecret, new: rotatedSecret },
+    });
 
     run("provider add", [
       "provider",
       "add",
       "relay",
       "--base-url",
-      "https://native-smoke.invalid/v1",
+      `http://127.0.0.1:${upstreamProbe.port}/v1`,
     ]);
     run("provider auth binding", [
       "provider",
@@ -119,6 +135,24 @@ async function runSmoke({ binary, backend, evidence }) {
       "bearer",
       "--native",
       logicalName,
+      "--codex",
+    ]);
+    run("missing provider add", [
+      "provider",
+      "add",
+      "missing",
+      "--base-url",
+      `http://127.0.0.1:${upstreamProbe.port}/v1`,
+      "--disabled",
+    ]);
+    run("missing provider auth binding", [
+      "provider",
+      "set-auth",
+      "missing",
+      "--kind",
+      "bearer",
+      "--native",
+      missingLogicalName,
       "--codex",
     ]);
     const preinstallCredential = credentialStatus(
@@ -163,6 +197,14 @@ async function runSmoke({ binary, backend, evidence }) {
     );
     expectEqual(readyCredential.readiness, "ready", "resident credential readiness");
     expectEqual(readyCredential.refresh.status, "runtime_ready", "resident refresh projection");
+    await assertRelayGeneration(proxyPort, upstreamProbe, "initial", "old", sensitiveValues);
+
+    run("enable missing provider", ["provider", "enable", "missing", "--codex"]);
+    const degraded = await pollService(run, "degraded");
+    validateServiceStatus(degraded, "degraded");
+    run("disable missing provider", ["provider", "disable", "missing", "--codex"]);
+    const readyAfterDegraded = await pollService(run, "ready");
+    validateServiceStatus(readyAfterDegraded, "ready");
 
     run("credential delete", [
       "credential",
@@ -188,6 +230,11 @@ async function runSmoke({ binary, backend, evidence }) {
       "runtime_missing",
       "deleted runtime projection",
     );
+    await assertBlockedRelayDoesNotReachUpstream(
+      proxyPort,
+      upstreamProbe,
+      sensitiveValues,
+    );
 
     run(
       "rotated credential create",
@@ -196,6 +243,7 @@ async function runSmoke({ binary, backend, evidence }) {
     );
     const restored = await pollService(run, "ready");
     validateServiceStatus(restored, "ready");
+    await assertRelayGeneration(proxyPort, upstreamProbe, "restored", "new", sensitiveValues);
     const unchanged = run(
       "unchanged credential set",
       ["credential", "set", logicalName, "--stdin"],
@@ -233,17 +281,23 @@ async function runSmoke({ binary, backend, evidence }) {
       },
       readiness_observations: [
         observation("initial", ready, readyCredential),
+        observation("degraded", degraded, null),
         observation("missing", blocked, missingCredential),
         observation("restored", restored, null),
         observation("same_value_refresh", finalStatus, null),
       ],
       failure_matrix: {
+        import_from_environment_preserves_source: "passed",
+        initial_relay_used_imported_credential: "passed",
+        rotated_relay_used_recreated_credential: "passed",
         service_context_ready: "passed",
+        degraded_keeps_service_running: "passed",
+        blocked_relay_made_zero_upstream_attempts: "passed",
         explicit_delete_blocks_without_stopping_daemon: "passed",
         recreate_restores_service_context: "passed",
         same_value_refresh_avoids_generation_churn: "passed",
-        prompt_or_timeout: "fail_closed",
-        unknown_readiness: "fail_closed",
+        observed_commands_completed_without_prompt_or_timeout: "passed",
+        observed_readiness_was_classified: "passed",
       },
       leakage_audit: {
         status: "passed",
@@ -324,6 +378,9 @@ async function runSmoke({ binary, backend, evidence }) {
         .map((error) => sanitize(error.message, sensitiveValues))
         .join("; ");
       cleanupError = new Error(`native smoke cleanup failed: ${detail}`);
+    }
+    if (upstreamProbe) {
+      await upstreamProbe.close();
     }
   }
 
@@ -714,6 +771,73 @@ function closeServer(server) {
   return new Promise((resolve) => server.close(resolve));
 }
 
+async function assertRelayGeneration(proxyPort, upstream, phase, expected, sensitiveValues) {
+  const probeId = `native-smoke-${phase}-${crypto.randomBytes(8).toString("hex")}`;
+  const before = upstream.requestCount();
+  const response = await fetch(`http://127.0.0.1:${proxyPort}/v1/responses`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "session_id": `native-smoke-${phase}`,
+      "x-codex-helper-smoke-probe": probeId,
+    },
+    body: JSON.stringify({
+      model: "gpt-5",
+      input: `native credential ${phase} generation probe`,
+      stream: false,
+    }),
+    signal: AbortSignal.timeout(15_000),
+  });
+  const body = await response.text();
+  assertNoSecret(`${phase} relay response`, body, sensitiveValues);
+  expectEqual(response.status, 200, `${phase} relay response status`);
+  if (upstream.requestCount() <= before) {
+    throw new Error(`${phase} relay did not reach the credential smoke upstream`);
+  }
+  const records = upstream.records().filter((record) => record.probe_id === probeId);
+  expectEqual(records.length, 1, `${phase} relay probe record count`);
+  expectEqual(records[0].generation, expected, `${phase} relay credential generation`);
+  if (!records[0].path?.split("?", 1)[0].endsWith("/responses")) {
+    throw new Error(`${phase} relay probe did not reach the responses endpoint`);
+  }
+}
+
+async function assertBlockedRelayDoesNotReachUpstream(
+  proxyPort,
+  upstreamSentinel,
+  sensitiveValues,
+) {
+  await delay(500);
+  const connectionsBefore = upstreamSentinel.connectionCount();
+  const requestsBefore = upstreamSentinel.requestCount();
+  const response = await fetch(`http://127.0.0.1:${proxyPort}/v1/responses`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-5",
+      input: "blocked native credential probe",
+      stream: false,
+    }),
+    signal: AbortSignal.timeout(15_000),
+  });
+  const body = await response.text();
+  assertNoSecret("blocked relay response", body, sensitiveValues);
+  if (response.status !== 503) {
+    throw new Error(`blocked relay returned ${response.status} instead of 503`);
+  }
+  await delay(250);
+  expectEqual(
+    upstreamSentinel.connectionCount(),
+    connectionsBefore,
+    "blocked relay upstream connection count",
+  );
+  expectEqual(
+    upstreamSentinel.requestCount(),
+    requestsBefore,
+    "blocked relay upstream request count",
+  );
+}
+
 async function pollService(run, expectedContext) {
   const deadline = Date.now() + STATUS_TIMEOUT_MS;
   let lastStatus;
@@ -1025,9 +1149,11 @@ function workflowRunUrl() {
   return `${server}/${repository}/actions/runs/${runId}`;
 }
 
-function runSelfTest() {
+async function runSelfTest() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-helper-native-smoke-self-test-"));
   const secret = `${SECRET_PREFIX}${crypto.randomBytes(16).toString("hex")}`;
+  const rotated = `${SECRET_PREFIX}${crypto.randomBytes(16).toString("hex")}`;
+  let upstream;
   try {
     fs.writeFileSync(path.join(root, "safe"), "redacted\n");
     const safe = scanArtifacts([root], [SECRET_PREFIX, secret]);
@@ -1094,8 +1220,42 @@ function runSelfTest() {
       escapedJournalRejected = error.message.includes("escapes");
     }
     expectEqual(escapedJournalRejected, true, "self-test escaping cleanup journal rejection");
+    upstream = await startCredentialSmokeUpstream({ credentials: { old: secret, new: rotated } });
+    const probeId = "native-smoke-self-test";
+    const response = await fetch(`http://127.0.0.1:${upstream.port}/v1/responses`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${secret}`,
+        "x-codex-helper-smoke-probe": probeId,
+      },
+    });
+    expectEqual(response.status, 200, "self-test upstream accepted old credential");
+    await response.text();
+    const record = upstream.records().find((item) => item.probe_id === probeId);
+    expectEqual(record?.generation, "old", "self-test upstream credential generation");
+    const rotatedProbeId = "native-smoke-self-test-rotated";
+    const rotatedResponse = await fetch(`http://127.0.0.1:${upstream.port}/v1/responses`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${rotated}`,
+        "x-codex-helper-smoke-probe": rotatedProbeId,
+      },
+    });
+    expectEqual(rotatedResponse.status, 200, "self-test upstream accepted rotated credential");
+    await rotatedResponse.text();
+    const rotatedRecord = upstream.records().find((item) => item.probe_id === rotatedProbeId);
+    expectEqual(rotatedRecord?.generation, "new", "self-test rotated credential generation");
+    const rejectedResponse = await fetch(`http://127.0.0.1:${upstream.port}/v1/responses`, {
+      method: "POST",
+      headers: { authorization: "Bearer unknown" },
+    });
+    expectEqual(rejectedResponse.status, 401, "self-test upstream rejected unknown credential");
+    await rejectedResponse.text();
     console.log("Native credential smoke self-test passed.");
   } finally {
+    if (upstream) {
+      await upstream.close();
+    }
     fs.rmSync(root, { recursive: true, force: true });
   }
 }

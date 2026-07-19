@@ -165,8 +165,13 @@ jobs:
       - name: Check native credential core for this platform
         run: cargo check --locked -p codex-helper-core --features native-credentials --all-targets
 
-      - name: Check isolated server capability boundary
-        run: cargo check --locked -p codex-helper-server --all-targets
+      - name: Build isolated server artifact
+        run: cargo build --locked -p codex-helper-server --target-dir target/server-isolated
+
+      - name: Test server capability under workspace feature unification
+        run: >-
+          cargo nextest run --locked --workspace
+          -E 'test(server_runtime_forbids_native_credentials_under_feature_unification)'
 
       - name: Test (nextest)
         run: cargo nextest run --locked --workspace --no-fail-fast

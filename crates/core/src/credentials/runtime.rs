@@ -120,6 +120,7 @@ pub(crate) struct CredentialRuntime {
 
 struct CredentialRuntimeInner {
     native: NativeCredentialDaemon,
+    client_file_fallback_enabled: bool,
     inflight: Mutex<BTreeMap<CredentialHandle, Arc<NativeReadFlight>>>,
     read_timeout: Duration,
 }
@@ -266,9 +267,11 @@ impl CredentialRuntime {
         installation: InstallationIdentity,
         scope_identity: Option<RuntimeQuotaIdentity>,
     ) -> Self {
+        let client_file_fallback_enabled = capabilities.client_file_fallback_enabled();
         Self {
             inner: Arc::new(CredentialRuntimeInner {
                 native: capabilities.daemon(installation),
+                client_file_fallback_enabled,
                 inflight: Mutex::new(BTreeMap::new()),
                 read_timeout: NATIVE_READ_TIMEOUT,
             }),
@@ -280,9 +283,14 @@ impl CredentialRuntime {
         let native = capabilities.forbidden_daemon().context(
             "runtime-store-free credential evaluation requires native credentials to be forbidden",
         )?;
+        anyhow::ensure!(
+            !capabilities.client_file_fallback_enabled(),
+            "runtime-store-free credential evaluation requires client-file fallback to be forbidden"
+        );
         Ok(Self {
             inner: Arc::new(CredentialRuntimeInner {
                 native,
+                client_file_fallback_enabled: false,
                 inflight: Mutex::new(BTreeMap::new()),
                 read_timeout: NATIVE_READ_TIMEOUT,
             }),
@@ -502,6 +510,7 @@ impl CredentialRuntime {
                 reference.service_name.as_str(),
                 None,
                 Some(reference.name.as_str()),
+                self.inner.client_file_fallback_enabled,
             ),
             NamedCredentialLookup::EnvironmentOnly => {
                 resolve_environment_credential_for_runtime(reference.name.as_str())
@@ -620,12 +629,17 @@ impl CredentialRuntime {
             source_kind,
             reference: display_ref.clone(),
         };
+        let client_file_fallback_enabled = self.inner.client_file_fallback_enabled;
         Ok(Some((
             handle,
             spec,
             Box::new(move || {
-                let resolution =
-                    resolve_service_credential_for_runtime(service_name, inline, env_name);
+                let resolution = resolve_service_credential_for_runtime(
+                    service_name,
+                    inline,
+                    env_name,
+                    client_file_fallback_enabled,
+                );
                 map_runtime_resolution(resolution, source_kind, display_ref)
             }),
         )))

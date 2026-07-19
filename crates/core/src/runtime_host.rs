@@ -1405,16 +1405,24 @@ env_key = "EXTERNAL_API_KEY"
     }
 
     #[tokio::test]
-    async fn runtime_config_driver_panic_stops_the_running_server() {
-        let error = run_runtime_config_driver_early_exit_case(tokio::spawn(async {
+    async fn runtime_config_driver_panic_backtrace_does_not_render_credential_canary() {
+        const CANARY: &str = "runtime-driver-panic-canary-1a467d90f28c4b35";
+        let credential = crate::credentials::SecretValue::new(CANARY.as_bytes().to_vec())
+            .expect("valid panic-path credential canary");
+        let error = run_runtime_config_driver_early_exit_case(tokio::spawn(async move {
+            std::hint::black_box(&credential);
             panic!("injected runtime config driver panic")
         }))
         .await;
-        assert!(
-            error
-                .to_string()
-                .contains("runtime config driver join error")
-        );
+        let rendered = format!("{error:#?}");
+        assert!(rendered.contains("runtime config driver join error"));
+        let bearer = format!("Bearer {CANARY}");
+        for forbidden in [CANARY, &CANARY[..20], bearer.as_str()] {
+            assert!(
+                !rendered.contains(forbidden),
+                "runtime panic surface leaked credential material: {rendered}"
+            );
+        }
     }
 
     #[tokio::test]

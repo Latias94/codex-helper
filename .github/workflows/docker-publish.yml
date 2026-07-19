@@ -29,6 +29,7 @@ on:
       - "deploy/**"
       - "tools/check-credential-surface.mjs"
       - "tools/docker-mounted-secret-smoke.sh"
+      - "tools/docker-smoke-upstream.mjs"
 
 permissions:
   contents: read

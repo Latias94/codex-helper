@@ -69,6 +69,7 @@ pub(crate) enum ServiceReceiptState {
     Absent,
     Current,
     Legacy,
+    Unsupported,
     Invalid,
     Foreign,
     PlatformMismatch,
@@ -667,8 +668,14 @@ fn begin_service_receipt_transaction(
     options: &ServiceInstallOptions,
 ) -> CliResult<(ServiceReceiptTransaction, ServiceReceipt)> {
     let receipt = service_receipt(options)?;
-    let transaction = ServiceReceiptTransaction::begin(options.helper_home.clone())
-        .map_err(|error| CliError::Other(format!("begin service receipt transaction: {error}")))?;
+    let transaction = ServiceReceiptTransaction::begin_install_replacement(
+        options.helper_home.clone(),
+    )
+    .map_err(|error| {
+        CliError::Other(format!(
+            "begin service receipt install replacement: {error}"
+        ))
+    })?;
     Ok((transaction, receipt))
 }
 
@@ -1048,6 +1055,14 @@ async fn enrich_service_status(
             append_status_detail(
                 &mut service_status,
                 "service receipt uses an unsupported legacy schema; reinstall the service",
+            );
+            return service_status;
+        }
+        Err(ServiceReceiptError::UnsupportedSchema { .. }) => {
+            service_status.receipt_state = ServiceReceiptState::Unsupported;
+            append_status_detail(
+                &mut service_status,
+                "service receipt uses a newer unsupported schema; upgrade codex-helper",
             );
             return service_status;
         }
@@ -2769,7 +2784,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_tolerates_absent_legacy_invalid_and_unreachable_runtime_receipts() {
+    async fn status_tolerates_absent_legacy_unsupported_invalid_and_unreachable_receipts() {
         let root = std::env::temp_dir().join(format!(
             "codex-helper-service-status-test-{}",
             uuid::Uuid::new_v4()
@@ -2796,6 +2811,20 @@ mod tests {
         )
         .await;
         assert_eq!(legacy.receipt_state, ServiceReceiptState::Legacy);
+
+        let unsupported_home = root.join("unsupported");
+        std::fs::create_dir_all(&unsupported_home).expect("create unsupported helper home");
+        std::fs::write(
+            crate::service_receipt::service_receipt_path(&unsupported_home),
+            br#"{"schema_version":2}"#,
+        )
+        .expect("write unsupported receipt");
+        let unsupported = enrich_service_status(
+            test_service_status(ServiceRuntimeState::Stopped),
+            &unsupported_home,
+        )
+        .await;
+        assert_eq!(unsupported.receipt_state, ServiceReceiptState::Unsupported);
 
         let invalid_home = root.join("invalid");
         std::fs::create_dir_all(&invalid_home).expect("create invalid helper home");

@@ -91,6 +91,11 @@ By default this will:
 - open the TUI in interactive terminals;
 - stop the proxy started by the current foreground console on exit.
 
+Automatic configuration migration only converts supported legacy syntax into version 6 and
+preserves the exact source backup. It never copies, deletes, or reinterprets a credential value.
+Moving a value into the OS credential store is a separate, explicit operation such as
+`codex-helper credential import relay.primary --from-env RELAY_TOKEN`.
+
 Start the proxy without the TUI:
 
 ```bash

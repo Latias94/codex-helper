@@ -85,7 +85,7 @@ pub(crate) fn evaluate(config: &HelperConfig, service: ServiceKind) -> Result<Ch
     let report = evaluate_service_credential_readiness_without_runtime_store(
         config,
         service,
-        CredentialSourceCapabilities::server(),
+        CredentialSourceCapabilities::server_check(),
     )?;
     let mut guidance = Vec::new();
     if report.endpoints.iter().any(|endpoint| {

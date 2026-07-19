@@ -132,6 +132,29 @@ const isolatedServerTree = runCargo([
   "--format",
   "{p}",
 ]);
+const unifiedWorkspaceTree = runCargo([
+  "tree",
+  "--locked",
+  "--workspace",
+  "-e",
+  "normal",
+  "--target",
+  "all",
+  "--prefix",
+  "none",
+  "--format",
+  "{p} features=[{f}]",
+]);
+if (!/^codex-helper-core\s+v[^\n]*features=\[[^\]]*native-credentials[^\]]*\]/m.test(
+  unifiedWorkspaceTree,
+)) {
+  failures.push("workspace-unified dependency graph does not enable core native-credentials");
+}
+for (const name of nativeBackendDependencies.keys()) {
+  if (!new RegExp(`^${escapeRegExp(name)}\\s+v`, "m").test(unifiedWorkspaceTree)) {
+    failures.push(`workspace-unified dependency graph is missing selected backend ${name}`);
+  }
+}
 // security-framework is also a transport dependency on macOS, so package presence alone
 // cannot identify the credential backend. The store-specific packages remain forbidden.
 const serverForbiddenCredentialPackages = [...nativeBackendDependencies.keys()].filter(
@@ -149,7 +172,10 @@ for (const [file, text] of [
   ["crates/server/src/config.rs", serverConfig],
   ["crates/server/src/check.rs", serverCheck],
 ]) {
-  if (!text.includes("CredentialSourceCapabilities::server()")) {
+  const expectedCapability = file.endsWith("check.rs")
+    ? "CredentialSourceCapabilities::server_check()"
+    : "CredentialSourceCapabilities::server()";
+  if (!text.includes(expectedCapability)) {
     failures.push(`${file} does not declare the native-forbidden server capability`);
   }
   for (const forbidden of ["NativeCredentialStore", "refresh_generation("]) {
@@ -161,7 +187,6 @@ for (const [file, text] of [
 if (!serverConfig.includes("server_runtime_forbids_native_credentials_under_feature_unification")) {
   failures.push("workspace feature-unification server boundary test is missing");
 }
-
 const credentialModel = read("crates/core/src/credentials/model.rs");
 const credentialTests = read("crates/core/src/credentials/tests.rs");
 if (!credentialModel.includes("pub struct SecretValue(Arc<SecretInner>);")) {
@@ -178,9 +203,9 @@ if (
   failures.push("SecretValue Debug/Serialize compile-time prohibition is missing");
 }
 
-const productionCredentialSources = collectFiles(
-  path.join(repositoryRoot, "crates/core/src/credentials"),
-).filter((file) => !/(?:^|\/)tests?\.rs$/.test(relative(file)));
+const productionCredentialSources = ["crates/core/src", "crates/server/src", "src"]
+  .flatMap((root) => collectFiles(path.join(repositoryRoot, root)))
+  .filter((file) => !/(?:^|\/)tests?(?:\/|\.rs$)/.test(relative(file)));
 const forbiddenProductionPatterns = [
   ["obsolete request-time resolver", /\bresolve_upstream_auth_for_target\b/],
   ["file-backed native credential store", /\b(?:File|Filesystem)CredentialStore\b/],
@@ -210,6 +235,10 @@ const requiredCanaryContracts = new Map([
     "imported_value_never_enters_cli_or_helper_owned_artifacts",
   ],
   ["src/service_receipt.rs", "receipt_bytes_are_non_secret_and_schema_is_closed"],
+  [
+    "crates/core/src/runtime_host.rs",
+    "runtime_config_driver_panic_backtrace_does_not_render_credential_canary",
+  ],
   ["crates/core/src/service_status.rs", "provider-body-secret-canary"],
   [
     "crates/core/src/credentials/runtime.rs",
@@ -250,7 +279,8 @@ for (const [file, text, required] of [
     [
       "migration never invents a native or secret-file reference",
       "They do not capture arbitrary shell environment variables",
-      "opens no runtime store or listener and sends no upstream request",
+      "opens no runtime store or listener",
+      "sends no upstream request",
     ],
   ],
   [
@@ -270,10 +300,35 @@ for (const [file, text, required] of [
   }
 }
 
+for (const [file, marker] of [
+  [
+    "docs/DOCKER_COMPOSE.md",
+    "verify the upstream accepts the new credential",
+  ],
+  [
+    "docs/adr/0001-central-relay-container-runtime.md",
+    "Neither placement stores upstream credential values in helper SQLite",
+  ],
+  [
+    "CHANGELOG.md",
+    "orphaned logical names require explicit review",
+  ],
+]) {
+  if (!read(file).includes(marker)) {
+    failures.push(`${file} is missing the release credential boundary: ${marker}`);
+  }
+}
+
 const nativeSmoke = read("tools/native-credential-smoke.mjs");
 for (const marker of [
   "dedicated runner already has a codex-helper service or receipt",
   "credential canary leaked into helper-owned artifact",
+  "initial credential import",
+  "import_from_environment_preserves_source",
+  "initial_relay_used_imported_credential",
+  "rotated_relay_used_recreated_credential",
+  "degraded_keeps_service_running",
+  "blocked_relay_made_zero_upstream_attempts",
   "explicit_delete_blocks_without_stopping_daemon",
   "cleanup service uninstall",
   "recoverPendingCleanup",
@@ -293,6 +348,11 @@ const nativeSmokeWorkflow = read(".github/workflows/native-credential-smoke.yml"
 for (const marker of [
   "environment: native-credential-smoke-execution",
   "environment: native-credential-release",
+  "verify-release-protection:",
+  "rule.prevent_self_review === true",
+  "Environment ${environmentName} must configure at least one required reviewer and prevent self-review",
+  "Require successful candidate CI",
+  "test-build (windows-2025)",
   "windows-credential-manager",
   "macos-keychain",
   "gnome-keyring",
@@ -300,6 +360,9 @@ for (const marker of [
   "actions/download-artifact@v8",
   "tools/native-credential-smoke.mjs",
   "Verify artifact run identity",
+  "release-prerequisites:",
+  "node tools/check-v5-loader-downgrade.mjs",
+  "bash tools/docker-mounted-secret-smoke.sh codex-helper-server:release-gate",
   "native-evidence-signoff:",
   "tools/verify-native-credential-evidence.mjs",
 ]) {
@@ -340,7 +403,7 @@ if (
 }
 if (
   !distWorkspace.includes(
-    'github-custom-job-permissions = { "native-credential-smoke" = { actions = "read", contents = "read" } }',
+    'github-custom-job-permissions = { "native-credential-smoke" = { actions = "read", checks = "read", contents = "read", deployments = "read" } }',
   )
 ) {
   failures.push("cargo-dist native smoke cannot read current-run artifacts safely");
@@ -380,7 +443,8 @@ for (const marker of [
   "tool: cargo-dist@0.32.0",
   "cargo dist generate --mode=ci --check",
   "cargo check --locked -p codex-helper-core --features native-credentials --all-targets",
-  "cargo check --locked -p codex-helper-server --all-targets",
+  "cargo build --locked -p codex-helper-server --target-dir target/server-isolated",
+  "test(server_runtime_forbids_native_credentials_under_feature_unification)",
 ]) {
   if (!ciWorkflow.includes(marker)) {
     failures.push(`cross-platform CI is missing credential gate: ${marker}`);
@@ -390,6 +454,17 @@ for (const marker of [
 const dockerWorkflow = read(".github/workflows/docker-publish.yml");
 if (!dockerWorkflow.includes("node tools/check-credential-surface.mjs")) {
   failures.push("Docker publish does not run the server credential boundary audit");
+}
+const dockerSmoke = read("tools/docker-mounted-secret-smoke.sh");
+for (const marker of [
+  "docker-smoke-upstream.mjs",
+  "expect_relay_generation initial old",
+  "expect_relay_generation restarted new",
+  "secret directory ACL does not match root:10001 mode 0750",
+]) {
+  if (!dockerSmoke.includes(marker)) {
+    failures.push(`Docker mounted-secret smoke is missing ${marker}`);
+  }
 }
 
 if (failures.length > 0) {
