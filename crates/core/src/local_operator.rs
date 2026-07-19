@@ -796,22 +796,32 @@ mod tests {
         #[cfg(windows)]
         {
             let user_sid = current_windows_user_sid_string().expect("current Windows user SID");
-            assert_eq!(
-                windows_dacl_sddl(&home),
-                canonical_windows_dacl_sddl(&windows_private_sddl(&user_sid, true)),
-                "helper home must apply the exact private DACL"
+            assert_windows_private_acl(
+                &home,
+                &windows_private_sddl(&user_sid, true),
+                "helper home",
             );
-            assert_eq!(
-                windows_dacl_sddl(&local_operator_token_path_in(&home)),
-                canonical_windows_dacl_sddl(&windows_private_sddl(&user_sid, false)),
-                "operator token must apply the exact private DACL"
+            assert_windows_private_acl(
+                &local_operator_token_path_in(&home),
+                &windows_private_sddl(&user_sid, false),
+                "operator token",
             );
         }
         fs::remove_dir_all(home).expect("remove temp home");
     }
 
     #[cfg(windows)]
-    fn canonical_windows_dacl_sddl(sddl: &str) -> String {
+    fn assert_windows_private_acl(path: &Path, expected_sddl: &str, label: &str) {
+        let actual_storage = read_windows_security_descriptor(path);
+        let expected = parse_windows_security_descriptor(expected_sddl);
+        let actual: *mut core::ffi::c_void = actual_storage.as_ptr().cast_mut().cast();
+
+        // SAFETY: Both descriptors remain live for the complete structural comparison.
+        unsafe { assert_windows_private_descriptor(actual, expected.0, label) };
+    }
+
+    #[cfg(windows)]
+    fn parse_windows_security_descriptor(sddl: &str) -> OwnedWindowsLocalAllocation {
         use windows_sys::Win32::Security::Authorization::{
             ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
         };
@@ -840,13 +850,11 @@ mod tests {
             !descriptor.is_null(),
             "parsed Windows DACL descriptor must not be null"
         );
-        let descriptor = OwnedWindowsLocalAllocation(descriptor);
-        // SAFETY: The LocalAlloc descriptor remains live for the duration of the conversion.
-        unsafe { windows_descriptor_dacl_sddl(descriptor.0) }
+        OwnedWindowsLocalAllocation(descriptor)
     }
 
     #[cfg(windows)]
-    fn windows_dacl_sddl(path: &Path) -> String {
+    fn read_windows_security_descriptor(path: &Path) -> Vec<usize> {
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, GetFileSecurityW};
 
@@ -890,51 +898,208 @@ mod tests {
             "read Windows security descriptor: {}",
             std::io::Error::last_os_error()
         );
-
-        // SAFETY: GetFileSecurityW initialized the descriptor in the live aligned buffer.
-        unsafe { windows_descriptor_dacl_sddl(descriptor.as_mut_ptr().cast()) }
+        descriptor
     }
 
-    /// # Safety
+    /// Compare the security properties that define this private ACL.
     ///
-    /// `descriptor` must point to a live Windows security descriptor for the duration of the call.
+    /// Windows may retain `SE_DACL_AUTO_INHERITED` in the descriptor control bits after a
+    /// protected DACL is applied. That bit records the ACL's origin; it does not re-enable
+    /// inheritance. The protected bit and every ACE remain strict requirements here.
     #[cfg(windows)]
-    unsafe fn windows_descriptor_dacl_sddl(descriptor: *mut core::ffi::c_void) -> String {
-        use windows_sys::Win32::Security::Authorization::{
-            ConvertSecurityDescriptorToStringSecurityDescriptorW, SDDL_REVISION_1,
+    unsafe fn assert_windows_private_descriptor(
+        actual: *mut core::ffi::c_void,
+        expected: *mut core::ffi::c_void,
+        label: &str,
+    ) {
+        use windows_sys::Win32::Security::{
+            ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
+            EqualSid, GetAce, GetAclInformation, GetSecurityDescriptorControl,
+            GetSecurityDescriptorDacl, SE_DACL_PROTECTED,
         };
-        use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
 
-        let mut sddl = std::ptr::null_mut();
-        // SAFETY: The caller guarantees a live descriptor and the output pointer is valid.
-        let succeeded = unsafe {
-            ConvertSecurityDescriptorToStringSecurityDescriptorW(
-                descriptor,
-                SDDL_REVISION_1,
-                DACL_SECURITY_INFORMATION,
-                &mut sddl,
-                std::ptr::null_mut(),
-            )
-        };
+        const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+
+        let mut actual_control = 0_u16;
+        let mut actual_revision = 0_u32;
+        // SAFETY: Both descriptors are valid and remain live for the duration of the call.
         assert_ne!(
-            succeeded,
+            unsafe {
+                GetSecurityDescriptorControl(actual, &mut actual_control, &mut actual_revision)
+            },
             0,
-            "format Windows DACL: {}",
+            "read {label} security descriptor control: {}",
             std::io::Error::last_os_error()
         );
-        assert!(!sddl.is_null(), "formatted Windows DACL must not be null");
-        let sddl = OwnedWindowsLocalAllocation(sddl.cast());
-        let wide = sddl.0.cast::<u16>();
-        let mut length = 0_usize;
-        // SAFETY: The conversion API returned a NUL-terminated LocalAlloc string.
-        unsafe {
-            while *wide.add(length) != 0 {
-                length = length.saturating_add(1);
-            }
+        let mut expected_control = 0_u16;
+        let mut expected_revision = 0_u32;
+        // SAFETY: Both descriptors are valid and remain live for the duration of the call.
+        assert_ne!(
+            unsafe {
+                GetSecurityDescriptorControl(
+                    expected,
+                    &mut expected_control,
+                    &mut expected_revision,
+                )
+            },
+            0,
+            "read expected {label} security descriptor control: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_ne!(
+            actual_control & SE_DACL_PROTECTED,
+            0,
+            "{label} DACL must be protected (control={actual_control:#06x})"
+        );
+        assert_ne!(
+            expected_control & SE_DACL_PROTECTED,
+            0,
+            "expected {label} DACL must be protected"
+        );
+        assert_eq!(
+            actual_revision, expected_revision,
+            "{label} descriptor revision"
+        );
+
+        let mut actual_present = 0;
+        let mut actual_defaulted = 0;
+        let mut actual_dacl: *mut ACL = std::ptr::null_mut();
+        // SAFETY: The output pointers are valid and the descriptors remain live.
+        assert_ne!(
+            unsafe {
+                GetSecurityDescriptorDacl(
+                    actual,
+                    &mut actual_present,
+                    &mut actual_dacl,
+                    &mut actual_defaulted,
+                )
+            },
+            0,
+            "read {label} DACL: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_ne!(actual_present, 0, "{label} DACL must be present");
+        assert!(!actual_dacl.is_null(), "{label} DACL must not be null");
+
+        let mut expected_present = 0;
+        let mut expected_defaulted = 0;
+        let mut expected_dacl: *mut ACL = std::ptr::null_mut();
+        // SAFETY: The output pointers are valid and the descriptors remain live.
+        assert_ne!(
+            unsafe {
+                GetSecurityDescriptorDacl(
+                    expected,
+                    &mut expected_present,
+                    &mut expected_dacl,
+                    &mut expected_defaulted,
+                )
+            },
+            0,
+            "read expected {label} DACL: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_ne!(expected_present, 0, "expected {label} DACL must be present");
+        assert!(
+            !expected_dacl.is_null(),
+            "expected {label} DACL must not be null"
+        );
+
+        let mut actual_size = ACL_SIZE_INFORMATION::default();
+        // SAFETY: The DACL and output structure are valid.
+        assert_ne!(
+            unsafe {
+                GetAclInformation(
+                    actual_dacl,
+                    (&mut actual_size as *mut ACL_SIZE_INFORMATION).cast(),
+                    std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                    AclSizeInformation,
+                )
+            },
+            0,
+            "read {label} ACL size: {}",
+            std::io::Error::last_os_error()
+        );
+        let mut expected_size = ACL_SIZE_INFORMATION::default();
+        // SAFETY: The DACL and output structure are valid.
+        assert_ne!(
+            unsafe {
+                GetAclInformation(
+                    expected_dacl,
+                    (&mut expected_size as *mut ACL_SIZE_INFORMATION).cast(),
+                    std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                    AclSizeInformation,
+                )
+            },
+            0,
+            "read expected {label} ACL size: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(
+            actual_size.AceCount, expected_size.AceCount,
+            "{label} ACL ACE count"
+        );
+        assert_eq!(
+            unsafe { (*actual_dacl).AclRevision },
+            unsafe { (*expected_dacl).AclRevision },
+            "{label} ACL revision"
+        );
+
+        for index in 0..actual_size.AceCount {
+            let mut actual_ace = std::ptr::null_mut();
+            // SAFETY: The index is bounded by the ACL's reported ACE count.
+            assert_ne!(
+                unsafe { GetAce(actual_dacl, index, &mut actual_ace) },
+                0,
+                "read {label} ACE {index}: {}",
+                std::io::Error::last_os_error()
+            );
+            let mut expected_ace = std::ptr::null_mut();
+            // SAFETY: The index is bounded by the ACL's reported ACE count.
+            assert_ne!(
+                unsafe { GetAce(expected_dacl, index, &mut expected_ace) },
+                0,
+                "read expected {label} ACE {index}: {}",
+                std::io::Error::last_os_error()
+            );
+
+            // SAFETY: GetAce returned valid ACE pointers within their live ACLs.
+            let actual_header = unsafe { &*actual_ace.cast::<ACE_HEADER>() };
+            // SAFETY: GetAce returned valid ACE pointers within their live ACLs.
+            let expected_header = unsafe { &*expected_ace.cast::<ACE_HEADER>() };
+            assert_eq!(
+                actual_header.AceType, ACCESS_ALLOWED_ACE_TYPE,
+                "{label} ACE {index} type"
+            );
+            assert_eq!(
+                expected_header.AceType, ACCESS_ALLOWED_ACE_TYPE,
+                "expected {label} ACE {index} type"
+            );
+            assert_eq!(
+                actual_header.AceFlags, expected_header.AceFlags,
+                "{label} ACE {index} inheritance flags"
+            );
+            assert_eq!(
+                actual_header.AceSize, expected_header.AceSize,
+                "{label} ACE {index} size"
+            );
+
+            // SAFETY: The ACE type was checked above and the pointers are valid.
+            let actual_allowed = unsafe { &*actual_ace.cast::<ACCESS_ALLOWED_ACE>() };
+            // SAFETY: The ACE type was checked above and the pointers are valid.
+            let expected_allowed = unsafe { &*expected_ace.cast::<ACCESS_ALLOWED_ACE>() };
+            assert_eq!(
+                actual_allowed.Mask, expected_allowed.Mask,
+                "{label} ACE {index} access mask"
+            );
+            let actual_sid = (&actual_allowed.SidStart as *const u32).cast_mut().cast();
+            let expected_sid = (&expected_allowed.SidStart as *const u32).cast_mut().cast();
+            // SAFETY: ACCESS_ALLOWED_ACE stores a valid SID immediately after SidStart.
+            assert_ne!(
+                unsafe { EqualSid(actual_sid, expected_sid) },
+                0,
+                "{label} ACE {index} SID"
+            );
         }
-        // SAFETY: The preceding loop found the terminator within the live API-owned string.
-        String::from_utf16(unsafe { std::slice::from_raw_parts(wide, length) })
-            .expect("decode Windows DACL SDDL")
     }
 
     #[test]
