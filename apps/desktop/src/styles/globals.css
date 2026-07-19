@@ -31,7 +31,7 @@ body,
 
 body {
   margin: 0;
-  min-width: 1280px;
+  min-width: 1120px;
   background:
     linear-gradient(rgba(15, 159, 143, 0.035) 1px, transparent 1px),
     linear-gradient(90deg, rgba(15, 159, 143, 0.035) 1px, transparent 1px),

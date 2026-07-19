@@ -17,7 +17,7 @@ use super::codex_relay_probe::codex_relay_probe_cases;
 use super::codex_relay_target::{
     CodexRelayTargetSelection, SelectedCodexRelayTarget, select_codex_relay_target,
 };
-use super::models_compat::maybe_decode_models_response_body;
+use super::models_compat::{ModelsTranslationScope, maybe_decode_models_response_body};
 use super::{
     CodexRelayProbeClient, CodexRelayProbeKind, CodexRelayProbeResult, ProxyControlError,
     ProxyService,
@@ -174,8 +174,13 @@ pub(super) async fn codex_relay_capabilities_for_proxy(
         models_observation,
     )?;
     let observed = build_observed_from_probe_observations(&observations);
-    let mismatches = build_mismatches(&expected, &observed);
     let config_source = runtime_snapshot.config();
+    let configured_translate_models = config_source
+        .codex
+        .client_patch
+        .unwrap_or_default()
+        .translate_models;
+    let mismatches = build_mismatches(&expected, &observed, configured_translate_models);
     let continuity = build_continuity_diagnostics(
         proxy.service_name,
         Some(&config_source.codex),
@@ -436,6 +441,7 @@ fn translated_models_catalog(
         "/models",
         &models_observation.headers,
         models_observation.body.clone(),
+        ModelsTranslationScope::Disabled,
     );
     let value = serde_json::from_slice::<Value>(body.as_ref()).ok()?;
     Some(CodexModelCatalogProfile::from_models_response_json(
@@ -446,6 +452,7 @@ fn translated_models_catalog(
 fn build_mismatches(
     expected: &CodexRelayProviderContract,
     observed: &CodexRelayCapabilitiesObserved,
+    configured_translate_models: bool,
 ) -> Vec<CodexRelayCapabilityMismatch> {
     let mut out = Vec::new();
     push_endpoint_mismatch(
@@ -465,10 +472,18 @@ fn build_mismatches(
             capability: "model_catalog".to_string(),
             expected: "codex_models".to_string(),
             observed: "openai_data_list".to_string(),
-            reason: "relay returned an OpenAI models list; the captured provider catalog remains authoritative and request-time client preset translation is not available".to_string(),
+            reason: model_catalog_translation_reason(configured_translate_models).to_string(),
         });
     }
     out
+}
+
+fn model_catalog_translation_reason(configured_translate_models: bool) -> &'static str {
+    if configured_translate_models {
+        "relay returned an OpenAI models list; server-default model translation is enabled and uses the selected provider's captured catalog, while a client runtime patch may override that default"
+    } else {
+        "relay returned an OpenAI models list; server-default model translation is disabled, but a client runtime patch may enable translation using the selected provider's captured catalog"
+    }
 }
 
 fn build_continuity_diagnostics(
@@ -681,6 +696,19 @@ mod tests {
         assert_eq!(request.provider_id.as_deref(), Some("relay"));
         assert_eq!(request.endpoint_id.as_deref(), Some("primary"));
         assert_eq!(request.model.as_deref(), Some("gpt-5.6-sol"));
+    }
+
+    #[test]
+    fn model_catalog_mismatch_explains_server_and_client_translation_precedence() {
+        let enabled = model_catalog_translation_reason(true);
+        assert!(enabled.contains("server-default model translation is enabled"));
+        assert!(enabled.contains("client runtime patch may override"));
+        assert!(enabled.contains("selected provider's captured catalog"));
+
+        let disabled = model_catalog_translation_reason(false);
+        assert!(disabled.contains("server-default model translation is disabled"));
+        assert!(disabled.contains("client runtime patch may enable"));
+        assert!(disabled.contains("selected provider's captured catalog"));
     }
 
     #[test]

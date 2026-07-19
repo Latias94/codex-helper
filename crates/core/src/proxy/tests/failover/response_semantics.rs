@@ -1385,6 +1385,55 @@ async fn proxy_does_not_translate_openai_models_list_by_default() {
     assert_openai_models_response(body.as_ref(), "gpt-5.5");
 }
 
+#[tokio::test]
+async fn proxy_translates_openai_models_list_when_client_patch_enables_it() {
+    let upstream = axum::Router::new().route(
+        "/v1/models",
+        get(|| async move {
+            Json(serde_json::json!({
+                "object": "list",
+                "data": [
+                    {"id": "gpt-5.6-sol", "object": "model"},
+                    {"id": "gpt-5.5", "object": "model", "display_name": "GPT-5.5"}
+                ]
+            }))
+        }),
+    );
+    let upstream = spawn_test_upstream(upstream);
+    let retry = retry_config(1, "502", Vec::new(), RetryStrategy::Failover);
+    let mut cfg = make_helper_config(vec![upstream.upstream_config()], retry);
+    cfg.codex.client_patch = Some(crate::config::CodexClientPatchConfig {
+        translate_models: true,
+        ..crate::config::CodexClientPatchConfig::default()
+    });
+    let proxy = spawn_test_proxy(cfg);
+
+    let resp = Client::new()
+        .get(proxy.url("/models"))
+        .send()
+        .await
+        .expect("send");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.bytes().await.expect("body");
+    let value: serde_json::Value = serde_json::from_slice(body.as_ref()).expect("json body");
+    assert!(value.get("data").is_none());
+    let models = value["models"].as_array().expect("translated models");
+    assert_eq!(models.len(), 2);
+    let sol = models
+        .iter()
+        .find(|model| model["slug"].as_str() == Some("gpt-5.6-sol"))
+        .expect("Sol model");
+    assert_eq!(sol["shell_type"].as_str(), Some("default"));
+    assert_eq!(
+        sol["supports_reasoning_summary_parameter"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(sol["input_modalities"], serde_json::json!(["text"]));
+    assert!(sol["context_window"].is_null());
+    assert!(sol.get("tool_mode").is_none());
+}
+
 fn assert_openai_models_response(body: &[u8], expected_slug: &str) -> serde_json::Value {
     let value: serde_json::Value = serde_json::from_slice(body).expect("json body");
     assert!(value.get("models").is_none());

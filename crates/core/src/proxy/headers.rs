@@ -1,6 +1,7 @@
 use axum::http::{HeaderMap, HeaderName};
 
 use crate::codex_switch::{CODEX_CLIENT_FACADE_ACTOR_HEADER, CODEX_CLIENT_FACADE_ACTOR_VALUE};
+use crate::config::CODEX_CLIENT_RUNTIME_PATCH_HEADER;
 use crate::logging::HeaderEntry;
 
 fn is_hop_by_hop_header(name_lower: &str) -> bool {
@@ -25,6 +26,7 @@ fn is_request_header_to_strip(name_lower: &str) -> bool {
             | "content-length"
             | "user-agent"
             | "cookie"
+            | CODEX_CLIENT_RUNTIME_PATCH_HEADER
             | "x-forwarded-api-key"
             | "x-codex-helper-admin-token"
     ) || is_hop_by_hop_header(name_lower)
@@ -145,6 +147,7 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue};
 
     use crate::codex_switch::{CODEX_CLIENT_FACADE_ACTOR_HEADER, CODEX_CLIENT_FACADE_ACTOR_VALUE};
+    use crate::config::CODEX_CLIENT_RUNTIME_PATCH_HEADER;
 
     use super::{
         filter_request_headers, filter_response_headers, header_map_to_entries,
@@ -173,6 +176,10 @@ mod tests {
             "x-codex-helper-admin-token",
             HeaderValue::from_static("admin-secret"),
         );
+        headers.insert(
+            CODEX_CLIENT_RUNTIME_PATCH_HEADER,
+            HeaderValue::from_static("v1;models=1;hosted=disabled"),
+        );
         headers.insert("x-keep-me", HeaderValue::from_static("ok"));
 
         let filtered = filter_request_headers(&headers);
@@ -186,6 +193,7 @@ mod tests {
         assert!(!filtered.contains_key("cookie"));
         assert!(!filtered.contains_key("x-forwarded-api-key"));
         assert!(!filtered.contains_key("x-codex-helper-admin-token"));
+        assert!(!filtered.contains_key(CODEX_CLIENT_RUNTIME_PATCH_HEADER));
         assert_eq!(
             filtered.get("authorization"),
             Some(&HeaderValue::from_static("Bearer secret"))

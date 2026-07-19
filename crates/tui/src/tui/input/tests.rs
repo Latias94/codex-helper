@@ -1,6 +1,7 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use codex_helper_core::codex_switch::CodexSwitchIntent;
+use codex_helper_core::config::CodexClientPreset;
 
 use super::{KeyEventContext, handle_key_event};
 use crate::dashboard_core::{
@@ -10,7 +11,9 @@ use crate::dashboard_core::{
 use crate::proxy::{OperatorEndpointMode, OperatorRoutingCommand, OperatorSessionAffinityCommand};
 use crate::state::SessionObservationScope;
 use crate::tui::Language;
-use crate::tui::input::normal::codex_switch_intent_for_key;
+use crate::tui::input::normal::{
+    accepts_codex_switch_key, codex_client_preset_for_key, codex_switch_intent_for_key,
+};
 use crate::tui::model::{ProviderOption, SessionRouteAffinityView, SessionRow, Snapshot};
 use crate::tui::operator_actions::PendingOperatorAction;
 use crate::tui::state::{RuntimeConnectionKind, UiState};
@@ -672,4 +675,32 @@ fn settings_n_o_keys_keep_the_explicit_local_codex_switch_contract() {
         Some(CodexSwitchIntent::Off)
     );
     assert_eq!(codex_switch_intent_for_key(KeyCode::Char('x'), 4321), None);
+}
+
+#[test]
+fn settings_preset_keys_cover_the_full_v0203_preset_set() {
+    for (key, preset) in [
+        ('B', CodexClientPreset::ChatGptBridge),
+        ('I', CodexClientPreset::ImagegenBridge),
+        ('F', CodexClientPreset::OfficialRelay),
+        ('V', CodexClientPreset::OfficialImagegen),
+        ('D', CodexClientPreset::Default),
+    ] {
+        assert_eq!(
+            codex_client_preset_for_key(KeyCode::Char(key)),
+            Some(preset)
+        );
+    }
+    assert_eq!(codex_client_preset_for_key(KeyCode::Char('b')), None);
+}
+
+#[test]
+fn settings_switch_actions_ignore_key_repeat_events() {
+    let pressed =
+        KeyEvent::new_with_kind(KeyCode::Char('V'), KeyModifiers::NONE, KeyEventKind::Press);
+    let repeated =
+        KeyEvent::new_with_kind(KeyCode::Char('V'), KeyModifiers::NONE, KeyEventKind::Repeat);
+
+    assert!(accepts_codex_switch_key(&pressed));
+    assert!(!accepts_codex_switch_key(&repeated));
 }

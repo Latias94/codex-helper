@@ -1,9 +1,9 @@
 use std::time::Instant;
 
 use codex_helper_core::codex_switch::{self, CodexSwitchIntent, ValidatedCodexBaseUrl};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use crate::config::proxy_home_dir;
+use crate::config::{CodexClientPatchConfig, CodexClientPreset, load_config, proxy_home_dir};
 use crate::proxy::{OperatorRoutingCommand, OperatorRoutingMutationRequest};
 use crate::sessions::find_codex_session_file_by_id;
 use crate::tui::Language;
@@ -41,23 +41,74 @@ pub(in crate::tui) fn codex_switch_intent_for_key(
     }
 }
 
-pub(in crate::tui) fn apply_codex_switch(ui: &mut UiState, intent: CodexSwitchIntent) {
+pub(in crate::tui) fn codex_client_preset_for_key(code: KeyCode) -> Option<CodexClientPreset> {
+    match code {
+        KeyCode::Char('B') => Some(CodexClientPreset::ChatGptBridge),
+        KeyCode::Char('I') => Some(CodexClientPreset::ImagegenBridge),
+        KeyCode::Char('F') => Some(CodexClientPreset::OfficialRelay),
+        KeyCode::Char('V') => Some(CodexClientPreset::OfficialImagegen),
+        KeyCode::Char('D') => Some(CodexClientPreset::Default),
+        _ => None,
+    }
+}
+
+pub(in crate::tui) fn accepts_codex_switch_key(key: &KeyEvent) -> bool {
+    key.kind == KeyEventKind::Press
+}
+
+pub(in crate::tui) async fn apply_codex_switch(
+    ui: &mut UiState,
+    intent: CodexSwitchIntent,
+    preset: Option<CodexClientPreset>,
+) {
     let action = if matches!(&intent, CodexSwitchIntent::On { .. }) {
         "on"
     } else {
         "off"
     };
-    let message = match codex_switch::apply(intent) {
+    let outcome = match &intent {
+        CodexSwitchIntent::On { .. } => {
+            let client_patch = match preset {
+                Some(preset) => Ok(CodexClientPatchConfig {
+                    preset,
+                    ..CodexClientPatchConfig::default()
+                }),
+                None => load_config()
+                    .await
+                    .map(|config| config.codex.client_patch.unwrap_or_default())
+                    .map_err(|error| {
+                        format!("read [codex.client_patch] from helper config: {error}")
+                    }),
+            };
+            match client_patch {
+                Ok(client_patch) => codex_switch::apply_with_client_patch(intent, client_patch)
+                    .map_err(|error| error.to_string()),
+                Err(error) => Err(error),
+            }
+        }
+        CodexSwitchIntent::Off => codex_switch::apply(intent).map_err(|error| error.to_string()),
+    };
+    let message = match outcome {
         Ok(outcome) => match ui.language {
             Language::Zh => format!(
-                "Codex 本地 switch {action}：{}（phase={}）；重启已有 Codex app 后生效",
+                "Codex 本地 switch {action}：{}（phase={}，preset={}）；重启已有 Codex app 后生效",
                 outcome.change.as_str(),
-                outcome.status.phase.as_str()
+                outcome.status.phase.as_str(),
+                outcome
+                    .status
+                    .client_patch
+                    .map(|patch| patch.preset.as_str())
+                    .unwrap_or("-")
             ),
             Language::En => format!(
-                "Codex local switch {action}: {} (phase={}); restart existing Codex apps to apply it",
+                "Codex local switch {action}: {} (phase={}, preset={}); restart existing Codex apps to apply it",
                 outcome.change.as_str(),
-                outcome.status.phase.as_str()
+                outcome.status.phase.as_str(),
+                outcome
+                    .status
+                    .client_patch
+                    .map(|patch| patch.preset.as_str())
+                    .unwrap_or("-")
             ),
         },
         Err(err) => match ui.language {
@@ -593,11 +644,28 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
         return true;
     }
 
-    if ui.page == Page::Settings
+    if accepts_codex_switch_key(&key)
+        && ui.page == Page::Settings
+        && ui.allows_local_codex_switch()
+        && let Some(preset) = codex_client_preset_for_key(key.code)
+    {
+        apply_codex_switch(
+            ui,
+            CodexSwitchIntent::On {
+                validated_base_url: ValidatedCodexBaseUrl::local(ui.proxy_port),
+            },
+            Some(preset),
+        )
+        .await;
+        return true;
+    }
+
+    if accepts_codex_switch_key(&key)
+        && ui.page == Page::Settings
         && ui.allows_local_codex_switch()
         && let Some(intent) = codex_switch_intent_for_key(key.code, ui.proxy_port)
     {
-        apply_codex_switch(ui, intent);
+        apply_codex_switch(ui, intent, None).await;
         return true;
     }
 

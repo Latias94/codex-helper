@@ -10,10 +10,15 @@ use toml::Value as TomlValue;
 use toml_edit::{DocumentMut, Item, Table, Value as EditableValue, value as editable_value};
 use uuid::Uuid;
 
+use crate::config::{
+    CODEX_CLIENT_RUNTIME_PATCH_HEADER, CodexAuthFacadeStrategy, CodexClientPatchConfig,
+    CodexClientPreset, CodexClientRuntimePatch, CodexCompactionStrategy, CodexFeatureBoolPatch,
+    CodexHostedImageGenerationMode, CodexProviderIdentity, CodexTomlBoolPatch,
+};
+
 const STATE_VERSION: u32 = 1;
 const PROVIDER_ID: &str = "codex_proxy";
 const COMPATIBLE_PROVIDER_NAME: &str = "codex-helper";
-const OPENAI_PROVIDER_NAME: &str = "OpenAI";
 // Current Codex treats a non-empty actor header as a client capability gate. The proxy consumes
 // this exact non-secret marker locally before applying upstream authentication policy.
 pub const CODEX_CLIENT_FACADE_ACTOR_HEADER: &str = "x-openai-actor-authorization";
@@ -25,6 +30,9 @@ const SWITCH_TEMP_FILE_PREFIX: &str = ".codex-switch-v1-";
 const LEGACY_SWITCH_TEMP_FILE_PREFIX: &str = ".codex-switch-";
 const SWITCH_TEMP_FILE_SUFFIX: &str = ".tmp";
 const SWITCH_DELETE_TOMBSTONE_PREFIX: &str = ".codex-switch-delete-v1-";
+const SWITCH_CAPTURE_FILE_PREFIX: &str = ".codex-switch-capture-v1-";
+const AUTH_BACKUP_FILE_PREFIX: &str = "codex-switch-auth-v1-";
+const AUTH_BACKUP_FILE_SUFFIX: &str = ".bak";
 #[cfg(windows)]
 const WINDOWS_FILE_OPERATION_ATTEMPTS: usize = 10;
 #[cfg(windows)]
@@ -91,15 +99,42 @@ impl CodexClientFacade {
         }
     }
 
-    const fn provider_name(self) -> &'static str {
+    pub const fn client_patch(self) -> CodexClientPatchConfig {
         match self {
-            Self::Compatible => COMPATIBLE_PROVIDER_NAME,
-            Self::OpenAi | Self::OpenAiTools => OPENAI_PROVIDER_NAME,
+            Self::Compatible => CodexClientPatchConfig {
+                preset: CodexClientPreset::Default,
+                responses_websocket: false,
+                compaction: CodexCompactionStrategy::Auto,
+                translate_models: false,
+                hosted_image_generation: CodexHostedImageGenerationMode::Auto,
+            },
+            Self::OpenAi => CodexClientPatchConfig {
+                preset: CodexClientPreset::OfficialRelay,
+                responses_websocket: false,
+                compaction: CodexCompactionStrategy::Auto,
+                translate_models: false,
+                hosted_image_generation: CodexHostedImageGenerationMode::Auto,
+            },
+            Self::OpenAiTools => CodexClientPatchConfig {
+                preset: CodexClientPreset::OfficialImagegen,
+                responses_websocket: false,
+                compaction: CodexCompactionStrategy::Auto,
+                translate_models: false,
+                hosted_image_generation: CodexHostedImageGenerationMode::Auto,
+            },
         }
     }
 
-    const fn exposes_openai_tools(self) -> bool {
-        matches!(self, Self::OpenAiTools)
+    fn for_client_patch(client_patch: CodexClientPatchConfig) -> Result<Self, CodexSwitchError> {
+        let compiled = client_patch.compile().map_err(invalid_client_patch_error)?;
+        if compiled.provider_identity != CodexProviderIdentity::OfficialOpenAi {
+            return Ok(Self::Compatible);
+        }
+        if compiled.actor_marker {
+            Ok(Self::OpenAiTools)
+        } else {
+            Ok(Self::OpenAi)
+        }
     }
 }
 
@@ -157,6 +192,7 @@ pub struct CodexSwitchStatus {
     pub managed: bool,
     pub base_url: Option<String>,
     pub client_facade: Option<CodexClientFacade>,
+    pub client_patch: Option<CodexClientPatchConfig>,
     pub recovery_reason: Option<String>,
     pub config_path: PathBuf,
     pub state_path: PathBuf,
@@ -170,6 +206,8 @@ pub struct CodexSwitchOutcome {
 
 #[derive(Debug, Error)]
 pub enum CodexSwitchError {
+    #[error("invalid Codex client patch: {reason}")]
+    InvalidClientPatch { reason: String },
     #[error("invalid Codex helper base URL: {reason}")]
     InvalidBaseUrl { reason: String },
     #[error("failed to {action} {path:?}: {source}")]
@@ -181,6 +219,8 @@ pub enum CodexSwitchError {
     },
     #[error("failed to parse Codex config {path:?}: {reason}")]
     InvalidConfig { path: PathBuf, reason: String },
+    #[error("cannot prepare Codex auth facade at {path:?}: {reason}")]
+    InvalidAuth { path: PathBuf, reason: String },
     #[error("failed to parse Codex switch state {path:?}: {reason}")]
     InvalidState { path: PathBuf, reason: String },
     #[error("Codex switch operation is already running; lock is held at {path:?}")]
@@ -214,10 +254,6 @@ pub enum CodexSwitchError {
         "Codex helper is already applied to {current}; run explicit switch off before switching to {requested}"
     )]
     AlreadyAppliedToDifferentTarget { current: String, requested: String },
-    #[error(
-        "Codex helper is already applied with client facade {current}; run explicit switch off before switching to {requested}"
-    )]
-    AlreadyAppliedWithDifferentFacade { current: String, requested: String },
     #[error("Codex switch recovery is required: {reason}")]
     RecoveryRequired { reason: String },
     #[error("Codex switch state changed repeatedly while it was being inspected")]
@@ -229,11 +265,18 @@ pub enum CodexSwitchError {
     InjectedFailure(&'static str),
 }
 
+fn invalid_client_patch_error(error: anyhow::Error) -> CodexSwitchError {
+    CodexSwitchError::InvalidClientPatch {
+        reason: error.to_string(),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum JournalPhase {
     Prepared,
     Applied,
+    Restored,
     RecoveryRequired,
 }
 
@@ -262,7 +305,56 @@ struct SwitchJournal {
     #[serde(default)]
     client_facade: CodexClientFacade,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_patch: Option<CodexClientPatchConfig>,
+    #[serde(default)]
+    original_features_present: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    original_remote_compaction_v2: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    original_image_generation: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auth_patch: Option<AuthJournal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auth_recovery_patch: Option<CodexClientPatchConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     recovery_reason: Option<String>,
+}
+
+impl SwitchJournal {
+    fn recovery_client_patch(&self) -> CodexClientPatchConfig {
+        self.client_patch
+            .unwrap_or_else(|| self.client_facade.client_patch())
+    }
+
+    fn records_complete_client_patch(&self, client_patch: CodexClientPatchConfig) -> bool {
+        self.client_patch == Some(client_patch)
+    }
+
+    fn recorded_auth_client_patch(&self) -> CodexClientPatchConfig {
+        self.auth_recovery_patch
+            .unwrap_or_else(|| self.recovery_client_patch())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+struct AuthJournal {
+    auth_path_fingerprint: String,
+    original_present: bool,
+    original_fingerprint: String,
+    applied_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    backup_file_name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RetainedAuthJournal {
+    client_patch: CodexClientPatchConfig,
+    auth: AuthJournal,
+}
+
+struct PreparedAuthJournal {
+    auth: Option<AuthJournal>,
+    recovery_patch: Option<CodexClientPatchConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -379,6 +471,14 @@ impl ConfigSnapshot {
     fn matches_applied(&self, journal: &SwitchJournal) -> bool {
         self.present && self.fingerprint == journal.applied_fingerprint
     }
+
+    fn matches_original_auth(&self, journal: &AuthJournal) -> bool {
+        self.present == journal.original_present && self.fingerprint == journal.original_fingerprint
+    }
+
+    fn matches_applied_auth(&self, journal: &AuthJournal) -> bool {
+        self.present && self.fingerprint == journal.applied_fingerprint
+    }
 }
 
 #[derive(Debug)]
@@ -393,6 +493,12 @@ enum ExpectedConfigState {
     Applied,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ExpectedAuthState {
+    Original,
+    Applied,
+}
+
 #[derive(Clone, Copy)]
 struct ConfigCommitExpectation<'a> {
     journal: &'a SwitchJournal,
@@ -400,12 +506,66 @@ struct ConfigCommitExpectation<'a> {
 }
 
 #[derive(Clone, Copy)]
+struct AuthCommitExpectation<'a> {
+    paths: &'a SwitchPaths,
+    switch_journal: &'a SwitchJournal,
+    journal: &'a AuthJournal,
+    state: ExpectedAuthState,
+}
+
+#[derive(Clone, Copy)]
 enum FileCommitExpectation<'a> {
     Journal(ConfigCommitExpectation<'a>),
+    Auth(AuthCommitExpectation<'a>),
     LegacySnapshot {
         expected: &'a ConfigSnapshot,
         legacy_path: &'a Path,
     },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ManagedCommitRole {
+    Config,
+    Auth,
+}
+
+impl ManagedCommitRole {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Config => "config",
+            Self::Auth => "auth",
+        }
+    }
+}
+
+impl<'a> FileCommitExpectation<'a> {
+    fn managed_capture(self) -> Option<(&'a str, ManagedCommitRole)> {
+        match self {
+            Self::Journal(expectation) => Some((
+                expectation.journal.operation_id.as_str(),
+                ManagedCommitRole::Config,
+            )),
+            Self::Auth(expectation) => Some((
+                expectation.switch_journal.operation_id.as_str(),
+                ManagedCommitRole::Auth,
+            )),
+            Self::LegacySnapshot { .. } => None,
+        }
+    }
+
+    fn expected_present(self) -> bool {
+        match self {
+            Self::Journal(expectation) => match expectation.state {
+                ExpectedConfigState::Original => expectation.journal.original_config_present,
+                ExpectedConfigState::Applied => true,
+            },
+            Self::Auth(expectation) => match expectation.state {
+                ExpectedAuthState::Original => expectation.journal.original_present,
+                ExpectedAuthState::Applied => true,
+            },
+            Self::LegacySnapshot { expected, .. } => expected.present,
+        }
+    }
 }
 
 impl ConfigEdit {
@@ -420,6 +580,13 @@ impl ConfigEdit {
             }
         }
     }
+
+    fn into_snapshot(self) -> ConfigSnapshot {
+        match self {
+            Self::Write(text) => ConfigSnapshot::from_text(true, text),
+            Self::Remove => ConfigSnapshot::from_text(false, String::new()),
+        }
+    }
 }
 
 struct OperationLock {
@@ -431,6 +598,8 @@ enum ApplyFailpoint {
     None,
     AfterPrepared,
     AfterConfigWrite,
+    AfterAuthWrite,
+    AfterAuthRestore,
     AfterLegacyConfigRestore,
     AfterLegacyAuthRestore,
 }
@@ -442,6 +611,8 @@ impl ApplyFailpoint {
             Self::None => "none",
             Self::AfterPrepared => "after_prepared",
             Self::AfterConfigWrite => "after_config_write",
+            Self::AfterAuthWrite => "after_auth_write",
+            Self::AfterAuthRestore => "after_auth_restore",
             Self::AfterLegacyConfigRestore => "after_legacy_config_restore",
             Self::AfterLegacyAuthRestore => "after_legacy_auth_restore",
         }
@@ -451,6 +622,9 @@ impl ApplyFailpoint {
 struct OnPatch {
     text: String,
     original_model_provider_repr: Option<String>,
+    original_features_present: bool,
+    original_remote_compaction_v2: Option<bool>,
+    original_image_generation: Option<bool>,
 }
 
 struct PlannedOnWrite {
@@ -459,14 +633,21 @@ struct PlannedOnWrite {
 }
 
 pub fn apply(intent: CodexSwitchIntent) -> Result<CodexSwitchOutcome, CodexSwitchError> {
-    apply_with_client_facade(intent, CodexClientFacade::Compatible)
+    apply_with_client_patch(intent, CodexClientPatchConfig::default())
 }
 
 pub fn apply_with_client_facade(
     intent: CodexSwitchIntent,
     client_facade: CodexClientFacade,
 ) -> Result<CodexSwitchOutcome, CodexSwitchError> {
-    apply_with_client_facade_and_failpoint(intent, client_facade, ApplyFailpoint::None)
+    apply_with_client_patch(intent, client_facade.client_patch())
+}
+
+pub fn apply_with_client_patch(
+    intent: CodexSwitchIntent,
+    client_patch: CodexClientPatchConfig,
+) -> Result<CodexSwitchOutcome, CodexSwitchError> {
+    apply_with_client_patch_and_failpoint(intent, client_patch, ApplyFailpoint::None)
 }
 
 pub fn inspect() -> Result<CodexSwitchStatus, CodexSwitchError> {
@@ -500,14 +681,24 @@ fn apply_with_failpoint(
     intent: CodexSwitchIntent,
     failpoint: ApplyFailpoint,
 ) -> Result<CodexSwitchOutcome, CodexSwitchError> {
-    apply_with_client_facade_and_failpoint(intent, CodexClientFacade::Compatible, failpoint)
+    apply_with_client_patch_and_failpoint(intent, CodexClientPatchConfig::default(), failpoint)
 }
 
+#[cfg(test)]
 fn apply_with_client_facade_and_failpoint(
     intent: CodexSwitchIntent,
     client_facade: CodexClientFacade,
     failpoint: ApplyFailpoint,
 ) -> Result<CodexSwitchOutcome, CodexSwitchError> {
+    apply_with_client_patch_and_failpoint(intent, client_facade.client_patch(), failpoint)
+}
+
+fn apply_with_client_patch_and_failpoint(
+    intent: CodexSwitchIntent,
+    client_patch: CodexClientPatchConfig,
+    failpoint: ApplyFailpoint,
+) -> Result<CodexSwitchOutcome, CodexSwitchError> {
+    client_patch.compile().map_err(invalid_client_patch_error)?;
     let paths = SwitchPaths::resolve()?;
     let _lock = OperationLock::acquire(paths.lock.as_path())?;
     cleanup_managed_switch_artifacts(&paths)?;
@@ -523,19 +714,16 @@ fn apply_with_client_facade_and_failpoint(
         recover_legacy_switch_state(&paths, failpoint)?;
         let current = read_config_snapshot(paths.config.as_path())?;
         return match intent {
-            CodexSwitchIntent::On { validated_base_url } => begin_on(
-                &paths,
-                current,
-                validated_base_url,
-                client_facade,
-                failpoint,
-            ),
+            CodexSwitchIntent::On { validated_base_url } => {
+                begin_on(&paths, current, validated_base_url, client_patch, failpoint)
+            }
             CodexSwitchIntent::Off => outcome(&paths, CodexSwitchChange::Recovered),
         };
     }
-    let journal = read_journal(paths.state.as_path())?;
-    if let Some(journal) = journal.as_ref() {
+    let mut journal = read_journal(paths.state.as_path())?;
+    if let Some(journal) = journal.as_mut() {
         ensure_journal_config_matches(&paths, journal)?;
+        recover_interrupted_file_captures(&paths, journal)?;
     }
     let current = read_config_snapshot(paths.config.as_path())?;
 
@@ -545,7 +733,7 @@ fn apply_with_client_facade_and_failpoint(
             current,
             journal,
             validated_base_url,
-            client_facade,
+            client_patch,
             failpoint,
         ),
         CodexSwitchIntent::Off => apply_off(&paths, current, journal, failpoint),
@@ -1053,6 +1241,7 @@ fn legacy_switch_status(paths: &SwitchPaths) -> Result<CodexSwitchStatus, CodexS
         managed: current_state_present,
         base_url,
         client_facade: None,
+        client_patch: None,
         recovery_reason: Some(recovery_reason),
         config_path: paths.config.clone(),
         state_path: paths.legacy_state.clone(),
@@ -1093,23 +1282,300 @@ fn write_current_config_edit(
     write_config_edit(paths.config.as_path(), edit, journal, expected)
 }
 
+fn write_current_auth_edit(
+    paths: &SwitchPaths,
+    edit: ConfigEdit,
+    switch_journal: &SwitchJournal,
+    auth_journal: &AuthJournal,
+    expected: ExpectedAuthState,
+) -> Result<(), CodexSwitchError> {
+    reject_legacy_switch_state(paths)?;
+    write_auth_edit(
+        paths,
+        paths.auth.as_path(),
+        edit,
+        switch_journal,
+        auth_journal,
+        expected,
+    )
+}
+
+fn managed_auth_backup_name(name: &str) -> bool {
+    name.strip_prefix(AUTH_BACKUP_FILE_PREFIX)
+        .and_then(|suffix| suffix.strip_suffix(AUTH_BACKUP_FILE_SUFFIX))
+        .is_some_and(managed_switch_artifact_uuid)
+}
+
+fn auth_backup_path(
+    paths: &SwitchPaths,
+    journal: &AuthJournal,
+) -> Result<Option<PathBuf>, CodexSwitchError> {
+    match (
+        journal.original_present,
+        journal.backup_file_name.as_deref(),
+    ) {
+        (false, None) => Ok(None),
+        (true, Some(name)) if managed_auth_backup_name(name) => {
+            let parent = paths
+                .state
+                .parent()
+                .ok_or_else(|| CodexSwitchError::InvalidState {
+                    path: paths.state.clone(),
+                    reason: "switch state path has no parent directory".to_string(),
+                })?;
+            Ok(Some(parent.join(name)))
+        }
+        (true, None) => Err(CodexSwitchError::InvalidState {
+            path: paths.state.clone(),
+            reason: "auth recovery metadata is missing its backup file name".to_string(),
+        }),
+        (false, Some(_)) => Err(CodexSwitchError::InvalidState {
+            path: paths.state.clone(),
+            reason: "auth recovery metadata records a backup for an absent original file"
+                .to_string(),
+        }),
+        (true, Some(_)) => Err(CodexSwitchError::InvalidState {
+            path: paths.state.clone(),
+            reason: "auth recovery metadata contains an invalid backup file name".to_string(),
+        }),
+    }
+}
+
+fn read_auth_backup(
+    paths: &SwitchPaths,
+    journal: &AuthJournal,
+) -> Result<Option<ConfigSnapshot>, CodexSwitchError> {
+    let Some(path) = auth_backup_path(paths, journal)? else {
+        return Ok(None);
+    };
+    let snapshot = read_config_snapshot(path.as_path())?;
+    validate_config_topology(path.as_path(), snapshot.present)?;
+    Ok(Some(snapshot))
+}
+
+fn ensure_auth_backup(
+    paths: &SwitchPaths,
+    journal: &AuthJournal,
+    current_auth: &ConfigSnapshot,
+) -> Result<(), CodexSwitchError> {
+    let Some(path) = auth_backup_path(paths, journal)? else {
+        return Ok(());
+    };
+    let backup = read_config_snapshot(path.as_path())?;
+    if backup.present {
+        validate_config_topology(path.as_path(), true)?;
+        if backup.fingerprint == journal.original_fingerprint {
+            return Ok(());
+        }
+        return Err(CodexSwitchError::RecoveryRequired {
+            reason: "the secure Codex auth backup does not match its recorded fingerprint"
+                .to_string(),
+        });
+    }
+    if !current_auth.matches_original_auth(journal) {
+        return Err(CodexSwitchError::RecoveryRequired {
+            reason: "the secure Codex auth backup is missing after auth.json changed".to_string(),
+        });
+    }
+    atomic_write_text(
+        path.as_path(),
+        current_auth.text.as_str(),
+        FilePermissions::Secure,
+        None,
+    )?;
+    let backup = read_config_snapshot(path.as_path())?;
+    validate_config_topology(path.as_path(), backup.present)?;
+    if backup.present && backup.fingerprint == journal.original_fingerprint {
+        Ok(())
+    } else {
+        Err(CodexSwitchError::RecoveryRequired {
+            reason: "the secure Codex auth backup was not committed with the recorded fingerprint"
+                .to_string(),
+        })
+    }
+}
+
+fn render_recorded_auth_facade(
+    paths: &SwitchPaths,
+    switch_journal: &SwitchJournal,
+    auth_journal: &AuthJournal,
+    current_auth: &ConfigSnapshot,
+) -> Result<String, CodexSwitchError> {
+    let strategy = switch_journal
+        .recorded_auth_client_patch()
+        .compile()
+        .map_err(|error| CodexSwitchError::InvalidState {
+            path: paths.state.clone(),
+            reason: format!("invalid recorded client patch: {error}"),
+        })?
+        .auth_facade;
+    if strategy == CodexAuthFacadeStrategy::Preserve {
+        return Err(CodexSwitchError::InvalidState {
+            path: paths.state.clone(),
+            reason: "auth recovery metadata exists for a client patch that preserves auth.json"
+                .to_string(),
+        });
+    }
+
+    let original = if auth_journal.original_present {
+        if current_auth.matches_original_auth(auth_journal) {
+            current_auth.text.as_str()
+        } else {
+            let backup = read_auth_backup(paths, auth_journal)?.ok_or_else(|| {
+                CodexSwitchError::RecoveryRequired {
+                    reason: "the secure Codex auth backup is missing".to_string(),
+                }
+            })?;
+            if backup.fingerprint != auth_journal.original_fingerprint {
+                return Err(CodexSwitchError::RecoveryRequired {
+                    reason: "the secure Codex auth backup does not match its recorded fingerprint"
+                        .to_string(),
+                });
+            }
+            return render_recorded_auth_facade_from_text(
+                paths,
+                strategy,
+                Some(backup.text.as_str()),
+                auth_journal,
+            );
+        }
+    } else {
+        ""
+    };
+    render_recorded_auth_facade_from_text(
+        paths,
+        strategy,
+        auth_journal.original_present.then_some(original),
+        auth_journal,
+    )
+}
+
+fn render_recorded_auth_facade_from_text(
+    paths: &SwitchPaths,
+    strategy: CodexAuthFacadeStrategy,
+    original: Option<&str>,
+    journal: &AuthJournal,
+) -> Result<String, CodexSwitchError> {
+    let rendered = crate::codex_auth_facade::render_auth_facade(strategy, original)
+        .map_err(|error| CodexSwitchError::InvalidState {
+            path: paths.state.clone(),
+            reason: format!("recorded auth facade can no longer be reproduced: {error}"),
+        })?
+        .ok_or_else(|| CodexSwitchError::InvalidState {
+            path: paths.state.clone(),
+            reason: "recorded auth facade strategy produced no projection".to_string(),
+        })?;
+    if fingerprint(rendered.as_bytes()) != journal.applied_fingerprint {
+        return Err(CodexSwitchError::RecoveryRequired {
+            reason: "recorded auth facade no longer produces the planned fingerprint".to_string(),
+        });
+    }
+    Ok(rendered)
+}
+
+fn auth_snapshot_matches_recorded_states(
+    paths: &SwitchPaths,
+    switch_journal: &SwitchJournal,
+    auth_journal: &AuthJournal,
+    current: &ConfigSnapshot,
+) -> Result<(bool, bool), CodexSwitchError> {
+    let matches_original = current.matches_original_auth(auth_journal);
+    let matches_applied = if current.matches_applied_auth(auth_journal) {
+        true
+    } else if current.present {
+        let applied = render_recorded_auth_facade(paths, switch_journal, auth_journal, current)?;
+        json_text_semantically_matches(current.text.as_str(), applied.as_str())
+    } else {
+        false
+    };
+    Ok((matches_original, matches_applied))
+}
+
+fn journal_patches_auth(
+    paths: &SwitchPaths,
+    journal: &SwitchJournal,
+) -> Result<bool, CodexSwitchError> {
+    let strategy = journal
+        .recovery_client_patch()
+        .compile()
+        .map_err(|error| CodexSwitchError::InvalidState {
+            path: paths.state.clone(),
+            reason: format!("invalid recorded client patch: {error}"),
+        })?
+        .auth_facade;
+    Ok(strategy != CodexAuthFacadeStrategy::Preserve)
+}
+
+fn restore_recorded_auth_original(
+    paths: &SwitchPaths,
+    switch_journal: &SwitchJournal,
+    auth_journal: &AuthJournal,
+    current_auth: &ConfigSnapshot,
+) -> Result<bool, CodexSwitchError> {
+    let (matches_original, matches_applied) =
+        auth_snapshot_matches_recorded_states(paths, switch_journal, auth_journal, current_auth)?;
+    if !matches_original && !matches_applied {
+        return Err(CodexSwitchError::RecoveryRequired {
+            reason: "Codex auth.json matches neither the saved original nor retained facade"
+                .to_string(),
+        });
+    }
+    ensure_auth_backup(paths, auth_journal, current_auth)?;
+    if matches_original {
+        return Ok(false);
+    }
+
+    let edit = if auth_journal.original_present {
+        let backup = read_auth_backup(paths, auth_journal)?.ok_or_else(|| {
+            CodexSwitchError::RecoveryRequired {
+                reason: "the secure Codex auth backup is missing".to_string(),
+            }
+        })?;
+        if backup.fingerprint != auth_journal.original_fingerprint {
+            return Err(CodexSwitchError::RecoveryRequired {
+                reason: "the secure Codex auth backup does not match its recorded fingerprint"
+                    .to_string(),
+            });
+        }
+        ConfigEdit::Write(backup.text)
+    } else {
+        ConfigEdit::Remove
+    };
+    write_current_auth_edit(
+        paths,
+        edit,
+        switch_journal,
+        auth_journal,
+        ExpectedAuthState::Applied,
+    )?;
+    let restored = read_config_snapshot(paths.auth.as_path())?;
+    if restored.matches_original_auth(auth_journal) {
+        Ok(true)
+    } else {
+        Err(CodexSwitchError::RecoveryRequired {
+            reason: "Codex auth.json changed before the retained original was restored".to_string(),
+        })
+    }
+}
+
 fn apply_on(
     paths: &SwitchPaths,
     current: ConfigSnapshot,
     journal: Option<SwitchJournal>,
     target: ValidatedCodexBaseUrl,
-    client_facade: CodexClientFacade,
+    client_patch: CodexClientPatchConfig,
     failpoint: ApplyFailpoint,
 ) -> Result<CodexSwitchOutcome, CodexSwitchError> {
     match journal {
-        None => begin_on(paths, current, target, client_facade, failpoint),
-        Some(mut journal) => match journal.phase {
+        None => begin_on(paths, current, target, client_patch, failpoint),
+        Some(journal) => match journal.phase {
             JournalPhase::RecoveryRequired => Err(CodexSwitchError::RecoveryRequired {
                 reason: journal
                     .recovery_reason
                     .unwrap_or_else(|| "stored switch state requires reconciliation".to_string()),
             }),
             JournalPhase::Applied => {
+                let mut repaired_retained_auth = false;
                 if !current.matches_applied(&journal) {
                     return mark_recovery(
                         paths,
@@ -1117,30 +1583,90 @@ fn apply_on(
                         "Codex config changed after helper applied its provider stanza",
                     );
                 }
-                ensure_switch_matches(&journal, &target, client_facade)?;
-                outcome(paths, CodexSwitchChange::Unchanged)
+                if let Some(auth_journal) = journal.auth_patch.clone() {
+                    let auth = read_config_snapshot(paths.auth.as_path())?;
+                    let (matches_original, matches_applied) =
+                        match auth_snapshot_matches_recorded_states(
+                            paths,
+                            &journal,
+                            &auth_journal,
+                            &auth,
+                        ) {
+                            Ok(matches) => matches,
+                            Err(CodexSwitchError::RecoveryRequired { reason }) => {
+                                return mark_recovery(paths, journal, reason);
+                            }
+                            Err(error) => return Err(error),
+                        };
+                    if journal_patches_auth(paths, &journal)? {
+                        if !matches_applied {
+                            return mark_recovery(
+                                paths,
+                                journal,
+                                "Codex auth.json changed after helper applied its client facade",
+                            );
+                        }
+                        if let Err(error) = ensure_auth_backup(paths, &auth_journal, &auth) {
+                            return match error {
+                                CodexSwitchError::RecoveryRequired { reason } => {
+                                    mark_recovery(paths, journal, reason)
+                                }
+                                error => Err(error),
+                            };
+                        }
+                    } else {
+                        repaired_retained_auth = match restore_recorded_auth_original(
+                            paths,
+                            &journal,
+                            &auth_journal,
+                            &auth,
+                        ) {
+                            Ok(repaired) => repaired,
+                            Err(CodexSwitchError::RecoveryRequired { reason }) => {
+                                return mark_recovery(paths, journal, reason);
+                            }
+                            Err(error) => return Err(error),
+                        };
+                        debug_assert!(matches_original || matches_applied);
+                    }
+                }
+                ensure_target_matches(&journal, &target)?;
+                if journal.records_complete_client_patch(client_patch) {
+                    outcome(
+                        paths,
+                        if repaired_retained_auth {
+                            CodexSwitchChange::Recovered
+                        } else {
+                            CodexSwitchChange::Unchanged
+                        },
+                    )
+                } else {
+                    reapply_on_after_off(paths, current, journal, target, client_patch, failpoint)
+                }
             }
             JournalPhase::Prepared => match journal.operation {
-                JournalOperation::On if current.matches_applied(&journal) => {
-                    ensure_switch_matches(&journal, &target, client_facade)?;
-                    journal.phase = JournalPhase::Applied;
-                    write_current_journal(paths, &journal)?;
-                    outcome(paths, CodexSwitchChange::Recovered)
+                JournalOperation::On
+                    if current.matches_applied(&journal) || current.matches_original(&journal) =>
+                {
+                    ensure_target_matches(&journal, &target)?;
+                    if journal.records_complete_client_patch(client_patch) {
+                        resume_on(paths, journal, failpoint, None)
+                    } else {
+                        reapply_on_after_off(
+                            paths,
+                            current,
+                            journal,
+                            target,
+                            client_patch,
+                            failpoint,
+                        )
+                    }
                 }
-                JournalOperation::On if current.matches_original(&journal) => {
-                    ensure_switch_matches(&journal, &target, client_facade)?;
-                    resume_on(paths, journal, failpoint, None)
-                }
-                JournalOperation::Off if current.matches_original(&journal) => {
-                    remove_current_journal(paths)?;
-                    begin_on(paths, current, target, client_facade, failpoint)
-                }
-                JournalOperation::Off if current.matches_applied(&journal) => {
-                    ensure_switch_matches(&journal, &target, client_facade)?;
-                    journal.phase = JournalPhase::Applied;
-                    journal.operation = JournalOperation::On;
-                    write_current_journal(paths, &journal)?;
-                    outcome(paths, CodexSwitchChange::Recovered)
+                JournalOperation::Off
+                    if current.matches_original(&journal) || current.matches_applied(&journal) =>
+                {
+                    ensure_target_matches(&journal, &target)?;
+                    reapply_on_after_off(paths, current, journal, target, client_patch, failpoint)
                 }
                 _ => mark_recovery(
                     paths,
@@ -1148,23 +1674,140 @@ fn apply_on(
                     "Codex config matches neither the prepared original nor applied fingerprint",
                 ),
             },
+            JournalPhase::Restored => {
+                if !current.matches_original(&journal) && !current.matches_applied(&journal) {
+                    return mark_recovery(
+                        paths,
+                        journal,
+                        "Codex config no longer matches the retained switch recovery point",
+                    );
+                }
+                reapply_on_after_off(paths, current, journal, target, client_patch, failpoint)
+            }
         },
     }
 }
 
-fn ensure_switch_matches(
+fn reapply_on_after_off(
+    paths: &SwitchPaths,
+    current: ConfigSnapshot,
+    journal: SwitchJournal,
+    target: ValidatedCodexBaseUrl,
+    client_patch: CodexClientPatchConfig,
+    failpoint: ApplyFailpoint,
+) -> Result<CodexSwitchOutcome, CodexSwitchError> {
+    let retained_auth = journal.auth_patch.clone().map(|auth| RetainedAuthJournal {
+        client_patch: journal.recorded_auth_client_patch(),
+        auth,
+    });
+    preflight_reapply_after_off(paths, &current, &journal, &target, client_patch)?;
+    apply_off(paths, current, Some(journal), failpoint)?;
+    let restored = read_config_snapshot(paths.config.as_path())?;
+    if let Some(retained_auth) = retained_auth.as_ref() {
+        ensure_retained_auth_is_still_original(paths, &retained_auth.auth)?;
+    }
+    begin_on_with_retained_auth(
+        paths,
+        restored,
+        target,
+        client_patch,
+        failpoint,
+        retained_auth.as_ref(),
+    )
+}
+
+fn ensure_retained_auth_is_still_original(
+    paths: &SwitchPaths,
+    auth_journal: &AuthJournal,
+) -> Result<(), CodexSwitchError> {
+    let current = read_config_snapshot(paths.auth.as_path())?;
+    validate_config_topology(paths.auth.as_path(), current.present)?;
+    if current.matches_original_auth(auth_journal) {
+        Ok(())
+    } else {
+        Err(CodexSwitchError::RecoveryRequired {
+            reason: "Codex auth.json changed between the retained switch-off recovery point and the new switch"
+                .to_string(),
+        })
+    }
+}
+
+fn preflight_reapply_after_off(
+    paths: &SwitchPaths,
+    current: &ConfigSnapshot,
     journal: &SwitchJournal,
     target: &ValidatedCodexBaseUrl,
-    client_facade: CodexClientFacade,
+    client_patch: CodexClientPatchConfig,
 ) -> Result<(), CodexSwitchError> {
-    ensure_target_matches(journal, target)?;
-    if journal.client_facade == client_facade {
+    let restored = if current.matches_original(journal) {
+        current.clone()
+    } else if current.matches_applied(journal) {
+        let edit = patch_off(paths.config.as_path(), current.text.as_str(), journal)?;
+        if !edit.matches_original(journal) {
+            return Err(CodexSwitchError::RestoreFingerprintMismatch);
+        }
+        edit.into_snapshot()
+    } else {
+        return Err(CodexSwitchError::RecoveryRequired {
+            reason: "Codex config cannot be preflighted from its recorded switch state".to_string(),
+        });
+    };
+    let original = inspect_config(paths.config.as_path(), restored.text.as_str())?;
+    reject_unowned_helper_config(&original)?;
+    patch_on(
+        paths.config.as_path(),
+        restored.text.as_str(),
+        target.as_str(),
+        client_patch,
+    )?;
+
+    let compiled = client_patch.compile().map_err(invalid_client_patch_error)?;
+    if compiled.auth_facade == CodexAuthFacadeStrategy::Preserve {
         return Ok(());
     }
-    Err(CodexSwitchError::AlreadyAppliedWithDifferentFacade {
-        current: journal.client_facade.as_str().to_string(),
-        requested: client_facade.as_str().to_string(),
-    })
+    let original_auth = original_auth_snapshot_for_reapply(paths, journal)?;
+    crate::codex_auth_facade::render_auth_facade(
+        compiled.auth_facade,
+        original_auth.present.then_some(original_auth.text.as_str()),
+    )
+    .map_err(|error| CodexSwitchError::InvalidAuth {
+        path: paths.auth.clone(),
+        reason: error.to_string(),
+    })?
+    .ok_or_else(|| CodexSwitchError::InvalidAuth {
+        path: paths.auth.clone(),
+        reason: "compiled auth facade strategy did not produce an auth projection".to_string(),
+    })?;
+    Ok(())
+}
+
+fn original_auth_snapshot_for_reapply(
+    paths: &SwitchPaths,
+    journal: &SwitchJournal,
+) -> Result<ConfigSnapshot, CodexSwitchError> {
+    let Some(auth_journal) = journal.auth_patch.as_ref() else {
+        return read_config_snapshot(paths.auth.as_path());
+    };
+    if !auth_journal.original_present {
+        return Ok(ConfigSnapshot::from_text(false, String::new()));
+    }
+
+    let current = read_config_snapshot(paths.auth.as_path())?;
+    if current.matches_original_auth(auth_journal) {
+        return Ok(current);
+    }
+    let backup = read_auth_backup(paths, auth_journal)?.ok_or_else(|| {
+        CodexSwitchError::RecoveryRequired {
+            reason: "the secure Codex auth backup is missing".to_string(),
+        }
+    })?;
+    if backup.fingerprint != auth_journal.original_fingerprint {
+        return Err(CodexSwitchError::RecoveryRequired {
+            reason: "the secure Codex auth backup does not match its recorded fingerprint"
+                .to_string(),
+        });
+    }
+    Ok(backup)
 }
 
 fn ensure_target_matches(
@@ -1185,6 +1828,13 @@ fn ensure_journal_config_matches(
     journal: &SwitchJournal,
 ) -> Result<(), CodexSwitchError> {
     if journal.config_path_fingerprint == paths.config_fingerprint {
+        if let Some(auth) = journal.auth_patch.as_ref()
+            && auth.auth_path_fingerprint != config_path_fingerprint(paths.auth.as_path())
+        {
+            return Err(CodexSwitchError::RecoveryRequired {
+                reason: "switch state belongs to a different Codex auth.json path".to_string(),
+            });
+        }
         return Ok(());
     }
     Err(CodexSwitchError::RecoveryRequired {
@@ -1196,18 +1846,31 @@ fn begin_on(
     paths: &SwitchPaths,
     current: ConfigSnapshot,
     target: ValidatedCodexBaseUrl,
-    client_facade: CodexClientFacade,
+    client_patch: CodexClientPatchConfig,
     failpoint: ApplyFailpoint,
+) -> Result<CodexSwitchOutcome, CodexSwitchError> {
+    begin_on_with_retained_auth(paths, current, target, client_patch, failpoint, None)
+}
+
+fn begin_on_with_retained_auth(
+    paths: &SwitchPaths,
+    current: ConfigSnapshot,
+    target: ValidatedCodexBaseUrl,
+    client_patch: CodexClientPatchConfig,
+    failpoint: ApplyFailpoint,
+    retained_auth: Option<&RetainedAuthJournal>,
 ) -> Result<CodexSwitchOutcome, CodexSwitchError> {
     validate_config_topology(paths.config.as_path(), current.present)?;
     let original = inspect_config(paths.config.as_path(), &current.text)?;
     reject_unowned_helper_config(&original)?;
+    let compiled = client_patch.compile().map_err(invalid_client_patch_error)?;
+    let prepared_auth = prepare_auth_journal(paths, compiled.auth_facade, retained_auth)?;
 
     let patch = patch_on(
         paths.config.as_path(),
         &current.text,
         target.as_str(),
-        client_facade,
+        client_patch,
     )?;
     let applied_fingerprint = fingerprint(patch.text.as_bytes());
     let planned_write = PlannedOnWrite {
@@ -1228,11 +1891,83 @@ fn begin_on(
         original_helper_stanza: original.helper_stanza,
         original_model_providers_present: original.model_providers_present,
         target_base_url: target.0,
-        client_facade,
+        client_facade: CodexClientFacade::for_client_patch(client_patch)?,
+        client_patch: Some(client_patch),
+        original_features_present: patch.original_features_present,
+        original_remote_compaction_v2: patch.original_remote_compaction_v2,
+        original_image_generation: patch.original_image_generation,
+        auth_patch: prepared_auth.auth,
+        auth_recovery_patch: prepared_auth.recovery_patch,
         recovery_reason: None,
     };
     write_current_journal(paths, &journal)?;
     resume_on(paths, journal, failpoint, Some(planned_write))
+}
+
+fn prepare_auth_journal(
+    paths: &SwitchPaths,
+    strategy: CodexAuthFacadeStrategy,
+    retained_auth: Option<&RetainedAuthJournal>,
+) -> Result<PreparedAuthJournal, CodexSwitchError> {
+    if strategy == CodexAuthFacadeStrategy::Preserve && retained_auth.is_none() {
+        return Ok(PreparedAuthJournal {
+            auth: None,
+            recovery_patch: None,
+        });
+    }
+    let original = read_config_snapshot(paths.auth.as_path())?;
+    validate_config_topology(paths.auth.as_path(), original.present)?;
+    if let Some(retained_auth) = retained_auth
+        && !original.matches_original_auth(&retained_auth.auth)
+    {
+        return Err(CodexSwitchError::RecoveryRequired {
+            reason: "Codex auth.json no longer matches the retained switch-off recovery point"
+                .to_string(),
+        });
+    }
+    if strategy == CodexAuthFacadeStrategy::Preserve {
+        let retained_auth = retained_auth.ok_or_else(|| CodexSwitchError::InvalidState {
+            path: paths.state.clone(),
+            reason: "preserved auth recovery metadata is missing".to_string(),
+        })?;
+        return Ok(PreparedAuthJournal {
+            auth: Some(retained_auth.auth.clone()),
+            recovery_patch: Some(retained_auth.client_patch),
+        });
+    }
+    let applied = crate::codex_auth_facade::render_auth_facade(
+        strategy,
+        original.present.then_some(original.text.as_str()),
+    )
+    .map_err(|error| CodexSwitchError::InvalidAuth {
+        path: paths.auth.clone(),
+        reason: error.to_string(),
+    })?
+    .ok_or_else(|| CodexSwitchError::InvalidAuth {
+        path: paths.auth.clone(),
+        reason: "compiled auth facade strategy did not produce an auth projection".to_string(),
+    })?;
+    Ok(PreparedAuthJournal {
+        auth: Some(AuthJournal {
+            auth_path_fingerprint: config_path_fingerprint(paths.auth.as_path()),
+            original_present: original.present,
+            original_fingerprint: original.fingerprint,
+            applied_fingerprint: fingerprint(applied.as_bytes()),
+            backup_file_name: if original.present {
+                retained_auth
+                    .and_then(|auth| auth.auth.backup_file_name.clone())
+                    .or_else(|| {
+                        Some(format!(
+                            "{AUTH_BACKUP_FILE_PREFIX}{}{AUTH_BACKUP_FILE_SUFFIX}",
+                            Uuid::new_v4()
+                        ))
+                    })
+            } else {
+                None
+            },
+        }),
+        recovery_patch: None,
+    })
 }
 
 fn resume_on(
@@ -1244,7 +1979,8 @@ fn resume_on(
     fail_if_requested(failpoint, ApplyFailpoint::AfterPrepared)?;
 
     let current = read_config_snapshot(paths.config.as_path())?;
-    if !current.matches_original(&journal) {
+    let mut resumed_existing_write = current.matches_applied(&journal);
+    if !current.matches_original(&journal) && !current.matches_applied(&journal) {
         return mark_recovery(
             paths,
             journal,
@@ -1254,39 +1990,86 @@ fn resume_on(
     if let Err(error) = validate_config_topology(paths.config.as_path(), current.present) {
         return mark_recovery(paths, journal, error.to_string());
     }
-    let applied_text = match planned_write {
-        Some(planned) if planned.original_text == current.text => planned.applied_text,
-        Some(_) | None => {
-            patch_on(
-                paths.config.as_path(),
-                current.text.as_str(),
-                journal.target_base_url.as_str(),
-                journal.client_facade,
-            )?
-            .text
+    let patches_auth = journal_patches_auth(paths, &journal)?;
+    if let Some(auth_journal) = journal.auth_patch.clone() {
+        let current_auth = read_config_snapshot(paths.auth.as_path())?;
+        if let Err(error) = validate_config_topology(paths.auth.as_path(), current_auth.present) {
+            return mark_recovery(paths, journal, error.to_string());
         }
-    };
-    if fingerprint(applied_text.as_bytes()) != journal.applied_fingerprint {
-        return mark_recovery(
+        let (matches_original, matches_applied) = match auth_snapshot_matches_recorded_states(
             paths,
-            journal,
-            "prepared Codex patch no longer produces the planned fingerprint",
-        );
-    }
-
-    match write_current_config_edit(
-        paths,
-        ConfigEdit::Write(applied_text),
-        &journal,
-        ExpectedConfigState::Original,
-    ) {
-        Ok(()) => {}
-        Err(CodexSwitchError::RecoveryRequired { reason }) => {
-            return mark_recovery(paths, journal, reason);
+            &journal,
+            &auth_journal,
+            &current_auth,
+        ) {
+            Ok(matches) => matches,
+            Err(CodexSwitchError::RecoveryRequired { reason }) => {
+                return mark_recovery(paths, journal, reason);
+            }
+            Err(error) => return Err(error),
+        };
+        if patches_auth {
+            resumed_existing_write |= matches_applied;
+            if !matches_original && !matches_applied {
+                return mark_recovery(
+                    paths,
+                    journal,
+                    "Codex auth.json matches neither the prepared original nor applied fingerprint",
+                );
+            }
+            if let Err(error) = ensure_auth_backup(paths, &auth_journal, &current_auth) {
+                return match error {
+                    CodexSwitchError::RecoveryRequired { reason } => {
+                        mark_recovery(paths, journal, reason)
+                    }
+                    error => Err(error),
+                };
+            }
+        } else {
+            match restore_recorded_auth_original(paths, &journal, &auth_journal, &current_auth) {
+                Ok(repaired) => resumed_existing_write |= repaired,
+                Err(CodexSwitchError::RecoveryRequired { reason }) => {
+                    return mark_recovery(paths, journal, reason);
+                }
+                Err(error) => return Err(error),
+            }
         }
-        Err(error) => return Err(error),
     }
-    fail_if_requested(failpoint, ApplyFailpoint::AfterConfigWrite)?;
+    if current.matches_original(&journal) {
+        let applied_text = match planned_write {
+            Some(planned) if planned.original_text == current.text => planned.applied_text,
+            Some(_) | None => {
+                patch_on(
+                    paths.config.as_path(),
+                    current.text.as_str(),
+                    journal.target_base_url.as_str(),
+                    journal.recovery_client_patch(),
+                )?
+                .text
+            }
+        };
+        if fingerprint(applied_text.as_bytes()) != journal.applied_fingerprint {
+            return mark_recovery(
+                paths,
+                journal,
+                "prepared Codex patch no longer produces the planned fingerprint",
+            );
+        }
+
+        match write_current_config_edit(
+            paths,
+            ConfigEdit::Write(applied_text),
+            &journal,
+            ExpectedConfigState::Original,
+        ) {
+            Ok(()) => {}
+            Err(CodexSwitchError::RecoveryRequired { reason }) => {
+                return mark_recovery(paths, journal, reason);
+            }
+            Err(error) => return Err(error),
+        }
+        fail_if_requested(failpoint, ApplyFailpoint::AfterConfigWrite)?;
+    }
     let written = read_config_snapshot(paths.config.as_path())?;
     if !written.matches_applied(&journal) {
         return mark_recovery(
@@ -1296,9 +2079,95 @@ fn resume_on(
         );
     }
 
+    if patches_auth && let Some(auth_journal) = journal.auth_patch.clone() {
+        let current_auth = read_config_snapshot(paths.auth.as_path())?;
+        if let Err(error) = validate_config_topology(paths.auth.as_path(), current_auth.present) {
+            return mark_recovery(paths, journal, error.to_string());
+        }
+        let (matches_original, matches_applied) = match auth_snapshot_matches_recorded_states(
+            paths,
+            &journal,
+            &auth_journal,
+            &current_auth,
+        ) {
+            Ok(matches) => matches,
+            Err(CodexSwitchError::RecoveryRequired { reason }) => {
+                return mark_recovery(paths, journal, reason);
+            }
+            Err(error) => return Err(error),
+        };
+        if matches_original && !matches_applied {
+            let applied_auth =
+                match render_recorded_auth_facade(paths, &journal, &auth_journal, &current_auth) {
+                    Ok(applied) => applied,
+                    Err(CodexSwitchError::RecoveryRequired { reason }) => {
+                        return mark_recovery(paths, journal, reason);
+                    }
+                    Err(error) => return Err(error),
+                };
+            match write_current_auth_edit(
+                paths,
+                ConfigEdit::Write(applied_auth),
+                &journal,
+                &auth_journal,
+                ExpectedAuthState::Original,
+            ) {
+                Ok(()) => {}
+                Err(CodexSwitchError::RecoveryRequired { reason }) => {
+                    return mark_recovery(paths, journal, reason);
+                }
+                Err(error) => return Err(error),
+            }
+            fail_if_requested(failpoint, ApplyFailpoint::AfterAuthWrite)?;
+        } else if !matches_applied {
+            return mark_recovery(
+                paths,
+                journal,
+                "Codex auth.json matches neither the prepared original nor applied fingerprint",
+            );
+        }
+        let written_auth = read_config_snapshot(paths.auth.as_path())?;
+        let (_, written_matches_applied) = match auth_snapshot_matches_recorded_states(
+            paths,
+            &journal,
+            &auth_journal,
+            &written_auth,
+        ) {
+            Ok(matches) => matches,
+            Err(CodexSwitchError::RecoveryRequired { reason }) => {
+                return mark_recovery(paths, journal, reason);
+            }
+            Err(error) => return Err(error),
+        };
+        if !written_matches_applied {
+            return mark_recovery(
+                paths,
+                journal,
+                "Codex auth.json changed before the applied switch state was committed",
+            );
+        }
+    } else if let Some(auth_journal) = journal.auth_patch.clone() {
+        let current_auth = read_config_snapshot(paths.auth.as_path())?;
+        match restore_recorded_auth_original(paths, &journal, &auth_journal, &current_auth) {
+            Ok(repaired) => resumed_existing_write |= repaired,
+            Err(CodexSwitchError::RecoveryRequired { reason }) => {
+                return mark_recovery(paths, journal, reason);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
     journal.phase = JournalPhase::Applied;
     write_current_journal(paths, &journal)?;
-    outcome(paths, CodexSwitchChange::Applied)
+    recover_interrupted_file_captures(paths, &mut journal)?;
+    outcome(
+        paths,
+        if resumed_existing_write {
+            CodexSwitchChange::Recovered
+        } else {
+            CodexSwitchChange::Applied
+        },
+    )
 }
 
 fn apply_off(
@@ -1307,7 +2176,7 @@ fn apply_off(
     journal: Option<SwitchJournal>,
     failpoint: ApplyFailpoint,
 ) -> Result<CodexSwitchOutcome, CodexSwitchError> {
-    let Some(mut journal) = journal else {
+    let Some(journal) = journal else {
         let config = inspect_config(paths.config.as_path(), &current.text)?;
         reject_unowned_helper_config(&config)?;
         return outcome(paths, CodexSwitchChange::Unchanged);
@@ -1320,35 +2189,135 @@ fn apply_off(
                 .unwrap_or_else(|| "stored switch state requires reconciliation".to_string()),
         }),
         JournalPhase::Applied => {
-            if !current.matches_applied(&journal) {
+            if !current.matches_applied(&journal) && !current.matches_original(&journal) {
                 return mark_recovery(
                     paths,
                     journal,
                     "Codex config changed after helper applied its provider stanza",
                 );
             }
-            begin_off(paths, journal, failpoint)
+            if let Some(auth_journal) = journal.auth_patch.clone() {
+                let auth = read_config_snapshot(paths.auth.as_path())?;
+                let (matches_original, matches_applied) =
+                    match auth_snapshot_matches_recorded_states(
+                        paths,
+                        &journal,
+                        &auth_journal,
+                        &auth,
+                    ) {
+                        Ok(matches) => matches,
+                        Err(CodexSwitchError::RecoveryRequired { reason }) => {
+                            return mark_recovery(paths, journal, reason);
+                        }
+                        Err(error) => return Err(error),
+                    };
+                if !matches_applied && !matches_original {
+                    return mark_recovery(
+                        paths,
+                        journal,
+                        "Codex auth.json changed after helper applied its client facade",
+                    );
+                }
+                if let Err(error) = ensure_auth_backup(paths, &auth_journal, &auth) {
+                    return match error {
+                        CodexSwitchError::RecoveryRequired { reason } => {
+                            mark_recovery(paths, journal, reason)
+                        }
+                        error => Err(error),
+                    };
+                }
+            }
+            begin_off(paths, journal, failpoint, false)
         }
         JournalPhase::Prepared => {
-            if current.matches_original(&journal) {
-                remove_current_journal(paths)?;
-                return outcome(paths, CodexSwitchChange::Recovered);
-            }
-            match journal.operation {
-                JournalOperation::On if current.matches_applied(&journal) => {
-                    journal.phase = JournalPhase::Applied;
-                    write_current_journal(paths, &journal)?;
-                    begin_off(paths, journal, failpoint)
-                }
-                JournalOperation::Off if current.matches_applied(&journal) => {
-                    resume_off(paths, journal, failpoint)
-                }
-                _ => mark_recovery(
+            if !current.matches_original(&journal) && !current.matches_applied(&journal) {
+                return mark_recovery(
                     paths,
                     journal,
                     "Codex config matches neither the prepared original nor applied fingerprint",
-                ),
+                );
             }
+            if let Some(auth_journal) = journal.auth_patch.clone() {
+                let auth = read_config_snapshot(paths.auth.as_path())?;
+                let (matches_original, matches_applied) =
+                    match auth_snapshot_matches_recorded_states(
+                        paths,
+                        &journal,
+                        &auth_journal,
+                        &auth,
+                    ) {
+                        Ok(matches) => matches,
+                        Err(CodexSwitchError::RecoveryRequired { reason }) => {
+                            return mark_recovery(paths, journal, reason);
+                        }
+                        Err(error) => return Err(error),
+                    };
+                if !matches_original && !matches_applied {
+                    return mark_recovery(
+                        paths,
+                        journal,
+                        "Codex auth.json matches neither the prepared original nor applied fingerprint",
+                    );
+                }
+                if matches_applied
+                    && let Err(error) = ensure_auth_backup(paths, &auth_journal, &auth)
+                {
+                    return match error {
+                        CodexSwitchError::RecoveryRequired { reason } => {
+                            mark_recovery(paths, journal, reason)
+                        }
+                        error => Err(error),
+                    };
+                }
+            }
+            match journal.operation {
+                JournalOperation::On => begin_off(paths, journal, failpoint, true),
+                JournalOperation::Off => {
+                    let resumed = current.matches_original(&journal);
+                    resume_off(paths, journal, failpoint, resumed)
+                }
+            }
+        }
+        JournalPhase::Restored => {
+            if !current.matches_original(&journal) && !current.matches_applied(&journal) {
+                return mark_recovery(
+                    paths,
+                    journal,
+                    "Codex config no longer matches the retained switch recovery point",
+                );
+            }
+            if let Some(auth_journal) = journal.auth_patch.clone() {
+                let auth = read_config_snapshot(paths.auth.as_path())?;
+                let (matches_original, matches_applied) =
+                    match auth_snapshot_matches_recorded_states(
+                        paths,
+                        &journal,
+                        &auth_journal,
+                        &auth,
+                    ) {
+                        Ok(matches) => matches,
+                        Err(CodexSwitchError::RecoveryRequired { reason }) => {
+                            return mark_recovery(paths, journal, reason);
+                        }
+                        Err(error) => return Err(error),
+                    };
+                if !matches_original && !matches_applied {
+                    return mark_recovery(
+                        paths,
+                        journal,
+                        "Codex auth.json no longer matches the retained switch recovery point",
+                    );
+                }
+                if let Err(error) = ensure_auth_backup(paths, &auth_journal, &auth) {
+                    return match error {
+                        CodexSwitchError::RecoveryRequired { reason } => {
+                            mark_recovery(paths, journal, reason)
+                        }
+                        error => Err(error),
+                    };
+                }
+            }
+            resume_off(paths, journal, failpoint, true)
         }
     }
 }
@@ -1357,24 +2326,26 @@ fn begin_off(
     paths: &SwitchPaths,
     mut journal: SwitchJournal,
     failpoint: ApplyFailpoint,
+    resumed: bool,
 ) -> Result<CodexSwitchOutcome, CodexSwitchError> {
     journal.phase = JournalPhase::Prepared;
     journal.operation = JournalOperation::Off;
     journal.operation_id = Uuid::new_v4().to_string();
     journal.recovery_reason = None;
     write_current_journal(paths, &journal)?;
-    resume_off(paths, journal, failpoint)
+    resume_off(paths, journal, failpoint, resumed)
 }
 
 fn resume_off(
     paths: &SwitchPaths,
     mut journal: SwitchJournal,
     failpoint: ApplyFailpoint,
+    resumed: bool,
 ) -> Result<CodexSwitchOutcome, CodexSwitchError> {
     fail_if_requested(failpoint, ApplyFailpoint::AfterPrepared)?;
 
     let current = read_config_snapshot(paths.config.as_path())?;
-    if !current.matches_applied(&journal) {
+    if !current.matches_applied(&journal) && !current.matches_original(&journal) {
         return mark_recovery(
             paths,
             journal,
@@ -1384,24 +2355,27 @@ fn resume_off(
     if let Err(error) = validate_config_topology(paths.config.as_path(), current.present) {
         return mark_recovery(paths, journal, error.to_string());
     }
-    let edit = patch_off(paths.config.as_path(), current.text.as_str(), &journal)?;
-    if !edit.matches_original(&journal) {
-        journal.phase = JournalPhase::RecoveryRequired;
-        journal.recovery_reason = Some(
-            "restoring the helper stanza would not reproduce the original fingerprint".to_string(),
-        );
-        write_current_journal(paths, &journal)?;
-        return Err(CodexSwitchError::RestoreFingerprintMismatch);
-    }
-
-    match write_current_config_edit(paths, edit, &journal, ExpectedConfigState::Applied) {
-        Ok(()) => {}
-        Err(CodexSwitchError::RecoveryRequired { reason }) => {
-            return mark_recovery(paths, journal, reason);
+    if current.matches_applied(&journal) && !current.matches_original(&journal) {
+        let edit = patch_off(paths.config.as_path(), current.text.as_str(), &journal)?;
+        if !edit.matches_original(&journal) {
+            journal.phase = JournalPhase::RecoveryRequired;
+            journal.recovery_reason = Some(
+                "restoring the helper stanza would not reproduce the original fingerprint"
+                    .to_string(),
+            );
+            write_current_journal(paths, &journal)?;
+            return Err(CodexSwitchError::RestoreFingerprintMismatch);
         }
-        Err(error) => return Err(error),
+
+        match write_current_config_edit(paths, edit, &journal, ExpectedConfigState::Applied) {
+            Ok(()) => {}
+            Err(CodexSwitchError::RecoveryRequired { reason }) => {
+                return mark_recovery(paths, journal, reason);
+            }
+            Err(error) => return Err(error),
+        }
+        fail_if_requested(failpoint, ApplyFailpoint::AfterConfigWrite)?;
     }
-    fail_if_requested(failpoint, ApplyFailpoint::AfterConfigWrite)?;
     let written = read_config_snapshot(paths.config.as_path())?;
     if !written.matches_original(&journal) {
         return mark_recovery(
@@ -1410,8 +2384,95 @@ fn resume_off(
             "Codex config changed before switch-off completion was committed",
         );
     }
-    remove_current_journal(paths)?;
-    outcome(paths, CodexSwitchChange::Removed)
+
+    if let Some(auth_journal) = journal.auth_patch.clone() {
+        let current_auth = read_config_snapshot(paths.auth.as_path())?;
+        if let Err(error) = validate_config_topology(paths.auth.as_path(), current_auth.present) {
+            return mark_recovery(paths, journal, error.to_string());
+        }
+        let (matches_original, matches_applied) = match auth_snapshot_matches_recorded_states(
+            paths,
+            &journal,
+            &auth_journal,
+            &current_auth,
+        ) {
+            Ok(matches) => matches,
+            Err(CodexSwitchError::RecoveryRequired { reason }) => {
+                return mark_recovery(paths, journal, reason);
+            }
+            Err(error) => return Err(error),
+        };
+        if matches_applied && !matches_original {
+            let edit = if auth_journal.original_present {
+                let backup = match read_auth_backup(paths, &auth_journal)? {
+                    Some(backup) if backup.fingerprint == auth_journal.original_fingerprint => {
+                        backup
+                    }
+                    Some(_) => {
+                        return mark_recovery(
+                            paths,
+                            journal,
+                            "the secure Codex auth backup does not match its recorded fingerprint",
+                        );
+                    }
+                    None => {
+                        return mark_recovery(
+                            paths,
+                            journal,
+                            "the secure Codex auth backup is missing",
+                        );
+                    }
+                };
+                ConfigEdit::Write(backup.text)
+            } else {
+                ConfigEdit::Remove
+            };
+            match write_current_auth_edit(
+                paths,
+                edit,
+                &journal,
+                &auth_journal,
+                ExpectedAuthState::Applied,
+            ) {
+                Ok(()) => {}
+                Err(CodexSwitchError::RecoveryRequired { reason }) => {
+                    return mark_recovery(paths, journal, reason);
+                }
+                Err(error) => return Err(error),
+            }
+            fail_if_requested(failpoint, ApplyFailpoint::AfterAuthRestore)?;
+        } else if !matches_original {
+            return mark_recovery(
+                paths,
+                journal,
+                "Codex auth.json matches neither the applied facade nor its saved original",
+            );
+        }
+        let restored_auth = read_config_snapshot(paths.auth.as_path())?;
+        if !restored_auth.matches_original_auth(&auth_journal) {
+            return mark_recovery(
+                paths,
+                journal,
+                "Codex auth.json changed before switch-off completion was committed",
+            );
+        }
+    }
+    journal.phase = JournalPhase::Restored;
+    journal.operation = JournalOperation::Off;
+    journal.recovery_reason = None;
+    write_current_journal(paths, &journal)?;
+    recover_interrupted_file_captures(paths, &mut journal)?;
+    if journal.auth_patch.is_none() {
+        remove_current_journal(paths)?;
+    }
+    outcome(
+        paths,
+        if resumed {
+            CodexSwitchChange::Recovered
+        } else {
+            CodexSwitchChange::Removed
+        },
+    )
 }
 
 fn mark_recovery<T>(
@@ -1466,8 +2527,28 @@ fn status_from_snapshot(
             managed: true,
             base_url: Some(journal.target_base_url.clone()),
             client_facade: Some(journal.client_facade),
+            client_patch: journal.client_patch,
             recovery_reason: Some(
                 "switch state belongs to a different Codex config path".to_string(),
+            ),
+            config_path: paths.config.clone(),
+            state_path: paths.state.clone(),
+        });
+    }
+    if let Some(journal) = journal
+        && journal.auth_patch.as_ref().is_some_and(|auth| {
+            auth.auth_path_fingerprint != config_path_fingerprint(paths.auth.as_path())
+        })
+    {
+        return Ok(CodexSwitchStatus {
+            phase: CodexSwitchPhase::RecoveryRequired,
+            enabled: false,
+            managed: true,
+            base_url: Some(journal.target_base_url.clone()),
+            client_facade: Some(journal.client_facade),
+            client_patch: journal.client_patch,
+            recovery_reason: Some(
+                "switch state belongs to a different Codex auth.json path".to_string(),
             ),
             config_path: paths.config.clone(),
             state_path: paths.state.clone(),
@@ -1492,6 +2573,7 @@ fn status_from_snapshot(
             managed: false,
             base_url: config_base_url,
             client_facade: None,
+            client_patch: None,
             recovery_reason: orphaned.then(|| {
                 "helper provider config exists without helper-owned switch state".to_string()
             }),
@@ -1499,6 +2581,7 @@ fn status_from_snapshot(
             state_path: paths.state.clone(),
         });
     };
+    let auth_should_be_applied = journal_patches_auth(paths, journal)?;
 
     if let Err(error) = validate_config_topology(paths.config.as_path(), current.present) {
         return Ok(CodexSwitchStatus {
@@ -1507,29 +2590,98 @@ fn status_from_snapshot(
             managed: true,
             base_url: config_base_url.or_else(|| Some(journal.target_base_url.clone())),
             client_facade: Some(journal.client_facade),
+            client_patch: journal.client_patch,
             recovery_reason: Some(error.to_string()),
             config_path: paths.config.clone(),
             state_path: paths.state.clone(),
         });
     }
 
-    let (phase, recovery_reason) = match journal.phase {
-        JournalPhase::RecoveryRequired => (
-            CodexSwitchPhase::RecoveryRequired,
-            journal.recovery_reason.clone(),
-        ),
-        JournalPhase::Applied if current.matches_applied(journal) => {
-            (CodexSwitchPhase::Applied, None)
+    let (auth_matches_original, auth_matches_applied, auth_recovery_reason) =
+        if let Some(auth_journal) = journal.auth_patch.as_ref() {
+            let auth = read_config_snapshot(paths.auth.as_path())?;
+            let topology_error = validate_config_topology(paths.auth.as_path(), auth.present)
+                .err()
+                .map(|error| error.to_string());
+            let (matches_original, matches_applied, mut reason) = if let Some(reason) =
+                topology_error
+            {
+                (false, false, Some(reason))
+            } else {
+                match auth_snapshot_matches_recorded_states(paths, journal, auth_journal, &auth) {
+                    Ok((matches_original, matches_applied)) => (
+                        matches_original,
+                        matches_applied,
+                        (!matches_original && !matches_applied).then(|| {
+                            "current Codex auth.json does not match switch journal fingerprints"
+                                .to_string()
+                        }),
+                    ),
+                    Err(error) => (false, false, Some(error.to_string())),
+                }
+            };
+            if reason.is_none() && auth_journal.original_present {
+                match read_auth_backup(paths, auth_journal) {
+                    Ok(Some(backup)) if backup.fingerprint == auth_journal.original_fingerprint => {
+                    }
+                    Ok(Some(_)) => {
+                        reason = Some(
+                            "the secure Codex auth backup does not match its recorded fingerprint"
+                                .to_string(),
+                        );
+                    }
+                    Ok(None) => {
+                        reason = Some("the secure Codex auth backup is missing".to_string());
+                    }
+                    Err(error) => reason = Some(error.to_string()),
+                }
+            }
+            (matches_original, matches_applied, reason)
+        } else {
+            (true, true, None)
+        };
+
+    let (phase, recovery_reason) = if let Some(reason) = auth_recovery_reason {
+        (CodexSwitchPhase::RecoveryRequired, Some(reason))
+    } else {
+        match journal.phase {
+            JournalPhase::RecoveryRequired => (
+                CodexSwitchPhase::RecoveryRequired,
+                journal.recovery_reason.clone(),
+            ),
+            JournalPhase::Applied
+                if current.matches_applied(journal)
+                    && if auth_should_be_applied {
+                        auth_matches_applied
+                    } else {
+                        auth_matches_original
+                    } =>
+            {
+                (CodexSwitchPhase::Applied, None)
+            }
+            JournalPhase::Restored
+                if current.matches_original(journal) && auth_matches_original =>
+            {
+                (CodexSwitchPhase::Off, None)
+            }
+            JournalPhase::Restored => (
+                CodexSwitchPhase::RecoveryRequired,
+                Some(
+                    "Codex files changed after switch-off; retained recovery material can restore the recorded original"
+                        .to_string(),
+                ),
+            ),
+            JournalPhase::Prepared
+                if (current.matches_original(journal) || current.matches_applied(journal))
+                    && (auth_matches_original || auth_matches_applied) =>
+            {
+                (CodexSwitchPhase::Prepared, None)
+            }
+            _ => (
+                CodexSwitchPhase::RecoveryRequired,
+                Some("current Codex config does not match switch journal fingerprints".to_string()),
+            ),
         }
-        JournalPhase::Prepared
-            if current.matches_original(journal) || current.matches_applied(journal) =>
-        {
-            (CodexSwitchPhase::Prepared, None)
-        }
-        _ => (
-            CodexSwitchPhase::RecoveryRequired,
-            Some("current Codex config does not match switch journal fingerprints".to_string()),
-        ),
     };
 
     Ok(CodexSwitchStatus {
@@ -1538,6 +2690,7 @@ fn status_from_snapshot(
         managed: true,
         base_url: config_base_url.or_else(|| Some(journal.target_base_url.clone())),
         client_facade: Some(journal.client_facade),
+        client_patch: journal.client_patch,
         recovery_reason,
         config_path: paths.config.clone(),
         state_path: paths.state.clone(),
@@ -1624,11 +2777,33 @@ fn patch_on(
     path: &Path,
     text: &str,
     base_url: &str,
-    client_facade: CodexClientFacade,
+    client_patch: CodexClientPatchConfig,
 ) -> Result<OnPatch, CodexSwitchError> {
+    let compiled = client_patch.compile().map_err(invalid_client_patch_error)?;
     let mut document = editable_document(path, text)?;
     let original_model_provider_repr = model_provider_repr_from_document(path, &document)?;
     let root = document.as_table_mut();
+    let owns_remote_compaction_v2 =
+        matches!(compiled.remote_compaction_v2, CodexFeatureBoolPatch::Set(_));
+    let owns_image_generation = matches!(compiled.image_generation, CodexFeatureBoolPatch::Set(_));
+    let original_features_present =
+        (owns_remote_compaction_v2 || owns_image_generation) && root.contains_key("features");
+    let original_remote_compaction_v2 = capture_feature_bool(
+        path,
+        root,
+        "remote_compaction_v2",
+        owns_remote_compaction_v2,
+    )?;
+    let original_image_generation =
+        capture_feature_bool(path, root, "image_generation", owns_image_generation)?;
+    apply_feature_bool_patch(
+        path,
+        root,
+        "remote_compaction_v2",
+        compiled.remote_compaction_v2,
+    )?;
+    apply_feature_bool_patch(path, root, "image_generation", compiled.image_generation)?;
+
     if !root.contains_key("model_providers") {
         root.insert("model_providers", Item::Table(Table::new()));
     }
@@ -1640,16 +2815,31 @@ fn patch_on(
             reason: "model_providers must be a table".to_string(),
         })?;
     let mut helper = Table::new();
-    helper.insert("name", editable_value(client_facade.provider_name()));
+    helper.insert(
+        "name",
+        editable_value(compiled.provider_identity.provider_name()),
+    );
     helper.insert("base_url", editable_value(base_url));
     helper.insert("wire_api", editable_value("responses"));
     helper.insert("request_max_retries", editable_value(0));
-    if client_facade.exposes_openai_tools() {
+    if let CodexTomlBoolPatch::Set(value) = compiled.requires_openai_auth {
+        helper.insert("requires_openai_auth", editable_value(value));
+    }
+    if let CodexTomlBoolPatch::Set(value) = compiled.supports_websockets {
+        helper.insert("supports_websockets", editable_value(value));
+    }
+    {
         let mut headers = Table::new();
         headers.insert(
-            CODEX_CLIENT_FACADE_ACTOR_HEADER,
-            editable_value(CODEX_CLIENT_FACADE_ACTOR_VALUE),
+            CODEX_CLIENT_RUNTIME_PATCH_HEADER,
+            editable_value(CodexClientRuntimePatch::from(client_patch).encode()),
         );
+        if compiled.actor_marker {
+            headers.insert(
+                CODEX_CLIENT_FACADE_ACTOR_HEADER,
+                editable_value(CODEX_CLIENT_FACADE_ACTOR_VALUE),
+            );
+        }
         helper.insert("http_headers", Item::Table(headers));
     }
     providers.insert(PROVIDER_ID, Item::Table(helper));
@@ -1657,7 +2847,63 @@ fn patch_on(
     Ok(OnPatch {
         text: document.to_string(),
         original_model_provider_repr,
+        original_features_present,
+        original_remote_compaction_v2,
+        original_image_generation,
     })
+}
+
+fn capture_feature_bool(
+    path: &Path,
+    root: &Table,
+    key: &str,
+    owned: bool,
+) -> Result<Option<bool>, CodexSwitchError> {
+    if !owned {
+        return Ok(None);
+    }
+    let Some(features) = root.get("features") else {
+        return Ok(None);
+    };
+    let features = features
+        .as_table()
+        .ok_or_else(|| CodexSwitchError::InvalidConfig {
+            path: path.to_path_buf(),
+            reason: "features must be a table".to_string(),
+        })?;
+    let Some(value) = features.get(key) else {
+        return Ok(None);
+    };
+    value
+        .as_bool()
+        .map(Some)
+        .ok_or_else(|| CodexSwitchError::InvalidConfig {
+            path: path.to_path_buf(),
+            reason: format!("features.{key} must be a boolean"),
+        })
+}
+
+fn apply_feature_bool_patch(
+    path: &Path,
+    root: &mut Table,
+    key: &str,
+    patch: CodexFeatureBoolPatch,
+) -> Result<(), CodexSwitchError> {
+    let CodexFeatureBoolPatch::Set(value) = patch else {
+        return Ok(());
+    };
+    if !root.contains_key("features") {
+        root.insert("features", Item::Table(Table::new()));
+    }
+    let features = root
+        .get_mut("features")
+        .and_then(Item::as_table_mut)
+        .ok_or_else(|| CodexSwitchError::InvalidConfig {
+            path: path.to_path_buf(),
+            reason: "features must be a table".to_string(),
+        })?;
+    set_value_preserving_decor(features, key, EditableValue::from(value));
+    Ok(())
 }
 
 fn patch_off(
@@ -1701,11 +2947,66 @@ fn patch_off(
         root.remove("model_providers");
     }
 
+    let compiled = journal.recovery_client_patch().compile().map_err(|error| {
+        CodexSwitchError::InvalidState {
+            path: path.to_path_buf(),
+            reason: error.to_string(),
+        }
+    })?;
+    restore_feature_bool_patch(
+        path,
+        root,
+        "remote_compaction_v2",
+        compiled.remote_compaction_v2,
+        journal.original_remote_compaction_v2,
+    )?;
+    restore_feature_bool_patch(
+        path,
+        root,
+        "image_generation",
+        compiled.image_generation,
+        journal.original_image_generation,
+    )?;
+    if !journal.original_features_present
+        && root
+            .get("features")
+            .and_then(Item::as_table)
+            .is_some_and(Table::is_empty)
+    {
+        root.remove("features");
+    }
+
     if !journal.original_config_present && root.is_empty() {
         Ok(ConfigEdit::Remove)
     } else {
         Ok(ConfigEdit::Write(document.to_string()))
     }
+}
+
+fn restore_feature_bool_patch(
+    path: &Path,
+    root: &mut Table,
+    key: &str,
+    patch: CodexFeatureBoolPatch,
+    original: Option<bool>,
+) -> Result<(), CodexSwitchError> {
+    if patch == CodexFeatureBoolPatch::Preserve {
+        return Ok(());
+    }
+    let features = root
+        .get_mut("features")
+        .and_then(Item::as_table_mut)
+        .ok_or_else(|| CodexSwitchError::InvalidConfig {
+            path: path.to_path_buf(),
+            reason: "features must be a table while restoring owned Codex feature keys".to_string(),
+        })?;
+    match original {
+        Some(value) => set_value_preserving_decor(features, key, EditableValue::from(value)),
+        None => {
+            features.remove(key);
+        }
+    }
+    Ok(())
 }
 
 fn editable_document(path: &Path, text: &str) -> Result<DocumentMut, CodexSwitchError> {
@@ -1907,6 +3208,35 @@ fn verify_journal_before_commit(
     })
 }
 
+fn verify_auth_before_commit(
+    path: &Path,
+    expectation: AuthCommitExpectation<'_>,
+) -> Result<(), CodexSwitchError> {
+    let current = read_config_snapshot(path)?;
+    let matches = match expectation.state {
+        ExpectedAuthState::Original => current.matches_original_auth(expectation.journal),
+        ExpectedAuthState::Applied => {
+            auth_snapshot_matches_recorded_states(
+                expectation.paths,
+                expectation.switch_journal,
+                expectation.journal,
+                &current,
+            )?
+            .1
+        }
+    };
+    if !matches {
+        return Err(CodexSwitchError::RecoveryRequired {
+            reason: "Codex auth.json changed after the final switch fingerprint check".to_string(),
+        });
+    }
+    validate_config_topology(path, current.present).map_err(|error| {
+        CodexSwitchError::RecoveryRequired {
+            reason: error.to_string(),
+        }
+    })
+}
+
 fn verify_legacy_snapshot_before_commit(
     path: &Path,
     legacy_path: &Path,
@@ -1935,6 +3265,7 @@ fn verify_file_before_commit(
         FileCommitExpectation::Journal(expectation) => {
             verify_journal_before_commit(path, expectation)
         }
+        FileCommitExpectation::Auth(expectation) => verify_auth_before_commit(path, expectation),
         FileCommitExpectation::LegacySnapshot {
             expected,
             legacy_path,
@@ -1977,7 +3308,91 @@ fn parse_journal(path: &Path, raw: String) -> Result<JournalSnapshot, CodexSwitc
             ),
         });
     }
+    if let Some(client_patch) = journal.client_patch {
+        client_patch
+            .compile()
+            .map_err(|error| CodexSwitchError::InvalidState {
+                path: path.to_path_buf(),
+                reason: format!("invalid recorded client patch: {error}"),
+            })?;
+    }
+    if let Some(auth) = journal.auth_patch.as_ref() {
+        validate_auth_journal(path, auth)?;
+    }
+    if let Some(auth_recovery_patch) = journal.auth_recovery_patch {
+        if journal.auth_patch.is_none() {
+            return Err(CodexSwitchError::InvalidState {
+                path: path.to_path_buf(),
+                reason: "auth recovery patch exists without auth recovery metadata".to_string(),
+            });
+        }
+        let recovery_strategy = auth_recovery_patch
+            .compile()
+            .map_err(|error| CodexSwitchError::InvalidState {
+                path: path.to_path_buf(),
+                reason: format!("invalid auth recovery client patch: {error}"),
+            })?
+            .auth_facade;
+        let current_strategy = journal
+            .recovery_client_patch()
+            .compile()
+            .map_err(|error| CodexSwitchError::InvalidState {
+                path: path.to_path_buf(),
+                reason: format!("invalid recorded client patch: {error}"),
+            })?
+            .auth_facade;
+        if recovery_strategy == CodexAuthFacadeStrategy::Preserve
+            || current_strategy != CodexAuthFacadeStrategy::Preserve
+        {
+            return Err(CodexSwitchError::InvalidState {
+                path: path.to_path_buf(),
+                reason: "auth recovery patch must retain a non-preserving facade for a client patch that currently preserves auth.json"
+                    .to_string(),
+            });
+        }
+    } else if journal.auth_patch.is_some()
+        && journal
+            .recovery_client_patch()
+            .compile()
+            .map_err(|error| CodexSwitchError::InvalidState {
+                path: path.to_path_buf(),
+                reason: format!("invalid recorded client patch: {error}"),
+            })?
+            .auth_facade
+            == CodexAuthFacadeStrategy::Preserve
+    {
+        return Err(CodexSwitchError::InvalidState {
+            path: path.to_path_buf(),
+            reason:
+                "auth recovery metadata for a preserving client patch is missing its source patch"
+                    .to_string(),
+        });
+    }
     Ok(JournalSnapshot { raw, journal })
+}
+
+fn validate_auth_journal(path: &Path, auth: &AuthJournal) -> Result<(), CodexSwitchError> {
+    let invalid = |reason: &str| CodexSwitchError::InvalidState {
+        path: path.to_path_buf(),
+        reason: reason.to_string(),
+    };
+    if !auth.original_present && auth.original_fingerprint != fingerprint(&[]) {
+        return Err(invalid(
+            "an absent original auth.json must use the absent-file fingerprint",
+        ));
+    }
+    match (auth.original_present, auth.backup_file_name.as_deref()) {
+        (true, Some(name)) if managed_auth_backup_name(name) => {}
+        (true, Some(_)) => return Err(invalid("auth backup file name is not helper-owned")),
+        (true, None) => return Err(invalid("present original auth.json requires a backup file")),
+        (false, Some(_)) => {
+            return Err(invalid(
+                "absent original auth.json cannot record an auth backup file",
+            ));
+        }
+        (false, None) => {}
+    }
+    Ok(())
 }
 
 fn read_optional_text(path: &Path) -> Result<Option<String>, CodexSwitchError> {
@@ -2011,18 +3426,24 @@ fn write_config_edit(
         journal,
         state: expected,
     });
-    match edit {
-        ConfigEdit::Write(text) => atomic_write_text(
-            path,
-            text.as_str(),
-            FilePermissions::PreserveOrSecure,
-            Some(expectation),
-        ),
-        ConfigEdit::Remove => {
-            verify_file_before_commit(path, expectation)?;
-            remove_file_durable(path)
-        }
-    }
+    write_file_edit(path, edit, expectation)
+}
+
+fn write_auth_edit(
+    paths: &SwitchPaths,
+    path: &Path,
+    edit: ConfigEdit,
+    switch_journal: &SwitchJournal,
+    auth_journal: &AuthJournal,
+    expected: ExpectedAuthState,
+) -> Result<(), CodexSwitchError> {
+    let expectation = FileCommitExpectation::Auth(AuthCommitExpectation {
+        paths,
+        switch_journal,
+        journal: auth_journal,
+        state: expected,
+    });
+    write_file_edit(path, edit, expectation)
 }
 
 fn write_snapshot_edit(
@@ -2035,6 +3456,14 @@ fn write_snapshot_edit(
         expected,
         legacy_path,
     };
+    write_file_edit(path, edit, expectation)
+}
+
+fn write_file_edit(
+    path: &Path,
+    edit: ConfigEdit,
+    expectation: FileCommitExpectation<'_>,
+) -> Result<(), CodexSwitchError> {
     match edit {
         ConfigEdit::Write(text) => atomic_write_text(
             path,
@@ -2042,10 +3471,7 @@ fn write_snapshot_edit(
             FilePermissions::PreserveOrSecure,
             Some(expectation),
         ),
-        ConfigEdit::Remove => {
-            verify_file_before_commit(path, expectation)?;
-            remove_file_durable(path)
-        }
+        ConfigEdit::Remove => commit_remove_file(path, expectation),
     }
 }
 
@@ -2072,6 +3498,18 @@ fn atomic_write_text(
         FilePermissions::Secure => prepare_state_directory(path)?,
         FilePermissions::PreserveOrSecure => prepare_config_directory(path)?,
     }
+    #[cfg(windows)]
+    let preserved_metadata = match permissions {
+        FilePermissions::Secure => None,
+        FilePermissions::PreserveOrSecure => match std::fs::symlink_metadata(path) {
+            Ok(metadata) => Some(
+                crate::config::ConfigFileMetadata::capture(path, &metadata)
+                    .map_err(|source| io_error("capture permissions for", path, source))?,
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(source) => return Err(io_error("read metadata for", path, source)),
+        },
+    };
     let temp_path = parent.join(format!(
         "{SWITCH_TEMP_FILE_PREFIX}{}{SWITCH_TEMP_FILE_SUFFIX}",
         Uuid::new_v4()
@@ -2103,6 +3541,24 @@ fn atomic_write_text(
         let mut file = options
             .open(temp_path.as_path())
             .map_err(|source| io_error("create temporary file for", path, source))?;
+        #[cfg(windows)]
+        match preserved_metadata.as_ref() {
+            Some(metadata) => {
+                metadata
+                    .apply_to_staged_file(temp_path.as_path())
+                    .map_err(|source| {
+                        io_error("preserve temporary file permissions for", path, source)
+                    })?
+            }
+            None => crate::local_operator::secure_private_windows_path(temp_path.as_path(), false)
+                .map_err(|error| {
+                    io_error(
+                        "secure temporary file for",
+                        path,
+                        std::io::Error::other(error.to_string()),
+                    )
+                })?,
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -2114,11 +3570,13 @@ fn atomic_write_text(
         file.sync_all()
             .map_err(|source| io_error("sync temporary file for", path, source))?;
         drop(file);
-        if let Some(expectation) = expectation {
-            verify_file_before_commit(path, expectation)?;
+        match expectation {
+            Some(expectation) => commit_staged_file(temp_path.as_path(), path, expectation),
+            None => {
+                replace_file(temp_path.as_path(), path)?;
+                sync_parent_directory(path)
+            }
         }
-        replace_file(temp_path.as_path(), path)?;
-        sync_parent_directory(path)
     })();
 
     if result.is_err() {
@@ -2127,9 +3585,294 @@ fn atomic_write_text(
     result
 }
 
+fn managed_commit_capture_path(
+    path: &Path,
+    expectation: FileCommitExpectation<'_>,
+) -> Result<Option<PathBuf>, CodexSwitchError> {
+    let Some((operation_id, role)) = expectation.managed_capture() else {
+        return Ok(None);
+    };
+    managed_capture_path(path, operation_id, role).map(Some)
+}
+
+fn managed_capture_path(
+    path: &Path,
+    operation_id: &str,
+    role: ManagedCommitRole,
+) -> Result<PathBuf, CodexSwitchError> {
+    let operation_id =
+        Uuid::parse_str(operation_id).map_err(|error| CodexSwitchError::InvalidState {
+            path: path.to_path_buf(),
+            reason: format!("switch operation id is not a UUID: {error}"),
+        })?;
+    let parent = path.parent().ok_or_else(|| {
+        io_error(
+            "resolve parent for",
+            path,
+            std::io::Error::other("path has no parent directory"),
+        )
+    })?;
+    Ok(parent.join(format!(
+        "{SWITCH_CAPTURE_FILE_PREFIX}{operation_id}-{}",
+        role.as_str()
+    )))
+}
+
+fn recover_interrupted_file_captures(
+    paths: &SwitchPaths,
+    journal: &mut SwitchJournal,
+) -> Result<(), CodexSwitchError> {
+    if journal.phase == JournalPhase::RecoveryRequired {
+        return Ok(());
+    }
+    for (path, role) in [
+        (paths.config.as_path(), ManagedCommitRole::Config),
+        (paths.auth.as_path(), ManagedCommitRole::Auth),
+    ] {
+        if matches!(role, ManagedCommitRole::Auth) && journal.auth_patch.is_none() {
+            continue;
+        }
+        let capture_path = managed_capture_path(path, journal.operation_id.as_str(), role)?;
+        if let Err(reason) =
+            recover_interrupted_file_capture(paths, path, capture_path.as_path(), role, journal)
+        {
+            journal.phase = JournalPhase::RecoveryRequired;
+            journal.recovery_reason = Some(reason.clone());
+            write_current_journal(paths, journal)?;
+            return Err(CodexSwitchError::RecoveryRequired { reason });
+        }
+    }
+    Ok(())
+}
+
+fn recover_interrupted_file_capture(
+    paths: &SwitchPaths,
+    path: &Path,
+    capture_path: &Path,
+    role: ManagedCommitRole,
+    journal: &SwitchJournal,
+) -> Result<(), String> {
+    let capture = read_config_snapshot(capture_path).map_err(|error| error.to_string())?;
+    if !capture.present {
+        return Ok(());
+    }
+    validate_config_topology(capture_path, true).map_err(|error| error.to_string())?;
+    let patches_auth = journal_patches_auth(paths, journal).map_err(|error| error.to_string())?;
+    let capture_matches_expected = match (role, journal.operation) {
+        (ManagedCommitRole::Config, JournalOperation::On) => capture.matches_original(journal),
+        (ManagedCommitRole::Config, JournalOperation::Off) => capture.matches_applied(journal),
+        (ManagedCommitRole::Auth, JournalOperation::On) if patches_auth => journal
+            .auth_patch
+            .as_ref()
+            .is_some_and(|auth| capture.matches_original_auth(auth)),
+        (ManagedCommitRole::Auth, JournalOperation::On) => match journal.auth_patch.as_ref() {
+            Some(auth) => {
+                auth_snapshot_matches_recorded_states(paths, journal, auth, &capture)
+                    .map_err(|error| error.to_string())?
+                    .1
+            }
+            None => false,
+        },
+        (ManagedCommitRole::Auth, JournalOperation::Off) => match journal.auth_patch.as_ref() {
+            Some(auth) => {
+                auth_snapshot_matches_recorded_states(paths, journal, auth, &capture)
+                    .map_err(|error| error.to_string())?
+                    .1
+            }
+            None => false,
+        },
+    };
+    if !capture_matches_expected {
+        return Err(format!(
+            "the preserved {} capture changed after it was detached; it was retained at {:?}",
+            role.as_str(),
+            capture_path
+        ));
+    }
+
+    let current = read_config_snapshot(path).map_err(|error| error.to_string())?;
+    let current_matches_desired = match (role, journal.operation) {
+        (ManagedCommitRole::Config, JournalOperation::On) => current.matches_applied(journal),
+        (ManagedCommitRole::Config, JournalOperation::Off) => current.matches_original(journal),
+        (ManagedCommitRole::Auth, JournalOperation::On) if patches_auth => {
+            match journal.auth_patch.as_ref() {
+                Some(auth) => {
+                    auth_snapshot_matches_recorded_states(paths, journal, auth, &current)
+                        .map_err(|error| error.to_string())?
+                        .1
+                }
+                None => false,
+            }
+        }
+        (ManagedCommitRole::Auth, JournalOperation::On) => journal
+            .auth_patch
+            .as_ref()
+            .is_some_and(|auth| current.matches_original_auth(auth)),
+        (ManagedCommitRole::Auth, JournalOperation::Off) => journal
+            .auth_patch
+            .as_ref()
+            .is_some_and(|auth| current.matches_original_auth(auth)),
+    };
+    if current_matches_desired {
+        return remove_file_durable(capture_path).map_err(|error| error.to_string());
+    }
+    if !current.present {
+        move_file_no_replace(capture_path, path).map_err(|error| {
+            format!(
+                "failed to restore the preserved {} capture without replacing another writer: {error}",
+                role.as_str()
+            )
+        })?;
+        return sync_parent_directory(path).map_err(|error| error.to_string());
+    }
+    Err(format!(
+        "a competing writer changed the Codex {} path while the helper held a preserved capture at {:?}",
+        role.as_str(),
+        capture_path
+    ))
+}
+
+fn capture_expected_file(
+    path: &Path,
+    capture_path: &Path,
+    expectation: FileCommitExpectation<'_>,
+) -> Result<(), CodexSwitchError> {
+    ensure_pending_delete_destination_absent(capture_path)?;
+    move_file_no_replace(path, capture_path)?;
+    sync_parent_directory(path)?;
+    if let Err(error) = verify_file_before_commit(capture_path, expectation) {
+        return match move_file_no_replace(capture_path, path) {
+            Ok(()) => {
+                sync_parent_directory(path)?;
+                Err(error)
+            }
+            Err(restore_error) => Err(CodexSwitchError::RecoveryRequired {
+                reason: format!(
+                    "captured Codex file did not match the expected fingerprint and could not be restored without replacing another writer: {restore_error}"
+                ),
+            }),
+        };
+    }
+    Ok(())
+}
+
+fn commit_staged_file(
+    stage_path: &Path,
+    path: &Path,
+    expectation: FileCommitExpectation<'_>,
+) -> Result<(), CodexSwitchError> {
+    let Some(capture_path) = managed_commit_capture_path(path, expectation)? else {
+        verify_file_before_commit(path, expectation)?;
+        replace_file(stage_path, path)?;
+        return sync_parent_directory(path);
+    };
+
+    if expectation.expected_present() {
+        capture_expected_file(path, capture_path.as_path(), expectation)?;
+    } else {
+        verify_file_before_commit(path, expectation)?;
+    }
+    if let Err(error) = move_file_no_replace(stage_path, path) {
+        return Err(CodexSwitchError::RecoveryRequired {
+            reason: format!(
+                "Codex file changed while the helper was publishing its prepared replacement; the competing file and recovery capture were preserved: {error}"
+            ),
+        });
+    }
+    sync_parent_directory(path)
+}
+
+fn commit_remove_file(
+    path: &Path,
+    expectation: FileCommitExpectation<'_>,
+) -> Result<(), CodexSwitchError> {
+    let Some(capture_path) = managed_commit_capture_path(path, expectation)? else {
+        verify_file_before_commit(path, expectation)?;
+        return remove_file_durable(path);
+    };
+    if expectation.expected_present() {
+        capture_expected_file(path, capture_path.as_path(), expectation)?;
+    } else {
+        verify_file_before_commit(path, expectation)?;
+    }
+    sync_parent_directory(path)
+}
+
 #[cfg(windows)]
 fn replace_file(source: &Path, destination: &Path) -> Result<(), CodexSwitchError> {
     move_file_write_through(source, destination, true)
+}
+
+#[cfg(windows)]
+fn move_file_no_replace(source: &Path, destination: &Path) -> Result<(), CodexSwitchError> {
+    move_file_write_through(source, destination, false)
+}
+
+#[cfg(unix)]
+fn unix_path_cstring(path: &Path) -> Result<std::ffi::CString, CodexSwitchError> {
+    use std::os::unix::ffi::OsStrExt;
+
+    std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|source| io_error("encode Unix path for", path, source.into()))
+}
+
+#[cfg(target_vendor = "apple")]
+fn move_file_no_replace(source: &Path, destination: &Path) -> Result<(), CodexSwitchError> {
+    let source_c = unix_path_cstring(source)?;
+    let destination_c = unix_path_cstring(destination)?;
+    // SAFETY: Both C strings are null-terminated and remain alive for the call.
+    let result =
+        unsafe { libc::renamex_np(source_c.as_ptr(), destination_c.as_ptr(), libc::RENAME_EXCL) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io_error(
+            "move without replacing",
+            destination,
+            std::io::Error::last_os_error(),
+        ))
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn move_file_no_replace(source: &Path, destination: &Path) -> Result<(), CodexSwitchError> {
+    let source_c = unix_path_cstring(source)?;
+    let destination_c = unix_path_cstring(destination)?;
+    // SAFETY: Both C strings are null-terminated and remain alive for the call.
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            source_c.as_ptr(),
+            libc::AT_FDCWD,
+            destination_c.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io_error(
+            "move without replacing",
+            destination,
+            std::io::Error::last_os_error(),
+        ))
+    }
+}
+
+#[cfg(all(
+    unix,
+    not(target_vendor = "apple"),
+    not(any(target_os = "linux", target_os = "android"))
+))]
+fn move_file_no_replace(_source: &Path, destination: &Path) -> Result<(), CodexSwitchError> {
+    Err(io_error(
+        "move without replacing",
+        destination,
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "this platform has no supported no-replace rename primitive",
+        ),
+    ))
 }
 
 #[cfg(windows)]
@@ -2263,7 +4006,6 @@ fn pending_delete_path(path: &Path) -> Result<PathBuf, CodexSwitchError> {
     )))
 }
 
-#[cfg(any(windows, test))]
 fn ensure_pending_delete_destination_absent(path: &Path) -> Result<(), CodexSwitchError> {
     match std::fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -2450,6 +4192,14 @@ fn prepare_state_directory(path: &Path) -> Result<(), CodexSwitchError> {
     let missing_directories = missing_directories(parent)?;
     std::fs::create_dir_all(parent)
         .map_err(|source| io_error("create directory", parent, source))?;
+    #[cfg(windows)]
+    crate::local_operator::secure_private_windows_path(parent, true).map_err(|error| {
+        io_error(
+            "secure directory",
+            parent,
+            std::io::Error::other(error.to_string()),
+        )
+    })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -2728,6 +4478,34 @@ mod tests {
             self.codex_home.join("auth.json")
         }
 
+        fn auth_backup_path(&self) -> PathBuf {
+            let journal = read_journal(self.state_path().as_path())
+                .expect("read switch journal")
+                .expect("switch journal");
+            let name = journal
+                .auth_patch
+                .and_then(|auth| auth.backup_file_name)
+                .expect("auth backup file name");
+            self.helper_home.join("state").join(name)
+        }
+
+        fn auth_backup_files(&self) -> Vec<PathBuf> {
+            let state_dir = self.helper_home.join("state");
+            let Ok(entries) = std::fs::read_dir(state_dir) else {
+                return Vec::new();
+            };
+            entries
+                .map(|entry| entry.expect("read state entry"))
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(managed_auth_backup_name)
+                })
+                .map(|entry| entry.path())
+                .collect()
+        }
+
         fn lock_path(&self) -> PathBuf {
             self.helper_home.join("state").join(LOCK_FILE_NAME)
         }
@@ -2763,6 +4541,26 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    fn chatgpt_auth_json_for_switch_tests() -> String {
+        use base64::Engine as _;
+
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            br#"{"email":"user@example.com","https://api.openai.com/auth":{"chatgpt_account_id":"acct_test"}}"#,
+        );
+        serde_json::to_string_pretty(&serde_json::json!({
+            "auth_mode": "apikey",
+            "OPENAI_API_KEY": "private-api-key",
+            "tokens": {
+                "id_token": format!("header.{payload}.signature"),
+                "access_token": "access-secret",
+                "refresh_token": "refresh-secret",
+                "account_id": "acct_test"
+            },
+            "last_refresh": "2026-07-19T00:00:00Z"
+        }))
+        .expect("serialize ChatGPT auth fixture")
     }
 
     #[test]
@@ -2913,10 +4711,8 @@ trust_level = "trusted"
             assert_eq!(outcome.status.client_facade, Some(facade));
             let applied = env.read_config();
             assert!(applied.contains(format!("name = \"{provider_name}\"").as_str()));
-            assert_eq!(
-                applied.contains("[model_providers.codex_proxy.http_headers]"),
-                exposes_tools
-            );
+            assert!(applied.contains("[model_providers.codex_proxy.http_headers]"));
+            assert!(applied.contains(CODEX_CLIENT_RUNTIME_PATCH_HEADER));
             assert_eq!(
                 applied.contains(CODEX_CLIENT_FACADE_ACTOR_HEADER),
                 exposes_tools
@@ -2926,10 +4722,17 @@ trust_level = "trusted"
                 exposes_tools
             );
             assert!(!applied.contains("requires_openai_auth"));
-            assert_eq!(
-                std::fs::read(env.auth_path()).expect("read auth sentinel"),
-                b"auth sentinel"
-            );
+            let applied_auth =
+                std::fs::read(env.auth_path()).expect("read applied auth projection");
+            if exposes_tools {
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&applied_auth)
+                        .expect("parse imagegen auth facade"),
+                    serde_json::json!({})
+                );
+            } else {
+                assert_eq!(applied_auth, b"auth sentinel");
+            }
 
             apply(CodexSwitchIntent::Off).expect("switch off facade");
             assert_eq!(env.read_config(), original);
@@ -2941,31 +4744,976 @@ trust_level = "trusted"
     }
 
     #[test]
-    fn changing_client_facade_requires_explicit_switch_off() {
+    fn client_patch_projection_round_trips_owned_provider_and_feature_keys() {
+        let env = TestEnvironment::new();
+        let original = r#"# preserve formatting
+model_provider = "openai"
+
+[features]
+remote_compaction_v2 = true
+image_generation = true
+unrelated_feature = true
+"#;
+        env.write_config(original);
+        std::fs::write(env.auth_path(), b"auth sentinel").expect("write auth sentinel");
+        let patch = crate::config::CodexClientPatchConfig {
+            preset: crate::config::CodexClientPreset::OfficialImagegen,
+            responses_websocket: true,
+            compaction: crate::config::CodexCompactionStrategy::RemoteV1,
+            hosted_image_generation: crate::config::CodexHostedImageGenerationMode::Disabled,
+            ..crate::config::CodexClientPatchConfig::default()
+        };
+
+        let outcome = apply_with_client_patch(
+            CodexSwitchIntent::On {
+                validated_base_url: ValidatedCodexBaseUrl::local(3211),
+            },
+            patch,
+        )
+        .expect("apply complete client patch");
+
+        assert_eq!(outcome.status.client_patch.as_ref(), Some(&patch));
+        let applied = env.read_config();
+        assert!(applied.contains("name = \"OpenAI\""));
+        assert!(applied.contains("supports_websockets = true"));
+        assert!(applied.contains("remote_compaction_v2 = false"));
+        assert!(applied.contains("image_generation = false"));
+        assert!(applied.contains("unrelated_feature = true"));
+        assert!(!applied.contains(CODEX_CLIENT_FACADE_ACTOR_VALUE));
+        assert_eq!(
+            std::fs::read(env.auth_path()).expect("read untouched auth"),
+            b"auth sentinel"
+        );
+        let journal = std::fs::read_to_string(env.state_path()).expect("read switch journal");
+        assert!(journal.contains("official-imagegen"));
+        assert!(journal.contains("remote-v1"));
+        assert!(!journal.contains("auth sentinel"));
+
+        apply(CodexSwitchIntent::Off).expect("restore complete client patch");
+        assert_eq!(env.read_config(), original);
+        assert_eq!(
+            std::fs::read(env.auth_path()).expect("read restored auth sentinel"),
+            b"auth sentinel"
+        );
+    }
+
+    #[test]
+    fn imagegen_presets_install_an_empty_auth_facade_and_restore_the_exact_original() {
+        for preset in [
+            crate::config::CodexClientPreset::ImagegenBridge,
+            crate::config::CodexClientPreset::OfficialImagegen,
+        ] {
+            let env = TestEnvironment::new();
+            let original_config = "model_provider = \"openai\"\n";
+            let original_auth = r#"{"auth_mode":"chatgpt","OPENAI_API_KEY":"private-auth-canary"}"#;
+            env.write_config(original_config);
+            std::fs::write(env.auth_path(), original_auth).expect("write original auth");
+            let patch = crate::config::CodexClientPatchConfig {
+                preset,
+                ..crate::config::CodexClientPatchConfig::default()
+            };
+
+            apply_with_client_patch(
+                CodexSwitchIntent::On {
+                    validated_base_url: ValidatedCodexBaseUrl::local(3211),
+                },
+                patch,
+            )
+            .expect("apply imagegen auth facade");
+
+            let applied_auth = std::fs::read_to_string(env.auth_path()).expect("read auth facade");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&applied_auth)
+                    .expect("parse auth facade"),
+                serde_json::json!({})
+            );
+            let journal = std::fs::read_to_string(env.state_path()).expect("read switch journal");
+            assert!(!journal.contains("private-auth-canary"));
+
+            apply(CodexSwitchIntent::Off).expect("restore imagegen auth facade");
+            assert_eq!(env.read_config(), original_config);
+            assert_eq!(
+                std::fs::read_to_string(env.auth_path()).expect("read restored auth"),
+                original_auth
+            );
+        }
+    }
+
+    #[test]
+    fn chatgpt_bridge_validates_and_restores_the_complete_login_object() {
+        let env = TestEnvironment::new();
+        let original_config = "model_provider = \"openai\"\n";
+        let original_auth = chatgpt_auth_json_for_switch_tests();
+        env.write_config(original_config);
+        std::fs::write(env.auth_path(), &original_auth).expect("write ChatGPT auth");
+        let patch = crate::config::CodexClientPatchConfig {
+            preset: crate::config::CodexClientPreset::ChatGptBridge,
+            ..crate::config::CodexClientPatchConfig::default()
+        };
+
+        apply_with_client_patch(
+            CodexSwitchIntent::On {
+                validated_base_url: ValidatedCodexBaseUrl::local(3211),
+            },
+            patch,
+        )
+        .expect("apply ChatGPT bridge auth patch");
+
+        let applied = serde_json::from_slice::<serde_json::Value>(
+            &std::fs::read(env.auth_path()).expect("read patched ChatGPT auth"),
+        )
+        .expect("parse patched ChatGPT auth");
+        assert_eq!(applied["auth_mode"], "chatgpt");
+        assert!(applied["OPENAI_API_KEY"].is_null());
+        assert_eq!(applied["tokens"]["access_token"], "access-secret");
+        let journal = std::fs::read_to_string(env.state_path()).expect("read switch journal");
+        assert!(!journal.contains("access-secret"));
+
+        apply(CodexSwitchIntent::Off).expect("restore ChatGPT bridge auth patch");
+        assert_eq!(env.read_config(), original_config);
+        assert_eq!(
+            std::fs::read_to_string(env.auth_path()).expect("read restored ChatGPT auth"),
+            original_auth
+        );
+    }
+
+    #[test]
+    fn chatgpt_bridge_rejects_missing_login_without_mutating_config_or_state() {
+        let env = TestEnvironment::new();
+        let original = "model_provider = \"openai\"\n";
+        env.write_config(original);
+        let patch = crate::config::CodexClientPatchConfig {
+            preset: crate::config::CodexClientPreset::ChatGptBridge,
+            ..crate::config::CodexClientPatchConfig::default()
+        };
+
+        let error = apply_with_client_patch(
+            CodexSwitchIntent::On {
+                validated_base_url: ValidatedCodexBaseUrl::local(3211),
+            },
+            patch,
+        )
+        .expect_err("missing ChatGPT login must fail");
+
+        assert!(error.to_string().contains("auth.json"));
+        assert_eq!(env.read_config(), original);
+        assert!(!env.auth_path().exists());
+        assert!(!env.state_path().exists());
+    }
+
+    #[test]
+    fn imagegen_facade_removes_auth_created_for_an_absent_original() {
+        let env = TestEnvironment::new();
+        let original_config = "model_provider = \"openai\"\n";
+        env.write_config(original_config);
+        let patch = CodexClientPatchConfig {
+            preset: CodexClientPreset::ImagegenBridge,
+            ..CodexClientPatchConfig::default()
+        };
+
+        apply_with_client_patch(
+            CodexSwitchIntent::On {
+                validated_base_url: ValidatedCodexBaseUrl::local(3211),
+            },
+            patch,
+        )
+        .expect("apply imagegen facade without original auth");
+
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                &std::fs::read(env.auth_path()).expect("read created auth facade")
+            )
+            .expect("parse created auth facade"),
+            serde_json::json!({})
+        );
+        assert!(env.auth_backup_files().is_empty());
+
+        apply(CodexSwitchIntent::Off).expect("remove created auth facade");
+        assert_eq!(env.read_config(), original_config);
+        assert!(!env.auth_path().exists());
+        let status = inspect().expect("inspect retained absent-auth recovery point");
+        assert_eq!(status.phase, CodexSwitchPhase::Off);
+        assert!(!status.enabled);
+        assert!(status.managed);
+        assert!(env.state_path().exists());
+        assert!(env.auth_backup_files().is_empty());
+
+        std::fs::write(env.auth_path(), "{}\n").expect("simulate a stale Codex facade write");
+        assert_eq!(
+            inspect().expect("inspect stale facade write").phase,
+            CodexSwitchPhase::RecoveryRequired
+        );
+        assert_eq!(
+            apply(CodexSwitchIntent::Off)
+                .expect("remove stale facade using retained recovery point")
+                .change,
+            CodexSwitchChange::Recovered
+        );
+        assert!(!env.auth_path().exists());
+        assert_eq!(
+            inspect().expect("inspect repaired off state").phase,
+            CodexSwitchPhase::Off
+        );
+    }
+
+    #[test]
+    fn reapply_from_imagegen_to_chatgpt_uses_the_saved_original_login() {
+        let env = TestEnvironment::new();
+        let original_config = "model_provider = \"openai\"\n";
+        let original_auth = chatgpt_auth_json_for_switch_tests();
+        env.write_config(original_config);
+        std::fs::write(env.auth_path(), &original_auth).expect("write original ChatGPT auth");
+        let target = ValidatedCodexBaseUrl::local(3211);
+        let imagegen = CodexClientPatchConfig {
+            preset: CodexClientPreset::ImagegenBridge,
+            ..CodexClientPatchConfig::default()
+        };
+        let chatgpt = CodexClientPatchConfig {
+            preset: CodexClientPreset::ChatGptBridge,
+            ..CodexClientPatchConfig::default()
+        };
+
+        apply_with_client_patch(
+            CodexSwitchIntent::On {
+                validated_base_url: target.clone(),
+            },
+            imagegen,
+        )
+        .expect("apply imagegen facade");
+        apply_with_client_patch(
+            CodexSwitchIntent::On {
+                validated_base_url: target,
+            },
+            chatgpt,
+        )
+        .expect("reapply ChatGPT bridge from saved original");
+
+        let applied = serde_json::from_slice::<serde_json::Value>(
+            &std::fs::read(env.auth_path()).expect("read reapplied ChatGPT auth"),
+        )
+        .expect("parse reapplied ChatGPT auth");
+        assert_eq!(applied["tokens"]["access_token"], "access-secret");
+        assert_eq!(applied["auth_mode"], "chatgpt");
+        assert!(applied["OPENAI_API_KEY"].is_null());
+
+        apply(CodexSwitchIntent::Off).expect("restore original after reapply");
+        assert_eq!(env.read_config(), original_config);
+        assert_eq!(
+            std::fs::read_to_string(env.auth_path()).expect("read restored original auth"),
+            original_auth
+        );
+        assert_eq!(
+            inspect().expect("inspect retained recovery point").phase,
+            CodexSwitchPhase::Off
+        );
+        assert_eq!(env.auth_backup_files().len(), 1);
+    }
+
+    #[test]
+    fn retained_off_recovery_restores_auth_after_a_stale_facade_write() {
+        let env = TestEnvironment::new();
+        let original_config = "model_provider = \"openai\"\n";
+        let original_auth = r#"{"auth_mode":"apikey","OPENAI_API_KEY":"original-secret"}"#;
+        env.write_config(original_config);
+        std::fs::write(env.auth_path(), original_auth).expect("write original auth");
+        let patch = CodexClientPatchConfig {
+            preset: CodexClientPreset::ImagegenBridge,
+            ..CodexClientPatchConfig::default()
+        };
+
+        apply_with_client_patch(
+            CodexSwitchIntent::On {
+                validated_base_url: ValidatedCodexBaseUrl::local(3211),
+            },
+            patch,
+        )
+        .expect("apply auth facade");
+        apply(CodexSwitchIntent::Off).expect("restore original auth");
+        let backup = env.auth_backup_path();
+        assert_eq!(
+            inspect().expect("inspect off state").phase,
+            CodexSwitchPhase::Off
+        );
+
+        std::fs::write(env.auth_path(), "{}\n").expect("simulate a stale Codex facade write");
+        assert_eq!(
+            inspect().expect("inspect stale facade write").phase,
+            CodexSwitchPhase::RecoveryRequired
+        );
+        assert_eq!(
+            apply(CodexSwitchIntent::Off)
+                .expect("repair stale facade from retained recovery")
+                .change,
+            CodexSwitchChange::Recovered
+        );
+        assert_eq!(
+            std::fs::read_to_string(env.auth_path()).expect("read repaired auth"),
+            original_auth
+        );
+        assert!(backup.exists());
+        assert_eq!(
+            inspect().expect("inspect repaired off state").phase,
+            CodexSwitchPhase::Off
+        );
+    }
+
+    #[test]
+    fn retained_auth_backup_survives_a_new_prepared_switch() {
         let env = TestEnvironment::new();
         env.write_config("model_provider = \"openai\"\n");
+        let original_auth = r#"{"auth_mode":"apikey","OPENAI_API_KEY":"original-secret"}"#;
+        std::fs::write(env.auth_path(), original_auth).expect("write original auth");
+        let patch = CodexClientPatchConfig {
+            preset: CodexClientPreset::ImagegenBridge,
+            ..CodexClientPatchConfig::default()
+        };
+        let on = CodexSwitchIntent::On {
+            validated_base_url: ValidatedCodexBaseUrl::local(3211),
+        };
+
+        apply_with_client_patch(on.clone(), patch).expect("apply first auth facade");
+        apply(CodexSwitchIntent::Off).expect("retain the first recovery point");
+        let retained_backup = env.auth_backup_path();
+        assert!(retained_backup.exists());
+
+        assert!(matches!(
+            apply_with_client_patch_and_failpoint(on.clone(), patch, ApplyFailpoint::AfterPrepared),
+            Err(CodexSwitchError::InjectedFailure("after_prepared"))
+        ));
+        assert_eq!(env.auth_backup_path(), retained_backup);
+        assert_eq!(env.auth_backup_files(), vec![retained_backup.clone()]);
+
+        assert_eq!(
+            apply_with_client_patch(on, patch)
+                .expect("resume the new switch from the retained backup")
+                .change,
+            CodexSwitchChange::Applied
+        );
+        assert_eq!(env.auth_backup_path(), retained_backup);
+        assert_eq!(env.auth_backup_files(), vec![retained_backup]);
+        apply(CodexSwitchIntent::Off).expect("restore after resumed switch");
+        assert_eq!(
+            std::fs::read_to_string(env.auth_path()).expect("read restored auth"),
+            original_auth
+        );
+    }
+
+    #[test]
+    fn preserving_reapply_retains_auth_recovery_across_durable_boundaries() {
+        for failpoint in [
+            ApplyFailpoint::AfterPrepared,
+            ApplyFailpoint::AfterConfigWrite,
+        ] {
+            let env = TestEnvironment::new();
+            env.write_config("model_provider = \"openai\"\n");
+            let original_auth = r#"{"auth_mode":"apikey","OPENAI_API_KEY":"original-secret"}"#;
+            std::fs::write(env.auth_path(), original_auth).expect("write original auth");
+            let facade_patch = CodexClientPatchConfig {
+                preset: CodexClientPreset::ImagegenBridge,
+                ..CodexClientPatchConfig::default()
+            };
+            let preserving_patch = CodexClientPatchConfig::default();
+            let on = CodexSwitchIntent::On {
+                validated_base_url: ValidatedCodexBaseUrl::local(3211),
+            };
+
+            apply_with_client_patch(on.clone(), facade_patch).expect("apply auth facade");
+            let retained_backup = env.auth_backup_path();
+            assert!(matches!(
+                apply_with_client_patch_and_failpoint(on.clone(), preserving_patch, failpoint),
+                Err(CodexSwitchError::InjectedFailure(_))
+            ));
+
+            let prepared = read_journal(env.state_path().as_path())
+                .expect("read prepared journal")
+                .expect("prepared journal");
+            assert_eq!(prepared.phase, JournalPhase::Prepared);
+            assert_eq!(prepared.operation, JournalOperation::Off);
+            assert_eq!(prepared.client_patch, Some(facade_patch));
+            assert_eq!(prepared.auth_recovery_patch, None);
+            assert!(prepared.auth_patch.is_some());
+            assert_eq!(env.auth_backup_path(), retained_backup);
+
+            apply_with_client_patch(on, preserving_patch)
+                .expect("resume preserving patch from retained recovery");
+            let applied = read_journal(env.state_path().as_path())
+                .expect("read applied preserving journal")
+                .expect("applied preserving journal");
+            assert_eq!(applied.phase, JournalPhase::Applied);
+            assert_eq!(applied.client_patch, Some(preserving_patch));
+            assert_eq!(applied.auth_recovery_patch, Some(facade_patch));
+            assert!(applied.auth_patch.is_some());
+            assert_eq!(
+                std::fs::read_to_string(env.auth_path()).expect("read auth after resume"),
+                original_auth
+            );
+            apply(CodexSwitchIntent::Off).expect("restore preserving patch");
+            assert_eq!(
+                inspect().expect("inspect retained off state").phase,
+                CodexSwitchPhase::Off
+            );
+            assert_eq!(env.auth_backup_path(), retained_backup);
+        }
+    }
+
+    #[test]
+    fn preserving_patch_repairs_a_stale_retained_facade_on_switch_off() {
+        let env = TestEnvironment::new();
+        env.write_config("model_provider = \"openai\"\n");
+        let original_auth = r#"{"auth_mode":"apikey","OPENAI_API_KEY":"original-secret"}"#;
+        std::fs::write(env.auth_path(), original_auth).expect("write original auth");
+        let facade_patch = CodexClientPatchConfig {
+            preset: CodexClientPreset::ImagegenBridge,
+            ..CodexClientPatchConfig::default()
+        };
+        let preserving_patch = CodexClientPatchConfig::default();
+        let on = CodexSwitchIntent::On {
+            validated_base_url: ValidatedCodexBaseUrl::local(3211),
+        };
+
+        apply_with_client_patch(on.clone(), facade_patch).expect("apply auth facade");
+        apply_with_client_patch(on, preserving_patch).expect("apply preserving patch");
+        let retained_backup = env.auth_backup_path();
+        assert_eq!(
+            std::fs::read_to_string(env.auth_path()).expect("read preserved auth"),
+            original_auth
+        );
+
+        std::fs::write(env.auth_path(), "{}\n").expect("simulate stale facade write");
+        assert_eq!(
+            inspect().expect("inspect stale retained facade").phase,
+            CodexSwitchPhase::RecoveryRequired
+        );
+        assert_eq!(
+            apply(CodexSwitchIntent::Off)
+                .expect("repair stale facade and switch off")
+                .change,
+            CodexSwitchChange::Removed
+        );
+        assert_eq!(
+            std::fs::read_to_string(env.auth_path()).expect("read restored auth"),
+            original_auth
+        );
+        assert_eq!(env.auth_backup_path(), retained_backup);
+        assert_eq!(
+            inspect().expect("inspect repaired off state").phase,
+            CodexSwitchPhase::Off
+        );
+    }
+
+    #[test]
+    fn restored_switch_rebuilds_a_missing_auth_backup_from_the_original() {
+        let env = TestEnvironment::new();
+        env.write_config("model_provider = \"openai\"\n");
+        let original_auth = r#"{"auth_mode":"apikey","OPENAI_API_KEY":"original-secret"}"#;
+        std::fs::write(env.auth_path(), original_auth).expect("write original auth");
+        let patch = CodexClientPatchConfig {
+            preset: CodexClientPreset::ImagegenBridge,
+            ..CodexClientPatchConfig::default()
+        };
+
+        apply_with_client_patch(
+            CodexSwitchIntent::On {
+                validated_base_url: ValidatedCodexBaseUrl::local(3211),
+            },
+            patch,
+        )
+        .expect("apply auth facade");
+        apply(CodexSwitchIntent::Off).expect("restore original auth");
+        let backup = env.auth_backup_path();
+        std::fs::remove_file(&backup).expect("remove retained auth backup");
+
+        assert_eq!(
+            inspect().expect("inspect missing backup").phase,
+            CodexSwitchPhase::RecoveryRequired
+        );
+        assert_eq!(
+            apply(CodexSwitchIntent::Off)
+                .expect("rebuild missing backup from unchanged original")
+                .change,
+            CodexSwitchChange::Recovered
+        );
+        assert_eq!(
+            std::fs::read_to_string(&backup).expect("read rebuilt auth backup"),
+            original_auth
+        );
+        assert_eq!(
+            inspect().expect("inspect rebuilt recovery point").phase,
+            CodexSwitchPhase::Off
+        );
+    }
+
+    #[test]
+    fn restored_switch_rejects_a_tampered_auth_backup() {
+        let env = TestEnvironment::new();
+        let original_config = "model_provider = \"openai\"\n";
+        let original_auth = r#"{"auth_mode":"apikey","OPENAI_API_KEY":"original-secret"}"#;
+        env.write_config(original_config);
+        std::fs::write(env.auth_path(), original_auth).expect("write original auth");
+        let patch = CodexClientPatchConfig {
+            preset: CodexClientPreset::ImagegenBridge,
+            ..CodexClientPatchConfig::default()
+        };
+
+        apply_with_client_patch(
+            CodexSwitchIntent::On {
+                validated_base_url: ValidatedCodexBaseUrl::local(3211),
+            },
+            patch,
+        )
+        .expect("apply auth facade");
+        apply(CodexSwitchIntent::Off).expect("restore original auth");
+        std::fs::write(env.auth_backup_path(), "tampered-backup").expect("tamper auth backup");
+
+        assert_eq!(
+            inspect().expect("inspect tampered retained backup").phase,
+            CodexSwitchPhase::RecoveryRequired
+        );
+        assert!(matches!(
+            apply(CodexSwitchIntent::Off),
+            Err(CodexSwitchError::RecoveryRequired { .. })
+        ));
+        assert_eq!(env.read_config(), original_config);
+        assert_eq!(
+            std::fs::read_to_string(env.auth_path()).expect("read preserved original auth"),
+            original_auth
+        );
+    }
+
+    #[test]
+    fn invalid_reapply_keeps_the_existing_switch_and_recovery_material() {
+        let env = TestEnvironment::new();
+        let original_config = "model_provider = \"openai\"\n";
+        let invalid_chatgpt_auth = r#"{"auth_mode":"apikey"}"#;
+        env.write_config(original_config);
+        std::fs::write(env.auth_path(), invalid_chatgpt_auth).expect("write original auth");
+        let target = ValidatedCodexBaseUrl::local(3211);
+        let imagegen = CodexClientPatchConfig {
+            preset: CodexClientPreset::ImagegenBridge,
+            ..CodexClientPatchConfig::default()
+        };
+        let chatgpt = CodexClientPatchConfig {
+            preset: CodexClientPreset::ChatGptBridge,
+            ..CodexClientPatchConfig::default()
+        };
+
+        apply_with_client_patch(
+            CodexSwitchIntent::On {
+                validated_base_url: target.clone(),
+            },
+            imagegen,
+        )
+        .expect("apply initial imagegen facade");
+        let applied_config = std::fs::read(env.config_path()).expect("capture applied config");
+        let applied_auth = std::fs::read(env.auth_path()).expect("capture applied auth");
+        let applied_state = std::fs::read(env.state_path()).expect("capture applied journal");
+        let backup_files = env.auth_backup_files();
+        assert_eq!(backup_files.len(), 1);
+        let backup = std::fs::read(&backup_files[0]).expect("capture auth backup");
+
+        let error = apply_with_client_patch(
+            CodexSwitchIntent::On {
+                validated_base_url: target,
+            },
+            chatgpt,
+        )
+        .expect_err("invalid ChatGPT reapply must fail before switch-off");
+
+        assert!(matches!(error, CodexSwitchError::InvalidAuth { .. }));
+        assert_eq!(std::fs::read(env.config_path()).unwrap(), applied_config);
+        assert_eq!(std::fs::read(env.auth_path()).unwrap(), applied_auth);
+        assert_eq!(std::fs::read(env.state_path()).unwrap(), applied_state);
+        assert_eq!(env.auth_backup_files(), backup_files);
+        assert_eq!(std::fs::read(&backup_files[0]).unwrap(), backup);
+
+        apply(CodexSwitchIntent::Off).expect("restore the preserved switch");
+        assert_eq!(env.read_config(), original_config);
+        assert_eq!(
+            std::fs::read_to_string(env.auth_path()).expect("read restored auth"),
+            invalid_chatgpt_auth
+        );
+    }
+
+    #[test]
+    fn auth_facade_recovers_after_each_durable_write_boundary() {
+        let patch = CodexClientPatchConfig {
+            preset: CodexClientPreset::ImagegenBridge,
+            ..CodexClientPatchConfig::default()
+        };
+
+        let env = TestEnvironment::new();
+        let original_config = "model_provider = \"openai\"\n";
+        let original_auth = r#"{"auth_mode":"apikey","OPENAI_API_KEY":"auth-secret"}"#;
+        env.write_config(original_config);
+        std::fs::write(env.auth_path(), original_auth).expect("write original auth");
+        let on = CodexSwitchIntent::On {
+            validated_base_url: ValidatedCodexBaseUrl::local(3211),
+        };
+
+        assert!(matches!(
+            apply_with_client_patch_and_failpoint(
+                on.clone(),
+                patch,
+                ApplyFailpoint::AfterAuthWrite
+            ),
+            Err(CodexSwitchError::InjectedFailure("after_auth_write"))
+        ));
+        assert_eq!(
+            inspect().expect("inspect prepared auth write").phase,
+            CodexSwitchPhase::Prepared
+        );
+        assert_eq!(
+            apply_with_client_patch(on, patch)
+                .expect("finish prepared auth write")
+                .change,
+            CodexSwitchChange::Recovered
+        );
+
+        assert!(matches!(
+            apply_with_client_patch_and_failpoint(
+                CodexSwitchIntent::Off,
+                patch,
+                ApplyFailpoint::AfterConfigWrite
+            ),
+            Err(CodexSwitchError::InjectedFailure("after_config_write"))
+        ));
+        assert_eq!(env.read_config(), original_config);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                &std::fs::read(env.auth_path()).expect("read still-applied auth facade")
+            )
+            .expect("parse still-applied auth facade"),
+            serde_json::json!({})
+        );
+        assert_eq!(
+            apply(CodexSwitchIntent::Off)
+                .expect("finish auth restoration")
+                .change,
+            CodexSwitchChange::Recovered
+        );
+        assert_eq!(
+            std::fs::read_to_string(env.auth_path()).expect("read restored auth"),
+            original_auth
+        );
+        assert_eq!(
+            inspect().expect("inspect retained recovery point").phase,
+            CodexSwitchPhase::Off
+        );
+        assert_eq!(env.auth_backup_files().len(), 1);
+
+        apply_with_client_patch(
+            CodexSwitchIntent::On {
+                validated_base_url: ValidatedCodexBaseUrl::local(3211),
+            },
+            patch,
+        )
+        .expect("apply facade again");
+        assert!(matches!(
+            apply_with_client_patch_and_failpoint(
+                CodexSwitchIntent::Off,
+                patch,
+                ApplyFailpoint::AfterAuthRestore
+            ),
+            Err(CodexSwitchError::InjectedFailure("after_auth_restore"))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(env.auth_path()).expect("read restored auth after failure"),
+            original_auth
+        );
+        assert!(env.state_path().exists());
+        assert_eq!(
+            apply(CodexSwitchIntent::Off)
+                .expect("finish state cleanup after auth restoration")
+                .change,
+            CodexSwitchChange::Recovered
+        );
+        assert_eq!(
+            inspect().expect("inspect completed off state").phase,
+            CodexSwitchPhase::Off
+        );
+        assert_eq!(env.auth_backup_files().len(), 1);
+    }
+
+    #[test]
+    fn external_auth_edit_is_never_overwritten_during_switch_off() {
+        let env = TestEnvironment::new();
+        env.write_config("model_provider = \"openai\"\n");
+        std::fs::write(env.auth_path(), "original-auth-secret").expect("write original auth");
+        let patch = CodexClientPatchConfig {
+            preset: CodexClientPreset::ImagegenBridge,
+            ..CodexClientPatchConfig::default()
+        };
+        apply_with_client_patch(
+            CodexSwitchIntent::On {
+                validated_base_url: ValidatedCodexBaseUrl::local(3211),
+            },
+            patch,
+        )
+        .expect("apply imagegen facade");
+        let backup = env.auth_backup_path();
+        let external = r#"{"auth_mode":"chatgpt","OPENAI_API_KEY":"external-change"}"#;
+        std::fs::write(env.auth_path(), external).expect("write external auth change");
+
+        assert!(matches!(
+            apply(CodexSwitchIntent::Off),
+            Err(CodexSwitchError::RecoveryRequired { .. })
+        ));
+        assert_eq!(
+            std::fs::read_to_string(env.auth_path()).expect("read preserved external auth"),
+            external
+        );
+        assert!(backup.exists());
+        assert_eq!(
+            inspect().expect("inspect recovery state").phase,
+            CodexSwitchPhase::RecoveryRequired
+        );
+    }
+
+    #[test]
+    fn tampered_auth_backup_is_reported_before_config_is_restored() {
+        let env = TestEnvironment::new();
+        let original_config = "model_provider = \"openai\"\n";
+        env.write_config(original_config);
+        std::fs::write(env.auth_path(), "original-auth-secret").expect("write original auth");
+        let patch = CodexClientPatchConfig {
+            preset: CodexClientPreset::ImagegenBridge,
+            ..CodexClientPatchConfig::default()
+        };
+        apply_with_client_patch(
+            CodexSwitchIntent::On {
+                validated_base_url: ValidatedCodexBaseUrl::local(3211),
+            },
+            patch,
+        )
+        .expect("apply imagegen facade");
+        let applied_config = env.read_config();
+        std::fs::write(env.auth_backup_path(), "tampered-backup").expect("tamper auth backup");
+
+        assert_eq!(
+            inspect().expect("inspect tampered backup").phase,
+            CodexSwitchPhase::RecoveryRequired
+        );
+        assert!(matches!(
+            apply(CodexSwitchIntent::Off),
+            Err(CodexSwitchError::RecoveryRequired { .. })
+        ));
+        assert_eq!(env.read_config(), applied_config);
+        assert_ne!(env.read_config(), original_config);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_backup_is_stored_with_private_unix_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let env = TestEnvironment::new();
+        env.write_config("model_provider = \"openai\"\n");
+        std::fs::write(env.auth_path(), "private-auth-secret").expect("write original auth");
+        apply_with_client_patch(
+            CodexSwitchIntent::On {
+                validated_base_url: ValidatedCodexBaseUrl::local(3211),
+            },
+            CodexClientPatchConfig {
+                preset: CodexClientPreset::ImagegenBridge,
+                ..CodexClientPatchConfig::default()
+            },
+        )
+        .expect("apply imagegen facade");
+
+        let backup = env.auth_backup_path();
+        assert_eq!(
+            std::fs::metadata(&backup)
+                .expect("read backup metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(backup.parent().expect("backup parent"))
+                .expect("read state directory metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let journal = std::fs::read_to_string(env.state_path()).expect("read journal");
+        assert!(!journal.contains("private-auth-secret"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn switch_writes_preserve_or_apply_private_windows_acls() {
+        fn metadata(path: &Path) -> crate::config::ConfigFileMetadata {
+            let file_metadata = std::fs::symlink_metadata(path).expect("read file metadata");
+            crate::config::ConfigFileMetadata::capture(path, &file_metadata)
+                .expect("capture Windows security metadata")
+        }
+
+        let env = TestEnvironment::new();
+        env.write_config("model_provider = \"openai\"\n");
+        std::fs::write(env.auth_path(), "private-auth-secret").expect("write original auth");
+        crate::local_operator::secure_private_windows_path(env.config_path().as_path(), false)
+            .expect("secure original config");
+        crate::local_operator::secure_private_windows_path(env.auth_path().as_path(), false)
+            .expect("secure original auth");
+        let config_metadata = metadata(env.config_path().as_path());
+        let auth_metadata = metadata(env.auth_path().as_path());
+
+        let private_file = env.root.join("private-reference");
+        std::fs::write(&private_file, "reference").expect("write private reference file");
+        crate::local_operator::secure_private_windows_path(&private_file, false)
+            .expect("secure private reference file");
+        let private_file_metadata = metadata(&private_file);
+        let private_directory = env.root.join("private-reference-directory");
+        std::fs::create_dir(&private_directory).expect("create private reference directory");
+        crate::local_operator::secure_private_windows_path(&private_directory, true)
+            .expect("secure private reference directory");
+        let private_directory_metadata = metadata(&private_directory);
+
+        apply_with_client_patch(
+            CodexSwitchIntent::On {
+                validated_base_url: ValidatedCodexBaseUrl::local(3211),
+            },
+            CodexClientPatchConfig {
+                preset: CodexClientPreset::ImagegenBridge,
+                ..CodexClientPatchConfig::default()
+            },
+        )
+        .expect("apply imagegen facade");
+
+        assert!(metadata(env.config_path().as_path()).matches(&config_metadata));
+        assert!(metadata(env.auth_path().as_path()).matches(&auth_metadata));
+        assert!(metadata(env.state_path().as_path()).matches(&private_file_metadata));
+        assert!(metadata(env.auth_backup_path().as_path()).matches(&private_file_metadata));
+        assert!(
+            metadata(env.state_path().parent().expect("state directory"))
+                .matches(&private_directory_metadata)
+        );
+
+        apply(CodexSwitchIntent::Off).expect("restore switch files");
+        assert!(metadata(env.config_path().as_path()).matches(&config_metadata));
+        assert!(metadata(env.auth_path().as_path()).matches(&auth_metadata));
+    }
+
+    #[test]
+    fn client_patch_removes_features_table_created_only_for_owned_keys_on_switch_off() {
+        let env = TestEnvironment::new();
+        let original = "model_provider = \"openai\"\n";
+        env.write_config(original);
+        let patch = crate::config::CodexClientPatchConfig {
+            preset: crate::config::CodexClientPreset::OfficialRelay,
+            compaction: crate::config::CodexCompactionStrategy::RemoteV2,
+            hosted_image_generation: crate::config::CodexHostedImageGenerationMode::Enabled,
+            ..crate::config::CodexClientPatchConfig::default()
+        };
+
+        apply_with_client_patch(
+            CodexSwitchIntent::On {
+                validated_base_url: ValidatedCodexBaseUrl::local(3211),
+            },
+            patch,
+        )
+        .expect("apply feature-owning patch");
+        let applied = env.read_config();
+        assert!(applied.contains("remote_compaction_v2 = true"));
+        assert!(applied.contains("image_generation = true"));
+
+        apply(CodexSwitchIntent::Off).expect("restore absent features table");
+        assert_eq!(env.read_config(), original);
+    }
+
+    #[test]
+    fn prepared_switch_resumes_with_recorded_complete_client_patch() {
+        let env = TestEnvironment::new();
+        env.write_config("model_provider = \"openai\"\n");
+        let intent = CodexSwitchIntent::On {
+            validated_base_url: ValidatedCodexBaseUrl::local(3211),
+        };
+        let patch = crate::config::CodexClientPatchConfig {
+            preset: crate::config::CodexClientPreset::OfficialImagegen,
+            responses_websocket: true,
+            compaction: crate::config::CodexCompactionStrategy::RemoteV2,
+            hosted_image_generation: crate::config::CodexHostedImageGenerationMode::Enabled,
+            ..crate::config::CodexClientPatchConfig::default()
+        };
+
+        assert!(matches!(
+            apply_with_client_patch_and_failpoint(
+                intent.clone(),
+                patch,
+                ApplyFailpoint::AfterPrepared,
+            ),
+            Err(CodexSwitchError::InjectedFailure("after_prepared"))
+        ));
+        let outcome =
+            apply_with_client_patch(intent, patch).expect("resume prepared complete client patch");
+
+        assert_eq!(outcome.status.client_patch.as_ref(), Some(&patch));
+        let applied = env.read_config();
+        assert!(applied.contains(CODEX_CLIENT_FACADE_ACTOR_VALUE));
+        assert!(applied.contains("supports_websockets = true"));
+        assert!(applied.contains("remote_compaction_v2 = true"));
+        assert!(applied.contains("image_generation = true"));
+    }
+
+    #[test]
+    fn changing_client_facade_reapplies_without_losing_the_original_config() {
+        let env = TestEnvironment::new();
+        let original = "model_provider = \"openai\"\n\n[features]\nimage_generation = false\n";
+        env.write_config(original);
         let on = CodexSwitchIntent::On {
             validated_base_url: ValidatedCodexBaseUrl::local(3211),
         };
         apply_with_client_facade(on.clone(), CodexClientFacade::OpenAi)
             .expect("switch on OpenAI facade");
-        let config_before = env.read_config();
-        let state_before = std::fs::read(env.state_path()).expect("read state before mismatch");
+        let outcome = apply_with_client_facade(on, CodexClientFacade::OpenAiTools)
+            .expect("reapply OpenAI tools facade");
 
-        assert!(matches!(
-            apply_with_client_facade(on.clone(), CodexClientFacade::OpenAiTools),
-            Err(CodexSwitchError::AlreadyAppliedWithDifferentFacade { .. })
-        ));
-        assert_eq!(env.read_config(), config_before);
         assert_eq!(
-            std::fs::read(env.state_path()).expect("read state after mismatch"),
-            state_before
+            outcome.status.client_facade,
+            Some(CodexClientFacade::OpenAiTools)
         );
-
-        apply(CodexSwitchIntent::Off).expect("switch off old facade");
-        apply_with_client_facade(on, CodexClientFacade::OpenAiTools)
-            .expect("switch on new facade after off");
         assert!(env.read_config().contains(CODEX_CLIENT_FACADE_ACTOR_VALUE));
+
+        apply(CodexSwitchIntent::Off).expect("switch off reapplied facade");
+        assert_eq!(env.read_config(), original);
+    }
+
+    #[test]
+    fn interrupted_client_patch_reapply_resumes_from_the_recorded_off_transition() {
+        for failpoint in [
+            ApplyFailpoint::AfterPrepared,
+            ApplyFailpoint::AfterConfigWrite,
+        ] {
+            let env = TestEnvironment::new();
+            let original = "model_provider = \"openai\"\n";
+            env.write_config(original);
+            let on = CodexSwitchIntent::On {
+                validated_base_url: ValidatedCodexBaseUrl::local(3211),
+            };
+            apply_with_client_facade(on.clone(), CodexClientFacade::OpenAi)
+                .expect("switch on initial facade");
+
+            assert!(matches!(
+                apply_with_client_facade_and_failpoint(
+                    on.clone(),
+                    CodexClientFacade::OpenAiTools,
+                    failpoint,
+                ),
+                Err(CodexSwitchError::InjectedFailure(_))
+            ));
+            let outcome = apply_with_client_facade(on, CodexClientFacade::OpenAiTools)
+                .expect("resume interrupted facade reapply");
+
+            assert_eq!(outcome.status.phase, CodexSwitchPhase::Applied);
+            assert_eq!(
+                outcome.status.client_facade,
+                Some(CodexClientFacade::OpenAiTools)
+            );
+            apply(CodexSwitchIntent::Off).expect("restore after resumed reapply");
+            assert_eq!(env.read_config(), original);
+        }
     }
 
     #[test]
@@ -3022,6 +5770,100 @@ trust_level = "trusted"
             apply(on).expect("reuse old journal shape").change,
             CodexSwitchChange::Unchanged
         );
+    }
+
+    #[test]
+    fn facade_only_journals_are_reapplied_as_complete_client_patches() {
+        for facade in [
+            CodexClientFacade::Compatible,
+            CodexClientFacade::OpenAi,
+            CodexClientFacade::OpenAiTools,
+        ] {
+            let env = TestEnvironment::new();
+            let original_config = "model_provider = \"openai\"\n";
+            let original_auth = b"auth sentinel";
+            env.write_config(original_config);
+            std::fs::write(env.auth_path(), original_auth).expect("write original auth");
+            let target = ValidatedCodexBaseUrl::local(3211);
+            let patch = facade.client_patch();
+
+            apply_with_client_patch(
+                CodexSwitchIntent::On {
+                    validated_base_url: target.clone(),
+                },
+                patch,
+            )
+            .expect("apply current complete patch before journal downgrade");
+
+            let mut applied = env.read_config();
+            if matches!(
+                facade,
+                CodexClientFacade::OpenAi | CodexClientFacade::OpenAiTools
+            ) {
+                applied = applied.replace("supports_websockets = false\n", "");
+            }
+            env.write_config(applied.as_str());
+            let mut state = serde_json::from_slice::<serde_json::Value>(
+                &std::fs::read(env.state_path()).expect("read current journal"),
+            )
+            .expect("parse current journal");
+            let object = state.as_object_mut().expect("journal object");
+            object.remove("client_patch");
+            object.insert(
+                "applied_fingerprint".to_string(),
+                serde_json::Value::String(fingerprint(applied.as_bytes())),
+            );
+            if facade == CodexClientFacade::OpenAiTools {
+                object.remove("auth_patch");
+                std::fs::write(env.auth_path(), original_auth).expect("restore legacy auth");
+                for backup in env.auth_backup_files() {
+                    std::fs::remove_file(backup).expect("remove new-only auth backup");
+                }
+            }
+            std::fs::write(
+                env.state_path(),
+                serde_json::to_vec_pretty(&state).expect("serialize facade-only journal"),
+            )
+            .expect("write facade-only journal");
+
+            let legacy_status = inspect().expect("inspect facade-only journal");
+            assert_eq!(legacy_status.client_facade, Some(facade));
+            assert_eq!(legacy_status.client_patch, None);
+
+            let outcome = apply_with_client_patch(
+                CodexSwitchIntent::On {
+                    validated_base_url: target,
+                },
+                patch,
+            )
+            .expect("upgrade facade-only journal");
+
+            assert_eq!(outcome.change, CodexSwitchChange::Applied);
+            assert_eq!(outcome.status.client_patch, Some(patch));
+            let upgraded_state = serde_json::from_slice::<serde_json::Value>(
+                &std::fs::read(env.state_path()).expect("read upgraded journal"),
+            )
+            .expect("parse upgraded journal");
+            assert!(upgraded_state.get("client_patch").is_some());
+            if facade == CodexClientFacade::OpenAi {
+                assert!(env.read_config().contains("supports_websockets = false"));
+            }
+            if facade == CodexClientFacade::OpenAiTools {
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(
+                        &std::fs::read(env.auth_path()).expect("read upgraded auth facade")
+                    )
+                    .expect("parse upgraded auth facade"),
+                    serde_json::json!({})
+                );
+                assert_eq!(env.auth_backup_files().len(), 1);
+                assert!(upgraded_state.get("auth_patch").is_some());
+            }
+
+            apply(CodexSwitchIntent::Off).expect("restore upgraded switch");
+            assert_eq!(env.read_config(), original_config);
+            assert_eq!(std::fs::read(env.auth_path()).unwrap(), original_auth);
+        }
     }
 
     #[test]
@@ -3421,6 +6263,7 @@ request_max_retries = 7"#;
             ".codex-switch-not-a-uuid.tmp",
             ".codex-switch-v1-not-a-uuid.tmp",
             ".codex-switch-delete-v1-not-a-uuid",
+            &format!("{SWITCH_CAPTURE_FILE_PREFIX}{uuid}-config"),
             ".config.toml.codex-switch-delete-pending",
             ".codex-switch-delete-v1-00000000-0000-0000-0000-000000000000.extra",
             ".codex-switch-v1-00000000-0000-0000-0000-000000000000",
@@ -3458,6 +6301,174 @@ request_max_retries = 7"#;
             std::fs::read(tombstone).expect("read existing tombstone"),
             b"existing tombstone"
         );
+    }
+
+    #[test]
+    fn no_replace_move_collision_preserves_source_and_destination() {
+        let env = TestEnvironment::new();
+        let source = env.codex_home.join("no-replace-source");
+        let destination = env.codex_home.join("no-replace-destination");
+        std::fs::write(&source, b"prepared replacement").expect("write move source");
+        std::fs::write(&destination, b"competing writer").expect("write move destination");
+
+        move_file_no_replace(source.as_path(), destination.as_path())
+            .expect_err("no-replace move must reject an existing destination");
+
+        assert_eq!(
+            std::fs::read(source).expect("read preserved source"),
+            b"prepared replacement"
+        );
+        assert_eq!(
+            std::fs::read(destination).expect("read preserved destination"),
+            b"competing writer"
+        );
+    }
+
+    #[test]
+    fn interrupted_managed_capture_is_restored_before_switch_resume() {
+        let env = TestEnvironment::new();
+        let original = "model_provider = \"openai\"\n";
+        env.write_config(original);
+        let on = CodexSwitchIntent::On {
+            validated_base_url: ValidatedCodexBaseUrl::local(3211),
+        };
+        assert!(matches!(
+            apply_with_failpoint(on.clone(), ApplyFailpoint::AfterPrepared),
+            Err(CodexSwitchError::InjectedFailure("after_prepared"))
+        ));
+        let paths = SwitchPaths::resolve().expect("resolve switch paths");
+        let journal = read_journal(env.state_path().as_path())
+            .expect("read prepared journal")
+            .expect("prepared journal");
+        let capture = managed_capture_path(
+            env.config_path().as_path(),
+            journal.operation_id.as_str(),
+            ManagedCommitRole::Config,
+        )
+        .expect("resolve managed capture");
+        capture_expected_file(
+            env.config_path().as_path(),
+            capture.as_path(),
+            FileCommitExpectation::Journal(ConfigCommitExpectation {
+                journal: &journal,
+                state: ExpectedConfigState::Original,
+            }),
+        )
+        .expect("simulate crash after detaching the expected config");
+        assert!(!env.config_path().exists());
+        assert_eq!(
+            std::fs::read_to_string(&capture).expect("read detached original"),
+            original
+        );
+
+        assert_eq!(
+            apply(on)
+                .expect("recover the capture and resume switch")
+                .change,
+            CodexSwitchChange::Applied
+        );
+        assert_eq!(
+            inspect().expect("inspect resumed switch").phase,
+            CodexSwitchPhase::Applied
+        );
+        assert!(!capture.exists());
+        apply(CodexSwitchIntent::Off).expect("restore original config");
+        assert_eq!(env.read_config(), original);
+        assert!(!capture.exists());
+        assert!(!paths.state.exists());
+    }
+
+    #[test]
+    fn competing_writer_after_capture_is_preserved_for_manual_recovery() {
+        let env = TestEnvironment::new();
+        let original = "model_provider = \"openai\"\n";
+        let competing = "model_provider = \"external\"\n";
+        env.write_config(original);
+        let on = CodexSwitchIntent::On {
+            validated_base_url: ValidatedCodexBaseUrl::local(3211),
+        };
+        assert!(matches!(
+            apply_with_failpoint(on.clone(), ApplyFailpoint::AfterPrepared),
+            Err(CodexSwitchError::InjectedFailure("after_prepared"))
+        ));
+        let journal = read_journal(env.state_path().as_path())
+            .expect("read prepared journal")
+            .expect("prepared journal");
+        let capture = managed_capture_path(
+            env.config_path().as_path(),
+            journal.operation_id.as_str(),
+            ManagedCommitRole::Config,
+        )
+        .expect("resolve managed capture");
+        capture_expected_file(
+            env.config_path().as_path(),
+            capture.as_path(),
+            FileCommitExpectation::Journal(ConfigCommitExpectation {
+                journal: &journal,
+                state: ExpectedConfigState::Original,
+            }),
+        )
+        .expect("detach expected config");
+        env.write_config(competing);
+
+        assert!(matches!(
+            apply(on),
+            Err(CodexSwitchError::RecoveryRequired { .. })
+        ));
+        assert_eq!(env.read_config(), competing);
+        assert_eq!(
+            std::fs::read_to_string(&capture).expect("read preserved capture"),
+            original
+        );
+        let stored = read_journal(env.state_path().as_path())
+            .expect("read recovery journal")
+            .expect("recovery journal");
+        assert_eq!(stored.phase, JournalPhase::RecoveryRequired);
+        assert_eq!(
+            inspect().expect("inspect collision").phase,
+            CodexSwitchPhase::RecoveryRequired
+        );
+    }
+
+    #[test]
+    fn commit_time_mismatch_restores_the_captured_external_file() {
+        let env = TestEnvironment::new();
+        let original = "model_provider = \"openai\"\n";
+        let external = "model_provider = \"external\"\n";
+        env.write_config(original);
+        let on = CodexSwitchIntent::On {
+            validated_base_url: ValidatedCodexBaseUrl::local(3211),
+        };
+        assert!(matches!(
+            apply_with_failpoint(on, ApplyFailpoint::AfterPrepared),
+            Err(CodexSwitchError::InjectedFailure("after_prepared"))
+        ));
+        let journal = read_journal(env.state_path().as_path())
+            .expect("read prepared journal")
+            .expect("prepared journal");
+        let capture = managed_capture_path(
+            env.config_path().as_path(),
+            journal.operation_id.as_str(),
+            ManagedCommitRole::Config,
+        )
+        .expect("resolve managed capture");
+        let stage = env.codex_home.join("prepared-config-stage");
+        env.write_config(external);
+        std::fs::write(&stage, b"helper replacement").expect("write staged replacement");
+
+        commit_staged_file(
+            stage.as_path(),
+            env.config_path().as_path(),
+            FileCommitExpectation::Journal(ConfigCommitExpectation {
+                journal: &journal,
+                state: ExpectedConfigState::Original,
+            }),
+        )
+        .expect_err("commit-time mismatch must fail closed");
+
+        assert_eq!(env.read_config(), external);
+        assert!(stage.exists());
+        assert!(!capture.exists());
     }
 
     #[test]

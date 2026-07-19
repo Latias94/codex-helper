@@ -40,7 +40,7 @@ Codex-owned files remain owned by Codex:
 - `~/.codex/auth.json`
 - `~/.codex/config.toml`
 
-Only an explicit local `switch on/off` action may patch `~/.codex/config.toml`, and it is limited to the helper-owned provider selector and `model_providers.codex_proxy` stanza. codex-helper never reads or writes the Codex model cache or SQLite. Ordinary runtime operation does not write `auth.json`; however, when a provider explicitly configures `auth_token_env` / `api_key_env` and the running process lacks that variable, a Codex runtime may read only the same-named top-level string field from `$CODEX_HOME/auth.json`. The only auth-writing exception is the one-time legacy switch recovery below, which may restore an auth facade managed by the old helper while it strictly matches the old patch.
+Only an explicit local `switch on/off` action patches the journaled provider selector, `model_providers.codex_proxy`, and client-capability fields in `~/.codex/config.toml`. A preset that requires an auth facade also patches `auth.json` temporarily and restores its exact original bytes from a private helper backup. codex-helper never reads or writes the Codex model cache or SQLite. Ordinary runtime operation does not write `auth.json`; when a provider explicitly configures `auth_token_env` / `api_key_env` and the running process lacks that variable, a Codex runtime may read only the same-named top-level string field from `$CODEX_HOME/auth.json`. That credential fallback is independent from the client-patch facade lifecycle.
 
 ## Automatic Configuration Migration
 
@@ -120,31 +120,34 @@ Client switching is a separate local action from starting, selecting, or diagnos
 codex-helper switch on                         # http://127.0.0.1:3211
 codex-helper switch on --port 4321
 codex-helper switch on --base-url https://relay.example/v1
+codex-helper switch on --preset imagegen-bridge
+codex-helper switch on --preset official-imagegen --compaction remote-v2 --responses-websocket
+codex-helper switch on --translate-models=false --hosted-image-generation disabled
 codex-helper switch on --client-facade openai
 codex-helper switch on --client-facade openai-tools
 codex-helper switch status
 codex-helper switch off
 ```
 
-`switch on` records the original selector and helper stanza, then writes only the helper-owned `model_providers.codex_proxy` stanza and selects it. `switch off` restores only the recorded selector/stanza. The recovery journal lives under `~/.codex-helper/state/`; an external edit that makes the current file match neither the original nor helper-applied fingerprint moves the switch to `recovery_required` and leaves the file untouched for human reconciliation.
+`switch on` loads the complete `[codex.client_patch]` described below, records the original selector, helper stanza, relevant feature flags, and any auth facade required by the preset, then applies the helper-owned `model_providers.codex_proxy`. `switch off` restores only journaled content. The recovery journal lives under `~/.codex-helper/state/`; an auth-bearing patch retains its recovery point while reporting `Off`, so it can repair a semantically equivalent facade that Codex writes later. An external edit attributable to neither the original nor helper facade moves the switch to `recovery_required`; no-replace CAS preserves both the competing file and recovery material for reconciliation.
 
-`--client-facade` is an explicit client-side capability advertisement:
+`--client-facade` is a compatibility shortcut for the earlier reduced surface and maps to canonical presets:
 
-| Facade | Helper-owned Codex provider stanza | Client behavior made eligible |
+| Facade | Equivalent client patch | Client behavior made eligible |
 | --- | --- | --- |
-| `compatible` (default) | `name = "codex-helper"` | Ordinary OpenAI-compatible Responses behavior only |
-| `openai` | `name = "OpenAI"` | Remote compaction and Web Search, subject to Codex feature/model rules |
-| `openai-tools` | `name = "OpenAI"` plus a helper marker in `x-openai-actor-authorization` | The `openai` behavior plus hosted image generation, subject to Codex feature/model rules |
+| `compatible` (default) | `preset = "default"` | Ordinary OpenAI-compatible Responses behavior |
+| `openai` | `preset = "official-relay"` | Remote compaction and Web Search, subject to Codex feature/model rules |
+| `openai-tools` | `preset = "official-imagegen"` | Hosted image generation in addition to official identity, subject to Codex feature/model rules |
 
-This facade controls what the Codex client is willing to expose; it does not prove that the selected relay supports the corresponding request. In particular, `openai` can make Codex call `/responses/compact`, and `openai-tools` can emit hosted image-generation traffic. Verify the relay contract separately. The exact helper marker is consumed locally before every HTTP or WebSocket upstream handshake. A real actor-authorization value remains passthrough-capable only for an unconfigured official OpenAI origin and is stripped from third-party or helper-authenticated routes. Both forms are redacted from request diagnostics.
+A client patch controls what the Codex client is willing to expose; it does not prove that the selected relay supports the corresponding request. Official presets can make Codex call `/responses/compact` or open a WebSocket, while image-generation presets can emit hosted-image traffic. Verify the relay contract separately. The exact helper actor marker is consumed locally before every HTTP or WebSocket upstream handshake. A real actor-authorization value remains passthrough-capable only for an unconfigured official OpenAI origin and is stripped from third-party or helper-authenticated routes. Both forms are redacted from request diagnostics.
 
-Changing the target URL or facade while a switch journal is active is rejected. Run `switch off` first so the original provider stanza is restored through the journal, then run `switch on` with the new choice. `switch status` reports the recorded facade.
+At the same target URL, a repeated `switch on` can replace the client patch: helper first restores the old journal completely, then applies the new patch from the original config/auth. Changing the target URL still requires `switch off` first. `switch status` reports all five effective client-patch fields.
 
-Except for the one-time v0.20.3 legacy-state recovery below, the switch never reads or changes `~/.codex/auth.json`, `models_cache.json`, Codex SQLite, unrelated providers, global feature flags, compaction settings, or WebSocket settings. It never creates the historical empty `{}` auth facade. The current Codex source exposes the hosted-image tool through the provider header contract above, so mutating login state is unnecessary. Actual upstream capabilities still come from the selected provider contract and live observations.
+Only `chatgpt-bridge` and image-generation presets whose hosted-image mode is not disabled produce an auth facade. The ChatGPT facade requires complete existing login material and preserves its tokens; an image-generation facade temporarily writes semantic empty `{}`. Original auth bytes live in a private backup rather than the JSON journal and are restored exactly through CAS on `switch off`. The switch never reads or writes `models_cache.json` or Codex SQLite and does not restore the retired SQL hack. Actual upstream capabilities still come from the selected provider contract and live observations.
 
 ### Upgrading From 0.20.3 Or Earlier
 
-Releases through 0.20.3 used a different switch implementation and stored recovery data in `~/.codex/codex-helper-switch-state.json`. That state can contain the original provider selector and, for the old bridge presets, the original `auth.json` content. The current binary reads it only during an explicit `switch on` or `switch off` for one-time safe recovery; the new journal itself stores no auth content.
+Releases through 0.20.3 used a different switch implementation and stored recovery data in `~/.codex/codex-helper-switch-state.json`. That state can contain the original provider selector and, for the old bridge presets, the original `auth.json` content. The current binary reads it only during an explicit `switch on` or `switch off` for one-time safe recovery; the current journal stores no auth content and only references a private helper backup.
 
 Use this upgrade order if the legacy state file exists:
 
@@ -1149,6 +1152,44 @@ reasoning_effort = "high"
 
 Profiles define request defaults only; provider selection belongs in `[codex.routing]`.
 
+## Codex Client Patch
+
+`[codex.client_patch]` is the version 6 declarative contract for Codex client capabilities. It is Codex-only; `[claude.client_patch]` is rejected.
+
+```toml
+[codex.client_patch]
+preset = "official-imagegen"
+responses_websocket = true
+compaction = "remote-v2"
+translate_models = true
+hosted_image_generation = "auto"
+```
+
+Five presets combine Codex's own provider identity and auth gating:
+
+| preset | Codex provider identity | auth facade | Typical use |
+| --- | --- | --- | --- |
+| `default` | `codex-helper` | Preserve | Ordinary compatible relays through the local helper proxy |
+| `chatgpt-bridge` | `codex-helper` | Preserve complete ChatGPT tokens and normalize the ChatGPT login view | ChatGPT login gating while model traffic still uses helper |
+| `imagegen-bridge` | `codex-helper` | Semantic empty `{}` while hosted image is not disabled | Expose hosted `image_generation` with helper identity |
+| `official-relay` | `OpenAI` | Preserve | Expose official-identity gating such as Web Search and remote compact |
+| `official-imagegen` | `OpenAI` | Semantic empty `{}` while hosted image is not disabled | Official identity plus hosted `image_generation` gating |
+
+The remaining fields are orthogonal, but invalid combinations fail validation:
+
+- `compaction = "auto" | "local" | "remote-v1" | "remote-v2"`. `auto` preserves Codex's current `remote_compaction_v2` feature. `local` explicitly disables remote compaction and uses helper identity. `remote-v1` and `remote-v2` require an official preset and respectively disable or enable the v2 feature.
+- `responses_websocket = true` requires official identity and cannot be combined with `compaction = "local"`. It also updates the Codex provider WebSocket declaration; helper runtime still follows the selected provider's actual capability.
+- `translate_models = true` translates incompatible `/models` results into a Codex-compatible model list at proxy runtime. Failure or translation on this endpoint does not affect inference/compact cooldown, quota policy, or session affinity.
+- `hosted_image_generation = "auto" | "enabled" | "disabled"` preserves, enables, or disables the Codex feature. `disabled` also suppresses an image preset's actor marker/auth facade and filters hosted-image tool requests from the Codex client; helper's OpenAI Images-compatible entrypoint remains independently available.
+
+`codex-helper switch on` without client-patch arguments loads this entire table. `--preset` temporarily replaces the preset and resets compaction/WebSocket to their defaults for that switch, while retaining the configured model-translation and hosted-image modes. Every field can be overridden explicitly with `--compaction ...`, `--responses-websocket[=true|false]`, `--translate-models[=true|false]`, and `--hosted-image-generation auto|enabled|disabled`. `--client-facade compatible|openai|openai-tools` is a compatibility shortcut for the earlier reduced surface and cannot be mixed with full patch arguments. Desktop exposes all five fields; integrated TUI preset shortcuts use preset defaults, while config mode loads this table.
+
+The switch writes a non-secret, strictly versioned `x-codex-helper-client-patch` marker in the helper provider's `http_headers`. It carries only model-translation and hosted-image filtering choices, allowing the client-selected patch to override the server's own config when the runtime is local, remote, or containerized. Missing, duplicate, or malformed markers are ignored in favor of runtime config. Both HTTP and Responses WebSocket paths consume and strip the marker before the upstream handshake; it is never sent to a provider.
+
+A client patch advertises client capability; it does not invent upstream support. Hosted image generation, remote compaction, and Responses WebSocket still require support in the active provider/catalog contract. `codex relay-capabilities` and live smoke are diagnostic and never rewrite this table implicitly.
+
+When a preset requires an auth facade, `switch on` creates its journal before writing either Codex file and stores the exact original `auth.json` bytes in a randomly named private backup under `~/.codex-helper/state/`. The JSON journal contains only path/content fingerprints, original presence, and the backup filename, never tokens. Writes use a capture-verify-no-replace CAS: after a crash at any durable boundary, the next operation restores the capture or finishes publication, while a competing writer is never overwritten. After `switch off` restores the exact bytes, an auth-bearing patch retains its private backup/journal but reports `Off`; another `switch off` repairs a semantically equivalent facade written later by Codex. The next `switch on` transfers that same backup to the new journal. Even when the new patch uses `Preserve` and does not actively rewrite `auth.json`, it retains the old facade's recovery source and leaves no unreferenced secret copy across a `Prepared` crash. Unattributable external edits, a missing/tampered backup, or journal mismatch produce `recovery_required`. Model cache and Codex SQLite are never part of this lifecycle, and no SQL hack is restored.
+
 ## Balance Adapters
 
 Most relay users do not need to write `usage_providers.json` just to see balances. The file is optional and operator-owned: when it is absent, codex-helper uses in-memory built-ins without creating it. An unreadable or invalid file produces an explicit load error and is never replaced or rewritten. If no explicit adapter matches an upstream, codex-helper tries common relay probes:
@@ -1560,7 +1601,7 @@ Downgrade is backup-based, not an in-place edit. Once version 6 is saved, a vers
 
 | 0.20.3 input or behavior | Current behavior | Upgrade action |
 | --- | --- | --- |
-| `[codex.client_patch]` | Startup backs up the file and removes the table; presets, auth facades, compaction, hosted-tool switches, and WebSocket patching are no longer helper config | Preview with `config migrate --dry-run`; use only the explicit URL switch described above |
+| `[codex.client_patch]` | Preserved as canonical version 6 configuration. Legacy `mode` becomes `preset`; underscore/bridge aliases and compaction/hosted-image aliases normalize to canonical values. Conflicts or unknown fields fail closed | Preview with `config migrate --dry-run`; normally no manual migration is needed, then keep only the canonical `preset` spelling |
 | `[codex.compaction]` / `[claude.compaction]` | Startup backs up the file and removes either table; the shared v0.20.3 schema accepted the Claude table even though it had no Claude runtime effect | Preview the cleanup; helper no longer performs remote-v2-to-v1 downgrade |
 | `[ui.usage_forecast]` | Startup backs up the file and removes the table; the old local forecast was removed | Use committed quota pace and reset-window views instead |
 | `codex.profiles.*.station` / `claude.profiles.*.station` | Startup backs up the file and removes every matching profile field | Express provider selection in the service route graph |

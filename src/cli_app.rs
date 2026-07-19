@@ -1,12 +1,12 @@
 use crate::cli_types::{
-    Cli, CliError, CliResult, CodexClientFacadeArg, Command, DaemonCommand, NotifyCommand,
-    RelayCommand, ServiceCommand, SwitchCommand,
+    Cli, CliError, CliResult, Command, DaemonCommand, NotifyCommand, RelayCommand, ServiceCommand,
+    SwitchCommand, reject_legacy_switch_mode,
 };
 use crate::codex_integration;
 use crate::commands;
 use crate::config::{
-    LoadedConfig, RelayTargetConfig, ServiceKind, load_config, load_config_with_source,
-    save_helper_config,
+    CodexClientPatchConfig, CodexClientPatchOverrides, LoadedConfig, RelayTargetConfig,
+    ServiceKind, load_config, load_config_with_source, save_helper_config,
 };
 use crate::control_plane_client::{
     ControlPlaneClient, ControlPlaneEndpoint, configured_local_admin_token_env,
@@ -133,8 +133,31 @@ pub async fn run_cli() -> CliResult<()> {
                 SwitchCommand::On {
                     port,
                     base_url,
+                    preset,
+                    legacy_mode,
+                    responses_websocket,
+                    compaction,
+                    translate_models,
+                    hosted_image_generation,
                     client_facade,
-                } => do_switch_on(port, base_url, client_facade)?,
+                } => {
+                    reject_legacy_switch_mode(legacy_mode)?;
+                    do_switch_on(
+                        port,
+                        base_url,
+                        CodexSwitchClientPatchSelection {
+                            overrides: CodexClientPatchOverrides {
+                                preset: preset.map(Into::into),
+                                responses_websocket,
+                                compaction: compaction.map(Into::into),
+                                translate_models,
+                                hosted_image_generation: hosted_image_generation.map(Into::into),
+                            },
+                            compatibility_facade: client_facade.map(Into::into),
+                        },
+                    )
+                    .await?;
+                }
                 SwitchCommand::Off => do_switch_off()?,
                 SwitchCommand::Status => do_switch_status()?,
             }
@@ -538,6 +561,7 @@ async fn relay_status(target: Option<String>, json: bool) -> CliResult<()> {
                     "managed": status.managed,
                     "phase": status.phase.as_str(),
                     "client_facade": status.client_facade.map(|facade| facade.as_str()),
+                    "client_patch": status.client_patch,
                     "recovery_reason": status.recovery_reason,
                 }
             }))
@@ -1848,10 +1872,16 @@ fn parse_unix_lsof_owners(output: &str) -> Vec<PortOwner> {
     owners
 }
 
-fn do_switch_on(
+#[derive(Debug, Clone, Copy, Default)]
+struct CodexSwitchClientPatchSelection {
+    overrides: CodexClientPatchOverrides,
+    compatibility_facade: Option<codex_switch::CodexClientFacade>,
+}
+
+async fn do_switch_on(
     port: Option<u16>,
     base_url: Option<String>,
-    client_facade: CodexClientFacadeArg,
+    selection: CodexSwitchClientPatchSelection,
 ) -> CliResult<()> {
     let validated_base_url = match base_url {
         Some(base_url) => ValidatedCodexBaseUrl::parse(base_url),
@@ -1860,9 +1890,16 @@ fn do_switch_on(
         }))),
     }
     .map_err(|error| CliError::CodexConfig(error.to_string()))?;
-    let outcome = codex_switch::apply_with_client_facade(
+    let configured = load_config()
+        .await
+        .map_err(|error| CliError::Configuration(error.to_string()))?
+        .codex
+        .client_patch
+        .unwrap_or_default();
+    let client_patch = resolve_codex_switch_client_patch(configured, selection);
+    let outcome = codex_switch::apply_with_client_patch(
         CodexSwitchIntent::On { validated_base_url },
-        client_facade.into(),
+        client_patch,
     )
     .map_err(|error| CliError::CodexConfig(error.to_string()))?;
     println!(
@@ -1876,9 +1913,37 @@ fn do_switch_on(
     if let Some(client_facade) = outcome.status.client_facade {
         println!("  client_facade: {}", client_facade.as_str());
     }
+    if let Some(client_patch) = outcome.status.client_patch.as_ref() {
+        print_codex_client_patch(client_patch);
+    }
     println!("  config: {:?}", outcome.status.config_path);
     println!("  state:  {:?}", outcome.status.state_path);
     Ok(())
+}
+
+fn resolve_codex_switch_client_patch(
+    configured: CodexClientPatchConfig,
+    selection: CodexSwitchClientPatchSelection,
+) -> CodexClientPatchConfig {
+    if let Some(client_facade) = selection.compatibility_facade {
+        return client_facade.client_patch();
+    }
+
+    configured.with_overrides(selection.overrides)
+}
+
+fn print_codex_client_patch(client_patch: &CodexClientPatchConfig) {
+    println!("  preset: {}", client_patch.preset);
+    println!("  compaction: {}", client_patch.compaction);
+    println!(
+        "  responses_websocket: {}",
+        client_patch.responses_websocket
+    );
+    println!("  translate_models: {}", client_patch.translate_models);
+    println!(
+        "  hosted_image_generation: {}",
+        client_patch.hosted_image_generation
+    );
 }
 
 fn do_switch_off() -> CliResult<()> {
@@ -1951,6 +2016,9 @@ fn print_codex_switch_status() -> CliResult<()> {
             .map(|facade| facade.as_str())
             .unwrap_or("<unset>")
     );
+    if let Some(client_patch) = status.client_patch.as_ref() {
+        print_codex_client_patch(client_patch);
+    }
     if let Some(reason) = status.recovery_reason.as_deref() {
         println!("  recovery: {}", reason.yellow());
     }
@@ -1980,6 +2048,105 @@ async fn wait_for_shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod switch_client_patch_tests {
+    use super::{CodexSwitchClientPatchSelection, resolve_codex_switch_client_patch};
+    use codex_helper_core::codex_switch::CodexClientFacade;
+    use codex_helper_core::config::{
+        CodexClientPatchConfig, CodexClientPatchOverrides, CodexClientPreset,
+        CodexCompactionStrategy, CodexHostedImageGenerationMode,
+    };
+
+    fn configured_patch() -> CodexClientPatchConfig {
+        CodexClientPatchConfig {
+            preset: CodexClientPreset::OfficialImagegen,
+            responses_websocket: true,
+            compaction: CodexCompactionStrategy::RemoteV2,
+            translate_models: true,
+            hosted_image_generation: CodexHostedImageGenerationMode::Disabled,
+        }
+    }
+
+    #[test]
+    fn switch_without_overrides_uses_the_complete_configured_patch() {
+        let configured = configured_patch();
+        let resolved = resolve_codex_switch_client_patch(
+            configured,
+            CodexSwitchClientPatchSelection::default(),
+        );
+
+        assert_eq!(resolved, configured);
+    }
+
+    #[test]
+    fn explicit_preset_resets_dependent_defaults_but_preserves_other_config_fields() {
+        let resolved = resolve_codex_switch_client_patch(
+            configured_patch(),
+            CodexSwitchClientPatchSelection {
+                overrides: CodexClientPatchOverrides {
+                    preset: Some(CodexClientPreset::Default),
+                    ..CodexClientPatchOverrides::default()
+                },
+                ..CodexSwitchClientPatchSelection::default()
+            },
+        );
+
+        assert_eq!(resolved.preset, CodexClientPreset::Default);
+        assert!(!resolved.responses_websocket);
+        assert_eq!(resolved.compaction, CodexCompactionStrategy::Auto);
+        assert!(resolved.translate_models);
+        assert_eq!(
+            resolved.hosted_image_generation,
+            CodexHostedImageGenerationMode::Disabled
+        );
+    }
+
+    #[test]
+    fn explicit_transport_and_compaction_override_the_preset_defaults() {
+        let resolved = resolve_codex_switch_client_patch(
+            configured_patch(),
+            CodexSwitchClientPatchSelection {
+                overrides: CodexClientPatchOverrides {
+                    preset: Some(CodexClientPreset::OfficialRelay),
+                    responses_websocket: Some(false),
+                    compaction: Some(CodexCompactionStrategy::RemoteV1),
+                    translate_models: Some(false),
+                    hosted_image_generation: Some(CodexHostedImageGenerationMode::Enabled),
+                },
+                ..CodexSwitchClientPatchSelection::default()
+            },
+        );
+
+        assert_eq!(resolved.preset, CodexClientPreset::OfficialRelay);
+        assert!(!resolved.responses_websocket);
+        assert_eq!(resolved.compaction, CodexCompactionStrategy::RemoteV1);
+        assert!(!resolved.translate_models);
+        assert_eq!(
+            resolved.hosted_image_generation,
+            CodexHostedImageGenerationMode::Enabled
+        );
+    }
+
+    #[test]
+    fn compatibility_facade_replaces_the_full_configured_patch() {
+        let resolved = resolve_codex_switch_client_patch(
+            configured_patch(),
+            CodexSwitchClientPatchSelection {
+                compatibility_facade: Some(CodexClientFacade::OpenAi),
+                ..CodexSwitchClientPatchSelection::default()
+            },
+        );
+
+        assert_eq!(
+            resolved,
+            CodexClientPatchConfig {
+                preset: CodexClientPreset::OfficialRelay,
+                ..CodexClientPatchConfig::default()
+            }
+        );
     }
 }
 

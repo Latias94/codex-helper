@@ -520,7 +520,6 @@ fn collect_retired_relay_target_settings(value: &TomlValue, retired: &mut Vec<St
 }
 
 const RETIRED_V5_REMOVALS: &[(&[&str], &str)] = &[
-    (&["codex", "client_patch"], "codex.client_patch"),
     (&["codex", "compaction"], "codex.compaction"),
     (&["claude", "compaction"], "claude.compaction"),
     (&["ui", "usage_forecast"], "ui.usage_forecast"),
@@ -643,6 +642,84 @@ fn remove_retired_settings(value: &mut TomlValue, notices: &mut Vec<String>) {
             }
         }
     }
+}
+
+fn normalize_codex_client_patch(
+    value: &mut TomlValue,
+    notices: &mut Vec<String>,
+    source_version: Option<u64>,
+) -> Result<()> {
+    let Some(patch) = value
+        .get_mut("codex")
+        .and_then(TomlValue::as_table_mut)
+        .and_then(|codex| codex.get_mut("client_patch"))
+    else {
+        return Ok(());
+    };
+    let Some(table) = patch.as_table_mut() else {
+        anyhow::bail!("codex.client_patch must be a table");
+    };
+    if source_version.unwrap_or_default() < u64::from(CURRENT_CONFIG_VERSION) {
+        let mut normalized_empty_default = false;
+        for field in ["preset", "mode"] {
+            if table
+                .get(field)
+                .and_then(TomlValue::as_str)
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                table.remove(field);
+                normalized_empty_default = true;
+            }
+        }
+        for field in ["compaction", "hosted_image_generation"] {
+            if table
+                .get(field)
+                .and_then(TomlValue::as_str)
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                table.insert(field.to_string(), TomlValue::String("auto".to_string()));
+                normalized_empty_default = true;
+            }
+        }
+        if normalized_empty_default {
+            notices.push(
+                "normalized legacy empty `codex.client_patch` values to their defaults".to_string(),
+            );
+        }
+    }
+    let parsed = patch
+        .clone()
+        .try_into::<CodexClientPatchConfig>()
+        .context("parse codex.client_patch during migration")?;
+    let table = patch
+        .as_table_mut()
+        .expect("client patch table was validated before parsing");
+
+    let had_preset = table.contains_key("preset");
+    let had_mode = table.remove("mode").is_some();
+    if had_preset || had_mode {
+        table.insert(
+            "preset".to_string(),
+            TomlValue::String(parsed.preset.as_str().to_string()),
+        );
+    }
+    if table.contains_key("compaction") {
+        table.insert(
+            "compaction".to_string(),
+            TomlValue::String(parsed.compaction.as_str().to_string()),
+        );
+    }
+    if table.contains_key("hosted_image_generation") {
+        table.insert(
+            "hosted_image_generation".to_string(),
+            TomlValue::String(parsed.hosted_image_generation.as_str().to_string()),
+        );
+    }
+    if had_mode {
+        notices
+            .push("normalized legacy `codex.client_patch.mode` to canonical `preset`".to_string());
+    }
+    Ok(())
 }
 
 fn json_value_to_toml(
@@ -1977,7 +2054,17 @@ fn migration_service_unknown_fields(value: &TomlValue, notices: &mut Vec<String>
         let Some(service) = value.get(service_name).and_then(TomlValue::as_table) else {
             continue;
         };
-        let known = ["default_profile", "profiles", "providers", "routing"];
+        let known = if service_name == "codex" {
+            vec![
+                "client_patch",
+                "default_profile",
+                "profiles",
+                "providers",
+                "routing",
+            ]
+        } else {
+            vec!["default_profile", "profiles", "providers", "routing"]
+        };
         let unknown = service
             .keys()
             .filter(|key| !known.contains(&key.as_str()))
@@ -2107,6 +2194,7 @@ async fn build_config_migration_plan(
     }
 
     migrate_flat_retry_settings(&mut raw, &mut notices)?;
+    normalize_codex_client_patch(&mut raw, &mut notices, source_version)?;
     remove_retired_settings(&mut raw, &mut notices);
     migration_root_unknown_fields(&raw, &mut notices);
     migration_service_unknown_fields(&raw, &mut notices);
@@ -2637,25 +2725,25 @@ impl ExistingConfigToml {
 }
 
 #[derive(Debug, Clone)]
-struct ConfigFileMetadata {
+pub(crate) struct ConfigFileMetadata {
     permissions: std::fs::Permissions,
     platform: PlatformConfigFileMetadata,
 }
 
 impl ConfigFileMetadata {
-    fn capture(path: &Path, metadata: &std::fs::Metadata) -> io::Result<Self> {
+    pub(crate) fn capture(path: &Path, metadata: &std::fs::Metadata) -> io::Result<Self> {
         Ok(Self {
             permissions: metadata.permissions(),
             platform: PlatformConfigFileMetadata::capture(path, metadata)?,
         })
     }
 
-    fn matches(&self, other: &Self) -> bool {
+    pub(crate) fn matches(&self, other: &Self) -> bool {
         config_permissions_match(&self.permissions, &other.permissions)
             && self.platform == other.platform
     }
 
-    fn apply_to_staged_file(&self, path: &Path) -> io::Result<()> {
+    pub(crate) fn apply_to_staged_file(&self, path: &Path) -> io::Result<()> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         self.platform.apply(path, &file)?;
         file.set_permissions(self.permissions.clone())?;

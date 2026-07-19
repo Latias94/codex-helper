@@ -3,6 +3,7 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
 mod canonical_schema;
+mod client_patch_contract;
 mod current_v5_contract;
 mod current_v6_contract;
 mod io_bootstrap;

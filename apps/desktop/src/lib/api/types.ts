@@ -22,12 +22,34 @@ export type RuntimeDataSeverity = "neutral" | "info" | "success" | "warning" | "
 
 export type DesktopRuntimeConnectionMode = "desktop-owned" | "attached" | "stopped" | "unknown";
 export type CodexSwitchPhase = "off" | "prepared" | "applied" | "recovery_required";
+export type CodexClientPreset =
+  | "default"
+  | "chatgpt-bridge"
+  | "imagegen-bridge"
+  | "official-relay"
+  | "official-imagegen";
+export type CodexCompactionStrategy = "auto" | "local" | "remote-v1" | "remote-v2";
+export type CodexHostedImageGenerationMode = "auto" | "enabled" | "disabled";
+
+export type CodexClientPatchSnapshot = {
+  preset: CodexClientPreset;
+  responsesWebsocket: boolean;
+  compaction: CodexCompactionStrategy;
+  translateModels: boolean;
+  hostedImageGeneration: CodexHostedImageGenerationMode;
+};
+
+export type SwitchCodexPayload = {
+  enabled: boolean;
+  confirmation: string;
+} & Partial<CodexClientPatchSnapshot>;
 
 export type CodexSwitchSnapshot = {
   phase?: CodexSwitchPhase | null;
   enabled: boolean;
   managed: boolean;
   baseUrl?: string | null;
+  clientPatch?: CodexClientPatchSnapshot | null;
   recoveryReason?: string | null;
   errorMessage?: string | null;
 };

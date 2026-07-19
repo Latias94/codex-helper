@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { invoke } from "@tauri-apps/api/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -32,6 +32,7 @@ const mockedInvoke = vi.mocked(invoke);
 
 beforeEach(() => {
   queryClient.clear();
+  mockedInvoke.mockClear();
   mockedInvoke.mockRejectedValue(new Error("tauri runtime unavailable in unit tests"));
 });
 
@@ -353,6 +354,13 @@ describe("desktop app routes", () => {
         enabled: false,
         managed: true,
         baseUrl: "http://127.0.0.1:3211/v1",
+        clientPatch: {
+          preset: "official-imagegen",
+          responsesWebsocket: true,
+          compaction: "remote-v2",
+          translateModels: true,
+          hostedImageGeneration: "disabled",
+        },
         recoveryReason: "Codex config changed after switch on",
         errorMessage: null,
       },
@@ -382,9 +390,11 @@ describe("desktop app routes", () => {
 
     expect(await screen.findByText("需要人工恢复")).toBeInTheDocument();
     expect(screen.getByText("Codex config changed after switch on")).toBeInTheDocument();
-    expect(screen.queryByText("当前预设")).not.toBeInTheDocument();
-    expect(screen.queryByText("chatgpt-bridge")).not.toBeInTheDocument();
+    expect(screen.getByText("Client preset")).toBeInTheDocument();
+    expect(screen.getAllByText("remote-v2")).toHaveLength(2);
+    expect(screen.getByText("hosted disabled")).toBeInTheDocument();
     expect(screen.getByRole("switch", { name: "Codex 本地中转" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "应用 client patch" })).toBeDisabled();
   });
 
   it("sends only the canonical local Codex switch payload", async () => {
@@ -446,11 +456,85 @@ describe("desktop app routes", () => {
 
     render(<App />);
 
-    await userEvent.click(screen.getByRole("switch", { name: "Codex 本地中转" }));
+    const codexSwitch = await screen.findByRole("switch", { name: "Codex 本地中转" });
+    await waitFor(() => expect(codexSwitch).toBeEnabled());
+    expect(screen.getByRole("combobox", { name: "Client preset" })).toHaveValue("config");
+    await userEvent.click(codexSwitch);
 
     expect(mockedInvoke).toHaveBeenCalledWith("switch_codex", {
       payload: {
         enabled: true,
+        confirmation: "SWITCH CODEX",
+      },
+    });
+  });
+
+  it("applies an explicit Codex client preset from Settings", async () => {
+    window.location.hash = "#/settings";
+    const offState = {
+      ...liveControlState(),
+      codexSwitch: {
+        phase: "off",
+        enabled: false,
+        managed: false,
+        baseUrl: null,
+        clientPatch: null,
+        recoveryReason: null,
+        errorMessage: null,
+      },
+    };
+    mockedInvoke.mockImplementation(async (command, args) => {
+      if (command === "get_app_metadata") {
+        return { name: "codex-helper", version: "0.20.0", tauri: "2" };
+      }
+      if (command === "get_admin_read_model") {
+        return liveReadModel();
+      }
+      if (command === "get_desktop_control_state") {
+        return offState;
+      }
+      if (command === "get_known_paths") {
+        return {
+          home: "C:/Users/dev",
+          config: "C:/Users/dev/.codex-helper/config.toml",
+          logs: "C:/Users/dev/.codex-helper/logs",
+          cache: "C:/Users/dev/.codex-helper/cache",
+        };
+      }
+      if (command === "switch_codex") {
+        return {
+          ok: true,
+          action: "switch-codex-on",
+          message: "Codex local switch applied.",
+          state: offState,
+        };
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    render(<App />);
+
+    const preset = await screen.findByRole("combobox", { name: "Client preset" });
+    await waitFor(() => expect(preset).toBeEnabled());
+    await userEvent.selectOptions(preset, "official-imagegen");
+    expect(preset).toHaveValue("official-imagegen");
+    await userEvent.selectOptions(screen.getByRole("combobox", { name: "Compaction" }), "remote-v2");
+    await userEvent.click(screen.getByRole("switch", { name: "Responses WebSocket" }));
+    await userEvent.click(screen.getByRole("switch", { name: "Translate /models" }));
+    await userEvent.selectOptions(
+      screen.getByRole("combobox", { name: "Hosted image generation" }),
+      "disabled",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "应用 client patch" }));
+
+    expect(mockedInvoke).toHaveBeenCalledWith("switch_codex", {
+      payload: {
+        enabled: true,
+        preset: "official-imagegen",
+        responsesWebsocket: true,
+        compaction: "remote-v2",
+        translateModels: true,
+        hostedImageGeneration: "disabled",
         confirmation: "SWITCH CODEX",
       },
     });
@@ -893,6 +977,13 @@ function liveControlState() {
       enabled: true,
       managed: true,
       baseUrl: "http://127.0.0.1:3211/v1",
+      clientPatch: {
+        preset: "official-imagegen",
+        responsesWebsocket: false,
+        compaction: "auto",
+        translateModels: false,
+        hostedImageGeneration: "auto",
+      },
       recoveryReason: null,
       errorMessage: null,
     },

@@ -9,7 +9,7 @@ use crate::config::UpstreamConfig;
 use crate::credentials::{CapturedUpstreamCredential, CredentialReadinessCode};
 
 use super::classify::{ROUTING_MISMATCH_CAPABILITY_CLASS, classify_upstream_response};
-use super::models_compat::maybe_decode_models_response_body;
+use super::models_compat::{ModelsTranslationScope, maybe_decode_models_response_body};
 
 const MAX_PROBE_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const UPSTREAM_AUTH_UNAVAILABLE_REASON: &str = "configured upstream credentials are unavailable";
@@ -224,7 +224,13 @@ pub fn classify_codex_relay_probe_response(
     body: &[u8],
 ) -> CodexRelayProbeResult {
     let body = if spec.kind == CodexRelayProbeKind::Models && status.is_success() {
-        maybe_decode_models_response_body("codex", "/models", headers, Bytes::copy_from_slice(body))
+        maybe_decode_models_response_body(
+            "codex",
+            "/models",
+            headers,
+            Bytes::copy_from_slice(body),
+            ModelsTranslationScope::Disabled,
+        )
     } else {
         Bytes::copy_from_slice(body)
     };

@@ -241,6 +241,7 @@ fn current_v5_tag_preferred_stop_excludes_non_matching_fallbacks() {
     let source = HelperConfig {
         version: CURRENT_CONFIG_VERSION,
         codex: ServiceRouteConfig {
+            client_patch: None,
             default_profile: None,
             profiles: BTreeMap::new(),
             providers: BTreeMap::from([
@@ -301,6 +302,7 @@ fn current_v5_nested_route_graph_expands_monthly_pool_before_paygo() {
     let source = HelperConfig {
         version: CURRENT_CONFIG_VERSION,
         codex: ServiceRouteConfig {
+            client_patch: None,
             default_profile: None,
             profiles: BTreeMap::new(),
             providers: BTreeMap::from([
@@ -406,6 +408,7 @@ fn current_v5_compiled_route_graph_preserves_endpoint_order_and_model_mapping() 
     let source = HelperConfig {
         version: CURRENT_CONFIG_VERSION,
         codex: ServiceRouteConfig {
+            client_patch: None,
             default_profile: Some("daily".to_string()),
             profiles: BTreeMap::from([(
                 "daily".to_string(),

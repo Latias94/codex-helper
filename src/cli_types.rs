@@ -457,14 +457,135 @@ pub(crate) enum SwitchCommand {
         /// Explicit helper proxy base URL
         #[arg(long, conflicts_with = "port")]
         base_url: Option<String>,
-        /// Codex capability facade written into the helper-owned provider stanza
-        #[arg(long, value_enum, default_value_t = CodexClientFacadeArg::Compatible)]
-        client_facade: CodexClientFacadeArg,
+        /// Codex client preset; if omitted, use [codex.client_patch] from helper config
+        #[arg(long, value_enum, conflicts_with = "client_facade")]
+        preset: Option<CodexClientPresetArg>,
+        /// Removed legacy spelling; use --preset instead
+        #[arg(long = "mode", hide = true, conflicts_with = "client_facade")]
+        legacy_mode: Option<String>,
+        /// Override Responses WebSocket transport (`--responses-websocket` means true)
+        #[arg(
+            long,
+            action = clap::ArgAction::Set,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            require_equals = true,
+            conflicts_with = "client_facade"
+        )]
+        responses_websocket: Option<bool>,
+        /// Override the Codex client compaction strategy
+        #[arg(long, value_enum, conflicts_with = "client_facade")]
+        compaction: Option<CodexCompactionStrategyArg>,
+        /// Override OpenAI `/models` translation (`--translate-models` means true)
+        #[arg(
+            long,
+            action = clap::ArgAction::Set,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            require_equals = true,
+            conflicts_with = "client_facade"
+        )]
+        translate_models: Option<bool>,
+        /// Override hosted image generation handling
+        #[arg(long, value_enum, conflicts_with = "client_facade")]
+        hosted_image_generation: Option<CodexHostedImageGenerationArg>,
+        /// Compatibility shortcut for the reduced client facade surface
+        #[arg(
+            long,
+            value_enum,
+            conflicts_with_all = [
+                "preset",
+                "legacy_mode",
+                "responses_websocket",
+                "compaction",
+                "translate_models",
+                "hosted_image_generation"
+            ]
+        )]
+        client_facade: Option<CodexClientFacadeArg>,
     },
     /// Restore the selector and helper stanza recorded by the explicit switch operation
     Off,
     /// Show the helper-owned Codex switch status
     Status,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+#[value(rename_all = "kebab-case")]
+pub(crate) enum CodexClientPresetArg {
+    Default,
+    ChatgptBridge,
+    ImagegenBridge,
+    OfficialRelay,
+    OfficialImagegen,
+}
+
+impl From<CodexClientPresetArg> for codex_helper_core::config::CodexClientPreset {
+    fn from(value: CodexClientPresetArg) -> Self {
+        match value {
+            CodexClientPresetArg::Default => Self::Default,
+            CodexClientPresetArg::ChatgptBridge => Self::ChatGptBridge,
+            CodexClientPresetArg::ImagegenBridge => Self::ImagegenBridge,
+            CodexClientPresetArg::OfficialRelay => Self::OfficialRelay,
+            CodexClientPresetArg::OfficialImagegen => Self::OfficialImagegen,
+        }
+    }
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+#[value(rename_all = "kebab-case")]
+pub(crate) enum CodexCompactionStrategyArg {
+    Auto,
+    Local,
+    RemoteV1,
+    RemoteV2,
+}
+
+impl From<CodexCompactionStrategyArg> for codex_helper_core::config::CodexCompactionStrategy {
+    fn from(value: CodexCompactionStrategyArg) -> Self {
+        match value {
+            CodexCompactionStrategyArg::Auto => Self::Auto,
+            CodexCompactionStrategyArg::Local => Self::Local,
+            CodexCompactionStrategyArg::RemoteV1 => Self::RemoteV1,
+            CodexCompactionStrategyArg::RemoteV2 => Self::RemoteV2,
+        }
+    }
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+#[value(rename_all = "kebab-case")]
+pub(crate) enum CodexHostedImageGenerationArg {
+    Auto,
+    Enabled,
+    Disabled,
+}
+
+impl From<CodexHostedImageGenerationArg>
+    for codex_helper_core::config::CodexHostedImageGenerationMode
+{
+    fn from(value: CodexHostedImageGenerationArg) -> Self {
+        match value {
+            CodexHostedImageGenerationArg::Auto => Self::Auto,
+            CodexHostedImageGenerationArg::Enabled => Self::Enabled,
+            CodexHostedImageGenerationArg::Disabled => Self::Disabled,
+        }
+    }
+}
+
+pub(crate) fn reject_legacy_switch_mode(value: Option<String>) -> CliResult<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let trimmed = value.trim();
+    let replacement = match trimmed {
+        "official-relay-bridge" | "official_relay_bridge" => "official-relay",
+        "official-imagegen-bridge" | "official_imagegen_bridge" => "official-imagegen",
+        "" => "<preset>",
+        other => other,
+    };
+    Err(CliError::Other(format!(
+        "`--mode {trimmed}` has been removed; use `--preset {replacement}` instead"
+    )))
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1328,7 +1449,13 @@ mod tests {
                 SwitchCommand::On {
                     port: None,
                     base_url: Some(base_url),
-                    client_facade: CodexClientFacadeArg::Compatible,
+                    preset: None,
+                    legacy_mode: None,
+                    responses_websocket: None,
+                    compaction: None,
+                    translate_models: None,
+                    hosted_image_generation: None,
+                    client_facade: None,
                 },
         }) = cli.command
         else {
@@ -1353,17 +1480,151 @@ mod tests {
             else {
                 panic!("expected switch-on client facade");
             };
-            assert_eq!(client_facade, expected);
+            assert_eq!(client_facade, Some(expected));
+        }
+    }
+
+    #[test]
+    fn switch_on_accepts_full_client_patch_overrides() {
+        let cli = Cli::try_parse_from([
+            "codex-helper",
+            "switch",
+            "on",
+            "--preset",
+            "official-imagegen",
+            "--responses-websocket",
+            "--compaction",
+            "remote-v2",
+            "--translate-models=false",
+            "--hosted-image-generation",
+            "disabled",
+        ])
+        .expect("parse full client patch overrides");
+        let Some(Command::Switch {
+            cmd:
+                SwitchCommand::On {
+                    preset,
+                    responses_websocket,
+                    compaction,
+                    translate_models,
+                    hosted_image_generation,
+                    client_facade,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected switch-on client patch overrides");
+        };
+
+        assert_eq!(preset, Some(CodexClientPresetArg::OfficialImagegen));
+        assert_eq!(responses_websocket, Some(true));
+        assert_eq!(compaction, Some(CodexCompactionStrategyArg::RemoteV2));
+        assert_eq!(translate_models, Some(false));
+        assert_eq!(
+            hosted_image_generation,
+            Some(CodexHostedImageGenerationArg::Disabled)
+        );
+        assert_eq!(client_facade, None);
+    }
+
+    #[test]
+    fn switch_on_accepts_explicit_false_boolean_overrides() {
+        let cli = Cli::try_parse_from([
+            "codex-helper",
+            "switch",
+            "on",
+            "--responses-websocket=false",
+            "--translate-models=false",
+        ])
+        .expect("parse explicit false client patch overrides");
+        let Some(Command::Switch {
+            cmd:
+                SwitchCommand::On {
+                    responses_websocket,
+                    translate_models,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected switch-on boolean overrides");
+        };
+
+        assert_eq!(responses_websocket, Some(false));
+        assert_eq!(translate_models, Some(false));
+    }
+
+    #[test]
+    fn switch_legacy_mode_returns_a_canonical_preset_hint() {
+        let cli = Cli::try_parse_from([
+            "codex-helper",
+            "switch",
+            "on",
+            "--mode",
+            "official-imagegen-bridge",
+        ])
+        .expect("legacy mode is parsed so the CLI can return a migration hint");
+        let Some(Command::Switch {
+            cmd: SwitchCommand::On { legacy_mode, .. },
+        }) = cli.command
+        else {
+            panic!("expected legacy switch mode");
+        };
+
+        let error = reject_legacy_switch_mode(legacy_mode).expect_err("legacy mode must fail");
+        assert!(error.to_string().contains("--preset official-imagegen"));
+    }
+
+    #[test]
+    fn switch_on_rejects_client_facade_with_client_patch_overrides() {
+        for args in [
+            vec![
+                "codex-helper",
+                "switch",
+                "on",
+                "--client-facade",
+                "openai",
+                "--preset",
+                "official-relay",
+            ],
+            vec![
+                "codex-helper",
+                "switch",
+                "on",
+                "--client-facade",
+                "openai",
+                "--responses-websocket",
+            ],
+            vec![
+                "codex-helper",
+                "switch",
+                "on",
+                "--client-facade",
+                "openai",
+                "--compaction",
+                "local",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
         }
     }
 
     #[test]
     fn switch_rejects_removed_mutation_surfaces() {
         for args in [
-            vec!["codex-helper", "switch", "on", "--preset", "default"],
-            vec!["codex-helper", "switch", "on", "--mode", "official-relay"],
-            vec!["codex-helper", "switch", "on", "--compaction", "local"],
-            vec!["codex-helper", "switch", "on", "--responses-websocket"],
+            vec![
+                "codex-helper",
+                "switch",
+                "on",
+                "--preset",
+                "official-relay-bridge",
+            ],
+            vec![
+                "codex-helper",
+                "switch",
+                "on",
+                "--preset",
+                "official-imagegen-bridge",
+            ],
             vec!["codex-helper", "switch", "on", "--claude"],
             vec!["codex-helper", "switch", "on", "--codex"],
             vec!["codex-helper", "switch", "off", "--claude"],

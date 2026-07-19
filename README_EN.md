@@ -18,7 +18,7 @@ Use codex-helper if:
 
 - you use multiple Codex/OpenAI-compatible relays and do not want to keep editing `~/.codex/config.toml`;
 - you want monthly relays first, then pay-as-you-go or official providers as fallback;
-- you need an explicit, recoverable local proxy switch that never touches Codex auth, cache, or SQLite;
+- you need an explicit, recoverable local proxy switch, including journaled recovery for Codex features that require an `auth.json` facade instead of a manual hack;
 - your sub2api-style or other relay works for ordinary chat but is shaky around `/models`, `/responses/compact`, hosted `image_generation`, or provider-specific model names;
 - you want TUI or desktop visibility into provider choice, balance/plan, tokens, cache tokens, latency, retries, and estimated cost;
 - you run a local proxy for long periods and need bounded runtime state plus rotated logs;
@@ -29,7 +29,7 @@ It is probably unnecessary if you only use one official account and do not need 
 ## Main Features
 
 - **Local proxy**: listens on `127.0.0.1:3211` by default.
-- **Explicit safe switch**: only a local `switch on/off` action edits the helper provider selector/stanza in `~/.codex/config.toml`; `--client-facade compatible|openai|openai-tools` explicitly advertises client capabilities, conflicting external edits produce `recovery_required`, and Codex auth, model cache, and SQLite remain outside helper ownership.
+- **Complete Codex client patch**: `[codex.client_patch]` and `switch on --preset ...` can declare provider identity, remote compaction, Responses WebSocket, `/models` translation, and hosted image generation. Presets that need an auth facade preserve the exact original `auth.json` in protected helper state and restore it through CAS/journaling; conflicting external edits produce `recovery_required`. Model cache and SQLite remain outside helper ownership.
 - **Provider-owned capability contract**: Responses, compact, WebSocket, hosted-tool, and model decisions come from captured provider/catalog facts rather than client patch assumptions.
 - **OpenAI Images-compatible entrypoint**: the local proxy also exposes `POST /v1/images/generations` and JSON `POST /v1/images/edits`, translates them into Responses hosted `image_generation` requests, and keeps using the same provider routing / fallback chain for local skills and scripts.
 - **Relay capability diagnostics**: explicit, process-local CLI actions perform bounded `/models`, `/responses`, and `/responses/compact` checks and show provider contract, observations, continuity, and mismatches without changing configuration or routing.
@@ -124,6 +124,8 @@ Switch the Codex client to helper explicitly:
 codex-helper switch on
 codex-helper switch on --port 4321
 codex-helper switch on --base-url https://relay.example/v1
+codex-helper switch on --preset imagegen-bridge
+codex-helper switch on --preset official-imagegen --compaction remote-v2 --responses-websocket
 codex-helper switch on --client-facade openai-tools
 codex-helper switch status
 codex-helper switch off
@@ -149,7 +151,11 @@ Plain `ch` still starts the local foreground helper. `ch relay local` is the exp
 
 Container and server runtimes do not provide access to a client's local transcript/session files. Local `session` commands read only the Codex session files on the machine where the command runs.
 
-The client switch points Codex at one helper URL and can explicitly select `compatible` (default), `openai` (remote-compaction and Web Search eligibility), or `openai-tools` (plus hosted image-generation eligibility) through `--client-facade`. A facade controls client exposure; it does not guarantee relay support. `switch on` records the original selector and helper stanza, then writes `model_providers.codex_proxy`; `switch off` restores only the recorded content. Conflicting external edits move the state to `recovery_required` and leave the file untouched. Run `switch off` before changing the URL or facade. Except for the one-time legacy recovery described below, Codex `auth.json`, `models_cache.json`, SQLite, global feature flags, compaction, and WebSocket settings are never read or changed. The historical empty `{}` auth facade is not recreated. The helper capability marker never reaches an upstream, while real actor authorization can pass only to an official OpenAI origin without configured helper credentials.
+The client switch points Codex at one helper URL and applies the complete `[codex.client_patch]`. `--preset default|chatgpt-bridge|imagegen-bridge|official-relay|official-imagegen` temporarily overrides the preset; `--compaction`, `--responses-websocket[=false]`, `--translate-models[=false]`, and `--hosted-image-generation` override the other fields. Without overrides, all five fields come from `~/.codex-helper/config.toml`. `--client-facade compatible|openai|openai-tools` remains a compatibility shortcut for the earlier reduced surface. A client patch controls which capabilities Codex exposes and sends; it cannot make a relay implement those protocols, so runtime decisions still use the provider/catalog contract.
+
+`switch on` records the original Codex selector, helper stanza, relevant feature flags, and an auth facade when required. `chatgpt-bridge` accepts only a complete, verifiable existing ChatGPT login and preserves its tokens. Image-generation presets may temporarily present a semantic empty `{}` auth facade to satisfy Codex hosted-tool gating. Original auth bytes never enter the JSON journal: they live in a private helper-state backup, while the journal stores only its random filename and fingerprints. `switch off` restores exact bytes through no-replace CAS. After an auth-bearing patch is off, status remains `Off` while the private backup/journal is retained, so another `switch off` can repair a semantically equivalent facade that Codex writes later; the next `switch on` safely adopts that recovery point. Unattributable external edits, a missing backup, or a fingerprint mismatch produce `recovery_required` without replacing a competing file. The helper capability marker never reaches an upstream, while real actor authorization can pass only to an official OpenAI origin without configured helper credentials.
+
+Client patching never reads or changes `models_cache.json` or Codex SQLite and does not restore the retired `remote-control` SQL hack. It manages only the recorded `config.toml` sections and optional `auth.json` facade during an explicit `switch on/off` lifecycle.
 
 When upgrading from 0.20.3 or earlier, a current `switch off` safely and automatically restores the selector/provider stanza and any verifiable auth facade managed by a remaining `~/.codex/codex-helper-switch-state.json`; `switch on` performs the same recovery before creating its new journal. Recovery writes only while the current files still match the old helper patch. Malformed or unknown state and legacy/current journal conflicts preserve the original state and fail closed. The legacy file may contain original auth content, so do not delete, edit, or share it. The new release does not undo `remote_connections` or Codex SQLite state written by the removed `switch remote-control enable`, and that database must not be cleaned with an SQL hack. See [Configuration Compatibility](docs/CONFIGURATION.md#configuration-compatibility) for the full sequence, v5-to-v6 migration, and retired fields.
 
@@ -213,7 +219,7 @@ To send model traffic through a relay, point the client at helper and let helper
 2. Configure `codex.providers.*` and `codex.routing` in `~/.codex-helper/config.toml`.
 3. Add provider-scoped `model_mapping` if the relay expects prefixed model names.
 
-This path neither changes nor proxies Codex login state; account files remain owned by Codex.
+This path does not proxy Codex login. Only a client patch that requires an auth facade temporarily changes the `auth.json` client view during the explicit switch lifecycle and restores the original bytes on switch-off; Codex remains responsible for creating and maintaining the login credentials.
 
 The Codex-side local proxy entry is normally written by `switch on`; avoid hand-editing it over unrelated Codex settings:
 
@@ -403,12 +409,12 @@ The new Tauri desktop client lives under `apps/desktop` and uses React 19, Tailw
 - Post-commit debug log: `~/.codex-helper/logs/requests.jsonl`
 - Codex relay diagnostic evidence: `~/.codex-helper/logs/codex_relay_evidence.jsonl`
 
-Codex-owned files remain owned by Codex:
+Codex files remain authoritative to Codex:
 
 - `~/.codex/auth.json`
 - `~/.codex/config.toml`
 
-Only an explicit local `switch on/off` action touches the helper provider selector/stanza in `~/.codex/config.toml`; Codex auth, model cache, and SQLite remain untouched.
+An explicit local `switch on/off` action manages the recorded client-patch sections in `~/.codex/config.toml` and may temporarily manage an `auth.json` facade when required. Private backup plus CAS restores the original auth exactly. Codex model cache and SQLite remain untouched.
 
 ## Design Boundaries
 

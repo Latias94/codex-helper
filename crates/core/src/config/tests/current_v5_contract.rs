@@ -229,6 +229,19 @@ fn v0_20_3_supported_version_5_fixture_migrates_with_exact_backup() {
     assert_eq!(config.version, CURRENT_CONFIG_VERSION);
     assert_eq!(config.default_service, Some(ServiceKind::Codex));
     assert_eq!(config.codex.default_profile.as_deref(), Some("daily"));
+    let client_patch = config
+        .codex
+        .client_patch
+        .as_ref()
+        .expect("migrated Codex client patch");
+    assert_eq!(client_patch.preset, CodexClientPreset::OfficialImagegen);
+    assert!(client_patch.responses_websocket);
+    assert_eq!(client_patch.compaction, CodexCompactionStrategy::RemoteV2);
+    assert!(client_patch.translate_models);
+    assert_eq!(
+        client_patch.hosted_image_generation,
+        CodexHostedImageGenerationMode::Disabled
+    );
     assert_eq!(
         config.codex.profiles["base"].reasoning_effort.as_deref(),
         Some("medium")
@@ -444,6 +457,9 @@ fn v0_20_3_supported_version_5_fixture_migrates_with_exact_backup() {
     );
     let migrated = std::fs::read_to_string(&path).expect("read migrated fixture");
     assert!(migrated.contains("version = 6"));
+    assert!(migrated.contains("[codex.client_patch]"));
+    assert!(migrated.contains("preset = \"official-imagegen\""));
+    assert!(!migrated.contains("mode ="));
     assert_eq!(
         std::fs::read(path.with_file_name("config.toml.bak")).expect("read exact v0.20.3 backup"),
         original
@@ -583,11 +599,6 @@ fn retired_version_5_inputs_are_auto_migrated_before_typed_load() {
     let runtime = test_runtime();
     let cases = [
         (
-            "codex.client_patch",
-            "client_patch",
-            "version = 5\n[codex.client_patch]\npreset = \"default\"\n",
-        ),
-        (
             "ui.usage_forecast",
             "usage_forecast",
             "version = 5\n[ui.usage_forecast]\nenabled = true\n",
@@ -710,7 +721,7 @@ fn explicit_invalid_toml_versions_are_rejected_without_shape_inference() {
 }
 
 #[test]
-fn retired_v5_cleanup_preserves_other_fields_and_permissions() {
+fn v5_migration_preserves_client_patch_other_fields_and_permissions() {
     let _env = setup_temp_codex_home();
     let path = current_config_path();
     let text = r#"version = 5
@@ -735,11 +746,15 @@ enabled = true
 
     let config = test_runtime()
         .block_on(load_config())
-        .expect("clean retired setting while retaining other fields");
+        .expect("migrate while retaining client patch and other fields");
     assert!(config.notify.enabled);
+    assert_eq!(
+        config.codex.client_patch.as_ref().map(|patch| patch.preset),
+        Some(CodexClientPreset::Default)
+    );
     let migrated = std::fs::read_to_string(&path).expect("read migrated config");
     assert!(migrated.contains("operator_extension = \"keep-me\""));
-    assert!(!migrated.contains("client_patch"));
+    assert!(migrated.contains("[codex.client_patch]"));
     assert_eq!(
         std::fs::read_to_string(path.with_file_name("config.toml.bak"))
             .expect("read original-byte backup"),
@@ -876,12 +891,8 @@ client_preset = "default"
         .block_on(load_config())
         .expect("all retired settings should be cleaned in one migration");
     let migrated = std::fs::read_to_string(&path).expect("read cleaned config");
-    for marker in [
-        "client_patch",
-        "client_preset",
-        "responses_websocket",
-        "usage_forecast",
-    ] {
+    assert!(migrated.contains("[codex.client_patch]"));
+    for marker in ["client_preset", "responses_websocket", "usage_forecast"] {
         assert!(!migrated.contains(marker), "cleanup retained {marker}");
     }
     assert_eq!(

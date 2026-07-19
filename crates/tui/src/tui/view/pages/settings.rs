@@ -68,6 +68,34 @@ fn codex_switch_status_lines(
             Style::default().fg(p.text),
         ),
     ]));
+    if let Some(client_patch) = status.client_patch.as_ref() {
+        lines.push(Line::from(vec![
+            Span::styled("  preset: ", Style::default().fg(p.muted)),
+            Span::styled(client_patch.preset.to_string(), Style::default().fg(p.text)),
+            Span::styled("  compaction: ", Style::default().fg(p.muted)),
+            Span::styled(
+                client_patch.compaction.to_string(),
+                Style::default().fg(p.text),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("  websocket: ", Style::default().fg(p.muted)),
+            Span::styled(
+                yes_no(client_patch.responses_websocket),
+                Style::default().fg(p.text),
+            ),
+            Span::styled("  translate_models: ", Style::default().fg(p.muted)),
+            Span::styled(
+                yes_no(client_patch.translate_models),
+                Style::default().fg(p.text),
+            ),
+            Span::styled("  hosted_image: ", Style::default().fg(p.muted)),
+            Span::styled(
+                client_patch.hosted_image_generation.to_string(),
+                Style::default().fg(p.text),
+            ),
+        ]));
+    }
     if let Some(reason) = status.recovery_reason.as_deref() {
         lines.push(Line::from(vec![
             Span::styled("  recovery: ", Style::default().fg(p.warn)),
@@ -286,9 +314,9 @@ pub(super) fn render_settings_page(
         }
         lines.push(Line::from(Span::styled(
             match ui.language {
-                Language::Zh => "  n/o 显式开启/关闭本地 switch；已有 Codex app 需重启后生效。",
+                Language::Zh => "  n/o 按配置开启/关闭；B/I/F/V/D 切换 ChatGPT/Imagegen/Official/Official Imagegen/Default preset。",
                 Language::En => {
-                    "  n/o explicitly switch the local Codex target on/off; restart existing Codex apps to apply it."
+                    "  n/o apply configured patch/off; B/I/F/V/D select ChatGPT/Imagegen/Official/Official Imagegen/Default presets."
                 }
             },
             Style::default().fg(p.muted),
@@ -314,7 +342,9 @@ pub(super) fn render_settings_page(
 
 #[cfg(test)]
 mod tests {
-    use super::{read_status_label, render_settings_page, retry_profile_name};
+    use super::{
+        codex_switch_status_lines, read_status_label, render_settings_page, retry_profile_name,
+    };
     use crate::config::RetryProfileName;
     use crate::dashboard_core::OperatorReadStatus;
     use crate::tui::Language;
@@ -386,5 +416,38 @@ mod tests {
             retry_profile_name(Some(RetryProfileName::AggressiveFailover)),
             "aggressive-failover"
         );
+    }
+
+    #[test]
+    fn codex_switch_status_shows_the_complete_client_patch() {
+        let status = codex_helper_core::codex_switch::CodexSwitchStatus {
+            phase: codex_helper_core::codex_switch::CodexSwitchPhase::Applied,
+            enabled: true,
+            managed: true,
+            base_url: Some("http://127.0.0.1:3211/v1".to_string()),
+            client_facade: Some(codex_helper_core::codex_switch::CodexClientFacade::OpenAiTools),
+            client_patch: Some(crate::config::CodexClientPatchConfig {
+                preset: crate::config::CodexClientPreset::OfficialImagegen,
+                responses_websocket: true,
+                compaction: crate::config::CodexCompactionStrategy::RemoteV2,
+                translate_models: true,
+                hosted_image_generation: crate::config::CodexHostedImageGenerationMode::Disabled,
+            }),
+            recovery_reason: None,
+            config_path: "/tmp/codex/config.toml".into(),
+            state_path: "/tmp/helper/codex-switch.json".into(),
+        };
+
+        let text = codex_switch_status_lines(Palette::default(), Language::En, &status)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("preset: official-imagegen"), "{text}");
+        assert!(text.contains("compaction: remote-v2"), "{text}");
+        assert!(text.contains("websocket: yes"), "{text}");
+        assert!(text.contains("translate_models: yes"), "{text}");
+        assert!(text.contains("hosted_image: disabled"), "{text}");
     }
 }
