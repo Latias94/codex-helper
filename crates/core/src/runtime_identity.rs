@@ -4,8 +4,6 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::config::UpstreamAuth;
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ProviderEndpointKey {
     pub service_name: String,
@@ -129,11 +127,11 @@ impl RuntimeUpstreamIdentity {
         }
     }
 
-    pub fn new_with_auth(
+    pub(crate) fn new_with_credential_scope(
         provider_endpoint: ProviderEndpointKey,
         base_url: impl Into<String>,
         continuity_domain: Option<String>,
-        auth: &UpstreamAuth,
+        credential_scope: Option<String>,
     ) -> Self {
         Self {
             provider_endpoint,
@@ -141,7 +139,7 @@ impl RuntimeUpstreamIdentity {
             continuity_domain: continuity_domain
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
-            credential_scope: runtime_credential_scope(auth),
+            credential_scope,
         }
     }
 
@@ -171,57 +169,6 @@ impl RuntimeUpstreamIdentity {
         }
         format!("sha256:{:x}", digest.finalize())
     }
-}
-
-fn runtime_credential_scope(auth: &UpstreamAuth) -> Option<String> {
-    let mut digest = Sha256::new();
-    digest.update(b"codex-helper:runtime-upstream-credentials:v1\0");
-    let mut present = false;
-    present |= hash_effective_credential(
-        &mut digest,
-        b"bearer",
-        auth.auth_token.as_deref(),
-        auth.auth_token_env.as_deref(),
-    );
-    present |= hash_effective_credential(
-        &mut digest,
-        b"api-key",
-        auth.api_key.as_deref(),
-        auth.api_key_env.as_deref(),
-    );
-    present.then(|| format!("sha256:{:x}", digest.finalize()))
-}
-
-fn hash_effective_credential(
-    digest: &mut Sha256,
-    kind: &[u8],
-    inline: Option<&str>,
-    env_name: Option<&str>,
-) -> bool {
-    digest.update((kind.len() as u64).to_be_bytes());
-    digest.update(kind);
-    if let Some(value) = inline.filter(|value| !value.trim().is_empty()) {
-        digest.update([1]);
-        digest.update((value.len() as u64).to_be_bytes());
-        digest.update(value.as_bytes());
-        return true;
-    }
-    let Some(env_name) = env_name.filter(|value| !value.trim().is_empty()) else {
-        digest.update([0]);
-        return false;
-    };
-    digest.update([2]);
-    digest.update((env_name.len() as u64).to_be_bytes());
-    digest.update(env_name.as_bytes());
-    match std::env::var(env_name) {
-        Ok(value) if !value.trim().is_empty() => {
-            digest.update([1]);
-            digest.update((value.len() as u64).to_be_bytes());
-            digest.update(value.as_bytes());
-        }
-        _ => digest.update([0]),
-    }
-    true
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -270,7 +217,6 @@ fn identities_by_provider_endpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::UpstreamAuth;
 
     #[test]
     fn provider_endpoint_key_uses_stable_service_provider_endpoint_shape() {
@@ -412,25 +358,19 @@ mod tests {
     }
 
     #[test]
-    fn identity_delta_replaces_provider_endpoint_state_when_credentials_change() {
+    fn identity_delta_replaces_provider_endpoint_state_when_credential_scope_changes() {
         let endpoint = ProviderEndpointKey::new("codex", "input", "default");
-        let previous = vec![RuntimeUpstreamIdentity::new_with_auth(
+        let previous = vec![RuntimeUpstreamIdentity::new_with_credential_scope(
             endpoint.clone(),
             "https://api.example/v1",
             None,
-            &UpstreamAuth {
-                auth_token: Some("account-a-secret".to_string()),
-                ..UpstreamAuth::default()
-            },
+            Some("hmac-sha256-v1:scope-a".to_string()),
         )];
-        let current = vec![RuntimeUpstreamIdentity::new_with_auth(
+        let current = vec![RuntimeUpstreamIdentity::new_with_credential_scope(
             endpoint,
             "https://api.example/v1",
             None,
-            &UpstreamAuth {
-                auth_token: Some("account-b-secret".to_string()),
-                ..UpstreamAuth::default()
-            },
+            Some("hmac-sha256-v1:scope-b".to_string()),
         )];
 
         let delta = diff_runtime_upstream_identities(&previous, &current);
@@ -438,7 +378,8 @@ mod tests {
         assert!(delta.retained.is_empty());
         assert_eq!(delta.added, current);
         assert_eq!(delta.removed, previous);
-        let serialized = serde_json::to_string(&delta.added).expect("serialize safe identity");
+        let serialized = serde_json::to_string(&(&delta.added, &delta.removed))
+            .expect("serialize safe identity collections");
         assert!(!serialized.contains("account-a-secret"));
         assert!(!serialized.contains("account-b-secret"));
     }

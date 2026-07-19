@@ -351,6 +351,43 @@ describe("admin API mappers", () => {
     expect(Object.keys(data)).toEqual(["providers"]);
   });
 
+  it("maps typed credential readiness without exposing credential values", () => {
+    const data = mapProvidersData({
+      ...operatorSummary,
+      credential_readiness: "degraded",
+      providers: [
+        {
+          ...operatorSummary.providers[0],
+          credential_readiness: "blocked",
+          endpoints: [
+            {
+              ...operatorSummary.providers[0].endpoints[0],
+              routable: false,
+              credential_readiness: "permission_denied",
+              credential_details: [
+                {
+                  kind: "bearer",
+                  code: "permission_denied",
+                  source_kind: "native",
+                  reference: "work-account",
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(data.providers[0].credentialReadiness).toBe("blocked");
+    expect(data.providers[0].endpoints[0].credentialReadiness).toBe("permission_denied");
+    expect(data.providers[0].endpoints[0].credentialDetails[0]).toMatchObject({
+      kind: "bearer",
+      code: "permission_denied",
+      sourceKind: "native",
+      reference: "work-account",
+    });
+  });
+
   it("does not infer an active provider without an explicit canonical fact", () => {
     const data = mapAdminDashboardData({
       summary: operatorSummary,

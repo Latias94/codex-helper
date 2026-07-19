@@ -14,11 +14,13 @@ use crate::basellm_catalog::{
     load_basellm_catalog_runtime_state, sync_basellm_catalog,
 };
 use crate::config::{HelperConfig, LoadedConfig, ServiceKind, load_config_with_source};
+use crate::credentials::CredentialSourceCapabilities;
 use crate::proxy::{
     ProxyService, admin_listener_router, admin_loopback_addr_for_proxy_port, proxy_only_router,
 };
 use crate::quota_sampler::{QuotaSampler, QuotaSamplerConfig, QuotaSamplerRefreshOutcome};
 use crate::runtime_store::RuntimeStore;
+use crate::service_target::ServiceRuntimeIdentity;
 use crate::state::ProxyState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,32 +66,16 @@ pub struct RunningProxyRuntime {
 struct RuntimeTaskJoinResults {
     server: Result<Result<()>, tokio::task::JoinError>,
     quota_sampler: Result<(), tokio::task::JoinError>,
+    runtime_config_driver: Result<(), tokio::task::JoinError>,
+    runtime_config_driver_exited_before_shutdown: bool,
     basellm_sync: Result<(), tokio::task::JoinError>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ProxyRuntimeOptions {
     pub admin_addr: SocketAddr,
-}
-
-struct PreparedProxyRuntimeResources {
-    runtime_store: Arc<RuntimeStore>,
-    listener: tokio::net::TcpListener,
-    admin_listener: tokio::net::TcpListener,
-}
-
-impl PreparedProxyRuntimeResources {
-    fn new(
-        runtime_store: Arc<RuntimeStore>,
-        listener: tokio::net::TcpListener,
-        admin_listener: tokio::net::TcpListener,
-    ) -> Self {
-        Self {
-            runtime_store,
-            listener,
-            admin_listener,
-        }
-    }
+    pub credential_sources: CredentialSourceCapabilities,
+    pub service_runtime_identity: Option<ServiceRuntimeIdentity>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,11 +119,31 @@ impl ProxyListenerBindError {
 impl ProxyRuntimeOptions {
     pub fn for_proxy_port(port: u16) -> Self {
         let admin_addr = admin_loopback_addr_for_proxy_port(port);
-        Self { admin_addr }
+        Self {
+            admin_addr,
+            credential_sources: CredentialSourceCapabilities::server(),
+            service_runtime_identity: None,
+        }
     }
 
     pub fn with_admin_addr(mut self, admin_addr: SocketAddr) -> Self {
         self.admin_addr = admin_addr;
+        self
+    }
+
+    pub fn with_credential_sources(
+        mut self,
+        credential_sources: CredentialSourceCapabilities,
+    ) -> Self {
+        self.credential_sources = credential_sources;
+        self
+    }
+
+    pub fn with_service_runtime_identity(
+        mut self,
+        service_runtime_identity: Option<ServiceRuntimeIdentity>,
+    ) -> Self {
+        self.service_runtime_identity = service_runtime_identity;
         self
     }
 }
@@ -181,6 +187,9 @@ impl ProxyRuntime {
             }
         });
         let quota_sampler_handle = sampler.spawn(self.shutdown_rx.clone());
+        let runtime_config_driver_handle = self
+            .proxy
+            .spawn_runtime_config_driver(self.shutdown_rx.clone());
         let basellm_sync_handle = spawn_basellm_catalog_sync(
             Arc::clone(&self.runtime_store),
             self.proxy.clone(),
@@ -194,6 +203,7 @@ impl ProxyRuntime {
             self.shutdown_tx.clone(),
             server_handle,
             quota_sampler_handle,
+            runtime_config_driver_handle,
             basellm_sync_handle,
         );
 
@@ -264,18 +274,22 @@ impl RunningProxyRuntime {
 
 impl RuntimeTaskJoinResults {
     fn graceful_result(self) -> Result<()> {
+        self.ensure_runtime_config_driver_remained_supervised()?;
         match self.server {
             Ok(result) => result?,
             Err(error) => return Err(anyhow::anyhow!("server task join error: {error}")),
         }
         self.quota_sampler
             .map_err(|error| anyhow::anyhow!("quota sampler task join error: {error}"))?;
+        self.runtime_config_driver
+            .map_err(|error| anyhow::anyhow!("runtime config driver join error: {error}"))?;
         self.basellm_sync
             .map_err(|error| anyhow::anyhow!("BaseLLM sync task join error: {error}"))?;
         Ok(())
     }
 
     fn aborted_result(self) -> Result<()> {
+        self.ensure_runtime_config_driver_remained_supervised()?;
         match self.server {
             Ok(Ok(())) => {}
             Ok(Err(error)) => return Err(error),
@@ -287,8 +301,28 @@ impl RuntimeTaskJoinResults {
             Err(error) if error.is_cancelled() => {}
             Err(error) => return Err(anyhow::anyhow!("quota sampler task join error: {error}")),
         }
+        match self.runtime_config_driver {
+            Ok(()) => {}
+            Err(error) if error.is_cancelled() => {}
+            Err(error) => {
+                return Err(anyhow::anyhow!("runtime config driver join error: {error}"));
+            }
+        }
         self.basellm_sync
             .map_err(|error| anyhow::anyhow!("BaseLLM sync task join error: {error}"))
+    }
+
+    fn ensure_runtime_config_driver_remained_supervised(&self) -> Result<()> {
+        if !self.runtime_config_driver_exited_before_shutdown {
+            return Ok(());
+        }
+
+        match &self.runtime_config_driver {
+            Ok(()) => Err(anyhow::anyhow!(
+                "runtime config driver exited before runtime shutdown"
+            )),
+            Err(error) => Err(anyhow::anyhow!("runtime config driver join error: {error}")),
+        }
     }
 }
 
@@ -296,15 +330,35 @@ fn spawn_runtime_task_joiner(
     shutdown_tx: watch::Sender<bool>,
     server_handle: JoinHandle<Result<()>>,
     quota_sampler_handle: JoinHandle<()>,
+    runtime_config_driver_handle: JoinHandle<()>,
     basellm_sync_handle: JoinHandle<()>,
 ) -> JoinHandle<RuntimeTaskJoinResults> {
     tokio::spawn(async move {
-        let server = server_handle.await;
-        let _ = shutdown_tx.send(true);
+        let mut server_handle = server_handle;
+        let mut runtime_config_driver_handle = runtime_config_driver_handle;
+        let shutdown_rx = shutdown_tx.subscribe();
+        let (server, runtime_config_driver, runtime_config_driver_exited_before_shutdown) = tokio::select! {
+            server = &mut server_handle => {
+                let _ = shutdown_tx.send(true);
+                let runtime_config_driver = runtime_config_driver_handle.await;
+                (server, runtime_config_driver, false)
+            }
+            runtime_config_driver = &mut runtime_config_driver_handle => {
+                let exited_before_shutdown = !*shutdown_rx.borrow();
+                if exited_before_shutdown {
+                    let _ = shutdown_tx.send(true);
+                    server_handle.abort();
+                }
+                let server = server_handle.await;
+                (server, runtime_config_driver, exited_before_shutdown)
+            }
+        };
         let (quota_sampler, basellm_sync) = tokio::join!(quota_sampler_handle, basellm_sync_handle);
         RuntimeTaskJoinResults {
             server,
             quota_sampler,
+            runtime_config_driver,
+            runtime_config_driver_exited_before_shutdown,
             basellm_sync,
         }
     })
@@ -399,37 +453,12 @@ async fn build_proxy_runtime_from_loaded_with_options_and_runtime_store(
     runtime_store: Arc<RuntimeStore>,
 ) -> Result<ProxyRuntime> {
     initialize_basellm_catalog(Arc::clone(&runtime_store)).await?;
-    let addr: SocketAddr = SocketAddr::from((host, port));
-    let listener = bind_listener(addr, ProxyListenerKind::Proxy).await?;
-    let admin_listener = bind_listener(options.admin_addr, ProxyListenerKind::Admin).await?;
-    let resources = PreparedProxyRuntimeResources::new(runtime_store, listener, admin_listener);
-    build_proxy_runtime_from_bound_listeners_with_options(
-        service_name,
-        host,
-        port,
-        options,
-        loaded,
-        resources,
-    )
-    .await
-}
-
-async fn build_proxy_runtime_from_bound_listeners_with_options(
-    service_name: &'static str,
-    host: IpAddr,
-    port: u16,
-    options: ProxyRuntimeOptions,
-    loaded: LoadedConfig,
-    resources: PreparedProxyRuntimeResources,
-) -> Result<ProxyRuntime> {
-    let PreparedProxyRuntimeResources {
-        runtime_store,
-        listener,
-        admin_listener,
-    } = resources;
+    let ProxyRuntimeOptions {
+        admin_addr,
+        credential_sources,
+        service_runtime_identity,
+    } = options;
     validate_service_has_upstream(service_name, &loaded.source)?;
-    let config_source = Arc::new(loaded.source);
-
     let client = crate::proxy::upstream_http_client_builder()
         .connect_timeout(std::time::Duration::from_secs(10))
         .tcp_keepalive(std::time::Duration::from_secs(30))
@@ -438,22 +467,34 @@ async fn build_proxy_runtime_from_bound_listeners_with_options(
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    let proxy = ProxyService::new_with_runtime_store(
-        client,
-        config_source.clone(),
-        service_name,
-        Arc::clone(&runtime_store),
-    )?;
+    let proxy_config = Arc::new(loaded.source);
+    let proxy_store = Arc::clone(&runtime_store);
+    let proxy = tokio::task::spawn_blocking(move || {
+        ProxyService::new_with_runtime_store_and_credential_sources(
+            client,
+            proxy_config,
+            service_name,
+            proxy_store,
+            credential_sources,
+        )
+        .map(|proxy| proxy.with_service_runtime_identity(service_runtime_identity))
+    })
+    .await
+    .context("join initial credential and runtime snapshot builder")??;
+    let runtime_config = proxy.captured_runtime_config().await;
     let state = proxy.state_handle();
     let app = proxy_only_router(proxy.clone());
     let admin_app = admin_listener_router(proxy.clone());
+    let addr: SocketAddr = SocketAddr::from((host, port));
+    let listener = bind_listener(addr, ProxyListenerKind::Proxy).await?;
+    let admin_listener = bind_listener(admin_addr, ProxyListenerKind::Admin).await?;
 
     Ok(ProxyRuntime {
         service_name,
         host,
         port,
-        admin_addr: options.admin_addr,
-        config: config_source,
+        admin_addr,
+        config: runtime_config,
         proxy,
         state,
         shutdown_tx,
@@ -1139,10 +1180,15 @@ env_key = "EXTERNAL_API_KEY"
         });
         let server_abort_handle = server_handle.abort_handle();
         let quota_sampler_abort_handle = quota_sampler_handle.abort_handle();
+        let mut runtime_config_shutdown_rx = shutdown_tx.subscribe();
+        let runtime_config_driver_handle = tokio::spawn(async move {
+            wait_for_runtime_shutdown(&mut runtime_config_shutdown_rx).await;
+        });
         let runtime_join_handle = spawn_runtime_task_joiner(
             shutdown_tx.clone(),
             server_handle,
             quota_sampler_handle,
+            runtime_config_driver_handle,
             basellm_sync_handle,
         );
         let mut running = RunningProxyRuntime {
@@ -1214,6 +1260,61 @@ env_key = "EXTERNAL_API_KEY"
     }
 
     #[test]
+    fn runtime_snapshot_failure_happens_before_listener_bind() {
+        let _lock = env_lock();
+        let root = std::env::temp_dir().join(format!(
+            "codex-helper-runtime-snapshot-order-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let helper_home = root.join(".codex-helper");
+        let mut env = ScopedEnv::new();
+        unsafe {
+            env.set_path("CODEX_HELPER_HOME", &helper_home);
+        }
+
+        let occupied_proxy =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("reserve occupied proxy address");
+        let proxy_addr = occupied_proxy.local_addr().expect("occupied proxy address");
+        let mut loaded = loaded_runtime_test_config();
+        loaded.source.codex.routing =
+            Some(crate::config::RouteGraphConfig::ordered_failover(vec![
+                "missing-provider".to_string(),
+            ]));
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+        let result = runtime.block_on(build_proxy_runtime_from_loaded_with_options(
+            "codex",
+            proxy_addr.ip(),
+            proxy_addr.port(),
+            ProxyRuntimeOptions::for_proxy_port(proxy_addr.port())
+                .with_admin_addr(SocketAddr::from(([127, 0, 0, 1], 0))),
+            loaded,
+        ));
+        let error = match result {
+            Ok(_) => panic!("invalid runtime snapshot must prevent startup"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .chain()
+                .all(|cause| cause.downcast_ref::<ProxyListenerBindError>().is_none()),
+            "listener bind must not run before snapshot construction: {error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("routing references missing route or provider"),
+            "unexpected snapshot build error: {error:#}"
+        );
+
+        drop(occupied_proxy);
+        drop(env);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn runtime_builder_reports_proxy_and_admin_bind_addresses() {
         let _lock = env_lock();
         let root = std::env::temp_dir().join(format!(
@@ -1271,5 +1372,66 @@ env_key = "EXTERNAL_API_KEY"
 
         drop(env);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    async fn run_runtime_config_driver_early_exit_case(
+        runtime_config_driver_handle: JoinHandle<()>,
+    ) -> anyhow::Error {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (server_stopped_tx, server_stopped_rx) = tokio::sync::oneshot::channel();
+        let joiner = spawn_runtime_task_joiner(
+            shutdown_tx,
+            tokio::spawn(async move {
+                let _stopped = TaskDropSignal(Some(server_stopped_tx));
+                std::future::pending::<Result<()>>().await
+            }),
+            tokio::spawn(async {}),
+            runtime_config_driver_handle,
+            tokio::spawn(async {}),
+        );
+
+        let results = joiner.await.expect("join runtime task coordinator");
+        let error = results
+            .graceful_result()
+            .expect_err("early runtime config driver exit must fail runtime wait");
+        server_stopped_rx
+            .await
+            .expect("runtime config driver failure must terminate the server task");
+        assert!(
+            *shutdown_rx.borrow(),
+            "runtime config driver failure must broadcast runtime shutdown"
+        );
+        error
+    }
+
+    #[tokio::test]
+    async fn runtime_config_driver_panic_backtrace_does_not_render_credential_canary() {
+        const CANARY: &str = "runtime-driver-panic-canary-1a467d90f28c4b35";
+        let credential = crate::credentials::SecretValue::new(CANARY.as_bytes().to_vec())
+            .expect("valid panic-path credential canary");
+        let error = run_runtime_config_driver_early_exit_case(tokio::spawn(async move {
+            std::hint::black_box(&credential);
+            panic!("injected runtime config driver panic")
+        }))
+        .await;
+        let rendered = format!("{error:#?}");
+        assert!(rendered.contains("runtime config driver join error"));
+        let bearer = format!("Bearer {CANARY}");
+        for forbidden in [CANARY, &CANARY[..20], bearer.as_str()] {
+            assert!(
+                !rendered.contains(forbidden),
+                "runtime panic surface leaked credential material: {rendered}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_config_driver_normal_early_exit_stops_the_running_server() {
+        let error = run_runtime_config_driver_early_exit_case(tokio::spawn(async {})).await;
+        assert!(
+            error
+                .to_string()
+                .contains("runtime config driver exited before runtime shutdown")
+        );
     }
 }

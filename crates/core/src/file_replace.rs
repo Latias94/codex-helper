@@ -1,6 +1,6 @@
 use std::ffi::OsStr;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::fs::{self, File, OpenOptions, TryLockError};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -49,6 +49,393 @@ impl AtomicWriteError {
             path: path.to_path_buf(),
             stage,
             source,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ManagedFileSnapshot {
+    bytes: Option<Vec<u8>>,
+}
+
+impl ManagedFileSnapshot {
+    pub fn bytes(&self) -> Option<&[u8]> {
+        self.bytes.as_deref()
+    }
+}
+
+impl std::fmt::Debug for ManagedFileSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedFileSnapshot")
+            .field("exists", &self.bytes.is_some())
+            .field("byte_len", &self.bytes.as_ref().map(Vec::len))
+            .finish()
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ManagedFileTransactionError {
+    #[error("managed file transaction is already active for {path:?}")]
+    Busy { path: PathBuf },
+    #[error("managed file {path:?} changed concurrently")]
+    ConcurrentChange { path: PathBuf },
+    #[error("managed file operation {operation} failed for {path:?}: {source}")]
+    Io {
+        path: PathBuf,
+        operation: &'static str,
+        #[source]
+        source: io::Error,
+    },
+    #[error(
+        "managed file operation {operation} for {path:?} may have committed before an error was reported: {source}"
+    )]
+    CommitStateUnknown {
+        path: PathBuf,
+        operation: &'static str,
+        #[source]
+        source: io::Error,
+    },
+}
+
+#[derive(Debug)]
+struct ConcurrentManagedFileChange;
+
+impl std::fmt::Display for ConcurrentManagedFileChange {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("managed file changed concurrently")
+    }
+}
+
+impl std::error::Error for ConcurrentManagedFileChange {}
+
+pub struct ManagedFileTransaction {
+    path: PathBuf,
+    max_bytes: usize,
+    _lock: File,
+    original: ManagedFileSnapshot,
+    current: ManagedFileSnapshot,
+}
+
+impl std::fmt::Debug for ManagedFileTransaction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedFileTransaction")
+            .field("path", &self.path)
+            .field("original", &self.original)
+            .field("current", &self.current)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ManagedFileTransaction {
+    pub fn begin(
+        path: impl Into<PathBuf>,
+        max_bytes: usize,
+    ) -> Result<Self, ManagedFileTransactionError> {
+        let path = path.into();
+        let parent = destination_parent(&path)
+            .map_err(|source| managed_file_io(&path, "resolve parent", source))?;
+        fs::create_dir_all(&parent)
+            .map_err(|source| managed_file_io(&path, "create parent", source))?;
+        let lock_path = managed_file_lock_path(&path)
+            .map_err(|source| managed_file_io(&path, "resolve transaction lock", source))?;
+        let lock = open_managed_file_lock(&lock_path)
+            .map_err(|source| managed_file_io(&path, "open transaction lock", source))?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                return Err(ManagedFileTransactionError::Busy { path });
+            }
+            Err(TryLockError::Error(source)) => {
+                return Err(managed_file_io(&path, "acquire transaction lock", source));
+            }
+        }
+        validate_managed_regular_file(&lock_path)
+            .map_err(|source| managed_file_io(&path, "validate transaction lock", source))?;
+        let snapshot = read_managed_file_snapshot(&path, max_bytes)?;
+        Ok(Self {
+            path,
+            max_bytes,
+            _lock: lock,
+            original: snapshot.clone(),
+            current: snapshot,
+        })
+    }
+
+    pub fn current(&self) -> &ManagedFileSnapshot {
+        &self.current
+    }
+
+    pub fn replace(&mut self, data: &[u8]) -> Result<(), ManagedFileTransactionError> {
+        if data.len() > self.max_bytes {
+            return Err(managed_file_io(
+                &self.path,
+                "validate replacement size",
+                managed_file_size_error(self.max_bytes),
+            ));
+        }
+        self.ensure_current()?;
+        if self.current.bytes() == Some(data) {
+            return Ok(());
+        }
+
+        let expected = self.current.clone();
+        let path = self.path.clone();
+        let max_bytes = self.max_bytes;
+        let result = write_bytes_file_validated_with_permissions_and_before_replace(
+            &self.path,
+            data,
+            None,
+            |_| Ok(()),
+            move |_staged_path, destination| {
+                let actual = read_managed_file_snapshot_io(destination, max_bytes)?;
+                if actual != expected {
+                    return Err(io::Error::other(ConcurrentManagedFileChange));
+                }
+                Ok(())
+            },
+        );
+        match result {
+            Ok(()) => {
+                match read_managed_file_snapshot_io(&self.path, self.max_bytes) {
+                    Ok(snapshot) => self.current = snapshot,
+                    Err(source) => {
+                        self.refresh_current_best_effort();
+                        return Err(ManagedFileTransactionError::CommitStateUnknown {
+                            path,
+                            operation: "verify replace",
+                            source,
+                        });
+                    }
+                }
+                if self.current.bytes() != Some(data) {
+                    return Err(ManagedFileTransactionError::ConcurrentChange {
+                        path: self.path.clone(),
+                    });
+                }
+                Ok(())
+            }
+            Err(error) => {
+                self.refresh_current_best_effort();
+                Err(map_atomic_write_error(error, "replace"))
+            }
+        }
+    }
+
+    pub fn remove(&mut self) -> Result<(), ManagedFileTransactionError> {
+        let parent = destination_parent(&self.path)
+            .map_err(|source| managed_file_io(&self.path, "resolve parent", source))?;
+        self.ensure_current()?;
+        if self.current.bytes.is_none() {
+            return Ok(());
+        }
+        match fs::remove_file(&self.path) {
+            Ok(()) => {
+                self.current = missing_managed_file_snapshot();
+                sync_parent_directory(&parent).map_err(|source| {
+                    ManagedFileTransactionError::CommitStateUnknown {
+                        path: self.path.clone(),
+                        operation: "remove",
+                        source,
+                    }
+                })?;
+                Ok(())
+            }
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                self.current = missing_managed_file_snapshot();
+                Err(ManagedFileTransactionError::ConcurrentChange {
+                    path: self.path.clone(),
+                })
+            }
+            Err(source) => Err(managed_file_io(&self.path, "remove", source)),
+        }
+    }
+
+    pub fn rollback(&mut self) -> Result<(), ManagedFileTransactionError> {
+        self.ensure_current()?;
+        if self.current == self.original {
+            return Ok(());
+        }
+        match self.original.bytes.clone() {
+            Some(bytes) => self.replace(&bytes),
+            None => self.remove(),
+        }
+    }
+
+    fn ensure_current(&self) -> Result<(), ManagedFileTransactionError> {
+        let actual = read_managed_file_snapshot(&self.path, self.max_bytes)?;
+        if actual == self.current {
+            Ok(())
+        } else {
+            Err(ManagedFileTransactionError::ConcurrentChange {
+                path: self.path.clone(),
+            })
+        }
+    }
+
+    fn refresh_current_best_effort(&mut self) {
+        if let Ok(snapshot) = read_managed_file_snapshot(&self.path, self.max_bytes) {
+            self.current = snapshot;
+        }
+    }
+}
+
+pub fn read_managed_file_snapshot(
+    path: impl AsRef<Path>,
+    max_bytes: usize,
+) -> Result<ManagedFileSnapshot, ManagedFileTransactionError> {
+    let path = path.as_ref();
+    read_managed_file_snapshot_io(path, max_bytes)
+        .map_err(|source| managed_file_io(path, "read snapshot", source))
+}
+
+fn missing_managed_file_snapshot() -> ManagedFileSnapshot {
+    ManagedFileSnapshot { bytes: None }
+}
+
+fn read_managed_file_snapshot_io(path: &Path, max_bytes: usize) -> io::Result<ManagedFileSnapshot> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => validate_managed_regular_file(path)?,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            return Ok(missing_managed_file_snapshot());
+        }
+        Err(source) => return Err(source),
+    }
+    let file = File::open(path)?;
+    if file.metadata()?.len() > u64::try_from(max_bytes).unwrap_or(u64::MAX) {
+        return Err(managed_file_size_error(max_bytes));
+    }
+    let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1024));
+    file.take(
+        u64::try_from(max_bytes)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1),
+    )
+    .read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(managed_file_size_error(max_bytes));
+    }
+    validate_managed_regular_file(path)?;
+    Ok(ManagedFileSnapshot { bytes: Some(bytes) })
+}
+
+fn managed_file_size_error(max_bytes: usize) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("managed file exceeds the maximum size of {max_bytes} bytes"),
+    )
+}
+
+fn validate_managed_regular_file(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "managed path must be a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if metadata.nlink() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed path must not have hard links",
+            ));
+        }
+    }
+    #[cfg(windows)]
+    {
+        let information = crate::windows_file_info::path_information_no_follow(path)?;
+        if crate::windows_file_info::is_reparse_point(&information)
+            || information.number_of_links() != 1
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed path must not be a reparse point or hard link",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn managed_file_lock_path(path: &Path) -> io::Result<PathBuf> {
+    let file_name = path.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "managed path must name a file")
+    })?;
+    let mut lock_name = file_name.to_os_string();
+    lock_name.push(".lock");
+    Ok(path.with_file_name(lock_name))
+}
+
+fn open_managed_file_lock(path: &Path) -> io::Result<File> {
+    let mut create = OpenOptions::new();
+    create.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        create.mode(0o600);
+    }
+    match create.open(path) {
+        Ok(file) => Ok(file),
+        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+            validate_managed_regular_file(path)?;
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(path)?;
+            validate_managed_regular_file(path)?;
+            if !file.metadata()?.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "managed transaction lock is not a regular file",
+                ));
+            }
+            Ok(file)
+        }
+        Err(source) => Err(source),
+    }
+}
+
+fn managed_file_io(
+    path: &Path,
+    operation: &'static str,
+    source: io::Error,
+) -> ManagedFileTransactionError {
+    ManagedFileTransactionError::Io {
+        path: path.to_path_buf(),
+        operation,
+        source,
+    }
+}
+
+fn map_atomic_write_error(
+    error: AtomicWriteError,
+    operation: &'static str,
+) -> ManagedFileTransactionError {
+    match error {
+        AtomicWriteError::BeforeCommit { path, source, .. }
+            if source
+                .get_ref()
+                .is_some_and(|error| error.is::<ConcurrentManagedFileChange>()) =>
+        {
+            ManagedFileTransactionError::ConcurrentChange { path }
+        }
+        AtomicWriteError::BeforeCommit { path, source, .. } => ManagedFileTransactionError::Io {
+            path,
+            operation,
+            source,
+        },
+        AtomicWriteError::CommitStateUnknown { path, source, .. } => {
+            ManagedFileTransactionError::CommitStateUnknown {
+                path,
+                operation,
+                source,
+            }
         }
     }
 }
@@ -441,27 +828,6 @@ pub async fn write_bytes_file_async(
     write_bytes_file_validated_async(path, data, |_| Ok(())).await
 }
 
-pub(crate) async fn write_bytes_file_async_with_permissions(
-    path: &Path,
-    data: &[u8],
-    permissions: fs::Permissions,
-) -> std::result::Result<(), AtomicWriteError> {
-    let path = path.to_path_buf();
-    let error_path = path.clone();
-    let data = data.to_vec();
-    tokio::task::spawn_blocking(move || {
-        write_bytes_file_validated_with_permissions(&path, &data, Some(permissions), |_| Ok(()))
-    })
-    .await
-    .map_err(|err| {
-        AtomicWriteError::commit_state_unknown(
-            &error_path,
-            "join blocking writer",
-            io::Error::other(err),
-        )
-    })?
-}
-
 pub(crate) async fn write_bytes_file_async_with_permissions_and_before_replace<B>(
     path: &Path,
     data: &[u8],
@@ -609,6 +975,30 @@ mod tests {
 
         assert_eq!(fs::read_to_string(&path).expect("read new file"), "new");
         assert!(managed_temp_files(&directory.0).is_empty());
+    }
+
+    #[test]
+    fn managed_file_transaction_bounds_replacements_and_snapshot_reads() {
+        let directory = TestDir::new();
+        let path = directory.join("receipt.json");
+        let mut transaction =
+            ManagedFileTransaction::begin(&path, 3).expect("begin bounded transaction");
+
+        assert!(matches!(
+            transaction.replace(b"four"),
+            Err(ManagedFileTransactionError::Io { .. })
+        ));
+        assert!(!path.exists(), "oversized replacement must not be written");
+
+        transaction.replace(b"new").expect("write bounded payload");
+        assert_eq!(fs::read(&path).expect("read bounded payload"), b"new");
+        drop(transaction);
+
+        fs::write(&path, b"four").expect("write oversized external payload");
+        assert!(matches!(
+            read_managed_file_snapshot(&path, 3),
+            Err(ManagedFileTransactionError::Io { .. })
+        ));
     }
 
     #[cfg(unix)]

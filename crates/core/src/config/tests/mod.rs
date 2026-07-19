@@ -4,7 +4,9 @@ use std::sync::{Mutex, OnceLock};
 
 mod canonical_schema;
 mod current_v5_contract;
+mod current_v6_contract;
 mod io_bootstrap;
+mod legacy_v5_migration_contract;
 mod retry_profiles;
 mod route_graph_ops;
 

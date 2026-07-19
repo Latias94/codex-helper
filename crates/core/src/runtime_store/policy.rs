@@ -339,8 +339,15 @@ impl ProviderObservationTicket {
 pub struct ProviderObservationReservation {
     pub ticket: ProviderObservationTicket,
     pub scope_digest: String,
+    route_scope: String,
     pub policy_revision: u64,
     pub projection: ProviderEligibilityProjection,
+}
+
+impl ProviderObservationReservation {
+    pub(crate) fn route_scope(&self) -> &str {
+        self.route_scope.as_str()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -414,6 +421,7 @@ pub(super) fn reserve_provider_observation(
         &endpoint_json,
         &scope.route_scope,
     )?;
+    let route_scope = scope.route_scope.clone();
     let scope_digest = scope.digest();
     ensure_revision_row(transaction, path, store_id, reserved_at)?;
     let current = transaction
@@ -561,6 +569,7 @@ pub(super) fn reserve_provider_observation(
             generation,
         },
         scope_digest,
+        route_scope,
         policy_revision,
         projection,
     })
@@ -1042,14 +1051,30 @@ pub(super) fn reconcile_runtime_upstream_identities(
 }
 
 fn validate_current_runtime_scope(
-    transaction: &Transaction<'_>,
+    connection: &Connection,
     path: &Path,
     store_id: Uuid,
     provider_endpoint: &ProviderEndpointKey,
     endpoint_json: &str,
     route_scope: &str,
 ) -> Result<(), RuntimeStoreError> {
-    let authority_exists = transaction
+    if current_runtime_scope_is_active(connection, path, store_id, endpoint_json, route_scope)? {
+        return Ok(());
+    }
+    Err(policy_invariant(
+        provider_endpoint,
+        "provider observation scope is not active in the current runtime snapshot",
+    ))
+}
+
+fn current_runtime_scope_is_active(
+    connection: &Connection,
+    path: &Path,
+    store_id: Uuid,
+    endpoint_json: &str,
+    route_scope: &str,
+) -> Result<bool, RuntimeStoreError> {
+    let authority_exists = connection
         .query_row(
             "SELECT 1 FROM runtime_identity_authority WHERE store_id = ?1",
             [store_id.to_string()],
@@ -1059,9 +1084,9 @@ fn validate_current_runtime_scope(
         .map_err(|source| sqlite_error(path, "read runtime identity authority", source))?
         .is_some();
     if !authority_exists {
-        return Ok(());
+        return Ok(true);
     }
-    let current_scope = transaction
+    let current_scope = connection
         .query_row(
             "SELECT route_scope FROM runtime_upstream_identities
              WHERE store_id = ?1 AND endpoint_key_json = ?2",
@@ -1070,13 +1095,23 @@ fn validate_current_runtime_scope(
         )
         .optional()
         .map_err(|source| sqlite_error(path, "read current runtime upstream identity", source))?;
-    if current_scope.as_deref() == Some(route_scope) {
-        return Ok(());
-    }
-    Err(policy_invariant(
-        provider_endpoint,
-        "provider observation scope is not active in the current runtime snapshot",
-    ))
+    Ok(current_scope.as_deref() == Some(route_scope))
+}
+
+pub(super) fn runtime_upstream_identity_is_active(
+    connection: &Connection,
+    path: &Path,
+    store_id: Uuid,
+    identity: &RuntimeUpstreamIdentity,
+) -> Result<bool, RuntimeStoreError> {
+    let endpoint_json = encode_endpoint(&identity.provider_endpoint)?;
+    current_runtime_scope_is_active(
+        connection,
+        path,
+        store_id,
+        &endpoint_json,
+        &identity.policy_route_scope(),
+    )
 }
 
 pub(super) fn provider_policy_snapshot(

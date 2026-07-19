@@ -93,6 +93,11 @@ async fn build_operator_read_model_once(
         proxy.state.get_provider_balance_view(proxy.service_name),
         proxy.state.capture_routing_operator_control(),
     );
+    let service_status = crate::service_status::project_service_status_snapshot(
+        &config.ui.service_status,
+        Some(route_graph.as_ref()),
+        proxy.service_name,
+    );
     let default_profile = effective_default_profile_name(view);
     let session_stats = build_operator_session_stats(&recent);
     let policy_actions = proxy.state.policy_action_projections_for_snapshot(
@@ -143,6 +148,14 @@ async fn build_operator_read_model_once(
         .iter()
         .map(OperatorProviderSummary::from)
         .collect::<Vec<_>>();
+    let credential_codes = providers
+        .iter()
+        .flat_map(|provider| provider.endpoints.iter())
+        .filter_map(|endpoint| endpoint.credential_readiness)
+        .collect::<Vec<_>>();
+    let credential_readiness = Some(
+        crate::credentials::CredentialAggregateReadiness::from_endpoint_codes(credential_codes),
+    );
     let retry_observations = summarize_recent_retry_observations(&recent);
     let local_session_ids = session_cards
         .iter()
@@ -191,6 +204,7 @@ async fn build_operator_read_model_once(
             recent_same_provider_retries: retry_observations.recent_same_provider_retries,
             recent_fast_mode_requests: retry_observations.recent_fast_mode_requests,
         },
+        credential_readiness,
         sessions,
         profiles,
         providers: operator_providers,
@@ -242,6 +256,7 @@ async fn build_operator_read_model_once(
             stats_5m,
             stats_1h,
             pricing_catalog: redact_operator_pricing_catalog(operator_pricing_catalog.snapshot()),
+            service_status: Some(service_status),
             quota_analytics: redact_operator_quota_analytics(
                 proxy
                     .state

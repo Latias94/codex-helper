@@ -27,6 +27,9 @@ on:
       - "crates/**"
       - ".github/workflows/docker-publish.yml"
       - "deploy/**"
+      - "tools/check-credential-surface.mjs"
+      - "tools/docker-mounted-secret-smoke.sh"
+      - "tools/docker-smoke-upstream.mjs"
 
 permissions:
   contents: read
@@ -37,11 +40,17 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  image:
-    name: Build Docker image
+  prepare:
+    name: Prepare Docker build
     runs-on: ubuntu-24.04
     env:
       DOCKER_PUBLISH: ${{ github.event_name == 'push' || github.event_name == 'release' || inputs.publish == true }}
+    outputs:
+      image: ${{ steps.release.outputs.image }}
+      publish: ${{ steps.release.outputs.publish }}
+      ref: ${{ steps.release.outputs.ref }}
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
     steps:
       - name: Resolve release ref
         id: release
@@ -89,32 +98,144 @@ jobs:
             echo "tag=$tag"
             echo "version=$version"
             echo "image=$image"
+            echo "publish=${DOCKER_PUBLISH}"
           } >>"$GITHUB_OUTPUT"
 
       - name: Checkout release ref
         uses: actions/checkout@v6
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.sha || steps.release.outputs.ref }}
+          ref: ${{ steps.release.outputs.ref }}
           persist-credentials: false
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Check server credential boundary
+        run: node tools/check-credential-surface.mjs
+
+  build:
+    name: Build Docker image (${{ matrix.arch }})
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout release ref
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      - name: Build smoke image
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker build --target runtime -t codex-helper-server:smoke .
-
-      - name: Smoke test image
-        shell: bash
-        run: docker run --rm codex-helper-server:smoke --help
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ needs.prepare.outputs.image }}
+          labels: |
+            org.opencontainers.image.title=codex-helper-server
+            org.opencontainers.image.description=Container-oriented codex-helper central relay runtime
 
       - name: Login to GHCR
-        if: env.DOCKER_PUBLISH == 'true'
+        if: needs.prepare.outputs.publish == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build native smoke image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: runtime
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: codex-helper-server:smoke-${{ matrix.arch }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=codex-helper-server-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=codex-helper-server-${{ matrix.arch }}
+
+      - name: Smoke test environment and mounted-secret deployments
+        shell: bash
+        run: bash tools/docker-mounted-secret-smoke.sh codex-helper-server:smoke-${{ matrix.arch }}
+
+      - name: Publish native image by digest
+        if: needs.prepare.outputs.publish == 'true'
+        id: publish
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: runtime
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ needs.prepare.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=codex-helper-server-${{ matrix.arch }}
+
+      - name: Export image digest
+        if: needs.prepare.outputs.publish == 'true'
+        shell: bash
+        env:
+          IMAGE_DIGEST: ${{ steps.publish.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          digest="${IMAGE_DIGEST#sha256:}"
+          if [[ "$IMAGE_DIGEST" != sha256:* || ! "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Build did not return a valid image digest: $IMAGE_DIGEST" >&2
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/docker-digests"
+          touch "$RUNNER_TEMP/docker-digests/$digest"
+
+      - name: Upload image digest
+        if: needs.prepare.outputs.publish == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: docker-digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/docker-digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  manifest:
+    name: Publish Docker manifest
+    needs:
+      - prepare
+      - build
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download image digests
+        uses: actions/download-artifact@v8
+        with:
+          pattern: docker-digest-*
+          path: ${{ runner.temp }}/docker-digests
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
@@ -125,37 +246,92 @@ jobs:
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ${{ steps.release.outputs.image }}
+          images: ${{ needs.prepare.outputs.image }}
           tags: |
-            type=semver,pattern={{version}},value=${{ steps.release.outputs.tag }},enable=${{ github.event_name != 'pull_request' }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ steps.release.outputs.tag }},enable=${{ github.event_name != 'pull_request' }}
-            type=raw,value=${{ steps.release.outputs.version }},enable=${{ github.event_name == 'pull_request' }}
-            type=raw,value=latest,enable=${{ github.event_name != 'pull_request' && startsWith(steps.release.outputs.tag, 'v') && !contains(steps.release.outputs.version, '-') }}
+            type=semver,pattern={{version}},value=${{ needs.prepare.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.prepare.outputs.tag }}
+            type=raw,value=latest,enable=${{ startsWith(needs.prepare.outputs.tag, 'v') && !contains(needs.prepare.outputs.version, '-') }}
             type=sha
           labels: |
             org.opencontainers.image.title=codex-helper-server
             org.opencontainers.image.description=Container-oriented codex-helper central relay runtime
 
-      - name: Build and optionally publish
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          target: runtime
-          platforms: linux/amd64,linux/arm64
-          push: ${{ env.DOCKER_PUBLISH == 'true' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Create multi-platform manifest
+        shell: bash
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          METADATA_JSON: ${{ steps.meta.outputs.json }}
+        run: |
+          set -euo pipefail
+
+          mapfile -t digest_files < <(find "$RUNNER_TEMP/docker-digests" -maxdepth 1 -type f -print | sort)
+          if [[ "${#digest_files[@]}" -ne 2 ]]; then
+            echo "Expected two native image digests, found ${#digest_files[@]}" >&2
+            exit 1
+          fi
+
+          sources=()
+          for digest_file in "${digest_files[@]}"; do
+            digest="$(basename "$digest_file")"
+            if [[ ! "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "Invalid native image digest artifact: $digest" >&2
+              exit 1
+            fi
+            sources+=("${IMAGE}@sha256:${digest}")
+          done
+
+          mapfile -t tags < <(jq -r '.tags[]' <<<"$METADATA_JSON")
+          if [[ "${#tags[@]}" -eq 0 ]]; then
+            echo "Docker metadata did not produce any manifest tags" >&2
+            exit 1
+          fi
+          tag_args=()
+          for tag in "${tags[@]}"; do
+            tag_args+=(--tag "$tag")
+          done
+
+          docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
+          docker buildx imagetools inspect "${tags[0]}"
+
+  image:
+    name: Build Docker image
+    needs:
+      - prepare
+      - build
+      - manifest
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Verify native Docker build
+        shell: bash
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
+          MANIFEST_RESULT: ${{ needs.manifest.result }}
+          PREPARE_RESULT: ${{ needs.prepare.result }}
+          PUBLISH: ${{ needs.prepare.outputs.publish }}
+        run: |
+          set -euo pipefail
+
+          [[ "$PREPARE_RESULT" == success ]]
+          [[ "$BUILD_RESULT" == success ]]
+          if [[ "$PUBLISH" == true ]]; then
+            [[ "$MANIFEST_RESULT" == success ]]
+          else
+            [[ "$MANIFEST_RESULT" == skipped ]]
+          fi
 
       - name: Write summary
         shell: bash
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          PUBLISH: ${{ needs.prepare.outputs.publish }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
           {
             echo "## Docker image"
             echo
-            echo "- Image: \`${{ steps.release.outputs.image }}:${{ steps.release.outputs.version }}\`"
-            echo "- Published: \`${DOCKER_PUBLISH}\`"
-            echo "- Smoke image: \`codex-helper-server:smoke\`"
+            echo "- Image: \`${IMAGE}:${VERSION}\`"
+            echo "- Published: \`${PUBLISH}\`"
+            echo "- Native platforms: \`linux/amd64\`, \`linux/arm64\`"
           } >>"$GITHUB_STEP_SUMMARY"

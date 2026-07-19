@@ -3,6 +3,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Color, Line, Modifier, Span, Style, Text};
 use ratatui::widgets::{Block, Borders, HighlightSpacing, Paragraph, Row, Table, Wrap};
 
+use crate::credentials::CredentialReadinessCode;
 use crate::dashboard_core::{
     OperatorProviderCapacity, OperatorProviderEndpointSummary, OperatorRouteCandidateSummary,
     OperatorRouteTargetSummary, OperatorRoutingSummary,
@@ -236,15 +237,49 @@ fn endpoint_status_label(
             Language::En => "full",
         };
     }
+    if let Some(readiness) = endpoint.credential_readiness
+        && !readiness.is_routable()
+    {
+        return credential_readiness_short_label(readiness, lang);
+    }
     if !endpoint.routable {
         return match lang {
             Language::Zh => "不可用",
             Language::En => "blocked",
         };
     }
+    if endpoint.credential_readiness == Some(CredentialReadinessCode::Stale) {
+        return credential_readiness_short_label(CredentialReadinessCode::Stale, lang);
+    }
     match lang {
         Language::Zh => "可用",
         Language::En => "ready",
+    }
+}
+
+pub(super) fn credential_readiness_short_label(
+    readiness: CredentialReadinessCode,
+    lang: Language,
+) -> &'static str {
+    match (readiness, lang) {
+        (CredentialReadinessCode::Ready, Language::Zh) => "可用",
+        (CredentialReadinessCode::Ready, Language::En) => "ready",
+        (CredentialReadinessCode::Stale, Language::Zh) => "凭据旧",
+        (CredentialReadinessCode::Stale, Language::En) => "auth stale",
+        (CredentialReadinessCode::Missing, Language::Zh) => "缺凭据",
+        (CredentialReadinessCode::Missing, Language::En) => "auth miss",
+        (CredentialReadinessCode::Invalid, Language::Zh) => "凭据错",
+        (CredentialReadinessCode::Invalid, Language::En) => "auth bad",
+        (CredentialReadinessCode::Locked, Language::Zh) => "已锁",
+        (CredentialReadinessCode::Locked, Language::En) => "locked",
+        (CredentialReadinessCode::PermissionDenied, Language::Zh) => "无权限",
+        (CredentialReadinessCode::PermissionDenied, Language::En) => "denied",
+        (CredentialReadinessCode::InteractionRequired, Language::Zh) => "需交互",
+        (CredentialReadinessCode::InteractionRequired, Language::En) => "needs UI",
+        (CredentialReadinessCode::BackendUnavailable, Language::Zh) => "存储故障",
+        (CredentialReadinessCode::BackendUnavailable, Language::En) => "store down",
+        (CredentialReadinessCode::Unsupported, Language::Zh) => "不支持",
+        (CredentialReadinessCode::Unsupported, Language::En) => "unsupported",
     }
 }
 
@@ -739,18 +774,47 @@ fn selected_candidate_detail_lines(
                 .unwrap_or_else(|| "-".to_string())
         ),
     }));
+    let readiness = endpoint
+        .and_then(|endpoint| endpoint.credential_readiness)
+        .map(CredentialReadinessCode::as_str)
+        .unwrap_or("unreported");
     lines.push(Line::from(match ui.language {
         Language::Zh => format!(
-            "状态={}  并发={}",
+            "状态={}  并发={}  凭据={readiness}",
             endpoint_status_label(endpoint, ui.language),
             capacity_label(endpoint.map(|endpoint| &endpoint.capacity))
         ),
         Language::En => format!(
-            "state={}  capacity={}",
+            "state={}  capacity={}  credential={readiness}",
             endpoint_status_label(endpoint, ui.language),
             capacity_label(endpoint.map(|endpoint| &endpoint.capacity))
         ),
     }));
+    if let Some(endpoint) = endpoint {
+        for detail in &endpoint.credential_details {
+            let kind = detail.kind.map(|kind| kind.as_str()).unwrap_or("upstream");
+            let source = detail.source_kind.as_deref().unwrap_or("unreported");
+            let reference = detail.reference.as_deref().unwrap_or("-");
+            let cause = detail
+                .stale_cause
+                .map(|cause| format!(" cause={}", cause.as_str()))
+                .unwrap_or_default();
+            lines.push(Line::from(Span::styled(
+                shorten_middle(
+                    &format!(
+                        "{kind}: {} source={source} ref={reference}{cause}",
+                        detail.code.as_str()
+                    ),
+                    max_width,
+                ),
+                Style::default().fg(if detail.code.is_routable() {
+                    p.muted
+                } else {
+                    p.warn
+                }),
+            )));
+        }
+    }
     lines.push(Line::from(Span::styled(
         shorten_middle(
             &match ui.language {
@@ -1032,6 +1096,28 @@ pub(super) fn render_routing_page(
 mod tests {
     use super::*;
 
+    fn endpoint_with_credential(
+        readiness: CredentialReadinessCode,
+    ) -> OperatorProviderEndpointSummary {
+        OperatorProviderEndpointSummary {
+            provider_name: "provider".to_string(),
+            name: "default".to_string(),
+            provider_endpoint_key: "endpoint:opaque".to_string(),
+            origin: None,
+            priority: 0,
+            configured_enabled: true,
+            effective_enabled: true,
+            routable: readiness.is_routable(),
+            credential_readiness: Some(readiness),
+            credential_details: Vec::new(),
+            runtime_enabled_override: None,
+            runtime_state: RuntimeConfigState::Normal,
+            runtime_state_override: None,
+            capacity: OperatorProviderCapacity::default(),
+            policy_actions: Vec::new(),
+        }
+    }
+
     fn candidate(provider_id: &str, endpoint_id: &str) -> OperatorRouteCandidateSummary {
         OperatorRouteCandidateSummary {
             route_order: 0,
@@ -1093,6 +1179,40 @@ mod tests {
                 RoutingTableLayout::Tiny
             );
         }
+    }
+
+    #[test]
+    fn endpoint_status_uses_compact_typed_credential_readiness() {
+        let missing = endpoint_with_credential(CredentialReadinessCode::Missing);
+        assert_eq!(
+            endpoint_status_label(Some(&missing), Language::Zh),
+            "缺凭据"
+        );
+        assert_eq!(
+            endpoint_status_label(Some(&missing), Language::En),
+            "auth miss"
+        );
+
+        let stale = endpoint_with_credential(CredentialReadinessCode::Stale);
+        assert_eq!(endpoint_status_label(Some(&stale), Language::Zh), "凭据旧");
+        assert_eq!(
+            endpoint_status_label(Some(&stale), Language::En),
+            "auth stale"
+        );
+
+        let mut stale_breaker = stale.clone();
+        stale_breaker.runtime_state = RuntimeConfigState::BreakerOpen;
+        assert_eq!(
+            endpoint_status_label(Some(&stale_breaker), Language::En),
+            "breaker"
+        );
+
+        let mut stale_saturated = stale;
+        stale_saturated.capacity.saturated = true;
+        assert_eq!(
+            endpoint_status_label(Some(&stale_saturated), Language::En),
+            "full"
+        );
     }
 
     #[test]

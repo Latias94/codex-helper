@@ -13,6 +13,40 @@ pub enum RoutingOperatorControlError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreparedRoutingOperatorRouteGraph {
+    service_name: String,
+    route_graph_key: String,
+}
+
+impl PreparedRoutingOperatorRouteGraph {
+    pub(crate) fn new(
+        service_name: impl Into<String>,
+        route_graph_key: impl Into<String>,
+    ) -> Result<Self, RoutingOperatorControlError> {
+        let service_name = service_name.into();
+        if service_name.trim().is_empty() {
+            return Err(RoutingOperatorControlError::EmptyServiceName);
+        }
+        let route_graph_key = route_graph_key.into();
+        if route_graph_key.trim().is_empty() {
+            return Err(RoutingOperatorControlError::EmptyRouteGraphKey);
+        }
+        Ok(Self {
+            service_name,
+            route_graph_key,
+        })
+    }
+
+    pub(super) fn service_name(&self) -> &str {
+        self.service_name.as_str()
+    }
+
+    pub(super) fn route_graph_key(&self) -> &str {
+        self.route_graph_key.as_str()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewSessionPreference {
     pub route_graph_key: String,
     pub target: ProviderEndpointKey,

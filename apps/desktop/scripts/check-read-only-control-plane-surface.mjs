@@ -82,6 +82,15 @@ const forbiddenFrontendWriteMethods = [
   /\bmethod\s*:\s*["'`](?!(?:GET|HEAD)["'`])[^"'`]+["'`]/i,
 ];
 
+const allowedReadOnlyCapabilityFields = new Map([
+  [
+    "src/lib/api/admin-types.ts",
+    new Map([
+      ["refresh_provider_balances", /^\s{2}refresh_provider_balances: boolean;$/m],
+    ]),
+  ],
+]);
+
 const failures = [];
 
 for (const source of sources) {
@@ -96,7 +105,7 @@ for (const source of sources) {
     ...forbiddenTauriCommands,
     ...forbiddenFrontendSymbols,
   ]) {
-    if (source.text.includes(value)) {
+    if (source.text.includes(value) && !isAllowedReadOnlyCapabilityField(source, value)) {
       failures.push(`${source.file}: contains forbidden remote mutation surface ${JSON.stringify(value)}`);
     }
   }
@@ -111,6 +120,15 @@ if (failures.length > 0) {
 }
 
 console.log(`Desktop control-plane surface is read-only across ${sourceFiles.length} production files.`);
+
+function isAllowedReadOnlyCapabilityField(source, value) {
+  const declaration = allowedReadOnlyCapabilityFields.get(source.file)?.get(value);
+  if (!declaration) {
+    return false;
+  }
+  const occurrences = source.text.split(value).length - 1;
+  return occurrences === 1 && declaration.test(source.text);
+}
 
 function collectSourceFiles(root) {
   const files = [];

@@ -59,11 +59,15 @@ async fn proxy_routing_explain_returns_selected_route_and_structured_skip_reason
     };
 
     let proxy = ProxyService::new(Client::new(), Arc::new(cfg), "codex");
+    let old_endpoint = crate::runtime_identity::ProviderEndpointKey::new("codex", "old", "legacy");
+    let old_identity = proxy
+        .runtime_identity_for_provider_endpoint_for_test(&old_endpoint)
+        .await;
     proxy
         .state
-        .penalize_provider_endpoint_attempt(
+        .penalize_runtime_upstream_attempt(
             "codex",
-            crate::runtime_identity::ProviderEndpointKey::new("codex", "old", "legacy"),
+            &old_identity,
             30,
             crate::endpoint_health::CooldownBackoff {
                 factor: 1,

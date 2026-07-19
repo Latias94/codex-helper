@@ -227,6 +227,26 @@ async fn next_test_websocket_json(socket: &mut TestWebSocket) -> serde_json::Val
         .expect("websocket json event")
 }
 
+async fn wait_for_credential_generation_after(proxy: &ProxyService, revision: u64) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if proxy
+                .config
+                .capture()
+                .await
+                .credential_generation()
+                .revision()
+                > revision
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("credential rotation should publish a new generation");
+}
+
 #[tokio::test]
 async fn responses_websocket_fails_closed_before_upstream_when_auth_reference_is_missing() {
     let _env_guard = env_lock().await;
@@ -315,7 +335,7 @@ async fn responses_websocket_fails_closed_before_upstream_when_auth_header_is_in
         .get_mut("single")
         .expect("single provider")
         .inline_auth
-        .auth_token = Some("invalid\r\nbearer".to_string());
+        .auth_token = Some("invalid\r\nbearer".to_string().into());
     let proxy = ProxyService::new(Client::new(), Arc::new(source), "codex");
     let app = crate::proxy::router(proxy);
     let (proxy_addr, proxy_handle) = spawn_axum_server(app);
@@ -335,6 +355,563 @@ async fn responses_websocket_fails_closed_before_upstream_when_auth_header_is_in
     );
     assert_eq!(handshake_hits.load(Ordering::SeqCst), 0);
 
+    proxy_handle.abort();
+    upstream_handle.abort();
+    let _ = std::fs::remove_dir_all(codex_home);
+}
+
+#[tokio::test]
+async fn responses_websocket_never_replays_auth_handshake_failures_and_refreshes_once() {
+    let _env_guard = env_lock().await;
+    let codex_home = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HOME", &codex_home);
+    }
+    enable_responses_websocket_for_test(&codex_home);
+
+    for (status, cloudflare_challenge, expected_native_reads) in [
+        (StatusCode::UNAUTHORIZED, false, 2),
+        (StatusCode::FORBIDDEN, false, 2),
+        (StatusCode::FORBIDDEN, true, 1),
+    ] {
+        let primary_hits = Arc::new(AtomicUsize::new(0));
+        let primary_authorizations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hits_for_route = Arc::clone(&primary_hits);
+        let authorizations_for_route = Arc::clone(&primary_authorizations);
+        let primary = axum::Router::new().route(
+            "/v1/responses",
+            get(move |headers: HeaderMap| {
+                let hits = Arc::clone(&hits_for_route);
+                let authorizations = Arc::clone(&authorizations_for_route);
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    authorizations
+                        .lock()
+                        .expect("authorization capture lock")
+                        .push(
+                            headers
+                                .get("authorization")
+                                .and_then(|value| value.to_str().ok())
+                                .map(str::to_owned),
+                        );
+                    if cloudflare_challenge {
+                        axum::response::IntoResponse::into_response((
+                            status,
+                            [
+                                (axum::http::header::CONTENT_TYPE, "text/html"),
+                                (axum::http::header::SERVER, "cloudflare"),
+                            ],
+                            "<html><script src=\"/cdn-cgi/challenge-platform/x.js\"></script></html>",
+                        ))
+                    } else {
+                        axum::response::IntoResponse::into_response((
+                            status,
+                            Json(serde_json::json!({ "error": "auth failed" })),
+                        ))
+                    }
+                }
+            }),
+        );
+        let (primary_addr, primary_handle) = spawn_axum_server(primary);
+
+        let backup_hits = Arc::new(AtomicUsize::new(0));
+        let backup_hits_for_route = Arc::clone(&backup_hits);
+        let backup = axum::Router::new().route(
+            "/v1/responses",
+            get(move || {
+                let hits = Arc::clone(&backup_hits_for_route);
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            }),
+        );
+        let (backup_addr, backup_handle) = spawn_axum_server(backup);
+
+        let retry = RetryConfig {
+            upstream: Some(retry_layer_config(
+                2,
+                "401,403",
+                Vec::new(),
+                RetryStrategy::SameUpstream,
+            )),
+            provider: Some(retry_layer_config(
+                2,
+                "401,403",
+                Vec::new(),
+                RetryStrategy::Failover,
+            )),
+            ..RetryConfig::default()
+        };
+        let source = HelperConfig {
+            retry,
+            codex: ServiceRouteConfig {
+                providers: std::collections::BTreeMap::from([
+                    (
+                        "primary".to_string(),
+                        ProviderConfig {
+                            base_url: Some(format!("http://{primary_addr}/v1")),
+                            auth: UpstreamAuth {
+                                auth_token_ref: Some(crate::config::CredentialRef::Native {
+                                    name: "relay.primary".to_string(),
+                                }),
+                                ..UpstreamAuth::default()
+                            },
+                            ..ProviderConfig::default()
+                        },
+                    ),
+                    (
+                        "backup".to_string(),
+                        ProviderConfig {
+                            base_url: Some(format!("http://{backup_addr}/v1")),
+                            auth: UpstreamAuth {
+                                allow_anonymous: Some(true),
+                                ..UpstreamAuth::default()
+                            },
+                            ..ProviderConfig::default()
+                        },
+                    ),
+                ]),
+                routing: Some(RouteGraphConfig::ordered_failover(vec![
+                    "primary".to_string(),
+                    "backup".to_string(),
+                ])),
+                ..ServiceRouteConfig::default()
+            },
+            ..HelperConfig::default()
+        };
+        let (credential_sources, credential_control) =
+            crate::credentials::CredentialSourceCapabilities::test_native(
+                crate::credentials::SecretValue::new(b"generation-a".to_vec())
+                    .expect("valid initial credential"),
+            );
+        let runtime_store = Arc::new(
+            crate::runtime_store::RuntimeStore::open_in_memory().expect("open runtime store"),
+        );
+        let proxy = ProxyService::new_with_runtime_store_and_credential_sources(
+            Client::new(),
+            Arc::new(source),
+            "codex",
+            runtime_store,
+            credential_sources,
+        )
+        .expect("build credential-backed proxy");
+        assert_eq!(credential_control.read_count(), 1);
+        credential_control.set_value(
+            crate::credentials::SecretValue::new(b"generation-b".to_vec())
+                .expect("valid rotated credential"),
+        );
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let refresh_driver = proxy.spawn_credential_refresh_driver(shutdown_rx);
+        let app = crate::proxy::router(proxy);
+        let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+        let mut request = test_websocket_request(proxy_addr, "ws-auth-handshake-failure");
+        request.headers_mut().insert(
+            WS_PROVIDER_ENDPOINT_HEADER,
+            HeaderValue::from_static("codex/primary/default"),
+        );
+        let error = tokio_tungstenite::connect_async(request)
+            .await
+            .expect_err("upstream authentication failure must reject the handshake");
+        let tokio_tungstenite::tungstenite::Error::Http(response) = error else {
+            panic!("expected HTTP authentication failure, got {error:?}");
+        };
+        assert_eq!(
+            response.status(),
+            status,
+            "unexpected handshake body: {}",
+            String::from_utf8_lossy(response.body().as_deref().unwrap_or_default())
+        );
+
+        if expected_native_reads == 2 {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while credential_control.read_count() < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("authentication failure should schedule one credential refresh");
+        } else {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            credential_control.read_count(),
+            expected_native_reads,
+            "Cloudflare challenge pages are transport failures, not credential evidence"
+        );
+        assert_eq!(
+            *primary_authorizations
+                .lock()
+                .expect("authorization capture lock"),
+            vec![Some("Bearer generation-a".to_string())]
+        );
+
+        shutdown_tx.send(true).expect("signal refresh shutdown");
+        refresh_driver.await.expect("join refresh driver");
+        proxy_handle.abort();
+        primary_handle.abort();
+        backup_handle.abort();
+    }
+
+    let _ = std::fs::remove_dir_all(codex_home);
+}
+
+#[tokio::test]
+async fn responses_websocket_requires_reconnect_when_another_endpoint_credential_rotates() {
+    let _env_guard = env_lock().await;
+    let codex_home = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HOME", &codex_home);
+    }
+    enable_responses_websocket_for_test(&codex_home);
+
+    let primary_handshakes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let primary_frames = Arc::new(AtomicUsize::new(0));
+    let handshakes_for_route = Arc::clone(&primary_handshakes);
+    let frames_for_route = Arc::clone(&primary_frames);
+    let primary = axum::Router::new().route(
+        "/v1/responses",
+        get(
+            move |ws: axum::extract::ws::WebSocketUpgrade, headers: HeaderMap| {
+                let handshakes = Arc::clone(&handshakes_for_route);
+                let frames = Arc::clone(&frames_for_route);
+                async move {
+                    handshakes.lock().expect("handshake capture lock").push(
+                        headers
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned),
+                    );
+                    ws.on_upgrade(move |mut socket| async move {
+                        while let Some(Ok(message)) = socket.recv().await {
+                            if !matches!(
+                                message,
+                                axum::extract::ws::Message::Text(_)
+                                    | axum::extract::ws::Message::Binary(_)
+                            ) {
+                                continue;
+                            }
+                            frames.fetch_add(1, Ordering::SeqCst);
+                            send_successful_websocket_response(&mut socket, "resp-primary").await;
+                        }
+                    })
+                }
+            },
+        ),
+    );
+    let (primary_addr, primary_handle) = spawn_axum_server(primary);
+
+    let secondary_handshakes = Arc::new(AtomicUsize::new(0));
+    let secondary_handshakes_for_route = Arc::clone(&secondary_handshakes);
+    let secondary = axum::Router::new().route(
+        "/v1/responses",
+        get(move |ws: axum::extract::ws::WebSocketUpgrade| {
+            let handshakes = Arc::clone(&secondary_handshakes_for_route);
+            async move {
+                handshakes.fetch_add(1, Ordering::SeqCst);
+                ws.on_upgrade(|mut socket| async move { while socket.recv().await.is_some() {} })
+            }
+        }),
+    );
+    let (secondary_addr, secondary_handle) = spawn_axum_server(secondary);
+
+    let source = HelperConfig {
+        codex: ServiceRouteConfig {
+            providers: std::collections::BTreeMap::from([
+                (
+                    "primary".to_string(),
+                    ProviderConfig {
+                        base_url: Some(format!("http://{primary_addr}/v1")),
+                        auth: UpstreamAuth {
+                            auth_token_ref: Some(crate::config::CredentialRef::Native {
+                                name: "relay.primary".to_string(),
+                            }),
+                            ..UpstreamAuth::default()
+                        },
+                        ..ProviderConfig::default()
+                    },
+                ),
+                (
+                    "secondary".to_string(),
+                    ProviderConfig {
+                        base_url: Some(format!("http://{secondary_addr}/v1")),
+                        auth: UpstreamAuth {
+                            auth_token_ref: Some(crate::config::CredentialRef::Native {
+                                name: "relay.secondary".to_string(),
+                            }),
+                            ..UpstreamAuth::default()
+                        },
+                        ..ProviderConfig::default()
+                    },
+                ),
+            ]),
+            routing: Some(RouteGraphConfig::ordered_failover(vec![
+                "primary".to_string(),
+                "secondary".to_string(),
+            ])),
+            ..ServiceRouteConfig::default()
+        },
+        ..HelperConfig::default()
+    };
+    let (credential_sources, credential_control) =
+        crate::credentials::CredentialSourceCapabilities::test_native(
+            crate::credentials::SecretValue::new(b"generation-a".to_vec())
+                .expect("valid initial credential"),
+        );
+    let runtime_store =
+        Arc::new(crate::runtime_store::RuntimeStore::open_in_memory().expect("open runtime store"));
+    let proxy = ProxyService::new_with_runtime_store_and_credential_sources(
+        Client::new(),
+        Arc::new(source),
+        "codex",
+        runtime_store,
+        credential_sources,
+    )
+    .expect("build credential-backed proxy");
+    let retained = proxy.clone();
+    let before = retained.config.capture().await;
+    let route_plan = before
+        .capture_route_plan("codex", &crate::routing_ir::RouteRequestContext::default())
+        .expect("capture route plan")
+        .expect("route plan");
+    let secondary_candidate = route_plan
+        .template()
+        .candidates
+        .iter()
+        .find(|candidate| candidate.provider_id == "secondary")
+        .expect("secondary candidate");
+    let secondary_target = route_plan
+        .template()
+        .capture_candidate(secondary_candidate)
+        .expect("capture secondary credential");
+    let initial_generation_revision = before.credential_generation().revision();
+    assert_eq!(credential_control.read_count(), 2);
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let refresh_driver = retained.spawn_credential_refresh_driver(shutdown_rx);
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let mut request = test_websocket_request(proxy_addr, "ws-other-credential-rotation");
+    request.headers_mut().insert(
+        WS_PROVIDER_ENDPOINT_HEADER,
+        HeaderValue::from_static("codex/primary/default"),
+    );
+    let mut socket = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("initial WebSocket handshake")
+        .0;
+
+    credential_control.set_value(
+        crate::credentials::SecretValue::new(b"generation-b".to_vec())
+            .expect("valid rotated credential"),
+    );
+    retained
+        .config
+        .schedule_credential_refresh(secondary_target.credential());
+    wait_for_credential_generation_after(&retained, initial_generation_revision).await;
+    assert_eq!(credential_control.read_count(), 3);
+
+    send_test_response_create(&mut socket, "after other endpoint rotation").await;
+    let rejection = next_test_websocket_json(&mut socket).await;
+    assert_eq!(rejection["type"].as_str(), Some("error"));
+    assert_eq!(
+        rejection["code"].as_str(),
+        Some("websocket_reconnect_required")
+    );
+    assert_eq!(primary_frames.load(Ordering::SeqCst), 0);
+    assert_eq!(secondary_handshakes.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        *primary_handshakes.lock().expect("handshake capture lock"),
+        [Some("Bearer generation-a".to_string())]
+    );
+
+    shutdown_tx.send(true).expect("signal refresh shutdown");
+    refresh_driver.await.expect("join refresh driver");
+    proxy_handle.abort();
+    primary_handle.abort();
+    secondary_handle.abort();
+    let _ = std::fs::remove_dir_all(codex_home);
+}
+
+#[tokio::test]
+async fn responses_websocket_finishes_active_generation_then_reconnects_for_rotated_credential() {
+    let _env_guard = env_lock().await;
+    let codex_home = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HOME", &codex_home);
+    }
+    enable_responses_websocket_for_test(&codex_home);
+
+    let handshake_authorizations = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let create_hits = Arc::new(AtomicUsize::new(0));
+    let first_started = Arc::new(tokio::sync::Notify::new());
+    let release_first = Arc::new(tokio::sync::Notify::new());
+    let authorizations_for_route = Arc::clone(&handshake_authorizations);
+    let hits_for_route = Arc::clone(&create_hits);
+    let started_for_route = Arc::clone(&first_started);
+    let release_for_route = Arc::clone(&release_first);
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        get(
+            move |ws: axum::extract::ws::WebSocketUpgrade, headers: HeaderMap| {
+                let authorizations = Arc::clone(&authorizations_for_route);
+                let hits = Arc::clone(&hits_for_route);
+                let first_started = Arc::clone(&started_for_route);
+                let release_first = Arc::clone(&release_for_route);
+                async move {
+                    authorizations
+                        .lock()
+                        .expect("authorization capture lock")
+                        .push(
+                            headers
+                                .get("authorization")
+                                .and_then(|value| value.to_str().ok())
+                                .map(str::to_owned),
+                        );
+                    ws.on_upgrade(move |mut socket| async move {
+                        while let Some(Ok(message)) = socket.recv().await {
+                            if !matches!(
+                                message,
+                                axum::extract::ws::Message::Text(_)
+                                    | axum::extract::ws::Message::Binary(_)
+                            ) {
+                                continue;
+                            }
+                            let hit = hits.fetch_add(1, Ordering::SeqCst);
+                            if hit == 0 {
+                                first_started.notify_one();
+                                release_first.notified().await;
+                            }
+                            send_successful_websocket_response(
+                                &mut socket,
+                                format!("resp-generation-{hit}").as_str(),
+                            )
+                            .await;
+                        }
+                    })
+                }
+            },
+        ),
+    );
+    let (upstream_addr, upstream_handle) = spawn_axum_server(upstream);
+
+    let mut source = single_provider_websocket_config(upstream_addr, SchedulingPreset::Balanced, 2);
+    source
+        .codex
+        .providers
+        .get_mut("single")
+        .expect("single provider")
+        .auth = UpstreamAuth {
+        auth_token_ref: Some(crate::config::CredentialRef::Native {
+            name: "relay.primary".to_string(),
+        }),
+        ..UpstreamAuth::default()
+    };
+    let (credential_sources, credential_control) =
+        crate::credentials::CredentialSourceCapabilities::test_native(
+            crate::credentials::SecretValue::new(b"generation-a".to_vec())
+                .expect("valid initial credential"),
+        );
+    let runtime_store =
+        Arc::new(crate::runtime_store::RuntimeStore::open_in_memory().expect("open runtime store"));
+    let proxy = ProxyService::new_with_runtime_store_and_credential_sources(
+        Client::new(),
+        Arc::new(source),
+        "codex",
+        runtime_store,
+        credential_sources,
+    )
+    .expect("build credential-backed proxy");
+    let retained = proxy.clone();
+    let before = retained.config.capture().await;
+    let route_plan = before
+        .capture_route_plan("codex", &crate::routing_ir::RouteRequestContext::default())
+        .expect("capture route plan")
+        .expect("route plan");
+    let old_target = route_plan
+        .template()
+        .capture_candidate(
+            route_plan
+                .template()
+                .candidates
+                .first()
+                .expect("single candidate"),
+        )
+        .expect("capture initial credential");
+    let initial_generation_revision = before.credential_generation().revision();
+    assert_eq!(credential_control.read_count(), 1);
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let refresh_driver = retained.spawn_credential_refresh_driver(shutdown_rx);
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let mut old_socket = connect_test_websocket(proxy_addr, "ws-generation-a").await;
+    send_test_response_create(&mut old_socket, "active on generation A").await;
+    tokio::time::timeout(Duration::from_secs(2), first_started.notified())
+        .await
+        .expect("generation A response should start upstream");
+
+    credential_control.set_value(
+        crate::credentials::SecretValue::new(b"generation-b".to_vec())
+            .expect("valid rotated credential"),
+    );
+    retained
+        .config
+        .schedule_credential_refresh(old_target.credential());
+    wait_for_credential_generation_after(&retained, initial_generation_revision).await;
+    assert_eq!(credential_control.read_count(), 2);
+
+    release_first.notify_one();
+    assert_eq!(
+        next_test_websocket_json(&mut old_socket).await["type"].as_str(),
+        Some("response.created")
+    );
+    assert_eq!(
+        next_test_websocket_json(&mut old_socket).await["type"].as_str(),
+        Some("response.completed")
+    );
+
+    send_test_response_create(&mut old_socket, "must reconnect for generation B").await;
+    let rejection = next_test_websocket_json(&mut old_socket).await;
+    assert_eq!(rejection["type"].as_str(), Some("error"));
+    assert_eq!(
+        rejection["code"].as_str(),
+        Some("websocket_reconnect_required")
+    );
+    assert_eq!(create_hits.load(Ordering::SeqCst), 1);
+
+    let mut new_socket = connect_test_websocket(proxy_addr, "ws-generation-b").await;
+    send_test_response_create(&mut new_socket, "new connection uses generation B").await;
+    assert_eq!(
+        next_test_websocket_json(&mut new_socket).await["type"].as_str(),
+        Some("response.created")
+    );
+    assert_eq!(
+        next_test_websocket_json(&mut new_socket).await["type"].as_str(),
+        Some("response.completed")
+    );
+    assert_eq!(create_hits.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        *handshake_authorizations
+            .lock()
+            .expect("authorization capture lock"),
+        [
+            Some("Bearer generation-a".to_string()),
+            Some("Bearer generation-b".to_string()),
+        ]
+    );
+
+    new_socket.close(None).await.expect("close new WebSocket");
+    shutdown_tx.send(true).expect("signal refresh shutdown");
+    refresh_driver.await.expect("join refresh driver");
     proxy_handle.abort();
     upstream_handle.abort();
     let _ = std::fs::remove_dir_all(codex_home);
@@ -823,10 +1400,12 @@ supports_websockets = true
         vec![UpstreamConfig {
             base_url: format!("http://{}/v1", u_addr),
             auth: UpstreamAuth {
-                auth_token: Some("server-token".to_string()),
+                auth_token: Some("server-token".to_string().into()),
                 auth_token_env: None,
+                auth_token_ref: None,
                 api_key: None,
                 api_key_env: None,
+                api_key_ref: None,
                 allow_anonymous: None,
             },
             tags: HashMap::new(),
@@ -957,10 +1536,15 @@ supports_websockets = true
     };
     let proxy = ProxyService::new(Client::new(), Arc::new(source), "codex");
     let state = proxy.state.clone();
+    let provider_endpoint =
+        crate::runtime_identity::ProviderEndpointKey::new("codex", "ws-provider", "default");
+    let provider_identity = proxy
+        .runtime_identity_for_provider_endpoint_for_test(&provider_endpoint)
+        .await;
     state
-        .penalize_provider_endpoint_attempt(
+        .penalize_runtime_upstream_attempt(
             "codex",
-            crate::runtime_identity::ProviderEndpointKey::new("codex", "ws-provider", "default"),
+            &provider_identity,
             30,
             crate::endpoint_health::CooldownBackoff {
                 factor: 1,
@@ -1300,6 +1884,10 @@ supports_websockets = true
         .route_graph_key();
     let proxy = ProxyService::new(Client::new(), Arc::new(source), "codex");
     let state = proxy.state.clone();
+    let b_endpoint = ProviderEndpointKey::new("codex", "b", "default");
+    let b_identity = proxy
+        .runtime_identity_for_provider_endpoint_for_test(&b_endpoint)
+        .await;
     state
         .record_session_route_affinity_success(
             None,
@@ -1317,9 +1905,9 @@ supports_websockets = true
         .await
         .expect("persist route affinity");
     state
-        .penalize_provider_endpoint_attempt(
+        .penalize_runtime_upstream_attempt(
             "codex",
-            ProviderEndpointKey::new("codex", "b", "default"),
+            &b_identity,
             30,
             crate::endpoint_health::CooldownBackoff {
                 factor: 1,
@@ -1341,11 +1929,7 @@ supports_websockets = true
         .await
         .expect("connect proxy websocket");
     state
-        .record_provider_endpoint_attempt_success(
-            "codex",
-            ProviderEndpointKey::new("codex", "b", "default"),
-            crate::logging::now_ms(),
-        )
+        .record_runtime_upstream_attempt_success("codex", &b_identity, crate::logging::now_ms())
         .await;
     socket
         .send(tokio_tungstenite::tungstenite::Message::Text(
@@ -3495,8 +4079,8 @@ supports_websockets = true
     );
     let upstream = spawn_test_upstream(upstream);
     let mut upstream_config = upstream.upstream_config();
-    upstream_config.auth.auth_token = Some("server-owned-token".to_string());
-    upstream_config.auth.api_key = Some("server-owned-api-key".to_string());
+    upstream_config.auth.auth_token = Some("server-owned-token".to_string().into());
+    upstream_config.auth.api_key = Some("server-owned-api-key".to_string().into());
     let proxy = spawn_test_proxy(make_helper_config(
         vec![upstream_config],
         retry_config(1, "502", Vec::new(), RetryStrategy::Failover),

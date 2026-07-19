@@ -61,6 +61,30 @@ const contractDefinitions = [
         shape: true,
       },
       {
+        id: "operatorActionCapabilities",
+        file: "../../crates/core/src/dashboard_core/operator_summary.rs",
+        struct: "OperatorActionCapabilities",
+        shape: true,
+      },
+      {
+        id: "operatorRoutingSummary",
+        file: "../../crates/core/src/dashboard_core/operator_summary.rs",
+        struct: "OperatorRoutingSummary",
+        shape: true,
+      },
+      {
+        id: "operatorRouteTargetSummary",
+        file: "../../crates/core/src/dashboard_core/operator_summary.rs",
+        struct: "OperatorRouteTargetSummary",
+        shape: true,
+      },
+      {
+        id: "operatorRouteCandidateSummary",
+        file: "../../crates/core/src/dashboard_core/operator_summary.rs",
+        struct: "OperatorRouteCandidateSummary",
+        shape: true,
+      },
+      {
         id: "controlProfileOption",
         file: "../../crates/core/src/dashboard_core/types.rs",
         struct: "ControlProfileOption",
@@ -76,6 +100,12 @@ const contractDefinitions = [
         id: "operatorProviderEndpointSummary",
         file: "../../crates/core/src/dashboard_core/operator_summary.rs",
         struct: "OperatorProviderEndpointSummary",
+        shape: true,
+      },
+      {
+        id: "credentialReadinessDetail",
+        file: "../../crates/core/src/credentials/model.rs",
+        struct: "CredentialReadinessDetail",
         shape: true,
       },
       {
@@ -321,6 +351,48 @@ const contractDefinitions = [
     ],
     enums: [
       {
+        file: "../../crates/core/src/credentials/model.rs",
+        rust: "CredentialReadinessCode",
+        typescriptFile: "src/lib/api/admin-types.ts",
+        typescript: "ApiCredentialReadinessCode",
+        rename: "snake",
+      },
+      {
+        file: "../../crates/core/src/credentials/model.rs",
+        rust: "CredentialBindingKind",
+        typescriptFile: "src/lib/api/admin-types.ts",
+        typescript: "ApiCredentialBindingKind",
+        rename: "snake",
+      },
+      {
+        file: "../../crates/core/src/credentials/model.rs",
+        rust: "CredentialAggregateReadiness",
+        typescriptFile: "src/lib/api/admin-types.ts",
+        typescript: "ApiCredentialAggregateReadiness",
+        rename: "snake",
+      },
+      {
+        file: "../../crates/core/src/config.rs",
+        rust: "RouteStrategy",
+        typescriptFile: "src/lib/api/admin-types.ts",
+        typescript: "ApiRouteStrategy",
+        rename: "kebab",
+      },
+      {
+        file: "../../crates/core/src/config.rs",
+        rust: "RouteAffinityPolicy",
+        typescriptFile: "src/lib/api/admin-types.ts",
+        typescript: "ApiRouteAffinityPolicy",
+        rename: "kebab",
+      },
+      {
+        file: "../../crates/core/src/config.rs",
+        rust: "SchedulingPreset",
+        typescriptFile: "src/lib/api/admin-types.ts",
+        typescript: "ApiSchedulingPreset",
+        rename: "kebab",
+      },
+      {
         file: "../../crates/core/src/dashboard_core/operator_summary.rs",
         rust: "OperatorReadStatus",
         typescriptFile: "src/lib/api/admin-types.ts",
@@ -457,6 +529,30 @@ const contractDefinitions = [
       },
       {
         file: "src/lib/api/admin-types.ts",
+        type: "ApiOperatorActionCapabilities",
+        fieldsFrom: "operatorActionCapabilities",
+        strictShape: true,
+      },
+      {
+        file: "src/lib/api/admin-types.ts",
+        type: "ApiOperatorRoutingSummary",
+        fieldsFrom: "operatorRoutingSummary",
+        strictShape: true,
+      },
+      {
+        file: "src/lib/api/admin-types.ts",
+        type: "ApiOperatorRouteTargetSummary",
+        fieldsFrom: "operatorRouteTargetSummary",
+        strictShape: true,
+      },
+      {
+        file: "src/lib/api/admin-types.ts",
+        type: "ApiOperatorRouteCandidateSummary",
+        fieldsFrom: "operatorRouteCandidateSummary",
+        strictShape: true,
+      },
+      {
+        file: "src/lib/api/admin-types.ts",
         type: "ApiControlProfileOption",
         fieldsFrom: "controlProfileOption",
         strictShape: true,
@@ -471,6 +567,12 @@ const contractDefinitions = [
         file: "src/lib/api/admin-types.ts",
         type: "ApiOperatorProviderEndpointSummary",
         fieldsFrom: "operatorProviderEndpointSummary",
+        strictShape: true,
+      },
+      {
+        file: "src/lib/api/admin-types.ts",
+        type: "ApiCredentialReadinessDetail",
+        fieldsFrom: "credentialReadinessDetail",
         strictShape: true,
       },
       {

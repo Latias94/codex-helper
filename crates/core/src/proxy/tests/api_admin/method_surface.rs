@@ -65,6 +65,7 @@ async fn proxy_control_plane_exposes_only_get_and_head_routes() {
         "/__codex_helper/api/v1/overrides/session/reset",
         "/__codex_helper/api/v1/healthcheck/start",
         "/__codex_helper/api/v1/healthcheck/cancel",
+        "/__codex_helper/local/v1/operator/credentials/refresh",
     ];
 
     let non_read_methods = [
@@ -151,6 +152,7 @@ async fn control_plane_read_surface_matches_canonical_allowlist() {
         "/__codex_helper/api/v1/overrides/session/service-tier",
         "/__codex_helper/api/v1/overrides/global-station",
         "/__codex_helper/api/v1/overrides/global-route",
+        "/__codex_helper/local/v1/operator/credentials/refresh",
     ];
 
     for path in canonical_paths {

@@ -1,5 +1,6 @@
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, HeaderName};
 
+use crate::codex_switch::{CODEX_CLIENT_FACADE_ACTOR_HEADER, CODEX_CLIENT_FACADE_ACTOR_VALUE};
 use crate::logging::HeaderEntry;
 
 fn is_hop_by_hop_header(name_lower: &str) -> bool {
@@ -62,6 +63,31 @@ pub(super) fn filter_request_headers(src: &HeaderMap) -> HeaderMap {
     out
 }
 
+pub(super) fn strip_codex_client_facade_marker(headers: &mut HeaderMap) {
+    let retained = headers
+        .get_all(CODEX_CLIENT_FACADE_ACTOR_HEADER)
+        .iter()
+        .filter(|value| value.as_bytes() != CODEX_CLIENT_FACADE_ACTOR_VALUE.as_bytes())
+        .cloned()
+        .collect::<Vec<_>>();
+    if retained.len()
+        == headers
+            .get_all(CODEX_CLIENT_FACADE_ACTOR_HEADER)
+            .iter()
+            .count()
+    {
+        return;
+    }
+
+    headers.remove(CODEX_CLIENT_FACADE_ACTOR_HEADER);
+    for value in retained {
+        headers.append(
+            HeaderName::from_static(CODEX_CLIENT_FACADE_ACTOR_HEADER),
+            value,
+        );
+    }
+}
+
 pub(super) fn filter_response_headers(src: &HeaderMap) -> HeaderMap {
     let extra = hop_by_hop_connection_tokens(src);
     let mut out = HeaderMap::new();
@@ -99,7 +125,9 @@ pub(super) fn header_map_to_entries(headers: &HeaderMap) -> Vec<HeaderEntry> {
     let mut out = Vec::new();
     for (name, value) in headers.iter() {
         let name_lower = name.as_str().to_ascii_lowercase();
-        let value = if is_sensitive(name_lower.as_str()) {
+        let value = if is_sensitive(name_lower.as_str())
+            || name_lower == CODEX_CLIENT_FACADE_ACTOR_HEADER
+        {
             "[REDACTED]".to_string()
         } else {
             String::from_utf8_lossy(value.as_bytes()).into_owned()
@@ -116,7 +144,12 @@ pub(super) fn header_map_to_entries(headers: &HeaderMap) -> Vec<HeaderEntry> {
 mod tests {
     use axum::http::{HeaderMap, HeaderValue};
 
-    use super::{filter_request_headers, filter_response_headers, header_map_to_entries};
+    use crate::codex_switch::{CODEX_CLIENT_FACADE_ACTOR_HEADER, CODEX_CLIENT_FACADE_ACTOR_VALUE};
+
+    use super::{
+        filter_request_headers, filter_response_headers, header_map_to_entries,
+        strip_codex_client_facade_marker,
+    };
 
     #[test]
     fn request_header_filter_removes_hop_by_hop_and_connection_targets() {
@@ -203,12 +236,22 @@ mod tests {
             "x-codex-helper-admin-token",
             HeaderValue::from_static("admin-secret"),
         );
+        headers.insert(
+            CODEX_CLIENT_FACADE_ACTOR_HEADER,
+            HeaderValue::from_static("actor-secret"),
+        );
         headers.insert("content-type", HeaderValue::from_static("application/json"));
 
         let entries = header_map_to_entries(&headers);
 
         assert!(entries.iter().any(|entry| {
             entry.name.eq_ignore_ascii_case("authorization") && entry.value == "[REDACTED]"
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry
+                .name
+                .eq_ignore_ascii_case(CODEX_CLIENT_FACADE_ACTOR_HEADER)
+                && entry.value == "[REDACTED]"
         }));
         assert!(entries.iter().any(|entry| {
             entry.name.eq_ignore_ascii_case("x-api-key") && entry.value == "[REDACTED]"
@@ -222,5 +265,27 @@ mod tests {
         assert!(entries.iter().any(|entry| {
             entry.name.eq_ignore_ascii_case("content-type") && entry.value == "application/json"
         }));
+    }
+
+    #[test]
+    fn client_facade_marker_is_removed_without_dropping_real_actor_authorization() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            CODEX_CLIENT_FACADE_ACTOR_HEADER,
+            HeaderValue::from_static(CODEX_CLIENT_FACADE_ACTOR_VALUE),
+        );
+        headers.append(
+            CODEX_CLIENT_FACADE_ACTOR_HEADER,
+            HeaderValue::from_static("real-actor-token"),
+        );
+
+        strip_codex_client_facade_marker(&mut headers);
+
+        let values = headers
+            .get_all(CODEX_CLIENT_FACADE_ACTOR_HEADER)
+            .iter()
+            .map(HeaderValue::as_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![b"real-actor-token".as_slice()]);
     }
 }

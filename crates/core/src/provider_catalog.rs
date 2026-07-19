@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 
-use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -58,65 +57,27 @@ impl AccountFingerprint {
         Self(digest)
     }
 
-    pub fn from_final_headers(headers: &HeaderMap) -> Self {
-        const ACCOUNT_HEADERS: &[&str] = &[
-            "authorization",
-            "chatgpt-account-id",
-            "openai-organization",
-            "openai-project",
-            "x-api-key",
-            "x-openai-fedramp",
-            "x-openai-organization",
-            "x-openai-project",
-            "x-organization-id",
-            "x-project-id",
-        ];
+    pub(crate) const fn from_keyed_account_digest(digest: [u8; 32]) -> Self {
+        Self(digest)
+    }
 
+    pub(crate) fn unscoped() -> Self {
         let mut digest = Sha256::new();
-        digest.update(b"codex-helper:provider-account:v1\0");
-        let mut found = false;
-        for name in ACCOUNT_HEADERS {
-            let mut values = headers
-                .get_all(*name)
-                .iter()
-                .map(|value| normalized_account_header_value(name, value.as_bytes()))
-                .collect::<Vec<_>>();
-            values.sort();
-            for value in values {
-                found = true;
-                digest.update(name.as_bytes());
-                digest.update([0]);
-                digest.update((value.len() as u64).to_be_bytes());
-                digest.update(value);
-            }
-        }
-        if !found {
-            digest.update(b"anonymous");
-        }
+        digest.update(b"codex-helper:provider-account:credential-scope:v2\0");
+        digest.update([0]);
         Self(digest.finalize().into())
     }
-}
 
-fn normalized_account_header_value(name: &str, value: &[u8]) -> Vec<u8> {
-    if name != "authorization" {
-        return value.to_vec();
+    /// Maps an installation-keyed opaque credential scope into the legacy persisted shape.
+    /// Request headers and credential values must never be used as this input.
+    pub(crate) fn from_credential_scope(credential_scope: &str) -> Self {
+        let mut digest = Sha256::new();
+        digest.update(b"codex-helper:provider-account:credential-scope:v2\0");
+        digest.update([1]);
+        digest.update((credential_scope.len() as u64).to_be_bytes());
+        digest.update(credential_scope.as_bytes());
+        Self(digest.finalize().into())
     }
-    let Ok(value) = std::str::from_utf8(value) else {
-        return value.to_vec();
-    };
-    let Some(fields) = value.strip_prefix("AWS4-HMAC-SHA256") else {
-        return value.as_bytes().to_vec();
-    };
-    fields
-        .trim_start()
-        .split(',')
-        .find_map(|part| part.trim().strip_prefix("Credential="))
-        .and_then(|credential| credential.split('/').next())
-        .filter(|credential| !credential.is_empty())
-        .map_or_else(
-            || value.as_bytes().to_vec(),
-            |credential| credential.as_bytes().to_vec(),
-        )
 }
 
 impl std::fmt::Debug for AccountFingerprint {
@@ -982,8 +943,6 @@ fn openai_gpt_5_6_pricing_catalog() -> ProviderPricingCatalog {
 
 #[cfg(test)]
 mod tests {
-    use axum::http::{HeaderMap, HeaderValue};
-
     use super::*;
 
     fn fingerprint(seed: u8) -> AccountFingerprint {
@@ -1053,32 +1012,22 @@ mod tests {
     }
 
     #[test]
-    fn final_account_headers_produce_a_stable_non_secret_fingerprint() {
-        let mut first = HeaderMap::new();
-        first.insert(
-            "authorization",
-            HeaderValue::from_static("Bearer account-secret-one"),
+    fn opaque_credential_scopes_produce_stable_account_fingerprints() {
+        let first_fingerprint = AccountFingerprint::from_credential_scope(
+            "hmac-sha256-v1:opaque-installation-scoped-account-one",
         );
-        first.insert("x-request-id", HeaderValue::from_static("request-a"));
-
-        let mut same_account = first.clone();
-        same_account.insert("x-request-id", HeaderValue::from_static("request-b"));
-
-        let mut other_account = first.clone();
-        other_account.insert(
-            "authorization",
-            HeaderValue::from_static("Bearer account-secret-two"),
+        let same_fingerprint = AccountFingerprint::from_credential_scope(
+            "hmac-sha256-v1:opaque-installation-scoped-account-one",
         );
-
-        let first_fingerprint = AccountFingerprint::from_final_headers(&first);
-        let same_fingerprint = AccountFingerprint::from_final_headers(&same_account);
-        let other_fingerprint = AccountFingerprint::from_final_headers(&other_account);
+        let other_fingerprint = AccountFingerprint::from_credential_scope(
+            "hmac-sha256-v1:opaque-installation-scoped-account-two",
+        );
 
         assert_eq!(first_fingerprint, same_fingerprint);
         assert_ne!(first_fingerprint, other_fingerprint);
         let rendered = first_fingerprint.to_string();
         assert!(rendered.starts_with("sha256:"));
-        assert!(!rendered.contains("account-secret-one"));
+        assert!(!rendered.contains("opaque-installation-scoped-account-one"));
         assert_eq!(
             format!("{first_fingerprint:?}"),
             "AccountFingerprint([redacted])"
@@ -1086,38 +1035,15 @@ mod tests {
     }
 
     #[test]
-    fn aws_sigv4_fingerprint_uses_access_key_identity_not_per_request_signature() {
-        let mut first = HeaderMap::new();
-        first.insert(
-            "authorization",
-            HeaderValue::from_static(
-                "AWS4-HMAC-SHA256 Credential=AKIAEXAMPLE/20260711/us-east-1/bedrock/aws4_request, SignedHeaders=content-type;host;x-amz-date, Signature=aaaaaaaa",
-            ),
-        );
+    fn anonymous_account_fingerprint_is_stable_and_distinct_from_credential_scope() {
+        let anonymous = AccountFingerprint::unscoped();
 
-        let mut same_account = HeaderMap::new();
-        same_account.insert(
-            "authorization",
-            HeaderValue::from_static(
-                "AWS4-HMAC-SHA256 Credential=AKIAEXAMPLE/20260712/us-west-2/bedrock/aws4_request, SignedHeaders=content-type;host;x-amz-date, Signature=bbbbbbbb",
-            ),
-        );
-
-        let mut other_account = HeaderMap::new();
-        other_account.insert(
-            "authorization",
-            HeaderValue::from_static(
-                "AWS4-HMAC-SHA256 Credential=AKIAOTHER/20260711/us-east-1/bedrock/aws4_request, SignedHeaders=content-type;host;x-amz-date, Signature=aaaaaaaa",
-            ),
-        );
-
-        assert_eq!(
-            AccountFingerprint::from_final_headers(&first),
-            AccountFingerprint::from_final_headers(&same_account)
-        );
+        assert_eq!(anonymous, AccountFingerprint::unscoped());
         assert_ne!(
-            AccountFingerprint::from_final_headers(&first),
-            AccountFingerprint::from_final_headers(&other_account)
+            anonymous,
+            AccountFingerprint::from_credential_scope(
+                "hmac-sha256-v1:opaque-installation-scoped-account"
+            )
         );
     }
 

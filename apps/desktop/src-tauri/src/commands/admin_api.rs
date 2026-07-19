@@ -258,6 +258,7 @@ mod tests {
                     runtime: Default::default(),
                     counts: Default::default(),
                     retry: Default::default(),
+                    credential_readiness: None,
                     sessions: Vec::new(),
                     profiles: Vec::new(),
                     providers: Vec::new(),
@@ -272,6 +273,7 @@ mod tests {
                 stats_5m: Default::default(),
                 stats_1h: Default::default(),
                 pricing_catalog: Default::default(),
+                service_status: None,
                 provider_balances: Vec::new(),
             },
         )

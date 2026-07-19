@@ -4,13 +4,13 @@ use super::*;
 fn upstream_anonymous_policy_is_explicit_and_round_trips_in_v5() {
     let legacy_shape = toml::from_str::<HelperConfig>(
         r#"
-version = 5
+version = 6
 
 [codex.providers.relay]
 base_url = "https://relay.example/v1"
 "#,
     )
-    .expect("parse v5 provider without anonymous policy");
+    .expect("parse current provider without anonymous policy");
     assert_eq!(
         legacy_shape
             .codex
@@ -24,7 +24,7 @@ base_url = "https://relay.example/v1"
 
     let explicit = toml::from_str::<HelperConfig>(
         r#"
-version = 5
+version = 6
 
 [codex.providers.relay]
 base_url = "https://relay.example/v1"
@@ -189,7 +189,7 @@ fn load_config_rejects_remote_fleet_http_without_admin_token_env() {
         write_file(
             &toml_path,
             r#"
-version = 5
+version = 6
 
 [fleet.nodes.remote]
 label = "Remote"
@@ -219,7 +219,7 @@ fn load_config_rejects_invalid_fleet_token_env_name() {
         write_file(
             &toml_path,
             r#"
-version = 5
+version = 6
 
 [fleet.nodes.remote]
 label = "Remote"
@@ -643,7 +643,7 @@ fn save_current_v5_writes_route_graph_and_preserves_provider_tags() {
             .await
             .expect("save current config");
         let saved = std::fs::read_to_string(path).expect("read saved current config");
-        assert!(saved.contains("version = 5"));
+        assert!(saved.contains("version = 6"));
         assert!(saved.contains("[codex.routing]"));
         assert!(saved.contains("entry = \"main_route\""));
         assert!(saved.contains("affinity_policy = \"fallback-sticky\""));
@@ -662,7 +662,7 @@ fn save_current_v5_writes_route_graph_and_preserves_provider_tags() {
 #[test]
 fn compile_current_v5_rejects_zero_provider_concurrency_limit() {
     let source = HelperConfig {
-        version: 5,
+        version: CURRENT_CONFIG_VERSION,
         codex: ServiceRouteConfig {
             providers: BTreeMap::from([(
                 "relay".to_string(),
@@ -702,7 +702,7 @@ fn load_config_does_not_auto_add_default_route_graph_affinity_policy() {
         write_file(
             &toml_path,
             r#"
-version = 5
+version = 6
 
 [codex.providers.main]
 base_url = "https://api.example.com/v1"
@@ -719,7 +719,7 @@ target = "main"
 
         let loaded = super::load_config_with_source()
             .await
-            .expect("load v5 config");
+            .expect("load current config");
         assert_eq!(loaded.source.version, CURRENT_CONFIG_VERSION);
 
         let saved = std::fs::read_to_string(&toml_path).expect("read unchanged config");

@@ -7,6 +7,7 @@ pub mod codex_integration;
 pub mod codex_switch;
 pub mod config;
 pub mod control_plane_client;
+pub mod credentials;
 pub mod dashboard_core;
 pub mod doctor;
 pub mod endpoint_health;
@@ -36,7 +37,9 @@ pub mod runtime_host;
 pub mod runtime_identity;
 pub mod runtime_manager;
 pub mod runtime_store;
+pub mod service_readiness;
 pub mod service_status;
+pub mod service_target;
 pub mod sessions;
 mod sse;
 pub mod state;
@@ -46,3 +49,8 @@ pub mod usage_format;
 pub mod usage_providers;
 #[cfg(windows)]
 mod windows_file_info;
+
+pub use file_replace::{
+    ManagedFileSnapshot, ManagedFileTransaction, ManagedFileTransactionError,
+    read_managed_file_snapshot,
+};

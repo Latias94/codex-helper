@@ -20,17 +20,9 @@ pub(super) async fn prune_runtime_observability_after_reload(proxy: &ProxyServic
     let Some(graph) = snapshot.route_graph(proxy.service_name) else {
         return;
     };
-    let active_provider_endpoints = graph
-        .candidates()
-        .iter()
-        .map(|candidate| {
-            crate::runtime_identity::ProviderEndpointKey::new(
-                proxy.service_name,
-                candidate.provider_id.clone(),
-                candidate.endpoint_id.clone(),
-            )
-        })
-        .collect();
+    let Ok(active_runtime_identities) = graph.candidate_identities() else {
+        return;
+    };
     let mut active_limit_keys = BTreeSet::new();
     for candidate in graph.candidates() {
         let Some(limit_value) = candidate.concurrency.max_concurrent_requests else {
@@ -55,7 +47,11 @@ pub(super) async fn prune_runtime_observability_after_reload(proxy: &ProxyServic
     }
     proxy
         .state
-        .prune_provider_endpoint_runtime_for_service(proxy.service_name, &active_provider_endpoints)
+        .prune_provider_endpoint_runtime_for_service(
+            proxy.service_name,
+            snapshot.revision(),
+            active_runtime_identities.as_slice(),
+        )
         .await;
     proxy.concurrency_limiter.prune_inactive(&active_limit_keys);
 }

@@ -33,6 +33,55 @@ fn write(path: &Path, text: &str) {
     std::fs::write(path, text).expect("write temporary config");
 }
 
+#[cfg(windows)]
+fn set_windows_dacl_protection(path: &Path, protected: bool) {
+    let metadata = std::fs::metadata(path).expect("inspect Windows ACL source");
+    let snapshot =
+        PlatformConfigFileMetadata::capture(path, &metadata).expect("capture Windows ACL source");
+    let path = windows_wide_path(path).expect("encode Windows ACL path");
+    apply_windows_dacl_protection(
+        &path,
+        &snapshot.descriptor,
+        snapshot.descriptor_len,
+        protected,
+    )
+    .expect("set Windows DACL protection");
+}
+
+#[cfg(target_os = "linux")]
+fn set_linux_test_acl(path: &Path) {
+    use std::os::unix::fs::MetadataExt;
+
+    const ACL_USER_OBJ: u16 = 0x01;
+    const ACL_USER: u16 = 0x02;
+    const ACL_GROUP_OBJ: u16 = 0x04;
+    const ACL_MASK: u16 = 0x10;
+    const ACL_OTHER: u16 = 0x20;
+    const ACL_UNDEFINED_ID: u32 = u32::MAX;
+
+    fn push_entry(acl: &mut Vec<u8>, tag: u16, permissions: u16, id: u32) {
+        acl.extend_from_slice(&tag.to_le_bytes());
+        acl.extend_from_slice(&permissions.to_le_bytes());
+        acl.extend_from_slice(&id.to_le_bytes());
+    }
+
+    let metadata = std::fs::metadata(path).expect("inspect Linux ACL source");
+    let named_uid = metadata.uid().checked_add(1).expect("test uid has room");
+    let mut acl = 2_u32.to_le_bytes().to_vec();
+    push_entry(&mut acl, ACL_USER_OBJ, 0o6, ACL_UNDEFINED_ID);
+    push_entry(&mut acl, ACL_USER, 0o4, named_uid);
+    push_entry(&mut acl, ACL_GROUP_OBJ, 0, ACL_UNDEFINED_ID);
+    push_entry(&mut acl, ACL_MASK, 0o4, ACL_UNDEFINED_ID);
+    push_entry(&mut acl, ACL_OTHER, 0, ACL_UNDEFINED_ID);
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .expect("open Linux ACL source");
+    apply_config_file_acl(&file, Some(&acl)).expect("set Linux POSIX ACL");
+}
+
 fn migrated_provider_order(plan: &ConfigMigrationPlan) -> Vec<String> {
     let config = toml::from_str::<HelperConfig>(&plan.rendered)
         .expect("parse migrated helper configuration");
@@ -42,6 +91,82 @@ fn migrated_provider_order(plan: &ConfigMigrationPlan) -> Vec<String> {
         .into_iter()
         .map(|candidate| candidate.provider_id)
         .collect()
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn migration_preserves_a_linux_posix_acl() {
+    let temp = TempConfigDir::new();
+    let path = temp.0.join("config.toml");
+    write(&path, "version = 5\n");
+    set_linux_test_acl(&path);
+    let source_metadata = ConfigFileMetadata::capture(
+        &path,
+        &std::fs::metadata(&path).expect("inspect Linux ACL source"),
+    )
+    .expect("capture Linux ACL source metadata");
+    assert!(source_metadata.platform.acl.is_some());
+
+    let plan = build_config_migration_plan(&temp.paths())
+        .await
+        .expect("build Linux ACL migration plan");
+    apply_config_migration_plan(&temp.paths(), &plan)
+        .await
+        .expect("migrate a config with a Linux POSIX ACL");
+
+    for output in [temp.0.join("config.toml.bak"), path] {
+        let output_metadata = ConfigFileMetadata::capture(
+            &output,
+            &std::fs::metadata(&output).expect("inspect Linux ACL migration output"),
+        )
+        .expect("capture Linux ACL migration output metadata");
+        assert!(
+            output_metadata.matches(&source_metadata),
+            "{} did not preserve the Linux POSIX ACL",
+            output.display()
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn migration_preserves_a_macos_extended_acl() {
+    let temp = TempConfigDir::new();
+    let path = temp.0.join("config.toml");
+    write(&path, "version = 5\n");
+    let status = std::process::Command::new("chmod")
+        .arg("+a")
+        .arg("everyone allow read")
+        .arg(&path)
+        .status()
+        .expect("run macOS chmod ACL command");
+    assert!(status.success(), "macOS chmod failed with {status}");
+    let metadata = ConfigFileMetadata::capture(
+        &path,
+        &std::fs::metadata(&path).expect("inspect ACL source"),
+    )
+    .expect("capture ACL source metadata");
+    assert!(metadata.platform.acl.is_some());
+
+    let plan = build_config_migration_plan(&temp.paths())
+        .await
+        .expect("build macOS ACL migration plan");
+    apply_config_migration_plan(&temp.paths(), &plan)
+        .await
+        .expect("migrate a config with a macOS extended ACL");
+
+    for output in [temp.0.join("config.toml.bak"), path] {
+        let output_metadata = ConfigFileMetadata::capture(
+            &output,
+            &std::fs::metadata(&output).expect("inspect macOS ACL migration output"),
+        )
+        .expect("capture macOS ACL migration output metadata");
+        assert!(
+            output_metadata.matches(&metadata),
+            "{} did not preserve the macOS extended ACL",
+            output.display()
+        );
+    }
 }
 
 #[tokio::test]
@@ -77,7 +202,7 @@ children = ["primary"]
             .iter()
             .any(|notice| notice.contains("codex.client_patch"))
     );
-    assert!(plan.rendered.contains("version = 5"));
+    assert!(plan.rendered.contains("version = 6"));
     assert!(!plan.rendered.contains("client_patch"));
     let report = plan.report(false);
     assert!(!report.contains("inline-secret-for-test"));
@@ -91,7 +216,7 @@ children = ["primary"]
 }
 
 #[tokio::test]
-async fn migration_write_creates_backup_and_v5_output() {
+async fn migration_write_creates_backup_and_v6_output() {
     let temp = TempConfigDir::new();
     let source = r#"
 version = 4
@@ -105,9 +230,18 @@ entry = "main"
 [codex.routing.routes.main]
 strategy = "ordered-failover"
 children = ["primary"]
-"#;
+    "#;
     let path = temp.0.join("config.toml");
     write(&path, source);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))
+            .expect("set non-default source mode");
+    }
+    let source_file_metadata = std::fs::metadata(&path).expect("inspect migration source");
+    let source_metadata = ConfigFileMetadata::capture(&path, &source_file_metadata)
+        .expect("capture migration source metadata");
 
     let plan = build_config_migration_plan(&temp.paths())
         .await
@@ -123,7 +257,60 @@ children = ["primary"]
     let migrated = std::fs::read_to_string(&path).expect("read migrated config");
     let parsed = toml::from_str::<HelperConfig>(&migrated).expect("parse migrated config");
     assert_eq!(parsed.version, CURRENT_CONFIG_VERSION);
-    assert!(migrated.contains("version = 5"));
+    assert!(migrated.contains("version = 6"));
+    let backup_path = temp.0.join("config.toml.bak");
+    let backup_file_metadata = std::fs::metadata(&backup_path).expect("inspect migration backup");
+    let backup_metadata = ConfigFileMetadata::capture(&backup_path, &backup_file_metadata)
+        .expect("capture migration backup metadata");
+    let target_file_metadata = std::fs::metadata(&path).expect("inspect migrated config");
+    let target_metadata = ConfigFileMetadata::capture(&path, &target_file_metadata)
+        .expect("capture migrated config metadata");
+    assert!(
+        backup_metadata.matches(&source_metadata),
+        "backup ownership and permissions must match the source"
+    );
+    assert!(
+        target_metadata.matches(&source_metadata),
+        "migrated ownership and permissions must match the source"
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn migration_preserves_windows_dacl_protection_and_components() {
+    for protected in [false, true] {
+        let temp = TempConfigDir::new();
+        let path = temp.0.join("config.toml");
+        let source = "version = 5\n";
+        write(&path, source);
+        set_windows_dacl_protection(&path, protected);
+        let source_metadata = ConfigFileMetadata::capture(
+            &path,
+            &std::fs::metadata(&path).expect("inspect Windows migration source"),
+        )
+        .expect("capture Windows migration source metadata");
+        assert_eq!(source_metadata.platform.dacl_protected, protected);
+
+        let plan = build_config_migration_plan(&temp.paths())
+            .await
+            .expect("build Windows migration plan");
+        apply_config_migration_plan(&temp.paths(), &plan)
+            .await
+            .expect("apply Windows migration plan");
+
+        for output in [temp.0.join("config.toml.bak"), path.clone()] {
+            let output_metadata = ConfigFileMetadata::capture(
+                &output,
+                &std::fs::metadata(&output).expect("inspect Windows migration output"),
+            )
+            .expect("capture Windows migration output metadata");
+            assert!(
+                output_metadata.matches(&source_metadata),
+                "{} did not preserve Windows owner/group/DACL semantics",
+                output.display()
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -846,22 +1033,27 @@ route_extension = "keep-route"
 }
 
 #[tokio::test]
-async fn migration_rechecks_toml_source_immediately_before_replace() {
+async fn migration_rechecks_toml_source_before_publishing_backup_or_target() {
     let temp = TempConfigDir::new();
     let path = temp.0.join("config.toml");
+    let backup_path = temp.0.join("config.toml.bak");
     let source = "version = 4\n[notify]\nenabled = true\n";
+    let backup_sentinel = "existing backup must survive failed migration\n";
     write(&path, source);
+    write(&backup_path, backup_sentinel);
     let plan = build_config_migration_plan(&temp.paths())
         .await
         .expect("build migration plan");
     let changed_path = path.clone();
 
-    let error =
-        apply_config_migration_plan_with_before_replace(&temp.paths(), &plan, move |_, _| {
-            std::fs::write(&changed_path, "version = 5\n# concurrent user edit\n")
-        })
-        .await
-        .expect_err("a concurrent source edit must prevent replacement");
+    let error = apply_config_migration_plan_with_race_hooks(
+        &temp.paths(),
+        &plan,
+        move || std::fs::write(&changed_path, "version = 5\n# concurrent user edit\n"),
+        || Ok(()),
+    )
+    .await
+    .expect_err("a concurrent source edit must prevent replacement");
     assert!(
         format!("{error:#}").contains("changed while migration was being prepared"),
         "unexpected source race error: {error:#}"
@@ -871,30 +1063,34 @@ async fn migration_rechecks_toml_source_immediately_before_replace() {
         "version = 5\n# concurrent user edit\n"
     );
     assert_eq!(
-        std::fs::read_to_string(temp.0.join("config.toml.bak"))
-            .expect("read original source backup"),
-        source
+        std::fs::read_to_string(backup_path).expect("read preserved existing backup"),
+        backup_sentinel
     );
 }
 
 #[tokio::test]
-async fn json_migration_rechecks_that_canonical_toml_did_not_appear() {
+async fn json_migration_rechecks_target_before_publishing_backup_or_target() {
     let temp = TempConfigDir::new();
     let json_path = temp.0.join("config.json");
     let toml_path = temp.0.join("config.toml");
+    let backup_path = temp.0.join("config.json.bak");
     let source = r#"{"version":4,"notify":{"enabled":true}}"#;
+    let backup_sentinel = "existing JSON backup must survive failed migration\n";
     write(&json_path, source);
+    write(&backup_path, backup_sentinel);
     let plan = build_config_migration_plan(&temp.paths())
         .await
         .expect("build JSON migration plan");
     let appeared_path = toml_path.clone();
 
-    let error =
-        apply_config_migration_plan_with_before_replace(&temp.paths(), &plan, move |_, _| {
-            std::fs::write(&appeared_path, "version = 5\n# user-owned TOML\n")
-        })
-        .await
-        .expect_err("an appearing canonical TOML must prevent JSON replacement");
+    let error = apply_config_migration_plan_with_race_hooks(
+        &temp.paths(),
+        &plan,
+        move || std::fs::write(&appeared_path, "version = 5\n# user-owned TOML\n"),
+        || Ok(()),
+    )
+    .await
+    .expect_err("an appearing canonical TOML must prevent JSON replacement");
     assert!(
         format!("{error:#}").contains("config.toml appeared while migrating config.json"),
         "unexpected target race error: {error:#}"
@@ -904,8 +1100,61 @@ async fn json_migration_rechecks_that_canonical_toml_did_not_appear() {
         "version = 5\n# user-owned TOML\n"
     );
     assert_eq!(
-        std::fs::read_to_string(temp.0.join("config.json.bak")).expect("read JSON backup"),
+        std::fs::read_to_string(&json_path).expect("read unchanged JSON source"),
         source
+    );
+    assert_eq!(
+        std::fs::read_to_string(backup_path).expect("read preserved existing JSON backup"),
+        backup_sentinel
+    );
+}
+
+#[tokio::test]
+async fn json_migration_restores_backup_if_target_appears_after_backup_commit() {
+    let temp = TempConfigDir::new();
+    let json_path = temp.0.join("config.json");
+    let toml_path = temp.0.join("config.toml");
+    let backup_path = temp.0.join("config.json.bak");
+    let source = r#"{"version":4,"notify":{"enabled":true}}"#;
+    let backup_sentinel = "existing JSON backup must be restored after target rejection\n";
+    write(&json_path, source);
+    write(&backup_path, backup_sentinel);
+    let plan = build_config_migration_plan(&temp.paths())
+        .await
+        .expect("build JSON migration plan");
+    let appeared_path = toml_path.clone();
+    let committed_backup_path = backup_path.clone();
+
+    let error = apply_config_migration_plan_with_race_hooks(
+        &temp.paths(),
+        &plan,
+        || Ok(()),
+        move || {
+            assert_eq!(
+                std::fs::read(&committed_backup_path).expect("read committed migration backup"),
+                source.as_bytes(),
+                "post-backup hook must run after backup publication"
+            );
+            std::fs::write(&appeared_path, "version = 5\n# late user-owned TOML\n")
+        },
+    )
+    .await
+    .expect_err("a target appearing after backup commit must reject target replacement");
+    assert!(
+        format!("{error:#}").contains("config.toml appeared while migrating config.json"),
+        "unexpected target race error: {error:#}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&toml_path).expect("read preserved late user TOML"),
+        "version = 5\n# late user-owned TOML\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&json_path).expect("read unchanged JSON source"),
+        source
+    );
+    assert_eq!(
+        std::fs::read_to_string(backup_path).expect("read restored existing JSON backup"),
+        backup_sentinel
     );
 }
 
@@ -920,7 +1169,7 @@ async fn migration_config_init_imports_json_only_installations() {
         .expect("config init should migrate legacy JSON");
 
     let migrated = std::fs::read_to_string(outcome.path).expect("read migrated config.toml");
-    assert!(migrated.contains("version = 5"));
+    assert!(migrated.contains("version = 6"));
     assert!(migrated.contains("enabled = true"));
     assert!(
         outcome
@@ -952,7 +1201,7 @@ async fn migration_config_init_reports_plain_template_creation_without_a_legacy_
     assert!(
         std::fs::read_to_string(outcome.path)
             .expect("read generated config.toml")
-            .contains("version = 5")
+            .contains("version = 6")
     );
     assert!(!temp.0.join("config.toml.bak").exists());
     assert!(!temp.0.join("config.json.bak").exists());
@@ -1133,9 +1382,9 @@ order = ["main"]
 }
 
 #[tokio::test]
-async fn migration_write_is_a_noop_for_clean_v5_and_preserves_legacy_backup() {
+async fn migration_write_is_a_noop_for_clean_v6_and_preserves_legacy_backup() {
     let temp = TempConfigDir::new();
-    let source = "version = 5\n[notify]\nenabled = true\n";
+    let source = "version = 6\n[notify]\nenabled = true\n";
     let backup = "version = 2\n# only surviving legacy backup\n";
     let path = temp.0.join("config.toml");
     let backup_path = temp.0.join("config.toml.bak");
@@ -1144,11 +1393,11 @@ async fn migration_write_is_a_noop_for_clean_v5_and_preserves_legacy_backup() {
 
     let plan = build_config_migration_plan(&temp.paths())
         .await
-        .expect("validate clean v5 config");
+        .expect("validate clean v6 config");
     assert!(!plan.requires_write);
     apply_config_migration_plan(&temp.paths(), &plan)
         .await
-        .expect("clean v5 migration should be a no-op");
+        .expect("clean v6 migration should be a no-op");
 
     assert_eq!(std::fs::read_to_string(path).expect("read config"), source);
     assert_eq!(
@@ -1275,7 +1524,7 @@ children = ["current"]
 #[tokio::test]
 async fn migration_detects_current_version_files_that_still_contain_legacy_shapes() {
     let temp = TempConfigDir::new();
-    let source = r#"version = 5
+    let source = r#"version = 6
 [codex.providers.primary]
 base_url = "https://primary.example/v1"
 [codex.groups.selected]
@@ -1462,5 +1711,64 @@ async fn migration_rejects_json_nulls_that_the_published_schema_rejected() {
         );
         assert!(!temp.0.join("config.json.bak").exists());
         assert!(!temp.0.join("config.toml").exists());
+    }
+}
+
+#[tokio::test]
+async fn migration_rejects_flattened_pre_v6_station_references_without_writing() {
+    let cases = [
+        (
+            "config.toml",
+            r#"version = 1
+[codex]
+active = "primary"
+[codex.stations.primary]
+[[codex.stations.primary.upstreams]]
+base_url = "https://relay.example/v1"
+auth_token_ref = { source = "native", name = "relay.primary" }
+[codex.stations.primary.upstreams.auth]
+auth_token_env = "RELAY_API_KEY"
+"#,
+        ),
+        (
+            "config.json",
+            r#"{
+  "version": 1,
+  "codex": {
+    "active": "primary",
+    "stations": {
+      "primary": {
+        "upstreams": [{
+          "base_url": "https://relay.example/v1",
+          "auth_token_ref": {"source": "native", "name": "relay.primary"},
+          "auth": {"auth_token_env": "RELAY_API_KEY"}
+        }]
+      }
+    }
+  }
+}"#,
+        ),
+    ];
+
+    for (source_name, source) in cases {
+        let temp = TempConfigDir::new();
+        let source_path = temp.0.join(source_name);
+        write(&source_path, source);
+
+        let error = build_config_migration_plan(&temp.paths())
+            .await
+            .expect_err("pre-v6 flattened credential reference must fail closed");
+        let detail = format!("{error:#}");
+        assert!(
+            detail.contains("credential reference") && detail.contains("auth_token_ref"),
+            "unexpected migration error: {detail}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&source_path).expect("read rejected source"),
+            source
+        );
+        assert!(!temp.0.join("config.toml").exists() || source_name == "config.toml");
+        assert!(!temp.0.join(format!("{source_name}.bak")).exists());
+        assert!(!temp.0.join("config.toml.bak").exists());
     }
 }

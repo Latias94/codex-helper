@@ -1,4 +1,4 @@
-import { Network } from "lucide-react";
+import { KeyRound, Network } from "lucide-react";
 
 import { Badge, Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui";
 import type { ProviderCardView } from "@/lib/api/types";
@@ -16,10 +16,18 @@ export function ProviderCard({ provider }: { provider: ProviderCardView }) {
               {provider.alias ? provider.name : `${provider.endpointCount} endpoints`}
             </CardDescription>
           </div>
-          <Badge variant={status.tone}>
-            <Network className="h-3.5 w-3.5" />
-            {status.label}
-          </Badge>
+          <div className="flex shrink-0 flex-wrap justify-end gap-1.5">
+            {provider.credentialReadiness ? (
+              <Badge variant={credentialTone(provider.credentialReadiness)}>
+                <KeyRound className="h-3.5 w-3.5" />
+                {provider.credentialReadiness}
+              </Badge>
+            ) : null}
+            <Badge variant={status.tone}>
+              <Network className="h-3.5 w-3.5" />
+              {status.label}
+            </Badge>
+          </div>
         </div>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -44,6 +52,11 @@ export function ProviderCard({ provider }: { provider: ProviderCardView }) {
                   </div>
                   <div className="flex shrink-0 flex-wrap justify-end gap-1">
                     <Badge variant="muted">priority {endpoint.priority}</Badge>
+                    {endpoint.credentialReadiness ? (
+                      <Badge variant={credentialCodeTone(endpoint.credentialReadiness)}>
+                        {endpoint.credentialReadiness}
+                      </Badge>
+                    ) : null}
                     <Badge variant={endpoint.routable ? "success" : "muted"}>
                       {endpoint.routable ? "routable" : "not routable"}
                     </Badge>
@@ -54,6 +67,24 @@ export function ProviderCard({ provider }: { provider: ProviderCardView }) {
                   {endpoint.capacity ? ` · capacity ${endpoint.capacity}` : ""}
                   {endpoint.policyActionCount > 0 ? ` · control ${endpoint.policyActionCount}` : ""}
                 </div>
+                {endpoint.credentialDetails.length > 0 ? (
+                  <div className="mt-1.5 space-y-1 border-l-2 border-slate-200 pl-2">
+                    {endpoint.credentialDetails.map((detail, index) => (
+                      <div
+                        key={`${detail.kind}:${detail.sourceKind}:${detail.reference}:${index}`}
+                        className="min-w-0 text-xs text-slate-500"
+                        title={`${detail.kind} ${detail.code} source=${detail.sourceKind} ref=${detail.reference}${detail.staleCause ? ` cause=${detail.staleCause}` : ""}`}
+                      >
+                        <span className="font-medium text-slate-700">{detail.kind}</span>{" "}
+                        <span>{detail.code}</span>{" "}
+                        <span className="font-mono">
+                          {detail.sourceKind}:<span className="break-all">{detail.reference}</span>
+                        </span>
+                        {detail.staleCause ? <span> cause={detail.staleCause}</span> : null}
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
               </div>
             ))
           )}
@@ -81,6 +112,18 @@ export function ProviderCard({ provider }: { provider: ProviderCardView }) {
       </CardContent>
     </Card>
   );
+}
+
+function credentialTone(readiness: NonNullable<ProviderCardView["credentialReadiness"]>) {
+  if (readiness === "ready") return "success" as const;
+  if (readiness === "degraded") return "warning" as const;
+  return "danger" as const;
+}
+
+function credentialCodeTone(readiness: string) {
+  if (readiness === "ready") return "success" as const;
+  if (readiness === "stale") return "warning" as const;
+  return "danger" as const;
 }
 
 function Info({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {

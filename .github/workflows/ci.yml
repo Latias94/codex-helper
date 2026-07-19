@@ -19,11 +19,19 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
+        with:
+          # The real v0.20.3 downgrade gate archives its pinned historical loader.
+          fetch-depth: 0
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+
+      - name: Install cargo-dist
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-dist@0.32.0
 
       - name: Install Linux desktop dependencies
         run: |
@@ -71,6 +79,17 @@ jobs:
       - name: Check canonical runtime source surface
         run: node tools/check-canonical-runtime-surface.mjs
 
+      - name: Check credential source and dependency surface
+        run: node tools/check-credential-surface.mjs
+
+      - name: Check generated cargo-dist workflow
+        run: dist generate --mode=ci --check
+
+      - name: Test native credential smoke safeguards
+        run: |
+          node tools/native-credential-smoke.mjs --self-test
+          node tools/verify-native-credential-evidence.mjs --self-test
+
       - name: Test desktop
         run: pnpm --dir apps/desktop test -- --run
 
@@ -82,6 +101,9 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Verify v0.20.3 downgrade boundary
+        run: node tools/check-v5-loader-downgrade.mjs
 
   test-build:
     name: test-build (${{ matrix.os }})
@@ -139,6 +161,17 @@ jobs:
         run: |
           cargo --version
           cargo nextest --version
+
+      - name: Check native credential core for this platform
+        run: cargo check --locked -p codex-helper-core --features native-credentials --all-targets
+
+      - name: Build isolated server artifact
+        run: cargo build --locked -p codex-helper-server --target-dir target/server-isolated
+
+      - name: Test server capability under workspace feature unification
+        run: >-
+          cargo nextest run --locked --workspace
+          -E 'test(server_runtime_forbids_native_credentials_under_feature_unification)'
 
       - name: Test (nextest)
         run: cargo nextest run --locked --workspace --no-fail-fast

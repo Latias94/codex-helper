@@ -3,16 +3,17 @@ use std::sync::Arc;
 
 use axum::http::StatusCode;
 
-use crate::config::{HelperConfig, ProviderConcurrencyLimits, ServiceRouteConfig};
+use crate::config::{ProviderConcurrencyLimits, ServiceRouteConfig};
 use crate::dashboard_core::{
     ProviderCapacity, ProviderOption, build_provider_options_from_route_runtime,
 };
 use crate::logging::now_ms;
-use crate::routing_ir::RouteCandidateConcurrency;
+use crate::routing_ir::{CapturedRouteCandidate, RouteCandidateConcurrency};
 use crate::runtime_identity::ProviderEndpointKey;
 use crate::runtime_store::ProviderPolicySnapshot;
 use crate::usage_providers::{
-    UsageProviderRefreshOptions, UsageProviderRefreshSummary, refresh_balances_for_service,
+    UsageProviderRefreshOptions, UsageProviderRefreshSummary, UsageProviderRuntimeCapture,
+    refresh_balances_for_service,
 };
 
 use super::ProxyService;
@@ -29,18 +30,10 @@ fn format_provider_balance_refresh_error(error: &anyhow::Error) -> String {
 
 pub(super) fn enqueue_provider_balance_probe(
     client: reqwest::Client,
-    config: Arc<HelperConfig>,
     state: Arc<crate::state::ProxyState>,
-    service_name: &str,
-    provider_endpoint: ProviderEndpointKey,
+    target: CapturedRouteCandidate,
 ) {
-    crate::usage_providers::enqueue_poll_for_codex_provider_endpoint(
-        client,
-        config,
-        state,
-        service_name,
-        provider_endpoint,
-    );
+    crate::usage_providers::enqueue_poll_for_captured_route_candidate(client, state, target);
 }
 
 fn capacity_limit_group(limits: &ProviderConcurrencyLimits) -> Option<String> {
@@ -286,11 +279,29 @@ pub(super) async fn build_provider_options_for_runtime_snapshot(
         })?;
     let template = graph.handshake_plan();
     let provider_policy = runtime_snapshot.provider_policy();
+    let runtime_identities = template.candidate_identities().map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("captured runtime credential binding is invalid: {error}"),
+        )
+    })?;
     let mut runtime = proxy
         .state
-        .route_plan_runtime_state_with_provider_policy(proxy.service_name, provider_policy.as_ref())
+        .route_plan_runtime_state_with_provider_policy(
+            proxy.service_name,
+            provider_policy.as_ref(),
+            runtime_snapshot.revision(),
+            runtime_identities.as_slice(),
+        )
         .await;
-    apply_auth_resolution_to_runtime(proxy.service_name, &template, &mut runtime);
+    apply_auth_resolution_to_runtime(proxy.service_name, &template, &mut runtime).map_err(
+        |error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("captured runtime credential binding is invalid: {error}"),
+            )
+        },
+    )?;
     apply_concurrency_snapshots_to_runtime(
         proxy,
         &template,
@@ -315,7 +326,10 @@ pub(super) async fn refresh_provider_balances_for_proxy(
     let runtime_snapshot = proxy.config.capture().await;
     let refresh = refresh_balances_for_service(
         &proxy.client,
-        runtime_snapshot.config(),
+        UsageProviderRuntimeCapture::new(
+            runtime_snapshot.config(),
+            runtime_snapshot.credential_generation(),
+        ),
         proxy.state.clone(),
         proxy.service_name,
         UsageProviderRefreshOptions {

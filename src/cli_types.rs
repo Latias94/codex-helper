@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use codex_helper_core::runtime_identity::ProviderEndpointKey;
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -125,6 +125,11 @@ pub(crate) enum Command {
     Provider {
         #[command(subcommand)]
         cmd: ProviderCommand,
+    },
+    /// Manage installation-scoped native credentials
+    Credential {
+        #[command(subcommand)]
+        cmd: CredentialCommand,
     },
     /// Codex-specific relay diagnostics and evidence commands
     Codex {
@@ -297,6 +302,9 @@ pub(crate) enum ServiceCommand {
         /// Codex or Claude home captured at installation time
         #[arg(long)]
         client_home: Option<std::path::PathBuf>,
+        /// Non-secret install generation captured by the service definition
+        #[arg(long, hide = true)]
+        install_generation: Option<String>,
     },
 }
 
@@ -449,11 +457,35 @@ pub(crate) enum SwitchCommand {
         /// Explicit helper proxy base URL
         #[arg(long, conflicts_with = "port")]
         base_url: Option<String>,
+        /// Codex capability facade written into the helper-owned provider stanza
+        #[arg(long, value_enum, default_value_t = CodexClientFacadeArg::Compatible)]
+        client_facade: CodexClientFacadeArg,
     },
     /// Restore the selector and helper stanza recorded by the explicit switch operation
     Off,
     /// Show the helper-owned Codex switch status
     Status,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[value(rename_all = "kebab-case")]
+pub(crate) enum CodexClientFacadeArg {
+    #[default]
+    Compatible,
+    #[value(name = "openai")]
+    OpenAi,
+    #[value(name = "openai-tools")]
+    OpenAiTools,
+}
+
+impl From<CodexClientFacadeArg> for codex_helper_core::codex_switch::CodexClientFacade {
+    fn from(value: CodexClientFacadeArg) -> Self {
+        match value {
+            CodexClientFacadeArg::Compatible => Self::Compatible,
+            CodexClientFacadeArg::OpenAi => Self::OpenAi,
+            CodexClientFacadeArg::OpenAiTools => Self::OpenAiTools,
+        }
+    }
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -488,10 +520,10 @@ pub enum ConfigCommand {
     },
     /// Preview or explicitly apply a legacy configuration migration.
     Migrate {
-        /// Preview the migrated v5 TOML without writing any file (the default).
+        /// Preview the migrated v6 TOML without writing any file (the default).
         #[arg(long, conflicts_with = "write")]
         dry_run: bool,
-        /// Write the migrated v5 TOML after creating a source backup.
+        /// Write the migrated v6 TOML after creating a source backup.
         #[arg(long, conflicts_with = "dry_run", requires = "yes")]
         write: bool,
         /// Confirm the replacement of the canonical configuration file.
@@ -737,6 +769,96 @@ pub enum ProviderCommand {
         #[arg(long)]
         claude: bool,
     },
+    /// Bind one provider authentication kind to a non-inline source
+    #[command(group(
+        ArgGroup::new("provider_auth_source")
+            .required(true)
+            .multiple(false)
+            .args(["native", "secret_file", "environment"])
+    ))]
+    SetAuth {
+        name: String,
+        /// Authentication header kind to bind
+        #[arg(long, value_enum)]
+        kind: ProviderAuthKind,
+        /// Bind to an installation-scoped native credential name
+        #[arg(long, value_name = "CREDENTIAL")]
+        native: Option<String>,
+        /// Bind to an absolute mounted secret-file path
+        #[arg(long = "secret-file", value_name = "PATH")]
+        secret_file: Option<std::path::PathBuf>,
+        /// Bind to an environment variable name
+        #[arg(long, value_name = "ENV")]
+        environment: Option<String>,
+        /// Target Codex provider catalog (default if neither flag is set)
+        #[arg(long)]
+        codex: bool,
+        /// Target Claude provider catalog
+        #[arg(long)]
+        claude: bool,
+    },
+    /// Clear one provider authentication kind without changing other settings
+    ClearAuth {
+        name: String,
+        /// Authentication header kind to clear
+        #[arg(long, value_enum)]
+        kind: ProviderAuthKind,
+        /// Target Codex provider catalog (default if neither flag is set)
+        #[arg(long)]
+        codex: bool,
+        /// Target Claude provider catalog
+        #[arg(long)]
+        claude: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum CredentialCommand {
+    /// Create a new native credential and fail if it already exists
+    Create {
+        name: String,
+        /// Read the credential from standard input instead of a masked TTY prompt
+        #[arg(long)]
+        stdin: bool,
+    },
+    /// Create or replace a native credential
+    Set {
+        name: String,
+        /// Read the credential from standard input instead of a masked TTY prompt
+        #[arg(long)]
+        stdin: bool,
+    },
+    /// Import a native credential from an explicitly named source
+    Import {
+        name: String,
+        /// Read the credential from this environment variable without modifying it
+        #[arg(long, value_name = "ENV")]
+        from_env: String,
+    },
+    /// Inspect one credential or all native credentials referenced by configuration
+    Status {
+        name: Option<String>,
+        /// Output JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete a native credential without rewriting provider configuration
+    Delete {
+        name: String,
+        /// Confirm deletion without an interactive prompt
+        #[arg(long)]
+        yes: bool,
+        /// Succeed when the credential is already absent
+        #[arg(long)]
+        if_exists: bool,
+    },
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+#[value(rename_all = "kebab-case")]
+pub enum ProviderAuthKind {
+    Bearer,
+    ApiKey,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -1206,12 +1328,33 @@ mod tests {
                 SwitchCommand::On {
                     port: None,
                     base_url: Some(base_url),
+                    client_facade: CodexClientFacadeArg::Compatible,
                 },
         }) = cli.command
         else {
             panic!("expected explicit switch-on base URL");
         };
         assert_eq!(base_url, "https://relay.example/v1");
+    }
+
+    #[test]
+    fn switch_on_accepts_explicit_client_facades() {
+        for (label, expected) in [
+            ("compatible", CodexClientFacadeArg::Compatible),
+            ("openai", CodexClientFacadeArg::OpenAi),
+            ("openai-tools", CodexClientFacadeArg::OpenAiTools),
+        ] {
+            let cli =
+                Cli::try_parse_from(["codex-helper", "switch", "on", "--client-facade", label])
+                    .expect("parse client facade");
+            let Some(Command::Switch {
+                cmd: SwitchCommand::On { client_facade, .. },
+            }) = cli.command
+            else {
+                panic!("expected switch-on client facade");
+            };
+            assert_eq!(client_facade, expected);
+        }
     }
 
     #[test]
@@ -1731,6 +1874,8 @@ mod tests {
             r"C:\Users\test\.codex-helper",
             "--client-home",
             r"C:\Users\test\.codex",
+            "--install-generation",
+            "2c387ce9-aa5d-43ff-a266-35c894e63695",
         ])
         .expect("parse internal scheduled-task run command");
 
@@ -1742,6 +1887,7 @@ mod tests {
                     port,
                     helper_home,
                     client_home,
+                    install_generation,
                 },
         }) = cli.command
         else {
@@ -1757,6 +1903,10 @@ mod tests {
         assert_eq!(
             client_home,
             Some(std::path::PathBuf::from(r"C:\Users\test\.codex"))
+        );
+        assert_eq!(
+            install_generation.as_deref(),
+            Some("2c387ce9-aa5d-43ff-a266-35c894e63695")
         );
     }
 
@@ -2026,6 +2176,245 @@ mod tests {
                 }
             })
         ));
+    }
+
+    #[test]
+    fn credential_commands_parse_only_explicit_safe_input_sources() {
+        let create = Cli::try_parse_from([
+            "codex-helper",
+            "credential",
+            "create",
+            "relay.primary",
+            "--stdin",
+        ])
+        .expect("parse credential create");
+        assert!(matches!(
+            create.command,
+            Some(Command::Credential {
+                cmd: CredentialCommand::Create { stdin: true, .. }
+            })
+        ));
+
+        let set = Cli::try_parse_from(["codex-helper", "credential", "set", "relay.primary"])
+            .expect("parse credential set");
+        assert!(matches!(
+            set.command,
+            Some(Command::Credential {
+                cmd: CredentialCommand::Set { stdin: false, .. }
+            })
+        ));
+
+        let import = Cli::try_parse_from([
+            "codex-helper",
+            "credential",
+            "import",
+            "relay.primary",
+            "--from-env",
+            "RELAY_TOKEN",
+        ])
+        .expect("parse credential import");
+        assert!(matches!(
+            import.command,
+            Some(Command::Credential {
+                cmd: CredentialCommand::Import { from_env, .. }
+            }) if from_env == "RELAY_TOKEN"
+        ));
+
+        let status = Cli::try_parse_from([
+            "codex-helper",
+            "credential",
+            "status",
+            "relay.primary",
+            "--json",
+        ])
+        .expect("parse credential status");
+        assert!(matches!(
+            status.command,
+            Some(Command::Credential {
+                cmd: CredentialCommand::Status {
+                    name: Some(_),
+                    json: true,
+                }
+            })
+        ));
+
+        let delete = Cli::try_parse_from([
+            "codex-helper",
+            "credential",
+            "delete",
+            "relay.primary",
+            "--yes",
+            "--if-exists",
+        ])
+        .expect("parse credential delete");
+        assert!(matches!(
+            delete.command,
+            Some(Command::Credential {
+                cmd: CredentialCommand::Delete {
+                    yes: true,
+                    if_exists: true,
+                    ..
+                }
+            })
+        ));
+    }
+
+    #[test]
+    fn credential_commands_reject_argv_secret_values_and_conflicting_sources() {
+        for args in [
+            vec![
+                "codex-helper",
+                "credential",
+                "create",
+                "relay.primary",
+                "--value",
+                "secret-canary",
+            ],
+            vec![
+                "codex-helper",
+                "credential",
+                "create",
+                "relay.primary",
+                "secret-canary",
+            ],
+            vec![
+                "codex-helper",
+                "credential",
+                "create",
+                "relay.primary",
+                "--stdin",
+                "--from-env",
+                "RELAY_TOKEN",
+            ],
+            vec![
+                "codex-helper",
+                "credential",
+                "import",
+                "relay.primary",
+                "--from-env",
+                "RELAY_TOKEN",
+                "--stdin",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
+    fn provider_auth_commands_require_one_kind_and_one_reference_source() {
+        let set = Cli::try_parse_from([
+            "codex-helper",
+            "provider",
+            "set-auth",
+            "relay",
+            "--kind",
+            "api-key",
+            "--native",
+            "relay.primary",
+            "--claude",
+        ])
+        .expect("parse provider set-auth");
+        assert!(matches!(
+            set.command,
+            Some(Command::Provider {
+                cmd: ProviderCommand::SetAuth {
+                    kind: ProviderAuthKind::ApiKey,
+                    native: Some(_),
+                    claude: true,
+                    ..
+                }
+            })
+        ));
+
+        for args in [
+            vec![
+                "codex-helper",
+                "provider",
+                "set-auth",
+                "relay",
+                "--kind",
+                "bearer",
+                "--secret-file",
+                "/run/secrets/relay",
+                "--codex",
+            ],
+            vec![
+                "codex-helper",
+                "provider",
+                "set-auth",
+                "relay",
+                "--kind",
+                "api-key",
+                "--environment",
+                "RELAY_API_KEY",
+            ],
+        ] {
+            Cli::try_parse_from(args).expect("parse provider reference source");
+        }
+
+        let clear = Cli::try_parse_from([
+            "codex-helper",
+            "provider",
+            "clear-auth",
+            "relay",
+            "--kind",
+            "bearer",
+        ])
+        .expect("parse provider clear-auth");
+        assert!(matches!(
+            clear.command,
+            Some(Command::Provider {
+                cmd: ProviderCommand::ClearAuth {
+                    kind: ProviderAuthKind::Bearer,
+                    ..
+                }
+            })
+        ));
+
+        for args in [
+            vec![
+                "codex-helper",
+                "provider",
+                "set-auth",
+                "relay",
+                "--native",
+                "relay.primary",
+            ],
+            vec![
+                "codex-helper",
+                "provider",
+                "set-auth",
+                "relay",
+                "--kind",
+                "bearer",
+            ],
+            vec![
+                "codex-helper",
+                "provider",
+                "set-auth",
+                "relay",
+                "--kind",
+                "bearer",
+                "--native",
+                "relay.primary",
+                "--environment",
+                "RELAY_TOKEN",
+            ],
+            vec![
+                "codex-helper",
+                "provider",
+                "set-auth",
+                "relay",
+                "--kind",
+                "bearer",
+                "--kind",
+                "api-key",
+                "--native",
+                "relay.primary",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
     }
 
     #[test]

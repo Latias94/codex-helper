@@ -1528,6 +1528,23 @@ impl RuntimeStore {
         )
     }
 
+    pub(crate) fn runtime_upstream_identity_is_active(
+        &self,
+        identity: &RuntimeUpstreamIdentity,
+    ) -> Result<bool, RuntimeStoreError> {
+        let mut connection = self
+            ._connection
+            .lock()
+            .map_err(|_| RuntimeStoreError::ConnectionPoisoned)?;
+        validate_connection_file_identity(&mut connection, &self.backing)?;
+        policy::runtime_upstream_identity_is_active(
+            &connection.connection,
+            &self.display_path(),
+            self.identity.store_id,
+            identity,
+        )
+    }
+
     /// Reads durable observation history in incarnation/generation order.
     pub fn read_provider_observation_history(
         &self,
@@ -1759,6 +1776,37 @@ impl RuntimeStore {
             self.identity.store_id,
             logical_request.id,
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn raw_attempt_pending_evidence_json_for_test(
+        &self,
+        attempt_id: AttemptId,
+    ) -> Result<String, RuntimeStoreError> {
+        let mut connection = self
+            ._connection
+            .lock()
+            .map_err(|_| RuntimeStoreError::ConnectionPoisoned)?;
+        validate_connection_file_identity(&mut connection, &self.backing)?;
+        connection
+            .connection
+            .query_row(
+                "SELECT pending_evidence_json
+                 FROM upstream_attempts
+                 WHERE store_id = ?1 AND attempt_id = ?2",
+                params![
+                    self.identity.store_id.to_string(),
+                    attempt_id.as_uuid().as_bytes().as_slice()
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|source| {
+                sqlite_error(
+                    &self.display_path(),
+                    "read raw upstream attempt pending evidence for test",
+                    source,
+                )
+            })
     }
 
     /// Reads the latest committed startup recovery report.

@@ -1,5 +1,6 @@
 use super::*;
 use crate::control_plane_client::{ControlPlaneEndpoint, LocalOperatorClient};
+use crate::credentials::{CredentialName, CredentialSourceCapabilities, SecretValue};
 use crate::dashboard_core::{OperatorReadModel, OperatorRoutingSummary};
 use crate::local_operator::{
     LocalOperatorSessionRequest, LocalOperatorSessionResponse, local_operator_client_proof,
@@ -9,10 +10,14 @@ use crate::local_operator::{
 use crate::proxy::tests::harness::{TestProxyServer, proxy_service};
 use crate::proxy::{
     LOCAL_OPERATOR_NONCE_HEADER, LOCAL_OPERATOR_SESSION_HEADER, LOCAL_OPERATOR_SIGNATURE_HEADER,
-    LOCAL_OPERATOR_TIMESTAMP_HEADER, LOCAL_V1_BALANCE_REFRESH, LOCAL_V1_OPERATOR_SESSION,
-    OperatorEndpointMode, OperatorRoutingCommand, OperatorRoutingMutationRequest,
-    OperatorRoutingMutationStatus, OperatorSessionAffinityCommand,
+    LOCAL_OPERATOR_TIMESTAMP_HEADER, LOCAL_V1_BALANCE_REFRESH, LOCAL_V1_CREDENTIAL_REFRESH,
+    LOCAL_V1_OPERATOR_SESSION, OperatorEndpointMode, OperatorRoutingCommand,
+    OperatorRoutingMutationRequest, OperatorRoutingMutationStatus, OperatorSessionAffinityCommand,
     OperatorSessionAffinityMutationRequest, OperatorSessionAffinityMutationStatus,
+};
+use crate::service_target::{
+    LocalCredentialRefreshAction, LocalCredentialRefreshRequest, LocalCredentialRefreshStatus,
+    LocalServiceRuntimeReadRequest, ServiceInstallGeneration, ServiceRuntimeIdentity,
 };
 use crate::state::{FinishRequestParams, RuntimeConfigState, SessionRouteAffinityTarget};
 
@@ -26,6 +31,59 @@ fn empty_proxy_config() -> HelperConfig {
     make_helper_config(Vec::new(), RetryConfig::default())
 }
 
+fn native_credential_proxy_config() -> HelperConfig {
+    HelperConfig {
+        codex: ServiceRouteConfig {
+            providers: std::collections::BTreeMap::from([(
+                "native".to_string(),
+                ProviderConfig {
+                    base_url: Some("https://native.example.test/v1".to_string()),
+                    inline_auth: UpstreamAuth {
+                        auth_token_ref: Some(crate::config::CredentialRef::Native {
+                            name: "relay.primary".to_string(),
+                        }),
+                        ..UpstreamAuth::default()
+                    },
+                    ..ProviderConfig::default()
+                },
+            )]),
+            routing: Some(RouteGraphConfig::ordered_failover(vec![
+                "native".to_string(),
+            ])),
+            ..ServiceRouteConfig::default()
+        },
+        ..HelperConfig::default()
+    }
+}
+
+fn native_credential_proxy(
+    generation: Option<ServiceInstallGeneration>,
+) -> (
+    ProxyService,
+    crate::credentials::TestNativeCredentialControl,
+) {
+    let initial =
+        SecretValue::new(b"credential-generation-a".to_vec()).expect("valid initial credential");
+    let (credential_sources, control) = CredentialSourceCapabilities::test_native(initial);
+    let runtime_store = Arc::new(
+        crate::runtime_store::RuntimeStore::open_in_memory()
+            .expect("open local operator runtime store"),
+    );
+    let proxy = ProxyService::new_with_runtime_store_and_credential_sources(
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build test proxy client"),
+        Arc::new(native_credential_proxy_config()),
+        "codex",
+        runtime_store,
+        credential_sources,
+    )
+    .expect("build native credential proxy")
+    .with_service_install_generation(generation);
+    (proxy, control)
+}
+
 fn routing_proxy_config() -> HelperConfig {
     HelperConfig {
         codex: ServiceRouteConfig {
@@ -36,7 +94,7 @@ fn routing_proxy_config() -> HelperConfig {
                         base_url: Some("https://input.example.test/v1".to_string()),
                         continuity_domain: Some("shared-relay-state".to_string()),
                         inline_auth: UpstreamAuth {
-                            auth_token: Some("input-test-token".to_string()),
+                            auth_token: Some("input-test-token".to_string().into()),
                             ..UpstreamAuth::default()
                         },
                         ..ProviderConfig::default()
@@ -48,7 +106,7 @@ fn routing_proxy_config() -> HelperConfig {
                         base_url: Some("https://ciii.example.test/v1".to_string()),
                         continuity_domain: Some("shared-relay-state".to_string()),
                         inline_auth: UpstreamAuth {
-                            auth_token: Some("ciii-test-token".to_string()),
+                            auth_token: Some("ciii-test-token".to_string().into()),
                             ..UpstreamAuth::default()
                         },
                         ..ProviderConfig::default()
@@ -232,21 +290,36 @@ fn signed_balance_request(
     body_to_sign: &[u8],
     body_to_send: Vec<u8>,
 ) -> reqwest::RequestBuilder {
+    signed_operator_request(
+        context,
+        LOCAL_V1_BALANCE_REFRESH,
+        body_to_sign,
+        body_to_send,
+        unix_time_ms(),
+    )
+}
+
+fn signed_operator_request(
+    context: &SignedOperatorRequestContext<'_>,
+    path: &str,
+    body_to_sign: &[u8],
+    body_to_send: Vec<u8>,
+    timestamp_ms: u64,
+) -> reqwest::RequestBuilder {
     let request_nonce = new_local_operator_nonce();
-    let timestamp_ms = unix_time_ms();
     let signature = local_operator_request_signature(
         context.token,
         context.client_nonce,
         &context.session.session_id,
         &request_nonce,
         timestamp_ms,
-        LOCAL_V1_BALANCE_REFRESH,
+        path,
         body_to_sign,
     )
     .expect("sign local operator request");
     let mut request = context
         .client
-        .post(context.server.url(LOCAL_V1_BALANCE_REFRESH))
+        .post(context.server.url(path))
         .header(LOCAL_OPERATOR_SESSION_HEADER, &context.session.session_id)
         .header(LOCAL_OPERATOR_NONCE_HEADER, request_nonce)
         .header(LOCAL_OPERATOR_TIMESTAMP_HEADER, timestamp_ms.to_string())
@@ -371,6 +444,379 @@ async fn local_operator_http_protocol_enforces_proof_replay_and_admin_layers() {
         .await
         .expect("two-layer authenticated refresh");
     assert_eq!(response.service_name, "codex");
+
+    drop(server);
+    drop(scoped);
+    std::fs::remove_dir_all(home).expect("remove helper home");
+}
+
+#[tokio::test]
+async fn signed_credential_refresh_publishes_only_for_matching_service_generation() {
+    const ROTATED_CANARY: &str = "credential-canary-49173bf8d4ec4d5389281b13d09fd52c";
+
+    let _env_guard = env_lock().await;
+    let home = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HELPER_HOME", &home);
+        scoped.set(ADMIN_TOKEN_ENV_VAR, "");
+    }
+    crate::local_operator::ensure_local_operator_token().expect("create operator token");
+    let install_generation = ServiceInstallGeneration::generate();
+    let (proxy, control) = native_credential_proxy(Some(install_generation.clone()));
+    assert_eq!(control.read_count(), 1);
+    let server = spawn_admin_listener(proxy);
+    let endpoint = ControlPlaneEndpoint::new(format!("http://{}", server.addr), None::<String>)
+        .expect("loopback endpoint");
+    let operator = LocalOperatorClient::from_helper_home(endpoint, &home)
+        .expect("local operator client from selected helper home");
+    let credential_name = CredentialName::parse("relay.primary").expect("credential name");
+
+    control.set_value(SecretValue::new(ROTATED_CANARY.as_bytes().to_vec()).expect("canary"));
+    let published = operator
+        .refresh_native_credential(&LocalCredentialRefreshRequest {
+            service: crate::config::ServiceKind::Codex,
+            install_generation: install_generation.clone(),
+            credential_name: credential_name.clone(),
+            action: LocalCredentialRefreshAction::Upsert,
+        })
+        .await
+        .expect("publish rotated credential");
+    assert_eq!(published.status, LocalCredentialRefreshStatus::Published);
+    assert_eq!(control.read_count(), 2);
+    let rendered = format!(
+        "{:?} {}",
+        published,
+        serde_json::to_string(&published).expect("serialize response")
+    );
+    assert!(!rendered.contains(ROTATED_CANARY));
+    assert!(!rendered.contains("fingerprint"));
+
+    let unchanged = operator
+        .refresh_native_credential(&LocalCredentialRefreshRequest {
+            service: crate::config::ServiceKind::Codex,
+            install_generation: install_generation.clone(),
+            credential_name: credential_name.clone(),
+            action: LocalCredentialRefreshAction::Upsert,
+        })
+        .await
+        .expect("refresh unchanged credential");
+    assert_eq!(unchanged.status, LocalCredentialRefreshStatus::Unchanged);
+    assert_eq!(unchanged.runtime_revision, published.runtime_revision);
+    assert_eq!(control.read_count(), 3);
+
+    control.set_missing();
+    let degraded = operator
+        .refresh_native_credential(&LocalCredentialRefreshRequest {
+            service: crate::config::ServiceKind::Codex,
+            install_generation: install_generation.clone(),
+            credential_name: credential_name.clone(),
+            action: LocalCredentialRefreshAction::Upsert,
+        })
+        .await
+        .expect_err("stale last-known-good publication is not a successful rotation");
+    assert!(matches!(
+        &degraded,
+        crate::control_plane_client::ControlPlaneError::HttpStatus { status: 503, .. }
+    ));
+    assert!(!degraded.to_string().contains(ROTATED_CANARY));
+    assert_eq!(control.read_count(), 4);
+
+    let not_referenced = operator
+        .refresh_native_credential(&LocalCredentialRefreshRequest {
+            service: crate::config::ServiceKind::Codex,
+            install_generation: install_generation.clone(),
+            credential_name: CredentialName::parse("relay.unused").expect("unused name"),
+            action: LocalCredentialRefreshAction::Upsert,
+        })
+        .await
+        .expect("report unreferenced credential");
+    assert_eq!(
+        not_referenced.status,
+        LocalCredentialRefreshStatus::NotReferenced
+    );
+    assert_eq!(control.read_count(), 4);
+
+    let deleted = operator
+        .refresh_native_credential(&LocalCredentialRefreshRequest {
+            service: crate::config::ServiceKind::Codex,
+            install_generation,
+            credential_name,
+            action: LocalCredentialRefreshAction::Delete,
+        })
+        .await
+        .expect("publish explicit delete");
+    assert_eq!(deleted.status, LocalCredentialRefreshStatus::Published);
+    assert_eq!(control.read_count(), 4);
+
+    drop(server);
+    drop(scoped);
+    std::fs::remove_dir_all(home).expect("remove helper home");
+}
+
+#[tokio::test]
+async fn signed_service_runtime_read_binds_identity_and_operator_model_atomically() {
+    const CREDENTIAL_CANARY: &str = "service-runtime-canary-fb41804311c849a086438241d33b71fd";
+
+    let _env_guard = env_lock().await;
+    let home = make_temp_test_dir();
+    let client_home = home.join("client");
+    std::fs::create_dir_all(&client_home).expect("create client home");
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HELPER_HOME", &home);
+        scoped.set(ADMIN_TOKEN_ENV_VAR, "");
+    }
+    crate::local_operator::ensure_local_operator_token().expect("create operator token");
+    let install_generation = ServiceInstallGeneration::generate();
+    let identity = ServiceRuntimeIdentity {
+        service: crate::config::ServiceKind::Codex,
+        helper_home: home.clone(),
+        client_home: client_home.clone(),
+        install_generation: install_generation.clone(),
+    };
+    let (proxy, control) = native_credential_proxy(Some(install_generation.clone()));
+    control.set_value(SecretValue::new(CREDENTIAL_CANARY.as_bytes().to_vec()).expect("canary"));
+    let server = spawn_admin_listener(proxy.with_service_runtime_identity(Some(identity.clone())));
+    let endpoint = ControlPlaneEndpoint::new(format!("http://{}", server.addr), None::<String>)
+        .expect("loopback endpoint");
+    let operator = LocalOperatorClient::from_helper_home(endpoint, &home)
+        .expect("local operator client from selected helper home");
+
+    let response = operator
+        .read_service_runtime(&LocalServiceRuntimeReadRequest {
+            service: crate::config::ServiceKind::Codex,
+            install_generation: install_generation.clone(),
+        })
+        .await
+        .expect("read bound service runtime");
+    assert_eq!(response.identity, identity);
+    assert_eq!(response.operator.service_name, "codex");
+    assert_eq!(
+        response.credential_readiness,
+        crate::credentials::CredentialAggregateReadiness::Ready
+    );
+    let rendered = format!(
+        "{:?} {}",
+        response,
+        serde_json::to_string(&response).expect("serialize service runtime response")
+    );
+    assert!(!rendered.contains(CREDENTIAL_CANARY));
+    assert!(!rendered.contains("fingerprint"));
+
+    let stale = operator
+        .read_service_runtime(&LocalServiceRuntimeReadRequest {
+            service: crate::config::ServiceKind::Codex,
+            install_generation: ServiceInstallGeneration::generate(),
+        })
+        .await
+        .expect_err("reject stale receipt generation");
+    assert!(matches!(
+        stale,
+        crate::control_plane_client::ControlPlaneError::HttpStatus { status: 409, .. }
+    ));
+
+    drop(server);
+    drop(scoped);
+    std::fs::remove_dir_all(home).expect("remove helper home");
+}
+
+#[tokio::test]
+async fn credential_refresh_rejects_unbound_stale_or_foreign_target_before_native_read() {
+    let _env_guard = env_lock().await;
+    let home = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HELPER_HOME", &home);
+        scoped.set(ADMIN_TOKEN_ENV_VAR, "");
+    }
+    crate::local_operator::ensure_local_operator_token().expect("create operator token");
+    let active_generation = ServiceInstallGeneration::generate();
+    let (proxy, control) = native_credential_proxy(Some(active_generation.clone()));
+    let server = spawn_admin_listener(proxy);
+    let endpoint = ControlPlaneEndpoint::new(format!("http://{}", server.addr), None::<String>)
+        .expect("loopback endpoint");
+    let operator = LocalOperatorClient::from_helper_home(endpoint, &home)
+        .expect("local operator client from selected helper home");
+    control.set_value(
+        SecretValue::new(b"credential-generation-b".to_vec()).expect("rotated credential"),
+    );
+
+    for request in [
+        LocalCredentialRefreshRequest {
+            service: crate::config::ServiceKind::Codex,
+            install_generation: ServiceInstallGeneration::generate(),
+            credential_name: CredentialName::parse("relay.primary").expect("credential name"),
+            action: LocalCredentialRefreshAction::Upsert,
+        },
+        LocalCredentialRefreshRequest {
+            service: crate::config::ServiceKind::Claude,
+            install_generation: active_generation,
+            credential_name: CredentialName::parse("relay.primary").expect("credential name"),
+            action: LocalCredentialRefreshAction::Upsert,
+        },
+    ] {
+        let error = operator
+            .refresh_native_credential(&request)
+            .await
+            .expect_err("foreign target must be rejected");
+        assert!(matches!(
+            error,
+            crate::control_plane_client::ControlPlaneError::HttpStatus { status: 409, .. }
+        ));
+    }
+    assert_eq!(
+        control.read_count(),
+        1,
+        "target mismatch must be rejected before native-store I/O"
+    );
+
+    drop(server);
+
+    let (unbound_proxy, unbound_control) = native_credential_proxy(None);
+    let unbound_server = spawn_admin_listener(unbound_proxy);
+    let unbound_endpoint =
+        ControlPlaneEndpoint::new(format!("http://{}", unbound_server.addr), None::<String>)
+            .expect("unbound loopback endpoint");
+    let unbound_operator = LocalOperatorClient::from_helper_home(unbound_endpoint, &home)
+        .expect("unbound local operator client");
+    let error = unbound_operator
+        .refresh_native_credential(&LocalCredentialRefreshRequest {
+            service: crate::config::ServiceKind::Codex,
+            install_generation: ServiceInstallGeneration::generate(),
+            credential_name: CredentialName::parse("relay.primary").expect("credential name"),
+            action: LocalCredentialRefreshAction::Upsert,
+        })
+        .await
+        .expect_err("a runtime without an install generation must be rejected");
+    assert!(matches!(
+        error,
+        crate::control_plane_client::ControlPlaneError::HttpStatus { status: 409, .. }
+    ));
+    assert_eq!(
+        unbound_control.read_count(),
+        1,
+        "an unbound runtime must be rejected before native-store I/O"
+    );
+
+    drop(unbound_server);
+    drop(scoped);
+    std::fs::remove_dir_all(home).expect("remove helper home");
+}
+
+#[tokio::test]
+async fn credential_refresh_signature_is_single_use_and_rejects_expired_timestamp() {
+    let _env_guard = env_lock().await;
+    let home = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HELPER_HOME", &home);
+        scoped.set(ADMIN_TOKEN_ENV_VAR, "");
+    }
+    let token =
+        crate::local_operator::ensure_local_operator_token().expect("create operator token");
+    let generation = ServiceInstallGeneration::generate();
+    let (proxy, control) = native_credential_proxy(Some(generation.clone()));
+    control.set_value(
+        SecretValue::new(b"credential-generation-b".to_vec()).expect("rotated credential"),
+    );
+    let server = spawn_admin_listener(proxy);
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("build local client");
+    let body = serde_json::to_vec(&LocalCredentialRefreshRequest {
+        service: crate::config::ServiceKind::Codex,
+        install_generation: generation,
+        credential_name: CredentialName::parse("relay.primary").expect("credential name"),
+        action: LocalCredentialRefreshAction::Upsert,
+    })
+    .expect("serialize credential refresh");
+
+    let (client_nonce, session) = begin_operator_session(&client, &server, &token, None).await;
+    let request = signed_operator_request(
+        &SignedOperatorRequestContext {
+            client: &client,
+            server: &server,
+            token: &token,
+            client_nonce: &client_nonce,
+            session: &session,
+            admin_token: None,
+        },
+        LOCAL_V1_CREDENTIAL_REFRESH,
+        &body,
+        body.clone(),
+        unix_time_ms(),
+    )
+    .build()
+    .expect("build signed credential request");
+    let replay = request.try_clone().expect("clone credential replay");
+    assert_eq!(
+        client
+            .execute(request)
+            .await
+            .expect("send credential refresh")
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        client
+            .execute(replay)
+            .await
+            .expect("send credential replay")
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(control.read_count(), 2);
+
+    let (client_nonce, session) = begin_operator_session(&client, &server, &token, None).await;
+    let expired = signed_operator_request(
+        &SignedOperatorRequestContext {
+            client: &client,
+            server: &server,
+            token: &token,
+            client_nonce: &client_nonce,
+            session: &session,
+            admin_token: None,
+        },
+        LOCAL_V1_CREDENTIAL_REFRESH,
+        &body,
+        body.clone(),
+        unix_time_ms().saturating_sub(60_000),
+    )
+    .send()
+    .await
+    .expect("send expired credential refresh");
+    assert_eq!(expired.status(), StatusCode::FORBIDDEN);
+    assert_eq!(control.read_count(), 2);
+
+    let (client_nonce, session) = begin_operator_session(&client, &server, &token, None).await;
+    let tampered_body = serde_json::to_vec(&LocalCredentialRefreshRequest {
+        service: crate::config::ServiceKind::Codex,
+        install_generation: ServiceInstallGeneration::generate(),
+        credential_name: CredentialName::parse("relay.primary").expect("credential name"),
+        action: LocalCredentialRefreshAction::Delete,
+    })
+    .expect("serialize tampered credential refresh");
+    let invalid_signature = signed_operator_request(
+        &SignedOperatorRequestContext {
+            client: &client,
+            server: &server,
+            token: &token,
+            client_nonce: &client_nonce,
+            session: &session,
+            admin_token: None,
+        },
+        LOCAL_V1_CREDENTIAL_REFRESH,
+        &body,
+        tampered_body,
+        unix_time_ms(),
+    )
+    .send()
+    .await
+    .expect("send tampered credential refresh");
+    assert_eq!(invalid_signature.status(), StatusCode::FORBIDDEN);
+    assert_eq!(control.read_count(), 2);
 
     drop(server);
     drop(scoped);

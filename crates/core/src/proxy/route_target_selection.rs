@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::auth_resolution::resolve_upstream_auth_for_target;
+use crate::auth_resolution::target_credential_readiness;
 use crate::config::SchedulingPreset;
 use crate::logging::log_control_trace_event;
 use crate::routing_ir::{
@@ -8,6 +8,7 @@ use crate::routing_ir::{
     RoutePlanRuntimeState, RoutePlanTemplate,
 };
 use crate::runtime_store::ProviderPolicySnapshot;
+use anyhow::Result;
 
 use super::ProxyService;
 use super::concurrency_limits::{
@@ -23,16 +24,22 @@ pub(super) async fn route_graph_runtime_for_request(
     runtime_revision: u64,
     provider_policy: &ProviderPolicySnapshot,
     session_id: Option<&str>,
-) -> RoutePlanRuntimeState {
+) -> Result<RoutePlanRuntimeState> {
+    let runtime_identities = template.candidate_identities()?;
     let mut runtime = proxy
         .state
-        .route_plan_runtime_state_with_provider_policy(proxy.service_name, provider_policy)
+        .route_plan_runtime_state_with_provider_policy(
+            proxy.service_name,
+            provider_policy,
+            runtime_revision,
+            runtime_identities.as_slice(),
+        )
         .await;
-    apply_auth_resolution_to_runtime(proxy.service_name, template, &mut runtime);
+    apply_auth_resolution_to_runtime(proxy.service_name, template, &mut runtime)?;
     apply_concurrency_snapshots_to_runtime(proxy, template, runtime_revision, &mut runtime);
     apply_session_route_affinity_for_template(proxy, session_id, template, &mut runtime).await;
     apply_routing_operator_control_to_runtime(proxy, routing_control_graph_key, &mut runtime).await;
-    runtime
+    Ok(runtime)
 }
 
 pub(super) async fn apply_routing_operator_control_to_runtime(
@@ -52,18 +59,23 @@ pub(super) fn apply_auth_resolution_to_runtime(
     service_name: &str,
     template: &RoutePlanTemplate,
     runtime: &mut RoutePlanRuntimeState,
-) {
+) -> Result<()> {
     for candidate in &template.candidates {
         let provider_endpoint = template.candidate_provider_endpoint_key(candidate);
         let mut state = runtime.provider_endpoint(&provider_endpoint);
-        state.missing_auth = resolve_upstream_auth_for_target(
+        let credential = template
+            .credential_generation
+            .capture_bound(&provider_endpoint)?;
+        state.credential_readiness = target_credential_readiness(
             service_name,
-            &candidate.auth,
+            credential.configured_contract(),
+            credential.allow_anonymous(),
             candidate.base_url.as_str(),
-        )
-        .is_err();
+            credential.readiness_code(),
+        );
         runtime.set_provider_endpoint(provider_endpoint, state);
     }
+    Ok(())
 }
 
 pub(super) fn apply_concurrency_snapshots_to_runtime(

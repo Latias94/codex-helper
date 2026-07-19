@@ -29,11 +29,11 @@ It is probably unnecessary if you only use one official account and do not need 
 ## Main Features
 
 - **Local proxy**: listens on `127.0.0.1:3211` by default.
-- **Explicit safe switch**: only a local `switch on/off` action edits the helper provider selector/stanza in `~/.codex/config.toml`; conflicting external edits produce `recovery_required`, while Codex auth, model cache, and SQLite remain outside helper ownership.
+- **Explicit safe switch**: only a local `switch on/off` action edits the helper provider selector/stanza in `~/.codex/config.toml`; `--client-facade compatible|openai|openai-tools` explicitly advertises client capabilities, conflicting external edits produce `recovery_required`, and Codex auth, model cache, and SQLite remain outside helper ownership.
 - **Provider-owned capability contract**: Responses, compact, WebSocket, hosted-tool, and model decisions come from captured provider/catalog facts rather than client patch assumptions.
 - **OpenAI Images-compatible entrypoint**: the local proxy also exposes `POST /v1/images/generations` and JSON `POST /v1/images/edits`, translates them into Responses hosted `image_generation` requests, and keeps using the same provider routing / fallback chain for local skills and scripts.
 - **Relay capability diagnostics**: explicit, process-local CLI actions perform bounded `/models`, `/responses`, and `/responses/compact` checks and show provider contract, observations, continuity, and mismatches without changing configuration or routing.
-- **Provider / routing config**: `version = 5` route graph schema. Define providers once, then use routing entry/routes for order, pinning, grouping, or tag preference.
+- **Provider / routing config**: `version = 6` route graph schema. Define providers once, then use routing entry/routes for order, pinning, grouping, or tag preference.
 - **Session affinity and failover**: each Codex session tries to keep using the selected provider, then falls through to other route candidates when requests fail, upstreams are unavailable, or trusted balance snapshots are exhausted.
 - **Provider signal control loop**: rate limits, quota responses, transport failures, and exhausted balances are first recorded as provider signals, then converted into helper-owned temporary policy actions projected into routing. Manual disables have higher precedence, and automatic actions never mutate Codex auth or third-party account files.
 - **Balance and plan visibility**: probes common Sub2API, New API, and `/user/balance` endpoints; lookup failures are not treated as exhausted.
@@ -87,9 +87,14 @@ ch
 By default this will:
 
 - start the local proxy;
-- load the only supported `version = 5` `~/.codex-helper/config.toml`;
+- load the only supported `version = 6` `~/.codex-helper/config.toml`, automatically backing up and migrating an existing v5 file first;
 - open the TUI in interactive terminals;
 - stop the proxy started by the current foreground console on exit.
+
+Automatic configuration migration only converts supported legacy syntax into version 6 and
+preserves the exact source backup. It never copies, deletes, or reinterprets a credential value.
+Moving a value into the OS credential store is a separate, explicit operation such as
+`codex-helper credential import relay.primary --from-env RELAY_TOKEN`.
 
 Start the proxy without the TUI:
 
@@ -119,6 +124,7 @@ Switch the Codex client to helper explicitly:
 codex-helper switch on
 codex-helper switch on --port 4321
 codex-helper switch on --base-url https://relay.example/v1
+codex-helper switch on --client-facade openai-tools
 codex-helper switch status
 codex-helper switch off
 ```
@@ -143,9 +149,9 @@ Plain `ch` still starts the local foreground helper. `ch relay local` is the exp
 
 Container and server runtimes do not provide access to a client's local transcript/session files. Local `session` commands read only the Codex session files on the machine where the command runs.
 
-The client switch only points Codex at one helper URL. `switch on` records the original selector and helper stanza, then writes `model_providers.codex_proxy`; `switch off` restores only the recorded content. Conflicting external edits move the state to `recovery_required` and leave the file untouched. Except for the one-time legacy recovery described below, Codex `auth.json`, `models_cache.json`, SQLite, feature flags, compaction, and WebSocket settings are never read or changed.
+The client switch points Codex at one helper URL and can explicitly select `compatible` (default), `openai` (remote-compaction and Web Search eligibility), or `openai-tools` (plus hosted image-generation eligibility) through `--client-facade`. A facade controls client exposure; it does not guarantee relay support. `switch on` records the original selector and helper stanza, then writes `model_providers.codex_proxy`; `switch off` restores only the recorded content. Conflicting external edits move the state to `recovery_required` and leave the file untouched. Run `switch off` before changing the URL or facade. Except for the one-time legacy recovery described below, Codex `auth.json`, `models_cache.json`, SQLite, global feature flags, compaction, and WebSocket settings are never read or changed. The historical empty `{}` auth facade is not recreated. The helper capability marker never reaches an upstream, while real actor authorization can pass only to an official OpenAI origin without configured helper credentials.
 
-When upgrading from 0.20.3 or earlier, a current `switch off` safely and automatically restores the selector/provider stanza and any verifiable auth facade managed by a remaining `~/.codex/codex-helper-switch-state.json`; `switch on` performs the same recovery before creating its new journal. Recovery writes only while the current files still match the old helper patch. Malformed or unknown state and legacy/current journal conflicts preserve the original state and fail closed. The legacy file may contain original auth content, so do not delete, edit, or share it. The new release does not undo `remote_connections` or Codex SQLite state written by the removed `switch remote-control enable`, and that database must not be cleaned with an SQL hack. See [Configuration Compatibility](docs/CONFIGURATION.md#configuration-compatibility) for the full sequence and retired version 5 fields.
+When upgrading from 0.20.3 or earlier, a current `switch off` safely and automatically restores the selector/provider stanza and any verifiable auth facade managed by a remaining `~/.codex/codex-helper-switch-state.json`; `switch on` performs the same recovery before creating its new journal. Recovery writes only while the current files still match the old helper patch. Malformed or unknown state and legacy/current journal conflicts preserve the original state and fail closed. The legacy file may contain original auth content, so do not delete, edit, or share it. The new release does not undo `remote_connections` or Codex SQLite state written by the removed `switch remote-control enable`, and that database must not be cleaned with an SQL hack. See [Configuration Compatibility](docs/CONFIGURATION.md#configuration-compatibility) for the full sequence, v5-to-v6 migration, and retired fields.
 
 Relay capabilities come from the selected provider adapter, catalog, and bounded observations rather than switch configuration. Inspect the provider contract, live `/models` / `/responses` / `/responses/compact` results, continuity, and mismatches with:
 
@@ -153,7 +159,7 @@ Relay capabilities come from the selected provider adapter, catalog, and bounded
 codex-helper codex relay-capabilities --model gpt-5.5 --provider ciii --endpoint default
 ```
 
-Third-party relays should configure their own `auth_token_env`, `auth_token`, or equivalent API key. Credentials resolve from inline config, the daemon process environment, then an explicitly referenced same-name field in Codex `auth.json` or Claude settings; an unresolved explicit reference fails closed before upstream I/O. A Windows per-user Scheduled Task does not capture temporary `$env:*` values from the current PowerShell window; see [Provider Fields](docs/CONFIGURATION.md#provider-fields) for service-safe options. Codex client authentication may pass only to the official OpenAI origin, preventing account headers from leaking to a relay.
+Third-party relays must configure helper-owned authentication explicitly. Version 6 can bind bearer or `X-API-Key` auth to a native credential, an absolute read-only secret file, an environment variable, or a compatibility inline value; selecting `auth_token_ref` / `api_key_ref` disables fallback to legacy sources of the same kind. Installed desktop services should use the logged-in user's Credential Manager, Keychain, or Secret Service. Docker/headless servers use environment variables or mounted secrets; the server rejects native references and never creates a plaintext or SQLite fallback. See [Provider Fields](docs/CONFIGURATION.md#provider-fields) for commands, precedence, and readiness semantics. Codex client authentication may pass only to the official OpenAI origin, preventing account headers from leaking to a relay.
 
 To avoid degrading capable relays, codex-helper normalizes compressed HTTP request bodies before routing by default (`zstd`, `gzip` / `x-gzip`, `br`, and `deflate`). For Codex `/responses`, `/responses/compact`, and Responses WebSocket, helper also completes missing `session_id`, `x-session-id`, official `session-id` / `thread-id`, and `prompt_cache_key` fields from existing request evidence: header session ids, body `session_id`, `prompt_cache_key`, or `metadata.session_id`. `previous_response_id` is only used for stale-response repair, not as a session identity source. It does not invent a synthetic session id and does not overwrite session fields the client already sent.
 
@@ -225,7 +231,7 @@ The codex-helper side only owns upstreams and routing:
 
 ```toml
 # ~/.codex-helper/config.toml
-version = 5
+version = 6
 
 [codex.providers.relay]
 base_url = "https://relay.example/v1"
@@ -269,7 +275,7 @@ codex-helper config set-retry-profile balanced
 The resulting `~/.codex-helper/config.toml` stays small:
 
 ```toml
-version = 5
+version = 6
 
 [codex.providers.input]
 base_url = "https://ai.input.im/v1"

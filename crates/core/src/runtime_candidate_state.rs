@@ -1,3 +1,4 @@
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::balance::{ProviderBalanceSnapshot, ProviderRoutingBalanceSummary};
@@ -34,18 +35,18 @@ impl RoutePlanTemplate {
         &self,
         candidate: &RouteCandidate,
         inputs: &RouteRuntimeSignalInputs<'_>,
-    ) -> RouteCandidateRuntimeSignals {
-        let identity = self.candidate_identity(candidate);
-        RouteCandidateRuntimeSignals {
+    ) -> Result<RouteCandidateRuntimeSignals> {
+        let identity = self.candidate_identity(candidate)?;
+        Ok(RouteCandidateRuntimeSignals {
             balance: candidate_balance_summary(&identity, inputs.provider_balances, inputs.now_ms),
             identity,
-        }
+        })
     }
 
     pub fn candidate_runtime_signal_view(
         &self,
         inputs: &RouteRuntimeSignalInputs<'_>,
-    ) -> Vec<RouteCandidateRuntimeSignals> {
+    ) -> Result<Vec<RouteCandidateRuntimeSignals>> {
         self.candidates
             .iter()
             .map(|candidate| self.candidate_runtime_signals(candidate, inputs))
@@ -77,7 +78,12 @@ mod tests {
         ProviderConcurrencyLimits, ProviderConfig, ProviderEndpointConfig, ServiceRouteConfig,
         UpstreamAuth,
     };
-    use crate::routing_ir::compile_route_plan_template;
+    use crate::credentials::{
+        CredentialCandidateInput, CredentialRuntime, CredentialSourceCapabilities,
+    };
+    use crate::routing_ir::{CompiledRouteGraph, RouteRequestContext};
+    use crate::runtime_identity::ProviderEndpointKey;
+    use crate::runtime_store::RuntimeStore;
     use std::collections::BTreeMap;
 
     fn provider(base_url: &str) -> ProviderConfig {
@@ -85,6 +91,32 @@ mod tests {
             base_url: Some(base_url.to_string()),
             ..ProviderConfig::default()
         }
+    }
+
+    fn runtime_template(view: &ServiceRouteConfig) -> RoutePlanTemplate {
+        let graph = CompiledRouteGraph::compile("codex", view).expect("compile route graph");
+        let store = RuntimeStore::open_in_memory().expect("open runtime store");
+        let runtime =
+            CredentialRuntime::from_runtime_store(CredentialSourceCapabilities::server(), &store)
+                .expect("build credential runtime");
+        let generation =
+            runtime
+                .build_generation(graph.candidates().iter().map(|candidate| {
+                    CredentialCandidateInput {
+                        provider_endpoint: ProviderEndpointKey::new(
+                            "codex",
+                            candidate.provider_id.clone(),
+                            candidate.endpoint_id.clone(),
+                        ),
+                        auth: &candidate.auth,
+                    }
+                }))
+                .expect("build credential generation");
+        graph
+            .with_credential_generation(generation, "test:runtime-signals".to_string())
+            .expect("bind credential generation")
+            .route_plan(&RouteRequestContext::default())
+            .expect("build route template")
     }
 
     fn balance_snapshot(
@@ -122,7 +154,7 @@ mod tests {
             )]),
             ..ServiceRouteConfig::default()
         };
-        let template = compile_route_plan_template("codex", &view).expect("route template");
+        let template = runtime_template(&view);
 
         let provider_balances = vec![balance_snapshot("source-a", "other", "default", true)];
         let inputs = RouteRuntimeSignalInputs {
@@ -130,7 +162,9 @@ mod tests {
             now_ms: 150,
         };
 
-        let signals = template.candidate_runtime_signal_view(&inputs);
+        let signals = template
+            .candidate_runtime_signal_view(&inputs)
+            .expect("capture runtime signals");
 
         assert_eq!(signals.len(), 1);
         assert_eq!(
@@ -182,7 +216,7 @@ mod tests {
             )]),
             ..ServiceRouteConfig::default()
         };
-        let template = compile_route_plan_template("codex", &view).expect("route template");
+        let template = runtime_template(&view);
         let provider_balances = vec![
             balance_snapshot("source-a", "input", "fast", false),
             balance_snapshot("source-a", "input", "slow", true),
@@ -192,7 +226,9 @@ mod tests {
             now_ms: 150,
         };
 
-        let signals = template.candidate_runtime_signal_view(&inputs);
+        let signals = template
+            .candidate_runtime_signal_view(&inputs)
+            .expect("capture runtime signals");
 
         assert_eq!(
             signals
@@ -216,7 +252,7 @@ mod tests {
             )]),
             ..ServiceRouteConfig::default()
         };
-        let template = compile_route_plan_template("codex", &view).expect("route template");
+        let template = runtime_template(&view);
 
         let provider_balances = vec![
             balance_snapshot("source-a", "input", "default", false),
@@ -228,7 +264,9 @@ mod tests {
             now_ms: 150,
         };
 
-        let signals = template.candidate_runtime_signal_view(&inputs);
+        let signals = template
+            .candidate_runtime_signal_view(&inputs)
+            .expect("capture runtime signals");
 
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].balance.snapshots, 2);

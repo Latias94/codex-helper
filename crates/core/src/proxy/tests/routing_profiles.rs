@@ -272,7 +272,7 @@ async fn proxy_default_profile_binding_does_not_patch_request_fields() {
 }
 
 #[tokio::test]
-async fn claude_settings_cache_refreshes_after_source_change() {
+async fn claude_settings_reader_observes_source_changes_without_retaining_json() {
     let _env_lock = env_lock().await;
     let mut scoped = ScopedEnv::default();
     let base = make_temp_test_dir();
@@ -293,13 +293,10 @@ async fn claude_settings_cache_refreshes_after_source_change() {
         Some("claude-first".to_string())
     );
 
-    sleep(Duration::from_millis(30)).await;
     write_text_file(
         &claude_settings,
         r#"{"env":{"ANTHROPIC_API_KEY":"claude-second"}}"#,
     );
-    sleep(Duration::from_millis(30)).await;
-
     assert_eq!(
         super::claude_settings_env_value("ANTHROPIC_API_KEY"),
         Some("claude-second".to_string())

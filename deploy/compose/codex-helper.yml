@@ -8,7 +8,7 @@ services:
     environment:
       CODEX_HELPER_HOME: /data
       CODEX_HELPER_ADMIN_TOKEN: ${CODEX_HELPER_ADMIN_TOKEN:?set CODEX_HELPER_ADMIN_TOKEN}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:?set OPENAI_API_KEY or edit deploy/container/config.toml}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       RUST_LOG: ${RUST_LOG:-info}
     ports:
       - "${CODEX_HELPER_PROXY_BIND:-0.0.0.0}:3211:3211"

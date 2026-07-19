@@ -12,6 +12,7 @@ use crate::state::{
 
 use super::ProxyService;
 use super::client_identity::ClientSessionIdentity;
+use super::models_compat::codex_path_is_models;
 use super::request_body::{
     ReasoningOrchestrationIntent, RequestDialect, apply_model_override_value,
     apply_reasoning_effort_override_value, apply_service_tier_override_value,
@@ -24,6 +25,18 @@ use super::request_continuity::{
 use super::retry::{RetryPlan, retry_plan};
 use super::runtime_config::{CapturedRoutePlan, RuntimeSnapshot};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SharedRouteStateImpact {
+    RouteFacing,
+    RequestLocalOnly,
+}
+
+impl SharedRouteStateImpact {
+    pub(super) fn allows_shared_updates(self) -> bool {
+        self == Self::RouteFacing
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct RequestFlavor {
     pub client_content_type: Option<String>,
@@ -33,12 +46,24 @@ pub(super) struct RequestFlavor {
     pub is_remote_compaction_v2_request: bool,
     pub remote_compaction_requires_affinity: bool,
     pub is_codex_service: bool,
+    pub shared_route_state_impact: SharedRouteStateImpact,
     pub codex_bridge_log: Option<CodexBridgeLog>,
 }
 
 impl RequestFlavor {
     pub(super) fn is_remote_compaction_request(&self) -> bool {
         self.is_remote_compaction_v1_request || self.is_remote_compaction_v2_request
+    }
+
+    pub(super) fn route_state_session_id<'a>(
+        &self,
+        session_id: Option<&'a str>,
+    ) -> Option<&'a str> {
+        if self.shared_route_state_impact.allows_shared_updates() {
+            session_id
+        } else {
+            None
+        }
     }
 
     pub(super) fn with_remote_compaction_context_from_body(mut self, raw_body: &[u8]) -> Self {
@@ -158,11 +183,6 @@ pub(super) async fn load_request_config_context(
     proxy: &ProxyService,
     session_identity: Option<&ClientSessionIdentity>,
 ) -> RequestConfigContext {
-    let config_reloaded = proxy.config.maybe_reload_from_disk().await;
-    if config_reloaded {
-        super::control_plane_service::prune_runtime_observability_after_reload(proxy).await;
-    }
-
     let session_id = session_identity_value(session_identity);
     let session_identity_source = session_identity_source(session_identity);
     let session_route_control = match session_id.as_deref() {
@@ -380,16 +400,23 @@ pub(super) fn detect_request_flavor(
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
 
-    let is_stream = headers
-        .get("accept")
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.to_ascii_lowercase().contains("text/event-stream"))
-        .unwrap_or(false);
+    let is_codex_service = service_name == "codex";
+    let shared_route_state_impact =
+        if is_codex_service && *method == Method::GET && codex_path_is_models(path) {
+            SharedRouteStateImpact::RequestLocalOnly
+        } else {
+            SharedRouteStateImpact::RouteFacing
+        };
+    let is_stream = shared_route_state_impact.allows_shared_updates()
+        && headers
+            .get("accept")
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.to_ascii_lowercase().contains("text/event-stream"))
+            .unwrap_or(false);
 
     let is_responses_path = codex_path_is_responses(path);
     let is_remote_compaction_v1_request = codex_path_is_responses_compact(path);
     let is_user_turn = *method == Method::POST && is_responses_path;
-    let is_codex_service = service_name == "codex";
     let codex_bridge_log =
         (is_codex_service && is_remote_compaction_v1_request).then(|| CodexBridgeLog {
             patch_mode: "request-dialect".to_string(),
@@ -407,6 +434,7 @@ pub(super) fn detect_request_flavor(
         is_remote_compaction_v2_request: false,
         remote_compaction_requires_affinity: false,
         is_codex_service,
+        shared_route_state_impact,
         codex_bridge_log,
     }
 }
@@ -684,6 +712,47 @@ mod tests {
         assert!(!flavor.is_remote_compaction_v2_request);
         assert!(!flavor.is_remote_compaction_request());
         assert!(flavor.is_codex_service);
+        assert_eq!(
+            flavor.shared_route_state_impact,
+            SharedRouteStateImpact::RouteFacing
+        );
+    }
+
+    #[test]
+    fn codex_models_get_is_request_local_even_with_session_and_sse_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("accept", HeaderValue::from_static("text/event-stream"));
+
+        for path in ["/models", "/v1/models/", "/backend-api/codex/models"] {
+            let flavor = detect_request_flavor("codex", &Method::GET, &headers, path);
+            assert_eq!(
+                flavor.shared_route_state_impact,
+                SharedRouteStateImpact::RequestLocalOnly,
+                "{path}"
+            );
+            assert!(!flavor.is_stream, "{path}");
+            assert_eq!(flavor.route_state_session_id(Some("session-a")), None);
+        }
+    }
+
+    #[test]
+    fn models_like_requests_outside_codex_get_remain_route_facing() {
+        for (service, method, path) in [
+            ("codex", Method::POST, "/models"),
+            ("claude", Method::GET, "/models"),
+            ("codex", Method::GET, "/models/detail"),
+        ] {
+            let flavor = detect_request_flavor(service, &method, &HeaderMap::new(), path);
+            assert_eq!(
+                flavor.shared_route_state_impact,
+                SharedRouteStateImpact::RouteFacing,
+                "{service} {method} {path}"
+            );
+            assert_eq!(
+                flavor.route_state_session_id(Some("session-a")),
+                Some("session-a")
+            );
+        }
     }
 
     #[test]

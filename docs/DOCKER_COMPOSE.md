@@ -6,10 +6,12 @@ This deployment runs `codex-helper-server`, a container-first central relay runt
 
 - `Dockerfile` builds the `codex-helper-server` binary with `cargo-chef`.
 - `deploy/compose/codex-helper.yml` is the Synology-friendly Compose stack.
+- `deploy/compose/codex-helper.secrets.yml` is the opt-in mounted-secret overlay.
 - `deploy/container/server.toml` controls server process settings: service, proxy bind, and admin bind.
 - `deploy/container/config.toml` is the initial codex-helper route graph copied into the `/data` volume on first start.
+- `deploy/container/config.secrets.toml` is the version 6 route graph used by the mounted-secret overlay.
 
-## First Start
+## Environment Deployment
 
 Create an environment file from `deploy/compose/.env.example`, set a long `CODEX_HELPER_ADMIN_TOKEN`, and provide the provider credentials referenced by `deploy/container/config.toml`.
 
@@ -18,6 +20,90 @@ docker compose --env-file deploy/compose/.env -f deploy/compose/codex-helper.yml
 ```
 
 The first start copies `/config/config.toml` into `/data/config.toml`. Later starts keep the existing `/data/config.toml`, so container updates do not overwrite runtime routing changes.
+
+The environment sample intentionally starts from a version 5 config to exercise the supported automatic migration. The first config load writes a version 6 `/data/config.toml` and preserves the exact source as `/data/config.toml.bak`. It does not move or copy the environment credential. `OPENAI_API_KEY` must be non-empty; Compose leaves it optional at interpolation time so the same base file can be used with the mounted-secret overlay, while `--check` rejects an omitted value as blocked.
+
+Before exposing ports, run the offline credential check through the same Compose configuration:
+
+```bash
+docker compose --env-file deploy/compose/.env \
+  -f deploy/compose/codex-helper.yml \
+  run --rm --no-deps --entrypoint sh codex-helper \
+  -ceu 'test -f /data/config.toml || cp /config/config.toml /data/config.toml; exec codex-helper-server --config /config/server.toml --check --json'
+```
+
+The check loads and compiles routing and resolves only environment or mounted-file credentials. It opens no runtime database or listener and sends no client or upstream request. `ready` and `degraded` exit with status 0; `blocked` prints its redacted report and exits with status 1.
+
+## Mounted-Secret Deployment
+
+Local Compose `file:` secrets are read-only bind mounts. They are not encrypted host storage, and Compose ownership/mode overrides are not portable. Protect the host source yourself. On a conventional Linux host, the tested ownership for the image's effective UID/GID 10001 is:
+
+```bash
+sudo install -d -o root -g 10001 -m 0750 /srv/codex-helper-secrets
+read -rsp 'OpenAI API key: ' OPENAI_API_KEY; printf '\n'
+printf '%s\n' "$OPENAI_API_KEY" | sudo tee /srv/codex-helper-secrets/openai_api_key.new >/dev/null
+unset OPENAI_API_KEY
+sudo chown root:10001 /srv/codex-helper-secrets/openai_api_key.new
+sudo chmod 0440 /srv/codex-helper-secrets/openai_api_key.new
+sudo mv /srv/codex-helper-secrets/openai_api_key.new /srv/codex-helper-secrets/openai_api_key
+```
+
+Do not put a literal token in the Compose file, command line, or `.env`. Set only the absolute host path and the separate admin token:
+
+```bash
+export CODEX_HELPER_OPENAI_SECRET_FILE=/srv/codex-helper-secrets/openai_api_key
+export CODEX_HELPER_ADMIN_TOKEN='long-random-admin-token'
+
+docker compose \
+  -f deploy/compose/codex-helper.yml \
+  -f deploy/compose/codex-helper.secrets.yml \
+  run --rm --no-deps --entrypoint sh codex-helper \
+  -ceu 'test -f /data/config.toml || cp /config/config.toml /data/config.toml; exec codex-helper-server --config /config/server.toml --check --json'
+
+docker compose \
+  -f deploy/compose/codex-helper.yml \
+  -f deploy/compose/codex-helper.secrets.yml \
+  up -d --build
+```
+
+The overlay mounts the source only at `/run/secrets/openai_api_key`, clears `OPENAI_API_KEY`, and uses a distinct `/data` volume so enabling it cannot overwrite an existing environment deployment's config. The secret value is read directly from the mount. It is never copied into `/data`, config, SQLite/WAL/SHM, logs, or operator JSON. One terminal LF or CRLF is accepted; empty, over-64-KiB, non-regular, unreadable, or malformed values are rejected with a stable category and the configured path only.
+
+Verify the effective identity and mount after start:
+
+```bash
+docker compose \
+  -f deploy/compose/codex-helper.yml \
+  -f deploy/compose/codex-helper.secrets.yml \
+  exec codex-helper sh -ceu '
+    test "$(id -u)" = 10001
+    test "$(id -g)" = 10001
+    test -r /run/secrets/openai_api_key
+    test ! -w /run/secrets/openai_api_key
+  '
+```
+
+Docker Desktop and NAS ACL implementations can map host ownership differently. The check above is authoritative for that host; do not relax the file to world-readable merely to make a mount work.
+
+### Rotation
+
+Write a replacement next to the source, apply the same ownership/mode, and rename it atomically over the configured path. A file bind mount pins the old inode in the running container. The tested behavior is:
+
+- runtime reload does not remount the host path;
+- `docker compose restart` is the first tested operation that rebuilds the mount namespace, resolves the replacement path, and publishes the new credential generation;
+- container recreation also exposes the replacement, but is not required by the tested Docker Engine path.
+
+Use:
+
+```bash
+docker compose \
+  -f deploy/compose/codex-helper.yml \
+  -f deploy/compose/codex-helper.secrets.yml \
+  restart codex-helper
+```
+
+Then rerun `--check`. Do not claim a rotation completed from process state alone; require a ready check after restart and verify the upstream accepts the new credential. The repository's `tools/docker-mounted-secret-smoke.sh` reproduces the ACL, invalid-input, reload/restart/recreate, operator, persistence, and canary-leakage gates on a real Linux Docker Engine.
+
+Native credential references are deliberately unsupported by `codex-helper-server`, including builds where Cargo feature unification compiled a desktop native backend into another workspace package. Use `*_env` or an absolute `secret_file` reference for server deployments.
 
 ## Client Configuration
 
@@ -55,6 +141,8 @@ wire_api = "responses"
 ```
 
 Do not run `codex-helper switch on` inside the container. That command is for local desktop/client machines and writes local Codex files.
+
+The server image receives no client `~/.codex`, `~/.claude`, session, or local runtime mount. A remote client uses the hosted relay over its explicit proxy/admin URLs; the server cannot inspect or mutate that client's files.
 
 ## Admin API
 

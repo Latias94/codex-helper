@@ -287,8 +287,10 @@ async fn proxy_operator_summary_reports_retry_profile_and_attempt_limits() {
             auth: UpstreamAuth {
                 auth_token: None,
                 auth_token_env: None,
+                auth_token_ref: None,
                 api_key: None,
                 api_key_env: None,
+                api_key_ref: None,
                 allow_anonymous: None,
             },
             tags: HashMap::new(),

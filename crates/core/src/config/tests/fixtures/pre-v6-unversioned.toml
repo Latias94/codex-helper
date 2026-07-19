@@ -1,0 +1,11 @@
+[codex]
+active = "legacy"
+
+[codex.configs.legacy]
+
+[[codex.configs.legacy.upstreams]]
+base_url = "https://unversioned.example/v1"
+
+[codex.configs.legacy.upstreams.auth]
+auth_token = "fixture-unversioned-inline"
+auth_token_env = "FIXTURE_INLINE_ENV"

@@ -95,6 +95,24 @@ pub(in crate::tui::view) fn render_provider_info_modal(
                 Style::default().fg(p.text),
             ),
         ]));
+        lines.push(Line::from(vec![
+            Span::styled("credential readiness: ", Style::default().fg(p.muted)),
+            Span::styled(
+                provider
+                    .credential_readiness
+                    .map(|readiness| readiness.as_str())
+                    .unwrap_or("unreported"),
+                Style::default().fg(
+                    if provider.credential_readiness.is_some_and(|readiness| {
+                        readiness == crate::credentials::CredentialAggregateReadiness::Ready
+                    }) {
+                        p.good
+                    } else {
+                        p.warn
+                    },
+                ),
+            ),
+        ]));
         lines.push(Line::from(""));
         if let Some(endpoint_id) = ui.provider_info_endpoint_id.as_deref()
             && let Some(endpoint) = provider
@@ -156,6 +174,34 @@ pub(in crate::tui::view) fn render_provider_info_modal(
                 endpoint.routable,
                 endpoint.runtime_state
             )));
+            lines.push(Line::from(format!(
+                "  {}={}",
+                label("凭据", "credential"),
+                endpoint
+                    .credential_readiness
+                    .map(|readiness| readiness.as_str())
+                    .unwrap_or("unreported")
+            )));
+            for detail in &endpoint.credential_details {
+                let kind = detail.kind.map(|kind| kind.as_str()).unwrap_or("upstream");
+                let source = detail.source_kind.as_deref().unwrap_or("unreported");
+                let reference = detail.reference.as_deref().unwrap_or("-");
+                let cause = detail
+                    .stale_cause
+                    .map(|cause| format!(" cause={}", cause.as_str()))
+                    .unwrap_or_default();
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "    {kind}: {} source={source} ref={reference}{cause}",
+                        detail.code.as_str()
+                    ),
+                    Style::default().fg(if detail.code.is_routable() {
+                        p.muted
+                    } else {
+                        p.warn
+                    }),
+                )));
+            }
             for action in endpoint.policy_actions.iter().take(8) {
                 let cooldown = action
                     .cooldown_remaining_secs
@@ -221,12 +267,16 @@ pub(in crate::tui::view) fn render_provider_info_modal(
                     Span::raw("       "),
                     Span::styled(
                         format!(
-                            "priority={} configured={} effective={} routable={} state={:?}",
+                            "priority={} configured={} effective={} routable={} state={:?} credential={}",
                             endpoint.priority,
                             endpoint.configured_enabled,
                             endpoint.effective_enabled,
                             endpoint.routable,
-                            endpoint.runtime_state
+                            endpoint.runtime_state,
+                            endpoint
+                                .credential_readiness
+                                .map(|readiness| readiness.as_str())
+                                .unwrap_or("unreported")
                         )
                         .to_ascii_lowercase(),
                         Style::default().fg(p.muted),

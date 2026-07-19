@@ -1,11 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
-use std::path::PathBuf;
+use std::fmt;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use toml::Value as TomlValue;
+use zeroize::{Zeroize as _, Zeroizing};
 
 pub use crate::client_config::{
     claude_home, claude_settings_backup_path, claude_settings_path, codex_config_path, codex_home,
@@ -35,88 +38,296 @@ pub use retry_impl::{
     ReasoningGuardStreamMode, ResolvedReasoningGuardConfig, ResolvedRetryConfig,
     ResolvedRetryLayerConfig, RetryConfig, RetryLayerConfig, RetryProfileName, RetryStrategy,
 };
-#[cfg(test)]
-pub(crate) use storage_impl::mutate_helper_config;
 pub use storage_impl::{
     ConfigInitOutcome, LoadedConfig, config_file_path, init_config_toml,
-    init_config_toml_with_outcome, load_config, load_config_with_source, save_helper_config,
+    init_config_toml_with_outcome, load_config, load_config_with_source, mutate_helper_config,
+    save_helper_config,
 };
 
 pub mod storage {
     pub use super::storage_impl::{
         ConfigInitOutcome, LoadedConfig, config_file_path, init_config_toml,
-        init_config_toml_with_outcome, load_config, load_config_with_source, save_helper_config,
+        init_config_toml_with_outcome, load_config, load_config_with_source, mutate_helper_config,
+        save_helper_config,
     };
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CredentialRef {
+    Native { name: String },
+    SecretFile { path: String },
+}
+
+impl CredentialRef {
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            Self::Native { name } => {
+                crate::credentials::CredentialName::parse(name.clone())
+                    .context("invalid native credential reference")?;
+            }
+            Self::SecretFile { path } => {
+                if !Path::new(path).is_absolute() {
+                    anyhow::bail!("secret-file credential path must be absolute");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn source_name(&self) -> &'static str {
+        match self {
+            Self::Native { .. } => "native",
+            Self::SecretFile { .. } => "secret_file",
+        }
+    }
+}
+
+/// The configured source for one upstream credential field.
+///
+/// This view never exposes an inline credential value. References expose only
+/// their configured locator, not the secret stored behind it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamCredentialSource<'a> {
+    Unconfigured,
+    LegacyInline,
+    LegacyEnvironment { variable: &'a str },
+    Reference { reference: &'a CredentialRef },
+}
+
+#[derive(Clone)]
+pub struct InlineCredentialValue(Arc<InlineCredentialInner>);
+
+struct InlineCredentialInner {
+    value: Zeroizing<String>,
+    #[cfg(test)]
+    drop_observer: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl InlineCredentialValue {
+    pub fn as_str(&self) -> &str {
+        self.0.value.as_str()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_drop_observer(
+        value: impl Into<String>,
+        observer: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self(Arc::new(InlineCredentialInner {
+            value: Zeroizing::new(value.into()),
+            drop_observer: Some(observer),
+        }))
+    }
+}
+
+impl From<String> for InlineCredentialValue {
+    fn from(value: String) -> Self {
+        Self(Arc::new(InlineCredentialInner {
+            value: Zeroizing::new(value),
+            #[cfg(test)]
+            drop_observer: None,
+        }))
+    }
+}
+
+impl From<&str> for InlineCredentialValue {
+    fn from(value: &str) -> Self {
+        value.to_owned().into()
+    }
+}
+
+impl std::ops::Deref for InlineCredentialValue {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+impl AsRef<str> for InlineCredentialValue {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl PartialEq for InlineCredentialValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl Eq for InlineCredentialValue {}
+
+impl fmt::Debug for InlineCredentialValue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("InlineCredentialValue(<redacted>)")
+    }
+}
+
+impl Serialize for InlineCredentialValue {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for InlineCredentialValue {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(Self::from)
+    }
+}
+
+impl Drop for InlineCredentialInner {
+    fn drop(&mut self) {
+        self.value.zeroize();
+        #[cfg(test)]
+        if let Some(observer) = &self.drop_observer {
+            observer.store(
+                self.value.bytes().all(|byte| byte == 0),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct UpstreamAuth {
     /// Bearer token, e.g. OpenAI style
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub auth_token: Option<String>,
+    pub auth_token: Option<InlineCredentialValue>,
     /// Environment variable name for bearer token (preferred over storing secrets on disk)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_token_env: Option<String>,
+    /// Explicit native-store or mounted-secret source for a bearer token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_token_ref: Option<CredentialRef>,
     /// Optional API key header for some providers
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub api_key: Option<String>,
+    pub api_key: Option<InlineCredentialValue>,
     /// Environment variable name for API key header value
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
+    /// Explicit native-store or mounted-secret source for an API key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key_ref: Option<CredentialRef>,
     /// Explicitly allow a remote third-party upstream to receive an anonymous request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allow_anonymous: Option<bool>,
 }
 
+impl fmt::Debug for UpstreamAuth {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UpstreamAuth")
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("auth_token_env", &self.auth_token_env)
+            .field("auth_token_ref", &self.auth_token_ref)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("api_key_env", &self.api_key_env)
+            .field("api_key_ref", &self.api_key_ref)
+            .field("allow_anonymous", &self.allow_anonymous)
+            .finish()
+    }
+}
+
 impl UpstreamAuth {
+    pub(crate) fn zeroize_inline_values(&mut self) {
+        self.auth_token = None;
+        self.api_key = None;
+    }
+
     pub fn with_overrides(&self, overrides: &Self) -> Self {
+        let (auth_token, auth_token_env) = if overrides.auth_token_ref.is_some() {
+            (
+                overrides.auth_token.clone(),
+                overrides.auth_token_env.clone(),
+            )
+        } else {
+            (
+                overrides
+                    .auth_token
+                    .clone()
+                    .or_else(|| self.auth_token.clone()),
+                overrides
+                    .auth_token_env
+                    .clone()
+                    .or_else(|| self.auth_token_env.clone()),
+            )
+        };
+        let (api_key, api_key_env) = if overrides.api_key_ref.is_some() {
+            (overrides.api_key.clone(), overrides.api_key_env.clone())
+        } else {
+            (
+                overrides.api_key.clone().or_else(|| self.api_key.clone()),
+                overrides
+                    .api_key_env
+                    .clone()
+                    .or_else(|| self.api_key_env.clone()),
+            )
+        };
+
         Self {
-            auth_token: overrides
-                .auth_token
+            auth_token,
+            auth_token_env,
+            auth_token_ref: overrides
+                .auth_token_ref
                 .clone()
-                .or_else(|| self.auth_token.clone()),
-            auth_token_env: overrides
-                .auth_token_env
+                .or_else(|| self.auth_token_ref.clone()),
+            api_key,
+            api_key_env,
+            api_key_ref: overrides
+                .api_key_ref
                 .clone()
-                .or_else(|| self.auth_token_env.clone()),
-            api_key: overrides.api_key.clone().or_else(|| self.api_key.clone()),
-            api_key_env: overrides
-                .api_key_env
-                .clone()
-                .or_else(|| self.api_key_env.clone()),
+                .or_else(|| self.api_key_ref.clone()),
             allow_anonymous: overrides.allow_anonymous.or(self.allow_anonymous),
         }
     }
 
-    pub fn resolve_auth_token(&self) -> Option<String> {
-        if let Some(token) = self.auth_token.as_deref()
-            && !token.trim().is_empty()
-        {
-            return Some(token.to_string());
-        }
-        if let Some(env_name) = self.auth_token_env.as_deref()
-            && let Ok(v) = env::var(env_name)
-            && !v.trim().is_empty()
-        {
-            return Some(v);
-        }
-        None
+    /// Inspects the effective bearer-token source without resolving a secret.
+    pub fn auth_token_source(&self) -> UpstreamCredentialSource<'_> {
+        inspect_credential_source(
+            self.auth_token_ref.as_ref(),
+            self.auth_token.as_deref(),
+            self.auth_token_env.as_deref(),
+        )
     }
 
-    pub fn resolve_api_key(&self) -> Option<String> {
-        if let Some(key) = self.api_key.as_deref()
-            && !key.trim().is_empty()
-        {
-            return Some(key.to_string());
-        }
-        if let Some(env_name) = self.api_key_env.as_deref()
-            && let Ok(v) = env::var(env_name)
-            && !v.trim().is_empty()
-        {
-            return Some(v);
-        }
-        None
+    /// Inspects the effective API-key source without resolving a secret.
+    pub fn api_key_source(&self) -> UpstreamCredentialSource<'_> {
+        inspect_credential_source(
+            self.api_key_ref.as_ref(),
+            self.api_key.as_deref(),
+            self.api_key_env.as_deref(),
+        )
     }
+}
+
+fn inspect_credential_source<'a>(
+    reference: Option<&'a CredentialRef>,
+    inline: Option<&'a str>,
+    environment: Option<&'a str>,
+) -> UpstreamCredentialSource<'a> {
+    if let Some(reference) = reference {
+        return UpstreamCredentialSource::Reference { reference };
+    }
+    if inline.is_some_and(|value| !value.trim().is_empty()) {
+        return UpstreamCredentialSource::LegacyInline;
+    }
+    environment
+        .map(str::trim)
+        .filter(|variable| !variable.is_empty())
+        .map_or(UpstreamCredentialSource::Unconfigured, |variable| {
+            UpstreamCredentialSource::LegacyEnvironment { variable }
+        })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -362,7 +573,7 @@ pub struct RelayTargetConfig {
     pub admin_token_env: Option<String>,
 }
 
-pub const CURRENT_CONFIG_VERSION: u32 = 5;
+pub const CURRENT_CONFIG_VERSION: u32 = 6;
 
 pub fn is_supported_config_version(version: u32) -> bool {
     version == CURRENT_CONFIG_VERSION
@@ -406,6 +617,17 @@ impl Default for HelperConfig {
             relay_targets: BTreeMap::new(),
             fleet: FleetRegistryConfig::default(),
             ui: UiConfig::default(),
+        }
+    }
+}
+
+impl HelperConfig {
+    pub(crate) fn zeroize_inline_credentials(&mut self) {
+        for service in [&mut self.codex, &mut self.claude] {
+            for provider in service.providers.values_mut() {
+                provider.auth.zeroize_inline_values();
+                provider.inline_auth.zeroize_inline_values();
+            }
         }
     }
 }
@@ -978,8 +1200,10 @@ pub struct PersistedRoutingSpec {
 fn is_default_upstream_auth(auth: &UpstreamAuth) -> bool {
     auth.auth_token.is_none()
         && auth.auth_token_env.is_none()
+        && auth.auth_token_ref.is_none()
         && auth.api_key.is_none()
         && auth.api_key_env.is_none()
+        && auth.api_key_ref.is_none()
         && auth.allow_anonymous.is_none()
 }
 
@@ -1013,7 +1237,11 @@ pub struct PersistedProviderSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_token_env: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token_ref: Option<CredentialRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_ref: Option<CredentialRef>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tags: BTreeMap<String, String>,
     #[serde(

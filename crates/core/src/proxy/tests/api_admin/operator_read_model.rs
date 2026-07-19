@@ -1,4 +1,5 @@
 use super::*;
+use crate::credentials::{CredentialAggregateReadiness, CredentialReadinessCode};
 use crate::dashboard_core::{OperatorReadModel, OperatorReadStatus};
 use crate::proxy::tests::harness::{proxy_service, spawn_proxy_service};
 use crate::runtime_identity::ProviderEndpointKey;
@@ -124,6 +125,16 @@ async fn operator_read_model_isolates_requests_and_sessions_by_service() {
     assert_eq!(data.summary.counts.active_requests, 1);
     assert_eq!(data.summary.counts.recent_requests, 1);
     assert_eq!(data.summary.counts.sessions, 2);
+    let service_status = data
+        .service_status
+        .as_ref()
+        .expect("operator service status projection");
+    assert!(!service_status.enabled);
+    assert!(!service_status.configured);
+    assert_eq!(
+        data.summary.credential_readiness,
+        Some(CredentialAggregateReadiness::Blocked)
+    );
 
     let serialized = serde_json::to_string(&model).expect("serialize operator read model");
     assert!(!serialized.contains("claude-active-secret"));
@@ -250,6 +261,28 @@ async fn operator_provider_projection_uses_compiled_candidate_order_and_route_me
     assert!(!unused.effective_enabled);
     assert_eq!(unused.routable_endpoints, 0);
     assert!(unused.endpoints.iter().all(|endpoint| !endpoint.routable));
+    assert_eq!(unused.credential_readiness, None);
+
+    assert_eq!(
+        data.summary.credential_readiness,
+        Some(CredentialAggregateReadiness::Blocked)
+    );
+    for provider in providers
+        .iter()
+        .filter(|provider| provider.name != "m-unused")
+    {
+        assert_eq!(
+            provider.credential_readiness,
+            Some(CredentialAggregateReadiness::Blocked)
+        );
+        assert!(provider.endpoints.iter().all(|endpoint| {
+            endpoint.credential_readiness == Some(CredentialReadinessCode::Missing)
+                && endpoint
+                    .credential_details
+                    .iter()
+                    .all(|detail| detail.reference.is_none())
+        }));
+    }
 
     let routing = data.routing.as_ref().expect("operator routing summary");
     assert_eq!(routing.entry, "main");
@@ -287,6 +320,40 @@ async fn operator_provider_projection_uses_compiled_candidate_order_and_route_me
             ),
         ]
     );
+}
+
+#[tokio::test]
+async fn operator_credential_readiness_is_degraded_when_one_route_remains_ready() {
+    let mut config = operator_provider_config(&["ready", "blocked"], None);
+    config
+        .codex
+        .providers
+        .get_mut("ready")
+        .expect("ready provider")
+        .inline_auth
+        .auth_token = Some("operator-readiness-canary".to_string().into());
+    let proxy = proxy_service(config);
+
+    let capture = proxy
+        .operator_read_capture()
+        .await
+        .expect("capture operator read model");
+    let data = capture.model.data.expect("ready operator data");
+
+    assert_eq!(
+        data.summary.credential_readiness,
+        Some(CredentialAggregateReadiness::Degraded)
+    );
+    assert_eq!(
+        data.summary.providers[0].credential_readiness,
+        Some(CredentialAggregateReadiness::Ready)
+    );
+    assert_eq!(
+        data.summary.providers[1].credential_readiness,
+        Some(CredentialAggregateReadiness::Blocked)
+    );
+    let encoded = serde_json::to_string(&data).expect("serialize operator data");
+    assert!(!encoded.contains("operator-readiness-canary"));
 }
 
 #[tokio::test]

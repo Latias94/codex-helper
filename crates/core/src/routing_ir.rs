@@ -5,9 +5,12 @@ use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
 use crate::config::{
-    ProviderConcurrencyLimits, ProviderConfig, RouteAffinityPolicy, RouteCondition,
+    CredentialRef, ProviderConcurrencyLimits, ProviderConfig, RouteAffinityPolicy, RouteCondition,
     RouteExhaustedAction, RouteGraphConfig, RouteNodeConfig, RouteStrategy, SchedulingPreset,
     ServiceRouteConfig, UpstreamAuth, effective_routing,
+};
+use crate::credentials::{
+    CapturedUpstreamCredential, CredentialGeneration, CredentialReadinessCode,
 };
 use crate::endpoint_health::FAILURE_THRESHOLD;
 use crate::model_routing;
@@ -24,6 +27,7 @@ pub struct RoutePlanTemplate {
     pub nodes: BTreeMap<String, RouteNodePlan>,
     pub expanded_provider_order: Vec<String>,
     pub candidates: Vec<RouteCandidate>,
+    pub(crate) credential_generation: Arc<CredentialGeneration>,
 }
 
 impl RoutePlanTemplate {
@@ -61,24 +65,42 @@ impl RoutePlanTemplate {
             .unwrap_or_else(|| ContinuityDomainKey::provider_endpoint(provider_endpoint))
     }
 
-    pub fn candidate_identity(&self, candidate: &RouteCandidate) -> RuntimeUpstreamIdentity {
-        RuntimeUpstreamIdentity::new_with_auth(
-            candidate_provider_endpoint_key(self, candidate),
+    pub(crate) fn candidate_identity(
+        &self,
+        candidate: &RouteCandidate,
+    ) -> Result<RuntimeUpstreamIdentity> {
+        let provider_endpoint = candidate_provider_endpoint_key(self, candidate);
+        self.credential_generation.bind_upstream_identity(
+            provider_endpoint,
             candidate.base_url.clone(),
             candidate.continuity_domain.clone(),
-            &candidate.auth,
         )
     }
 
-    pub fn candidate_identities(&self) -> Vec<RuntimeUpstreamIdentity> {
+    pub(crate) fn candidate_identities(&self) -> Result<Vec<RuntimeUpstreamIdentity>> {
         self.candidates
             .iter()
             .map(|candidate| self.candidate_identity(candidate))
             .collect()
     }
 
-    pub(crate) fn capture_candidate(&self, candidate: &RouteCandidate) -> CapturedRouteCandidate {
-        CapturedRouteCandidate::from_candidate(self.service_name.as_str(), candidate)
+    pub(crate) fn capture_candidate(
+        &self,
+        candidate: &RouteCandidate,
+    ) -> Result<CapturedRouteCandidate> {
+        let provider_endpoint = candidate_provider_endpoint_key(self, candidate);
+        let runtime_identity = self.credential_generation.bind_upstream_identity(
+            provider_endpoint.clone(),
+            candidate.base_url.clone(),
+            candidate.continuity_domain.clone(),
+        )?;
+        Ok(CapturedRouteCandidate::from_candidate(
+            self.service_name.as_str(),
+            candidate,
+            runtime_identity,
+            self.credential_generation
+                .capture_bound(&provider_endpoint)?,
+        ))
     }
 
     pub fn continuity_topology(&self) -> RoutePlanContinuityTopology<'_> {
@@ -256,15 +278,22 @@ impl RouteCandidate {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct CapturedRouteCandidate {
     candidate: Arc<RouteCandidate>,
     provider_endpoint: ProviderEndpointKey,
     continuity_domain: ContinuityDomainKey,
+    runtime_identity: RuntimeUpstreamIdentity,
+    credential: CapturedUpstreamCredential,
 }
 
 impl CapturedRouteCandidate {
-    fn from_candidate(service_name: &str, candidate: &RouteCandidate) -> Self {
+    fn from_candidate(
+        service_name: &str,
+        candidate: &RouteCandidate,
+        runtime_identity: RuntimeUpstreamIdentity,
+        credential: CapturedUpstreamCredential,
+    ) -> Self {
         let provider_endpoint = ProviderEndpointKey::new(
             service_name,
             candidate.provider_id.clone(),
@@ -280,12 +309,26 @@ impl CapturedRouteCandidate {
             candidate: Arc::new(candidate.clone()),
             provider_endpoint,
             continuity_domain,
+            runtime_identity,
+            credential,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn capture_for_service(service_name: &str, candidate: &RouteCandidate) -> Self {
-        Self::from_candidate(service_name, candidate)
+        let provider_endpoint = ProviderEndpointKey::new(
+            service_name,
+            candidate.provider_id.clone(),
+            candidate.endpoint_id.clone(),
+        );
+        let (credential, runtime_identity) =
+            CapturedUpstreamCredential::runtime_binding_from_config_for_test(
+                &provider_endpoint,
+                candidate.base_url.as_str(),
+                candidate.continuity_domain.clone(),
+                &candidate.auth,
+            );
+        Self::from_candidate(service_name, candidate, runtime_identity, credential)
     }
 
     pub(crate) fn candidate(&self) -> &RouteCandidate {
@@ -296,8 +339,12 @@ impl CapturedRouteCandidate {
         self.candidate.base_url.as_str()
     }
 
-    pub(crate) fn auth(&self) -> &UpstreamAuth {
-        &self.candidate.auth
+    pub(crate) fn credential(&self) -> &CapturedUpstreamCredential {
+        &self.credential
+    }
+
+    pub(crate) fn runtime_identity(&self) -> &RuntimeUpstreamIdentity {
+        &self.runtime_identity
     }
 
     pub(crate) fn effective_model(&self, requested_model: &str) -> String {
@@ -342,6 +389,21 @@ impl CapturedRouteCandidate {
 
     pub(crate) fn route_path(&self) -> &[String] {
         &self.candidate.route_path
+    }
+}
+
+impl std::fmt::Debug for CapturedRouteCandidate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CapturedRouteCandidate")
+            .field("provider_endpoint", &self.provider_endpoint)
+            .field("continuity_domain", &self.continuity_domain)
+            .field("runtime_identity", &self.runtime_identity)
+            .field("credential", &self.credential)
+            .field("base_url", &self.candidate.base_url)
+            .field("preference_group", &self.candidate.preference_group)
+            .field("route_path", &self.candidate.route_path)
+            .finish()
     }
 }
 
@@ -529,7 +591,7 @@ pub struct RoutePlanUpstreamRuntimeState {
     pub cooldown_active: bool,
     pub cooldown_remaining_secs: Option<u64>,
     pub usage_exhausted: bool,
-    pub missing_auth: bool,
+    pub credential_readiness: CredentialReadinessCode,
     pub concurrency_saturated: bool,
     pub concurrency_active: Option<u32>,
     pub concurrency_limit: Option<u32>,
@@ -541,7 +603,7 @@ impl RoutePlanUpstreamRuntimeState {
     }
 
     fn hard_unavailable(self) -> bool {
-        self.runtime_disabled || self.missing_auth || self.breaker_open()
+        self.runtime_disabled || !self.credential_readiness.is_routable() || self.breaker_open()
     }
 }
 
@@ -558,6 +620,7 @@ pub struct RoutePlanCandidateRuntimeSnapshot {
     pub breaker_open: bool,
     pub failure_count: u32,
     pub usage_exhausted: bool,
+    pub credential_readiness: CredentialReadinessCode,
     pub missing_auth: bool,
     pub concurrency_saturated: bool,
     pub concurrency_active: Option<u32>,
@@ -592,7 +655,8 @@ impl RoutePlanCandidateRuntimeSnapshot {
             breaker_open,
             failure_count: runtime_state.failure_count,
             usage_exhausted: runtime_state.usage_exhausted,
-            missing_auth: runtime_state.missing_auth,
+            credential_readiness: runtime_state.credential_readiness,
+            missing_auth: !runtime_state.credential_readiness.is_routable(),
             concurrency_saturated: runtime_state.concurrency_saturated,
             concurrency_active: runtime_state.concurrency_active,
             concurrency_limit: runtime_state.concurrency_limit,
@@ -1529,6 +1593,7 @@ pub struct CompiledRouteGraph {
     static_leaves: Vec<RouteLeaf>,
     static_candidates: Vec<RouteCandidate>,
     digest: String,
+    credential_generation: Arc<CredentialGeneration>,
 }
 
 impl CompiledRouteGraph {
@@ -1554,7 +1619,54 @@ impl CompiledRouteGraph {
             static_leaves,
             static_candidates,
             digest,
+            credential_generation: CredentialGeneration::empty(),
         })
+    }
+
+    pub(crate) fn with_credential_generation(
+        mut self,
+        credential_generation: Arc<CredentialGeneration>,
+        source_digest: String,
+    ) -> Result<Self> {
+        self.validate_credential_generation(credential_generation.as_ref())?;
+        self.credential_generation = credential_generation;
+        self.digest = source_digest;
+        Ok(self)
+    }
+
+    pub(crate) fn rebound_credential_generation(
+        &self,
+        credential_generation: Arc<CredentialGeneration>,
+    ) -> Result<Self> {
+        self.validate_credential_generation(credential_generation.as_ref())?;
+        let mut graph = self.clone();
+        graph.credential_generation = credential_generation;
+        Ok(graph)
+    }
+
+    pub(crate) fn zeroize_inline_credentials(&mut self) {
+        for provider in self.view.providers.values_mut() {
+            provider.auth.zeroize_inline_values();
+            provider.inline_auth.zeroize_inline_values();
+        }
+        for candidate in &mut self.static_candidates {
+            candidate.auth.zeroize_inline_values();
+        }
+    }
+
+    fn validate_credential_generation(&self, generation: &CredentialGeneration) -> Result<()> {
+        for candidate in &self.static_candidates {
+            generation.bind_upstream_identity(
+                ProviderEndpointKey::new(
+                    self.service_name.clone(),
+                    candidate.provider_id.clone(),
+                    candidate.endpoint_id.clone(),
+                ),
+                candidate.base_url.clone(),
+                candidate.continuity_domain.clone(),
+            )?;
+        }
+        Ok(())
     }
 
     pub fn digest(&self) -> &str {
@@ -1569,19 +1681,19 @@ impl CompiledRouteGraph {
         self.static_candidates.as_slice()
     }
 
-    pub fn candidate_identities(&self) -> Vec<RuntimeUpstreamIdentity> {
+    pub(crate) fn candidate_identities(&self) -> Result<Vec<RuntimeUpstreamIdentity>> {
         self.static_candidates
             .iter()
             .map(|candidate| {
-                RuntimeUpstreamIdentity::new_with_auth(
-                    ProviderEndpointKey::new(
-                        self.service_name.clone(),
-                        candidate.provider_id.clone(),
-                        candidate.endpoint_id.clone(),
-                    ),
+                let provider_endpoint = ProviderEndpointKey::new(
+                    self.service_name.clone(),
+                    candidate.provider_id.clone(),
+                    candidate.endpoint_id.clone(),
+                );
+                self.credential_generation.bind_upstream_identity(
+                    provider_endpoint,
                     candidate.base_url.clone(),
                     candidate.continuity_domain.clone(),
-                    &candidate.auth,
                 )
             })
             .collect()
@@ -1634,6 +1746,7 @@ impl CompiledRouteGraph {
             nodes: self.nodes.clone(),
             expanded_provider_order: leaves.iter().map(|leaf| leaf.provider_id.clone()).collect(),
             candidates,
+            credential_generation: Arc::clone(&self.credential_generation),
         }
     }
 }
@@ -2523,12 +2636,12 @@ fn encode_affinity_route_candidate(
     digest.text("continuity_domain");
     digest.optional_text(candidate.continuity_domain.as_deref());
     digest.text("credential_scope");
-    digest.optional_text(
-        template
-            .candidate_identity(candidate)
-            .credential_scope
-            .as_deref(),
-    );
+    let provider_endpoint = template.candidate_provider_endpoint_key(candidate);
+    let credential_scope = template
+        .credential_generation
+        .credential_scope_for_route_digest(&provider_endpoint)
+        .expect("route template credential generation was validated before publication");
+    digest.optional_text(credential_scope);
     digest.text("tags");
     digest.string_map(&candidate.tags);
     digest.text("supported_models");
@@ -2685,6 +2798,26 @@ fn encode_auth_shape(digest: &mut StableRouteDigest, auth: &UpstreamAuth) {
     digest.bool(auth.api_key.is_some());
     digest.bool(auth.api_key_env.is_some());
     digest.bool(auth.allow_anonymous == Some(true));
+    if auth.auth_token_ref.is_some() || auth.api_key_ref.is_some() {
+        digest.text("credential_refs_v1");
+        encode_credential_ref(digest, auth.auth_token_ref.as_ref());
+        encode_credential_ref(digest, auth.api_key_ref.as_ref());
+    }
+}
+
+fn encode_credential_ref(digest: &mut StableRouteDigest, reference: Option<&CredentialRef>) {
+    digest.bool(reference.is_some());
+    match reference {
+        Some(CredentialRef::Native { name }) => {
+            digest.text("native");
+            digest.text(name);
+        }
+        Some(CredentialRef::SecretFile { path }) => {
+            digest.text("secret_file");
+            digest.text(path);
+        }
+        None => {}
+    }
 }
 
 fn affinity_policy_name(policy: RouteAffinityPolicy) -> &'static str {
@@ -3032,9 +3165,13 @@ mod tests {
 
     fn provider_endpoint_keys(template: &RoutePlanTemplate) -> Vec<String> {
         template
-            .candidate_identities()
-            .into_iter()
-            .map(|identity| identity.provider_endpoint.stable_key())
+            .candidates
+            .iter()
+            .map(|candidate| {
+                template
+                    .candidate_provider_endpoint_key(candidate)
+                    .stable_key()
+            })
             .collect()
     }
 
@@ -3156,6 +3293,23 @@ mod tests {
     }
 
     #[test]
+    fn legacy_auth_shape_digest_remains_frozen_without_references() {
+        let mut digest = StableRouteDigest::new();
+        encode_auth_shape(
+            &mut digest,
+            &UpstreamAuth {
+                auth_token: Some("legacy-secret".to_string().into()),
+                ..UpstreamAuth::default()
+            },
+        );
+
+        assert_eq!(
+            digest.finish(),
+            "sha256:90c2d860ddef48000ad574b5325e11aff82830cefa6fff79897385f5ced428dc"
+        );
+    }
+
+    #[test]
     fn route_graph_key_ignores_local_concurrency_policy() {
         let route = |limit, limit_group: Option<&str>| ServiceRouteConfig {
             providers: BTreeMap::from([(
@@ -3187,14 +3341,14 @@ mod tests {
     }
 
     #[test]
-    fn route_graph_key_changes_with_effective_runtime_credentials() {
+    fn raw_route_graph_key_does_not_derive_identity_from_secret_values() {
         let route = |secret: &str| ServiceRouteConfig {
             providers: BTreeMap::from([(
                 "relay".to_string(),
                 ProviderConfig {
                     base_url: Some("https://relay.example/v1".to_string()),
                     auth: UpstreamAuth {
-                        auth_token: Some(secret.to_string()),
+                        auth_token: Some(secret.to_string().into()),
                         ..UpstreamAuth::default()
                     },
                     ..ProviderConfig::default()
@@ -3210,7 +3364,7 @@ mod tests {
             .expect("account B route template")
             .route_graph_key();
 
-        assert_ne!(account_a, account_b);
+        assert_eq!(account_a, account_b);
         assert!(!account_a.contains("account-a-secret"));
         assert!(!account_b.contains("account-b-secret"));
     }
@@ -3557,7 +3711,7 @@ mod tests {
     }
 
     #[test]
-    fn routing_ir_candidate_identity_is_provider_endpoint_scoped() {
+    fn topology_only_route_template_rejects_runtime_identity_capture() {
         let view = ServiceRouteConfig {
             providers: BTreeMap::from([(
                 "input".to_string(),
@@ -3567,14 +3721,15 @@ mod tests {
         };
 
         let template = compile_route_plan_template("codex", &view).expect("route template");
-        let identities = template.candidate_identities();
-
-        assert_eq!(identities.len(), 1);
-        assert_eq!(
-            identities[0].provider_endpoint.stable_key(),
-            "codex/input/default"
+        let error = template
+            .candidate_identity(&template.candidates[0])
+            .expect_err("topology-only templates must not expose runtime identity");
+        assert!(
+            error
+                .to_string()
+                .contains("has no identity binding for codex/input/default"),
+            "unexpected binding error: {error:#}"
         );
-        assert_eq!(identities[0].base_url, "https://input.example/v1");
     }
 
     #[test]
@@ -4410,6 +4565,7 @@ mod tests {
                     concurrency: RouteCandidateConcurrency::default(),
                 },
             ],
+            credential_generation: CredentialGeneration::empty(),
         };
         assert_eq!(
             template
@@ -4774,7 +4930,7 @@ mod tests {
         runtime.set_provider_endpoint(
             endpoint_key("codex", "missing-auth", "default"),
             RoutePlanUpstreamRuntimeState {
-                missing_auth: true,
+                credential_readiness: CredentialReadinessCode::Missing,
                 ..RoutePlanUpstreamRuntimeState::default()
             },
         );
@@ -4916,7 +5072,7 @@ mod tests {
                 cooldown_active: true,
                 cooldown_remaining_secs: Some(30),
                 usage_exhausted: true,
-                missing_auth: true,
+                credential_readiness: CredentialReadinessCode::Missing,
                 concurrency_saturated: true,
                 concurrency_active: Some(2),
                 concurrency_limit: Some(2),
@@ -4933,6 +5089,10 @@ mod tests {
         assert!(snapshot.breaker_open);
         assert_eq!(snapshot.cooldown_remaining_secs, Some(30));
         assert!(snapshot.usage_exhausted);
+        assert_eq!(
+            snapshot.credential_readiness,
+            CredentialReadinessCode::Missing
+        );
         assert!(snapshot.missing_auth);
         assert!(snapshot.concurrency_saturated);
         assert_eq!(snapshot.concurrency_active, Some(2));
@@ -5708,6 +5868,110 @@ mod tests {
 
         assert_eq!(counts.get("input"), Some(&200));
         assert_eq!(counts.get("ciii"), Some(&150));
+    }
+
+    #[test]
+    fn round_robin_reenters_a_restored_credential_without_losing_session_affinity() {
+        let view = ServiceRouteConfig {
+            providers: BTreeMap::from([
+                (
+                    "input".to_string(),
+                    limited_provider("https://rr-credential-input.example/v1", 20),
+                ),
+                (
+                    "ciii".to_string(),
+                    limited_provider("https://rr-credential-ciii.example/v1", 15),
+                ),
+            ]),
+            routing: Some(RouteGraphConfig::round_robin(vec![
+                "input".to_string(),
+                "ciii".to_string(),
+            ])),
+            ..ServiceRouteConfig::default()
+        };
+        let template = compile_route_plan_template("codex", &view).expect("route template");
+        let executor = RoutePlanExecutor::new(&template);
+        let input = endpoint_key("codex", "input", "default");
+        let mut runtime = RoutePlanRuntimeState::default();
+        runtime.set_provider_endpoint(
+            input.clone(),
+            RoutePlanUpstreamRuntimeState {
+                credential_readiness: CredentialReadinessCode::Missing,
+                ..RoutePlanUpstreamRuntimeState::default()
+            },
+        );
+
+        for _ in 0..40 {
+            let selected = executor
+                .select_supported_candidate_with_runtime_state(
+                    &mut RoutePlanAttemptState::default(),
+                    &runtime,
+                    None,
+                )
+                .selected
+                .expect("remaining credential-ready candidate");
+            assert_eq!(selected.candidate.provider_id, "ciii");
+        }
+
+        runtime.set_provider_endpoint(
+            input.clone(),
+            RoutePlanUpstreamRuntimeState {
+                credential_readiness: CredentialReadinessCode::Ready,
+                ..RoutePlanUpstreamRuntimeState::default()
+            },
+        );
+        let mut counts = BTreeMap::<String, usize>::new();
+        for _ in 0..350 {
+            let provider_id = executor
+                .select_supported_candidate_with_runtime_state(
+                    &mut RoutePlanAttemptState::default(),
+                    &runtime,
+                    None,
+                )
+                .selected
+                .expect("restored round-robin candidate")
+                .candidate
+                .provider_id
+                .clone();
+            *counts.entry(provider_id).or_default() += 1;
+        }
+        assert_eq!(counts.get("input"), Some(&200));
+        assert_eq!(counts.get("ciii"), Some(&150));
+
+        runtime.set_affinity_provider_endpoint(Some(input.clone()));
+        runtime.set_provider_endpoint(
+            input.clone(),
+            RoutePlanUpstreamRuntimeState {
+                credential_readiness: CredentialReadinessCode::Missing,
+                ..RoutePlanUpstreamRuntimeState::default()
+            },
+        );
+        let fallback = executor
+            .select_supported_candidate_with_runtime_state(
+                &mut RoutePlanAttemptState::default(),
+                &runtime,
+                None,
+            )
+            .selected
+            .expect("fallback while affinity credential is unavailable");
+        assert_eq!(fallback.candidate.provider_id, "ciii");
+
+        runtime.set_provider_endpoint(
+            input.clone(),
+            RoutePlanUpstreamRuntimeState {
+                credential_readiness: CredentialReadinessCode::Ready,
+                ..RoutePlanUpstreamRuntimeState::default()
+            },
+        );
+        let restored_affinity = executor
+            .select_supported_candidate_with_runtime_state(
+                &mut RoutePlanAttemptState::default(),
+                &runtime,
+                None,
+            )
+            .selected
+            .expect("restored affinity candidate");
+        assert_eq!(restored_affinity.provider_endpoint, input);
     }
 
     #[test]

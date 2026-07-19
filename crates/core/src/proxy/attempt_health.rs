@@ -10,11 +10,7 @@ pub(super) async fn record_attempt_success(
     target: &CapturedRouteCandidate,
 ) {
     state
-        .record_provider_endpoint_attempt_success(
-            service_name,
-            target.provider_endpoint().clone(),
-            now_ms(),
-        )
+        .record_runtime_upstream_attempt_success(service_name, target.runtime_identity(), now_ms())
         .await;
 }
 
@@ -26,9 +22,9 @@ pub(super) async fn record_attempt_failure(
     cooldown_backoff: CooldownBackoff,
 ) {
     state
-        .record_provider_endpoint_attempt_failure(
+        .record_runtime_upstream_attempt_failure(
             service_name,
-            target.provider_endpoint().clone(),
+            target.runtime_identity(),
             failure_threshold_cooldown_secs,
             cooldown_backoff,
         )
@@ -43,9 +39,9 @@ pub(super) async fn penalize_attempt_target(
     cooldown_backoff: CooldownBackoff,
 ) {
     state
-        .penalize_provider_endpoint_attempt(
+        .penalize_runtime_upstream_attempt(
             service_name,
-            target.provider_endpoint().clone(),
+            target.runtime_identity(),
             cooldown_secs,
             cooldown_backoff,
         )

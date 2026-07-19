@@ -250,6 +250,46 @@ describe("desktop app routes", () => {
     expect(screen.queryByRole("button", { name: /编辑 multi-provider/ })).not.toBeInTheDocument();
   });
 
+  it("renders a large provider inventory without dropping later providers", async () => {
+    window.location.hash = "#/providers";
+    const providers = Array.from({ length: 25 }, (_, index): ApiOperatorProviderSummary => ({
+      name: `provider-${String(index + 1).padStart(2, "0")}`,
+      configured_enabled: true,
+      effective_enabled: true,
+      routable_endpoints: 1,
+      credential_readiness: "ready",
+      endpoints: [
+        {
+          provider_name: `provider-${String(index + 1).padStart(2, "0")}`,
+          name: "default",
+          provider_endpoint_key: `endpoint:sha256:${index + 1}`,
+          origin: `https://provider-${index + 1}.example`,
+          priority: index,
+          configured_enabled: true,
+          effective_enabled: true,
+          routable: true,
+          credential_readiness: "ready",
+          runtime_state: "normal",
+        },
+      ],
+    }));
+    mockedInvoke.mockImplementation(async (command) => {
+      if (command === "get_app_metadata") {
+        return { name: "codex-helper", version: "0.20.0", tauri: "2" };
+      }
+      if (command === "get_admin_read_model") {
+        return liveReadModel({ providers });
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText("25 providers")).toBeInTheDocument();
+    expect(screen.getByText("provider-01")).toBeInTheDocument();
+    expect(screen.getByText("provider-25")).toBeInTheDocument();
+  });
+
   it("routes the custom close button to hide-to-tray instead of quitting the proxy", async () => {
     render(<App />);
 

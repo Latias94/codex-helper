@@ -1,7 +1,11 @@
 use std::fmt;
 use std::path::Path;
 
+use base64::Engine as _;
+use hmac::{Hmac, Mac as _};
+use http::HeaderMap;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use sha2::Sha256;
 use uuid::Uuid;
 
 use super::{RuntimeStoreError, invalid_metadata, sqlite_error};
@@ -31,6 +35,118 @@ impl RuntimeQuotaIdentity {
     pub fn revision(&self) -> u64 {
         self.revision
     }
+
+    pub(crate) fn derive_credential_scope(
+        &self,
+        bearer: Option<&[u8]>,
+        api_key: Option<&[u8]>,
+    ) -> Option<String> {
+        if bearer.is_none() && api_key.is_none() {
+            return None;
+        }
+        type HmacSha256 = Hmac<Sha256>;
+        let mut mac = HmacSha256::new_from_slice(&self.key)
+            .expect("runtime quota identity is a valid HMAC key");
+        mac.update(b"codex-helper/runtime-credential-scope/hmac-sha256/v1\0");
+        for value in [bearer, api_key] {
+            match value {
+                Some(value) => {
+                    mac.update(&[1]);
+                    mac.update(&(value.len() as u64).to_be_bytes());
+                    mac.update(value);
+                }
+                None => mac.update(&[0]),
+            }
+        }
+        let digest = mac.finalize().into_bytes();
+        let opaque = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
+        Some(format!("hmac-sha256-v1:{opaque}"))
+    }
+
+    pub(crate) fn derive_usage_account_fingerprint(
+        &self,
+        token: &[u8],
+        new_api_user_id: Option<&str>,
+    ) -> String {
+        type HmacSha256 = Hmac<Sha256>;
+        let mut mac = HmacSha256::new_from_slice(&self.key)
+            .expect("runtime quota identity is a valid HMAC key");
+        mac.update(b"codex-helper/usage-provider-account/hmac-sha256/v1\0");
+        mac.update(&(token.len() as u64).to_be_bytes());
+        mac.update(token);
+        match new_api_user_id {
+            Some(user_id) => {
+                mac.update(&[1]);
+                mac.update(&(user_id.len() as u64).to_be_bytes());
+                mac.update(user_id.as_bytes());
+            }
+            None => mac.update(&[0]),
+        }
+        format!("sha256:{:x}", mac.finalize().into_bytes())
+    }
+
+    pub(crate) fn derive_provider_account_fingerprint(
+        &self,
+        final_headers: &HeaderMap,
+    ) -> Option<[u8; 32]> {
+        const ACCOUNT_HEADERS: &[&str] = &[
+            "authorization",
+            "chatgpt-account-id",
+            "openai-organization",
+            "openai-project",
+            "x-api-key",
+            "x-openai-actor-authorization",
+            "x-openai-fedramp",
+            "x-openai-organization",
+            "x-openai-project",
+            "x-organization-id",
+            "x-project-id",
+        ];
+
+        type HmacSha256 = Hmac<Sha256>;
+        let mut mac = HmacSha256::new_from_slice(&self.key)
+            .expect("runtime quota identity is a valid HMAC key");
+        mac.update(b"codex-helper/provider-account/hmac-sha256/v1\0");
+        let mut found = false;
+        for name in ACCOUNT_HEADERS {
+            let mut values = final_headers
+                .get_all(*name)
+                .iter()
+                .map(|value| normalized_provider_account_header(name, value.as_bytes()))
+                .collect::<Vec<_>>();
+            values.sort();
+            for value in values {
+                found = true;
+                mac.update(&(name.len() as u64).to_be_bytes());
+                mac.update(name.as_bytes());
+                mac.update(&(value.len() as u64).to_be_bytes());
+                mac.update(&value);
+            }
+        }
+        found.then(|| mac.finalize().into_bytes().into())
+    }
+}
+
+fn normalized_provider_account_header(name: &str, value: &[u8]) -> Vec<u8> {
+    if name != "authorization" {
+        return value.to_vec();
+    }
+    let Ok(value) = std::str::from_utf8(value) else {
+        return value.to_vec();
+    };
+    let Some(fields) = value.strip_prefix("AWS4-HMAC-SHA256") else {
+        return value.as_bytes().to_vec();
+    };
+    fields
+        .trim_start()
+        .split(',')
+        .find_map(|part| part.trim().strip_prefix("Credential="))
+        .and_then(|credential| credential.split('/').next())
+        .filter(|credential| !credential.is_empty())
+        .map_or_else(
+            || value.as_bytes().to_vec(),
+            |credential| credential.as_bytes().to_vec(),
+        )
 }
 
 impl fmt::Debug for RuntimeQuotaIdentity {
@@ -306,4 +422,174 @@ fn decode_nonnegative_u64(
     field: &'static str,
 ) -> Result<u64, RuntimeStoreError> {
     u64::try_from(value).map_err(|_| invalid_metadata(path, format!("{field} is negative")))
+}
+
+#[cfg(test)]
+mod tests {
+    use http::{HeaderMap, HeaderValue};
+    use sha2::{Digest as _, Sha256};
+
+    use super::RuntimeQuotaIdentity;
+
+    fn identity(key: [u8; 32]) -> RuntimeQuotaIdentity {
+        RuntimeQuotaIdentity { key, revision: 1 }
+    }
+
+    fn provider_headers(token: &'static str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static(token));
+        headers
+    }
+
+    #[test]
+    fn usage_account_fingerprint_is_stable_opaque_and_well_formed() {
+        let identity = identity([0x11; 32]);
+        let token = b"usage-provider-token";
+
+        let first = identity.derive_usage_account_fingerprint(token, Some("user-42"));
+        let second = identity.derive_usage_account_fingerprint(token, Some("user-42"));
+
+        assert_eq!(first, second);
+        let digest = first
+            .strip_prefix("sha256:")
+            .expect("fingerprint uses the persisted account fingerprint prefix");
+        assert_eq!(digest.len(), 64);
+        assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(digest, digest.to_ascii_lowercase());
+        assert_ne!(first, format!("sha256:{:x}", Sha256::digest(token)));
+    }
+
+    #[test]
+    fn usage_account_fingerprint_separates_installation_token_and_user() {
+        let first_installation = identity([0x11; 32]);
+        let second_installation = identity([0x22; 32]);
+        let baseline =
+            first_installation.derive_usage_account_fingerprint(b"token-a", Some("user-a"));
+
+        assert_ne!(
+            baseline,
+            second_installation.derive_usage_account_fingerprint(b"token-a", Some("user-a"))
+        );
+        assert_ne!(
+            baseline,
+            first_installation.derive_usage_account_fingerprint(b"token-b", Some("user-a"))
+        );
+        assert_ne!(
+            baseline,
+            first_installation.derive_usage_account_fingerprint(b"token-a", Some("user-b"))
+        );
+        assert_ne!(
+            baseline,
+            first_installation.derive_usage_account_fingerprint(b"token-a", None)
+        );
+        assert_ne!(
+            first_installation.derive_usage_account_fingerprint(b"token-a", Some("")),
+            first_installation.derive_usage_account_fingerprint(b"token-a", None)
+        );
+    }
+
+    #[test]
+    fn usage_account_fingerprint_and_identity_debug_do_not_expose_secrets() {
+        let key = *b"runtime-key-canary-0123456789abc";
+        let token = b"canary-bearer-token-never-log";
+        let identity = identity(key);
+
+        let fingerprint = identity.derive_usage_account_fingerprint(token, Some("canary-user"));
+        let debug = format!("{identity:?}");
+
+        assert!(!fingerprint.contains("canary-bearer-token-never-log"));
+        assert!(!fingerprint.contains("canary-user"));
+        assert!(!debug.contains("runtime-key-canary-0123456789abc"));
+        assert!(!debug.contains("canary-bearer-token-never-log"));
+    }
+
+    #[test]
+    fn provider_account_fingerprint_is_stable_and_installation_keyed() {
+        let first_installation = identity([0x11; 32]);
+        let second_installation = identity([0x22; 32]);
+        let account = provider_headers("Bearer provider-account-canary");
+
+        let first = first_installation
+            .derive_provider_account_fingerprint(&account)
+            .expect("account-bearing headers");
+        let same = first_installation
+            .derive_provider_account_fingerprint(&account)
+            .expect("same account-bearing headers");
+        let other_installation = second_installation
+            .derive_provider_account_fingerprint(&account)
+            .expect("same account on another installation");
+
+        assert_eq!(first, same);
+        assert_ne!(first, other_installation);
+    }
+
+    #[test]
+    fn provider_account_fingerprint_partitions_accounts_and_ignores_request_headers() {
+        let identity = identity([0x11; 32]);
+        let first = provider_headers("Bearer provider-account-one");
+        let mut same_account = first.clone();
+        same_account.insert("x-request-id", HeaderValue::from_static("request-two"));
+        let second = provider_headers("Bearer provider-account-two");
+
+        assert_eq!(
+            identity.derive_provider_account_fingerprint(&first),
+            identity.derive_provider_account_fingerprint(&same_account)
+        );
+        assert_ne!(
+            identity.derive_provider_account_fingerprint(&first),
+            identity.derive_provider_account_fingerprint(&second)
+        );
+        assert_eq!(
+            identity.derive_provider_account_fingerprint(&HeaderMap::new()),
+            None
+        );
+    }
+
+    #[test]
+    fn provider_account_fingerprint_partitions_openai_actor_authorizations() {
+        let identity = identity([0x11; 32]);
+        let mut first = HeaderMap::new();
+        first.insert(
+            "x-openai-actor-authorization",
+            HeaderValue::from_static("actor-account-one"),
+        );
+        let mut second = HeaderMap::new();
+        second.insert(
+            "x-openai-actor-authorization",
+            HeaderValue::from_static("actor-account-two"),
+        );
+
+        assert_ne!(
+            identity.derive_provider_account_fingerprint(&first),
+            identity.derive_provider_account_fingerprint(&second)
+        );
+        assert!(
+            identity
+                .derive_provider_account_fingerprint(&first)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn provider_account_fingerprint_normalizes_aws_sigv4_to_access_key_identity() {
+        let identity = identity([0x11; 32]);
+        let first = provider_headers(
+            "AWS4-HMAC-SHA256 Credential=AKIAEXAMPLE/20260711/us-east-1/bedrock/aws4_request, SignedHeaders=content-type;host;x-amz-date, Signature=aaaaaaaa",
+        );
+        let same_account = provider_headers(
+            "AWS4-HMAC-SHA256 Credential=AKIAEXAMPLE/20260712/us-west-2/bedrock/aws4_request, SignedHeaders=content-type;host;x-amz-date, Signature=bbbbbbbb",
+        );
+        let other_account = provider_headers(
+            "AWS4-HMAC-SHA256 Credential=AKIAOTHER/20260711/us-east-1/bedrock/aws4_request, SignedHeaders=content-type;host;x-amz-date, Signature=aaaaaaaa",
+        );
+
+        assert_eq!(
+            identity.derive_provider_account_fingerprint(&first),
+            identity.derive_provider_account_fingerprint(&same_account)
+        );
+        assert_ne!(
+            identity.derive_provider_account_fingerprint(&first),
+            identity.derive_provider_account_fingerprint(&other_account)
+        );
+    }
 }

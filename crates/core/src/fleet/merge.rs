@@ -26,6 +26,7 @@ pub fn merge_fleet_snapshots(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::credentials::CredentialAggregateReadiness;
     use crate::fleet::model::{
         FleetGraphStatus, FleetNodeHealth, FleetNodeKind, FleetProcessSummary, FleetTopology,
     };
@@ -37,6 +38,7 @@ mod tests {
             label: node_id.to_string(),
             kind: FleetNodeKind::Remote,
             health: FleetNodeHealth::Fresh,
+            credential_readiness: None,
             refreshed_at_ms: 1,
             stale_since_ms: None,
             snapshot_age_ms: None,
@@ -58,6 +60,48 @@ mod tests {
                 .map(|node| node.node_id.as_str())
                 .collect::<Vec<_>>(),
             vec!["a", "b"]
+        );
+    }
+
+    #[test]
+    fn merge_preserves_node_owned_credential_readiness() {
+        let node = |node_id: &str, credential_readiness| FleetNodeSnapshot {
+            node_id: node_id.to_string(),
+            label: node_id.to_string(),
+            kind: FleetNodeKind::Remote,
+            health: FleetNodeHealth::Fresh,
+            credential_readiness: Some(credential_readiness),
+            refreshed_at_ms: 1,
+            stale_since_ms: None,
+            snapshot_age_ms: None,
+            active_endpoint: None,
+            last_error: None,
+            processes: FleetProcessSummary::default(),
+            topology: FleetTopology {
+                status: FleetGraphStatus::Unavailable,
+                edges: Vec::new(),
+                note: None,
+            },
+            work_units: Vec::new(),
+        };
+        let merged = merge_fleet_nodes(
+            "codex",
+            vec![
+                node("local", CredentialAggregateReadiness::Ready),
+                node("server", CredentialAggregateReadiness::Blocked),
+            ],
+        );
+
+        assert_eq!(
+            merged
+                .nodes
+                .iter()
+                .map(|node| (node.node_id.as_str(), node.credential_readiness))
+                .collect::<Vec<_>>(),
+            vec![
+                ("local", Some(CredentialAggregateReadiness::Ready)),
+                ("server", Some(CredentialAggregateReadiness::Blocked)),
+            ]
         );
     }
 }

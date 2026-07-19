@@ -76,7 +76,7 @@ auth_token_env = "RIGHTCODE_API_KEY"
         );
 
         let migrated = std::fs::read_to_string(&toml_path).expect("read migrated TOML");
-        assert!(migrated.contains("version = 5"));
+        assert!(migrated.contains("version = 6"));
         assert!(!migrated.contains("[codex.configs.right]"));
         assert_eq!(
             std::fs::read_to_string(toml_path.with_file_name("config.toml.bak"))
@@ -116,7 +116,7 @@ fn save_after_auto_migration_preserves_the_original_legacy_backup() {
         assert_eq!(
             std::fs::read_to_string(&backup_path).expect("read preserved migration backup"),
             original,
-            "a typed save must not replace the only original legacy backup with migrated v5 bytes"
+            "a typed save must not replace the only original legacy backup with migrated v6 bytes"
         );
         assert!(
             std::fs::read_to_string(&toml_path)
@@ -204,7 +204,7 @@ auth_token_env = "RIGHTCODE_API_KEY"
             .expect("unversioned legacy config should be migrated");
         assert_eq!(cfg.version, CURRENT_CONFIG_VERSION);
         let migrated = std::fs::read_to_string(&toml_path).expect("read migrated config.toml");
-        assert!(migrated.contains("version = 5"));
+        assert!(migrated.contains("version = 6"));
         assert!(!migrated.contains("[codex.configs.right]"));
         assert_eq!(
             std::fs::read_to_string(toml_path.with_file_name("config.toml.bak"))
@@ -358,7 +358,7 @@ fn config_mutations_fail_before_overwrite_when_backup_cannot_be_written() {
         let dir = super::proxy_home_dir();
         let toml_path = dir.join("config.toml");
         let backup_path = dir.join("config.toml.bak");
-        let original = "version = 5\n[notify]\nenabled = true\n";
+        let original = "version = 6\n[notify]\nenabled = true\n";
         write_file(&toml_path, original);
         std::fs::create_dir(&backup_path).expect("reserve backup path as a directory");
 
@@ -397,7 +397,7 @@ fn config_mutations_reject_config_symlink_without_touching_its_target() {
         let dir = super::proxy_home_dir();
         let toml_path = dir.join("config.toml");
         let target_path = env.home.join("dotfiles/codex-helper.toml");
-        let original = "version = 5\n[notify]\nenabled = true\n";
+        let original = "version = 6\n[notify]\nenabled = true\n";
         write_file(&target_path, original);
         symlink(&target_path, &toml_path).expect("create config symlink");
         let original_link = std::fs::read_link(&toml_path).expect("read config symlink");
@@ -440,7 +440,7 @@ fn config_symlink_cannot_alias_the_backup_path() {
     let dir = super::proxy_home_dir();
     let toml_path = dir.join("config.toml");
     let backup_path = dir.join("config.toml.bak");
-    let original = "version = 5\n[notify]\nenabled = true\n";
+    let original = "version = 6\n[notify]\nenabled = true\n";
     write_file(&backup_path, original);
     symlink(&backup_path, &toml_path).expect("alias config to backup path");
 
@@ -481,7 +481,7 @@ fn valid_config_directory_symlink_is_preserved_for_mutations() {
     symlink(&target_dir, &logical_dir).expect("create config directory symlink");
     write_file(
         &target_dir.join("config.toml"),
-        "version = 5\n[notify]\nenabled = true\n",
+        "version = 6\n[notify]\nenabled = true\n",
     );
 
     tokio::runtime::Builder::new_current_thread()
@@ -537,7 +537,7 @@ fn config_backup_preserves_private_source_mode() {
     let dir = super::proxy_home_dir();
     let toml_path = dir.join("config.toml");
     let backup_path = dir.join("config.toml.bak");
-    write_file(&toml_path, "version = 5\n[notify]\nenabled = true\n");
+    write_file(&toml_path, "version = 6\n[notify]\nenabled = true\n");
     std::fs::set_permissions(&toml_path, std::fs::Permissions::from_mode(0o600))
         .expect("set private config mode");
 
@@ -564,7 +564,7 @@ fn config_mutation_lock_rejects_a_concurrent_writer_without_changes() {
     let dir = super::proxy_home_dir();
     let toml_path = dir.join("config.toml");
     let lock_path = dir.join("config.toml.lock");
-    let original = "version = 5\n[notify]\nenabled = true\n";
+    let original = "version = 6\n[notify]\nenabled = true\n";
     write_file(&toml_path, original);
     let lock = std::fs::OpenOptions::new()
         .read(true)
@@ -647,7 +647,7 @@ env_key = "RIGHTCODE_API_KEY"
             .await
             .expect("init_config_toml");
         let text = std::fs::read_to_string(&path).expect("read config.toml");
-        assert!(text.contains("version = 5"), "expected v5 template");
+        assert!(text.contains("version = 6"), "expected v6 template");
         assert!(
             !text.contains("\n[codex.providers.right]\n"),
             "config init must not import Codex providers"

@@ -11,6 +11,9 @@ use crate::config::{
     RetryProfileName, RouteAffinityPolicy, RouteGraphConfig, RouteStrategy, SchedulingPreset,
     ServiceRouteConfig,
 };
+use crate::credentials::{
+    CredentialAggregateReadiness, CredentialReadinessCode, CredentialReadinessDetail,
+};
 use crate::logging::{RouteAttemptLog, upstream_origin};
 use crate::pricing::{CostBreakdown, ModelPriceCatalogSnapshot};
 use crate::quota_analytics::QuotaAnalyticsView;
@@ -100,6 +103,8 @@ pub struct OperatorReadData {
     #[serde(default)]
     pub stats_1h: WindowStats,
     pub pricing_catalog: ModelPriceCatalogSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_status: Option<crate::service_status::ServiceStatusSnapshot>,
     #[serde(default)]
     pub provider_balances: Vec<OperatorProviderBalanceSummary>,
 }
@@ -636,6 +641,10 @@ pub struct OperatorProviderEndpointSummary {
     pub effective_enabled: bool,
     pub routable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_readiness: Option<CredentialReadinessCode>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credential_details: Vec<CredentialReadinessDetail>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_enabled_override: Option<bool>,
     pub runtime_state: RuntimeConfigState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -657,6 +666,8 @@ impl From<&ProviderEndpointOption> for OperatorProviderEndpointSummary {
             configured_enabled: endpoint.configured_enabled,
             effective_enabled: endpoint.effective_enabled,
             routable: endpoint.routable,
+            credential_readiness: endpoint.credential_readiness,
+            credential_details: endpoint.credential_details.clone(),
             runtime_enabled_override: endpoint.runtime_enabled_override,
             runtime_state: endpoint.runtime_state,
             runtime_state_override: endpoint.runtime_state_override,
@@ -682,6 +693,8 @@ pub struct OperatorProviderSummary {
     pub configured_enabled: bool,
     pub effective_enabled: bool,
     pub routable_endpoints: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_readiness: Option<CredentialAggregateReadiness>,
     #[serde(default)]
     pub endpoints: Vec<OperatorProviderEndpointSummary>,
     #[serde(default, skip_serializing_if = "OperatorProviderCapacity::is_empty")]
@@ -696,6 +709,7 @@ impl From<&ProviderOption> for OperatorProviderSummary {
             configured_enabled: provider.configured_enabled,
             effective_enabled: provider.effective_enabled,
             routable_endpoints: provider.routable_endpoints,
+            credential_readiness: provider.credential_readiness,
             endpoints: provider.endpoints.iter().map(Into::into).collect(),
             capacity: OperatorProviderCapacity::from(&provider.capacity),
         }
@@ -1212,6 +1226,8 @@ pub struct ApiV1OperatorSummary {
     pub runtime: OperatorRuntimeSummary,
     pub counts: OperatorSummaryCounts,
     pub retry: OperatorRetrySummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_readiness: Option<CredentialAggregateReadiness>,
     #[serde(default)]
     pub sessions: Vec<OperatorSessionSummary>,
     #[serde(default)]
@@ -1368,6 +1384,7 @@ mod tests {
                     runtime: Default::default(),
                     counts: Default::default(),
                     retry: Default::default(),
+                    credential_readiness: None,
                     sessions: Vec::new(),
                     profiles: Vec::new(),
                     providers: Vec::new(),
@@ -1382,6 +1399,7 @@ mod tests {
                 stats_5m: Default::default(),
                 stats_1h: Default::default(),
                 pricing_catalog: Default::default(),
+                service_status: None,
                 provider_balances: Vec::new(),
             },
         )

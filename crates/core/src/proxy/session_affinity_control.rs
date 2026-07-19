@@ -202,15 +202,32 @@ async fn validate_target_available(
     candidate: &RouteCandidate,
 ) -> Result<(), ProxyControlError> {
     let provider_policy = runtime_snapshot.provider_policy();
+    let runtime_identities = template.candidate_identities().map_err(|error| {
+        ProxyControlError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("captured runtime credential binding is invalid: {error}"),
+        )
+    })?;
     let mut runtime = proxy
         .state
-        .route_plan_runtime_state_with_provider_policy(proxy.service_name, provider_policy.as_ref())
+        .route_plan_runtime_state_with_provider_policy(
+            proxy.service_name,
+            provider_policy.as_ref(),
+            runtime_snapshot.revision(),
+            runtime_identities.as_slice(),
+        )
         .await;
     super::route_target_selection::apply_auth_resolution_to_runtime(
         proxy.service_name,
         template,
         &mut runtime,
-    );
+    )
+    .map_err(|error| {
+        ProxyControlError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("captured runtime credential binding is invalid: {error}"),
+        )
+    })?;
     super::route_target_selection::apply_concurrency_snapshots_to_runtime(
         proxy,
         template,

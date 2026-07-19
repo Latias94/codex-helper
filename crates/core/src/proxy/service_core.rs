@@ -7,10 +7,14 @@ use reqwest::Client;
 use crate::config::{
     HelperConfig, PersistedProviderSpec, PersistedProvidersCatalog, PersistedRoutingSpec,
 };
+use crate::credentials::CredentialSourceCapabilities;
 use crate::filter::RequestFilter;
 use crate::routing_explain::RoutingExplainResponse;
 use crate::routing_ir::RouteRequestContext;
 use crate::runtime_store::RuntimeStore;
+use crate::service_target::{
+    LocalCredentialRefreshAction, LocalCredentialRefreshStatus, ServiceInstallGeneration,
+};
 use crate::state::{ProxyState, SessionBinding, SessionContinuityMode};
 
 use super::profile_defaults::effective_default_profile_name;
@@ -21,6 +25,59 @@ use super::{
 };
 
 impl ProxyService {
+    pub(crate) async fn captured_runtime_config(&self) -> Arc<HelperConfig> {
+        self.config.snapshot().await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spawn_credential_refresh_driver(
+        &self,
+        shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
+        let config = Arc::clone(&self.config);
+        tokio::spawn(async move {
+            config.run_credential_refresh_driver(shutdown_rx).await;
+        })
+    }
+
+    pub(crate) fn spawn_runtime_config_driver(
+        &self,
+        shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
+        let credential_config = Arc::clone(&self.config);
+        let automatic_reload_proxy = self.clone();
+        let credential_shutdown_rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = credential_config.run_credential_refresh_driver(credential_shutdown_rx) => {}
+                _ = automatic_reload_proxy.run_automatic_reload_driver(shutdown_rx) => {}
+            }
+        })
+    }
+
+    async fn run_automatic_reload_driver(
+        &self,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) {
+        let check_interval = self.config.automatic_reload_check_interval();
+        loop {
+            let changed = tokio::select! {
+                biased;
+                _ = wait_for_proxy_shutdown(&mut shutdown_rx) => return,
+                changed = self.config.maybe_reload_from_disk() => changed,
+            };
+            if changed {
+                super::control_plane_service::prune_runtime_observability_after_reload(self).await;
+            }
+
+            tokio::select! {
+                biased;
+                _ = wait_for_proxy_shutdown(&mut shutdown_rx) => return,
+                () = tokio::time::sleep(check_interval) => {}
+            }
+        }
+    }
+
     pub(crate) async fn publish_operator_pricing_catalog(&self) -> anyhow::Result<bool> {
         self.config.publish_operator_pricing_catalog().await
     }
@@ -35,8 +92,15 @@ impl ProxyService {
             RuntimeStore::open_in_memory()
                 .expect("an isolated in-memory runtime store should open"),
         );
-        Self::new_with_runtime_store_inner(client, config, service_name, runtime_store, false)
-            .expect("test proxy route graph must compile")
+        Self::new_with_runtime_store_inner(
+            client,
+            config,
+            service_name,
+            runtime_store,
+            CredentialSourceCapabilities::server(),
+            false,
+        )
+        .expect("test proxy route graph must compile")
     }
 
     pub(crate) fn new_with_runtime_store(
@@ -45,7 +109,31 @@ impl ProxyService {
         service_name: &'static str,
         runtime_store: Arc<RuntimeStore>,
     ) -> anyhow::Result<Self> {
-        Self::new_with_runtime_store_inner(client, config, service_name, runtime_store, true)
+        Self::new_with_runtime_store_inner(
+            client,
+            config,
+            service_name,
+            runtime_store,
+            CredentialSourceCapabilities::server(),
+            true,
+        )
+    }
+
+    pub(crate) fn new_with_runtime_store_and_credential_sources(
+        client: Client,
+        config: Arc<HelperConfig>,
+        service_name: &'static str,
+        runtime_store: Arc<RuntimeStore>,
+        credential_sources: CredentialSourceCapabilities,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_runtime_store_inner(
+            client,
+            config,
+            service_name,
+            runtime_store,
+            credential_sources,
+            true,
+        )
     }
 
     fn new_with_runtime_store_inner(
@@ -53,18 +141,15 @@ impl ProxyService {
         config: Arc<HelperConfig>,
         service_name: &'static str,
         runtime_store: Arc<RuntimeStore>,
+        credential_sources: CredentialSourceCapabilities,
         spawn_cleanup_task: bool,
     ) -> anyhow::Result<Self> {
-        let provider_policy = RuntimeConfig::reconcile_initial_provider_policy(
-            config.as_ref(),
-            runtime_store.as_ref(),
-        )?;
-        let state = ProxyState::new_with_runtime_store(runtime_store)?;
-        let runtime_config = Arc::new(RuntimeConfig::new_with_policy_state(
+        let (runtime_config, state) = RuntimeConfig::new_with_runtime_store_and_credential_sources(
             config,
-            provider_policy,
-            Arc::clone(&state),
-        )?);
+            runtime_store,
+            credential_sources,
+        )?;
+        let runtime_config = Arc::new(runtime_config);
         if spawn_cleanup_task {
             ProxyState::spawn_cleanup_task(&state);
         }
@@ -75,7 +160,68 @@ impl ProxyService {
             concurrency_limiter: Arc::new(super::concurrency_limits::ConcurrencyLimiter::default()),
             filter: RequestFilter::new(),
             state,
+            service_install_generation: None,
+            service_runtime_identity: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_service_install_generation(
+        mut self,
+        generation: Option<ServiceInstallGeneration>,
+    ) -> Self {
+        self.service_install_generation = generation;
+        self
+    }
+
+    pub(crate) fn service_install_generation(&self) -> Option<&ServiceInstallGeneration> {
+        self.service_install_generation.as_ref()
+    }
+
+    pub(crate) fn with_service_runtime_identity(
+        mut self,
+        identity: Option<crate::service_target::ServiceRuntimeIdentity>,
+    ) -> Self {
+        self.service_install_generation = identity
+            .as_ref()
+            .map(|identity| identity.install_generation.clone());
+        self.service_runtime_identity = identity;
+        self
+    }
+
+    pub(crate) fn service_runtime_identity(
+        &self,
+    ) -> Option<&crate::service_target::ServiceRuntimeIdentity> {
+        self.service_runtime_identity.as_ref()
+    }
+
+    pub(crate) async fn refresh_native_credential(
+        &self,
+        name: &crate::credentials::CredentialName,
+        action: LocalCredentialRefreshAction,
+    ) -> Result<(LocalCredentialRefreshStatus, u64), ProxyControlError> {
+        let result = match action {
+            LocalCredentialRefreshAction::Upsert => {
+                self.config
+                    .refresh_native_credential_after_upsert(name)
+                    .await
+            }
+            LocalCredentialRefreshAction::Delete => {
+                self.config.invalidate_deleted_native_credential(name).await
+            }
+        }
+        .map_err(|error| {
+            tracing::warn!(
+                service = self.service_name,
+                error = %error,
+                "local credential runtime refresh failed"
+            );
+            ProxyControlError::new(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "credential runtime refresh failed",
+            )
+        })?;
+        Ok((result.status, result.runtime_revision))
     }
 
     pub fn new_ephemeral_diagnostic(
@@ -131,23 +277,37 @@ impl ProxyService {
     }
 
     #[cfg(test)]
+    pub(crate) async fn runtime_identity_for_provider_endpoint_for_test(
+        &self,
+        provider_endpoint: &crate::runtime_identity::ProviderEndpointKey,
+    ) -> crate::runtime_identity::RuntimeUpstreamIdentity {
+        let snapshot = self.config.capture().await;
+        snapshot
+            .route_graph(self.service_name)
+            .into_iter()
+            .flat_map(|graph| {
+                graph
+                    .candidate_identities()
+                    .expect("published route graph credential bindings")
+            })
+            .find(|identity| identity.provider_endpoint == *provider_endpoint)
+            .unwrap_or_else(|| {
+                panic!(
+                    "provider endpoint {provider_endpoint} is not active in the current runtime snapshot"
+                )
+            })
+    }
+
+    #[cfg(test)]
     pub(crate) async fn set_provider_automatic_block_for_test(
         &self,
         provider_endpoint: crate::runtime_identity::ProviderEndpointKey,
         blocked: bool,
         observed_at_ms: u64,
     ) -> crate::runtime_store::ProviderObservationCommit {
-        let snapshot = self.config.capture().await;
-        let identity = snapshot
-            .route_graph(self.service_name)
-            .into_iter()
-            .flat_map(|graph| graph.candidate_identities())
-            .find(|identity| identity.provider_endpoint == provider_endpoint)
-            .unwrap_or_else(|| {
-                panic!(
-                    "provider endpoint {provider_endpoint} is not active in the current runtime snapshot"
-                )
-            });
+        let identity = self
+            .runtime_identity_for_provider_endpoint_for_test(&provider_endpoint)
+            .await;
         self.state
             .set_provider_automatic_block_for_runtime_identity_for_test(
                 identity,
@@ -287,10 +447,19 @@ impl ProxyService {
     }
 }
 
+async fn wait_for_proxy_shutdown(shutdown_rx: &mut tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if *shutdown_rx.borrow() || shutdown_rx.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 fn persisted_provider_spec_from_config_for_service(
     name: &str,
     provider: &crate::config::ProviderConfig,
 ) -> PersistedProviderSpec {
+    let auth = provider.effective_auth();
     let mut endpoints = Vec::new();
     if let Some(base_url) = provider
         .base_url
@@ -322,8 +491,10 @@ fn persisted_provider_spec_from_config_for_service(
         name: name.to_string(),
         alias: provider.alias.clone(),
         enabled: provider.enabled,
-        auth_token_env: provider.inline_auth.auth_token_env.clone(),
-        api_key_env: provider.inline_auth.api_key_env.clone(),
+        auth_token_env: auth.auth_token_env,
+        auth_token_ref: auth.auth_token_ref,
+        api_key_env: auth.api_key_env,
+        api_key_ref: auth.api_key_ref,
         tags: provider.tags.clone(),
         limits: provider.limits.clone(),
         endpoints,
@@ -386,5 +557,27 @@ mod tests {
                 .expect("build ephemeral diagnostic proxy");
 
         assert_eq!(proxy.state_handle().runtime_store_handle().path(), None);
+    }
+
+    #[test]
+    fn persisted_provider_spec_projects_effective_credential_references() {
+        let provider = crate::config::ProviderConfig {
+            base_url: Some("https://relay.example/v1".to_string()),
+            auth: crate::config::UpstreamAuth {
+                auth_token_ref: Some(crate::config::CredentialRef::Native {
+                    name: "relay.primary".to_string(),
+                }),
+                api_key_env: Some("RELAY_API_KEY".to_string()),
+                ..crate::config::UpstreamAuth::default()
+            },
+            ..crate::config::ProviderConfig::default()
+        };
+
+        let spec = persisted_provider_spec_from_config_for_service("relay", &provider);
+        let serialized = serde_json::to_value(&spec).expect("serialize provider spec");
+
+        assert_eq!(serialized["auth_token_ref"]["source"], "native");
+        assert_eq!(serialized["auth_token_ref"]["name"], "relay.primary");
+        assert_eq!(serialized["api_key_env"], "RELAY_API_KEY");
     }
 }

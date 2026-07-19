@@ -1171,6 +1171,515 @@ async fn proxy_http_capacity_wait_keeps_captured_runtime_snapshot_across_reload(
 }
 
 #[tokio::test]
+async fn proxy_http_capacity_wait_keeps_captured_credential_across_rotation() {
+    let upstream_hits = Arc::new(AtomicUsize::new(0));
+    let seen_generations = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+    let first_started = Arc::new(tokio::sync::Notify::new());
+    let release_first = Arc::new(tokio::sync::Notify::new());
+    let hits_for_route = Arc::clone(&upstream_hits);
+    let generations_for_route = Arc::clone(&seen_generations);
+    let first_started_for_route = Arc::clone(&first_started);
+    let release_first_for_route = Arc::clone(&release_first);
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        post(move |headers: axum::http::HeaderMap| {
+            let hits = Arc::clone(&hits_for_route);
+            let generations = Arc::clone(&generations_for_route);
+            let first_started = Arc::clone(&first_started_for_route);
+            let release_first = Arc::clone(&release_first_for_route);
+            async move {
+                let hit = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                let generation = match headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .map(axum::http::HeaderValue::as_bytes)
+                {
+                    Some(b"Bearer generation-a") => "a",
+                    Some(b"Bearer generation-b") => "b",
+                    _ => "unexpected",
+                };
+                generations
+                    .lock()
+                    .expect("credential generation capture lock")
+                    .push(generation);
+                if hit == 1 {
+                    first_started.notify_one();
+                    release_first.notified().await;
+                }
+                (StatusCode::OK, Json(serde_json::json!({ "hit": hit })))
+            }
+        }),
+    );
+    let (upstream_addr, upstream_handle) = spawn_axum_server(upstream);
+
+    let mut source = capacity_wait_config(format!("http://{upstream_addr}/v1"), None);
+    source
+        .codex
+        .providers
+        .get_mut("primary")
+        .expect("primary provider")
+        .auth = UpstreamAuth {
+        auth_token_ref: Some(crate::config::CredentialRef::Native {
+            name: "relay.primary".to_string(),
+        }),
+        ..UpstreamAuth::default()
+    };
+    let (credential_sources, credential_control) =
+        crate::credentials::CredentialSourceCapabilities::test_native(
+            crate::credentials::SecretValue::new(b"generation-a".to_vec())
+                .expect("valid initial credential"),
+        );
+    let runtime_store =
+        Arc::new(crate::runtime_store::RuntimeStore::open_in_memory().expect("open runtime store"));
+    let proxy = ProxyService::new_with_runtime_store_and_credential_sources(
+        Client::new(),
+        Arc::new(source),
+        "codex",
+        runtime_store,
+        credential_sources,
+    )
+    .expect("build credential-backed proxy");
+    let retained = proxy.clone();
+    let before = retained.config.capture().await;
+    let old_plan = before
+        .capture_route_plan("codex", &crate::routing_ir::RouteRequestContext::default())
+        .expect("capture old route plan")
+        .expect("old route plan");
+    let old_candidate = old_plan
+        .template()
+        .candidates
+        .first()
+        .expect("old candidate");
+    let old_target = old_plan
+        .template()
+        .capture_candidate(old_candidate)
+        .expect("capture old target credential");
+    let old_generation_revision = before.credential_generation().revision();
+    assert_eq!(credential_control.read_count(), 1);
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let refresh_driver = retained.spawn_credential_refresh_driver(shutdown_rx);
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let client = reqwest::Client::new();
+
+    let first_request = tokio::spawn({
+        let client = client.clone();
+        async move { send_responses_json(&client, proxy_addr, Some("sid-credential-first")).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), first_started.notified())
+        .await
+        .expect("first request should occupy provider capacity");
+
+    let queued_request = tokio::spawn({
+        let client = client.clone();
+        async move { send_responses_json(&client, proxy_addr, Some("sid-credential-queued")).await }
+    });
+    wait_for_provider_pending(&retained, "primary", 1, 1).await;
+
+    credential_control.set_value(
+        crate::credentials::SecretValue::new(b"generation-b".to_vec())
+            .expect("valid rotated credential"),
+    );
+    retained
+        .config
+        .schedule_credential_refresh(old_target.credential());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if retained
+                .config
+                .capture()
+                .await
+                .credential_generation()
+                .revision()
+                > old_generation_revision
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("credential rotation should publish while the old request waits");
+    assert_eq!(credential_control.read_count(), 2);
+
+    release_first.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), first_request)
+        .await
+        .expect("first request should finish after release")
+        .expect("first request task should join");
+    tokio::time::timeout(Duration::from_secs(2), queued_request)
+        .await
+        .expect("queued request should acquire released capacity")
+        .expect("queued request task should join");
+    send_responses_json(&client, proxy_addr, Some("sid-credential-next")).await;
+
+    assert_eq!(upstream_hits.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        *seen_generations
+            .lock()
+            .expect("credential generation capture lock"),
+        ["a", "a", "b"]
+    );
+
+    shutdown_tx.send(true).expect("signal refresh shutdown");
+    refresh_driver.await.expect("join refresh driver");
+    proxy_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_sse_stream_keeps_generation_and_scopes_across_credential_rotation() {
+    const CREATED_SSE: &[u8] = b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-rotation\"}}\n\n";
+    const COMPLETED_SSE: &[u8] = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-rotation\"}}\n\ndata: [DONE]\n\n";
+    const IMMEDIATE_SSE: &[u8] = b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-immediate\"}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-immediate\"}}\n\ndata: [DONE]\n\n";
+
+    let upstream_hits = Arc::new(AtomicUsize::new(0));
+    let seen_generations = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+    let release_stream = Arc::new(tokio::sync::Notify::new());
+    let hits_for_route = Arc::clone(&upstream_hits);
+    let generations_for_route = Arc::clone(&seen_generations);
+    let release_stream_for_route = Arc::clone(&release_stream);
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        post(move |headers: axum::http::HeaderMap| {
+            let hits = Arc::clone(&hits_for_route);
+            let generations = Arc::clone(&generations_for_route);
+            let release_stream = Arc::clone(&release_stream_for_route);
+            async move {
+                let hit = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                let generation = match headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .map(axum::http::HeaderValue::as_bytes)
+                {
+                    Some(b"Bearer generation-a") => "a",
+                    Some(b"Bearer generation-b") => "b",
+                    _ => "unexpected",
+                };
+                generations
+                    .lock()
+                    .expect("credential generation capture lock")
+                    .push(generation);
+
+                let body = if hit == 2 {
+                    let created = stream::once(async {
+                        Ok::<Bytes, Infallible>(Bytes::from_static(CREATED_SSE))
+                    });
+                    let completed = stream::once(async move {
+                        release_stream.notified().await;
+                        Ok::<Bytes, Infallible>(Bytes::from_static(COMPLETED_SSE))
+                    });
+                    Body::from_stream(created.chain(completed))
+                } else {
+                    Body::from_stream(stream::once(async {
+                        Ok::<Bytes, Infallible>(Bytes::from_static(IMMEDIATE_SSE))
+                    }))
+                };
+                let mut response = Response::new(body);
+                response.headers_mut().insert(
+                    axum::http::header::CONTENT_TYPE,
+                    HeaderValue::from_static("text/event-stream"),
+                );
+                response
+            }
+        }),
+    );
+    let (upstream_addr, upstream_handle) = spawn_axum_server(upstream);
+
+    let mut source = capacity_wait_config(format!("http://{upstream_addr}/v1"), None);
+    source
+        .codex
+        .providers
+        .get_mut("primary")
+        .expect("primary provider")
+        .auth = UpstreamAuth {
+        auth_token_ref: Some(crate::config::CredentialRef::Native {
+            name: "relay.primary".to_string(),
+        }),
+        ..UpstreamAuth::default()
+    };
+    let (credential_sources, credential_control) =
+        crate::credentials::CredentialSourceCapabilities::test_native(
+            crate::credentials::SecretValue::new(b"generation-a".to_vec())
+                .expect("valid initial credential"),
+        );
+    let runtime_store =
+        Arc::new(crate::runtime_store::RuntimeStore::open_in_memory().expect("open runtime store"));
+    let proxy = ProxyService::new_with_runtime_store_and_credential_sources(
+        Client::new(),
+        Arc::new(source),
+        "codex",
+        Arc::clone(&runtime_store),
+        credential_sources,
+    )
+    .expect("build credential-backed proxy");
+    let retained = proxy.clone();
+    let state = Arc::clone(&proxy.state);
+    let before = retained.config.capture().await;
+    let old_plan = before
+        .capture_route_plan("codex", &crate::routing_ir::RouteRequestContext::default())
+        .expect("capture old route plan")
+        .expect("old route plan");
+    let old_candidate = old_plan
+        .template()
+        .candidates
+        .first()
+        .expect("old candidate");
+    let old_target = old_plan
+        .template()
+        .capture_candidate(old_candidate)
+        .expect("capture old target credential");
+    let old_generation_revision = before.credential_generation().revision();
+    let old_route_graph_key = old_plan.template().route_graph_key().to_string();
+    let old_policy_route_scope = old_target.runtime_identity().policy_route_scope();
+    let old_account_fingerprint =
+        crate::provider_catalog::AccountFingerprint::from_credential_scope(
+            old_target
+                .runtime_identity()
+                .credential_scope
+                .as_deref()
+                .expect("old native credential scope"),
+        )
+        .to_string();
+    assert_eq!(credential_control.read_count(), 1);
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let refresh_driver = retained.spawn_credential_refresh_driver(shutdown_rx);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(crate::proxy::router(proxy));
+    let client = reqwest::Client::new();
+    let request_url = format!("http://{proxy_addr}/v1/responses");
+    let session_id = "sid-stream-credential-rotation";
+
+    let seed_response = client
+        .post(&request_url)
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .header("session_id", session_id)
+        .body(r#"{"model":"gpt-5","input":"seed","stream":true}"#)
+        .send()
+        .await
+        .expect("send affinity seed request");
+    assert_eq!(seed_response.status(), StatusCode::OK);
+    let seed_body = seed_response
+        .text()
+        .await
+        .expect("drain affinity seed response");
+    assert!(seed_body.contains("response.completed"), "{seed_body}");
+    assert_eq!(
+        state
+            .peek_session_route_affinity(session_id)
+            .await
+            .expect("generation A affinity")
+            .route_graph_key,
+        old_route_graph_key
+    );
+
+    let mut streaming_response = client
+        .post(&request_url)
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .header("session_id", session_id)
+        .body(r#"{"model":"gpt-5","input":"stream","stream":true}"#)
+        .send()
+        .await
+        .expect("send generation A streaming request");
+    assert_eq!(streaming_response.status(), StatusCode::OK);
+    let first_chunk = tokio::time::timeout(Duration::from_secs(2), streaming_response.chunk())
+        .await
+        .expect("generation A stream should produce its first event")
+        .expect("read generation A first event")
+        .expect("generation A stream first event");
+    let first_chunk = String::from_utf8_lossy(first_chunk.as_ref());
+    assert!(first_chunk.contains("response.created"), "{first_chunk}");
+    assert!(!first_chunk.contains("response.completed"), "{first_chunk}");
+
+    credential_control.set_value(
+        crate::credentials::SecretValue::new(b"generation-b".to_vec())
+            .expect("valid rotated credential"),
+    );
+    retained
+        .config
+        .schedule_credential_refresh(old_target.credential());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if retained
+                .config
+                .capture()
+                .await
+                .credential_generation()
+                .revision()
+                > old_generation_revision
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("credential rotation should publish while generation A is streaming");
+    assert_eq!(credential_control.read_count(), 2);
+
+    let after = retained.config.capture().await;
+    let new_plan = after
+        .capture_route_plan("codex", &crate::routing_ir::RouteRequestContext::default())
+        .expect("capture new route plan")
+        .expect("new route plan");
+    let new_candidate = new_plan
+        .template()
+        .candidates
+        .first()
+        .expect("new candidate");
+    let new_target = new_plan
+        .template()
+        .capture_candidate(new_candidate)
+        .expect("capture new target credential");
+    let new_route_graph_key = new_plan.template().route_graph_key().to_string();
+    let new_policy_route_scope = new_target.runtime_identity().policy_route_scope();
+    let new_account_fingerprint =
+        crate::provider_catalog::AccountFingerprint::from_credential_scope(
+            new_target
+                .runtime_identity()
+                .credential_scope
+                .as_deref()
+                .expect("new native credential scope"),
+        )
+        .to_string();
+    assert_ne!(old_route_graph_key, new_route_graph_key);
+    assert_ne!(old_policy_route_scope, new_policy_route_scope);
+    assert_ne!(old_account_fingerprint, new_account_fingerprint);
+    assert_eq!(
+        new_target
+            .credential()
+            .bearer_header()
+            .expect("generation B bearer")
+            .as_bytes(),
+        b"Bearer generation-b"
+    );
+    assert_eq!(
+        state
+            .peek_session_route_affinity(session_id)
+            .await
+            .expect("generation A affinity remains explicit during rotation")
+            .route_graph_key,
+        old_route_graph_key
+    );
+
+    release_stream.notify_one();
+    let terminal_body = tokio::time::timeout(Duration::from_secs(2), streaming_response.text())
+        .await
+        .expect("generation A stream should finish after release")
+        .expect("drain generation A stream terminal");
+    assert!(
+        terminal_body.contains("response.completed"),
+        "{terminal_body}"
+    );
+    assert_eq!(
+        state
+            .peek_session_route_affinity(session_id)
+            .await
+            .expect("completed generation A affinity")
+            .route_graph_key,
+        old_route_graph_key,
+        "a late generation A completion must not masquerade as generation B affinity"
+    );
+
+    let next_response = client
+        .post(&request_url)
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .header("session_id", session_id)
+        .body(r#"{"model":"gpt-5","input":"next","stream":true}"#)
+        .send()
+        .await
+        .expect("send generation B request");
+    assert_eq!(next_response.status(), StatusCode::OK);
+    let next_body = next_response
+        .text()
+        .await
+        .expect("drain generation B response");
+    assert!(next_body.contains("response.completed"), "{next_body}");
+    assert_eq!(
+        state
+            .peek_session_route_affinity(session_id)
+            .await
+            .expect("generation B affinity")
+            .route_graph_key,
+        new_route_graph_key,
+        "generation B must not inherit the stale generation A route-graph affinity"
+    );
+
+    assert_eq!(upstream_hits.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        *seen_generations
+            .lock()
+            .expect("credential generation capture lock"),
+        ["a", "a", "b"]
+    );
+
+    let logical_requests = runtime_store
+        .read_recent_logical_requests(10)
+        .expect("read durable logical requests");
+    let mut captured_scopes = logical_requests
+        .into_iter()
+        .map(|request| {
+            let payload = request
+                .terminal
+                .as_ref()
+                .expect("logical request terminal")
+                .terminal
+                .payload
+                .as_ref()
+                .expect("logical request terminal payload");
+            let scope = payload
+                .provider_epoch
+                .as_ref()
+                .expect("captured provider epoch")
+                .scope
+                .clone();
+            (payload.finished_request.id, scope)
+        })
+        .collect::<Vec<_>>();
+    captured_scopes.sort_by_key(|(request_id, _)| *request_id);
+    assert_eq!(captured_scopes.len(), 3);
+    assert_eq!(
+        captured_scopes[0].1.route_scope,
+        captured_scopes[1].1.route_scope
+    );
+    assert_eq!(
+        captured_scopes[0].1.account_fingerprint,
+        captured_scopes[1].1.account_fingerprint
+    );
+    assert_eq!(
+        captured_scopes[1].1.route_scope, captured_scopes[2].1.route_scope,
+        "credential rotation retains the provider endpoint route dimension"
+    );
+    assert_eq!(
+        captured_scopes[1].1.account_fingerprint,
+        old_account_fingerprint
+    );
+    assert_eq!(
+        captured_scopes[2].1.account_fingerprint,
+        new_account_fingerprint
+    );
+    assert_ne!(
+        captured_scopes[1].1.account_fingerprint, captured_scopes[2].1.account_fingerprint,
+        "generation B must receive a distinct opaque quota and observation identity"
+    );
+    assert_eq!(
+        captured_scopes[0].1.config_revision,
+        captured_scopes[1].1.config_revision
+    );
+    assert_ne!(
+        captured_scopes[1].1.config_revision,
+        captured_scopes[2].1.config_revision
+    );
+
+    shutdown_tx.send(true).expect("signal refresh shutdown");
+    refresh_driver.await.expect("join refresh driver");
+    proxy_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
 async fn proxy_http_capacity_wait_keeps_captured_policy_until_next_request() {
     let primary_hits = Arc::new(AtomicUsize::new(0));
     let first_started = Arc::new(tokio::sync::Notify::new());

@@ -14,6 +14,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::connect_async;
 
 use crate::auth_resolution::UpstreamAuthResolutionError;
+use crate::credentials::CredentialGenerationMarker;
 use tokio_tungstenite::tungstenite;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http as tungstenite_http;
@@ -34,11 +35,13 @@ use crate::state::{
 use super::attempt_failures::{TerminalUpstreamFailureParams, apply_terminal_upstream_failure};
 use super::attempt_health::record_attempt_success;
 use super::attempt_request::inject_auth_headers;
+use super::classify::{classify_observed_upstream_response, is_credential_auth_failure};
 use super::client_identity::extract_session_identity;
 use super::codex_failure::CodexFailureKind;
 use super::concurrency_limits::{
     ConcurrencyAcquireError, ConcurrencyLimit, ConcurrencyPermit, ConcurrencyWaitPolicy,
 };
+use super::headers::strip_codex_client_facade_marker;
 use super::request_body::{
     ReasoningOrchestrationIntent, RequestDialect, apply_deferred_reasoning_intent,
     codex_session_identity_and_completed_body, extract_model_from_response_body,
@@ -130,6 +133,7 @@ struct ResponsesWebSocketSelected {
 struct ResponsesWebSocketHandshakeRoute {
     runtime_snapshot: Arc<RuntimeSnapshot>,
     route_revision: u64,
+    handshake_credential_generation: CredentialGenerationMarker,
     route_template: Arc<RoutePlanTemplate>,
     binding_source: WebSocketHandshakeBindingSource,
     routing_control_graph_key: String,
@@ -219,9 +223,6 @@ pub(super) async fn handle_responses_websocket(
         }
     };
 
-    if proxy.config.maybe_reload_from_disk().await {
-        super::control_plane_service::prune_runtime_observability_after_reload(&proxy).await;
-    }
     let runtime_snapshot = proxy.config.capture().await;
     let route =
         match prepare_responses_websocket_handshake_route(&proxy, runtime_snapshot, &headers).await
@@ -246,7 +247,7 @@ pub(super) async fn handle_responses_websocket(
                 tracing::warn!(
                     provider_id = route.target.provider_id(),
                     auth_error_code = error.code(),
-                    error = %error,
+                    auth_source_kind = error.source_kind(),
                     "selected WebSocket provider authentication could not be resolved"
                 );
                 return (
@@ -285,7 +286,24 @@ pub(super) async fn handle_responses_websocket(
     let (upstream_socket, upstream_response) =
         match tokio::time::timeout(WS_HANDSHAKE_TIMEOUT, connect_async(upstream_request)).await {
             Ok(Ok(value)) => value,
-            Ok(Err(error)) => return upstream_ws_handshake_error_response(error),
+            Ok(Err(error)) => {
+                if let tungstenite::Error::Http(response) = &error {
+                    let classification = classify_observed_upstream_response(
+                        response.status().as_u16(),
+                        response.headers(),
+                        response.body().as_deref().unwrap_or_default(),
+                    );
+                    if is_credential_auth_failure(
+                        response.status(),
+                        classification.class.as_deref(),
+                    ) {
+                        proxy
+                            .config
+                            .schedule_credential_refresh(route.target.credential());
+                    }
+                }
+                return upstream_ws_handshake_error_response(error);
+            }
             Err(_) => {
                 return (
                     StatusCode::GATEWAY_TIMEOUT,
@@ -303,6 +321,10 @@ pub(super) async fn handle_responses_websocket(
         .map(str::to_owned);
     let success_headers = filter_upstream_ws_success_headers(upstream_response.headers());
     let route_revision = route.route_revision;
+    let account_fingerprint = proxy.state.derive_provider_account_fingerprint(
+        route.target.runtime_identity().credential_scope.as_deref(),
+        &upstream_headers,
+    );
     let upstream = ResponsesWebSocketUpstream {
         route,
         socket: upstream_socket,
@@ -310,7 +332,7 @@ pub(super) async fn handle_responses_websocket(
         headers_ms: upstream_headers_ms,
         attempt_scope: ResponsesWebSocketAttemptScope {
             endpoint: target_url,
-            account_fingerprint: AccountFingerprint::from_final_headers(&upstream_headers),
+            account_fingerprint,
         },
         _connection_permit: connection_permit,
     };
@@ -507,11 +529,29 @@ async fn prepare_responses_websocket_handshake_route(
         })?;
     let routing_control_graph_key = graph.digest().to_string();
     let template = graph.handshake_plan();
+    let runtime_identities = template.candidate_identities().map_err(|error| {
+        ResponsesWebSocketSelectionFailure::new(
+            StatusCode::BAD_GATEWAY,
+            format!("captured WebSocket credential binding is invalid: {error}"),
+        )
+    })?;
     let mut runtime = proxy
         .state
-        .route_plan_runtime_state_with_provider_policy(proxy.service_name, provider_policy.as_ref())
+        .route_plan_runtime_state_with_provider_policy(
+            proxy.service_name,
+            provider_policy.as_ref(),
+            runtime_snapshot.revision(),
+            runtime_identities.as_slice(),
+        )
         .await;
-    apply_auth_resolution_to_runtime(proxy.service_name, &template, &mut runtime);
+    apply_auth_resolution_to_runtime(proxy.service_name, &template, &mut runtime).map_err(
+        |error| {
+            ResponsesWebSocketSelectionFailure::new(
+                StatusCode::BAD_GATEWAY,
+                format!("captured WebSocket credential binding is invalid: {error}"),
+            )
+        },
+    )?;
     apply_routing_operator_control_to_runtime(
         proxy,
         routing_control_graph_key.as_str(),
@@ -750,6 +790,9 @@ fn compatible_websocket_route_with_template(
     uri: &Uri,
     attempt_scope: &ResponsesWebSocketAttemptScope,
 ) -> Option<ResponsesWebSocketHandshakeRoute> {
+    if current_snapshot.credential_generation().marker() != bound.handshake_credential_generation {
+        return None;
+    }
     let current_graph = current_snapshot.route_graph(proxy.service_name)?;
     if current_graph.digest() != routing_control_graph_key
         || current_graph.handshake_plan().scheduling_preset != template.scheduling_preset
@@ -763,7 +806,7 @@ fn compatible_websocket_route_with_template(
     let topology = template.continuity_topology();
     let candidate =
         topology.find_candidate_by_provider_endpoint(bound.target.provider_endpoint())?;
-    let target = template.capture_candidate(candidate);
+    let target = template.capture_candidate(candidate).ok()?;
     if target.continuity_domain() != bound.target.continuity_domain() {
         return None;
     }
@@ -774,8 +817,10 @@ fn compatible_websocket_route_with_template(
     }
     let upstream_headers =
         upstream_ws_handshake_headers(client_headers, &target, target_url.as_str()).ok()?;
-    if AccountFingerprint::from_final_headers(&upstream_headers)
-        != attempt_scope.account_fingerprint
+    if proxy.state.derive_provider_account_fingerprint(
+        target.runtime_identity().credential_scope.as_deref(),
+        &upstream_headers,
+    ) != attempt_scope.account_fingerprint
     {
         return None;
     }
@@ -783,6 +828,7 @@ fn compatible_websocket_route_with_template(
     Some(ResponsesWebSocketHandshakeRoute {
         route_revision: current_snapshot.revision(),
         runtime_snapshot: current_snapshot,
+        handshake_credential_generation: bound.handshake_credential_generation.clone(),
         route_template: template,
         binding_source: bound.binding_source,
         routing_control_graph_key,
@@ -876,10 +922,19 @@ fn select_captured_handshake_route(
         _ => {}
     }
 
-    let target = template.capture_candidate(selected.candidate);
+    let target = template
+        .capture_candidate(selected.candidate)
+        .map_err(|_| {
+            ResponsesWebSocketSelectionFailure::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "captured WebSocket route has no matching credential binding",
+            )
+        })?;
+    let handshake_credential_generation = runtime_snapshot.credential_generation().marker();
     Ok(ResponsesWebSocketHandshakeRoute {
         route_revision: runtime_snapshot.revision(),
         runtime_snapshot,
+        handshake_credential_generation,
         route_template: Arc::new(template.clone()),
         binding_source,
         routing_control_graph_key,
@@ -1544,7 +1599,7 @@ async fn websocket_bound_candidate_is_current(
         } else {
             None
         };
-    let mut runtime = route_graph_runtime_for_request(
+    let Ok(mut runtime) = route_graph_runtime_for_request(
         proxy,
         route.route_template.as_ref(),
         route.routing_control_graph_key.as_str(),
@@ -1552,7 +1607,10 @@ async fn websocket_bound_candidate_is_current(
         route.runtime_snapshot.provider_policy().as_ref(),
         prepared.session_id.as_deref(),
     )
-    .await;
+    .await
+    else {
+        return false;
+    };
     if reservation_guard.is_some() {
         match apply_session_route_reservation_to_runtime(
             proxy,
@@ -2097,6 +2155,7 @@ fn upstream_ws_handshake_headers(
         "openai-organization",
         "openai-project",
         "x-api-key",
+        "x-openai-actor-authorization",
         "x-openai-fedramp",
         "x-openai-organization",
         "x-openai-project",
@@ -2124,6 +2183,7 @@ fn upstream_ws_handshake_headers(
     ];
 
     let mut headers = copy_allowlisted_ws_headers(client_headers, ALLOWED_CLIENT_HEADERS);
+    strip_codex_client_facade_marker(&mut headers);
     if let Some(session_identity) = extract_session_identity(client_headers)
         && let Ok(value) = HeaderValue::from_str(session_identity.value())
     {
@@ -2133,7 +2193,7 @@ fn upstream_ws_handshake_headers(
             }
         }
     }
-    inject_auth_headers("codex", target.auth(), target_url, &mut headers)?;
+    inject_auth_headers("codex", target.credential(), target_url, &mut headers)?;
     headers.insert(
         HeaderName::from_static("openai-beta"),
         HeaderValue::from_static(RESPONSES_WS_BETA_HEADER),
@@ -2226,11 +2286,12 @@ fn upstream_ws_request(
 ) -> Result<tungstenite_http::Request<()>, tungstenite::Error> {
     let mut request = url.into_client_request()?;
     for (name, value) in headers {
-        if let (Ok(name), Ok(value)) = (
+        if let (Ok(name), Ok(mut converted_value)) = (
             tungstenite_http::HeaderName::from_bytes(name.as_str().as_bytes()),
             tungstenite_http::HeaderValue::from_bytes(value.as_bytes()),
         ) {
-            request.headers_mut().append(name, value);
+            converted_value.set_sensitive(value.is_sensitive());
+            request.headers_mut().append(name, converted_value);
         }
     }
     Ok(request)
@@ -2340,6 +2401,10 @@ mod tests {
                 HeaderValue::from_static("client-api-key"),
             ),
             (
+                HeaderName::from_static("x-openai-actor-authorization"),
+                HeaderValue::from_static("real-actor-token"),
+            ),
+            (
                 HeaderName::from_static("x-oai-attestation"),
                 HeaderValue::from_static("device-attestation"),
             ),
@@ -2375,10 +2440,17 @@ mod tests {
             "openai-organization",
             "openai-project",
             "x-api-key",
+            "x-openai-actor-authorization",
             "x-oai-attestation",
         ] {
             assert_eq!(official.get(header), client_headers.get(header), "{header}");
         }
+        assert!(
+            official
+                .get("x-openai-actor-authorization")
+                .expect("actor authorization")
+                .is_sensitive()
+        );
         assert!(!official.contains_key("cookie"));
 
         let relay_target = ws_target(
@@ -2416,6 +2488,7 @@ mod tests {
             "openai-organization",
             "openai-project",
             "x-api-key",
+            "x-openai-actor-authorization",
             "x-oai-attestation",
         ] {
             assert!(!relay.contains_key(header), "{header}");
@@ -2425,7 +2498,7 @@ mod tests {
         let helper_target = ws_target(
             "https://api.openai.com/v1",
             crate::config::UpstreamAuth {
-                auth_token: Some("helper-token".to_string()),
+                auth_token: Some("helper-token".to_string().into()),
                 ..crate::config::UpstreamAuth::default()
             },
         );
@@ -2439,15 +2512,53 @@ mod tests {
             helper.get("authorization"),
             Some(&HeaderValue::from_static("Bearer helper-token"))
         );
+        assert!(
+            helper
+                .get("authorization")
+                .expect("helper authorization header")
+                .is_sensitive()
+        );
+        let upstream_request = upstream_ws_request("wss://api.openai.com/v1/responses", &helper)
+            .expect("build upstream WebSocket request");
+        assert!(
+            upstream_request
+                .headers()
+                .get("authorization")
+                .expect("upstream authorization header")
+                .is_sensitive()
+        );
         for header in [
             "chatgpt-account-id",
             "openai-organization",
             "openai-project",
             "x-api-key",
+            "x-openai-actor-authorization",
             "x-oai-attestation",
         ] {
             assert!(!helper.contains_key(header), "{header}");
         }
+    }
+
+    #[test]
+    fn websocket_handshake_consumes_client_facade_marker() {
+        let mut client_headers = codex_account_headers();
+        client_headers.insert(
+            crate::codex_switch::CODEX_CLIENT_FACADE_ACTOR_HEADER,
+            HeaderValue::from_static(crate::codex_switch::CODEX_CLIENT_FACADE_ACTOR_VALUE),
+        );
+        let target = ws_target(
+            "https://api.openai.com/v1",
+            crate::config::UpstreamAuth::default(),
+        );
+
+        let headers = upstream_ws_handshake_headers(
+            &client_headers,
+            &target,
+            "https://api.openai.com/v1/responses",
+        )
+        .expect("build facade WebSocket handshake headers");
+
+        assert!(!headers.contains_key(crate::codex_switch::CODEX_CLIENT_FACADE_ACTOR_HEADER));
     }
 
     #[test]
