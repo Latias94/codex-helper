@@ -2478,7 +2478,10 @@ mod linux {
             }
             systemctl(&["daemon-reload"])?;
             systemctl(&["enable", LINUX_UNIT_NAME])?;
-            if systemctl_output(&["is-enabled", LINUX_UNIT_NAME]).as_deref() != Ok("enabled") {
+            if !matches!(
+                systemctl_output(&["is-enabled", LINUX_UNIT_NAME]).as_deref(),
+                Ok("enabled")
+            ) {
                 return Err(CliError::Other(
                     "systemd user unit did not report enabled after installation".to_string(),
                 ));
