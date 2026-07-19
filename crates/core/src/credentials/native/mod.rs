@@ -175,6 +175,8 @@ fn validate_native_lock_file(
     file: &File,
     path: &Path,
 ) -> Result<(), super::capabilities::NativeStoreError> {
+    #[cfg(not(unix))]
+    let _ = path;
     let metadata = file.metadata().map_err(|_| backend_unavailable())?;
     if !metadata.is_file() {
         return Err(backend_unavailable());

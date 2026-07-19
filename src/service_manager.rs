@@ -819,6 +819,7 @@ async fn read_service_runtime_with_timeout(
     .map_err(|error| error.to_string())
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn rollback_error(primary: CliError, failures: Vec<String>) -> CliError {
     if failures.is_empty() {
         CliError::Other(format!(
