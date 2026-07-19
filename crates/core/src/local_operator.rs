@@ -670,11 +670,13 @@ fn windows_private_sddl(user_sid: &str, directory: bool) -> String {
 #[cfg(windows)]
 fn secure_private_windows_path(path: &Path, directory: bool) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
     use windows_sys::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1, SE_FILE_OBJECT,
+        SetNamedSecurityInfoW,
     };
     use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SetFileSecurityW,
+        DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION,
     };
 
     let user_sid = current_windows_user_sid_string()?;
@@ -703,17 +705,47 @@ fn secure_private_windows_path(path: &Path, directory: bool) -> Result<()> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
-    // SAFETY: Both buffers remain alive for the duration of SetFileSecurityW.
+    let mut dacl_present = 0;
+    let mut dacl_defaulted = 0;
+    let mut dacl = std::ptr::null_mut();
+    // SAFETY: The converted descriptor remains alive and all output pointers are valid.
     if unsafe {
-        SetFileSecurityW(
-            path_wide.as_ptr(),
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+        GetSecurityDescriptorDacl(
             descriptor.0,
+            &mut dacl_present,
+            &mut dacl,
+            &mut dacl_defaulted,
         )
     } == 0
     {
         return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("secure Windows path {}", path.display()));
+            .with_context(|| format!("read private Windows ACL for {}", path.display()));
+    }
+    if dacl_present == 0 || dacl.is_null() {
+        anyhow::bail!(
+            "private Windows security descriptor for {} has no usable DACL",
+            path.display()
+        );
+    }
+    // SetFileSecurityW does not support the protected-DACL flag. Apply the complete DACL and
+    // inheritance boundary together through the named-object API.
+    // SAFETY: The path is NUL-terminated and the DACL points into the live descriptor.
+    let status = unsafe {
+        SetNamedSecurityInfoW(
+            path_wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            dacl,
+            std::ptr::null_mut(),
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(
+            i32::try_from(status).unwrap_or(i32::MAX),
+        ))
+        .with_context(|| format!("secure Windows path {}", path.display()));
     }
     Ok(())
 }
@@ -761,7 +793,148 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o600);
         }
+        #[cfg(windows)]
+        {
+            let user_sid = current_windows_user_sid_string().expect("current Windows user SID");
+            assert_eq!(
+                windows_dacl_sddl(&home),
+                canonical_windows_dacl_sddl(&windows_private_sddl(&user_sid, true)),
+                "helper home must apply the exact private DACL"
+            );
+            assert_eq!(
+                windows_dacl_sddl(&local_operator_token_path_in(&home)),
+                canonical_windows_dacl_sddl(&windows_private_sddl(&user_sid, false)),
+                "operator token must apply the exact private DACL"
+            );
+        }
         fs::remove_dir_all(home).expect("remove temp home");
+    }
+
+    #[cfg(windows)]
+    fn canonical_windows_dacl_sddl(sddl: &str) -> String {
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+
+        let sddl = sddl
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut descriptor = std::ptr::null_mut();
+        // SAFETY: The SDDL buffer is NUL-terminated and the output pointer is valid.
+        let succeeded = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(
+            succeeded,
+            0,
+            "parse expected Windows DACL: {}",
+            std::io::Error::last_os_error()
+        );
+        assert!(
+            !descriptor.is_null(),
+            "parsed Windows DACL descriptor must not be null"
+        );
+        let descriptor = OwnedWindowsLocalAllocation(descriptor);
+        // SAFETY: The LocalAlloc descriptor remains live for the duration of the conversion.
+        unsafe { windows_descriptor_dacl_sddl(descriptor.0) }
+    }
+
+    #[cfg(windows)]
+    fn windows_dacl_sddl(path: &Path) -> String {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, GetFileSecurityW};
+
+        let path = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut required_bytes = 0_u32;
+        // SAFETY: A null descriptor with length zero is the documented size-query form.
+        unsafe {
+            GetFileSecurityW(
+                path.as_ptr(),
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                0,
+                &mut required_bytes,
+            );
+        }
+        assert!(required_bytes > 0, "size Windows security descriptor");
+
+        let word_size = std::mem::size_of::<usize>();
+        let words = usize::try_from(required_bytes)
+            .expect("Windows descriptor size")
+            .saturating_add(word_size.saturating_sub(1))
+            / word_size;
+        let mut descriptor = vec![0_usize; words];
+        // SAFETY: The aligned buffer has the size returned by the preceding query.
+        let succeeded = unsafe {
+            GetFileSecurityW(
+                path.as_ptr(),
+                DACL_SECURITY_INFORMATION,
+                descriptor.as_mut_ptr().cast(),
+                required_bytes,
+                &mut required_bytes,
+            )
+        };
+        assert_ne!(
+            succeeded,
+            0,
+            "read Windows security descriptor: {}",
+            std::io::Error::last_os_error()
+        );
+
+        // SAFETY: GetFileSecurityW initialized the descriptor in the live aligned buffer.
+        unsafe { windows_descriptor_dacl_sddl(descriptor.as_mut_ptr().cast()) }
+    }
+
+    /// # Safety
+    ///
+    /// `descriptor` must point to a live Windows security descriptor for the duration of the call.
+    #[cfg(windows)]
+    unsafe fn windows_descriptor_dacl_sddl(descriptor: *mut core::ffi::c_void) -> String {
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertSecurityDescriptorToStringSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
+
+        let mut sddl = std::ptr::null_mut();
+        // SAFETY: The caller guarantees a live descriptor and the output pointer is valid.
+        let succeeded = unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                descriptor,
+                SDDL_REVISION_1,
+                DACL_SECURITY_INFORMATION,
+                &mut sddl,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(
+            succeeded,
+            0,
+            "format Windows DACL: {}",
+            std::io::Error::last_os_error()
+        );
+        assert!(!sddl.is_null(), "formatted Windows DACL must not be null");
+        let sddl = OwnedWindowsLocalAllocation(sddl.cast());
+        let wide = sddl.0.cast::<u16>();
+        let mut length = 0_usize;
+        // SAFETY: The conversion API returned a NUL-terminated LocalAlloc string.
+        unsafe {
+            while *wide.add(length) != 0 {
+                length = length.saturating_add(1);
+            }
+        }
+        // SAFETY: The preceding loop found the terminator within the live API-owned string.
+        String::from_utf16(unsafe { std::slice::from_raw_parts(wide, length) })
+            .expect("decode Windows DACL SDDL")
     }
 
     #[test]
