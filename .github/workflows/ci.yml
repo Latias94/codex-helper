@@ -83,7 +83,7 @@ jobs:
         run: node tools/check-credential-surface.mjs
 
       - name: Check generated cargo-dist workflow
-        run: cargo dist generate --mode=ci --check
+        run: dist generate --mode=ci --check
 
       - name: Test native credential smoke safeguards
         run: |
