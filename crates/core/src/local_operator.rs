@@ -906,6 +906,13 @@ mod tests {
     /// Windows may retain `SE_DACL_AUTO_INHERITED` in the descriptor control bits after a
     /// protected DACL is applied. That bit records the ACL's origin; it does not re-enable
     /// inheritance. The protected bit and every ACE remain strict requirements here.
+    ///
+    /// # Safety
+    ///
+    /// `actual` and `expected` must be non-null, correctly aligned pointers to valid Windows
+    /// security descriptors whose backing allocations remain alive for the duration of this
+    /// call. Each descriptor must contain a present, non-null DACL that can be queried by the
+    /// Win32 security descriptor APIs used below.
     #[cfg(windows)]
     unsafe fn assert_windows_private_descriptor(
         actual: *mut core::ffi::c_void,
