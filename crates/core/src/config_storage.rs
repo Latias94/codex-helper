@@ -3125,8 +3125,7 @@ impl PlatformConfigFileMetadata {
     fn apply(&self, path: &Path, file: &File) -> io::Result<()> {
         use windows_sys::Win32::Security::{
             DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
-            PROTECTED_DACL_SECURITY_INFORMATION, SetFileSecurityW,
-            UNPROTECTED_DACL_SECURITY_INFORMATION,
+            SetFileSecurityW,
         };
 
         if self.descriptor_len == 0
@@ -3146,13 +3145,9 @@ impl PlatformConfigFileMetadata {
         if self.group_sid != staged.group_sid {
             requested |= GROUP_SECURITY_INFORMATION;
         }
-        if self.dacl != staged.dacl || self.dacl_protected != staged.dacl_protected {
+        let dacl_protection_changed = self.dacl_protected != staged.dacl_protected;
+        if self.dacl != staged.dacl || dacl_protection_changed {
             requested |= DACL_SECURITY_INFORMATION;
-            requested |= if self.dacl_protected {
-                PROTECTED_DACL_SECURITY_INFORMATION
-            } else {
-                UNPROTECTED_DACL_SECURITY_INFORMATION
-            };
         }
         if requested == 0 {
             return Ok(());
@@ -3168,8 +3163,88 @@ impl PlatformConfigFileMetadata {
         {
             return Err(io::Error::last_os_error());
         }
+        if dacl_protection_changed {
+            apply_windows_dacl_protection(
+                path.as_slice(),
+                &self.descriptor,
+                self.descriptor_len,
+                self.dacl_protected,
+            )?;
+        }
         Ok(())
     }
+}
+
+#[cfg(windows)]
+fn apply_windows_dacl_protection(
+    path: &[u16],
+    descriptor: &[usize],
+    descriptor_len: usize,
+    protected: bool,
+) -> io::Result<()> {
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION,
+        UNPROTECTED_DACL_SECURITY_INFORMATION,
+    };
+
+    let descriptor_capacity = descriptor
+        .len()
+        .saturating_mul(std::mem::size_of::<usize>());
+    if descriptor_len == 0 || descriptor_len > descriptor_capacity {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid Windows security descriptor snapshot",
+        ));
+    }
+
+    let mut dacl_present = 0;
+    let mut dacl_defaulted = 0;
+    let mut dacl = std::ptr::null_mut();
+    // SAFETY: The aligned snapshot contains the captured self-relative descriptor and all output
+    // pointers remain valid for the duration of the call.
+    if unsafe {
+        GetSecurityDescriptorDacl(
+            descriptor.as_ptr().cast_mut().cast(),
+            &mut dacl_present,
+            &mut dacl,
+            &mut dacl_defaulted,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if dacl_present == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cannot apply Windows DACL protection without a captured DACL",
+        ));
+    }
+
+    let protection = if protected {
+        PROTECTED_DACL_SECURITY_INFORMATION
+    } else {
+        UNPROTECTED_DACL_SECURITY_INFORMATION
+    };
+    // SAFETY: The path is NUL-terminated and the DACL points into the live aligned descriptor.
+    let status = unsafe {
+        SetNamedSecurityInfoW(
+            path.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | protection,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            dacl,
+            std::ptr::null_mut(),
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(
+            i32::try_from(status).unwrap_or(i32::MAX),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(windows)]

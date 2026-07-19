@@ -35,34 +35,17 @@ fn write(path: &Path, text: &str) {
 
 #[cfg(windows)]
 fn set_windows_dacl_protection(path: &Path, protected: bool) {
-    use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SetFileSecurityW,
-        UNPROTECTED_DACL_SECURITY_INFORMATION,
-    };
-
     let metadata = std::fs::metadata(path).expect("inspect Windows ACL source");
     let snapshot =
         PlatformConfigFileMetadata::capture(path, &metadata).expect("capture Windows ACL source");
     let path = windows_wide_path(path).expect("encode Windows ACL path");
-    let protection = if protected {
-        PROTECTED_DACL_SECURITY_INFORMATION
-    } else {
-        UNPROTECTED_DACL_SECURITY_INFORMATION
-    };
-    // SAFETY: The path and aligned self-relative descriptor remain live for the API call.
-    let succeeded = unsafe {
-        SetFileSecurityW(
-            path.as_ptr(),
-            DACL_SECURITY_INFORMATION | protection,
-            snapshot.descriptor.as_ptr().cast_mut().cast(),
-        )
-    };
-    assert_ne!(
-        succeeded,
-        0,
-        "set Windows DACL protection: {}",
-        std::io::Error::last_os_error()
-    );
+    apply_windows_dacl_protection(
+        &path,
+        &snapshot.descriptor,
+        snapshot.descriptor_len,
+        protected,
+    )
+    .expect("set Windows DACL protection");
 }
 
 #[cfg(target_os = "linux")]
