@@ -484,13 +484,29 @@ fn destination_parent(path: &Path) -> io::Result<PathBuf> {
 }
 
 fn create_staged_file(parent: &Path) -> io::Result<(File, StagedFileGuard)> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Foundation::GENERIC_WRITE;
+        use windows_sys::Win32::Storage::FileSystem::{
+            DELETE, FILE_FLAG_WRITE_THROUGH, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        options
+            .access_mode(DELETE | GENERIC_WRITE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_WRITE_THROUGH);
+    }
+
     for _ in 0..TEMP_FILE_CREATE_ATTEMPTS {
         let path = parent.join(format!(
             "{TEMP_FILE_PREFIX}{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4()
         ));
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
+        match options.open(&path) {
             Ok(file) => return Ok((file, StagedFileGuard::new(path))),
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(err) => return Err(err),
@@ -582,16 +598,28 @@ fn before_replace_noop(_staged_path: &Path, _destination: &Path) -> io::Result<(
 }
 
 #[cfg(windows)]
-fn replace_existing_file(staged_path: &Path, destination: &Path) -> io::Result<()> {
+fn replace_existing_file(
+    staged_file: &File,
+    staged_path: &Path,
+    destination: &Path,
+) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::{
-        ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION,
+        ERROR_ACCESS_DENIED, ERROR_CALL_NOT_IMPLEMENTED, ERROR_INVALID_FUNCTION,
+        ERROR_INVALID_PARAMETER, ERROR_LOCK_VIOLATION, ERROR_NOT_SUPPORTED,
+        ERROR_SHARING_VIOLATION,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        FILE_INFO_BY_HANDLE_CLASS, FILE_RENAME_INFO, FILE_RENAME_INFO_0, FileRenameInfo,
+        FileRenameInfoEx, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        SetFileInformationByHandle,
     };
 
-    fn wide_path(path: &Path) -> io::Result<Vec<u16>> {
+    const FILE_RENAME_REPLACE_IF_EXISTS: u32 = 0x1;
+    const FILE_RENAME_POSIX_SEMANTICS: u32 = 0x2;
+
+    fn encode_wide_path(path: &Path) -> io::Result<Vec<u16>> {
         let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
         if path[..path.len().saturating_sub(1)].contains(&0) {
             return Err(io::Error::new(
@@ -602,60 +630,193 @@ fn replace_existing_file(staged_path: &Path, destination: &Path) -> io::Result<(
         Ok(path)
     }
 
-    let staged_path_wide = wide_path(staged_path)?;
-    let destination_wide = wide_path(destination)?;
-    let mut backoff = Duration::from_millis(1);
-    for attempt in 0..WINDOWS_REPLACE_ATTEMPTS {
-        // SAFETY: Both buffers are null-terminated and remain alive for the duration of the call.
-        let replaced = unsafe {
-            MoveFileExW(
-                staged_path_wide.as_ptr(),
-                destination_wide.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+    fn canonical_destination_path(path: &Path) -> io::Result<PathBuf> {
+        let file_name = path.file_name().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "destination must include a file name",
             )
-        };
-        if replaced != 0 {
-            return Ok(());
-        }
+        })?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        Ok(fs::canonicalize(parent)?.join(file_name))
+    }
 
-        let move_err = io::Error::last_os_error();
-        let err = if move_err.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) {
-            // Rust's Windows rename uses FileRenameInfoEx with POSIX semantics, allowing open
-            // destination handles to retain the old file while new opens see the replacement.
-            match fs::rename(staged_path, destination) {
-                Ok(()) => return Ok(()),
-                Err(err) => err,
+    fn rename_buffer(path: &Path, anonymous: FILE_RENAME_INFO_0) -> io::Result<(Vec<usize>, u32)> {
+        let path = encode_wide_path(path)?;
+        let file_name_length = path
+            .len()
+            .saturating_sub(1)
+            .checked_mul(size_of::<u16>())
+            .and_then(|length| u32::try_from(length).ok())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path is too long"))?;
+        let buffer_size = std::mem::offset_of!(FILE_RENAME_INFO, FileName)
+            .checked_add(file_name_length as usize)
+            .and_then(|length| length.checked_add(size_of::<u16>()))
+            .and_then(|length| u32::try_from(length).ok())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path is too long"))?;
+        let mut buffer = vec![0usize; (buffer_size as usize).div_ceil(size_of::<usize>())];
+        let rename_info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+
+        // SAFETY: The usize buffer is suitably aligned, is large enough for the variable-length
+        // structure and null-terminated path, and remains alive while the API consumes it.
+        unsafe {
+            (*rename_info).Anonymous = anonymous;
+            (*rename_info).RootDirectory = std::ptr::null_mut();
+            (*rename_info).FileNameLength = file_name_length;
+            path.as_ptr().copy_to_nonoverlapping(
+                std::ptr::addr_of_mut!((*rename_info).FileName).cast::<u16>(),
+                path.len(),
+            );
+        }
+        Ok((buffer, buffer_size))
+    }
+
+    fn replace_with_file_info(
+        staged_file: &File,
+        rename_buffer: &mut [usize],
+        rename_buffer_size: u32,
+        information_class: FILE_INFO_BY_HANDLE_CLASS,
+    ) -> io::Result<()> {
+        let rename_info = rename_buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        let mut backoff = Duration::from_millis(1);
+        for attempt in 0..WINDOWS_REPLACE_ATTEMPTS {
+            // SAFETY: The handle and aligned rename buffer remain valid for the call.
+            let replaced = unsafe {
+                SetFileInformationByHandle(
+                    staged_file.as_raw_handle(),
+                    information_class,
+                    rename_info.cast(),
+                    rename_buffer_size,
+                )
+            };
+            if replaced != 0 {
+                return Ok(());
             }
-        } else {
-            move_err
-        };
-        let retryable = matches!(
-            err.raw_os_error(),
+
+            let error = io::Error::last_os_error();
+            if !retryable_rename_error(&error) || attempt + 1 == WINDOWS_REPLACE_ATTEMPTS {
+                return Err(error);
+            }
+            std::thread::sleep(backoff);
+            backoff = std::cmp::min(backoff.saturating_mul(2), WINDOWS_REPLACE_MAX_BACKOFF);
+        }
+        unreachable!("the bounded replacement loop always returns on its final attempt")
+    }
+
+    fn retryable_rename_error(error: &io::Error) -> bool {
+        matches!(
+            error.raw_os_error(),
             Some(code)
                 if code == ERROR_ACCESS_DENIED as i32
                     || code == ERROR_SHARING_VIOLATION as i32
                     || code == ERROR_LOCK_VIOLATION as i32
-        );
-        if !retryable || attempt + 1 == WINDOWS_REPLACE_ATTEMPTS {
-            return Err(err);
-        }
-
-        std::thread::sleep(backoff);
-        backoff = std::cmp::min(backoff.saturating_mul(2), WINDOWS_REPLACE_MAX_BACKOFF);
+        )
     }
 
-    unreachable!("the bounded replacement loop always returns on its final attempt")
+    fn extended_rename_is_unsupported(error: &io::Error) -> bool {
+        matches!(
+            error.raw_os_error(),
+            Some(code)
+                if code == ERROR_INVALID_FUNCTION as i32
+                    || code == ERROR_NOT_SUPPORTED as i32
+                    || code == ERROR_INVALID_PARAMETER as i32
+                    || code == ERROR_CALL_NOT_IMPLEMENTED as i32
+        )
+    }
+
+    fn replace_with_move_file(staged_path: &Path, destination: &Path) -> io::Result<()> {
+        let staged_file_name = staged_path.file_name().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "staging path must include a file name",
+            )
+        })?;
+        let destination_parent = destination.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "destination must include a parent",
+            )
+        })?;
+        let staged_path = encode_wide_path(&destination_parent.join(staged_file_name))?;
+        let destination = encode_wide_path(destination)?;
+        let mut backoff = Duration::from_millis(1);
+        for attempt in 0..WINDOWS_REPLACE_ATTEMPTS {
+            // SAFETY: Both buffers are null-terminated and remain alive for the call.
+            let replaced = unsafe {
+                MoveFileExW(
+                    staged_path.as_ptr(),
+                    destination.as_ptr(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            };
+            if replaced != 0 {
+                return Ok(());
+            }
+
+            let error = io::Error::last_os_error();
+            if !retryable_rename_error(&error) || attempt + 1 == WINDOWS_REPLACE_ATTEMPTS {
+                return Err(error);
+            }
+            std::thread::sleep(backoff);
+            backoff = std::cmp::min(backoff.saturating_mul(2), WINDOWS_REPLACE_MAX_BACKOFF);
+        }
+        unreachable!("the bounded replacement loop always returns on its final attempt")
+    }
+
+    let destination = canonical_destination_path(destination)?;
+    let (mut extended_buffer, extended_buffer_size) = rename_buffer(
+        &destination,
+        FILE_RENAME_INFO_0 {
+            Flags: FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS,
+        },
+    )?;
+    match replace_with_file_info(
+        staged_file,
+        &mut extended_buffer,
+        extended_buffer_size,
+        FileRenameInfoEx,
+    ) {
+        Ok(()) => return staged_file.sync_all(),
+        Err(error) if extended_rename_is_unsupported(&error) => {}
+        Err(error) => return Err(error),
+    }
+
+    let (mut standard_buffer, standard_buffer_size) = rename_buffer(
+        &destination,
+        FILE_RENAME_INFO_0 {
+            ReplaceIfExists: true,
+        },
+    )?;
+    match replace_with_file_info(
+        staged_file,
+        &mut standard_buffer,
+        standard_buffer_size,
+        FileRenameInfo,
+    ) {
+        Ok(()) => return staged_file.sync_all(),
+        Err(error) if extended_rename_is_unsupported(&error) => {}
+        Err(error) => return Err(error),
+    }
+
+    replace_with_move_file(staged_path, &destination)?;
+    staged_file.sync_all()
 }
 
 #[cfg(not(windows))]
-fn replace_existing_file(staged_path: &Path, destination: &Path) -> io::Result<()> {
+fn replace_existing_file(
+    _staged_file: &File,
+    staged_path: &Path,
+    destination: &Path,
+) -> io::Result<()> {
     fs::rename(staged_path, destination)
 }
 
 #[cfg(windows)]
 fn sync_parent_directory(_parent: &Path) -> io::Result<()> {
-    // The fast path uses MOVEFILE_WRITE_THROUGH. The POSIX fallback has no portable directory
-    // fsync equivalent, but the staged file is synced before either rename path.
+    // The rename handle uses write-through I/O and is synced after the directory entry changes.
     Ok(())
 }
 
@@ -697,7 +858,7 @@ where
     W: FnOnce(&mut File, &[u8]) -> io::Result<()>,
     S: FnOnce(&mut File) -> io::Result<()>,
     B: FnOnce(&Path, &Path) -> io::Result<()>,
-    R: FnOnce(&Path, &Path) -> io::Result<()>,
+    R: FnOnce(&File, &Path, &Path) -> io::Result<()>,
     D: FnOnce(&Path) -> io::Result<()>,
 {
     let AtomicWriteOperations {
@@ -721,8 +882,6 @@ where
         .map_err(|err| AtomicWriteError::before_commit(path, "write staging file", err))?;
     sync_staged(&mut staged_file)
         .map_err(|err| AtomicWriteError::before_commit(path, "sync staging file", err))?;
-    drop(staged_file);
-
     let staged_bytes = fs::read(staged_guard.path())
         .map_err(|err| AtomicWriteError::before_commit(path, "read staging file", err))?;
     if staged_bytes != data {
@@ -740,7 +899,7 @@ where
     before_replace(staged_guard.path(), path)
         .map_err(|err| AtomicWriteError::before_commit(path, "before replace", err))?;
 
-    if let Err(err) = replace(staged_guard.path(), path) {
+    if let Err(err) = replace(&staged_file, staged_guard.path(), path) {
         let staged_file_still_exists = matches!(staged_guard.path().try_exists(), Ok(true));
         return Err(if staged_file_still_exists {
             AtomicWriteError::before_commit(path, "replace destination", err)
@@ -952,12 +1111,20 @@ mod tests {
         Err(io::Error::other("injected pre-replace failure"))
     }
 
-    fn replace_then_report_error(staged_path: &Path, destination: &Path) -> io::Result<()> {
-        replace_existing_file(staged_path, destination)?;
+    fn replace_then_report_error(
+        staged_file: &File,
+        staged_path: &Path,
+        destination: &Path,
+    ) -> io::Result<()> {
+        replace_existing_file(staged_file, staged_path, destination)?;
         Err(io::Error::other("injected post-replace uncertainty"))
     }
 
-    fn fail_replace_without_commit(_staged_path: &Path, _destination: &Path) -> io::Result<()> {
+    fn fail_replace_without_commit(
+        _staged_file: &File,
+        _staged_path: &Path,
+        _destination: &Path,
+    ) -> io::Result<()> {
         Err(io::Error::other("injected replacement failure"))
     }
 
@@ -975,6 +1142,26 @@ mod tests {
 
         assert_eq!(fs::read_to_string(&path).expect("read new file"), "new");
         assert!(managed_temp_files(&directory.0).is_empty());
+    }
+
+    #[test]
+    fn replacement_keeps_existing_reader_on_old_file_and_new_reads_on_new_file() {
+        let directory = TestDir::new();
+        let path = directory.join("state.json");
+        fs::write(&path, "old").expect("write old file");
+        let mut old_reader = File::open(&path).expect("open old destination");
+
+        write_text_file(&path, "new").expect("replace destination while old reader remains open");
+
+        let mut old_contents = String::new();
+        old_reader
+            .read_to_string(&mut old_contents)
+            .expect("read old destination handle");
+        assert_eq!(old_contents, "old");
+        assert_eq!(
+            fs::read_to_string(&path).expect("read replacement by path"),
+            "new"
+        );
     }
 
     #[test]
