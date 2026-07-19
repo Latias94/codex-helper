@@ -312,7 +312,10 @@ fn init_tracing(cli: &Cli) -> Option<WorkerGuard> {
             .init();
         Some(guard)
     } else {
-        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_writer(std::io::stderr)
+            .init();
         None
     }
 }

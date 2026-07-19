@@ -24,7 +24,7 @@ const DAEMON_METADATA_QUERY_POLICY: MacosDaemonQueryPolicy = MacosDaemonQueryPol
 const DAEMON_DATA_QUERY_POLICY: MacosDaemonQueryPolicy = MacosDaemonQueryPolicy {
     load_attributes: false,
     load_data: true,
-    limit_all: true,
+    limit_all: false,
     skip_authentication_ui: true,
 };
 
@@ -252,7 +252,7 @@ mod tests {
             MacosDaemonQueryPolicy {
                 load_attributes: false,
                 load_data: true,
-                limit_all: true,
+                limit_all: false,
                 skip_authentication_ui: true,
             }
         );
