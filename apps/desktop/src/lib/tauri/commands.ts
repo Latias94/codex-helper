@@ -5,7 +5,11 @@ import {
   isEnabled as isAutostartEnabled,
 } from "@tauri-apps/plugin-autostart";
 
-import type { DesktopActionResult, DesktopControlState } from "@/lib/api/types";
+import type {
+  DesktopActionResult,
+  DesktopControlState,
+  SwitchCodexPayload,
+} from "@/lib/api/types";
 import type { ApiOperatorReadModel, ApiRequestChainExport } from "@/lib/api/admin-types";
 
 export type AppMetadata = {
@@ -127,9 +131,6 @@ export async function startDesktopProxy() {
   return invoke<DesktopActionResult>("start_desktop_proxy");
 }
 
-export async function switchCodex(payload: {
-  enabled: boolean;
-  confirmation: string;
-}) {
+export async function switchCodex(payload: SwitchCodexPayload) {
   return invoke<DesktopActionResult>("switch_codex", { payload });
 }

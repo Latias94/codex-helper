@@ -668,7 +668,7 @@ fn windows_private_sddl(user_sid: &str, directory: bool) -> String {
 }
 
 #[cfg(windows)]
-fn secure_private_windows_path(path: &Path, directory: bool) -> Result<()> {
+pub(crate) fn secure_private_windows_path(path: &Path, directory: bool) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::ERROR_SUCCESS;
     use windows_sys::Win32::Security::Authorization::{

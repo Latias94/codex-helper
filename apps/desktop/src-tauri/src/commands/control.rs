@@ -5,6 +5,10 @@ use std::time::{Duration, Instant};
 use codex_helper_core::codex_switch::{
     self, CodexSwitchIntent, CodexSwitchPhase, CodexSwitchStatus, ValidatedCodexBaseUrl,
 };
+use codex_helper_core::config::{
+    CodexClientPatchConfig, CodexClientPatchOverrides, CodexClientPreset, CodexCompactionStrategy,
+    CodexHostedImageGenerationMode, load_config,
+};
 #[cfg(test)]
 use codex_helper_core::runtime_manager::RuntimeOwnerKind;
 use codex_helper_core::runtime_manager::{
@@ -58,8 +62,31 @@ pub struct CodexSwitchSnapshot {
     pub enabled: bool,
     pub managed: bool,
     pub base_url: Option<String>,
+    pub client_patch: Option<DesktopCodexClientPatch>,
     pub recovery_reason: Option<String>,
     pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopCodexClientPatch {
+    pub preset: CodexClientPreset,
+    pub responses_websocket: bool,
+    pub compaction: CodexCompactionStrategy,
+    pub translate_models: bool,
+    pub hosted_image_generation: CodexHostedImageGenerationMode,
+}
+
+impl From<CodexClientPatchConfig> for DesktopCodexClientPatch {
+    fn from(value: CodexClientPatchConfig) -> Self {
+        Self {
+            preset: value.preset,
+            responses_websocket: value.responses_websocket,
+            compaction: value.compaction,
+            translate_models: value.translate_models,
+            hosted_image_generation: value.hosted_image_generation,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -76,6 +103,16 @@ pub struct DesktopActionResult {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SwitchCodexPayload {
     pub enabled: bool,
+    #[serde(default)]
+    pub preset: Option<CodexClientPreset>,
+    #[serde(default)]
+    pub responses_websocket: Option<bool>,
+    #[serde(default)]
+    pub compaction: Option<CodexCompactionStrategy>,
+    #[serde(default)]
+    pub translate_models: Option<bool>,
+    #[serde(default)]
+    pub hosted_image_generation: Option<CodexHostedImageGenerationMode>,
     pub confirmation: String,
 }
 
@@ -172,15 +209,44 @@ pub async fn switch_codex(
         require_confirmation(payload.confirmation.as_str(), CODEX_SWITCH_OFF_CONFIRMATION)?;
         ("switch-codex-off", CodexSwitchIntent::Off)
     };
-    let outcome =
-        codex_switch::apply(intent).map_err(|err| DesktopError::Switch(err.to_string()))?;
+    let outcome = if payload.enabled {
+        let configured = load_config()
+            .await
+            .map_err(|err| DesktopError::Switch(err.to_string()))?
+            .codex
+            .client_patch
+            .unwrap_or_default();
+        let client_patch = resolve_desktop_client_patch(configured, &payload);
+        codex_switch::apply_with_client_patch(intent, client_patch)
+            .map_err(|err| DesktopError::Switch(err.to_string()))?
+    } else {
+        codex_switch::apply(intent).map_err(|err| DesktopError::Switch(err.to_string()))?
+    };
     let message = format!(
-        "Codex 本地 switch：{}（phase: {}）。",
+        "Codex 本地 switch：{}（phase: {}，preset: {}）。",
         outcome.change.as_str(),
-        outcome.status.phase.as_str()
+        outcome.status.phase.as_str(),
+        outcome
+            .status
+            .client_patch
+            .map(|patch| patch.preset.as_str())
+            .unwrap_or("-")
     );
     let state = load_control_state().await?;
     Ok(result_with_state(action, message, state))
+}
+
+fn resolve_desktop_client_patch(
+    configured: CodexClientPatchConfig,
+    payload: &SwitchCodexPayload,
+) -> CodexClientPatchConfig {
+    configured.with_overrides(CodexClientPatchOverrides {
+        preset: payload.preset,
+        responses_websocket: payload.responses_websocket,
+        compaction: payload.compaction,
+        translate_models: payload.translate_models,
+        hosted_image_generation: payload.hosted_image_generation,
+    })
 }
 
 async fn load_control_state() -> Result<DesktopControlState, CommandError> {
@@ -229,6 +295,7 @@ fn codex_switch_snapshot() -> CodexSwitchSnapshot {
             enabled: false,
             managed: false,
             base_url: None,
+            client_patch: None,
             recovery_reason: None,
             error_message: Some(err.to_string()),
         },
@@ -242,6 +309,7 @@ impl CodexSwitchSnapshot {
             enabled: status.enabled,
             managed: status.managed,
             base_url: status.base_url,
+            client_patch: status.client_patch.map(Into::into),
             recovery_reason: status.recovery_reason,
             error_message: None,
         }
@@ -419,18 +487,45 @@ mod tests {
     }
 
     #[test]
-    fn switch_payload_rejects_removed_preset_fields() {
+    fn switch_payload_accepts_the_complete_client_patch_surface() {
         let payload = serde_json::json!({
             "enabled": true,
-            "preset": "chatgpt-bridge",
+            "preset": "official-imagegen",
+            "responsesWebsocket": true,
+            "compaction": "remote-v2",
+            "translateModels": true,
+            "hostedImageGeneration": "disabled",
             "confirmation": CODEX_SWITCH_ON_CONFIRMATION,
         });
 
-        assert!(serde_json::from_value::<SwitchCodexPayload>(payload).is_err());
+        let parsed = serde_json::from_value::<SwitchCodexPayload>(payload)
+            .expect("parse complete client patch payload");
+        assert_eq!(
+            parsed.preset,
+            Some(codex_helper_core::config::CodexClientPreset::OfficialImagegen)
+        );
+        assert_eq!(parsed.responses_websocket, Some(true));
+        assert_eq!(
+            parsed.compaction,
+            Some(codex_helper_core::config::CodexCompactionStrategy::RemoteV2)
+        );
+        assert_eq!(parsed.translate_models, Some(true));
+        assert_eq!(
+            parsed.hosted_image_generation,
+            Some(codex_helper_core::config::CodexHostedImageGenerationMode::Disabled)
+        );
+
+        let unknown = serde_json::json!({
+            "enabled": true,
+            "preset": "default",
+            "unknownPatchField": true,
+            "confirmation": CODEX_SWITCH_ON_CONFIRMATION,
+        });
+        assert!(serde_json::from_value::<SwitchCodexPayload>(unknown).is_err());
     }
 
     #[test]
-    fn switch_snapshot_serializes_recovery_phase_and_reason_without_presets() {
+    fn switch_snapshot_serializes_recovery_phase_and_complete_client_patch() {
         let snapshot =
             CodexSwitchSnapshot::from_status(codex_helper_core::codex_switch::CodexSwitchStatus {
                 phase: codex_helper_core::codex_switch::CodexSwitchPhase::RecoveryRequired,
@@ -438,6 +533,14 @@ mod tests {
                 managed: true,
                 base_url: Some("http://127.0.0.1:3211/v1".to_string()),
                 client_facade: Some(codex_helper_core::codex_switch::CodexClientFacade::Compatible),
+                client_patch: Some(codex_helper_core::config::CodexClientPatchConfig {
+                    preset: codex_helper_core::config::CodexClientPreset::OfficialImagegen,
+                    responses_websocket: true,
+                    compaction: codex_helper_core::config::CodexCompactionStrategy::RemoteV2,
+                    translate_models: true,
+                    hosted_image_generation:
+                        codex_helper_core::config::CodexHostedImageGenerationMode::Disabled,
+                }),
                 recovery_reason: Some("Codex config changed after switch on".to_string()),
                 config_path: "/tmp/codex/config.toml".into(),
                 state_path: "/tmp/helper/state/codex-switch.json".into(),
@@ -450,9 +553,49 @@ mod tests {
             value["recoveryReason"],
             "Codex config changed after switch on"
         );
-        assert!(value.get("preset").is_none());
-        assert!(value.get("requiresOpenaiAuth").is_none());
-        assert!(value.get("supportsWebsockets").is_none());
+        assert_eq!(value["clientPatch"]["preset"], "official-imagegen");
+        assert_eq!(value["clientPatch"]["responsesWebsocket"], true);
+        assert_eq!(value["clientPatch"]["compaction"], "remote-v2");
+        assert_eq!(value["clientPatch"]["translateModels"], true);
+        assert_eq!(value["clientPatch"]["hostedImageGeneration"], "disabled");
+    }
+
+    #[test]
+    fn desktop_patch_overrides_preserve_unspecified_config_fields() {
+        let configured = codex_helper_core::config::CodexClientPatchConfig {
+            preset: codex_helper_core::config::CodexClientPreset::OfficialImagegen,
+            responses_websocket: true,
+            compaction: codex_helper_core::config::CodexCompactionStrategy::RemoteV2,
+            translate_models: true,
+            hosted_image_generation:
+                codex_helper_core::config::CodexHostedImageGenerationMode::Disabled,
+        };
+        let payload = SwitchCodexPayload {
+            enabled: true,
+            preset: Some(codex_helper_core::config::CodexClientPreset::Default),
+            responses_websocket: None,
+            compaction: None,
+            translate_models: None,
+            hosted_image_generation: None,
+            confirmation: CODEX_SWITCH_ON_CONFIRMATION.to_string(),
+        };
+
+        let resolved = resolve_desktop_client_patch(configured, &payload);
+
+        assert_eq!(
+            resolved.preset,
+            codex_helper_core::config::CodexClientPreset::Default
+        );
+        assert!(!resolved.responses_websocket);
+        assert_eq!(
+            resolved.compaction,
+            codex_helper_core::config::CodexCompactionStrategy::Auto
+        );
+        assert!(resolved.translate_models);
+        assert_eq!(
+            resolved.hosted_image_generation,
+            codex_helper_core::config::CodexHostedImageGenerationMode::Disabled
+        );
     }
 
     #[test]

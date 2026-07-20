@@ -41,6 +41,7 @@ pub(crate) async fn handle_proxy(
         request_body_len: prepared.request_body_len,
         body_for_upstream: &prepared.body_for_upstream,
         request_dialect: prepared.request_dialect,
+        translate_openai_models: prepared.translate_openai_models,
         request_model: prepared.request_model.as_deref(),
         session_binding: prepared.session_binding.as_ref(),
         effective_effort: prepared.effective_effort.as_deref(),

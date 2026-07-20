@@ -2,6 +2,7 @@ mod auth_resolution;
 pub mod balance;
 pub mod basellm_catalog;
 mod client_config;
+mod codex_auth_facade;
 pub mod codex_capability_profile;
 pub mod codex_integration;
 pub mod codex_switch;

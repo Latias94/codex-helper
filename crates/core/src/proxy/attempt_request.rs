@@ -389,6 +389,10 @@ mod tests {
             HeaderValue::from_static("Bearer client-token"),
         );
         client_headers.insert("x-api-key", HeaderValue::from_static("client-key"));
+        client_headers.insert(
+            crate::config::CODEX_CLIENT_RUNTIME_PATCH_HEADER,
+            HeaderValue::from_static("v1;models=1;hosted=disabled"),
+        );
         client_headers.insert("content-type", HeaderValue::from_static("application/json"));
 
         let cache = OnceLock::new();
@@ -429,6 +433,11 @@ mod tests {
         assert_eq!(
             setup.headers.get("accept-encoding"),
             Some(&HeaderValue::from_static("identity"))
+        );
+        assert!(
+            !setup
+                .headers
+                .contains_key(crate::config::CODEX_CLIENT_RUNTIME_PATCH_HEADER)
         );
         assert_ne!(setup.account_fingerprint, AccountFingerprint::unscoped());
         assert!(setup.debug_base.is_none());

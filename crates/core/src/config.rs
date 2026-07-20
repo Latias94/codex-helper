@@ -15,8 +15,13 @@ pub use crate::client_config::{
 };
 pub use crate::fleet::registry::{FleetNodeConfig, FleetRegistryConfig};
 
+#[path = "codex_client_patch.rs"]
+mod codex_client_patch_impl;
+
 #[path = "config_storage.rs"]
 mod storage_impl;
+#[cfg(windows)]
+pub(crate) use storage_impl::ConfigFileMetadata;
 
 #[path = "config_legacy_json.rs"]
 mod legacy_json_impl;
@@ -30,6 +35,14 @@ mod profiles_impl;
 #[path = "helper_config.rs"]
 mod helper_config_impl;
 
+pub(crate) use codex_client_patch_impl::{
+    CODEX_CLIENT_RUNTIME_PATCH_HEADER, CodexClientRuntimePatch,
+};
+pub use codex_client_patch_impl::{
+    CodexAuthFacadeStrategy, CodexClientPatchConfig, CodexClientPatchOverrides, CodexClientPreset,
+    CodexCompactionStrategy, CodexFeatureBoolPatch, CodexHostedImageGenerationMode,
+    CodexProviderIdentity, CodexTomlBoolPatch, CompiledCodexClientPatch,
+};
 pub use helper_config_impl::{effective_routing, resolved_provider_order, validate_helper_config};
 pub(crate) use profiles_impl::validate_service_profile_catalog;
 pub use profiles_impl::{ServiceControlProfile, resolve_service_profile_from_catalog};
@@ -634,6 +647,8 @@ impl HelperConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ServiceRouteConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_patch: Option<CodexClientPatchConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_profile: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]

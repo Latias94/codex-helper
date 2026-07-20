@@ -26,6 +26,7 @@ use super::attempt_transport::{
 };
 use super::concurrency_limits::ConcurrencyPermit;
 use super::headers::filter_response_headers;
+use super::models_compat::ModelsTranslationScope;
 use super::reasoning_guard::should_strict_buffer_reasoning_guard;
 use super::request_body::{
     ReasoningOrchestrationIntent, RequestDialect, is_stale_previous_response_error,
@@ -83,6 +84,7 @@ pub(super) struct ExecuteSelectedUpstreamParams<'a> {
     pub(super) request_body_len: usize,
     pub(super) body_for_upstream: &'a Bytes,
     pub(super) request_dialect: RequestDialect,
+    pub(super) translate_openai_models: bool,
     pub(super) request_model: Option<&'a str>,
     pub(super) session_binding: Option<&'a SessionBinding>,
     pub(super) effective_effort: Option<&'a str>,
@@ -132,6 +134,7 @@ pub(super) async fn execute_selected_upstream(
         request_body_len,
         body_for_upstream,
         request_dialect,
+        translate_openai_models,
         request_model,
         session_binding,
         effective_effort,
@@ -624,6 +627,10 @@ pub(super) async fn execute_selected_upstream(
                 response_headers: resp_headers,
                 response_headers_filtered: resp_headers_filtered,
                 response_body: bytes,
+                models_translation: ModelsTranslationScope::for_request(
+                    translate_openai_models,
+                    attempt_context.provider_epoch(),
+                ),
                 attempt_handle,
                 request_id,
                 duration_ms: dur,

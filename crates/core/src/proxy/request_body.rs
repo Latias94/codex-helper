@@ -36,6 +36,10 @@ impl RequestDialect {
     pub(super) fn supports_reasoning_effort(self) -> bool {
         self.uses_responses_reasoning() || self == Self::ChatCompletions
     }
+
+    pub(super) fn supports_hosted_image_generation_tools(self) -> bool {
+        self.uses_responses_reasoning()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,6 +298,49 @@ pub(super) fn normalize_codex_compact_request_value(value: &mut serde_json::Valu
     }
 }
 
+pub(super) fn remove_hosted_image_generation_tools_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            if let Some(tools) = object
+                .get_mut("tools")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                tools.retain(|tool| !tool_is_hosted_image_generation(tool));
+            }
+
+            if object
+                .get("tool_choice")
+                .is_some_and(tool_choice_forces_hosted_image_generation)
+            {
+                object.insert(
+                    "tool_choice".to_string(),
+                    serde_json::Value::String("auto".to_string()),
+                );
+            }
+
+            for nested in object.values_mut() {
+                remove_hosted_image_generation_tools_value(nested);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                remove_hosted_image_generation_tools_value(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn tool_is_hosted_image_generation(tool: &serde_json::Value) -> bool {
+    tool.get("type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|tool_type| tool_type == "image_generation")
+}
+
+fn tool_choice_forces_hosted_image_generation(tool_choice: &serde_json::Value) -> bool {
+    tool_is_hosted_image_generation(tool_choice)
+}
+
 pub(super) fn codex_compact_request_requires_affinity(body: &[u8]) -> bool {
     let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
         return false;
@@ -546,8 +593,8 @@ mod tests {
         extract_model_from_response_body, extract_model_from_value,
         extract_reasoning_effort_from_value, extract_service_tier_from_response_body,
         extract_service_tier_from_value, is_stale_previous_response_error,
-        normalize_codex_compact_request_value, remove_previous_response_id_from_body,
-        scan_response_metadata_from_sse_bytes_incremental,
+        normalize_codex_compact_request_value, remove_hosted_image_generation_tools_value,
+        remove_previous_response_id_from_body, scan_response_metadata_from_sse_bytes_incremental,
         scan_service_tier_from_sse_bytes_incremental,
     };
     use crate::provider_catalog::{
@@ -608,6 +655,42 @@ mod tests {
         assert_eq!(
             extract_service_tier_from_value(&value).as_deref(),
             Some("flex")
+        );
+    }
+
+    #[test]
+    fn removes_hosted_image_generation_tools_without_dropping_other_fields() {
+        let mut value = serde_json::json!({
+            "model": "gpt-5",
+            "input": [{
+                "type": "additional_tools",
+                "tools": [
+                    {"type": "image_generation", "output_format": "png"},
+                    {"type": "function", "name": "nested", "future": true}
+                ]
+            }],
+            "tools": [
+                {"type": "image_generation", "output_format": "png"},
+                {"type": "function", "name": "shell", "future": {"enabled": true}}
+            ],
+            "tool_choice": {"type": "image_generation"},
+            "future_request_field": {"preserve": true}
+        });
+
+        remove_hosted_image_generation_tools_value(&mut value);
+
+        assert_eq!(value["tools"].as_array().map(Vec::len), Some(1));
+        assert_eq!(value["tools"][0]["type"].as_str(), Some("function"));
+        assert_eq!(value["tools"][0]["future"]["enabled"].as_bool(), Some(true));
+        assert_eq!(value["input"][0]["tools"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            value["input"][0]["tools"][0]["name"].as_str(),
+            Some("nested")
+        );
+        assert_eq!(value["tool_choice"].as_str(), Some("auto"));
+        assert_eq!(
+            value["future_request_field"]["preserve"].as_bool(),
+            Some(true)
         );
     }
 

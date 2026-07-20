@@ -1,7 +1,7 @@
 import { useState } from "react";
 
 import { save } from "@tauri-apps/plugin-dialog";
-import { Copy, FolderOpen, RefreshCw } from "lucide-react";
+import { Check, Copy, FolderOpen, RefreshCw } from "lucide-react";
 
 import { PageHeader } from "@/app/AppShell";
 import { DataStateBanner } from "@/components/page/DataStateBanner";
@@ -27,7 +27,13 @@ import {
 import { ActionStatusBanner } from "@/features/runtime/ActionStatusBanner";
 import { useRuntimeSummary } from "@/features/runtime/hooks";
 import { useKnownPaths, useLaunchAtLogin } from "@/features/settings/hooks";
-import type { CodexSwitchPhase } from "@/lib/api/types";
+import type {
+  CodexClientPatchSnapshot,
+  CodexClientPreset,
+  CodexCompactionStrategy,
+  CodexHostedImageGenerationMode,
+  CodexSwitchPhase,
+} from "@/lib/api/types";
 import {
   exportConfig,
   hideMainWindow,
@@ -38,6 +44,20 @@ import {
 
 const updatePolicy =
   "自动更新暂未启用：Tauri updater 需要签名私钥、固定公钥、HTTPS 发布端点和回滚策略；当前版本请从 GitHub Releases 手动安装。";
+
+type CodexPresetSelection = "config" | CodexClientPreset;
+
+type CodexPatchDraft = Omit<CodexClientPatchSnapshot, "preset"> & {
+  preset: CodexPresetSelection;
+};
+
+const defaultCodexPatchDraft: CodexPatchDraft = {
+  preset: "config",
+  responsesWebsocket: false,
+  compaction: "auto",
+  translateModels: false,
+  hostedImageGeneration: "auto",
+};
 
 export function SettingsPage() {
   const knownPaths = useKnownPaths();
@@ -50,6 +70,7 @@ export function SettingsPage() {
     message: "",
   });
   const [desktopBusy, setDesktopBusy] = useState(false);
+  const [codexPatchDraft, setCodexPatchDraft] = useState<CodexPatchDraft>(defaultCodexPatchDraft);
   const paths = knownPaths.data;
   const codexSwitch = control.data?.codexSwitch;
   const codexSwitchRecovery = codexSwitch?.phase === "recovery_required";
@@ -59,6 +80,57 @@ export function SettingsPage() {
     && !codexSwitchRecovery
     && !codexSwitch?.errorMessage
     && (codexSwitch?.enabled ? control.data?.canSwitchOff : control.data?.canSwitchOn);
+  const canApplyCodexPreset = Boolean(control.data?.canSwitchOn)
+    && runtime.state.canUseLiveActions
+    && !codexSwitchRecovery
+    && !codexSwitch?.errorMessage
+    && !codexSwitchBusy;
+  const usesConfiguredCodexPatch = codexPatchDraft.preset === "config";
+  const usesOfficialCodexIdentity = codexPatchDraft.preset === "official-relay"
+    || codexPatchDraft.preset === "official-imagegen";
+  const canEnableResponsesWebsocket = !usesConfiguredCodexPatch
+    && usesOfficialCodexIdentity
+    && codexPatchDraft.compaction !== "local";
+  const applyCodexPreset = () => {
+    if (codexPatchDraft.preset === "config") {
+      actions.switchOn.mutate({
+        confirmation: CONTROL_CONFIRMATIONS.switchCodexOn,
+      });
+      return;
+    }
+
+    actions.switchOn.mutate({
+      confirmation: CONTROL_CONFIRMATIONS.switchCodexOn,
+      preset: codexPatchDraft.preset,
+      responsesWebsocket: codexPatchDraft.responsesWebsocket,
+      compaction: codexPatchDraft.compaction,
+      translateModels: codexPatchDraft.translateModels,
+      hostedImageGeneration: codexPatchDraft.hostedImageGeneration,
+    });
+  };
+  const selectCodexPreset = (preset: CodexPresetSelection) => {
+    setCodexPatchDraft((current) => {
+      const official = preset === "official-relay" || preset === "official-imagegen";
+      const compaction = !official && current.compaction.startsWith("remote-")
+        ? "auto"
+        : current.compaction;
+      return {
+        ...current,
+        preset,
+        compaction,
+        responsesWebsocket: official && compaction !== "local"
+          ? current.responsesWebsocket
+          : false,
+      };
+    });
+  };
+  const selectCodexCompaction = (compaction: CodexCompactionStrategy) => {
+    setCodexPatchDraft((current) => ({
+      ...current,
+      compaction,
+      responsesWebsocket: compaction === "local" ? false : current.responsesWebsocket,
+    }));
+  };
   const runPathAction = (kind: KnownPathKind) => {
     void runDesktopAction(async () => {
       await openKnownPath({ kind });
@@ -204,12 +276,101 @@ export function SettingsPage() {
             disabled={!canToggleCodexSwitch || codexSwitchBusy}
             onCheckedChange={(enabled) => {
               if (enabled) {
-                actions.switchOn.mutate(CONTROL_CONFIRMATIONS.switchCodexOn);
+                applyCodexPreset();
               } else {
                 actions.switchOff.mutate(CONTROL_CONFIRMATIONS.switchCodexOff);
               }
             }}
           />
+          <FieldRow label="Client preset">
+            <div className="flex flex-wrap items-center justify-end gap-2">
+              <SelectBox
+                aria-label="Client preset"
+                value={codexPatchDraft.preset}
+                disabled={!canApplyCodexPreset}
+                onChange={(event) => selectCodexPreset(event.currentTarget.value as CodexPresetSelection)}
+                className="w-52"
+              >
+                <option value="config">config.toml</option>
+                <option value="default">default</option>
+                <option value="chatgpt-bridge">chatgpt-bridge</option>
+                <option value="imagegen-bridge">imagegen-bridge</option>
+                <option value="official-relay">official-relay</option>
+                <option value="official-imagegen">official-imagegen</option>
+              </SelectBox>
+              <Button
+                variant="outline"
+                disabled={!canApplyCodexPreset}
+                onClick={applyCodexPreset}
+              >
+                <Check className="h-4 w-4" />
+                应用 client patch
+              </Button>
+            </div>
+          </FieldRow>
+          <FieldRow label="Compaction">
+            <SelectBox
+              aria-label="Compaction"
+              value={codexPatchDraft.compaction}
+              disabled={!canApplyCodexPreset || usesConfiguredCodexPatch}
+              onChange={(event) => selectCodexCompaction(event.currentTarget.value as CodexCompactionStrategy)}
+              className="w-52"
+            >
+              <option value="auto">auto</option>
+              <option value="local">local</option>
+              <option value="remote-v1" disabled={!usesOfficialCodexIdentity}>remote-v1</option>
+              <option value="remote-v2" disabled={!usesOfficialCodexIdentity}>remote-v2</option>
+            </SelectBox>
+          </FieldRow>
+          <ToggleRow
+            label="Responses WebSocket"
+            checked={codexPatchDraft.responsesWebsocket}
+            disabled={!canApplyCodexPreset || !canEnableResponsesWebsocket}
+            onCheckedChange={(responsesWebsocket) => {
+              setCodexPatchDraft((current) => ({ ...current, responsesWebsocket }));
+            }}
+          />
+          <ToggleRow
+            label="Translate /models"
+            checked={codexPatchDraft.translateModels}
+            disabled={!canApplyCodexPreset || usesConfiguredCodexPatch}
+            onCheckedChange={(translateModels) => {
+              setCodexPatchDraft((current) => ({ ...current, translateModels }));
+            }}
+          />
+          <FieldRow label="Hosted image generation">
+            <SelectBox
+              aria-label="Hosted image generation"
+              value={codexPatchDraft.hostedImageGeneration}
+              disabled={!canApplyCodexPreset || usesConfiguredCodexPatch}
+              onChange={(event) => {
+                const hostedImageGeneration = event.currentTarget.value as CodexHostedImageGenerationMode;
+                setCodexPatchDraft((current) => ({ ...current, hostedImageGeneration }));
+              }}
+              className="w-52"
+            >
+              <option value="auto">auto</option>
+              <option value="enabled">enabled</option>
+              <option value="disabled">disabled</option>
+            </SelectBox>
+          </FieldRow>
+          {codexSwitch?.clientPatch ? (
+            <FieldRow label="Active patch">
+              <div className="flex max-w-xl flex-wrap justify-end gap-2">
+                <Badge variant="teal">{codexSwitch.clientPatch.preset}</Badge>
+                <Badge variant="blue">{codexSwitch.clientPatch.compaction}</Badge>
+                <Badge variant={codexSwitch.clientPatch.responsesWebsocket ? "teal" : "muted"}>
+                  ws {codexSwitch.clientPatch.responsesWebsocket ? "on" : "off"}
+                </Badge>
+                <Badge variant={codexSwitch.clientPatch.translateModels ? "teal" : "muted"}>
+                  models {codexSwitch.clientPatch.translateModels ? "translated" : "passthrough"}
+                </Badge>
+                <Badge variant={codexSwitch.clientPatch.hostedImageGeneration === "disabled" ? "warning" : "muted"}>
+                  hosted {codexSwitch.clientPatch.hostedImageGeneration}
+                </Badge>
+              </div>
+            </FieldRow>
+          ) : null}
           <FieldRow label="Switch 阶段">
             <div className="flex items-center gap-2">
               <Badge variant={codexSwitchPhaseVariant(codexSwitch?.phase)}>

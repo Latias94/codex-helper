@@ -249,8 +249,20 @@ pub async fn run_doctor(
         }
     }
 
-    // 2) Helper-owned explicit Codex switch state. This path never reads auth.json.
+    // 2) Helper-owned explicit Codex switch state and retained auth recovery health.
     match inspect_codex_switch() {
+        Ok(status) if status.phase == CodexSwitchPhase::Off && status.managed => {
+            checks.push(DoctorCheck {
+                id: "codex.switch_state",
+                status: DoctorStatus::Info,
+                message: pick(
+                    lang,
+                    "Codex 本地 switch 已关闭；codex-helper 仍保留认证恢复点，用于修复旧 Codex 进程延迟写回的 facade。",
+                    "The local Codex switch is off; codex-helper retains an auth recovery point for repairing a delayed facade write from an older Codex process.",
+                )
+                .to_string(),
+            });
+        }
         Ok(status) if status.phase == CodexSwitchPhase::Off => checks.push(DoctorCheck {
             id: "codex.switch_state",
             status: DoctorStatus::Info,
@@ -544,8 +556,10 @@ fn escape_doctor_reference(reference: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codex_switch::{CodexSwitchIntent, ValidatedCodexBaseUrl};
     use crate::config::{
-        CredentialRef, HelperConfig, ProviderConfig, RouteGraphConfig, UpstreamAuth,
+        CodexClientPatchConfig, CodexClientPreset, CredentialRef, HelperConfig, ProviderConfig,
+        RouteGraphConfig, UpstreamAuth,
     };
     use crate::credentials::SecretValue;
     use crate::runtime_store::RuntimeStore;
@@ -635,6 +649,71 @@ mod tests {
                 && check.id != "bootstrap.codex"
                 && !check.message.contains("import-from-codex")
         }));
+    }
+
+    #[test]
+    fn doctor_reports_a_retained_auth_recovery_point_while_switch_is_off() {
+        let _lock = env_lock();
+        let home = std::env::temp_dir().join(format!(
+            "codex-helper-doctor-retained-switch-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let helper_home = home.join(".codex-helper");
+        let codex_home = home.join(".codex");
+        std::fs::create_dir_all(&helper_home).expect("create helper home");
+        std::fs::create_dir_all(&codex_home).expect("create Codex home");
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "model_provider = \"openai\"\n",
+        )
+        .expect("write Codex config");
+        std::fs::write(
+            codex_home.join("auth.json"),
+            r#"{"auth_mode":"apikey","OPENAI_API_KEY":"doctor-secret"}"#,
+        )
+        .expect("write Codex auth");
+
+        let mut env = ScopedEnv::new();
+        unsafe {
+            env.set("HOME", &home);
+            env.set("USERPROFILE", &home);
+            env.set("CODEX_HELPER_HOME", &helper_home);
+            env.set("CODEX_HOME", &codex_home);
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        let report = runtime.block_on(async {
+            crate::config::init_config_toml(true)
+                .await
+                .expect("write canonical config");
+            crate::codex_switch::apply_with_client_patch(
+                CodexSwitchIntent::On {
+                    validated_base_url: ValidatedCodexBaseUrl::local(3211),
+                },
+                CodexClientPatchConfig {
+                    preset: CodexClientPreset::ImagegenBridge,
+                    ..CodexClientPatchConfig::default()
+                },
+            )
+            .expect("apply auth facade");
+            crate::codex_switch::apply(CodexSwitchIntent::Off).expect("switch off");
+            run_doctor(DoctorLang::En, CredentialSourceCapabilities::server()).await
+        });
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.id == "codex.switch_state")
+            .expect("switch-state doctor check");
+        assert_eq!(check.status, DoctorStatus::Info);
+        assert!(check.message.contains("retains an auth recovery point"));
+        assert!(
+            !check
+                .message
+                .contains("No explicit codex-helper switch state")
+        );
     }
 
     #[test]

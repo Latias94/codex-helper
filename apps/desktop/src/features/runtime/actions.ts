@@ -2,7 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useState } from "react";
 
 import { queryKeys } from "@/lib/api/query-keys";
-import type { DesktopActionResult } from "@/lib/api/types";
+import type { DesktopActionResult, SwitchCodexPayload } from "@/lib/api/types";
 import {
   attachExistingProxy,
   getDesktopControlState,
@@ -19,6 +19,8 @@ export type RuntimeActionStatus = {
   kind: "idle" | "success" | "error";
   message: string;
 };
+
+export type CodexSwitchOnInput = Omit<SwitchCodexPayload, "enabled">;
 
 export function useDesktopControlState() {
   return useQuery({
@@ -57,12 +59,7 @@ export function useRuntimeActions() {
   const startProxy = useMutation(mutationOptions<void>(() => startDesktopProxy()));
   const attachProxy = useMutation(mutationOptions<void>(() => attachExistingProxy()));
   const switchOn = useMutation(
-    mutationOptions<string>((confirmation) =>
-      switchCodex({
-        enabled: true,
-        confirmation,
-      }),
-    ),
+    mutationOptions<CodexSwitchOnInput>((input) => switchCodex({ enabled: true, ...input })),
   );
   const switchOff = useMutation(
     mutationOptions<string>((confirmation) => switchCodex({ enabled: false, confirmation })),

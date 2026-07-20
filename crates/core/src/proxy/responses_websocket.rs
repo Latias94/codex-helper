@@ -59,8 +59,8 @@ use super::request_failures::{
 };
 use super::request_observer::{RequestObserver, RequestPublication};
 use super::request_preparation::{
-    CommonRequestPreparationError, CommonRequestPreparationParams, load_request_config_context,
-    prepare_common_request,
+    CommonRequestPreparationError, CommonRequestPreparationParams, RequestOrigin,
+    load_request_config_context, prepare_common_request,
 };
 use super::retry::{RetryPlan, retry_info_for_failed_attempts, retry_info_for_observed_attempts};
 use super::route_affinity::{
@@ -429,6 +429,7 @@ async fn prepare_responses_websocket(
         client_headers: &client_headers,
         raw_body: &raw_body,
         request_dialect: RequestDialect::ResponsesWebSocket,
+        request_origin: RequestOrigin::Client,
         client_name,
         client_addr,
         started_at_ms,
@@ -2546,6 +2547,10 @@ mod tests {
             crate::codex_switch::CODEX_CLIENT_FACADE_ACTOR_HEADER,
             HeaderValue::from_static(crate::codex_switch::CODEX_CLIENT_FACADE_ACTOR_VALUE),
         );
+        client_headers.insert(
+            crate::config::CODEX_CLIENT_RUNTIME_PATCH_HEADER,
+            HeaderValue::from_static("v1;models=1;hosted=disabled"),
+        );
         let target = ws_target(
             "https://api.openai.com/v1",
             crate::config::UpstreamAuth::default(),
@@ -2559,6 +2564,7 @@ mod tests {
         .expect("build facade WebSocket handshake headers");
 
         assert!(!headers.contains_key(crate::codex_switch::CODEX_CLIENT_FACADE_ACTOR_HEADER));
+        assert!(!headers.contains_key(crate::config::CODEX_CLIENT_RUNTIME_PATCH_HEADER));
     }
 
     #[test]

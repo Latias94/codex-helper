@@ -183,6 +183,15 @@ pub fn validate_helper_config(source: &HelperConfig) -> Result<()> {
         anyhow::bail!("unsupported route graph config version: {}", source.version);
     }
     source.fleet.validate()?;
+    source
+        .codex
+        .client_patch
+        .as_ref()
+        .map(CodexClientPatchConfig::validate)
+        .transpose()?;
+    if source.claude.client_patch.is_some() {
+        anyhow::bail!("claude.client_patch is invalid; client_patch is a Codex-only contract");
+    }
     validate_service_config("codex", &source.codex)?;
     validate_service_config("claude", &source.claude)
 }

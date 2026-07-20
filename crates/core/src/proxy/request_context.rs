@@ -20,7 +20,7 @@ use super::request_failures::{
     finish_failed_proxy_request,
 };
 use super::request_preparation::{
-    CommonRequestPreparationError, CommonRequestPreparationParams, RequestFlavor,
+    CommonRequestPreparationError, CommonRequestPreparationParams, RequestFlavor, RequestOrigin,
     codex_path_is_responses_or_compact, detect_request_flavor, load_request_config_context,
     prepare_common_request,
 };
@@ -43,6 +43,7 @@ pub(super) struct PreparedProxyRequest {
     pub(super) cwd: Option<String>,
     pub(super) body_for_upstream: Bytes,
     pub(super) request_dialect: RequestDialect,
+    pub(super) translate_openai_models: bool,
     pub(super) request_model: Option<String>,
     pub(super) effective_effort: Option<String>,
     pub(super) deferred_reasoning_intent: Option<ReasoningOrchestrationIntent>,
@@ -70,6 +71,10 @@ pub(super) async fn prepare_proxy_request(
     let (parts, body) = req.into_parts();
     let client_addr = extract_client_addr(&parts.extensions);
     let response_semantic_contract = parts.extensions.get::<ResponseSemanticContract>().copied();
+    let request_origin = match response_semantic_contract {
+        Some(ResponseSemanticContract::HostedImageGeneration) => RequestOrigin::ImagesCompatibility,
+        None => RequestOrigin::Client,
+    };
     let uri = parts.uri;
     let client_uri = uri.to_string();
     let method = parts.method;
@@ -130,6 +135,7 @@ pub(super) async fn prepare_proxy_request(
         client_headers: &client_headers,
         raw_body: &raw_body,
         request_dialect: RequestDialect::from_http_path(uri.path()),
+        request_origin,
         client_name,
         client_addr,
         started_at_ms,
@@ -197,6 +203,7 @@ pub(super) async fn prepare_proxy_request(
         cwd: prepared.cwd,
         body_for_upstream: prepared.body_for_upstream,
         request_dialect: prepared.request_dialect,
+        translate_openai_models: prepared.translate_openai_models,
         request_model: prepared.request_model,
         effective_effort: prepared.effective_effort,
         deferred_reasoning_intent: prepared.deferred_reasoning_intent,

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use axum::body::Bytes;
 use axum::http::{HeaderMap, Method, Uri};
 
+use crate::config::{CODEX_CLIENT_RUNTIME_PATCH_HEADER, CodexClientRuntimePatch};
 use crate::endpoint_health::CooldownBackoff;
 use crate::logging::{BodyPreview, CodexBridgeLog, ServiceTierLog, make_body_preview};
 use crate::routing_ir::RouteRequestContext;
@@ -17,7 +18,8 @@ use super::request_body::{
     ReasoningOrchestrationIntent, RequestDialect, apply_model_override_value,
     apply_reasoning_effort_override_value, apply_service_tier_override_value,
     extract_model_from_value, extract_reasoning_effort_from_value, extract_service_tier_from_value,
-    normalize_codex_compact_request_value, remove_reasoning_effort_value,
+    normalize_codex_compact_request_value, remove_hosted_image_generation_tools_value,
+    remove_reasoning_effort_value,
 };
 use super::request_continuity::{
     RequestContinuityClassificationInput, RequestTransport, classify_request_continuity,
@@ -29,6 +31,12 @@ use super::runtime_config::{CapturedRoutePlan, RuntimeSnapshot};
 pub(super) enum SharedRouteStateImpact {
     RouteFacing,
     RequestLocalOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RequestOrigin {
+    Client,
+    ImagesCompatibility,
 }
 
 impl SharedRouteStateImpact {
@@ -133,6 +141,7 @@ pub(super) struct CommonPreparedRequest {
     pub(super) cwd: Option<String>,
     pub(super) body_for_upstream: Bytes,
     pub(super) request_dialect: RequestDialect,
+    pub(super) translate_openai_models: bool,
     pub(super) request_model: Option<String>,
     pub(super) effective_effort: Option<String>,
     pub(super) deferred_reasoning_intent: Option<ReasoningOrchestrationIntent>,
@@ -172,6 +181,7 @@ pub(super) struct CommonRequestPreparationParams<'a> {
     pub(super) client_headers: &'a HeaderMap,
     pub(super) raw_body: &'a Bytes,
     pub(super) request_dialect: RequestDialect,
+    pub(super) request_origin: RequestOrigin,
     pub(super) client_name: Option<String>,
     pub(super) client_addr: Option<String>,
     pub(super) started_at_ms: u64,
@@ -226,6 +236,7 @@ async fn prepare_common_request_inner(
         client_headers,
         raw_body,
         request_dialect,
+        request_origin,
         client_name,
         client_addr,
         started_at_ms,
@@ -237,7 +248,7 @@ async fn prepare_common_request_inner(
         config_snapshot.as_ref(),
         proxy.service_name,
     );
-    let _ = client_headers;
+    let client_runtime_patch = client_runtime_patch(client_headers);
     let session_id = config.session_id.clone();
     let session_identity_source = config.session_identity_source;
     let session_binding = if let Some(id) = session_id.as_deref() {
@@ -253,12 +264,33 @@ async fn prepare_common_request_inner(
     let binding_effort = binding_reasoning_effort_for_request(session_binding.as_ref());
     let binding_model = binding_model_for_request(session_binding.as_ref());
     let binding_service_tier = binding_service_tier_for_request(session_binding.as_ref());
+    let filter_hosted_image_generation_tools = proxy.service_name == "codex"
+        && request_origin == RequestOrigin::Client
+        && request_dialect.supports_hosted_image_generation_tools()
+        && client_runtime_patch
+            .map(|patch| patch.hosted_image_generation)
+            .or_else(|| {
+                view.client_patch
+                    .as_ref()
+                    .map(|patch| patch.hosted_image_generation)
+            })
+            .is_some_and(|mode| mode.filters_client_image_requests());
+    let translate_openai_models = proxy.service_name == "codex"
+        && client_runtime_patch
+            .map(|patch| patch.translate_models)
+            .or_else(|| {
+                view.client_patch
+                    .as_ref()
+                    .map(|patch| patch.translate_models)
+            })
+            .unwrap_or(false);
     let prepared_request = prepare_request_body(PrepareRequestBodyParams {
         raw_body,
         dialect: request_dialect,
         binding_effort,
         binding_model,
         binding_service_tier,
+        filter_hosted_image_generation_tools,
     });
     let body_for_upstream = prepared_request.body_for_upstream.clone();
     let request_model = prepared_request.request_model.clone();
@@ -372,6 +404,7 @@ async fn prepare_common_request_inner(
         cwd,
         body_for_upstream,
         request_dialect,
+        translate_openai_models,
         request_model,
         effective_effort,
         deferred_reasoning_intent,
@@ -387,6 +420,18 @@ async fn prepare_common_request_inner(
         plan,
         cooldown_backoff,
     })
+}
+
+fn client_runtime_patch(headers: &HeaderMap) -> Option<CodexClientRuntimePatch> {
+    let mut values = headers.get_all(CODEX_CLIENT_RUNTIME_PATCH_HEADER).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    value
+        .to_str()
+        .ok()
+        .and_then(CodexClientRuntimePatch::decode)
 }
 
 pub(super) fn detect_request_flavor(
@@ -539,6 +584,7 @@ pub(super) struct PrepareRequestBodyParams<'a> {
     binding_effort: Option<&'a str>,
     binding_model: Option<&'a str>,
     binding_service_tier: Option<&'a str>,
+    filter_hosted_image_generation_tools: bool,
 }
 
 pub(super) fn prepare_request_body(params: PrepareRequestBodyParams<'_>) -> PreparedRequestBody {
@@ -548,6 +594,7 @@ pub(super) fn prepare_request_body(params: PrepareRequestBodyParams<'_>) -> Prep
         binding_effort,
         binding_model,
         binding_service_tier,
+        filter_hosted_image_generation_tools,
     } = params;
     let mut request_json = serde_json::from_slice::<serde_json::Value>(raw_body).ok();
     let original_effort = request_json
@@ -592,6 +639,9 @@ pub(super) fn prepare_request_body(params: PrepareRequestBodyParams<'_>) -> Prep
         }
         if dialect == RequestDialect::ResponsesCompact {
             normalize_codex_compact_request_value(value);
+        }
+        if filter_hosted_image_generation_tools {
+            remove_hosted_image_generation_tools_value(value);
         }
     }
 
@@ -653,8 +703,8 @@ mod tests {
 
     use super::*;
     use crate::config::{
-        HelperConfig, LoadedConfig, ProviderConfig, RouteGraphConfig, ServiceControlProfile,
-        ServiceRouteConfig,
+        CodexClientPatchConfig, CodexHostedImageGenerationMode, HelperConfig, LoadedConfig,
+        ProviderConfig, RouteGraphConfig, ServiceControlProfile, ServiceRouteConfig,
     };
 
     struct ScopedCodexHome {
@@ -833,6 +883,7 @@ mod tests {
             binding_effort: Some("high"),
             binding_model: Some("gpt-5.4"),
             binding_service_tier: Some("flex"),
+            filter_hosted_image_generation_tools: false,
         });
 
         assert_eq!(prepared.request_model.as_deref(), Some("gpt-5.4"));
@@ -860,6 +911,7 @@ mod tests {
             binding_effort: Some("high"),
             binding_model: None,
             binding_service_tier: None,
+            filter_hosted_image_generation_tools: false,
         });
 
         let value: serde_json::Value =
@@ -890,6 +942,7 @@ mod tests {
             binding_effort: Some("xhigh"),
             binding_model: None,
             binding_service_tier: None,
+            filter_hosted_image_generation_tools: false,
         });
 
         let value: serde_json::Value =
@@ -916,6 +969,7 @@ mod tests {
             binding_effort: Some("high"),
             binding_model: None,
             binding_service_tier: None,
+            filter_hosted_image_generation_tools: false,
         });
 
         let value: serde_json::Value =
@@ -938,6 +992,7 @@ mod tests {
             binding_effort: Some("ultra"),
             binding_model: None,
             binding_service_tier: None,
+            filter_hosted_image_generation_tools: false,
         });
 
         let value: serde_json::Value =
@@ -959,6 +1014,7 @@ mod tests {
             binding_effort: None,
             binding_model: None,
             binding_service_tier: None,
+            filter_hosted_image_generation_tools: false,
         });
         let value: serde_json::Value =
             serde_json::from_slice(prepared.body_for_upstream.as_ref()).expect("json body");
@@ -983,6 +1039,7 @@ mod tests {
             binding_effort: None,
             binding_model: None,
             binding_service_tier: None,
+            filter_hosted_image_generation_tools: false,
         });
 
         let value: serde_json::Value =
@@ -1003,6 +1060,33 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("image_generation")
         );
+    }
+
+    #[test]
+    fn prepare_request_body_filters_hosted_image_generation_when_requested() {
+        let raw_body = Bytes::from_static(
+            br#"{"model":"gpt-5","input":[{"type":"additional_tools","tools":[{"type":"image_generation","output_format":"png"},{"type":"function","name":"nested"}]}],"tools":[{"type":"image_generation","output_format":"png"},{"type":"function","name":"shell"}],"tool_choice":{"type":"image_generation"}}"#,
+        );
+
+        let prepared = prepare_request_body(PrepareRequestBodyParams {
+            raw_body: &raw_body,
+            dialect: RequestDialect::ResponsesHttp,
+            binding_effort: None,
+            binding_model: None,
+            binding_service_tier: None,
+            filter_hosted_image_generation_tools: true,
+        });
+
+        let value: serde_json::Value =
+            serde_json::from_slice(prepared.body_for_upstream.as_ref()).expect("json body");
+        assert_eq!(value["tools"].as_array().map(Vec::len), Some(1));
+        assert_eq!(value["tools"][0]["name"].as_str(), Some("shell"));
+        assert_eq!(value["input"][0]["tools"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            value["input"][0]["tools"][0]["name"].as_str(),
+            Some("nested")
+        );
+        assert_eq!(value["tool_choice"].as_str(), Some("auto"));
     }
 
     #[test]
@@ -1075,6 +1159,7 @@ mod tests {
     fn test_config_with_active_route(provider_id: &str) -> HelperConfig {
         HelperConfig {
             codex: ServiceRouteConfig {
+                client_patch: None,
                 default_profile: Some("default".to_string()),
                 profiles: std::collections::BTreeMap::from([(
                     "default".to_string(),
@@ -1104,6 +1189,16 @@ mod tests {
             Arc::new(test_config_with_active_route("test")),
             "codex",
         )
+    }
+
+    fn test_proxy_with_hosted_image_generation_disabled() -> ProxyService {
+        let mut config = test_config_with_active_route("test");
+        config.codex.client_patch = Some(CodexClientPatchConfig {
+            translate_models: true,
+            hosted_image_generation: CodexHostedImageGenerationMode::Disabled,
+            ..CodexClientPatchConfig::default()
+        });
+        ProxyService::new(reqwest::Client::new(), Arc::new(config), "codex")
     }
 
     #[tokio::test]
@@ -1264,6 +1359,7 @@ mod tests {
             client_headers: &headers,
             raw_body: &raw_body,
             request_dialect: RequestDialect::ResponsesHttp,
+            request_origin: RequestOrigin::Client,
             client_name: None,
             client_addr: None,
             started_at_ms: 1,
@@ -1301,6 +1397,7 @@ mod tests {
             client_headers: &headers,
             raw_body: &raw_body,
             request_dialect: RequestDialect::ResponsesHttp,
+            request_origin: RequestOrigin::Client,
             client_name: Some("test-client".to_string()),
             client_addr: None,
             started_at_ms: 2,
@@ -1372,6 +1469,7 @@ mod tests {
             client_headers: &headers,
             raw_body: &raw_body,
             request_dialect: RequestDialect::ResponsesHttp,
+            request_origin: RequestOrigin::Client,
             client_name: Some("test-client".to_string()),
             client_addr: None,
             started_at_ms: 3,
@@ -1397,6 +1495,210 @@ mod tests {
                 .get("tool_choice")
                 .and_then(|choice| choice.get("type"))
                 .and_then(serde_json::Value::as_str),
+            Some("image_generation")
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_common_request_filters_from_captured_client_patch_snapshot() {
+        let proxy = test_proxy_with_hosted_image_generation_disabled();
+        let config = load_request_config_context(&proxy, None).await;
+        let captured_revision = config.runtime_snapshot.revision();
+        proxy
+            .config
+            .reload_with_source(|| async {
+                Ok((
+                    LoadedConfig {
+                        source: test_config_with_active_route("test"),
+                    },
+                    None,
+                ))
+            })
+            .await
+            .expect("reload runtime config");
+        assert!(proxy.config.capture().await.revision() > captured_revision);
+
+        let headers = HeaderMap::new();
+        let method = Method::POST;
+        let uri = "/v1/responses".parse::<Uri>().expect("uri");
+        let raw_body = Bytes::from_static(
+            br#"{"model":"gpt-5","tools":[{"type":"image_generation"},{"type":"function","name":"shell"}],"tool_choice":{"type":"image_generation"}}"#,
+        );
+        let prepared = prepare_common_request_without_route_plan(CommonRequestPreparationParams {
+            proxy: &proxy,
+            config: &config,
+            method: &method,
+            uri: &uri,
+            client_headers: &headers,
+            raw_body: &raw_body,
+            request_dialect: RequestDialect::ResponsesHttp,
+            request_origin: RequestOrigin::Client,
+            client_name: None,
+            client_addr: None,
+            started_at_ms: 4,
+            client_content_type: Some("application/json"),
+            request_body_previews: false,
+        })
+        .await
+        .expect("prepared");
+
+        let value: serde_json::Value =
+            serde_json::from_slice(prepared.body_for_upstream.as_ref()).expect("json body");
+        assert_eq!(value["tools"].as_array().map(Vec::len), Some(1));
+        assert_eq!(value["tools"][0]["name"].as_str(), Some("shell"));
+        assert_eq!(value["tool_choice"].as_str(), Some("auto"));
+        assert!(prepared.translate_openai_models);
+    }
+
+    #[tokio::test]
+    async fn prepare_common_request_filters_websocket_response_create() {
+        let proxy = test_proxy_with_hosted_image_generation_disabled();
+        let config = load_request_config_context(&proxy, None).await;
+        let headers = HeaderMap::new();
+        let method = Method::GET;
+        let uri = "/v1/responses".parse::<Uri>().expect("uri");
+        let raw_body = Bytes::from_static(
+            br#"{"type":"response.create","model":"gpt-5","tools":[{"type":"image_generation"},{"type":"function","name":"shell"}]}"#,
+        );
+
+        let prepared = prepare_common_request_without_route_plan(CommonRequestPreparationParams {
+            proxy: &proxy,
+            config: &config,
+            method: &method,
+            uri: &uri,
+            client_headers: &headers,
+            raw_body: &raw_body,
+            request_dialect: RequestDialect::ResponsesWebSocket,
+            request_origin: RequestOrigin::Client,
+            client_name: None,
+            client_addr: None,
+            started_at_ms: 5,
+            client_content_type: Some("application/json"),
+            request_body_previews: false,
+        })
+        .await
+        .expect("prepared");
+
+        let value: serde_json::Value =
+            serde_json::from_slice(prepared.body_for_upstream.as_ref()).expect("json body");
+        assert_eq!(value["tools"].as_array().map(Vec::len), Some(1));
+        assert_eq!(value["tools"][0]["name"].as_str(), Some("shell"));
+    }
+
+    #[tokio::test]
+    async fn client_runtime_marker_overrides_captured_patch_in_both_directions() {
+        let method = Method::POST;
+        let uri = "/v1/responses".parse::<Uri>().expect("uri");
+        let raw_body = Bytes::from_static(
+            br#"{"model":"gpt-5","tools":[{"type":"image_generation"},{"type":"function","name":"shell"}]}"#,
+        );
+
+        for (proxy, marker, expected_tools, expected_translation) in [
+            (
+                test_proxy_with_hosted_image_generation_disabled(),
+                "v1;models=0;hosted=enabled",
+                2,
+                false,
+            ),
+            (
+                test_proxy_with_active_route(),
+                "v1;models=1;hosted=disabled",
+                1,
+                true,
+            ),
+        ] {
+            let config = load_request_config_context(&proxy, None).await;
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                CODEX_CLIENT_RUNTIME_PATCH_HEADER,
+                HeaderValue::from_str(marker).expect("runtime marker header"),
+            );
+            let prepared =
+                prepare_common_request_without_route_plan(CommonRequestPreparationParams {
+                    proxy: &proxy,
+                    config: &config,
+                    method: &method,
+                    uri: &uri,
+                    client_headers: &headers,
+                    raw_body: &raw_body,
+                    request_dialect: RequestDialect::ResponsesHttp,
+                    request_origin: RequestOrigin::Client,
+                    client_name: None,
+                    client_addr: None,
+                    started_at_ms: 7,
+                    client_content_type: Some("application/json"),
+                    request_body_previews: false,
+                })
+                .await
+                .expect("prepare marker override");
+            let value: serde_json::Value =
+                serde_json::from_slice(prepared.body_for_upstream.as_ref())
+                    .expect("parse prepared body");
+
+            assert_eq!(
+                value["tools"].as_array().map(Vec::len),
+                Some(expected_tools)
+            );
+            assert_eq!(prepared.translate_openai_models, expected_translation);
+        }
+    }
+
+    #[test]
+    fn client_runtime_marker_rejects_duplicate_or_malformed_headers() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            CODEX_CLIENT_RUNTIME_PATCH_HEADER,
+            HeaderValue::from_static("v1;models=1;hosted=disabled"),
+        );
+        headers.append(
+            CODEX_CLIENT_RUNTIME_PATCH_HEADER,
+            HeaderValue::from_static("v1;models=0;hosted=enabled"),
+        );
+        assert_eq!(client_runtime_patch(&headers), None);
+
+        headers.clear();
+        headers.insert(
+            CODEX_CLIENT_RUNTIME_PATCH_HEADER,
+            HeaderValue::from_static("v2;models=1;hosted=disabled"),
+        );
+        assert_eq!(client_runtime_patch(&headers), None);
+    }
+
+    #[tokio::test]
+    async fn prepare_common_request_preserves_images_compatibility_contract() {
+        let proxy = test_proxy_with_hosted_image_generation_disabled();
+        let config = load_request_config_context(&proxy, None).await;
+        let headers = HeaderMap::new();
+        let method = Method::POST;
+        let uri = "/v1/responses".parse::<Uri>().expect("uri");
+        let raw_body = Bytes::from_static(
+            br#"{"model":"gpt-5","tools":[{"type":"image_generation","output_format":"png"}],"tool_choice":{"type":"image_generation"}}"#,
+        );
+
+        let prepared = prepare_common_request_without_route_plan(CommonRequestPreparationParams {
+            proxy: &proxy,
+            config: &config,
+            method: &method,
+            uri: &uri,
+            client_headers: &headers,
+            raw_body: &raw_body,
+            request_dialect: RequestDialect::ResponsesHttp,
+            request_origin: RequestOrigin::ImagesCompatibility,
+            client_name: None,
+            client_addr: None,
+            started_at_ms: 6,
+            client_content_type: Some("application/json"),
+            request_body_previews: false,
+        })
+        .await
+        .expect("prepared");
+
+        let value: serde_json::Value =
+            serde_json::from_slice(prepared.body_for_upstream.as_ref()).expect("json body");
+        assert_eq!(value["tools"].as_array().map(Vec::len), Some(1));
+        assert_eq!(value["tools"][0]["type"].as_str(), Some("image_generation"));
+        assert_eq!(
+            value["tool_choice"]["type"].as_str(),
             Some("image_generation")
         );
     }

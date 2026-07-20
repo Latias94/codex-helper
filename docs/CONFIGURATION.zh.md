@@ -40,7 +40,7 @@ Codex 自己的文件仍由 Codex 维护：
 - `~/.codex/auth.json`
 - `~/.codex/config.toml`
 
-只有显式执行本地 `switch on/off` 才能 patch `~/.codex/config.toml`，而且范围仅限 helper 自有的 provider selector 和 `model_providers.codex_proxy` stanza。codex-helper 不会读写 Codex 的模型缓存或 SQLite。普通 runtime 不写入 `auth.json`；但当 provider 显式配置 `auth_token_env` / `api_key_env` 而当前进程环境缺少该变量时，Codex runtime 可只读查找 `$CODEX_HOME/auth.json` 顶层的同名字符串字段。唯一可写 auth 的例外是下述一次性 legacy switch 恢复，而且只会在严格匹配旧 patch 时恢复旧 helper 管理过的 auth facade。
+只有显式执行本地 `switch on/off` 才会 patch `~/.codex/config.toml` 中 journal 记录的 provider selector、`model_providers.codex_proxy` 和 client capability fields；需要 auth facade 的 preset 还会临时 patch `auth.json`，并从 helper 私有 backup 按原始字节恢复。codex-helper 永远不读写 Codex 模型缓存或 SQLite。普通 runtime 不写入 `auth.json`；但当 provider 显式配置 `auth_token_env` / `api_key_env` 而当前进程环境缺少该变量时，Codex runtime 可只读查找 `$CODEX_HOME/auth.json` 顶层的同名字符串字段。该凭据 fallback 与 client patch facade 是两个独立生命周期。
 
 ## 配置自动迁移
 
@@ -120,31 +120,34 @@ enabled = true
 codex-helper switch on                         # http://127.0.0.1:3211
 codex-helper switch on --port 4321
 codex-helper switch on --base-url https://relay.example/v1
+codex-helper switch on --preset imagegen-bridge
+codex-helper switch on --preset official-imagegen --compaction remote-v2 --responses-websocket
+codex-helper switch on --translate-models=false --hosted-image-generation disabled
 codex-helper switch on --client-facade openai
 codex-helper switch on --client-facade openai-tools
 codex-helper switch status
 codex-helper switch off
 ```
 
-`switch on` 会记录原 selector 和 helper stanza，然后只写入 helper 自有的 `model_providers.codex_proxy` stanza 并选中它。`switch off` 只恢复记录过的 selector/stanza。恢复 journal 位于 `~/.codex-helper/state/`；如果外部编辑导致当前文件既不匹配原 fingerprint，也不匹配 helper 应用后的 fingerprint，状态会进入 `recovery_required`，配置文件保持不动，等待人工协调。
+`switch on` 会加载下文 `[codex.client_patch]` 的完整声明，记录原 selector、helper stanza、相关 feature flags，以及 preset 需要时的 auth facade，然后应用 helper 自有的 `model_providers.codex_proxy`。`switch off` 只恢复 journal 记录过的内容。恢复 journal 位于 `~/.codex-helper/state/`；认证型 patch 关闭后仍保留恢复点并显示 `Off`，用于修复 Codex 随后重写的语义等价 facade。无法识别为原始值或 helper facade 的外部编辑会进入 `recovery_required`，no-replace CAS 会同时保留竞争文件与恢复材料，等待人工协调。
 
-`--client-facade` 是显式的客户端能力声明：
+`--client-facade` 是旧精简接口的兼容快捷方式，映射到正式 preset：
 
-| Facade | helper 自有 Codex provider stanza | 让客户端具备的候选行为 |
+| Facade | 等价 client patch | 让客户端具备的候选行为 |
 | --- | --- | --- |
-| `compatible`（默认） | `name = "codex-helper"` | 只提供普通 OpenAI-compatible Responses 行为 |
-| `openai` | `name = "OpenAI"` | Remote compaction 与 Web Search，仍受 Codex feature/model 规则约束 |
-| `openai-tools` | `name = "OpenAI"`，并在 `x-openai-actor-authorization` 写入 helper marker | 在 `openai` 基础上允许 hosted image generation，仍受 Codex feature/model 规则约束 |
+| `compatible`（默认） | `preset = "default"` | 普通 OpenAI-compatible Responses 行为 |
+| `openai` | `preset = "official-relay"` | Remote compaction 与 Web Search，仍受 Codex feature/model 规则约束 |
+| `openai-tools` | `preset = "official-imagegen"` | 在 official identity 基础上允许 hosted image generation，仍受 Codex feature/model 规则约束 |
 
-Facade 只决定 Codex 客户端是否愿意暴露对应能力，并不证明所选 relay 真能处理请求。例如 `openai` 可能让 Codex 调用 `/responses/compact`，`openai-tools` 可能产生 hosted image-generation 流量；relay 契约需要另行验证。helper 生成的精确 marker 会在每次 HTTP 或 WebSocket 上游握手前于本地消费，不会转发。真实 actor-authorization 值只允许在“未配置 helper 凭据且目标为 OpenAI 官方源站”时透传；第三方或 helper-authenticated route 会剥离它。两类值在请求诊断中都会脱敏。
+Client patch 只决定 Codex 客户端是否愿意暴露对应能力，并不证明所选 relay 真能处理请求。例如 official preset 可能让 Codex 调用 `/responses/compact` 或发起 WebSocket，imagegen preset 可能产生 hosted image-generation 流量；relay 契约需要另行验证。helper 生成的精确 actor marker 会在每次 HTTP 或 WebSocket 上游握手前于本地消费，不会转发。真实 actor-authorization 值只允许在“未配置 helper 凭据且目标为 OpenAI 官方源站”时透传；第三方或 helper-authenticated route 会剥离它。两类值在请求诊断中都会脱敏。
 
-Switch journal 存在时不能原地更换 target URL 或 facade。请先运行 `switch off`，让 journal 恢复原 provider stanza，再用新选项执行 `switch on`。`switch status` 会显示 journal 记录的 facade。
+相同 target URL 下可以重复执行 `switch on` 更换 client patch：helper 会先按旧 journal 完整恢复，再以原始 config/auth 为输入应用新 patch。更换 target URL 仍需先运行 `switch off`。`switch status` 会显示生效的五项 client-patch 字段。
 
-除下述 v0.20.3 legacy state 的一次性恢复外，Switch 不会读写 `~/.codex/auth.json`、`models_cache.json`、Codex SQLite、无关 providers、全局 feature flags、compaction 设置或 WebSocket 设置，也不会再创建历史上的空 `{}` auth facade。当前 Codex 源码已通过上述 provider header contract 暴露 hosted-image tool，因此无需篡改登录状态。真实上游能力仍来自选中 provider 的契约和实时观测。
+只有 `chatgpt-bridge` 和未禁用 hosted image 的 imagegen preset 会生成 auth facade。ChatGPT facade 要求原文件包含完整登录材料并保留 token；imagegen facade 会临时写入语义空 `{}`。原始 auth 字节存放在私有 backup，而非 JSON journal；`switch off` 通过 CAS 精确恢复。Switch 永远不会读写 `models_cache.json` 或 Codex SQLite，也不会恢复旧 SQL hack。真实上游能力仍来自选中 provider 的契约和实时观测。
 
 ### 从 0.20.3 及更早版本升级
 
-0.20.3 及更早版本使用另一套 switch 实现，并把恢复数据保存在 `~/.codex/codex-helper-switch-state.json`。该文件可能包含原 provider selector；使用过旧 bridge preset 时，还可能包含原始 `auth.json` 内容。新版只在显式 `switch on` / `switch off` 时读取它，用于一次性安全恢复；新 journal 本身不保存 auth。
+0.20.3 及更早版本使用另一套 switch 实现，并把恢复数据保存在 `~/.codex/codex-helper-switch-state.json`。该文件可能包含原 provider selector；使用过旧 bridge preset 时，还可能包含原始 `auth.json` 内容。新版只在显式 `switch on` / `switch off` 时读取它，用于一次性安全恢复；当前 journal 不保存 auth 内容，只引用 helper 私有 backup。
 
 如果 legacy state 文件存在，请按下面的顺序升级：
 
@@ -1072,6 +1075,44 @@ reasoning_effort = "high"
 
 Profiles 只定义请求默认值；provider selection 属于 `[codex.routing]`。
 
+## Codex client patch
+
+`[codex.client_patch]` 是 version 6 中声明 Codex 客户端能力的正式配置。它只适用于 Codex；`[claude.client_patch]` 会被拒绝。
+
+```toml
+[codex.client_patch]
+preset = "official-imagegen"
+responses_websocket = true
+compaction = "remote-v2"
+translate_models = true
+hosted_image_generation = "auto"
+```
+
+五种 preset 负责组合 Codex 自身的 provider identity 与 auth gating：
+
+| preset | Codex provider identity | auth facade | 典型用途 |
+| --- | --- | --- | --- |
+| `default` | `codex-helper` | 保持原样 | 普通兼容 relay，只使用 helper 本地代理 |
+| `chatgpt-bridge` | `codex-helper` | 保留完整 ChatGPT token，并规范化为 ChatGPT 登录视图 | 需要 ChatGPT 登录 gating、但模型流量仍走 helper 的场景 |
+| `imagegen-bridge` | `codex-helper` | hosted image 未禁用时临时使用语义空 `{}` | 使用 helper identity 暴露 hosted `image_generation` |
+| `official-relay` | `OpenAI` | 保持原样 | 暴露 Web Search / remote compact 等官方 identity gating |
+| `official-imagegen` | `OpenAI` | hosted image 未禁用时临时使用语义空 `{}` | 官方 identity 加 hosted `image_generation` gating |
+
+其余字段相互独立，但组合会严格校验：
+
+- `compaction = "auto" | "local" | "remote-v1" | "remote-v2"`。`auto` 保留 Codex 当前 `remote_compaction_v2` feature；`local` 明确关闭远端压缩并使用 helper identity；`remote-v1` 与 `remote-v2` 只允许配合两个 official preset，分别关闭或开启 v2 feature。
+- `responses_websocket = true` 只允许 official identity 且不能与 `compaction = "local"` 组合；它同时更新 Codex provider WebSocket 声明，helper runtime 仍会按选中 provider 的真实能力处理连接。
+- `translate_models = true` 在代理运行时把不兼容的 `/models` 结果转换为 Codex 可消费的模型列表。该端点的失败和翻译不会污染对话/compact cooldown、quota policy 或 session affinity。
+- `hosted_image_generation = "auto" | "enabled" | "disabled"` 分别保留、开启或关闭 Codex feature。`disabled` 还会抑制 imagegen preset 的 actor marker/auth facade，并过滤 Codex 客户端发出的 hosted image tool；helper 的 OpenAI Images 兼容入口仍可独立使用。
+
+`codex-helper switch on` 不带 client-patch 参数时加载这里的全部配置。`--preset` 临时替换 preset，并把该次 switch 的 compaction/WebSocket 恢复为各自默认值；`translate_models` 与 hosted-image 模式保持配置值。五项都可显式覆盖：`--compaction ...`、`--responses-websocket[=true|false]`、`--translate-models[=true|false]` 和 `--hosted-image-generation auto|enabled|disabled`。`--client-facade compatible|openai|openai-tools` 是早期精简接口的兼容快捷方式，不能与完整 patch 参数混用。桌面端可以显式设置全部五项；integrated TUI 的 preset 快捷键使用对应 preset 默认值，配置模式则加载本表。
+
+Switch 会在 helper provider 的 `http_headers` 中写入非敏感、严格版本化的 `x-codex-helper-client-patch` marker。它只携带 `translate_models` 与 hosted-image 过滤模式，使客户端选择的 patch 在连接本地、远端或容器 runtime 时优先于 server 自身配置；缺失、重复或格式无效时会忽略并回退 runtime 配置。HTTP 与 Responses WebSocket 都会在上游握手前消费并剥离该 marker，绝不会把它发给 provider。
+
+Client patch 是客户端能力声明，不是上游能力伪造。Hosted image generation、remote compaction 和 Responses WebSocket 仍必须由当前 provider/catalog 契约实际支持；`codex relay-capabilities` 和 live smoke 只用于诊断，不会隐式改写本表。
+
+需要 auth facade 时，`switch on` 会在任何 Codex 文件写入前创建 journal，并把原始 `auth.json` 字节保存到 `~/.codex-helper/state/` 下随机命名的私有 backup；JSON journal 只包含路径/内容指纹、原文件是否存在和备份文件名，不包含 token。写入采用“捕获预期文件、验证、no-replace 发布”的 CAS：进程在任一边界崩溃时，下次操作会恢复捕获文件或完成发布；竞争写入永不被覆盖。`switch off` 精确恢复原字节后，对认证型 patch 保留私有 backup/journal，但公开状态为 `Off`；如果 Codex 之后重新写入语义等价的 facade，再次 `switch off` 会自动恢复。下一次 `switch on` 会让新 journal 接管同一 backup；即使新 patch 使用 `Preserve` 而不主动改写 `auth.json`，旧 facade 的恢复来源仍会保留，跨 `Prepared` 崩溃也不会留下无引用的敏感副本。无法归因的外部修改、backup 缺失/篡改或 journal 不一致会进入 `recovery_required`。模型缓存和 Codex SQLite 永远不在该生命周期内，也没有恢复 SQL hack。
+
 ## 余额适配
 
 大多数 relay 用户不需要为了显示余额手写 `usage_providers.json`。这个文件是可选且由 operator 管理的输入：文件缺失时，codex-helper 只使用内存中的内置 adapters，不会创建文件；文件不可读或内容无效时会返回明确的加载错误，也绝不会替换或重写原文件。如果没有显式 adapter 匹配某个 upstream，codex-helper 会尝试常见 relay 探测：
@@ -1483,7 +1524,7 @@ TUI 和桌面端消费同一份 typed、redacted `OperatorReadModel`，对远程
 
 | 0.20.3 输入或行为 | 当前行为 | 升级操作 |
 | --- | --- | --- |
-| `[codex.client_patch]` | 启动先备份文件再删除整张表；helper config 不再管理 preset、auth facade、compaction、hosted-tool switch 或 WebSocket patch | 先用 `config migrate --dry-run` 预览；只使用上文显式 URL switch |
+| `[codex.client_patch]` | 保留为 version 6 正式配置；旧 `mode` 会规范化为 `preset`，underscore/bridge alias 与 compaction、hosted-image alias 会转为 canonical 值；冲突或未知字段失败关闭 | 用 `config migrate --dry-run` 预览；通常无需人工迁移，之后只保留 canonical `preset` 写法 |
 | `[codex.compaction]` / `[claude.compaction]` | 启动先备份文件再删除任一表；v0.20.3 的共享 schema 曾接受 Claude 表，但它从未产生 Claude 运行时效果 | 预览清理结果；helper 不再执行 remote-v2-to-v1 downgrade |
 | `[ui.usage_forecast]` | 启动先备份文件再删除整张表；旧本地 forecast 已移除 | 改用已提交的 quota pace 和 reset-window 视图 |
 | `codex.profiles.*.station` / `claude.profiles.*.station` | 启动先备份文件再删除每个命中的 profile 字段 | 通过 service route graph 表达 provider selection |

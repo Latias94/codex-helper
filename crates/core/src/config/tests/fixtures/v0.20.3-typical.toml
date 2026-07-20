@@ -5,6 +5,13 @@ default_service = "codex"
 [codex]
 default_profile = "daily"
 
+[codex.client_patch]
+mode = "official_imagegen_bridge"
+responses_websocket = true
+compaction = "remote_v2"
+translate_models = true
+hosted_image_generation = "disabled"
+
 [codex.profiles.base]
 reasoning_effort = "medium"
 

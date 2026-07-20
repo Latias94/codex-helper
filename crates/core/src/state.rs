@@ -1306,6 +1306,10 @@ impl CapturedUpstreamAttemptContext {
     pub(crate) fn request_contract(&self) -> Option<&ProviderModelRequestContract> {
         self.request_contract.as_ref()
     }
+
+    pub(crate) fn provider_epoch(&self) -> Option<&ProviderCatalogEpoch> {
+        self.provider_epoch.as_ref()
+    }
 }
 
 fn freeze_provider_epoch(

@@ -197,13 +197,9 @@ children = ["primary"]
     let plan = build_config_migration_plan(&temp.paths())
         .await
         .expect("build migration plan");
-    assert!(
-        plan.notices
-            .iter()
-            .any(|notice| notice.contains("codex.client_patch"))
-    );
     assert!(plan.rendered.contains("version = 6"));
-    assert!(!plan.rendered.contains("client_patch"));
+    assert!(plan.rendered.contains("[codex.client_patch]"));
+    assert!(plan.rendered.contains("preset = \"default\""));
     let report = plan.report(false);
     assert!(!report.contains("inline-secret-for-test"));
     assert!(!report.contains("inline-api-key-for-test"));
@@ -213,6 +209,65 @@ children = ["primary"]
         before
     );
     assert!(!temp.0.join("config.toml.bak").exists());
+}
+
+#[tokio::test]
+async fn migration_normalizes_v0203_empty_client_patch_defaults() {
+    let temp = TempConfigDir::new();
+    write(
+        &temp.0.join("config.toml"),
+        r#"version = 5
+
+[codex.client_patch]
+preset = ""
+mode = ""
+compaction = ""
+hosted_image_generation = ""
+"#,
+    );
+
+    let plan = build_config_migration_plan(&temp.paths())
+        .await
+        .expect("migrate v0.20.3 empty client-patch defaults");
+    let migrated = toml::from_str::<HelperConfig>(&plan.rendered)
+        .expect("parse migrated empty client-patch defaults");
+    let patch = migrated
+        .codex
+        .client_patch
+        .expect("retain the client-patch table");
+
+    assert_eq!(patch, crate::config::CodexClientPatchConfig::default());
+    assert!(!plan.rendered.contains("preset = \"\""));
+    assert!(!plan.rendered.contains("mode = \"\""));
+    assert!(plan.rendered.contains("compaction = \"auto\""));
+    assert!(plan.rendered.contains("hosted_image_generation = \"auto\""));
+    assert!(
+        plan.notices
+            .iter()
+            .any(|notice| notice.contains("legacy empty"))
+    );
+}
+
+#[tokio::test]
+async fn migration_keeps_v6_client_patch_values_strict() {
+    let temp = TempConfigDir::new();
+    write(
+        &temp.0.join("config.toml"),
+        r#"version = 6
+
+[codex.client_patch]
+compaction = ""
+"#,
+    );
+
+    let error = build_config_migration_plan(&temp.paths())
+        .await
+        .expect_err("current client-patch values must remain strict");
+
+    assert!(
+        format!("{error:#}").contains("parse codex.client_patch during migration"),
+        "unexpected strict client-patch error: {error:#}"
+    );
 }
 
 #[tokio::test]

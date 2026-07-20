@@ -23,7 +23,7 @@ use super::classify::{
 };
 use super::concurrency_limits::ConcurrencyPermit;
 use super::http_debug::HttpDebugBase;
-use super::models_compat::maybe_decode_models_response_body;
+use super::models_compat::{ModelsTranslationScope, maybe_decode_models_response_body};
 use super::provider_evidence::{ResponseEvidenceParams, response_evidence_from_classification};
 use super::reasoning_guard::{
     REASONING_GUARD_BLOCKED_CLASS, evaluate_reasoning_guard, reasoning_guard_error_body,
@@ -71,6 +71,7 @@ pub(super) struct AttemptResponseParams<'a> {
     pub(super) response_headers: HeaderMap,
     pub(super) response_headers_filtered: HeaderMap,
     pub(super) response_body: Bytes,
+    pub(super) models_translation: ModelsTranslationScope<'a>,
     pub(super) attempt_handle: AttemptHandle,
     pub(super) request_id: u64,
     pub(super) duration_ms: u64,
@@ -358,6 +359,7 @@ pub(super) async fn handle_attempt_response(
         response_headers,
         response_headers_filtered,
         response_body,
+        models_translation,
         attempt_handle,
         request_id,
         duration_ms,
@@ -431,6 +433,7 @@ pub(super) async fn handle_attempt_response(
             path,
             &response_headers,
             response_body,
+            models_translation,
         )
     } else {
         response_body

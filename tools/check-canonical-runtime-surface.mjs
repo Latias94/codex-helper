@@ -94,19 +94,12 @@ const forbiddenProductionStrings = [
   "CODEX_HELPER_SESSION_ROUTE_AFFINITY_LEDGER",
   "basellm-catalog-attempt-v1.json",
   "basellm-catalog-lkg-v1.json",
-  "client_patch",
   "policy-actions.json",
   "quota-samples.json",
   "station_mapping",
   "session-route-affinities.json",
   "remote_connections",
 ];
-const allowedForbiddenProductionSnippets = new Map([
-  [
-    "crates/core/src/config_storage.rs",
-    ['(&["codex", "client_patch"], "codex.client_patch"),'],
-  ],
-]);
 
 for (const file of sourceFiles) {
   const relativePath = path.relative(repositoryRoot, file);
@@ -128,14 +121,7 @@ for (const file of sourceFiles) {
 
 for (const file of productionFiles) {
   const relativePath = path.relative(repositoryRoot, file);
-  let text = fs.readFileSync(file, "utf8");
-  for (const snippet of allowedForbiddenProductionSnippets.get(relativePath) ?? []) {
-    if (!text.includes(snippet)) {
-      failures.push(`${relativePath}: expected retired-config diagnostic allowlist drifted`);
-      continue;
-    }
-    text = text.replace(snippet, "");
-  }
+  const text = fs.readFileSync(file, "utf8");
   for (const value of forbiddenProductionStrings) {
     if (text.includes(value)) {
       failures.push(`${relativePath}: contains removed production surface ${value}`);
