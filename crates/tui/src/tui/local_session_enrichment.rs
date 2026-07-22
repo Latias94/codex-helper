@@ -1043,7 +1043,11 @@ mod tests {
             .expect("render enriched Dashboard");
         let text = buffer_text(frame.buffer);
         assert!(text.contains(RAW_SESSION_ID), "{text}");
-        assert!(text.contains("workspace/proj"), "{text}");
+        let cwd_fragment = Path::new("workspace").join("project");
+        assert!(
+            text.contains(cwd_fragment.to_string_lossy().as_ref()),
+            "{text}"
+        );
         assert!(text.contains(" project "), "{text}");
         assert!(text.contains("host-local enriched"), "{text}");
     }
