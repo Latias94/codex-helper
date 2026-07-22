@@ -76,6 +76,7 @@ pub struct ProxyRuntimeOptions {
     pub admin_addr: SocketAddr,
     pub credential_sources: CredentialSourceCapabilities,
     pub service_runtime_identity: Option<ServiceRuntimeIdentity>,
+    pub local_runtime_shutdown_policy: crate::local_operator::LocalRuntimeShutdownPolicy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,6 +124,8 @@ impl ProxyRuntimeOptions {
             admin_addr,
             credential_sources: CredentialSourceCapabilities::server(),
             service_runtime_identity: None,
+            local_runtime_shutdown_policy:
+                crate::local_operator::LocalRuntimeShutdownPolicy::ForegroundProcess,
         }
     }
 
@@ -144,6 +147,14 @@ impl ProxyRuntimeOptions {
         service_runtime_identity: Option<ServiceRuntimeIdentity>,
     ) -> Self {
         self.service_runtime_identity = service_runtime_identity;
+        self
+    }
+
+    pub fn with_local_runtime_shutdown_policy(
+        mut self,
+        policy: crate::local_operator::LocalRuntimeShutdownPolicy,
+    ) -> Self {
+        self.local_runtime_shutdown_policy = policy;
         self
     }
 }
@@ -456,6 +467,7 @@ async fn build_proxy_runtime_from_loaded_with_options_and_runtime_store(
         admin_addr,
         credential_sources,
         service_runtime_identity,
+        local_runtime_shutdown_policy,
     } = options;
     validate_service_has_upstream(service_name, &loaded.source)?;
     let client = crate::proxy::upstream_http_client_builder()
@@ -465,6 +477,7 @@ async fn build_proxy_runtime_from_loaded_with_options_and_runtime_store(
         .build()?;
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let local_runtime_shutdown_tx = shutdown_tx.clone();
 
     let proxy_config = Arc::new(loaded.source);
     let proxy_store = Arc::clone(&runtime_store);
@@ -476,7 +489,15 @@ async fn build_proxy_runtime_from_loaded_with_options_and_runtime_store(
             proxy_store,
             credential_sources,
         )
-        .map(|proxy| proxy.with_service_runtime_identity(service_runtime_identity))
+        .map(|proxy| {
+            proxy
+                .with_service_runtime_identity(service_runtime_identity)
+                .with_local_runtime_shutdown(
+                    port,
+                    local_runtime_shutdown_policy,
+                    local_runtime_shutdown_tx,
+                )
+        })
     })
     .await
     .context("join initial credential and runtime snapshot builder")??;

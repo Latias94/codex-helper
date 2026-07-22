@@ -160,7 +160,7 @@ Client patch 只决定 Codex 客户端是否愿意暴露对应能力，并不证
 
 0.20.3 的 `~/.codex-helper/state/session-route-affinities.json` 是旧 helper 生成的运行时状态，不是用户配置；新版不会把它导入 `state.sqlite`，也不会改写或删除它。升级前应结束仍依赖多 endpoint affinity 的活跃 state-bound 会话，升级后开启新会话。不要用相同 session key 发送普通 Responses 请求来修复旧会话：当前 route 可能选中与持有上游状态的 endpoint 不同的目标。旧 state-bound 请求缺少可恢复 affinity 时，`fallback-sticky` 可能沿当前 graph 选路并由上游判断状态是否有效，`hard` 则会在多 endpoint graph 上本地 fail closed。
 
-Proxy 生命周期与 switch 独立。`codex-helper serve` 默认在前台运行，`--resident` 会在控制台退出后保持 runtime，`codex-helper tui` 只附着一个只读控制台。这些命令都不会执行 `switch on` 或 `switch off`。Resident runtime 会在 `~/.codex-helper/run/` 写入提示性的 owner marker；使用只读的 `codex-helper daemon status` 检查。已安装的本地 runtime 使用 `codex-helper service start/stop/restart` 管理，不提供远程 HTTP shutdown 命令。
+Proxy 生命周期与 switch 独立。`codex-helper serve` 默认在前台运行，`--resident` 会在控制台退出后保持 runtime，`codex-helper tui` 只附着一个只读控制台。这些命令都不会执行 `switch on` 或 `switch off`。Resident runtime 会在 `~/.codex-helper/run/` 写入提示性的 owner marker；使用只读的 `codex-helper daemon status` 检查。`codex-helper daemon stop` 只通过同一用户的一次性签名 loopback action 停止手工启动的 `serve --resident` runtime；supervisor、已安装服务和桌面 owner 会拒绝它并给出对应的停止指引。远端控制面不能请求 shutdown，旧未鉴权 HTTP route 仍不存在。
 
 codex-helper 会在检查和转发前规范化 HTTP `Content-Encoding`。支持 `zstd`、`gzip` / `x-gzip`、`br` 和 `deflate`；成功解码后会转发普通 JSON，并移除失效的 `Content-Encoding` / `Content-Length`。只有上游要求收到完全相同的压缩 body 时，才设置 `CODEX_HELPER_REQUEST_BODY_ENCODING=passthrough`。
 

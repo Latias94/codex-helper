@@ -376,6 +376,51 @@ async fn migration_preserves_v0203_hosted_image_overrides_independently_from_pre
 }
 
 #[tokio::test]
+async fn migration_moves_legacy_client_patch_fields_with_their_toml_decor() {
+    let temp = TempConfigDir::new();
+    write(
+        &temp.0.join("config.toml"),
+        r#"version = 5
+
+[codex.client_patch] # keep patch heading
+# keep mode prefix
+mode    =  "official-relay-bridge" # keep mode suffix
+
+[relay_targets.nas] # keep target heading
+service = "codex"
+proxy_url = "http://127.0.0.1:3211"
+# keep target preset prefix
+client_preset    =  "official-relay" # keep target preset suffix
+# keep target websocket prefix
+responses_websocket  =   true # keep target websocket suffix
+future_target = { mode = "keep" } # keep unknown inline comment
+"#,
+    );
+
+    let plan = build_config_migration_plan(&temp.paths())
+        .await
+        .expect("migrate decorated legacy client-patch fields");
+
+    for preserved in [
+        "[codex.client_patch] # keep patch heading",
+        "# keep mode prefix\npreset    =  \"official-relay\" # keep mode suffix",
+        "[relay_targets.nas] # keep target heading",
+        "# keep target preset prefix\npreset    =  \"official-relay\" # keep target preset suffix",
+        "# keep target websocket prefix\nresponses_websocket  =   true # keep target websocket suffix",
+        "future_target = { mode = \"keep\" } # keep unknown inline comment",
+    ] {
+        assert!(
+            plan.rendered.contains(preserved),
+            "missing migrated decor fragment {preserved:?} in:\n{}",
+            plan.rendered
+        );
+    }
+    assert!(!plan.rendered.contains("mode    ="));
+    assert!(!plan.rendered.contains("client_preset"));
+    assert!(plan.rendered.contains("[relay_targets.nas.client_patch]"));
+}
+
+#[tokio::test]
 async fn migration_keeps_v6_client_patch_values_strict() {
     let temp = TempConfigDir::new();
     write(

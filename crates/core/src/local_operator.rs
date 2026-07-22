@@ -37,6 +37,54 @@ pub(crate) struct LocalOperatorSessionResponse {
     pub proof: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalRuntimeShutdownPolicy {
+    ForegroundProcess,
+    ManualResident,
+    SupervisorManaged,
+    SystemService,
+    DesktopManaged,
+}
+
+impl LocalRuntimeShutdownPolicy {
+    pub fn allows_signed_shutdown(self) -> bool {
+        matches!(self, Self::ManualResident)
+    }
+
+    pub(crate) fn rejection_guidance(self) -> &'static str {
+        match self {
+            Self::ManualResident => "",
+            Self::ForegroundProcess => {
+                "this runtime belongs to its foreground process; stop it with Ctrl-C in that terminal"
+            }
+            Self::SupervisorManaged => {
+                "this runtime is owned by daemon supervise and would otherwise be restarted; stop the supervisor with Ctrl-C in its terminal"
+            }
+            Self::SystemService => {
+                "this runtime is owned by the installed service; run `codex-helper service stop`"
+            }
+            Self::DesktopManaged => {
+                "this runtime is owned by the desktop application; use its explicit Stop Proxy action"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LocalRuntimeShutdownRequest {
+    pub service_name: String,
+    pub proxy_port: u16,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LocalRuntimeShutdownResponse {
+    pub accepted: bool,
+    pub service_name: String,
+    pub proxy_port: u16,
+}
+
 #[derive(Debug, Clone)]
 struct LocalOperatorSession {
     client_nonce: String,

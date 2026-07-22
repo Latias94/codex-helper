@@ -208,6 +208,18 @@ pub(crate) enum DaemonCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Gracefully stop a manually started resident proxy on this machine
+    Stop {
+        /// Target Codex proxy (default if neither flag is set)
+        #[arg(long)]
+        codex: bool,
+        /// Target Claude proxy
+        #[arg(long)]
+        claude: bool,
+        /// Proxy port; defaults to 3211 for Codex and 3210 for Claude
+        #[arg(long)]
+        port: Option<u16>,
+    },
     /// Run a foreground watchdog that restarts a resident proxy child after crashes
     Supervise {
         /// Target Codex proxy (default if neither flag is set)
@@ -2188,8 +2200,31 @@ mod tests {
     }
 
     #[test]
-    fn daemon_cli_rejects_http_stop_but_service_stop_remains_explicit() {
-        assert!(Cli::try_parse_from(["codex-helper", "daemon", "stop", "--codex"]).is_err());
+    fn daemon_cli_parses_signed_local_stop_target() {
+        let cli = Cli::try_parse_from([
+            "codex-helper",
+            "daemon",
+            "stop",
+            "--claude",
+            "--port",
+            "4210",
+        ])
+        .expect("parse daemon stop command");
+
+        let Some(Command::Daemon {
+            cmd:
+                DaemonCommand::Stop {
+                    codex,
+                    claude,
+                    port,
+                },
+        }) = cli.command
+        else {
+            panic!("expected daemon stop command");
+        };
+        assert!(!codex);
+        assert!(claude);
+        assert_eq!(port, Some(4210));
 
         let service_stop = Cli::try_parse_from(["codex-helper", "service", "stop"])
             .expect("parse local service stop command");

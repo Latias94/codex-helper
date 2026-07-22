@@ -94,6 +94,24 @@ impl ServeRuntimeOptions {
             && !self.desktop_managed
             && !self.service_managed
     }
+
+    fn local_runtime_shutdown_policy(
+        self,
+    ) -> codex_helper_core::local_operator::LocalRuntimeShutdownPolicy {
+        use codex_helper_core::local_operator::LocalRuntimeShutdownPolicy;
+
+        if self.service_managed {
+            LocalRuntimeShutdownPolicy::SystemService
+        } else if self.desktop_managed {
+            LocalRuntimeShutdownPolicy::DesktopManaged
+        } else if self.supervisor_managed {
+            LocalRuntimeShutdownPolicy::SupervisorManaged
+        } else if self.resident {
+            LocalRuntimeShutdownPolicy::ManualResident
+        } else {
+            LocalRuntimeShutdownPolicy::ForegroundProcess
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -402,6 +420,15 @@ async fn handle_daemon_cmd(cmd: DaemonCommand, auto_manage_codex_switch: bool) -
             let service_name = resolve_cli_service_name(codex, claude).await?;
             let port = port.unwrap_or_else(|| default_proxy_port_for_service(service_name));
             print_daemon_status(service_name, port, json).await
+        }
+        DaemonCommand::Stop {
+            codex,
+            claude,
+            port,
+        } => {
+            let service_name = resolve_cli_service_name(codex, claude).await?;
+            let port = port.unwrap_or_else(|| default_proxy_port_for_service(service_name));
+            stop_daemon(service_name, port).await
         }
         DaemonCommand::Supervise {
             codex,
@@ -1160,18 +1187,81 @@ fn operator_read_model_is_reachable(model: &OperatorReadModel) -> bool {
     model.status != OperatorReadStatus::Disconnected
 }
 
+const DAEMON_STATUS_SCHEMA_VERSION: u32 = 1;
+
+fn daemon_status_is_running(status: OperatorReadStatus) -> bool {
+    matches!(
+        status,
+        OperatorReadStatus::Ready | OperatorReadStatus::Stale
+    )
+}
+
+fn daemon_status_error(status: OperatorReadStatus) -> Option<&'static str> {
+    match status {
+        OperatorReadStatus::Disconnected => Some("local operator endpoint is disconnected"),
+        OperatorReadStatus::AuthRequired => Some("local operator authentication is required"),
+        OperatorReadStatus::Ready | OperatorReadStatus::Stale => None,
+    }
+}
+
+fn daemon_status_code(status: OperatorReadStatus) -> &'static str {
+    match status {
+        OperatorReadStatus::Ready => "UP",
+        OperatorReadStatus::Stale => "STALE",
+        OperatorReadStatus::Disconnected => "DOWN",
+        OperatorReadStatus::AuthRequired => "AUTH_REQUIRED",
+    }
+}
+
+fn daemon_status_display_label(status: OperatorReadStatus) -> &'static str {
+    match status {
+        OperatorReadStatus::Ready => "[UP]",
+        OperatorReadStatus::Stale => "[STALE]",
+        OperatorReadStatus::Disconnected => "[DOWN]",
+        OperatorReadStatus::AuthRequired => "[AUTH REQUIRED]",
+    }
+}
+
+fn daemon_status_json_payload(
+    service_name: &str,
+    port: u16,
+    owner: Option<&RuntimeOwnerMarker>,
+    model: &OperatorReadModel,
+) -> serde_json::Value {
+    let mut payload = model
+        .data
+        .as_ref()
+        .and_then(|data| serde_json::to_value(&data.summary).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    payload.insert(
+        "schema_version".to_string(),
+        serde_json::json!(DAEMON_STATUS_SCHEMA_VERSION),
+    );
+    payload.insert("service_name".to_string(), serde_json::json!(service_name));
+    payload.insert("port".to_string(), serde_json::json!(port));
+    payload.insert(
+        "status".to_string(),
+        serde_json::json!(daemon_status_code(model.status)),
+    );
+    payload.insert(
+        "running".to_string(),
+        serde_json::json!(daemon_status_is_running(model.status)),
+    );
+    payload.insert("owner".to_string(), serde_json::json!(owner));
+    payload.insert("operator_read_model".to_string(), serde_json::json!(model));
+    if let Some(error) = daemon_status_error(model.status) {
+        payload.insert("error".to_string(), serde_json::json!(error));
+    }
+    serde_json::Value::Object(payload)
+}
+
 async fn print_daemon_status(service_name: &'static str, port: u16, json: bool) -> CliResult<()> {
     let owner_marker = read_owner_marker_best_effort(service_name, port);
     let model = read_local_operator_model(service_name, port).await?;
 
     if json {
-        let payload = serde_json::json!({
-            "service_name": service_name,
-            "port": port,
-            "running": operator_read_model_is_reachable(&model),
-            "owner": owner_marker,
-            "operator_read_model": model,
-        });
+        let payload = daemon_status_json_payload(service_name, port, owner_marker.as_ref(), &model);
         println!(
             "{}",
             serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
@@ -1185,28 +1275,28 @@ async fn print_daemon_status(service_name: &'static str, port: u16, json: bool) 
     match model.status {
         OperatorReadStatus::Ready => println!(
             "{} {}:{} (admin: http://{})",
-            "[UP]".green(),
+            daemon_status_display_label(model.status).green(),
             model.service_name,
             port,
             admin_addr
         ),
         OperatorReadStatus::Stale => println!(
             "{} {}:{} (admin: http://{})",
-            "[STALE]".yellow(),
+            daemon_status_display_label(model.status).yellow(),
             model.service_name,
             port,
             admin_addr
         ),
         OperatorReadStatus::AuthRequired => println!(
             "{} {}:{} (admin: http://{})",
-            "[AUTH REQUIRED]".yellow(),
+            daemon_status_display_label(model.status).yellow(),
             service_name,
             port,
             admin_addr
         ),
         OperatorReadStatus::Disconnected => println!(
             "{} {}:{} (admin: http://{})",
-            "[DOWN]".yellow(),
+            daemon_status_display_label(model.status).yellow(),
             service_name,
             port,
             admin_addr
@@ -1256,6 +1346,252 @@ async fn print_daemon_status(service_name: &'static str, port: u16, json: bool) 
         );
     }
     Ok(())
+}
+
+fn validate_daemon_stop_owner(
+    service_name: &str,
+    port: u16,
+    owner: Option<&RuntimeOwnerMarker>,
+) -> CliResult<()> {
+    let Some(owner) = owner else {
+        return Ok(());
+    };
+    if owner.service_name != service_name || owner.proxy_port != port {
+        return Err(CliError::Other(format!(
+            "refusing to stop {service_name} daemon on port {port}: runtime ownership marker identifies {} on port {}",
+            owner.service_name, owner.proxy_port
+        )));
+    }
+    match owner.owner {
+        RuntimeOwnerKind::ManualCli
+            if owner.lifecycle_mode == ProxyLifecycleMode::ResidentDaemon =>
+        {
+            Ok(())
+        }
+        RuntimeOwnerKind::Supervisor => Err(CliError::Other(format!(
+            "refusing to stop {service_name} daemon on port {port}: daemon supervise owns it and would otherwise restart it; stop the supervisor with Ctrl-C in its terminal"
+        ))),
+        RuntimeOwnerKind::SystemService => Err(CliError::Other(format!(
+            "refusing to stop {service_name} daemon on port {port}: the installed service owns it; run `codex-helper service stop`"
+        ))),
+        RuntimeOwnerKind::Desktop => Err(CliError::Other(format!(
+            "refusing to stop {service_name} daemon on port {port}: the desktop application owns it; use its explicit Stop Proxy action"
+        ))),
+        RuntimeOwnerKind::ManualCli => Err(CliError::Other(format!(
+            "refusing to stop {service_name} daemon on port {port}: the foreground process owns it; stop it with Ctrl-C in that terminal"
+        ))),
+    }
+}
+
+async fn stop_daemon(service_name: &'static str, port: u16) -> CliResult<()> {
+    let owner = read_owner_marker_best_effort(service_name, port);
+    validate_daemon_stop_owner(service_name, port, owner.as_ref())?;
+    let endpoint = ControlPlaneEndpoint::new(
+        daemon_admin_base_url_for_proxy_port(port),
+        configured_local_admin_token_env().map(str::to_string),
+    )
+    .map_err(|error| CliError::Other(format!("resolve local daemon authority: {error}")))?;
+    let client = crate::control_plane_client::LocalOperatorClient::from_helper_home(
+        endpoint,
+        crate::config::proxy_home_dir(),
+    )
+    .map_err(|error| CliError::Other(format!("load local daemon capability: {error}")))?;
+    client
+        .shutdown_runtime(
+            &codex_helper_core::local_operator::LocalRuntimeShutdownRequest {
+                service_name: service_name.to_string(),
+                proxy_port: port,
+            },
+        )
+        .await
+        .map_err(|error| {
+            CliError::Other(format!(
+                "failed to stop {service_name} daemon on port {port}: {error}"
+            ))
+        })?;
+
+    println!(
+        "{} requested shutdown for {} daemon on port {}",
+        "[OK]".green(),
+        service_name,
+        port
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod daemon_status_contract_tests {
+    use super::*;
+    use crate::dashboard_core::{
+        ApiV1OperatorSummary, OperatorReadData, OperatorReadIssue, OperatorRevisionBundle,
+        OperatorSummaryCounts,
+    };
+
+    fn ready_operator_model() -> OperatorReadModel {
+        OperatorReadModel::ready(
+            "codex",
+            1_700_000_000_000,
+            OperatorRevisionBundle {
+                runtime_revision: 7,
+                runtime_digest: "runtime-7".to_string(),
+                route_digest: "route-7".to_string(),
+                catalog_revision: "catalog-7".to_string(),
+                pricing_revision: "pricing-7".to_string(),
+                operator_pricing_revision: "operator-pricing-7".to_string(),
+                policy_revision: 8,
+                ledger_revision: "operator-ledger-v1:test-store:9".to_string(),
+            },
+            OperatorReadData {
+                summary: ApiV1OperatorSummary {
+                    api_version: 1,
+                    service_name: "codex".to_string(),
+                    runtime: crate::dashboard_core::OperatorRuntimeSummary {
+                        default_profile: Some("daily".to_string()),
+                        ..Default::default()
+                    },
+                    counts: OperatorSummaryCounts {
+                        active_requests: 3,
+                        recent_requests: 5,
+                        ..Default::default()
+                    },
+                    retry: Default::default(),
+                    credential_readiness: None,
+                    sessions: Vec::new(),
+                    profiles: Vec::new(),
+                    providers: Vec::new(),
+                },
+                routing: None,
+                active_requests: Vec::new(),
+                recent_requests: Vec::new(),
+                usage_summaries: Vec::new(),
+                usage_day: Default::default(),
+                usage_rollup: Default::default(),
+                quota_analytics: Default::default(),
+                stats_5m: Default::default(),
+                stats_1h: Default::default(),
+                pricing_catalog: Default::default(),
+                service_status: None,
+                provider_balances: Vec::new(),
+            },
+        )
+    }
+
+    #[test]
+    fn daemon_status_json_keeps_legacy_summary_paths_and_complete_read_model() {
+        let model = ready_operator_model();
+        let payload = daemon_status_json_payload("codex", 3211, None, &model);
+
+        assert_eq!(payload["schema_version"], 1);
+        assert_eq!(payload["status"], "UP");
+        assert_eq!(payload["running"], true);
+        assert_eq!(
+            payload
+                .pointer("/counts/active_requests")
+                .and_then(serde_json::Value::as_u64),
+            Some(3)
+        );
+        assert_eq!(
+            payload
+                .pointer("/runtime/default_profile")
+                .and_then(serde_json::Value::as_str),
+            Some("daily")
+        );
+        assert_eq!(
+            payload["operator_read_model"],
+            serde_json::to_value(&model).expect("serialize full operator model")
+        );
+    }
+
+    #[test]
+    fn daemon_status_codes_are_stable_for_ready_down_and_auth_required() {
+        let down = OperatorReadModel::disconnected("codex");
+        let auth = OperatorReadModel::auth_required("codex");
+        let stale = OperatorReadModel {
+            status: OperatorReadStatus::Stale,
+            issue: Some(OperatorReadIssue::RefreshFailed),
+            ..ready_operator_model()
+        };
+
+        assert_eq!(daemon_status_code(OperatorReadStatus::Ready), "UP");
+        assert_eq!(daemon_status_code(OperatorReadStatus::Disconnected), "DOWN");
+        assert_eq!(
+            daemon_status_code(OperatorReadStatus::AuthRequired),
+            "AUTH_REQUIRED"
+        );
+        assert_eq!(daemon_status_code(OperatorReadStatus::Stale), "STALE");
+        assert_eq!(
+            daemon_status_display_label(OperatorReadStatus::Ready),
+            "[UP]"
+        );
+        assert_eq!(
+            daemon_status_display_label(OperatorReadStatus::Disconnected),
+            "[DOWN]"
+        );
+        assert_eq!(
+            daemon_status_display_label(OperatorReadStatus::AuthRequired),
+            "[AUTH REQUIRED]"
+        );
+        assert_eq!(
+            daemon_status_json_payload("codex", 3211, None, &down)["status"],
+            "DOWN"
+        );
+        assert_eq!(
+            daemon_status_json_payload("codex", 3211, None, &down)["running"],
+            false
+        );
+        assert!(
+            daemon_status_json_payload("codex", 3211, None, &down)["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("disconnected"))
+        );
+        assert_eq!(
+            daemon_status_json_payload("codex", 3211, None, &auth)["status"],
+            "AUTH_REQUIRED"
+        );
+        assert_eq!(
+            daemon_status_json_payload("codex", 3211, None, &auth)["running"],
+            false
+        );
+        assert!(
+            daemon_status_json_payload("codex", 3211, None, &auth)["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("authentication"))
+        );
+        assert_eq!(
+            daemon_status_json_payload("codex", 3211, None, &stale)["status"],
+            "STALE"
+        );
+    }
+
+    #[test]
+    fn daemon_stop_owner_guard_preserves_supervisor_and_service_authority() {
+        for (owner_kind, guidance) in [
+            (RuntimeOwnerKind::Supervisor, "Ctrl-C"),
+            (RuntimeOwnerKind::SystemService, "service stop"),
+        ] {
+            let owner =
+                RuntimeOwnerMarker::new_with_pid(owner_kind, "codex", 3211, 42, 1_700_000_000_000);
+            let error = validate_daemon_stop_owner("codex", 3211, Some(&owner))
+                .expect_err("managed runtime ownership must reject daemon stop");
+            assert!(error.to_string().contains(guidance), "{error}");
+        }
+
+        let manual = RuntimeOwnerMarker::new_with_pid(
+            RuntimeOwnerKind::ManualCli,
+            "codex",
+            3211,
+            42,
+            1_700_000_000_000,
+        );
+        validate_daemon_stop_owner("codex", 3211, Some(&manual))
+            .expect("manual resident may use signed daemon stop");
+        let mismatch = validate_daemon_stop_owner("claude", 3210, Some(&manual))
+            .expect_err("ownership identity mismatch must fail closed");
+        assert!(
+            mismatch.to_string().contains("ownership marker"),
+            "{mismatch}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2337,10 +2673,20 @@ async fn run_server(
     let loaded = load_serve_config().await?;
     let tui_lang = resolve_serve_tui_language(&loaded).await;
     let client_patch = loaded.source.codex.client_patch.unwrap_or_default();
+    if options.is_resident() {
+        codex_helper_core::local_operator::ensure_local_operator_token()
+            .context("prepare the resident runtime's signed local operator capability")?;
+    }
 
-    let runtime =
-        build_local_proxy_runtime(service_name, host, port, options.service_managed, loaded)
-            .await?;
+    let runtime = build_local_proxy_runtime(
+        service_name,
+        host,
+        port,
+        options.service_managed,
+        options.local_runtime_shutdown_policy(),
+        loaded,
+    )
+    .await?;
     let owner_lease = options
         .owner_marker(service_name, port)
         .map(|marker| RuntimeOwnerLease::acquire(&marker).context("acquire runtime ownership"))
@@ -2479,6 +2825,7 @@ async fn build_local_proxy_runtime(
     host: IpAddr,
     port: u16,
     service_managed: bool,
+    local_runtime_shutdown_policy: codex_helper_core::local_operator::LocalRuntimeShutdownPolicy,
     loaded: LoadedConfig,
 ) -> anyhow::Result<ProxyRuntime> {
     let admin_addr = admin_loopback_addr_for_proxy_port(port);
@@ -2517,7 +2864,8 @@ async fn build_local_proxy_runtime(
         ProxyRuntimeOptions::for_proxy_port(port)
             .with_admin_addr(admin_addr)
             .with_credential_sources(CredentialSourceCapabilities::platform_native())
-            .with_service_runtime_identity(service_runtime_identity),
+            .with_service_runtime_identity(service_runtime_identity)
+            .with_local_runtime_shutdown_policy(local_runtime_shutdown_policy),
         loaded,
     )
     .await
@@ -4873,6 +5221,7 @@ env_key = "EXTERNAL_API_KEY"
             proxy_addr.ip(),
             proxy_addr.port(),
             false,
+            codex_helper_core::local_operator::LocalRuntimeShutdownPolicy::ForegroundProcess,
             empty_loaded_test_config(),
         ));
         let error = match result {
@@ -4918,6 +5267,7 @@ env_key = "EXTERNAL_API_KEY"
                 proxy_addr.ip(),
                 proxy_addr.port(),
                 false,
+                codex_helper_core::local_operator::LocalRuntimeShutdownPolicy::ForegroundProcess,
                 loaded_runtime_test_config(),
             )
             .await;
@@ -4944,6 +5294,7 @@ env_key = "EXTERNAL_API_KEY"
                 IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
                 proxy_port,
                 false,
+                codex_helper_core::local_operator::LocalRuntimeShutdownPolicy::ForegroundProcess,
                 loaded_runtime_test_config(),
             )
             .await;

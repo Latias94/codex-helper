@@ -101,9 +101,9 @@ use self::concurrency_limits::ConcurrencyLimiter;
 pub(crate) use self::control_plane_manifest::{
     LOCAL_V1_BALANCE_REFRESH, LOCAL_V1_CREDENTIAL_REFRESH, LOCAL_V1_DEFAULT_PROFILE_MUTATION,
     LOCAL_V1_OPERATOR_SESSION, LOCAL_V1_RELAY_CAPABILITIES, LOCAL_V1_RELAY_LIVE_SMOKE,
-    LOCAL_V1_ROUTING_MUTATION, LOCAL_V1_RUNTIME_RELOAD, LOCAL_V1_SERVICE_RUNTIME_READ,
-    LOCAL_V1_SESSION_AFFINITY_MUTATION, LOCAL_V1_SESSION_BINDING_MUTATION,
-    LOCAL_V1_SESSION_METADATA_READ,
+    LOCAL_V1_ROUTING_MUTATION, LOCAL_V1_RUNTIME_RELOAD, LOCAL_V1_RUNTIME_SHUTDOWN,
+    LOCAL_V1_SERVICE_RUNTIME_READ, LOCAL_V1_SESSION_AFFINITY_MUTATION,
+    LOCAL_V1_SESSION_BINDING_MUTATION, LOCAL_V1_SESSION_METADATA_READ,
 };
 pub(crate) use self::entrypoint::handle_proxy;
 pub(crate) use self::local_operator_routes::{
@@ -155,6 +155,65 @@ pub struct ProxyService {
     state: Arc<ProxyState>,
     service_install_generation: Option<crate::service_target::ServiceInstallGeneration>,
     service_runtime_identity: Option<crate::service_target::ServiceRuntimeIdentity>,
+    local_runtime_shutdown: Option<LocalRuntimeShutdownControl>,
+}
+
+#[derive(Clone)]
+struct LocalRuntimeShutdownControl {
+    policy: crate::local_operator::LocalRuntimeShutdownPolicy,
+    proxy_port: u16,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+}
+
+impl ProxyService {
+    pub(crate) fn with_local_runtime_shutdown(
+        mut self,
+        proxy_port: u16,
+        policy: crate::local_operator::LocalRuntimeShutdownPolicy,
+        shutdown_tx: tokio::sync::watch::Sender<bool>,
+    ) -> Self {
+        self.local_runtime_shutdown = Some(LocalRuntimeShutdownControl {
+            policy,
+            proxy_port,
+            shutdown_tx,
+        });
+        self
+    }
+
+    fn request_local_runtime_shutdown(
+        &self,
+        request: &crate::local_operator::LocalRuntimeShutdownRequest,
+    ) -> Result<crate::local_operator::LocalRuntimeShutdownResponse, ProxyControlError> {
+        let Some(control) = self.local_runtime_shutdown.as_ref() else {
+            return Err(ProxyControlError::new(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "signed local runtime shutdown is unavailable for this proxy instance",
+            ));
+        };
+        if request.service_name != self.service_name || request.proxy_port != control.proxy_port {
+            return Err(ProxyControlError::new(
+                axum::http::StatusCode::CONFLICT,
+                "shutdown target does not match the running proxy identity",
+            ));
+        }
+        if !control.policy.allows_signed_shutdown() {
+            return Err(ProxyControlError::new(
+                axum::http::StatusCode::CONFLICT,
+                control.policy.rejection_guidance(),
+            ));
+        }
+        control.shutdown_tx.send(true).map_err(|_| {
+            ProxyControlError::new(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "the proxy runtime already released its shutdown receiver",
+            )
+        })?;
+        Ok(crate::local_operator::LocalRuntimeShutdownResponse {
+            accepted: true,
+            service_name: self.service_name.to_string(),
+            proxy_port: control.proxy_port,
+        })
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

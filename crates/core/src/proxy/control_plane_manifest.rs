@@ -17,6 +17,8 @@ pub(crate) const LOCAL_V1_SESSION_BINDING_MUTATION: &str =
 pub(crate) const LOCAL_V1_DEFAULT_PROFILE_MUTATION: &str =
     "/__codex_helper/local/v1/operator/default-profile";
 pub(crate) const LOCAL_V1_RUNTIME_RELOAD: &str = "/__codex_helper/local/v1/operator/runtime/reload";
+pub(crate) const LOCAL_V1_RUNTIME_SHUTDOWN: &str =
+    "/__codex_helper/local/v1/operator/runtime/shutdown";
 pub(crate) const LOCAL_V1_RELAY_CAPABILITIES: &str =
     "/__codex_helper/local/v1/operator/relay/capabilities";
 pub(crate) const LOCAL_V1_RELAY_LIVE_SMOKE: &str =

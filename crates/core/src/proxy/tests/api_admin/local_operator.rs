@@ -117,6 +117,7 @@ fn proxy_with_usage_provider_catalog(
         state,
         service_install_generation: None,
         service_runtime_identity: None,
+        local_runtime_shutdown: None,
     }
 }
 

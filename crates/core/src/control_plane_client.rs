@@ -13,9 +13,9 @@ use crate::dashboard_core::{
     LocalOperatorSessionMetadataResponse, OperatorReadModel, OperatorReadStatus,
 };
 use crate::local_operator::{
-    LocalOperatorSessionRequest, LocalOperatorSessionResponse, local_operator_client_proof,
-    local_operator_request_signature, new_local_operator_nonce, unix_time_ms,
-    verify_local_operator_server_proof,
+    LocalOperatorSessionRequest, LocalOperatorSessionResponse, LocalRuntimeShutdownRequest,
+    LocalRuntimeShutdownResponse, local_operator_client_proof, local_operator_request_signature,
+    new_local_operator_nonce, unix_time_ms, verify_local_operator_server_proof,
 };
 use crate::proxy::{
     ADMIN_TOKEN_ENV_VAR, ADMIN_TOKEN_HEADER, CodexRelayCapabilitiesRequest,
@@ -24,7 +24,7 @@ use crate::proxy::{
     LOCAL_OPERATOR_TIMESTAMP_HEADER, LOCAL_V1_BALANCE_REFRESH, LOCAL_V1_CREDENTIAL_REFRESH,
     LOCAL_V1_DEFAULT_PROFILE_MUTATION, LOCAL_V1_OPERATOR_SESSION, LOCAL_V1_RELAY_CAPABILITIES,
     LOCAL_V1_RELAY_LIVE_SMOKE, LOCAL_V1_ROUTING_MUTATION, LOCAL_V1_RUNTIME_RELOAD,
-    LOCAL_V1_SERVICE_RUNTIME_READ, LOCAL_V1_SESSION_AFFINITY_MUTATION,
+    LOCAL_V1_RUNTIME_SHUTDOWN, LOCAL_V1_SERVICE_RUNTIME_READ, LOCAL_V1_SESSION_AFFINITY_MUTATION,
     LOCAL_V1_SESSION_BINDING_MUTATION, LOCAL_V1_SESSION_METADATA_READ,
     OperatorDefaultProfileMutationRequest, OperatorDefaultProfileMutationResponse,
     OperatorRoutingMutationRequest, OperatorRoutingMutationResponse, OperatorRuntimeReloadRequest,
@@ -37,7 +37,6 @@ use crate::service_target::{
     LocalCredentialRefreshRequest, LocalCredentialRefreshResponse, LocalServiceRuntimeReadRequest,
     LocalServiceRuntimeReadResponse,
 };
-
 const MAX_HTTP_ERROR_BODY_BYTES: usize = 4 * 1024;
 const LOCAL_OPERATOR_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const LOCAL_OPERATOR_BALANCE_REFRESH_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -433,6 +432,27 @@ impl LocalOperatorClient {
     pub async fn reload_runtime(&self) -> Result<OperatorRuntimeReloadResponse, ControlPlaneError> {
         self.post_json_classified(LOCAL_V1_RUNTIME_RELOAD, &OperatorRuntimeReloadRequest {})
             .await
+    }
+
+    pub async fn shutdown_runtime(
+        &self,
+        request: &LocalRuntimeShutdownRequest,
+    ) -> Result<LocalRuntimeShutdownResponse, ControlPlaneError> {
+        let response = self
+            .post_json_classified::<_, LocalRuntimeShutdownResponse>(
+                LOCAL_V1_RUNTIME_SHUTDOWN,
+                request,
+            )
+            .await?;
+        if !response.accepted
+            || response.service_name != request.service_name
+            || response.proxy_port != request.proxy_port
+        {
+            return Err(ControlPlaneError::InvalidPayload {
+                reason: "local operator daemon returned a different shutdown target".to_string(),
+            });
+        }
+        Ok(response)
     }
 
     pub async fn inspect_relay_capabilities(

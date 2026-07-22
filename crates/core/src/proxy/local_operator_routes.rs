@@ -12,9 +12,9 @@ use super::admin_api_error::{AdminApiHttpError, AdminApiResult};
 use super::control_plane_manifest::{
     LOCAL_V1_BALANCE_REFRESH, LOCAL_V1_CREDENTIAL_REFRESH, LOCAL_V1_DEFAULT_PROFILE_MUTATION,
     LOCAL_V1_OPERATOR_SESSION, LOCAL_V1_RELAY_CAPABILITIES, LOCAL_V1_RELAY_LIVE_SMOKE,
-    LOCAL_V1_ROUTING_MUTATION, LOCAL_V1_RUNTIME_RELOAD, LOCAL_V1_SERVICE_RUNTIME_READ,
-    LOCAL_V1_SESSION_AFFINITY_MUTATION, LOCAL_V1_SESSION_BINDING_MUTATION,
-    LOCAL_V1_SESSION_METADATA_READ,
+    LOCAL_V1_ROUTING_MUTATION, LOCAL_V1_RUNTIME_RELOAD, LOCAL_V1_RUNTIME_SHUTDOWN,
+    LOCAL_V1_SERVICE_RUNTIME_READ, LOCAL_V1_SESSION_AFFINITY_MUTATION,
+    LOCAL_V1_SESSION_BINDING_MUTATION, LOCAL_V1_SESSION_METADATA_READ,
 };
 use super::{
     CodexRelayCapabilitiesRequest, CodexRelayLiveSmokeRequest,
@@ -66,6 +66,7 @@ pub(super) fn local_operator_routes(proxy: ProxyService) -> Router {
             post(mutate_default_profile),
         )
         .route(LOCAL_V1_RUNTIME_RELOAD, post(reload_runtime))
+        .route(LOCAL_V1_RUNTIME_SHUTDOWN, post(shutdown_runtime))
         .route(
             LOCAL_V1_RELAY_CAPABILITIES,
             post(inspect_relay_capabilities),
@@ -347,6 +348,27 @@ async fn reload_runtime(
         .proxy
         .operator_runtime_reload(request)
         .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn shutdown_runtime(
+    State(state): State<LocalOperatorRouteState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> AdminApiResult<crate::local_operator::LocalRuntimeShutdownResponse> {
+    authorize_local_operator_action(&state, &headers, LOCAL_V1_RUNTIME_SHUTDOWN, &body)?;
+    let request =
+        serde_json::from_slice::<crate::local_operator::LocalRuntimeShutdownRequest>(&body)
+            .map_err(|error| {
+                AdminApiHttpError::bad_request(
+                    "local_operator_invalid_json",
+                    format!("invalid local operator runtime shutdown request: {error}"),
+                )
+            })?;
+    state
+        .proxy
+        .request_local_runtime_shutdown(&request)
         .map(Json)
         .map_err(Into::into)
 }

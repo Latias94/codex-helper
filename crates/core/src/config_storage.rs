@@ -4031,6 +4031,7 @@ fn render_lossless_toml_value_transform(
     let after_table = after
         .as_table()
         .with_context(|| format!("config.toml state after {operation} is not a table"))?;
+    let decor_moves = capture_migration_decor_moves(&document, before, after);
 
     apply_typed_config_diff(
         document.as_table_mut(),
@@ -4038,6 +4039,7 @@ fn render_lossless_toml_value_transform(
         after_table,
         generated.as_table(),
     )?;
+    apply_migration_decor_moves(&mut document, decor_moves)?;
 
     let rendered = document.to_string();
     let reparsed = toml::from_str::<TomlValue>(&rendered)
@@ -4047,6 +4049,151 @@ fn render_lossless_toml_value_transform(
         "format-preserving config.toml {operation} did not reproduce the requested configuration"
     );
     Ok(rendered)
+}
+
+struct MigrationDecorMove {
+    destination_path: Vec<String>,
+    source_key: toml_edit::Key,
+    source_item: toml_edit::Item,
+}
+
+fn capture_migration_decor_moves(
+    document: &toml_edit::DocumentMut,
+    before: &TomlValue,
+    after: &TomlValue,
+) -> Vec<MigrationDecorMove> {
+    let mut moves = Vec::new();
+    capture_migration_decor_move(
+        document,
+        before,
+        after,
+        &["codex", "client_patch", "mode"],
+        &["codex", "client_patch", "preset"],
+        &mut moves,
+    );
+
+    if let Some(targets) = before.get("relay_targets").and_then(TomlValue::as_table) {
+        for target_name in targets.keys() {
+            capture_migration_decor_move(
+                document,
+                before,
+                after,
+                &["relay_targets", target_name.as_str(), "client_preset"],
+                &[
+                    "relay_targets",
+                    target_name.as_str(),
+                    "client_patch",
+                    "preset",
+                ],
+                &mut moves,
+            );
+            capture_migration_decor_move(
+                document,
+                before,
+                after,
+                &["relay_targets", target_name.as_str(), "responses_websocket"],
+                &[
+                    "relay_targets",
+                    target_name.as_str(),
+                    "client_patch",
+                    "responses_websocket",
+                ],
+                &mut moves,
+            );
+        }
+    }
+
+    moves
+}
+
+fn capture_migration_decor_move(
+    document: &toml_edit::DocumentMut,
+    before: &TomlValue,
+    after: &TomlValue,
+    source_path: &[&str],
+    destination_path: &[&str],
+    moves: &mut Vec<MigrationDecorMove>,
+) {
+    if nested_toml_value(before, source_path).is_none()
+        || nested_toml_value(before, destination_path).is_some()
+        || nested_toml_value(after, source_path).is_some()
+        || nested_toml_value(after, destination_path).is_none()
+    {
+        return;
+    }
+
+    let Some((source_key_name, source_parent_path)) = source_path.split_last() else {
+        return;
+    };
+    let Some(source_parent) = toml_edit_table_at_path(document.as_table(), source_parent_path)
+    else {
+        return;
+    };
+    let Some((source_key, source_item)) = source_parent.get_key_value(source_key_name) else {
+        return;
+    };
+
+    moves.push(MigrationDecorMove {
+        destination_path: destination_path
+            .iter()
+            .map(|component| (*component).to_string())
+            .collect(),
+        source_key: source_key.clone(),
+        source_item: source_item.clone(),
+    });
+}
+
+fn apply_migration_decor_moves(
+    document: &mut toml_edit::DocumentMut,
+    moves: Vec<MigrationDecorMove>,
+) -> Result<()> {
+    for decor_move in moves {
+        let (destination_key_name, destination_parent_path) = decor_move
+            .destination_path
+            .split_last()
+            .expect("migration decor destinations are never empty");
+        let destination_parent =
+            toml_edit_table_at_path_mut(document.as_table_mut(), destination_parent_path)
+                .with_context(|| {
+                    format!(
+                        "format-preserving migration omitted destination table `{}`",
+                        destination_parent_path.join(".")
+                    )
+                })?;
+        let (mut destination_key, destination_item) = destination_parent
+            .get_key_value_mut(destination_key_name)
+            .with_context(|| {
+                format!(
+                    "format-preserving migration omitted destination field `{}`",
+                    decor_move.destination_path.join(".")
+                )
+            })?;
+
+        *destination_key.leaf_decor_mut() = decor_move.source_key.leaf_decor().clone();
+        *destination_key.dotted_decor_mut() = decor_move.source_key.dotted_decor().clone();
+        copy_config_item_decor(&decor_move.source_item, destination_item);
+    }
+    Ok(())
+}
+
+fn toml_edit_table_at_path<'a>(
+    table: &'a dyn toml_edit::TableLike,
+    path: &[&str],
+) -> Option<&'a dyn toml_edit::TableLike> {
+    path.iter().try_fold(table, |current, component| {
+        current.get(component)?.as_table_like()
+    })
+}
+
+fn toml_edit_table_at_path_mut<'a>(
+    table: &'a mut dyn toml_edit::TableLike,
+    path: &[String],
+) -> Option<&'a mut dyn toml_edit::TableLike> {
+    let Some((component, remaining)) = path.split_first() else {
+        return Some(table);
+    };
+    let child = table.get_mut(component)?.as_table_like_mut()?;
+    toml_edit_table_at_path_mut(child, remaining)
 }
 
 fn apply_typed_config_diff(
@@ -4144,7 +4291,12 @@ fn replace_config_item_preserving_decor(
         return;
     };
 
-    match (&*current, &mut replacement) {
+    copy_config_item_decor(&*current, &mut replacement);
+    *current = replacement;
+}
+
+fn copy_config_item_decor(source: &toml_edit::Item, destination: &mut toml_edit::Item) {
+    match (source, destination) {
         (toml_edit::Item::Value(current), toml_edit::Item::Value(replacement)) => {
             *replacement.decor_mut() = current.decor().clone();
         }
@@ -4154,7 +4306,6 @@ fn replace_config_item_preserving_decor(
         }
         _ => {}
     }
-    *current = replacement;
 }
 
 pub async fn mutate_helper_config<T>(

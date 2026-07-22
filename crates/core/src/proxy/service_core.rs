@@ -162,6 +162,7 @@ impl ProxyService {
             state,
             service_install_generation: None,
             service_runtime_identity: None,
+            local_runtime_shutdown: None,
         })
     }
 
